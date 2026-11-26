@@ -40,7 +40,14 @@ SCHED = KERNEL_SRC / "proc" / "sched.ritz"
 ENTRY = KERNEL_SRC / "syscall" / "runtime" / "entry.ritz"
 CONSOLE = KERNEL_SRC / "tty" / "console.ritz"
 
-MODULES = ["syscall/errno.ritz", "proc/table.ritz", "proc/waitset.ritz"]
+# Tree path -> real source. driver_abi.wait (the WaitEvent layout and the
+# event bits) is a leaf the kernel takes from the driver_abi package.
+MODULES = {
+    "syscall/errno.ritz": KERNEL_SRC / "syscall" / "errno.ritz",
+    "proc/table.ritz": KERNEL_SRC / "proc" / "table.ritz",
+    "driver_abi/wait.ritz": HARLAND / "driver_abi" / "src" / "wait.ritz",
+    "proc/waitset.ritz": KERNEL_SRC / "proc" / "waitset.ritz",
+}
 
 
 def _compile(tmp_path, path, name, extra=()):
@@ -54,9 +61,9 @@ def _compile(tmp_path, path, name, extra=()):
 def _run(tmp_path, src):
     """Compile the real proc/table.ritz and proc/waitset.ritz with `src`, link, run."""
     tree = tmp_path / "tree"
-    for rel in MODULES:
+    for rel, real in MODULES.items():
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
-        (tree / rel).write_text((KERNEL_SRC / rel).read_text())
+        (tree / rel).write_text(real.read_text())
     objs = [str(_compile(tmp_path, tree / rel, rel[:-5].replace("/", "_"), ("--no-runtime",)))
             for rel in MODULES]
     (tmp_path / "t.ritz").write_text(src)
@@ -242,6 +249,253 @@ fn main() -> i32
 @pytest.mark.integration
 def test_waitset_latch_wake_and_deadline(tmp_path):
     assert _run(tmp_path, WAITSET) == 0
+
+
+# Shm latches, ShmNotify, the inbox and the collect step both waits share
+# (AGAST #4727, RING1_DRIVER.md "Wait and notify"). Exit status: the number
+# of the first claim that failed, 0 if all held.
+SHM_WAIT = """\
+import proc.table
+import proc.waitset
+import driver_abi.wait
+
+const IRQ: u64 = 0xA0               # the driver's IRQ object
+const FRAME: u64 = 7                # shm object ids: the frame object,
+const APP1: u64 = 8                 # two app exchanges,
+const APP2: u64 = 9
+const LONE: u64 = 10                # and one only the driver holds
+const DRIVER: u64 = 2
+const SERVICE: u64 = 3
+const APP: u64 = 4
+const NOBODY: u64 = 9               # no process has this pid
+# Handles are opaque to the wait set: it copies them into the records.
+const H_IRQ: u64 = 0x100000000
+const H_FRAME: u64 = 0x200000001
+const H_LONE: u64 = 0x300000002
+const H_APP1: u64 = 0x400000003
+const H_APP2: u64 = 0x500000004
+
+pub fn cap_irq_owner(object_id: u64) -> u32
+    if object_id == IRQ
+        return DRIVER as u32
+    0
+
+pub fn lapic_is_bsp() -> bool
+    true
+
+fn park(slot: i32)
+    let was: i32 = proc_current_slot()
+    proc_set_current(slot)
+    proc_block(BLOCK_WAIT, 0)
+    proc_set_current(was)
+
+fn parked(slot: i32) -> bool
+    proc_at(slot).state == PROC_BLOCKED and proc_at(slot).block == BLOCK_WAIT
+
+fn running(slot: i32) -> bool
+    proc_at(slot).state == PROC_RUNNING
+
+fn is_posted(n: Notify) -> bool
+    match n
+        Notify.Posted => true
+        _ => false
+
+fn is_bad_bits(n: Notify) -> bool
+    match n
+        Notify.BadBits => true
+        _ => false
+
+fn is_no_peer(n: Notify) -> bool
+    match n
+        Notify.NoPeer => true
+        _ => false
+
+fn has(got: *Collected, i: u32, handle: u64, bits: u32) -> bool
+    got.events[i as i32].handle == handle and got.events[i as i32].bits == bits
+
+# The driver's wait: the IRQ, then the frame object and LONE.
+fn driver_plan(frame_mask: u32) -> WaitPlan
+    var plan: WaitPlan = wait_plan_irq(H_IRQ, IRQ)
+    wait_plan_add(@plan, H_FRAME, FRAME, frame_mask)
+    wait_plan_add(@plan, H_LONE, LONE, EVENT_DATA)
+    plan
+
+fn main() -> i32
+    proc_table_reset()
+    proc_enter_init(0)
+    let d: i32 = proc_new_child()
+    proc_start(d)
+    let s: i32 = proc_new_child()
+    proc_start(s)
+    let a: i32 = proc_new_child()
+    proc_start(a)
+    if proc_at(d).pid != DRIVER or proc_at(s).pid != SERVICE or proc_at(a).pid != APP
+        return 100
+    if not irq_object_register(IRQ, IRQ_NO_VECTOR)
+        return 101
+
+    # One latch per (object, holding pid), made when the handle is
+    # inserted: a second insert of the same pair adds none, so one drop
+    # ends it.
+    if not shm_latch_create(LONE, DRIVER) or not shm_latch_create(LONE, DRIVER)
+        return 1
+    shm_latch_drop(LONE, DRIVER)
+    if shm_latch_held(LONE, DRIVER)
+        return 2
+    if not shm_latch_create(LONE, DRIVER) or not shm_latch_create(FRAME, DRIVER) or not shm_latch_create(FRAME, SERVICE)
+        return 3
+    if not shm_latch_create(APP1, SERVICE) or not shm_latch_create(APP1, APP)
+        return 4
+    if not shm_latch_create(APP2, SERVICE) or not shm_latch_create(APP2, APP)
+        return 5
+
+    # ShmNotify with no other holder: NoDev, nothing posted.
+    if not is_no_peer(shm_notify(LONE, DRIVER, EVENT_DATA)) or shm_latch_bits(LONE, DRIVER) != 0
+        return 6
+    # Userspace may post DATA and SPACE only: zero, a kernel bit, a mix
+    # holding one, and the reserved bit are refused, and the peer's latch
+    # (and so its attachment) is untouched.
+    if not is_bad_bits(shm_notify(APP1, APP, EVENT_PEER_CLOSE))
+        return 7
+    if not is_bad_bits(shm_notify(APP1, APP, EVENT_DATA | EVENT_DRIVER_GONE))
+        return 8
+    if not is_bad_bits(shm_notify(APP1, APP, 0)) or not is_bad_bits(shm_notify(APP1, APP, EVENT_RESERVED_32))
+        return 9
+    if shm_latch_bits(APP1, SERVICE) != 0 or not shm_latch_held(APP1, SERVICE)
+        return 10
+
+    # A TX notify before the driver parks lands on the driver's latch (it has
+    # mapped nothing; the latch is the handle's), not the notifier's.
+    if not is_posted(shm_notify(FRAME, SERVICE, EVENT_DATA))
+        return 11
+    if shm_latch_bits(FRAME, DRIVER) != EVENT_DATA or shm_latch_bits(FRAME, SERVICE) != 0
+        return 12
+    # The driver's next wait copies it without parking, and the IRQ is cold:
+    # the IRQ flag is clear (DrvIrqWait returns 2), one record, latch cleared.
+    var plan: WaitPlan = driver_plan(EVENT_DATA)
+    var got: Collected = waitset_collect(@plan, DRIVER, 8)
+    if got.count != 1 or got.irq or not has(@got, 0, H_FRAME, EVENT_DATA)
+        return 13
+    if shm_latch_bits(FRAME, DRIVER) != 0
+        return 14
+    # Nothing hot: an empty collection (the wait parks or returns 1).
+    got = waitset_collect(@plan, DRIVER, 8)
+    if got.count != 0 or got.irq
+        return 15
+
+    # A notify wakes the peer parked on its wait set, and only it.
+    park(d)
+    park(s)
+    shm_notify(FRAME, SERVICE, EVENT_DATA)
+    if not running(d) or not parked(s)
+        return 16
+    proc_wake_pid(SERVICE, BLOCK_WAIT)
+
+    # out_cap 2 with four hot sources: the IRQ record first, then the frame
+    # object's; LONE's kernel post and the inbox record stay for the next
+    # wait, which returns them without the IRQ.
+    irq_object_latch(IRQ)
+    if not shm_latch_post(LONE, DRIVER, EVENT_PEER_CLOSE)
+        return 17
+    if not waitset_inbox_post(DRIVER, 0x77, EVENT_ATTACH)
+        return 18
+    got = waitset_collect(@plan, DRIVER, 2)
+    if got.count != 2 or not got.irq
+        return 19
+    if not has(@got, 0, H_IRQ, EVENT_DATA) or not has(@got, 1, H_FRAME, EVENT_DATA)
+        return 20
+    if shm_latch_bits(LONE, DRIVER) != EVENT_PEER_CLOSE or waitset_inbox_len(DRIVER) != 1
+        return 21
+    # A kernel bit is copied whatever the mask (LONE's lists DATA only).
+    got = waitset_collect(@plan, DRIVER, 8)
+    if got.count != 2 or got.irq
+        return 22
+    if not has(@got, 0, H_LONE, EVENT_PEER_CLOSE) or not has(@got, 1, 0x77, EVENT_ATTACH)
+        return 23
+    if shm_latch_bits(LONE, DRIVER) != 0 or waitset_inbox_len(DRIVER) != 0
+        return 24
+
+    # The mask picks among DATA and SPACE: an unlisted bit stays latched
+    # and is copied (only it) once the mask names it.
+    shm_notify(FRAME, SERVICE, EVENT_SPACE)
+    got = waitset_collect(@plan, DRIVER, 8)
+    if got.count != 0 or shm_latch_bits(FRAME, DRIVER) != EVENT_SPACE
+        return 25
+    var spaced: WaitPlan = driver_plan(EVENT_DATA | EVENT_SPACE)
+    got = waitset_collect(@spaced, DRIVER, 8)
+    if got.count != 1 or not has(@got, 0, H_FRAME, EVENT_SPACE)
+        return 26
+
+    # One service wait returns every hot source, in the caller's order, then
+    # the inbox in queue order. SPACE, outside the frame's mask, stays.
+    shm_notify(APP2, APP, EVENT_DATA)
+    shm_notify(APP1, APP, EVENT_DATA)
+    shm_notify(FRAME, DRIVER, EVENT_DATA | EVENT_SPACE)
+    waitset_inbox_post(SERVICE, 0x81, EVENT_ATTACH)
+    waitset_inbox_post(SERVICE, 0x82, EVENT_ATTACH)
+    var svc: WaitPlan = wait_plan_new()
+    wait_plan_add(@svc, H_FRAME, FRAME, EVENT_DATA)
+    wait_plan_add(@svc, H_APP1, APP1, EVENT_DATA)
+    wait_plan_add(@svc, H_APP2, APP2, EVENT_DATA)
+    got = waitset_collect(@svc, SERVICE, 8)
+    if got.count != 5 or got.irq
+        return 27
+    if not has(@got, 0, H_FRAME, EVENT_DATA) or not has(@got, 1, H_APP1, EVENT_DATA) or not has(@got, 2, H_APP2, EVENT_DATA)
+        return 28
+    if not has(@got, 3, 0x81, EVENT_ATTACH) or not has(@got, 4, 0x82, EVENT_ATTACH)
+        return 29
+    if shm_latch_bits(FRAME, SERVICE) != EVENT_SPACE
+        return 30
+
+    # The inbox holds eight records: a ninth is refused. A wait with no
+    # sources copies them in order, as many as fit; the rest stay queued.
+    var h: u64 = 1
+    while h <= 8
+        if not waitset_inbox_post(SERVICE, h, EVENT_ATTACH)
+            return 31
+        h = h + 1
+    if waitset_inbox_post(SERVICE, 9, EVENT_ATTACH) or waitset_inbox_len(SERVICE) != 8
+        return 32
+    var empty: WaitPlan = wait_plan_new()
+    got = waitset_collect(@empty, SERVICE, 3)
+    if got.count != 3 or not has(@got, 0, 1, EVENT_ATTACH) or not has(@got, 2, 3, EVENT_ATTACH)
+        return 33
+    got = waitset_collect(@empty, SERVICE, 8)
+    if got.count != 5 or not has(@got, 0, 4, EVENT_ATTACH) or not has(@got, 4, 8, EVENT_ATTACH)
+        return 34
+
+    # Kernel posts wake a parked holder too: a latch post and an inbox post.
+    park(d)
+    shm_latch_post(FRAME, DRIVER, EVENT_LINK)
+    if not running(d)
+        return 35
+    park(s)
+    waitset_inbox_post(SERVICE, 0x90, EVENT_ATTACH)
+    if not running(s)
+        return 36
+    # A post to a pid with no latch or no process lands nowhere.
+    if shm_latch_post(FRAME, APP, EVENT_LINK) or waitset_inbox_post(NOBODY, 1, EVENT_ATTACH)
+        return 37
+
+    # A process that drops its last handle has no latch: notifying the
+    # object it shared finds no other holder.
+    shm_latch_drop(LONE, DRIVER)
+    shm_latch_drop(FRAME, DRIVER)
+    if not is_no_peer(shm_notify(FRAME, SERVICE, EVENT_DATA))
+        return 38
+    # Exit forgets every latch and the inbox of that pid, and no other.
+    waitset_forget_pid(SERVICE)
+    if shm_latch_held(APP1, SERVICE) or shm_latch_held(APP2, SERVICE) or waitset_inbox_len(SERVICE) != 0
+        return 39
+    if not shm_latch_held(APP1, APP) or not is_no_peer(shm_notify(APP1, APP, EVENT_DATA))
+        return 40
+    0
+"""
+
+
+@pytest.mark.integration
+def test_shm_latches_notify_inbox_and_collect(tmp_path):
+    assert _run(tmp_path, SHM_WAIT) == 0
 
 
 def _fn_body(src, name):

@@ -3,7 +3,7 @@
 #
 # A driver process parks in DrvIrqWait (syscall/runtime/driver.ritz) on its
 # own wait set, not on the shared BLOCK_IRQ queue that every MSI-X and the
-# LAPIC watchdog wake (proc/waitq.ritz). The set has two things here:
+# LAPIC watchdog wake (proc/waitq.ritz). The set holds:
 #
 #   * IRQ objects. One per CAP_TYPE_IRQ object id the kernel registered,
 #     with `latched`, bumped for that object only (by msix_dispatch for the
@@ -24,14 +24,28 @@
 #     calls waitset_console_ready, which wakes each watcher parked on its
 #     wait set. A plain read(0) still blocks on BLOCK_TTY.
 #
-# A wake only makes the process runnable: DrvIrqWait re-checks its own
-# object and deadline under cli, and parks again when neither is due. The
-# shm sources and the inbox join this set in RING1_DRIVER.md PR 6b (T21).
+#   * Shm latches (#4727, RING1_DRIVER.md "Wait and notify"). One per
+#     (shm object, holding pid), made when the kernel inserts that process's
+#     handle (cap/table.ritz cap_table_insert), so a notify reaches a peer
+#     that has not mapped the object or listed it yet. ShmNotify ORs DATA or
+#     SPACE into every other holder's latch; kernel posts add PEER_CLOSE,
+#     DRIVER_GONE and LINK. The bits live here, not in a wait call.
+#   * An inbox per process slot: up to INBOX_CAP {handle, bits} records the
+#     kernel queues (ATTACH), scanned by every wait, sources listed or not.
+#
+# waitset_collect is the check both waits (DrvIrqWait, ShmWait) run under
+# cli: the IRQ if hot, then the listed sources in the caller's order, then
+# the inbox in queue order, up to out_cap records; it clears only what it
+# copied, so a match that does not fit stays for the next wait.
+#
+# A wake only makes the process runnable: the wait collects again under
+# cli, and parks again when nothing matched and the deadline is not due.
 #
 # Processes run on the BSP only (proc/sched.ritz). A latch on another CPU
 # is recorded but wakes nobody, as waitq_wake_irq does.
 
 import proc.table { MAX_PROCS, BLOCK_WAIT, proc_at, proc_wake_pid }
+import driver_abi.wait { WaitEvent, EVENT_DATA, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_USER_MASK, WAIT_SOURCE_CAP, WAIT_OUT_CAP }
 
 # Declared, not imported: the kernel's are cap/table.ritz and
 # arch/x86_64/apic.ritz. msix.ritz calls in here from irq_handler, and the
@@ -177,3 +191,279 @@ pub fn waitset_tick(now: u64)
         if deadline != NO_DEADLINE and now >= deadline
             proc_wake_pid(proc_at(slot).pid, BLOCK_WAIT)
         slot = slot + 1
+
+# ============================================================================
+# Shm latches, ShmNotify and the inbox (#4727)
+# ============================================================================
+
+# Live (shm object, holding pid) pairs, system-wide: mm/shm.ritz's
+# MAX_SHM_MAPS, one per mapping a holder can make.
+const SHM_LATCH_MAX: i32 = 32
+# Records an inbox holds; a wait's out_cap covers a full inbox.
+pub const INBOX_CAP: u32 = 8
+
+# Kernel-posted latch bits: a listed source reports them whatever its mask
+# (a peer must see PEER_CLOSE, DRIVER_GONE and LINK). The mask picks among
+# the user bits, DATA and SPACE.
+const KERNEL_LATCH_BITS: u32 = EVENT_PEER_CLOSE | EVENT_DRIVER_GONE | EVENT_LINK
+
+struct ShmLatch
+    object_id: u64
+    pid: u64
+    bits: u32               # EVENT_*, posted and not yet copied by a wait
+    in_use: bool
+    _pad: [3]u8
+
+var shm_latches: [32]ShmLatch       # SHM_LATCH_MAX
+var inbox: [64]WaitEvent            # MAX_PROCS * INBOX_CAP, slot-major
+var inbox_len: [8]u32               # MAX_PROCS, by process slot
+var inbox_pid: [8]u64               # the pid the slot's records are for
+
+# What ShmNotify did.
+pub enum Notify
+    Posted                  # every other holder's latch has the bits
+    BadBits                 # zero, or a bit userspace may not post: nothing posted
+    NoPeer                  # no other process holds the object: nothing posted
+
+# The latch of `pid` for `object_id`, or -1.
+fn latch_slot(object_id: u64, pid: u64) -> i32
+    var i: i32 = 0
+    while i < SHM_LATCH_MAX
+        if shm_latches[i].in_use and shm_latches[i].object_id == object_id and shm_latches[i].pid == pid
+            return i
+        i = i + 1
+    -1
+
+# Post `bits` on latch `i` and wake its holder if it is parked on its wait
+# set. IF=0.
+fn latch_post(i: i32, bits: u32)
+    shm_latches[i].bits = shm_latches[i].bits | bits
+    if lapic_is_bsp()
+        proc_wake_pid(shm_latches[i].pid, BLOCK_WAIT)
+
+# `pid` now holds a handle for shm object `object_id`: make its latch,
+# cold. True if it has one (already, or now); false only when the table is
+# full, and the caller then refuses the handle.
+pub fn shm_latch_create(object_id: u64, pid: u64) -> bool
+    if latch_slot(object_id, pid) >= 0
+        return true
+    var i: i32 = 0
+    while i < SHM_LATCH_MAX
+        if not shm_latches[i].in_use
+            shm_latches[i].object_id = object_id
+            shm_latches[i].pid = pid
+            shm_latches[i].bits = 0
+            shm_latches[i].in_use = true
+            return true
+        i = i + 1
+    false
+
+# `pid` dropped its last handle for `object_id`: its latch and any bits on
+# it go.
+pub fn shm_latch_drop(object_id: u64, pid: u64)
+    let i: i32 = latch_slot(object_id, pid)
+    if i >= 0
+        shm_latches[i].in_use = false
+        shm_latches[i].bits = 0
+
+# `pid` has a latch for `object_id` (it holds a handle).
+pub fn shm_latch_held(object_id: u64, pid: u64) -> bool
+    latch_slot(object_id, pid) >= 0
+
+# The bits on `pid`'s latch for `object_id` (0 with no latch).
+pub fn shm_latch_bits(object_id: u64, pid: u64) -> u32
+    let i: i32 = latch_slot(object_id, pid)
+    if i < 0
+        return 0
+    shm_latches[i].bits
+
+# A kernel post (PEER_CLOSE, DRIVER_GONE, LINK or a user bit) onto `pid`'s
+# latch for `object_id`, waking it if parked on its wait set. False, and
+# nothing posted, when `pid` holds no handle for it. IF=0.
+pub fn shm_latch_post(object_id: u64, pid: u64, bits: u32) -> bool
+    let i: i32 = latch_slot(object_id, pid)
+    if i < 0
+        return false
+    latch_post(i, bits)
+    true
+
+# ShmNotify from `from_pid`: OR `bits` into the latch of every other
+# process that holds `object_id`, mapped or not, and wake each one parked
+# on its wait set. Userspace may post only DATA and SPACE. IF=0.
+pub fn shm_notify(object_id: u64, from_pid: u64, bits: u32) -> Notify
+    if bits == 0 or (bits & ~EVENT_USER_MASK) != 0
+        return Notify.BadBits
+    var posted: bool = false
+    var i: i32 = 0
+    while i < SHM_LATCH_MAX
+        if shm_latches[i].in_use and shm_latches[i].object_id == object_id and shm_latches[i].pid != from_pid
+            latch_post(i, bits)
+            posted = true
+        i = i + 1
+    if posted
+        return Notify.Posted
+    Notify.NoPeer
+
+# The process slot of `pid` with its inbox ready, or -1 when no process has
+# that pid. A slot's records belong to the pid they were queued for: a new
+# process in the slot starts with an empty inbox.
+fn inbox_slot(pid: u64) -> i32
+    if pid == 0
+        return -1
+    var slot: i32 = 0
+    while slot < MAX_PROCS
+        if proc_at(slot).pid == pid
+            if inbox_pid[slot] != pid
+                inbox_pid[slot] = pid
+                inbox_len[slot] = 0
+            return slot
+        slot = slot + 1
+    -1
+
+# A kernel post of `{handle, bits}` (ATTACH) on `pid`'s inbox, waking it if
+# parked on its wait set. False, and nothing queued, for an unknown pid or
+# a full inbox (INBOX_CAP records not yet copied out). IF=0.
+pub fn waitset_inbox_post(pid: u64, handle: u64, bits: u32) -> bool
+    let slot: i32 = inbox_slot(pid)
+    if slot < 0 or inbox_len[slot] >= INBOX_CAP
+        return false
+    let at: i32 = slot * INBOX_CAP as i32 + inbox_len[slot] as i32
+    inbox[at].handle = handle
+    inbox[at].bits = bits
+    inbox[at]._pad = 0
+    inbox_len[slot] = inbox_len[slot] + 1
+    if lapic_is_bsp()
+        proc_wake_pid(pid, BLOCK_WAIT)
+    true
+
+# Records on `pid`'s inbox (0 for an unknown pid).
+pub fn waitset_inbox_len(pid: u64) -> u32
+    let slot: i32 = inbox_slot(pid)
+    if slot < 0
+        return 0
+    inbox_len[slot]
+
+# Process `pid` is going away (its capability table is freed): its latches
+# and its inbox go with it.
+pub fn waitset_forget_pid(pid: u64)
+    var i: i32 = 0
+    while i < SHM_LATCH_MAX
+        if shm_latches[i].in_use and shm_latches[i].pid == pid
+            shm_latches[i].in_use = false
+            shm_latches[i].bits = 0
+        i = i + 1
+    var slot: i32 = 0
+    while slot < MAX_PROCS
+        if inbox_pid[slot] == pid
+            inbox_len[slot] = 0
+            inbox_pid[slot] = 0
+        slot = slot + 1
+
+# ============================================================================
+# Collecting a wait (#4727)
+# ============================================================================
+
+# One listed source, resolved by the syscall to the object its handle names.
+pub struct PlanSource
+    handle: u64
+    object_id: u64
+    mask: u32               # EVENT_DATA and/or EVENT_SPACE
+    _pad: u32
+
+# What a wait checks, in kernel memory: the IRQ object (DrvIrqWait only) and
+# up to WAIT_SOURCE_CAP sources in the caller's order.
+pub struct WaitPlan
+    irq_handle: u64
+    irq_object: u64
+    sources: [8]PlanSource  # WAIT_SOURCE_CAP
+    source_count: u32
+    with_irq: bool
+    _pad: [3]u8
+
+# What one collection copied: `count` records, the IRQ's first if `irq`.
+pub struct Collected
+    events: [8]WaitEvent    # WAIT_OUT_CAP
+    count: u32
+    irq: bool
+    _pad: [3]u8
+
+# A plan with no IRQ and no sources (ShmWait).
+pub fn wait_plan_new() -> WaitPlan
+    var plan: WaitPlan
+    plan.irq_handle = 0
+    plan.irq_object = 0
+    plan.source_count = 0
+    plan.with_irq = false
+    plan
+
+# A plan whose first source is IRQ object `irq_object`, reported as
+# `irq_handle` (DrvIrqWait).
+pub fn wait_plan_irq(irq_handle: u64, irq_object: u64) -> WaitPlan
+    var plan: WaitPlan = wait_plan_new()
+    plan.irq_handle = irq_handle
+    plan.irq_object = irq_object
+    plan.with_irq = true
+    plan
+
+# List shm object `object_id` (handle `handle`) for the bits in `mask`.
+# False when the plan already holds WAIT_SOURCE_CAP sources.
+pub fn wait_plan_add(plan: *WaitPlan, handle: u64, object_id: u64, mask: u32) -> bool
+    if plan.source_count >= WAIT_SOURCE_CAP
+        return false
+    let i: i32 = plan.source_count as i32
+    plan.sources[i].handle = handle
+    plan.sources[i].object_id = object_id
+    plan.sources[i].mask = mask
+    plan.sources[i]._pad = 0
+    plan.source_count = plan.source_count + 1
+    true
+
+fn collected_push(got: *Collected, handle: u64, bits: u32)
+    let i: i32 = got.count as i32
+    got.events[i].handle = handle
+    got.events[i].bits = bits
+    got.events[i]._pad = 0
+    got.count = got.count + 1
+
+# Collect what is hot for process `pid` under `plan`, at most `out_cap`
+# records (1..=WAIT_OUT_CAP): the IRQ ({irq_handle, DATA}, and seen =
+# latched), then each listed source whose latch has a bit in its mask or a
+# kernel bit, then inbox records in queue order. Only what is copied is
+# cleared. An empty result means nothing matched. IF=0.
+pub fn waitset_collect(plan: *WaitPlan, pid: u64, out_cap: u32) -> Collected
+    var got: Collected
+    got.count = 0
+    got.irq = false
+    var cap: u32 = out_cap
+    if cap > WAIT_OUT_CAP
+        cap = WAIT_OUT_CAP
+    if cap > 0 and plan.with_irq and irq_object_take(plan.irq_object)
+        collected_push(@got, plan.irq_handle, EVENT_DATA)
+        got.irq = true
+    var s: u32 = 0
+    while s < plan.source_count and got.count < cap
+        let src: PlanSource = plan.sources[s as i32]
+        let i: i32 = latch_slot(src.object_id, pid)
+        if i >= 0
+            let bits: u32 = shm_latches[i].bits & ((src.mask & EVENT_USER_MASK) | KERNEL_LATCH_BITS)
+            if bits != 0
+                shm_latches[i].bits = shm_latches[i].bits & ~bits
+                collected_push(@got, src.handle, bits)
+        s = s + 1
+    let slot: i32 = inbox_slot(pid)
+    if slot >= 0 and inbox_len[slot] > 0 and got.count < cap
+        var take: u32 = cap - got.count
+        if take > inbox_len[slot]
+            take = inbox_len[slot]
+        let base: i32 = slot * INBOX_CAP as i32
+        var r: u32 = 0
+        while r < take
+            collected_push(@got, inbox[base + r as i32].handle, inbox[base + r as i32].bits)
+            r = r + 1
+        # The rest move to the front, in order.
+        var k: u32 = take
+        while k < inbox_len[slot]
+            inbox[base + (k - take) as i32] = inbox[base + k as i32]
+            k = k + 1
+        inbox_len[slot] = inbox_len[slot] - take
+    got

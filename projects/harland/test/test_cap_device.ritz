@@ -14,6 +14,13 @@ import cap.types { CapHandle, CapEntry, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SH
 import cap.table { CapTable, cap_table_alloc, cap_table_get, cap_table_free_pid, cap_table_lookup, cap_grant, cap_kernel_grant, cap_irq_owner }
 import cap.syscall { sys_cap_grant, sys_cap_revoke }
 import cap.selftest { cap_device_selftest }
+import proc.waitset { shm_latch_held }
+
+# cap/table.ritz makes a shm handle's latch in proc/waitset.ritz (#4727),
+# which declares the kernel's arch/x86_64/apic.ritz lapic_is_bsp. On the
+# host there is one CPU, and it runs every process.
+pub fn lapic_is_bsp() -> bool
+    true
 
 const IRQ_OBJECT: u64 = 0x2B
 const MMIO_OBJECT: u64 = 0xFEB00000
@@ -174,6 +181,36 @@ fn test_revoke_drops_only_callers_copy() -> i32
         return 5
     if sys_cap_revoke(70, pack(a)) != Errno.BadF as i64
         return 6
+    return 0
+
+# A shm handle brings its holder's latch for the object, made when the
+# handle is inserted, not when the object is mapped (#4727): one per
+# (object, pid), dropped with that pid's last handle and with its table.
+[[test]]
+fn test_shm_handle_carries_one_latch() -> i32
+    if cap_table_alloc(76) == 0 as *CapTable or cap_table_alloc(77) == 0 as *CapTable
+        return 1
+    let a: CapHandle = cap_kernel_grant(76, CAP_TYPE_SHM, CAP_RIGHT_READ, SHM_OBJECT)
+    let b: CapHandle = cap_kernel_grant(76, CAP_TYPE_SHM, CAP_RIGHT_READ, SHM_OBJECT)
+    if a.index == 0xFFFFFFFF or b.index == 0xFFFFFFFF or not shm_latch_held(SHM_OBJECT, 76)
+        return 2
+    # Another type for the same id makes none.
+    cap_kernel_grant(77, CAP_TYPE_MMIO, CAP_RIGHT_READ, SHM_OBJECT)
+    if shm_latch_held(SHM_OBJECT, 77)
+        return 3
+    # The latch outlives the first revoke and goes with the last.
+    if sys_cap_revoke(76, pack(a)) != 0 or not shm_latch_held(SHM_OBJECT, 76)
+        return 4
+    if sys_cap_revoke(76, pack(b)) != 0 or shm_latch_held(SHM_OBJECT, 76)
+        return 5
+    # A process that exits holding the handle loses its latch with its table.
+    cap_kernel_grant(77, CAP_TYPE_SHM, CAP_RIGHT_READ, SHM_OBJECT)
+    if not shm_latch_held(SHM_OBJECT, 77)
+        return 6
+    cap_table_free_pid(77)
+    if shm_latch_held(SHM_OBJECT, 77)
+        return 7
+    cap_table_free_pid(76)
     return 0
 
 # The IRQ owner is cleared when it revokes its last handle for the device,

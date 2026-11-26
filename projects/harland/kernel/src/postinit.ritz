@@ -50,6 +50,11 @@ import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_RIGHT_READ, CAP_R
 import cap.table { CapTable, cap_kernel_grant, cap_table_alloc, cap_table_free_pid }
 import proc.waitset { IRQ_NO_VECTOR, irq_object_register, irq_object_unregister, irq_object_latch }
 import syscall.runtime.driver { drv_irq_wait_park_count, drv_mmio_map, drv_mmio_leaf }
+import cap.types { CAP_TYPE_SHM, CAP_RIGHT_WRITE }
+import cap.table { CapTable, cap_table_get, cap_revoke }
+import mm.shm { shm_create, shm_destroy }
+import proc.waitset { Notify, shm_notify, shm_latch_bits, shm_latch_held }
+import driver_abi.wait { EVENT_DATA, EVENT_SPACE }
 import driver_abi.wait { DEVICE_WAIT_MS }
 import drivers.virtio.window { phys_range, phys_range_none, vio_window_add, vio_window_remove }
 
@@ -404,6 +409,7 @@ const DRIVER_STUB_SPIN: u64 = 2
 const DRIVER_STUB_IRQ_WAIT: u64 = 3
 const DRIVER_STUB_CONSOLE_POLL: u64 = 4
 const DRIVER_STUB_POLL_NVAL: u64 = 5
+const DRIVER_STUB_SHM_WAIT: u64 = 6
 const DRIVER_STUB_MMIO_MAP: u64 = 21
 const DRIVER_STUB_DMA_ALLOC: u64 = 22
 const DRIVER_STUB_COOKIE: u64 = 0x4713
@@ -650,6 +656,96 @@ fn drv_irq_wait_self_test() -> bool
         klog(", the IRQ return or the deadline came too soon")
     klog("\n")
     return ok and status == 0 and reparked and waited
+
+# shm-wait (#4727, RING1_DRIVER.md "Wait and notify" and PR 6b): the shm
+# latches, ShmNotify and ShmWait on a kernel-spawned process. Pid 1 makes a
+# frame object both it and the stub hold, a second object only the stub
+# holds, and an IRQ object (no vector) for the stub. Before the stub runs,
+# pid 1 posts DATA on the frame object, which the stub has not mapped, and
+# latches the IRQ: the stub's DrvIrqWait with room for one copies the IRQ
+# only, and the next returns 2 with the frame event, neither parking (no
+# deadline). The stub's refused notifies (PEER_CLOSE, 0, the lone object,
+# a handle it lacks) post nothing; its SPACE lands on pid 1's latch; its
+# ShmWait with deadline 0 returns 1; its last ShmWait parks until pid 1
+# posts DATA. The stub exits 0 only if each return and what it wrote
+# matched (driver_stub.s mode 6). Exactly one park: that last wait.
+const SHM_TEST_IRQ: u64 = 0xFFFF4727A
+# The stub's handles: a fresh table's first three grants (index |
+# generation << 32), as driver_stub.s SHM_H_*.
+const SHM_TEST_H_IRQ: u64 = 1 << 32
+const SHM_TEST_H_FRAME: u64 = 0x200000001
+const SHM_TEST_H_LONE: u64 = 0x300000002
+# Pid 1, which holds the frame object's other handle.
+const SHM_TEST_PEER: u32 = 1
+
+fn notified(n: Notify) -> bool
+    match n
+        Notify.Posted => true
+        _ => false
+
+fn shm_wait_self_test() -> bool
+    klog("\nTesting ShmNotify and ShmWait on a kernel-spawned process...\n")
+    let frame: u64 = shm_create(1).unwrap_or(0)
+    let lone: u64 = shm_create(1).unwrap_or(0)
+    if frame == 0 or lone == 0 or not irq_object_register(SHM_TEST_IRQ, IRQ_NO_VECTOR)
+        klog("  objects not made\n")
+        if frame != 0
+            shm_destroy(frame)
+        if lone != 0
+            shm_destroy(lone)
+        return false
+    let rights: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
+    let mine: CapHandle = cap_kernel_grant(SHM_TEST_PEER, CAP_TYPE_SHM, rights, frame)
+    sched_start(proc_current_slot())
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_SHM_WAIT, SHM_TEST_H_IRQ)
+    var posted: bool = false
+    var spaced: bool = false
+    var one_park: bool = false
+    var status: i64 = -1
+    if spawned > 0
+        let pid: u64 = spawned as u64
+        # It cannot run before pid 1 yields: the grants land first.
+        let irq: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, SHM_TEST_IRQ))
+        let hf: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rights, frame))
+        let hl: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rights, lone))
+        if irq != SHM_TEST_H_IRQ or hf != SHM_TEST_H_FRAME or hl != SHM_TEST_H_LONE or not shm_latch_held(frame, SHM_TEST_PEER as u64)
+            klog("  grants gave other handles\n")
+            process_mark_exit(pid)
+            status = drv_stub_status(pid)
+        else
+            disable_interrupts()
+            posted = notified(shm_notify(frame, SHM_TEST_PEER as u64, EVENT_DATA))
+            irq_object_latch(SHM_TEST_IRQ)
+            enable_interrupts()
+            let parks: u64 = drv_irq_wait_park_count()
+            if await_park(pid, parks, DRV_TEST_PARK_US)
+                # Its SPACE, and nothing from the refused PEER_CLOSE.
+                spaced = shm_latch_bits(frame, SHM_TEST_PEER as u64) == EVENT_SPACE
+                disable_interrupts()
+                shm_notify(frame, SHM_TEST_PEER as u64, EVENT_DATA)
+                enable_interrupts()
+            else
+                klog("  the stub never parked\n")
+                process_mark_exit(pid)
+            status = drv_stub_status(pid)
+            one_park = drv_irq_wait_park_count() == parks + 1
+    sched_stop()
+    let table: *CapTable = cap_table_get(SHM_TEST_PEER)
+    let dropped: bool = cap_revoke(table, mine) and not shm_latch_held(frame, SHM_TEST_PEER as u64)
+    let freed: bool = shm_destroy(frame) and shm_destroy(lone)
+    irq_object_unregister(SHM_TEST_IRQ)
+    klog("  status ")
+    klog_dec(status)
+    if not posted
+        klog(", pid 1's DATA found no holder")
+    if not spaced
+        klog(", pid 1's latch did not hold the stub's SPACE alone")
+    if not one_park
+        klog(", a wait parked that should have returned")
+    if not dropped or not freed
+        klog(", the objects outlived the test")
+    klog("\n")
+    return status == 0 and posted and spaced and one_park and dropped and freed
 
 # console-poll (#4829): poll(2) on fd 0 is the console's timed read. The stub
 # (modes 4 and 5, driver_stub.s) polls { 0, POLLIN } with the console raw
@@ -907,6 +1003,7 @@ fn driver_process_tests()
     boot_test_result("console-poll", console_poll_self_test())
     boot_test_result("drv-mmio-map", drv_mmio_map_self_test())
     boot_test_result("drv-dma-alloc", drv_dma_alloc_self_test())
+    boot_test_result("shm-wait", shm_wait_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before

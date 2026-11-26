@@ -3,11 +3,16 @@
 #
 # DrvIrqWait (220): drv_irq_wait(irq_handle, *WaitRequest). A driver process
 # parks on its own wait set (proc/waitset.ritz) until the IRQ object its
-# CAP_TYPE_IRQ handle names is hot, or DEVICE_WAIT_MS has passed:
+# CAP_TYPE_IRQ handle names is hot, a listed shm source or its inbox has an
+# event (#4727), or DEVICE_WAIT_MS has passed. One return copies every hot
+# source that fits in out_cap, in order: the IRQ, the listed sources in the
+# caller's order, then inbox records (waitset_collect). What does not fit
+# stays latched for the next call, and only what was copied is cleared.
 #
 #   0   the IRQ record was copied: out[0] = { irq_handle, EVENT_DATA },
-#       out_count = 1, and seen = latched, so the same interrupt does not
-#       complete the next call
+#       seen = latched (the same interrupt does not complete the next
+#       call), and out[1..out_count] are any other events that fit
+#   2   events were copied and the IRQ was not hot: out_count of them
 #   1   the deadline passed: out_count = 0 and out is not written
 #   <0  an errno, with nothing consumed and nothing written:
 #       Errno.Perm   the caller holds no CAP_TYPE_IRQ handle `irq_handle`
@@ -23,16 +28,26 @@
 # The request and the source array are copied into kernel memory before a
 # latch is cleared; the user source array is never written. The deadline is
 # now + DEVICE_WAIT_MS on this process's wait set; WaitRequest.deadline is
-# ShmWait's (229) and is ignored here. A wake that leaves the object cold
-# before the deadline (another object's interrupt reaching this owner, or a
-# kernel post) parks again; it is not a return of 1. The shared LAPIC
+# ShmWait's (229) and is ignored here. A wake that matches nothing before
+# the deadline (another object's interrupt reaching this owner, a notify of
+# a bit outside a source's mask) parks again; it is not a return of 1. The shared LAPIC
 # watchdog and the BLOCK_IRQ queue that irq_wait_vector (NVMe, virtio) uses
 # are not touched. A process marked PROC_REAP stops waiting: its return to
 # user exits instead (syscall_entry.s reap_if_marked).
 #
-# Listed shm sources are checked and copied, but nothing posts to a shm
-# latch until ShmNotify and the inbox land (RING1_DRIVER.md PR 6b), so they
-# never match yet, and return 2 (shm or inbox events only) does not occur.
+# ShmWait (229): shm_wait(*WaitRequest) is the same wait with no IRQ, for a
+# process with no IRQ capability (the ring-2 service). Its deadline is
+# WaitRequest.deadline milliseconds from the call (Harland has no user
+# clock to name an absolute one); 0 checks once. 2 events, 1 the deadline,
+# or Perm / Fault / Inval / Again as above.
+#
+# ShmNotify (230): shm_notify(shm_handle, bits) ORs DATA and/or SPACE into
+# the latch of every other process holding that shm object, mapped or not,
+# and wakes the one parked on its wait set. 0, or Errno.Perm (no such
+# CAP_TYPE_SHM handle), Errno.Inval (bits 0 or any other bit: PEER_CLOSE,
+# DRIVER_GONE, LINK and ATTACH are kernel posts, proc/waitset.ritz
+# shm_latch_post and waitset_inbox_post), Errno.NoDev (no other holder).
+# Nothing is posted on an errno.
 
 import io { disable_interrupts, enable_interrupts }
 import mm.uptr { uptr_check_read, uptr_check_write }
@@ -43,9 +58,10 @@ import cap.table { CapTable, cap_table_get, cap_table_lookup }
 import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_reap_pending }
 import proc.sched { sched_block }
 import proc.waitq { waitq_can_park }
-import proc.waitset { irq_object_known, irq_object_take, waitset_arm, waitset_disarm }
+import proc.waitset { irq_object_known, waitset_arm, waitset_disarm }
+import proc.waitset { WaitPlan, Collected, Notify, wait_plan_new, wait_plan_irq, wait_plan_add, waitset_collect, shm_notify }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
-import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_DATA, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
+import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
 import mm.dma { dma_alloc_zeroed, dma_free_pages }
@@ -54,8 +70,8 @@ import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
 
 const US_PER_MS: u64 = 1000
 
-# Parks DrvIrqWait has made, re-parks included (the drv-irq-wait boot test
-# reads it to see a non-matching wake park again).
+# Parks DrvIrqWait and ShmWait have made, re-parks included (the
+# drv-irq-wait and shm-wait boot tests read it to see a wait park).
 var drv_irq_wait_parks: u64 = 0
 
 pub fn drv_irq_wait_park_count() -> u64
@@ -74,20 +90,29 @@ fn held_object(pid: u32, packed: u64, cap_type: u8) -> Option<u64>
         return None
     Some(entry.object_id)
 
-# What copy_request found. Not a Result: VtdDma and goliath's ErrorCode,
-# both in this module's import closure, declare `Ok` too, so a bare `Ok(x)`
-# is ambiguous here and Result has no qualified constructor.
+# What copy_request found: the plan, with the listed sources resolved to
+# their objects, or the errno. Not a Result: VtdDma and goliath's
+# ErrorCode, both in this module's import closure, declare `Ok` too, so a
+# bare `Ok(x)` is ambiguous here and Result has no qualified constructor.
 enum RequestCheck
-    Valid(WaitRequest)
+    Valid(CheckedRequest)
     Refused(Errno)
 
-# The caller's request (`ureq`), copied into kernel memory and checked, or
-# the errno that refuses it: Fault, Inval or Perm (above). Each listed source
-# is copied before its handle is checked, so the check reads the kernel's
-# copy and never a second read of the user array; the copies are not used
-# again until shm latches exist (PR 6b). The out range is checked too, so
-# storing the result cannot fault.
-fn copy_request(pid: u32, ureq: *WaitRequest) -> RequestCheck
+# A request copied into kernel memory and checked.
+struct CheckedRequest
+    plan: WaitPlan
+    out: *WaitEvent         # the caller's out range, checked writable
+    out_cap: u32
+    _pad: u32
+    deadline_ms: u64        # ShmWait's WaitRequest.deadline
+
+# The caller's request (`ureq`), copied into kernel memory and checked
+# against `plan` (the IRQ, or none), or the errno that refuses it: Fault,
+# Inval or Perm (above). Each listed source is copied before its handle is
+# checked, so the check reads the kernel's copy and never a second read of
+# the user array. The out range is checked too, so storing the result
+# cannot fault. Nothing is consumed here.
+fn copy_request(pid: u32, ureq: *WaitRequest, plan: WaitPlan) -> RequestCheck
     # Writable, for out_count.
     if uptr_check_write(ureq as *u8, sizeof(WaitRequest) as u64) != 0
         return RequestCheck.Refused(Errno.Fault)
@@ -97,47 +122,48 @@ fn copy_request(pid: u32, ureq: *WaitRequest) -> RequestCheck
     let count: u64 = req.source_count as u64
     if count > 0 and uptr_check_read(req.sources as *u8, count * sizeof(WaitSource) as u64) != 0
         return RequestCheck.Refused(Errno.Fault)
-    var sources: [8]WaitSource          # WAIT_SOURCE_CAP
+    var checked: CheckedRequest
+    checked.plan = plan
     var i: u64 = 0
     while i < count
-        sources[i as i32] = *(req.sources + i)
-        if held_object(pid, sources[i as i32].handle, CAP_TYPE_SHM).is_none()
-            return RequestCheck.Refused(Errno.Perm)
+        let source: WaitSource = *(req.sources + i)
+        let object_id: u64 = match held_object(pid, source.handle, CAP_TYPE_SHM)
+            Some(id) => id
+            None => return RequestCheck.Refused(Errno.Perm)
+        wait_plan_add(@checked.plan, source.handle, object_id, source.mask)
         i = i + 1
     if uptr_check_write(req.out as *u8, req.out_cap as u64 * sizeof(WaitEvent) as u64) != 0
         return RequestCheck.Refused(Errno.Fault)
-    RequestCheck.Valid(req)
+    checked.out = req.out
+    checked.out_cap = req.out_cap
+    checked._pad = 0
+    checked.deadline_ms = req.deadline
+    RequestCheck.Valid(checked)
 
-# drv_irq_wait for process `pid` (above). `ureq` is the caller's request.
-fn drv_irq_wait(pid: u32, irq_handle: u64, ureq: *WaitRequest) -> i64
-    # Authority first: a process without the handle learns nothing else.
-    let object_id: u64 = match held_object(pid, irq_handle, CAP_TYPE_IRQ)
-        Some(id) => id
-        None => return Errno.Perm as i64
-    let req: WaitRequest = match copy_request(pid, ureq)
-        RequestCheck.Valid(r) => r
-        RequestCheck.Refused(e) => return e as i64
-    if not irq_object_known(object_id)
-        return Errno.NoDev as i64
+# Collect for the calling process (`pid`) under `checked`, parking on its
+# wait set until something matches or TSC `deadline` passes: 0 (the IRQ
+# record was copied), 2 (events without the IRQ) or 1 (the deadline), with
+# out_count written; Errno.Again when this CPU cannot park or the process
+# is marked to exit (nothing consumed; its return to user exits instead).
+fn wait_collect(pid: u32, ureq: *WaitRequest, checked: *CheckedRequest, deadline: u64) -> i64
     disable_interrupts()
     if not waitq_can_park()
         enable_interrupts()
         return Errno.Again as i64
-
-    let deadline: u64 = deadline_after_us(DEVICE_WAIT_MS * US_PER_MS)
     let slot: i32 = proc_current_slot()
     var result: i64 = 1
     while true
         if proc_reap_pending(proc_current())
-            # Nothing consumed; the return to user exits instead.
             result = Errno.Again as i64
             break
-        if irq_object_take(object_id)
-            (*req.out).handle = irq_handle
-            (*req.out).bits = EVENT_DATA
-            (*req.out)._pad = 0
-            (*ureq).out_count = 1
-            result = 0
+        let got: Collected = waitset_collect(@checked.plan, pid as u64, checked.out_cap)
+        if got.count > 0
+            var i: u32 = 0
+            while i < got.count
+                *(checked.out + i as u64) = got.events[i as i32]
+                i = i + 1
+            (*ureq).out_count = got.count
+            result = if got.irq then 0 else 2
             break
         if deadline_passed(deadline)
             (*ureq).out_count = 0
@@ -150,6 +176,19 @@ fn drv_irq_wait(pid: u32, irq_handle: u64, ureq: *WaitRequest) -> i64
     waitset_disarm(slot)
     enable_interrupts()
     result
+
+# drv_irq_wait for process `pid` (above). `ureq` is the caller's request.
+fn drv_irq_wait(pid: u32, irq_handle: u64, ureq: *WaitRequest) -> i64
+    # Authority first: a process without the handle learns nothing else.
+    let object_id: u64 = match held_object(pid, irq_handle, CAP_TYPE_IRQ)
+        Some(id) => id
+        None => return Errno.Perm as i64
+    var checked: CheckedRequest = match copy_request(pid, ureq, wait_plan_irq(irq_handle, object_id))
+        RequestCheck.Valid(c) => c
+        RequestCheck.Refused(e) => return e as i64
+    if not irq_object_known(object_id)
+        return Errno.NoDev as i64
+    wait_collect(pid, ureq, @checked, deadline_after_us(DEVICE_WAIT_MS * US_PER_MS))
 
 # drv_irq_wait(irq_handle, request): the caller's page table is loaded.
 pub fn sys_drv_irq_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -275,3 +314,45 @@ pub fn sys_drv_mmio_map_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # loaded.
 pub fn sys_drv_dma_alloc_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     drv_dma_alloc(proc_current_pid() as u32, vmm_get_current_pml4(), rdi, rsi, rdx as *DmaAlloc)
+
+# ============================================================================
+# ShmWait (229) and ShmNotify (230), #4727
+# ============================================================================
+
+# The longest ShmWait deadline, in ms, whose microseconds fit a u64: a
+# longer one waits this long (about 585,000 years).
+const SHM_WAIT_MAX_MS: u64 = 0xFFFFFFFFFFFFFFFF / US_PER_MS
+
+# shm_wait for process `pid` (above). `ureq` is the caller's request.
+fn shm_wait(pid: u32, ureq: *WaitRequest) -> i64
+    var checked: CheckedRequest = match copy_request(pid, ureq, wait_plan_new())
+        RequestCheck.Valid(c) => c
+        RequestCheck.Refused(e) => return e as i64
+    var ms: u64 = checked.deadline_ms
+    if ms > SHM_WAIT_MAX_MS
+        ms = SHM_WAIT_MAX_MS
+    wait_collect(pid, ureq, @checked, deadline_after_us(ms * US_PER_MS))
+
+# shm_notify for process `pid` (above). `bits` is the caller's whole
+# register: a bit above the low 32 is no event bit either (Errno.Inval).
+fn shm_notify_from(pid: u32, shm_handle: u64, bits: u64) -> i64
+    let object_id: u64 = match held_object(pid, shm_handle, CAP_TYPE_SHM)
+        Some(id) => id
+        None => return Errno.Perm as i64
+    if bits > 0xFFFFFFFF
+        return Errno.Inval as i64
+    disable_interrupts()
+    let posted: Notify = shm_notify(object_id, pid as u64, bits as u32)
+    enable_interrupts()
+    match posted
+        Notify.Posted => 0
+        Notify.BadBits => Errno.Inval as i64
+        Notify.NoPeer => Errno.NoDev as i64
+
+# shm_wait(request): the caller's page table is loaded.
+pub fn sys_shm_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    shm_wait(proc_current_pid() as u32, rdi as *WaitRequest)
+
+# shm_notify(shm_handle, bits).
+pub fn sys_shm_notify_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    shm_notify_from(proc_current_pid() as u32, rdi, rsi)

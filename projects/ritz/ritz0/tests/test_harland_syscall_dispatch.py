@@ -101,6 +101,9 @@ ABI = {
     # ShmMap (227): map a CAP_TYPE_SHM handle into the caller (#4717,
     # RING1_DRIVER.md §5).
     "ShmMap": 227,
+    # ShmWait (229) and ShmNotify (230): the wait set's shm latches and inbox
+    # (#4727, RING1_DRIVER.md "Wait and notify").
+    "ShmWait": 229, "ShmNotify": 230,
     "Smp": 254,
     "DebugPrint": 255,
 }
@@ -117,6 +120,7 @@ DISPATCHED = {
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
     "Sync", "Smp", "ShmMap", "DrvIrqWait", "DrvMmioMap", "DrvDmaAlloc", "NetInfo", "NetAddr", "NetAttach", "Poll",
+    "ShmWait", "ShmNotify",
     "Stat", "Fstat",
 }
 

@@ -5,6 +5,7 @@
 
 import klog { klog, klog_dec }
 import mm.shm { shm_unmap, shm_forget_pid }
+import proc.waitset { shm_latch_create, shm_latch_drop, waitset_forget_pid }
 import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_IRQ, CAP_TYPE_SHM, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid, cap_type_is_device, cap_type_is_kernel_granted }
 
 # ============================================================================
@@ -101,6 +102,8 @@ pub fn cap_table_free(table: *CapTable) -> i32
     # Its shm mappings end with it; its PML4's teardown leaves their frames
     # to the objects (#4717)
     shm_forget_pid((*table).pid)
+    # So do its shm latches and its inbox (#4727)
+    waitset_forget_pid((*table).pid as u64)
     (*table).in_use = false
     (*table).pid = 0
     (*table).active_count = 0
@@ -127,6 +130,12 @@ pub fn cap_table_insert(table: *CapTable, cap_type: u8, rights: u32, object_id: 
     if table == 0 as *CapTable
         return cap_handle_invalid()
 
+    # A shm handle comes with its holder's latch for the object, made here
+    # so a notify reaches a peer that has not mapped it (#4727,
+    # RING1_DRIVER.md "Wait and notify"). No latch to be had: no handle.
+    if cap_type == CAP_TYPE_SHM and not shm_latch_create(object_id, (*table).pid as u64)
+        return cap_handle_invalid()
+
     # Find a free slot
     var i: i32 = 0
     while i < 64
@@ -145,7 +154,10 @@ pub fn cap_table_insert(table: *CapTable, cap_type: u8, rights: u32, object_id: 
             return cap_handle_init(i as u32, gen)
         i = i + 1
 
-    # No free slots
+    # No free slots; a latch made for this handle goes unless an earlier
+    # handle for the object still holds it
+    if cap_type == CAP_TYPE_SHM and not cap_table_holds_object(table, cap_type, object_id)
+        shm_latch_drop(object_id, (*table).pid as u64)
     return cap_handle_invalid()
 
 # Look up a capability by handle
@@ -489,7 +501,8 @@ fn cap_table_holds_object(table: *CapTable, cap_type: u8, object_id: u64) -> boo
 
 # The CapRevoke hook: `table`'s process dropped its last handle of
 # `cap_type` for `object_id`. An IRQ owner stops owning the device's IRQ. A
-# shm object is unmapped from that process only (#4717). MMIO leaves are
+# shm object is unmapped from that process only (#4717), and its latch for
+# the object goes (#4727). MMIO leaves are
 # unmapped here once a later ring-1 task maps them (docs/RING1_DRIVER.md,
 # Grants); today nothing maps them. Other types have no per-process
 # mapping. Another process's handles and mappings are never touched.
@@ -498,6 +511,7 @@ fn cap_last_handle_dropped(table: *CapTable, cap_type: u8, object_id: u64)
         irq_owner_release(object_id, (*table).pid)
     else if cap_type == CAP_TYPE_SHM
         shm_unmap((*table).pid, object_id)
+        shm_latch_drop(object_id, (*table).pid as u64)
 
 # CapRevoke: remove `handle` from `table` (only the caller's copy) and, when
 # the caller holds no other handle for the same object, run the hook. False
