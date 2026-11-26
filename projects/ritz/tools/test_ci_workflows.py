@@ -2,6 +2,8 @@
 
 What these tests pin, and why:
 
+* Two workflows: main.yml (the compiler) and builder.yml (the builder
+  image, AGAST #4824, which main.yml neither runs nor waits on).
 * pr.yml is gone. Rooms land by `git merge --ff-only` on a local machine,
   so a `pull_request` workflow never triggers; its last run was 2026-09-04.
   Its affected-project logic (`cut -d/ -f2`) also ignored reverse
@@ -50,8 +52,8 @@ def _jobs():
 
 
 @pytest.mark.unit
-def test_only_main_workflow_exists():
-    assert [p.name for p in _workflow_files()] == ["main.yml"]
+def test_only_main_and_builder_workflows_exist():
+    assert [p.name for p in _workflow_files()] == ["builder.yml", "main.yml"]
 
 
 @pytest.mark.unit
@@ -68,8 +70,14 @@ def test_no_job_or_step_is_continue_on_error():
 
 @pytest.mark.unit
 def test_every_job_checks_out_then_uses_the_setup_action():
+    """builder.yml's builder job (AGAST #4824) is the exception: it builds
+    inside Docker, whose image installs its own clang, so the host's
+    toolchain plays no part, and it uses no action but checkout."""
     for wf, name, job in _jobs():
         uses = [str(s.get("uses", "")) for s in job.get("steps") or []]
+        if (wf, name) == ("builder.yml", "builder"):
+            assert [u for u in uses if u] == ["actions/checkout@v4"], uses
+            continue
         assert uses[:2] == ["actions/checkout@v4", SETUP_ACTION], (wf, name, uses[:2])
 
 
@@ -128,6 +136,7 @@ def test_gate_coverage_is_documented_where_main_yml_points():
     assert sorted(rows) == jobs, sorted(rows)
     # read-set-audit (AGAST #4315) is the one job a merge does not wait on:
     # ~15 min under strace, and it audits the gate's skip rule, not a change.
+    # (builder.yml's image build is outside this table: it isn't main.yml's.)
     not_gated = {"read-set-audit"}
     for job, row in rows.items():
         gated = row.split("|")[2].strip()

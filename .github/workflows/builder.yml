@@ -1,0 +1,99 @@
+name: Builder Image
+# AGAST #4824 (epic #4783). The builder image (projects/builder, #4822) is its
+# own project, so it is built here, out of band from main.yml's compiler CI,
+# which neither runs nor waits on this 75-minute build.
+#
+#   push of any tag     -> ghcr.io/ritz-lang/rz-builder:<tag>, :ritz1-<sha12>,
+#                          :<commit>
+#   push to main that   -> :main, :<commit>
+#   changes the builder
+#   workflow_dispatch   -> build, test and dry-run; pushes nothing
+#
+# <tag> is the git tag sanitised to a Docker tag; a git tag that would land
+# on :main, :ritz1-* or a :<commit> is refused (.github/scripts/
+# publish_builder.sh, tested in projects/ritz/tools/test_publish_builder.py).
+# Every tag publishes, with no filter: tagging is the explicit "give me an
+# image of this commit" (Aaron, 2026-11-26), and in a monorepo any tag names a
+# commit whose image is worth having.
+on:
+  push:
+    # GitHub ignores `paths` for a tag push, so the filter below limits main
+    # only, and a push qualifies if it is to main OR is a tag.
+    tags: ['**']
+    branches: [main]
+    paths:
+      - 'projects/builder/**'
+      - '.github/workflows/builder.yml'
+      - '.github/scripts/publish_builder.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # test.sh builds the image from `git archive` of the pushed commit, runs
+  # the in-container checks and fails over the size budget README.md records
+  # (400 MiB unpacked, measured inside the image). The image builds everything
+  # it needs inside Docker (clang 21 from apt.llvm.org, the bootstrap, the
+  # fixed-point check), so the job checks out and does not use the setup
+  # action: the host's toolchain plays no part. Not part of the room gate:
+  # smoke-plan.sh's `builder` target runs the same test.sh before a merge
+  # that touches projects/builder.
+  #
+  # The registry token is the job's GITHUB_TOKEN (packages: write here only),
+  # read by `docker login --password-stdin` from the environment into a
+  # DOCKER_CONFIG under runner.temp, removed by the always() logout. It never
+  # reaches the build context (test.sh builds from `git archive`) or a layer.
+  #
+  # The ref reaches scripts as "$GITHUB_REF", never as ${{ github.ref }} in
+  # the script text: a tag name may hold $(...) or backticks.
+  builder:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      packages: write
+    # One group per event and ref: a tag publish and a main publish don't
+    # wait on each other; two main publishes queue and never cancel the
+    # running one, so :main can't move back to an older commit. A group
+    # keeps one pending run, so the event is in the key too: a dispatch dry
+    # run on main must not replace a queued main publish.
+    concurrency:
+      group: builder-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      BUILDER_IMAGE: ghcr.io/ritz-lang/rz-builder
+    steps:
+      - uses: actions/checkout@v4
+
+      # Two-pass build from `git archive`, every check in the image, the size
+      # budget. --keep leaves the image for the publish steps.
+      - name: Build and test the builder image
+        run: |
+          set -o pipefail
+          bash projects/builder/test.sh --keep "${{ github.sha }}" | tee "$RUNNER_TEMP/builder-test.log"
+          grep -E 'MiB unpacked|^builder image' "$RUNNER_TEMP/builder-test.log" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Builder image tags (dry run)
+        run: bash .github/scripts/publish_builder.sh --dry-run "${{ github.sha }}" "$BUILDER_IMAGE" "$GITHUB_REF"
+
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish the builder image
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: bash .github/scripts/publish_builder.sh "${{ github.sha }}" "$BUILDER_IMAGE" "$GITHUB_REF"
+
+      - name: Log out of ghcr.io
+        if: always() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: |
+          docker logout ghcr.io || true
+          rm -rf "$DOCKER_CONFIG"

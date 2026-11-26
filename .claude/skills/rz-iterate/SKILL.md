@@ -684,7 +684,7 @@ reap ritz-task-1450 1a2b3c4
 
 ### Gate coverage: what runs before a merge (AGAST #1838, #3969)
 
-`.github/workflows/main.yml` is the only workflow, and it runs on push to
+`.github/workflows/main.yml` is the compiler workflow, and it runs on push to
 `main`, i.e. **after** the merge. Before the merge, the only check is the gate:
 `make -C projects/ritz ci-local` over main.yml's `build-all`, `test-all` and
 `bootstrap` jobs (room gate and train gate, both through run-gate.sh's
@@ -696,6 +696,14 @@ default command). So:
 | `test-all` (`./rz test --all`) | yes (#3969, Aaron 2026-11-18) | yes |
 | `bootstrap` (matrix-full, regression.sh, ...) | yes | yes |
 | `read-set-audit` (strace of the two scoped regression steps) | no (#4315: ~15 min traced; it checks the gate's own skip rule, not the change) | yes |
+
+The one other workflow, `.github/workflows/builder.yml` (#4824), is where
+`ghcr.io/ritz-lang/rz-builder` comes from. Out of band from main.yml, it
+builds and tests the image (`projects/builder/test.sh`), then pushes
+`:<tag>`, `:ritz1-<sha12>` and `:<commit>` for any git tag, or `:main` and
+`:<commit>` for a push to main that changes the builder. It isn't in the gate
+or in this table. Before a merge that touches `projects/builder`,
+smoke-plan.sh's `builder` target runs the same test.sh.
 
 **A budget-only gate verdict is terminal, and `rz` accepts that REAP.** A gate
 can end `EXIT=2` with the only failing step `[bootstrap] ritz0 unit tests`, the

@@ -64,7 +64,14 @@ That compares the host's `./rz build` and `./rz test` under
 Linux bin, tome, one indium PIC bin, and harland's kernel ELF (build
 only). The two sides must agree on pass/fail and on the test counts.
 
-Publishing from CI and enforcing the size budget is #4824.
+The published image comes from `.github/workflows/builder.yml`
+(#4824), out of band from the compiler CI. Each run builds and tests the image
+with `test.sh`, including its size budget. A push of any git tag publishes
+`ghcr.io/ritz-lang/rz-builder:<tag>`, `:ritz1-<sha12>` and `:<commit>`; the
+tag is sanitised to a Docker tag, and one that would land on `main`,
+`ritz1-*` or a commit is refused. A push to main that changes this directory
+publishes `:main` and `:<commit>`. A manual run builds, tests and dry-runs,
+and pushes nothing.
 
 This directory is not a Ritz package and has no `ritz.toml`. `rz`'s
 `projects/**` glob only matches directories that have a `ritz.toml`
