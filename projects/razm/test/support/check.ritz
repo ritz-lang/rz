@@ -1,0 +1,327 @@
+# The encode tests' table runner and operand builders.
+#
+# A case is `check(mode, text, want, spec)`: the instruction `spec` describes
+# must encode to `want`, which is what `as --64` writes for `text` in that
+# mode. `want` is the bytes in hex, then ` | offset:kindwidth:target+addend`
+# per relocation. tests/encode_fixtures.py reads the cases out of
+# test/test_encode_*.ritz and rewrites each `want` from `as`; its check mode
+# runs under ./rz test razm.
+#
+# A spec names registers and values; `check` builds the `Insn` from it over a
+# fresh `Exprs` arena, and evaluates against an empty symbol table, so every
+# symbol is undefined and becomes a fixup. `L` stands for a label on the
+# instruction's own first byte: a fixup to it is applied here, as `as`
+# resolves a branch to a local label with no relocation.
+import ritzlib.io
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview { StrView }
+import ritzlib.string { String }
+import razm.expr { BinOp, Expr, ExprNode, Exprs, SymTable, exprs_new, symtable_new }
+import razm.fixup { Fixup, FixupKind }
+import razm.insn { Insn, Mem, OpSize, Operand, Prefix, Reg, insn_new, reg_from_name }
+import razm.parse { Mode }
+import razm.emit
+import razm.encode
+
+enum OpndKind
+    RegOp
+    ImmOp
+    MemOp
+    StarOp
+
+
+# One operand as a case writes it: register names with their `%`, a value as
+# `sym` ("" for none) plus `num`.
+struct Opnd
+    kind: OpndKind
+    reg: StrView        # the register, or a memory operand's base
+    index: StrView
+    scale: u8
+    seg: StrView
+    sym: StrView
+    num: i64
+
+
+# One instruction as a case writes it.
+pub struct Spec
+    name: StrView
+    suffix: StrView
+    prefix: Prefix
+    ops: [2]Opnd
+    n: i64
+
+
+fn opnd(kind: OpndKind, reg: StrView, sym: StrView, num: i64) -> Opnd
+    Opnd { kind: kind, reg: reg, index: "", scale: 1, seg: "", sym: sym, num: num }
+
+
+fn memory(seg: StrView, sym: StrView, num: i64, base: StrView, index: StrView, scale: u8) -> Opnd
+    Opnd { kind: OpndKind.MemOp, reg: base, index: index, scale: scale, seg: seg, sym: sym, num: num }
+
+
+# `%reg`: a GPR, %cr0-%cr4 or a segment register.
+pub fn r(name: StrView) -> Opnd
+    opnd(OpndKind.RegOp, name, "", 0)
+
+
+# `*%reg`.
+pub fn star(name: StrView) -> Opnd
+    opnd(OpndKind.StarOp, name, "", 0)
+
+
+# `$n`.
+pub fn imm(n: i64) -> Opnd
+    opnd(OpndKind.ImmOp, "", "", n)
+
+
+# `$sym+addend`.
+pub fn isym(sym: StrView, addend: i64) -> Opnd
+    opnd(OpndKind.ImmOp, "", sym, addend)
+
+
+# `disp(%base)`; an empty base is none.
+pub fn mem(disp: i64, base: StrView) -> Opnd
+    memory("", "", disp, base, "", 1)
+
+
+# `disp(%base,%index,scale)`.
+pub fn sib(disp: i64, base: StrView, index: StrView, scale: u8) -> Opnd
+    memory("", "", disp, base, index, scale)
+
+
+# `sym+addend(%base)`.
+pub fn msym(sym: StrView, addend: i64, base: StrView) -> Opnd
+    memory("", sym, addend, base, "", 1)
+
+
+# `sym(,%index,scale)`.
+pub fn msym_index(sym: StrView, index: StrView, scale: u8) -> Opnd
+    memory("", sym, 0, "", index, scale)
+
+
+# The absolute memory operand `n`, `(n)`.
+pub fn at(n: i64) -> Opnd
+    memory("", "", n, "", "", 1)
+
+
+# A bare symbol: absolute memory, or a branch's target.
+pub fn sym(name: StrView) -> Opnd
+    memory("", name, 0, "", "", 1)
+
+
+# `sym+addend(%rip)`.
+pub fn rip(name: StrView, addend: i64) -> Opnd
+    memory("", name, addend, "%rip", "", 1)
+
+
+# `n(%rip)`.
+pub fn rip_at(n: i64) -> Opnd
+    memory("", "", n, "%rip", "", 1)
+
+
+# `%seg:n`.
+pub fn seg_at(seg: StrView, n: i64) -> Opnd
+    memory(seg, "", n, "", "", 1)
+
+
+# `%seg:sym`.
+pub fn seg_sym(seg: StrView, name: StrView) -> Opnd
+    memory(seg, name, 0, "", "", 1)
+
+
+# `%seg:disp(%base)`.
+pub fn seg_mem(seg: StrView, disp: i64, base: StrView) -> Opnd
+    memory(seg, "", disp, base, "", 1)
+
+
+# An instruction from its base mnemonic, suffix ("" for none) and operands.
+pub fn ins0(name: StrView, suffix: StrView) -> Spec
+    Spec { name: name, suffix: suffix, prefix: Prefix.NoPrefix, ops: [imm(0), imm(0)], n: 0 }
+
+
+pub fn ins1(name: StrView, suffix: StrView, a: Opnd) -> Spec
+    Spec { name: name, suffix: suffix, prefix: Prefix.NoPrefix, ops: [a, imm(0)], n: 1 }
+
+
+pub fn ins2(name: StrView, suffix: StrView, a: Opnd, b: Opnd) -> Spec
+    Spec { name: name, suffix: suffix, prefix: Prefix.NoPrefix, ops: [a, b], n: 2 }
+
+
+# `p` in front of `s`.
+pub fn with_prefix(p: Prefix, s: Spec) -> Spec
+    var out = s
+    out.prefix = p
+    out
+
+
+[[test_helper]]
+fn register(name: StrView) -> Reg
+    assert name.starts_with("%"), "a register name starts with %"
+    match reg_from_name(name.slice(1, name.len))
+        Some(reg) => return reg
+        None => pass
+    assert false, "not a register name"
+    Reg { class: RegClass.Gpr64, num: 0 }
+
+
+fn some_register(name: StrView) -> Option<Reg>
+    if name.len == 0 then None else Some(register(name))
+
+
+# `sym + num` in `x`: a symbol, a number, or their sum.
+fn value_expr(x: @&Exprs, sym: StrView, num: i64) -> Expr
+    if sym.len == 0
+        return x.num(num)
+    let s = x.sym(sym)
+    if num == 0
+        return s
+    let n = x.num(num)
+    x.add(ExprNode.Bin(BinOp.Add, s, n))
+
+
+fn operand(x: @&Exprs, o: Opnd) -> Operand
+    match o.kind
+        RegOp => Operand.Register(register(o.reg))
+        StarOp => Operand.Indirect(register(o.reg))
+        ImmOp => Operand.Imm(value_expr(x, o.sym, o.num))
+        MemOp =>
+            let seg: Option<Reg> = some_register(o.seg)
+            let d: Expr = value_expr(x, o.sym, o.num)
+            Operand.Memory(Mem {
+                seg: seg, disp: Some(d), base: some_register(o.reg),
+                index: some_register(o.index), scale: o.scale
+            })
+
+
+fn size_named(suffix: StrView) -> OpSize
+    match suffix
+        "b" => OpSize.Byte
+        "w" => OpSize.Word
+        "l" => OpSize.Long
+        "q" => OpSize.Quad
+        _ => OpSize.Unsized
+
+
+# The `Insn` `s` describes, its expressions in `x`.
+pub fn build(x: @&Exprs, s: Spec) -> Insn
+    var insn = insn_new(s.prefix, s.name, size_named(s.suffix))
+    for i in 0..s.n
+        let pushed: bool = insn.push(operand(x, s.ops[i]))
+    insn
+
+
+# `s` encoded in `mode`, a branch in its near form.
+pub fn encode_spec(mode: Mode, s: Spec) -> Result<Encoded, EncodeError>
+    var x = exprs_new()
+    let syms = symtable_new()
+    let insn = build(@&x, s)
+    encode(@insn, mode, @x, @syms)
+
+
+# The rel8 form of the branch `s`.
+pub fn encode_spec_short(mode: Mode, s: Spec) -> Result<Encoded, EncodeError>
+    var x = exprs_new()
+    let syms = symtable_new()
+    let insn = build(@&x, s)
+    encode_short(@insn, mode, @x, @syms)
+
+
+fn hex_digit(d: u8) -> u8
+    if d < 10 then '0' + d else 'a' + d - 10
+
+
+fn push_hex(s: @&String, b: u8)
+    s.push(hex_digit(b >> 4))
+    s.push(hex_digit(b & 15))
+
+
+fn kind_name(k: FixupKind) -> StrView
+    match k
+        Absolute => "abs"
+        AbsoluteSigned => "sabs"
+        PcRelative => "pc"
+        Plt => "plt"
+        GotPcRelx => "gotx"
+
+
+# `e` in the fixture notation, with fixups to `L` applied.
+pub fn render(e: @Encoded) -> String
+    var bytes: [15]u8 = [0; 15]
+    let src = e.bytes()
+    for i in 0..src.len
+        bytes[i] = src[i]
+    var out = String.new()
+    var rest = String.new()
+    for f in e.fixups()
+        if f.target.eq("L")
+            let v: i64 = f.addend - f.offset
+            for k in 0..f.width
+                bytes[f.offset + k] = ((v >> (k * 8)) & 0xFF) as u8
+            continue
+        rest.push_str(" | ")
+        rest.push_str(String.from_i64(f.offset).as_view())
+        rest.push(':')
+        rest.push_str(kind_name(f.kind))
+        rest.push_str(String.from_i64(f.width).as_view())
+        rest.push(':')
+        rest.push_str(f.target)
+        if f.addend >= 0
+            rest.push('+')
+        rest.push_str(String.from_i64(f.addend).as_view())
+    for i in 0..src.len
+        if i > 0
+            out.push(' ')
+        push_hex(@&out, bytes[i])
+    out.push_str(rest.as_view())
+    out
+
+
+fn report(mode: Mode, text: StrView, want: StrView, got: StrView) -> i32
+    let m: i64 = match mode
+        Code16 => 16
+        Code32 => 32
+        Code64 => 64
+    eprint("  .code{m} {text}\n    as:   {want}\n    razm: {got}\n")
+    1
+
+
+fn error_name(e: EncodeError) -> StrView
+    match e
+        BadOperands => "BadOperands"
+        NoSize => "NoSize"
+        SizeMismatch => "SizeMismatch"
+        NotInMode => "NotInMode"
+        BadRegister => "BadRegister"
+        BadAddress => "BadAddress"
+        ImmRange => "ImmRange"
+        DispRange => "DispRange"
+        NoShortForm => "NoShortForm"
+        UnknownMnemonic => "UnknownMnemonic"
+        BadExpr(_) => "BadExpr"
+
+
+fn compare(mode: Mode, text: StrView, want: StrView, got: Result<Encoded, EncodeError>) -> i32
+    match got
+        Ok(e) =>
+            let s = render(@e)
+            if s.eq(want) then 0 else report(mode, text, want, s.as_view())
+        Err(err) => report(mode, text, want, error_name(err))
+
+
+# 0 when `spec` encodes (near, for a branch) to `want`; else 1, and stderr
+# shows both.
+pub fn check(mode: Mode, text: StrView, want: StrView, spec: Spec) -> i32
+    compare(mode, text, want, encode_spec(mode, spec))
+
+
+# The same for the short (rel8) form of a branch.
+pub fn check_short(mode: Mode, text: StrView, want: StrView, spec: Spec) -> i32
+    compare(mode, text, want, encode_spec_short(mode, spec))
+
+
+# 0 when `spec` does not encode in `mode`, as `as` rejects `text`.
+pub fn check_err(mode: Mode, text: StrView, spec: Spec) -> i32
+    match encode_spec(mode, spec)
+        Ok(e) => report(mode, text, "an error", render(@e).as_view())
+        Err(_) => 0

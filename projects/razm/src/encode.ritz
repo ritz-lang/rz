@@ -1,10 +1,373 @@
-# encode: a structured instruction (mnemonic, operand size, operands) to
-# bytes plus fixups. DESIGN.md "Library".
+# encode: a structured instruction to bytes plus fixups, in a .code16,
+# .code32 or .code64 mode. DESIGN.md "Library".
+#
+# The operands' expressions are evaluated against `syms`: a constant is
+# absolute, and a label or undefined symbol becomes a fixup against it, which
+# the Object resolves or turns into a relocation.
+#
+# A branch (jmp, jcc) has two forms: `encode` gives the near one (rel16 in
+# .code16, else rel32) and `encode_short` the rel8 one, so the assembler can
+# start short and grow a branch whose target is out of range. `loop` has
+# only the rel8 form, and `call` only the near one.
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview { StrView }
+import razm.expr { Exprs, SymTable, Value }
+import razm.fixup { FixupKind }
+import razm.insn { Insn, OpSize, Operand }
+import razm.parse { Mode }
+import razm.emit
+import razm.encode_ops
+import razm.encode_mov
 
-# How a fixup's field is resolved.
-pub enum FixupKind
-    Absolute
-    AbsoluteSigned
-    PcRelative
-    Plt
-    GotPcRelx
+
+# `insn` in `mode`, a branch in its near form.
+pub fn encode(insn: @Insn, mode: Mode, exprs: @Exprs, syms: @SymTable) -> Result<Encoded, EncodeError>
+    let op: Op = op_of(insn.name)?
+    var e = emitter(mode)
+    e.resolve(insn, exprs, syms)
+    e.prefix(insn.prefix)
+    lay_out(@&e, insn, op, false)
+    e.finish()
+
+
+# The rel8 form of the branch `insn`: jmp, jcc or loop to a target.
+pub fn encode_short(insn: @Insn, mode: Mode, exprs: @Exprs, syms: @SymTable) -> Result<Encoded, EncodeError>
+    let op: Op = op_of(insn.name)?
+    var e = emitter(mode)
+    e.resolve(insn, exprs, syms)
+    if not has_short_form(@&e, insn, op)
+        return Err(EncodeError.NoShortForm)
+    e.prefix(insn.prefix)
+    lay_out(@&e, insn, op, true)
+    e.finish()
+
+
+# What an instruction name encodes as. Aliases share one: jc is jb, jnc
+# jae, jz je, jnz jne.
+enum Op
+    Add
+    Or
+    And
+    Sub
+    Xor
+    Cmp
+    Test
+    Bt
+    Mov
+    Movabs
+    Movzb
+    Lea
+    Xchg
+    Inc
+    Dec
+    Shl
+    Shr
+    Sar
+    Push
+    Pop
+    Pushf
+    Popf
+    Call
+    Jmp
+    Ja
+    Jb
+    Jae
+    Je
+    Jne
+    Loop
+    Ret
+    Lret
+    Iret
+    Sysret
+    Syscall
+    Swapgs
+    Cli
+    Sti
+    Cld
+    Std
+    Hlt
+    Nop
+    Pause
+    Ud2
+    Cpuid
+    Rdtsc
+    Rdmsr
+    Wrmsr
+    Xgetbv
+    Lfence
+    Mfence
+    Sfence
+    Rdrand
+    Clflush
+    Invlpg
+    Lgdt
+    Lidt
+    Ltr
+    In
+    Out
+    Lods
+    Stos
+
+
+# The base mnemonic `name` (the suffix removed, as parse writes it).
+fn op_of(name: StrView) -> Result<Op, EncodeError>
+    match name
+        "add" => Ok(Op.Add)
+        "or" => Ok(Op.Or)
+        "and" => Ok(Op.And)
+        "sub" => Ok(Op.Sub)
+        "xor" => Ok(Op.Xor)
+        "cmp" => Ok(Op.Cmp)
+        "test" => Ok(Op.Test)
+        "bt" => Ok(Op.Bt)
+        "mov" => Ok(Op.Mov)
+        "movabs" => Ok(Op.Movabs)
+        "movzb" => Ok(Op.Movzb)
+        "lea" => Ok(Op.Lea)
+        "xchg" => Ok(Op.Xchg)
+        "inc" => Ok(Op.Inc)
+        "dec" => Ok(Op.Dec)
+        "shl" => Ok(Op.Shl)
+        "shr" => Ok(Op.Shr)
+        "sar" => Ok(Op.Sar)
+        "push" => Ok(Op.Push)
+        "pop" => Ok(Op.Pop)
+        "pushf" => Ok(Op.Pushf)
+        "popf" => Ok(Op.Popf)
+        "call" => Ok(Op.Call)
+        "jmp" => Ok(Op.Jmp)
+        "ja" => Ok(Op.Ja)
+        "jb" | "jc" => Ok(Op.Jb)
+        "jae" | "jnc" => Ok(Op.Jae)
+        "je" | "jz" => Ok(Op.Je)
+        "jne" | "jnz" => Ok(Op.Jne)
+        "loop" => Ok(Op.Loop)
+        "ret" => Ok(Op.Ret)
+        "lret" => Ok(Op.Lret)
+        "iret" => Ok(Op.Iret)
+        "sysret" => Ok(Op.Sysret)
+        "syscall" => Ok(Op.Syscall)
+        "swapgs" => Ok(Op.Swapgs)
+        "cli" => Ok(Op.Cli)
+        "sti" => Ok(Op.Sti)
+        "cld" => Ok(Op.Cld)
+        "std" => Ok(Op.Std)
+        "hlt" => Ok(Op.Hlt)
+        "nop" => Ok(Op.Nop)
+        "pause" => Ok(Op.Pause)
+        "ud2" => Ok(Op.Ud2)
+        "cpuid" => Ok(Op.Cpuid)
+        "rdtsc" => Ok(Op.Rdtsc)
+        "rdmsr" => Ok(Op.Rdmsr)
+        "wrmsr" => Ok(Op.Wrmsr)
+        "xgetbv" => Ok(Op.Xgetbv)
+        "lfence" => Ok(Op.Lfence)
+        "mfence" => Ok(Op.Mfence)
+        "sfence" => Ok(Op.Sfence)
+        "rdrand" => Ok(Op.Rdrand)
+        "clflush" => Ok(Op.Clflush)
+        "invlpg" => Ok(Op.Invlpg)
+        "lgdt" => Ok(Op.Lgdt)
+        "lidt" => Ok(Op.Lidt)
+        "ltr" => Ok(Op.Ltr)
+        "in" => Ok(Op.In)
+        "out" => Ok(Op.Out)
+        "lods" => Ok(Op.Lods)
+        "stos" => Ok(Op.Stos)
+        _ => Err(EncodeError.UnknownMnemonic)
+
+
+fn has_short_form(e: @&Emitter, insn: @Insn, op: Op) -> bool
+    let direct: bool = insn.n_ops == 1 and target_of(e, insn.ops[0]).is_some()
+    match op
+        Jmp | Ja | Jb | Jae | Je | Jne | Loop => direct
+        _ => false
+
+
+fn lay_out(e: @&Emitter, insn: @Insn, op: Op, short: bool)
+    match op
+        Add => alu(e, insn, 0)
+        Or => alu(e, insn, 1)
+        And => alu(e, insn, 4)
+        Sub => alu(e, insn, 5)
+        Xor => alu(e, insn, 6)
+        Cmp => alu(e, insn, 7)
+        Test => test(e, insn)
+        Bt => bt(e, insn)
+        Mov => mov(e, insn)
+        Movabs => movabs(e, insn)
+        Movzb => movzb(e, insn)
+        Lea => lea(e, insn)
+        Xchg => xchg(e, insn)
+        Inc => inc_dec(e, insn, 0)
+        Dec => inc_dec(e, insn, 1)
+        Shl => shift(e, insn, 4)
+        Shr => shift(e, insn, 5)
+        Sar => shift(e, insn, 7)
+        Push => push(e, insn)
+        Pop => pop(e, insn)
+        Pushf => flags(e, insn, 0x9C)
+        Popf => flags(e, insn, 0x9D)
+        Call => call_or_jump(e, insn, 0xE8, 2, short)
+        Jmp => call_or_jump(e, insn, 0xE9, 4, short)
+        Ja => jcc(e, insn, 0x7, short)
+        Jb => jcc(e, insn, 0x2, short)
+        Jae => jcc(e, insn, 0x3, short)
+        Je => jcc(e, insn, 0x4, short)
+        Jne => jcc(e, insn, 0x5, short)
+        Loop => rel8(e, insn, 0xE2)
+        Ret => ret(e, insn)
+        Lret => only(e, insn, true, 0xCB)
+        Iret => only(e, insn, true, 0xCF)
+        Sysret => sysret(e, insn)
+        Syscall => fixed2(e, insn, 0x0F, 0x05)
+        Swapgs => swapgs(e, insn)
+        Cli => only(e, insn, false, 0xFA)
+        Sti => only(e, insn, false, 0xFB)
+        Cld => only(e, insn, false, 0xFC)
+        Std => only(e, insn, false, 0xFD)
+        Hlt => only(e, insn, false, 0xF4)
+        Nop => nop(e, insn)
+        Pause => fixed2(e, insn, 0xF3, 0x90)
+        Ud2 => fixed2(e, insn, 0x0F, 0x0B)
+        Cpuid => fixed2(e, insn, 0x0F, 0xA2)
+        Rdtsc => fixed2(e, insn, 0x0F, 0x31)
+        Rdmsr => fixed2(e, insn, 0x0F, 0x32)
+        Wrmsr => fixed2(e, insn, 0x0F, 0x30)
+        Xgetbv => fixed3(e, insn, 0xD0)
+        Lfence => fixed3_ae(e, insn, 0xE8)
+        Mfence => fixed3_ae(e, insn, 0xF0)
+        Sfence => fixed3_ae(e, insn, 0xF8)
+        Rdrand => rdrand(e, insn)
+        Clflush => system_mem(e, insn, 0xAE, 7)
+        Invlpg => system_mem(e, insn, 0x01, 7)
+        Lgdt => system_mem(e, insn, 0x01, 2)
+        Lidt => system_mem(e, insn, 0x01, 3)
+        Ltr => ltr(e, insn)
+        In => port_io(e, insn, 0xE4, 0xEC, 1)
+        Out => port_io(e, insn, 0xE6, 0xEE, 0)
+        Lods => string_op(e, insn, 0xAC)
+        Stos => string_op(e, insn, 0xAA)
+
+
+# The target of a direct branch: a bare expression, which reaches encode as
+# an absolute memory operand.
+fn target_of(e: @&Emitter, o: Operand) -> Option<Value>
+    match o
+        Operand.Memory(m) =>
+            if m.base.is_some() or m.index.is_some() or m.seg.is_some()
+                return None
+            match m.disp
+                Some(x) => Some(e.value(x))
+                None => None
+        _ => None
+
+
+# A suffix on a branch or ret names the mode's own size, or it is an error.
+fn natural_suffix(e: @&Emitter, insn: @Insn)
+    if not size_is(insn.size, OpSize.Unsized) and not size_is(insn.size, default_size(e.mode))
+        e.fail(EncodeError.NotInMode)
+
+
+# The near displacement: rel16 in .code16, else rel32; through the PLT in
+# 64-bit mode, as `as` writes a branch to a global, undefined or
+# other-section symbol (the Object resolves a same-section local itself).
+fn near(e: @&Emitter, target: Value)
+    let width: i64 = if e.mode_is(Mode.Code16) then 2 else 4
+    let kind: FixupKind = if e.is64() then FixupKind.Plt else FixupKind.PcRelative
+    e.relative(target, width, kind)
+
+
+# call (e8 rel, ff /2) and jmp (e9 rel or eb rel8, ff /4).
+fn call_or_jump(e: @&Emitter, insn: @Insn, near_op: u8, ext: u8, short: bool)
+    operands(e, insn, 1)
+    natural_suffix(e, insn)
+    match insn.ops[0]
+        Operand.Indirect(r) =>
+            if not size_is(gpr_size(r), default_size(e.mode))
+                e.fail(EncodeError.SizeMismatch)
+            e.opcode(0xFF)
+            e.ext(ext)
+            e.rm_reg(r)
+        o =>
+            match target_of(e, o)
+                Some(t) =>
+                    if short
+                        e.opcode(0xEB)
+                        e.relative(t, 1, FixupKind.PcRelative)
+                    else
+                        e.opcode(near_op)
+                        near(e, t)
+                None => e.fail(EncodeError.BadOperands)
+
+
+# jcc on condition code `cc`: 0f 80+cc rel, or 70+cc rel8.
+fn jcc(e: @&Emitter, insn: @Insn, cc: u8, short: bool)
+    operands(e, insn, 1)
+    natural_suffix(e, insn)
+    match target_of(e, insn.ops[0])
+        Some(t) =>
+            if short
+                e.opcode(0x70 + cc)
+                e.relative(t, 1, FixupKind.PcRelative)
+            else
+                e.opcode2(0x0F, 0x80 + cc)
+                near(e, t)
+        None => e.fail(EncodeError.BadOperands)
+
+
+# A branch with only a rel8 form (loop).
+fn rel8(e: @&Emitter, insn: @Insn, op: u8)
+    operands(e, insn, 1)
+    match target_of(e, insn.ops[0])
+        Some(t) =>
+            e.opcode(op)
+            e.relative(t, 1, FixupKind.PcRelative)
+        None => e.fail(EncodeError.BadOperands)
+
+
+fn ret(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 0)
+    natural_suffix(e, insn)
+    e.opcode(0xC3)
+
+
+# A one-byte instruction with no operands; `sized` lets a suffix pick the
+# operand size (lretq, iretq).
+fn only(e: @&Emitter, insn: @Insn, sized: bool, op: u8)
+    if sized
+        sized_operandless(e, insn)
+    else
+        operands(e, insn, 0)
+    e.opcode(op)
+
+
+fn fixed2(e: @&Emitter, insn: @Insn, a: u8, b: u8)
+    operands(e, insn, 0)
+    e.opcode2(a, b)
+
+
+# 0f 01 `c`.
+fn fixed3(e: @&Emitter, insn: @Insn, c: u8)
+    operands(e, insn, 0)
+    e.opcode3(0x0F, 0x01, c)
+
+
+# 0f ae `c`: the fences.
+fn fixed3_ae(e: @&Emitter, insn: @Insn, c: u8)
+    operands(e, insn, 0)
+    e.opcode3(0x0F, 0xAE, c)
+
+
+fn sysret(e: @&Emitter, insn: @Insn)
+    sized_operandless(e, insn)
+    if not e.is64()
+        e.fail(EncodeError.NotInMode)
+    e.opcode2(0x0F, 0x07)
+
+
+fn swapgs(e: @&Emitter, insn: @Insn)
+    if not e.is64()
+        e.fail(EncodeError.NotInMode)
+    fixed3(e, insn, 0xF8)

@@ -96,7 +96,7 @@ Operands are a GPR at any width; `%cr0`, `%cr2`, `%cr3`, `%cr4`; the segment reg
 
 razm is a library with three parts. rllvm uses all three. The `razm` binary is the text driver over them.
 
-- `encode`: a structured instruction (mnemonic, operand size, operands) to bytes plus fixups. A fixup is (offset in the instruction, width, kind, target symbol, addend), where kind is absolute, absolute sign-extended, PC-relative, PLT, or GOTPCRELX. It accepts the encoder set below.
+- `encode`: a structured instruction (mnemonic, operand size, operands) to bytes plus fixups. A fixup is (offset in the instruction, width, kind, target symbol, addend), where kind is absolute, absolute sign-extended, PC-relative, PLT, or GOTPCRELX. It accepts the encoder set below. It takes the code mode and the symbol table the operands' expressions are evaluated against: a constant is absolute, and a label or undefined symbol becomes a fixup. A `jmp` or `jcc` encodes in its near form, and `encode_short` gives its rel8 form, so the branch sizing iteration can grow one.
 - `parse`: AT&T text to structured instructions and directives. It accepts only the [text dialect](#text-razm-accepts). A mnemonic the encoder knows but the dialect does not list is a parse error.
 - `Object`: the ELF writer, holding sections, symbols, COMDAT groups, and fixups. It applies a PC-relative fixup to a local label in the same section itself, and turns every other fixup into a relocation, against the section symbol plus offset when the target is local.
 

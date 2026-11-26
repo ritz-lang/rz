@@ -1,0 +1,55 @@
+# encode evaluates operands against the symbol table: a `.set` constant is
+# absolute, a label or undefined symbol is a fixup against it, and a label
+# not yet laid out, or a name outside the encoder set, is an error.
+import ritzlib.option
+import ritzlib.result
+import razm.expr { SymDef, exprs_new, symtable_new }
+import razm.fixup { FixupKind }
+import razm.insn { Prefix }
+import razm.parse { Mode }
+import razm.emit
+import razm.encode
+import test.support.check
+
+
+[[test]]
+fn test_encode_a_constant_symbol_is_an_absolute_immediate()
+    var x = exprs_new()
+    var syms = symtable_new()
+    syms.define("KERNEL_CS", SymDef.Constant(8))
+    let insn = build(@&x, ins1("push", "q", isym("KERNEL_CS", 0)))
+    match encode(@insn, Mode.Code64, @x, @syms)
+        Ok(e) =>
+            let b = e.bytes()
+            assert b.len == 2 and b[0] == 0x6A and b[1] == 8, "pushq $KERNEL_CS is 6a 08"
+            assert e.fixups().len == 0, "a constant needs no fixup"
+        Err(_) =>
+            assert false, "pushq $KERNEL_CS encodes"
+
+
+[[test]]
+fn test_encode_a_label_is_a_fixup_against_it()
+    var x = exprs_new()
+    var syms = symtable_new()
+    syms.define("gdt_ptr", SymDef.Label(1, 64))
+    let insn = build(@&x, ins2("mov", "l", isym("gdt_ptr", 2), r("%edi")))
+    match encode(@insn, Mode.Code32, @x, @syms)
+        Ok(e) =>
+            assert e.bytes().len == 5, "movl $gdt_ptr+2, %edi is bf imm32"
+            let f = e.fixups()
+            assert f.len == 1, "one fixup"
+            assert f[0].target.eq("gdt_ptr") and f[0].addend == 2, "against the label, + 2"
+            assert f[0].offset == 1 and f[0].width == 4, "the imm32"
+        Err(_) =>
+            assert false, "movl $gdt_ptr+2, %edi encodes"
+
+
+[[test]]
+fn test_encode_refuses_an_unplaced_label_and_an_unknown_name()
+    var x = exprs_new()
+    var syms = symtable_new()
+    syms.define("later", SymDef.Unplaced(0))
+    let unplaced = build(@&x, ins2("mov", "q", isym("later", 0), r("%rax")))
+    assert encode(@unplaced, Mode.Code64, @x, @syms).is_err(), "an Unplaced label has no value"
+    let unknown = build(@&x, ins0("frob", ""))
+    assert encode(@unknown, Mode.Code64, @x, @syms).is_err(), "frob is not in the encoder set"

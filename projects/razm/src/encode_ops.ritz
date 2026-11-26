@@ -1,0 +1,383 @@
+# The operand forms of `encode`'s instruction groups: which opcode, ModRM
+# fields and immediate each AT&T operand combination takes, chosen as GNU
+# as chooses them.
+import ritzlib.option
+import razm.expr { Value }
+import razm.fixup { FixupKind }
+import razm.insn { Insn, OpSize, Operand, Reg, RegClass }
+import razm.emit
+
+
+# The operand size: the suffix's, else the GPR operand `i`'s.
+pub fn size_at(e: @&Emitter, insn: @Insn, i: i64) -> OpSize
+    if not size_is(insn.size, OpSize.Unsized)
+        return insn.size
+    if i < insn.n_ops
+        match gpr_of(insn.ops[i])
+            Some(r) => return gpr_size(r)
+            None => pass
+    e.fail(EncodeError.NoSize)
+    OpSize.Long
+
+
+# The operand size from the suffix or the first GPR operand.
+pub fn size_of(e: @&Emitter, insn: @Insn) -> OpSize
+    for i in 0..insn.n_ops
+        match gpr_of(insn.ops[i])
+            Some(_) => return size_at(e, insn, i)
+            None => pass
+    size_at(e, insn, insn.n_ops)
+
+
+# Every GPR operand is `size` wide.
+pub fn same_size(e: @&Emitter, insn: @Insn, size: OpSize)
+    for i in 0..insn.n_ops
+        match gpr_of(insn.ops[i])
+            Some(r) =>
+                if not size_is(gpr_size(r), size)
+                    e.fail(EncodeError.SizeMismatch)
+            None => pass
+
+
+# `insn` has exactly `n` operands.
+pub fn operands(e: @&Emitter, insn: @Insn, n: i64)
+    if insn.n_ops != n
+        e.fail(EncodeError.BadOperands)
+
+
+# The accumulator (%al, %ax, %eax, %rax) as an operand.
+pub fn is_acc(o: Operand) -> bool
+    match gpr_of(o)
+        Some(r) => r.num == 0 and not class_is(r, RegClass.Gpr8High)
+        None => false
+
+
+# `base` for a byte operation, `base + 1` for any other size.
+pub fn by_size(size: OpSize, base: u8) -> u8
+    if size_is(size, OpSize.Byte) then base else base + 1
+
+
+# `v` as an imm8 standing for an operand of `size`, if it is one.
+fn imm8_of(v: Value, size: OpSize) -> Option<Value>
+    if value_sym(v).is_some()
+        return None
+    let bits: i64 = size_bytes(size) * 8
+    var t: i64 = value_num(v)
+    if bits < 64
+        let shift: i64 = 64 - bits
+        t = (t << shift) >> shift
+    if t >= -128 and t <= 127 then Some(absolute(t)) else None
+
+
+# add, or, and, sub, xor, cmp: group 1, opcode extension `ext`.
+pub fn alu(e: @&Emitter, insn: @Insn, ext: u8)
+    operands(e, insn, 2)
+    let size = size_of(e, insn)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    let src = insn.ops[0]
+    let dst = insn.ops[1]
+    let base: u8 = ext * 8
+    match src
+        Operand.Imm(x) =>
+            let v: Value = e.value(x)
+            if size_is(size, OpSize.Byte)
+                if is_acc(dst)
+                    e.opcode(base + 4)
+                else
+                    e.opcode(0x80)
+                    e.ext(ext)
+                    e.rm(dst)
+                e.immediate(v, 1, FixupKind.Absolute)
+                return
+            match imm8_of(v, size)
+                Some(short) =>
+                    e.opcode(0x83)
+                    e.ext(ext)
+                    e.rm(dst)
+                    e.immediate(short, 1, FixupKind.Absolute)
+                None =>
+                    if is_acc(dst)
+                        e.opcode(base + 5)
+                    else
+                        e.opcode(0x81)
+                        e.ext(ext)
+                        e.rm(dst)
+                    e.immediate_sized(v, size)
+        Operand.Register(s) =>
+            e.opcode(by_size(size, base))
+            e.reg(s)
+            e.rm(dst)
+        Operand.Memory(_) =>
+            match dst
+                Operand.Register(d) =>
+                    e.opcode(by_size(size, base + 2))
+                    e.reg(d)
+                    e.rm(src)
+                _ => e.fail(EncodeError.BadOperands)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# test: a8/a9 on the accumulator, f6/f7 /0 with an immediate, 84/85 with a
+# register.
+pub fn test(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 2)
+    let size = size_of(e, insn)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    let src = insn.ops[0]
+    let dst = insn.ops[1]
+    match src
+        Operand.Imm(x) =>
+            let v: Value = e.value(x)
+            if is_acc(dst)
+                e.opcode(by_size(size, 0xA8))
+            else
+                e.opcode(by_size(size, 0xF6))
+                e.ext(0)
+                e.rm(dst)
+            e.immediate_sized(v, size)
+        Operand.Register(s) =>
+            e.opcode(by_size(size, 0x84))
+            e.reg(s)
+            e.rm(dst)
+        Operand.Memory(_) =>
+            match dst
+                Operand.Register(d) =>
+                    e.opcode(by_size(size, 0x84))
+                    e.reg(d)
+                    e.rm(src)
+                _ => e.fail(EncodeError.BadOperands)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# bt: 0f ba /4 ib with an immediate bit, 0f a3 with a register.
+pub fn bt(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 2)
+    let size = size_at(e, insn, 1)
+    same_size(e, insn, size)
+    if size_is(size, OpSize.Byte)
+        e.fail(EncodeError.SizeMismatch)
+    e.operand_size(size)
+    match insn.ops[0]
+        Operand.Imm(x) =>
+            let v: Value = e.value(x)
+            e.opcode2(0x0F, 0xBA)
+            e.ext(4)
+            e.rm(insn.ops[1])
+            e.immediate(v, 1, FixupKind.Absolute)
+        Operand.Register(s) =>
+            e.opcode2(0x0F, 0xA3)
+            e.reg(s)
+            e.rm(insn.ops[1])
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# inc (ext 0) and dec (ext 1): 40+r / 48+r outside 64-bit mode, where
+# those bytes are REX.
+pub fn inc_dec(e: @&Emitter, insn: @Insn, ext: u8)
+    operands(e, insn, 1)
+    let size = size_of(e, insn)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    if size_is(size, OpSize.Byte)
+        e.opcode(0xFE)
+    else
+        match insn.ops[0]
+            Operand.Register(r) =>
+                if not e.is64()
+                    e.opcode_reg(0x40 + ext * 8, r)
+                    return
+            _ => pass
+        e.opcode(0xFF)
+    e.ext(ext)
+    e.rm(insn.ops[0])
+
+
+# shl (ext 4), shr (5), sar (7): by 1 (d0/d1, as writes `$1` so), by imm8
+# (c0/c1), or by %cl (d2/d3).
+pub fn shift(e: @&Emitter, insn: @Insn, ext: u8)
+    if insn.n_ops != 1 and insn.n_ops != 2
+        e.fail(EncodeError.BadOperands)
+        return
+    let di: i64 = insn.n_ops - 1
+    let dst = insn.ops[di]
+    let size = size_at(e, insn, di)
+    match dst
+        Operand.Register(r) =>
+            if not size_is(gpr_size(r), size)
+                e.fail(EncodeError.SizeMismatch)
+        _ => pass
+    e.operand_size(size)
+    if insn.n_ops == 1
+        e.opcode(by_size(size, 0xD0))
+    else
+        match insn.ops[0]
+            Operand.Imm(x) =>
+                let v: Value = e.value(x)
+                if value_sym(v).is_none() and value_num(v) == 1
+                    e.opcode(by_size(size, 0xD0))
+                else
+                    e.opcode(by_size(size, 0xC0))
+                    e.immediate(v, 1, FixupKind.Absolute)
+            Operand.Register(c) =>
+                if c.num != 1 or class_is(c, RegClass.Gpr8High) or not size_is(gpr_size(c), OpSize.Byte)
+                    e.fail(EncodeError.BadOperands)
+                e.opcode(by_size(size, 0xD2))
+            _ => e.fail(EncodeError.BadOperands)
+    e.ext(ext)
+    e.rm(dst)
+
+
+# The size of a stack operand: the suffix's, a register's, else the mode's.
+fn stack_operand_size(e: @&Emitter, insn: @Insn) -> OpSize
+    if not size_is(insn.size, OpSize.Unsized)
+        return insn.size
+    if insn.n_ops > 0
+        match gpr_of(insn.ops[0])
+            Some(r) => return gpr_size(r)
+            None => pass
+    default_size(e.mode)
+
+
+# push: 50+r, 6a ib or 68 iz, ff /6 on memory.
+pub fn push(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 1)
+    let size = stack_operand_size(e, insn)
+    same_size(e, insn, size)
+    e.stack_size(size)
+    let o = insn.ops[0]
+    match o
+        Operand.Register(r) => e.opcode_reg(0x50, r)
+        Operand.Imm(x) =>
+            let v: Value = e.value(x)
+            match imm8_of(v, size)
+                Some(short) =>
+                    e.opcode(0x6A)
+                    e.immediate(short, 1, FixupKind.Absolute)
+                None =>
+                    e.opcode(0x68)
+                    e.immediate_sized(v, size)
+        Operand.Memory(_) =>
+            e.opcode(0xFF)
+            e.ext(6)
+            e.rm(o)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# pop: 58+r, 8f /0 on memory.
+pub fn pop(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 1)
+    let size = stack_operand_size(e, insn)
+    same_size(e, insn, size)
+    e.stack_size(size)
+    let o = insn.ops[0]
+    match o
+        Operand.Register(r) => e.opcode_reg(0x58, r)
+        Operand.Memory(_) =>
+            e.opcode(0x8F)
+            e.ext(0)
+            e.rm(o)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# pushf (9c) and popf (9d).
+pub fn flags(e: @&Emitter, insn: @Insn, op: u8)
+    operands(e, insn, 0)
+    e.stack_size(stack_operand_size(e, insn))
+    e.opcode(op)
+
+
+# in (`port`, acc) and out (acc, `port`): the port is an imm8 or %dx.
+pub fn port_io(e: @&Emitter, insn: @Insn, imm_op: u8, dx_op: u8, acc_at: i64)
+    operands(e, insn, 2)
+    let acc = insn.ops[acc_at]
+    let size = size_at(e, insn, acc_at)
+    match acc
+        Operand.Register(r) =>
+            if not size_is(gpr_size(r), size)
+                e.fail(EncodeError.SizeMismatch)
+        _ => pass
+    if not is_acc(acc) or size_is(size, OpSize.Quad)
+        e.fail(EncodeError.BadOperands)
+    e.operand_size(size)
+    match insn.ops[1 - acc_at]
+        Operand.Imm(x) =>
+            let v: Value = e.value(x)
+            if value_sym(v).is_some() or value_num(v) < 0 or value_num(v) > 255
+                e.fail(EncodeError.ImmRange)
+            e.opcode(by_size(size, imm_op))
+            e.immediate(v, 1, FixupKind.Absolute)
+        Operand.Register(d) =>
+            if d.num != 2 or not size_is(gpr_size(d), OpSize.Word)
+                e.fail(EncodeError.BadOperands)
+            e.opcode(by_size(size, dx_op))
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# lods (ac) and stos (aa), on the size the suffix names.
+pub fn string_op(e: @&Emitter, insn: @Insn, op: u8)
+    operands(e, insn, 0)
+    e.operand_size(insn.size)
+    e.opcode(by_size(insn.size, op))
+
+
+# A memory-only system instruction: 0f `op` /`ext`, no operand size.
+pub fn system_mem(e: @&Emitter, insn: @Insn, op: u8, ext: u8)
+    operands(e, insn, 1)
+    match insn.ops[0]
+        Operand.Memory(_) =>
+            e.opcode2(0x0F, op)
+            e.ext(ext)
+            e.rm(insn.ops[0])
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# ltr: 0f 00 /3 on a 16-bit register or memory, with no size prefix.
+pub fn ltr(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 1)
+    match insn.ops[0]
+        Operand.Register(r) =>
+            if not size_is(gpr_size(r), OpSize.Word)
+                e.fail(EncodeError.SizeMismatch)
+        _ => pass
+    e.opcode2(0x0F, 0x00)
+    e.ext(3)
+    e.rm(insn.ops[0])
+
+
+# nop (90), or the multi-byte nop 0f 1f /0 on an operand.
+pub fn nop(e: @&Emitter, insn: @Insn)
+    if insn.n_ops == 0
+        e.opcode(0x90)
+        return
+    operands(e, insn, 1)
+    let size = size_of(e, insn)
+    e.operand_size(size)
+    e.opcode2(0x0F, 0x1F)
+    e.ext(0)
+    e.rm(insn.ops[0])
+
+
+# rdrand: 0f c7 /6 on a 16-, 32- or 64-bit register.
+pub fn rdrand(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 1)
+    let size = size_of(e, insn)
+    same_size(e, insn, size)
+    if size_is(size, OpSize.Byte)
+        e.fail(EncodeError.SizeMismatch)
+    match insn.ops[0]
+        Operand.Register(r) =>
+            e.operand_size(size)
+            e.opcode2(0x0F, 0xC7)
+            e.ext(6)
+            e.rm_reg(r)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# An instruction with no operands whose suffix, if any, selects an operand
+# size that `op` bytes follow (lret, iret, sysret).
+pub fn sized_operandless(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 0)
+    if not size_is(insn.size, OpSize.Unsized)
+        e.operand_size(insn.size)

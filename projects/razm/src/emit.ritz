@@ -1,0 +1,577 @@
+# The byte layer of `encode`: prefixes, REX, opcode, ModRM/SIB, displacement
+# and immediate, laid out the way GNU as lays them out, with a fixup for each
+# field that names a symbol.
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span { Span }
+import ritzlib.strview { StrView }
+import razm.expr { Expr, ExprError, Exprs, Reloc, SymTable, Value, eval }
+import razm.fixup { Fixup, FixupKind }
+import razm.insn { Insn, Mem, OpSize, Operand, Prefix, Reg, RegClass }
+import razm.parse { Mode }
+
+const MAX_INSN: i64 = 15
+const REX_W: u8 = 0x08
+const REX_R: u8 = 0x04
+const REX_X: u8 = 0x02
+const REX_B: u8 = 0x01
+
+
+# Why an instruction does not encode.
+pub enum EncodeError
+    UnknownMnemonic  # a name outside the encoder set
+    BadOperands      # the operand count or kinds do not fit the mnemonic
+    NoSize           # no suffix and no register gives the operand size
+    SizeMismatch     # a register's width disagrees with the suffix
+    NotInMode        # the form does not exist in this .code mode
+    BadRegister      # ah/ch/dh/bh beside a REX prefix, or a register misused
+    BadAddress       # an addressing form razm does not encode
+    ImmRange         # an immediate does not fit its field
+    DispRange        # a displacement does not fit its field
+    NoShortForm      # encode_short of an instruction with no rel8 form
+    BadExpr(ExprError)   # an operand's expression does not evaluate
+
+
+# An encoded instruction: its bytes and the fixups on them.
+pub struct Encoded
+    buf: [15]u8
+    len: i64
+    fix: [2]Fixup
+    nfix: i64
+
+
+impl Encoded
+    # The instruction's bytes; a field with a fixup holds zero.
+    pub fn bytes(self: @Encoded) -> Span<u8>
+        let all: [u8] = @self.buf
+        all.to(self.len)
+
+    # The fields still to resolve, at offsets from the first byte.
+    pub fn fixups(self: @Encoded) -> Span<Fixup>
+        let all: [Fixup] = @self.fix
+        all.to(self.nfix)
+
+
+# The absolute value `n`.
+pub fn absolute(n: i64) -> Value
+    Value.Absolute(n)
+
+
+# The symbol a value is relative to, if any.
+pub fn value_sym(v: Value) -> Option<StrView>
+    match v
+        Absolute(_) => None
+        Relocatable(r) => Some(r.sym)
+
+
+# An absolute value's number, or a relocatable one's addend.
+pub fn value_num(v: Value) -> i64
+    match v
+        Absolute(n) => n
+        Relocatable(r) => r.addend
+
+
+# A displacement or immediate field: `width` bytes of `value`.
+struct Field
+    value: Value
+    width: i64
+    kind: FixupKind
+    pc: bool
+
+
+fn no_field() -> Field
+    Field { value: absolute(0), width: 0, kind: FixupKind.Absolute, pc: false }
+
+
+# The instruction under construction. Operand expressions are evaluated
+# first (`resolve`), and the first error sticks: `finish` returns it, so the
+# group encoders can lay out a form without checking each step.
+pub struct Emitter
+    mode: Mode
+    seg: u8
+    addr: bool
+    data: bool
+    rep: u8
+    lock: bool
+    rex: u8
+    rex_needed: bool
+    rex_banned: bool
+    op: [3]u8
+    oplen: i64
+    has_modrm: bool
+    modrm_mod: u8
+    modrm_reg: u8
+    modrm_rm: u8
+    has_sib: bool
+    sib: u8
+    disp: Field
+    imm: Field
+    ids: [3]i64          # the Expr handles `vals` belong to
+    vals: [3]Value
+    nvals: i64
+    err: Option<EncodeError>
+
+
+# An empty instruction for `mode`.
+pub fn emitter(mode: Mode) -> Emitter
+    Emitter {
+        mode: mode, seg: 0, addr: false, data: false, rep: 0, lock: false,
+        rex: 0, rex_needed: false, rex_banned: false, op: [0; 3], oplen: 0,
+        has_modrm: false, modrm_mod: 0, modrm_reg: 0, modrm_rm: 0,
+        has_sib: false, sib: 0, disp: no_field(), imm: no_field(),
+        ids: [-1; 3], vals: [absolute(0), absolute(0), absolute(0)], nvals: 0, err: None
+    }
+
+
+# The operand size `mode` uses with no prefix: Word, Long or Quad.
+pub fn default_size(mode: Mode) -> OpSize
+    match mode
+        Code16 => OpSize.Word
+        Code32 => OpSize.Long
+        Code64 => OpSize.Quad
+
+
+# The width in bytes of an operand size; 0 for Unsized.
+pub fn size_bytes(size: OpSize) -> i64
+    match size
+        Unsized => 0
+        Byte => 1
+        Word => 2
+        Long => 4
+        Quad => 8
+
+
+# The two sizes are the same.
+pub fn size_is(a: OpSize, b: OpSize) -> bool
+    (a as u8) == (b as u8)
+
+
+# `r` is of class `c`.
+pub fn class_is(r: Reg, c: RegClass) -> bool
+    (r.class as u8) == (c as u8)
+
+
+# A general-purpose register's width; Unsized for any other register.
+pub fn gpr_size(r: Reg) -> OpSize
+    match r.class
+        Gpr8 => OpSize.Byte
+        Gpr8High => OpSize.Byte
+        Gpr16 => OpSize.Word
+        Gpr32 => OpSize.Long
+        Gpr64 => OpSize.Quad
+        _ => OpSize.Unsized
+
+
+# `r` is a general-purpose register at some width.
+pub fn is_gpr(r: Reg) -> bool
+    not size_is(gpr_size(r), OpSize.Unsized)
+
+
+# The GPR an operand names, if it is one.
+pub fn gpr_of(o: Operand) -> Option<Reg>
+    match o
+        Operand.Register(r) => if is_gpr(r) then Some(r) else None
+        _ => None
+
+
+# `v` as a `width`-byte field, signed: it reads back the same after sign
+# extension.
+pub fn fits_signed(v: i64, width: i64) -> bool
+    if width >= 8
+        return true
+    let half: i64 = 1 << (width * 8 - 1)
+    v >= 0 - half and v < half
+
+
+# `v` as a `width`-byte field, signed or unsigned, as `as` accepts it.
+pub fn fits_field(v: i64, width: i64) -> bool
+    if width >= 8
+        return true
+    let half: i64 = 1 << (width * 8 - 1)
+    v >= 0 - half and v < half * 2
+
+
+impl Emitter
+    # Record `e`, unless an earlier error is already recorded.
+    pub fn fail(self: @&Emitter, e: EncodeError)
+        if self.err.is_none()
+            self.err = Some(e)
+
+    # The mode is .code64.
+    pub fn is64(self: @Emitter) -> bool
+        match self.mode
+            Code64 => true
+            _ => false
+
+    # The mode is `m`.
+    pub fn mode_is(self: @Emitter, m: Mode) -> bool
+        (self.mode as u8) == (m as u8)
+
+    # Evaluate the expression each operand of `insn` carries.
+    pub fn resolve(self: @&Emitter, insn: @Insn, exprs: @Exprs, syms: @SymTable)
+        for i in 0..insn.n_ops
+            let x: Option<Expr> = match insn.ops[i]
+                Operand.Imm(e) => Some(e)
+                Operand.Memory(m) => m.disp
+                _ => None
+            match x
+                Some(e) =>
+                    match eval(exprs, e, syms)
+                        Ok(v) =>
+                            self.ids[self.nvals] = e.id
+                            self.vals[self.nvals] = v
+                            self.nvals += 1
+                        Err(err) => self.fail(EncodeError.BadExpr(err))
+                None => pass
+
+    # The value `resolve` found for `x`.
+    pub fn value(self: @&Emitter, x: Expr) -> Value
+        for i in 0..self.nvals
+            if self.ids[i] == x.id
+                return self.vals[i]
+        self.fail(EncodeError.BadOperands)
+        absolute(0)
+
+    # The value of a memory operand's displacement; 0 when it has none.
+    fn disp_value(self: @&Emitter, m: Mem) -> Value
+        match m.disp
+            Some(x) => self.value(x)
+            None => absolute(0)
+
+    # The lock (f0) or rep (f3) prefix written before the mnemonic.
+    pub fn prefix(self: @&Emitter, p: Prefix)
+        match p
+            NoPrefix => pass
+            Lock =>
+                self.lock = true
+            Rep =>
+                self.rep = 0xF3
+
+    # Append one opcode byte (at most three).
+    pub fn opcode(self: @&Emitter, b: u8)
+        if self.oplen >= 3
+            self.fail(EncodeError.BadOperands)
+            return
+        self.op[self.oplen] = b
+        self.oplen += 1
+
+    # Append two opcode bytes.
+    pub fn opcode2(self: @&Emitter, a: u8, b: u8)
+        self.opcode(a)
+        self.opcode(b)
+
+    # Append three opcode bytes.
+    pub fn opcode3(self: @&Emitter, a: u8, b: u8, c: u8)
+        self.opcode(a)
+        self.opcode(b)
+        self.opcode(c)
+
+    # The prefixes that select `size` as the operand size.
+    pub fn operand_size(self: @&Emitter, size: OpSize)
+        match size
+            Unsized =>
+                self.fail(EncodeError.NoSize)
+            Byte => pass
+            Word =>
+                self.data = not self.mode_is(Mode.Code16)
+            Long =>
+                self.data = self.mode_is(Mode.Code16)
+            Quad =>
+                if not self.is64()
+                    self.fail(EncodeError.NotInMode)
+                self.rex = self.rex | REX_W
+
+    # The prefix for a stack or near-branch operand of `size`, whose default
+    # is the mode's own size (push, pop, pushf).
+    pub fn stack_size(self: @&Emitter, size: OpSize)
+        if size_bytes(size) == size_bytes(default_size(self.mode))
+            return
+        match size
+            Word =>
+                self.data = true
+            Long =>
+                if self.mode_is(Mode.Code16)
+                    self.data = true
+                else
+                    self.fail(EncodeError.NotInMode)
+            _ => self.fail(EncodeError.NotInMode)
+
+    # The REX needs of naming GPR `r`, and whether the mode has it.
+    pub fn use_reg(self: @&Emitter, r: Reg)
+        if not is_gpr(r) or r.num > 15
+            self.fail(EncodeError.BadRegister)
+        if size_is(gpr_size(r), OpSize.Quad) and not self.is64()
+            self.fail(EncodeError.NotInMode)
+        if class_is(r, RegClass.Gpr8High)
+            self.rex_banned = true
+        else if class_is(r, RegClass.Gpr8) and r.num >= 4 and r.num <= 7
+            self.rex_needed = true
+
+    # The ModRM reg field: register `r`.
+    pub fn reg(self: @&Emitter, r: Reg)
+        self.use_reg(r)
+        self.modrm_reg = r.num & 7
+        if r.num >= 8
+            self.rex = self.rex | REX_R
+
+    # The ModRM reg field: the opcode extension /n.
+    pub fn ext(self: @&Emitter, n: u8)
+        self.modrm_reg = n
+
+    # The opcode `base + r`, the register in its low three bits.
+    pub fn opcode_reg(self: @&Emitter, base: u8, r: Reg)
+        self.use_reg(r)
+        self.opcode(base + (r.num & 7))
+        if r.num >= 8
+            self.rex = self.rex | REX_B
+
+    # ModRM r/m: register `r`.
+    pub fn rm_reg(self: @&Emitter, r: Reg)
+        self.use_reg(r)
+        self.has_modrm = true
+        self.modrm_mod = 3
+        self.modrm_rm = r.num & 7
+        if r.num >= 8
+            self.rex = self.rex | REX_B
+
+    # ModRM r/m: a GPR or memory operand.
+    pub fn rm(self: @&Emitter, o: Operand)
+        match o
+            Operand.Register(r) => self.rm_reg(r)
+            Operand.Memory(m) => self.rm_mem(m)
+            _ => self.fail(EncodeError.BadOperands)
+
+    # The segment-override prefix for `s`, if any.
+    pub fn segment(self: @&Emitter, s: Option<Reg>)
+        match s
+            Some(r) =>
+                if not class_is(r, RegClass.Segment) or r.num > 5
+                    self.fail(EncodeError.BadRegister)
+                self.seg = SEG_PREFIX[r.num & 7]
+            None => pass
+
+    # The address size of `m`'s registers, setting 0x67 when it is not the
+    # mode's; 0 for none.
+    fn address_bits(self: @&Emitter, m: Mem) -> i64
+        var bits: i64 = 0
+        for r in [m.base, m.index]
+            match r
+                Some(g) =>
+                    if not is_gpr(g)
+                        self.fail(EncodeError.BadAddress)
+                    let b: i64 = size_bytes(gpr_size(g)) * 8
+                    if bits != 0 and bits != b
+                        self.fail(EncodeError.BadAddress)
+                    bits = b
+                None => pass
+        if bits == 0
+            return 0
+        if bits <= 16
+            self.fail(EncodeError.BadAddress)
+        else if bits == 64
+            if not self.is64()
+                self.fail(EncodeError.NotInMode)
+        else if self.is64() or self.mode_is(Mode.Code16)
+            self.addr = true
+        bits
+
+    # The kind of a displacement holding a symbol, at `bits` address size.
+    fn disp_kind(self: @Emitter, bits: i64) -> FixupKind
+        if bits == 64 or (bits == 0 and self.is64())
+            return FixupKind.AbsoluteSigned
+        FixupKind.Absolute
+
+    # ModRM r/m: memory `m`.
+    pub fn rm_mem(self: @&Emitter, m: Mem)
+        self.segment(m.seg)
+        self.has_modrm = true
+        let d: Value = self.disp_value(m)
+        match m.base
+            Some(b) =>
+                if class_is(b, RegClass.Rip)
+                    if not self.is64() or m.index.is_some()
+                        self.fail(EncodeError.NotInMode)
+                    self.modrm_mod = 0
+                    self.modrm_rm = 5
+                    self.disp = Field { value: d, width: 4, kind: FixupKind.PcRelative, pc: true }
+                    return
+            None => pass
+        let bits: i64 = self.address_bits(m)
+        let kind: FixupKind = self.disp_kind(bits)
+        match m.base
+            None =>
+                match m.index
+                    None => self.absolute_address(d, kind)
+                    Some(i) =>
+                        self.modrm_mod = 0
+                        self.modrm_rm = 4
+                        self.sib_of(m.scale, i, 5)
+                        self.disp = Field { value: d, width: 4, kind: kind, pc: false }
+            Some(b) =>
+                let low: u8 = b.num & 7
+                if b.num >= 8
+                    self.rex = self.rex | REX_B
+                match m.index
+                    None =>
+                        if low == 4
+                            self.sib = (4 << 3) | 4
+                            self.has_sib = true
+                        self.modrm_rm = low
+                    Some(i) =>
+                        self.modrm_rm = 4
+                        self.sib_of(m.scale, i, low)
+                self.displacement(d, low == 5, kind)
+
+    # An absolute address: disp16 in 16-bit addressing, disp32 in 32, and a
+    # SIB with no base or index in 64 (as writes it so, not as a moffs).
+    fn absolute_address(self: @&Emitter, d: Value, kind: FixupKind)
+        self.modrm_mod = 0
+        match self.mode
+            Code16 =>
+                self.modrm_rm = 6
+                self.disp = Field { value: d, width: 2, kind: FixupKind.Absolute, pc: false }
+            Code32 =>
+                self.modrm_rm = 5
+                self.disp = Field { value: d, width: 4, kind: kind, pc: false }
+            Code64 =>
+                self.modrm_rm = 4
+                self.sib = (4 << 3) | 5
+                self.has_sib = true
+                self.disp = Field { value: d, width: 4, kind: kind, pc: false }
+
+    fn sib_of(self: @&Emitter, scale: u8, index: Reg, base_low: u8)
+        if index.num == 4
+            self.fail(EncodeError.BadAddress)
+        if index.num >= 8
+            self.rex = self.rex | REX_X
+        let ss: u8 = match scale
+            1 => 0
+            2 => 1
+            4 => 2
+            8 => 3
+            _ =>
+                self.fail(EncodeError.BadAddress)
+                0
+        self.sib = (ss << 6) | ((index.num & 7) << 3) | base_low
+        self.has_sib = true
+
+    # mod and displacement for a based address: none for an absolute 0
+    # (except on rbp/r13, which have no mod-0 form), disp8 when it fits,
+    # else disp32.
+    fn displacement(self: @&Emitter, d: Value, bp_like: bool, kind: FixupKind)
+        if value_sym(d).is_some()
+            self.modrm_mod = 2
+            self.disp = Field { value: d, width: 4, kind: kind, pc: false }
+            return
+        let n: i64 = value_num(d)
+        if n == 0 and not bp_like
+            self.modrm_mod = 0
+        else if fits_signed(n, 1)
+            self.modrm_mod = 1
+            self.disp = Field { value: d, width: 1, kind: kind, pc: false }
+        else
+            self.modrm_mod = 2
+            self.disp = Field { value: d, width: 4, kind: kind, pc: false }
+
+    # A moffs: the accumulator's absolute address, at the address size.
+    pub fn moffs(self: @&Emitter, m: Mem)
+        self.segment(m.seg)
+        let width: i64 = if self.mode_is(Mode.Code16) then 2 else 4
+        let d: Value = self.disp_value(m)
+        self.disp = Field { value: d, width: width, kind: FixupKind.Absolute, pc: false }
+
+    # The immediate: `width` bytes of `v`, a fixup of `kind` if it names a
+    # symbol.
+    pub fn immediate(self: @&Emitter, v: Value, width: i64, kind: FixupKind)
+        self.imm = Field { value: v, width: width, kind: kind, pc: false }
+
+    # The immediate an operand of `size` takes: imm8, imm16, or imm32 (for
+    # Quad sign-extended, so it must fit as signed).
+    pub fn immediate_sized(self: @&Emitter, v: Value, size: OpSize)
+        match size
+            Unsized =>
+                self.fail(EncodeError.NoSize)
+            Byte => self.immediate(v, 1, FixupKind.Absolute)
+            Word => self.immediate(v, 2, FixupKind.Absolute)
+            Long => self.immediate(v, 4, FixupKind.Absolute)
+            Quad =>
+                if value_sym(v).is_none() and not fits_signed(value_num(v), 4)
+                    self.fail(EncodeError.ImmRange)
+                self.immediate(v, 4, FixupKind.AbsoluteSigned)
+
+    # A branch displacement to `target`, relative to the instruction's end.
+    pub fn relative(self: @&Emitter, target: Value, width: i64, kind: FixupKind)
+        if value_sym(target).is_none()
+            self.fail(EncodeError.BadOperands)
+        self.imm = Field { value: target, width: width, kind: kind, pc: true }
+
+    # The bytes and fixups, or the first error.
+    pub fn finish(self: @Emitter) -> Result<Encoded, EncodeError>
+        match self.err
+            Some(e) => return Err(e)
+            None => pass
+        let blank = Fixup { offset: 0, width: 0, kind: FixupKind.Absolute, target: "", addend: 0 }
+        var out = Encoded { buf: [0; 15], len: 0, fix: [blank, blank], nfix: 0 }
+        if self.seg != 0
+            out.put(self.seg)
+        if self.addr
+            out.put(0x67)
+        if self.data
+            out.put(0x66)
+        if self.rep != 0
+            out.put(self.rep)
+        if self.lock
+            out.put(0xF0)
+        if self.rex != 0 or self.rex_needed
+            if not self.is64()
+                return Err(EncodeError.NotInMode)
+            if self.rex_banned
+                return Err(EncodeError.BadRegister)
+            out.put(0x40 | self.rex)
+        for i in 0..self.oplen
+            out.put(self.op[i])
+        if self.has_modrm
+            out.put((self.modrm_mod << 6) | ((self.modrm_reg & 7) << 3) | self.modrm_rm)
+        if self.has_sib
+            out.put(self.sib)
+        let disp_at: i64 = out.len
+        out.len += self.disp.width
+        let imm_at: i64 = out.len
+        out.len += self.imm.width
+        if out.len > MAX_INSN
+            return Err(EncodeError.BadOperands)
+        out.field(disp_at, self.disp, EncodeError.DispRange)?
+        out.field(imm_at, self.imm, EncodeError.ImmRange)?
+        Ok(out)
+
+
+impl Encoded
+    fn put(self: @&Encoded, b: u8)
+        if self.len < MAX_INSN
+            self.buf[self.len] = b
+        self.len += 1
+
+    # Write field `f` at `at`: the number itself, or zero and a fixup. A
+    # PC-relative addend is taken from the field to the instruction's end.
+    fn field(self: @&Encoded, at: i64, f: Field, range: EncodeError) -> Result<(), EncodeError>
+        if f.width == 0
+            return Ok(())
+        match f.value
+            Relocatable(r) =>
+                var addend: i64 = r.addend
+                if f.pc
+                    addend = addend - (self.len - at)
+                self.fix[self.nfix] = Fixup {
+                    offset: at, width: f.width, kind: f.kind, target: r.sym, addend: addend
+                }
+                self.nfix += 1
+            Absolute(v) =>
+                if not f.pc and not fits_field(v, f.width)
+                    return Err(range)
+                for i in 0..f.width
+                    self.buf[at + i] = ((v >> (i * 8)) & 0xFF) as u8
+        Ok(())
+
+
+# The segment-override prefix of %es, %cs, %ss, %ds, %fs, %gs.
+const SEG_PREFIX: [8]u8 = [0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0, 0]

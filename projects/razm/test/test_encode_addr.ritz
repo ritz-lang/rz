@@ -1,0 +1,122 @@
+# encode: ModRM/SIB addressing, disp8 and disp32, RIP-relative and absolute
+# addresses, segment overrides and the 0x67 address-size prefix, in every
+# mode, against `as --64` (test/support/check.ritz).
+import ritzlib.result
+import razm.insn { Prefix }
+import razm.parse { Mode }
+import razm.encode
+import test.support.check
+
+
+[[test]]
+fn test_encode_based_and_indexed_addresses_match_as() -> i32
+    var n: i32 = 0
+    n += check(Code64, "movq (%rsp), %rax", "48 8b 04 24",
+        ins2("mov", "q", mem(0, "%rsp"), r("%rax")))
+    n += check(Code64, "movq (%rbp), %rax", "48 8b 45 00",
+        ins2("mov", "q", mem(0, "%rbp"), r("%rax")))
+    n += check(Code64, "movq (%r12), %rax", "49 8b 04 24",
+        ins2("mov", "q", mem(0, "%r12"), r("%rax")))
+    n += check(Code64, "movq (%r13), %rax", "49 8b 45 00",
+        ins2("mov", "q", mem(0, "%r13"), r("%rax")))
+    n += check(Code64, "movq 8(%r12), %rax", "49 8b 44 24 08",
+        ins2("mov", "q", mem(8, "%r12"), r("%rax")))
+    n += check(Code64, "movq -8(%rbp), %rax", "48 8b 45 f8",
+        ins2("mov", "q", mem(-8, "%rbp"), r("%rax")))
+    n += check(Code64, "movq 127(%rax), %rax", "48 8b 40 7f",
+        ins2("mov", "q", mem(127, "%rax"), r("%rax")))
+    n += check(Code64, "movq 128(%rax), %rax", "48 8b 80 80 00 00 00",
+        ins2("mov", "q", mem(128, "%rax"), r("%rax")))
+    n += check(Code64, "movq -128(%rax), %rax", "48 8b 40 80",
+        ins2("mov", "q", mem(-128, "%rax"), r("%rax")))
+    n += check(Code64, "movq -129(%rax), %rax", "48 8b 80 7f ff ff ff",
+        ins2("mov", "q", mem(-129, "%rax"), r("%rax")))
+    n += check(Code64, "movq 0x7fffffff(%rax), %rax", "48 8b 80 ff ff ff 7f",
+        ins2("mov", "q", mem(0x7fffffff, "%rax"), r("%rax")))
+    n += check(Code64, "movq (%rax,%rbx), %rcx", "48 8b 0c 18",
+        ins2("mov", "q", sib(0, "%rax", "%rbx", 1), r("%rcx")))
+    n += check(Code64, "movq (%rax,%rbx,8), %rcx", "48 8b 0c d8",
+        ins2("mov", "q", sib(0, "%rax", "%rbx", 8), r("%rcx")))
+    n += check(Code64, "movq 16(%rsp,%rcx,4), %rdx", "48 8b 54 8c 10",
+        ins2("mov", "q", sib(16, "%rsp", "%rcx", 4), r("%rdx")))
+    n += check(Code64, "movq (%rbp,%rsi,2), %rdx", "48 8b 54 75 00",
+        ins2("mov", "q", sib(0, "%rbp", "%rsi", 2), r("%rdx")))
+    n += check(Code64, "movq (%r13,%r9,8), %r10", "4f 8b 54 cd 00",
+        ins2("mov", "q", sib(0, "%r13", "%r9", 8), r("%r10")))
+    n += check(Code64, "movq 1024(%r12,%r15), %r8", "4f 8b 84 3c 00 04 00 00",
+        ins2("mov", "q", sib(1024, "%r12", "%r15", 1), r("%r8")))
+    n += check(Code64, "movq (,%rax,8), %rcx", "48 8b 0c c5 00 00 00 00",
+        ins2("mov", "q", sib(0, "", "%rax", 8), r("%rcx")))
+    n += check(Code64, "movq 64(,%r11,4), %rcx", "4a 8b 0c 9d 40 00 00 00",
+        ins2("mov", "q", sib(64, "", "%r11", 4), r("%rcx")))
+    n += check(Code64, "movq foo(,%rax,8), %rcx", "48 8b 0c c5 00 00 00 00 | 4:sabs4:foo+0",
+        ins2("mov", "q", msym_index("foo", "%rax", 8), r("%rcx")))
+    n += check(Code64, "movq foo+8(%rbx), %rcx", "48 8b 8b 00 00 00 00 | 3:sabs4:foo+8",
+        ins2("mov", "q", msym("foo", 8, "%rbx"), r("%rcx")))
+    n += check(Code64, "movq %rbx, foo(%r14)", "49 89 9e 00 00 00 00 | 3:sabs4:foo+0",
+        ins2("mov", "q", r("%rbx"), msym("foo", 0, "%r14")))
+    n += check_err(Code64, "movq (%rax,%rsp), %rcx",
+        ins2("mov", "q", sib(0, "%rax", "%rsp", 1), r("%rcx")))
+    n += check_err(Code64, "movq (%rax,%rbx,3), %rcx",
+        ins2("mov", "q", sib(0, "%rax", "%rbx", 3), r("%rcx")))
+    n += check_err(Code64, "movq (%rax,%ebx), %rcx",
+        ins2("mov", "q", sib(0, "%rax", "%ebx", 1), r("%rcx")))
+    n
+
+
+[[test]]
+fn test_encode_absolute_rip_and_segment_addresses_match_as() -> i32
+    var n: i32 = 0
+    n += check(Code64, "movq (0x9000), %rax", "48 8b 04 25 00 90 00 00",
+        ins2("mov", "q", at(0x9000), r("%rax")))
+    n += check(Code64, "movq foo, %rax", "48 8b 04 25 00 00 00 00 | 4:sabs4:foo+0",
+        ins2("mov", "q", sym("foo"), r("%rax")))
+    n += check(Code64, "movq %rax, foo", "48 89 04 25 00 00 00 00 | 4:sabs4:foo+0",
+        ins2("mov", "q", r("%rax"), sym("foo")))
+    n += check(Code64, "movl foo, %eax", "8b 04 25 00 00 00 00 | 3:sabs4:foo+0",
+        ins2("mov", "l", sym("foo"), r("%eax")))
+    n += check(Code64, "movq foo(%rip), %r9", "4c 8b 0d 00 00 00 00 | 3:pc4:foo-4",
+        ins2("mov", "q", rip("foo", 0), r("%r9")))
+    n += check(Code64, "movq 8(%rip), %rax", "48 8b 05 08 00 00 00",
+        ins2("mov", "q", rip_at(8), r("%rax")))
+    n += check(Code64, "movq %gs:0x10, %rax", "65 48 8b 04 25 10 00 00 00",
+        ins2("mov", "q", seg_at("%gs", 0x10), r("%rax")))
+    n += check(Code64, "movq %gs:0, %rsp", "65 48 8b 24 25 00 00 00 00",
+        ins2("mov", "q", seg_at("%gs", 0), r("%rsp")))
+    n += check(Code64, "movq %r11, %gs:0x20", "65 4c 89 1c 25 20 00 00 00",
+        ins2("mov", "q", r("%r11"), seg_at("%gs", 0x20)))
+    n += check(Code64, "movq %rax, %fs:8(%rdi)", "64 48 89 47 08",
+        ins2("mov", "q", r("%rax"), seg_mem("%fs", 8, "%rdi")))
+    n += check(Code64, "movl %es:(%rax), %eax", "26 8b 00",
+        ins2("mov", "l", seg_mem("%es", 0, "%rax"), r("%eax")))
+    n += check(Code64, "movq %gs:foo, %rax", "65 48 8b 04 25 00 00 00 00 | 5:sabs4:foo+0",
+        ins2("mov", "q", seg_sym("%gs", "foo"), r("%rax")))
+    n += check(Code64, "movl %eax, (%edi)", "67 89 07", ins2("mov", "l", r("%eax"), mem(0, "%edi")))
+    n += check(Code64, "movq 8(%esp), %rax", "67 48 8b 44 24 08",
+        ins2("mov", "q", mem(8, "%esp"), r("%rax")))
+    n += check(Code64, "movq foo(%eax), %rax", "67 48 8b 80 00 00 00 00 | 4:abs4:foo+0",
+        ins2("mov", "q", msym("foo", 0, "%eax"), r("%rax")))
+    n += check(Code32, "movl foo(%eax), %ecx", "8b 88 00 00 00 00 | 2:abs4:foo+0",
+        ins2("mov", "l", msym("foo", 0, "%eax"), r("%ecx")))
+    n += check(Code32, "movl 8(%esp,%ecx,4), %edx", "8b 54 8c 08",
+        ins2("mov", "l", sib(8, "%esp", "%ecx", 4), r("%edx")))
+    n += check(Code32, "movl (%ebp), %eax", "8b 45 00", ins2("mov", "l", mem(0, "%ebp"), r("%eax")))
+    n += check(Code32, "movl %fs:(%eax), %ecx", "64 8b 08",
+        ins2("mov", "l", seg_mem("%fs", 0, "%eax"), r("%ecx")))
+    n += check(Code32, "movl %ecx, (0x9000)", "89 0d 00 90 00 00",
+        ins2("mov", "l", r("%ecx"), at(0x9000)))
+    n += check(Code16, "movl (%eax), %ecx", "67 66 8b 08",
+        ins2("mov", "l", mem(0, "%eax"), r("%ecx")))
+    n += check(Code16, "movw 4(%esi), %cx", "67 8b 4e 04",
+        ins2("mov", "w", mem(4, "%esi"), r("%cx")))
+    n += check(Code16, "movw %cx, (0x600)", "89 0e 00 06", ins2("mov", "w", r("%cx"), at(0x600)))
+    n += check(Code16, "movw foo, %cx", "8b 0e 00 00 | 2:abs2:foo+0",
+        ins2("mov", "w", sym("foo"), r("%cx")))
+    n += check_err(Code64, "movq (%ax), %rcx", ins2("mov", "q", mem(0, "%ax"), r("%rcx")))
+    n
+
+
+[[test]]
+fn test_encode_refuses_16_bit_register_addressing()
+    let bx = ins2("mov", "w", mem(0, "%bx"), r("%cx"))
+    assert encode_spec(Code16, bx).is_err(), "(%bx) is outside the dialect"

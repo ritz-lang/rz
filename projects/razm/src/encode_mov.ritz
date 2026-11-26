@@ -1,0 +1,251 @@
+# encode's moves: mov at every width and to or from %cr and segment
+# registers, movabs, movzb, lea and xchg.
+import ritzlib.option
+import razm.expr { Value }
+import razm.fixup { FixupKind }
+import razm.insn { Insn, Mem, OpSize, Operand, Reg, RegClass }
+import razm.emit
+import razm.encode_ops
+
+
+# The register `o` names, if it is one of class `class`.
+fn register_of(o: Operand, class: RegClass) -> Option<Reg>
+    match o
+        Operand.Register(r) => if class_is(r, class) then Some(r) else None
+        _ => None
+
+
+# A memory operand the accumulator moves through a moffs: an absolute
+# address outside 64-bit mode, where as uses ModRM instead.
+fn moffs_of(e: @Emitter, o: Operand) -> Option<Mem>
+    if e.is64()
+        return None
+    match o
+        Operand.Memory(m) =>
+            if m.base.is_none() and m.index.is_none() then Some(m) else None
+        _ => None
+
+
+# mov: the moves to and from segment and control registers, then the
+# immediate, register and memory forms, with a moffs for the accumulator
+# outside 64-bit mode.
+pub fn mov(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 2)
+    let src = insn.ops[0]
+    let dst = insn.ops[1]
+    match register_of(dst, RegClass.Segment)
+        Some(s) =>
+            to_segment(e, src, s)
+            return
+        None => pass
+    match register_of(dst, RegClass.Control)
+        Some(c) =>
+            control(e, src, c, 0x22)
+            return
+        None => pass
+    match register_of(src, RegClass.Segment)
+        Some(s) =>
+            from_segment(e, insn, s, dst)
+            return
+        None => pass
+    match register_of(src, RegClass.Control)
+        Some(c) =>
+            control(e, dst, c, 0x20)
+            return
+        None => pass
+    let size = size_of(e, insn)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    match src
+        Operand.Imm(x) =>
+            mov_imm(e, e.value(x), size, dst)
+        Operand.Register(s) =>
+            match moffs_of(e, dst)
+                Some(m) =>
+                    if is_acc(src)
+                        e.opcode(by_size(size, 0xA2))
+                        e.moffs(m)
+                        return
+                None => pass
+            e.opcode(by_size(size, 0x88))
+            e.reg(s)
+            e.rm(dst)
+        Operand.Memory(_) =>
+            match dst
+                Operand.Register(d) =>
+                    match moffs_of(e, src)
+                        Some(m) =>
+                            if is_acc(dst)
+                                e.opcode(by_size(size, 0xA0))
+                                e.moffs(m)
+                                return
+                        None => pass
+                    e.opcode(by_size(size, 0x8A))
+                    e.reg(d)
+                    e.rm(src)
+                _ => e.fail(EncodeError.BadOperands)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# mov $imm: b0+r / b8+r to a register, c6 / c7 to memory, and for a 64-bit
+# register c7's sign-extended imm32 unless only the imm64 form holds it.
+fn mov_imm(e: @&Emitter, v: Value, size: OpSize, dst: Operand)
+    match dst
+        Operand.Register(d) =>
+            if size_is(size, OpSize.Byte)
+                e.opcode_reg(0xB0, d)
+            else if size_is(size, OpSize.Quad)
+                if value_sym(v).is_none() and not fits_signed(value_num(v), 4)
+                    e.opcode_reg(0xB8, d)
+                    e.immediate(v, 8, FixupKind.Absolute)
+                    return
+                e.opcode(0xC7)
+                e.ext(0)
+                e.rm_reg(d)
+            else
+                e.opcode_reg(0xB8, d)
+            e.immediate_sized(v, size)
+        Operand.Memory(_) =>
+            e.opcode(by_size(size, 0xC6))
+            e.ext(0)
+            e.rm(dst)
+            e.immediate_sized(v, size)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# mov to %ds etc.: 8e, which takes no operand-size prefix.
+fn to_segment(e: @&Emitter, src: Operand, s: Reg)
+    match src
+        Operand.Register(g) =>
+            if size_is(gpr_size(g), OpSize.Byte)
+                e.fail(EncodeError.SizeMismatch)
+        Operand.Memory(_) => pass
+        _ => e.fail(EncodeError.BadOperands)
+    e.opcode(0x8E)
+    e.ext(s.num)
+    e.rm(src)
+
+
+# mov from %cs etc.: 8c, 16-bit only with the 0x66 prefix, and never REX.W.
+fn from_segment(e: @&Emitter, insn: @Insn, s: Reg, dst: Operand)
+    match dst
+        Operand.Register(g) =>
+            let size = size_at(e, insn, 1)
+            same_size(e, insn, size)
+            if size_is(size, OpSize.Word)
+                e.operand_size(size)
+            else if size_is(size, OpSize.Byte)
+                e.fail(EncodeError.SizeMismatch)
+        Operand.Memory(_) => pass
+        _ => e.fail(EncodeError.BadOperands)
+    e.opcode(0x8C)
+    e.ext(s.num)
+    e.rm(dst)
+
+
+# mov to (0f 22) or from (0f 20) %cr`n`: the GPR is the mode's own width.
+fn control(e: @&Emitter, o: Operand, cr: Reg, op: u8)
+    let n: u8 = cr.num
+    if n > 4 or n == 1
+        e.fail(EncodeError.BadRegister)
+    let natural: OpSize = if e.is64() then OpSize.Quad else OpSize.Long
+    match o
+        Operand.Register(g) =>
+            if not size_is(gpr_size(g), natural)
+                e.fail(EncodeError.SizeMismatch)
+            e.opcode2(0x0F, op)
+            e.ext(n)
+            e.rm_reg(g)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# movabsq $imm64, %reg: REX.W b8+r io.
+pub fn movabs(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 2)
+    match insn.ops[0]
+        Operand.Imm(x) =>
+            let v: Value = e.value(x)
+            match insn.ops[1]
+                Operand.Register(d) =>
+                    if not size_is(gpr_size(d), OpSize.Quad)
+                        e.fail(EncodeError.SizeMismatch)
+                    e.operand_size(OpSize.Quad)
+                    e.opcode_reg(0xB8, d)
+                    e.immediate(v, 8, FixupKind.Absolute)
+                _ => e.fail(EncodeError.BadOperands)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# movzb (movzbl etc.): 0f b6, the suffix sizing the destination.
+pub fn movzb(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 2)
+    let size = size_at(e, insn, 1)
+    match insn.ops[0]
+        Operand.Register(s) =>
+            if not size_is(gpr_size(s), OpSize.Byte)
+                e.fail(EncodeError.SizeMismatch)
+        Operand.Memory(_) => pass
+        _ => e.fail(EncodeError.BadOperands)
+    match insn.ops[1]
+        Operand.Register(d) =>
+            if size_is(size, OpSize.Byte) or not size_is(gpr_size(d), size)
+                e.fail(EncodeError.SizeMismatch)
+            e.operand_size(size)
+            e.opcode2(0x0F, 0xB6)
+            e.reg(d)
+            e.rm(insn.ops[0])
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# lea: 8d with a memory source.
+pub fn lea(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 2)
+    let size = size_at(e, insn, 1)
+    same_size(e, insn, size)
+    if size_is(size, OpSize.Byte)
+        e.fail(EncodeError.SizeMismatch)
+    e.operand_size(size)
+    match insn.ops[0]
+        Operand.Memory(_) =>
+            match insn.ops[1]
+                Operand.Register(d) =>
+                    e.opcode(0x8D)
+                    e.reg(d)
+                    e.rm(insn.ops[0])
+                _ => e.fail(EncodeError.BadOperands)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# xchg: 90+r beside the accumulator (except xchgl %eax, %eax in 64-bit
+# mode, which would be nop), else 86 / 87 with the register in ModRM reg.
+pub fn xchg(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 2)
+    let size = size_of(e, insn)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    let a = insn.ops[0]
+    let b = insn.ops[1]
+    match a
+        Operand.Register(ra) =>
+            match b
+                Operand.Register(rb) =>
+                    let nop_like = is_acc(a) and is_acc(b) and size_is(size, OpSize.Long) and e.is64()
+                    if not size_is(size, OpSize.Byte) and not nop_like
+                        if is_acc(a)
+                            e.opcode_reg(0x90, rb)
+                            return
+                        if is_acc(b)
+                            e.opcode_reg(0x90, ra)
+                            return
+                _ => pass
+            e.opcode(by_size(size, 0x86))
+            e.reg(ra)
+            e.rm(b)
+        Operand.Memory(_) =>
+            match b
+                Operand.Register(rb) =>
+                    e.opcode(by_size(size, 0x86))
+                    e.reg(rb)
+                    e.rm(a)
+                _ => e.fail(EncodeError.BadOperands)
+        _ => e.fail(EncodeError.BadOperands)

@@ -1,0 +1,130 @@
+# encode takes every instruction of the frozen corpus (tests/corpus), as
+# parse gives it, in the .code mode it is written in. Byte equality with `as`
+# is the case tables' job (test_encode_*.ritz cover each form these use);
+# this proves the corpus uses no form outside them.
+#
+# Labels are placed at offset 0 of their section, so a label difference (the
+# trampoline's `ap_gdt32_ptr - ap_trampoline_start`) evaluates; the value is
+# not what is checked.
+import ritzlib.fs { read_file }
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from, string_new }
+import razm.expr { SymDef, SymTable, Value, eval, symtable_new }
+import razm.insn { Insn, Operand }
+import razm.parse { Item, Mode, Program, parse_in }
+import razm.emit
+import razm.encode
+
+const CORPUS_DIR: StrView = "tests/corpus"
+const CORPUS: [9]StrView = [
+    "kernel/boot.s", "kernel/isr_stubs.s", "kernel/ap_trampoline.s",
+    "kernel/syscall_entry.s", "kernel/proc_switch.s", "kernel/user_program.s",
+    "kernel/driver_stub.s", "boot/uefi_entry.s", "synthetic/incbin.s"
+]
+
+
+[[test_helper]]
+fn read_corpus(rel: StrView) -> String
+    var path: String = string_from(CORPUS_DIR)
+    path.push('/')
+    path.push_str(rel)
+    match read_file(path.as_view())
+        Ok(text) => return text
+        Err(_) =>
+            print("cannot read {path.as_view()}\n")
+            assert false
+    string_new()
+
+
+# Every label at offset 0 of its section, and every constant `.set` defines.
+fn symbols(p: @Program) -> SymTable
+    var syms = symtable_new()
+    var section: i64 = 0
+    for i in 0..p.stmts.len
+        match p.stmts.get(i).item
+            Item.Section(_) =>
+                section += 1
+            Item.Label(name) =>
+                syms.define(name, SymDef.Label(section, 0))
+            Item.Set(name, e) =>
+                match eval(@p.exprs, e, @syms)
+                    Ok(v) =>
+                        match v
+                            Absolute(n) => syms.define(name, SymDef.Constant(n))
+                            Relocatable(_) => pass
+                    Err(_) => pass
+            _ => pass
+    syms
+
+
+# A jmp, jcc or loop to a target, which has a rel8 form.
+fn is_branch(insn: @Insn) -> bool
+    let direct: bool = match insn.ops[0]
+        Operand.Memory(_) => insn.n_ops == 1
+        _ => false
+    match insn.name
+        "jmp" | "ja" | "jb" | "jc" | "je" | "jz" | "jne" | "jnz" | "jnc" | "loop" => direct
+        _ => false
+
+
+fn mode_bits(m: Mode) -> i64
+    match m
+        Code16 => 16
+        Code32 => 32
+        Code64 => 64
+
+
+# How many of a file's instructions encode and how many do not.
+struct Tally
+    encoded: i64
+    bad: i64
+
+
+# `rel`'s tally; each instruction that does not encode is printed.
+fn tally(rel: StrView) -> Tally
+    let text: String = read_corpus(rel)
+    match parse_in(text.as_view(), CORPUS_DIR)
+        Ok(p) =>
+            let syms = symbols(@p)
+            var mode: Mode = Mode.Code64
+            var bad: i64 = 0
+            var encoded: i64 = 0
+            for i in 0..p.stmts.len
+                let st = p.stmts.get(i)
+                match st.item
+                    Item.CodeMode(m) =>
+                        mode = m
+                    Item.Instruction(insn) =>
+                        let near_ok: bool = encode(@insn, mode, @p.exprs, @syms).is_ok()
+                        var short_ok: bool = true
+                        if is_branch(@insn)
+                            short_ok = encode_short(@insn, mode, @p.exprs, @syms).is_ok()
+                        if not near_ok or not short_ok
+                            let line: i64 = st.line
+                            let name: StrView = insn.name
+                            let bits: i64 = mode_bits(mode)
+                            print("  {rel}:{line}: .code{bits} {name} does not encode\n")
+                            bad += 1
+                        else
+                            encoded += 1
+                    _ => pass
+            Tally { encoded: encoded, bad: bad }
+        Err(e) =>
+            let line: i64 = e.line
+            print("  {rel}:{line}: does not parse: {e.what.as_view()}\n")
+            Tally { encoded: 0, bad: 1 }
+
+
+[[test]]
+fn test_encode_takes_every_corpus_instruction() -> i32
+    var bad: i64 = 0
+    var encoded: i64 = 0
+    for rel in CORPUS
+        let t = tally(rel)
+        bad += t.bad
+        encoded += t.encoded
+    print("  {encoded} corpus instructions encode\n")
+    assert encoded > 1000, "the corpus parsed to its instructions"
+    bad as i32
