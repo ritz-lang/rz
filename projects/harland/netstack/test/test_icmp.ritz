@@ -1,0 +1,247 @@
+# Harland netstack: ICMP echo request/reply, the protocol part (AGAST
+# #4740, docs/RING2_NET.md "ICMP")
+#
+# Ported from docs/stack_example/test_stack.py's `icmp_echo_answered`
+# fixture (a broadcast IPv4 destination, a broadcast Ethernet destination,
+# and a bad checksum are never answered; a unicast echo with a good
+# checksum is), then the rest of the ticket: the wire round trip, the
+# reply's next hop (the requester's address, never the request's source
+# MAC), and matching a reply to an outstanding id.
+
+import netstack.bytes { be16_get, be16_put }
+import netstack.checksum { inet_checksum }
+import netstack.ethernet { MacAddr, SendError, ETH_PAYLOAD_OFF, eth_demux, mac_eq, mac_is_broadcast }
+import netstack.ipv4 { Ipv4Config, IpProto, IPV4_HEADER_MIN, IPV4_BROADCAST, ipv4_parse, ipv4_frame_write }
+import netstack.icmp {
+    IcmpType, IcmpRx, IcmpDrop, IcmpTable, ICMP_HEADER_LEN, ICMP_PENDING_CAP,
+    icmp_parse, icmp_should_reply, icmp_reply_next_hop,
+    icmp_echo_request_write, icmp_echo_reply_write, icmp_echo_reply_frame_write,
+}
+import driver_abi.link { NetInfo }
+
+const OUR_IP: u32 = 0x0A00020F        # 10.0.2.15
+const PEER_IP: u32 = 0x0A000202       # 10.0.2.2
+const FAR_IP: u32 = 0x08080808        # 8.8.8.8
+const MASK_24: u32 = 0xFFFFFF00
+
+var g_table: IcmpTable
+var g_buf: [256]u8
+
+fn our_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+
+fn peer_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC]
+
+fn broadcast_mac() -> MacAddr
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+
+fn link() -> NetInfo
+    NetInfo { mac: our_mac(), link_up: 1, device_type: 1, mtu: 1500 }
+
+fn configured() -> Ipv4Config
+    Ipv4Config { addr: Some(OUR_IP), netmask: Some(MASK_24), gateway: Some(PEER_IP) }
+
+fn reset()
+    g_table.init()
+
+fn kept(r: Result<IcmpRx, IcmpDrop>) -> bool
+    match r
+        Ok(_) => true
+        Err(_) => false
+
+fn dropped(r: Result<IcmpRx, IcmpDrop>, why: IcmpDrop) -> bool
+    match r
+        Err(w) => w == why
+        Ok(_) => false
+
+# A hand-built echo request message (the bytes after the IPv4 header).
+fn echo_request(id: u16, seq: u16, body: [u8]) -> [u8]
+    let out: [u8] = @g_buf
+    let n = match icmp_echo_request_write(out, id, seq, body)
+        Ok(len) => len
+        Err(_) => 0
+    out[0..n]
+
+fn echo_reply(id: u16, seq: u16, body: [u8]) -> [u8]
+    let out: [u8] = @g_buf
+    let n = match icmp_echo_reply_write(out, id, seq, body)
+        Ok(len) => len
+        Err(_) => 0
+    out[0..n]
+
+# ---------------------------------------------------------------------------
+# Wire format
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_parse_rejects_short_bad_checksum_and_bad_type() -> i32
+    let good = echo_request(7, 1, "ping")
+    let too_short = good[0..ICMP_HEADER_LEN - 1]
+    match icmp_parse(too_short)
+        Err(w) =>
+            if w != IcmpDrop.Short
+                return 1
+        Ok(_) => return 2
+    let bad_csum = echo_request(7, 1, "ping")
+    bad_csum[ICMP_HEADER_LEN - 1] = bad_csum[ICMP_HEADER_LEN - 1] ^ 0x01
+    if not dropped(icmp_parse(bad_csum), IcmpDrop.Checksum)
+        return 3
+    let bad_type = echo_request(7, 1, "ping")
+    bad_type[0] = 3                   # destination unreachable: not handled
+    be16_put(bad_type, 2, 0)
+    be16_put(bad_type, 2, inet_checksum(bad_type))
+    if not dropped(icmp_parse(bad_type), IcmpDrop.Type)
+        return 4
+    let fresh = echo_request(7, 1, "ping")
+    if not kept(icmp_parse(fresh))
+        return 5
+    0
+
+[[test]]
+fn test_request_and_reply_round_trip_id_seq_and_body() -> i32
+    let req = echo_request(0x1234, 9, "pingdata")
+    match icmp_parse(req)
+        Ok(rx) =>
+            if rx.kind != IcmpType.EchoRequest or rx.id != 0x1234 or rx.seq != 9 or rx.body.len != 8 or rx.body[0] != 'p'
+                return 1
+        Err(_) => return 2
+    let rep = echo_reply(0x1234, 9, "pingdata")
+    match icmp_parse(rep)
+        Ok(rx) =>
+            if rx.kind != IcmpType.EchoReply or rx.id != 0x1234 or rx.seq != 9 or rx.body[0] != 'p'
+                return 3
+        Err(_) => return 4
+    0
+
+# ---------------------------------------------------------------------------
+# No broadcast replies (ported from stack_example's icmp_echo_answered)
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_should_reply_refuses_broadcast_destinations() -> i32
+    let req = match icmp_parse(echo_request(1, 1, "x"))
+        Ok(rx) => rx
+        Err(_) => return 1
+    # A unicast echo with a good checksum is answered.
+    if not icmp_should_reply(req.kind, OUR_IP, our_mac())
+        return 2
+    # A broadcast IPv4 destination is not.
+    if icmp_should_reply(req.kind, IPV4_BROADCAST, our_mac())
+        return 3
+    # A broadcast Ethernet destination is not, even to our own IPv4.
+    if icmp_should_reply(req.kind, OUR_IP, broadcast_mac())
+        return 4
+    # A reply is never answered, broadcast or not.
+    let rep = match icmp_parse(echo_reply(1, 1, "x"))
+        Ok(rx) => rx
+        Err(_) => return 5
+    if icmp_should_reply(rep.kind, OUR_IP, our_mac())
+        return 6
+    0
+
+# ---------------------------------------------------------------------------
+# The reply's next hop: the requester's address, never the request's MAC
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_reply_next_hop_is_the_requesters_address() -> i32
+    let cfg = configured()
+    # On-link: the requester's own address, whatever its source MAC was.
+    match icmp_reply_next_hop(cfg, PEER_IP)
+        Ok(hop) =>
+            if hop != PEER_IP
+                return 1
+        Err(_) => return 2
+    # Off-link: the gateway, not the (foreign, unreachable) requester MAC.
+    match icmp_reply_next_hop(cfg, FAR_IP)
+        Ok(hop) =>
+            if hop != PEER_IP
+                return 3
+        Err(_) => return 4
+    let no_gw = Ipv4Config { addr: Some(OUR_IP), netmask: Some(MASK_24), gateway: None }
+    match icmp_reply_next_hop(no_gw, FAR_IP)
+        Err(e) =>
+            if e != SendError.Unroutable
+                return 5
+        Ok(_) => return 6
+    0
+
+[[test]]
+fn test_full_reply_frame_round_trip() -> i32
+    var frame: [256]u8
+    var sent: i64 = 0
+    match icmp_echo_reply_frame_write(@frame, link(), peer_mac(), OUR_IP, PEER_IP, 42, 3, "pong")
+        Ok(n) =>
+            if n != ETH_PAYLOAD_OFF + IPV4_HEADER_MIN + ICMP_HEADER_LEN + 4
+                return 1
+            sent = n
+        Err(_) => return 2
+    let full: [u8] = @frame
+    let out: [u8] = full[0..sent]
+    # Unicast to the requester, never the broadcast or the request's MAC.
+    match eth_demux(out, peer_mac())
+        Ok(eth) =>
+            if not mac_eq(eth.dst, peer_mac()) or not mac_eq(eth.src, our_mac())
+                return 3
+        Err(_) => return 4
+    # Parsed from the requester's own point of view: the reply's IPv4
+    # destination is the requester's address, not ours.
+    let peer_cfg = Ipv4Config { addr: Some(PEER_IP), netmask: None, gateway: None }
+    let out_len = out.len
+    let ip_packet: [u8] = out[ETH_PAYLOAD_OFF..out_len]
+    match ipv4_parse(ip_packet, peer_cfg)
+        Ok(ip) =>
+            if ip.protocol != IpProto.Icmp or ip.src != OUR_IP or ip.dst != PEER_IP
+                return 5
+            match icmp_parse(ip.body)
+                Ok(rx) =>
+                    if rx.kind != IcmpType.EchoReply or rx.id != 42 or rx.seq != 3 or rx.body[0] != 'p'
+                        return 6
+                Err(_) => return 7
+        Err(_) => return 8
+    0
+
+# ---------------------------------------------------------------------------
+# Echo request / reply matching
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_reply_matches_only_an_outstanding_id() -> i32
+    reset()
+    let unexpected = match icmp_parse(echo_reply(5, 0, "x"))
+        Ok(rx) => rx
+        Err(_) => return 1
+    # No request was ever sent for id 5: not matched.
+    if g_table.observe(unexpected)
+        return 2
+    if not g_table.note_sent(5)
+        return 3
+    if not g_table.observe(unexpected)
+        return 4
+    # Matched once; a second, late copy of the same reply is no longer
+    # outstanding.
+    if g_table.observe(unexpected)
+        return 5
+    # An echo request never matches, even with the same id outstanding.
+    if not g_table.note_sent(9)
+        return 6
+    let as_request = match icmp_parse(echo_request(9, 0, "x"))
+        Ok(rx) => rx
+        Err(_) => return 7
+    if g_table.observe(as_request)
+        return 8
+    0
+
+[[test]]
+fn test_pending_table_refuses_past_its_cap() -> i32
+    reset()
+    for i in 0..ICMP_PENDING_CAP
+        if not g_table.note_sent(i as u16)
+            return 1
+    if g_table.note_sent(ICMP_PENDING_CAP as u16)
+        return 2
+    # Re-noting an id already outstanding is not a new slot.
+    if not g_table.note_sent(0)
+        return 3
+    0

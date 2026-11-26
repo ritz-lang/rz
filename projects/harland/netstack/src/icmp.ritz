@@ -1,0 +1,172 @@
+# Harland netstack: ICMP echo request and reply, the protocol part
+# (AGAST #4740, docs/RING2_NET.md "ICMP"; ring plan T34)
+#
+# Receive handles two types, after the ICMP checksum matches: an echo
+# request and an echo reply. Every other type (redirects and
+# unreachables included: this draft sends neither) is dropped. An echo
+# request is answered unless the IPv4 destination or the Ethernet
+# destination is broadcast -- `icmp_should_reply`, ported from
+# stack_example's `icmp_echo_answered`. A received echo reply is matched
+# to an outstanding request id by `IcmpTable`; `APP_PING`'s deadline and
+# event bookkeeping (RING2_NET.md's second ICMP paragraph) is ring plan
+# T43, not here.
+#
+# Send of an echo reply is routed by `ipv4_next_hop(cfg, requester)`, the
+# same lookup a request's next hop uses -- never the request's Ethernet
+# source MAC, which is why this layer does not even carry one: an
+# `IcmpRx` has no MAC field, so there is nothing to reuse by mistake. The
+# caller resolves that next hop's MAC through ARP and passes it in.
+
+import netstack.bytes { be16_get, be16_put }
+import netstack.checksum { inet_checksum }
+import netstack.ethernet { MacAddr, SendError, ETH_PAYLOAD_OFF, mac_is_broadcast }
+import netstack.ipv4 { Ipv4Config, IpProto, IPV4_HEADER_MIN, IPV4_BROADCAST, ipv4_next_hop, ipv4_frame_write }
+import driver_abi.link { NetInfo }
+
+pub const ICMP_HEADER_LEN: i64 = 8
+const ICMP_TYPE_ECHO_REPLY: u8 = 0
+const ICMP_TYPE_ECHO_REQUEST: u8 = 8
+
+# This table's own fixed sizing (no RING2_NET number): the single in-flight
+# echo T43 tracks per attachment, times a generous number of attachments.
+pub const ICMP_PENDING_CAP: i64 = 16
+
+pub enum IcmpType
+    EchoRequest
+    EchoReply
+
+# One parsed ICMP message (an IPv4 body). `body` is the echo payload past
+# the 8-byte header.
+pub struct IcmpRx
+    kind: IcmpType
+    id: u16
+    seq: u16
+    body: [u8]
+
+pub enum IcmpDrop
+    Short                             # under ICMP_HEADER_LEN bytes
+    Checksum                          # checksum mismatch
+    Type                              # not an echo request or reply
+
+pub fn icmp_parse(payload: [u8]) -> Result<IcmpRx, IcmpDrop>
+    if payload.len < ICMP_HEADER_LEN
+        return Err(IcmpDrop.Short)
+    if inet_checksum(payload) != 0
+        return Err(IcmpDrop.Checksum)
+    let t = payload[0]
+    var kind = IcmpType.EchoRequest
+    if t == ICMP_TYPE_ECHO_REPLY
+        kind = IcmpType.EchoReply
+    else if t != ICMP_TYPE_ECHO_REQUEST
+        return Err(IcmpDrop.Type)
+    let body = payload[ICMP_HEADER_LEN..payload.len]
+    Ok(IcmpRx {
+        kind: kind,
+        id: be16_get(payload, 4),
+        seq: be16_get(payload, 6),
+        body: body,
+    })
+
+# Whether a received echo request should be answered: never when the
+# IPv4 destination is the limited broadcast or the Ethernet destination
+# is the broadcast MAC (RING2_NET.md "ICMP"; stack_example's
+# `icmp_echo_answered`). A reply is never answered.
+pub fn icmp_should_reply(kind: IcmpType, ip_dst: u32, eth_dst: MacAddr) -> bool
+    match kind
+        IcmpType.EchoRequest => ip_dst != IPV4_BROADCAST and not mac_is_broadcast(eth_dst)
+        IcmpType.EchoReply => false
+
+# The next hop for an echo reply to `requester`: IPv4's own lookup, same as
+# a request's. Never the request's Ethernet source MAC.
+pub fn icmp_reply_next_hop(cfg: Ipv4Config, requester: u32) -> Result<u32, SendError>
+    ipv4_next_hop(cfg, requester)
+
+# Write an 8-byte ICMP header plus `body`, checksum included, at
+# `packet[0..]`. Ok is the message length.
+fn icmp_header_write(packet: [u8], icmp_type: u8, id: u16, seq: u16, body: [u8]) -> Result<i64, SendError>
+    let len = ICMP_HEADER_LEN + body.len
+    if packet.len < len
+        return Err(SendError.TooBig)
+    packet[0] = icmp_type
+    packet[1] = 0
+    be16_put(packet, 2, 0)
+    be16_put(packet, 4, id)
+    be16_put(packet, 6, seq)
+    for i in 0..body.len
+        packet[ICMP_HEADER_LEN + i] = body[i]
+    let msg = packet[0..len]
+    be16_put(packet, 2, inet_checksum(msg))
+    Ok(len)
+
+# Write one echo reply message: same id, seq and body as the request,
+# type flipped to reply.
+pub fn icmp_echo_reply_write(packet: [u8], id: u16, seq: u16, body: [u8]) -> Result<i64, SendError>
+    icmp_header_write(packet, ICMP_TYPE_ECHO_REPLY, id, seq, body)
+
+# Write one echo request message.
+pub fn icmp_echo_request_write(packet: [u8], id: u16, seq: u16, body: [u8]) -> Result<i64, SendError>
+    icmp_header_write(packet, ICMP_TYPE_ECHO_REQUEST, id, seq, body)
+
+# Write a full echo reply frame (ICMP, IPv4, Ethernet) to `dst_mac` -- the
+# ARP resolution of `icmp_reply_next_hop`'s result, never the request's
+# Ethernet source. `dst_ip` is the requester's address, the IP destination
+# of the reply (distinct from the next hop, which only picks the MAC to
+# resolve).
+pub fn icmp_echo_reply_frame_write(frame: [u8], link: NetInfo, dst_mac: MacAddr, src_ip: u32, dst_ip: u32, id: u16, seq: u16, body: [u8]) -> Result<i64, SendError>
+    let packet_off = ETH_PAYLOAD_OFF + IPV4_HEADER_MIN
+    if frame.len < packet_off
+        return Err(SendError.TooBig)
+    let packet = frame[packet_off..frame.len]
+    let icmp_len = icmp_echo_reply_write(packet, id, seq, body)?
+    ipv4_frame_write(frame, link, dst_mac, IpProto.Icmp, src_ip, dst_ip, icmp_len)
+
+# ---------------------------------------------------------------------------
+# Echo request / reply matching
+# ---------------------------------------------------------------------------
+
+struct IcmpOutstanding
+    id: u16
+    live: bool
+
+# Outstanding echo request ids awaiting a reply. Stateless per message:
+# T43 owns the deadline and the one-event-per-request bookkeeping, this
+# only tells the caller whether a given reply id is one it is still
+# waiting on.
+pub struct IcmpTable
+    outstanding: [ICMP_PENDING_CAP]IcmpOutstanding
+
+impl IcmpTable
+    pub fn init(self: @&IcmpTable)
+        for i in 0..ICMP_PENDING_CAP
+            self.outstanding[i].live = false
+
+    fn find(self: @&IcmpTable, id: u16) -> Option<i64>
+        for i in 0..ICMP_PENDING_CAP
+            if self.outstanding[i].live and self.outstanding[i].id == id
+                return Some(i)
+        None
+
+    # Record `id` as awaiting a reply. False if the table is full and
+    # `id` was not already outstanding.
+    pub fn note_sent(self: @&IcmpTable, id: u16) -> bool
+        match self.find(id)
+            Some(_) => return true
+            None => pass
+        for i in 0..ICMP_PENDING_CAP
+            if not self.outstanding[i].live
+                self.outstanding[i] = IcmpOutstanding { id: id, live: true }
+                return true
+        false
+
+    # Whether `rx` is an echo reply matching an outstanding id; clears
+    # that id so a later reply with the same id is a late, unmatched one.
+    # An echo request never matches.
+    pub fn observe(self: @&IcmpTable, rx: IcmpRx) -> bool
+        match rx.kind
+            IcmpType.EchoRequest => false
+            IcmpType.EchoReply =>
+                match self.find(rx.id)
+                    None => false
+                    Some(idx) =>
+                        self.outstanding[idx].live = false
+                        true
