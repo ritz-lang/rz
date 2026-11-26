@@ -185,7 +185,7 @@ def test_init_exit_powers_off():
 def test_init_runs_the_fault_test_and_exits_to_poweroff():
     init = INDIUM / "user" / "init.ritz"
     suite = _fn(init, "run_tier1_tests")
-    assert 'run_test(c"/bin/fault_child",  c"fault_child",  142)' in suite, suite
+    assert 'run_test("/bin/fault_child",  "fault_child",  142)' in suite, suite
     # A later test still runs: init survived the child's fault.
     assert suite.index("fault_child") < suite.index("rzsh --help")
     # init leaves the poweroff to the kernel's exit path

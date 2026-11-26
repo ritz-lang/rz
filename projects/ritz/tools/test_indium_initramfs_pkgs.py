@@ -68,7 +68,7 @@ def test_every_binary_init_spawns_is_packed():
     """The #2759 bug: init spawns /bin/hello_gfx, which only prism builds."""
     spawned = set(
         re.findall(
-            r'c"/bin/([A-Za-z0-9_.]+)"', (INDIUM / "user" / "init.ritz").read_text()
+            r'"/bin/([A-Za-z0-9_.]+)"', (INDIUM / "user" / "init.ritz").read_text()
         )
     )
     assert "hello_gfx" in spawned and "rzsh" in spawned, spawned

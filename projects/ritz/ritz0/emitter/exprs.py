@@ -77,12 +77,14 @@ class ExprEmitter:
         elif isinstance(expr, rast.BoolLit):
             return ir.Constant(self.i1, 1 if expr.value else 0)
 
-        elif isinstance(expr, rast.StringLit) and not expr.as_ptr:
-            # "hello" -> StrView (zero-copy view)
+        elif isinstance(expr, rast.StringLit):
+            # "hello" -> StrView (zero-copy view), always: a `*u8` slot
+            # refuses a bare string literal outright (AGAST #4694), so any
+            # StringLit still standing here is never one.
             return self._emit_strview_string_literal(expr)
 
-        elif isinstance(expr, (rast.StringLit, rast.CStringLit)):
-            # c"hello", or "hello" in a `*u8` slot -> *u8 (null-terminated)
+        elif isinstance(expr, rast.CStringLit):
+            # c"hello" -> *u8 (null-terminated)
             gvar = self._get_string_constant(expr.value)
             # Get pointer to first element
             zero = ir.Constant(self.i64, 0)

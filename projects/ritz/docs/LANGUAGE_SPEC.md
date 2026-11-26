@@ -346,12 +346,14 @@ for something takes a NUL-terminated `*u8`, the fix is a `StrView` API in
 ritzlib, not a `c"..."` at the call site ([STANDARD.md](STANDARD.md) S-TEXT-1).
 
 A literal has no fixed type until a slot gives it one, as `5`, `null` and
-`[1, 2]` already behave. `"..."` is `StrView` by default and `*u8` in a `*u8`
-slot, wherever that slot is: `let`, `var`, `=`, `return`, a tail, a field, an
-array element, an `if` or `match` arm, an argument (LARB R3, AGAST #2341).
-That conversion serves the same boundary: it lets a literal fill a C-facing
-`*u8` slot without a `c` prefix. It is no reason to give a text API a `*u8`
-parameter. `c"..."` is always `*u8`, so it is what an untyped `let` needs:
+`[1, 2]` already behave. `"..."` is always `StrView` (AGAST #4694), wherever
+the slot is: `let`, `var`, `=`, `return`, a tail, a field, an array element,
+an `if` or `match` arm, an argument. A `*u8` slot never takes a bare
+`"..."`; it takes `c"..."` (C interop only) or a `StrView` API — the error
+is at the literal, the same words from ritz0 and ritz1: "a string literal is
+a `StrView`; a `*u8` slot takes `c"..."` (C interop only) — or use a
+`StrView` API (S-TEXT-1)". `c"..."` is always `*u8`, so it is what a `*u8`
+slot, or an untyped `let`, needs:
 
 ```ritz
 extern fn puts(s: *u8) -> i32       # C reads up to the NUL: no length
@@ -361,17 +363,17 @@ struct CName                        # mirrors a C struct's `const char *`
 
 fn c_greeting(short: bool) -> *u8   # its caller hands the result to C
     if short
-        "hi"
+        c"hi"
     else
-        "hello"
+        c"hello"
 
 fn main() -> i32
-    let n = CName { text: "Ritz" }
-    let argv: [3]*u8 = ["/bin/ls", "-l", null]   # execve's argv
+    let n = CName { text: c"Ritz" }
+    let argv: [3]*u8 = [c"/bin/ls", c"-l", null]   # execve's argv
     puts(c_greeting(true))
     puts(n.text)
     puts(argv[1])
-    puts("an argument")
+    puts(c"an argument")
     let p = c"untyped"
     puts(p)
     0
@@ -379,11 +381,12 @@ fn main() -> i32
 
 **Every string literal is stored NUL-terminated**, `"..."` and `c"..."` alike:
 the terminator follows the literal's bytes and isn't counted in a `StrView`'s
-`len`. That is what makes the `*u8` slot sound for a literal; a `StrView` in
-general carries no NUL.
+`len`. That is what makes `c"..."` free to read a `"..."` literal's own bytes
+without a copy; a non-literal `StrView` in general carries no NUL.
 
-Only the literal converts. A literal is retyped, a value isn't, so a `StrView`
-that happens to hold a literal doesn't reach `*u8` (see [String
+Only the literal's own kind (`"..."` or `c"..."`) is ever reached that way. A
+value isn't retyped by its slot, so a `StrView` or `String` that happens to
+hold a literal's text never reaches `*u8` (see [String
 Types](#35-string-types)).
 
 A literal that doesn't fit its slot is an error wherever it is, including in an
@@ -1107,7 +1110,7 @@ A `*u8` element that is not a string or `null` is an error at the element. A
 pointer is `null`, never the integer `0` (§3.2):
 
 ```ritz expect-error="const 'NAMES' element 1 is not a string literal or null"
-const NAMES: [2]*u8 = ["a", 0]
+const NAMES: [2]*u8 = [c"a", 0]
 ```
 
 ### 3.4 Slice Types

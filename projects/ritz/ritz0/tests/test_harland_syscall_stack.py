@@ -248,7 +248,7 @@ def test_no_big_locals_on_syscall_paths():
 
 def test_tier1_runs_the_readdir_and_open_child():
     init = (INDIUM / "user" / "init.ritz").read_text()
-    assert 'run_test(c"/bin/readdir64_child", c"readdir64", 0)' in init
+    assert 'run_test("/bin/readdir64_child", "readdir64", 0)' in init
     toml = (INDIUM / "ritz.toml").read_text()
     assert 'name = "readdir64_child"' in toml
     child = (INDIUM / "user" / "readdir64_child.ritz").read_text()

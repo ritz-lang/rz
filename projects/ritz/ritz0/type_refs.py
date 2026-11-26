@@ -179,9 +179,10 @@ class RefChecksMixin:
         """`c as @&C`, `c as @C` or `c as *C` with `c` a struct or array value,
         a `:&` param's included (AGAST #2370): a cast isn't a borrow, so it's
         the bare form's error, as ritz1's ref_cast_value_to_ref. An integer
-        source is the integer-to-pointer cast and stays; a string literal is a
-        `*u8` already, and a StrView or String into a `*T` has LARB R3's own
-        words (the emitter's _STR_AS_PTR, AGAST #2341)."""
+        source is the integer-to-pointer cast and stays; a string literal's
+        cast is the emitter's own slot rule to judge (refused outright for a
+        `*u8` target, AGAST #4694), and a StrView or String into a `*T` has
+        LARB R3's own words (the emitter's _STR_AS_PTR, AGAST #2341)."""
         target = self._resolve_alias(cast.target)
         if source is None or not isinstance(target, (rast.PtrType, rast.RefType)):
             return

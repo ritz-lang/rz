@@ -137,12 +137,19 @@ fn main() -> i32
     0
 """
 
+_PTR_LITERAL = ('a string literal is a `StrView`; a `*u8` slot takes `c"..."` '
+                '(C interop only) — or use a `StrView` API (S-TEXT-1)')
+
 PAYLOAD_WANTED = [
     ("9:18", "`900` does not fit in `u8`"),
     ("14:24", "`300` does not fit in `u8`"),
     ("15:22", "`301` does not fit in `u8`"),
     ("16:37", "`302` does not fit in `u8`"),
     ("17:18", "`903` does not fit in `u8`"),
+    # AGAST #4694: `E.W([2]*u8)`'s array payload is a `*u8` slot per element,
+    # same as any other, so `"a"` / `"b"` are refused there too.
+    ("18:21", _PTR_LITERAL),
+    ("18:26", _PTR_LITERAL),
 ]
 
 

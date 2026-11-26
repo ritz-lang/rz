@@ -443,14 +443,20 @@ fn reset(p: @Point)
 
 **Status: ENFORCED**
 
-Only a string literal fits a `*u8` slot. A `StrView` or a `String` is passed
-to a C-string API as `.ptr` or `s.as_ptr()`, which makes its NUL
-assumption visible (LARB R3, #2341). Whether that C-string API should exist
-at all is S-TEXT-1's question.
+Nothing crosses to `*u8` implicitly: not a bare `"..."` literal (AGAST
+#4694), not a `StrView`, not a `String`. A `c"..."` literal is the only
+literal that fits a `*u8` slot; a `StrView` or a `String` is passed to a
+C-string API as `.ptr` or `s.as_ptr()`, which makes its NUL assumption
+visible (LARB R3, #2341). Whether that C-string API should exist at all is
+S-TEXT-1's question.
 
 ```ritz body expect-error="a StrView is not a `*u8`"
 let s: StrView = "hello"
 let p: *u8 = s
+```
+
+```ritz body expect-error='a string literal is a `StrView`; a `*u8` slot takes `c"..."`'
+let p: *u8 = "hello"
 ```
 
 #### S-PTR-6 A reference never outlives its local

@@ -174,10 +174,11 @@ def span_empty_needs_slot(method: str) -> str:
 # destination and the load is deleted. That is what tome_cli needed:
 # `var client: TomeClient = client_new()` stored an 8 KB first-class value
 # into a debug-declared alloca, and clang -O2 took 6.5 GB to lower it.
-# What a StrView or String landing in a `*u8` slot says (LARB R3, AGAST #2341).
+# What a StrView or String landing in a `*u8` slot says (LARB R3, AGAST
+# #2341). Neither a literal of either kind reaches here (AGAST #4694): a
+# `"..."` literal is refused at its slot before this ever runs.
 _STR_AS_PTR = {
-    'StrView': ("a StrView is not a `*u8`: only a string literal converts; "
-                "write `.ptr` if you know it is NUL-terminated"),
+    'StrView': "a StrView is not a `*u8`: write `.ptr` if you know it is NUL-terminated",
     'String': "a String is not a `*u8`: write `s.as_ptr()`",
 }
 
@@ -1736,9 +1737,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
             # Set initializer for definitions
             if var_def.value is not None:
-                if isinstance(var_def.value, rast.StringLit) and var_def.value.as_ptr:
-                    gvar.initializer = self._const_str_ptr(var_def.value.value)
-                elif (folded := self._fold_scalar_global_init(var_def.value)) is not None:
+                if (folded := self._fold_scalar_global_init(var_def.value)) is not None:
                     # `5`, `-1`, `~0`, `'A'`, `-0.75`, `null`, `4096 as *u8`
                     # (AGAST #3027, #1539), written in the global's own type.
                     gvar.initializer = self._global_init_constant(var_def, ty, *folded)
@@ -2796,8 +2795,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                     # Array constants - emitted once every scalar const is
                     # known, so an element may name a const declared later.
                     const_arrays.append(item)
-                elif (isinstance(item.value, rast.CStringLit)
-                        or (isinstance(item.value, rast.StringLit) and item.value.as_ptr)):
+                elif isinstance(item.value, rast.CStringLit):
                     gvar = ir.GlobalVariable(self.module, ty, name=item.name)
                     gvar.global_constant = True
                     gvar.linkage = "internal"
@@ -11193,11 +11191,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                            value: Optional[rast.Expr], fit: bool = True) -> None:
         """A literal has no fixed type until a slot gives it one (LARB R3).
 
-        Each string literal among `value`'s tails takes `*u8` from a `*u8`
-        slot, and only a literal does: `_emit_expr` refuses a StrView or String
-        at any tail marked here, where an arm's own locals are still in scope.
-        With `fit`, a literal that can't be the slot's type is an error too; a
-        cast passes False, since `300 as u8` says it means to truncate.
+        A bare `"..."` is always a `StrView` (AGAST #4694): it never takes
+        `*u8` from a `*u8` slot, wherever that slot is, so a string literal
+        reaching one is refused here, at the literal, with the same words
+        ritz1 uses. `c"..."` is the only literal `*u8` fills a `*u8` slot
+        with. With `fit`, a literal that can't be the slot's type is an error
+        too; a cast passes False, since `300 as u8` says it means to
+        truncate.
         """
         if slot is None or value is None:
             return
@@ -11205,8 +11205,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         for tail, tail_slot in slot_tails(slot, value, resolve):
             wants_ptr = self._is_u8_ptr(tail_slot)
             if isinstance(tail, rast.StringLit):
-                tail.as_ptr = wants_ptr
-                # AGAST #3353: and a `Span<u8>` in a `Span<u8>` slot, so the
+                if wants_ptr:
+                    self._refuse_strview_literal_as_ptr(tail)
+                # AGAST #3353: a `Span<u8>` in a `Span<u8>` slot, so the
                 # answer no longer hangs on whether StrView is registered.
                 tail.as_span = self._is_u8_span(tail_slot)
             elif isinstance(tail, rast.CStringLit) and fit:
@@ -11306,6 +11307,15 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         name = self._ensure_builtin_generic_struct_specialization(
             rast.NamedType(span, 'Span', [rast.NamedType(span, 'u8', [])]))
         return self.struct_types[name]
+
+    def _refuse_strview_literal_as_ptr(self, tail: rast.StringLit) -> None:
+        """A bare `"..."` is a `StrView`, never a `*u8` (AGAST #4694, S-TEXT-1):
+        a `*u8` slot takes `c"..."` (C interop only) or a `StrView` API.
+        ritz1's lit_into_ptr refuses with the same words."""
+        raise EmitError(
+            'a string literal is a `StrView`; a `*u8` slot takes `c"..."` '
+            '(C interop only) — or use a `StrView` API (S-TEXT-1)',
+            self._value_span(tail))
 
     def _refuse_cstring_in_view(self, tail: rast.CStringLit,
                                 slot: Optional[rast.Type]) -> None:
@@ -12820,8 +12830,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         raise EmitError(bool_rules.value_into_bool(self._value_kind(val.type)), span)
 
     def _check_str_tail(self, val: ir.Value, tail: rast.Expr) -> None:
-        """No conversion reaches `*u8` from a StrView or String. A literal took
-        `*u8` from its slot before it was emitted, so it never gets here."""
+        """No conversion reaches `*u8` from a StrView or String, and a bare
+        `"..."` literal is one of those two, never `*u8` (AGAST #4694): it was
+        refused at its slot before it was emitted, so it never gets here."""
         if isinstance(val.type, ir.PointerType):
             return
         name = self._get_struct_name_from_type(val.type)

@@ -253,13 +253,12 @@ class StringLit(Expr):
     value: str
     print_value: Optional[str] = None
     interp: Optional[Tuple[List[str], List[str]]] = None
-    # Set by the emitter when the slot this literal lands in is `*u8`; the
-    # default is StrView (LARB R3, AGAST #2341). A slot visit always rewrites
-    # it, so a body shared between two instantiations can't keep a stale type.
-    as_ptr: bool = field(default=False, compare=False, repr=False)
-    # Set the same way when the slot is `Span<u8>`: the literal is then a
-    # `Span$u8` over its bytes, whether or not a StrView struct is registered
-    # (AGAST #3353).
+    # Set by the emitter when the slot this literal lands in is `Span<u8>`:
+    # the literal is then a `Span$u8` over its bytes, whether or not a
+    # StrView struct is registered (AGAST #3353). A slot visit always
+    # rewrites it, so a body shared between two instantiations can't keep a
+    # stale type. A `*u8` slot is never this literal's type (AGAST #4694):
+    # `_literal_into_slot` refuses it instead of coercing (LARB R3).
     as_span: bool = field(default=False, compare=False, repr=False)
 
 

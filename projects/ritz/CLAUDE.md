@@ -92,9 +92,10 @@ the fix is a `StrView` API in ritzlib, not a `c""` at the call site
 - `c"hello"` → `*u8`, NUL-terminated. C interop only: an `extern fn` or a
   syscall path/argv argument, ideally inside a ritzlib wrapper. A project's
   `c"` count is pinned down-only (`tools/test_standard_callers.py`)
-- A bare `"hello"` also fits a `*u8` slot (every literal carries a trailing
-  NUL), for the same boundaries. A non-literal `StrView` or a `String` never
-  does: write `.ptr` / `s.as_ptr()`
+- A bare `"hello"` is always `StrView`, in every slot, a `*u8` one included
+  (AGAST #4694): a `*u8` slot takes `c"hello"` or a `StrView` API, never a
+  bare `"hello"`. A non-literal `StrView` or a `String` never fits `*u8`
+  either: write `.ptr` / `s.as_ptr()`
 
 `s"hello"` was removed by AGAST #98: bare `"..."` now produces a `StrView` of
 the same `{ ptr, len }` shape, so the prefix was redundant. `make

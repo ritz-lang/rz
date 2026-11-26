@@ -105,9 +105,12 @@ class SlotInferMixin:
 
     def _slot_string_type(self, expr: rast.Expr, ty: rast.Type,
                           slot: Optional[rast.Type]) -> rast.Type:
-        """A `"..."` in a `*u8` slot is a `*u8` (LARB R3), recorded so: the
-        emitter reads it here, not the `as_ptr` its own slot rule sets as it
-        emits (_literal_into_slot, AGAST #4068).  Anything else keeps `ty`."""
+        """A `"..."` in a `*u8` slot is still typed `*u8` here (LARB R3), so
+        this pass's own slot checks (_check_ref_slot et al.) treat it as
+        compatible rather than raising their own, differently-worded
+        mismatch: the literal's actual fate is the emitter's
+        `_literal_into_slot`, which refuses it outright (AGAST #4694) rather
+        than emitting it as one. Anything else keeps `ty`."""
         if not isinstance(expr, rast.StringLit) or slot is None:
             return ty
         base = self._resolve_alias(slot)

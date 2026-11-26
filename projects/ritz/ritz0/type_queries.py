@@ -295,11 +295,13 @@ class TypeQueriesMixin:
     def _value_fits(self, value: Optional[rast.Expr], actual: rast.Type,
                     expected: rast.Type) -> bool:
         """`value`, of type `actual`, in an `expected` slot. A string literal has
-        no fixed type: it is `*u8` in a `*u8` slot (LARB R3) and a `Span<u8>` of
-        its bytes in a `Span<u8>` slot (LARB R62, AGAST #3596), and nothing else
-        is, so a StrView, a `c"…"` or a String stays a mismatch. An integer
-        literal is whichever float its f32 / f64 slot is (§7.5, AGAST #3604), and
-        any other integer fits one when exact there (§7.5, AGAST #4113)."""
+        no fixed type: it is typed `*u8` in a `*u8` slot for this query (LARB
+        R3), though the emitter refuses it there outright (AGAST #4694), and a
+        `Span<u8>` of its bytes in a `Span<u8>` slot (LARB R62, AGAST #3596),
+        and nothing else is, so a StrView, a `c"…"` or a String stays a
+        mismatch. An integer literal is whichever float its f32 / f64 slot is
+        (§7.5, AGAST #3604), and any other integer fits one when exact there
+        (§7.5, AGAST #4113)."""
         if self._type_fits(actual, expected):
             return True
         if value is None:

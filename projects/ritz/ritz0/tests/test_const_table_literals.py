@@ -7,7 +7,9 @@ The forms a table takes:
   - `[N]S` of struct literals whose fields are integers, `"..."` into a
     `StrView` / `Span<u8>`, and so on (#1569, #3651 cover the field kinds);
   - `[N]StrView` of `"..."`, as a list or a fill (#3978);
-  - `[N]*u8` of `"..."`, `c"..."` or `null`, as a list or a fill;
+  - `[N]*u8` of `c"..."` or `null`, as a list or a fill (a bare `"..."`
+    doesn't fit a `*u8` element any more than any other `*u8` slot, AGAST
+    #4694);
   - `[N]u32` / `[N]u64` of hex literals with the top bit set (SHA round K).
 
 What was broken before #1866, one row each:
@@ -88,7 +90,7 @@ pub fn main() -> i32
     3
 """,
     "ptr_index": """\
-const T: [3]*u8 = [c"ab", "cd", null]
+const T: [3]*u8 = [c"ab", c"cd", null]
 
 pub fn main() -> i32
     var i: i32 = 1
@@ -100,7 +102,7 @@ pub fn main() -> i32
     3
 """,
     "ptr_for": """\
-const T: [2]*u8 = [c"ab", "cd"]
+const T: [2]*u8 = [c"ab", c"cd"]
 
 pub fn main() -> i32
     var n: i32 = 0
@@ -111,7 +113,7 @@ pub fn main() -> i32
     3
 """,
     "ptr_fill_str": """\
-const T: [2]*u8 = ["ab"; 2]
+const T: [2]*u8 = [c"ab"; 2]
 
 pub fn main() -> i32
     var i: i32 = 1
@@ -229,7 +231,7 @@ PTR_ELEM = "is not a string literal or null"
 REFUSED = {
     "ptr_int": ('const T: [2]*u8 = [c"A", ^5]\n', 1),
     # A pointer is `null`, never the integer 0 (§3.2).
-    "ptr_zero": ('const T: [2]*u8 = [^0, "A"]\n', 0),
+    "ptr_zero": ('const T: [2]*u8 = [^0, c"A"]\n', 0),
     "ptr_fill_int": ("const T: [2]*u8 = [^7; 2]\n", 0),
 }
 

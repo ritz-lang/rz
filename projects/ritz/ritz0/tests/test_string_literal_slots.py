@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""A string literal takes `*u8` from its slot; nothing else does (LARB R3, #2341).
+"""A bare `"..."` is always a `StrView`; a `*u8` slot never takes one (LARB R3,
+AGAST #2341, #4694).
 
 A literal has no fixed type until a slot gives it one, as `5`, `null` and `[1, 2]`
-already behave. `"..."` is StrView by default and `*u8` in any `*u8` slot, and every
-literal is stored NUL-terminated. Before this `take("A")` worked but `let p: *u8 =
-"A"`, `return` and a field did not, while `take(sv)` compiled with no NUL promise.
+already behave, but `"..."` is `StrView` always: a `*u8` slot (`let`, `var`, `=`,
+`return`, a tail, a field, an array element, an `if`/`match` arm, an argument)
+refuses a bare `"..."` outright, at the literal, with the same words from ritz0
+and ritz1. `c"..."` is the only literal `*u8` fills one with, and every literal
+is stored NUL-terminated regardless.
 
-A non-literal StrView (`sv as *u8` too) and a String never fit `*u8`: write `.ptr`
-or `s.as_ptr()`. A literal that doesn't fit its element or scalar type is an
-error wherever it is, and a non-literal array element narrows only under section
-7.5. `[1, 300]` into `[2]u8` was a silent 44 on both compilers.
+A non-literal StrView (`sv as *u8` too) and a String never fit `*u8` either:
+write `.ptr` or `s.as_ptr()`. A literal that doesn't fit its element or scalar
+type is an error wherever it is, and a non-literal array element narrows only
+under section 7.5. `[1, 300]` into `[2]u8` was a silent 44 on both compilers.
 
 Every table goes through ritz0, ritz1 and ritz1_selfhosted, which must give the
 same located error. The accepted half is run, not only compiled, so rejecting
@@ -52,11 +55,15 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 _PRELUDE = "import ritzlib.strview\n"
 _MAIN = "fn main() -> i32\n    0\n"
 _SV = "struct Holder\n    p: *u8\n"
-_STRVIEW = ("a StrView is not a `*u8`: only a string literal converts; "
-            "write `.ptr` if you know it is NUL-terminated")
+_STRVIEW = "a StrView is not a `*u8`: write `.ptr` if you know it is NUL-terminated"
 _STRING = "a String is not a `*u8`: write `s.as_ptr()`"
 _IMPORT_STRING = "import ritzlib.string\n"
 _MAKE_STRING = 'var s: String = string_from("A")'
+# AGAST #4694: a bare `"..."` is always a `StrView`; a `*u8` slot never takes
+# one, wherever that slot is. ritz0's `_refuse_strview_literal_as_ptr` and
+# ritz1's `lit_refuse_string_as_ptr` (literal_slot.ritz) give the same words.
+_PTR_LITERAL = ('a string literal is a `StrView`; a `*u8` slot takes '
+                '`c"..."` (C interop only) — or use a `StrView` API (S-TEXT-1)')
 
 
 def _fn(params, body, ret="i64"):
@@ -82,7 +89,10 @@ REJECTED = {
     "strview_element": (_fn("s: StrView", "let a: [1]*u8 = [s]\n0"), 2, 22, _STRVIEW),
     "strview_element_assign": (_fn("s: StrView", "var a: [1]*u8 = [null]\na[0] = s\n0"),
                                3, 12, _STRVIEW),
-    "strview_arm": (_fn("s: StrView, n: i64", 'let p: *u8 = if n > 0\n    "A"\nelse\n    s\n0'),
+    # `c"A"`, not `"A"` (AGAST #4694): the other arm's literal would else be
+    # refused first (the same slot refuses both), masking the StrView arm
+    # this row means to test.
+    "strview_arm": (_fn("s: StrView, n: i64", 'let p: *u8 = if n > 0\n    c"A"\nelse\n    s\n0'),
                     5, 9, _STRVIEW),
     "strview_arg": ("fn take(p: *u8) -> i32\n    0\n" + _fn("s: StrView", "take(s)\n0"),
                     4, 10, _STRVIEW),
@@ -187,6 +197,78 @@ REJECTED = {
     "narrow_large_fill": (_fn("k: i64", "var a: [100]u8 = [k; 100]\n0"), 2, 23, "implicit narrowing"),
     "narrow_fill": (_fn("k: i64", "let a: [2]u8 = [k; 2]\n0"), 2, 21, "implicit narrowing"),
     "narrow_element_var": (_fn("k: i32", "var a: [2]u8 = [k, 1]\n0"), 2, 21, "implicit narrowing"),
+
+    # AGAST #4694: a bare `"..."` in a `*u8` slot, wherever that slot is.
+    # Each location is measured against the current emitter (ritz0 and ritz1
+    # agree, test_string_literal_slots' own compile-and-check).
+    "ptr_let": ('fn main() -> i32\n    let p: *u8 = "A"\n    *p as i32\n', 2, 18, _PTR_LITERAL),
+    "ptr_var": ('fn main() -> i32\n    var p: *u8 = "A"\n    *p as i32\n', 2, 18, _PTR_LITERAL),
+    "ptr_assign": ('fn main() -> i32\n    var p: *u8 = null\n    p = "A"\n    *p as i32\n',
+                   3, 9, _PTR_LITERAL),
+    "ptr_return": ('fn g() -> *u8\n    return "A"\nfn main() -> i32\n    *g() as i32\n',
+                   2, 12, _PTR_LITERAL),
+    "ptr_tail": ('fn g() -> *u8\n    "A"\nfn main() -> i32\n    *g() as i32\n', 2, 5, _PTR_LITERAL),
+    "ptr_tail_if": ('fn g(n: i64) -> *u8\n    if n > 0\n        "A"\n    else\n        "B"\n'
+                    "fn main() -> i32\n    *g(0) as i32\n", 3, 9, _PTR_LITERAL),
+    "ptr_return_if": ('fn g(n: i64) -> *u8\n    return if n > 0\n        "A"\n    else\n'
+                      '        "B"\nfn main() -> i32\n    *g(1) as i32\n', 3, 9, _PTR_LITERAL),
+    "ptr_field": (_SV + 'fn main() -> i32\n    let h = Holder { p: "A" }\n    *h.p as i32\n',
+                  4, 25, _PTR_LITERAL),
+    "ptr_field_assign": (_SV + "fn main() -> i32\n    var h = Holder { p: null }\n"
+                         '    h.p = "A"\n    *h.p as i32\n', 5, 11, _PTR_LITERAL),
+    "ptr_field_through_pointer": (_SV + 'fn put(h: *Holder)\n    h.p = "A"\n'
+                                  "fn main() -> i32\n    var h = Holder { p: null }\n"
+                                  "    put(@h)\n    *h.p as i32\n", 4, 11, _PTR_LITERAL),
+    "ptr_element": ('fn main() -> i32\n    let a: [2]*u8 = ["A", "B"]\n    *a[1] as i32\n',
+                    2, 22, _PTR_LITERAL),
+    "ptr_element_assign": ('fn main() -> i32\n    var a: [2]*u8 = [null, null]\n    a[1] = "B"\n'
+                          "    *a[1] as i32\n", 3, 12, _PTR_LITERAL),
+    "ptr_fill": ('fn main() -> i32\n    let a: [2]*u8 = ["A"; 2]\n    *a[1] as i32\n',
+                2, 22, _PTR_LITERAL),
+    "ptr_arm_if": ('fn main() -> i32\n    let n: i64 = 1\n    let p: *u8 = if n > 0\n        "A"\n'
+                  '    else\n        "B"\n    *p as i32\n', 4, 9, _PTR_LITERAL),
+    "ptr_arm_match": ('fn main() -> i32\n    let n: i64 = 2\n    let p: *u8 = match n\n'
+                      '        1 => "A"\n        _ => "B"\n    *p as i32\n', 4, 14, _PTR_LITERAL),
+    "ptr_arm_block_tail": ('fn main() -> i32\n    let n: i64 = 0\n    let p: *u8 = if n > 0\n'
+                          '        let k: i64 = 1\n        "A"\n    else\n        "B"\n'
+                          "    *p as i32\n", 5, 9, _PTR_LITERAL),
+    "ptr_arm_beside_pointer": ('fn main() -> i32\n    let n: i64 = 1\n    let q: *u8 = c"B"\n'
+                               '    let p: *u8 = if n > 0\n        "A"\n    else\n        q\n'
+                               "    *p as i32\n", 5, 9, _PTR_LITERAL),
+    "ptr_arg": ('fn take(p: *u8) -> i32\n    *p as i32\nfn main() -> i32\n    take("A")\n',
+               4, 10, _PTR_LITERAL),
+    "ptr_method_arg": ("struct W\n    n: i64\nimpl W\n    fn take(self, p: *u8) -> i32\n"
+                       "        *p as i32\nfn main() -> i32\n    let w = W { n: 0 }\n"
+                       '    w.take("A")\n', 8, 12, _PTR_LITERAL),
+    "ptr_method_tail": ("struct W\n    n: i64\nimpl W\n    fn g(self) -> *u8\n        \"A\"\n"
+                        "fn main() -> i32\n    let w = W { n: 0 }\n    *w.g() as i32\n",
+                        5, 9, _PTR_LITERAL),
+    "ptr_method_return": ("struct W\n    n: i64\nimpl W\n    fn g(self) -> *u8\n        return \"A\"\n"
+                          "fn main() -> i32\n    let w = W { n: 0 }\n    *w.g() as i32\n",
+                          5, 16, _PTR_LITERAL),
+    "ptr_array_arg": ("fn take(a: [2]*u8) -> i32\n    *a[1] as i32\n"
+                      'fn main() -> i32\n    take(["A", "B"])\n', 4, 11, _PTR_LITERAL),
+    "ptr_array_field": ("struct A2\n    a: [2]*u8\n"
+                        'fn main() -> i32\n    let v = A2 { a: ["A", "B"] }\n    *v.a[1] as i32\n',
+                        4, 22, _PTR_LITERAL),
+    "ptr_large_fill_field": ("struct A2\n    a: [100]*u8\n"
+                            'fn main() -> i32\n    let v = A2 { a: ["A"; 100] }\n    *v.a[99] as i32\n',
+                            4, 22, _PTR_LITERAL),
+    "ptr_fn_pointer_arg": ('fn take(p: *u8) -> i32\n    *p as i32\nfn main() -> i32\n'
+                          '    let f: fn(*u8) -> i32 = take\n    f("A")\n', 5, 7, _PTR_LITERAL),
+    "ptr_as_cast": ('fn main() -> i32\n    let p = "A" as *u8\n    *p as i32\n', 2, 13, _PTR_LITERAL),
+    "ptr_const": ('const P: *u8 = "A"\nfn main() -> i32\n    *P as i32\n', 1, 16, _PTR_LITERAL),
+    "ptr_terminator_ends_a_scan": (
+        'fn strlen_of(p: *u8) -> i64\n    var n: i64 = 0\n    while *(p + n) != 0\n        n += 1\n'
+        '    n\nfn main() -> i32\n    strlen_of("ABC") as i32\n', 7, 15, _PTR_LITERAL),
+    "ptr_nul_terminated": ('fn main() -> i32\n    let p: *u8 = "AB"\n    *(p + 2) as i32\n',
+                          2, 18, _PTR_LITERAL),
+    "ptr_empty_literal": ('fn main() -> i32\n    let p: *u8 = ""\n    *p as i32\n', 2, 18, _PTR_LITERAL),
+    "ptr_global": ('var G: *u8 = "A"\nfn main() -> i32\n    *G as i32\n', 1, 14, _PTR_LITERAL),
+    "ptr_const_element": ('const A: [2]*u8 = ["A", "B"]\nfn main() -> i32\n    *A[1] as i32\n',
+                         1, 20, _PTR_LITERAL),
+    "ptr_element_nested": ('fn main() -> i32\n    var a: [1][2]*u8 = [ ["A", "B"] ]\n'
+                          "    *a[0][1] as i32\n", 2, 27, _PTR_LITERAL),
 }
 
 
@@ -196,71 +278,12 @@ def _first(ret_body):
 
 # name -> (source, exit code)
 ACCEPTED = {
-    "let": ('fn main() -> i32\n    let p: *u8 = "A"\n    *p as i32\n', 65),
-    "var": ('fn main() -> i32\n    var p: *u8 = "A"\n    *p as i32\n', 65),
-    "assign": ('fn main() -> i32\n    var p: *u8 = null\n    p = "A"\n    *p as i32\n', 65),
-    "return": (_first('fn g() -> *u8\n    return "A"\n'), 65),
-    "tail": (_first('fn g() -> *u8\n    "A"\n'), 65),
-    "tail_if": ('fn g(n: i64) -> *u8\n    if n > 0\n        "A"\n    else\n        "B"\n'
-                "fn main() -> i32\n    *g(0) as i32\n", 66),
-    "return_if": ('fn g(n: i64) -> *u8\n    return if n > 0\n        "A"\n    else\n        "B"\n'
-                  "fn main() -> i32\n    *g(1) as i32\n", 65),
-    "field": (_SV + 'fn main() -> i32\n    let h = Holder { p: "A" }\n    *h.p as i32\n', 65),
-    "field_assign": (_SV + "fn main() -> i32\n    var h = Holder { p: null }\n"
-                     '    h.p = "A"\n    *h.p as i32\n', 65),
-    "field_through_pointer": (_SV + 'fn put(h: *Holder)\n    h.p = "A"\n'
-                              "fn main() -> i32\n    var h = Holder { p: null }\n"
-                              "    put(@h)\n    *h.p as i32\n", 65),
-    "element": ('fn main() -> i32\n    let a: [2]*u8 = ["A", "B"]\n    *a[1] as i32\n', 66),
-    "element_assign": ('fn main() -> i32\n    var a: [2]*u8 = [null, null]\n    a[1] = "B"\n'
-                       "    *a[1] as i32\n", 66),
-    "fill": ('fn main() -> i32\n    let a: [2]*u8 = ["A"; 2]\n    *a[1] as i32\n', 65),
-    "arm_if": ('fn main() -> i32\n    let n: i64 = 1\n    let p: *u8 = if n > 0\n        "A"\n'
-               '    else\n        "B"\n    *p as i32\n', 65),
-    "arm_match": ('fn main() -> i32\n    let n: i64 = 2\n    let p: *u8 = match n\n'
-                  '        1 => "A"\n        _ => "B"\n    *p as i32\n', 66),
-    "arm_block_tail": ('fn main() -> i32\n    let n: i64 = 0\n    let p: *u8 = if n > 0\n'
-                       '        let k: i64 = 1\n        "A"\n    else\n        "B"\n'
-                       "    *p as i32\n", 66),
-    "arm_beside_pointer": ('fn main() -> i32\n    let n: i64 = 1\n    let q: *u8 = c"B"\n'
-                           '    let p: *u8 = if n > 0\n        "A"\n    else\n        q\n'
-                           "    *p as i32\n", 65),
-    "arg": ('fn take(p: *u8) -> i32\n    *p as i32\nfn main() -> i32\n    take("A")\n', 65),
-    "method_arg": ("struct W\n    n: i64\nimpl W\n    fn take(self, p: *u8) -> i32\n"
-                   "        *p as i32\nfn main() -> i32\n    let w = W { n: 0 }\n"
-                   '    w.take("A")\n', 65),
-    "method_tail": ("struct W\n    n: i64\nimpl W\n    fn g(self) -> *u8\n        \"A\"\n"
-                    "fn main() -> i32\n    let w = W { n: 0 }\n    *w.g() as i32\n", 65),
-    "method_return": ("struct W\n    n: i64\nimpl W\n    fn g(self) -> *u8\n        return \"A\"\n"
-                      "fn main() -> i32\n    let w = W { n: 0 }\n    *w.g() as i32\n", 65),
-    "array_arg": ("fn take(a: [2]*u8) -> i32\n    *a[1] as i32\n"
-                  'fn main() -> i32\n    take(["A", "B"])\n', 66),
-    "array_field": ("struct A2\n    a: [2]*u8\n"
-                    'fn main() -> i32\n    let v = A2 { a: ["A", "B"] }\n    *v.a[1] as i32\n', 66),
-    "large_fill_field": ("struct A2\n    a: [100]*u8\n"
-                         'fn main() -> i32\n    let v = A2 { a: ["A"; 100] }\n    *v.a[99] as i32\n', 65),
-    "enum_payload": ("enum E\n    V(*u8)\n    N\n"
-                     'fn main() -> i32\n    let e = E.V("A")\n    match e\n'
-                     "        V(p) => *p as i32\n        N => 0\n", 65),
-    "option_payload": ("fn g() -> Option<*u8>\n    Some(\"A\")\n"
-                       "fn main() -> i32\n    match g()\n        Some(p) => *p as i32\n        None => 0\n", 65),
-    "fn_pointer_arg": ('fn take(p: *u8) -> i32\n    *p as i32\nfn main() -> i32\n'
-                       '    let f: fn(*u8) -> i32 = take\n    f("A")\n', 65),
-    "fn_pointer_field_arg": ('struct H\n    f: fn(*u8) -> i32\nfn take(p: *u8) -> i32\n    *p as i32\n'
-                             'fn main() -> i32\n    let h = H { f: take }\n    (h.f)("A")\n', 65),
-    "as_cast": ('fn main() -> i32\n    let p = "A" as *u8\n    *p as i32\n', 65),
-    "const": ('const P: *u8 = "A"\nfn main() -> i32\n    *P as i32\n', 65),
-    "generic_arg": ('fn id<T>(x: T) -> T\n    x\nfn main() -> i32\n'
-                    '    let p: *u8 = id<*u8>("A")\n    *p as i32\n', 65),
-    "terminator_ends_a_scan": (
-        'fn strlen_of(p: *u8) -> i64\n    var n: i64 = 0\n    while *(p + n) != 0\n        n += 1\n'
-        '    n\nfn main() -> i32\n    strlen_of("ABC") as i32\n', 3),
-
-    # Every literal is stored NUL-terminated, whichever type it took.
-    "nul_terminated": ('fn main() -> i32\n    let p: *u8 = "AB"\n    *(p + 2) as i32\n', 0),
+    # Every `c"..."` literal is stored NUL-terminated, and fits a `*u8` slot
+    # wherever one of the moved-to-REJECTED `ptr_*` rows above once took a
+    # bare `"..."` there (AGAST #4694).
+    "const_cstr": ('const P: *u8 = c"A"\nfn main() -> i32\n    *P as i32\n', 65),
     "strview_ptr_is_terminated": ('fn main() -> i32\n    let s: StrView = "AB"\n'
                                   "    *(s.ptr + 2) as i32\n", 0),
-    "empty_literal": ('fn main() -> i32\n    let p: *u8 = ""\n    *p as i32\n', 0),
 
     # The default stays StrView, and only the slot's own literal is retyped.
     "default_is_strview": ('fn main() -> i32\n    let s = "AB"\n    s.len as i32\n', 2),
@@ -279,7 +302,6 @@ ACCEPTED = {
     # What fits still fits.
     "fit_edges": ("fn main() -> i32\n    let a: u8 = 255\n    let b: i8 = -128\n"
                   "    let c: u16 = 65535\n    (a as i32) - 255 + (b as i32) + 128 + (c as i32) - 65535\n", 0),
-    "const_cstr": ('const P: *u8 = c"A"\nfn main() -> i32\n    *P as i32\n', 65),
     "fit_u64_hex": ("fn main() -> i32\n    let a: u64 = 0xF000000000000000\n"
                     "    (a >> 60) as i32\n", 15),
     "fit_i64_min": ("fn main() -> i32\n    let b: i64 = -9223372036854775808\n    if b < 0\n"
@@ -309,10 +331,9 @@ ACCEPTED = {
     "element_widens": ("fn main() -> i32\n    let k: u8 = 7\n    let a: [1]i64 = [k as i64]\n"
                        "    a[0] as i32\n", 7),
     # A global and a const array element are slots too: ritz1 points them at the
-    # literal's own `@.str` (#2357).
-    "global": ('var G: *u8 = "A"\nfn main() -> i32\n    *G as i32\n', 65),
-    "const_element": ('const A: [2]*u8 = ["A", "B"]\nfn main() -> i32\n    *A[1] as i32\n', 66),
-    # The `c"..."` spelling of both is the same `*u8` (AGAST #3051).
+    # literal's own `@.str` (#2357). The `c"..."` spelling of both is the same
+    # `*u8` (AGAST #3051); a bare `"..."` there is now `ptr_global` /
+    # `ptr_const_element` above (AGAST #4694).
     "global_c": ('var G: *u8 = c"A"\nfn main() -> i32\n    *G as i32\n', 65),
     "const_element_c": ('const A: [2]*u8 = [c"A", c"B"]\nfn main() -> i32\n    *A[1] as i32\n', 66),
 }
@@ -320,8 +341,29 @@ ACCEPTED = {
 
 # An N-D initialiser's leaves are slots too (ritz1: AGAST #3377).
 REJECTED["fit_element_nested"] = (_fn("", "let a: [1][2]u8 = [ [1, 300] ]\n0"), 2, 29, _fits(300, "u8"))
-ACCEPTED["element_nested"] = ('fn main() -> i32\n    var a: [1][2]*u8 = [ ["A", "B"] ]\n'
-                              "    *a[0][1] as i32\n", 66)
+
+# AGAST #4694: ritz1's literal_slot.ritz never typed these four shapes even
+# under the old rule (a user/builtin variant's scalar, non-array payload
+# (lit_payload only handles ArrayLit/ArrayFill), a call through a
+# struct-field-held fn pointer, and an explicit generic instantiation's
+# argument) — a pre-existing gap this ticket's measurement surfaced, not one
+# it created. ritz0 refuses each at the literal; ritz1 neither refuses nor
+# (so far as this table checks) miscompiles it, so only ritz0 is asserted
+# here. Filed as a follow-up, not fixed in this commit (ROOM.md "finish the
+# job" is about #4694's own goal, not every gap it happens to expose).
+RITZ0_ONLY_PTR_LITERAL = {
+    "ptr_enum_payload": ("enum E\n    V(*u8)\n    N\n"
+                        'fn main() -> i32\n    let e = E.V("A")\n    match e\n'
+                        "        V(p) => *p as i32\n        N => 0\n", 5, 17, _PTR_LITERAL),
+    "ptr_option_payload": ("fn g() -> Option<*u8>\n    Some(\"A\")\n"
+                          "fn main() -> i32\n    match g()\n        Some(p) => *p as i32\n        None => 0\n",
+                          2, 10, _PTR_LITERAL),
+    "ptr_fn_pointer_field_arg": ('struct H\n    f: fn(*u8) -> i32\nfn take(p: *u8) -> i32\n    *p as i32\n'
+                                'fn main() -> i32\n    let h = H { f: take }\n    (h.f)("A")\n',
+                                7, 11, _PTR_LITERAL),
+    "ptr_generic_arg": ('fn id<T>(x: T) -> T\n    x\nfn main() -> i32\n'
+                       '    let p: *u8 = id<*u8>("A")\n    *p as i32\n', 4, 26, _PTR_LITERAL),
+}
 
 # AGAST #3440 (R62): a `c"..."` is a bare `*u8`, so it fits no `{ ptr, len }`
 # slot. ritz0 gave `.len` 120 with ritzlib.span imported and a traceback without;
@@ -440,17 +482,19 @@ NO_IMPORT_REJECTED = {
 }
 
 # Shapes ritz1 refuses with an error of its own, whatever the literal: it lowers
-# no tuple type and no `await`.
+# no tuple type and no `await`. `c"A"`, not `"A"` (AGAST #4694): a tuple
+# element's `*u8` slot is as unforgiving of a bare literal as any other.
 RITZ0_ACCEPTED = {
-    "tuple_element": ('fn main() -> i32\n    let t: (i32, *u8) = (1, "A")\n    *t.1 as i32\n', 65),
+    "tuple_element": ('fn main() -> i32\n    let t: (i32, *u8) = (1, c"A")\n    *t.1 as i32\n', 65),
 }
 
 # Compiled, not run: nothing to link `take` against, and a one-file link has no
 # ritzlib.string to call. A literal that stayed a StrView is refused, so this is
-# the extern slot's own test.
+# the extern slot's own test. `c"A"` (AGAST #4694): an `extern fn`'s `*u8`
+# param is exactly the C-interop boundary a bare literal never fills.
 # `await` outside an async fn is the poll loop, which passes the arguments itself.
-_ASYNC_ARG = 'async fn g(p: *u8) -> i32\n    *p as i32\nfn main() -> i32\n    await g("A")\n'
-_EXTERN_ARG = 'extern fn take(p: *u8) -> i32\nfn main() -> i32\n    take("A")\n'
+_ASYNC_ARG = 'async fn g(p: *u8) -> i32\n    *p as i32\nfn main() -> i32\n    await g(c"A")\n'
+_EXTERN_ARG = 'extern fn take(p: *u8) -> i32\nfn main() -> i32\n    take(c"A")\n'
 _STRING_AS_PTR = (_IMPORT_STRING + 'fn main() -> i32\n    var s: String = string_from("A")\n'
                   "    let p: *u8 = s.as_ptr()\n    *p as i32\n")
 
@@ -554,8 +598,15 @@ def _rejected_rows():
             yield Row(rid, COMPILERS, Refused(_PRELUDE + source, message, at=(line + 1, col)))
 
 
+def _ritz0_only_rows():
+    for name in sorted(RITZ0_ONLY_PTR_LITERAL):
+        source, line, col, message = RITZ0_ONLY_PTR_LITERAL[name]
+        rid = f"what_does_not_fit_is_a_located_error[{name}]"
+        yield Row(rid, ("ritz0",), Refused(_PRELUDE + source, message, at=(line + 1, col)))
+
+
 # Every REJECTED and ACCEPTED row, checked a chunk at a time per compiler.
-ROWS = list(_rejected_rows()) + [
+ROWS = list(_rejected_rows()) + list(_ritz0_only_rows()) + [
     Row(f"what_fits_compiles_and_runs[{name}]", COMPILERS, Run(_PRELUDE + ACCEPTED[name][0],
                                                                 ACCEPTED[name][1]))
     for name in sorted(ACCEPTED)]
@@ -592,9 +643,14 @@ def test_ritz0_only_accepted(request, tmp_path, name):
 
 
 # The typing pass has its own wording (a default compile prints the emitter's
-# where both refuse). Generic sites only.
-CHECKED_ACCEPTED = ["let", "var", "assign", "return", "tail", "field", "arg", "element",
-                    "arm_if", "arm_match", "arm_beside_pointer", "tail_if", "strview_slot"]
+# where both refuse). Generic sites only. The `ptr_*` rows moved to REJECTED
+# (AGAST #4694) still pass the typing pass alone: `_slot_string_type` still
+# types a literal `*u8` in a `*u8` slot for its own bookkeeping, and only the
+# emitter's `_literal_into_slot` refuses it outright (test_typed_pass.py's
+# `test_a_string_literal_in_a_u8_ptr_slot_is_a_u8_ptr`  has the same split).
+CHECKED_ACCEPTED = ["ptr_let", "ptr_var", "ptr_assign", "ptr_return", "ptr_tail", "ptr_field",
+                    "ptr_arg", "ptr_element", "ptr_arm_if", "ptr_arm_match",
+                    "ptr_arm_beside_pointer", "ptr_tail_if", "strview_slot"]
 CHECKED_REJECTED = ["strview_let", "strview_return", "strview_arg", "strview_field",
                     "strview_arm", "string_let", "string_arg"]
 
@@ -612,7 +668,12 @@ def _type_check_wrong(here, accepted, name):
     """Why the typing pass gets the row wrong, or None."""
     here.mkdir()
     if accepted:
-        proc = _type_check(here, ACCEPTED[name][0])
+        # `strview_slot` lives in ACCEPTED; the `ptr_*` rows (AGAST #4694)
+        # moved to REJECTED when the emitter started refusing them, but the
+        # typing pass alone still takes the literal, so their source is read
+        # from wherever the name actually lives.
+        source = ACCEPTED[name][0] if name in ACCEPTED else REJECTED[name][0]
+        proc = _type_check(here, source)
         output = proc.stdout + proc.stderr
         return None if proc.returncode == 0 else f"want it accepted, got:\n{output[-800:]}"
     proc = _type_check(here, REJECTED[name][0])

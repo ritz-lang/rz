@@ -12,8 +12,9 @@ the refusal names streq from ritzlib.str.  The literal may be on either side.
 AGAST #3196 extends this to a C-string literal (`p == c"lit"`): it type-checks
 as `*u8 == *u8`, but compares addresses, not text.  Same refusal.
 
-What still compiles: a `*u8` slot taking a literal (`let p: *u8 = "lit"`, an
-argument), and a pointer compared with a pointer or null.
+What still compiles: a `*u8` slot taking a `c"..."` literal (`let p: *u8 =
+c"lit"`, an argument; AGAST #4694 — a bare `"lit"` no longer fits one), and a
+pointer compared with a pointer or null.
 """
 
 import os
@@ -54,11 +55,12 @@ REFUSED = {
                      + _main('f(c"x")'),
 }
 
-# Still compiles, and runs to the code the program says.
+# Still compiles, and runs to the code the program says. `c"x"` / `c"y"`, not
+# a bare literal (AGAST #4694): a `*u8` slot never takes one any more.
 KEPT = {
-    "let_slot": (_main('let p: *u8 = "x"', "if *p == 120", "    return 5", "2"), 5),
+    "let_slot": (_main('let p: *u8 = c"x"', "if *p == 120", "    return 5", "2"), 5),
     "arg_slot": ('fn f(p: *u8) -> i32\n    if *p == 121\n        return 5\n    2\n'
-                 + _main('f("y")'), 5),
+                 + _main('f(c"y")'), 5),
     "pointer_eq_pointer": (_main('let p: *u8 = c"x"', "let q: *u8 = p", "if p == q",
                                  "    return 5", "2"), 5),
     "pointer_ne_null": (_main('let p: *u8 = c"x"', "if p != null", "    return 5", "2"), 5),

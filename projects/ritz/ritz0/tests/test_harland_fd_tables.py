@@ -725,8 +725,8 @@ def test_no_kernel_wide_fd_table_is_left():
 
 def test_init_runs_the_fd_table_tests():
     suite = _fn(INDIUM / "user" / "init.ritz", "run_tier1_tests")
-    assert 'run_test(c"/bin/fd_table_test",  c"fd_table_test",  0)' in suite
-    assert 'run_test(c"/bin/pid_child_test", c"pid_child_test", 0)' in suite
+    assert 'run_test("/bin/fd_table_test",  "fd_table_test",  0)' in suite
+    assert 'run_test("/bin/pid_child_test", "pid_child_test", 0)' in suite
     assert "run_fd_isolation_test()" in suite
     # init is the parent and runs the child twice (a second run must get fd 3)
     steps = _fn(INDIUM / "user" / "init.ritz", "fd_isolation_steps")

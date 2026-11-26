@@ -9,6 +9,9 @@
 
 import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.sys { sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_spawn_bg, sys_wait, sys_read, sys_write, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, sys_input_poll, sys_input_read, sys_open, sys_close, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC, sys_getcwd, sys_sync }
+import ritzlib.string { String, string_new }
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.span { Span, span_from_ptr }
 
 # ============================================================================
 # Test Infrastructure
@@ -17,11 +20,17 @@ import ritzlib.sys { sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_spawn
 var g_passed: i32 = 0
 var g_failed: i32 = 0
 
-# Run a test binary and check its exit code
-fn run_test(path: *u8, name: *u8, expected: i32) -> i32
+# Run a test binary and check its exit code. `path` is a StrView (AGAST
+# #4694): sys_spawn's *u8 slot is a C-interop boundary, not something a
+# caller should hand-NUL-terminate, so the owned, NUL-terminated String is
+# built right here instead (S-TEXT-1), not in a fixed-size stack buffer a
+# longer literal could overflow. The spawn+wait itself delegates to
+# spawn_and_wait (AGAST #4830) rather than repeating it.
+fn run_test(path: StrView, name: StrView, expected: i32) -> i32
     print("[test] {name} ... ")
 
-    let exit_code: i64 = spawn_and_wait(path)
+    var path_s: String = String.from(path)
+    let exit_code: i64 = spawn_and_wait(path_s.as_ptr())
     if exit_code == SPAWN_FAILED
         print("FAIL (spawn error)\n")
         g_failed = g_failed + 1
@@ -37,11 +46,32 @@ fn run_test(path: *u8, name: *u8, expected: i32) -> i32
         g_failed = g_failed + 1
         return 1
 
-# Run a test binary with arguments
-fn run_test_args(path: *u8, name: *u8, argv: **u8, argc: i32, expected: i32) -> i32
+# Run a test binary with arguments. `path`/`args` are StrViews (AGAST #4694);
+# sys_spawn_args' *u8/**u8 slots are the C-interop boundary, so the owned,
+# NUL-terminated path and argv are built right here (S-TEXT-1). `args`'
+# entries are concatenated into one owned `buf` (rzsh's envp_build pattern):
+# `buf` can reallocate as entries are appended, so the `ptrs` pointers into
+# it are taken only once `buf` is complete.
+fn run_test_args(path: StrView, name: StrView, args: Span<StrView>, expected: i32) -> i32
     print("[test] {name} ... ")
 
-    let pid: i64 = sys_spawn_args(path, argv, argc)
+    var path_s: String = String.from(path)
+    var buf: String = string_new()
+    var starts: Vec<i64> = vec_new<i64>()
+    var i: i64 = 0
+    while i < args.len
+        starts.push(buf.len())
+        buf.push_str(args.get(i))
+        buf.push(0)
+        i += 1
+    var ptrs: Vec<*u8> = vec_new<*u8>()
+    let base: *u8 = buf.as_ptr()
+    var k: i64 = 0
+    while k < starts.len
+        ptrs.push(base + starts.get(k))
+        k += 1
+
+    let pid: i64 = sys_spawn_args(path_s.as_ptr(), ptrs.as_ptr(), args.len as i32)
     if pid <= 0
         print("FAIL (spawn error)\n")
         g_failed = g_failed + 1
@@ -479,53 +509,58 @@ fn run_tier1_tests() -> i32
     # First, while init is still pid 1 with no child waiting to be reaped.
     run_spawn_fail_pid_test()
 
+    # Before any run_test/run_test_args call (AGAST #4694): each now builds
+    # its owned, NUL-terminated path/argv through String/Vec, so the first
+    # one refills init's allocator bins via mmap. mmap_isolation_steps reads
+    # its own first kernel-chosen mmap as "init's first ever" (the address a
+    # freshly spawned child's first mmap must also land at); run it before
+    # that allocator mmap claims the slot instead, or the comparison is
+    # against a heap-growth mapping, not USER_MMAP_START.
+    run_mmap_isolation_test()
+
     # Basic tests - no arguments needed
-    run_test(c"/bin/hello",       c"hello",       0)
-    run_test(c"/bin/true",        c"true",        0)
-    run_test(c"/bin/false",       c"false",       1)
-    run_test(c"/bin/exitcode",    c"exitcode",   42)
-    run_test(c"/bin/hello_tier1", c"hello_tier1", 0)
-    run_test(c"/bin/seq10",       c"seq10",       0)
-    run_test(c"/bin/cat_motd",    c"cat_motd",    0)
-    run_test(c"/bin/hello_gfx",   c"hello_gfx",   0)
-    run_test(c"/bin/cwd_test",    c"cwd_test",    0)
-    run_test(c"/bin/fd_table_test",  c"fd_table_test",  0)
+    run_test("/bin/hello",       "hello",       0)
+    run_test("/bin/true",        "true",        0)
+    run_test("/bin/false",       "false",       1)
+    run_test("/bin/exitcode",    "exitcode",   42)
+    run_test("/bin/hello_tier1", "hello_tier1", 0)
+    run_test("/bin/seq10",       "seq10",       0)
+    run_test("/bin/cat_motd",    "cat_motd",    0)
+    run_test("/bin/hello_gfx",   "hello_gfx",   0)
+    run_test("/bin/cwd_test",    "cwd_test",    0)
+    run_test("/bin/fd_table_test",  "fd_table_test",  0)
     # An open read fd keeps its bytes across a rewrite of the path
     # (AGAST #4322): goliath GC must not free a held blob under the reader.
-    run_test(c"/bin/fd_hold_test",   c"fd_hold_test",   0)
+    run_test("/bin/fd_hold_test",   "fd_hold_test",   0)
     # ritzlib.fs write_file on Harland, and a write fd that writes nothing:
     # an empty write commits an empty file, an O_WRONLY open with no write
     # and no O_TRUNC leaves the file, and a child killed between its O_TRUNC
     # open and its write leaves the old bytes (AGAST #4830). On /tmp and /var.
-    # Bare literals: each carries the NUL run_test's *u8 slots need.
     run_test("/bin/write_empty_test", "write_empty_test", 0)
-    run_test(c"/bin/pid_child_test", c"pid_child_test", 0)
+    run_test("/bin/pid_child_test", "pid_child_test", 0)
     run_fd_isolation_test()
-    run_mmap_isolation_test()
     # malloc/Vec/String with RAM exhausted: null and -1, never a write through
     # a failed mmap's -errno or null (AGAST #3551).
-    run_test(c"/bin/malloc_fail_child", c"malloc_fail", 0)
+    run_test("/bin/malloc_fail_child", "malloc_fail", 0)
     # Syscalls deep enough to have overrun the old 4 KiB syscall stack,
     # growing the kernel heap under a child CR3 (AGAST #2761).
-    run_test(c"/bin/heap_grow_child", c"heap_grow", 0)
+    run_test("/bin/heap_grow_child", "heap_grow", 0)
     # readdir of a 64-entry dir and 100 opens: frames that overran the old
     # syscall stack, now with a guard page under it (AGAST #1877).
-    run_test(c"/bin/readdir64_child", c"readdir64", 0)
+    run_test("/bin/readdir64_child", "readdir64", 0)
 
     # A child without the POWER capability cannot power off, and without the
     # display capability cannot map the framebuffer (AGAST #1888).
-    run_test(c"/bin/cap_child",   c"cap_child",    0)
+    run_test("/bin/cap_child",   "cap_child",    0)
 
     # A child that revokes its inherited channel capability is refused IPC,
     # and one that revokes its namespace capability is refused filesystem
     # access (AGAST #4472).
-    run_test(c"/bin/cap_ipc_child", c"cap_ipc_child", 0)
-    run_test(c"/bin/cap_fs_child",  c"cap_fs_child",  0)
+    run_test("/bin/cap_ipc_child", "cap_ipc_child", 0)
+    run_test("/bin/cap_fs_child",  "cap_fs_child",  0)
 
     # Without a CAP_TYPE_IRQ handle, DrvIrqWait (220) is refused with
     # Errno.Perm and writes nothing back (AGAST #4719).
-    # Bare literals: each carries its NUL for run_test's *u8 slots (the path
-    # is sys_spawn's), so no new c"" literal is needed.
     run_test("/bin/drv_refuse_test", "drv_refuse_test", 0)
 
     # ritzlib.timedread on the console (AGAST #4829): with nothing typed, a
@@ -533,60 +568,59 @@ fn run_tier1_tests() -> i32
     run_test("/bin/timed_read_test", "timed_read_test", 0)
 
     # A ring-3 page fault kills only the child: exit 128 + 14 (#2755).
-    run_test(c"/bin/fault_child",  c"fault_child",  142)
+    run_test("/bin/fault_child",  "fault_child",  142)
 
     # Test rzsh --help (non-interactive)
-    var rzsh_argv: [2]*u8
-    rzsh_argv[0] = c"rzsh"
-    rzsh_argv[1] = c"--help"
-    run_test_args(c"/bin/rzsh", c"rzsh --help", @rzsh_argv[0], 2, 0)
+    var rzsh_argv: [2]StrView
+    rzsh_argv[0] = "rzsh"
+    rzsh_argv[1] = "--help"
+    run_test_args("/bin/rzsh", "rzsh --help", span_from_ptr<StrView>(@rzsh_argv[0], 2), 0)
 
     # rzsh parses, sets and expands variables (AGAST #3459): its token and
     # variable tables are Vecs, so this is rzsh's first user mmap; the line
     # is #3530's repro, which once panicked the kernel. Exit 7 only if $N
     # expanded.
-    var rzsh_c_argv: [3]*u8
-    rzsh_c_argv[0] = c"rzsh"
-    rzsh_c_argv[1] = c"-c"
-    rzsh_c_argv[2] = c"X=hello ; echo $X world ; N=7 ; exit $N"
-    run_test_args(c"/bin/rzsh", c"rzsh -c vars", @rzsh_c_argv[0], 3, 7)
+    var rzsh_c_argv: [3]StrView
+    rzsh_c_argv[0] = "rzsh"
+    rzsh_c_argv[1] = "-c"
+    rzsh_c_argv[2] = "X=hello ; echo $X world ; N=7 ; exit $N"
+    run_test_args("/bin/rzsh", "rzsh -c vars", span_from_ptr<StrView>(@rzsh_c_argv[0], 3), 7)
 
     # A `pub fn main(args: Span<StrView>, env: Span<StrView>)` (AGAST
     # #4019): the adapter's Linux-shaped mmap builds the views on Harland,
     # and _start calls main 16-aligned. Each failure has its own exit code.
-    var span_argv: [3]*u8
-    span_argv[0] = c"span_args"
-    span_argv[1] = c"alpha"
-    span_argv[2] = c"beta-gamma"
-    run_test_args(c"/bin/span_args", c"span_args", @span_argv[0], 3, 0)
+    var span_argv: [3]StrView
+    span_argv[0] = "span_args"
+    span_argv[1] = "alpha"
+    span_argv[2] = "beta-gamma"
+    run_test_args("/bin/span_args", "span_args", span_from_ptr<StrView>(@span_argv[0], 3), 0)
 
     # The ring-3 net tools (AGAST #4751, harland docs/RING2_NET.md "Ring-3
     # tools"). No ring-2 service runs on a Tier-1 boot, so NetAttach answers
     # Errno.NoDev and each tool exits 19 (-NoDev) before it publishes a
     # request; tools/test_tier1_boot.sh checks all three lines (net_nodev).
-    # Bare literals: each carries the NUL the spawn ABI's *u8 slots need.
-    var ping_argv: [2]*u8
+    var ping_argv: [2]StrView
     ping_argv[0] = "ping"
     ping_argv[1] = "10.0.2.2"
-    run_test_args("/bin/ping", "ping nodev", @ping_argv[0], 2, 19)
-    var send_argv: [4]*u8
+    run_test_args("/bin/ping", "ping nodev", span_from_ptr<StrView>(@ping_argv[0], 2), 19)
+    var send_argv: [4]StrView
     send_argv[0] = "udp-send"
     send_argv[1] = "10.0.2.2"
     send_argv[2] = "7777"
     send_argv[3] = "hello"
-    run_test_args("/bin/udp-send", "udp-send nodev", @send_argv[0], 4, 19)
-    var recv_argv: [2]*u8
+    run_test_args("/bin/udp-send", "udp-send nodev", span_from_ptr<StrView>(@send_argv[0], 4), 19)
+    var recv_argv: [2]StrView
     recv_argv[0] = "udp-recv"
     recv_argv[1] = "7777"
-    run_test_args("/bin/udp-recv", "udp-recv nodev", @recv_argv[0], 2, 19)
+    run_test_args("/bin/udp-recv", "udp-recv nodev", span_from_ptr<StrView>(@recv_argv[0], 2), 19)
     # A malformed address or port is a usage error (exit 2), refused
     # before any net call: an octet above 255, three octets, port 65536.
     ping_argv[1] = "10.0.2.256"
-    run_test_args("/bin/ping", "ping bad address", @ping_argv[0], 2, 2)
+    run_test_args("/bin/ping", "ping bad address", span_from_ptr<StrView>(@ping_argv[0], 2), 2)
     send_argv[1] = "10.0.2"
-    run_test_args("/bin/udp-send", "udp-send bad address", @send_argv[0], 4, 2)
+    run_test_args("/bin/udp-send", "udp-send bad address", span_from_ptr<StrView>(@send_argv[0], 4), 2)
     recv_argv[1] = "65536"
-    run_test_args("/bin/udp-recv", "udp-recv bad port", @recv_argv[0], 2, 2)
+    run_test_args("/bin/udp-recv", "udp-recv bad port", span_from_ptr<StrView>(@recv_argv[0], 2), 2)
 
     # Three levels below init, each resuming after its child (AGAST #1882).
     run_nested_spawn_test()

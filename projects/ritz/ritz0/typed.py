@@ -47,9 +47,11 @@ MOVE_CHECKER_READS = (
 # Where its old rule said nothing (an `if` with no tail, a tuple with an
 # untyped element) the table may say more; over the matrix corpus, ritz1, the
 # examples and the .ritz tests the emitted IR is byte-identical.  A "..." in a
-# `*u8` slot is a `*u8` here (LARB R3), and a match is its first arm with a
-# known type, as the emitter's rules said when they were set as it emitted
-# (as_ptr, result_ritz_type; #4068).  MethodCall followed (#4066), with the
+# `*u8` slot is typed `*u8` here too (LARB R3) for this table's own
+# bookkeeping, though the literal never actually reaches one: the emitter's
+# `_literal_into_slot` refuses it first (AGAST #4694).  A match is its first
+# arm with a known type, as the emitter's rules said when they were set as it
+# emitted (result_ritz_type; #4068).  MethodCall followed (#4066), with the
 # typing pass typing a `sizeof` operand of one; an array literal is here too,
 # taken from the table where its old rule inferred the element type, though no
 # corpus input reaches that rule (#4066).  The kinds left (Ident, UnaryOp,
