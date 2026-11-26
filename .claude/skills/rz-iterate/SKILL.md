@@ -620,6 +620,16 @@ is one line where possible. Don't restate what the recipient's files say
 REAP line and the host verbs keep their formats. A message that needs more
 than a line names the file or ticket that holds the detail.
 
+**A task room's id is `ritz-task-<id>`, never `task-<id>`.**
+`send_room_message` to a room that doesn't exist creates an empty one and
+returns success, so a misaddressed message looks sent and nobody reads it.
+On 2026-11-26 a heads-up to #4731, #4733 and #4734 (the driver stub's page
+cap) went to `task-4731`/`task-4733`/`task-4734` and never reached them.
+Copy the room id from the REAP line or the AGAST claim (`assigned_agent`
+minus any `@<host>`), and treat a message whose answer matters as
+undelivered until the room replies. Host rooms are `adele-<host>` (see
+"Hosts").
+
 **Re-spawning after a spot loss:** keep the room ID (the evacuate refs and
 the hand-off message are keyed by it), and post this resume briefing in the
 room (`<old host>` is the lost box):
