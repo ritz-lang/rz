@@ -98,6 +98,17 @@ pub struct MonoCtx
     done_methods: *WantedMethod
     impl_self_name: *u8
     impl_self_len: i32
+    # AGAST #4844: where each instance was first named (InstSite, ast.ritz),
+    # for the notes an error inside it carries.  inst_sites parallels the fn
+    # instantiation table; a wanted method's is on its WantedMethod.  A
+    # request is made in the body of `req_fn` (a non-generic fn) or of the
+    # instance `req_site` is being made for, at `site_line:site_col` (the
+    # call or method call being walked).
+    inst_sites: **InstSite
+    req_fn: *FnDef
+    req_site: *InstSite
+    site_line: i32
+    site_col: i32
 
 # A fresh MonoCtx: every table empty, outside any generation.
 pub fn mono_ctx_new(ctx: *ParseCtx) -> *MonoCtx
@@ -134,6 +145,7 @@ pub fn init_instantiation_tracker(mono: *MonoCtx)
     mono.inst_suffixes = malloc((mono.inst_cap as i64) * 8) as **u8
     mono.inst_suffix_lens = malloc((mono.inst_cap as i64) * 4) as *i32
     mono.inst_gens = malloc((mono.inst_cap as i64) * 4) as *i32
+    mono.inst_sites = malloc((mono.inst_cap as i64) * 8) as **InstSite
     mono.inst_count = 0
     # Initialize struct tracking
     mono.struct_cap = INST_INIT_CAP
@@ -156,6 +168,7 @@ pub fn add_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: StrView) -
         if *(mono.inst_name_lens + i) == name_len and *(mono.inst_suffix_lens + i) == suffix_len
             if memcmp(*(mono.inst_names + i), name, name_len as i64) == 0
                 if memcmp(*(mono.inst_suffixes + i), suffix, suffix_len as i64) == 0
+                    inst_site_again(mono, *(mono.inst_sites + i))
                     return 0  # Already tracked
 
     # Add new entry
@@ -166,6 +179,7 @@ pub fn add_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: StrView) -
         mono.inst_suffixes = realloc(mono.inst_suffixes as *u8, cap * 8) as **u8
         mono.inst_suffix_lens = realloc(mono.inst_suffix_lens as *u8, cap * 4) as *i32
         mono.inst_gens = realloc(mono.inst_gens as *u8, cap * 4) as *i32
+        mono.inst_sites = realloc(mono.inst_sites as *u8, cap * 8) as **InstSite
         mono.inst_cap = cap as i32
 
     *(mono.inst_names + mono.inst_count) = name
@@ -173,8 +187,62 @@ pub fn add_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: StrView) -
     *(mono.inst_suffixes + mono.inst_count) = suffix
     *(mono.inst_suffix_lens + mono.inst_count) = suffix_len
     *(mono.inst_gens + mono.inst_count) = mono.cur_gen + 1
+    *(mono.inst_sites + mono.inst_count) = inst_site_new(mono)
     mono.inst_count = mono.inst_count + 1
     return 1  # Added new
+
+# AGAST #4844: the request being made now, at mono's site in its body.
+pub fn inst_site_new(mono: *MonoCtx) -> *InstSite
+    let site: *InstSite = calloc(1, sizeof(InstSite)) as *InstSite
+    site.line = mono.site_line
+    site.col = mono.site_col
+    site.from = mono.req_fn
+    site.from_site = mono.req_site
+    site
+
+# Another place names the instance `site` records.
+pub fn inst_site_again(mono: *MonoCtx, site: *InstSite)
+    if site == null
+        return
+    if site.line != mono.site_line or site.col != mono.site_col or site.from != mono.req_fn or site.from_site != mono.req_site
+        site.more += 1
+
+# Instance `name<args>.method`'s own copy of request `req` (a wanted
+# method's is shared by every instance an unknown receiver reaches); null
+# when nothing recorded one.
+pub fn inst_site_made(req: *InstSite, name: StrView, args: StrView, method: StrView) -> *InstSite
+    if req == null
+        return null
+    let site: *InstSite = calloc(1, sizeof(InstSite)) as *InstSite
+    site.line = req.line
+    site.col = req.col
+    site.from = req.from
+    site.from_site = req.from_site
+    site.more = req.more
+    site.name = name
+    site.args = args
+    site.method = method
+    site
+
+# Walk the body the request `site` will be made for; returns the request
+# context it replaces, for inst_site_leave.
+pub fn inst_site_enter(mono: *MonoCtx, site: *InstSite) -> *InstSite
+    let saved: *InstSite = mono.req_site
+    mono.req_site = site
+    mono.req_fn = null
+    saved
+
+# `site`'s instance is `f` (null: none was made).
+pub fn inst_site_leave(mono: *MonoCtx, site: *InstSite, f: *FnDef, saved: *InstSite)
+    mono.req_site = saved
+    if site != null and f != null
+        site.inst = f
+        f.inst_site = site
+
+# The call or method call at `e` is the one being walked.
+pub fn inst_site_at(mono: *MonoCtx, e: *Expr)
+    mono.site_line = e.span.line
+    mono.site_col = e.span.col
 
 pub fn get_instantiation_count(mono: *MonoCtx) -> i32
     mono.inst_count
@@ -1929,6 +1997,7 @@ struct WantedMethod
     suffix_len: i32
     method: *u8
     method_len: i32
+    site: *InstSite      # AGAST #4844: where it was first wanted
     next: *WantedMethod
 
 # The instance whose impl method is being specialised ("W$i32"), for its
@@ -1975,22 +2044,46 @@ pub fn push_wanted(list: *WantedMethod, base_sv: StrView, suffix_sv: StrView, me
     w.suffix_len = suffix_len
     w.method = meth
     w.method_len = meth_len
+    w.site = null
     w.next = list
     w
+
+# AGAST #4844: where `base_sv suffix_sv`'s `meth` was first wanted: on that
+# instance, else on every one (a receiver the tracker couldn't type).
+pub fn wanted_site(list: *WantedMethod, base_sv: StrView, suffix_sv: StrView, meth_sv: StrView) -> *InstSite
+    var wild: *InstSite = null
+    var w: *WantedMethod = list
+    while w != null
+        if name_eq(StrView { ptr: (w.method), len: (w.method_len) as i64 }, meth_sv) == 1
+            if w.suffix == null
+                if wild == null
+                    wild = w.site
+            else if name_eq(StrView { ptr: (w.base), len: (w.base_len) as i64 }, base_sv) == 1 and name_eq(StrView { ptr: (w.suffix), len: (w.suffix_len) as i64 }, suffix_sv) == 1
+                return w.site
+        w = w.next
+    wild
+
+# A call wants `meth` on `base_sv suffix_sv` (null: every instance): a new
+# want records its site, a repeat counts another place.
+fn want_at(mono: *MonoCtx, base_sv: StrView, suffix_sv: StrView, meth_sv: StrView)
+    if wanted_in(mono.wanted_methods, base_sv, suffix_sv, meth_sv) == 1
+        inst_site_again(mono, wanted_site(mono.wanted_methods, base_sv, suffix_sv, meth_sv))
+        return
+    mono.wanted_methods = push_wanted(mono.wanted_methods, base_sv, suffix_sv, meth_sv)
+    mono.wanted_methods.site = inst_site_new(mono)
 
 # A call names `meth` on an instance of type `tn` ("W$i32"; null: unknown).
 pub fn want_method(mono: *MonoCtx, m: *Module, tn_sv: StrView, meth_sv: StrView)
     var tn: *u8 = tn_sv.ptr
     var tn_len: i32 = tn_sv.len as i32
     if tn == null or tn_len <= 0
-        if inherent_generic_method(m, StrView { ptr: (null), len: (0) as i64 }, meth_sv) == 1 and wanted_in(mono.wanted_methods, StrView { ptr: (null), len: (0) as i64 }, StrView { ptr: (null), len: (0) as i64 }, meth_sv) == 0
-            mono.wanted_methods = push_wanted(mono.wanted_methods, StrView { ptr: (null), len: (0) as i64 }, StrView { ptr: (null), len: (0) as i64 }, meth_sv)
+        if inherent_generic_method(m, StrView { ptr: (null), len: (0) as i64 }, meth_sv) == 1
+            want_at(mono, StrView { ptr: (null), len: (0) as i64 }, StrView { ptr: (null), len: (0) as i64 }, meth_sv)
         return
     let d: i32 = find_dollar_sign(tn_sv)
     if d <= 0 or inherent_generic_method(m, StrView { ptr: (tn), len: (d) as i64 }, meth_sv) == 0
         return
-    if wanted_in(mono.wanted_methods, StrView { ptr: (tn), len: (d) as i64 }, StrView { ptr: (tn + d), len: (tn_len - d) as i64 }, meth_sv) == 0
-        mono.wanted_methods = push_wanted(mono.wanted_methods, StrView { ptr: (tn), len: (d) as i64 }, StrView { ptr: (tn + d), len: (tn_len - d) as i64 }, meth_sv)
+    want_at(mono, StrView { ptr: (tn), len: (d) as i64 }, StrView { ptr: (tn + d), len: (tn_len - d) as i64 }, meth_sv)
 
 # "Vec$i32" / "Span$u8" for a Vec / Span of the tracker's kind and suffix.
 pub fn collection_instance_name(kind: i32, suf_sv: StrView) -> StrView

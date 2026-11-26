@@ -23,7 +23,10 @@ value an instance finds, the `_at_drop_type` rows; `t_param_at_copy_type`
 is the same body at `T = i32`, where the move is a copy.
 
 Each row compiles `main.ritz` beside one module, `dup.ritz`. Each expected
-location names the file its line and column are counted in.
+location names the file its line and column are counted in.  An error in
+dup.ritz's instance is followed by the note naming main.ritz's call that
+instantiated it (AGAST #4844), but for ritz0's `drop_local` rows: an error
+at every T, which ritz0 finds on the generic's own body, has no instance.
 """
 
 import os
@@ -104,7 +107,7 @@ def _write(tmp_path, module, extra, call):
     return main, tmp_path / "main.ll", env
 
 
-def _check(rc, out, expected):
+def _check(rc, out, expected, noted=True):
     if expected is None:
         assert rc == 0, out
         return
@@ -118,7 +121,14 @@ def _check(rc, out, expected):
         pat = (rf"(^|[\s/]){file}\.ritz:{line}:{col}: .*use of moved value: `{re.escape(name)}` "
                rf"\(moved at \S*{file}\.ritz:{mline}:{mcol}\)")
     assert re.search(pat, out, re.MULTILINE), out
-    assert f"{other}.ritz:" not in out, out
+    # The error names its own file; only its instantiation note (AGAST
+    # #4844) names main.ritz, where `twice<..>` was instantiated.
+    lines = out.splitlines()
+    errors = "\n".join(line for line in lines if ": note: " not in line)
+    assert f"{other}.ritz:" not in errors, out
+    if file == "dup" and noted:
+        assert any(re.search(r"(^|[\s/])main\.ritz:\d+:\d+: note: `twice<", line)
+                   for line in lines), out
 
 
 @pytest.mark.parametrize("name", sorted(CASES))
@@ -126,7 +136,10 @@ def test_ritz0(tmp_path, name):
     module, extra, call, expected = CASES[name]
     main, ll, env = _write(tmp_path, module, extra, call)
     proc = run_ritz0([str(main), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
-    _check(proc.returncode, proc.stdout + proc.stderr, expected)
+    # A `D` local moved twice is refused on the generic's own body, at any
+    # T, before there is an instance to name: ritz0 gives no note there.
+    _check(proc.returncode, proc.stdout + proc.stderr, expected,
+           noted=not name.startswith("drop_local"))
 
 
 @pytest.mark.parametrize("compiler", RITZ1S)

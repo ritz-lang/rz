@@ -39,7 +39,8 @@ from monomorph_core import (  # noqa: F401 -- re-exported: monomorph's public na
     TypeSubstitution, bind_type_params, map_child_nodes, mangle_generic_name,
     mangle_type_name, note_instance_display, resolve_alias_in, type_aliases)
 from monomorph_infer import MonoInferMixin
-from trait_bounds import TraitImpls, bound_error
+from trait_bounds import TraitImpls, bound_error, type_name
+from instance_site import InstanceSite
 from monomorph_rewrite import MonoRewriteMixin
 
 
@@ -139,6 +140,34 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         # untyped to inference (#3064), as ritz1 has it, though the table
         # types it.  Per fn, as var_types is.
         self._tuple_lit_names: Set[str] = set()
+
+        # AGAST #4844: where each instance was first named, for the notes an
+        # error inside it carries (instance_site.py).  Keyed ('fn', name,
+        # args key), ('method', base, args key, method) or ('wild', method)
+        # for a method wanted on a receiver of unknown type.  `_requester`
+        # is the fn whose body the walk is in (None while an instance's body
+        # is being made: `_made_sites` then collects the sites it names, and
+        # the instance becomes their requester once it exists);
+        # `_site_span` the expression wanting a method.
+        self._sites: Dict[tuple, InstanceSite] = {}
+        self._requester: Optional[rast.FnDef] = None
+        self._made_sites: Optional[List[InstanceSite]] = None
+        self._site_span = None
+
+    def _note_site(self, key: tuple, span) -> None:
+        """`span`, in the body being walked, names instance `key`."""
+        site = self._sites.get(key)
+        if site is not None:
+            site.again(span, self._requester)
+            return
+        site = self._sites[key] = InstanceSite(span, self._requester)
+        if self._requester is None and self._made_sites is not None:
+            self._made_sites.append(site)
+
+    def _site_of(self, key: tuple, name: str) -> Optional[InstanceSite]:
+        """Instance `name`'s own copy of the site that named `key`."""
+        site = self._sites.get(key)
+        return site.made(name) if site is not None else None
 
     def _type_to_key(self, ty: rast.Type) -> str:
         """Convert a type to a string key for deduplication."""
@@ -249,23 +278,11 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             # concrete during specialization (e.g., vec_grow<i32>).
             if item.is_generic():
                 return
-            # Clear variable types for new function scope
-            self.var_types = {}
-            self._tuple_lit_names = set()
-            # Register parameter types
-            for param in item.params:
-                self._visit_type(param.type)
-                param_type = param.type
-                if param_type is None and param.name == 'self' and impl_type_name:
-                    # `fn m(self)` in an impl block: self is the impl type.
-                    param_type = rast.NamedType(item.span, impl_type_name, [])
-                self.var_types[param.name] = param_type
-            # Visit return type
-            self.current_ret_type = item.ret_type
-            if item.ret_type:
-                self._visit_type(item.ret_type)
-            # Visit body
-            self._visit_block(item.body)
+            saved_requester, self._requester = self._requester, item
+            try:
+                self._visit_fn(item, impl_type_name)
+            finally:
+                self._requester = saved_requester
         elif isinstance(item, rast.StructDef):
             # Skip generic structs, as for generic fns above: a field that
             # names a type parameter (`v: Vec<T>`) is an instance only once
@@ -291,6 +308,26 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             # e.g., impl Drop for String { fn drop() { vec_drop<u8>(...) } }
             for method in item.methods:
                 self._visit_item(method, impl_type_name=item.type_name)
+
+    def _visit_fn(self, item: rast.FnDef, impl_type_name: Optional[str]) -> None:
+        """A non-generic fn's (or an instance's) signature and body."""
+        # Clear variable types for new function scope
+        self.var_types = {}
+        self._tuple_lit_names = set()
+        # Register parameter types
+        for param in item.params:
+            self._visit_type(param.type)
+            param_type = param.type
+            if param_type is None and param.name == 'self' and impl_type_name:
+                # `fn m(self)` in an impl block: self is the impl type.
+                param_type = rast.NamedType(item.span, impl_type_name, [])
+            self.var_types[param.name] = param_type
+        # Visit return type
+        self.current_ret_type = item.ret_type
+        if item.ret_type:
+            self._visit_type(item.ret_type)
+        # Visit body
+        self._visit_block(item.body)
 
     def _visit_type(self, ty: rast.Type) -> None:
         """Visit a type to find instantiations."""
@@ -413,6 +450,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 if fn_name in self.generic_functions:
                     key = (fn_name, self._type_args_to_key(expr.type_args))
                     self._note_use('fn', *key, expr.type_args)
+                    self._note_site(('fn',) + key, expr.span)
                     if key not in self.function_instantiations:
                         mangled = mangle_generic_name(fn_name, expr.type_args)
                         self.function_instantiations[key] = mangled
@@ -542,6 +580,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
 
         # Check if it's a Vec<T> type
         if var_type.name == 'Vec' and var_type.args:
+            self._site_span = expr.span
             self._want_method(var_type, 'slice')
             self._want_method(var_type, 'len')
 
@@ -710,6 +749,9 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
 
                 subst = TypeSubstitution(dict(zip(generic_def.type_params, type_args)), struct_manglings)
                 specialized = self._specialize_function(generic_def, mangled_name, subst)
+                specialized.instance_site = self._site_of(
+                    ('fn',) + key,
+                    f"{base_name}<{', '.join(type_name(a) for a in type_args)}>")
                 self.specialized_functions.append(specialized)
                 processed_functions.add(key)
 
@@ -756,6 +798,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
     def _want_called_method(self, expr: rast.MethodCall) -> None:
         """`x.m()` / `T.m()` names inherent method `m` of x's / the slot's
         instance (AGAST #3617)."""
+        self._site_span = expr.span
         if not self._impl_instances and not any(
                 g.trait_name is None for impls in self.generic_impls.values() for g in impls):
             return
@@ -788,6 +831,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             # call the scan can't type still finds its method.
             if any(self._inherent_method(b, method) for b in self.generic_impls):
                 self._wild_methods.setdefault(method, None)
+                self._note_site(('wild', method), self._site_span)
             return
         if not isinstance(receiver, rast.NamedType):
             return
@@ -796,6 +840,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             return
         key = (receiver.name, self._type_args_to_key(receiver.args), method)
         self._wanted_methods.setdefault(key, None)
+        self._note_site(('method',) + key, self._site_span)
 
     def _instance_of_mangled(self, ty: rast.Type) -> rast.Type:
         """`W<Cell<i32>>` for a mangled `W$Cell_i32` or `W<Cell$i32>`: the
@@ -858,6 +903,11 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 subst = TypeSubstitution(dict(zip(generic_impl.type_params, type_args)),
                                          struct_manglings)
                 specialized = self._specialize_function_for_impl(template, subst)
+                args = ', '.join(type_name(a) for a in type_args)
+                specialized.instance_site = self._site_of(
+                    ('method', base_name, type_args_key, method),
+                    f"{base_name}<{args}>.{method}") or self._site_of(
+                    ('wild', method), f"{base_name}<{args}>.{method}")
                 shell_key = (id(generic_impl), mangled_name)
                 shell = self._impl_shells.get(shell_key)
                 if shell is None:
@@ -1081,7 +1131,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         new_ret = subst.apply(generic_def.ret_type) if generic_def.ret_type else None
 
         # Deep copy and specialize body
-        new_body = self._specialize_block(generic_def.body, subst)
+        new_body, made = self._specialize_body(generic_def.body, subst)
 
         new_fn = rast.FnDef(
             generic_def.span,
@@ -1099,6 +1149,8 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         new_fn.is_monomorphized = True
         new_fn.instance_args = list(subst.mapping.values())
         new_fn.instance_subst = subst
+        for site in made:
+            site.requester = new_fn
         return new_fn
 
     def _specialize_impl(self, generic_impl: rast.ImplBlock, mangled_type_name: str,
@@ -1146,7 +1198,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         new_ret = subst.apply(fn.ret_type) if fn.ret_type else None
 
         # Deep copy and specialize body
-        new_body = self._specialize_block(fn.body, subst)
+        new_body, made = self._specialize_body(fn.body, subst)
 
         new_fn = rast.FnDef(
             fn.span,
@@ -1164,7 +1216,19 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         new_fn.is_monomorphized = True
         new_fn.instance_args = list(subst.mapping.values())
         new_fn.instance_subst = subst
+        for site in made:
+            site.requester = new_fn
         return new_fn
+
+    def _specialize_body(self, block: rast.Block, subst: TypeSubstitution):
+        """An instance's body, and the sites of the instances it names
+        first, whose requester the instance will be (AGAST #4844)."""
+        saved = self._requester, self._made_sites
+        self._requester, self._made_sites = None, []
+        try:
+            return self._specialize_block(block, subst), self._made_sites
+        finally:
+            self._requester, self._made_sites = saved
 
     def _specialize_block(self, block: rast.Block, subst: TypeSubstitution) -> rast.Block:
         """Specialize a block by substituting types."""
@@ -1260,6 +1324,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                     substituted_type_args = [subst.bare(arg) for arg in expr.type_args]
                     key = (fn_name, self._type_args_to_key(substituted_type_args))
                     self._note_use('fn', *key, expr.type_args)
+                    self._note_site(('fn',) + key, expr.span)
                     # If this instantiation doesn't exist yet, add it
                     # This handles transitive generic calls discovered during specialization
                     if key not in self.function_instantiations:

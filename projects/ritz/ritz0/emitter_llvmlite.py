@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from typing import ClassVar, Dict, Optional, Tuple, List, Union, Set, Iterator
 from llvmlite import ir
 import ritz_ast as rast
+from instance_site import add_notes
 from monomorph import mangle_generic_name, mangle_type_name, resolve_alias_in
 from monomorph_core import instance_display_name, note_instance_display
 from tail_value import arm_diverges, slot_tails, value_gap, value_tails
@@ -5727,6 +5728,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         self._emit_span = getattr(fn_def, 'span', None)
         try:
             fn = self._emit_function_body_inner(fn_def)
+        except EmitError as error:
+            # An instance's error names where it was instantiated (#4844).
+            raise add_notes(error, fn_def)
         finally:
             self.ritz_types = saved_ritz_types
             self._emit_span = None
