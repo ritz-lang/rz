@@ -2035,6 +2035,10 @@ interrupted by a signal is retried, so `Err(Intr)` never escapes.
 | `f.chmod(mode)` | `fn(mode: i32) -> Result<(), Errno>` | fchmod(2) |
 | `f.lock(op)` | `fn(op: i32) -> Result<(), Errno>` | flock(2): `LOCK_SH`, `LOCK_EX`, `LOCK_UN`, `+ LOCK_NB` |
 | `f.sendfile(out, offset, count)` | `fn(out: @Fd, offset: i64, count: i64) -> Result<i64, Errno>` | sendfile(2): up to `count` bytes of `f` from `offset` to `out`, in the kernel; `Ok` = bytes sent, `Ok(0)` at EOF; `f`'s own offset doesn't move |
+| `f.set_nonblocking(on)` | `fn(on: bool) -> Result<(), Errno>` | Set or clear `O_NONBLOCK` (fcntl(2)), other flags kept; it belongs to the open file, so a dup changes too |
+| `f.is_nonblocking()` | `fn() -> Result<bool, Errno>` | Is `O_NONBLOCK` set? |
+| `f.try_read(buf)` | `fn(buf: Span<u8>) -> Result<TryRead, Errno>` | One read on a nonblocking Fd: `Ok(Data(n))`, `Ok(Eof)`, `Ok(WouldBlock)` (EAGAIN: poll for `POLLIN`), else `Err` (AGAST #4815) |
+| `f.try_write(data)` | `fn(data: Span<u8>) -> Result<TryWrite, Errno>` | One write on a nonblocking Fd: `Ok(Wrote(n))`, possibly short, `Ok(WouldBlock)` when full (poll for `POLLOUT`); `Err(Pipe)` once the reader is gone, with SIGPIPE blocked or ignored |
 | `f.raw()` | `fn() -> i32` | The number, for a kernel-ABI hand-off (poll, io_uring); ownership stays |
 | `f.valid()` | `fn() -> bool` | Open? |
 | `p.close()` (Pipe) | `fn() -> Result<(), Errno>` | Close both ends |
@@ -2603,6 +2607,10 @@ struct ProcessResult
 | `spawn_env` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>) -> Result<Process, Errno>` | `spawn`, but the child's environment is exactly `env` (`"KEY=VALUE"` views, nothing of ours merged in; an empty span is empty). `spawn` inherits ours |
 | `spawn_env_merged` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>, stdin_fd: i32) -> Result<Process, Errno>` | `spawn_env`, but the child reads stdin from `stdin_fd` (dup'd; the caller still closes it; negative is `Err(BadF)`) and its stderr goes down the stdout pipe (`2>&1`), so `read_stdout_all` gets both in order. The `Process` has no stdin or stderr pipe. For test harnesses: `ritzlib.testlib`'s `exec_capture` |
 
+A spawned child starts with an empty signal mask, whatever this process has
+blocked (for a signalfd, say): the mask would otherwise survive execve(2)
+(AGAST #4815).
+
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `p.valid()` | `fn() -> bool` | Whether the spawn gave a live pid |
@@ -2622,6 +2630,8 @@ itself, or replaces itself):
 |--------|-----------|-------------|
 | `p.write_all(data)` | `fn(data: StrView) -> Result<i64, Errno>` | Write all of `data` to stdin (retries short writes and EINTR); `Ok(data.len)`, `Err(BadF)` once stdin is closed, `Err(Pipe)` once the child closed it |
 | `p.close_stdin()` | `fn()` | Close stdin (EOF) |
+| `p.stdin()` / `p.stdout()` / `p.stderr()` | `fn() -> Fd` | The parent's pipe ends, borrowed for `poll`, `try_read`, `try_write` (AGAST #4815): never close them, the `Process` does. A closed or absent pipe is a closed Fd. Fetch again after `close_stdin` |
+| `p.set_nonblocking()` | `fn() -> Result<(), Errno>` | `O_NONBLOCK` on every open parent end; the child's ends stay blocking |
 | `p.read_stdout(buf)` | `fn(buf: Span<u8>) -> Result<i64, Errno>` | Read up to `buf.len` bytes of stdout into `buf`: `Ok(n)`, `Ok(0)` at EOF, `Err(BadF)` once the pipe is closed |
 | `p.read_stdout_all()` | `fn() -> Vec<u8>` | Read all stdout |
 | `p.read_line()` | `fn() -> Vec<u8>` | Read line |

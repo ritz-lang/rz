@@ -38,6 +38,13 @@
 #
 # Every Err is a ritzlib.errno `Errno`, never a -1 or a negative errno
 # (AGAST #4298).
+#
+# In an event loop (AGAST #4815): p.set_nonblocking(), then poll the
+# borrowed Fds p.stdin() / p.stdout() / p.stderr() and move bytes with
+# try_write / try_read (ritzlib.fd), which tell WouldBlock from EOF and
+# Err(Pipe).  Block SIGPIPE to get Err(Pipe) rather than a kill.  The child
+# starts with an empty signal mask, so blocking signals for a signalfd here
+# does not leak into it.
 
 import ritzlib.sys
 import ritzlib.memory
@@ -368,6 +375,13 @@ fn spawn_fork(path: *u8, argv: **u8, envp: **u8, stdin_fd: i32, merge: bool) -> 
         sys_close(stderr_pipe[0])
         sys_close(stderr_pipe[1])
 
+        # Unblock every signal before exec (AGAST #4815): the mask survives
+        # execve(2), and a parent that blocks signals for its signalfd must
+        # not hand that mask to a program that expects SIGINT or SIGTERM to
+        # stop it.  Nothing to report on failure: the child can only exec.
+        let none: SigSet = sigset_empty()
+        none.set_mask()
+
         sys_execve(path, argv, child_envp)
 
         # If we get here, exec failed
@@ -421,6 +435,36 @@ impl Process
                 break
             done += n
         Ok(done)
+
+    # The parent's ends of the child's pipes as borrowed Fds (AGAST #4815),
+    # for poll, set_nonblocking, try_read and try_write.  The Process still
+    # owns them: never close a borrowed Fd (use close_stdin / close_pipes /
+    # cleanup).  A pipe the Process closed, or never had (spawn_env_merged's
+    # stdin and stderr), is a closed Fd: raw() -1, every operation Err(BadF).
+    pub fn stdin(self: @Process) -> Fd
+        fd_borrow(self.stdin_fd)
+
+    pub fn stdout(self: @Process) -> Fd
+        fd_borrow(self.stdout_fd)
+
+    pub fn stderr(self: @Process) -> Fd
+        fd_borrow(self.stderr_fd)
+
+    # Put every open parent end (stdin, stdout, stderr) in O_NONBLOCK, for an
+    # event loop that polls them.  Only the parent's ends change: the child's
+    # are separate open files and stay blocking.  The first error wins.
+    pub fn set_nonblocking(self: @Process) -> Result<(), Errno>
+        var ends: [3]i32
+        ends[0] = self.stdin_fd
+        ends[1] = self.stdout_fd
+        ends[2] = self.stderr_fd
+        for i in 0..3
+            let end: Fd = fd_borrow(ends[i])
+            if end.valid()
+                match end.set_nonblocking(true)
+                    Err(e) => return Err(e)
+                    Ok(_) => pass
+        Ok(())
 
     # Close stdin (signals EOF to child)
     pub fn close_stdin(self: @&Process)

@@ -33,6 +33,23 @@
 #
 # A read or write interrupted by a signal (EINTR) is retried, so Err(Intr)
 # never escapes these methods.
+#
+# Nonblocking I/O (AGAST #4815): set_nonblocking(true), then poll and
+# try_read / try_write, whose Ok tells "nothing yet" (WouldBlock) apart from
+# data, EOF (TryRead.Eof) and errors (Err(Pipe), ...):
+#
+#     out.set_nonblocking(true)                 # Result<(), Errno>
+#     match out.try_read(buf)                   # Result<TryRead, Errno>
+#         Ok(t) => match t
+#             Data(n) => ...
+#             Eof => ...
+#             WouldBlock => ...                 # poll for POLLIN
+#         Err(e) => ...
+#     match inp.try_write(rest)                 # Result<TryWrite, Errno>
+#         Ok(t) => match t
+#             Wrote(n) => ...                   # possibly short: keep the rest
+#             WouldBlock => ...                 # pipe full: poll for POLLOUT
+#         Err(e) => ...                         # Pipe: the reader is gone
 
 import ritzlib.sys
 # What a caller of fd_open / stat / lock / poll needs, so `import ritzlib.fd` is enough.
@@ -54,6 +71,24 @@ const FD_ENAMETOOLONG: i32 = 36
 const FD_EBADF: i32 = 9
 const FD_EINTR: i32 = 4
 const FD_EIO: i32 = 5
+const FD_EAGAIN: i32 = 11
+const FD_F_GETFL: i32 = 3
+const FD_F_SETFL: i32 = 4
+
+# What a nonblocking read got (Fd.try_read): `Data(n)` bytes, `Eof` (the
+# writer is gone and the pipe is drained), or `WouldBlock` (nothing there
+# yet: poll for POLLIN and try again). Errors are the Result's Err.
+pub enum TryRead
+    Data(i64)
+    Eof
+    WouldBlock
+
+# What a nonblocking write did (Fd.try_write): `Wrote(n)` bytes, possibly
+# short, or `WouldBlock` (the pipe is full: poll for POLLOUT, then write the
+# rest). A reader that is gone is Err(Pipe), with SIGPIPE blocked or ignored.
+pub enum TryWrite
+    Wrote(i64)
+    WouldBlock
 
 # An owned file descriptor; `fd` is -1 once closed.
 pub struct Fd
@@ -301,6 +336,65 @@ impl Fd
         while n == -(FD_EINTR as i64)
             n = sys_sendfile(out.fd, self.fd, @at, count)
         fd_count(n)
+
+    # Turn O_NONBLOCK on (`on`) or off for this descriptor's open file
+    # (fcntl(2) F_GETFL then F_SETFL), leaving its other status flags alone.
+    # The flag belongs to the open file, so a dup of this Fd changes with it.
+    pub fn set_nonblocking(self: @Fd, on: bool) -> Result<(), Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        let flags: i32 = sys_fcntl(self.fd, FD_F_GETFL, 0)
+        if flags < 0
+            return Err(errno_from_raw(flags))
+        var next: i32 = flags & ~O_NONBLOCK
+        if on
+            next = flags | O_NONBLOCK
+        if next == flags
+            return Ok(())
+        fd_unit(sys_fcntl(self.fd, FD_F_SETFL, next as i64))
+
+    # Whether O_NONBLOCK is set on this descriptor's open file (F_GETFL).
+    pub fn is_nonblocking(self: @Fd) -> Result<bool, Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        let flags: i32 = sys_fcntl(self.fd, FD_F_GETFL, 0)
+        if flags < 0
+            return Err(errno_from_raw(flags))
+        Ok((flags & O_NONBLOCK) != 0)
+
+    # One read(2) of at most buf.len bytes on a nonblocking Fd (see
+    # set_nonblocking): Ok(Data(n)), Ok(Eof) at end of file, Ok(WouldBlock)
+    # when nothing is there yet (EAGAIN), else Err. On a blocking Fd it
+    # blocks like read, and WouldBlock never comes back.
+    pub fn try_read(self: @Fd, buf: Span<u8>) -> Result<TryRead, Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        var n: i64 = sys_read(self.fd, buf.ptr, buf.len)
+        while n == -(FD_EINTR as i64)
+            n = sys_read(self.fd, buf.ptr, buf.len)
+        if n == -(FD_EAGAIN as i64)
+            return Ok(TryRead.WouldBlock)
+        if n < 0
+            return Err(errno_from_raw(n as i32))
+        if n == 0 and buf.len > 0
+            return Ok(TryRead.Eof)
+        Ok(TryRead.Data(n))
+
+    # One write(2) of at most data.len bytes on a nonblocking Fd:
+    # Ok(Wrote(n)), possibly short (keep the rest and its offset, and write
+    # it after POLLOUT), Ok(WouldBlock) when the pipe is full (EAGAIN), else
+    # Err: Err(Pipe) once the reader is gone, if SIGPIPE is blocked or ignored.
+    pub fn try_write(self: @Fd, data: Span<u8>) -> Result<TryWrite, Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        var n: i64 = sys_write(self.fd, data.ptr, data.len)
+        while n == -(FD_EINTR as i64)
+            n = sys_write(self.fd, data.ptr, data.len)
+        if n == -(FD_EAGAIN as i64)
+            return Ok(TryWrite.WouldBlock)
+        if n < 0
+            return Err(errno_from_raw(n as i32))
+        Ok(TryWrite.Wrote(n))
 
     # Advisory whole-file lock (flock(2)): LOCK_SH, LOCK_EX, LOCK_UN, with
     # LOCK_NB added to fail with Again instead of blocking.

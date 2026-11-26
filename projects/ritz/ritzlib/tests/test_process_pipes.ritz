@@ -1,0 +1,459 @@
+# ritzlib.process + ritzlib.fd: a child's pipes in an event loop (AGAST #4815).
+#
+#   p.stdin() / p.stdout() / p.stderr() -> Fd     borrowed: the Process closes them
+#   p.set_nonblocking() -> Result<(), Errno>       O_NONBLOCK on every parent end
+#   fd.set_nonblocking(on) / fd.is_nonblocking()
+#   fd.try_read(buf) -> Result<TryRead, Errno>     Data(n) | Eof | WouldBlock
+#   fd.try_write(data) -> Result<TryWrite, Errno>  Wrote(n) | WouldBlock
+#   spawn's child starts with an empty signal mask, whatever its parent blocked.
+#
+# poll (ritzlib.fd) is the only wait.  A test that changes the signal mask
+# runs in a forked child and reports by exit code: 0 passed, anything else
+# names the step that failed.
+
+import ritzlib.sys
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+import ritzlib.fd
+import ritzlib.process
+
+# 1 MiB: far more than cat's stdin pipe, its buffer and its stdout pipe hold
+# together, so a writer that never stops to read must see WouldBlock.
+const PIPE_TOTAL: i64 = 1048576
+const PIPE_CHUNK: i64 = 4096
+# Generous: each poll returns as soon as either pipe moves.
+const PIPE_POLL_MS: i32 = 10000
+
+# Byte `i` of the stream pushed through cat: not periodic in the chunk size,
+# so a dropped or repeated chunk shows up as a mismatch.
+fn pattern(i: i64) -> u8
+    (i % 251) as u8
+
+fn no_args() -> Span<StrView>
+    span_empty<StrView>()
+
+# The exit code of an Ok wait, -1000 - errno for an Err.
+fn exit_of(r: Result<ProcessResult, Errno>) -> i32
+    match r
+        Ok(pr) => pr.exit_code
+        Err(e) => -1000 - e.code()
+
+# Run `body` in a forked child; its exit code (0 = passed).
+fn in_child(body: fn() -> i32) -> i32
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child =>
+                    sys_exit(body())
+                    0
+                Parent(pid) => exit_of(wait_pid(pid))
+        Err(e) => -1000 - e.code()
+
+# 1 for an Ok(()).
+fn unit_ok(r: Result<(), Errno>) -> i32
+    match r
+        Ok(_) => 1
+        Err(_) => 0
+
+# 1 for Ok(true), 0 for Ok(false), -1 for an Err.
+fn flag_of(r: Result<bool, Errno>) -> i32
+    match r
+        Ok(b) => b as i32
+        Err(_) => -1
+
+# A try_read as one number: n > 0 for Data(n), 0 for Eof, -1 for
+# WouldBlock, -2 for Data(0), -1000 - errno for an Err.
+fn read_code(r: Result<TryRead, Errno>) -> i64
+    match r
+        Ok(t) =>
+            match t
+                Data(n) =>
+                    # Data(0) for a non-empty buffer would be a hidden Eof.
+                    if n == 0
+                        return -2
+                    n
+                Eof => 0
+                WouldBlock => -1
+        Err(e) => -1000 - e.code() as i64
+
+# A try_write as one number: n >= 0 for Wrote(n), -1 for WouldBlock,
+# -1000 - errno for an Err.
+fn write_code(r: Result<TryWrite, Errno>) -> i64
+    match r
+        Ok(t) =>
+            match t
+                Wrote(n) => n
+                WouldBlock => -1
+        Err(e) => -1000 - e.code() as i64
+
+# Wait for `events` on borrowed `a` and `b` (a closed Fd is skipped): the poll count,
+# 0 on a timeout, -1 on an Err.
+fn poll2(a: Fd, a_events: i16, b: Fd, b_events: i16) -> i32
+    var fds: [2]PollFd
+    fds[0] = PollFd { fd: a.raw(), events: a_events, revents: 0 }
+    fds[1] = PollFd { fd: b.raw(), events: b_events, revents: 0 }
+    match poll(span_from_ptr<PollFd>(@fds[0], 2), PIPE_POLL_MS)
+        Ok(n) => n
+        Err(_) => -1
+
+# Read `fd` to EOF through poll + try_read, discarding the bytes: the byte
+# count, or -1 on an Err or a timeout.
+fn drain_to_eof(fd: Fd) -> i64
+    var buf: [4096]u8
+    var total: i64 = 0
+    loop
+        let n: i64 = read_code(fd.try_read(Span<u8> { ptr: @buf[0], len: PIPE_CHUNK }))
+        if n == 0
+            return total
+        if n < -1
+            return -1
+        if n > 0
+            total += n
+        else
+            let closed: Fd = fd_adopt(-1)
+            if poll2(fd, POLLIN, closed, 0) <= 0
+                return -1
+
+fn spawn_or_dead(cmd: StrView, args: Span<StrView>) -> Process
+    match spawn(cmd, args)
+        Ok(p) => p
+        Err(_) => Process { pid: -1, stdin_fd: -1, stdout_fd: -1, stderr_fd: -1, waited: 0 }
+
+# ============================================================================
+# Fd: set_nonblocking, try_read, try_write on a plain pipe
+# ============================================================================
+
+fn pipe_or_closed() -> Pipe
+    match pipe()
+        Ok(p) => p
+        Err(_) => Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+
+[[test]]
+fn test_set_nonblocking_toggles_o_nonblock() -> i32
+    var p: Pipe = pipe_or_closed()
+    assert p.read.valid()
+    assert flag_of(p.read.is_nonblocking()) == 0
+    assert unit_ok(p.read.set_nonblocking(true)) == 1
+    assert flag_of(p.read.is_nonblocking()) == 1
+    # Setting it again changes nothing.
+    assert unit_ok(p.read.set_nonblocking(true)) == 1
+    assert flag_of(p.read.is_nonblocking()) == 1
+    assert unit_ok(p.read.set_nonblocking(false)) == 1
+    assert flag_of(p.read.is_nonblocking()) == 0
+    # The write end is a separate open file: untouched.
+    assert flag_of(p.write.is_nonblocking()) == 0
+    p.close()
+    0
+
+[[test]]
+fn test_try_read_tells_would_block_data_and_eof_apart() -> i32
+    var p: Pipe = pipe_or_closed()
+    assert unit_ok(p.read.set_nonblocking(true)) == 1
+    var buf: [16]u8
+    let span: Span<u8> = Span<u8> { ptr: @buf[0], len: 16 }
+    # Empty, writer open: WouldBlock, not Eof.
+    assert read_code(p.read.try_read(span)) == -1
+    assert write_code(p.write.try_write(Span<u8> { ptr: "xyz".ptr, len: 3 })) == 3
+    assert read_code(p.read.try_read(span)) == 3
+    assert buf[0] == 'x' and buf[2] == 'z'
+    assert read_code(p.read.try_read(span)) == -1
+    # Writer gone, pipe drained: Eof.
+    p.write.close()
+    assert read_code(p.read.try_read(span)) == 0
+    p.close()
+    0
+
+[[test]]
+fn test_try_write_on_a_full_pipe_would_block() -> i32
+    var p: Pipe = pipe_or_closed()
+    assert unit_ok(p.write.set_nonblocking(true)) == 1
+    var chunk: [4096]u8
+    for i in 0..PIPE_CHUNK
+        chunk[i] = 'x'
+    var total: i64 = 0
+    var last: i64 = 0
+    # A default pipe holds 64 KiB; 1 MiB is a cap, not the expected count.
+    while total < PIPE_TOTAL and last >= 0
+        last = write_code(p.write.try_write(Span<u8> { ptr: @chunk[0], len: PIPE_CHUNK }))
+        if last > 0
+            total += last
+    assert last == -1
+    assert total > 0 and total < PIPE_TOTAL
+    # Full means no POLLOUT.
+    var fds: [1]PollFd
+    fds[0] = PollFd { fd: p.write.raw(), events: POLLOUT, revents: 0 }
+    var ready: i32 = -1
+    match poll(span_from_ptr<PollFd>(@fds[0], 1), 0)
+        Ok(n) => ready = n
+        Err(_) => ready = -1
+    assert ready == 0
+    p.close()
+    0
+
+[[test]]
+fn test_try_read_and_try_write_on_a_closed_fd_are_badf() -> i32
+    let f: Fd = fd_adopt(-1)
+    var buf: [4]u8
+    assert read_code(f.try_read(Span<u8> { ptr: @buf[0], len: 4 })) == -1009
+    assert write_code(f.try_write(Span<u8> { ptr: @buf[0], len: 4 })) == -1009
+    assert unit_ok(f.set_nonblocking(true)) == 0
+    0
+
+# ============================================================================
+# Process: borrowed pipe Fds
+# ============================================================================
+
+[[test]]
+fn test_process_pipe_accessors_borrow_the_parent_ends() -> i32
+    var p: Process = spawn_or_dead("cat", no_args())
+    assert p.valid()
+    assert p.stdin().raw() == p.stdin_fd
+    assert p.stdout().raw() == p.stdout_fd
+    assert p.stderr().raw() == p.stderr_fd
+    assert p.stdin().valid() and p.stdout().valid() and p.stderr().valid()
+    assert unit_ok(p.set_nonblocking()) == 1
+    assert flag_of(p.stdin().is_nonblocking()) == 1
+    assert flag_of(p.stdout().is_nonblocking()) == 1
+    assert flag_of(p.stderr().is_nonblocking()) == 1
+    # Once the Process closes a pipe, its accessor is a closed Fd.
+    p.close_stdin()
+    assert not p.stdin().valid()
+    var buf: [4]u8
+    assert write_code(p.stdin().try_write(Span<u8> { ptr: @buf[0], len: 4 })) == -1009
+    assert drain_to_eof(p.stdout()) == 0
+    assert exit_of(p.wait()) == 0
+    p.cleanup()
+    0
+
+# spawn_env_merged's Process (no stdin or stderr pipe) through the
+# accessors: 0, or the failed step.
+fn merged_accessors(null_in: i32) -> i32
+    var env: [1]StrView
+    env[0] = "PATH=/usr/bin:/bin"
+    match spawn_env_merged("true", no_args(), span_from_ptr<StrView>(@env[0], 1), null_in)
+        Ok(q) =>
+            var p: Process = q
+            if p.stdin().valid() or p.stderr().valid() or not p.stdout().valid()
+                return 1
+            # Only the pipes it has are touched.
+            if unit_ok(p.set_nonblocking()) != 1
+                return 2
+            if flag_of(p.stdout().is_nonblocking()) != 1
+                return 3
+            if drain_to_eof(p.stdout()) != 0
+                return 4
+            if exit_of(p.wait()) != 0
+                return 5
+            p.cleanup()
+            0
+        Err(_) => 6
+
+[[test]]
+fn test_spawn_env_merged_has_no_stdin_or_stderr_fd() -> i32
+    var code: i32 = 7
+    match fd_open("/dev/null", O_RDONLY, 0)
+        Ok(f) =>
+            var null_in: Fd = f
+            code = merged_accessors(null_in.raw())
+            null_in.close()
+        Err(_) => code = 8
+    assert code == 0
+    0
+
+# ============================================================================
+# cat through polled nonblocking pipes
+# ============================================================================
+
+# Push PIPE_TOTAL pattern bytes into cat and read them back, writing until
+# WouldBlock before reading and polling only when neither side can move:
+# the loop an editor runs against a language server.  0, or the failed step.
+[[test]]
+fn test_cat_round_trip_through_polled_nonblocking_pipes() -> i32
+    var p: Process = spawn_or_dead("cat", no_args())
+    assert p.valid()
+    assert unit_ok(p.set_nonblocking()) == 1
+    # A blocking stdin would deadlock the loop below instead of failing it.
+    assert flag_of(p.stdin().is_nonblocking()) == 1
+    assert flag_of(p.stdout().is_nonblocking()) == 1
+
+    var wbuf: [4096]u8
+    var rbuf: [4096]u8
+    var sent: i64 = 0
+    var got: i64 = 0
+    var blocked: i64 = 0
+    var eof: bool = false
+    var mismatch: bool = false
+    var stuck: bool = false
+
+    while not eof and not mismatch and not stuck
+        var moved: bool = false
+        # Write until the pipe is full or everything is sent.
+        var full: bool = false
+        while sent < PIPE_TOTAL and not full
+            var n: i64 = PIPE_TOTAL - sent
+            if n > PIPE_CHUNK
+                n = PIPE_CHUNK
+            for i in 0..n
+                wbuf[i] = pattern(sent + i)
+            let w: i64 = write_code(p.stdin().try_write(Span<u8> { ptr: @wbuf[0], len: n }))
+            assert w >= -1
+            if w == -1
+                blocked += 1
+                full = true
+            else
+                sent += w
+                moved = true
+            if sent == PIPE_TOTAL
+                # EOF for cat; p.stdin() is a closed Fd from here on.
+                p.close_stdin()
+
+        let r: i64 = read_code(p.stdout().try_read(Span<u8> { ptr: @rbuf[0], len: PIPE_CHUNK }))
+        assert r >= -1
+        if r == 0
+            eof = true
+        if r > 0
+            for i in 0..r
+                if rbuf[i] != pattern(got + i)
+                    mismatch = true
+            got += r
+            moved = true
+
+        if not moved and not eof
+            var out_events: i16 = 0
+            if p.stdin().valid()
+                out_events = POLLOUT
+            if poll2(p.stdin(), out_events, p.stdout(), POLLIN) <= 0
+                stuck = true
+
+    assert not stuck
+    assert not mismatch
+    assert blocked > 0
+    assert sent == PIPE_TOTAL
+    assert got == PIPE_TOTAL
+    assert exit_of(p.wait()) == 0
+    p.cleanup()
+    0
+
+# Before cat writes anything its stdout is WouldBlock, not Eof; closing its
+# stdin makes it exit, and then stdout and stderr read Eof.
+[[test]]
+fn test_child_exit_reads_eof_on_stdout_and_stderr() -> i32
+    var p: Process = spawn_or_dead("cat", no_args())
+    assert p.valid()
+    assert unit_ok(p.set_nonblocking()) == 1
+    var buf: [64]u8
+    let span: Span<u8> = Span<u8> { ptr: @buf[0], len: 64 }
+    assert read_code(p.stdout().try_read(span)) == -1
+    assert read_code(p.stderr().try_read(span)) == -1
+    p.close_stdin()
+    assert drain_to_eof(p.stdout()) == 0
+    assert drain_to_eof(p.stderr()) == 0
+    assert read_code(p.stdout().try_read(span)) == 0
+    assert exit_of(p.wait()) == 0
+    p.cleanup()
+    0
+
+# ============================================================================
+# EPIPE, with SIGPIPE blocked (per process: in a forked child)
+# ============================================================================
+
+# `true` exits without reading: once its stdout is at EOF it is gone, and
+# so is the only reader of its stdin pipe.
+fn epipe_on_a_closed_stdin() -> i32
+    let pipe_only: SigSet = sigset_of(SIGPIPE)
+    match pipe_only.block()
+        Ok(_) => pass
+        Err(_) => return 1
+    var p: Process = spawn_or_dead("true", no_args())
+    if not p.valid()
+        return 2
+    if unit_ok(p.set_nonblocking()) != 1
+        return 3
+    if drain_to_eof(p.stdout()) != 0
+        return 4
+    match p.try_wait()
+        Some(_) => pass
+        None =>
+            if exit_of(wait_pid(p.pid)) != 0
+                return 5
+            p.waited = 1
+    let w: i64 = write_code(p.stdin().try_write(Span<u8> { ptr: "x".ptr, len: 1 }))
+    # Err(Pipe) is EPIPE 32: neither WouldBlock nor a count.
+    if w != -1032
+        return 6
+    p.cleanup()
+    0
+
+[[test]]
+fn test_write_to_an_exited_child_is_epipe_with_sigpipe_blocked() -> i32
+    # Without the block the forked child dies of SIGPIPE: exit code 141.
+    assert in_child(epipe_on_a_closed_stdin) == 0
+    0
+
+# ============================================================================
+# The child's signal mask
+# ============================================================================
+
+# Whether the "SigBlk:" line of /proc/<pid>/status text `s` is all zeros:
+# 1 if so, 0 if a signal is blocked, -1 if there is no such line.
+fn sigblk_empty(s: StrView) -> i32
+    let at: i64 = s.find("SigBlk:")
+    if at < 0 or at >= s.len
+        return -1
+    var i: i64 = at + 7
+    while i < s.len and (*(s.ptr + i) == ' ' or *(s.ptr + i) == '\t')
+        i += 1
+    var digits: i64 = 0
+    while i < s.len and *(s.ptr + i) != '\n'
+        if *(s.ptr + i) != '0'
+            return 0
+        digits += 1
+        i += 1
+    if digits == 0
+        return -1
+    1
+
+# Block three signals, check this process's own SigBlk shows them, then
+# spawn `cat /proc/self/status`: cat's SigBlk must be empty.
+fn child_mask_is_empty_after_blocked_parent() -> i32
+    var set: SigSet = sigset_of(SIGTERM)
+    set.add(SIGINT)
+    set.add(SIGPIPE)
+    match set.block()
+        Ok(_) => pass
+        Err(_) => return 1
+
+    # The control: the parent's own mask is not empty, so a child that
+    # simply inherited it would fail below.
+    var own: String = string_new()
+    match fd_open("/proc/self/status", O_RDONLY, 0)
+        Ok(f) =>
+            var st: Fd = f
+            st.read_to_end(@&own)
+            st.close()
+        Err(_) => return 2
+    if sigblk_empty(own.as_view()) != 0
+        return 3
+
+    var args: [1]StrView
+    args[0] = "/proc/self/status"
+    var p: Process = spawn_or_dead("cat", span_from_ptr<StrView>(@args[0], 1))
+    if not p.valid()
+        return 4
+    let out: Vec<u8> = p.read_stdout_all()
+    if exit_of(p.wait()) != 0
+        return 5
+    p.cleanup()
+    let r: i32 = sigblk_empty(strview_from_ptr(out.data, out.len))
+    if r != 1
+        return 10 + r
+    0
+
+[[test]]
+fn test_spawned_child_starts_with_an_empty_signal_mask() -> i32
+    assert in_child(child_mask_is_empty_after_blocked_parent) == 0
+    0
