@@ -51,6 +51,7 @@
 import ritzlib.io
 import ritzlib.strview
 import ritzlib.gvec
+import ritzlib.span
 import src.token
 import src.lexer
 import src.ast
@@ -211,8 +212,7 @@ struct FuncRec
 
 struct Interp
     parser: Parser
-    src: *u8
-    src_len: i64
+    src: StrView
     arena: Vec<u8>
     scopes: Vec<Scope>
     bindings: Vec<Binding>
@@ -606,12 +606,9 @@ fn f64_cbrt(x: f64) -> f64
 # =============================================================================
 
 fn interp_new(source: StrView, echo: i32) -> Interp
-    let src_ptr = source.as_ptr()
-    let src_len = source.len()
     Interp {
         parser: parse(source),
-        src: src_ptr,
-        src_len: src_len,
+        src: source,
         arena: vec_new<u8>(),
         scopes: vec_new<Scope>(),
         bindings: vec_new<Binding>(),
@@ -643,14 +640,11 @@ fn child_at(it: @&Interp, start: i64, i: i64) -> i64
 # Source text of a node (for error messages)
 fn node_text(it: @&Interp, idx: i64) -> StrView
     let node = node_at(it, idx)
-    var end_pos: i64 = node.end_pos
-    if end_pos > it.src_len
-        end_pos = it.src_len
-    strview_from_ptr(it.src + node.start, end_pos - node.start)
+    it.src.slice(node.start, node.end_pos)
 
 fn ident_text(it: @&Interp, idx: i64) -> StrView
     let node = node_at(it, idx)
-    strview_from_ptr(it.src + node.str_start, node.str_len)
+    it.src.slice(node.str_start, node.str_start + node.str_len)
 
 # =============================================================================
 # Strings
@@ -661,8 +655,13 @@ fn str_from_sv(it: @&Interp, s: StrView) -> Value
     buf_push_sv(@&it.arena, s)
     v_str(start, s.len())
 
+# arena[start..start + len] as text
+fn arena_view(it: @&Interp, start: i64, len: i64) -> StrView
+    let s: [u8] = it.arena[start..start + len]
+    s.as_strview()
+
 fn str_view(it: @&Interp, v: Value) -> StrView
-    strview_from_ptr(it.arena.as_ptr() + v.a, v.b)
+    arena_view(it, v.a, v.b)
 
 fn str_eq(it: @&Interp, x: Value, y: Value) -> i32
     if x.b != y.b
@@ -722,12 +721,12 @@ fn string_literal(it: @&Interp, idx: i64) -> Value
     let start = it.arena.len()
     var i: i64 = 0
     while i < n
-        let c: u8 = *(it.src + s + i)
+        let c: u8 = it.src.get(s + i)
         if c != 92 or i + 1 >= n
             it.arena.push(c)
             i = i + 1
             continue
-        let e: u8 = *(it.src + s + i + 1)
+        let e: u8 = it.src.get(s + i + 1)
         i = i + 2
         if e == 110
             it.arena.push(10)      # \n
@@ -747,8 +746,8 @@ fn string_literal(it: @&Interp, idx: i64) -> Value
             i = i  # line continuation: nothing
         else if e == 120 and i + 1 < n
             # \xHH
-            let h1 = hex_val(*(it.src + s + i))
-            let h2 = hex_val(*(it.src + s + i + 1))
+            let h1 = hex_val(it.src.get(s + i))
+            let h2 = hex_val(it.src.get(s + i + 1))
             if h1 >= 0 and h2 >= 0
                 push_utf8(@&it.arena, h1 * 16 + h2)
                 i = i + 2
@@ -760,7 +759,7 @@ fn string_literal(it: @&Interp, idx: i64) -> Value
             var j: i64 = 0
             var ok: i32 = 1
             while j < 4
-                let h = hex_val(*(it.src + s + i + j))
+                let h = hex_val(it.src.get(s + i + j))
                 if h < 0
                     ok = 0
                 cp = cp * 16 + h
@@ -783,7 +782,7 @@ fn string_literal(it: @&Interp, idx: i64) -> Value
 
 fn name_byte(it: @&Interp, in_src: i32, i: i64) -> u8
     if in_src == 1
-        return *(it.src + i)
+        return it.src.get(i)
     it.arena.get(i)
 
 fn names_eq(it: @&Interp, s1: i32, a1: i64, l1: i64, s2: i32, a2: i64, l2: i64) -> i32
@@ -798,8 +797,8 @@ fn names_eq(it: @&Interp, s1: i32, a1: i64, l1: i64, s2: i32, a2: i64, l2: i64) 
 
 fn name_view(it: @&Interp, in_src: i32, start: i64, len: i64) -> StrView
     if in_src == 1
-        return strview_from_ptr(it.src + start, len)
-    strview_from_ptr(it.arena.as_ptr() + start, len)
+        return it.src.slice(start, start + len)
+    arena_view(it, start, len)
 
 # =============================================================================
 # Scopes
@@ -1224,7 +1223,7 @@ fn string_to_number(it: @&Interp, v: Value) -> f64
         if c0 == 45
             neg = 1
         s = s + 1
-    let body = strview_from_ptr(it.arena.as_ptr() + v.a + s, e - s)
+    let body = arena_view(it, v.a + s, e - s)
     var r: f64 = 0.0
     if body.eq("Infinity")
         r = f64_inf()
@@ -1447,7 +1446,7 @@ fn own_keys(it: @&Interp, target: Value) -> Value
             let pr = it.props.get(p)
             var k: Value = v_undef()
             if pr.in_src == 1
-                k = str_from_sv(it, strview_from_ptr(it.src + pr.key, pr.key_len))
+                k = str_from_sv(it, it.src.slice(pr.key, pr.key + pr.key_len))
             else
                 k = v_str(pr.key, pr.key_len)
             arr_append(it, arr.a, k)
@@ -1806,7 +1805,7 @@ fn get_property(it: @&Interp, obj: Value, key: Key) -> Value
         buf_push_sv(@&it.arena, " (reading '")
         buf_push_sv(@&it.arena, name_view(it, key.in_src, key.start, key.len))
         buf_push_sv(@&it.arena, "')")
-        let detail = strview_from_ptr(it.arena.as_ptr() + start, it.arena.len() - start)
+        let detail = arena_view(it, start, it.arena.len() - start)
         throw_error(it, "TypeError", "Cannot read properties of ", detail)
         return v_undef()
     if obj.tag == V_OBJECT
@@ -2063,7 +2062,8 @@ fn console_print(it: @&Interp, native: i64, args: @Vec<Value>)
         push_inspect(it, @&it.line, args.get(i), 0)
         i = i + 1
     it.line.push(10)
-    let text = strview_from_ptr(it.line.as_ptr(), it.line.len())
+    let line: [u8] = it.line[0..it.line.len()]
+    let text = line.as_strview()
     if native == NATIVE_CONSOLE_ERROR
         eprints(text)
         return
@@ -2811,8 +2811,10 @@ pub fn interp_failed(it: @Interp) -> i32
 
 # Why the run failed, e.g. "Uncaught ReferenceError: x is not defined"
 pub fn interp_error(it: @Interp) -> StrView
-    strview_from_ptr(it.err.as_ptr(), it.err.len())
+    let s: [u8] = it.err[0..it.err.len()]
+    s.as_strview()
 
 # What console.log printed (js_run only; js_run_echo writes it to stdout)
 pub fn interp_output(it: @Interp) -> StrView
-    strview_from_ptr(it.out.as_ptr(), it.out.len())
+    let s: [u8] = it.out[0..it.out.len()]
+    s.as_strview()
