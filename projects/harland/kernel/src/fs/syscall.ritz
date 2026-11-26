@@ -250,8 +250,9 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     (*f).path = 0 as *u8
     (*f).path_len = 0
 
-    # Handle O_TRUNC - truncate file to zero
-    if (flags & O_TRUNC) != 0 and (flags & O_WRONLY) != 0
+    # O_TRUNC on a writable fd: the fd reads the file as empty from here, and
+    # close commits its write buffer even if it is empty (fs_close_commits).
+    if fs_truncates(flags)
         (*f).size = 0
         (*f).position = 0
 
@@ -317,7 +318,7 @@ fn fs_close_file(p: *FsProc, fd: i32) -> i32
     let f: *FsFile = @(*p).files[owner_fd]
     # Whether closing this fd committed bytes to the persistent subtree, and
     # so owes the storage device a (debounced) save.
-    let wrote: bool = (*f).wbuf != 0 as *u8 and (*f).wbuf_size > 0
+    let wrote: bool = fs_close_commits(f)
     let persist: bool = (*f).path != 0 as *u8 and kfs_is_persist(StrView { ptr: (*f).path, len: (*f).path_len as i64 })
     let flush_result: i32 = fs_flush_write_buffer(f)
     if (*f).path != 0 as *u8
@@ -399,7 +400,8 @@ pub fn sys_fs_read(fd: i32, buf: *u8, count: u64) -> i64
 # ============================================================================
 #
 # For content-addressable storage, writes create new blobs: the data is
-# buffered per fd and written back to the namespace on close.
+# buffered per fd and written back to the namespace on close (see "What close
+# commits" below for when).
 
 # Simple realloc implementation
 fn krealloc(old_ptr: *u8, new_size: u64, old_size: u64) -> *u8
@@ -462,31 +464,58 @@ pub fn sys_fs_write(fd: i32, buf: *u8, count: u64) -> i64
 
     count as i64
 
-# Flush f's write buffer to the namespace and free it: 0, or an Errno that
-# sys_close returns.
+# ============================================================================
+# What close commits (AGAST #4830)
+# ============================================================================
+#
+# A write fd's bytes go to a per-fd buffer, whatever the file position, and
+# the last close of the fd (sys_close, or fs_process_end at exit) replaces
+# the whole file with that buffer. Close commits the buffer when
+#
+#   - any byte was written to the fd, or
+#   - the fd was opened writable (O_WRONLY or O_RDWR) with O_TRUNC: then an
+#     empty buffer commits an empty file.
+#
+# Otherwise close leaves the file as it was: an fd opened for writing
+# without O_TRUNC that writes nothing (or only zero-byte writes) does not
+# truncate it. So write_file's O_WRONLY | O_CREAT | O_TRUNC open and
+# zero-byte write empties the file, and a process killed before its first
+# write to an fd opened without O_TRUNC leaves the old file.
+
+# Whether open flags truncate: O_TRUNC on a writable open.
+fn fs_truncates(flags: i32) -> bool
+    (flags & O_TRUNC) != 0 and ((flags & O_WRONLY) != 0 or (flags & O_RDWR) != 0)
+
+# Whether closing f's last fd replaces the file (the rule above).
+fn fs_close_commits(f: *FsFile) -> bool
+    ((*f).wbuf != 0 as *u8 and (*f).wbuf_size > 0) or fs_truncates((*f).flags)
+
+# Commit f's write buffer to the namespace if fs_close_commits says so, and
+# free it: 0, or an Errno that sys_close returns.
 fn fs_flush_write_buffer(f: *FsFile) -> i32
+    let commits: bool = fs_close_commits(f)
     let wbuf: *u8 = (*f).wbuf
-    if wbuf == 0 as *u8
-        return 0  # Nothing to flush
     let wsize: u64 = (*f).wbuf_size
     (*f).wbuf = 0 as *u8
     (*f).wbuf_size = 0
     (*f).wbuf_cap = 0
 
-    if wsize == 0
+    var result: i32 = 0
+    if commits and (*f).path_len == 0
+        result = Errno.Io as i32  # no path to write back to
+    else if commits
+        # Write back through the path routing: the runtime tree always, and
+        # the persistent subtree too when the path is at or below /var (which
+        # is the namespace the blob was held in). An fd that wrote nothing
+        # has no buffer; its commit is the empty file.
+        let path: StrView = StrView { ptr: (*f).path, len: (*f).path_len as i64 }
+        var empty: u8 = 0
+        var bytes: *u8 = @empty
+        if wsize > 0
+            bytes = wbuf
+        result = kfs_persist_write(path, bytes, wsize)
+    if wbuf != 0 as *u8
         kfree(wbuf)
-        return 0
-
-    if (*f).path_len == 0
-        kfree(wbuf)
-        return Errno.Io as i32  # no path to write back to
-
-    # Write back through the path routing: the runtime tree always, and the
-    # persistent subtree too when the path is at or below /var (which is the
-    # namespace the blob was held in).
-    let path: StrView = StrView { ptr: (*f).path, len: (*f).path_len as i64 }
-    let result: i32 = kfs_persist_write(path, wbuf, wsize)
-    kfree(wbuf)
     result
 
 # ============================================================================

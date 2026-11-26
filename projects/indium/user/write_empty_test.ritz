@@ -1,0 +1,107 @@
+# write_empty_test: ritzlib.fs write_file / read_file on Harland, and the
+# kernel's commit-on-close rule for a write fd (AGAST #4830).
+#
+# A Harland write fd buffers its writes and the buffer replaces the file on
+# close (kernel/src/fs/syscall.ritz). Before #4830 an empty buffer committed
+# nothing, so writing an empty file left the old bytes. The rule now:
+#
+#   close commits the buffer if any byte was written, or if the fd was opened
+#   with O_TRUNC (an empty buffer then commits an empty file). An fd opened
+#   for writing without O_TRUNC that writes nothing leaves the file as it was.
+#
+# Each step runs on a RAM path (/tmp) and, when the boot has a storage disk,
+# on /var, which goes through the persistent subtree as well. Each exit code
+# names the step that failed: 10 + step for /tmp, 20 + step for /var.
+# tools/test_tier1_boot.sh requires the final PASS line to name /var, so the
+# /var leg cannot skip unnoticed on a boot that has the disk.
+
+import ritzlib.fs { write_file, read_file }
+import ritzlib.strview { StrView }
+# Raw sys_close: steps 3 and 4 test the kernel's open-flag rules, which no
+# ritzlib fs API exposes (write_file always opens with O_TRUNC).
+import ritzlib.sys { sys_close, O_WRONLY, O_RDWR, O_TRUNC }
+import tool_io { open_path, make_directory }
+
+const DIR_EXISTS: i64 = -17
+
+fn fail(step: i32, what: StrView) -> i32
+    print("[write_empty_test] FAIL step {step}: {what}\n")
+    step
+
+# Does `path` read back exactly `want`?
+fn reads_back(path: StrView, want: StrView) -> bool
+    match read_file(path)
+        Ok(s) => s.eq(want)
+        Err(_) => false
+
+# Open `path` with `flags` and close it again with no write: whether both
+# succeeded.
+fn open_close(path: StrView, flags: i32) -> bool
+    let fd: i32 = open_path(path, flags)
+    fd >= 0 and sys_close(fd) == 0
+
+# The steps on one path; 0, or the failing step (1..7).
+fn run_steps(path: StrView) -> i32
+    # 1. A file with bytes in it, through the portable create-and-write.
+    match write_file(path, "hello")
+        Ok(n) =>
+            if n != 5
+                return fail(1, "write_file of 5 bytes reported another count")
+        Err(_) => return fail(1, "write_file hello failed")
+    if not reads_back(path, "hello")
+        return fail(2, "hello did not read back")
+
+    # 2. Write it empty: the empty buffer must commit an empty file.
+    match write_file(path, "")
+        Ok(n) =>
+            if n != 0
+                return fail(3, "write_file of 0 bytes reported another count")
+        Err(_) => return fail(3, "write_file of 0 bytes failed")
+    if not reads_back(path, "")
+        return fail(4, "the empty write left the old bytes")
+
+    # 3. Open for writing without O_TRUNC and write nothing: the file stays.
+    match write_file(path, "keep")
+        Ok(_) => pass
+        Err(_) => return fail(5, "write_file keep failed")
+    if not open_close(path, O_WRONLY)
+        return fail(5, "O_WRONLY open/close failed")
+    if not reads_back(path, "keep")
+        return fail(6, "an O_WRONLY open with no write changed the file")
+
+    # 4. O_RDWR | O_TRUNC with no write truncates, as O_WRONLY | O_TRUNC does.
+    if not open_close(path, O_RDWR | O_TRUNC)
+        return fail(7, "O_RDWR | O_TRUNC open/close failed")
+    if not reads_back(path, "")
+        return fail(7, "O_RDWR | O_TRUNC with no write left the old bytes")
+    0
+
+# Whether this boot has a storage disk: the kernel counts boots in /var/boots.
+fn has_var() -> bool
+    match read_file("/var/boots")
+        Ok(_) => true
+        Err(_) => false
+
+pub fn main() -> i32
+    # /tmp is made here because nothing else does; a reboot may have kept it.
+    let mk: i64 = make_directory("/tmp")
+    if mk != 0 and mk != DIR_EXISTS
+        return fail(1, "mkdir /tmp failed")
+
+    let ram: i32 = run_steps("/tmp/write_empty")
+    if ram != 0
+        return 10 + ram
+
+    if not has_var()
+        print("[write_empty_test] PASS: /tmp (no storage disk, /var skipped)\n")
+        return 0
+
+    # Close updates the runtime tree and the persistent subtree, so a read
+    # back after close covers both; the save to disk is debounced, and the
+    # grub boots' image check sees /write_empty in what was saved.
+    let var_step: i32 = run_steps("/var/write_empty")
+    if var_step != 0
+        return 20 + var_step
+
+    print("[write_empty_test] PASS: /tmp and /var\n")
+    0

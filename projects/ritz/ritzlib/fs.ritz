@@ -18,6 +18,12 @@
 # without a variant), never a -1 / null sentinel or a bare number (AGAST
 # #4248). A path of FS_PATH_MAX bytes or more fails with NameTooLong.
 #
+# Targets (AGAST #4830): read_file, write_file, copy_file, the path
+# utilities and the mode_is_* helpers compile for Linux and Harland. The rest
+# (stat, the predicates, mkdir/unlink/rmdir, access .. set_times, dir_open,
+# remove_dir_all) is [[target_os = "linux"]]: it rests on syscalls Harland
+# does not have.
+#
 # Note: Stat struct and STAT_SIZE are defined in ritzlib/sys.ritz
 
 import ritzlib.cstr
@@ -61,6 +67,7 @@ fn fs_path_cstr(path: StrView, buf: *u8) -> i32
     0
 
 # Shared body of stat/lstat. `follow` selects stat(2) (1) or lstat(2) (0).
+[[target_os = "linux"]]
 fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -77,10 +84,12 @@ fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, Errno>
     Ok(st)
 
 # Status of the file at `path`, following symlinks.
+[[target_os = "linux"]]
 pub fn stat(path: StrView) -> Result<Stat, Errno>
     fs_stat_impl(path, 1)
 
 # Status of the file at `path`; a symlink is reported as itself.
+[[target_os = "linux"]]
 pub fn lstat(path: StrView) -> Result<Stat, Errno>
     fs_stat_impl(path, 0)
 
@@ -123,6 +132,7 @@ pub fn mode_is_socket(mode: i32) -> bool
 # is_dir(link-to-dir) is false and a recursive walk does not follow links.
 
 # st_mode of `path` (lstat), or None if it cannot be statted.
+[[target_os = "linux"]]
 fn fs_lstat_mode(path: StrView) -> Option<i32>
     var r: Result<Stat, Errno> = fs_stat_impl(path, 0)
     match r
@@ -130,26 +140,31 @@ fn fs_lstat_mode(path: StrView) -> Option<i32>
         Err(_) => None
 
 # True if anything (file, directory, dangling symlink, ...) exists at `path`.
+[[target_os = "linux"]]
 pub fn path_exists(path: StrView) -> bool
     let m: Option<i32> = fs_lstat_mode(path)
     option_is_some<i32>(@m)
 
+[[target_os = "linux"]]
 pub fn is_dir(path: StrView) -> bool
     match fs_lstat_mode(path)
         Some(mode) => mode_is_dir(mode)
         None => false
 
+[[target_os = "linux"]]
 pub fn is_file(path: StrView) -> bool
     match fs_lstat_mode(path)
         Some(mode) => mode_is_file(mode)
         None => false
 
+[[target_os = "linux"]]
 pub fn is_symlink(path: StrView) -> bool
     match fs_lstat_mode(path)
         Some(mode) => mode_is_link(mode)
         None => false
 
 # Size in bytes of `path` (lstat: a symlink's own size).
+[[target_os = "linux"]]
 pub fn file_size(path: StrView) -> Result<i64, Errno>
     var r: Result<Stat, Errno> = fs_stat_impl(path, 0)
     match r
@@ -254,13 +269,26 @@ pub fn path_stem(path: StrView) -> StrView
 
 const FS_EIO: i32 = 5
 
+# Create-or-replace: what write_file and copy_file open their target with.
+const FS_CREATE_FLAGS: i32 = O_WRONLY | O_CREAT | O_TRUNC
+
 # open(2) a StrView path. Returns the fd, or -errno.
+[[target_os = "linux"]]
 fn fs_open(path: StrView, flags: i32, mode: i32) -> i32
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
     if perr != 0
         return -perr
     sys_open3(@cpath[0], flags, mode)
+
+# Harland's open takes the path's bytes and length, (path, path_len, flags),
+# so the view goes to the kernel as it is: no copy, no NUL. Harland files
+# have no permission bits, so `mode` is unused. Returns the fd, or -errno.
+[[target_os = "harland"]]
+fn fs_open(path: StrView, flags: i32, mode: i32) -> i32
+    if path.len >= FS_PATH_MAX
+        return -FS_ENAMETOOLONG
+    syscall3(SYS_OPEN, path.ptr as i64, path.len, flags as i64) as i32
 
 # Write all `len` bytes at `data` to `fd`. Returns 0, or a positive errno.
 fn fs_write_all(fd: i32, data: *u8, len: i64) -> i32
@@ -292,18 +320,30 @@ pub fn read_file(path: StrView) -> Result<String, Errno>
     sys_close(fd)
     Ok(out)
 
-# Create or truncate `path` (mode 0644) and write `content` to it.
-# Ok carries the number of bytes written.
+# The first error of a write (a positive errno, 0 for none) and the close
+# that follows it (0 or -errno), as Ok(len) or the Err that came first.
+fn fs_write_result(werr: i32, cerr: i32, len: i64) -> Result<i64, Errno>
+    if werr != 0
+        return Err(errno_from_raw(werr))
+    if cerr < 0
+        return Err(errno_from_raw(cerr))
+    Ok(len)
+
+# Create or replace `path` (mode 0644 on Linux) and write `content` to it:
+# afterwards the file holds exactly `content`, which may be empty. Ok carries
+# the number of bytes written.
+#
+# Portable (AGAST #4830): the same open, write and close on Linux and on
+# Harland. On Harland a write fd buffers its writes and close is what puts
+# them in the file (harland kernel/src/fs/syscall.ritz), so the close result
+# is checked: Ok means the file holds `content`. A save that has to survive a
+# reboot under Harland's /var also calls sys_sync.
 pub fn write_file(path: StrView, content: StrView) -> Result<i64, Errno>
-    # O_WRONLY | O_CREAT | O_TRUNC = 1 + 64 + 512 = 577; 0644 = 420
-    let fd: i32 = fs_open(path, 577, 420)
+    let fd: i32 = fs_open(path, FS_CREATE_FLAGS, 420)  # 0644
     if fd < 0
         return Err(errno_from_raw(fd))
     let werr: i32 = fs_write_all(fd, content.ptr, content.len)
-    sys_close(fd)
-    if werr != 0
-        return Err(errno_from_raw(werr))
-    Ok(content.len)
+    fs_write_result(werr, sys_close(fd), content.len)
 
 # Copy `src` to `dest` (created or truncated with `mode`).
 # Ok carries the number of bytes copied. `dest` is not created if `src`
@@ -312,7 +352,7 @@ pub fn copy_file(src: StrView, dest: StrView, mode: i32) -> Result<i64, Errno>
     let src_fd: i32 = fs_open(src, O_RDONLY, 0)
     if src_fd < 0
         return Err(errno_from_raw(src_fd))
-    let dest_fd: i32 = fs_open(dest, 577, mode)
+    let dest_fd: i32 = fs_open(dest, FS_CREATE_FLAGS, mode)
     if dest_fd < 0
         sys_close(src_fd)
         return Err(errno_from_raw(dest_fd))
@@ -333,10 +373,7 @@ pub fn copy_file(src: StrView, dest: StrView, mode: i32) -> Result<i64, Errno>
         total += nread
 
     sys_close(src_fd)
-    sys_close(dest_fd)
-    if err != 0
-        return Err(errno_from_raw(err))
-    Ok(total)
+    fs_write_result(err, sys_close(dest_fd), total)
 
 # Map a raw syscall return (0 or -errno) to Result<i32, Errno>.
 fn fs_unit(ret: i32) -> Result<i32, Errno>
@@ -345,6 +382,7 @@ fn fs_unit(ret: i32) -> Result<i32, Errno>
     Ok(0)
 
 # Create directory `path` with `mode` (e.g. 493 = 0755). EEXIST if present.
+[[target_os = "linux"]]
 pub fn mkdir(path: StrView, mode: i32) -> Result<i32, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -353,6 +391,7 @@ pub fn mkdir(path: StrView, mode: i32) -> Result<i32, Errno>
     fs_unit(sys_mkdir(@cpath[0], mode))
 
 # Remove the (non-directory) entry at `path`.
+[[target_os = "linux"]]
 pub fn unlink(path: StrView) -> Result<i32, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -361,6 +400,7 @@ pub fn unlink(path: StrView) -> Result<i32, Errno>
     fs_unit(sys_unlink(@cpath[0]))
 
 # Remove the empty directory at `path`.
+[[target_os = "linux"]]
 pub fn rmdir(path: StrView) -> Result<i32, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -387,6 +427,7 @@ fn fs_done(ret: i32) -> Result<(), Errno>
 
 # Whether `path` permits `mode`: F_OK (exists), or R_OK + W_OK + X_OK
 # summed, checked against the real uid as access(2) does.
+[[target_os = "linux"]]
 pub fn access(path: StrView, mode: i32) -> Result<(), Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -395,6 +436,7 @@ pub fn access(path: StrView, mode: i32) -> Result<(), Errno>
     fs_done(sys_access(@cpath[0], mode))
 
 # Change this process's working directory.
+[[target_os = "linux"]]
 pub fn chdir(path: StrView) -> Result<(), Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -404,6 +446,7 @@ pub fn chdir(path: StrView) -> Result<(), Errno>
 
 # Move `from` to `to` (rename(2)), replacing a file at `to`. Err(Other(18))
 # (EXDEV) across filesystems: copy_file then unlink instead.
+[[target_os = "linux"]]
 pub fn rename(from: StrView, to: StrView) -> Result<(), Errno>
     var cfrom: [4096]u8
     var cto: [4096]u8
@@ -416,6 +459,7 @@ pub fn rename(from: StrView, to: StrView) -> Result<(), Errno>
     fs_done(sys_rename(@cfrom[0], @cto[0]))
 
 # Set the permission bits of `path` (chmod(2)), e.g. 493 = 0755.
+[[target_os = "linux"]]
 pub fn chmod(path: StrView, mode: i32) -> Result<(), Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -425,6 +469,7 @@ pub fn chmod(path: StrView, mode: i32) -> Result<(), Errno>
 
 # Create a symbolic link at `link` whose contents are `target` (which need
 # not exist).
+[[target_os = "linux"]]
 pub fn symlink(target: StrView, link: StrView) -> Result<(), Errno>
     var ctarget: [4096]u8
     var clink: [4096]u8
@@ -437,6 +482,7 @@ pub fn symlink(target: StrView, link: StrView) -> Result<(), Errno>
     fs_done(sys_symlink(@ctarget[0], @clink[0]))
 
 # The current working directory, an absolute path.
+[[target_os = "linux"]]
 pub fn cwd() -> Result<String, Errno>
     var buf: [4096]u8
     # getcwd(2) returns the length including the NUL.
@@ -452,6 +498,7 @@ pub fn cwd() -> Result<String, Errno>
 
 # The contents of the symbolic link at `path` (readlink(2)): Err(Inval) if
 # `path` is not a symlink.
+[[target_os = "linux"]]
 pub fn read_link(path: StrView) -> Result<String, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -476,6 +523,7 @@ pub enum FileTime
     At(i64)
 
 # Fill one utimensat(2) timespec slot (two i64s at `ts`) from `t`.
+[[target_os = "linux"]]
 fn fs_timespec(t: FileTime, ts: @&[2]i64)
     match t
         Now =>
@@ -490,6 +538,7 @@ fn fs_timespec(t: FileTime, ts: @&[2]i64)
 
 # Set the access and modification times of `path` (utimensat(2), following
 # symlinks). `touch` is set_times(path, FileTime.Now, FileTime.Now).
+[[target_os = "linux"]]
 pub fn set_times(path: StrView, atime: FileTime, mtime: FileTime) -> Result<(), Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
@@ -541,6 +590,7 @@ pub struct DirIter
 
 # Open a directory for iteration; Err (NoEnt, NotDir, Acces, ...) if it
 # cannot be opened. Release the Ok iterator with dir_close.
+[[target_os = "linux"]]
 pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
     let fd: i32 = fs_open(path, O_RDONLY + O_DIRECTORY, 0)
     if fd < 0
@@ -555,6 +605,7 @@ pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
 # the end. Shared by dir_next and dir_next_entry. It takes @&DirIter and only
 # touches fields, because ritz1 cannot forward an @&T parameter into a *T one
 # (AGAST #1652).
+[[target_os = "linux"]]
 fn dir_advance(dir: @&DirIter) -> bool
     # Closed: fd < 0 and buf already freed. Do not hand getdents a null pointer.
     if dir.fd < 0 or dir.buf.cap() < DIR_BUF_SIZE
@@ -580,6 +631,14 @@ fn dir_advance(dir: @&DirIter) -> bool
     dir.buf_pos = dir.buf_pos + reclen as i64
 
     true
+
+# Harland has no getdents64 and no dir_open, so no DirIter is ever open
+# there: DirIter's methods compile on every target, since an impl's methods
+# cannot be gated one by one, and they end at once.
+[[target_os = "harland"]]
+fn dir_advance(dir: @&DirIter) -> bool
+    dir.entry = null
+    false
 
 # Methods (S-IMPL-1): a DirIter is the subject of every operation on it.
 impl DirIter
@@ -657,6 +716,7 @@ impl DirIter
 # removed, never followed, so nothing outside the tree is touched. Err(NotDir)
 # if `path` is not a directory (use unlink); the first other error stops the
 # walk and is returned, leaving what remains in place.
+[[target_os = "linux"]]
 pub fn remove_dir_all(path: StrView) -> Result<(), Errno>
     var dir: DirIter = match dir_open(path)
         Ok(d) => d

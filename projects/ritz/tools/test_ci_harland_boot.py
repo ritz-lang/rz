@@ -188,6 +188,8 @@ NET_NODEV = "".join(
     rf"[test] {t} nodev ... {t}: NetAttach: Errno.NoDev (no network service) (-19)\nPASS (exit=19)\n"
     for t in NET_TOOLS
 )
+# indium's write_empty_test checked /var as well as /tmp (AGAST #4830).
+WRITE_EMPTY_OK = r"[test] write_empty_test ... [write_empty_test] PASS: /tmp and /var\nPASS (exit=0)\n"
 # The native boot's virtio-blk is modern-only and offers 1024-entry queues;
 # the driver must take the MMIO transport and cap the queue (AGAST #3576).
 BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
@@ -235,7 +237,7 @@ RING_DUMP_END = r"\n=== END RING BUFFER ===\n"
 # dump repeating it.
 RING_OK = (KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_START
            + KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_END)
-PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + SUITE_PASSED + INIT_EXIT
+PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -496,7 +498,7 @@ def test_busy_children_coarsely_paired_by_load_pass(tree):
     serial = (RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
               + BUSY_PAIRED_9
               + SCHED_OK
-              + SMP_OK + NET_NODEV
+              + SMP_OK + NET_NODEV + WRITE_EMPTY_OK
               + SUITE_PASSED + INIT_EXIT)
     r = _run(tree, serial)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -597,6 +599,16 @@ def test_net_tool_that_did_not_answer_nodev_fails(tree, tool):
     r = _run(tree, PASSED.replace(good, bad))
     assert r.returncode == 1, r.stdout + r.stderr
     assert f"FAIL (native): {tool} did not exit 19 (Errno.NoDev)" in r.stdout
+
+
+@pytest.mark.integration
+def test_write_empty_on_tmp_alone_fails(tree):
+    """write_empty_test passes with only /tmp when /var/boots is missing; a
+    boot whose storage disk came up must not pass that way (AGAST #4830)."""
+    tmp_only = r"[test] write_empty_test ... [write_empty_test] PASS: /tmp (no storage disk, /var skipped)\nPASS (exit=0)\n"
+    r = _run(tree, PASSED.replace(WRITE_EMPTY_OK, tmp_only))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): write_empty_test did not pass on both /tmp and /var" in r.stdout
 
 
 @pytest.mark.integration

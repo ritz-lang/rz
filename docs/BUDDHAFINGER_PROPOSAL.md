@@ -207,26 +207,29 @@ follows what the kernel does (`kernel/src/fs/syscall.ritz`):
 - A file opened for writing gets a per-fd kernel write buffer that starts
   empty. Each `write` appends to it, whatever the file position. On `close`,
   or on process exit (`fs_process_end` closes every open fd the same way),
-  that buffer replaces the file's entire contents. `O_TRUNC` affects only the
-  fd's read view, and only with `O_WRONLY` (`O_RDWR | O_TRUNC` does not
-  truncate it); it does not change what close commits.
+  that buffer replaces the file's entire contents. Close commits the buffer
+  if any byte was written, or if the fd was opened writable with `O_TRUNC`
+  (`O_WRONLY` or `O_RDWR`): then an empty buffer commits an empty file. An fd
+  opened for writing without `O_TRUNC` that writes nothing leaves the file
+  as it was (#4830; the rule is written out above `fs_flush_write_buffer`).
 - A kill between two writes therefore commits the prefix written so far. A
-  kill before the first write leaves the old file.
-- A buffer of zero bytes commits nothing, so writing an empty file leaves the
-  old contents in place.
+  kill before the first write leaves the old file, unless the open had
+  `O_TRUNC`; then it empties the file.
 - Only paths under `/var` persist across reboot. Other paths are the
   initramfs copy in RAM. A `/var` close schedules a save to the storage
   device, debounced to at most one per 200 ms; `sync` (syscall 162,
   `sys_sync` in ritzlib) saves at once.
-- `ritzlib/fs.ritz` `write_file` opens through `sys_open3`, which exists only
-  on Linux, so it does not compile for Harland today.
+- `ritzlib/fs.ritz` `write_file`, `read_file` and `copy_file` compile for
+  Harland (#4830): `write_file` opens `O_WRONLY | O_CREAT | O_TRUNC`, writes
+  the whole buffer and returns the close result. The rest of `fs.ritz` (`stat`,
+  the predicates, directory iteration) stays Linux-only.
 
 So the Harland save builds the whole file in one buffer, opens the target
 `O_WRONLY | O_CREAT | O_TRUNC`, requires one full-length `write`, and checks
 the final `close` result. A single write avoids a process kill between chunks
 committing a prefix of an existing file. It requires a contiguous snapshot in
-the editor and a kernel write buffer. Until the empty-write fix lands, refuse
-an empty save before opening the target.
+the editor and a kernel write buffer. An empty save goes through the same
+path: its `O_TRUNC` open commits the empty file on close.
 
 For RAM-only paths, a successful close completes the save. For `/var`,
 require both a successful close and a successful `sync` before marking the
@@ -344,8 +347,8 @@ on both targets.
 | Need | Today | Required for | Milestone |
 |---|---|---|---|
 | Timed console read (`VTIME`-like timeout, or `poll` on fd 0) | Done (#4829): `poll` on fd 0, `ritzlib.timedread` | Bare Escape, key timeouts | First port |
-| Portable create-and-write in `ritzlib/fs.ritz` | `write_file` uses Linux-only `sys_open3` | Saving through ritzlib on Harland | First port |
-| Empty write commits on close | A zero-byte buffer commits nothing | Saving an empty buffer | First port |
+| Portable create-and-write in `ritzlib/fs.ritz` | Done (#4830) | Saving through ritzlib on Harland | First port |
+| Empty write commits on close | Done (#4830): an `O_TRUNC` fd commits its buffer, empty or not | Saving an empty buffer | First port |
 | Larger raw input queue, or an overrun the reader can see | Bytes past 1024 dropped silently | Paste, fast input bursts | Paste support |
 | `stat` / `fstat` (size, mtime, mode) | Missing; number 4 free | External-change check, permissions | Save parity |
 | `chmod` or mode on create | Missing | Preserving permissions | Save parity |

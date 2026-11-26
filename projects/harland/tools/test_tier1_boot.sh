@@ -674,6 +674,19 @@ all_passed() {
     fi
 }
 
+# write_empty NAME: pass only if indium's write_empty_test checked /var as
+# well as /tmp (AGAST #4830). Its exit code already fails the suite; this
+# stops a boot whose storage disk came up from passing on the /tmp leg alone.
+write_empty() {
+    if grep -aq "\[write_empty_test\] PASS: /tmp and /var" "$WORK/$1.log"; then
+        echo "PASS ($1): an empty write_file emptied the file on /tmp and /var"
+        return 0
+    fi
+    grep -a "\[write_empty_test\]" "$WORK/$1.log" | head -3
+    echo "FAIL ($1): write_empty_test did not pass on both /tmp and /var"
+    return 1
+}
+
 # net_nodev NAME: pass only if init ran indium's ping, udp-send and
 # udp-recv and each exited 19 (-Errno.NoDev): a Tier-1 boot runs no ring-2
 # service, so NetAttach answers NoDev and each tool ends before it publishes
@@ -760,6 +773,7 @@ if [ "$MODE" != grub ]; then
         -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
     all_passed native || rc=1
     net_nodev native || rc=1
+    write_empty native || rc=1
     boot_tests_passed native || rc=1
     smp_stacks native || rc=1
     ring_holds_boot native || rc=1
@@ -798,6 +812,7 @@ EOF
     fi
     all_passed grub || rc=1
     net_nodev grub || rc=1
+    write_empty grub || rc=1
     boot_tests_passed grub || rc=1
     smp_stacks grub || rc=1
     blk_transport grub legacy || rc=1
