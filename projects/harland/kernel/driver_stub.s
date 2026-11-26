@@ -182,6 +182,17 @@
 #                   11 free BASE + 20480, 4096          -> 0 (quarantined)
 #                   12 alloc 4096 -> BASE + 24576: the quarantined VA is
 #                      not handed out again
+#   modes 40-42 (#4733, postinit.ritz drv-quiesce): RSI is a CAP_TYPE_IRQ
+#                   handle on a device the kernel recorded (a window
+#                   double). Exit status: the number of the first failed
+#                   step, else 0; the kernel checks the quiesce after.
+#   mode 40 (QUIESCE): the driver of a frame object: 1 ShmMap(RETIRE_H)
+#                   and store RETIRE_MARKER there, then mode 41's step.
+#   mode 41 (QUIESCE_DMA): 2 DrvDmaAlloc 8000 -> DRV_DMA_BASE, and write
+#                   the run (the device's buffers). Exit.
+#   mode 42 (QUIESCE_REVOKE): step 2, then 3 CapRevoke of the IRQ handle
+#                   is 0 (the kernel quiesces the device there), 4
+#                   DrvDmaFree of the run is then Errno.Perm. Exit.
 # Report: Getpid, the CPL from CS, and arg1, packed into the exit status
 #   (arg1 & 0x7FFF) << 16 | cpl << 8 | (pid & 0xFF)
 # which the kernel decodes and logs as "[driver] pid N cpl C arg1 K".
@@ -227,6 +238,9 @@
 .equ DRIVER_STUB_MMIO_MAP, 21
 .equ DRIVER_STUB_DMA_ALLOC, 22
 .equ DRIVER_STUB_DMA_FREE, 23
+.equ DRIVER_STUB_QUIESCE, 40
+.equ DRIVER_STUB_QUIESCE_DMA, 41
+.equ DRIVER_STUB_QUIESCE_REVOKE, 42
 
 # DrvMmioMap and DrvDmaAlloc (mm/vmm.ritz, driver_abi/src/dma.ritz,
 # postinit.ritz MMIO_TEST_*)
@@ -339,6 +353,11 @@ driver_stub_start:
     je .Ldriver_stub_dma_alloc
     cmpq $DRIVER_STUB_DMA_FREE, %r12
     je .Ldriver_stub_dma_free
+    cmpq $DRIVER_STUB_QUIESCE, %r12
+    jb .Ldriver_stub_not_quiesce
+    cmpq $DRIVER_STUB_QUIESCE_REVOKE, %r12
+    jbe .Ldriver_stub_quiesce
+.Ldriver_stub_not_quiesce:
     cmpq $DRIVER_STUB_CONSOLE_POLL, %r12
     je .Ldriver_stub_console_poll
     cmpq $DRIVER_STUB_POLL_NVAL, %r12
@@ -1446,6 +1465,55 @@ driver_stub_start:
     jmp .Lretire_record
 .Lretire_wait_done:
     ret
+
+# Modes 40-42. r14 = the DmaAlloc, on the user stack; r15 = the failing
+# step; r13 = the IRQ handle.
+.Ldriver_stub_quiesce:
+    subq $16, %rsp
+    movq %rsp, %r14
+    cmpq $DRIVER_STUB_QUIESCE, %r12
+    jne .Lquiesce_dma
+    movl $1, %r15d                       # 1: map the frame object, store
+    movq $SYS_SHM_MAP, %rax
+    movabsq $RETIRE_H, %rdi
+    syscall
+    testq %rax, %rax
+    jle .Lquiesce_fail
+    movabsq $RETIRE_MARKER, %rcx
+    movq %rcx, (%rax)
+.Lquiesce_dma:
+    movl $2, %r15d                       # 2: a run at the window base
+    movq %r13, %rdi
+    movl $DMA_TEST_SIZE, %esi
+    movq %r14, %rdx
+    call .Ldma_call
+    movabsq $DRV_DMA_BASE, %rcx
+    cmpq %rcx, %rax
+    jne .Lquiesce_fail
+    movq $-1, (%rax)
+    cmpq $DRIVER_STUB_QUIESCE_REVOKE, %r12
+    jne .Lquiesce_pass
+    movl $3, %r15d                       # 3: let go of the device
+    movq $SYS_CAP_REVOKE, %rax
+    movq %r13, %rdi
+    syscall
+    testq %rax, %rax
+    jnz .Lquiesce_fail
+    movl $4, %r15d                       # 4: the handle is gone
+    movq $SYS_DRV_DMA_FREE, %rax
+    movq %r13, %rdi
+    movabsq $DRV_DMA_BASE, %rsi
+    movl $DMA_TEST_SIZE, %edx
+    syscall
+    cmpq $ERRNO_PERM, %rax
+    jne .Lquiesce_fail
+.Lquiesce_pass:
+    xorl %r15d, %r15d
+.Lquiesce_fail:
+    movl %r15d, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
 
 # Mode 33, last in the image so it lies past its first page (postinit.ritz
 # spawn-pages checks the offset): report as mode 0 does.

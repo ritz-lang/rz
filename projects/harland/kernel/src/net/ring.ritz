@@ -46,11 +46,11 @@ import mm.vmm { vmm_get_current_pml4 }
 import mm.shm { shm_create, shm_destroy, shm_map, shm_live }
 import cap.types { CapHandle, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, cap_handle_init }
 import cap.table { CapTable, cap_kernel_grant, cap_revoke, cap_table_get }
-import proc.table { MAX_PROCS, BLOCK_WAIT, proc_at, proc_block, proc_current_pid, proc_current_slot, proc_mark_exit }
+import proc.table { BLOCK_WAIT, proc_block, proc_current_pid, proc_current_slot, proc_mark_exit }
 import proc.sched { sched_yield, sched_block }
 import proc.waitq { waitq_can_park }
 import proc.waitset { waitset_arm, waitset_disarm, shm_latch_post_peers }
-import syscall.runtime.net { net_frame_register }
+import syscall.runtime.net { net_frame_register, pml4_of }
 import driver_abi.wait { EVENT_DATA }
 import driver_abi.frame_ring { FRAME_REGION_SIZE }
 import driver_abi.spsc { SpscConsumer, SpscProducer, SpscClose, Publish, Take, FrameBytes, spsc_rx_ring, spsc_tx_ring }
@@ -115,15 +115,6 @@ fn revoke(pid: u64, h: CapHandle)
         let generation: u32 = h.generation
         cap_revoke(cap_table_get(pid as u32), cap_handle_init(index, generation))
 
-# The page table of live process `pid`.
-fn pml4_of(pid: u64) -> Option<u64>
-    var slot: i32 = 0
-    while slot < MAX_PROCS
-        if proc_at(slot).pid == pid and proc_at(slot).pml4 != 0
-            return Some(proc_at(slot).pml4)
-        slot = slot + 1
-    None
-
 # The spawn helper: the frame object for ring-1 driver `driver_pid`, a
 # child pid 1 spawned and that has not run. Both get a read-write handle
 # (each insert makes that process's latch); the driver's mapping is made
@@ -136,9 +127,9 @@ pub fn ring_seat_open(driver_pid: u64) -> SeatOpen
         return SeatOpen.Busy
     if driver_pid == SEAT_PID or cap_table_get(driver_pid as u32) == 0 as *CapTable
         return SeatOpen.NoDriver
-    let driver_pml4: u64 = match pml4_of(driver_pid)
-        Some(p) => p
-        None => return SeatOpen.NoDriver
+    let driver_pml4: u64 = pml4_of(driver_pid as u32)
+    if driver_pml4 == 0
+        return SeatOpen.NoDriver
     let object_id: u64 = match shm_create(FRAME_REGION_SIZE / PAGE_SIZE)
         Some(id) => id
         None => return SeatOpen.NoMem
@@ -179,6 +170,11 @@ fn seat_close()
 # woken by the DRIVER_GONE post on the retired object and returns NoDriver.
 pub fn ring_driver_gone()
     driver_registered = false
+
+# `pid` is the driver of the open seat: driver_quiesce calls
+# ring_driver_gone only for it, so another driver's death leaves the seat.
+pub fn ring_seat_driver_is(pid: u32) -> bool
+    seat_open and seat_driver == pid as u64
 
 # The seat has a live driver to talk to. A retired frame object is a driver
 # that exited: driver_registered goes and the seat closes.

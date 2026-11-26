@@ -530,6 +530,19 @@ pub fn msix_vector_count(vector: u8) -> u64
     fake_msix_count(vector)
 """
 
+# common.ritz bounds the reset readback with a TSC deadline (#4733). The
+# kernel's arch/x86_64/tsc.ritz calibrates on the PIT; this one reads the
+# jumping clock above as a 1 GHz TSC, so a deadline passes on the next poll.
+TSC_STUB = """\
+import io { rdtsc }
+
+pub fn deadline_after_us(us: u64) -> u64
+    rdtsc() + us * 1000
+
+pub fn deadline_passed(deadline: u64) -> bool
+    rdtsc() >= deadline
+"""
+
 STUBS = {
     "serial.ritz": SERIAL_STUB,
     "klog.ritz": KLOG_STUB,
@@ -540,6 +553,7 @@ STUBS = {
     "mm/pmm.ritz": PMM_STUB,
     "mm/heap.ritz": HEAP_STUB,
     "mm/vmm.ritz": VMM_STUB,
+    "arch/x86_64/tsc.ritz": TSC_STUB,
 }
 REAL = ["drivers/virtio/blk.ritz", "drivers/virtio/common.ritz",
         "drivers/virtio/vmsix.ritz", "drivers/irq_wait.ritz",

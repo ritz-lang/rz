@@ -18,6 +18,7 @@ import drivers.pci { PciDevice, pci_enable_bus_master, pci_disable_bus_master, p
 import ritzlib.option
 import drivers.msix { PCI_CAP_MSIX }
 import drivers.virtio.window { PhysRange, phys_range, phys_range_none, vio_window_add }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 # The transport-independent virtqueue and feature negotiation (AGAST #4732):
 # this file is the transport, the allocation and the register access.
 import virtio_abi.virtq { Virtqueue, VIRTQ_MAX_SIZE, virtq_ring_bytes, virtq_init, virtq_desc_phys, virtq_avail_phys, virtq_used_phys }
@@ -191,6 +192,39 @@ pub fn vio_get_status(dev: *VirtioDevice) -> u8
 pub fn vio_reset(dev: *VirtioDevice)
     vio_set_status(dev, 0)
     (*dev).status = 0
+
+# How long a reset may take to read back 0 (Virtio 1.2 §2.1.2: the driver
+# treats the device as reset only once device_status reads 0). 100 ms.
+# The virtio code's own bound, not vtd.ritz's private VTD_TIMEOUT_US.
+pub const VIRTIO_RESET_TIMEOUT_US: u64 = 100000
+
+# A boot-test hook (drv-quiesce, postinit.ritz): the status byte at this
+# kernel VA belongs to a device double that never finishes its reset (each
+# read sees DEVICE_NEEDS_RESET again). 0: none.
+var vio_reset_stuck_va: u64 = 0
+
+pub fn vio_reset_force_stuck(status_va: u64)
+    vio_reset_stuck_va = status_va
+
+# Reset the device whose device_status byte the kernel maps at `status_va`
+# (driver_quiesce, #4733): write 0, then read until it is 0 or
+# VIRTIO_RESET_TIMEOUT_US has passed. The last value read: 0 means the
+# reset completed and the device is idle.
+pub fn vio_status_reset(status_va: u64) -> u8
+    let reg: *u8 = status_va as *u8
+    volatile_store(reg, 0)
+    let deadline: u64 = deadline_after_us(VIRTIO_RESET_TIMEOUT_US)
+    var status: u8 = vio_status_read(reg)
+    while status != 0 and not deadline_passed(deadline)
+        status = vio_status_read(reg)
+    status
+
+# One read of the status byte at `reg`; the stuck double (above) shows
+# DEVICE_NEEDS_RESET to every read.
+fn vio_status_read(reg: *u8) -> u8
+    if reg as u64 == vio_reset_stuck_va
+        volatile_store(reg, VIRTIO_STATUS_DEVICE_NEEDS_RESET)
+    volatile_load(reg)
 
 pub fn vio_add_status(dev: *VirtioDevice, status: u8)
     (*dev).status = (*dev).status | status

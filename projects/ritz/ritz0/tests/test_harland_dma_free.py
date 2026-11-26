@@ -158,6 +158,18 @@ fn main() -> i32
         h = h + 1
     if dma_runs_held(3) != 32 or dma_hole_take(3, NIC, 1, false).is_none()
         return 12
+    # 13: driver_quiesce takes the runs of one pid and device only (#4733)
+    while dma_run_take_pid(9).is_some()
+        n = n + 1
+    if not dma_run_add(run(4, NIC, BASE, 0, 1)) or not dma_run_add(run(4, BLK, BASE + P, 0, 1)) or not dma_run_add(run(2, NIC, BASE, 0, 1))
+        return 13
+    let d: DmaRun = match dma_run_take_device(4, NIC)
+        Some(x) => x
+        None => return 13
+    if d.object_id != NIC or d.pid != 4 or dma_run_take_device(4, NIC).is_some()
+        return 13
+    if dma_runs_held(4) != 1 or dma_runs_held(2) != 1
+        return 13
     0
 """
 

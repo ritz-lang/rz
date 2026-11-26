@@ -7,6 +7,10 @@ import klog { klog, klog_dec }
 import mm.shm { shm_unmap, shm_forget_pid, shm_retire }
 import driver_abi.wait { EVENT_PEER_CLOSE, EVENT_DRIVER_GONE }
 import proc.waitset { shm_latch_create, shm_latch_drop, waitset_forget_pid }
+# syscall/runtime/driver.ritz: quiesce the device when its IRQ owner drops
+# its last handle (#4733). Declared, not imported: driver.ritz imports this
+# module.
+extern fn driver_quiesce_object(pid: u32, object_id: u64)
 import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_IRQ, CAP_TYPE_SHM, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid, cap_type_is_device, cap_type_is_kernel_granted }
 
 # ============================================================================
@@ -428,7 +432,8 @@ pub fn cap_inherit_ambient(parent_pid: u32, child_pid: u32) -> i32
 #
 # The IRQ-cap owner is the process the kernel granted a device's IRQ to. It
 # is recorded per object id so the kernel can quiesce the device when that
-# owner exits or revokes its last IRQ handle for it (later ring-1 tasks).
+# owner exits or revokes its last IRQ handle for it (syscall/runtime/driver.ritz
+# driver_quiesce, #4733).
 
 const MAX_IRQ_CAP_OWNERS: i32 = 16
 
@@ -540,14 +545,17 @@ fn cap_table_holds_object(table: *CapTable, cap_type: u8, object_id: u64) -> boo
     return false
 
 # The CapRevoke hook: `table`'s process dropped its last handle of
-# `cap_type` for `object_id`. An IRQ owner stops owning the device's IRQ. A
-# shm object is unmapped from that process only (#4717), and its latch for
+# `cap_type` for `object_id`. An IRQ owner stops owning the device's IRQ,
+# once a device recorded for it is quiesced (#4733). A shm object is
+# unmapped from that process only (#4717), and its latch for
 # the object goes (#4727). MMIO leaves are
 # unmapped here once a later ring-1 task maps them (docs/RING1_DRIVER.md,
 # Grants); today nothing maps them. Other types have no per-process
 # mapping. Another process's handles and mappings are never touched.
 fn cap_last_handle_dropped(table: *CapTable, cap_type: u8, object_id: u64)
     if cap_type == CAP_TYPE_IRQ
+        # While it is still the owner: driver_quiesce_object checks that.
+        driver_quiesce_object((*table).pid, object_id)
         irq_owner_release(object_id, (*table).pid)
     else if cap_type == CAP_TYPE_SHM
         shm_unmap((*table).pid, object_id)

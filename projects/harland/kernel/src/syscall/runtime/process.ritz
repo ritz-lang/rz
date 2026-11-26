@@ -44,7 +44,7 @@ import ritzlib.result { Result }
 import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report }
 import cap.table { CapTable, cap_process_has, cap_table_alloc, cap_table_free_pid, cap_inherit_ambient, cap_retire_held_shm }
 import cap.types { CAP_TYPE_POWER, CAP_TYPE_NAMESPACE, CAP_RIGHT_EXECUTE, CAP_RIGHT_READ, CAP_RIGHT_CREATE }
-import syscall.runtime.driver { drv_dma_process_end }
+import syscall.runtime.driver { drv_dma_process_end, driver_quiesce }
 
 extern fn syscall_stack_size() -> u64
 
@@ -401,6 +401,14 @@ fn sys_exit_impl(code: i32) -> i64
         # Leave the exiting address space for the kernel's, which stays
         # mapped, before freeing it.
         vmm_switch_pml4(g_kernel_pml4)
+
+        # A ring-1 driver's device stops before anything of it is freed
+        # (#4733, RING1_DRIVER.md "Driver death"): MSI-X masked, reset read
+        # back, its DMA runs out of the domain (quarantined unless both
+        # confirmed), the link snapshot gone. While the capability table
+        # still names it the IRQ owner, and before the retire below posts
+        # DRIVER_GONE.
+        driver_quiesce(me.pid as u32, my_pml4)
 
         # Close the fds it left open (flushing their writes) and free its
         # fd table, so none outlive it (#2753).

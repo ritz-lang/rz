@@ -68,6 +68,9 @@ import mm.shm { shm_retire }
 import proc.waitset { waitset_inbox_len, shm_latch_post }
 import driver_abi.wait { DEVICE_WAIT_MS, EVENT_DRIVER_GONE, SHM_DETACH_TIMEOUT_MS }
 import drivers.virtio.window { phys_range, phys_range_none, vio_window_add, vio_window_remove }
+import syscall.runtime.driver { drv_device_bind, drv_device_unbind }
+import drivers.virtio.common { VIRTIO_RESET_TIMEOUT_US, vio_reset_force_stuck }
+import driver_abi.link { link_publish }
 
 # ============================================================================
 # Boot-test mode self-tests (AGAST #1887)
@@ -1853,6 +1856,231 @@ fn frame_ring_self_test() -> bool
     sched_stop()
     rx and overfull and tx and gone
 
+# drv-quiesce (#4733, RING1_DRIVER.md "Driver death"): a recorded device's
+# IRQ owner exits (or drops its IRQ handle) and the kernel quiesces the
+# device before the process's pages go. The device is a window double, one
+# RAM page: a virtio device_status byte at QUIESCE_STATUS_OFF, set to
+# DRIVER_OK, and a QUIESCE_MSIX_ENTRIES-entry MSI-X table at
+# QUIESCE_TABLE_OFF, unmasked, both recorded through the kernel's physmap
+# view (drv_device_bind). Each stub (driver_stub.s modes 40-42) allocates a
+# two-page DMA run of the device and writes it.
+#   * Reset reads back 0 (mode 40): the driver also maps a frame object
+#     whose consumer (mode 10) is parked, and a snapshot is published.
+#     After the exit the table is masked, status reads 0, every page is back
+#     in the PMM (the run freed once, by the PML4's teardown) and nothing
+#     newly quarantined, NetInfo is NoDev, and the consumer saw DRIVER_GONE
+#     and the driver's store.
+#   * A double that never reads 0 (mode 41, vio_reset_force_stuck): after
+#     VIRTIO_RESET_TIMEOUT_US the run's two pages are on dma_quarantine and
+#     missing from the PMM, not freed.
+#   * The driver drops its IRQ handle (mode 42): the device is quiesced
+#     there, while the process lives (its exit no longer owns the device),
+#     and the run is freed once by its exit.
+const DRIVER_STUB_QUIESCE: u64 = 40
+const DRIVER_STUB_QUIESCE_DMA: u64 = 41
+const DRIVER_STUB_QUIESCE_REVOKE: u64 = 42
+const QUIESCE_TEST_IRQ: u64 = 0xFFFF4733A
+const QUIESCE_STATUS_OFF: u64 = 0x14         # virtio_pci_common_cfg.device_status
+const QUIESCE_TABLE_OFF: u64 = 0x800
+const QUIESCE_MSIX_ENTRIES: u32 = 3
+const QUIESCE_ENTRY_CTRL: u64 = 12           # an MSI-X entry's vector control
+const QUIESCE_RUN_PAGES: u64 = 2             # driver_stub.s DMA_TEST_SIZE
+const QUIESCE_DRIVER_OK: u8 = 0x0F           # ACK | DRIVER | DRIVER_OK | FEATURES_OK
+# The driver's IRQ handle: a fresh table's second grant (the frame object
+# is the first) in mode 40, its first in modes 41 and 42.
+const QUIESCE_H_SECOND: u64 = 0x200000001
+
+fn quiesce_status(page: u64) -> u8
+    volatile_load(phys_to_virt(page + QUIESCE_STATUS_OFF) as *u8)
+
+fn quiesce_entry_ctrl(page: u64, entry: u64) -> *u32
+    phys_to_virt(page + QUIESCE_TABLE_OFF + entry * 16 + QUIESCE_ENTRY_CTRL) as *u32
+
+# The double as a live device: DRIVER_OK, every MSI-X entry unmasked.
+fn quiesce_arm(page: u64)
+    volatile_store(phys_to_virt(page + QUIESCE_STATUS_OFF) as *u8, QUIESCE_DRIVER_OK)
+    var e: u64 = 0
+    while e < QUIESCE_MSIX_ENTRIES as u64
+        volatile_store(quiesce_entry_ctrl(page, e), 0)
+        e = e + 1
+
+fn quiesce_masked(page: u64) -> bool
+    var e: u64 = 0
+    while e < QUIESCE_MSIX_ENTRIES as u64
+        if (volatile_load(quiesce_entry_ctrl(page, e)) & 1) == 0
+            return false
+        e = e + 1
+    true
+
+# Spawn a stub in `mode`, grant it shm object `frame` (0: none) and then
+# the device's IRQ handle, and wait for its exit: its status, or -1.
+fn quiesce_run_driver(mode: u64, frame: u64) -> i64
+    var arg: u64 = DRV_TEST_HANDLE_A
+    if frame != 0
+        arg = QUIESCE_H_SECOND
+    let spawned: i64 = process_spawn_image(driver_stub(), mode, arg)
+    if spawned <= 0
+        return -1
+    let pid: u64 = spawned as u64
+    if frame != 0 and retire_grant(pid, frame) != RETIRE_H
+        process_mark_exit(pid)
+    if packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, QUIESCE_TEST_IRQ)) != arg
+        klog("  grant gave another handle\n")
+        process_mark_exit(pid)
+    drv_stub_status(pid)
+
+# A published snapshot, as a driver's seqlocked write and NetPublish make
+# it: pid 1 holds the link object's publish handle.
+fn quiesce_publish(link: u64) -> bool
+    var info: NetInfo = NetInfo { mac: [0x52, 0x54, 0x00, 0x47, 0x33, 0x01], link_up: 1, device_type: NETDEV_TYPE_VIRTIO, mtu: LINK_TEST_MTU }
+    link_publish(phys_to_virt(shm_page(link, 0)), @info)
+    let h: CapHandle = cap_kernel_grant(LINK_TEST_CONSUMER, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_PUBLISH, link)
+    net_link_register(link)
+    let ok: bool = net_publish_for(LINK_TEST_CONSUMER, packed_handle(h)) == 0 and ring_driver_published()
+    cap_revoke(cap_table_get(LINK_TEST_CONSUMER), h)
+    ok
+
+# Reset reads back 0, with a consumer and a snapshot.
+fn quiesce_clean(page: u64) -> bool
+    let link: u64 = shm_create(1).unwrap_or(0)
+    let frame: u64 = shm_create(1).unwrap_or(0)
+    if link == 0 or frame == 0
+        klog("  objects not made\n")
+        return false
+    quiesce_arm(page)
+    let published: bool = quiesce_publish(link)
+    var driver: i64 = -1
+    var consumer: i64 = -1
+    var free: u64 = 0
+    var after: u64 = 0
+    let quarantined: u64 = dma_quarantined_pages()
+    let parks: u64 = drv_irq_wait_park_count()
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_SURVIVOR, EVENT_DRIVER_GONE as u64)
+    if spawned > 0
+        let pid: u64 = spawned as u64
+        net_frame_register(frame, pid)
+        if retire_grant(pid, frame) == RETIRE_H and await_park(pid, parks, DRV_TEST_PARK_US)
+            free = pmm_get_free_pages()
+            driver = quiesce_run_driver(DRIVER_STUB_QUIESCE, frame)
+            after = pmm_get_free_pages()
+            disable_interrupts()
+            shm_latch_post(frame, pid, EVENT_DATA)
+            enable_interrupts()
+        else
+            process_mark_exit(pid)
+        consumer = drv_stub_status(pid)
+    let status: u8 = quiesce_status(page)
+    let masked: bool = quiesce_masked(page)
+    let nodev: bool = net_info_snapshot().is_none()
+    let newly: u64 = dma_quarantined_pages() - quarantined
+    net_frame_register(0, 0)
+    net_link_register(0)
+    if shm_exists(frame)
+        shm_retire(frame, 0, 0)
+    if shm_exists(link)
+        shm_retire(link, 0, 0)
+    klog("  reset reads 0: driver ")
+    klog_dec(driver)
+    klog(", consumer ")
+    klog_dec(consumer)
+    klog(", status ")
+    klog_dec(status as i64)
+    klog(", free pages ")
+    klog_dec(free as i64)
+    klog(" before, ")
+    klog_dec(after as i64)
+    klog(" after")
+    if not published
+        klog(", no snapshot was published")
+    if not masked
+        klog(", an MSI-X entry is unmasked")
+    if not nodev
+        klog(", NetInfo still answers")
+    if newly != 0
+        klog(", pages were quarantined")
+    klog("\n")
+    driver == 0 and consumer == 0 and status == 0 and masked and published and nodev and after == free and newly == 0
+
+# A double that never reads 0: the run is quarantined, not freed.
+fn quiesce_stuck(page: u64) -> bool
+    quiesce_arm(page)
+    vio_reset_force_stuck(phys_to_virt(page + QUIESCE_STATUS_OFF))
+    let quarantined: u64 = dma_quarantined_pages()
+    let free: u64 = pmm_get_free_pages()
+    let start: u64 = rdtsc()
+    let driver: i64 = quiesce_run_driver(DRIVER_STUB_QUIESCE_DMA, 0)
+    let waited_us: u64 = (rdtsc() - start) / (tsc_hz() / 1000000)
+    vio_reset_force_stuck(0)
+    let after: u64 = pmm_get_free_pages()
+    let newly: u64 = dma_quarantined_pages() - quarantined
+    let status: u8 = quiesce_status(page)
+    let masked: bool = quiesce_masked(page)
+    klog("  reset never reads 0: driver ")
+    klog_dec(driver)
+    klog(", status ")
+    klog_dec(status as i64)
+    klog(", ")
+    klog_dec(newly as i64)
+    klog(" pages quarantined, free pages ")
+    klog_dec(free as i64)
+    klog(" before, ")
+    klog_dec(after as i64)
+    klog(" after, ")
+    klog_dec(waited_us as i64)
+    klog(" us\n")
+    driver == 0 and status != 0 and masked and newly == QUIESCE_RUN_PAGES and after == free - QUIESCE_RUN_PAGES and waited_us >= VIRTIO_RESET_TIMEOUT_US
+
+# The driver drops its IRQ handle: quiesced there, freed once at exit.
+fn quiesce_revoked(page: u64) -> bool
+    quiesce_arm(page)
+    let quarantined: u64 = dma_quarantined_pages()
+    let free: u64 = pmm_get_free_pages()
+    let driver: i64 = quiesce_run_driver(DRIVER_STUB_QUIESCE_REVOKE, 0)
+    let after: u64 = pmm_get_free_pages()
+    let newly: u64 = dma_quarantined_pages() - quarantined
+    let status: u8 = quiesce_status(page)
+    let masked: bool = quiesce_masked(page)
+    klog("  IRQ handle revoked: driver ")
+    klog_dec(driver)
+    klog(", status ")
+    klog_dec(status as i64)
+    klog(", free pages ")
+    klog_dec(free as i64)
+    klog(" before, ")
+    klog_dec(after as i64)
+    klog(" after")
+    if not masked
+        klog(", an MSI-X entry is unmasked")
+    klog("\n")
+    driver == 0 and status == 0 and masked and after == free and newly == 0
+
+fn drv_quiesce_self_test() -> bool
+    klog("\nTesting driver_quiesce on a device double...\n")
+    let page: u64 = pmm_alloc_page()
+    if page == 0
+        klog("  no page for the double\n")
+        return false
+    if not irq_object_register(QUIESCE_TEST_IRQ, IRQ_NO_VECTOR)
+        klog("  IRQ object not registered\n")
+        pmm_free_page(page)
+        return false
+    let bound: bool = drv_device_bind(QUIESCE_TEST_IRQ, phys_to_virt(page + QUIESCE_STATUS_OFF), phys_to_virt(page + QUIESCE_TABLE_OFF), QUIESCE_MSIX_ENTRIES)
+    sched_start(proc_current_slot())
+    var clean: bool = false
+    var stuck: bool = false
+    var revoked: bool = false
+    if bound
+        clean = quiesce_clean(page)
+        stuck = quiesce_stuck(page)
+        revoked = quiesce_revoked(page)
+    else
+        klog("  device not recorded\n")
+    sched_stop()
+    drv_device_unbind(QUIESCE_TEST_IRQ)
+    irq_object_unregister(QUIESCE_TEST_IRQ)
+    pmm_free_page(page)
+    clean and stuck and revoked
+
 # The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
 # stack: boot_process_tests).
 fn driver_process_tests()
@@ -1872,6 +2100,7 @@ fn driver_process_tests()
     boot_test_result("net-addr", net_addr_self_test())
     boot_test_result("frame-ring", frame_ring_self_test())
     boot_test_result("spawn-pages", spawn_pages_self_test())
+    boot_test_result("drv-quiesce", drv_quiesce_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before

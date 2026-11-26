@@ -58,7 +58,7 @@ import mm.uptr { uptr_check_read, uptr_check_write }
 import ritzlib.option
 import syscall.errno { Errno }
 import cap.types { CapEntry, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, cap_handle_init }
-import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_revoke }
+import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_revoke, cap_irq_owner }
 import mm.shm { shm_live, shm_detach_expired }
 import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_reap_pending }
 import proc.sched { sched_block }
@@ -70,11 +70,16 @@ import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_ATTACH, WAIT_
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_quarantine_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
 import mm.dma { dma_alloc_zeroed, dma_free_pages, dma_quarantine_iova }
-import mm.dma_runs { DmaRun, DmaRange, dma_run_room, dma_run_add, dma_run_take, dma_run_take_pid, dma_hole_put, dma_hole_take, dma_hole_floor, dma_holes_drop_pid }
+import mm.dma_runs { DmaRun, DmaRange, dma_run_room, dma_run_add, dma_run_take, dma_run_take_pid, dma_run_take_device, dma_hole_put, dma_hole_take, dma_hole_floor, dma_holes_drop_pid }
 import drivers.virtio.window { VioWindow, vio_window_find, vio_window_pages, vio_window_guarded, vio_window_queue_regs }
 import drivers.iommu.vtd { VtdEnter }
 import drivers.iommu.ir { dma_requester_isolated, dma_domain_iova_alloc, dma_domain_enter_at, dma_domain_leave }
 import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
+import klog { klog, klog_dec }
+import drivers.msix { msix_mask_entries }
+import drivers.virtio.common { vio_status_reset }
+import syscall.runtime.net { net_driver_quiesced, pml4_of }
+import net.ring { ring_seat_driver_is, ring_driver_gone }
 
 const US_PER_MS: u64 = 1000
 
@@ -486,6 +491,132 @@ pub fn drv_dma_process_end(pid: u32, pml4: u64)
             quarantine_leaves(pml4, run.vaddr, run.pages)
             dma_quarantine_iova(run.phys, run.pages, run.iova)
     dma_holes_drop_pid(pid)
+
+# ============================================================================
+# driver_quiesce (#4733, RING1_DRIVER.md "Driver death")
+# ============================================================================
+#
+# What the kernel needs to stop a ring-1 driver's device without it: the
+# kernel VAs (its own mappings, which outlive the process) of the device's
+# virtio device_status byte and of its MSI-X table, recorded against the
+# device's IRQ object when the kernel hands the device out. The process is
+# never given the MSI-X table.
+
+const DRV_DEVICE_MAX: i32 = 16      # one per IRQ object (waitset IRQ_OBJECT_MAX)
+
+pub struct DrvDevice
+    object_id: u64          # the CAP_TYPE_IRQ object: the device
+    status_va: u64          # kernel VA of the virtio device_status byte
+    msix_table_va: u64      # kernel VA of MSI-X entry 0, 0 for none
+    msix_entries: u32
+    in_use: bool
+    _pad: [3]u8
+
+var drv_devices: [16]DrvDevice      # DRV_DEVICE_MAX
+
+fn drv_device_slot(object_id: u64) -> i32
+    var i: i32 = 0
+    while i < DRV_DEVICE_MAX
+        if drv_devices[i].in_use and drv_devices[i].object_id == object_id
+            return i
+        i = i + 1
+    -1
+
+# The kernel records how to quiesce the device behind IRQ object
+# `object_id`. False if it is already recorded or the table is full.
+pub fn drv_device_bind(object_id: u64, status_va: u64, msix_table_va: u64, msix_entries: u32) -> bool
+    if object_id == 0 or drv_device_slot(object_id) >= 0
+        return false
+    var i: i32 = 0
+    while i < DRV_DEVICE_MAX
+        if not drv_devices[i].in_use
+            drv_devices[i] = DrvDevice { object_id: object_id, status_va: status_va, msix_table_va: msix_table_va, msix_entries: msix_entries, in_use: true, _pad: [0, 0, 0] }
+            return true
+        i = i + 1
+    false
+
+# Forget the record (the boot-test doubles only: a probed device lives
+# until reboot).
+pub fn drv_device_unbind(object_id: u64)
+    let slot: i32 = drv_device_slot(object_id)
+    if slot >= 0
+        drv_devices[slot].in_use = false
+
+# Stop device `dev`, whose IRQ owner `pid` (page table `pml4`, 0 for none)
+# is dying or has let go of it: mask its MSI-X entries, reset it and read
+# the reset back, then take each of `pid`'s DMA runs of the device out of
+# its domain and wait for the IOTLB. A run is left for vmm_free_pml4 to
+# free (once) only when both the reset and its invalidation completed;
+# otherwise its leaves get PTE_DEVICE (the free walk skips them) and its
+# frames and IOVA go on dma_quarantine until reboot. Never dma_free_pages:
+# the PML4's teardown is the one free. Logs "[quiesce] pid P status S"
+# (S is the last status read: 0 once the reset completed).
+fn quiesce_device(pid: u32, pml4: u64, dev: DrvDevice)
+    msix_mask_entries(dev.msix_table_va, dev.msix_entries)
+    let status: u8 = vio_status_reset(dev.status_va)
+    let reset_ok: bool = status == 0
+    var quarantined: u64 = 0
+    while true
+        let run: DmaRun = match dma_run_take_device(pid, dev.object_id)
+            Some(r) => r
+            None => break
+        let left: bool = run_left_domain(run)
+        if reset_ok and left
+            continue
+        if pml4 != 0
+            quarantine_leaves(pml4, run.vaddr, run.pages)
+        dma_quarantine_iova(run.phys, run.pages, run.iova)
+        quarantined = quarantined + run.pages
+    klog("[quiesce] pid ")
+    klog_dec(pid as i64)
+    klog(" status ")
+    klog_dec(status as i64)
+    klog("\n")
+    if quarantined != 0
+        klog("[quiesce] pid ")
+        klog_dec(pid as i64)
+        klog(" quarantined ")
+        klog_dec(quarantined as i64)
+        klog(" pages\n")
+
+# Step 4 for driver `pid`, gone from its device: the snapshot and the frame
+# registration go (net_driver_quiesced) and, if `pid` is the kernel seat's
+# driver, so does the seat's registration (ring_driver_gone), so a parked
+# take_rx answers NoDriver.
+fn driver_gone(pid: u32)
+    net_driver_quiesced(pid)
+    if ring_seat_driver_is(pid)
+        ring_driver_gone()
+
+# Process `pid` is exiting (sys_exit_impl, on the kernel PML4, before its
+# shm objects are retired, its capability table freed and `pml4` torn
+# down): quiesce every recorded device it owns the IRQ of, then, if there
+# was one, driver_gone: the link snapshot is invalidated (NetInfo is NoDev)
+# and the frame object's registration (and the kernel seat's) goes.
+# cap_retire_held_shm then retires the frame object and latches DRIVER_GONE
+# on the consumer. A pid that owns no recorded device changes nothing.
+pub fn driver_quiesce(pid: u32, pml4: u64)
+    var owned: bool = false
+    var i: i32 = 0
+    while i < DRV_DEVICE_MAX
+        if drv_devices[i].in_use and cap_irq_owner(drv_devices[i].object_id) == pid
+            quiesce_device(pid, pml4, drv_devices[i])
+            owned = true
+        i = i + 1
+    if owned
+        driver_gone(pid)
+
+# Process `pid` dropped its last IRQ handle for `object_id` (cap/table.ritz
+# cap_last_handle_dropped, while it is still the recorded owner): the device
+# is quiesced as on its death, the process's runs of it leave the domain
+# (they stay mapped, and its exit frees the confirmed ones once), and the
+# snapshot goes. Nothing for an object with no device record.
+pub fn driver_quiesce_object(pid: u32, object_id: u64)
+    let slot: i32 = drv_device_slot(object_id)
+    if slot < 0 or cap_irq_owner(object_id) != pid
+        return
+    quiesce_device(pid, pml4_of(pid), drv_devices[slot])
+    driver_gone(pid)
 
 # drv_mmio_map(mmio_handle): the caller's page table is loaded.
 pub fn sys_drv_mmio_map_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
