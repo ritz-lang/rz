@@ -6,26 +6,28 @@
 # - Only one owner at a time
 # - Owner is responsible for cleanup
 
-import ritzlib.memory
+import ritzlib.gvec
 import ritzlib.box
 import ritzlib.io
 
-# Non-Copy type (contains a pointer)
-struct UniquePtr
-    ptr: *u8
+# Non-Copy type: it owns a Vec, so it moves, and its drop glue frees the
+# bytes when its owner goes out of scope.
+struct UniqueBuf
+    data: Vec<u8>
     size: i64
 
-fn unique_ptr_new(size: i64) -> UniquePtr
-    let p = malloc(size)
-    return UniquePtr { ptr: p, size: size }
+fn unique_buf_new(size: i64) -> UniqueBuf
+    return UniqueBuf { data: vec_with_cap<u8>(size), size: size }
 
-fn unique_ptr_null() -> UniquePtr
-    return UniquePtr { ptr: null, size: 0 }
+fn unique_buf_empty() -> UniqueBuf
+    return UniqueBuf { data: vec_new<u8>(), size: 0 }
 
-fn unique_ptr_drop(self: @&UniquePtr)
-    if self.ptr != null
-        free(self.ptr)
-    self.ptr = null
+fn unique_buf_allocated(self: @UniqueBuf) -> bool
+    return self.data.cap() > 0
+
+# Release early, before scope end. Safe on an empty or released buffer.
+fn unique_buf_release(self: @&UniqueBuf)
+    self.data.deinit()
     self.size = 0
 
 # Copy type (all primitives)
@@ -71,75 +73,69 @@ fn test_box_ownership() -> i32
     0
 
 [[test]]
-fn test_unique_ptr_create() -> i32
-    var p = unique_ptr_new(1024)
-    assert p.ptr != null, "should be allocated"
+fn test_unique_buf_create() -> i32
+    var p = unique_buf_new(1024)
+    assert unique_buf_allocated(@p), "should be allocated"
     assert p.size == 1024, "size should be 1024"
-    unique_ptr_drop(@&p)
-    assert p.ptr == null, "should be null after drop"
+    unique_buf_release(@&p)
+    assert not unique_buf_allocated(@p), "should be empty after release"
     0
 
 # Test function that takes ownership
-fn consume_unique(p: UniquePtr)
-    # p is moved into this function
-    # p.drop() would be called automatically at end
-    var mp = p
-    unique_ptr_drop(@&mp)  # Manual for now
+fn consume_unique(p: UniqueBuf) -> i64
+    # p is moved into this function and dropped at its end
+    return p.size
 
 [[test]]
 fn test_move_to_function() -> i32
-    var p = unique_ptr_new(512)
-    consume_unique(p)
+    var p = unique_buf_new(512)
+    assert consume_unique(p) == 512, "moved in"
     # p is now moved, should not be used
     # (move checker should catch use-after-move)
     0
 
 # Test function that borrows
-fn borrow_unique(p: @UniquePtr) -> i64
+fn borrow_unique(p: @UniqueBuf) -> i64
     return p.size
 
 [[test]]
 fn test_borrow_preserves_ownership() -> i32
-    var p = unique_ptr_new(256)
+    var p = unique_buf_new(256)
     let size = borrow_unique(@p)
     assert size == 256, "borrowed size"
     # p is still valid - borrow doesn't transfer ownership
-    assert p.ptr != null, "still valid after borrow"
-    unique_ptr_drop(@&p)
+    assert unique_buf_allocated(@p), "still valid after borrow"
     0
 
 # Test mutable borrow
-fn modify_size(p: @&UniquePtr, new_size: i64)
+fn modify_size(p: @&UniqueBuf, new_size: i64)
     p.size = new_size
 
 [[test]]
 fn test_mutable_borrow() -> i32
-    var p = unique_ptr_new(100)
+    var p = unique_buf_new(100)
     assert p.size == 100, "initial size"
 
     modify_size(@&p, 200)
     assert p.size == 200, "modified size"
-
-    # Still own p
-    unique_ptr_drop(@&p)
+    # Still own p: it's freed at scope end
     0
 
 [[test]]
-fn test_null_unique_ptr() -> i32
-    var p = unique_ptr_null()
-    assert p.ptr == null, "should be null"
-    unique_ptr_drop(@&p)  # Should be safe to drop null
+fn test_empty_unique_buf() -> i32
+    var p = unique_buf_empty()
+    assert not unique_buf_allocated(@p), "should be empty"
+    unique_buf_release(@&p)  # Should be safe to release an empty one
     0
 
 # Ownership transfer via return
-fn create_resource() -> UniquePtr
-    var p = unique_ptr_new(64)
+fn create_resource() -> UniqueBuf
+    var p = unique_buf_new(64)
     return p  # Ownership transferred to caller
 
 [[test]]
 fn test_return_ownership() -> i32
     var p = create_resource()
-    assert p.ptr != null, "received ownership"
+    assert unique_buf_allocated(@p), "received ownership"
     assert p.size == 64, "correct size"
-    unique_ptr_drop(@&p)
     0

@@ -59,7 +59,10 @@ PINS = {
     "mausoleum": 2,
     "nexus": 0,
     "prism": 3,
-    "ritz": 1391,
+    # ritz/examples keeps 3, typed wrappers at a syscall boundary: time.sleep
+    # (nanosleep; exempt only for its free-fn name) in 10_sleep and 40_watch,
+    # process.exec (execve; owns the argv block) in 35_nohup.
+    "ritz": 1357,
     "ritz-lsp": 0,
     "ritzunit": 18,
     "rzrz": 3,
@@ -133,7 +136,7 @@ C_LITERAL_PINS = {
     "mausoleum": 33,
     "nexus": 0,
     "prism": 1,
-    "ritz": 3888,
+    "ritz": 3876,
     "ritz-lsp": 0,
     "ritzunit": 85,
     "rzrz": 34,
