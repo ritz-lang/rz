@@ -1,0 +1,656 @@
+# test/test_editor.ritz - modes and the first-release command list (AGAST #4818).
+#
+# Each command in docs/BUDDHAFINGER_PROPOSAL.md's "First usable release"
+# table, driven by key sequences, asserting the buffer, the cursor and the
+# mode, with the refusal messages and the edge cases: the empty buffer, the
+# last line, a search that wraps. Files go through an in-memory FileStore.
+
+import ritzlib.errno { Errno }
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result { Result }
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.string
+import ritzlib.termsession { Key }
+
+import core.buffer { Buffer }
+import core.editor { Editor, editor_new, editor_open, handle_key }
+import core.files { FileStore, LoadError, SaveError }
+import core.modes { Mode, mode_label }
+import core.screen { LineSource, Size, render, screen_new, view_new }
+import core.utf8 { utf8_encode }
+
+# ============================================================================
+# An in-memory FileStore: one file on "disk", and the last save.
+# ============================================================================
+
+struct Disk
+    disk_path: String       # the one file load finds
+    disk: Vec<u8>
+    saved_path: String      # the last save's path and bytes
+    saved: Vec<u8>
+    saves: i64
+    fail_load: bool         # load fails with EACCES
+    fail_save: bool         # save fails with ENOSPC
+    changed: bool           # save refuses: changed on disk
+
+fn disk_new() -> Disk
+    Disk { disk_path: string_new(), disk: vec_new<u8>(), saved_path: string_new(), saved: vec_new<u8>(), saves: 0, fail_load: false, fail_save: false, changed: false }
+
+fn disk_with(path: StrView, text: StrView) -> Disk
+    var d = disk_new()
+    d.disk_path.push_str(path)
+    d.disk.push_view(text)
+    d
+
+impl FileStore for Disk
+    fn load(self: @&Disk, path: StrView) -> Result<Vec<u8>, LoadError>
+        if self.fail_load
+            return Err(LoadError.Failed(Errno.Acces))
+        if not path.eq(self.disk_path.as_view())
+            return Err(LoadError.NotFound)
+        var out: Vec<u8> = vec_new<u8>()
+        out.push_span(span_from_vec<u8>(@self.disk))
+        Ok(out)
+
+    fn save(self: @&Disk, path: StrView, buf: @Buffer) -> Result<(), SaveError>
+        if self.changed
+            return Err(SaveError.Changed)
+        if self.fail_save
+            return Err(SaveError.Failed(Errno.NoSpc))
+        self.saved_path.clear()
+        self.saved_path.push_str(path)
+        self.saved.clear()
+        let bytes = buf.serialize()
+        self.saved.push_span(span_from_vec<u8>(@bytes))
+        self.saves += 1
+        Ok(())
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn open(text: StrView) -> Editor
+    editor_open("f.txt", span_from_strview(text))
+
+# Feed `keys`: each byte a key, except `<esc>` `<cr>` `<bs>` `<tab>`
+# `<up>` `<down>` `<left>` `<right>` and `<C-x>` (Ctrl plus a letter).
+fn feed(ed: @&Editor, d: @&Disk, keys: StrView)
+    var i: i64 = 0
+    while i < keys.len
+        let c = keys.get(i)
+        if c == '<'
+            let close = keys.slice(i, keys.len).find_byte('>')
+            if close > 0
+                let name = keys.slice(i + 1, i + close)
+                handle_key<Disk>(ed, d, key_named(name))
+                i += close + 1
+                continue
+        handle_key<Disk>(ed, d, Key.Char(c as u32))
+        i += 1
+
+fn key_named(name: StrView) -> Key
+    if name.eq("esc")
+        return Key.Escape
+    if name.eq("cr")
+        return Key.Enter
+    if name.eq("bs")
+        return Key.Backspace
+    if name.eq("tab")
+        return Key.Tab
+    if name.eq("up")
+        return Key.Up
+    if name.eq("down")
+        return Key.Down
+    if name.eq("left")
+        return Key.Left
+    if name.eq("right")
+        return Key.Right
+    if name.len == 3 and name.starts_with("C-")
+        return Key.Ctrl(name.get(2))
+    Key.Unknown
+
+# A fresh editor on `text` with `keys` fed through an empty disk.
+fn run(text: StrView, keys: StrView) -> Editor
+    var ed = open(text)
+    var d = disk_new()
+    feed(@&ed, @&d, keys)
+    ed
+
+fn holds(ed: @Editor, want: StrView) -> bool
+    let out = ed.buf.serialize()
+    let got = span_from_vec<u8>(@out)
+    if got.len != want.len
+        return false
+    for i in 0..got.len
+        if got[i] != want.get(i)
+            return false
+    true
+
+fn at(ed: @Editor, line: i64, col: i64) -> bool
+    ed.cursor.line == line and ed.cursor.col == col
+
+fn says(ed: @Editor, want: StrView) -> bool
+    ed.message.as_view().eq(want)
+
+fn saved(d: @Disk, want: StrView) -> bool
+    let got = span_from_vec<u8>(@d.saved)
+    if got.len != want.len
+        return false
+    for i in 0..got.len
+        if got[i] != want.get(i)
+            return false
+    true
+
+# ============================================================================
+# Modes
+# ============================================================================
+
+[[test]]
+fn test_modes_and_labels() -> i32
+    assert mode_label(Mode.Normal).eq("NORMAL")
+    assert mode_label(Mode.Insert).eq("INSERT")
+    assert mode_label(Mode.CommandLine).eq("COMMAND")
+    var ed = open("abc")
+    var d = disk_new()
+    assert ed.mode == Mode.Normal
+    feed(@&ed, @&d, "i")
+    assert ed.mode == Mode.Insert
+    feed(@&ed, @&d, "<esc>:")
+    assert ed.mode == Mode.CommandLine
+    assert ed.command_line().eq(":")
+    feed(@&ed, @&d, "<esc>/")
+    assert ed.mode == Mode.CommandLine
+    assert ed.command_line().eq("/")
+    feed(@&ed, @&d, "<esc>")
+    assert ed.mode == Mode.Normal
+    0
+
+[[test]]
+fn test_command_line_backspace_on_empty_cancels() -> i32
+    let ed = run("abc", ":q<bs>")
+    assert ed.mode == Mode.CommandLine and ed.command_line().eq(":")
+    let ed2 = run("abc", ":q<bs><bs>")
+    assert ed2.mode == Mode.Normal
+    assert not ed2.quit
+    0
+
+[[test]]
+fn test_unknown_normal_key_does_nothing() -> i32
+    let ed = run("abc", "lZ")
+    assert holds(@ed, "abc") and at(@ed, 0, 1) and ed.mode == Mode.Normal
+    0
+
+# ============================================================================
+# Motion
+# ============================================================================
+
+[[test]]
+fn test_h_l_and_arrows_stay_on_the_line() -> i32
+    assert at(@run("abc\ndef", "l"), 0, 1)
+    assert at(@run("abc\ndef", "lll"), 0, 2)          # never past the last char
+    assert at(@run("abc\ndef", "llh"), 0, 1)
+    assert at(@run("abc\ndef", "h"), 0, 0)
+    assert at(@run("abc\ndef", "<right><right><left>"), 0, 1)
+    assert at(@run("abc\ndef", "jlh<left><left>"), 1, 0)  # never to the line above
+    # By code point: é is two bytes.
+    assert at(@run("éa", "l"), 0, 2)
+    assert at(@run("éa", "lh"), 0, 0)
+    0
+
+[[test]]
+fn test_j_k_and_arrows_keep_the_column() -> i32
+    let ed = run("abcd\nx\nabcd", "lllj")
+    assert at(@ed, 1, 0)
+    assert at(@run("abcd\nx\nabcd", "lllj<down>"), 2, 3)   # the wanted column comes back
+    assert at(@run("abcd\nx\nabcd", "G<up><up>"), 0, 0)
+    assert at(@run("abcd\nx\nabcd", "k"), 0, 0)            # nothing above the first line
+    0
+
+[[test]]
+fn test_j_stops_at_the_last_line_not_the_empty_one_after_the_final_newline() -> i32
+    let ed = run("a\nb\n", "jjj")
+    assert at(@ed, 1, 0)
+    assert ed.line_count() == 2
+    assert run("", "jk").line_count() == 1
+    0
+
+[[test]]
+fn test_w_moves_to_word_starts() -> i32
+    assert at(@run("foo bar", "w"), 0, 4)
+    assert at(@run("foo.bar", "w"), 0, 3)                  # punctuation is its own word
+    assert at(@run("foo.bar", "ww"), 0, 4)
+    assert at(@run("foo\n  bar", "w"), 1, 2)               # across the line break
+    assert at(@run("foo\n\nbar", "w"), 1, 0)               # an empty line is a word
+    assert at(@run("foo bar", "ww"), 0, 6)                 # the last word: its last char
+    0
+
+[[test]]
+fn test_b_moves_to_word_starts_backward() -> i32
+    assert at(@run("foo bar", "$b"), 0, 4)
+    assert at(@run("foo bar", "$bb"), 0, 0)
+    assert at(@run("foo.bar", "$b"), 0, 4)
+    assert at(@run("foo.bar", "$bb"), 0, 3)
+    assert at(@run("foo\n  bar", "jwb"), 0, 0)
+    assert at(@run("foo\n\nbar", "Gb"), 1, 0)
+    assert at(@run("foo", "b"), 0, 0)
+    0
+
+[[test]]
+fn test_e_moves_to_word_ends() -> i32
+    assert at(@run("foo bar", "e"), 0, 2)
+    assert at(@run("foo bar", "ee"), 0, 6)
+    assert at(@run("foo.bar", "e"), 0, 2)
+    assert at(@run("foo.bar", "ee"), 0, 3)
+    assert at(@run("foo\n\n  bar", "ee"), 2, 4)            # e skips empty lines
+    assert at(@run("ab", "ee"), 0, 1)
+    0
+
+[[test]]
+fn test_0_and_dollar() -> i32
+    assert at(@run("abc", "$"), 0, 2)
+    assert at(@run("abc", "$0"), 0, 0)
+    assert at(@run("aé", "$"), 0, 1)                      # the last char's first byte
+    assert at(@run("", "$"), 0, 0)
+    0
+
+[[test]]
+fn test_gg_and_G_go_to_the_first_non_blank() -> i32
+    assert at(@run("a\nb\n  c\n", "G"), 2, 2)
+    assert at(@run("  a\nb\nc", "Ggg"), 0, 2)
+    # A lone g waits for the second; any other key drops it.
+    assert at(@run("a\nb\nc", "Ggjgg"), 0, 0)
+    assert at(@run("a\nb\nc", "Ggk"), 1, 0)
+    0
+
+[[test]]
+fn test_ctrl_f_and_ctrl_b_page() -> i32
+    var text = string_new()
+    for i in 0..100
+        text.push_i64(i)
+        text.push('\n')
+    var ed = open(text.as_view())
+    var d = disk_new()
+    ed.page = 22                       # 20 lines turn over per page
+    feed(@&ed, @&d, "<C-f>")
+    assert ed.cursor.line == 20 and ed.top == 20
+    feed(@&ed, @&d, "<C-f><C-b>")
+    assert ed.top == 20 and ed.cursor.line == 41
+    feed(@&ed, @&d, "<C-b><C-b>")
+    assert ed.top == 0
+    feed(@&ed, @&d, "<C-f><C-f><C-f><C-f><C-f><C-f>")
+    assert ed.cursor.line == 99                        # stops at the last line
+    0
+
+[[test]]
+fn test_motions_on_the_empty_buffer() -> i32
+    let ed = run("", "hjkl<up><down><left><right>wbe0$ggG<C-f><C-b>nN")
+    assert at(@ed, 0, 0) and holds(@ed, "") and ed.mode == Mode.Normal
+    0
+
+# ============================================================================
+# Insert
+# ============================================================================
+
+[[test]]
+fn test_i_inserts_before_and_escape_steps_back() -> i32
+    let ed = run("ac", "lib<esc>")
+    assert holds(@ed, "abc") and at(@ed, 0, 1) and ed.mode == Mode.Normal
+    0
+
+[[test]]
+fn test_a_appends_after() -> i32
+    assert holds(@run("ac", "ab<esc>"), "abc")
+    assert holds(@run("ab", "$ac<esc>"), "abc")
+    assert holds(@run("", "ax<esc>"), "x")
+    0
+
+[[test]]
+fn test_o_and_O_open_lines() -> i32
+    let ed = run("a\nc\n", "ob<esc>")
+    assert holds(@ed, "a\nb\nc\n") and at(@ed, 1, 0)
+    assert holds(@run("b\n", "Oa<esc>"), "a\nb\n")
+    assert holds(@run("a", "ob<esc>"), "a\nb")             # last line, no final newline
+    assert holds(@run("a\r\nc", "ob<esc>"), "a\r\nb\r\nc")  # the line's own terminator
+    assert holds(@run("", "Ox<esc>"), "x\n")
+    0
+
+[[test]]
+fn test_insert_backspace_enter_tab_and_text() -> i32
+    assert holds(@run("abc", "$a<bs><bs>x<esc>"), "ax")
+    assert holds(@run("ab", "li<cr><esc>"), "a\nb")
+    assert holds(@run("a\nb", "ji<bs><esc>"), "ab")           # joins at the line start
+    assert at(@run("a\nb", "ji<bs><esc>"), 0, 0)
+    assert holds(@run("ab", "i<bs><esc>"), "ab")              # nothing before the start
+    assert holds(@run("a", "i<tab><esc>"), "\ta")
+    var ed = open("")
+    var d = disk_new()
+    feed(@&ed, @&d, "i")
+    handle_key<Disk>(@&ed, @&d, Key.Char(0xE9))               # é
+    handle_key<Disk>(@&ed, @&d, Key.Char(0x65E5))             # 日
+    assert holds(@ed, "é日") and ed.cursor.col == 5
+    0
+
+[[test]]
+fn test_escape_at_line_start_stays() -> i32
+    let ed = run("abc", "i<esc>")
+    assert at(@ed, 0, 0)
+    0
+
+[[test]]
+fn test_utf8_encode() -> i32
+    let a = utf8_encode('A' as u32)
+    assert a.len() == 1 and a[0] == 'A'
+    let e = utf8_encode(0xE9)
+    assert e.len() == 2 and e[0] == 0xC3 and e[1] == 0xA9
+    let ri = utf8_encode(0x65E5)
+    assert ri.len() == 3 and ri[0] == 0xE6 and ri[1] == 0x97 and ri[2] == 0xA5
+    let g = utf8_encode(0x1F600)
+    assert g.len() == 4 and g[0] == 0xF0 and g[3] == 0x80
+    # Not a scalar value: U+FFFD.
+    let bad = utf8_encode(0xD800)
+    assert bad.len() == 3 and bad[0] == 0xEF and bad[1] == 0xBF and bad[2] == 0xBD
+    0
+
+# ============================================================================
+# Edit: x dd yy p P and the unnamed register
+# ============================================================================
+
+[[test]]
+fn test_x_deletes_the_char_under_the_cursor() -> i32
+    let ed = run("abc", "lx")
+    assert holds(@ed, "ac") and at(@ed, 0, 1)
+    let last = run("abc", "$x")
+    assert holds(@last, "ab") and at(@last, 0, 1)            # the cursor steps back
+    assert holds(@run("éb", "x"), "b")                         # a whole code point
+    assert holds(@run("\nb", "x"), "\nb")                      # an empty line: nothing
+    assert holds(@run("", "x"), "")
+    0
+
+[[test]]
+fn test_dd_deletes_lines() -> i32
+    let ed = run("a\nb\nc\n", "jdd")
+    assert holds(@ed, "a\nc\n") and at(@ed, 1, 0)
+    let last = run("a\nb\nc\n", "Gdd")
+    assert holds(@last, "a\nb\n") and at(@last, 1, 0)
+    assert holds(@run("a\nb", "Gdd"), "a")                      # no final newline
+    assert holds(@run("a\n", "dd"), "")
+    assert holds(@run("", "dd"), "")
+    # d then anything else is dropped.
+    assert holds(@run("ab", "dl"), "ab")
+    0
+
+[[test]]
+fn test_yy_p_and_P_put_lines() -> i32
+    let ed = run("a\nb\n", "yyjp")
+    assert holds(@ed, "a\nb\na\n") and at(@ed, 2, 0)
+    assert holds(@run("a\nb\n", "jyykP"), "b\na\nb\n")
+    assert holds(@run("a", "yyp"), "a\na")                     # after a last line with no newline
+    assert holds(@run("a\nb", "Gddp"), "a\nb")
+    assert holds(@run("  a\nb", "yyjp"), "  a\nb\n  a")
+    assert at(@run("  a\nb", "yyjp"), 2, 2)
+    0
+
+[[test]]
+fn test_x_then_p_and_P_put_chars() -> i32
+    let ed = run("abc", "xp")
+    assert holds(@ed, "bac") and at(@ed, 0, 1)
+    assert holds(@run("abc", "x$P"), "bac")
+    assert holds(@run("abc", "p"), "abc")                      # empty register: nothing
+    assert holds(@run("ab\n\n", "xjp"), "b\na\n")              # into an empty line
+    0
+
+[[test]]
+fn test_yank_keeps_the_buffer_clean() -> i32
+    let ed = run("a\nb", "yy")
+    assert not ed.buf.is_dirty()
+    assert ed.reg_lines
+    0
+
+# ============================================================================
+# Undo
+# ============================================================================
+
+[[test]]
+fn test_an_insert_session_is_one_undo_step() -> i32
+    let ed = run("x", "ihello<cr>world<esc>u")
+    assert holds(@ed, "x") and at(@ed, 0, 0)
+    let o = run("a", "obc<esc>u")
+    assert holds(@o, "a")
+    0
+
+[[test]]
+fn test_ctrl_r_redoes() -> i32
+    let ed = run("x", "iab<esc>xu<C-r>")      # x took the b
+    assert holds(@ed, "ax")
+    let back = run("x", "iab<esc>uu<C-r><C-r>")
+    assert holds(@back, "abx")
+    0
+
+[[test]]
+fn test_undo_dd_and_p() -> i32
+    assert holds(@run("a\nb\n", "ddu"), "a\nb\n")
+    assert holds(@run("a\nb\n", "yypu"), "a\nb\n")
+    0
+
+[[test]]
+fn test_undo_and_redo_with_nothing_say_so() -> i32
+    assert says(@run("a", "u"), "Already at oldest change")
+    assert says(@run("a", "<C-r>"), "Already at newest change")
+    0
+
+[[test]]
+fn test_undo_back_to_the_saved_state_is_clean() -> i32
+    let ed = run("a", "xu")
+    assert not ed.buf.is_dirty()
+    0
+
+# ============================================================================
+# Search
+# ============================================================================
+
+[[test]]
+fn test_slash_finds_a_literal_forward() -> i32
+    let ed = run("a.c abc\nx a.c", "/a.c<cr>")
+    assert at(@ed, 1, 2) and ed.mode == Mode.Normal          # literal: `.` is a dot
+    assert at(@run("abc abc", "/abc<cr>"), 0, 4)              # starts after the cursor
+    0
+
+[[test]]
+fn test_n_and_N_repeat() -> i32
+    assert at(@run("ab ab ab", "/ab<cr>n"), 0, 6)
+    assert at(@run("ab ab ab", "/ab<cr>nN"), 0, 3)
+    0
+
+[[test]]
+fn test_search_wraps_and_says_so() -> i32
+    let ed = run("ab\nxx\nab", "G/ab<cr>")
+    assert at(@ed, 0, 0)
+    assert says(@ed, "search hit BOTTOM, continuing at TOP")
+    let back = run("ab\nxx\nab", "/ab<cr>N")
+    assert at(@back, 0, 0) and says(@back, "")
+    let top = run("ab\nxx\nab", "N")
+    assert says(@top, "No previous search pattern")
+    let up = run("ab\nxx\nab", "/ab<cr>NN")
+    assert at(@up, 2, 0) and says(@up, "search hit TOP, continuing at BOTTOM")
+    # The only match is under the cursor: it wraps onto itself.
+    let self_ = run("ab", "/ab<cr>")
+    assert at(@self_, 0, 0) and says(@self_, "search hit BOTTOM, continuing at TOP")
+    0
+
+[[test]]
+fn test_search_not_found_and_empty_pattern() -> i32
+    let ed = run("abc", "/zz<cr>")
+    assert at(@ed, 0, 0) and says(@ed, "Pattern not found: zz")
+    # An empty pattern reuses the last one.
+    assert at(@run("ab ab ab", "/ab<cr>/<cr>"), 0, 6)
+    assert says(@run("ab", "/<cr>"), "No previous search pattern")
+    0
+
+[[test]]
+fn test_search_escape_cancels() -> i32
+    let ed = run("ab ab", "/ab<esc>n")
+    assert at(@ed, 0, 0) and says(@ed, "No previous search pattern")
+    0
+
+# ============================================================================
+# Command line
+# ============================================================================
+
+[[test]]
+fn test_w_saves_and_marks_clean() -> i32
+    var ed = open("ab")
+    var d = disk_new()
+    feed(@&ed, @&d, "x:w<cr>")
+    assert d.saves == 1 and saved(@d, "b") and d.saved_path.as_view().eq("f.txt")
+    assert not ed.buf.is_dirty() and ed.mode == Mode.Normal
+    assert says(@ed, "\"f.txt\" 1L, 1B written")
+    0
+
+[[test]]
+fn test_w_without_a_name_is_refused() -> i32
+    var ed = editor_new()
+    var d = disk_new()
+    feed(@&ed, @&d, "ix<esc>:w<cr>")
+    assert d.saves == 0 and ed.buf.is_dirty()
+    assert says(@ed, "E32: No file name")
+    0
+
+[[test]]
+fn test_w_path_names_an_unnamed_buffer() -> i32
+    var ed = editor_new()
+    var d = disk_new()
+    feed(@&ed, @&d, "ix<esc>:w new.txt<cr>")
+    assert d.saves == 1 and d.saved_path.as_view().eq("new.txt")
+    assert ed.path.as_view().eq("new.txt") and not ed.buf.is_dirty()
+    0
+
+[[test]]
+fn test_w_other_path_writes_a_copy() -> i32
+    var ed = open("ab")
+    var d = disk_new()
+    feed(@&ed, @&d, "x:w copy.txt<cr>")
+    assert d.saves == 1 and d.saved_path.as_view().eq("copy.txt") and saved(@d, "b")
+    assert ed.path.as_view().eq("f.txt") and ed.buf.is_dirty()
+    0
+
+[[test]]
+fn test_failed_save_keeps_the_buffer_dirty() -> i32
+    var ed = open("ab")
+    var d = disk_new()
+    d.fail_save = true
+    feed(@&ed, @&d, "x:w<cr>")
+    assert ed.buf.is_dirty()
+    assert says(@ed, "\"f.txt\" not written: No space left on device")
+    d.fail_save = false
+    d.changed = true
+    feed(@&ed, @&d, ":wq<cr>")
+    assert ed.buf.is_dirty() and not ed.quit
+    assert says(@ed, "\"f.txt\" changed on disk since it was read: not written")
+    0
+
+[[test]]
+fn test_q_is_refused_with_pending_edits() -> i32
+    let ed = run("ab", "x:q<cr>")
+    assert not ed.quit
+    assert says(@ed, "E37: No write since last change (add ! to override)")
+    assert run("ab", ":q<cr>").quit
+    assert run("ab", "xu:q<cr>").quit                         # undone: nothing pending
+    0
+
+[[test]]
+fn test_q_bang_quits_anyway() -> i32
+    let ed = run("ab", "x:q!<cr>")
+    assert ed.quit
+    0
+
+[[test]]
+fn test_wq_writes_then_quits() -> i32
+    var ed = open("ab")
+    var d = disk_new()
+    feed(@&ed, @&d, "x:wq<cr>")
+    assert ed.quit and d.saves == 1 and saved(@d, "b")
+    0
+
+[[test]]
+fn test_e_replaces_the_buffer() -> i32
+    var ed = open("ab")
+    var d = disk_with("g.txt", "one\ntwo\n")
+    feed(@&ed, @&d, "j:e g.txt<cr>")
+    assert holds(@ed, "one\ntwo\n") and at(@ed, 0, 0)
+    assert ed.path.as_view().eq("g.txt") and not ed.buf.is_dirty()
+    assert says(@ed, "\"g.txt\" 2L, 8B")
+    # The old buffer's undo history went with it.
+    feed(@&ed, @&d, "u")
+    assert holds(@ed, "one\ntwo\n")
+    0
+
+[[test]]
+fn test_e_is_refused_with_pending_edits() -> i32
+    var ed = open("ab")
+    var d = disk_with("g.txt", "one")
+    feed(@&ed, @&d, "x:e g.txt<cr>")
+    assert holds(@ed, "b") and ed.path.as_view().eq("f.txt")
+    assert says(@ed, "E37: No write since last change (add ! to override)")
+    0
+
+[[test]]
+fn test_e_of_a_missing_file_opens_it_empty() -> i32
+    var ed = open("ab")
+    var d = disk_new()
+    feed(@&ed, @&d, ":e new.txt<cr>")
+    assert holds(@ed, "") and ed.path.as_view().eq("new.txt")
+    assert says(@ed, "\"new.txt\" [New]")
+    0
+
+[[test]]
+fn test_e_that_fails_keeps_the_buffer() -> i32
+    var ed = open("ab")
+    var d = disk_with("g.txt", "one")
+    d.fail_load = true
+    feed(@&ed, @&d, ":e g.txt<cr>")
+    assert holds(@ed, "ab") and ed.path.as_view().eq("f.txt")
+    assert says(@ed, "\"g.txt\": Permission denied")
+    assert says(@run("ab", ":e<cr>"), "E32: No file name")
+    0
+
+[[test]]
+fn test_colon_line_goes_to_the_line() -> i32
+    assert at(@run("a\nb\n  c\n", ":3<cr>"), 2, 2)
+    assert at(@run("a\nb\nc\n", "G:1<cr>"), 0, 0)
+    assert at(@run("a\nb\nc\n", ":99<cr>"), 2, 0)              # past the end: the last line
+    assert at(@run("a\nb\nc\n", "G:0<cr>"), 0, 0)
+    0
+
+[[test]]
+fn test_unknown_command_says_so() -> i32
+    let ed = run("ab", ":wat<cr>")
+    assert says(@ed, "E492: Not an editor command: wat")
+    assert ed.mode == Mode.Normal and holds(@ed, "ab")
+    0
+
+[[test]]
+fn test_a_message_clears_on_the_next_key() -> i32
+    let ed = run("ab", ":wat<cr>l")
+    assert says(@ed, "")
+    0
+
+# ============================================================================
+# The screen's view: Editor as the LineSource, status() for the status line
+# ============================================================================
+
+[[test]]
+fn test_the_screen_shows_the_editor() -> i32
+    var ed = open("ab\n")
+    var d = disk_new()
+    feed(@&ed, @&d, "x")
+    let st = ed.status()
+    assert st.name.eq("f.txt") and st.dirty and st.mode == Mode.Normal
+    var scr = screen_new(Size { rows: 4, cols: 20 })
+    var view = view_new()
+    render(@&scr, @ed, @&view, ed.status(), ed.message.as_view())
+    assert scr.row_text(0).as_view().trim_end().eq("  1 b")
+    assert scr.row_text(1).as_view().trim_end().eq("~")       # no line after the final newline
+    assert scr.row_text(2).as_view().starts_with(" NORMAL  f.txt [+]")
+    0
