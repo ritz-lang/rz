@@ -5,14 +5,15 @@ pins every exempt raw API together). This pins only the allocator and mmap
 boundary: malloc/free/realloc/calloc, memzero/secure_zero, heap_alloc/
 heap_free, mmap_failed and sys_mmap/sys_munmap. Their idiomatic replacements:
 
-* an owned buffer: `Vec<u8>` / `Box<T>` / `String` (ritz1 waits on #1854's
-  Drop, so ownership doesn't turn its leaks into double frees);
+* an owned buffer: `Vec<u8>` / `Box<T>` / `String` (their Drop frees it);
 * `span.zero()` / `span.secure_zero()` for memzero(p, n) / secure_zero(p, n);
 * ritzlib.mapping's `mmap_anon(len) -> Result<Span<u8>, Errno>` and
   `munmap(span)` for sys_mmap / sys_munmap.
 
 `ritz` is split by its top directory (examples, ritz1, ...): they are ported
 separately. Each count is a ceiling: lower the pin when you port callers.
+AGAST #4692 brought every hosted project to 0 (no entry); the compilers
+(ritz/ritz0, ritz/ritz1) and the freestanding indium keep theirs.
 """
 
 import sys
