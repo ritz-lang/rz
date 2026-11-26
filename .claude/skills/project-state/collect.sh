@@ -53,12 +53,19 @@ def sh(*cmd, check=True):
 # ---------------------------------------------------------------------------
 LAYERS = {
     "1 · Compiler": ["ritz", "ritzlib", "ritzunit", "ritz-lsp", "rzrz"],
+    # AGAST project 71 (epic #4781): the assembler, IR compiler and linker
+    # that replace clang/lld for ELF builds. Its own row, so the compiler
+    # row's kLOC stays comparable with reports before 2026-11-26.
+    "1b · Native toolchain": ["razm", "rllvm"],
     "2 · Kernel": ["harland"],
     "3 · OS / userland": ["indium", "rzsh"],
     "4 · Desktop": ["prism", "angelo", "iris"],
-    "5 · Productivity": ["tempest", "lexis", "sage", "nexus"],
+    # buddhafinger: AGAST project 72 (epic #4782), the editor.
+    "5 · Productivity": ["tempest", "lexis", "sage", "nexus", "buddhafinger"],
+    # builder: AGAST project 73 (epic #4783), the CI builder image (no .ritz).
     "Foundation · Server & infra": ["valet", "zeus", "spire", "http", "cryptosec",
-                                    "squeeze", "mausoleum", "tome", "goliath"],
+                                    "squeeze", "mausoleum", "tome", "goliath",
+                                    "builder"],
     "Not a layer (reviews/docs)": ["larb"],
 }
 # Paths that are tracked but are not live code (rz.toml [workspace.exclude]).
