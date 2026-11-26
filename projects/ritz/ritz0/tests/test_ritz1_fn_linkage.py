@@ -11,7 +11,9 @@ defining file's hash (`priv_fn__1a2b3c4d`, #1858/#4356), a `pub fn` an external
 object's own copy, AGAST #4609: two types `Box` of two files each have a
 `pick$Box`, and a `linkonce_odr` copy served both). An
 inherent impl method stays `internal` (it can only be called through its
-type's module); a trait impl's methods are external. Only the module that
+type's module), unless the module exports a generic, whose instance in another
+object calls it (AGAST #4839, test_ritz1_private_callee_of_pub_generic_4839.py);
+a trait impl's methods are external. Only the module that
 declares the impl defines them.
 
 §15.3 refuses one import closure holding two `fn helper`, so the runtime test
