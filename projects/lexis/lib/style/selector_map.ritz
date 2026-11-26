@@ -11,11 +11,11 @@
 #   - tag_rules["div"]
 #   - universal_rules
 
-import ritzlib.memory { realloc, free }
+import ritzlib.gvec
 import lib.css.selector { ComplexSelector, CompoundSelector, SimpleSelector, Specificity,
                           SELECTOR_ID, SELECTOR_CLASS, SELECTOR_TYPE, SELECTOR_UNIVERSAL,
                           complex_selector_specificity }
-import lib.css.rule { StyleRule, Declaration, DeclarationBlock }
+import lib.css.rule { Stylesheet, StyleRule, Declaration, DeclarationBlock, stylesheet_selector }
 
 # =============================================================================
 # Rule Entry
@@ -78,13 +78,11 @@ fn hash_string(s: StrView) -> u32
 # bucket, which is fine because candidates are only a superset to run full
 # selector matching on.
 #
-# The map owns `entries` (selector_map_free). Growing it moves the entries,
+# The map owns `entries`. Growing it moves the entries,
 # so RuleEntry pointers from selector_map_get_candidates are valid only until
 # the next selector_map_add_rule.
 pub struct SelectorMap
-    entries: *RuleEntry
-    entry_count: u32
-    entry_cap: u32
+    entries: Vec<RuleEntry>
 
     id_rules: [HASH_MAP_SIZE]RuleBucket
     class_rules: [HASH_MAP_SIZE]RuleBucket
@@ -95,9 +93,7 @@ pub struct SelectorMap
 
 pub fn selector_map_new() -> SelectorMap
     var map: SelectorMap
-    map.entries = null
-    map.entry_count = 0
-    map.entry_cap = 0
+    map.entries = vec_new<RuleEntry>()
 
     var i: u32 = 0
     while i < HASH_MAP_SIZE
@@ -110,19 +106,6 @@ pub fn selector_map_new() -> SelectorMap
 
     map
 
-pub fn selector_map_free(map:& SelectorMap)
-    free(map.entries as *u8)
-    map.entries = null
-    map.entry_count = 0
-    map.entry_cap = 0
-    var i: u32 = 0
-    while i < HASH_MAP_SIZE
-        map.id_rules[i] = rule_bucket_new()
-        map.class_rules[i] = rule_bucket_new()
-        map.tag_rules[i] = rule_bucket_new()
-        i = i + 1
-    map.universal_rules = rule_bucket_new()
-
 # Which bucket array bucket_push appends to.
 const BUCKET_ID: i32 = 0
 const BUCKET_CLASS: i32 = 1
@@ -133,32 +116,21 @@ const BUCKET_UNIVERSAL: i32 = 3
 # (slot is ignored for BUCKET_UNIVERSAL). A failed allocation drops the rule,
 # as a full fixed bucket used to.
 fn bucket_push(map:& SelectorMap, which: i32, slot: u32, entry: @RuleEntry)
-    if map.entry_count == map.entry_cap
-        var new_cap: u32 = map.entry_cap * 2
-        if new_cap == 0
-            new_cap = 16
-        let bytes: i64 = new_cap as i64 * sizeof(RuleEntry)
-        let grown = realloc(map.entries as *u8, bytes) as *RuleEntry
-        if grown == null
-            return
-        map.entries = grown
-        map.entry_cap = new_cap
-
-    let idx = map.entry_count as i32
-    map.entries[idx] = *entry
+    if not map.entries.push(*entry)
+        return
+    let idx = (map.entries.len() - 1) as i32
     map.entries[idx].next = -1
-    map.entry_count = map.entry_count + 1
 
     if which == BUCKET_ID
-        link_tail(map.entries, map.id_rules[slot], idx)
+        link_tail(@&map.entries, map.id_rules[slot], idx)
     else if which == BUCKET_CLASS
-        link_tail(map.entries, map.class_rules[slot], idx)
+        link_tail(@&map.entries, map.class_rules[slot], idx)
     else if which == BUCKET_TAG
-        link_tail(map.entries, map.tag_rules[slot], idx)
+        link_tail(@&map.entries, map.tag_rules[slot], idx)
     else
-        link_tail(map.entries, map.universal_rules, idx)
+        link_tail(@&map.entries, map.universal_rules, idx)
 
-fn link_tail(entries: *RuleEntry, bucket:& RuleBucket, idx: i32)
+fn link_tail(entries: @&Vec<RuleEntry>, bucket:& RuleBucket, idx: i32)
     if bucket.tail >= 0
         entries[bucket.tail].next = idx
     else
@@ -170,11 +142,12 @@ fn link_tail(entries: *RuleEntry, bucket:& RuleBucket, idx: i32)
 # Indexing Rules
 # =============================================================================
 
-pub fn selector_map_add_rule(map:& SelectorMap, rule: @StyleRule)
+# `rule` is one of `sheet`'s rules.
+pub fn selector_map_add_rule(map:& SelectorMap, sheet: @Stylesheet, rule: @StyleRule)
     # For each selector in the rule
-    var sel_idx: u32 = 0
-    while sel_idx < rule.selectors.selector_count
-        let entry = rule_entry_new(rule.selectors.selectors[sel_idx], rule.declarations, rule.source_order)
+    var sel_idx: i64 = 0
+    while sel_idx < rule.selectors.count
+        let entry = rule_entry_new(stylesheet_selector(sheet, rule.selectors, sel_idx), rule.declarations, rule.source_order)
 
         # Get the key selector (rightmost compound selector)
         if entry.selector.compound_count > 0
@@ -274,9 +247,9 @@ pub fn selector_map_get_candidates(map: @SelectorMap, id: StrView, classes: StrV
 fn add_bucket_to_candidates(candidates:& RuleCandidates, map: @SelectorMap, bucket: RuleBucket)
     var idx = bucket.head
     while idx >= 0 and candidates.count < MAX_CANDIDATE_RULES
-        candidates.rules[candidates.count] = map.entries + idx
+        candidates.rules[candidates.count] = map.entries.as_ptr() + idx
         candidates.count = candidates.count + 1
-        idx = map.entries[idx].next
+        idx = (@map.entries[idx]).next
 
 # =============================================================================
 # Statistics (for debugging)

@@ -53,7 +53,7 @@ PINS = {
     "http": 2,
     "indium": 120,
     "larb": 0,
-    "lexis": 10,
+    "lexis": 0,
     # exec (2): test_integration / test_multi_collection fork+exec the built
     # server binary; ritzlib.process.exec is that process boundary.
     "mausoleum": 2,

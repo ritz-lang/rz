@@ -2,8 +2,8 @@
 #
 # Represents parsed CSS rules (style rules, at-rules, etc.)
 
-import ritzlib.memory { realloc, free }
-import lib.css.selector { SelectorList, Specificity, complex_selector_specificity, selector_list_free }
+import ritzlib.gvec
+import lib.css.selector { SelectorList, ComplexSelector, Specificity, complex_selector_specificity }
 import lib.css.value { CssValue }
 
 # =============================================================================
@@ -150,52 +150,32 @@ pub fn css_rule_style(selectors: SelectorList, declarations: DeclarationBlock, o
 # Stylesheet
 # =============================================================================
 
-# The rules live in a heap array that grows on demand, so a Stylesheet is a
-# small header and is cheap to return by value. It was a fixed [4096]CssRule
+# The rules live in a Vec that grows on demand, so a Stylesheet is a small
+# header and is cheap to return by value. It was a fixed [4096]CssRule
 # inline, ~18 GB, which put css_parse's and main's frames far past any stack
-# (#3700). Copies of the header share the array; free exactly one of them
-# with stylesheet_free, which also frees each rule's selector list.
+# (#3700). Every rule's complex selectors live in `selectors`, each rule's
+# SelectorList a range of it, so the sheet owns all its memory in two Vecs
+# that free themselves when it goes.
 pub struct Stylesheet
-    rules: *CssRule
-    rule_count: u32
-    rule_cap: u32
+    rules: Vec<CssRule>
+    selectors: Vec<ComplexSelector>
 
 pub fn stylesheet_new() -> Stylesheet
-    Stylesheet { rules: null, rule_count: 0, rule_cap: 0 }
+    Stylesheet { rules: vec_new<CssRule>(), selectors: vec_new<ComplexSelector>() }
 
-# Append `rule`; the sheet takes ownership of its selector list. Returns 1 on
-# success, 0 when the array could not grow (the caller still owns `rule`).
-pub fn stylesheet_add_rule(sheet:& Stylesheet, rule: @CssRule) -> i32
-    if sheet.rule_count == sheet.rule_cap
-        var new_cap: u32 = sheet.rule_cap * 2
-        if new_cap == 0
-            new_cap = 8
-        let bytes: i64 = new_cap as i64 * sizeof(CssRule)
-        let grown = realloc(sheet.rules as *u8, bytes) as *CssRule
-        if grown == null
-            return 0
-        sheet.rules = grown
-        sheet.rule_cap = new_cap
-    sheet.rules[sheet.rule_count] = *rule
-    sheet.rule_count = sheet.rule_count + 1
-    1
+# Append `rule`, whose selectors are already in sheet.selectors. False when
+# the rules could not grow.
+pub fn stylesheet_add_rule(sheet:& Stylesheet, rule: @CssRule) -> bool
+    sheet.rules.push(*rule)
 
-pub fn stylesheet_free(sheet:& Stylesheet)
-    var i: u32 = 0
-    while i < sheet.rule_count
-        selector_list_free(sheet.rules[i].style_rule.selectors)
-        i = i + 1
-    free(sheet.rules as *u8)
-    sheet.rules = null
-    sheet.rule_count = 0
-    sheet.rule_cap = 0
+# Complex selector `k` (in 0..list.count) of `list`, a list of this sheet.
+pub fn stylesheet_selector(sheet: @Stylesheet, list: SelectorList, k: i64) -> ComplexSelector
+    sheet.selectors[list.start + k]
 
 # Get all style rules (for selector matching)
 pub fn stylesheet_style_rule_count(sheet: @Stylesheet) -> u32
     var count: u32 = 0
-    var i: u32 = 0
-    while i < sheet.rule_count
-        if sheet.rules[i].kind == RULE_STYLE
+    for i in 0..sheet.rules.len()
+        if (@sheet.rules[i]).kind == RULE_STYLE
             count = count + 1
-        i = i + 1
     count

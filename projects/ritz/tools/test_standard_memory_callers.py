@@ -38,7 +38,6 @@ PINS = {
     "angelo": 4,
     "cryptosec": 0,
     "indium": 16,
-    "lexis": 6,
     "prism": 3,
     "ritz/ritz0": 18,
     "ritz/ritz1": 511,

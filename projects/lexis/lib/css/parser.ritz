@@ -3,6 +3,7 @@
 # Parses CSS tokens into stylesheet, rules, selectors, and declarations.
 
 import ritzlib.strview
+import ritzlib.gvec
 import lib.css.token
 import lib.css.tokenizer { CssTokenizer, css_tokenizer_new, css_tokenizer_next }
 import lib.css.selector
@@ -71,15 +72,15 @@ pub fn css_parse_stylesheet(p:& CssParser) -> Stylesheet
             continue
 
         # Try to parse a style rule
-        var style_rule = parse_style_rule(p)
-        if style_rule.selectors.selector_count > 0
+        let style_rule = parse_style_rule(p, @&sheet.selectors)
+        if style_rule.selectors.count > 0
             let css_rule = css_rule_style(style_rule.selectors, style_rule.declarations, p.rule_order)
-            if stylesheet_add_rule(sheet, @css_rule) == 1
+            if stylesheet_add_rule(sheet, @css_rule)
                 p.rule_order = p.rule_order + 1
             else
-                selector_list_free(style_rule.selectors)
-        else
-            selector_list_free(style_rule.selectors)
+                # The rule is dropped: so are its selectors, the pool's tail.
+                while sheet.selectors.len() > style_rule.selectors.start
+                    sheet.selectors.pop()
 
     sheet
 
@@ -87,8 +88,9 @@ pub fn css_parse_stylesheet(p:& CssParser) -> Stylesheet
 # Style Rule Parsing
 # =============================================================================
 
-fn parse_style_rule(p:& CssParser) -> StyleRule
-    let selectors = parse_selector_list(p)
+# The rule's complex selectors are appended to `pool`, its sheet's selectors.
+fn parse_style_rule(p:& CssParser, pool: @&Vec<ComplexSelector>) -> StyleRule
+    let selectors = parse_selector_list(p, pool)
 
     skip_whitespace(p)
 
@@ -108,15 +110,17 @@ fn parse_style_rule(p:& CssParser) -> StyleRule
 # Selector Parsing
 # =============================================================================
 
-fn parse_selector_list(p:& CssParser) -> SelectorList
-    var list = selector_list_new()
+fn parse_selector_list(p:& CssParser, pool: @&Vec<ComplexSelector>) -> SelectorList
+    var list = selector_list_new(pool.len())
 
     loop
         skip_whitespace(p)
 
         let complex = parse_complex_selector(p)
-        if complex.compound_count > 0
-            selector_list_add(list, complex)
+        # A failed allocation drops the selector, like the old fixed list
+        # did when it was full.
+        if complex.compound_count > 0 and pool.push(complex)
+            list.count = list.count + 1
 
         skip_whitespace(p)
 
