@@ -1,0 +1,203 @@
+# Harland - the PMM's multiboot2 memory map (AGAST #4856)
+#
+# GRUB 2.12 sizes the multiboot2 memory map tag (type 6) from one walk of the
+# firmware's map and fills it from another, before ExitBootServices: when
+# the map changes in between, the tag drops its highest entries or keeps
+# stale bytes. A grub-reboot boot on a loaded TCG runner found no RAM above
+# a few MiB in it and panicked, most likely that way. The EFI memory map tag (type 17) is the map
+# ExitBootServices accepted, so the PMM sizes and fills its bitmap from it
+# when GRUB passed one, and from the type-6 tag only otherwise; it logs a
+# disagreement between the two, and the whole info block when no bitmap
+# fits.
+
+import mm.pmm { Mb2BootInfo, mb2_usable_top, pmm_init_from_multiboot, pmm_set_physmap_offset, pmm_get_free_pages, pmm_bitmap_phys }
+import klog { klog_serial, ring_clear, ring_copy }
+import ritzlib.strview { StrView }
+
+# A multiboot2 info block: 8-byte header, then tags, each 8-byte aligned
+var g_mbi: [128]u64
+var g_end: u64 = 0
+var g_out: [16384]u8
+# The bitmap's page: pmm_init_from_multiboot writes it at physical 0x200000
+# through the physmap offset the test points here
+var g_bitmap: [4096]u8
+
+# OVMF's descriptor stride: 48 bytes, past the 40 of EFI_MEMORY_DESCRIPTOR
+const EFI_DESC_SIZE: u64 = 48
+const EFI_CONVENTIONAL: u32 = 7
+const EFI_BOOT_SERVICES_DATA: u32 = 4
+const EFI_LOADER_DATA: u32 = 2
+const EFI_RESERVED: u32 = 0
+const EFI_ACPI_NVS: u32 = 10
+const MB2_AVAILABLE: u32 = 1
+const MB2_RESERVED: u32 = 2
+
+fn put_u32(off: u64, v: u32)
+    let p: *u32 = (@g_mbi as u64 + off) as *u32
+    *p = v
+
+fn put_u64(off: u64, v: u64)
+    let p: *u64 = (@g_mbi as u64 + off) as *u64
+    *p = v
+
+fn mbi_start()
+    var i: i32 = 0
+    while i < 128
+        g_mbi[i] = 0
+        i = i + 1
+    g_end = 8
+
+# A type-6 tag with n entries; mb2_entry fills them.
+fn mb2_map(n: u64) -> u64
+    let off: u64 = g_end
+    put_u32(off, 6)
+    put_u32(off + 4, (16 + n * 24) as u32)
+    put_u32(off + 8, 24)
+    put_u32(off + 12, 0)
+    g_end = off + 16 + n * 24
+    return off + 16
+
+fn mb2_entry(at: u64, i: u64, base: u64, length: u64, entry_type: u32)
+    let e: u64 = at + i * 24
+    put_u64(e, base)
+    put_u64(e + 8, length)
+    put_u32(e + 16, entry_type)
+
+# A type-17 tag with n descriptors of desc_size bytes; efi_desc fills them.
+fn efi_map(n: u64, desc_size: u64) -> u64
+    let off: u64 = g_end
+    put_u32(off, 17)
+    put_u32(off + 4, (16 + n * desc_size) as u32)
+    put_u32(off + 8, desc_size as u32)
+    put_u32(off + 12, 1)
+    g_end = (off + 16 + n * desc_size + 7) & ~7
+    return off + 16
+
+fn efi_desc(at: u64, i: u64, desc_type: u32, base: u64, pages: u64)
+    let d: u64 = at + i * EFI_DESC_SIZE
+    put_u32(d, desc_type)
+    put_u64(d + 8, base)
+    put_u64(d + 16, 0)
+    put_u64(d + 24, pages)
+
+fn mbi_finish() -> *Mb2BootInfo
+    put_u32(g_end, 0)
+    put_u32(g_end + 4, 8)
+    put_u32(0, (g_end + 8) as u32)
+    klog_serial(false)
+    ring_clear()
+    return @g_mbi as *Mb2BootInfo
+
+fn ring_has(needle: StrView) -> bool
+    let n: i64 = ring_copy(@g_out[0], 16384)
+    let got: StrView = StrView { ptr: @g_out[0], len: n }
+    return got.contains(needle)
+
+# What GRUB's type-6 tag held on the failed boot: low RAM only
+fn short_mb2_map()
+    let m: u64 = mb2_map(2)
+    mb2_entry(m, 0, 0, 0x9F000, MB2_AVAILABLE)
+    mb2_entry(m, 1, 0x100000, 0x300000, MB2_AVAILABLE)
+
+[[test]]
+fn test_efi_map_wins_over_a_short_mb2_map() -> i32
+    mbi_start()
+    short_mb2_map()
+    let e: u64 = efi_map(3, EFI_DESC_SIZE)
+    efi_desc(e, 0, EFI_CONVENTIONAL, 0, 0x9F)
+    efi_desc(e, 1, EFI_CONVENTIONAL, 0x100000, 0x700)
+    efi_desc(e, 2, EFI_CONVENTIONAL, 0x900000, 0x7F000)
+    assert mb2_usable_top(mbi_finish()) == 0x7F900000
+    0
+
+[[test]]
+fn test_efi_map_disagreeing_with_the_mb2_map_is_logged() -> i32
+    mbi_start()
+    short_mb2_map()
+    let e: u64 = efi_map(1, EFI_DESC_SIZE)
+    efi_desc(e, 0, EFI_CONVENTIONAL, 0x100000, 0x7F000)
+    let top: u64 = mb2_usable_top(mbi_finish())
+    assert top == 0x7F100000
+    assert ring_has("[pmm] multiboot2 memory map ends at 0x400000, the EFI memory map at 0x7F100000: using the EFI map\n")
+    0
+
+[[test]]
+fn test_agreeing_maps_log_nothing() -> i32
+    mbi_start()
+    let m: u64 = mb2_map(1)
+    mb2_entry(m, 0, 0x100000, 0x7F000000, MB2_AVAILABLE)
+    let e: u64 = efi_map(1, EFI_DESC_SIZE)
+    efi_desc(e, 0, EFI_CONVENTIONAL, 0x100000, 0x7F000)
+    assert mb2_usable_top(mbi_finish()) == 0x7F100000
+    assert not ring_has("[pmm]")
+    0
+
+[[test]]
+fn test_efi_boot_services_and_loader_memory_is_usable_reserved_and_acpi_are_not() -> i32
+    # After ExitBootServices, boot-services and loader pages are free RAM,
+    # as GRUB's own type-6 translation counts them
+    mbi_start()
+    let e: u64 = efi_map(4, EFI_DESC_SIZE)
+    efi_desc(e, 0, EFI_LOADER_DATA, 0x100000, 0x100)
+    efi_desc(e, 1, EFI_BOOT_SERVICES_DATA, 0x200000, 0x100)
+    efi_desc(e, 2, EFI_ACPI_NVS, 0x300000, 0x100)
+    efi_desc(e, 3, EFI_RESERVED, 0x400000, 0x100)
+    assert mb2_usable_top(mbi_finish()) == 0x300000
+    0
+
+[[test]]
+fn test_mb2_map_alone_is_used() -> i32
+    mbi_start()
+    let m: u64 = mb2_map(2)
+    mb2_entry(m, 0, 0x100000, 0x7F000000, MB2_AVAILABLE)
+    mb2_entry(m, 1, 0xFEC00000, 0x1000, MB2_RESERVED)
+    assert mb2_usable_top(mbi_finish()) == 0x7F100000
+    0
+
+[[test]]
+fn test_efi_map_with_descriptors_too_short_is_ignored() -> i32
+    # A descriptor stride under EFI_MEMORY_DESCRIPTOR's 40 bytes can't be
+    # read: fall back to the type-6 tag
+    mbi_start()
+    short_mb2_map()
+    let e: u64 = efi_map(1, 16)
+    put_u32(e, EFI_CONVENTIONAL)
+    put_u64(e + 8, 0x100000)
+    assert mb2_usable_top(mbi_finish()) == 0x400000
+    0
+
+[[test]]
+fn test_no_bitmap_site_logs_the_info_block() -> i32
+    # RAM only under the kernel's 2 MiB window: no site for the bitmap
+    mbi_start()
+    let m: u64 = mb2_map(2)
+    mb2_entry(m, 0, 0, 0x9F000, MB2_AVAILABLE)
+    mb2_entry(m, 1, 0x100000, 0x80000, MB2_AVAILABLE)
+    let e: u64 = efi_map(1, EFI_DESC_SIZE)
+    efi_desc(e, 0, EFI_CONVENTIONAL, 0x100000, 0x80)
+    assert pmm_init_from_multiboot(mbi_finish(), 0x200000) == -1
+    assert ring_has("[pmm] no room below 1 GiB for a 4 KiB bitmap\n")
+    assert ring_has("[pmm] multiboot2 info at 0x")
+    assert ring_has("[pmm]   tag 6 size 64\n")
+    assert ring_has("[pmm]     0x100000 +0x80000 type 1\n")
+    assert ring_has("[pmm]   tag 17 size 64\n")
+    assert ring_has("[pmm]     EFI 0x100000 +0x80 pages type 7\n")
+    assert ring_has("[pmm]   tag 0 size 8\n")
+    0
+
+[[test]]
+fn test_bitmap_is_placed_and_filled_from_the_efi_map() -> i32
+    # Type 6 has no RAM above the kernel's 2 MiB window; the EFI map has 64
+    # pages at 2 MiB: the bitmap takes the first, the other 63 are free
+    mbi_start()
+    let m: u64 = mb2_map(1)
+    mb2_entry(m, 0, 0, 0x9F000, MB2_AVAILABLE)
+    let e: u64 = efi_map(1, EFI_DESC_SIZE)
+    efi_desc(e, 0, EFI_CONVENTIONAL, 0x200000, 64)
+    pmm_set_physmap_offset((@g_bitmap[0] as u64) - 0x200000)
+    let rc: i32 = pmm_init_from_multiboot(mbi_finish(), 0x200000)
+    pmm_set_physmap_offset(0)
+    assert rc == 0
+    assert pmm_bitmap_phys() == 0x200000
+    assert pmm_get_free_pages() == 63
+    0

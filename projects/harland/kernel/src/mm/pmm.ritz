@@ -5,7 +5,8 @@
 #
 # This is the foundation of memory management - VMM and heap depend on it.
 
-import klog { klog, klog_dec, klog_hex }
+import klog { klog, klog_dec, klog_hex, klog_hex_prefix }
+import ritzlib.option
 
 # ============================================================================
 # Page Constants (shared with VMM and heap)
@@ -115,6 +116,54 @@ pub fn mb2_find_module(mb_info: *Mb2BootInfo) -> *Mb2ModuleTag
                 return m
         tag_ptr = (tag_ptr + (*tag).size as u64 + 7) & ~7
     return 0 as *Mb2ModuleTag
+
+# EFI memory map tag (type 17, multiboot2 spec 3.6.15): the map GRUB's
+# ExitBootServices call was accepted with, descr_size-byte descriptors from
+# offset 16.
+pub struct Mb2EfiMmapTag
+    tag_type: u32
+    size: u32
+    descr_size: u32
+    descr_vers: u32
+
+# EFI_MEMORY_DESCRIPTOR (UEFI spec 7.2), its 40 defined bytes: firmware may
+# pad each to a larger descr_size (OVMF: 48).
+pub struct EfiMemDesc
+    mem_type: u32
+    pad: u32
+    phys_start: u64
+    virt_start: u64
+    num_pages: u64
+    attribute: u64
+
+const EFI_MEM_DESC_MIN: u64 = 40
+const EFI_LOADER_CODE: u32 = 1
+const EFI_LOADER_DATA: u32 = 2
+const EFI_BOOT_SERVICES_CODE: u32 = 3
+const EFI_BOOT_SERVICES_DATA: u32 = 4
+const EFI_CONVENTIONAL_MEMORY: u32 = 7
+
+# RAM that is free once boot services have exited: conventional memory, and
+# the loader's and boot services' pages. GRUB's type-6 tag counts the same
+# five as AVAILABLE.
+fn efi_mem_usable(mem_type: u32) -> bool
+    return mem_type == EFI_CONVENTIONAL_MEMORY or mem_type == EFI_LOADER_CODE or mem_type == EFI_LOADER_DATA or mem_type == EFI_BOOT_SERVICES_CODE or mem_type == EFI_BOOT_SERVICES_DATA
+
+# The EFI memory map tag; None if GRUB passed none or its descriptors are
+# shorter than EFI_MEMORY_DESCRIPTOR.
+fn mb2_efi_mmap(mb_info: *Mb2BootInfo) -> Option<*Mb2EfiMmapTag>
+    let info_end: u64 = (mb_info as u64) + (*mb_info).total_size as u64
+    var tag_ptr: u64 = (mb_info as u64) + 8
+    while tag_ptr + 8 <= info_end
+        let tag: *Mb2Tag = tag_ptr as *Mb2Tag
+        if (*tag).tag_type == MB2_TAG_END or (*tag).size < 8
+            break
+        if (*tag).tag_type == MB2_TAG_EFI_MMAP and (*tag).size >= 16
+            let efi: *Mb2EfiMmapTag = tag_ptr as *Mb2EfiMmapTag
+            if (*efi).descr_size as u64 >= EFI_MEM_DESC_MIN
+                return Some(efi)
+        tag_ptr = (tag_ptr + (*tag).size as u64 + 7) & ~7
+    return None
 
 # ============================================================================
 # Harland Boot Protocol (UEFI bootloader native format)
@@ -528,7 +577,8 @@ fn pmm_visit_usable(base: u64, length: u64, pass: u32, size: u64)
     else
         pmm_mark_region_free(base, length)
 
-fn pmm_mb2_pass(mb_info: *Mb2BootInfo, pass: u32, size: u64)
+# The type-6 tag's AVAILABLE entries.
+fn pmm_mb2_mmap_pass(mb_info: *Mb2BootInfo, pass: u32, size: u64)
     let info_end: u64 = (mb_info as u64) + (*mb_info).total_size as u64
     var tag_ptr: u64 = (mb_info as u64) + 8
 
@@ -553,6 +603,50 @@ fn pmm_mb2_pass(mb_info: *Mb2BootInfo, pass: u32, size: u64)
                 entry_ptr = entry_ptr + entry_size as u64
 
         tag_ptr = (tag_ptr + (*tag).size as u64 + 7) & ~7
+
+# The type-17 tag's usable descriptors (efi_mem_usable).
+fn pmm_efi_mmap_pass(efi: *Mb2EfiMmapTag, pass: u32, size: u64)
+    let stride: u64 = (*efi).descr_size as u64
+    let descs_end: u64 = (efi as u64) + (*efi).size as u64
+    var d_ptr: u64 = (efi as u64) + 16
+    while d_ptr + EFI_MEM_DESC_MIN <= descs_end
+        let d: *EfiMemDesc = d_ptr as *EfiMemDesc
+        if efi_mem_usable((*d).mem_type)
+            pmm_visit_usable((*d).phys_start, (*d).num_pages * PAGE_SIZE, pass, size)
+        d_ptr = d_ptr + stride
+
+# One pass over the multiboot2 RAM: the EFI memory map when GRUB passed a
+# readable one, else the type-6 tag (mb2_usable_top says why).
+fn pmm_mb2_pass(mb_info: *Mb2BootInfo, pass: u32, size: u64)
+    match mb2_efi_mmap(mb_info)
+        Some(efi) => pmm_efi_mmap_pass(efi, pass, size)
+        None => pmm_mb2_mmap_pass(mb_info, pass, size)
+
+# The end of the highest usable RAM the PMM tracks for this info block, and
+# pmm_scan_top set to it. GRUB 2.12 sizes the type-6 tag from one walk of the
+# firmware's map and fills it from a second, both before ExitBootServices: a
+# map that changed in between leaves the tag short its highest entries, or
+# holding stale bytes. A grub-reboot boot on a loaded TCG runner found no
+# bitmap site in its type-6 tag and panicked, most likely that way (AGAST
+# #4856; not reproduced in 850 local boots). The type-17 tag is the map
+# ExitBootServices accepted, so it wins; a type-6 tag that disagrees with it
+# is logged.
+pub fn mb2_usable_top(mb_info: *Mb2BootInfo) -> u64
+    pmm_scan_top = 0
+    pmm_mb2_mmap_pass(mb_info, PMM_PASS_TOP, 0)
+    let mb2_top: u64 = pmm_scan_top
+    match mb2_efi_mmap(mb_info)
+        Some(efi) =>
+            pmm_scan_top = 0
+            pmm_efi_mmap_pass(efi, PMM_PASS_TOP, 0)
+        None => return mb2_top
+    if mb2_top != 0 and mb2_top != pmm_scan_top
+        klog("[pmm] multiboot2 memory map ends at ")
+        klog_hex_prefix(mb2_top)
+        klog(", the EFI memory map at ")
+        klog_hex_prefix(pmm_scan_top)
+        klog(": using the EFI map\n")
+    return pmm_scan_top
 
 fn pmm_bootinfo_pass(info: *HarlandBootInfo, pass: u32, size: u64)
     let num_entries: u32 = (*info).memory_map_entries
@@ -585,26 +679,90 @@ fn pmm_start_bitmap(size: u64) -> i32
     pmm_init(pmm_site as *u8, pages)
     return 0
 
+# Log the multiboot2 info block a failed pmm_init_from_multiboot read: each
+# tag's type and size, and the entries of its type-6 and type-17 memory maps.
+# A map with no bitmap site leaves nothing else to go on (AGAST #4856).
+fn pmm_mb2_log_map(mb_info: *Mb2BootInfo)
+    let info_end: u64 = (mb_info as u64) + (*mb_info).total_size as u64
+    klog("[pmm] multiboot2 info at ")
+    klog_hex_prefix(mb_info as u64)
+    klog(", ")
+    klog_dec((*mb_info).total_size as u64)
+    klog(" bytes\n")
+    var tag_ptr: u64 = (mb_info as u64) + 8
+    while tag_ptr + 8 <= info_end
+        let tag: *Mb2Tag = tag_ptr as *Mb2Tag
+        klog("[pmm]   tag ")
+        klog_dec((*tag).tag_type as u64)
+        klog(" size ")
+        klog_dec((*tag).size as u64)
+        klog("\n")
+        if (*tag).tag_type == MB2_TAG_END or (*tag).size < 8
+            return
+        if (*tag).tag_type == MB2_TAG_MMAP and (*tag).size >= 16
+            pmm_log_mb2_entries(tag_ptr as *Mb2MmapTag)
+        if (*tag).tag_type == MB2_TAG_EFI_MMAP and (*tag).size >= 16
+            pmm_log_efi_descs(tag_ptr as *Mb2EfiMmapTag)
+        tag_ptr = (tag_ptr + (*tag).size as u64 + 7) & ~7
+
+fn pmm_log_mb2_entries(mmap_tag: *Mb2MmapTag)
+    let entry_size: u64 = (*mmap_tag).entry_size as u64
+    let entries_end: u64 = (mmap_tag as u64) + (*mmap_tag).size as u64
+    var entry_ptr: u64 = (mmap_tag as u64) + 16
+    while entry_size >= 24 and entry_ptr + 24 <= entries_end
+        let entry: *Mb2MmapEntry = entry_ptr as *Mb2MmapEntry
+        klog("[pmm]     ")
+        klog_hex_prefix((*entry).base_addr)
+        klog(" +")
+        klog_hex_prefix((*entry).length)
+        klog(" type ")
+        klog_dec((*entry).entry_type as u64)
+        klog("\n")
+        entry_ptr = entry_ptr + entry_size
+
+fn pmm_log_efi_descs(efi: *Mb2EfiMmapTag)
+    let stride: u64 = (*efi).descr_size as u64
+    let descs_end: u64 = (efi as u64) + (*efi).size as u64
+    var d_ptr: u64 = (efi as u64) + 16
+    while stride >= EFI_MEM_DESC_MIN and d_ptr + EFI_MEM_DESC_MIN <= descs_end
+        let d: *EfiMemDesc = d_ptr as *EfiMemDesc
+        klog("[pmm]     EFI ")
+        klog_hex_prefix((*d).phys_start)
+        klog(" +")
+        klog_hex_prefix((*d).num_pages)
+        klog(" pages type ")
+        klog_dec((*d).mem_type as u64)
+        klog("\n")
+        d_ptr = d_ptr + stride
+
 # Parse the Multiboot2 memory map and initialize the PMM. kernel_phys_end is
 # main's linker-derived image end (pmm_reserve_kernel's): the bitmap stays
-# off the image and the info block. Returns 0, or -1 (PMM left unusable).
+# off the image and the info block. Returns 0, or -1 (PMM left unusable,
+# the info block logged).
 pub fn pmm_init_from_multiboot(mb_info: *Mb2BootInfo, kernel_phys_end: u64) -> i32
+    if pmm_init_mb2(mb_info, kernel_phys_end)
+        return 0
+    pmm_mb2_log_map(mb_info)
+    return -1
+
+fn pmm_init_mb2(mb_info: *Mb2BootInfo, kernel_phys_end: u64) -> bool
     pmm_avoid_reset(kernel_phys_end)
     pmm_avoid(mb_info as u64, (*mb_info).total_size as u64)
     # The initramfs module (AGAST #4258) sits in "available" RAM too.
     let mb_mod: *Mb2ModuleTag = mb2_find_module(mb_info)
     if mb_mod != 0 as *Mb2ModuleTag
         pmm_avoid((*mb_mod).mod_start as u64, ((*mb_mod).mod_end - (*mb_mod).mod_start) as u64)
-    pmm_mb2_pass(mb_info, PMM_PASS_TOP, 0)
+    mb2_usable_top(mb_info)
     let size: u64 = pmm_bitmap_size_from_top()
     if size == 0
-        return -1
+        return false
     pmm_mb2_pass(mb_info, PMM_PASS_SITE, size)
     if pmm_start_bitmap(size) != 0
-        return -1
+        return false
     pmm_mb2_pass(mb_info, PMM_PASS_FREE, 0)
     pmm_mark_region_used(pmm_site, size)
-    return 0
+    return true
+
 
 # Initialize the PMM from Harland boot info (UEFI boot path). The bitmap
 # stays off the image, the boot info, its memory map and the PML4.

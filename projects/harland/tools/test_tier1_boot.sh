@@ -448,13 +448,25 @@ print(f"PASS ({name}): {n_pass} kernel boot self-tests passed")
 PY
 }
 
-# no_exception NAME: fail if the kernel took an exception or panicked.
+# no_exception NAME: fail if the kernel took an exception or panicked, and
+# print the first one: the 20 boot lines before it and up to 40 after, the
+# register dump or panic message included. A panic before init has no suite
+# output for boot's tail to show, and its message is no EXCEPTION line:
+# printing only an EXCEPTION..CR2 range left a grub-reboot panic as a bare
+# FAIL line (AGAST #4856).
 no_exception() {
-    if grep -aqE "EXCEPTION|KERNEL PANIC" "$WORK/$1.log"; then
-        sed -n '/EXCEPTION/,/CR2/p' "$WORK/$1.log"
-        echo "FAIL ($1): kernel exception during boot"
-        return 1
-    fi
+    local log="$WORK/$1.log" first
+    first="$(grep -anE "EXCEPTION|KERNEL PANIC" "$log" | head -1)"
+    [ -n "$first" ] || return 0
+    local n="${first%%:*}"
+    local from=$((n > 20 ? n - 20 : 1))
+    echo "----- $1 boot: serial lines $from-$((n + 40)), around the first EXCEPTION or KERNEL PANIC -----"
+    sed -n "${from},$((n + 40))p" "$log" | tr -d '\r' | sed 's/^/      /'
+    case "$first" in
+        *EXCEPTION*) echo "FAIL ($1): kernel exception during boot" ;;
+        *) echo "FAIL ($1): kernel panic during boot" ;;
+    esac
+    return 1
 }
 
 # powered_off NAME: pass only if init exited and QEMU then exited by itself

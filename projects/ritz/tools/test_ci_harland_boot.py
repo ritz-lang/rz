@@ -675,6 +675,53 @@ def test_kernel_panic_fails(tree):
     assert "FAIL (native)" in r.stdout
 
 
+def _dump(stdout: str, verdict: str) -> str:
+    """What no_exception printed: its header line through its verdict."""
+    head = "around the first EXCEPTION or KERNEL PANIC -----\n"
+    assert head in stdout and verdict in stdout, stdout
+    return stdout.split(head, 1)[1].split(verdict, 1)[0]
+
+
+@pytest.mark.integration
+def test_kernel_panic_prints_the_panic_and_the_boot_lines_before_it(tree):
+    """AGAST #4856: a grub-reboot boot panicked before init, and the step
+    printed only "kernel exception during boot": the tail starts at init's
+    suite and the dump at an EXCEPTION line, so a KERNEL PANIC showed
+    neither its message nor the boot lines that led to it."""
+    r = _run(
+        tree,
+        r"  [..] Physical memory[pmm] no room below 1 GiB for a 4 KiB bitmap\r\n"
+        r"\r  [!!] Physical memory (no bitmap)\n"
+        r"  [..] Kernel heap\r  [!!] Kernel heap (init failed)\n"
+        r"\n*** KERNEL PANIC ***\nkernel heap corrupt after vfs_init\n",
+        poweroff=False,
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): kernel panic during boot" in r.stdout
+    out = _dump(r.stdout, "FAIL (native): kernel panic")
+    for line in ("[pmm] no room below 1 GiB", "[!!] Kernel heap (init failed)",
+                 "*** KERNEL PANIC ***", "kernel heap corrupt after vfs_init"):
+        assert line in out, r.stdout
+
+
+@pytest.mark.integration
+def test_exception_prints_its_register_dump(tree):
+    """An exception other than a page fault has no CR2 line: its dump runs
+    to the registers, and so must what the step prints (AGAST #4856)."""
+    r = _run(
+        tree,
+        r"[kmain] start\n\n!!! EXCEPTION !!!\nVector: 13 (General Protection)\n"
+        r"RIP: 0xFFFFFFFF80101234\n\nRegisters:\nRAX: 0x0\n",
+        poweroff=False,
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): kernel exception during boot" in r.stdout
+    out = _dump(r.stdout, "FAIL (native): kernel exception")
+    for line in ("[kmain] start", "Vector: 13 (General Protection)",
+                 "RIP: 0xFFFFFFFF80101234", "RAX: 0x0"):
+        assert line in out, r.stdout
+
+
 @pytest.mark.integration
 def test_exception_fails_even_if_the_suite_passed(tree):
     r = _run(tree, r"EXCEPTION: #GP\nRIP=0x1\nCR2=0\n" + PASSED)
