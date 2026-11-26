@@ -28,7 +28,8 @@ sections below give the mechanics; this is the policy they serve:
    While a train is built, every new room is based on the deepest tail
    (`train.sh tail`), so its car boards as `KEPT` ("Spawning a room").
 4. **Cars smoke-check, trains gate.** A room runs `smoke-plan.sh run`: smoke
-   plus every subsystem its commit touches, each in full. It never runs a full gate
+   plus every subsystem its commit touches (the floor), plus what the room
+   judges it can break (#4777), each in full. It never runs a full gate
    unless it chooses to. The full gate runs once per train, on its tip.
    `main` never moves without a full gate on the landed SHA.
 5. **Rooms never chase the train; the conductor catches them up** (Aaron,

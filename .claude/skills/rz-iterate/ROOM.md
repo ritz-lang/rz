@@ -53,6 +53,17 @@ vouches that the subsystems you changed pass **in full** on that commit.
    `projects/ritz`: compare against `origin/main` before calling them
    pre-existing.
 
+   **The plan is the floor, not the whole check** (#4777). Before you run
+   it, name what your change can break beyond the files it touched: the
+   callers of a changed signature, the packages using a changed ritzlib
+   API, the compiler stages a language change reaches, the tests that read
+   the changed sources. Add those as `+<target>` (`run +pkg:<p>
+   +ritzlib-ritz1 +build-all-ritz1 ...`; the targets are in the script's
+   `cmd_of`), so the quote lists them, and run anything no target covers by
+   hand, in full. Compiler and language changes test more: if you're
+   unsure, run the full gate below. If you judged no extras were needed,
+   say why in your REAP's one line.
+
    **A full room gate is optional, and the stronger quote:**
    ```bash
    W=~/dev/ritz-lang/rz-task-<id>

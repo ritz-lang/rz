@@ -6,9 +6,13 @@
 # before merging, to keep the main branch stable.").  One script, so a room
 # and rz agree on what "the subsystems changed" means.
 #
-#   smoke-plan.sh plan [<rev-range>]    the targets for the diff, one per
-#                                       line: `<target>\t<command>`
-#   smoke-plan.sh run [<rev-range>]     run them, every one in full (not a
+#   smoke-plan.sh plan [<rev-range>] [+<target>...]
+#                                       the targets for the diff, one per
+#                                       line: `<target>\t<command>`; each
+#                                       +<target> is an extra the room adds
+#                                       (ROOM.md step 6), after the plan's
+#   smoke-plan.sh run [<rev-range>] [+<target>...]
+#                                       run them, every one in full (not a
 #                                       fail-fast subset: #4450 ran 59 files
 #                                       of ~24k tests and cost two trains),
 #                                       then print the REAP quote as the
@@ -33,16 +37,26 @@
 # `tools-ratchets`, below):
 #   *.md, docs/**                        doc-only: no target of its own,
 #     except projects/ritz/**.md         doc-examples
-#   projects/ritz/ritz0/**, ritz1/**,
-#     grammars/**, runtime/**            unit ritz1-bootstrap matrix (the
+#     and docs/LANGUAGE_SPEC.md          doc-examples build-all-ritz1
+#   projects/ritz/ritz0/**, grammars/**,
+#     runtime/**                         unit ritz1-bootstrap matrix (the
 #                                        compiler set rz briefs, 2026-11-23)
-#   projects/ritz/ritzlib/**             ritzlib matrix
+#                                        build-all-ritz1
+#   projects/ritz/ritz1/test/**          the compiler set, ritz1-unit
+#   projects/ritz/ritz1/** (the rest)    the compiler set, ritz1-unit,
+#                                        build-all-ritz1
+#   projects/ritz/ritzlib/**             ritzlib matrix build-all-ritz1
 #   projects/ritz/test/**                ritz-tests matrix
 #   projects/ritz/examples/**            examples
 #   projects/ritz/tools/**               tools-unit
 #   projects/ritz/scripts/**             harness-selftest
 #   projects/ritz/<anything else>        unit tools-unit (build.py & co.)
-#   projects/<pkg>/**                    pkg:<pkg>  (./rz build + ./rz test)
+#   projects/<pkg>/**                    ritz1-bootstrap pkg:<pkg>  (./rz
+#                                        build under ritz0, ritz1 and
+#                                        ritz1_selfhosted, then ./rz test),
+#                                        plus pkg:<pkg>/<sub> for a nested
+#                                        package (its own ritz.toml, not in
+#                                        rz.toml's [workspace.exclude])
 #   .claude/**                           tools-unit (tools/ tests read
 #                                        SKILL.md, hooks and settings), plus:
 #   .claude/skills/<skill>/**            skill:<skill> (shellcheck -S error,
@@ -62,6 +76,24 @@
 # gates (train.sh precheck).  tools-unit and unit together subsume it
 # (tools/ and all of ritz0): a diff that plans both runs only those; either
 # alone does not.
+#
+# The floor, not the whole check (AGAST #4777, ROOM.md step 6): a room adds
+# targets for what its change can break beyond the files it touched, and
+# `check` accepts the extras.  Two trains went red on cars whose smoke
+# passed: #4772 changed ritz1/src and broke a ritz1/test suite (ritz1-unit,
+# `make ritz1-unit`, planned by nothing), and #4739 changed a package only
+# ritz1 refused (pkg: built it with ritz0 alone).  Hence ritz1-unit for
+# ritz1/**, pkg: under all three compilers, and build-all-ritz1 (`make
+# build-all-ritz1`: every package under ritz1 and ritz1_selfhosted, the
+# gate's step) for a compiler or language change.  Measured on starbux
+# (2026-11-26; the ticket named omegalisk, this room ran on starbux), ritz1
+# already bootstrapped (~2 min cold): ritz1-unit ~5 s; build-all-ritz1
+# ~142 s first, ~49 s warm; pkg:harland ~11 s and pkg:harland/netstack ~6 s
+# under all three compilers.  Each was red on its failure and green on its
+# fix: ritz1-unit on #4772's car e0310a8e5 / e61f32567, and
+# pkg:harland/netstack and build-all-ritz1 on 25d60cd90 / 67c23c597ea6
+# (#4739's arp.ritz broke only with #4758's ritz1 on the train: its own car
+# built clean under ritz1, so #4758's car is the one build-all-ritz1 flags).
 #
 # Env (tests): RZ_SMOKE_RUNNER, a program run as `<runner> <target>
 # <command>` instead of `bash -c <command>`.
@@ -85,8 +117,17 @@ cmd_of() {
         ritzlib)          echo "./rz test ritz/ritzlib/tests" ;;
         ritz-tests)       echo "make -C projects/ritz ritz" ;;
         examples)         echo "make -C projects/ritz examples" ;;
+        ritz1-unit)       echo "make -C projects/ritz ritz1-unit" ;;
+        ritzlib-ritz1)    echo "make -C projects/ritz ritzlib-tests-ritz1" ;;
         build-all)        echo "./rz build --all" ;;
-        pkg:*)            echo "./rz build ${1#pkg:} && ./rz test ${1#pkg:}" ;;
+        build-all-ritz1)  echo "make -C projects/ritz build-all-ritz1" ;;
+        # The package under every compiler the gate builds it with (#4777:
+        # #4739's package built under ritz0 and only ritz1 refused it), all
+        # three in full, then its tests.  A compiler whose known-failures/
+        # `build` entries excuse the package is skipped, as `rz build --all`
+        # excuses it; the plan's ritz1-bootstrap built the compilers first.
+        pkg:*)            local p="${1#pkg:}"
+                          echo "rc=0; for c in ritz0 ritz1 ritz1_selfhosted; do if python3 projects/ritz/tools/known_failures.py list --gate build --compiler \$c | cut -f1 | grep -qxF '$p'; then echo \"$p: build under \$c excused by known-failures/\"; else ./rz build $p --compiler \$c || rc=1; fi; done; ./rz test $p || rc=1; exit \$rc" ;;
         skill:*)          local d=".claude/skills/${1#skill:}"
                           # A test that starts real units (test-*-systemd.sh)
                           # runs through room-unit.sh: rooms may not call
@@ -96,6 +137,25 @@ cmd_of() {
                           echo "shellcheck -S error -x $d/*.sh && rc=0 && for t in $d/test-*.sh; do [ -e \"\$t\" ] || continue; case \"\$t\" in *-systemd.sh) bash .claude/room-unit.sh --pipe \${TMPDIR:+--setenv=TMPDIR=\$TMPDIR} -- bash \"\$PWD/\$t\" || rc=1 ;; *) bash \"\$t\" || rc=1 ;; esac; done && exit \$rc" ;;
         *)                die "unknown target $1" ;;
     esac
+}
+
+# pkg_of <path>: `pkg:<id>` for the nearest package below projects/<top>/
+# that holds <path>, if it is not <top> itself (#4777: #4739 changed
+# harland/netstack, which harland's build never compiles).  A package is a
+# dir with a ritz.toml in plan_targets' MANIFESTS, not one rz.toml excludes
+# (harland/boot: harland builds it), or anything under one.
+pkg_of() {
+    local d="${1%/*}" rest="${1#projects/}" top e
+    top="projects/${rest%%/*}"
+    while [[ "$d" == "$top"/* ]]; do
+        if grep -qxF -- "$d" <<<"$MANIFESTS"; then
+            while IFS= read -r e; do
+                [[ -n "$e" && ( "$d" == "$e" || "$d" == "$e"/* ) ]] && return 0
+            done <<<"$EXCLUDED"
+            echo "pkg:${d#projects/}"; return 0
+        fi
+        d="${d%/*}"
+    done
 }
 
 # targets_of <path>: the targets one changed path needs (see the header).
@@ -109,33 +169,52 @@ targets_of() {
         .claude/*) echo tools-unit ;;
     esac
     case "$p" in
+        projects/ritz/docs/LANGUAGE_SPEC.md)
+            echo doc-examples; echo build-all-ritz1; return ;;
         projects/ritz/*.md|projects/ritz/docs/*)     # case globs: * crosses /
             echo doc-examples; return ;;
         .claude/skills/*/*)       rest="${p#.claude/skills/}"; echo "skill:${rest%%/*}" ;;
         .claude/host-env.sh)      echo skill:rz-iterate ;;
         *.md|docs/*) return ;;
-        projects/ritz/ritz0/*|projects/ritz/ritz1/*|projects/ritz/grammars/*|projects/ritz/runtime/*)
-                                  echo unit; echo ritz1-bootstrap; echo matrix ;;
-        projects/ritz/ritzlib/*)  echo ritzlib; echo matrix ;;
+        projects/ritz/ritz1/test/*)
+                                  echo unit; echo ritz1-bootstrap; echo ritz1-unit; echo matrix ;;
+        projects/ritz/ritz1/*)    echo unit; echo ritz1-bootstrap; echo ritz1-unit; echo matrix; echo build-all-ritz1 ;;
+        projects/ritz/ritz0/*|projects/ritz/grammars/*|projects/ritz/runtime/*)
+                                  echo unit; echo ritz1-bootstrap; echo matrix; echo build-all-ritz1 ;;
+        projects/ritz/ritzlib/*)  echo ritzlib; echo matrix; echo build-all-ritz1 ;;
         projects/ritz/test/*)     echo ritz-tests; echo matrix ;;
         projects/ritz/examples/*) echo examples ;;
         projects/ritz/tools/*)    echo tools-unit ;;
         projects/ritz/scripts/*)  echo harness-selftest ;;
         projects/ritz/*)          echo unit; echo tools-unit ;;
-        projects/*/*)             rest="${p#projects/}"; echo "pkg:${rest%%/*}" ;;
+        projects/*/*)             rest="${p#projects/}"; echo ritz1-bootstrap; echo "pkg:${rest%%/*}"
+                                  pkg_of "$p" ;;
         rz|rz.toml)               echo build-all ;;
     esac
 }
 
 # The fixed order targets run and are quoted in: cheap and broad first.
-ORDER=(smoke doc-examples tools-unit tools-ratchets harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap matrix build-all)
+ORDER=(smoke doc-examples tools-unit tools-ratchets harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1)
 
 # plan_targets <range...>: every target for the diff, smoke first, in ORDER,
 # then pkg:/skill: targets sorted.
 plan_targets() {
-    local files t o extra=()
+    local files t o extra=() tip last
     local -A want=()
     files="$(git -C "$ROOT" diff --name-only "$@")" || die "bad range: $*"
+    # The commit whose tree says where packages are (pkg_of): the range's
+    # far end, so rz's `check <sha>` and the room's `run` agree.
+    last="${*: -1}"
+    case "$last" in
+        *^!) tip="${last%^!}" ;;
+        *..*) tip="${last##*..}"; tip="${tip:-HEAD}" ;;
+        *)   if [[ $# -ge 2 ]]; then tip="$last"; else tip=HEAD; fi ;;
+    esac
+    # Read by pkg_of (bash's dynamic scope reaches targets_of's subshells).
+    local MANIFESTS EXCLUDED
+    MANIFESTS="$(git -C "$ROOT" ls-tree -r --name-only "$tip" -- projects 2>/dev/null | sed -n 's#/ritz\.toml$##p')"
+    EXCLUDED="$(git -C "$ROOT" show "$tip:rz.toml" 2>/dev/null \
+        | sed -n '/^\[workspace\.exclude\]/,/^\[[a-z]/s/^"\([^"]*\)" *=.*/\1/p')"
     want[smoke]=1
     want[tools-ratchets]=1
     while IFS= read -r f; do
@@ -152,11 +231,28 @@ plan_targets() {
 
 range_args() { if [[ $# -eq 0 ]]; then echo "HEAD^" "HEAD"; else echo "$@"; fi; }
 
-cmd_plan() {
-    local t
+# all_targets [<rev-range>] [+<target>...]: the plan (the floor), then each
+# `+<target>` the room added by judgment (ROOM.md step 6) that the plan
+# lacks, in the order given.  An unknown extra is an error, not a skip.
+all_targets() {
+    local a range=() extras=() planned t
+    for a in "$@"; do
+        case "$a" in +*) extras+=("${a#+}") ;; *) range+=("$a") ;; esac
+    done
     # shellcheck disable=SC2046  # range words
-    while IFS= read -r t; do printf '%s\t%s\n' "$t" "$(cmd_of "$t")"; done \
-        < <(plan_targets $(range_args "$@"))
+    planned="$(plan_targets $(range_args "${range[@]}"))" || exit 2
+    echo "$planned"
+    for t in "${extras[@]}"; do
+        cmd_of "$t" >/dev/null || exit 2
+        grep -qxF -- "$t" <<<"$planned" && continue
+        planned+=$'\n'"$t"; echo "$t"
+    done
+}
+
+cmd_plan() {
+    local t names
+    names="$(all_targets "$@")" || exit 2
+    while IFS= read -r t; do printf '%s\t%s\n' "$t" "$(cmd_of "$t")"; done <<<"$names"
 }
 
 cmd_run() {
@@ -164,8 +260,8 @@ cmd_run() {
     git -C "$ROOT" diff --quiet HEAD -- && git -C "$ROOT" diff --cached --quiet HEAD -- \
         || die "uncommitted changes: commit (squash) first, so the quote names what ran"
     head="$(git -C "$ROOT" rev-parse HEAD)"
-    # shellcheck disable=SC2046
-    mapfile -t names < <(plan_targets $(range_args "$@"))
+    r="$(all_targets "$@")" || exit 2
+    mapfile -t names <<<"$r"
     echo "smoke-plan: ${head:0:12}: ${names[*]}" >&2
     for t in "${names[@]}"; do
         echo "=== [$t] $(cmd_of "$t")" >&2
