@@ -47,10 +47,17 @@
 # of the segment walks them), points every requester's context at it (all
 # 256 buses x 256 dev.fn, so no device or DMA alias is left without one),
 # drops the context caches and IOTLBs, and only then sets TE: devices that
-# are already bus-mastering (virtio-blk, NVMe) keep working. No private
-# domain yet; the ring-1 cutover (RING1_DRIVER.md PR 7) moves the NIC's
-# requester off the identity domain. vtd_dma_translation_on says whether
+# are already bus-mastering (virtio-blk, NVMe) keep working.
+# vtd_dma_translation_on says whether
 # TE is on.
+#
+# The NIC's private domain (AGAST #4724): ir_init names the NIC and its
+# DMA aliases, and vtd_dma_init gives them no context (held: never in the
+# identity map, their DMA faults). The virtio-net probe then makes their
+# private domain (vtd_private_domain), maps only the pages it grants the
+# device at fresh IOVAs (vtd_domain_enter / vtd_domain_leave, also
+# DrvDmaAlloc's), and only then sets the NIC's bus master.
+# vtd_isolation_live reads every unit's status: TE, IRE and CFI blocked.
 #
 # vtd_ir_set and the DMA functions take no lock: today only the BSP calls
 # them, during boot. A caller on another CPU needs one around the table
@@ -65,6 +72,7 @@ import mm.pmm { pmm_alloc_page }
 import mm.vmm { vmm_map_mmio, vmm_ensure_mapped, phys_to_virt }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import ritzlib.option
+import ritzlib.span
 import drivers.acpi.tables { acpi_find_table }
 import drivers.iommu.dmar {
     ACPI_SIG_DMAR, DMAR_INTR_REMAP, DMAR_X2APIC_OPT_OUT,
@@ -113,6 +121,24 @@ var vtd_dom_sl_phys: [8]u64     # each domain's second-level table
 var vtd_dom_seg: [8]i32         # the segment index it serves
 var vtd_dom_levels: [8]u32      # its depth: 3 or 4
 var vtd_dma_on: bool = false    # TE is set on every unit (AGAST #4723)
+# Private domains (AGAST #4724): a requester's own, holding only the pages
+# granted to it. Set once every requester given to vtd_private_domain
+# names it; until then (or after a partial move) the domain isolates nothing.
+var vtd_dom_private: [8]bool
+var vtd_dom_iova_next: [8]u64   # the domain's next unallocated IOVA
+
+# A private domain's IOVAs start at 64 GiB, above any RAM the identity
+# domain maps on the boots harland supports: a device still on the
+# identity map that is handed one of these addresses faults instead of
+# reaching a page by accident. IOVAs are never reused, so a stale one
+# can't alias a later grant.
+pub const VTD_IOVA_BASE: u64 = 0x1000000000
+
+# Requesters vtd_dma_init leaves without an identity context: the NIC and
+# its aliases, so they are never in the identity map (AGAST #4724).
+const VTD_HELD_MAX: i32 = 8
+var vtd_held: [8]u32
+var vtd_held_count: i32 = 0
 
 # Why a DMA remapping call failed (or Ok).
 pub enum VtdDma
@@ -551,6 +577,8 @@ fn vtd_seg_domain_new(si: i32) -> Option<u32>
     vtd_dom_sl_phys[d] = sl
     vtd_dom_seg[d] = si
     vtd_dom_levels[d] = levels
+    vtd_dom_private[d] = false
+    vtd_dom_iova_next[d] = VTD_IOVA_BASE
     vtd_num_doms = d + 1
     return Some(did)
 
@@ -867,10 +895,13 @@ fn vtd_identity_map(d: i32, base: u64, last: u64, leaf: u32) -> VtdDma
 
 # Point every context entry on segment `si` that has none at domain index
 # `d`: all 256 buses, all 256 dev.fn, so a requester whose DMA arrives
-# under an alias (a bridge, a phantom function) has one too.
+# under an alias (a bridge, a phantom function) has one too. A held
+# requester gets none: its DMA faults until vtd_private_domain gives it
+# its own.
 fn vtd_seg_identity_contexts(si: i32, d: i32) -> VtdDma
     let lo: u64 = vtd_ctx_lo(vtd_dom_sl_phys[d])
     let hi: u64 = vtd_ctx_hi((d + 1) as u32, vtd_dom_levels[d])
+    let seg: u32 = (dmar_seg_id[si] as u32) << 16
     var bus: u32 = 0
     while bus < 256
         let table: u64 = vtd_ctx_entry(si, bus << 8, true)
@@ -879,7 +910,7 @@ fn vtd_seg_identity_contexts(si: i32, d: i32) -> VtdDma
         var f: u64 = 0
         while f < 256
             let ce: u64 = table + f * 16
-            if not vtd_entry_present(volatile_load(ce as *u64))
+            if not vtd_is_held(seg | (bus << 8) | (f as u32)) and not vtd_entry_present(volatile_load(ce as *u64))
                 # the domain first, then present: no half an entry
                 volatile_store((ce + 8) as *u64, hi)
                 memory_barrier()
@@ -918,18 +949,37 @@ fn vtd_seg_identity(si: i32, ram_top: u64) -> VtdDma
         return root
     return vtd_seg_identity_contexts(si, d)
 
+# Is `sid` one of the requesters vtd_dma_init holds back?
+fn vtd_is_held(sid: u32) -> bool
+    var k: i32 = 0
+    while k < vtd_held_count
+        if vtd_held[k] == sid
+            return true
+        k = k + 1
+    false
+
 # Turn DMA translation on, once interrupt remapping is (vtd_ir_init):
 # give every requester on every segment an identity context (physical
-# memory below `ram_top`, the PMM's top, and the RMRRs), drop every unit's
+# memory below `ram_top`, the PMM's top, and the RMRRs), except the
+# requesters in `held` (the NIC and its aliases: no context,
+# so their DMA faults until a private domain is theirs; past VTD_HELD_MAX
+# they are not held, and vtd_private_domain moves them off the identity
+# domain instead), drop every unit's
 # context cache and IOTLB, then set TE on each unit. False, with
 # translation left off (logged why), if remapping is off, a unit can't
 # translate, the RAM or an RMRR is past what a unit translates, there's no
 # page for a table, or a unit didn't confirm.
-pub fn vtd_dma_init(ram_top: u64) -> bool
+pub fn vtd_dma_init(ram_top: u64, held: Span<u32>) -> bool
     if not vtd_on
         return false
     if vtd_dma_on
         return true
+    vtd_held_count = 0
+    var h: i64 = 0
+    while h < held.len() and h < VTD_HELD_MAX as i64
+        vtd_held[h as i32] = held.get(h)
+        vtd_held_count = (h + 1) as i32
+        h = h + 1
     var si: i32 = 0
     while si < dmar_num_segs
         let r: VtdDma = vtd_seg_identity(si, ram_top)
@@ -967,5 +1017,133 @@ pub fn vtd_dma_init(ram_top: u64) -> bool
     klog_hex(ram_top)
     klog(", ")
     klog_dec(dmar_num_rmrrs as i64)
-    klog(" RMRR(s)\n")
+    klog(" RMRR(s), ")
+    klog_dec(vtd_held_count as i64)
+    klog(" requester(s) held for a private domain\n")
     return true
+
+# ============================================================================
+# Private domains (AGAST #4724, RING1_DRIVER.md "DMA domain")
+# ============================================================================
+
+# Point requester `sid`'s context at domain `dom`, whatever it named
+# before: an old context (the identity domain) is cleared and its caches
+# dropped first (vtd_context_detach), so the unit never mixes the two.
+fn vtd_context_move(dom: u32, sid: u32) -> VtdDma
+    let old: u32 = vtd_context_domain(sid).unwrap_or(0)
+    if old == dom
+        return VtdDma.Ok
+    if old != 0
+        let r: VtdDma = vtd_context_detach(sid)
+        if r != VtdDma.Ok
+            return r
+    return vtd_context_attach(dom, sid)
+
+# A new private domain for the requesters `sids` (a function and
+# its DMA aliases, all on one segment): empty, every requester's context
+# pointed at it, off the identity domain or out of the held set. Only when
+# every one names it is the domain private (vtd_requester_isolated). None
+# if translation is off, a requester has no segment or another one's, no
+# domain is left, or a unit didn't confirm; a requester already moved then
+# names a domain with nothing in it, so its DMA still reaches no page.
+pub fn vtd_private_domain(sids: Span<u32>) -> Option<u32>
+    if not vtd_dma_on or sids.is_empty()
+        return None
+    let si: i32 = vtd_sid_seg(sids.get(0))
+    if si < 0
+        return None
+    var k: i64 = 1
+    while k < sids.len()
+        if vtd_sid_seg(sids.get(k)) != si
+            return None
+        k = k + 1
+    let dom: u32 = vtd_seg_domain_new(si).unwrap_or(0)
+    if dom == 0
+        return None
+    k = 0
+    while k < sids.len()
+        if vtd_context_move(dom, sids.get(k)) != VtdDma.Ok
+            return None
+        k = k + 1
+    vtd_dom_private[vtd_dom_index(dom)] = true
+    Some(dom)
+
+# Is requester `sid`'s context a private domain: translation on and the
+# requester moved off the identity map with every alias it was given?
+pub fn vtd_requester_isolated(sid: u32) -> bool
+    if not vtd_dma_on
+        return false
+    let d: i32 = vtd_dom_index(vtd_context_domain(sid).unwrap_or(0))
+    d >= 0 and vtd_dom_private[d]
+
+# `pages` pages of fresh IOVA in domain `dom`, contiguous: the first. None
+# if `dom` isn't a domain or the run would pass what its units translate.
+pub fn vtd_domain_iova_alloc(dom: u32, pages: u64) -> Option<u64>
+    let d: i32 = vtd_dom_index(dom)
+    if d < 0 or pages == 0
+        return None
+    let first: u64 = vtd_dom_iova_next[d]
+    if not vtd_dom_iova_ok(d, first + (pages - 1) * 4096)
+        return None
+    vtd_dom_iova_next[d] = first + pages * 4096
+    Some(first)
+
+# What vtd_domain_enter did with a run.
+pub enum VtdEnter
+    Entered(u64)    # every page is mapped read-write from this IOVA on
+    Refused         # nothing of the run is mapped: its pages may go back to the PMM
+    Stuck           # a page was mapped and a unit didn't confirm its removal: the device may still reach the run, which must not go back
+
+# Unmap the `pages` pages from `iova` in domain `dom`; false if a unit
+# didn't confirm one (the device may still reach it).
+fn vtd_domain_unmap_run(dom: u32, iova: u64, pages: u64) -> bool
+    var ok: bool = true
+    var p: u64 = 0
+    while p < pages
+        if vtd_domain_unmap(dom, iova + p * 4096) != VtdDma.Ok
+            ok = false
+        p = p + 1
+    ok
+
+# Map the `pages` contiguous physical pages from `phys` read-write into
+# domain `dom` at fresh IOVAs (DrvDmaAlloc's run, the in-kernel NIC's rings
+# and buffers). A page that fails to map unmaps the ones before it and waits
+# for their invalidation (above).
+pub fn vtd_domain_enter(dom: u32, phys: u64, pages: u64) -> VtdEnter
+    let iova: u64 = match vtd_domain_iova_alloc(dom, pages)
+        Some(v) => v
+        None => return VtdEnter.Refused
+    var p: u64 = 0
+    while p < pages
+        let r: VtdDma = vtd_domain_map(dom, iova + p * 4096, phys + p * 4096, true)
+        if r != VtdDma.Ok
+            # a Timeout here mapped the page: it is unmapped with the rest
+            var undo: u64 = p
+            if r == VtdDma.Timeout
+                undo = p + 1
+            if not vtd_domain_unmap_run(dom, iova, undo)
+                return VtdEnter.Stuck
+            return VtdEnter.Refused
+        p = p + 1
+    VtdEnter.Entered(iova)
+
+# Take the `pages` pages from `iova` out of domain `dom` and wait for every
+# unit: true once the device can reach none of them.
+pub fn vtd_domain_leave(dom: u32, iova: u64, pages: u64) -> bool
+    vtd_domain_unmap_run(dom, iova, pages)
+
+# Is the platform isolating devices right now, read from every unit's
+# status register (not from what the kernel asked for): translation on
+# (GSTS.TES), interrupt remapping on (GSTS.IRES) and compatibility-format
+# interrupts blocked (GSTS.CFIS clear), so a device can neither DMA past
+# its domain nor forge an MSI by writing 0xFEE00000.
+pub fn vtd_isolation_live() -> bool
+    if not vtd_on or not vtd_dma_on or vtd_units == 0
+        return false
+    var u: i32 = 0
+    while u < vtd_units
+        let gsts: u32 = vtd_reg32(u, VTD_REG_GSTS)
+        if (gsts & GCMD_TE) == 0 or (gsts & GCMD_IRE) == 0 or (gsts & GCMD_CFI) != 0
+            return false
+        u = u + 1
+    true

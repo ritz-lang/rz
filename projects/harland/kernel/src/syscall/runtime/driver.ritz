@@ -58,14 +58,16 @@ import cap.table { CapTable, cap_table_get, cap_table_lookup }
 import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_reap_pending }
 import proc.sched { sched_block }
 import proc.waitq { waitq_can_park }
-import proc.waitset { irq_object_known, waitset_arm, waitset_disarm }
+import proc.waitset { irq_object_known, irq_object_domain, waitset_arm, waitset_disarm }
 import proc.waitset { WaitPlan, Collected, Notify, wait_plan_new, wait_plan_irq, wait_plan_add, waitset_collect, shm_notify }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
-import mm.dma { dma_alloc_zeroed, dma_free_pages }
-import drivers.virtio.window { VioWindow, vio_window_find, vio_window_pages, vio_window_guarded }
+import mm.dma { dma_alloc_zeroed, dma_free_pages, dma_quarantine }
+import drivers.virtio.window { VioWindow, vio_window_find, vio_window_pages, vio_window_guarded, vio_window_queue_regs }
+import drivers.iommu.vtd { VtdEnter }
+import drivers.iommu.ir { dma_requester_isolated, dma_domain_enter, dma_domain_leave }
 import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
 
 const US_PER_MS: u64 = 1000
@@ -207,7 +209,11 @@ pub fn sys_drv_irq_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # (drivers/virtio/window.ritz); the advisory copy in the shared page is
 # never read.
 #
-#   Errno.Perm   the caller holds no CAP_TYPE_MMIO handle `mmio_handle`
+#   Errno.Perm   the caller holds no CAP_TYPE_MMIO handle `mmio_handle`, or
+#                a page of the window holds the device's queue-address
+#                registers (COMMON_CFG) and the device is not in a private
+#                DMA domain with every alias named (AGAST #4724): those
+#                registers would let it DMA anywhere its requester reaches
 #   Errno.Inval  the object is no recorded window, or a page of it holds the
 #                MSI-X table or PBA: nothing is mapped
 #   Errno.NoMem  the window has no room, or a page table could not be had:
@@ -216,10 +222,14 @@ pub fn sys_drv_irq_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # DrvDmaAlloc(irq_handle, size, *DmaAlloc) allocates one zeroed contiguous
 # run of `size` bytes rounded up to pages and maps it write-back into the
 # caller's DMA window (DRV_DMA_BASE, PML4[252]). It returns the run's VA and
-# copies out { iova, size }. Until the device's DMA domain exists (PR 5b,
-# ring plan T18) nothing the device can use is published: iova is 0, and the
-# run is for the CPU only. The run is not a DmaRegion: the PML4 owns it, and
-# exit frees it once (no PTE_DEVICE).
+# copies out { iova, size }. When the IRQ object's device has a private DMA
+# domain (irq_object_bind_domain, AGAST #4724) the run is mapped read-write
+# into it at fresh IOVAs first, and iova is where the device sees the run;
+# otherwise nothing the device can use is published: iova is 0, and the run
+# is for the CPU only. The run is not a DmaRegion: the PML4 owns it, and
+# exit frees it once (no PTE_DEVICE). A failure after the run entered the
+# domain takes it out again; if a unit doesn't confirm that, the device may
+# still reach the pages and they go to dma_quarantine, never to the PMM.
 #
 #   Errno.Perm   the caller holds no CAP_TYPE_IRQ handle `irq_handle`
 #   Errno.Inval  size 0
@@ -273,6 +283,8 @@ pub fn drv_mmio_map(pid: u32, pml4: u64, mmio_handle: u64) -> i64
         None => return Errno.Inval as i64
     if vio_window_guarded(window)
         return Errno.Inval as i64
+    if vio_window_queue_regs(window) and not dma_requester_isolated(window.sid)
+        return Errno.Perm as i64
     let pages: u64 = vio_window_pages(window)
     let vaddr: u64 = match window_room(pml4, DRV_MMIO_BASE, pages)
         Some(v) => v
@@ -284,8 +296,9 @@ pub fn drv_mmio_map(pid: u32, pml4: u64, mmio_handle: u64) -> i64
 # DrvDmaAlloc for process `pid`, whose page table is `pml4` and loaded
 # (`out` is checked against it), above.
 fn drv_dma_alloc(pid: u32, pml4: u64, irq_handle: u64, size: u64, out: *DmaAlloc) -> i64
-    if held_object(pid, irq_handle, CAP_TYPE_IRQ).is_none()
-        return Errno.Perm as i64
+    let object_id: u64 = match held_object(pid, irq_handle, CAP_TYPE_IRQ)
+        Some(id) => id
+        None => return Errno.Perm as i64
     if size == 0
         return Errno.Inval as i64
     if size > DMA_ALLOC_MAX
@@ -299,10 +312,25 @@ fn drv_dma_alloc(pid: u32, pml4: u64, irq_handle: u64, size: u64, out: *DmaAlloc
     let phys: u64 = match dma_alloc_zeroed(pages as u32)
         Some(p) => p
         None => return Errno.NoMem as i64
+    # The device's view first: a run the CPU can't map is taken out again.
+    let dom: u32 = irq_object_domain(object_id)
+    var iova: u64 = 0
+    if dom != 0
+        match dma_domain_enter(dom, phys, pages)
+            VtdEnter.Entered(v) => iova = v
+            VtdEnter.Refused =>
+                dma_free_pages(phys, pages as u32)
+                return Errno.NoMem as i64
+            VtdEnter.Stuck =>
+                dma_quarantine(phys, pages)
+                return Errno.NoMem as i64
     if not map_run(pml4, vaddr, phys, pages, drv_dma_leaf())
-        dma_free_pages(phys, pages as u32)
+        if dom != 0 and not dma_domain_leave(dom, iova, pages)
+            dma_quarantine(phys, pages)
+        else
+            dma_free_pages(phys, pages as u32)
         return Errno.NoMem as i64
-    (*out).iova = 0                     # no DMA domain yet (PR 5b)
+    (*out).iova = iova                  # 0: no private domain, the run is the CPU's only
     (*out).size = pages * PAGE_SIZE
     vaddr as i64
 

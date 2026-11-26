@@ -81,10 +81,17 @@ fn guarded(id: u64) -> bool
         Some(w) => vio_window_guarded(w)
         None => false
 
+fn queue_regs(id: u64) -> bool
+    match vio_window_find(id)
+        Some(w) => vio_window_queue_regs(w)
+        None => false
+
+# The device's common configuration (queue addresses) is at BAR+0x20, 0x38
+# bytes; its requester is 00:03.0.
 fn add(phys: u64, len: u64) -> u64
     let t: PhysRange = phys_range(TABLE, 48)
     let p: PhysRange = phys_range(PBA, 8)
-    match vio_window_add(phys, len, 4, t, p)
+    match vio_window_add(phys, len, 4, t, p, phys_range(BAR + 0x20, 0x38), 0x18)
         Some(id) => id
         None => 0
 
@@ -96,7 +103,7 @@ fn main() -> i32
     let w: VioWindow = match vio_window_find(common)
         Some(x) => x
         None => return 1
-    if w.page_base != BAR or w.offset != 0x20 or w.length != 0x38 or w.notify_multiplier != 4
+    if w.page_base != BAR or w.offset != 0x20 or w.length != 0x38 or w.notify_multiplier != 4 or w.sid != 0x18
         return 2
     # 3: bytes that straddle a page boundary take both pages
     let straddle: u64 = add(BAR + 0x4FF0, 0x20)
@@ -105,6 +112,12 @@ fn main() -> i32
     # 4: neither touches the table's or the PBA's page
     if guarded(common) or guarded(straddle)
         return 4
+    # 16: the common configuration's window holds queue-address registers,
+    # and so does any window sharing its page; one past that page does not
+    # (AGAST #4724)
+    let isr: u64 = add(BAR + 0x800, 4)
+    if not queue_regs(common) or not queue_regs(isr) or queue_regs(straddle)
+        return 16
     # 5: a window sharing the table's page is guarded, though no byte of
     # the window itself is a table byte
     let beside_table: u64 = add(TABLE + 0x100, 0x10)
@@ -119,19 +132,19 @@ fn main() -> i32
     if guarded(below)
         return 7
     # 8: no table and no PBA: nothing guards
-    let bare: u64 = match vio_window_add(TABLE, 16, 0, phys_range_none(), phys_range_none())
+    let bare: u64 = match vio_window_add(TABLE, 16, 0, phys_range_none(), phys_range_none(), phys_range_none(), 0)
         Some(id) => id
         None => 0
-    if bare == 0 or guarded(bare)
+    if bare == 0 or guarded(bare) or queue_regs(bare)
         return 8
     # 9: length 0 records nothing; id 0 and unknown ids name nothing
-    if vio_window_add(BAR, 0, 0, phys_range_none(), phys_range_none()).is_some()
+    if vio_window_add(BAR, 0, 0, phys_range_none(), phys_range_none(), phys_range_none(), 0).is_some()
         return 9
     if not none_found(0) or not none_found(999)
         return 10
     # 15: a table ending exactly where the window's first page starts
     # does not guard it (checked before the table fills)
-    let edge: u64 = match vio_window_add(BAR + 0x6000, 16, 0, phys_range(BAR + 0x5FF0, 0x10), phys_range_none())
+    let edge: u64 = match vio_window_add(BAR + 0x6000, 16, 0, phys_range(BAR + 0x5FF0, 0x10), phys_range_none(), phys_range_none(), 0)
         Some(id) => id
         None => 0
     if edge == 0 or guarded(edge) or not vio_window_remove(edge)
@@ -143,7 +156,7 @@ fn main() -> i32
     if again == below or again == 0
         return 12
     # 13: sixteen records fill the table; the seventeenth is refused
-    var n: i32 = 6                  # live: common .. bare, less below, plus again
+    var n: i32 = 7                  # live: common .. bare and isr, less below, plus again
     while n < 16
         if add(BAR, 16) == 0
             return 13
@@ -172,6 +185,35 @@ def test_probe_records_every_window():
     assert "vio_note_window(" in _body(src, "vio_find_mmio_caps")
     note = _body(src, "vio_note_window")
     assert "vio_window_add(" in note and "PCI_CAP_MSIX" in note
+    # AGAST #4724: with the queue-address registers and the requester
+    assert "vio_common_range(pci_dev)" in note and "pci_dev_sid(pci_dev)" in note
+    assert "VIRTIO_PCI_CAP_COMMON_CFG" in _body(src, "vio_common_range")
+
+
+def test_queue_register_grant_needs_an_isolated_device():
+    """AGAST #4724: DrvMmioMap maps a page holding the queue-address
+    registers only for a device whose requester is in a private DMA domain,
+    and refuses it (Errno.Perm) before mapping anything."""
+    body = _body(DRIVER.read_text(), "drv_mmio_map")
+    m = re.search(r"if vio_window_queue_regs\(window\) and not dma_requester_isolated\(window\.sid\)\s+return Errno\.Perm", body)
+    assert m, body
+    assert body.index("vio_window_queue_regs") < body.index("map_run(")
+
+
+def test_dma_alloc_enters_the_holders_domain():
+    """AGAST #4724: DrvDmaAlloc maps its run into the IRQ object's device
+    domain and copies out that IOVA; a refused entry frees the run, a stuck
+    one (an unconfirmed invalidation) quarantines it, and a CPU mapping that
+    fails after the entry takes the run out of the domain first."""
+    body = _body(DRIVER.read_text(), "drv_dma_alloc")
+    assert "irq_object_domain(object_id)" in body
+    enter = body.index("dma_domain_enter(dom, phys, pages)")
+    assert enter < body.index("map_run(")
+    assert re.search(r"VtdEnter\.Entered\(v\) => iova = v", body)
+    assert re.search(r"VtdEnter\.Refused =>\s+dma_free_pages\(phys", body)
+    assert re.search(r"VtdEnter\.Stuck =>\s+dma_quarantine\(phys, pages\)", body)
+    assert re.search(r"if dom != 0 and not dma_domain_leave\(dom, iova, pages\)\s+dma_quarantine\(phys, pages\)", body)
+    assert "(*out).iova = iova" in body
 
 
 def test_mmio_leaves_are_uncached_device_user_nx():

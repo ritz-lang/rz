@@ -75,6 +75,17 @@
 #     VIRTIO_F_ACCESS_PLATFORM negotiated"). Every storage, NVMe and NIC
 #     check above must still pass with translation on: the disks and the
 #     NIC were bus-mastering through identity contexts, halted > 0 included.
+#   - the NIC's private DMA domain (AGAST #4724), on the vtd run only: TE
+#     comes on with the NIC's requester held out of the identity domain
+#     ("1 requester(s) held"), the NIC gets its own domain before its bus
+#     master ("[nic-dma] private domain D for SID ... bus master on"), a
+#     TX buffer at an unmapped IOVA faults with the NIC's source ID ("fault
+#     probe: the NIC's DMA to unmapped IOVA ... faulted with its source ID
+#     SID", and the unit's record for it), a received frame lands in a
+#     granted IOVA of domain D above every RAM address ("device DMA"), and
+#     net_ring1_allowed holds ("ring-1 owner allowed"). Every NIC check
+#     above then passed with the in-kernel driver on IOVAs. The pc run must
+#     give the NIC no domain and refuse a ring-1 owner.
 #
 # The NIC uses QEMU's user-mode network (slirp): its built-in DHCP server
 # answers inside QEMU, so this needs no root and no host network.
@@ -216,12 +227,68 @@ boot() {
     wait "$pid" 2>/dev/null
 }
 
+# nic_dma_checks SERIAL: the NIC's private DMA domain on the translating
+# boot (AGAST #4724); sets rc=1 on any failure.
+nic_dma_checks() {
+    local SERIAL="$1" line sid dom hole dma iova ddom
+    line=$(grep -aoE "\[nic-dma\] private domain [0-9]+ for [0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7] and [0-9]+ alias\(es\), never in the identity map; bus master on" "$SERIAL" | head -1)
+    dom=$(echo "$line" | sed -nE 's/.*private domain ([0-9]+) for.*/\1/p')
+    sid=$(echo "$line" | sed -nE 's/.* for ([0-9a-f:.]+) and .*/\1/p')
+    if [ -z "$line" ]; then
+        grep -a "\[nic-dma\]" "$SERIAL" | head -3
+        echo "FAIL: the NIC got no private DMA domain before its bus master"
+        rc=1
+        return
+    fi
+    echo "PASS: the NIC ($sid) is in private DMA domain $dom, held out of the identity map, bus master set after"
+    if grep -aqF "1 requester(s) held for a private domain" "$SERIAL"; then
+        echo "PASS: TE came on with the NIC's requester held out of the identity domain"
+    else
+        echo "FAIL: the NIC's requester was not held out of the identity domain when TE came on"
+        rc=1
+    fi
+    hole=$(grep -aoE "\[nic-dma\] fault probe: the NIC's DMA to unmapped IOVA 0x[0-9A-Fa-f]+ faulted with its source ID $sid" "$SERIAL" | head -1 | sed -nE 's/.*IOVA 0x([0-9A-Fa-f]+) faulted.*/\1/p')
+    if [ -z "$hole" ]; then
+        grep -a "\[nic-dma\] fault" "$SERIAL" | head -3
+        echo "FAIL: no fault record with the NIC's source ID ($sid) for an unmapped IOVA"
+        rc=1
+    elif ! grep -aqE "\[nic-dma\] fault record: source $sid IOVA 0x$hole reason [0-9]+" "$SERIAL"; then
+        echo "FAIL: the fault probe's record (IOVA 0x$hole) was not logged from the unit"
+        rc=1
+    else
+        echo "PASS: the NIC's DMA to unmapped IOVA 0x$hole faulted with its source ID $sid"
+    fi
+    dma=$(grep -aoE "\[nic-dma\] device DMA: [0-9]+ bytes received into granted IOVA 0x[0-9A-Fa-f]+ -> physical 0x[0-9A-Fa-f]+ in domain [0-9]+" "$SERIAL" | head -1)
+    iova=$(echo "$dma" | sed -nE 's/.*granted IOVA 0x([0-9A-Fa-f]+) .*/\1/p')
+    ddom=$(echo "$dma" | sed -nE 's/.*in domain ([0-9]+)$/\1/p')
+    if [ -z "$dma" ]; then
+        grep -a "\[nic-dma\] device DMA" "$SERIAL" | head -3
+        echo "FAIL: no device DMA into a granted page of the NIC's domain"
+        rc=1
+    elif [ "$ddom" != "$dom" ]; then
+        echo "FAIL: the NIC's DMA went through domain $ddom, not its private domain $dom"
+        rc=1
+    elif [ $((16#$iova)) -lt $((16#1000000000)) ]; then
+        echo "FAIL: the NIC was given IOVA 0x$iova, below the private IOVA base 0x1000000000 (a RAM address)"
+        rc=1
+    else
+        echo "PASS: the NIC DMA'd a frame into granted IOVA 0x$iova (domain $dom), above every RAM address"
+    fi
+    if grep -aqF "[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), NIC isolated" "$SERIAL"; then
+        echo "PASS: net_ring1_allowed: translation, remapping and blocked compatibility format read from the unit"
+    else
+        grep -a "\[nic-dma\] ring-1" "$SERIAL" | head -3
+        echo "FAIL: net_ring1_allowed is false on the translating boot"
+        rc=1
+    fi
+}
+
 # check NAME SERIAL: the verdicts for one boot; sets rc=1 on any failure.
 check() {
     local name="$1" SERIAL="$2"
     echo "===== msix boot ($name) ====="
     echo "----- msix boot ($name): MSI-X and IOMMU lines -----"
-    grep -aE "\[msix\]|Interrupt remapping|\[vtd\]|ACCESS_PLATFORM" "$SERIAL" | head -34
+    grep -aE "\[msix\]|Interrupt remapping|\[vtd\]|ACCESS_PLATFORM|\[nic-dma\]" "$SERIAL" | head -42
     echo "----------------------------------"
 
     if grep -aqE "EXCEPTION|KERNEL PANIC" "$SERIAL"; then
@@ -406,6 +473,17 @@ check() {
             echo "FAIL: \"[vtd] translation on\" on the pc machine, which has no IOMMU"
             rc=1
         fi
+        # ... nor give the NIC a domain, nor allow a ring-1 owner (AGAST #4724)
+        if grep -aqF "[nic-dma] private domain" "$SERIAL"; then
+            echo "FAIL: a private NIC DMA domain on the pc machine, which has no IOMMU"
+            rc=1
+        elif grep -aqF "[nic-dma] ring-1 owner refused" "$SERIAL"; then
+            echo "PASS: no IOMMU: the NIC stays on physical addresses and a ring-1 owner is refused"
+        else
+            grep -a "\[nic-dma\]" "$SERIAL" | head -3
+            echo "FAIL: no \"[nic-dma] ring-1 owner refused\" on the pc machine"
+            rc=1
+        fi
     else
         # The translating boot (AGAST #4723): interrupt remapping, then TE
         # with an identity context for every requester, and the NIC's DMA
@@ -430,6 +508,7 @@ check() {
             echo "FAIL: virtio-net did not negotiate VIRTIO_F_ACCESS_PLATFORM (bit 33) on the translating boot"
             rc=1
         fi
+        nic_dma_checks "$SERIAL"
     fi
     if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
         echo "PASS: init Tier-1 suite: ALL TESTS PASSED"

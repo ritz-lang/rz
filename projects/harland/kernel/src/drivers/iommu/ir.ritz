@@ -26,6 +26,11 @@ import drivers.iommu.dmar {
 }
 import mm.pmm { pmm_top_phys }
 import drivers.iommu.vtd { vtd_ir_init, vtd_ir_enabled, vtd_ir_x2apic, vtd_ir_set, vtd_ir_get_lo, vtd_ioapic_sid, vtd_dma_init, vtd_dma_translation_on }
+import drivers.iommu.vtd { VtdFault, VtdEnter, vtd_private_domain, vtd_requester_isolated, vtd_domain_iova_alloc, vtd_domain_enter, vtd_domain_leave, vtd_domain_entry, vtd_fault_next, vtd_isolation_live }
+import drivers.iommu.dmar { sl_present, vtd_entry_addr }
+import drivers.pci { PciDevice, DmaRequesters, pci_find_virtio, pci_dma_requesters, VIRTIO_DEVICE_NET }
+import ritzlib.option
+import ritzlib.span
 import drivers.iommu.ivrs { AMDVI_MSI_ADDR, amdvi_msi_data, amdvi_msi_handle, amdvi_rte_lo, amdvi_rte_handle }
 import drivers.iommu.amdvi { amdvi_ir_init, amdvi_ir_enabled, amdvi_ir_x2apic, amdvi_ir_set, amdvi_ir_get_dest, amdvi_ioapic_sid }
 
@@ -37,11 +42,14 @@ pub const IR_NO_HANDLE: u32 = 0xFFFFFFFF
 # hardware can. Returns 0 with remapping on, -1 with it off (logged why).
 # With VT-d remapping on, DMA translation comes on too where every unit
 # can translate: an identity context for every requester, then TE
-# (AGAST #4723). AMD-Vi stays DMA pass-through (decision D6).
+# (AGAST #4723). The NIC and its DMA aliases are held out of the identity
+# domain (AGAST #4724): its probe gives them a private one. AMD-Vi stays
+# DMA pass-through (decision D6).
 pub fn ir_init(x2apic: bool) -> i32
     if acpi_find_table(ACPI_SIG_DMAR) != 0
         if vtd_ir_init(x2apic) == 0
-            vtd_dma_init(pmm_top_phys())
+            var nic: DmaRequesters = nic_requesters()
+            vtd_dma_init(pmm_top_phys(), span_from_ptr<u32>(@nic.sids[0], nic.count as i64))
             return 0
         return -1
     let rc: i32 = amdvi_ir_init(x2apic)
@@ -55,6 +63,65 @@ pub fn ir_init(x2apic: bool) -> i32
 # VIRTIO_F_ACCESS_PLATFORM so its DMA goes through the domain.
 pub fn dma_translation_on() -> bool
     return vtd_dma_translation_on()
+
+# ============================================================================
+# Private DMA domains (AGAST #4724, RING1_DRIVER.md "DMA domain")
+# ============================================================================
+#
+# VT-d only: AMD-Vi is DMA pass-through, so every call here refuses there,
+# and a boot without translation keeps the NIC on physical addresses.
+
+# The virtio-net function's requesters, the ones vtd_dma_init holds out of
+# the identity domain; none without a NIC (PCI segment 0 is enumerated by
+# now; a NIC on a later segment is moved off identity by its probe).
+fn nic_requesters() -> DmaRequesters
+    let nic: *PciDevice = pci_find_virtio(VIRTIO_DEVICE_NET)
+    if nic == 0 as *PciDevice
+        var none: DmaRequesters
+        none.count = 0
+        none.named = true
+        return none
+    pci_dma_requesters(nic)
+
+# A private domain for the requesters `sids` (vtd_private_domain).
+pub fn dma_private_domain(sids: Span<u32>) -> Option<u32>
+    if not vtd_dma_translation_on()
+        return None
+    vtd_private_domain(sids)
+
+# Is requester `sid` in a private domain? What a queue-register grant
+# (DrvMmioMap) and the ring-1 cutover check.
+pub fn dma_requester_isolated(sid: u32) -> bool
+    vtd_requester_isolated(sid)
+
+# Map the contiguous run of `pages` pages at `phys` into domain `dom`
+# (vtd_domain_enter: Entered(iova), Refused, or Stuck).
+pub fn dma_domain_enter(dom: u32, phys: u64, pages: u64) -> VtdEnter
+    vtd_domain_enter(dom, phys, pages)
+
+# Take it out again: true once the device reaches none of it.
+pub fn dma_domain_leave(dom: u32, iova: u64, pages: u64) -> bool
+    vtd_domain_leave(dom, iova, pages)
+
+# An IOVA page in `dom` that nothing will map (a fault probe's target).
+pub fn dma_domain_hole(dom: u32) -> Option<u64>
+    vtd_domain_iova_alloc(dom, 1)
+
+# The physical page domain `dom` maps `iova` to, None if unmapped.
+pub fn dma_domain_phys(dom: u32, iova: u64) -> Option<u64>
+    let leaf: u64 = vtd_domain_entry(dom, iova - iova % 4096).unwrap_or(0)
+    if not sl_present(leaf)
+        return None
+    Some(vtd_entry_addr(leaf) + iova % 4096)
+
+# The next recorded DMA fault, cleared (vtd_fault_next).
+pub fn dma_fault_next() -> Option<VtdFault>
+    vtd_fault_next()
+
+# Is the platform isolating devices now, read from the hardware: DMA
+# translated, interrupts remapped, compatibility format blocked.
+pub fn dma_isolation_live() -> bool
+    vtd_isolation_live()
 
 # Is interrupt remapping on? Then every MSI and redirection entry must name
 # a table entry (ir_msi_*, ir_ioapic_rte_*).

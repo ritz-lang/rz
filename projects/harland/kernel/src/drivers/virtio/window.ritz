@@ -14,6 +14,12 @@
 # grant (vio_window_guarded): the kernel programs those registers through
 # its own U/S = 0 mapping.
 #
+# A window whose pages hold any byte of the device's common configuration
+# (its queue-address registers) is a grant only once the device's requester
+# is in a private DMA domain (vio_window_queue_regs; DrvMmioMap asks the
+# IOMMU about `sid`, AGAST #4724): whoever writes those registers chooses
+# where the device DMAs.
+#
 # Imports nothing, so ritz0/tests/test_harland_drv_windows.py compiles it
 # into a host program. Records are written at boot (device probe, or the
 # boot-test doubles) and only read from syscalls, so there is no lock.
@@ -35,9 +41,11 @@ pub struct VioWindow
     length: u64                 # the capability's bytes
     table: PhysRange            # the device's MSI-X table
     pba: PhysRange              # and its pending-bit array
+    queue_regs: PhysRange       # the device's common configuration (queue addresses)
     notify_multiplier: u32
+    sid: u32                    # the device's requester: segment << 16 | bus:dev.fn
     in_use: bool
-    _padding: [3]u8
+    _padding: [7]u8
 
 var vio_windows: [16]VioWindow
 # 0 names no window: a handle with object id 0 is never a grant.
@@ -50,9 +58,9 @@ pub fn phys_range_none() -> PhysRange
     PhysRange { base: 0, len: 0 }
 
 # Record the window of `length` bytes at physical `phys`, with the device's
-# MSI-X table and PBA ranges. Its object id, or None for length 0 or a
-# full table.
-pub fn vio_window_add(phys: u64, length: u64, notify_multiplier: u32, table: PhysRange, pba: PhysRange) -> Option<u64>
+# MSI-X table and PBA ranges, its common configuration and its requester
+# `sid`. Its object id, or None for length 0 or a full table.
+pub fn vio_window_add(phys: u64, length: u64, notify_multiplier: u32, table: PhysRange, pba: PhysRange, queue_regs: PhysRange, sid: u32) -> Option<u64>
     if length == 0
         return None
     var slot: i32 = 0
@@ -68,7 +76,9 @@ pub fn vio_window_add(phys: u64, length: u64, notify_multiplier: u32, table: Phy
     vio_windows[slot].length = length
     vio_windows[slot].table = table
     vio_windows[slot].pba = pba
+    vio_windows[slot].queue_regs = queue_regs
     vio_windows[slot].notify_multiplier = notify_multiplier
+    vio_windows[slot].sid = sid
     vio_windows[slot].in_use = true
     Some(id)
 
@@ -107,3 +117,9 @@ pub fn vio_window_guarded(w: VioWindow) -> bool
     let lo: u64 = w.page_base
     let hi: u64 = lo + vio_window_pages(w) * WINDOW_PAGE
     range_touches(w.table, lo, hi) or range_touches(w.pba, lo, hi)
+
+# Any page of the window holds a byte of the device's queue-address
+# registers: a grant only once the device is isolated (above).
+pub fn vio_window_queue_regs(w: VioWindow) -> bool
+    let lo: u64 = w.page_base
+    range_touches(w.queue_regs, lo, lo + vio_window_pages(w) * WINDOW_PAGE)

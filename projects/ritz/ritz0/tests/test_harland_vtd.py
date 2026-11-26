@@ -481,10 +481,10 @@ def test_vtd_picks_the_ir_table_by_the_requesters_segment():
 # With the unit "dead" the queue stops: every wait must end in a reported
 # timeout, not a hang. Nothing turns translation on: GCMD.TE stays clear.
 
+# As the kernel's serial.ritz: ritzlib's StrView (ritzlib.span, which
+# vtd.ritz takes requester lists in, AGAST #4724, uses it too).
 DMA_SERIAL_STUB = """\
-pub struct StrView
-    ptr: *u8
-    len: i64
+pub import ritzlib.strview { StrView }
 """
 
 DMA_KLOG_STUB = """\
@@ -849,6 +849,7 @@ TE_PROGRAM = """\
 import drivers.iommu.dmar
 import drivers.iommu.vtd
 import fakevtd
+import ritzlib.span
 
 # SAGAW 4-level, 256 domain IDs, MGAW 48, fault records at 0x220, PSI, DRD,
 # SLLPS 2 MiB (bit 34); no caching mode.
@@ -896,12 +897,12 @@ fn main() -> i32
     fake_set_reg64(VTD_REG_ECAP, ECAP)
     fake_set_rmrr(true)
     # nothing before interrupt remapping is on
-    if vtd_dma_translation_on() or vtd_dma_init(TOP)
+    if vtd_dma_translation_on() or vtd_dma_init(TOP, span_empty<u32>())
         return 1
     if vtd_ir_init(false) != 0 or te_on()
         return 2
     let n0: i32 = fake_log_n
-    if not vtd_dma_init(TOP)
+    if not vtd_dma_init(TOP, span_empty<u32>())
         return 3
     if not vtd_dma_translation_on() or not te_on() or (fake_reg32(VTD_REG_GCMD) & GCMD_TE) == 0
         return 4
@@ -932,7 +933,7 @@ fn main() -> i32
         return 11
     # a second call leaves it as it is
     let root: u64 = fake_reg64(VTD_REG_RTADDR)
-    if not vtd_dma_init(TOP) or fake_reg64(VTD_REG_RTADDR) != root or vtd_context_domain(0x18).unwrap_or(0) != dom
+    if not vtd_dma_init(TOP, span_empty<u32>()) or fake_reg64(VTD_REG_RTADDR) != root or vtd_context_domain(0x18).unwrap_or(0) != dom
         return 12
 
     # a unit without 2 MiB leaves: 4 KiB leaves
@@ -942,7 +943,7 @@ fn main() -> i32
     fake_set_reg64(VTD_REG_CAP, CAP & (0xFFFFFFFFFFFFFFFF ^ 0x400000000))
     if vtd_ir_init(false) != 0 or vtd_dma_translation_on() or te_on()
         return 13
-    if not vtd_dma_init(0x400000) or not te_on()
+    if not vtd_dma_init(0x400000, span_empty<u32>()) or not te_on()
         return 14
     if walk(0x18, 0x3FF000, @lvl) != sl_leaf(0x3FF000, true) or lvl != 1 or sl_present(walk(0x18, 0x400000, @lvl))
         return 15
@@ -951,18 +952,18 @@ fn main() -> i32
     fake_set_reg32(VTD_REG_GCMD, 0)
     fake_set_reg32(VTD_REG_GSTS, 0)
     fake_set_reg64(VTD_REG_CAP, CAP & (0xFFFFFFFFFFFFFFFF ^ (CAP_SAGAW_48 | CAP_SAGAW_39)))
-    if vtd_ir_init(false) != 0 or vtd_dma_init(TOP) or vtd_dma_translation_on() or te_on()
+    if vtd_ir_init(false) != 0 or vtd_dma_init(TOP, span_empty<u32>()) or vtd_dma_translation_on() or te_on()
         return 16
     # RAM past what the unit translates (MGAW 39): refused
     fake_set_reg64(VTD_REG_CAP, (CAP & (0xFFFFFFFFFFFFFFFF ^ 0x3F0000)) | 0x260000)
-    if vtd_ir_init(false) != 0 or vtd_dma_init(0x10000000000) or vtd_dma_translation_on() or te_on()
+    if vtd_ir_init(false) != 0 or vtd_dma_init(0x10000000000, span_empty<u32>()) or vtd_dma_translation_on() or te_on()
         return 17
     # a unit that stops answering its queue: refused, TE stays clear
     fake_set_reg64(VTD_REG_CAP, CAP)
     if vtd_ir_init(false) != 0
         return 18
     fake_set_dead(true)
-    if vtd_dma_init(TOP) or vtd_dma_translation_on() or te_on()
+    if vtd_dma_init(TOP, span_empty<u32>()) or vtd_dma_translation_on() or te_on()
         return 19
     0
 """
@@ -987,15 +988,18 @@ def test_vtd_sets_translation_enable_only_in_the_translating_boot():
     # the global flush, and only from ir_init once VT-d remapping is on
     code = _code(VTD)
     code = re.sub(r"^import [^{\n]*\{.*?\}", "", code, flags=re.M | re.S)
-    te = [m.start() for m in re.finditer(r"GCMD_TE", code)]
+    # a GCMD write naming TE; vtd_isolation_live (AGAST #4724) only reads GSTS
+    te = [m.start() for m in re.finditer(r"vtd_gcmd\([^)]*GCMD_TE", code)]
     init = _body(code, "vtd_dma_init").rstrip()
     assert te and all(code.find(init) <= i < code.find(init) + len(init) for i in te), \
-        "GCMD_TE outside vtd_dma_init"
+        "TE set outside vtd_dma_init"
+    live = _body(code, "vtd_isolation_live")
+    assert "VTD_REG_GSTS" in live and "vtd_gcmd" not in live and "vtd_wreg" not in live, live
     assert init.index("vtd_seg_identity(") < init.index("qi_cc_global_lo()") < init.index("GCMD_TE"), init
     assert "vtd_seg_levels(si) == 0" in _body(code, "vtd_seg_identity"), "a segment that can't translate must be refused"
     assert "if not vtd_on" in init, init
     ir_init = _body(_code(IR), "ir_init")
-    assert re.search(r"vtd_ir_init\(x2apic\) == 0", ir_init) and "vtd_dma_init(pmm_top_phys())" in ir_init, ir_init
+    assert re.search(r"vtd_ir_init\(x2apic\) == 0", ir_init) and "vtd_dma_init(pmm_top_phys(), " in ir_init, ir_init
     # the boot's answer: VT-d's; AMD-Vi stays pass-through (decision D6)
     on = _body(_code(IR), "dma_translation_on")
     assert "vtd_dma_translation_on()" in on and "amdvi" not in on, on
@@ -1014,3 +1018,261 @@ def test_virtio_net_asks_for_access_platform_on_a_translating_boot():
     assert re.search(r"if dma_translation_on\(\)\s+wanted = wanted \| VIRTIO_F_ACCESS_PLATFORM\s+vio_set_features\(vdev, wanted\)", init), \
         "virtio-net must ask for bit 33 on a translating boot"
     assert "VIRTIO_F_ACCESS_PLATFORM negotiated" in VIRTIO_NET.read_text()
+
+
+# --- The NIC's private domain (AGAST #4724) ---------------------------------------
+#
+# On the same emulated unit: vtd_dma_init holds the NIC and its alias out of
+# the identity domain; vtd_private_domain gives them their own (and moves a
+# requester already on identity off it, dropping its context-cache entry and
+# the identity domain's IOTLB first); vtd_domain_enter maps a run at fresh
+# IOVAs from VTD_IOVA_BASE, and a failure part-way unmaps what it mapped or,
+# when the unit doesn't confirm that, reports the run Stuck (DrvDmaAlloc
+# then quarantines it); vtd_isolation_live reads TE, IRE and CFI from GSTS.
+
+NIC_PROGRAM = """\
+import drivers.iommu.dmar
+import drivers.iommu.vtd
+import fakevtd
+import ritzlib.option
+import ritzlib.span
+
+const CAP: u64 = 0x800384222F0402
+const ECAP: u64 = 0x0A
+const TOP: u64 = 0x40000000
+const NIC: u32 = 0x18                       # 00:03.0
+const ALIAS: u32 = 0x100                    # 01:00.0, a PCIe-to-PCI bridge's alias
+const PAGE: u64 = 4096
+
+var held: [2]u32
+var one: [1]u32
+var mixed: [2]u32
+
+fn logged(k: i32, lo: u64, hi: u64) -> bool
+    return k < fake_log_n and fake_log_lo[k] == lo and fake_log_hi[k] == hi
+
+fn ctx(sid: u32) -> u32
+    return vtd_context_domain(sid).unwrap_or(0)
+
+fn entered(r: VtdEnter) -> u64
+    match r
+        VtdEnter.Entered(iova) => iova
+        VtdEnter.Refused => 1
+        VtdEnter.Stuck => 2
+
+# The 4 KiB leaf the unit's walk for requester `sid` ends on at `iova`, 0 if none.
+fn walk(sid: u32, iova: u64) -> u64
+    let re: u64 = volatile_load((fake_reg64(VTD_REG_RTADDR) + vtd_sid_bus(sid) * 16) as *u64)
+    if not vtd_entry_present(re)
+        return 0
+    let ce: u64 = vtd_entry_addr(re) + vtd_sid_devfn(sid) * 16
+    let lo: u64 = volatile_load(ce as *u64)
+    if not vtd_entry_present(lo)
+        return 0
+    var lvl: u32 = (volatile_load((ce + 8) as *u64) & 7) as u32 + 2
+    var t: u64 = vtd_entry_addr(lo)
+    while true
+        let e: u64 = volatile_load((t + sl_index(iova, lvl) * 8) as *u64)
+        if not sl_present(e) or lvl == 1 or sl_is_large(e)
+            return e
+        t = vtd_entry_addr(e)
+        lvl = lvl - 1
+
+fn main() -> i32
+    fake_set_reg64(VTD_REG_CAP, CAP)
+    fake_set_reg64(VTD_REG_ECAP, ECAP)
+    held[0] = NIC
+    held[1] = ALIAS
+    if vtd_ir_init(false) != 0
+        return 1
+    # no private domain, nothing isolated, before translation is on
+    if vtd_private_domain(span_from_ptr<u32>(@held[0], 2)).is_some() or vtd_isolation_live() or vtd_requester_isolated(NIC)
+        return 18
+    if not vtd_dma_init(TOP, span_from_ptr<u32>(@held[0], 2))
+        return 1
+    # held: no context, so no identity map; their neighbours have one
+    if vtd_context_domain(NIC).is_some() or vtd_context_domain(ALIAS).is_some() or walk(NIC, 0x1000) != 0
+        return 2
+    let ident: u32 = ctx(0x10)
+    if ident == 0 or ctx(0x101) != ident or ctx(0x20) != ident
+        return 3
+    if not vtd_isolation_live() or vtd_requester_isolated(NIC)
+        return 4
+    # the private domain: both requesters name it, and only they are isolated
+    let dom: u32 = vtd_private_domain(span_from_ptr<u32>(@held[0], 2)).unwrap_or(0)
+    if dom == 0 or dom == ident or ctx(NIC) != dom or ctx(ALIAS) != dom
+        return 6
+    if not vtd_requester_isolated(NIC) or not vtd_requester_isolated(ALIAS) or vtd_requester_isolated(0x10)
+        return 7
+    # a requester on identity, moved: its context-cache entry and the identity
+    # domain's IOTLB are dropped before it names the new domain
+    one[0] = 0x20
+    let n1: i32 = fake_log_n
+    let dom2: u32 = vtd_private_domain(span_from_ptr<u32>(@one[0], 1)).unwrap_or(0)
+    if dom2 == 0 or ctx(0x20) != dom2 or not logged(n1, qi_cc_device_lo(ident, 0x20), 0) or not logged(n1 + 1, qi_iotlb_lo(QI_G_DOMAIN, ident, CAP), 0)
+        return 8
+    if ctx(0x10) != ident
+        return 8
+    # requesters on two segments (the second has no unit): refused
+    mixed[0] = 0x28
+    mixed[1] = 0x10028
+    if vtd_private_domain(span_from_ptr<u32>(@mixed[0], 2)).is_some() or ctx(0x28) != ident or vtd_requester_isolated(0x28)
+        return 9
+    # a run enters at fresh IOVAs from VTD_IOVA_BASE, read-write, contiguous,
+    # and the NIC's walk reaches it
+    let iova: u64 = entered(vtd_domain_enter(dom, 0x5000000, 3))
+    if iova != VTD_IOVA_BASE
+        return 10
+    var k: u64 = 0
+    while k < 3
+        if vtd_domain_entry(dom, iova + k * PAGE).unwrap_or(0) != sl_leaf(0x5000000 + k * PAGE, true) or walk(NIC, iova + k * PAGE) != sl_leaf(0x5000000 + k * PAGE, true)
+            return 10
+        k = k + 1
+    # the next follows it: an IOVA is never handed out twice
+    let iova2: u64 = entered(vtd_domain_enter(dom, 0x6000000, 3))
+    if iova2 != VTD_IOVA_BASE + 3 * PAGE
+        return 11
+    # the private domain holds nothing else: no RAM, no other run
+    if vtd_domain_entry(dom, 0x5000000).is_some() or vtd_domain_entry(dom, 0).is_some() or walk(NIC, 0x5000000) != 0
+        return 12
+    if vtd_domain_entry(dom2, iova).is_some()
+        return 12
+    # leaving: every page unmapped with a page-selective invalidation
+    let n2: i32 = fake_log_n
+    if not vtd_domain_leave(dom, iova, 3) or vtd_domain_entry(dom, iova).is_some() or walk(NIC, iova + 2 * PAGE) != 0
+        return 13
+    if fake_log_n != n2 + 3 or not logged(n2, qi_iotlb_unmap_lo(dom, CAP), iova)
+        return 13
+    # isolation as the unit reports it: CFI passing, IRE or TE off is not isolation
+    let gsts: u32 = fake_reg32(VTD_REG_GSTS)
+    fake_set_reg32(VTD_REG_GSTS, gsts | GCMD_CFI)
+    if vtd_isolation_live()
+        return 14
+    fake_set_reg32(VTD_REG_GSTS, gsts & (0xFFFFFFFF ^ GCMD_IRE))
+    if vtd_isolation_live()
+        return 14
+    fake_set_reg32(VTD_REG_GSTS, gsts & (0xFFFFFFFF ^ GCMD_TE))
+    if vtd_isolation_live()
+        return 14
+    fake_set_reg32(VTD_REG_GSTS, gsts)
+    # a run past the domain's width: refused, nothing taken
+    if entered(vtd_domain_enter(dom, 0x7000000, 0x1000000000)) != 1
+        return 15
+    # a page that won't map part-way: the pages before it are unmapped again
+    let next: u64 = VTD_IOVA_BASE + 6 * PAGE
+    if vtd_domain_map(dom, next + PAGE, 0x9000, true) != VtdDma.Ok
+        return 16
+    if entered(vtd_domain_enter(dom, 0x7000000, 2)) != 1 or vtd_domain_entry(dom, next).is_some()
+        return 16
+    # ... and when the unit doesn't confirm that, the run is Stuck
+    let after: u64 = VTD_IOVA_BASE + 8 * PAGE
+    if vtd_domain_map(dom, after + PAGE, 0x9000, true) != VtdDma.Ok
+        return 17
+    fake_set_dead(true)
+    if entered(vtd_domain_enter(dom, 0x7000000, 2)) != 2
+        return 17
+    fake_set_dead(false)
+    0
+"""
+
+NIC_CLAIMS = {1: "IR and translation init with held requesters", 2: "held requesters get no context",
+              3: "every other requester keeps identity", 4: "isolation read live from GSTS",
+              6: "private domain named by the NIC and its alias", 7: "only the private domain's requesters are isolated",
+              8: "a requester moved off identity: context cache + identity IOTLB dropped first",
+              9: "requesters on two segments refused", 10: "a run enters at fresh IOVAs, walked by the NIC",
+              11: "IOVAs are never reused", 12: "the private domain maps nothing but its runs",
+              13: "leave unmaps with page-selective invalidation", 14: "CFI, IRE or TE off is not isolation",
+              15: "a run past the width is refused", 16: "a partial enter unmaps what it mapped",
+              17: "a partial enter on a dead unit is Stuck", 18: "nothing before translation is on"}
+
+
+@pytest.mark.integration
+def test_vtd_nic_private_domain_on_an_emulated_unit(tmp_path):
+    _run_on_emulated_unit(tmp_path, NIC_PROGRAM, NIC_CLAIMS)
+
+
+PCI = KERNEL_SRC / "drivers" / "pci.ritz"
+
+
+@pytest.mark.unit
+def test_nic_bus_master_waits_for_its_private_domain():
+    """AGAST #4724: on a translating boot the virtio probe leaves the NIC's
+    bus master off (and clears what firmware left), names every requester,
+    refuses an unnamed alias before anything else, and sets bus master only
+    once the private domain is live, then runs the fault probe."""
+    common = _code(VIRTIO_COMMON)
+    vinit = _body(common, "vio_init")
+    assert vinit.index("if not bus_master\n        pci_disable_bus_master(pci_dev)") < vinit.index("vio_find_mmio_caps")
+    assert vinit.count("pci_enable_bus_master(pci_dev)") == 2
+    assert vinit.count("if bus_master\n            pci_enable_bus_master(pci_dev)") == 1
+    assert vinit.count("if bus_master\n        pci_enable_bus_master(pci_dev)") == 1
+    assert "vio_init(pci_dev, false)" in _body(common, "vio_init_device_isolated")
+    net = _code(VIRTIO_NET)
+    init = _body(net, "virtio_net_init")
+    assert re.search(r"let isolate: bool = dma_translation_on\(\)\s+var vdev: \*VirtioDevice = 0 as \*VirtioDevice\s+"
+                     r"if isolate\s+vdev = vio_init_device_isolated\(pci_dev\)", init), init
+    assert init.index("virtio_net_isolate(pci_dev, vdev)") < init.index("virtio_net_setup_msix")
+    iso = _body(net, "virtio_net_isolate")
+    named = iso.index("if not req.named")
+    dom = iso.index("dma_private_domain(span_from_ptr<u32>(@req.sids[0], req.count as i64))")
+    bm = iso.index("pci_enable_bus_master(pci_dev)")
+    probe = iso.index("virtio_net_fault_probe(vdev, sid)")
+    assert named < dom < bm < probe, iso
+    assert iso[named:dom].count("return false") == 1 and iso[dom:bm].count("return false") == 1
+    # bus master is set nowhere else in the NIC driver
+    assert net.count("pci_enable_bus_master(") == 1
+
+
+@pytest.mark.unit
+def test_nic_dma_goes_through_its_domain():
+    """AGAST #4724: the rings and both buffer pools enter the NIC's domain
+    (the path DrvDmaAlloc uses) and the device is given their IOVAs; a
+    descriptor carries the device address as it is, no CPU translation."""
+    net = _code(VIRTIO_NET)
+    assert "dma_domain_enter(virtio_net_dom, (*vq).phys_addr, vio_queue_pages(vq))" in _body(net, "virtio_net_alloc_queue")
+    assert "VtdEnter.Entered(iova) => (*vq).phys_addr = iova" in _body(net, "virtio_net_alloc_queue")
+    pool = _body(net, "nic_pool_new")
+    assert "dma_domain_enter(virtio_net_dom, phys, VIRTIO_NET_POOL_PAGES)" in pool and "dma_quarantine(" in pool
+    add = _body(net, "virtq_add_buf")
+    assert "(*desc_ptr).addr = dev_addr" in add and "virt_to_phys" not in add
+    assert "virtio_rx_buffers" not in net and "virtio_tx_buffers" not in net
+    poll = _body(net, "virtio_net_poll")
+    assert "virtio_rx_pool.virt + (rx_addr - virtio_rx_pool.dev)" in poll and "phys_to_virt(rx_addr)" not in poll
+    probe = _body(net, "virtio_net_fault_probe")
+    assert "dma_domain_hole(virtio_net_dom)" in probe and "f.sid == sid and f.iova == hole" in probe
+    assert probe.index("virtq_kick(txq)") < probe.index("match dma_fault_next()")
+    assert "virtio_net_reset_done(vdev)" in probe
+    allowed = _body(net, "net_ring1_allowed")
+    assert "dma_isolation_live()" in allowed and "dma_requester_isolated(" in allowed
+
+
+@pytest.mark.unit
+def test_ir_init_holds_the_nic_out_of_the_identity_domain():
+    ir = _code(IR)
+    body = _body(ir, "ir_init")
+    assert "var nic: DmaRequesters = nic_requesters()" in body
+    assert "vtd_dma_init(pmm_top_phys(), span_from_ptr<u32>(@nic.sids[0], nic.count as i64))" in body
+    assert "pci_dma_requesters(nic)" in _body(ir, "nic_requesters")
+    # the private-domain calls are VT-d's alone
+    for fn in ("dma_private_domain", "dma_requester_isolated", "dma_isolation_live"):
+        assert "amdvi" not in _body(ir, fn), fn
+    assert "if not vtd_dma_translation_on()\n        return None" in _body(ir, "dma_private_domain")
+
+
+@pytest.mark.unit
+def test_dma_requesters_name_aliases_or_refuse():
+    """AGAST #4724: phantom functions are never named; a PCIe-to-PCI bridge
+    adds (secondary bus, devfn 0), a conventional or PCI-to-PCIe bridge its
+    own ID, and either only when the function is alone behind it; a PCIe
+    switch or root port adds nothing."""
+    pci = _code(PCI)
+    body = _body(pci, "pci_dma_requesters")
+    assert "requesters_add(@r, pci_dev_sid(dev))" in body
+    assert re.search(r"PCIE_DEVCTL_PHANTOM\) != 0\s+r\.named = false", body)
+    assert re.search(r"if cap == 0 or port == PCIE_TYPE_PCIE_TO_PCI or port == PCIE_TYPE_PCI_TO_PCIE\s+"
+                     r"if not pci_alone_behind\(bridge, dev\)\s+r\.named = false\s+"
+                     r"else if port == PCIE_TYPE_PCIE_TO_PCI\s+requesters_add\(@r, pci_sid\(\(\*bridge\)\.segment as u32, bus as u32, 0, 0\)\)\s+"
+                     r"else\s+requesters_add\(@r, pci_dev_sid\(bridge\)\)", body), body
+    assert "(*r).named = false" in _body(pci, "requesters_add")
+    assert "PCIE_TYPE_PCIE_TO_PCI: u16 = 7" in pci and "PCIE_TYPE_PCI_TO_PCIE: u16 = 8" in pci
+

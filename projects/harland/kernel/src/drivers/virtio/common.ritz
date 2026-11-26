@@ -14,7 +14,7 @@ import io { inb, outb, inw, outw, inl, outl }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_map_mmio, phys_to_virt }
-import drivers.pci { PciDevice, pci_enable_bus_master, pci_enable_memory, pci_enable_io, pci_find_capability, pci_find_capability_nth, pci_dev_read_config8, pci_dev_read_config16, pci_dev_read_config32, PCI_CAP_VENDOR }
+import drivers.pci { PciDevice, pci_enable_bus_master, pci_disable_bus_master, pci_enable_memory, pci_enable_io, pci_find_capability, pci_find_capability_nth, pci_dev_read_config8, pci_dev_read_config16, pci_dev_read_config32, pci_dev_sid, PCI_CAP_VENDOR }
 import ritzlib.option
 import drivers.msix { PCI_CAP_MSIX }
 import drivers.virtio.window { PhysRange, phys_range, phys_range_none, vio_window_add }
@@ -265,23 +265,31 @@ pub fn vio_setup_queue(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
     return vio_setup_queue_vec(dev, queue_idx, VIRTIO_MSI_NO_VECTOR)
 
 # Set up queue `queue_idx`, signalling MSI-X table entry `msix_vector`
-# (VIRTIO_MSI_NO_VECTOR for none; MSI-X must already be enabled otherwise).
-# The queue gets min(device max, VIRTQ_MAX_SIZE) entries. Returns 0 if the
-# queue doesn't exist, is legacy and larger than VIRTQ_MAX_SIZE, or refuses
-# the vector.
+# (VIRTIO_MSI_NO_VECTOR for none; MSI-X must already be enabled otherwise):
+# vio_queue_alloc, then vio_queue_program with the ring's physical address.
+# Returns 0 if the queue doesn't exist, is legacy and larger than
+# VIRTQ_MAX_SIZE, or refuses the vector.
 pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16) -> *Virtqueue
-    # Select the queue
-    if (*dev).transport == VIO_TRANSPORT_MMIO
-        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SEL as u64, queue_idx)
-    else
-        vio_write16(dev, VIRTIO_PCI_QUEUE_SEL, queue_idx)
+    let vq: *Virtqueue = vio_queue_alloc(dev, queue_idx)
+    if vq == 0 as *Virtqueue
+        return vq
+    if not vio_queue_program(dev, vq, msix_vector)
+        kfree(vq as *u8)
+        return 0 as *Virtqueue
+    return vq
 
-    # Get queue size
-    var num: u16 = 0
-    if (*dev).transport == VIO_TRANSPORT_MMIO
-        num = mmio_read16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SIZE as u64)
-    else
-        num = vio_read16(dev, VIRTIO_PCI_QUEUE_SIZE)
+# The pages queue `vq`'s rings take.
+pub fn vio_queue_pages(vq: *Virtqueue) -> u64
+    return (virtq_ring_bytes((*vq).num) + PAGE_SIZE - 1) / PAGE_SIZE
+
+# Allocate queue `queue_idx`'s rings, min(device max, VIRTQ_MAX_SIZE)
+# entries, zeroed, with the device address (vq.phys_addr) their physical
+# one. Nothing is told to the device: a caller whose device DMAs through a
+# domain sets phys_addr to the rings' IOVA before vio_queue_program
+# (AGAST #4724). 0 if the queue doesn't exist, is legacy and larger than
+# VIRTQ_MAX_SIZE, or there's no memory.
+pub fn vio_queue_alloc(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
+    var num: u16 = vio_get_queue_size(dev, queue_idx)
     if num == 0
         return 0 as *Virtqueue
     if num > VIRTQ_MAX_SIZE
@@ -292,25 +300,9 @@ pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16)
             klog_dec(num as i64)
             klog(" entries, more than the 256 supported\n")
             return 0 as *Virtqueue
-        # Modern queue_size is R/W: take only what the rings hold (§4.1.4.3)
+        # Modern queue_size is R/W: take only what the rings hold (§4.1.4.3);
+        # vio_queue_program writes it
         num = VIRTQ_MAX_SIZE
-        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SIZE as u64, num)
-
-    # The queue's MSI-X vector, while the queue is selected and before it is
-    # enabled. The device reads back NO_VECTOR if it couldn't take it.
-    if msix_vector != VIRTIO_MSI_NO_VECTOR
-        var got: u16 = 0
-        if (*dev).transport == VIO_TRANSPORT_MMIO
-            mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_MSIX_VEC as u64, msix_vector)
-            got = mmio_read16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_MSIX_VEC as u64)
-        else
-            vio_write16(dev, VIRTIO_PCI_MSI_QUEUE_VECTOR, msix_vector)
-            got = vio_read16(dev, VIRTIO_PCI_MSI_QUEUE_VECTOR)
-        if got == VIRTIO_MSI_NO_VECTOR
-            klog("[virtio] queue ")
-            klog_dec(queue_idx as i64)
-            klog(" refused its MSI-X vector\n")
-            return 0 as *Virtqueue
 
     # Allocate virtqueue structure
     let vq: *Virtqueue = kalloc(sizeof(Virtqueue) as u64) as *Virtqueue
@@ -343,17 +335,50 @@ pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16)
     # through the physmap (a process's address space has no identity map,
     # AGAST #1878).
     let ring_virt: u64 = phys_to_virt(ring_phys)
+    virtq_init(vq, queue_idx, num, ring_virt, ring_phys)
+    vio_queue_reset(vq)
+    (*vq).transport = (*dev).transport
+    return vq
 
-    # Zero all allocated ring memory
+# Zero queue `vq`'s rings and start its indices and free list over, at the
+# same device address: a queue being programmed again after a device reset.
+pub fn vio_queue_reset(vq: *Virtqueue)
+    let ring_virt: u64 = (*vq).desc as u64
     var i: u64 = 0
-    let total_size: u64 = pages_needed * PAGE_SIZE
+    let total_size: u64 = vio_queue_pages(vq) * PAGE_SIZE
     while i < total_size
         *((ring_virt + i) as *u8) = 0
         i = i + 1
-
     # Rings, free list and cursors (virtio_abi); the notify target is ours
-    virtq_init(vq, queue_idx, num, ring_virt, ring_phys)
-    (*vq).transport = (*dev).transport
+    virtq_init(vq, (*vq).queue_index, (*vq).num, ring_virt, (*vq).phys_addr)
+
+# Tell the device where queue `vq` is (its device address, vq.phys_addr),
+# with MSI-X table entry `msix_vector` (VIRTIO_MSI_NO_VECTOR for none), and
+# enable it. False if the queue refused the vector.
+pub fn vio_queue_program(dev: *VirtioDevice, vq: *Virtqueue, msix_vector: u16) -> bool
+    let queue_idx: u16 = (*vq).queue_index
+    # Select the queue
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SEL as u64, queue_idx)
+        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SIZE as u64, (*vq).num)
+    else
+        vio_write16(dev, VIRTIO_PCI_QUEUE_SEL, queue_idx)
+
+    # The queue's MSI-X vector, while the queue is selected and before it is
+    # enabled. The device reads back NO_VECTOR if it couldn't take it.
+    if msix_vector != VIRTIO_MSI_NO_VECTOR
+        var got: u16 = 0
+        if (*dev).transport == VIO_TRANSPORT_MMIO
+            mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_MSIX_VEC as u64, msix_vector)
+            got = mmio_read16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_MSIX_VEC as u64)
+        else
+            vio_write16(dev, VIRTIO_PCI_MSI_QUEUE_VECTOR, msix_vector)
+            got = vio_read16(dev, VIRTIO_PCI_MSI_QUEUE_VECTOR)
+        if got == VIRTIO_MSI_NO_VECTOR
+            klog("[virtio] queue ")
+            klog_dec(queue_idx as i64)
+            klog(" refused its MSI-X vector\n")
+            return false
 
     # Tell device where the queue is
     if (*dev).transport == VIO_TRANSPORT_MMIO
@@ -379,10 +404,10 @@ pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16)
         # The queue's notify port
         (*vq).notify_addr = ((*dev).io_base + VIRTIO_PCI_QUEUE_NOTIFY) as u64
         # Legacy: set PFN (page frame number)
-        let pfn: u32 = (ring_phys / PAGE_SIZE) as u32
+        let pfn: u32 = (virtq_desc_phys(vq) / PAGE_SIZE) as u32
         vio_write32(dev, VIRTIO_PCI_QUEUE_PFN, pfn)
 
-    return vq
+    return true
 
 # ============================================================================
 # Queue Notification
@@ -400,7 +425,20 @@ pub fn vq_notify(vq: *Virtqueue)
 # Device Initialization
 # ============================================================================
 
+# Pick the transport, enable the function (bus mastering included), reset
+# the device and set ACKNOWLEDGE | DRIVER.
 pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
+    return vio_init(pci_dev, true)
+
+# The same, with the function's bus mastering turned off and left off
+# (AGAST #4724): on a translating boot the NIC may not DMA until its
+# private domain is live, and its probe sets bus master only then.
+pub fn vio_init_device_isolated(pci_dev: *PciDevice) -> *VirtioDevice
+    return vio_init(pci_dev, false)
+
+fn vio_init(pci_dev: *PciDevice, bus_master: bool) -> *VirtioDevice
+    if not bus_master
+        pci_disable_bus_master(pci_dev)
     # Allocate device structure
     let dev: *VirtioDevice = kalloc(sizeof(VirtioDevice) as u64) as *VirtioDevice
     if dev == 0 as *VirtioDevice
@@ -425,7 +463,8 @@ pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
         (*dev).io_base = (*pci_dev).bar[0] as u16
 
         # Enable PCI bus mastering and I/O space
-        pci_enable_bus_master(pci_dev)
+        if bus_master
+            pci_enable_bus_master(pci_dev)
         pci_enable_io(pci_dev)
 
         # Reset the device
@@ -440,7 +479,8 @@ pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
         return dev
 
     # Enable PCI bus mastering and memory space BEFORE accessing MMIO
-    pci_enable_bus_master(pci_dev)
+    if bus_master
+        pci_enable_bus_master(pci_dev)
     pci_enable_memory(pci_dev)
 
     # Try modern MMIO transport via PCI capabilities
@@ -480,11 +520,30 @@ fn msix_register_range(pci_dev: *PciDevice, reg: u8, len: u64) -> PhysRange
         return phys_range_none()
     phys_range((*pci_dev).bar[bir] + ((loc & 0xFFFFFFF8) as u64), len)
 
+# The physical bytes of the device's common configuration (its queue-
+# address registers), or no range.
+fn vio_common_range(pci_dev: *PciDevice) -> PhysRange
+    var idx: i32 = 0
+    while idx < 16
+        let cap_ptr: u8 = pci_find_capability_nth(pci_dev, PCI_CAP_VENDOR, idx)
+        if cap_ptr == 0
+            break
+        idx = idx + 1
+        if pci_dev_read_config8(pci_dev, cap_ptr + VIRTIO_PCI_CAP_TYPE) == VIRTIO_PCI_CAP_COMMON_CFG
+            let bar: u8 = pci_dev_read_config8(pci_dev, cap_ptr + VIRTIO_PCI_CAP_BAR)
+            if bar <= 5 and (*pci_dev).bar_is_io[bar as i32] == 0 and (*pci_dev).bar[bar as i32] != 0
+                let offset: u32 = pci_dev_read_config32(pci_dev, cap_ptr + VIRTIO_PCI_CAP_OFFSET)
+                let length: u32 = pci_dev_read_config32(pci_dev, cap_ptr + VIRTIO_PCI_CAP_LENGTH)
+                return phys_range((*pci_dev).bar[bar as i32] + (offset as u64), length as u64)
+    phys_range_none()
+
 # Record the capability window at physical `phys`, `length` bytes, as a
 # CAP_TYPE_MMIO object (drivers/virtio/window.ritz, AGAST #4720), with the
 # device's MSI-X table and PBA so DrvMmioMap can refuse a page holding
-# either. The kernel's own mapping above is unaffected; a full record table
-# only means that window can't be granted.
+# either, and its common configuration and requester so DrvMmioMap grants
+# a page holding its queue-address registers only to a device in a
+# private DMA domain (AGAST #4724). The kernel's own mapping above is
+# unaffected; a full record table only means that window can't be granted.
 fn vio_note_window(pci_dev: *PciDevice, cap_ptr: u8, cap_type: u8, phys: u64, length: u64)
     var notify: u32 = 0
     if cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG
@@ -496,7 +555,7 @@ fn vio_note_window(pci_dev: *PciDevice, cap_ptr: u8, cap_type: u8, phys: u64, le
         let entries: u64 = ((pci_dev_read_config16(pci_dev, msix + MSIX_CAP_CONTROL) & 0x7FF) as u64) + 1
         table = msix_register_range(pci_dev, msix + MSIX_CAP_TABLE, entries * MSIX_ENTRY_BYTES)
         pba = msix_register_range(pci_dev, msix + MSIX_CAP_PBA, (entries + 63) / 64 * 8)
-    if vio_window_add(phys, length, notify, table, pba).is_none()
+    if vio_window_add(phys, length, notify, table, pba, vio_common_range(pci_dev), pci_dev_sid(pci_dev)).is_none()
         klog("[virtio] window table full: this window can't be granted\n")
 
 # Find the virtio modern PCI capabilities (virtio 1.x §4.1.4) and map the

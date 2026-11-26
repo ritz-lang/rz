@@ -209,6 +209,16 @@ fn main() -> i32
     # Its id can be registered again, cold.
     if not irq_object_register(OBJ_A, VEC_A) or irq_object_take(OBJ_A)
         return 21
+    # The device's DMA domain (AGAST #4724): none until bound; a binding
+    # names one object; an unregistered id binds nothing; re-registering
+    # starts with none.
+    if irq_object_domain(OBJ_A) != 0 or irq_object_bind_domain(OBJ_A + 1, 2) or irq_object_domain(OBJ_A + 1) != 0
+        return 28
+    if not irq_object_bind_domain(OBJ_A, 2) or irq_object_domain(OBJ_A) != 2 or irq_object_domain(OBJ_B) != 0
+        return 28
+    irq_object_unregister(OBJ_A)
+    if irq_object_domain(OBJ_A) != 0 or not irq_object_register(OBJ_A, VEC_A) or irq_object_domain(OBJ_A) != 0
+        return 29
 
     # The console on the wait set (#4829, a timed poll on fd 0): console
     # input wakes each slot watching it while parked on its wait set, and

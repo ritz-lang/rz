@@ -150,14 +150,31 @@ def net_rx_waits(waits: int = 880, halts: int = 880) -> str:
 
 WAITS_OK = BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + net_rx_waits()
 
-PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_OK + WAITS_OK + SUITE_PASSED
+# AGAST #4724: without an IOMMU the NIC stays on physical addresses and a
+# ring-1 owner is refused (both boots log a verdict; the vtd fixture adds
+# the allowed one).
+NIC_REFUSED = r"[nic-dma] ring-1 owner refused: the NIC is not isolated on this boot; the owner stays in the kernel\n"
+
+PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_OK + WAITS_OK + NIC_REFUSED + SUITE_PASSED
 
 # The translating boot's own lines (AGAST #4723): interrupt remapping, TE
 # with identity contexts, and the NIC's bit 33.
 IR_ON = r"      Interrupt remapping: VT-d on, 1 unit(s), table at 0x7E000, 8-bit xAPIC destinations\n"
-TE_ON = r"      [vtd] translation on: identity domain for every requester on 1 PCI segment(s), RAM below 0x80000000, 0 RMRR(s)\n"
+# AGAST #4724: the line also counts the requesters held for a private domain.
+TE_ON = (r"      [vtd] translation on: identity domain for every requester on 1 PCI segment(s), RAM below 0x80000000, "
+         r"0 RMRR(s), 1 requester(s) held for a private domain\n")
 NET_PLATFORM = r"[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated: DMA through the IOMMU\n"
-VTD_OK = IR_ON + TE_ON + NET_PLATFORM
+# The NIC's private domain (AGAST #4724): held out of identity at TE, its
+# own domain before bus master, the fault probe, a frame DMA'd into a
+# granted IOVA, and net_ring1_allowed.
+NIC_DOMAIN = r"[nic-dma] private domain 2 for 0000:00:04.0 and 0 alias(es), never in the identity map; bus master on\n"
+NIC_FAULT_RECORD = r"[nic-dma] fault record: source 0000:00:04.0 IOVA 0x1000006000 reason 6 (read)\n"
+NIC_FAULT = r"[nic-dma] fault probe: the NIC's DMA to unmapped IOVA 0x1000006000 faulted with its source ID 0000:00:04.0\n"
+NIC_DMA = r"[nic-dma] device DMA: 602 bytes received into granted IOVA 0x1000007000 -> physical 0x1BB4000 in domain 2\n"
+NIC_ALLOWED = (r"[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), "
+               r"NIC isolated; the owner stays in the kernel\n")
+NIC_DMA_OK = NIC_DOMAIN + NIC_FAULT_RECORD + NIC_FAULT + NIC_DMA + NIC_ALLOWED
+VTD_OK = IR_ON + TE_ON + NET_PLATFORM + NIC_DMA_OK
 
 
 # --------------------------------------------------------------------------
@@ -487,7 +504,7 @@ def test_nvme_commands_that_never_halted_still_pass(tree):
     the idle wait still proves the wait sleeps (AGAST #4246)"""
     serial = (NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_ON + NVME_READ
               + nvme_interrupts(5) + r"[msix] nvme waits halted: 0\n" + nvme_idle(1) + WAITS_OK
-              + SUITE_PASSED)
+              + NIC_REFUSED + SUITE_PASSED)
     r = _run(tree, serial)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PASS: NVMe idle interrupt wait slept" in r.stdout
@@ -574,3 +591,53 @@ def test_virtio_wait_check_fails(tree, waits, want):
     r = _run(tree, serial)
     assert r.returncode == 1, r.stdout + r.stderr
     assert want in r.stdout, r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "vtd, want",
+    [
+        (VTD_OK.replace(NIC_DOMAIN, ""), "the NIC got no private DMA domain before its bus master"),
+        (VTD_OK.replace(TE_ON, TE_ON.replace("1 requester(s) held", "0 requester(s) held")),
+         "was not held out of the identity domain"),
+        (VTD_OK.replace(NIC_FAULT, ""), "no fault record with the NIC's source ID (0000:00:04.0)"),
+        (VTD_OK.replace(NIC_FAULT, NIC_FAULT.replace("ID 0000:00:04.0", "ID 0000:00:05.0")),
+         "no fault record with the NIC's source ID (0000:00:04.0)"),
+        (VTD_OK.replace(NIC_FAULT_RECORD, ""), "was not logged from the unit"),
+        (VTD_OK.replace(NIC_DMA, ""), "no device DMA into a granted page"),
+        (VTD_OK.replace(NIC_DMA, NIC_DMA.replace("in domain 2", "in domain 1")), "not its private domain 2"),
+        (VTD_OK.replace(NIC_DMA, NIC_DMA.replace("IOVA 0x1000007000", "IOVA 0x1BB4000")), "below the private IOVA base"),
+        (VTD_OK.replace(NIC_ALLOWED, ""), "net_ring1_allowed is false on the translating boot"),
+    ],
+    ids=["no-domain", "not-held", "no-fault", "fault-from-another-source", "no-unit-record",
+         "no-device-dma", "dma-in-another-domain", "dma-at-a-ram-address", "ring1-not-allowed"],
+)
+def test_nic_private_domain_check_fails(tree, vtd, want):
+    """AGAST #4724: each claim of the NIC's private domain is checked on the
+    translating boot."""
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": vtd})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout
+
+
+@pytest.mark.integration
+def test_nic_private_domain_passes_on_the_translating_boot(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: the NIC DMA'd a frame into granted IOVA 0x1000007000 (domain 2)" in r.stdout
+    assert "PASS: no IOMMU: the NIC stays on physical addresses" in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "pc, want",
+    [
+        (PASSED + NIC_DOMAIN, "a private NIC DMA domain on the pc machine"),
+        (PASSED.replace(NIC_REFUSED, ""), 'no "[nic-dma] ring-1 owner refused" on the pc machine'),
+    ],
+    ids=["domain-on-pc", "no-refusal-on-pc"],
+)
+def test_nic_private_domain_on_pc_fails(tree, pc, want):
+    r = _run(tree, pc)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout

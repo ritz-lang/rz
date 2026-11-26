@@ -121,6 +121,14 @@ pub fn pci_find_virtio(virtio_device_id: u16) -> *PciDevice
 pub fn pci_enable_bus_master(dev: *PciDevice)
     return
 
+# vio_init_device_isolated (the NIC's, #4724) and the window record's
+# requester: never reached on blk or input.
+pub fn pci_disable_bus_master(dev: *PciDevice)
+    return
+
+pub fn pci_dev_sid(dev: *PciDevice) -> u32
+    0
+
 pub fn pci_enable_memory(dev: *PciDevice)
     return
 

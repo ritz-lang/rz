@@ -705,6 +705,116 @@ pub fn pci_enable_io(dev: *PciDevice)
     let cmd: u16 = pci_dev_read_config16(dev, PCI_REG_COMMAND)
     pci_dev_write_config16(dev, PCI_REG_COMMAND, cmd | PCI_CMD_IO_SPACE)
 
+# Stop the function's DMA: firmware may have left bus mastering on
+# (AGAST #4724, the NIC on a translating boot until its domain is live).
+pub fn pci_disable_bus_master(dev: *PciDevice)
+    let cmd: u16 = pci_dev_read_config16(dev, PCI_REG_COMMAND)
+    pci_dev_write_config16(dev, PCI_REG_COMMAND, cmd & (0xFFFF ^ PCI_CMD_BUS_MASTER))
+
+pub fn pci_bus_master_on(dev: *PciDevice) -> bool
+    (pci_dev_read_config16(dev, PCI_REG_COMMAND) & PCI_CMD_BUS_MASTER) != 0
+
+# ============================================================================
+# DMA requesters (AGAST #4724, docs/RING1_DRIVER.md "DMA domain")
+# ============================================================================
+#
+# The source IDs a function's DMA can reach the IOMMU under: its own, plus
+# the aliases a bridge on its path substitutes. A PCIe switch or root port
+# forwards the requester ID unchanged. A PCIe-to-PCI(-X) bridge (PCIe port
+# type 7) takes ownership with its secondary bus and devfn 0; a bridge with
+# no PCIe capability (conventional PCI) forwards with its own ID. Every
+# PCI/PCI-X-to-PCIe bridge (type 8) forwards with its own ID too. Every
+# function behind such a bridge shares that alias, so it is named for this
+# function only when the function is the only one behind the bridge.
+# Phantom functions (DevCtl bit 9) send under function numbers nobody
+# enumerates: never named. `named` false means an alias exists that a
+# private domain can't take, and the caller refuses the function's bus
+# master.
+
+pub const PCI_CAP_PCIE: u8 = 0x10
+const PCIE_REG_FLAGS: u8 = 2          # bits 7:4 device/port type
+const PCIE_REG_DEVCTL: u8 = 8
+const PCIE_DEVCTL_PHANTOM: u16 = 0x0200
+const PCIE_TYPE_PCIE_TO_PCI: u16 = 7
+const PCIE_TYPE_PCI_TO_PCIE: u16 = 8
+const PCI_REG_SECONDARY_BUS: u8 = 0x19
+const PCI_REG_SUBORDINATE_BUS: u8 = 0x1A
+pub const PCI_DMA_REQUESTERS_MAX: i32 = 4
+
+pub struct DmaRequesters
+    sids: [4]u32            # PCI_DMA_REQUESTERS_MAX; sids[0] is the function's own
+    count: i32
+    named: bool             # every alias the function's DMA can carry is in sids
+
+fn pci_is_bridge(dev: *PciDevice) -> bool
+    (*dev).class_code == PCI_CLASS_BRIDGE and (*dev).subclass == 0x04
+
+# The bridge in segment `seg` whose secondary bus is `bus`; None on a root bus.
+fn pci_bridge_above(seg: u16, bus: u8) -> Option<*PciDevice>
+    var i: i32 = 0
+    while i < pci_device_count
+        let dev: *PciDevice = @pci_devices[i]
+        if (*dev).segment == seg and pci_is_bridge(dev)
+            let secondary: u8 = pci_dev_read_config8(dev, PCI_REG_SECONDARY_BUS)
+            if secondary != 0 and secondary == bus
+                return Some(dev)
+        i = i + 1
+    None
+
+# Is `dev` the only function on the buses behind `bridge`?
+fn pci_alone_behind(bridge: *PciDevice, dev: *PciDevice) -> bool
+    let lo: u8 = pci_dev_read_config8(bridge, PCI_REG_SECONDARY_BUS)
+    let hi: u8 = pci_dev_read_config8(bridge, PCI_REG_SUBORDINATE_BUS)
+    var i: i32 = 0
+    while i < pci_device_count
+        let other: *PciDevice = @pci_devices[i]
+        if other != dev and (*other).segment == (*bridge).segment and (*other).bus >= lo and (*other).bus <= hi
+            return false
+        i = i + 1
+    true
+
+fn requesters_add(r: *DmaRequesters, sid: u32)
+    var k: i32 = 0
+    while k < (*r).count
+        if (*r).sids[k] == sid
+            return
+        k = k + 1
+    if (*r).count == PCI_DMA_REQUESTERS_MAX
+        (*r).named = false
+        return
+    (*r).sids[(*r).count] = sid
+    (*r).count = (*r).count + 1
+
+# The source IDs `dev`'s DMA can arrive under (above).
+pub fn pci_dma_requesters(dev: *PciDevice) -> DmaRequesters
+    var r: DmaRequesters
+    r.count = 0
+    r.named = true
+    requesters_add(@r, pci_dev_sid(dev))
+    let pcie: u8 = pci_find_capability(dev, PCI_CAP_PCIE)
+    if pcie != 0 and (pci_dev_read_config16(dev, pcie + PCIE_REG_DEVCTL) & PCIE_DEVCTL_PHANTOM) != 0
+        r.named = false
+    var bus: u8 = (*dev).bus
+    var hops: i32 = 0
+    while hops < 256
+        let bridge: *PciDevice = match pci_bridge_above((*dev).segment, bus)
+            Some(b) => b
+            None => break
+        let cap: u8 = pci_find_capability(bridge, PCI_CAP_PCIE)
+        var port: u16 = 0
+        if cap != 0
+            port = (pci_dev_read_config16(bridge, cap + PCIE_REG_FLAGS) >> 4) & 0xF
+        if cap == 0 or port == PCIE_TYPE_PCIE_TO_PCI or port == PCIE_TYPE_PCI_TO_PCIE
+            if not pci_alone_behind(bridge, dev)
+                r.named = false
+            else if port == PCIE_TYPE_PCIE_TO_PCI
+                requesters_add(@r, pci_sid((*bridge).segment as u32, bus as u32, 0, 0))
+            else
+                requesters_add(@r, pci_dev_sid(bridge))
+        bus = (*bridge).bus
+        hops = hops + 1
+    r
+
 pub fn pci_get_device_count() -> i32
     return pci_device_count
 
