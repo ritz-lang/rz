@@ -18,8 +18,10 @@ depends on it.
 
 THE FIX
 
-After a fn or impl method body is emitted (ritz1/src/emitter.ritz), the body
-text is scanned for calls to those intrinsics, and the define line gains
+As a fn or impl method body names one of those intrinsics, add_extern
+(ritz1/src/emitter_core.ritz) flags its feature on the fn's FnCtx (#4852;
+until then the finished body's IR text was scanned for it), and once the
+body is emitted (ritz1/src/emitter.ritz) the define line gains
 `"target-cpu"="x86-64" "target-features"="+..."` for exactly the features the
 body uses, matching ritz0 attribute for attribute. Functions that call none
 are left alone, so the rest of the module stays baseline x86-64 and the
@@ -286,4 +288,108 @@ def test_cryptosec_source_compiles_at_O2_without_march_flags(ritz1_bin, tmp_path
     assert r.returncode == 0, (
         f"clang -c -O2 crashed on ritz1's cryptosec/lib/{name}.ritz:\n"
         f"{_crash_head(r.stderr)}"
+    )
+
+
+# AGAST #4852: the features are flagged as the intrinsic is declared
+# (add_extern), per fn, not found by scanning each body's IR text.  So pin
+# what that bookkeeping can get wrong: a second caller of an intrinsic whose
+# extern is already registered (add_extern returns early for it), a fn
+# calling all three (one sorted string, as ritz0 spells it), a plain fn
+# after one that calls them (the flags reset per fn), and an impl method
+# beside free fns (its own define path and reset).
+MIXED_PROGRAM = """\
+struct Ctx
+    pad: i64
+
+impl Ctx
+    fn aes_again(self: *Ctx, a: *i32, b: *i32) -> i32
+        let s: v4i32 = simd_loadu(a)
+        let k: v4i32 = simd_loadu(b)
+        simd_storeu(a, aesdec(s, k))
+        0
+
+    fn plain_method(self: *Ctx) -> i32
+        2
+
+pub fn use_all(a: *i32, b: *i32, c: *i32, p: *i64, q: *i64) -> i32
+    let x: v4i32 = simd_loadu(a)
+    let y: v4i32 = simd_loadu(b)
+    let z: v4i32 = simd_loadu(c)
+    simd_storeu(a, sha256rnds2(x, y, z))
+    let u: v2i64 = simd_loadu(p)
+    let v: v2i64 = simd_loadu(q)
+    simd_storeu(p, simd_clmul(u, v, 0))
+    simd_storeu(b, aesdec(x, y))
+    0
+
+pub fn clmul_sha(a: *i32, b: *i32, c: *i32, p: *i64, q: *i64) -> i32
+    let u: v2i64 = simd_loadu(p)
+    let v: v2i64 = simd_loadu(q)
+    simd_storeu(p, simd_clmul(u, v, 1))
+    let x: v4i32 = simd_loadu(a)
+    let y: v4i32 = simd_loadu(b)
+    let z: v4i32 = simd_loadu(c)
+    simd_storeu(a, sha256msg1(x, y))
+    0
+
+pub fn plain_after(n: i32) -> i32
+    n + 1
+
+pub fn sha_again(a: *i32, b: *i32, c: *i32) -> i32
+    let x: v4i32 = simd_loadu(a)
+    let y: v4i32 = simd_loadu(b)
+    let z: v4i32 = simd_loadu(c)
+    simd_storeu(a, sha256rnds2(x, y, z))
+    0
+
+pub fn aes_again_free(a: *i32, b: *i32) -> i32
+    let s: v4i32 = simd_loadu(a)
+    let k: v4i32 = simd_loadu(b)
+    simd_storeu(a, aesdec(s, k))
+    0
+
+fn main() -> i32
+    var ctx: Ctx
+    var a: [4]i32
+    var b: [4]i32
+    var c: [4]i32
+    var p: [2]i64
+    var q: [2]i64
+    use_all(@a[0], @b[0], @c[0], @p[0], @q[0])
+    clmul_sha(@a[0], @b[0], @c[0], @p[0], @q[0])
+    plain_after(1)
+    sha_again(@a[0], @b[0], @c[0])
+    aes_again_free(@a[0], @b[0])
+    ctx.aes_again(@a[0], @b[0])
+    ctx.plain_method()
+"""
+
+
+@pytest.fixture(scope="module")
+def mixed_ir(ritz1_bin, tmp_path_factory) -> str:
+    return _compile(tmp_path_factory, "mixed_intrinsics", MIXED_PROGRAM).read_text()
+
+
+@pytest.mark.parametrize(
+    "fn,features", [("use_all", "+aes,+pclmul,+sha"), ("clmul_sha", "+pclmul,+sha")]
+)
+def test_features_are_one_sorted_string(mixed_ir, fn, features):
+    attrs = _define_attrs(mixed_ir, fn)
+    assert f'"target-cpu"="x86-64" "target-features"="{features}"' in attrs, attrs
+
+
+@pytest.mark.parametrize(
+    "fn,feature",
+    [("sha_again", "+sha"), ("aes_again_free", "+aes"), ("Ctx_aes_again", "+aes")],
+)
+def test_repeat_caller_of_a_declared_intrinsic_carries_its_feature(mixed_ir, fn, feature):
+    feats = _features(mixed_ir, fn)
+    assert feats == {feature}, f"@{fn}: want {{{feature}}}, got {sorted(feats)}"
+
+
+@pytest.mark.parametrize("fn", ["plain_after", "Ctx_plain_method", "main"])
+def test_flags_do_not_leak_into_the_next_fn(mixed_ir, fn):
+    assert not _features(mixed_ir, fn) and _cpu(mixed_ir, fn) is None, (
+        f"@{fn} calls no ISA-extension intrinsic but gained target attributes"
     )

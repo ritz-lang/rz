@@ -505,50 +505,33 @@ fn splice_entry_allocas(s: *EmitterState, body_start: i64)
 #
 # llvm.x86.sse2.* (psad.bw) is baseline x86-64 and needs nothing.
 
-# 1 if `pat` (plen bytes) occurs anywhere in s.ir.out from `from` on.
-fn out_contains(s: *EmitterState, from: i64, pat_sv: StrView) -> i32
-    var pat: *u8 = pat_sv.ptr
-    var plen: i64 = pat_sv.len
-    let base: *u8 = s.ir.out.data.data
-    var i: i64 = from
-    while i + plen <= s.ir.out.data.len
-        if memcmp(base + i, pat, plen) == 0
-            return 1
-        i += 1
-    0
-
 # Called once the body is complete (before the closing `}`), with attr_pos
 # the offset in s.ir.out just after the define line's other attributes. Splices
-# the target attributes in there when the body calls an intrinsic needing
-# one; the body text after attr_pos moves along unchanged.
+# the target attributes in there when the body called an intrinsic needing
+# one (s.fcx.x86_features, set by add_extern: AGAST #4852); the body text
+# after attr_pos moves along unchanged.  The define line is written before
+# the body, so the features aren't known yet when it is.
 fn tag_intrinsic_target_features(s: *EmitterState, attr_pos: i64)
-    let sha: i32 = out_contains(s, attr_pos, "@llvm.x86.sha")
-    let aes: i32 = out_contains(s, attr_pos, "@llvm.x86.aesni.")
-    let clmul: i32 = out_contains(s, attr_pos, "@llvm.x86.pclmulqdq")
-    if sha == 0 and aes == 0 and clmul == 0
+    let feats: i32 = s.fcx.x86_features
+    if feats == 0
         return
-    let n: i64 = s.ir.out.data.len - attr_pos
-    let tail: *u8 = malloc(n)
-    memcpy(tail, s.ir.out.data.data + attr_pos, n)
-    s.ir.out.data.len = attr_pos
-    format_into(s, " \"target-cpu\"=\"x86-64\" \"target-features\"=\"")
     # Sorted, as ritz0 emits them, so the two compilers' IR agrees.
-    var sep: i32 = 0
-    if aes == 1
-        format_into(s, "+aes")
-        sep = 1
-    if clmul == 1
-        if sep == 1
-            format_into(s, ",")
-        format_into(s, "+pclmul")
-        sep = 1
-    if sha == 1
-        if sep == 1
-            format_into(s, ",")
-        format_into(s, "+sha")
-    format_into(s, "\"")
-    s.ir.out.push_span(Span<u8> { ptr: (tail), len: (n) as i64 })
-    free(tail)
+    var attrs: String = string_from(" \"target-cpu\"=\"x86-64\" \"target-features\"=\"")
+    var sep: bool = false
+    if (feats & X86F_AES) != 0
+        attrs.push_str("+aes")
+        sep = true
+    if (feats & X86F_PCLMUL) != 0
+        if sep
+            attrs.push_str(",")
+        attrs.push_str("+pclmul")
+        sep = true
+    if (feats & X86F_SHA) != 0
+        if sep
+            attrs.push_str(",")
+        attrs.push_str("+sha")
+    attrs.push_str("\"")
+    out_insert(s, attr_pos, attrs.as_view())
 
 # 1 for an async fn's poll fn: its name ends in `$poll` (async_lower).
 fn fn_name_ends_poll(f: *FnDef) -> i32
@@ -659,6 +642,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     variant_site_set(s.sym.mono.pctx, diag_fn_source_file(f))   # AGAST #4609: its bare variants
     frame_begin_fn(s, f.line, f.col)   # AGAST #3739
     s.fcx.fn_assert_kind = assert_fn_kind(s.sym.mono.pctx, f)   # AGAST #1869
+    s.fcx.x86_features = 0   # AGAST #4852: add_extern sets the bits
     s.fcx.reg_counter = 1
     packed_marks_reset(s)   # AGAST #4462: register numbers restart per fn
     s.fcx.label_counter = 0
@@ -1001,6 +985,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     refuse_huge_byval_params(s, method)   # AGAST #3668
     frame_begin_fn(s, method.line, method.col)   # AGAST #3739
     s.fcx.fn_assert_kind = ASSERT_FN_PLAIN   # AGAST #1869: methods take no attributes
+    s.fcx.x86_features = 0   # AGAST #4852: add_extern sets the bits
     s.fcx.reg_counter = 1
     packed_marks_reset(s)   # AGAST #4462: register numbers restart per fn
     s.fcx.label_counter = 0
@@ -2451,6 +2436,7 @@ pub fn emit_module(m: *Module, out: *String, alloc: *Allocator, mono: *MonoCtx, 
             narrow_decl_count: 0,
             narrow_decl_overflow: 0,
             fn_assert_kind: ASSERT_FN_PLAIN,   # AGAST #1869 — see emit_assert_stmt
+            x86_features: 0,   # AGAST #4852 — see add_extern
             assert_cap_expr: null,
             assert_cap_ok: 0,
             assert_cap_l: 0,
