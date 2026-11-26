@@ -47,7 +47,11 @@ PROJECTS = RITZ_ROOT.parent
 
 PINS = {
     "angelo": 0,
-    "cryptosec": 10,
+    # cryptosec: ritzlib.mapping's munmap x1, lib/ca_store.ritz
+    # ca_store_destroy: the certificate arena is an mmap_anon mapping that
+    # hands out *X509Certificate slots by bump allocation; munmap(span) is
+    # its release (no Drop owner for a mapping yet, AGAST #1854).
+    "cryptosec": 1,
     "goliath": 0,
     "harland": 11,
     "http": 0,
