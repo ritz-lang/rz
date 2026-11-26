@@ -696,6 +696,13 @@ class MoveChecker(MoveWalk):
                 expr = expr.expr
             elif isinstance(expr, rast.Field) and self._through_deref(expr):
                 return True     # `deref` lends it (§7.7)
+            elif isinstance(expr, rast.Index) and not isinstance(expr.index, rast.Range) \
+                    and _element_of(self.types.resolve(self._place_type(expr.expr))) is not None:
+                # `v[i]` on a Vec, Span or String held by value is read through
+                # a reference too (LANGUAGE_SPEC, "`[]` sees through one
+                # level"): its buffer still holds, and drops, the element
+                # (AGAST #4843).
+                return True
             elif isinstance(expr, (rast.Field, rast.Index)):
                 expr = expr.expr
             elif isinstance(expr, rast.UnaryOp) and expr.op == '*':

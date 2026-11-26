@@ -539,6 +539,12 @@ class CallEmitter:
         # First, check if the receiver is an lvalue (identifier, field, index)
         # If so, get its address for auto-borrowing when method expects *Self
         receiver_is_lvalue = isinstance(expr.expr, (rast.Ident, rast.Field, rast.Index))
+        # A slice `x[lo..hi]` is a new value with no place (AGAST #3088): an
+        # `@self` method on it is lent a spill, as on any rvalue.  It was
+        # "can't take the address of a slice", where ritz1 accepts
+        # `all[a..b].copy_from(src)` (AGAST #4843, buddhafinger's buffer.ritz).
+        if isinstance(expr.expr, rast.Index) and isinstance(expr.expr.index, rast.Range):
+            receiver_is_lvalue = False
 
         (type_name, is_static_call, receiver_is_lvalue,
          receiver_probe, receiver_slot, rvalue_field, early) = \

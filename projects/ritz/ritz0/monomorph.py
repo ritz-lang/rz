@@ -442,9 +442,8 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         elif isinstance(expr, rast.Index):
             self._visit_expr(expr.expr)
             self._visit_expr(expr.index)
-            # Register vec_get<T> for Vec<T> indexing sugar, and vec_slice<T>
-            # for `v[lo..hi]`, which lowers as `v[lo:hi]` does (AGAST #2451).
-            self._register_index_instantiation(expr)
+            # `v[i]` on a Vec is its element in place, no method (AGAST #4843);
+            # `v[lo..hi]` wants `Vec<T>.slice`, as `v[lo:hi]` does (AGAST #2451).
             if isinstance(expr.index, rast.Range):
                 self._register_slice_instantiation(expr)
         elif isinstance(expr, rast.Field):
@@ -545,22 +544,6 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         if var_type.name == 'Vec' and var_type.args:
             self._want_method(var_type, 'slice')
             self._want_method(var_type, 'len')
-
-    def _register_index_instantiation(self, expr: rast.Index) -> None:
-        """Want `Vec<T>.get` for Vec<T> indexing sugar.
-
-        AGAST #4537: `v[i]` on a Vec<T> now desugars to the impl method
-        `Vec$T.get` in the emitter, so the monomorphizer specialises that
-        method alongside the call (as it does any `v.get(i)`).
-        """
-        var_type = self._type_of(expr.expr)
-        while isinstance(var_type, (rast.PtrType, rast.RefType)):
-            var_type = var_type.inner
-        if not isinstance(var_type, rast.NamedType):
-            return
-
-        if var_type.name == 'Vec' and var_type.args:
-            self._want_method(var_type, 'get')
 
     def _note_tuple_lit_let(self, stmt) -> None:
         """Track whether `stmt` binds its name to an untyped tuple literal."""

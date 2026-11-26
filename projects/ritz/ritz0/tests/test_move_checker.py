@@ -2841,12 +2841,17 @@ fn f(p: @[2]H) -> i32
         "struct W\n    s: Slot\n\nfn f(a: [1]W) -> i32\n    match a[0].s\n        Slot.Empty => return 0\n        _ => return 1\n",
         # A store into an element doesn't read it.
         "fn f(a: [1]T) -> i32\n    var b = a\n    b[0] = T { id: 2 }\n    return 0\n",
-        # A Vec doesn't drop its elements (gvec.ritz has no `impl Drop`), so
-        # `v[i]` leaves it nothing to drop twice: only an array is refused.
-        "struct Vec<X>\n    data: *X\n    len: i64\n\nfn f(v: Vec<T>) -> i32\n    return eat(v[0])\n",
-    ], ids=["copy_field", "borrow", "slice", "match", "match_field", "store", "vec"])
+    ], ids=["copy_field", "borrow", "slice", "match", "match_field", "store"])
     def test_a_read_that_moves_nothing_is_accepted(self, body):
         assert self.reasons(body) == []
+
+    def test_a_vec_element_is_the_reference_error(self):
+        """`v[i]` of a Vec held by value is read through a reference (the
+        spec's "`[]` sees through one level", AGAST #4843): its buffer still
+        holds the element, so a move-only one can't be taken, as `p[i]` can't."""
+        assert self.reasons(
+            "struct Vec<X>\n    data: *X\n    len: i64\n\nfn f(v: Vec<T>) -> i32\n"
+            "    return eat(v[0]) + v[1].id\n") == [MOVE_OUT_OF_REF]
 
     def test_it_is_reported_in_a_generic_instance_at_a_move_only_type(self):
         """`check` sees `a[0]` of an `[2]X` as a copy; the instance at `T` is

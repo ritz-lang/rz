@@ -8293,7 +8293,6 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         arr_ptr = None
         arr_len = None
         vec_ptr = None
-        vec_get_fn = None
 
         # Special-case bare identifiers that don't materialize through
         # `_emit_expr` (const arrays, global arrays, locals storing arrays).
@@ -8344,14 +8343,6 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                         iter_kind = "vec_like"
                         vec_ptr = vec_candidate_ptr
                         elem_ty = src_elems[0].pointee
-                        struct_name = self._get_struct_name_from_type(vec_ptr.type.pointee)
-                        if struct_name and struct_name.startswith("Vec$"):
-                            elem_suffix = struct_name[4:]
-                            # AGAST #4537: the free `vec_get` is gone; the
-                            # element read is the impl method `Vec$T.get`.
-                            get_name = self.method_lookup.get((f"Vec${elem_suffix}", 'get'))
-                            if get_name is not None and get_name in self.functions:
-                                vec_get_fn = self.functions[get_name][0]
 
         if iter_kind is None or elem_ty is None:
             # A user error, located at the iterable (AGAST #3007): `b.ptr` on a
@@ -8402,15 +8393,12 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             elem_ptr = self.builder.gep(arr_ptr, [ir.Constant(self.i32, 0), idx_val])
             elem_val = self.builder.load(elem_ptr)
         else:
-            if vec_get_fn is not None:
-                get_index_ty = self._fn_param_types(vec_get_fn)[1]
-                get_idx = idx_val if idx_val.type == get_index_ty else self._convert_type(idx_val, get_index_ty)
-                elem_val = self.builder.call(vec_get_fn, [vec_ptr, get_idx])
-            else:
-                data_ptr_ptr = self.builder.gep(vec_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
-                data_ptr = self.builder.load(data_ptr_ptr)
-                elem_ptr = self.builder.gep(data_ptr, [idx_val])
-                elem_val = self.builder.load(elem_ptr)
+            # The element in place, `*(v.data + i)` (AGAST #4843): never the
+            # by-value `Vec<T>.get`, whose body is refused for a move-only T.
+            data_ptr_ptr = self.builder.gep(vec_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
+            data_ptr = self.builder.load(data_ptr_ptr)
+            elem_ptr = self.builder.gep(data_ptr, [idx_val])
+            elem_val = self.builder.load(elem_ptr)
 
         self._bind_let(stmt.var, elem_val, elem_val.type)
         # AGAST #2406: the binding's Ritz type, for signedness. Without it a
@@ -9503,8 +9491,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                     ptr = self.builder.gep(inner_addr, [zero, index])
                     return self.builder.load(ptr)
 
-        # Check if this is a Vec or String type - provide index sugar
-        # v[i] becomes vec_get(&v, i), s[i] becomes String_get(&s, i)
+        # A String's `s[i]` is `String.get(@s, i)`.  A Vec's `v[i]` is the
+        # element in place, below (AGAST #4843).
         if isinstance(expr.expr, rast.Ident):
             name = expr.expr.name
             if name in self.ritz_types:
@@ -9512,39 +9500,10 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 if isinstance(base_ritz_type, rast.NamedType):
                     type_name = base_ritz_type.name
 
-                    # Handle Vec<T> / Vec$T indexing
-                    if type_name.startswith('Vec$') or type_name == 'Vec':
-                        # Get element type from Vec$T name
-                        if type_name.startswith('Vec$'):
-                            elem_type_name = type_name[4:]  # Strip "Vec$"
-                        else:
-                            # Try to get from type args
-                            if base_ritz_type.args:
-                                elem_ty = base_ritz_type.args[0]
-                                elem_type_name = self._type_to_name_suffix(elem_ty)
-                            else:
-                                raise self._err("Vec type without element type")
-
-                        # AGAST #4537: the free `vec_get` is gone; resolve the
-                        # impl method the way every other method call does.
-                        fn_name = self.method_lookup.get((f"Vec${elem_type_name}", 'get'))
-                        if fn_name is None or fn_name not in self.functions:
-                            raise self._err("Vec indexing requires `impl Vec<T>` "
-                                            "with `get` to be defined "
-                                            "(import ritzlib.gvec)")
-
-                        fn, _ = self.functions[fn_name]
-                        # Get pointer to vec
-                        vec_ptr = self._emit_lvalue_addr(expr.expr)
-                        # Ensure index is i64
-                        if index.type != self.i64:
-                            index = self.builder.sext(index, self.i64)
-                        return self.builder.call(fn, [vec_ptr, index])
-
                     # Handle String indexing: s[i] -> String_get(&s, i)
                     # (AGAST #4533: the free `string_get` is gone; resolve the
                     # impl method the way every other method call does.)
-                    elif type_name == 'String':
+                    if type_name == 'String':
                         fn_name = self.method_lookup.get(('String', 'get'))
                         if fn_name is None or fn_name not in self.functions:
                             raise self._err("String indexing requires `impl String` "
@@ -9559,10 +9518,12 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                             index = self.builder.sext(index, self.i64)
                         return self.builder.call(fn, [str_ptr, index])
 
-        # Vec<T> indexing sugar for non-identifier receivers, e.g.
-        # `s.entries[i]` or `mk()[i]`. We infer the base Ritz type and, if it
-        # is `Vec<T>`, dispatch to `vec_get$T` when available or fall back to
-        # indexing the backing data pointer directly.
+        # `v[i]` on a Vec, `s.entries[i]` or `mk()[i]`: the element in place,
+        # `*(v.data + i)`.  An index is a place (LANGUAGE_SPEC, "`[]` sees
+        # through one level"): it never calls the by-value `Vec<T>.get`, whose
+        # body is refused for a move-only T, so `v[i].f` on a Vec of move-only
+        # elements failed inside gvec.ritz (AGAST #4843).  The move checker
+        # refuses a by-value read of a move-only element at the program's `[]`.
         inferred_base_type = self._infer_ritz_type(expr.expr)
         if isinstance(inferred_base_type, rast.NamedType):
             inferred_name = inferred_base_type.name
@@ -9574,9 +9535,6 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 else:
                     elem_type_name = None
                 if elem_type_name:
-                    # AGAST #4537: the free `vec_get` is gone; the element read
-                    # is the impl method `Vec$T.get`, when monomorph specialized it.
-                    fn_name = self.method_lookup.get((f"Vec${elem_type_name}", 'get'))
                     try:
                         vec_ptr = self._emit_lvalue_addr(expr.expr)
                     except ValueError:
@@ -9589,9 +9547,6 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                             index = self.builder.sext(index, self.i64)
                         elif isinstance(index.type, ir.IntType) and index.type.width > 64:
                             index = self.builder.trunc(index, self.i64)
-                    if fn_name is not None and fn_name in self.functions:
-                        return self.builder.call(self.functions[fn_name][0], [vec_ptr, index])
-                    # Fallback: index the `data` field (backing storage) directly.
                     data_field_idx = self._get_struct_field_index(f"Vec${elem_type_name}", 'data')
                     data_ptr_ptr = self.builder.gep(
                         vec_ptr,
