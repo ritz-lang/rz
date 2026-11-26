@@ -1,13 +1,19 @@
-"""Buddhafinger builds and tests with ritz1_selfhosted only (AGAST #4813, epic #4782).
+"""Buddhafinger builds and tests with ritz1_selfhosted only (AGAST #4813,
+epic #4782; the CI side is #4826, folded into #4825's builder-matrix job).
 
 docs/BUDDHAFINGER_PROPOSAL.md, "Tests and build isolation": the editor is
 kept out of the compiler regression suites and the generic multi-compiler
 sweeps (`rz build --all` / `rz test --all` under ritz0, ritz1 and
-ritz1_selfhosted) by a reasoned rz.toml [workspace.exclude] entry, and is
-covered instead by one dedicated entry point, `make -C projects/buddhafinger
-test`, which passes ritz1_selfhosted explicitly to every build and test.
+ritz1_selfhosted) by a reasoned rz.toml [workspace.exclude] entry. Locally,
+`make -C projects/buddhafinger test` passes ritz1_selfhosted explicitly to
+every build and test. In CI (AGAST #4826), rz.toml's exclusion reason opts
+the package into main.yml's builder-matrix job (AGAST #4825): one container
+run of the published builder image's ritz1_selfhosted, isolated from the
+host toolchain, instead of a step running the Makefile target on the
+runner. test_builder_matrix.py pins that opt-in and the matrix job itself;
+this file pins the sweep exclusion and the local Makefile entry point.
 
-These pin both halves: the sweep skips the package, and the dedicated entry
+These pin both halves: the sweep skips the package, and a dedicated entry
 really builds and runs its ritzunit suite with that compiler. An exclusion
 whose stated gate ran nothing would hide the package from every gate.
 """
@@ -16,6 +22,7 @@ import importlib.machinery
 import importlib.util
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -26,6 +33,11 @@ PKG_REL = "projects/buddhafinger"
 PKG = WORKSPACE / PKG_REL
 ENTRY = f"make -C {PKG_REL} test"
 WORKFLOW = WORKSPACE / ".github" / "workflows" / "main.yml"
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+import builder_matrix  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -70,10 +82,14 @@ class TestSweepExcludesBuddhafinger:
         # Excluded from the sweep, not from rz: the entry addresses it by name.
         assert rz.resolve_project("buddhafinger") == "buddhafinger"
 
-    def test_ci_runs_the_dedicated_entry(self):
-        # The exclusion's reason must name a gate that runs: main.yml does.
-        assert re.search(rf"^\s*run:\s*{re.escape(ENTRY)}\s*$",
-                         WORKFLOW.read_text(), re.MULTILINE)
+    def test_ci_opts_into_the_builder_matrix_not_a_host_step(self, rz):
+        # AGAST #4826: no step in main.yml runs the Makefile target on the
+        # runner's own toolchain any more -- that was the isolation gap.
+        assert not re.search(rf"^\s*run:\s*{re.escape(ENTRY)}\s*$",
+                             WORKFLOW.read_text(), re.MULTILINE)
+        # Instead it is in the builder-matrix job's package list (AGAST
+        # #4825), which runs it inside the published builder image.
+        assert "buddhafinger" in builder_matrix.list_packages(rz=rz)
 
 
 @pytest.mark.unit

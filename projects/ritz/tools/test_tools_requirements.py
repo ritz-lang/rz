@@ -87,6 +87,7 @@ LOCAL_MODULES = {
     "ritz_ast",
     "import_resolver",
     "resolve",
+    "builder_matrix",  # tools/builder_matrix.py, the builder-matrix package list (AGAST #4825)
 }
 
 # Packages under tools/ whose modules are scanned too. smoke_stack was one

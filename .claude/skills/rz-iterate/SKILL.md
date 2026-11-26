@@ -696,6 +696,8 @@ default command). So:
 | `test-all` (`./rz test --all`) | yes (#3969, Aaron 2026-11-18) | yes |
 | `bootstrap` (matrix-full, regression.sh, ...) | yes | yes |
 | `read-set-audit` (strace of the two scoped regression steps) | no (#4315: ~15 min traced; it checks the gate's own skip rule, not the change) | yes |
+| `builder-packages` (computes the builder-matrix package list) | no (#4825: needs no toolchain, but is read by `builder-matrix`, which does need network) | yes |
+| `builder-matrix` (one builder-image container run per package; buddhafinger is #4826's first opt-in) | no (#4825, #4826: pulls `ghcr.io/ritz-lang/rz-builder` and runs Docker, which the room gate's sandbox gives neither) | yes |
 
 The one other workflow, `.github/workflows/builder.yml` (#4824), is where
 `ghcr.io/ritz-lang/rz-builder` comes from. Out of band from main.yml, it

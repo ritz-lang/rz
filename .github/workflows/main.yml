@@ -475,14 +475,6 @@ jobs:
         run: make ritzlib-tests-ritz1
         working-directory: projects/ritz
 
-      # AGAST #4813, epic #4782. Buddhafinger builds and tests with
-      # ritz1_selfhosted only (docs/BUDDHAFINGER_PROPOSAL.md, "Tests and build
-      # isolation"), so rz.toml [workspace.exclude] keeps it out of every
-      # --all sweep and this is its one gate. After ritz1-bootstrap, which
-      # makes the Makefile's own bootstrap a no-op.
-      - name: Buddhafinger suite (ritz1_selfhosted)
-        run: make -C projects/buddhafinger test
-
       # AGAST #4272, #4317. Every workspace package built by ritz1 and by
       # ritz1_selfhosted: the build-all job's `./rz build --all` again under
       # each self-hosted compiler. angelo was the last failure (#4245); before
@@ -647,6 +639,101 @@ jobs:
         # and turns a two-year-old codegen bug into a mystery CI break.
         env:
           RITZ_VERIFY_IR: '1'
+
+  # AGAST #4825, epic #4783 ("this will eventually become a CI unit",
+  # Aaron). The builder image's per-package CI unit: one container run per
+  # package, alongside the ritz0/ritz1 gate above, replacing none of it.
+  # GitHub-hosted ubuntu-latest for now (Aaron, 2026-11-26); the self-hosted
+  # fleet is a separate, later ticket.
+  #
+  # tools/builder_matrix.py computes the matrix: every workspace package
+  # that builds with ritz1_selfhosted (an open known-failures `build` or
+  # `parity` excuse under it skips a package here rather than turning every
+  # run red for a failure already tracked elsewhere), plus any package
+  # excluded from the workspace whose rz.toml reason opts in. It needs only
+  # the Python the runner ships (tomllib: 3.11+) -- no clang, so, like
+  # builder.yml's own job (which builds inside Docker), this needs no
+  # setup action.
+  builder-packages:
+    runs-on: ubuntu-latest
+    outputs:
+      packages: ${{ steps.list.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: List the builder-matrix packages
+        id: list
+        run: echo "packages=$(python3 tools/builder_matrix.py list)" >> "$GITHUB_OUTPUT"
+        working-directory: projects/ritz
+
+  # One container run per matrix package, built and tested with the
+  # published image's ritz1_selfhosted (AGAST #4823's entrypoint), never the
+  # default compiler. Buddhafinger (AGAST #4826) is the first package to
+  # opt in from outside the swept workspace: rz.toml [workspace.exclude]
+  # keeps it out of build-all / test-all above, and this is its dedicated
+  # gate, in the published image instead of the host toolchain (replacing
+  # the step that used to run `make -C projects/buddhafinger test` in the
+  # bootstrap job above).
+  #
+  # :main is the image builder.yml (AGAST #4824) last published from main;
+  # most commits touch nothing under projects/builder and publish no new
+  # tag, so this pins to the latest built compiler rather than to a
+  # same-commit tag that usually doesn't exist.
+  builder-matrix:
+    needs: builder-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJson(needs.builder-packages.outputs.packages) }}
+    permissions:
+      contents: read
+      packages: read
+    env:
+      BUILDER_IMAGE: ghcr.io/ritz-lang/rz-builder:main
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull the builder image
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: docker pull "$BUILDER_IMAGE"
+
+      - name: Compute a filesystem-safe artifact name
+        id: name
+        run: |
+          safe=$(printf '%s' "${{ matrix.package }}" | tr '/' '-')
+          echo "name=builder-$safe" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test projects/${{ matrix.package }} (ritz1_selfhosted, builder image)
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: |
+          bash .github/scripts/run_builder_package.sh "$BUILDER_IMAGE" \
+            "projects/${{ matrix.package }}" "$RUNNER_TEMP/builder-out"
+
+      - name: Upload /out
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ${{ runner.temp }}/builder-out
+          if-no-files-found: ignore
+
+      - name: Log out of ghcr.io
+        if: always()
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: |
+          docker logout ghcr.io || true
+          rm -rf "$DOCKER_CONFIG"
 
   # AGAST #4315. The gate skips "Regression harness self-tests" and
   # "Differential corpus regression" when a change touches nothing in their

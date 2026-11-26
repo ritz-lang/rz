@@ -68,15 +68,28 @@ def test_no_job_or_step_is_continue_on_error():
     assert not offenders, offenders
 
 
+#: Jobs that need no host clang/LLVM toolchain, so they skip the setup
+#: action entirely: builder.yml's builder job (AGAST #4824) builds inside
+#: Docker, whose image installs its own clang; main.yml's builder-packages
+#: (AGAST #4825) only reads rz.toml and known-failures/ with the Python the
+#: runner ships; main.yml's builder-matrix (AGAST #4825, #4826) also builds
+#: and tests inside the published builder image's container, never the
+#: host's compiler.
+NO_SETUP_JOBS = {
+    ("builder.yml", "builder"),
+    ("main.yml", "builder-packages"),
+    ("main.yml", "builder-matrix"),
+}
+
+
 @pytest.mark.unit
 def test_every_job_checks_out_then_uses_the_setup_action():
-    """builder.yml's builder job (AGAST #4824) is the exception: it builds
-    inside Docker, whose image installs its own clang, so the host's
-    toolchain plays no part, and it uses no action but checkout."""
+    """NO_SETUP_JOBS are the exception: checkout first, no toolchain ever."""
     for wf, name, job in _jobs():
         uses = [str(s.get("uses", "")) for s in job.get("steps") or []]
-        if (wf, name) == ("builder.yml", "builder"):
-            assert [u for u in uses if u] == ["actions/checkout@v4"], uses
+        if (wf, name) in NO_SETUP_JOBS:
+            assert (uses and uses[0] == "actions/checkout@v4"
+                   and SETUP_ACTION not in uses), (wf, name, uses)
             continue
         assert uses[:2] == ["actions/checkout@v4", SETUP_ACTION], (wf, name, uses[:2])
 
@@ -134,10 +147,14 @@ def test_gate_coverage_is_documented_where_main_yml_points():
             if line.startswith("| `")}
     jobs = sorted(yaml.safe_load(main)["jobs"])
     assert sorted(rows) == jobs, sorted(rows)
-    # read-set-audit (AGAST #4315) is the one job a merge does not wait on:
-    # ~15 min under strace, and it audits the gate's skip rule, not a change.
-    # (builder.yml's image build is outside this table: it isn't main.yml's.)
-    not_gated = {"read-set-audit"}
+    # read-set-audit (AGAST #4315) is one job a merge does not wait on: ~15
+    # min under strace, and it audits the gate's skip rule, not a change.
+    # builder-packages / builder-matrix (AGAST #4825, #4826) are the other
+    # two: they pull a published image over the network and run Docker,
+    # which a room gate's sandbox does not give them (no network, no
+    # systemd-run), the same reason builder.yml's own image build is out
+    # of band and outside this table entirely.
+    not_gated = {"read-set-audit", "builder-packages", "builder-matrix"}
     for job, row in rows.items():
         gated = row.split("|")[2].strip()
         assert gated.startswith("no" if job in not_gated else "yes"), row
