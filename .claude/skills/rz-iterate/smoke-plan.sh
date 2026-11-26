@@ -57,6 +57,10 @@
 #                                        plus pkg:<pkg>/<sub> for a nested
 #                                        package (its own ritz.toml, not in
 #                                        rz.toml's [workspace.exclude])
+#     but a top-level package that       ritz1-bootstrap entry:<pkg>  (`make
+#     [workspace.exclude] names          -C projects/<pkg> test`, its
+#                                        dedicated entry: buddhafinger is
+#                                        ritz1_selfhosted only, #4813)
 #   .claude/**                           tools-unit (tools/ tests read
 #                                        SKILL.md, hooks and settings), plus:
 #   .claude/skills/<skill>/**            skill:<skill> (shellcheck -S error,
@@ -126,6 +130,9 @@ cmd_of() {
         # three in full, then its tests.  A compiler whose known-failures/
         # `build` entries excuse the package is skipped, as `rz build --all`
         # excuses it; the plan's ritz1-bootstrap built the compilers first.
+        # An excluded top-level package's own gate (#4813): pkg:'s
+        # three-compiler build is the sweep its exclusion keeps it out of.
+        entry:*)          echo "make -C projects/${1#entry:} test" ;;
         pkg:*)            local p="${1#pkg:}"
                           echo "rc=0; for c in ritz0 ritz1 ritz1_selfhosted; do if python3 projects/ritz/tools/known_failures.py list --gate build --compiler \$c | cut -f1 | grep -qxF '$p'; then echo \"$p: build under \$c excused by known-failures/\"; else ./rz build $p --compiler \$c || rc=1; fi; done; ./rz test $p || rc=1; exit \$rc" ;;
         skill:*)          local d=".claude/skills/${1#skill:}"
@@ -187,7 +194,11 @@ targets_of() {
         projects/ritz/tools/*)    echo tools-unit ;;
         projects/ritz/scripts/*)  echo harness-selftest ;;
         projects/ritz/*)          echo unit; echo tools-unit ;;
-        projects/*/*)             rest="${p#projects/}"; echo ritz1-bootstrap; echo "pkg:${rest%%/*}"
+        projects/*/*)             rest="${p#projects/}"; echo ritz1-bootstrap
+                                  if grep -qxF -- "projects/${rest%%/*}" <<<"$EXCLUDED"; then
+                                      echo "entry:${rest%%/*}"; return
+                                  fi
+                                  echo "pkg:${rest%%/*}"
                                   pkg_of "$p" ;;
         rz|rz.toml)               echo build-all ;;
     esac
@@ -197,7 +208,7 @@ targets_of() {
 ORDER=(smoke doc-examples tools-unit tools-ratchets harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1)
 
 # plan_targets <range...>: every target for the diff, smoke first, in ORDER,
-# then pkg:/skill: targets sorted.
+# then entry:/pkg:/skill: targets sorted.
 plan_targets() {
     local files t o extra=() tip last
     local -A want=()
@@ -225,7 +236,7 @@ plan_targets() {
     # -m inproc half included (#4622): both, and the ratchets are covered.
     [[ -z "${want[tools-unit]:-}" || -z "${want[unit]:-}" ]] || unset 'want[tools-ratchets]'
     for o in "${ORDER[@]}"; do [[ -n "${want[$o]:-}" ]] && echo "$o"; done
-    for t in "${!want[@]}"; do case "$t" in pkg:*|skill:*) extra+=("$t") ;; esac; done
+    for t in "${!want[@]}"; do case "$t" in entry:*|pkg:*|skill:*) extra+=("$t") ;; esac; done
     [[ ${#extra[@]} -eq 0 ]] || printf '%s\n' "${extra[@]}" | sort
 }
 

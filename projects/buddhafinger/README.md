@@ -1,0 +1,26 @@
+# Buddhafinger
+
+A modal (Vim-style) terminal code editor written in Ritz, for Linux first and
+then Harland. [`docs/BUDDHAFINGER_PROPOSAL.md`](../../docs/BUDDHAFINGER_PROPOSAL.md)
+is the design and AGAST epic #4782 tracks the work. This is the skeleton:
+the modules exist, the editor does not yet.
+
+## Layout
+
+- `src/core/`: the editor core (`buffer`, `screen`, `modes`, `commands`).
+  It does no terminal or OS I/O, so it is tested without a terminal.
+- `src/platform/`: the platform adapters that do that I/O (`linux` so far).
+- `src/main.ritz`: the `buddhafinger` binary.
+- `test/`: the ritzunit suites.
+
+## Build and test
+
+```bash
+make -C projects/buddhafinger test
+```
+
+The editor builds and tests with `ritz1_selfhosted` only, and the Makefile
+passes it to every `rz` call (`rz`'s default is ritz0). rz.toml's
+`[workspace.exclude]` keeps the package out of the `rz build --all` /
+`rz test --all` sweeps, and CI runs the command above instead.
+`projects/ritz/tools/test_buddhafinger_isolation.py` checks both.

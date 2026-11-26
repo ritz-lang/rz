@@ -68,6 +68,7 @@ stale, the command to regenerate it is given instead.
 |---|---|
 | **nexus** | Knowledge base & wiki — builds; the binary is a Zeus worker, not a standalone server |
 | **rzsh** | Cross-platform shell — builds for both Harland (`rzsh.elf`) and Linux (`rzsh.linux`) |
+| **buddhafinger** | Modal terminal code editor, skeleton so far ([proposal](docs/BUDDHAFINGER_PROPOSAL.md)); built and tested with ritz1_selfhosted only, by `make -C projects/buddhafinger test` |
 
 ## Workspace Tooling
 

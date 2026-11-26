@@ -147,6 +147,7 @@ Two directories under `projects/` are deliberately not among them:
 | **nexus** | Official Ritz wiki — built on the full stack (mausoleum → tome → spire → zeus → valet), serves as living documentation |
 | **indium** | Harland distribution — packaging, installation, system images |
 | **rzsh** | Ritz shell — terminal shell with raw mode input, line editing, history, runs on Linux and Harland |
+| **buddhafinger** | Modal terminal code editor for Linux and Harland, skeleton so far ([proposal](docs/BUDDHAFINGER_PROPOSAL.md)) |
 
 ### Build status
 

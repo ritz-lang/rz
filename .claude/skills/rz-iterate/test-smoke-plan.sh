@@ -112,13 +112,21 @@ eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:harland" "the enclosin
 nest="$(git rev-parse HEAD~2)"; git mv -k projects/harland/netstack/ritz.toml projects/harland/netstack/x.toml; git commit -qm unnest
 eq "$(targets "$nest^!")" "smoke tools-ratchets ritz1-bootstrap pkg:harland pkg:harland/netstack" "the planned commit's tree decides, not the work tree"
 git reset -q --hard HEAD~1
+# AGAST #4813: a top-level package rz.toml excludes (buddhafinger: built with
+# ritz1_selfhosted only) runs its dedicated entry, never pkg:'s
+# three-compiler build, which is the sweep the exclusion keeps it out of.
+printf '"projects/editor" = "make -C projects/editor test"\n' >> rz.toml
+change projects/editor/ritz.toml >/dev/null
+change projects/editor/src/e.ritz >/dev/null
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap entry:editor" "an excluded top-level package runs its dedicated entry, not pkg:"
+has "$(bash "$SP" plan)" "^entry:editor	make -C projects/editor test$" "entry: runs the package's own make test"
 
 # 2. A mixed diff: each target once, in the fixed order, packages last.
 s="$(change projects/ritz/ritz0/y.py projects/ritz/tools/u.py projects/ritz/ritz0/z.py \
     projects/spire/lib/a.ritz projects/angelo/src/b.ritz docs/c.md)"
 eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire" "a mixed diff: each target once, in order"
 eq "$(targets "$s^!")" "smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire" "<sha>^! plans one commit"
-eq "$(targets "$toml^..HEAD")" "smoke doc-examples tools-unit unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1 pkg:angelo pkg:harland pkg:harland/netstack pkg:spire" \
+eq "$(targets "$toml^..HEAD")" "smoke doc-examples tools-unit unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1 entry:editor pkg:angelo pkg:harland pkg:harland/netstack pkg:spire" \
     "a range plans every commit in it"
 has "$(bash "$SP" plan)" "^unit	make -C projects/ritz unit$" "plan prints each target's command, tab-separated"
 has "$(bash "$SP" plan)" "^pkg:spire	rc=0; for c in ritz0 ritz1 ritz1_selfhosted; .*\./rz test spire [|][|] rc=1; exit .rc$" "a package's command builds it under each compiler, then tests it"
