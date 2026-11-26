@@ -27,9 +27,15 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
         return null
     var sname: *u8 = null
     var sname_len: i32 = 0
-    match e.left.kind
+    # `(*p).f` is `p.f` (R9 rule 2, AGAST #4836): the field of what `p`
+    # points at, one level.  Unstripped, `(*d).data[0..2]` had no field, so
+    # it was never a slice of a Vec and the emitter refused it.
+    var left: *Expr = e.left
+    if left.kind == ExprKind.Unary and left.op == OpKind.Deref and left.operand != null
+        left = left.operand
+    match left.kind
         ExprKind.Ident =>
-            let idx: i32 = find_local_var_idx(mono, e.left.ident)
+            let idx: i32 = find_local_var_idx(mono, left.ident)
             if idx >= 0
                 sname = *(mono.lv_type_names + idx)
                 sname_len = *(mono.lv_type_name_lens + idx)
@@ -37,7 +43,7 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
                 # AGAST #4778: a global, `g_conns.ids` with `var g_conns:
                 # *Conns`.  Untyped, `g_conns.ids.get(0)` wanted `get` at
                 # every Vec instance, move-only ones too.
-                let g: *GlobalVarDef = si_global(m, e.left.ident)
+                let g: *GlobalVarDef = si_global(m, left.ident)
                 if g != null and g.type_name != null
                     sname = g.type_name
                     sname_len = g.type_name_len
@@ -47,12 +53,12 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
         # AGAST #4778: a field of a call's or a method's result,
         # `h.item(0).next` with `item` returning `@T` at Holder$Node.
         ExprKind.Call | ExprKind.Method =>
-            let rsv: StrView = receiver_instance(mono, m, e.left)
+            let rsv: StrView = receiver_instance(mono, m, left)
             if rsv.ptr != null and rsv.len > 0
                 sname = rsv.ptr
                 sname_len = rsv.len as i32
         ExprKind.Member =>
-            let parent: *StructField = resolve_member_field(mono, m, e.left)
+            let parent: *StructField = resolve_member_field(mono, m, left)
             if parent != null
                 # Through a held `@T` / `@&T` as through a `*T` (AGAST #2383).
                 if parent.field_type == TypeKind.Struct or parent.field_type == TypeKind.Ptr or field_is_ref(parent) == 1
