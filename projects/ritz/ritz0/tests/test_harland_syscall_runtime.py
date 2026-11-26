@@ -84,8 +84,11 @@ AREAS = {
                # ShmWait (229), ShmNotify (230), #4727
                "sys_shm_wait_handler", "sys_shm_notify_handler"],
     # NetInfo (224), NetAddr (225), NetAttach (228): NoDev until a driver
-    # and service exist (#4751).
-    "net": ["sys_net_info_handler", "sys_net_addr_handler", "sys_net_attach_handler"],
+    # and service exist (#4751); NetPublish (226) and the snapshot (#4730),
+    # the exchange (#4728).
+    "net": ["sys_net_info_handler", "sys_net_addr_handler", "sys_net_attach_handler",
+            "sys_net_publish_handler", "net_attach_for", "net_publish_for",
+            "ring_driver_published", "snapshot_invalidate"],
     # Poll (7): the console's timed read (#4829).
     "poll": ["sys_poll_handler"],
 }
@@ -236,8 +239,8 @@ def test_table_registers_handlers_imported_from_their_area():
     # 42 with NetInfo, NetAddr, NetAttach (#4751); 43 with Poll (7, #4829);
     # 45 with Stat and Fstat (4, 5, #4832); 47 with DrvMmioMap and
     # DrvDmaAlloc (221, 222, #4720); 49 with ShmWait and ShmNotify
-    # (229, 230, #4727).
-    assert len(regs) == 49, regs
+    # (229, 230, #4727); 50 with NetPublish (226, #4730).
+    assert len(regs) == 50, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

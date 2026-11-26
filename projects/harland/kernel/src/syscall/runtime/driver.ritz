@@ -25,6 +25,10 @@
 #       Errno.NoDev  the handle names no registered IRQ object
 #       Errno.Again  this CPU cannot park (not the BSP, or no process)
 #
+# An ATTACH record copied out for an object already retired drops the
+# caller's handle for it before the wait returns; the record still names
+# the handle (#4728, RING1_DRIVER.md "Grants").
+#
 # The request and the source array are copied into kernel memory before a
 # latch is cleared; the user source array is never written. The deadline is
 # now + DEVICE_WAIT_MS on this process's wait set; WaitRequest.deadline is
@@ -54,14 +58,15 @@ import mm.uptr { uptr_check_read, uptr_check_write }
 import ritzlib.option
 import syscall.errno { Errno }
 import cap.types { CapEntry, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, cap_handle_init }
-import cap.table { CapTable, cap_table_get, cap_table_lookup }
+import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_revoke }
+import mm.shm { shm_live }
 import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_reap_pending }
 import proc.sched { sched_block }
 import proc.waitq { waitq_can_park }
 import proc.waitset { irq_object_known, irq_object_domain, waitset_arm, waitset_disarm }
 import proc.waitset { WaitPlan, Collected, Notify, wait_plan_new, wait_plan_irq, wait_plan_add, waitset_collect, shm_notify }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
-import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
+import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_ATTACH, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
 import mm.dma { dma_alloc_zeroed, dma_free_pages, dma_quarantine }
@@ -142,6 +147,21 @@ fn copy_request(pid: u32, ureq: *WaitRequest, plan: WaitPlan) -> RequestCheck
     checked.deadline_ms = req.deadline
     RequestCheck.Valid(checked)
 
+# An ATTACH record copied out for an object that is already retired (an
+# app that exited before the service mapped its exchange): the record still
+# names the handle, and the handle goes before the wait returns (#4728,
+# RING1_DRIVER.md "Grants"). Any other record, or a live object, is left.
+fn drop_if_retired(pid: u32, event: WaitEvent)
+    if (event.bits & EVENT_ATTACH) == 0
+        return
+    let object_id: u64 = match held_object(pid, event.handle, CAP_TYPE_SHM)
+        Some(id) => id
+        None => return
+    if not shm_live(object_id)
+        let index: u32 = (event.handle & 0xFFFFFFFF) as u32
+        let generation: u32 = (event.handle >> 32) as u32
+        cap_revoke(cap_table_get(pid), cap_handle_init(index, generation))
+
 # Collect for the calling process (`pid`) under `checked`, parking on its
 # wait set until something matches or TSC `deadline` passes: 0 (the IRQ
 # record was copied), 2 (events without the IRQ) or 1 (the deadline), with
@@ -163,6 +183,7 @@ fn wait_collect(pid: u32, ureq: *WaitRequest, checked: *CheckedRequest, deadline
             var i: u32 = 0
             while i < got.count
                 *(checked.out + i as u64) = got.events[i as i32]
+                drop_if_retired(pid, got.events[i as i32])
                 i = i + 1
             (*ureq).out_count = got.count
             result = if got.irq then 0 else 2

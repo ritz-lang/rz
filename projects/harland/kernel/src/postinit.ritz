@@ -54,7 +54,13 @@ import cap.types { CAP_TYPE_SHM, CAP_RIGHT_WRITE }
 import cap.table { CapTable, cap_table_get, cap_revoke }
 import mm.shm { shm_create, shm_destroy }
 import proc.waitset { Notify, shm_notify, shm_latch_bits, shm_latch_held }
-import driver_abi.wait { EVENT_DATA, EVENT_SPACE }
+import driver_abi.wait { EVENT_DATA, EVENT_SPACE, EVENT_LINK }
+import driver_abi.link { NetInfo, NETDEV_TYPE_VIRTIO }
+import syscall.runtime.net { net_publish_for, net_attach_for, net_service_register, net_exchanges_destroy, net_link_register, net_frame_register, net_info_snapshot, ring_driver_published, snapshot_invalidate }
+import cap.types { CapEntry, CAP_RIGHT_PUBLISH, cap_handle_init }
+import cap.table { cap_table_lookup, cap_holds_object }
+import mm.shm { shm_retire }
+import proc.waitset { waitset_inbox_len }
 import driver_abi.wait { DEVICE_WAIT_MS }
 import drivers.virtio.window { phys_range, phys_range_none, vio_window_add, vio_window_remove }
 
@@ -747,6 +753,234 @@ fn shm_wait_self_test() -> bool
     klog("\n")
     return status == 0 and posted and spaced and one_park and dropped and freed
 
+# net-attach (#4728, RING1_DRIVER.md "Grants" and "Wait and notify"):
+# NetAttach and the service's inbox. Before a service is registered an
+# attach is NoDev. Pid 1 spawns the service stub (driver_stub.s mode 7) and
+# registers it; the stub cannot run before pid 1 yields. Eight stand-in
+# apps (tables with no process, as cap/shm_selftest.ritz uses) each attach
+# once: eight ATTACH records on the inbox, a second attach from one of them
+# is Exist and a ninth app's is Again, creating nothing. Those eight
+# objects are retired (the apps "exited" before the service mapped them),
+# so the service's first wait, with an empty source list, copies out all
+# eight and loses each handle before it returns: the stub's ShmMap of each
+# is Perm. Then two real apps (mode 8), one after the other in the same
+# process slot, attach (a second attach of each, still holding its handle,
+# is Exist) and exit; the service maps both exchanges and exits with
+# records << 16 | refused maps << 8 | maps.
+const DRIVER_STUB_SERVICE: u64 = 7
+const DRIVER_STUB_APP: u64 = 8
+# The stand-in apps' pids: no process has them.
+const ATTACH_FAKE_PID: u32 = 0x47280
+const ATTACH_FAKES: u32 = 9
+const ATTACH_RETIRED: u32 = 8
+const ATTACH_APPS: u64 = 2
+const ATTACH_SERVICE_STATUS: i64 = 0x0A0802     # 10 records, 8 refused maps, 2 maps
+
+fn net_attach_self_test() -> bool
+    klog("\nTesting NetAttach and the service inbox...\n")
+    var ok: bool = true
+    var f: u32 = 0
+    while f < ATTACH_FAKES
+        if cap_table_alloc(ATTACH_FAKE_PID + f) == 0 as *CapTable
+            ok = false
+        f = f + 1
+    let nodev: bool = net_attach_for(ATTACH_FAKE_PID) == Errno.NoDev as i64
+    sched_start(proc_current_slot())
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_SERVICE, ATTACH_RETIRED as u64 + ATTACH_APPS)
+    var queued: bool = false
+    var exist: bool = false
+    var again: bool = false
+    var dropped: bool = false
+    var apps_ok: bool = false
+    var status: i64 = -1
+    if spawned > 0 and ok
+        let service: u64 = spawned as u64
+        net_service_register(service as u32)
+        var objects: [8]u64
+        queued = true
+        var i: u32 = 0
+        while i < ATTACH_RETIRED
+            let h: i64 = net_attach_for(ATTACH_FAKE_PID + i)
+            objects[i as i32] = held_shm_object(ATTACH_FAKE_PID + i, h)
+            if h < 0 or objects[i as i32] == 0
+                queued = false
+            i = i + 1
+        queued = queued and waitset_inbox_len(service) == ATTACH_RETIRED
+        exist = net_attach_for(ATTACH_FAKE_PID) == Errno.Exist as i64
+        let ninth: u32 = ATTACH_FAKE_PID + ATTACH_RETIRED
+        again = net_attach_for(ninth) == Errno.Again as i64 and cap_table_get(ninth).active_count == 0 and waitset_inbox_len(service) == ATTACH_RETIRED
+        i = 0
+        while i < ATTACH_RETIRED
+            shm_retire(objects[i as i32])
+            i = i + 1
+        # The stand-ins are gone; their records stay on the inbox.
+        f = 0
+        while f < ATTACH_FAKES
+            cap_table_free_pid(ATTACH_FAKE_PID + f)
+            f = f + 1
+        let parks: u64 = drv_irq_wait_park_count()
+        if queued and exist and again and await_park(service, parks, DRV_TEST_PARK_US)
+            dropped = waitset_inbox_len(service) == 0
+            i = 0
+            while i < ATTACH_RETIRED
+                if cap_holds_object(service as u32, CAP_TYPE_SHM, objects[i as i32])
+                    dropped = false
+                i = i + 1
+            apps_ok = true
+            var a: u64 = 0
+            while a < ATTACH_APPS
+                let app: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_APP, a)
+                if app <= 0 or process_wait(app as i32) != 0
+                    apps_ok = false
+                a = a + 1
+        else
+            klog("  the attaches or the service's first wait went wrong\n")
+            process_mark_exit(service)
+        status = drv_stub_status(service)
+    else
+        f = 0
+        while f < ATTACH_FAKES
+            cap_table_free_pid(ATTACH_FAKE_PID + f)
+            f = f + 1
+    sched_stop()
+    net_service_register(0)
+    let freed: bool = net_exchanges_destroy()
+    klog("  status ")
+    klog_hex(status as u64)
+    if not nodev
+        klog(", an attach with no service was not NoDev")
+    if not queued
+        klog(", the eight attaches did not each leave a record")
+    if not exist
+        klog(", a second attach was not Exist")
+    if not again
+        klog(", a ninth record was not Again, or it made something")
+    if not dropped
+        klog(", the retired records' handles outlived the wait")
+    if not apps_ok
+        klog(", an app stub failed")
+    if not freed
+        klog(", an exchange outlived the test")
+    klog("\n")
+    return status == ATTACH_SERVICE_STATUS and nodev and queued and exist and again and dropped and apps_ok and freed
+
+# The object behind `pid`'s shm handle `packed` (a NetAttach return), or 0.
+fn held_shm_object(pid: u32, packed: i64) -> u64
+    if packed < 0
+        return 0
+    let table: *CapTable = cap_table_get(pid)
+    let index: u32 = (packed as u64 & 0xFFFFFFFF) as u32
+    let generation: u32 = (packed as u64 >> 32) as u32
+    let entry: *CapEntry = cap_table_lookup(table, cap_handle_init(index, generation))
+    if entry == 0 as *CapEntry or entry.cap_type != CAP_TYPE_SHM
+        return 0
+    entry.object_id
+
+# net-info (#4730, RING1_DRIVER.md section 7, Test 7): the link snapshot.
+# Pid 1 makes a one-page link object and a frame object, registers both
+# (pid 1 as the frame's consumer, so it holds a latch), and spawns the
+# driver stub (mode 9) with two handles for the link object: the first with
+# CAP_RIGHT_PUBLISH, the second without. The stub checks NetInfo is NoDev
+# before any publish, NetPublish is Again at link_seq 0 and 1, the handle
+# without the right is Perm, the seqlocked generation 2 publishes, and
+# NetInfo then copies its MAC and MTU (and is Fault on a kernel pointer),
+# and a publish at odd link_seq 3 over zeroed bytes is Again and keeps
+# generation 2's snapshot.
+# Pid 1 sees the same snapshot, and LINK on its frame latch; its own
+# publish-right handle on the frame object is Perm (not the link object). After
+# snapshot_invalidate a second stub (mode 9, no handle) sees NoDev again.
+const DRIVER_STUB_LINK: u64 = 9
+# The stub's two link handles: a fresh table's first two grants.
+const LINK_TEST_H_PUBLISH: u64 = 1 << 32
+const LINK_TEST_H_PLAIN: u64 = 0x200000001
+const LINK_TEST_CONSUMER: u32 = 1
+# What the stub writes: driver_stub.s LINK_MAC_WORD (mac[0..6], link_up 1,
+# device_type 1) and LINK_MTU.
+# mac[0..6] = 52:54:00:47:30:01, low byte first
+const LINK_TEST_MAC: u64 = 0x013047005452
+const LINK_TEST_MTU: u32 = 1500
+
+fn link_snapshot_matches() -> bool
+    let n: NetInfo = match net_info_snapshot()
+        Some(i) => i
+        None => return false
+    var i: i32 = 0
+    while i < 6
+        if n.mac[i] as u64 != ((LINK_TEST_MAC >> (8 * i as u64)) & 0xFF)
+            return false
+        i = i + 1
+    n.link_up == 1 and n.device_type == NETDEV_TYPE_VIRTIO and n.mtu == LINK_TEST_MTU
+
+fn net_info_self_test() -> bool
+    klog("\nTesting NetPublish and NetInfo on a kernel-spawned process...\n")
+    let link: u64 = shm_create(1).unwrap_or(0)
+    let frame: u64 = shm_create(1).unwrap_or(0)
+    if link == 0 or frame == 0
+        klog("  objects not made\n")
+        if link != 0
+            shm_destroy(link)
+        if frame != 0
+            shm_destroy(frame)
+        return false
+    let rights: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
+    let mine: CapHandle = cap_kernel_grant(LINK_TEST_CONSUMER, CAP_TYPE_SHM, rights, frame)
+    net_link_register(link)
+    net_frame_register(frame, LINK_TEST_CONSUMER as u64)
+    let unpublished: bool = not ring_driver_published()
+    sched_start(proc_current_slot())
+    var status: i64 = -1
+    var after: i64 = -1
+    var matched: bool = false
+    var linked: bool = false
+    var invalidated: bool = false
+    var refused: bool = false
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_LINK, LINK_TEST_H_PUBLISH)
+    if spawned > 0
+        let pid: u64 = spawned as u64
+        let hp: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rights | CAP_RIGHT_PUBLISH, link))
+        let hn: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rights, link))
+        if hp != LINK_TEST_H_PUBLISH or hn != LINK_TEST_H_PLAIN
+            klog("  grants gave other handles\n")
+            process_mark_exit(pid)
+        status = drv_stub_status(pid)
+        # CAP_RIGHT_PUBLISH on any object but the registered link object is
+        # Perm too.
+        let wrong: u64 = packed_handle(cap_kernel_grant(LINK_TEST_CONSUMER, CAP_TYPE_SHM, rights | CAP_RIGHT_PUBLISH, frame))
+        refused = net_publish_for(LINK_TEST_CONSUMER, wrong) == Errno.Perm as i64
+        let wi: u32 = (wrong & 0xFFFFFFFF) as u32
+        let wg: u32 = (wrong >> 32) as u32
+        cap_revoke(cap_table_get(LINK_TEST_CONSUMER), cap_handle_init(wi, wg))
+        matched = ring_driver_published() and link_snapshot_matches()
+        linked = (shm_latch_bits(frame, LINK_TEST_CONSUMER as u64) & EVENT_LINK) != 0
+        snapshot_invalidate()
+        invalidated = not ring_driver_published() and net_info_snapshot().is_none()
+        let second: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_LINK, 0)
+        if second > 0
+            after = drv_stub_status(second as u64)
+    sched_stop()
+    net_link_register(0)
+    net_frame_register(0, 0)
+    let dropped: bool = cap_revoke(cap_table_get(LINK_TEST_CONSUMER), mine)
+    let freed: bool = shm_destroy(link) and shm_destroy(frame)
+    klog("  status ")
+    klog_dec(status)
+    klog(", after invalidation ")
+    klog_dec(after)
+    if not unpublished
+        klog(", a snapshot was published before the test")
+    if not matched
+        klog(", the snapshot is not what the stub wrote")
+    if not refused
+        klog(", a publish handle on the frame object was not Perm")
+    if not linked
+        klog(", no LINK on the consumer's frame latch")
+    if not invalidated
+        klog(", the snapshot outlived snapshot_invalidate")
+    if not dropped or not freed
+        klog(", the objects outlived the test")
+    klog("\n")
+    return status == 0 and after == 0 and unpublished and matched and refused and linked and invalidated and dropped and freed
+
 # console-poll (#4829): poll(2) on fd 0 is the console's timed read. The stub
 # (modes 4 and 5, driver_stub.s) polls { 0, POLLIN } with the console raw
 # (one byte readable) and nothing typed:
@@ -1004,6 +1238,8 @@ fn driver_process_tests()
     boot_test_result("drv-mmio-map", drv_mmio_map_self_test())
     boot_test_result("drv-dma-alloc", drv_dma_alloc_self_test())
     boot_test_result("shm-wait", shm_wait_self_test())
+    boot_test_result("net-attach", net_attach_self_test())
+    boot_test_result("net-info", net_info_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before

@@ -96,8 +96,13 @@ ABI = {
     # NetInfo (224), NetAddr (225) and NetAttach (228): the link record, the
     # address record and the app exchange (RING1_DRIVER.md §7, RING2_NET.md).
     # Until a driver publishes and a service registers, each answers
-    # Errno.NoDev (AGAST #4751; #4730, #4742 and #4728 give them bodies).
+    # Errno.NoDev (AGAST #4751). NetInfo copies the kernel's link snapshot
+    # (#4730) and NetAttach creates the exchange (#4728).
     "NetInfo": 224, "NetAddr": 225, "NetAttach": 228,
+    # NetPublish (226): the driver's seqlocked link record into the kernel's
+    # snapshot, with CAP_RIGHT_PUBLISH on the registered link object (#4730,
+    # RING1_DRIVER.md §7). 60 and 61 stay free.
+    "NetPublish": 226,
     # ShmMap (227): map a CAP_TYPE_SHM handle into the caller (#4717,
     # RING1_DRIVER.md §5).
     "ShmMap": 227,
@@ -120,7 +125,7 @@ DISPATCHED = {
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
     "Sync", "Smp", "ShmMap", "DrvIrqWait", "DrvMmioMap", "DrvDmaAlloc", "NetInfo", "NetAddr", "NetAttach", "Poll",
-    "ShmWait", "ShmNotify",
+    "ShmWait", "ShmNotify", "NetPublish",
     "Stat", "Fstat",
 }
 
@@ -258,34 +263,13 @@ def test_dispatch_table(compiler, tmp_path):
 
 
 # --- the net calls before a driver or service exists (AGAST #4751) ---------------
-
-NET_NODEV = """\
-import syscall.errno
-import syscall.runtime.net
-
-fn main() -> i32
-    if Errno.NoDev as i64 != -19
-        return 1
-    # No driver has published a link record: NetInfo copies nothing.
-    if sys_net_info_handler(0x1000, 0, 0, 0) != Errno.NoDev as i64
-        return 2
-    # No service has published an address record.
-    if sys_net_addr_handler(0x1000, 0, 0, 0) != Errno.NoDev as i64
-        return 3
-    # No service is registered to attach to.
-    if sys_net_attach_handler(0, 0, 0, 0) != Errno.NoDev as i64
-        return 4
-    0
-"""
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_net_calls_answer_nodev_without_a_service(compiler, tmp_path):
-    """indium's ping, udp-send and udp-recv end on NoDev, not NoSys, on every
-    boot that has no ring-2 service (RING2_NET.md "Ring-3 tools")."""
-    rc = _run(compiler, tmp_path, NET_NODEV, ["syscall.errno", "syscall.runtime.net"])
-    assert rc == 0, f"{compiler}: check {rc} failed"
+#
+# NetInfo, NetAttach and NetPublish reach the cap table, the shm objects and
+# the wait set (#4728, #4730), so syscall/runtime/net.ritz no longer links
+# into a host program alone. Their NoDev answers are boot-tested instead:
+# net-attach calls NetAttach before a service registers, and net-info's
+# stub calls NetInfo before the first publish and after the snapshot is
+# invalidated (postinit.ritz).
 
 
 # --- the kernel's use of it ------------------------------------------------------

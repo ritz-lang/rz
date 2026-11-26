@@ -1,0 +1,116 @@
+# Harland link-record seqlock (AGAST #4730, docs/RING1_DRIVER.md section 7)
+#
+# The ring-1 driver writes NetInfo on the link page under link_seq and the
+# kernel's NetPublish samples it. These host tests run both sides on a link
+# page in a host global, single-stepped: the writer's odd store, its bytes,
+# its even store, and the reader's sample at each point between.
+#
+# What they cannot force: a reorder of the plain NetInfo accesses across the
+# atomics. x86-64 is TSO and the compiler keeps the program order of these
+# accesses here, so removing either fence() does not turn a test red on
+# this host. The fences are the spec's (section 7, steps 2 and 3); the
+# protocol tests below are what a host can check: odd and unpublished
+# values are never sampled, the first stable generation is 2, every later
+# one is the next even number, and a write that started after the first
+# load invalidates the copy.
+
+import driver_abi.link { NetInfo, LINK_INFO_OFF, LINK_SEQ_OFF, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, NETDEV_TYPE_VIRTIO, link_write_begin, link_write_end, link_publish, link_sample, LinkSample, link_read_begin, link_read_copy, link_read_end }
+
+# One link page, u64s so link_seq is 8-aligned.
+var g_page: [512]u64
+
+fn fresh_page() -> u64
+    for i in 0..512
+        g_page[i] = 0
+    @g_page as u64
+
+fn seq_of(page: u64) -> u64
+    *((page + LINK_SEQ_OFF) as *u64)
+
+fn info(last: u8, up: u8, mtu: u32) -> NetInfo
+    var n: NetInfo
+    n.mac[0] = 0x52
+    n.mac[1] = 0x54
+    n.mac[2] = 0x00
+    n.mac[3] = 0x47
+    n.mac[4] = 0x30
+    n.mac[5] = last
+    n.link_up = up
+    n.device_type = NETDEV_TYPE_VIRTIO
+    n.mtu = mtu
+    n
+
+fn same(a: *NetInfo, b: *NetInfo) -> bool
+    for i in 0..6
+        if a.mac[i] != b.mac[i]
+            return false
+    a.link_up == b.link_up and a.device_type == b.device_type and a.mtu == b.mtu
+
+# Zeroed memory is unpublished: generation 0 is never sampled, though 0 is
+# even, so a NIC of zeros is never published.
+[[test]]
+fn test_zeroed_page_is_unpublished() -> i32
+    let page = fresh_page()
+    assert link_sample(page).generation == LINK_SEQ_UNPUBLISHED
+    0
+
+# The writer's first store is 1 (odd: a write in progress), and a sample
+# then is refused; the second store is 2, the first stable generation, and
+# a sample then copies the bytes written between.
+[[test]]
+fn test_first_publish_is_generation_two() -> i32
+    let page = fresh_page()
+    let odd = link_write_begin(page)
+    assert odd == 1 and seq_of(page) == 1
+    assert link_sample(page).generation == LINK_SEQ_UNPUBLISHED
+    let want = info(1, 1, 1500)
+    *((page + LINK_INFO_OFF) as *NetInfo) = want
+    assert link_sample(page).generation == LINK_SEQ_UNPUBLISHED
+    link_write_end(page, odd)
+    assert seq_of(page) == LINK_SEQ_FIRST_STABLE
+    let got = link_sample(page)
+    assert got.generation == LINK_SEQ_FIRST_STABLE
+    assert same(@got.info, @want)
+    0
+
+# Every later generation is the next even number, never 0, and the sample
+# carries the bytes of that generation.
+[[test]]
+fn test_later_publishes_are_the_next_even_number() -> i32
+    let page = fresh_page()
+    let first = info(1, 1, 1500)
+    assert link_publish(page, @first) == 2
+    let second = info(2, 0, 1500)
+    assert link_publish(page, @second) == 4
+    let third = info(3, 1, 2034)
+    assert link_publish(page, @third) == 6
+    let got = link_sample(page)
+    assert got.generation == 6
+    assert same(@got.info, @third)
+    0
+
+# A writer that starts between the reader's first load and its second
+# (single-stepped through the three steps link_sample is made of) changes
+# link_seq, so the copy, which may be torn, is refused.
+[[test]]
+fn test_a_write_during_the_copy_invalidates_it() -> i32
+    let page = fresh_page()
+    let first = info(1, 1, 1500)
+    link_publish(page, @first)
+    let s1 = link_read_begin(page)
+    assert s1 == 2
+    let torn = link_read_copy(page)
+    assert torn.mtu == 1500
+    let odd = link_write_begin(page)
+    assert not link_read_end(page, s1)
+    # Mid-write, the next sample does not even start.
+    assert link_read_begin(page) == LINK_SEQ_UNPUBLISHED
+    assert link_sample(page).generation == LINK_SEQ_UNPUBLISHED
+    # The write ends, and the sample is the new generation.
+    let second = info(2, 1, 1500)
+    *((page + LINK_INFO_OFF) as *NetInfo) = second
+    link_write_end(page, odd)
+    let got = link_sample(page)
+    assert got.generation == 4
+    assert same(@got.info, @second)
+    0

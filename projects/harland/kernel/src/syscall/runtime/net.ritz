@@ -1,33 +1,311 @@
 # Harland Syscall Runtime - Networking records and the app exchange
-# (AGAST #4751; docs/RING1_DRIVER.md section 7, docs/RING2_NET.md)
+# (AGAST #4751, #4728, #4730; docs/RING1_DRIVER.md "Grants", section 7,
+# docs/RING2_NET.md)
 #
-# NetInfo (224) copies the ring-1 driver's link snapshot, NetAddr (225) the
-# ring-2 service's address snapshot, and NetAttach (228) creates an app's
-# exchange object with the registered service. No driver publishes a link
-# record yet and no service registers, so each call answers what the spec
-# names for that state: NetInfo and NetAddr "return Errno.NoDev while the
-# generation is unpublished" and NetAttach with "no registered service ->
-# Errno.NoDev". Nothing is written through the caller's pointer and nothing
-# is allocated. #4730 (NetInfo), #4742 (NetAddr) and #4728 (NetAttach)
-# replace these bodies with the snapshots and the exchange; the numbers and
-# the NoDev answer they give on a boot without the service stay.
+# NetInfo (224): net_info(*NetInfo) copies the kernel's link snapshot. Any
+# process may call it. 0, or:
+#   Errno.NoDev  no stable generation is in the snapshot (none published
+#                yet, or snapshot_invalidate ran): nothing is written
+#   Errno.Fault  the NetInfo is not the caller's writable memory
 #
-# Declaring the three now, with the answer the spec gives, is what lets
-# indium's ping, udp-send and udp-recv end on NoDev rather than on the
-# NoSys every undeclared number gets (and the "[syscall] unknown" log line).
-# Each handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
+# NetPublish (226): net_publish(link_handle) samples the ring-1 driver's
+# seqlocked NetInfo on the registered link object (driver_abi.link
+# link_sample, through the physmap) into the snapshot, and ORs EVENT_LINK
+# into the consumer's latch on the registered frame object. 0, or:
+#   Errno.Perm   the caller holds no CAP_TYPE_SHM handle `link_handle`, its
+#                object is not the registered link object, or the handle
+#                lacks CAP_RIGHT_PUBLISH (every app-exchange handle)
+#   Errno.Again  link_seq is odd, below 2, or changed during every bounded
+#                retry: the previous snapshot stays
+# The address object (NetAddr, 225) publishes through the same call once
+# #4742 registers it; until then only the link object is accepted.
+#
+# NetAddr (225): NoDev until #4742 gives it the service's address snapshot.
+#
+# NetAttach (228): net_attach() creates the caller's exchange with the
+# registered ring-2 service: a new ShmObject of APP_EXCHANGE_SIZE bytes, a
+# read-write handle without the publish right (and without GRANT) in the
+# app and in the service, and {service_handle, EVENT_ATTACH} on the
+# service's inbox, which every wait of the service scans. Returns the app's
+# packed handle, or (each creating nothing):
+#   Errno.NoDev  no service is registered (every boot today)
+#   Errno.Exist  the caller still holds the handle of an exchange it
+#                attached: one live exchange per app process
+#   Errno.Again  the service's inbox holds INBOX_CAP records not yet copied
+#                out; the app retries
+#   Errno.Inval  the caller is the service
+#   Errno.NoMem  no object, exchange record or handle slot to be had
+#
+# The service, the link object and the frame object's consumer are
+# registered by the kernel (the boot that spawns them, and today the
+# net-attach and net-info boot tests); nothing else sets them. Each handler
+# is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
+import ritzlib.option
+import io { disable_interrupts, enable_interrupts }
 import syscall.errno { Errno }
+import mm.uptr { uptr_check_write }
+import mm.pmm { PAGE_SIZE }
+import mm.vmm { phys_to_virt }
+import mm.shm { shm_create, shm_destroy, shm_page }
+import cap.types { CapHandle, CapEntry, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_PUBLISH, cap_handle_init }
+import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_kernel_grant, cap_revoke, cap_holds_object }
+import proc.table { proc_current_pid }
+import proc.waitset { INBOX_CAP, waitset_inbox_len, waitset_inbox_post, shm_latch_post }
+import driver_abi.wait { EVENT_ATTACH, EVENT_LINK, APP_EXCHANGE_SIZE }
+import driver_abi.link { NetInfo, LinkSample, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, link_sample }
+
+# ============================================================================
+# Registration (the kernel only)
+# ============================================================================
+
+# The ring-2 service NetAttach attaches to, or 0.
+var net_service: u32 = 0
+# The driver's link object, and the frame object with its consumer (the
+# process whose latch NetPublish posts LINK on); 0 for none.
+var net_link_object: u64 = 0
+var net_frame_object: u64 = 0
+var net_frame_consumer: u64 = 0
+
+# Process `pid` is the ring-2 service: NetAttach hands it each exchange.
+# 0 unregisters it.
+pub fn net_service_register(pid: u32)
+    net_service = pid
+
+# Shm object `object_id` is the driver's link object: NetPublish samples it
+# for a holder with CAP_RIGHT_PUBLISH. 0 unregisters it.
+pub fn net_link_register(object_id: u64)
+    net_link_object = object_id
+
+# Shm object `object_id` is the frame object and `consumer` the process
+# whose latch on it NetPublish posts EVENT_LINK to. 0 unregisters it.
+pub fn net_frame_register(object_id: u64, consumer: u64)
+    net_frame_object = object_id
+    net_frame_consumer = consumer
+
+# ============================================================================
+# The link snapshot: NetInfo (224) and NetPublish (226), #4730
+# ============================================================================
+
+# How many samples NetPublish takes while link_seq moves under it.
+const LINK_SAMPLE_TRIES: i32 = 4
+
+var link_snapshot: NetInfo
+# The generation the snapshot was taken at; LINK_SEQ_UNPUBLISHED (0) until
+# the first publish and after snapshot_invalidate.
+var link_generation: u64 = 0
+
+# The snapshot holds a stable generation: a ring-1 driver has published.
+pub fn ring_driver_published() -> bool
+    link_generation >= LINK_SEQ_FIRST_STABLE
+
+# driver_quiesce's step 4 (#4733): NetInfo answers NoDev from now on, and
+# the link object is no longer registered, so no later publish revives it.
+# No zero MAC is stored into the snapshot.
+pub fn snapshot_invalidate()
+    disable_interrupts()
+    link_generation = LINK_SEQ_UNPUBLISHED
+    net_link_object = 0
+    enable_interrupts()
+
+# The snapshot, if a stable generation is in it.
+pub fn net_info_snapshot() -> Option<NetInfo>
+    disable_interrupts()
+    let published: bool = ring_driver_published()
+    let copy: NetInfo = link_snapshot
+    enable_interrupts()
+    if not published
+        return None
+    Some(copy)
+
+# NetInfo into `dst`, the caller's memory (checked here).
+fn net_info(dst: *NetInfo) -> i64
+    let copy: NetInfo = match net_info_snapshot()
+        Some(n) => n
+        None => return Errno.NoDev as i64
+    if uptr_check_write(dst as *u8, sizeof(NetInfo) as u64) != 0
+        return Errno.Fault as i64
+    *dst = copy
+    0
+
+# The object behind `pid`'s CAP_TYPE_SHM handle `packed`, if it holds it
+# with every right in `rights`.
+fn held_shm(pid: u32, packed: u64, rights: u32) -> Option<u64>
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return None
+    let index: u32 = (packed & 0xFFFFFFFF) as u32
+    let generation: u32 = (packed >> 32) as u32
+    let entry: *CapEntry = cap_table_lookup(table, cap_handle_init(index, generation))
+    if entry == 0 as *CapEntry or entry.cap_type != CAP_TYPE_SHM or (entry.rights & rights) != rights
+        return None
+    Some(entry.object_id)
+
+# NetPublish for process `pid` (above).
+pub fn net_publish_for(pid: u32, link_handle: u64) -> i64
+    let object_id: u64 = match held_shm(pid, link_handle, CAP_RIGHT_PUBLISH)
+        Some(id) => id
+        None => return Errno.Perm as i64
+    if net_link_object == 0 or object_id != net_link_object
+        return Errno.Perm as i64
+    let frame: u64 = shm_page(object_id, 0)
+    if frame == 0
+        return Errno.Perm as i64
+    let page: u64 = phys_to_virt(frame)
+    var got: LinkSample = link_sample(page)
+    var tries: i32 = 1
+    while got.generation == LINK_SEQ_UNPUBLISHED and tries < LINK_SAMPLE_TRIES
+        got = link_sample(page)
+        tries = tries + 1
+    if got.generation == LINK_SEQ_UNPUBLISHED
+        return Errno.Again as i64
+    disable_interrupts()
+    link_snapshot = got.info
+    link_generation = got.generation
+    if net_frame_object != 0
+        shm_latch_post(net_frame_object, net_frame_consumer, EVENT_LINK)
+    enable_interrupts()
+    0
 
 # net_info(dst: *NetInfo) -> 0 or -errno
 pub fn sys_net_info_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    Errno.NoDev as i64
+    net_info(rdi as *NetInfo)
 
 # net_addr(dst: *NetAddr) -> 0 or -errno
 pub fn sys_net_addr_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     Errno.NoDev as i64
 
+# net_publish(link_handle) -> 0 or -errno
+pub fn sys_net_publish_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    net_publish_for(proc_current_pid() as u32, rdi)
+
+# ============================================================================
+# The app exchange: NetAttach (228), #4728
+# ============================================================================
+
+# Exchanges the kernel tracks at once: one per shm object slot.
+const EXCHANGE_MAX: i32 = 16
+
+# One exchange: the object and the app process it was attached for. Live
+# while that process still holds a handle for the object; a dead record's
+# slot is reused.
+struct Exchange
+    object_id: u64
+    app_pid: u32
+    in_use: bool
+    _pad: [3]u8
+
+var exchanges: [16]Exchange         # EXCHANGE_MAX
+
+fn exchange_live(i: i32) -> bool
+    exchanges[i].in_use and cap_holds_object(exchanges[i].app_pid, CAP_TYPE_SHM, exchanges[i].object_id)
+
+# `pid` holds the handle of an exchange it attached.
+fn exchange_held_by(pid: u32) -> bool
+    var i: i32 = 0
+    while i < EXCHANGE_MAX
+        if exchanges[i].app_pid == pid and exchange_live(i)
+            return true
+        i = i + 1
+    false
+
+# A record slot no live exchange uses, or -1: an unused one first, then
+# one whose app no longer holds its handle.
+fn exchange_free_slot() -> i32
+    var i: i32 = 0
+    while i < EXCHANGE_MAX
+        if not exchanges[i].in_use
+            return i
+        i = i + 1
+    i = 0
+    while i < EXCHANGE_MAX
+        if not exchange_live(i)
+            return i
+        i = i + 1
+    -1
+
+fn packed(h: CapHandle) -> u64
+    let index: u32 = h.index
+    let generation: u32 = h.generation
+    (index as u64) | ((generation as u64) << 32)
+
+fn handle_ok(h: CapHandle) -> bool
+    let index: u32 = h.index
+    index != 0xFFFFFFFF
+
+# Undo a half-made exchange: drop `app`'s handle (if made) and free the
+# object, which nothing has mapped.
+fn attach_undo(app_pid: u32, app: CapHandle, object_id: u64)
+    if handle_ok(app)
+        let index: u32 = app.index
+        let generation: u32 = app.generation
+        cap_revoke(cap_table_get(app_pid), cap_handle_init(index, generation))
+    shm_destroy(object_id)
+
+# NetAttach for app process `app_pid` (above). IF=1 on entry and on return;
+# the checks and the inbox post run under cli, so a wait of the service
+# cannot drain or fill the inbox between them.
+pub fn net_attach_for(app_pid: u32) -> i64
+    let service: u32 = net_service
+    if service == 0 or cap_table_get(service) == 0 as *CapTable
+        return Errno.NoDev as i64
+    if app_pid == service
+        return Errno.Inval as i64
+    if cap_table_get(app_pid) == 0 as *CapTable
+        return Errno.Perm as i64
+    if exchange_held_by(app_pid)
+        return Errno.Exist as i64
+    disable_interrupts()
+    let result: i64 = attach_locked(app_pid, service)
+    enable_interrupts()
+    result
+
+fn attach_locked(app_pid: u32, service: u32) -> i64
+    if waitset_inbox_len(service as u64) >= INBOX_CAP
+        return Errno.Again as i64
+    let slot: i32 = exchange_free_slot()
+    if slot < 0
+        return Errno.NoMem as i64
+    let object_id: u64 = match shm_create(APP_EXCHANGE_SIZE / PAGE_SIZE)
+        Some(id) => id
+        None => return Errno.NoMem as i64
+    let rights: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
+    let app: CapHandle = cap_kernel_grant(app_pid, CAP_TYPE_SHM, rights, object_id)
+    if not handle_ok(app)
+        attach_undo(app_pid, app, object_id)
+        return Errno.NoMem as i64
+    let svc: CapHandle = cap_kernel_grant(service, CAP_TYPE_SHM, rights, object_id)
+    if not handle_ok(svc)
+        attach_undo(app_pid, app, object_id)
+        return Errno.NoMem as i64
+    if not waitset_inbox_post(service as u64, packed(svc), EVENT_ATTACH)
+        # The service has a table but no process slot: it is gone.
+        let index: u32 = svc.index
+        let generation: u32 = svc.generation
+        cap_revoke(cap_table_get(service), cap_handle_init(index, generation))
+        attach_undo(app_pid, app, object_id)
+        return Errno.NoDev as i64
+    exchanges[slot].object_id = object_id
+    exchanges[slot].app_pid = app_pid
+    exchanges[slot].in_use = true
+    packed(app) as i64
+
+# Boot tests only (net-attach): free every exchange object the kernel
+# recorded. True when each one was freed (none still mapped).
+pub fn net_exchanges_destroy() -> bool
+    var all: bool = true
+    var i: i32 = 0
+    while i < EXCHANGE_MAX
+        if exchanges[i].in_use
+            if not shm_destroy(exchanges[i].object_id)
+                all = false
+            exchanges[i].in_use = false
+            exchanges[i].object_id = 0
+            exchanges[i].app_pid = 0
+        i = i + 1
+    all
+
 # net_attach() -> the caller's exchange handle or -errno
 pub fn sys_net_attach_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    Errno.NoDev as i64
+    net_attach_for(proc_current_pid() as u32)

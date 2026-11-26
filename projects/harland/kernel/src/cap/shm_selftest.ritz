@@ -4,8 +4,9 @@
 # ShmObject through ShmMap (227) and share its pages; a second map by the
 # same process returns the same address and allocates nothing, and the
 # other's map allocates no page for the object; CapRevoke of a process's
-# last handle unmaps that process only; and when one process exits, the
-# other keeps its mapping and the pages stay allocated.
+# last handle unmaps that process only; when one process exits, the
+# other keeps its mapping and the pages stay allocated; and ShmMap of a
+# retired object maps nothing and drops the caller's handle (#4728).
 #
 # The two processes are what the kernel builds for a CPL-3 process (D8 =
 # (b)): a capability table and an isolated user PML4 each. The test drives
@@ -18,7 +19,7 @@
 import ritzlib.option
 import mm.pmm { PAGE_SIZE, pmm_get_free_pages, pmm_range_has_free }
 import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_NO_EXECUTE, PTE_DEVICE, PTE_SHM, PTE_ADDR_MASK, DRV_RING_BASE, vmm_create_user_pml4, vmm_free_pml4, vmm_pte_in, vmm_nx_flag, phys_to_virt }
-import mm.shm { shm_create, shm_destroy, shm_page, shm_map_count }
+import mm.shm { shm_create, shm_destroy, shm_page, shm_map_count, shm_retire }
 import syscall.errno { Errno }
 import cap.types { CapHandle, CAP_TYPE_SHM, CAP_TYPE_MMIO, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_ALL }
 import cap.table { CapTable, cap_table_alloc, cap_table_free_pid, cap_kernel_grant }
@@ -153,6 +154,16 @@ fn shm_map_steps() -> i32
     # B revokes its last handle: its leaves go, and nobody maps the object
     if sys_cap_revoke(SHM_PID_B, b) != 0 or vmm_pte_in(g_pml4_b, DRV_RING_BASE) != 0 or shm_map_count(g_obj) != 0
         return 26
+    # ShmMap of a retired object B still holds a handle for (#4728,
+    # RING1_DRIVER.md "Grants"): NoDev, nothing mapped, and the handle is
+    # gone, so the same call again is Perm
+    let late: u64 = shm_granted(SHM_PID_B, g_obj)
+    if shm_invalid(late) or not shm_retire(g_obj)
+        return 29
+    if sys_shm_map(SHM_PID_B, g_pml4_b, late) != Errno.NoDev as i64 or shm_map_count(g_obj) != 0
+        return 29
+    if sys_shm_map(SHM_PID_B, g_pml4_b, late) != Errno.Perm as i64
+        return 30
     return 0
 
 # 0 on pass, else the number of the step that failed (an i32 for the boot

@@ -5,7 +5,7 @@
 import klog { klog, klog_dec }
 import syscall.errno { Errno }
 import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, cap_handle_init, cap_type_is_device }
-import mm.shm { shm_map }
+import mm.shm { shm_map, shm_live }
 import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_revoke, cap_table_derive, cap_grant, cap_table_info, cap_has_rights }
 
 # ============================================================================
@@ -101,7 +101,8 @@ pub fn sys_cap_revoke(caller_pid: u32, handle_packed: u64) -> i64
 #   The user virtual address, in the ring window (PML4[251])
 #   Errno.Perm: no table, a handle the caller doesn't hold, not a shm
 #   handle, or no READ right
-#   Errno.NoDev / Errno.NoMem: see shm_map
+#   Errno.NoDev / Errno.NoMem: see shm_map. On NoDev for a retired object
+#   the caller's handle is dropped as well (#4728)
 
 pub fn sys_shm_map(caller_pid: u32, pml4: u64, handle_packed: u64) -> i64
     let index: u32 = (handle_packed & 0xFFFFFFFF) as u32
@@ -115,7 +116,14 @@ pub fn sys_shm_map(caller_pid: u32, pml4: u64, handle_packed: u64) -> i64
     if ((*entry).rights & CAP_RIGHT_READ) == 0
         return Errno.Perm as i64
     let writable: bool = ((*entry).rights & CAP_RIGHT_WRITE) != 0
-    return shm_map(caller_pid, pml4, (*entry).object_id, writable)
+    let object_id: u64 = (*entry).object_id
+    let mapped: i64 = shm_map(caller_pid, pml4, object_id, writable)
+    # A retired (or reclaimed) object maps nothing, and the handle that
+    # named it goes: the capability cleanup for an app that exited before
+    # the service mapped its exchange (#4728, RING1_DRIVER.md "Grants").
+    if mapped == Errno.NoDev as i64 and not shm_live(object_id)
+        cap_revoke(table, cap_handle_init(index, generation))
+    return mapped
 
 # ============================================================================
 # SYS_CAP_DERIVE

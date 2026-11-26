@@ -16,9 +16,12 @@
 # leaves' frames alone.
 #
 # Each holder's event latch for an object is proc/waitset.ritz's, made when
-# the cap table inserts the handle (#4727). Not here: retire, detach and the
-# detach timeout (ring plan T23). Only the shm-map and shm-wait boot tests
-# create an object yet.
+# the cap table inserts the handle (#4727). NetAttach (228) creates each app
+# exchange here (syscall/runtime/net.ritz, #4728). shm_retire only sets the
+# flag a retired object is refused by (ShmMap, and the copy-out of an
+# ATTACH record, drop the caller's handle for it); the PEER_CLOSE and
+# DRIVER_GONE posts, detach, the detach timeout and reclaim are ring plan
+# T23's (#4729).
 #
 # Like the capability tables, these tables take no lock: they are reached
 # from syscalls of the calling process and from boot, as the cap tables are.
@@ -28,8 +31,9 @@ import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
 import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_SHM, DRV_RING_BASE, DRV_DMA_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, phys_to_virt }
 import syscall.errno { Errno }
 
-# Pages one object holds: a frame ring or an app exchange fits.
-pub const SHM_MAX_PAGES: u64 = 16
+# Pages one object holds: an app exchange (driver_abi APP_EXCHANGE_SIZE,
+# 35 pages) fits. The frame ring's 0x103000 bytes are ring plan T25's.
+pub const SHM_MAX_PAGES: u64 = 35
 const MAX_SHM_OBJECTS: i32 = 16
 # Live (object, process) mappings, system-wide.
 const MAX_SHM_MAPS: i32 = 32
@@ -38,10 +42,10 @@ const MAX_SHM_CURSORS: i32 = 16
 
 pub struct ShmObject
     id: u64                 # never reused; the slot is free when in_use is false
-    pages: [16]u64          # SHM_MAX_PAGES physical frames, owned by the object
+    pages: [35]u64          # SHM_MAX_PAGES physical frames, owned by the object
     page_count: u64
     map_count: u32          # live mappings: one per process that mapped it
-    retired: bool           # set by retire (later tasks); a retired object maps nothing
+    retired: bool           # set by shm_retire; a retired object maps nothing
     in_use: bool
     _padding: [2]u8
 
@@ -124,7 +128,8 @@ pub fn shm_create(page_count: u64) -> Option<u64>
 
 # Free object `id` and its pages. Only an object no process maps: false (and
 # nothing freed) while any mapping is live, or for an unknown id. Until
-# retire lands (T21) only the shm-map boot test frees an object.
+# reclaim lands (T23, #4729) only the boot tests and NetAttach's undo free
+# an object.
 pub fn shm_destroy(id: u64) -> bool
     let slot: i32 = shm_object_slot(id)
     if slot < 0 or shm_objects[slot].map_count != 0
@@ -147,6 +152,23 @@ pub fn shm_map_count(id: u64) -> u32
     if slot < 0
         return 0
     return shm_objects[slot].map_count
+
+# Retire object `id`: it maps nothing from now on, and a holder that copies
+# out an ATTACH record for it, or calls ShmMap on it, loses its handle
+# (RING1_DRIVER.md "Grants"). Mappings already made stay. False for an
+# unknown id. The latch posts, detach and reclaim are T23's (#4729).
+pub fn shm_retire(id: u64) -> bool
+    let slot: i32 = shm_object_slot(id)
+    if slot < 0
+        return false
+    shm_objects[slot].retired = true
+    return true
+
+# Object `id` exists and is not retired: a handle for it is still worth
+# holding.
+pub fn shm_live(id: u64) -> bool
+    let slot: i32 = shm_object_slot(id)
+    return slot >= 0 and not shm_objects[slot].retired
 
 # ============================================================================
 # Mappings

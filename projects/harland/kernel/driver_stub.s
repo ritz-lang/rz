@@ -49,6 +49,33 @@
 #                   9  ShmWait, deadline SHM_WAIT_LONG_MS: parks until pid
 #                      1 posts DATA -> 2: out_count 1, out[0] = { frame,
 #                      DATA }
+#   mode 7 (SERVICE, #4728): the ring-2 service stand-in, registered by
+#                   the kernel; RSI = how many ATTACH records to collect.
+#                   Each ShmWait lists no source (out_cap 8, deadline
+#                   SHM_WAIT_LONG_MS) and must return 2; every record must
+#                   be ATTACH, and the stub ShmMaps its handle: a VA counts
+#                   as a map, Errno.Perm (the handle was dropped with a
+#                   retired record) as a refused map, anything else fails.
+#                   Exit status: records << 16 | refused << 8 | maps, or
+#                   0xFF on a failure.
+#   mode 8 (APP, #4728): NetAttach must return a handle, and a second
+#                   NetAttach Errno.Exist; exit 0, else 1 or 2.
+#   mode 9 (LINK, #4730): RSI is the link handle with CAP_RIGHT_PUBLISH
+#                   (LINK_H_PLAIN is a second one without), or 0. Exit
+#                   status: the number of the first failed step, else 0:
+#                   1  NetInfo                 -> Errno.NoDev (RSI 0: done)
+#                   2  NetPublish, link_seq 0  -> Errno.Again
+#                   3  ShmMap(link)            -> a VA
+#                   4  link_seq 1, NetPublish  -> Errno.Again
+#                      (then NetInfo bytes LINK_MAC_WORD / LINK_MTU, fence,
+#                      link_seq 2)
+#                   5  NetPublish(LINK_H_PLAIN) -> Errno.Perm
+#                   6  NetPublish(link)        -> 0
+#                   7  NetInfo                 -> 0, the bytes it wrote
+#                   8  NetInfo(kernel pointer) -> Errno.Fault
+#                   9  link_seq 3, the MAC zeroed, NetPublish -> Errno.Again
+#                      (the kernel then checks the snapshot kept generation
+#                      2's bytes)
 #   mode 21 (MMIO_MAP, #4720): RSI is a CAP_TYPE_MMIO handle on the
 #                   boot-test window double. Exit status: the number of the
 #                   first failed step, else 0:
@@ -81,6 +108,10 @@
 .equ SYS_DRV_IRQ_WAIT, 220
 .equ SYS_SHM_WAIT, 229
 .equ SYS_SHM_NOTIFY, 230
+.equ SYS_NET_INFO, 224
+.equ SYS_NET_PUBLISH, 226
+.equ SYS_SHM_MAP, 227
+.equ SYS_NET_ATTACH, 228
 .equ SYS_POLL,   7
 .equ SYS_DRV_MMIO_MAP,  221
 .equ SYS_DRV_DMA_ALLOC, 222
@@ -92,6 +123,9 @@
 .equ DRIVER_STUB_CONSOLE_POLL, 4
 .equ DRIVER_STUB_POLL_NVAL, 5
 .equ DRIVER_STUB_SHM_WAIT, 6
+.equ DRIVER_STUB_SERVICE, 7
+.equ DRIVER_STUB_APP, 8
+.equ DRIVER_STUB_LINK, 9
 .equ DRIVER_STUB_MMIO_MAP, 21
 .equ DRIVER_STUB_DMA_ALLOC, 22
 
@@ -148,6 +182,16 @@
 .equ EVENT_PEER_CLOSE, 4
 .equ ERRNO_NODEV,     -19
 .equ SHM_WAIT_LONG_MS, 5000
+# Modes 7-9 (postinit.ritz ATTACH_* and LINK_TEST_*; driver_abi/src/link.ritz)
+.equ EVENT_ATTACH,    64
+.equ ERRNO_AGAIN,     -11
+.equ ERRNO_EXIST,     -17
+.equ SERVICE_OUT_CAP, 8
+.equ SERVICE_END,     176         # where the service keeps its records' end
+.equ LINK_SEQ_OFF,    0x20
+.equ LINK_H_PLAIN,    0x200000001
+.equ LINK_MAC_WORD,   0x0101013047005452   # 52:54:00:47:30:01, link_up 1, type 1
+.equ LINK_MTU,        1500
 
 .global driver_stub_start
 .type driver_stub_start, @function
@@ -174,6 +218,12 @@ driver_stub_start:
     je .Ldriver_stub_poll_nval
     cmpq $DRIVER_STUB_SHM_WAIT, %r12
     je .Ldriver_stub_shm_wait
+    cmpq $DRIVER_STUB_SERVICE, %r12
+    je .Ldriver_stub_service
+    cmpq $DRIVER_STUB_APP, %r12
+    je .Ldriver_stub_app
+    cmpq $DRIVER_STUB_LINK, %r12
+    je .Ldriver_stub_link
     cmpq $DRIVER_STUB_SPIN, %r12
     jne .Ldriver_stub_report
     rdtsc
@@ -598,6 +648,171 @@ driver_stub_start:
     movq %rax, WR_SOURCE+WS_HANDLE(%r14)
     movl $EVENT_DATA, WR_SOURCE+WS_MASK(%r14)
     movl $0, WR_SOURCE+WS_PAD(%r14)
+    ret
+
+# Mode 7. r14 = the request and eight out slots; r15 = records so far; rbx
+# = refused << 8 | maps; r12 walks the records one return copied.
+.Ldriver_stub_service:
+    subq $192, %rsp
+    movq %rsp, %r14
+    xorl %r15d, %r15d
+    xorl %ebx, %ebx
+.Lservice_wait:
+    movq $0, WR_SOURCES(%r14)
+    movl $0, WR_SOURCE_COUNT(%r14)
+    movl $SERVICE_OUT_CAP, WR_OUT_CAP(%r14)
+    leaq WR_EVENTS(%r14), %rax
+    movq %rax, WR_OUT(%r14)
+    movq $SHM_WAIT_LONG_MS, WR_DEADLINE(%r14)
+    movl $0, WR_OUT_COUNT(%r14)
+    movl $0, WR_PAD(%r14)
+    movq $SYS_SHM_WAIT, %rax
+    movq %r14, %rdi
+    syscall
+    cmpq $2, %rax
+    jne .Lservice_fail
+    movl WR_OUT_COUNT(%r14), %eax
+    testl %eax, %eax
+    jz .Lservice_fail
+    shlq $4, %rax                        # * WE_SIZE
+    leaq WR_EVENTS(%r14,%rax), %rax
+    movq %rax, SERVICE_END(%r14)
+    leaq WR_EVENTS(%r14), %r12
+.Lservice_record:
+    cmpl $EVENT_ATTACH, WE_BITS(%r12)
+    jne .Lservice_fail
+    movq $SYS_SHM_MAP, %rax
+    movq WE_HANDLE(%r12), %rdi
+    syscall
+    cmpq $ERRNO_PERM, %rax
+    je .Lservice_refused
+    testq %rax, %rax
+    jle .Lservice_fail
+    incq %rbx                            # mapped
+    jmp .Lservice_next
+.Lservice_refused:
+    addq $0x100, %rbx                    # dropped with its retired record
+.Lservice_next:
+    incq %r15
+    addq $WE_SIZE, %r12
+    cmpq SERVICE_END(%r14), %r12
+    jb .Lservice_record
+    cmpq %r13, %r15
+    jb .Lservice_wait
+    movq %r15, %rdi
+    shlq $16, %rdi
+    orq %rbx, %rdi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+.Lservice_fail:
+    movl $0xFF, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# Mode 8: attach, then attach again while holding the handle.
+.Ldriver_stub_app:
+    movq $SYS_NET_ATTACH, %rax
+    syscall
+    movl $1, %edi
+    testq %rax, %rax
+    js .Lapp_exit
+    movq $SYS_NET_ATTACH, %rax
+    syscall
+    movl $2, %edi
+    cmpq $ERRNO_EXIST, %rax
+    jne .Lapp_exit
+    xorl %edi, %edi
+.Lapp_exit:
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# Mode 9. r14 = a NetInfo buffer; r12 = the mapped link page; r15 = the
+# step number reported if a check fails.
+.Ldriver_stub_link:
+    subq $32, %rsp
+    movq %rsp, %r14
+    movl $1, %r15d                       # 1: nothing published
+    movq $SYS_NET_INFO, %rax
+    movq %r14, %rdi
+    syscall
+    cmpq $ERRNO_NODEV, %rax
+    jne .Llink_fail
+    testq %r13, %r13
+    jz .Llink_done
+    movl $2, %r15d                       # 2: link_seq 0 is unpublished
+    call .Llink_publish
+    cmpq $ERRNO_AGAIN, %rax
+    jne .Llink_fail
+    movl $3, %r15d                       # 3: map the link page
+    movq $SYS_SHM_MAP, %rax
+    movq %r13, %rdi
+    syscall
+    testq %rax, %rax
+    jle .Llink_fail
+    movq %rax, %r12
+    movl $4, %r15d                       # 4: link_seq 1, a write in progress
+    movq $1, LINK_SEQ_OFF(%r12)
+    mfence
+    call .Llink_publish
+    cmpq $ERRNO_AGAIN, %rax
+    jne .Llink_fail
+    movabsq $LINK_MAC_WORD, %rax
+    movq %rax, 0(%r12)
+    movl $LINK_MTU, 8(%r12)
+    mfence
+    movq $2, LINK_SEQ_OFF(%r12)          # generation 2
+    movl $5, %r15d                       # 5: no CAP_RIGHT_PUBLISH
+    movq $SYS_NET_PUBLISH, %rax
+    movabsq $LINK_H_PLAIN, %rdi
+    syscall
+    cmpq $ERRNO_PERM, %rax
+    jne .Llink_fail
+    movl $6, %r15d                       # 6: the publish
+    call .Llink_publish
+    testq %rax, %rax
+    jne .Llink_fail
+    movl $7, %r15d                       # 7: NetInfo copies the snapshot
+    movq $0, 0(%r14)
+    movq $0, 8(%r14)
+    movq $SYS_NET_INFO, %rax
+    movq %r14, %rdi
+    syscall
+    testq %rax, %rax
+    jne .Llink_fail
+    movabsq $LINK_MAC_WORD, %rax
+    cmpq %rax, 0(%r14)
+    jne .Llink_fail
+    cmpl $LINK_MTU, 8(%r14)
+    jne .Llink_fail
+    movl $8, %r15d                       # 8: not the caller's memory
+    movq $SYS_NET_INFO, %rax
+    movabsq $KERNEL_ADDR, %rdi
+    syscall
+    cmpq $ERRNO_FAULT, %rax
+    jne .Llink_fail
+    movl $9, %r15d                       # 9: link_seq 3 over scribbled bytes
+    movq $3, LINK_SEQ_OFF(%r12)
+    mfence
+    movq $0, 0(%r12)
+    call .Llink_publish
+    cmpq $ERRNO_AGAIN, %rax
+    jne .Llink_fail
+.Llink_done:
+    xorl %r15d, %r15d
+.Llink_fail:
+    movl %r15d, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# NetPublish with the publish handle (r13). RAX = the result.
+.Llink_publish:
+    movq $SYS_NET_PUBLISH, %rax
+    movq %r13, %rdi
+    syscall
     ret
 
 .size driver_stub_start, . - driver_stub_start
