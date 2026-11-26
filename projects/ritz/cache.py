@@ -37,6 +37,11 @@ CACHE_DIR_NAME = ".ritz-cache"
 # Persisted direct-import scans (AGAST #1832): "<context>\0<path>" ->
 # {"hash": content hash, "imports": [resolved paths]}.
 IMPORTS_FILE = "imports.json"
+# Recorded import closures of build entry points (AGAST #4775): see
+# `ClosureStore`.
+CLOSURES_FILE = "closures.json"
+# Import-resolution records a compiler change discards.
+SCAN_FILES = (IMPORTS_FILE, CLOSURES_FILE)
 COMPILER_HASH_FILE = "compiler_hash"
 # Left behind in old cache directories by the deleted artifact cache (AGAST
 # #3454). Nothing writes them now; a compiler change sweeps them away.
@@ -390,7 +395,7 @@ class BuildCache:
                     return False
             except OSError:
                 pass  # no record yet
-            for name in (IMPORTS_FILE, *LEGACY_ENTRIES):
+            for name in (*SCAN_FILES, *LEGACY_ENTRIES):
                 path = self.cache_dir / name
                 if path.is_dir():
                     shutil.rmtree(path)
@@ -441,3 +446,99 @@ class BuildCache:
                 self.get_transitive_dependencies(imp_path_obj, visited)
 
         return visited
+
+
+# (st_ino, st_size, st_mtime_ns, st_ctime_ns) -> content hash, per resolved
+# path. A package's targets share most of their closures (indium's 35 bins
+# import mostly the same ritzlib modules): each file is read once per
+# process while its stat is unchanged.
+_HASH_MEMO: dict[str, tuple[tuple[int, int, int, int], str]] = {}
+
+
+def _memo_file_hash(path: str) -> str | None:
+    """Content hash of `path`, None when it is not a readable file."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    stamp = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    hit = _HASH_MEMO.get(path)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    try:
+        digest = compute_file_hash(Path(path))
+    except OSError:
+        return None
+    _HASH_MEMO[path] = (stamp, digest)
+    return digest
+
+
+class ClosureStore:
+    """Recorded import closures of build entry points (AGAST #4775).
+
+    `ritz0/list_deps.py` resolves a target's closure in a fresh interpreter
+    (~0.19 s, most of it lexing and parsing). A warm build asked it again for
+    every target, every run: 6.5 s of indium's 7.3 s no-op build. A record
+    here lets the next build skip it while the evidence still holds, the
+    same evidence ritz0's source fast path trusts:
+
+      * `files`: the closure, in list_deps order, and each one's content
+        hash (an edit may add or drop an import);
+      * `misses`: every candidate the resolver probed and found missing
+        before a hit; one appearing shadows the import (AGAST #2030);
+      * `configs`: the ritz.toml files that registered an imported
+        namespace, hashed; their `sources` decide `<ns>.*` (AGAST #2087).
+
+    The caller's key carries everything else resolution reads (entry file,
+    project root, dependencies, source roots, RITZ_PATH, interface mode);
+    `identity` (ritz0's fingerprint) is folded into it. A failed resolution
+    is never recorded. The file lives with the import scans (`SCAN_FILES`)
+    and goes with them on a compiler change.
+    """
+
+    def __init__(self, cache_dir: Path, identity: str):
+        self.cache_dir = Path(cache_dir)
+        self.identity = identity
+        self._db: dict[str, dict] | None = None
+
+    def _full_key(self, key: str) -> str:
+        return f"{self.identity}\0{key}"
+
+    def _load(self) -> dict[str, dict]:
+        if self._db is None:
+            self._db = _read_json(self.cache_dir / CLOSURES_FILE)
+        return self._db
+
+    def lookup(self, key: str) -> list[str] | None:
+        """The recorded closure for `key`, or None if absent or stale."""
+        entry = self._load().get(self._full_key(key))
+        if not isinstance(entry, dict):
+            return None
+        try:
+            hashes = entry["hashes"]
+            if any(_memo_file_hash(p) != h for p, h in hashes.items()):
+                return None
+            if any(os.path.exists(m) for m in entry["misses"]):
+                return None
+            return list(entry["files"])
+        except (KeyError, TypeError, AttributeError):
+            return None  # malformed: resolve again
+
+    def record(self, key: str, closure: dict) -> None:
+        """Record list_deps' `--record` output for `key`.
+
+        `closure` has `files`, `misses` and `configs`. The files are hashed
+        here, after resolution; ritz0's own sig has the same window (an
+        edit landing mid-resolve is vouched for until the file next changes).
+        """
+        hashes: dict[str, str] = {}
+        for p in [*closure["files"], *closure["configs"]]:
+            digest = _memo_file_hash(p)
+            if digest is None:
+                return  # vanished already: nothing sound to record
+            hashes[p] = digest
+        entry = {"files": list(closure["files"]), "hashes": hashes,
+                 "misses": sorted(closure["misses"])}
+        with _cache_lock(self.cache_dir):
+            self._db = _merge_json(self.cache_dir / CLOSURES_FILE,
+                                   {self._full_key(key): entry}, indent=None)

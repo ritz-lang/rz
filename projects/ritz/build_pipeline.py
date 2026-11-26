@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import bounded_run
-from cache import BuildCache
+from cache import BuildCache, ClosureStore
 import cas
 from manifest import (BinaryConfig, LibraryConfig, SkippedBinary, StrayTestsDirError,
                       discover_test_files, get_build_profile,
@@ -1103,16 +1103,57 @@ def _list_deps(src_path: Path, *, project_root: Path,
                dependencies: dict[str, DependencySpec] = None,
                source_roots: list[str] = None,
                env: dict = None) -> subprocess.CompletedProcess:
-    """ritz0/list_deps.py on `src_path`: its import closure, one per line."""
+    """ritz0/list_deps.py on `src_path`: its import closure, one per line.
+
+    Served from the closure store while its record holds (AGAST #4775): a
+    no-op build then runs no list_deps.py at all. A miss runs it with
+    `--record` and records what the closure depends on.
+    """
+    env = env if env is not None else os.environ
     cmd = [sys.executable, str(RITZ0_DIR / "list_deps.py"), str(src_path),
            "--project-root", str(project_root)]
     if dependencies:
         cmd.extend(["--deps", _deps_json(dependencies)])
     if source_roots:
         cmd.extend(["--sources", json.dumps(source_roots)])
-    # The environment carries RITZ_PATH for import resolution.
-    return bounded_run.step(cmd, capture_output=True, text=True,
-                            env=env if env is not None else os.environ)
+    store = _closure_store()
+    # Everything resolution reads besides the files the record hashes. The
+    # environment carries RITZ_PATH, and whether interfaces are on.
+    key = json.dumps([str(Path(src_path).resolve()), cmd[1:],
+                      env.get("RITZ_PATH", ""),
+                      env.get(module_interface.DISABLE_ENV, "")])
+    files = store.lookup(key)
+    if files is not None:
+        return subprocess.CompletedProcess(
+            cmd, 0, "".join(f"{f}\n" for f in files), "")
+    result = bounded_run.step(cmd + ["--record"], capture_output=True,
+                              text=True, env=env)
+    if result.returncode != 0:
+        return result
+    try:
+        closure = json.loads(result.stdout)
+        files = closure["files"]
+    except (ValueError, KeyError, TypeError):
+        result.returncode = 1
+        result.stderr = f"list_deps.py --record printed no closure: {result.stdout!r}"
+        return result
+    store.record(key, closure)
+    result.stdout = "".join(f"{f}\n" for f in files)
+    return result
+
+
+# AGAST #4775: the closure store, created on first use (it needs ritz0's
+# fingerprint). Tests swap in their own.
+_CLOSURES: ClosureStore | None = None
+
+
+def _closure_store() -> ClosureStore:
+    """The closure store: beside ritz0's import scans, keyed by its identity."""
+    global _CLOSURES
+    if _CLOSURES is None:
+        ritz0 = get_build_cache("ritz0")
+        _CLOSURES = ClosureStore(ritz0.cache_dir, ritz0._get_current_compiler_hash())
+    return _CLOSURES
 
 
 def _listed_modules(stdout: str) -> list[Path]:

@@ -1952,6 +1952,16 @@ def collect_all_source_files(
     dependencies: Optional[Dict[str, DependencyMapping]] = None,
     source_roots: Optional[List[str]] = None
 ) -> List[str]:
+    """The `files` of `collect_closure`: main + all imports, in order."""
+    return collect_closure(source_path, project_root, dependencies, source_roots)["files"]
+
+
+def collect_closure(
+    source_path: str,
+    project_root: str | None = None,
+    dependencies: dict[str, DependencyMapping] | None = None,
+    source_roots: list[str] | None = None
+) -> dict[str, list[str]]:
     """Collect all source files needed for a module (main + all imports).
 
     This does a "dry run" of import resolution to discover all required files.
@@ -1964,10 +1974,14 @@ def collect_all_source_files(
         source_roots: List of source directories to search for imports
 
     Returns:
-        List of absolute paths to all required source files, in a deterministic
-        order (imports sorted by POSIX path first, main file last). The order is
-        stable across processes regardless of `PYTHONHASHSEED` — see
-        `order_source_files`.
+        `files`: absolute paths to all required source files, in a
+        deterministic order (imports sorted by POSIX path first, main file
+        last), stable across processes regardless of `PYTHONHASHSEED` (see
+        `order_source_files`). `misses`: every candidate probed and found
+        missing before a hit, and `configs`: the ritz.toml files that
+        registered an imported namespace; together with the files' contents,
+        what the closure depends on (AGAST #2030, #2087). build.py records
+        all three to skip re-resolving an unchanged closure (AGAST #4775).
     """
     # Ensure ritz0 directory is in path for local imports
     import sys
@@ -1993,4 +2007,8 @@ def collect_all_source_files(
     # Resolve imports (this populates resolver.processed_files)
     resolver.resolve(module, source_path)
 
-    return order_source_files(resolver.processed_files, source_path)
+    return {
+        "files": order_source_files(resolver.processed_files, source_path),
+        "misses": sorted(resolver.missed_candidates),
+        "configs": sorted(resolver.config_files),
+    }
