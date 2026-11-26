@@ -10,9 +10,9 @@ The first target machine for M2.4, "Boots on a laptop" (#1842, #1853).
 | Memory | 64 GB, 2 SO-DIMMs |
 | Captured | 2026-11-15. Read-only, over ssh, with sudo, from the machine's running Ubuntu 26.04 (kernel 7.0.0-42) |
 
-The machine left the LAN after this capture, so nothing here can be
-re-captured. Missing data will have to come from the inventory boot image
-(#3406) once the machine is back.
+The machine left the LAN after this capture, so nothing in it can be
+re-captured. The inventory stick (#3406) was booted on it on 2026-11-26:
+`hwinv/` is that dump, and it fills most of "What's missing" below.
 
 ## Files
 
@@ -31,6 +31,8 @@ re-captured. Missing data will have to come from the inventory boot image
 | `root/iomem.txt`, `root/interrupts.txt` | `/proc/iomem` (real addresses), `/proc/interrupts` |
 | `root/memmap/memmap.txt` | Firmware memory map from `/sys/firmware/memmap` (the e820 view) |
 | `root/efivars-list.txt` | EFI variable names (names only, no contents) |
+| `hwinv/` | The inventory stick's dump, scrubbed (#4300): raw ACPI, raw SMBIOS, the UEFI memory map, 4 KiB PCI config space, GOP modes, EDID. Layout: `projects/harland/inventory/README.md` |
+| `hwinv-summary.txt` | CPU, RAM, PCI names and display, generated from `hwinv/` by `inventory/dump_summary.py` |
 
 The DSDT and SSDTs are **not decompiled**: `iasl` (acpica-tools) is not
 installed on the machine where this was committed. Run
@@ -73,24 +75,29 @@ All ACPI table checksums are valid as committed (FACS has no checksum).
 
 ## What's missing
 
-What Linux could not show, or what this capture did not include:
+What Linux could not show, or what the Linux capture did not include. The
+first three and the last are now in `hwinv/`:
 
-- The **UEFI memory map** with EFI memory types. `memmap.txt` is the e820
-  view, and `iomem.txt` is Linux's merged view.
+- The **UEFI memory map** with EFI memory types: `hwinv/memmap.txt`, 90
+  descriptors. (`root/memmap/memmap.txt` is the e820 view, and `iomem.txt` is
+  Linux's merged view.)
 - **GOP modes**, the mode firmware boots in, and the framebuffer base and
-  stride.
-- **EDID:** the capture has no `edid/` directory, so panel timings are
-  missing.
+  stride: `hwinv/gop.txt`. Firmware boots in mode 0, 3840x2400, stride 3840
+  pixels, framebuffer 0x4000000000 (size 0x2328000). That is the iGPU's
+  prefetchable BAR, so the iGPU drives the panel at boot.
+- **EDID:** `hwinv/edid-0.bin`, the AUO B160ZAN01.T panel (256 bytes, base
+  block and one extension).
 - **The boot log.** The kernel ring buffer had wrapped after about 3 days of
   uptime and held only AppArmor audit lines and Bluetooth `hci0` reset
   timeouts. It was dropped (see below), so there are no boot-time e820, EFI,
   ACPI or PCI messages.
 - **The contents of EFI variables** (Setup, Secure Boot keys and so on), the
   TPM event log, and Option ROMs.
-- **The SMBIOS entry point and raw table bytes.** Only `dmidecode`'s decoded
-  text is here.
+- **The SMBIOS entry point and raw table bytes:** `hwinv/smbios/`.
 
-The inventory boot image (#3406) is meant to capture these.
+`hwinv/acpi/` is byte-identical to `root/acpi/` except `BGRT` and `PHAT`,
+which firmware rebuilds on every boot. The stick names `ASF!` as `ASF_`: it
+writes any signature byte outside `[0-9A-Za-z]` as `_`.
 
 ## Scrubbing
 
@@ -126,3 +133,22 @@ search of this directory for each original value finds nothing.
   default, so it was kept.
 - The `ssh` post-quantum warning lines at the top of some files were also
   removed.
+
+### `hwinv/`
+
+`hwinv/` was scrubbed by `projects/harland/inventory/scrub_dump.py`, which
+applies the rules above to the raw dump and keeps every file's size. Its
+report:
+
+- SMBIOS: the system, baseboard and chassis serial numbers, both DIMMs'
+  serial numbers and the system UUID; the battery's SBDS serial number; the
+  Lenovo type 133 opaque ID (handle 0x0031) and the string that repeats it.
+  The serials are overwritten with `X`s, and the UUID and IDs are zeroed.
+- `pci.bin`: the Device Serial Number of the card reader (0a:00.0) and of each
+  Thunderbolt function (20:00.0, 21:0x.0, 22:00.0) is zeroed.
+- The EDID has no serial number, and no ACPI table held an identifier.
+
+After the scrub, the script searched every file for each removed value, as
+text, as UTF-16 and as bytes in both byte orders, and for the machine's
+hostname and the owner's username. Nothing matched, and `check_dump.py`
+passes on the result.

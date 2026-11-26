@@ -2,7 +2,7 @@
 
 projects/harland/inventory holds a UEFI app (HWINV.EFI) that dumps ACPI,
 SMBIOS, the memory map, PCI config space, GOP/EDID and firmware facts to
-\\INVENTORY\\<timestamp>\\ on the FAT32 ESP it booted from, and two host tools:
+\\INVENTORY\\<timestamp>\\ on the FAT32 ESP it booted from, and host tools:
 
   esp_image.py   builds the raw USB-stick image (protective MBR + GPT + one
                  FAT32 ESP holding \\EFI\\BOOT\\BOOTX64.EFI) and reads files
@@ -10,9 +10,13 @@ SMBIOS, the memory map, PCI config space, GOP/EDID and firmware facts to
   check_dump.py  validates a dump: every ACPI table's signature, length and
                  checksum, the XSDT's table count, the SMBIOS entry point and
                  structure table, the memory map, PCI, GOP and the manifest,
-                 and any facts the test pinned on QEMU's command line.
+                 and any facts the test pinned on QEMU's command line;
+  scrub_dump.py  copies a real machine's dump without its serials, UUID,
+                 PCIe DSNs, EDID serial and product key, and proves none is
+                 left (#4300);
+  dump_summary.py  CPU, RAM, PCI names and display, read from a dump.
 
-These run both tools on synthetic inputs, so they need no QEMU, OVMF or
+These run the tools on synthetic inputs, so they need no QEMU, OVMF or
 build. inventory/test.sh boots the real image (the CI boot step).
 """
 
@@ -420,3 +424,271 @@ def test_linux_style_names_for_repeated_signatures(tmp_path):
     (d / "manifest.txt").write_text(
         "".join(f"{p.relative_to(d).as_posix()} {p.stat().st_size}\n" for p in files) + "end\n")
     assert _check(d) == 0
+
+
+def _rewrite_manifest(d):
+    files = sorted(p for p in d.rglob("*") if p.is_file() and p.name != "manifest.txt")
+    (d / "manifest.txt").write_text(
+        "".join(f"{p.relative_to(d).as_posix()} {p.stat().st_size}\n" for p in files) + "end\n")
+
+
+def _add_tables(d, tables):
+    """Add (file name, table) pairs to the dump, list them in the XSDT."""
+    xsdt = bytearray((d / "acpi" / "XSDT").read_bytes())
+    for name, t in tables:
+        xsdt += struct.pack("<Q", 0x7FFF0000 + len(xsdt))
+        (d / "acpi" / name).write_bytes(t)
+    struct.pack_into("<I", xsdt, 4, len(xsdt))
+    xsdt[9] = 0
+    (d / "acpi" / "XSDT").write_bytes(_checksum_fix(xsdt, 9))
+    _rewrite_manifest(d)
+
+
+@pytest.mark.parametrize("sig, names", [
+    ("ASF!", ["ASF_"]),               # HWINV writes a FAT-unsafe byte as '_'
+    ("DBG2", ["DBG2"]),               # a digit in the signature is not an instance number
+    ("TPM2", ["TPM2"]),
+    ("DBG2", ["DBG21", "DBG22"]),     # ...and a repeated one still gets 1, 2
+])
+def test_real_firmware_table_names(tmp_path, capsys, sig, names):
+    d = _write_dump(tmp_path)
+    _add_tables(d, [(n, _acpi_table(sig, bytes(4 * i))) for i, n in enumerate(names)])
+    assert _check(d) == 0, capsys.readouterr().out
+
+
+# --- scrub_dump: identifiers out, everything else byte-identical --------------
+
+scrub_dump = _load("scrub_dump")
+dump_summary = _load("dump_summary")
+
+SYS_SERIAL, BOARD_SERIAL, CHASSIS_SERIAL, ASSET = "SYSSER0001", "BRDSER0002", "CHSSER0003", "ASSET-0077"
+CPU_SERIAL, DIMM_SERIAL = "CPUSER0004", "DIMMSER05"
+UUID = bytes(range(0x31, 0x41))
+OEM_ID = bytes(range(0xA1, 0xB1))
+DSN = bytes.fromhex("0011223344556677")
+EDID_SERIAL32 = bytes.fromhex("51525354")
+EDID_SERIAL_TEXT = "MONSER0006"
+PRODUCT_KEY = "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE"
+SECRETS = [SYS_SERIAL, BOARD_SERIAL, CHASSIS_SERIAL, ASSET, CPU_SERIAL, DIMM_SERIAL, UUID, OEM_ID,
+           DSN, EDID_SERIAL32, EDID_SERIAL_TEXT, PRODUCT_KEY]
+
+
+def _struct_at(typ, handle, ln, fields, strings):
+    """An SMBIOS structure of formatted length ln with byte/word fields set."""
+    f = bytearray(ln)
+    f[0], f[1] = typ, ln
+    struct.pack_into("<H", f, 2, handle)
+    for at, v in fields.items():
+        if isinstance(v, bytes):
+            f[at:at + len(v)] = v
+        elif at in WORD_FIELDS.get(typ, ()):
+            struct.pack_into("<H", f, at, v)
+        else:
+            f[at] = v
+    tail = b"\0".join(s if isinstance(s, bytes) else s.encode() for s in strings) + b"\0\0" \
+        if strings else b"\0\0"
+    return bytes(f) + tail
+
+
+WORD_FIELDS = {4: (0x14, 0x16), 17: (0x0C, 0x15), 22: (0x10,)}
+
+
+def _real_smbios():
+    s = [
+        _struct_at(0, 0, 0x1A, {4: 1, 5: 2, 8: 3}, ["Firmware Co", "1.57", "10/21/2024"]),
+        _struct_at(1, 1, 0x1B, {4: 1, 5: 2, 6: 3, 7: 4, 8: UUID}, ["Box Co", "Box 9", "Rev A", SYS_SERIAL]),
+        _struct_at(2, 2, 0x0F, {4: 1, 5: 2, 6: 3, 7: 4, 8: 5},
+                   ["Board Co", "BRD-1", "1.0", BOARD_SERIAL, "Default string"]),
+        _struct_at(3, 3, 0x16, {4: 1, 5: 0x0A, 6: 2, 7: 3, 8: 4}, ["Box Co", "1.0", CHASSIS_SERIAL, ASSET]),
+        _struct_at(4, 4, 0x30, {0x10: 1, 0x14: 4000, 0x16: 3500, 0x18: 0x41, 0x20: 2, 0x21: 3, 0x23: 4, 0x25: 8},
+                   ["Example CPU 9000 @ 3.50GHz", CPU_SERIAL, "To Be Filled By O.E.M."]),
+        _struct_at(17, 5, 0x28, {0x0C: 8192, 0x10: 1, 0x12: 0x1A, 0x15: 3200, 0x17: 2, 0x18: 3, 0x1A: 4},
+                   ["DIMM_A1", "Hynix", DIMM_SERIAL, "HMA81GS6 "]),
+        _struct_at(17, 6, 0x28, {0x0C: 8192, 0x10: 1, 0x12: 0x1A, 0x15: 3200, 0x17: 2, 0x18: 3, 0x1A: 4},
+                   ["DIMM_B1", "Hynix", "00000000", "HMA81GS6 "]),
+        _struct_at(22, 7, 0x1A, {4: 1, 5: 2, 8: 3, 0x10: 0xBEEF}, ["Front", "SMP", "BATT-NAME1"]),
+        _struct_at(133, 8, 0x2C, {4: OEM_ID}, [b"\x85," + OEM_ID, b"\x03OEMTEXT"]),
+        _struct_at(127, 9, 4, {}, []),
+    ]
+    table = b"".join(s)
+    ep = bytearray(24)
+    ep[0:5] = b"_SM3_"
+    ep[6], ep[7], ep[10] = 24, 3, 1
+    struct.pack_into("<IQ", ep, 12, len(table), 0x7F000000)
+    return _checksum_fix(ep, 5), table
+
+
+def _edid():
+    e = bytearray(128)
+    e[0:8] = b"\0\xff\xff\xff\xff\xff\xff\0"
+    e[8:10] = b"\x04\x43"
+    e[12:16] = EDID_SERIAL32
+    for i, (tag, text) in enumerate([(0xFF, EDID_SERIAL_TEXT), (0xFC, "PANEL-27")]):
+        blk = 54 + 18 * i
+        e[blk + 3] = tag
+        e[blk + 5:blk + 18] = (text.encode() + b"\n").ljust(13, b" ")
+    return _checksum_fix(e, 127)
+
+
+def _write_real_dump(root):
+    """A dump shaped like a real machine's: serials, a UUID, a PCIe DSN, an
+    EDID serial and a Windows product key, beside the names that stay."""
+    d = _write_dump(root)
+    ep, dmi = _real_smbios()
+    (d / "smbios" / "smbios_entry_point").write_bytes(ep)
+    (d / "smbios" / "DMI").write_bytes(dmi)
+    cfg = bytearray(4096)
+    struct.pack_into("<HH", cfg, 0, 0x8086, 0x15A1)
+    cfg[9], cfg[10], cfg[11] = 0, 0, 2
+    struct.pack_into("<I", cfg, 0x100, 0x00000003 | (1 << 16) | (0x140 << 20))
+    cfg[0x104:0x10C] = DSN
+    struct.pack_into("<I", cfg, 0x140, 0x0000000B | (1 << 16))   # a vendor cap after it
+    cfg[0x144:0x148] = b"KEEP"
+    with (d / "pci.bin").open("ab") as f:
+        f.write(struct.pack("<HBBBBH", 0, 4, 0, 0, 0, 4096) + bytes(cfg))
+    with (d / "pci.txt").open("a") as f:
+        f.write("0000:04:00.0 8086:15a1 class 020000 cfg 4096\n")
+    (d / "edid-0.bin").write_bytes(_edid())
+    (d / "gop.txt").write_text((d / "gop.txt").read_text().replace("edid none", "edid 0 128"))
+    (d / "hwinv.log").write_text("HWINV: writing \\INVENTORY\\20261119-060203\n")
+    msdm = struct.pack("<IIIII", 1, 0, 1, 0, len(PRODUCT_KEY)) + PRODUCT_KEY.encode()
+    _add_tables(d, [("MSDM", _acpi_table("MSDM", msdm))])
+    return d
+
+
+def test_an_edid_with_a_bad_checksum_fails(tmp_path, capsys):
+    d = _write_real_dump(tmp_path / "raw")
+    e = bytearray((d / "edid-0.bin").read_bytes())
+    e[20] ^= 1
+    (d / "edid-0.bin").write_bytes(bytes(e))
+    assert check_dump.main([str(d)]) == 1
+    assert "edid-0.bin" in capsys.readouterr().out
+
+
+def _scrub(raw, out, *extra):
+    return scrub_dump.main([str(raw), str(out), *extra])
+
+
+def _haystacks(d):
+    return {p.relative_to(d).as_posix(): p.read_bytes() for p in d.rglob("*") if p.is_file()}
+
+
+def _forms(secret):
+    if isinstance(secret, bytes):
+        return [secret, secret[::-1]]
+    return [secret.encode(), secret.encode("utf-16-le")]
+
+
+def test_the_real_shaped_dump_is_valid_and_holds_every_secret(tmp_path, capsys):
+    """The fixture itself: check_dump passes it, and each secret is in it."""
+    d = _write_real_dump(tmp_path / "raw")
+    assert check_dump.main([str(d)]) == 0, capsys.readouterr().out
+    blob = b"".join(_haystacks(d).values())
+    for s in SECRETS:
+        assert _forms(s)[0] in blob, s
+
+
+def test_scrub_removes_every_identifier(tmp_path, capsys):
+    raw = _write_real_dump(tmp_path / "raw")
+    out = tmp_path / "out"
+    assert _scrub(raw, out) == 0, capsys.readouterr().out
+    for name, data in _haystacks(out).items():
+        for s in SECRETS:
+            for form in _forms(s):
+                assert form not in data, f"{s!r} left in {name}"
+
+
+def test_scrubbed_dump_still_checks_and_keeps_its_shape(tmp_path, capsys):
+    raw = _write_real_dump(tmp_path / "raw")
+    out = tmp_path / "out"
+    assert _scrub(raw, out) == 0
+    assert check_dump.main([str(out)]) == 0, capsys.readouterr().out
+    before, after = _haystacks(raw), _haystacks(out)
+    assert {k: len(v) for k, v in before.items()} == {k: len(v) for k, v in after.items()}
+    for unchanged in ("memmap.bin", "acpi/DSDT", "acpi/APIC", "gop.txt", "manifest.txt"):
+        assert before[unchanged] == after[unchanged], unchanged
+
+
+def test_scrub_keeps_names_placeholders_and_the_rest_of_config_space(tmp_path):
+    raw = _write_real_dump(tmp_path / "raw")
+    out = tmp_path / "out"
+    assert _scrub(raw, out) == 0
+    dmi = (out / "smbios" / "DMI").read_bytes()
+    for kept in (b"Box Co", b"Box 9", b"Example CPU 9000", b"Default string", b"To Be Filled By O.E.M.",
+                 b"00000000", b"HMA81GS6", b"BATT-NAME1", b"\x03OEMTEXT"):
+        assert kept in dmi, kept
+    assert b"KEEP" in (out / "pci.bin").read_bytes()
+    assert b"PANEL-27" in (out / "edid-0.bin").read_bytes()
+    assert b"\xef\xbe" not in dmi                           # the battery's SBDS serial word
+
+
+@pytest.mark.parametrize("planted", [
+    SYS_SERIAL.encode(),                    # a serial as text
+    SYS_SERIAL.encode("utf-16-le"),         # ...as UTF-16, as in a _STR
+    DSN[::-1],                              # an ID's bytes, the other byte order
+], ids=["text", "utf16", "reversed"])
+def test_scrub_refuses_an_identifier_it_cannot_place(tmp_path, capsys, planted):
+    """A serial somewhere no rule covers (here: in the DSDT) fails the scrub
+    and writes nothing, rather than committing it."""
+    raw = _write_real_dump(tmp_path / "raw")
+    (raw / "acpi" / "DSDT").write_bytes(_acpi_table("DSDT", b"\x0d" + planted + b"\0", rev=2))
+    _rewrite_manifest(raw)
+    out = tmp_path / "out"
+    assert _scrub(raw, out) == 1
+    assert "acpi/DSDT" in capsys.readouterr().out
+    assert not out.exists()
+
+
+def test_scrub_refuses_a_forbidden_word(tmp_path, capsys):
+    raw = _write_real_dump(tmp_path / "raw")
+    (raw / "hwinv.log").write_text("HWINV on myhost\n")
+    _rewrite_manifest(raw)
+    assert _scrub(raw, tmp_path / "out", "--forbid", "MyHost") == 1
+    assert "hwinv.log" in capsys.readouterr().out
+    assert not (tmp_path / "out").exists()
+
+
+def test_scrub_report_names_fields_not_values(tmp_path, capsys):
+    raw = _write_real_dump(tmp_path / "raw")
+    assert _scrub(raw, tmp_path / "out") == 0
+    report = capsys.readouterr().out
+    for what in ("serial", "uuid", "dsn", "edid", "msdm"):
+        assert what in report.lower(), what
+    for s in SECRETS:
+        assert (s if isinstance(s, str) else s.hex()) not in report
+
+
+# --- dump_summary: CPU, RAM and PCI names, from the dump on the host -------------
+
+PCI_IDS = """\
+#\tVersion: 2026.11.01
+1234  Technical Corp.
+\t1111  QEMU Virtual Video Controller
+8086  Intel Corporation
+\t15a1  Ethernet Connection (2) I218-V
+\t29c0  82G33/G31/P35/P31 Express DRAM Controller
+C 02  Network controller
+\t00  Ethernet controller
+C 03  Display controller
+\t00  VGA compatible controller
+C 06  Bridge
+\t00  Host bridge
+"""
+
+
+def test_summary_names_cpu_ram_pci_and_panel(tmp_path):
+    d = _write_real_dump(tmp_path / "raw")
+    ids = tmp_path / "pci.ids"
+    ids.write_text(PCI_IDS)
+    text = dump_summary.summarize(d, ids)
+    assert "Example CPU 9000 @ 3.50GHz" in text
+    assert "4 cores, 8 threads" in text
+    assert "16384 MiB" in text and "DDR4" in text and "3200 MT/s" in text and "HMA81GS6" in text
+    assert "0000:04:00.0 8086:15a1 Ethernet controller: Intel Corporation " \
+           "Ethernet Connection (2) I218-V" in text
+    assert "0000:00:02.0 1af4:1005 class 00ff00" in text     # not in pci.ids: ids only
+    assert "pci.ids 2026.11.01" in text
+    assert "PANEL-27" in text
+    assert "Box Co Box 9" in text
+    for s in SECRETS:
+        assert (s if isinstance(s, str) else s.hex()) not in text

@@ -5,8 +5,10 @@ HWINV.EFI writes \\INVENTORY\\<timestamp>\\ with:
 
     acpi/RSDP, acpi/XSDT, acpi/<SIG>[n]   every table, raw; names as Linux's
                                           /sys/firmware/acpi/tables (SSDT1,
-                                          SSDT2 when a signature repeats);
-                                          DSDT and FACS come from the FADT
+                                          SSDT2 when a signature repeats),
+                                          except that a byte outside [0-9A-Za-z]
+                                          is '_' (ASF! is ASF_); DSDT and FACS
+                                          come from the FADT
     smbios/smbios_entry_point, smbios/DMI as /sys/firmware/dmi/tables
     memmap.bin, memmap.txt                GetMemoryMap's descriptors
     pci.bin, pci.txt                      config space of every function
@@ -37,6 +39,61 @@ NO_CHECKSUM = {"FACS"}
 
 class DumpError(Exception):
     pass
+
+
+def file_sig(sig):
+    """The file name HWINV gives a table's signature: bytes outside
+    [0-9A-Za-z] become '_' (main.ritz table_name), so ASF! is ASF_."""
+    return re.sub(r"[^0-9A-Za-z]", "_", sig)
+
+
+class SmbiosStruct:
+    """One SMBIOS structure: its offset in the table, type, handle, formatted
+    length, and its strings with their offsets (string i is strings[i - 1])."""
+
+    def __init__(self, dmi, off, ln, end):
+        self.off, self.typ, self.ln = off, dmi[off], ln
+        self.handle = struct.unpack_from("<H", dmi, off + 2)[0]
+        self.strings, self.string_offs = [], []
+        at = off + ln
+        if end > at:
+            for raw in dmi[at:end].split(b"\0"):
+                self.strings.append(raw)
+                self.string_offs.append(at)
+                at += len(raw) + 1
+        self.dmi = dmi
+
+    def byte(self, i):
+        return self.dmi[self.off + i] if i < self.ln else 0
+
+    def word(self, i):
+        return struct.unpack_from("<H", self.dmi, self.off + i)[0] if i + 2 <= self.ln else 0
+
+    def string_index(self, i):
+        idx = self.byte(i)
+        return idx if 0 < idx <= len(self.strings) else 0
+
+    def s(self, i):
+        idx = self.string_index(i)
+        return self.strings[idx - 1].decode("latin-1") if idx else ""
+
+
+def smbios_structures(dmi):
+    """Every structure in an SMBIOS structure table, through type 127.
+    Raises DumpError on a bad length or a missing string-set terminator."""
+    off = 0
+    while off + 4 <= len(dmi):
+        ln = dmi[off + 1]
+        if ln < 4 or off + ln > len(dmi):
+            raise DumpError(f"SMBIOS: structure at {off} has a bad length")
+        end = dmi.find(b"\0\0", off + ln)
+        if end < 0:
+            raise DumpError(f"SMBIOS: structure at {off} has no string-set terminator")
+        st = SmbiosStruct(dmi, off, ln, end)
+        yield st
+        if st.typ == 127:
+            return
+        off = end + 2
 
 
 def find_dump_dir(root):
@@ -81,16 +138,17 @@ class Checker:
                     self.err(f"RSDP: extended length {length} / checksum wrong (file {len(rsdp)} bytes)")
                 elif struct.unpack_from("<Q", rsdp, 24)[0] == 0:
                     self.err("RSDP: revision 2 with no XSDT address")
-        tables = {}
+        tables, file_sigs = {}, {}
         for p in sorted((self.d / "acpi").glob("*")) if (self.d / "acpi").is_dir() else []:
             if p.name == "RSDP":
                 continue
             t = p.read_bytes()
             tables[p.name] = t
             sig = t[:4].decode("latin-1")
-            if not re.fullmatch(re.escape(sig) + r"\d*", p.name):
+            if not re.fullmatch(re.escape(file_sig(sig)) + r"\d*", p.name):
                 self.err(f"acpi/{p.name}: signature is {sig!r}, not the file's name")
                 continue
+            file_sigs[p.name] = file_sig(sig)
             if len(t) < 8 or struct.unpack_from("<I", t, 4)[0] != len(t):
                 self.err(f"acpi/{p.name}: header length != file size {len(t)}")
                 continue
@@ -107,7 +165,8 @@ class Checker:
             self.err(f"XSDT lists {listed} tables but {len(via_xsdt)} were dumped: {sorted(via_xsdt)}")
         sigs = {}
         for n in via_xsdt:
-            sigs.setdefault(re.sub(r"\d+$", "", n), []).append(n)
+            if n in file_sigs:   # by the table's own signature: DBG2 is not DBG + 2
+                sigs.setdefault(file_sigs[n], []).append(n)
         for sig, names in sigs.items():
             want = [sig] if len(names) == 1 else [f"{sig}{i}" for i in range(1, len(names) + 1)]
             if sorted(names) != sorted(want):
@@ -155,33 +214,22 @@ class Checker:
         else:
             self.err("SMBIOS entry point: no _SM3_ or _SM_ anchor")
             return
-        off, mem_mib, system, ended = 0, 0, {}, False
-        while off + 4 <= len(dmi):
-            typ, ln = dmi[off], dmi[off + 1]
-            if ln < 4 or off + ln > len(dmi):
-                self.err(f"SMBIOS: structure at {off} has a bad length")
-                return
-            end = dmi.find(b"\0\0", off + ln)
-            if end < 0:
-                self.err(f"SMBIOS: structure at {off} has no string-set terminator")
-                return
-            strings = dmi[off + ln:end].split(b"\0")
-
-            def s(i):
-                idx = dmi[off + i] if i < ln else 0
-                return strings[idx - 1].decode("latin-1") if 0 < idx <= len(strings) else ""
-            if typ == 1:
-                system = {"manufacturer": s(4), "product": s(5), "version": s(6), "serial": s(7)}
-            elif typ == 17 and ln >= 0x0E:
-                size = struct.unpack_from("<H", dmi, off + 0x0C)[0]
-                if size == 0x7FFF and ln >= 0x20:
-                    mem_mib += struct.unpack_from("<I", dmi, off + 0x1C)[0]
-                elif size not in (0, 0xFFFF):
-                    mem_mib += (size & 0x7FFF) // 1024 if size & 0x8000 else size
-            off = end + 2
-            if typ == 127:
-                ended = True
-                break
+        mem_mib, system, ended = 0, {}, False
+        try:
+            for st in smbios_structures(dmi):
+                if st.typ == 1:
+                    system = {"manufacturer": st.s(4), "product": st.s(5), "version": st.s(6),
+                              "serial": st.s(7)}
+                elif st.typ == 17 and st.ln >= 0x0E:
+                    size = st.word(0x0C)
+                    if size == 0x7FFF and st.ln >= 0x20:
+                        mem_mib += struct.unpack_from("<I", dmi, st.off + 0x1C)[0]
+                    elif size not in (0, 0xFFFF):
+                        mem_mib += (size & 0x7FFF) // 1024 if size & 0x8000 else size
+                ended = st.typ == 127
+        except DumpError as e:
+            self.err(str(e))
+            return
         if not ended:
             self.err("SMBIOS: no end-of-table (type 127) structure")
         self.facts["smbios_system"] = system
@@ -256,6 +304,8 @@ class Checker:
                 e = self.read(f"edid-{em[1]}.bin")
                 if e is not None and (len(e) != int(em[2]) or e[:8] != b"\0\xff\xff\xff\xff\xff\xff\0"):
                     self.err(f"edid-{em[1]}.bin: bad size or EDID header")
+                elif e is not None and any(sum(e[i:i + 128]) & 0xFF for i in range(0, len(e), 128)):
+                    self.err(f"edid-{em[1]}.bin: a 128-byte block's checksum does not sum to zero")
 
     def firmware(self):
         txt = self.read("firmware.txt")

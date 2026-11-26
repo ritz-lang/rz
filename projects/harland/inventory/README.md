@@ -17,6 +17,8 @@ and read the files on any computer.
   removable-media default path, so firmware boots it with no NVRAM entry.
   The script is pure Python: it needs no mtools, dosfstools or root.
 - **`check_dump.py`** validates a dump (see below).
+- **`scrub_dump.py`** and **`dump_summary.py`** prepare a real machine's dump
+  for committing (see "Commit a real machine's dump").
 - **`test.sh`** boots the image headless (q35 + OVMF, writable USB storage)
   and checks the dump. CI runs it in the build-all job.
 
@@ -40,7 +42,7 @@ machines can share one stick.
 | File | Contents |
 |---|---|
 | `acpi/RSDP`, `acpi/XSDT` (or `RSDT`) | raw |
-| `acpi/<SIG>[n]` | every table the XSDT lists, raw, named as Linux's `/sys/firmware/acpi/tables` (`SSDT1`, `SSDT2` when a signature repeats) |
+| `acpi/<SIG>[n]` | every table the XSDT lists, raw, named as Linux's `/sys/firmware/acpi/tables` (`SSDT1`, `SSDT2` when a signature repeats), except that a signature byte outside `[0-9A-Za-z]` is written as `_` (`ASF!` is `ASF_`) |
 | `acpi/DSDT`, `acpi/FACS` | from the FADT |
 | `smbios/smbios_entry_point`, `smbios/DMI` | SMBIOS3 when the firmware has it, else 2.x; same layout as `/sys/firmware/dmi/tables` |
 | `memmap.bin`, `memmap.txt` | GetMemoryMap's descriptors, raw and one line each (`type start pages attr`) |
@@ -62,9 +64,11 @@ python3 projects/harland/inventory/check_dump.py out/
 `check_dump.py` checks:
 
 - every ACPI table's signature, length and checksum;
-- that the XSDT's table count matches the files and the files use Linux's names;
+- that the XSDT's table count matches the files and the files use Linux's
+  names, telling an instance number from a digit in the signature (`DBG2`,
+  `TPM2`);
 - the SMBIOS entry point and structure table;
-- the memory map, PCI, GOP and the manifest.
+- the memory map, PCI, GOP, each EDID block's checksum, and the manifest.
 
 `--expect-cpus`, `--expect-mem-mib`, `--expect-smbios field=value`,
 `--expect-acpi` and `--expect-pci` pin known facts. `test.sh` uses them with
@@ -77,5 +81,39 @@ installed.
 make -C projects/harland test-inventory      # ~12 s
 ```
 
-Real hardware and a scrub/commit script for the dumps are Phase 2 (AGAST
-#4300).
+## Commit a real machine's dump
+
+A real dump holds the machine's identifiers, so it is never committed raw
+(#4300). The dumps live in `projects/harland/docs/hardware/<model>/hwinv/`,
+next to the machine's README and `hwinv-summary.txt`.
+
+```bash
+I=projects/harland/inventory
+H=projects/harland/docs/hardware/<model>
+python3 $I/check_dump.py /media/stick/INVENTORY/<stamp>
+python3 $I/scrub_dump.py /media/stick/INVENTORY/<stamp> $H/hwinv \
+    --forbid <hostname> --forbid <username>
+python3 $I/dump_summary.py $H/hwinv -o $H/hwinv-summary.txt
+```
+
+`scrub_dump.py` copies the dump with these removed, and everything else
+byte-identical:
+
+- SMBIOS serial numbers and asset tags (types 1, 2, 3, 4, 17, 22, 39), unless
+  they are a vendor placeholder; the system UUID; the battery's SBDS serial;
+  Lenovo's type 133 opaque ID;
+- every PCIe Device Serial Number (some NICs put their MAC address in it);
+- the EDID serial number and serial-string descriptor;
+- the Windows product key in `MSDM`.
+
+Edits keep each file's size and fix the checksums they break, so
+`manifest.txt` stays right and `check_dump.py` still passes. Afterwards the
+script searches every file for every value it removed (text, UTF-16, bytes in
+both byte orders) and for each `--forbid` word. If one still turns up
+somewhere no rule covers, it writes nothing and names the file. It prints
+which fields it scrubbed, never their values: copy that into the machine's
+README.
+
+`dump_summary.py` prints the machine, firmware, CPU, RAM, display and every
+PCI function with its name from `pci.ids` (lspci's database, found on the
+host; `--pci-ids` picks another). It never prints a serial number.
