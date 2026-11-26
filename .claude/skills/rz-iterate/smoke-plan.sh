@@ -51,6 +51,9 @@
 #   projects/ritz/tools/**               tools-unit
 #   projects/ritz/scripts/**             harness-selftest
 #   projects/ritz/<anything else>        unit tools-unit (build.py & co.)
+#   projects/builder/**                  builder (projects/builder/test.sh:
+#                                        the image build and its in-container
+#                                        checks; no ritz.toml, AGAST #4822)
 #   projects/<pkg>/**                    ritz1-bootstrap pkg:<pkg>  (./rz
 #                                        build under ritz0, ritz1 and
 #                                        ritz1_selfhosted, then ./rz test),
@@ -125,6 +128,7 @@ cmd_of() {
         ritzlib-ritz1)    echo "make -C projects/ritz ritzlib-tests-ritz1" ;;
         build-all)        echo "./rz build --all" ;;
         build-all-ritz1)  echo "make -C projects/ritz build-all-ritz1" ;;
+        builder)          echo "bash projects/builder/test.sh" ;;
         # The package under every compiler the gate builds it with (#4777:
         # #4739's package built under ritz0 and only ritz1 refused it), all
         # three in full, then its tests.  A compiler whose known-failures/
@@ -194,6 +198,7 @@ targets_of() {
         projects/ritz/tools/*)    echo tools-unit ;;
         projects/ritz/scripts/*)  echo harness-selftest ;;
         projects/ritz/*)          echo unit; echo tools-unit ;;
+        projects/builder/*)       echo builder ;;
         projects/*/*)             rest="${p#projects/}"; echo ritz1-bootstrap
                                   if grep -qxF -- "projects/${rest%%/*}" <<<"$EXCLUDED"; then
                                       echo "entry:${rest%%/*}"; return
@@ -205,7 +210,7 @@ targets_of() {
 }
 
 # The fixed order targets run and are quoted in: cheap and broad first.
-ORDER=(smoke doc-examples tools-unit tools-ratchets harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1)
+ORDER=(smoke doc-examples tools-unit tools-ratchets harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1 builder)
 
 # plan_targets <range...>: every target for the diff, smoke first, in ORDER,
 # then entry:/pkg:/skill: targets sorted.

@@ -39,6 +39,11 @@ change projects/ritz/tools/t.py >/dev/null;     eq "$(targets)" "smoke tools-uni
 change projects/ritz/scripts/s.sh >/dev/null;   eq "$(targets)" "smoke tools-ratchets harness-selftest" "scripts run the harness self-tests"
 change projects/ritz/build.py >/dev/null;       eq "$(targets)" "smoke tools-unit unit" "other ritz files run unit and tools-unit"
 change projects/nexus/src/n.ritz >/dev/null;    eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:nexus" "a package builds the compilers, then its own build and tests"
+# AGAST #4822: projects/builder has no ritz.toml (a Dockerfile, not a
+# package), so pkg:builder would be `./rz build builder`, which fails.  Its
+# own test builds the image, which bootstraps the compilers inside it.
+change projects/builder/Dockerfile >/dev/null;  eq "$(targets)" "smoke tools-ratchets builder" "the builder image runs its own image test, not a package build"
+has "$(bash "$SP" plan)" "^builder	bash projects/builder/test.sh$" "the builder target runs projects/builder/test.sh"
 change .claude/skills/rz-iterate/train.sh >/dev/null
 eq "$(targets)" "smoke tools-unit tools-ratchets skill:rz-iterate" "a skill runs its own tests and tools-unit"
 # AGAST #4580 bounce: tools/test_provision_room.py and test_smoke.py assert
@@ -120,6 +125,19 @@ change projects/editor/ritz.toml >/dev/null
 change projects/editor/src/e.ritz >/dev/null
 eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap entry:editor" "an excluded top-level package runs its dedicated entry, not pkg:"
 has "$(bash "$SP" plan)" "^entry:editor	make -C projects/editor test$" "entry: runs the package's own make test"
+# #4822 x #4813: the two rules side by side.  buddhafinger keeps its entry:
+# when the same diff touches the builder image, and projects/builder stays
+# builder even if rz.toml excludes it (it has no make test to run).  Reset
+# after, so the range assertion below is unchanged.
+mark="$(git rev-parse HEAD)"
+printf '"projects/buddhafinger" = "ritz1_selfhosted only, #4782"\n"projects/builder" = "not a package"\n' >> rz.toml
+change projects/buddhafinger/ritz.toml >/dev/null
+change projects/buddhafinger/src/main.ritz projects/builder/test.sh >/dev/null
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap builder entry:buddhafinger" "builder and an excluded package in one diff: builder, and buddhafinger's entry:"
+has "$(bash "$SP" plan)" "^entry:buddhafinger	make -C projects/buddhafinger test$" "buddhafinger's entry: runs its make test"
+change projects/builder/Dockerfile >/dev/null
+eq "$(targets)" "smoke tools-ratchets builder" "an excluded projects/builder is still builder, never entry:builder"
+git reset -q --hard "$mark"
 
 # 2. A mixed diff: each target once, in the fixed order, packages last.
 s="$(change projects/ritz/ritz0/y.py projects/ritz/tools/u.py projects/ritz/ritz0/z.py \
