@@ -1,0 +1,74 @@
+# paste_check: a paste into a busy reader on Harland's console (AGAST #4831).
+#
+# harland's tools/shell_session.py runs it from rzsh over the serial
+# console. It puts the console in raw mode, takes a KeyReader, prints
+# `paste_check: ready` and then reads nothing for PASTE_BUSY_MS, the way an
+# editor busy redrawing doesn't, while the host pastes: COM1's interrupt
+# keeps moving the bytes into the console's input queue (16 KiB). Then it
+# reads until PASTE_IDLE_MS pass with nothing more and prints
+#
+#     paste_check: <n> bytes sum <s> overrun <m>
+#
+# n the bytes it read, s their sum, m the reader's take_overruns(): what
+# the queue dropped. A paste that fits arrives whole (overrun 0); a larger
+# one is n + m bytes, so a program can say "input overrun" instead of
+# losing keys silently.
+#
+# Exit 0, or 1 if the console is not a terminal or a read failed.
+
+import ritzlib.strview { StrView }
+import ritzlib.span { span_from_ptr }
+import ritzlib.result
+import ritzlib.timedread
+import ritzlib.termsession
+
+const STDIN: i32 = 0
+# The host pastes as soon as it sees `ready`; under TCG the whole paste is
+# in the queue (or dropped) well within this.
+const PASTE_BUSY_MS: i32 = 3000
+# The paste is over once nothing arrives for this long.
+const PASTE_IDLE_MS: i32 = 500
+const CHUNK: i64 = 512
+
+# No file: poll(2) skips a negative fd, so a wait on it ends only at its
+# timeout. Harland has no nanosleep; this is its sleep.
+const NO_FD: i32 = -1
+
+# Read nothing for `ms`.
+fn stay_busy(ms: i32)
+    match wait_readable(NO_FD, ms)
+        Ok(_) => pass
+        Err(_) => pass
+
+pub fn main() -> i32
+    var session: TermSession = match term_enter_raw(STDIN)
+        Ok(s) => s
+        Err(_) =>
+            print("paste_check: stdin is not a terminal\n")
+            return 1
+    var reader: KeyReader = key_reader(STDIN)
+    print("paste_check: ready\n")
+    stay_busy(PASTE_BUSY_MS)
+
+    var buf: [512]u8
+    var n: i64 = 0
+    var sum: i64 = 0
+    while true
+        match read_timeout(STDIN, span_from_ptr<u8>(@buf[0], CHUNK), PASTE_IDLE_MS)
+            Ok(r) => match r
+                TimedRead.Read(got) =>
+                    if got == 0
+                        break
+                    for i in 0..got
+                        sum = sum + buf[i] as i64
+                    n = n + got
+                TimedRead.TimedOut => break
+            Err(_) =>
+                print("paste_check: read failed\n")
+                return 1
+    let overrun: u32 = reader.take_overruns()
+    match session.restore()
+        Ok(_) => pass
+        Err(_) => pass
+    print("paste_check: {n} bytes sum {sum} overrun {overrun}\n")
+    0

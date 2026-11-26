@@ -8,7 +8,7 @@
 import klog { klog, klog_serial_write, klog_serial_drain }
 import serial { StrView }
 import drivers.display.fbcon { fbcon_write }
-import tty.console { tty_console_read, tty_console_get_flags, tty_console_set_flags, tty_console_set_fg }
+import tty.console { tty_console_read, tty_console_get_flags, tty_console_set_flags, tty_console_set_fg, tty_console_overruns }
 import mm.uptr { uptr_validate_string, uptr_check_read, uptr_check_write }
 import fs.kfs { kfs_ns_for, kfs_local, kfs_list, kfs_errno }
 import goliath.namespace { Namespace }
@@ -261,9 +261,11 @@ pub fn sys_readdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
             return Errno.Fault as i64
     return sys_readdir_impl(strview_from_ptr(rdi as *u8, path_result), rsi as *u8, rdx as i64)
 
-# The console's terminal flags (#4254): tty/ldisc.ritz's TTY_ECHO,
-# TTY_ICANON and TTY_ISIG in a 4-byte struct (ritzlib's TtyAttrs). fds 0-2
-# are the console unless they name a file; anything else is not a terminal.
+# The console's terminal attributes, ritzlib's TtyAttrs: two u32s, the flags
+# (#4254: tty/ldisc.ritz's TTY_ECHO, TTY_ICANON and TTY_ISIG) and the input
+# bytes dropped with the input queue full since boot (#4831). getattr writes
+# both; setattr reads only the flags. fds 0-2 are the console unless they
+# name a file; anything else is not a terminal.
 fn tty_fd_ok(fd: i32) -> bool
     fd >= 0 and fd <= 2 and not is_fs_fd(fd)
 
@@ -271,9 +273,10 @@ fn tty_fd_ok(fd: i32) -> bool
 pub fn sys_tty_getattr_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if not tty_fd_ok(rdi as i32)
         return Errno.NotTy as i64
-    if uptr_check_write(rsi as *u8, 4) != 0
+    if uptr_check_write(rsi as *u8, 8) != 0
         return Errno.Fault as i64
     *(rsi as *u32) = tty_console_get_flags()
+    *((rsi + 4) as *u32) = tty_console_overruns()
     return 0
 
 # tty_setattr(fd, attrs)

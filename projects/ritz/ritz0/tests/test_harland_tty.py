@@ -54,6 +54,7 @@ EXCEPTIONS = KERNEL_SRC / "arch" / "x86_64" / "exceptions.ritz"
 ENTRY = KERNEL_SRC / "syscall" / "runtime" / "entry.ritz"
 NUMBERS = KERNEL_SRC / "syscall" / "numbers.ritz"
 SYS = RITZ_ROOT / "ritzlib" / "sys.ritz"
+TERMSESSION = RITZ_ROOT / "ritzlib" / "termsession.ritz"
 
 # The kernel is built by ritz0 only, so one compiler row (TESTING.md, "What a
 # ritz0 pytest case costs").
@@ -81,6 +82,27 @@ fn read_is(max: i64, s: *u8) -> bool
             return false
         i = i + 1
     i == n
+
+# StrView forms of type_str / read_is: the length comes from the view, no NUL
+# (S-TEXT-1). New checks use these; the *u8 forms above predate them.
+fn type_view(s: StrView) -> i32
+    var raised: i32 = 0
+    var i: i64 = 0
+    while i < s.len
+        raised = raised + ldisc_input(*(s.ptr + i))
+        i = i + 1
+    raised
+
+fn read_is_view(max: i64, s: StrView) -> bool
+    let n: i64 = ldisc_read(@rbuf[0], max)
+    if n != s.len
+        return false
+    var i: i64 = 0
+    while i < n
+        if rbuf[i] != *(s.ptr + i)
+            return false
+        i = i + 1
+    true
 
 fn echo_is(s: *u8) -> bool
     let n: i64 = ldisc_take_echo(@ebuf[0], 512)
@@ -195,6 +217,49 @@ fn main() -> i32
     type_str(c"wxyz")
     if ldisc_take_echo(@ebuf[0], 2) != 2 or ebuf[1] != 120 or not echo_is(c"yz")
         return 28
+    # The raw queue holds a 16 KiB paste (#4831) with nobody reading ...
+    ldisc_reset()
+    ldisc_set_flags(0)
+    i = 0
+    while i < 16384
+        ldisc_input((97 + i % 26) as u8)
+        i = i + 1
+    if ldisc_overruns() != 0
+        return 29
+    # ... and each byte past it is dropped and counted, not lost silently.
+    ldisc_input(33)
+    ldisc_input(33)
+    if ldisc_overruns() != 2
+        return 30
+    var total: i64 = 0
+    var in_order: bool = true
+    var n: i64 = ldisc_read(@rbuf[0], 512)
+    while n > 0
+        var j: i64 = 0
+        while j < n
+            if rbuf[j] != (97 + (total + j) % 26) as u8
+                in_order = false
+            j = j + 1
+        total = total + n
+        n = ldisc_read(@rbuf[0], 512)
+    if total != 16384 or not in_order
+        return 31
+    # Room again: input is taken, and the count stays (it only grows).
+    ldisc_input(120)
+    if not read_is_view(100, "x") or ldisc_overruns() != 2
+        return 32
+    # A completed canonical line that does not fit is counted the same.
+    i = 0
+    while i < 16380
+        ldisc_input(120)
+        i = i + 1
+    ldisc_set_flags(TTY_ICANON)
+    type_view("abcdef\\r")
+    if ldisc_overruns() != 5
+        return 33
+    ldisc_reset()
+    if ldisc_overruns() != 0 or ldisc_readable()
+        return 34
     0
 """
 
@@ -210,7 +275,12 @@ CLAIMS = {1: "cooked by default", 2: "canonical: no partial line readable",
           21: "flags 0 is raw", 22: "raw: Ctrl-C is data, no interrupt",
           23: "raw: bytes readable at once, no echo", 24: "raw + ECHO echoes",
           25: "leaving canonical flushes the line", 26: "ISIG off drops the interrupt",
-          27: "unknown flag bits dropped", 28: "a short echo take keeps the rest"}
+          27: "unknown flag bits dropped", 28: "a short echo take keeps the rest",
+          29: "the raw queue holds a 16 KiB paste", 30: "bytes past the queue are counted",
+          31: "the queued paste reads back whole, in order",
+          32: "input is taken again once read; the count stays",
+          33: "a canonical line that does not fit is counted",
+          34: "reset clears the queue and the count"}
 
 
 @pytest.mark.integration
@@ -294,6 +364,19 @@ def test_tty_syscalls_numbered_and_registered():
     get = _body(sys, "sys_tty_getattr")
     assert "SYS_TTY_GETATTR" in get, "no stub: a real syscall"
     assert "SYS_TTY_SETATTR" in _body(sys, "sys_tty_setattr")
+    # #4831: the bytes the line discipline dropped (its queue full) are a
+    # counter that tty_getattr reports in TtyAttrs' second word, and
+    # termsession's KeyReader turns into take_overruns().
+    get = _body(_code(FILE_RT), "sys_tty_getattr_handler")
+    assert "uptr_check_write(rsi as *u8, 8)" in get, "TtyAttrs is 8 bytes: flags, overruns"
+    assert "tty_console_overruns()" in get
+    assert "ldisc_overruns()" in _body(_code(CONSOLE), "tty_console_overruns")
+    attrs = re.search(r"pub struct TtyAttrs\n((?:    .*\n)+)", sys + "\n").group(1)
+    assert re.findall(r"^    (\w+): u32", attrs, re.M) == ["flags", "overruns"]
+    ts = _code(TERMSESSION)
+    assert "take_overruns" in ts and "overruns_seen" in ts
+    harland = ts.split('[[target_os = "harland"]]\nfn tty_overruns')[1].split("[[target_os")[0]
+    assert "sys_tty_getattr" in harland and ".overruns" in harland
 
 
 # --- the console's foreground (#4276) ---------------------------------------

@@ -145,6 +145,23 @@ while True:
         fg = "spin"
         s.sendall(b"spin: running\r\n")
         continue
+    if cmd == "paste_check":  # #4831: a 16 KiB queue, the rest an overrun
+        s.sendall(b"paste_check: ready\r\n")
+        got = b""
+        s.settimeout(0.5)
+        try:
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                got += chunk
+        except socket.timeout:
+            pass
+        s.settimeout(None)
+        kept = got[:16384]
+        s.sendall(b"paste_check: %d bytes sum %d overrun %d\r\n"
+                  % (len(kept), sum(kept), len(got) - len(kept)) + prompt)
+        continue
     s.sendall(reply(cmd) + prompt)
 """
 QEMU_IMG_STUB = """#!/usr/bin/env bash
@@ -195,6 +212,9 @@ TTY_PASSES = (
     "PASS: rzsh survives Ctrl-C at its prompt",
     "PASS: rzsh stops between tty_setattr and spawn",
     "PASS: Ctrl-C between tty_setattr and spawn does not kill rzsh",
+    # paste_session() (#4831)
+    "PASS: an 8192-byte paste into a busy reader arrives whole",
+    "PASS: a 20000-byte paste: the queue keeps 16384",
 )
 EXIT = ("Goodbye!\r\n[init] Shell exited\r\n"
         "[exit] init exited with code 0, powering off\r\n")

@@ -28,8 +28,13 @@ pub const TTY_ISIG: u32 = 4
 pub const TTY_FLAGS_ALL: u32 = 7
 pub const TTY_FLAGS_DEFAULT: u32 = 7
 
-# Bytes read() can take: completed lines (canonical) or raw bytes.
-const LDISC_QUEUE_SIZE: i32 = 1024
+# Bytes read() can take: completed lines (canonical) or raw bytes (#4831).
+# 16 KiB holds a realistic paste (about 200 lines of 80 columns) while the
+# reader is busy: QEMU's COM1 has no baud limit, so a paste lands as fast as
+# the IRQ drains the FIFO; on a real 115200 baud line it is 1.4 s of solid
+# input, far longer than an editor's redraw. 15 KiB more kernel BSS than the
+# 1 KiB it replaces. Past it, bytes are dropped and counted (overruns).
+const LDISC_QUEUE_SIZE: i32 = 16384
 # The line being edited: 255 bytes and its NL, then input is dropped
 # (as a full Linux line is) until NL, rubout or Ctrl-C.
 const LDISC_LINE_SIZE: i32 = 256
@@ -45,10 +50,15 @@ const CH_DEL: u8 = 127       # what a terminal's backspace key sends
 
 var g_ldisc_flags: u32 = 7
 
-var g_ldisc_queue: [1024]u8
+var g_ldisc_queue: [16384]u8
 var g_ldisc_q_head: i32 = 0      # next write
 var g_ldisc_q_tail: i32 = 0      # next read
 var g_ldisc_q_count: i32 = 0
+# Bytes dropped because the queue was full, since boot (saturates). The
+# reader sees it through tty_getattr (TtyAttrs.overruns) and compares it
+# with what it saw last, so no read clears it.
+var g_ldisc_overruns: u32 = 0
+const LDISC_OVERRUNS_MAX: u32 = 0xFFFFFFFF
 
 var g_ldisc_line: [256]u8
 var g_ldisc_line_len: i32 = 0
@@ -67,6 +77,7 @@ pub fn ldisc_reset()
     g_ldisc_q_head = 0
     g_ldisc_q_tail = 0
     g_ldisc_q_count = 0
+    g_ldisc_overruns = 0
     g_ldisc_line_len = 0
     g_ldisc_eof = 0
     g_ldisc_intr = 0
@@ -86,8 +97,14 @@ pub fn ldisc_set_flags(flags: u32)
         g_ldisc_intr = 0
     g_ldisc_flags = f
 
+# How many input bytes the queue has dropped (above).
+pub fn ldisc_overruns() -> u32
+    g_ldisc_overruns
+
 fn queue_put(c: u8)
     if g_ldisc_q_count >= LDISC_QUEUE_SIZE
+        if g_ldisc_overruns < LDISC_OVERRUNS_MAX
+            g_ldisc_overruns = g_ldisc_overruns + 1
         return
     g_ldisc_queue[g_ldisc_q_head] = c
     g_ldisc_q_head = (g_ldisc_q_head + 1) % LDISC_QUEUE_SIZE

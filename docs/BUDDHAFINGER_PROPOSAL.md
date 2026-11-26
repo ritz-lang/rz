@@ -162,10 +162,12 @@ through the shared terminal-session module. Harland reports no window size,
 so use a configurable viewport. Escape sequences reach a terminal only on the
 serial console, so Buddhafinger runs there. Exercise the adapter under QEMU.
 
-The raw input queue holds `LDISC_QUEUE_SIZE` (1024) bytes and `ldisc_input`
-drops anything past that without telling the reader. A paste or burst larger
-than the queue is silently truncated, so paste on Harland is not a supported
-path until the queue grows or reports overruns.
+The raw input queue holds `LDISC_QUEUE_SIZE` (16 KiB, #4831) bytes, about
+200 lines of 80 columns, while the reader is busy. `ldisc_input` drops
+anything past that and counts it; `tty_getattr` reports the count
+(`TtyAttrs.overruns`) and termsession's `KeyReader.take_overruns()` returns
+what was lost since the last call, so the editor reports "input overrun"
+instead of truncating a paste silently.
 
 A killed process runs no cleanup. rzsh restores the console flags at its next
 prompt, but alternate-screen and cursor state stay on the host terminal until
@@ -366,7 +368,7 @@ on both targets.
 | Timed console read (`VTIME`-like timeout, or `poll` on fd 0) | Done (#4829): `poll` on fd 0, `ritzlib.timedread` | Bare Escape, key timeouts | First port |
 | Portable create-and-write in `ritzlib/fs.ritz` | Done (#4830) | Saving through ritzlib on Harland | First port |
 | Empty write commits on close | Done (#4830): an `O_TRUNC` fd commits its buffer, empty or not, on an explicit `close`; at process exit an empty buffer leaves the file | Saving an empty buffer | First port |
-| Larger raw input queue, or an overrun the reader can see | Bytes past 1024 dropped silently | Paste, fast input bursts | Paste support |
+| Larger raw input queue, or an overrun the reader can see | Done (#4831): 16 KiB queue, overruns counted, `KeyReader.take_overruns()` | Paste, fast input bursts | Paste support |
 | `stat` / `fstat` (size, mtime, mode) | Done (#4832): syscalls 4 and 5, Linux's `struct stat`; mtime is the file clock | External-change check, permissions | Save parity |
 | `chmod` or mode on create | Done (#4832): `O_CREAT` takes the mode, a rewrite keeps it | Preserving permissions | Save parity |
 | Transactional replacement and storage failure recovery | Runtime and persistent namespace writes can fail independently | A defined save contract across close and sync failures | Save parity |

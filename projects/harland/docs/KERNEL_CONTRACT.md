@@ -98,11 +98,14 @@ fn sys_tty_getattr(fd: i32, attrs: *TtyAttrs) -> i32
 fn sys_tty_setattr(fd: i32, attrs: *TtyAttrs) -> i32
 ```
 
-- **attrs**: `{ flags: u32 }`: TTY_ECHO (1) echoes input, TTY_ICANON (2)
+- **attrs**: `{ flags: u32, overruns: u32 }`: flags TTY_ECHO (1) echoes input, TTY_ICANON (2)
   edits a line in the kernel (DEL/BS rub out, CR reads as NL, Ctrl-D ends
   input) and `read(0)` returns one line, TTY_ISIG (4) makes Ctrl-C kill the
   foreground process (exit status 130; init is never killed). All three are
-  set at boot. `read(0)` blocks until there is input.
+  set at boot. `read(0)` blocks until there is input. `overruns: u32`
+  (getattr only; #4831): input bytes dropped since boot because the
+  console's 16 KiB input queue was full. It only grows; a reader compares
+  it with its last look (ritzlib.termsession's `KeyReader.take_overruns()`).
 - **fd**: 0, 1 or 2 when it is not an open file
 - **Returns**: 0, ENOTTY for any other fd, EFAULT for a bad `attrs`
 

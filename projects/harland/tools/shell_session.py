@@ -13,7 +13,9 @@ wait for the next prompt and check what the command printed.
 After SESSION, tty_session() checks that the console is a terminal (#4254):
 rubout in rzsh's editor and in the kernel's cooked mode, Ctrl-C on a program
 blocked in read(0) and on one computing in a loop (`spin`), `$?` = 130 after
-each, and Ctrl-C at the prompt leaving rzsh alive.
+each, and Ctrl-C at the prompt leaving rzsh alive. paste_session() pastes
+into a busy reader (#4831): 8 KiB arrives whole, and past the console's
+16 KiB queue the reader is told how much was dropped.
 
 Every byte the guest sends is written to LOG. Each check prints one
 `PASS: ...` or `FAIL: ...` line. Exit status: 0 = every check passed;
@@ -471,6 +473,54 @@ def net_session(con: "Console", host: HostUdp, timeout: float) -> int:
     return fails
 
 
+# A paste into a busy reader (AGAST #4831). The console's input queue holds
+# 16 KiB; bytes past it are dropped and counted, and the reader sees the
+# count (TtyAttrs.overruns, termsession's KeyReader.take_overruns).
+# /bin/paste_check reads nothing for 3 s after `ready`, then reports what it
+# read. The paste is sent in one go: QEMU's COM1 takes bytes from the socket
+# only as its FIFO has room, so none is lost before the kernel's queue.
+PASTE_QUEUE = 16384
+PASTE_RESULT = re.compile(rb"paste_check: (\d+) bytes sum (\d+) overrun (\d+)")
+
+
+def _paste_bytes(n: int) -> bytes:
+    """n printable bytes, a..z repeating: no control byte for the console."""
+    return bytes(97 + i % 26 for i in range(n))
+
+
+def _paste(con: "Console", n: int, timeout: float):
+    """Paste n bytes into paste_check: (bytes read, their sum, overrun), or
+    None if it never got ready or never reported."""
+    con.type_line("paste_check")
+    if con.expect(b"paste_check: ready", timeout) is None:
+        return None
+    try:
+        con.conn.sendall(_paste_bytes(n))
+    except (BrokenPipeError, ConnectionResetError):
+        return None
+    out = con.expect(PROMPT, timeout)
+    m = PASTE_RESULT.search(out or b"")
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def paste_session(con: "Console", timeout: float) -> int:
+    """A paste that fits the queue arrives whole; a larger one is dropped
+    past the queue, and the reader is told how much. Returns the failures."""
+    fails = 0
+    fit = 8192                              # 8x the 1 KiB queue before #4831
+    got = _paste(con, fit, timeout)
+    fails += _ok(got == (fit, sum(_paste_bytes(fit)), 0),
+                 f"an {fit}-byte paste into a busy reader arrives whole, no overrun",
+                 repr(got).encode())
+    big = PASTE_QUEUE + 3616
+    got = _paste(con, big, timeout)
+    fails += _ok(got is not None and got[2] > 0 and got[0] + got[2] == big
+                 and got[0] >= PASTE_QUEUE,
+                 f"a {big}-byte paste: the queue keeps {PASTE_QUEUE} and the reader "
+                 f"sees the rest as an overrun", repr(got).encode())
+    return fails
+
+
 def main(argv: list[str]) -> int:
     fwd_port = None
     if argv[:1] == ["--net"] and len(argv) > 1 and argv[1].isdigit():
@@ -528,6 +578,8 @@ def main(argv: list[str]) -> int:
                         print(f"FAIL: `{cmd}`: {what}; got {lines!r}")
                         rc = 1
                 if tty_session(con, timeout):
+                    rc = 1
+                if paste_session(con, timeout):
                     rc = 1
             con.type_line("exit")
             tail = con.drain(timeout)

@@ -14,6 +14,9 @@
 #       one Key per call, from a KeyDecoder. After an incomplete sequence
 #       (a lone ESC above all) it waits `escape_timeout_ms` (25 by default)
 #       for the rest, so a bare Escape arrives without the next keystroke.
+#       reader.take_overruns() -> u32: input the terminal dropped since the
+#       last call (Harland's console, its queue full: a paste larger than
+#       16 KiB into a busy reader; always 0 on Linux). Say so to the user.
 #   key_decoder() -> KeyDecoder         decoder.feed(b) -> Option<Key>
 #       the byte-at-a-time state machine, for callers with their own reads.
 #   term_out() -> TermOut               out.cursor_to(r, c), out.style(s), ...
@@ -334,9 +337,10 @@ pub struct KeyReader
     fd: i32
     escape_timeout_ms: i32     # set it to change the wait for a sequence's rest
     decoder: KeyDecoder
+    overruns_seen: u32         # the terminal's overrun count at the last look
 
 pub fn key_reader(fd: i32) -> KeyReader
-    KeyReader { fd: fd, escape_timeout_ms: ESCAPE_TIMEOUT_MS, decoder: key_decoder() }
+    KeyReader { fd: fd, escape_timeout_ms: ESCAPE_TIMEOUT_MS, decoder: key_decoder(), overruns_seen: tty_overruns(fd) }
 
 impl KeyReader
     # The next key. Blocks until one is complete; after a sequence's first
@@ -375,6 +379,30 @@ impl KeyReader
     # Drop any sequence in progress (rzsh starts each line afresh).
     pub fn reset(self: @&KeyReader)
         self.decoder.reset()
+
+    # How many input bytes the terminal dropped since the reader was made
+    # or last asked: keys lost to a full input queue (#4831), which the
+    # program should report ("input overrun"). One tty_getattr on Harland;
+    # 0 on Linux, whose tty does not count them, and for a pipe or file.
+    pub fn take_overruns(self: @&KeyReader) -> u32
+        let now: u32 = tty_overruns(self.fd)
+        var lost: u32 = 0
+        if now > self.overruns_seen
+            lost = now - self.overruns_seen
+        self.overruns_seen = now
+        lost
+
+# The terminal's count of dropped input bytes; 0 where there is none.
+[[target_os = "linux"]]
+fn tty_overruns(fd: i32) -> u32
+    0
+
+[[target_os = "harland"]]
+fn tty_overruns(fd: i32) -> u32
+    var a: TtyAttrs = TtyAttrs { flags: 0, overruns: 0 }
+    if sys_tty_getattr(fd, @a) != 0
+        return 0
+    a.overruns
 
 # ============================================================================
 # TermSession: raw mode, restored on drop
@@ -486,7 +514,7 @@ fn attrs_set_raw(fd: i32, a: @SavedAttrs) -> Result<(), Errno>
 
 [[target_os = "harland"]]
 fn attrs_get(fd: i32) -> Result<SavedAttrs, Errno>
-    var a: SavedAttrs = SavedAttrs { tty: TtyAttrs { flags: 0 } }
+    var a: SavedAttrs = SavedAttrs { tty: TtyAttrs { flags: 0, overruns: 0 } }
     let rc: i32 = sys_tty_getattr(fd, @a.tty)
     if rc != 0
         return Err(errno_from_raw(rc))
