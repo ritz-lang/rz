@@ -1,0 +1,950 @@
+# ritz1/src/emitter_aggregate.ritz - array and struct values written into a place
+#
+# An array literal, an `[x; N]` fill, a struct literal, an n-d array init and
+# an array-valued `if` / `match` / block, each emitted straight into the slot
+# it initializes or assigns.  Moved out of emitter_expr and emitter_stmt so
+# neither imports the other (AGAST #4697): what they emit inside the place
+# (an element, a field, an arm) recurses through the emit table
+# (emitter_seam.ritz).
+
+import ritzlib.string
+
+import ast
+import types           # the one primitive type table (AGAST #1889)
+import emitter_core
+import emitter_seam    # emit_expr / emit_stmt / ... (AGAST #4697)
+import text_bridge     # no_name / unnamed / named_by / llvm_text (AGAST #4696)
+import emitter_abi
+import emitter_types
+import emitter_ir
+import emitter_call_lower
+import emitter_decl
+import emitter_stmt_parts
+import emitter_expr_access   # emit_nd_index_ptr, emit_plane_ptr, emit_lent_referent
+import emitter_match         # emit_match_into, emit_match_arm_stmts
+import ownership
+
+# The address of the array array_ptr_shape recognised behind `e`.
+pub fn emit_array_ptr_value(s: *EmitterState, e: *Expr) -> i32
+    let loc: *LocalVar = array_ptr_local(s, e)
+    if loc != null
+        return emit_array_ptr_base(s, loc)
+    let val: i32 = emit_expr(s, e)
+    let ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, val)
+    ptr
+
+# The address of the place array_place_shape recognised in `value`.
+pub fn emit_array_place_ptr(s: *EmitterState, value: *Expr) -> i32
+    if value.kind == ExprKind.Unary
+        let inner: *Expr = addr_of_array_place(s, value.operand)
+        if inner != null
+            return emit_array_place_ptr(s, inner)   # AGAST #2305: `*@a`
+        lent_array_local(s, value.operand)
+        return emit_array_ptr_value(s, value.operand)   # AGAST #2304
+    let lent: *LocalVar = lent_array_local(s, value)
+    if lent != null
+        return lent.reg
+    let loc: *LocalVar = find_local_struct_name(s, value.ident)
+    if loc != null
+        return loc.reg
+    return emit_global_array_ptr(s, find_global(s, value.ident))
+
+# AGAST #2302: store the `[N x T]` that call `value` returns (`ra` is its
+# return as a param) at `dst_ptr`.  AGAST #3181: a large one's call value is
+# the sret slot it wrote (emit_sret_array_call_slot), copied pointer-to-pointer.
+fn emit_call_array_store(s: *EmitterState, value: *Expr, ra: *Param, dst_ptr: i32)
+    let cv: i32 = emit_expr(s, value)
+    if array_param_uses_byval(s, ra) == 1 and ra.param_array_shape != null
+        emit_nd_plane_copy(s, ra.param_array_shape, 0, dst_ptr, cv)   # AGAST #3634
+        return
+    if array_param_uses_byval(s, ra) == 1
+        emit_local_array_copy(s, ra.param_array_size, ra.param_array_elem_type, StrView { ptr: (ra.param_type_name), len: (ra.param_type_name_len) as i64 }, cv, dst_ptr)
+        return
+    format_into(s, "  store ")
+    emit_array_value_llvm_type(s, ra)
+    format_into(s, " %.{cv}, ptr %.{dst_ptr}\n")
+
+# AGAST #2302: the `[N x T]` call `value` returns, in a fresh temporary whose
+# address is returned.  AGAST #3258: a result the move check made a temporary
+# (T needing a drop) is already in the slot own_note_temp queued its drop on,
+# and that slot is the one read, as a struct temporary's (own_temp_slot_of).
+pub fn emit_call_array_temp(s: *EmitterState, value: *Expr, ra: *Param) -> i32
+    if own_temp_marked(s, value)
+        # 0 only when the call itself failed to emit, already an error.
+        return own_temp_slot_of(s, emit_expr(s, value))
+    let tmp: i32 = next_reg(s)
+    entry_alloca_reg_begin(s, tmp)
+    emit_array_value_llvm_type(s, ra)
+    format_into(s, "  ; #2302 call result\n")
+    entry_alloca_reg_end(s)
+    emit_call_array_store(s, value, ra, tmp)
+    tmp
+
+# The refusals more than one whole-array copy below shares.
+const MEMBER_NOT_ARRAY_FIELD: StrView = "whole-array read into a local array from this member is not supported by ritz1 (only an inline array field)"
+
+const ND_SHAPE_MISMATCH: StrView = "multi-dimensional array initializer's shape does not match the local array's"
+
+# AGAST #1935: `x.f = <array value>` where the right-hand side is not a
+# literal.  Resolve the source array's storage and copy it over the field
+# at `field_ptr`, after checking it has the field's length and element type
+# (ritz0 rejects a mismatch).  Supported sources:
+#   * a local `[N]T` array or by-value param (`w.vals = a`); its alloca is
+#     `[N x T]` with the field's element spelling for every T (f32 / f64 since
+#     #1966 / #1971, bool `i1` since #2063);
+#   * a global `[N]T` array (#2287);
+#   * another inline array field (`y.vals = x.vals`, `p.b = p.a`), whose
+#     layout is the field's own;
+#   * `*src` for a param or annotated local `src: *[N]T` (AGAST #1953), whose
+#     N and T are recorded on the LocalVar (pointee_array_*).  A local,
+#     field or global pointee shares the field's element layout (#1971,
+#     #2063), so every element type copies.
+# Returns 1 once handled (copied or diagnosed).  Anything else fails
+# closed: emit_expr has no whole-array value, and the pre-#1934 generic
+# path stored an ADDRESS into the field.
+fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructField, value: *Expr)
+    var src_ptr: i32 = -1
+    var src_size: i32 = -1
+    var src_et: TypeKind = TypeKind.Void
+    var src_name: StrView = no_name()
+    var place: ArraySrc
+    if array_place_shape(s, value, @place) == 1
+        src_ptr = emit_array_place_ptr(s, value)
+        src_size = place.size
+        src_et = place.elem
+        src_name = StrView { ptr: place.name, len: place.name_len as i64 }
+    else if value.kind == ExprKind.Member
+        var mr: MemberPtrResult
+        emit_member_ptr(s, value, @mr)
+        if mr.success == 1 and mr.field != null and mr.field.field_type == TypeKind.Array
+            src_ptr = mr.reg
+            src_size = mr.field.array_size
+            src_et = mr.field.array_elem_type
+            src_name = StrView { ptr: mr.field.array_elem_type_name, len: mr.field.array_elem_type_name_len as i64 }
+    else if call_ret_array(s, value) != null
+        # AGAST #2302: a call's `[N x T]`, through a temporary.
+        let cra: *Param = call_ret_array(s, value)
+        src_ptr = emit_call_array_temp(s, value, cra)
+        src_size = cra.param_array_size
+        src_et = cra.param_array_elem_type
+        src_name = StrView { ptr: cra.param_type_name, len: cra.param_type_name_len as i64 }
+    if src_ptr < 0
+        emit_ir_error_sv(s, value.span, "whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
+        return
+    if src_size != field.array_size
+        emit_ir_error_sv(s, value.span, "array length does not match the struct field's array length")
+        return
+    if not array_store_fits(s, value, src_et, src_name, field.array_elem_type, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
+        return
+    emit_array_field_copy(s, field, src_ptr, field_ptr)
+
+# AGAST #2035: the reverse of emit_array_field_copy_from.  A local `[N]T`
+# array at `dst_ptr` (length `dst_size`, element `dst_et`, element struct name
+# `dst_name`) is initialised or assigned from `value`, `let a: [N]T = x.f` /
+# `a = p.f`.  When `value` is a member expression, copy the inline array field
+# it names into the local, after checking that the length and element type
+# match.  A local array uses the field's element spelling for every T
+# (local_array_elem_llvm, f32 / f64 since #1966, bool since #2063), so the
+# field's `[N x T]` copies as one aggregate.  The generic path loaded
+# the field as `[N x T]` and emitted `store i64 <[N x T]>`, which clang rejects.
+# True once handled (copied or diagnosed), false for a non-member value,
+# which is left to the caller.  A member that is not a matching array field
+# fails closed.
+fn emit_array_local_copy_from_field(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, value: *Expr) -> bool
+    if value == null or value.kind != ExprKind.Member
+        return false
+    var mr: MemberPtrResult
+    emit_member_ptr(s, value, @mr)
+    if mr.success != 1 or mr.field == null or mr.field.field_type != TypeKind.Array
+        emit_ir_error_sv(s, value.span, MEMBER_NOT_ARRAY_FIELD)
+        return true
+    let field: *StructField = mr.field
+    if field.array_size != dst_size
+        emit_ir_error_sv(s, value.span, "struct field's array length does not match the local array's length")
+        return true
+    if not array_store_fits(s, value, field.array_elem_type, StrView { ptr: field.array_elem_type_name, len: field.array_elem_type_name_len as i64 }, dst_et, dst_name)
+        return true
+    emit_array_field_copy(s, field, mr.reg, dst_ptr)
+    true
+
+# AGAST #3299: initialise the N-D slot at `dst_ptr` (shape `sh`) from `value`
+# when it is a whole N-D place: a field (`h.m`, `p.m` through `p: *H`, a
+# chain), or a local or global `[N][M]..T` (#2169's `var b = a`).  Copied as
+# one aggregate, or pointer-to-pointer when large (as emit_local_array_copy),
+# so the slot is a copy, never a view.  True once handled (copied, or a
+# shape mismatch diagnosed), false, having emitted nothing, for any other value.
+# AGAST #3350: or a plane of a deeper one (`g[1]` of `[2][2][3]T`, any base
+# emit_nd_index_ptr takes), copied from the address that GEP gives.
+pub fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, value: *Expr) -> bool
+    # AGAST #3634: a call's `-> [N][M]T`, stored straight into the slot.
+    let cra: *Param = call_ret_array(s, value)
+    if cra != null and cra.param_array_shape != null
+        if not array_shapes_match(cra.param_array_shape, sh)
+            emit_ir_error_sv(s, value.span, ND_SHAPE_MISMATCH)
+            return true
+        emit_call_array_store(s, value, cra, dst_ptr)
+        return true
+    # AGAST #3635: `*p`, the whole array behind a `*[N][M]..T` (deref_nd_shape).
+    var dsh: *ArrayShape = null
+    if value.kind == ExprKind.Unary and value.op == OpKind.Deref and value.operand != null
+        dsh = deref_nd_shape(s, value.operand)
+    if dsh != null
+        if not array_shapes_match(dsh, sh)
+            emit_ir_error_sv(s, value.span, ND_SHAPE_MISMATCH)
+            return true
+        var from: i32 = 0
+        if plane_ptr_shape(s, value.operand) != null
+            from = emit_plane_ptr(s, value.operand)
+        else
+            from = emit_array_ptr_value(s, value.operand)   # `*(p + k)`
+        emit_nd_plane_copy(s, sh, 0, dst_ptr, from)
+        return true
+    var src_sh: *ArrayShape = nd_array_base_shape(s, value)
+    if src_sh == null
+        src_sh = nd_plane_shape(s, value)
+    if src_sh == null
+        return false
+    if not array_shapes_match(src_sh, sh)
+        emit_ir_error_sv(s, value.span, ND_SHAPE_MISMATCH)
+        return true
+    var src_ptr: i32 = -1
+    match value.kind
+        ExprKind.Index =>
+            var pp: NdIndexPtr
+            emit_nd_index_ptr(s, value, @pp)
+            src_ptr = pp.reg
+        ExprKind.Member =>
+            var mr: MemberPtrResult
+            emit_member_ptr(s, value, @mr)
+            if mr.success != 1
+                emit_ir_error_sv(s, value.span, MEMBER_NOT_ARRAY_FIELD)
+                return true
+            src_ptr = mr.reg
+        _ =>
+            let loc: *LocalVar = find_local_struct_name(s, value.ident)
+            if loc != null
+                src_ptr = loc.reg
+            else
+                src_ptr = emit_global_array_ptr(s, find_global(s, value.ident))
+    emit_nd_plane_copy(s, sh, 0, dst_ptr, src_ptr)
+    true
+
+# AGAST #3634: the whole `[N][M]..T` value `value` (an N-D place or a call
+# returning one, emit_nd_array_init_copy) copied into the fresh slot `dst_ptr`
+# of shape `sh`, for a by-value param or a return.  AGAST #4178: or a nested
+# literal or fill (`sz<[2][2]i64>([ [1, 2], [3, 4] ])`), written straight into
+# the slot as a local's initialiser is (emit_nd_array_init_into checks every
+# dimension's count).  Anything else is no value of that type: a located error.
+pub fn emit_nd_array_value_into(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, value: *Expr)
+    if emit_nd_array_init_copy(s, dst_ptr, sh, value)
+        return
+    if value.kind == ExprKind.ArrayLit or value.kind == ExprKind.ArrayFill
+        emit_nd_array_init_into(s, sh, 0, dst_ptr, value)
+        return
+    emit_nd_error_sv(s, value.span.line, value.span.col, "this value is not a multi-dimensional array of that shape")
+
+# AGAST #3377 (LARB R39): write the initialiser `e` into the dimension-`d`
+# plane of `sh` at `ptr`, the whole N-D local at d == 0.  Each level is a
+# literal `[a, b, ..]` or a fill `[v; n]` with exactly that dimension's
+# count: every element gets a value, which an array of a Drop type must have
+# (§3.3).  The innermost rows are written as a 1-D local's are
+# (emit_array_lit_into / emit_array_fill_into), after the leaf slot checks;
+# an outer `[row; n]` writes
+# row 0 and copies it into the rest, so a move-only leaf can fill only one
+# row (as `[v; n]` itself, ref_check_fill).  Any other row (a named `[M]T`
+# local, a call) is refused, located.  Returns 1 when it wrote `e`.
+pub fn emit_nd_array_init_into(s: *EmitterState, sh: *ArrayShape, d: i32, ptr: i32, e: *Expr) -> i32
+    var count: i32 = -1
+    match e.kind
+        ExprKind.ArrayLit =>
+            count = array_lit_count(e)
+        ExprKind.ArrayFill =>
+            count = e.int_val as i32
+        _ =>
+            emit_nd_error_sv(s, e.span.line, e.span.col, "a row of a multi-dimensional array initializer must be `[a, b, ..]` or `[v; n]` in ritz1")
+            return 0
+    if count != sh.dims[d]
+        emit_nd_error_sv(s, e.span.line, e.span.col, ND_SHAPE_MISMATCH)
+        return 0
+    if d == sh.rank - 1
+        # The leaf slot checks (`300` into a u8, a `"A"` into a `*u8`, #2357)
+        # are Sema's: literal_slot.ritz's lit_nd_rows (#3510), bool_check (#3502).
+        if e.kind == ExprKind.ArrayLit
+            emit_array_lit_into(s, ptr, sh.dims[d], sh.leaf_type, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, e)
+        else
+            emit_array_fill_into(s, ptr, sh.dims[d], sh.leaf_type, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, e.left)
+        return 1
+    if e.kind == ExprKind.ArrayLit
+        var idx: i32 = 0
+        var it: *Expr = e.args
+        while it != null
+            let row: i32 = emit_nd_row_gep(s, sh, d, ptr, idx)
+            if emit_nd_array_init_into(s, sh, d + 1, row, it) == 0
+                return 0
+            idx = idx + 1
+            it = it.next
+        return 1
+    if count > 1 and sh.leaf_type == TypeKind.Struct and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+        emit_nd_error_sv(s, e.span.line, e.span.col, "`[v; n]` copies `v` into every element: a move-only value fills one, `[v; 1]`")
+        return 0
+    let row0: i32 = emit_nd_row_gep(s, sh, d, ptr, 0)
+    if emit_nd_array_init_into(s, sh, d + 1, row0, e.left) == 0
+        return 0
+    var i: i32 = 1
+    while i < count
+        emit_nd_plane_copy(s, sh, d + 1, emit_nd_row_gep(s, sh, d, ptr, i), row0)
+        i = i + 1
+    1
+
+# AGAST #2169: a 1-D local `[N]T` array at `dst_ptr` (length `dst_size`,
+# element `dst_et`, element struct `dst_name`) gets a whole-array value, as
+# `let a: [N]T = v` or `a = v`.  The generic scalar path loaded / stored the
+# value as ONE i64: `a = c` and `var d: [3]i64 = a` copied 8 bytes, and
+# `a = [x, y]` stored the literal's address (or `store i64 <%T>`, which clang
+# rejects).  Supported values, each checked for length and element type:
+#   * `[a, b, ..]`: built in a temporary `[N x T]` then copied over, so
+#     `a = [a[1], a[0]]` swaps (as for a field, #1934);
+#   * `[v; N]`: written in place (v is evaluated once, before any store);
+#   * another 1-D local array or by-value param (`a = c`);
+#   * a 1-D global array (#2287);
+#   * an inline array field (`a = x.f`, #2035);
+#   * `*p` for `p: *[N]T`, `@[N]T` or `@&[N]T` (#1953, #2287).
+# Anything else fails closed: emit_expr has no whole-array value.  `dst_ptr` may
+# be any `[N x T]`: `*p = a`, `G = a` and a by-value argument come here too.
+pub fn emit_array_local_whole_assign_impl(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, value: *Expr)
+    match value.kind
+        ExprKind.If =>
+            emit_array_if_into(s, dst_ptr, dst_size, dst_et, dst_name, value)
+        ExprKind.Match =>
+            emit_array_match_into(s, dst_ptr, dst_size, dst_et, dst_name, value.left, value.args as *MatchArm, value.span)
+        ExprKind.ArrayFill =>
+            if array_len_matches(s, value, array_literal_len(value), dst_size, "array literal length does not match the local array's length")
+                emit_array_fill_into(s, dst_ptr, dst_size, dst_et, dst_name, value.left)
+        ExprKind.ArrayLit =>
+            if array_len_matches(s, value, array_literal_len(value), dst_size, "array literal length does not match the local array's length")
+                # Built in a temporary, then copied: every element is read
+                # before any is written.
+                let tmp: i32 = next_reg(s)
+                entry_alloca_reg_begin(s, tmp)
+                emit_local_array_llvm_type(s, dst_size, dst_et, dst_name)
+                format_into(s, "\n")
+                entry_alloca_reg_end(s)
+                emit_array_lit_into(s, tmp, dst_size, dst_et, dst_name, value)
+                emit_local_array_copy(s, dst_size, dst_et, dst_name, tmp, dst_ptr)
+        _ =>
+            emit_array_place_into(s, dst_ptr, dst_size, dst_et, dst_name, value)
+
+# A whole `[N]T` copied from a place or a call into the local at `dst_ptr`:
+# a field, a call's `[N x T]` value, an N-D row, or any other array place.
+fn emit_array_place_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, value: *Expr)
+    if emit_array_local_copy_from_field(s, dst_ptr, dst_size, dst_et, dst_name, value)
+        return
+    # AGAST #2302: a call's `[N x T]` value is stored whole.
+    let cra: *Param = call_ret_array(s, value)
+    if cra != null
+        if not array_len_matches(s, value, cra.param_array_size, dst_size, "array length does not match the local array's length")
+            return
+        if not array_store_fits(s, value, cra.param_array_elem_type, StrView { ptr: (cra.param_type_name), len: (cra.param_type_name_len) as i64 }, dst_et, dst_name)
+            return
+        emit_call_array_store(s, value, cra, dst_ptr)
+        return
+    var place: ArraySrc
+    if nd_row_src(s, value, @place)
+        # AGAST #2517: a row `g[i]`, `x.m[i]`, `mk().m[i]` or `mkp().m[i]`.
+        if not array_len_matches(s, value, place.size, dst_size, "array length does not match the local array's length")
+            return
+        if not array_store_fits(s, value, place.elem, StrView { ptr: (place.name), len: (place.name_len) as i64 }, dst_et, dst_name)
+            return
+        var ndp: NdIndexPtr
+        emit_nd_index_ptr(s, value, @ndp)
+        emit_local_array_copy(s, dst_size, dst_et, dst_name, ndp.reg, dst_ptr)
+        return
+    if array_place_shape(s, value, @place) == 0
+        emit_ir_error_sv(s, value.span, "whole-array assignment to a local array from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
+        return
+    if not array_len_matches(s, value, place.size, dst_size, "array length does not match the local array's length")
+        return
+    if not array_store_fits(s, value, place.elem, StrView { ptr: (place.name), len: (place.name_len) as i64 }, dst_et, dst_name)
+        return
+    emit_local_array_copy(s, dst_size, dst_et, dst_name, emit_array_place_ptr(s, value), dst_ptr)
+
+# `[a, b, ..]` / `[v; N]`: how many elements the literal has.
+fn array_literal_len(value: *Expr) -> i32
+    if value.kind == ExprKind.ArrayFill
+        return value.int_val as i32
+    var n: i32 = 0
+    var it: *Expr = value.args
+    while it != null
+        n += 1
+        it = it.next
+    n
+
+# True when a source of `n` elements fits a destination of `want`; else `msg`
+# is reported at `value`.
+fn array_len_matches(s: *EmitterState, value: *Expr, n: i32, want: i32, msg: StrView) -> bool
+    if n == want
+        return true
+    emit_ir_error_sv(s, value.span, msg)
+    false
+
+# AGAST #2305: `if c then a else b` (or the block form) as a whole `[N]T` value.
+# Each arm stores its own array at `dst_ptr`, held to N and T as any source is,
+# so no `[N x T]` phi is needed.  Before this the arms' i64s met in a phi: 8
+# bytes, or a type clang refused.  An arm that leaves (`return`) stores nothing.
+fn emit_array_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, value: *Expr)
+    let then_arm: *MatchArm = value.args as *MatchArm
+    let else_arm: *MatchArm = then_arm.next
+    # Sema refused a valueless arm (if_arm_value.ritz, AGAST #3512).
+    let cond_i1: i32 = cond_to_i1(s, emit_expr(s, value.left))
+    let then_label: i32 = next_label(s)
+    let else_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+    br_if(s, cond_i1, then_label, else_label)
+    begin_block(s, then_label)
+    emit_array_arm_into(s, dst_ptr, dst_size, dst_et, dst_name, then_arm, end_label)
+    begin_block(s, else_label)
+    emit_array_arm_into(s, dst_ptr, dst_size, dst_et, dst_name, else_arm, end_label)
+    begin_block(s, end_label)
+
+# AGAST #3276: a `match` of whole arrays (an ExprKind.Match value or a StmtKind.Match
+# tail) stored at `dst_ptr`: emit_match's own dispatch, each arm storing its
+# array there (emit_match_into).
+pub fn emit_array_match_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan)
+    var into: ArrayInto
+    into.ptr = dst_ptr
+    into.size = dst_size
+    into.et = dst_et
+    into.name = dst_name.ptr
+    into.name_len = dst_name.len as i32
+    emit_match_into(s, scrutinee, arms, span, @into)
+
+# AGAST #2305: an `if` / `else` STATEMENT whose arms end in a whole `[N]T`, the
+# tail of a `-> [N]T` fn: as emit_array_if_into, with each block's last
+# statement its value.  A nested `if` / `else` there is a value too.
+pub fn emit_array_stmt_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, st: *Stmt)
+    let cond_i1: i32 = cond_to_i1(s, emit_expr(s, st.if_cond))
+    let then_label: i32 = next_label(s)
+    let else_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+    br_if(s, cond_i1, then_label, else_label)
+    begin_block(s, then_label)
+    emit_array_block_into(s, dst_ptr, dst_size, dst_et, dst_name, st.if_then, end_label)
+    begin_block(s, else_label)
+    emit_array_block_into(s, dst_ptr, dst_size, dst_et, dst_name, st.if_else, end_label)
+    begin_block(s, end_label)
+
+# A block whose last statement is the array: an expression, an `if` / `else`,
+# or a `match` (AGAST #3276).
+# Any other last statement (a `return`) is emitted as it is.
+fn emit_array_block_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, stmts: *Stmt, end_label: i32)
+    var st: *Stmt = stmts
+    while st != null
+        if st.next != null or not emit_array_tail_into(s, dst_ptr, dst_size, dst_et, dst_name, st)
+            emit_stmt(s, st, s.fn_ret_type)
+            if st.kind == StmtKind.Return
+                begin_block(s, next_label(s))
+                clear_last_expr(s)
+        st = st.next
+    br_to(s, end_label)
+
+# A block's last statement `st` stored at `dst_ptr` as its array value; false,
+# having emitted nothing, when it is no array value.
+fn emit_array_tail_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, st: *Stmt) -> bool
+    match st.kind
+        StmtKind.Expr =>
+            own_arm_moves(s, st.expr)   # the value moves
+            emit_array_local_whole_assign(s, dst_ptr, dst_size, dst_et, dst_name, st.expr)
+        StmtKind.If =>
+            if st.if_else == null
+                return false
+            emit_array_stmt_if_into(s, dst_ptr, dst_size, dst_et, dst_name, st)
+        StmtKind.Match =>
+            emit_array_match_into(s, dst_ptr, dst_size, dst_et, dst_name, st.if_cond, st.if_then as *MatchArm, st.span)   # AGAST #3276
+        _ =>
+            return false
+    true
+
+fn emit_array_arm_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, arm: *MatchArm, end_label: i32)
+    emit_match_arm_stmts(s, arm.body_stmts)
+    if arm.is_pass == 0 and arm.body != null
+        own_arm_moves(s, arm.body)   # as emit_match_arm_body does
+        emit_array_local_whole_assign(s, dst_ptr, dst_size, dst_et, dst_name, arm.body)
+    br_to(s, end_label)
+
+# AGAST #1934: `x.f = [a, b, ..]` / `x.f = [v; N]` where `f` is an inline
+# `[N]T` array field at `field_ptr`.  The elements are written at the field's
+# declared element type, as a struct literal's array field is (#1605/#1608);
+# bool / f32 / f64 elements as `i1` / `float` / `double` (#1935).
+#
+#   * `[v; N]` is written straight into the field: emit_array_fill_into
+#     evaluates `v` once, before any store.
+#   * `[a, b, ..]` is built in a temporary `[N x T]` and then copied over the
+#     field, so every element is read before any is written
+#     (`x.f = [x.f[1], x.f[0]]` swaps, as in ritz0).
+#   * any other right-hand side is copied by emit_array_field_copy_from.
+#
+# A literal whose length differs from the field's fails closed (ritz0
+# rejects it too).
+pub fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *StructField, value: *Expr)
+    if value.kind != ExprKind.ArrayLit and value.kind != ExprKind.ArrayFill
+        emit_array_field_copy_from(s, field_ptr, field, value)
+        return
+    if not array_len_matches(s, value, array_literal_len(value), field.array_size, "array literal length does not match the struct field's array length")
+        return
+    let et: TypeKind = field.array_elem_type
+    let et_name: StrView = StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }
+    if value.kind == ExprKind.ArrayFill
+        emit_array_fill_into(s, field_ptr, field.array_size, et, et_name, value.left)
+        return
+    # Build in a temporary (a fixed-size alloca, written into the entry-block
+    # buffer), then copy the whole aggregate over the field.
+    let tmp: i32 = next_reg(s)
+    entry_alloca_reg_begin(s, tmp)
+    emit_array_field_llvm_type(s, field)
+    format_into(s, "\n")
+    entry_alloca_reg_end(s)
+    emit_array_lit_into(s, tmp, field.array_size, et, et_name, value)
+    emit_array_field_copy(s, field, tmp, field_ptr)
+
+# The LLVM spelling of a scalar `[N]elem_ty` element in memory, a local array
+# or a field array alike: `iN` for an integer, `ptr` for a pointer, `i1` /
+# `float` / `double` for bool / f32 / f64 (array_elem_typed_scalar, #1966,
+# #2063), else an i64 slot.  A struct element is spelled `%T` by its caller.
+fn array_slot_elem_llvm(elem_ty: TypeKind) -> StrView
+    if ty_int_bits(elem_ty) > 0 or array_elem_typed_scalar(elem_ty) == 1
+        return elem_mem_llvm(elem_ty)
+    if ty_is_ptr(elem_ty) == 1
+        return "ptr"
+    "i64"
+
+# Bytes one `[N]elem_ty` element occupies for the zero fill: its store size,
+# or an i64 slot's 8 for a kind with none.
+fn array_fill_elem_bytes(elem_ty: TypeKind) -> i32
+    let n: i32 = ty_store_size(elem_ty) as i32
+    if n == 0
+        return 8
+    n
+
+# A counted `i32` loop over `[0, arr_size)` opened by array_fill_loop_open:
+# the counter's slot, the blocks to branch back to / leave by, and the
+# counter's value as loaded in the condition block.
+struct ArrayFillLoop
+    idx: i32
+    l_cond: i32
+    l_end: i32
+    cur: i32
+
+# Open the loop: the counter slot (stored 0), the condition block, and the
+# body block, which is left current.
+fn array_fill_loop_open(s: *EmitterState, arr_size: i32) -> ArrayFillLoop
+    let idx: i32 = next_reg(s)
+    entry_alloca_reg_begin(s, idx)
+    format_into(s, "i32\n")
+    entry_alloca_reg_end(s)
+    format_into(s, "  store i32 0, ptr %.{idx}\n")
+    let l_cond: i32 = next_label(s)
+    let l_body: i32 = next_label(s)
+    let l_end: i32 = next_label(s)
+    format_into(s, "  br label %L{l_cond}\n")
+    begin_block(s, l_cond)
+    let cur: i32 = next_reg(s)
+    format_into(s, "  %.{cur} = load i32, ptr %.{idx}\n")
+    let cmp: i32 = next_reg(s)
+    format_into(s, "  %.{cmp} = icmp ult i32 %.{cur}, {arr_size}\n")
+    format_into(s, "  br i1 %.{cmp}, label %L{l_body}, label %L{l_end}\n")
+    begin_block(s, l_body)
+    ArrayFillLoop { idx: idx, l_cond: l_cond, l_end: l_end, cur: cur }
+
+# Close the loop: store `at` + 1 back to the counter, branch to the
+# condition, and open the exit block.
+fn array_fill_loop_close(s: *EmitterState, lp: ArrayFillLoop, at: i32)
+    let idx: i32 = lp.idx
+    let l_cond: i32 = lp.l_cond
+    let inc: i32 = next_reg(s)
+    format_into(s, "  %.{inc} = add i32 %.{at}, 1\n")
+    format_into(s, "  store i32 %.{inc}, ptr %.{idx}\n")
+    format_into(s, "  br label %L{l_cond}\n")
+    begin_block(s, lp.l_end)
+
+# Write `[fill_val; arr_size]` into the `[arr_size x elem_ty]` storage at
+# `base_reg` (a `ptr` register: a local alloca or a struct-field GEP).
+#
+# Strategy (mirrors ritz0):
+#   * Zero fill (e.g. `[0; 65536]`)  -> @__ritz_sret_zero (AGAST #3218)
+#   * Small N (<= 16)                 -> straight-line unrolled stores
+#   * Otherwise                       -> a real LLVM loop
+# Unrolling [0; 65536] would emit 65536 GEP+store pairs — clang -O2
+# then spends minutes folding it.  (AGAST #178)
+#
+# Shared by `let buf: [N]T = [v; N]` (emit_var_decl) and by `[v; N]` as an
+# array field of a struct literal (emit_var_decl's struct-literal loop and
+# emit_struct_lit_to_alloca).  The latter used to go through emit_expr's
+# ExprKind.ArrayFill fallback, which builds a shadow `[N x i64]` alloca and
+# returns its ADDRESS — stored as an i64 over the field's first slots, with
+# the fill value never reaching the field at all.  (AGAST #1605)
+# Store the `%T` aggregate `agg` into every slot of the `[N x %T]` array at
+# `base_reg`. Always a counted loop: clang unrolls the small ones, and a
+# large struct array stays O(1) in IR size. (AGAST #1362)
+fn emit_array_fill_struct_loop(s: *EmitterState, base_reg: i32, arr_size: i32, st: *StructDef, agg: i32)
+    let lp: ArrayFillLoop = array_fill_loop_open(s, arr_size)
+    let cur: i32 = lp.cur
+    let st_name: StrView = StrView { ptr: (st.name), len: (st.name_len) as i64 }
+    let st_ir: String = ir_name(st_name)
+    let ep: i32 = next_reg(s)
+    format_into(s, "  %.{ep} = getelementptr [{arr_size} x %{st_ir.as_view()}], ptr %.{base_reg}, i32 0, i32 %.{cur}\n")
+    emit_struct_store_or_copy(s, TypeKind.Struct, st_name, agg, ep)
+    array_fill_loop_close(s, lp, cur)
+
+# 1 when an element of `[N]elem_ty` is stored with emit_field_elem_narrow at
+# `float` / `double` / `i1` width: every f32 / f64 / bool array, field or
+# local (#1966; bool locals are `i1` since #2063).
+pub fn array_elem_typed_scalar(elem_ty: TypeKind) -> i32
+    if elem_ty == TypeKind.F32 or elem_ty == TypeKind.F64 or elem_ty == TypeKind.Bool
+        return 1
+    0
+
+# Write `[v; arr_size]` into the array at `base_reg`, a local array or an
+# inline STRUCT FIELD array: both share one element layout (bool `i1`,
+# f32 / f64 `float` / `double`; array_elem_typed_scalar).  `elem_name_sv`
+# names a struct element's type (AGAST #2288).
+pub fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: TypeKind, elem_name_sv: StrView, fill_val: *Expr)
+    # `[T { .. }; N]`: the element is the literal's own struct type, stored
+    # as a `%T` aggregate built once by the rvalue lowering. (AGAST #1362)
+    if fill_val != null and fill_val.kind == ExprKind.StructLit
+        let lit_st: *StructDef = find_struct(s, fill_val.ident)
+        if lit_st != null
+            let agg: i32 = emit_struct_lit_value(s, fill_val)
+            emit_array_fill_struct_loop(s, base_reg, arr_size, lit_st, agg)
+            return
+    if elem_ty == TypeKind.Struct and fill_val != null
+        let elem_st: *StructDef = find_struct(s, elem_name_sv)
+        if elem_st != null
+            # AGAST #2288: `[c; N]` with `c:& C` into a `[N]C` fills with the
+            # referent, as in ritz0.  It stored the pointer as an i64.
+            if lent_referent_local(s, fill_val) != null
+                let referent: i32 = emit_lent_referent(s, fill_val, elem_name_sv)
+                if referent != 0
+                    emit_array_fill_struct_loop(s, base_reg, arr_size, elem_st, referent)
+                    return
+            # AGAST #2976: `[c; N]` of any other struct value into a `[N]C` (a
+            # local, a param, a call result, an element or field, a generic `T`
+            # at a struct) is the `%C` aggregate emit_expr yields, evaluated once
+            # and stored into every `%C` slot. It fell through to the scalar
+            # path below: `store i64 <%C>` into `[N x i64]` slots, which clang
+            # rejects.
+            let val_agg: i32 = emit_expr(s, fill_val)
+            emit_array_fill_struct_loop(s, base_reg, arr_size, elem_st, val_agg)
+            return
+    # Fast path: integer-literal zero fill (squeeze's `[0; 65536]` lz_symbols
+    # arrays).  Anything else falls into the store path.
+    # AGAST #3218: through the module-internal @__ritz_sret_zero, never
+    # llvm.memset: codegen lowers a large intrinsic memset to a call to libc
+    # `memset`, and a program that does not import ritzlib then fails to link
+    # -nostdlib.  The helper is "no-builtins", so it stays a byte loop.
+    if fill_val != null and fill_val.kind == ExprKind.IntLit and fill_val.int_val == 0
+        let zero_bytes: i64 = (arr_size * array_fill_elem_bytes(elem_ty)) as i64
+        format_into(s, "  call void @__ritz_sret_zero(ptr %.{base_reg}, i64 {zero_bytes})\n")
+        s.sret_helpers_used = 1
+        return
+    let elem_llvm: StrView = array_slot_elem_llvm(elem_ty)
+    # Evaluate the fill value ONCE — even if it's a function call we
+    # only want to invoke it once. Its i64 SSA result is reused for
+    # every store.
+    let fill_val_reg: i32 = emit_expr(s, fill_val)
+    # Pre-truncate the value to the element width so we don't
+    # re-emit the trunc inside the loop body (and so a pointer
+    # element type gets one inttoptr we can reuse).
+    var fill_narrow: i32 = fill_val_reg
+    if array_elem_typed_scalar(elem_ty) == 1
+        fill_narrow = emit_field_elem_narrow(s, fill_val_reg, elem_ty, fill_val)
+    else if ty_int_bits(elem_ty) == 8
+        fill_narrow = ir_trunc_i64_i8(s.out, @s.reg_counter, fill_val_reg)
+    else if ty_int_bits(elem_ty) == 16
+        fill_narrow = ir_trunc_i64_i16(s.out, @s.reg_counter, fill_val_reg)
+    else if ty_int_bits(elem_ty) == 32
+        fill_narrow = ir_trunc_i64_i32(s.out, @s.reg_counter, fill_val_reg)
+    else if ty_is_ptr(elem_ty) == 1
+        # AGAST #3029: `@&x` is a `ptr` already
+        if expr_is_ptr_valued(s, fill_val) != 1
+            fill_narrow = ir_inttoptr_ptr(s.out, @s.reg_counter, fill_val_reg)
+    else if elem_ty == TypeKind.Ref or elem_ty == TypeKind.MutRef
+        fill_narrow = ptr_value_to_i64(s, fill_val, fill_val_reg)   # AGAST #2369: an `[N]@&T` holds i64s
+    if arr_size <= 16
+        # Small N: unroll for simple straight-line IR.
+        var fi: i32 = 0
+        while fi < arr_size
+            let fep: i32 = next_reg(s)
+            format_into(s, "  %.{fep} = getelementptr [{arr_size} x {elem_llvm}], ptr %.{base_reg}, i64 0, i64 {fi}\n")
+            format_into(s, "  store {elem_llvm} %.{fill_narrow}, ptr %.{fep}\n")
+            fi = fi + 1
+        return
+    # Larger N: real LLVM loop with i32 induction var on stack.
+    let lp: ArrayFillLoop = array_fill_loop_open(s, arr_size)
+    let idx: i32 = lp.idx
+    let cur: i32 = next_reg(s)
+    format_into(s, "  %.{cur} = load i32, ptr %.{idx}\n")
+    let ep: i32 = next_reg(s)
+    format_into(s, "  %.{ep} = getelementptr [{arr_size} x {elem_llvm}], ptr %.{base_reg}, i32 0, i32 %.{cur}\n")
+    format_into(s, "  store {elem_llvm} %.{fill_narrow}, ptr %.{ep}\n")
+    array_fill_loop_close(s, lp, cur)
+
+# Write the array literal `lit` (`[a, b, ..]`) element by element into the
+# `[arr_size x elem]` storage at `base_reg` (a `ptr` register: a local alloca
+# or a struct-field GEP). Elements past `arr_size` are ignored.
+#
+# Shared by `let a: [N]T = [..]` (emit_var_decl) and by `[..]` as an array
+# field of a struct literal (emit_struct_lit_array_fill_field). Element
+# handling depends on the element type:
+#   * scalars: evaluate to i64, then trunc / inttoptr to the element width.
+#   * structs (`elem_ty == TypeKind.Struct`, named by `elem_name_sv`): a struct
+#     literal element is written in place into its slot with
+#     emit_struct_lit_to_alloca. emit_expr has no lowering for a bare literal
+#     that matches the slot. Any other element (a local, a call) is a loaded
+#     `%T` aggregate and is stored as one.
+# The generic ExprKind.ArrayLit arm of emit_expr builds an `[N x i64]` shadow and
+# stored each struct element as an i64 (invalid IR). (AGAST #1608)
+#
+# bool / f32 / f64 elements are `i1` / `float` / `double` in a local and a
+# field array alike (array_elem_typed_scalar, #1966, #2063).
+pub fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_ty: TypeKind, elem_name_sv: StrView, lit: *Expr)
+    let is_struct: bool = elem_ty == TypeKind.Struct and elem_name_sv.len > 0
+    let elem_llvm: StrView = array_slot_elem_llvm(elem_ty)
+    let elem_ir: String = ir_name(elem_name_sv)
+    var idx: i32 = 0
+    var it: *Expr = lit.args
+    while it != null and idx < arr_size
+        # A struct-literal element has no value register; GEP first, then
+        # write it in place.
+        var val_reg: i32 = -1
+        if not is_struct or it.kind != ExprKind.StructLit
+            val_reg = emit_expr_into_slot(s, it, elem_ty, elem_name_sv)   # AGAST #2454
+        let elem_ptr: i32 = next_reg(s)
+        if is_struct
+            format_into(s, "  %.{elem_ptr} = getelementptr [{arr_size} x %{elem_ir.as_view()}], ptr %.{base_reg}, i64 0, i64 {idx}\n")
+            if val_reg < 0
+                emit_struct_lit_to_alloca(s, it, elem_ptr)
+            else
+                let agg: i32 = coerce_struct_ret_value(s, it, val_reg, elem_name_sv)
+                emit_struct_store_or_copy(s, TypeKind.Struct, elem_name_sv, agg, elem_ptr)
+        else
+            format_into(s, "  %.{elem_ptr} = getelementptr [{arr_size} x {elem_llvm}], ptr %.{base_reg}, i64 0, i64 {idx}\n")
+            let stored: i32 = emit_array_lit_elem_narrow(s, it, val_reg, elem_ty, elem_llvm)
+            format_into(s, "  store {elem_llvm} %.{stored}, ptr %.{elem_ptr}\n")
+        idx = idx + 1
+        it = it.next
+
+# The i64 value `val_reg` of array-literal element `it` narrowed to the
+# `elem_llvm` slot of a scalar `[N]elem_ty`.
+fn emit_array_lit_elem_narrow(s: *EmitterState, it: *Expr, val_reg: i32, elem_ty: TypeKind, elem_llvm: StrView) -> i32
+    if array_elem_typed_scalar(elem_ty) == 1
+        return emit_field_elem_narrow(s, val_reg, elem_ty, it)
+    if ty_is_ptr(elem_ty) == 1
+        if expr_is_ptr_valued(s, it) == 1
+            return val_reg   # AGAST #3029: `@&x` is a `ptr` already
+        let as_ptr: i32 = next_reg(s)
+        format_into(s, "  %.{as_ptr} = inttoptr i64 %.{val_reg} to ptr\n")
+        return as_ptr
+    if elem_ty == TypeKind.Ref or elem_ty == TypeKind.MutRef
+        return ptr_value_to_i64(s, it, val_reg)   # AGAST #2369: an `[N]@&T` holds i64s
+    if ty_int_in(elem_ty, 8, 32) == 1
+        let narrowed: i32 = next_reg(s)
+        format_into(s, "  %.{narrowed} = trunc i64 %.{val_reg} to {elem_llvm}\n")
+        return narrowed
+    val_reg
+
+# `&base.<field field_idx>` of struct `st` at `base_reg`, in a fresh register:
+# the GEP every struct-literal field store opens with.
+fn struct_lit_field_ptr(s: *EmitterState, st: *StructDef, base_reg: i32, field_idx: i32) -> i32
+    let field_ptr: i32 = next_reg(s)
+    gep_struct_open(s, field_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+    format_into(s, ", ptr %.{base_reg}, i32 0, i32 {field_idx as i64}\n")
+    field_ptr
+
+# If struct literal field `field_idx` of `st` is an inline array initialised
+# with `[v; N]` (AGAST #1605) or `[a, b, ..]` (AGAST #1608), GEP to the field
+# inside `base_reg` and write it in place; return 1. Otherwise emit nothing
+# and return 0 so the caller's generic evaluate-then-store path handles the
+# field.
+pub fn emit_struct_lit_array_fill_field(s: *EmitterState, st: *StructDef, field_idx: i32, value: *Expr, base_reg: i32) -> i32
+    if value == null or (value.kind != ExprKind.ArrayFill and value.kind != ExprKind.ArrayLit)
+        return 0
+    let field: *StructField = get_field_type(st, field_idx)
+    if field.field_type != TypeKind.Array
+        return 0
+    let field_ptr: i32 = struct_lit_field_ptr(s, st, base_reg, field_idx)
+    let elem_sv: StrView = StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }
+    if value.kind == ExprKind.ArrayLit
+        emit_array_lit_into(s, field_ptr, field.array_size, field.array_elem_type, elem_sv, value)
+    else
+        emit_array_fill_into(s, field_ptr, field.array_size, field.array_elem_type, elem_sv, value.left)
+    1
+
+# `  store <ty> %.{val}, ptr %.{field_ptr}`: a struct-literal field's store.
+fn struct_lit_field_put(s: *EmitterState, ty: StrView, val: i32, field_ptr: i32)
+    format_into(s, "  store {ty} %.{val}, ptr %.{field_ptr}\n")
+
+# The i64 value `val_reg` truncated to `ty` (a narrow integer or bool field)
+# and stored.
+fn struct_lit_field_put_narrow(s: *EmitterState, ty: StrView, val_reg: i32, field_ptr: i32)
+    let narrow: i32 = next_reg(s)
+    format_into(s, "  %.{narrow} = trunc i64 %.{val_reg} to {ty}\n")
+    struct_lit_field_put(s, ty, narrow, field_ptr)
+
+# Evaluate struct-literal field `field_idx` of `st` and store it into the
+# struct at `base_reg`, at the field's own width.
+#
+# The ONE field-store dispatch for struct literals: emit_var_decl's
+# `let s = S { ... }` loop and emit_struct_lit_to_alloca (tail / return /
+# reassignment literals) both call it, so the two cannot drift again. Before
+# AGAST #1497 they had: the let loop stored a bool with an 8-byte `store i64`
+# (clobbering the next field), and the alloca loop had no bool, u32, i16/u16
+# or struct arm and silently dropped those fields.
+#
+# Values are i64 in ritz1's value model (a bool too, AGAST #1646 / #3001), so
+# narrow fields `trunc` first.
+# An unlowerable field type is a located error, never a silent skip.
+pub fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: i32, value: *Expr, base_reg: i32)
+    let field: *StructField = get_field_type(st, field_idx)
+    let field_ty_sv: StrView = StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }
+    # AGAST #3005: a tuple field (`Box<(u32, u32)> { v: (1, 2) }`, a nested
+    # tuple) names a nameless tuple literal.
+    if field.field_type == TypeKind.Struct
+        tuple_lit_name(s, value, field_ty_sv)
+    # A nested literal (`E { name: V { .. } }`) has no value register:
+    # emit_expr rejects a bare ExprKind.StructLit. Write it in place into the
+    # field instead, recursively. (AGAST #1655)
+    if value != null and value.kind == ExprKind.StructLit and field.field_type == TypeKind.Struct
+        emit_struct_lit_to_alloca(s, value, struct_lit_field_ptr(s, st, base_reg, field_idx))
+        return
+    # AGAST #1748: an array field from a non-literal (`rows: b.rows`, a
+    # local array, a `:&` array param) is copied into the literal's slot,
+    # exactly as `h.a = a` assigns it. A `[..]` / `[v; N]` value was written in
+    # place by emit_struct_lit_array_fill_field before this is reached.
+    if field.field_type == TypeKind.Array
+        emit_array_field_whole_assign(s, struct_lit_field_ptr(s, st, base_reg, field_idx), field, value)
+        return
+    # AGAST #2142: `Font { cmap: Some(..) }` builds the field's enum.
+    let val_reg: i32 = emit_expr_into_field(s, value, field)
+    let field_ptr: i32 = struct_lit_field_ptr(s, st, base_reg, field_idx)
+    let bits: i32 = ty_int_bits(field.field_type)
+    if bits == 64
+        # AGAST #2064: u64 is already an i64 register; no trunc needed.
+        struct_lit_field_put(s, "i64", val_reg, field_ptr)
+        return
+    if bits == 32
+        struct_lit_field_put_narrow(s, "i32", val_reg, field_ptr)
+        return
+    if bits == 16
+        struct_lit_field_put_narrow(s, "i16", val_reg, field_ptr)
+        return
+    if bits == 8
+        struct_lit_field_put_narrow(s, "i8", val_reg, field_ptr)
+        return
+    match field.field_type
+        TypeKind.Bool =>
+            struct_lit_field_put_narrow(s, "i1", val_reg, field_ptr)
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            # AGAST #2041: `R { ch: @&c }` -- `@&c` (or an `@&T` local) is
+            # already a `ptr`; only an i64-model pointer value needs inttoptr.
+            struct_lit_field_put(s, "ptr", i64_value_to_ptr(s, value, val_reg), field_ptr)
+        TypeKind.F32 =>
+            # Float lit emits as `double`; an f64 value is fptrunc'd, an
+            # integer one sitofp'd (#2065), by emit_field_elem_narrow.
+            struct_lit_field_put(s, "float", emit_field_elem_narrow(s, val_reg, TypeKind.F32, value), field_ptr)
+        TypeKind.F64 =>
+            struct_lit_field_put(s, "double", emit_field_elem_narrow(s, val_reg, TypeKind.F64, value), field_ptr)
+        TypeKind.Struct =>
+            if field.field_type_name_len <= 0
+                emit_ir_error_sv(s, value.span, "struct literal field of this type is not lowered")
+                return
+            # task-103: struct-by-value field (e.g. `Vec$T` in `Wrap`).
+            # val_reg is the loaded aggregate (`%Vec$T`), not an i64.
+            # A bare "..." is a %Span$u8; a StrView field needs it rebuilt as
+            # %StrView (the layout-equivalent pair) before the store (#1669).
+            let agg: i32 = coerce_struct_ret_value(s, value, val_reg, field_ty_sv)
+            emit_struct_store_or_copy(s, TypeKind.Struct, field_ty_sv, agg, field_ptr)
+        _ =>
+            emit_ir_error_sv(s, value.span, "struct literal field of this type is not lowered")
+
+# Emit a struct literal into an existing alloca and return the alloca register
+# Used for returning struct literals from functions
+pub fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) -> i32
+    let lname: StrView = tuple_lit_name(s, e, no_name()).unwrap_or(no_name())   # AGAST #3005
+    var st: *StructDef = null
+    if not unnamed(lname)
+        st = find_struct(s, lname)
+    if st == null
+        emit_ir_error_sv(s, e.span, "struct not found for literal")
+        return alloca_reg
+
+    # Iterate through field initializers
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        let field_idx: i32 = find_field_index(st, StrView { ptr: (fi.name), len: (fi.name_len) as i64 })
+        # `a: [v; N]` for an array field is written in place (AGAST #1605).
+        if field_idx >= 0 and emit_struct_lit_array_fill_field(s, st, field_idx, fi.value, alloca_reg) == 0
+            emit_struct_lit_field_store(s, st, field_idx, fi.value, alloca_reg)
+        fi = fi.next
+    emit_struct_lit_zero_omitted(s, st, e, alloca_reg)
+    alloca_reg
+
+# True if struct literal `e` gives a field named `f`.
+fn struct_lit_gives(e: *Expr, f: *StructField) -> bool
+    let want: StrView = StrView { ptr: (f.name), len: (f.name_len) as i64 }
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        if want.eq(StrView { ptr: (fi.name), len: (fi.name_len) as i64 })
+            return true
+        fi = fi.next
+    false
+
+# Zero every field of `st` that struct literal `e` leaves out, in the struct
+# at `base_reg` (LANGUAGE_SPEC §9.2, AGAST #1749).  Called after the given
+# fields are stored, so a given field is never overwritten.  A scalar is a
+# `store zeroinitializer`; an array or struct goes through @__ritz_sret_zero,
+# never llvm.memset (AGAST #3218: codegen turns a large one into a libc call,
+# and ritz links -nostdlib).  Both literal lowerings call it: emit_var_decl's
+# `let` / `var` loop and emit_struct_lit_to_alloca.
+pub fn emit_struct_lit_zero_omitted(s: *EmitterState, st: *StructDef, e: *Expr, base_reg: i32)
+    var idx: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        if not struct_lit_gives(e, f)
+            let fp: i32 = next_reg(s)
+            gep_struct_open(s, fp, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+            format_into(s, ", ptr %.{base_reg}, i32 0, i32 {idx as i64}  ; omitted field: zero\n")
+            if f.field_type == TypeKind.Array or f.field_type == TypeKind.Struct
+                format_into(s, "  call void @__ritz_sret_zero(ptr %.{fp}, i64 ptrtoint (ptr getelementptr (")
+                emit_field_llvm_type(s, f)
+                format_into(s, ", ptr null, i32 1) to i64))\n")
+                s.sret_helpers_used = 1
+            else
+                format_into(s, "  store ")
+                emit_field_llvm_type(s, f)
+                format_into(s, " zeroinitializer, ptr %.{fp}\n")
+        idx = idx + 1
+        f = f.next
+
+# Lower a struct literal to a value: `alloca %T`, fill it field by field via
+# emit_struct_lit_to_alloca, then `load %T`. Returns the aggregate register.
+# Unknown struct names are a located error (from emit_struct_lit_to_alloca's
+# lookup), never a silently wrong value. (AGAST #1362)
+pub fn emit_struct_lit_value(s: *EmitterState, e: *Expr) -> i32
+    let lname: StrView = tuple_lit_name(s, e, no_name()).unwrap_or(no_name())   # AGAST #3005
+    var st: *StructDef = null
+    if not unnamed(lname)
+        st = find_struct(s, lname)
+    if st == null
+        emit_ir_error_sv(s, e.span, "struct not found for literal")
+        let zero: i32 = next_reg(s)
+        format_into(s, "  %.{zero} = add i64 0, 0\n")
+        return zero
+    let st_ir: String = ir_name(StrView { ptr: (st.name), len: (st.name_len) as i64 })
+    let tmp: i32 = next_reg(s)
+    entry_alloca_reg_begin_named(s, tmp)
+    format_into(s, "{st_ir.as_view()}  ; rvalue struct literal\n")
+    entry_alloca_reg_end(s)
+    emit_struct_lit_to_alloca(s, e, tmp)
+    let val: i32 = next_reg(s)
+    format_into(s, "  %.{val} = load %{st_ir.as_view()}, ptr %.{tmp}\n")
+    val

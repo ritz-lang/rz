@@ -7,24 +7,23 @@ import ast
 import types           # the one primitive type table (AGAST #1889)
 import ast_helpers
 import emitter_core
+import emitter_seam   # emit_expr / emit_stmt / ...: the emit table (AGAST #4697)
 import text_bridge     # StrView views of the older *u8 text APIs (AGAST #4696)
 import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
 import emitter_types   # AGAST #1818: type inference moved out of emitter_core
 import emitter_ir
 import diag                 # diag_error_at (AGAST #3445)
-import emitter_expr
-import emitter_expr_arith   # emit_nd_index_value (AGAST #1509)
 import deref_field          # df_no_field_once (AGAST #3015)
-import emitter_expr_call
-import emitter_match
 import ritzlib.cstr
 import ritzlib.io
 import ritzlib.str
 import ritzlib.string
 import ritzlib.option
 import ritzlib.strview
-import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
-import emitter_decl   # AGAST #1818: split out below the emitter cycle
+import ritzlib.memory      # malloc: through_spill (AGAST #4697)
+import ritzlib.fmt.digits  # fmt_i64_into: through_spill
+import emitter_call_lower   # AGAST #1818: below the emission modules
+import emitter_decl   # AGAST #1818: below the emission modules
 import text_bridge   # no_name / unnamed (AGAST #4696)
 
 
@@ -1289,3 +1288,221 @@ pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
         return 0
     emit_ir_error_sv(s, e.span, "unhandled EXPR_MEMBER")
     0
+
+var g_base_spills: i32 = 0
+
+# "#" + up to 20 digits of an i64 + NUL (AGAST #1820: no magic alloc sizes).
+const BASE_SPILL_NAME_BUF: i64 = 24
+
+# =============================================================================
+# Spills and through-index places that emit their operand (AGAST #1818: moved
+# up from emitter_types / index_through, which no longer reach emit_expr).
+# =============================================================================
+# AGAST #2329: `view`, bound, at an emitting site.  A base_array_view's base is
+# evaluated once, into a `*T` local named `#k`, so `x[i]` is `*(#k + i)` the way a
+# local's is `*(p# + i)`; anything else is `view` itself.
+pub fn through_spill(s: *EmitterState, view: *LocalVar) -> *LocalVar
+    if view == null or lv_array_base(view) == null
+        return view
+    let val: i32 = emit_expr(s, lv_array_base(view))
+    let slot: i32 = entry_alloca(s, "i64")
+    format_into(s, "  store i64 %.{val}, ptr %.{slot}\n")
+    g_base_spills = g_base_spills + 1
+    # The local's name outlives this fn (the scope keeps the pointer), so it
+    # is its own allocation, not a String dropped at the end of the fn.
+    let name: *u8 = malloc(BASE_SPILL_NAME_BUF)
+    *name = '#'   # no identifier has one
+    let len: i32 = 1 + fmt_i64_into(Span<u8> { ptr: name + 1, len: BASE_SPILL_NAME_BUF - 1 }, g_base_spills as i64).len as i32
+    add_local_full(s, StrView { ptr: (name), len: (len) as i64 }, slot, TypeKind.Ptr, StrView { ptr: (lv_type_name(view)), len: (lv_type_name_len(view)) as i64 }, lv_pointee_type(view), 0, TypeKind.Void)
+    let bound: *LocalVar = local_at(s, s.local_count - 1)
+    lv_mark_array_view(bound)
+    bound
+
+# AGAST #2098 / #3635: the `ptr` a plane_ptr_shape base `e` is, in a register:
+# a local's slot loaded (twice for `*r`, r a `**`), else `e` (or the X of a
+# `*X`) evaluated.
+pub fn emit_plane_ptr(s: *EmitterState, e: *Expr) -> i32
+    var x: *Expr = e
+    if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
+        x = e.operand
+    if x.kind == ExprKind.Ident
+        let lv: *LocalVar = find_local_struct_name(s, x.ident)
+        if lv != null
+            var r: i32 = next_reg(s)
+            format_into(s, "  %.{r} = load ptr, ptr %.{lv.reg}\n")
+            if local_holds_plane_ptr(lv) == 1   # AGAST #4122: a ref too
+                let r2: i32 = next_reg(s)
+                format_into(s, "  %.{r2} = load ptr, ptr %.{r}\n")
+                r = r2
+            return r
+    let v: i32 = emit_expr(s, x)
+    let ptr: i32 = next_reg(s)
+    format_into(s, "  %.{ptr} = inttoptr i64 %.{v} to ptr\n")
+    # AGAST #4122: `*s.q` / `*gq` / `*f()` loads the `*[N][M]T` the `**` holds.
+    if x != e and base_plane_ptr_ptr(s, x) != null
+        let held: i32 = next_reg(s)
+        format_into(s, "  %.{held} = load ptr, ptr %.{ptr}\n")
+        return held
+    ptr
+
+# AGAST #2250: `e` read into a by-value slot of struct `name`.  `c:& C` reads
+# as the pointer, but the slot holds a `C`, so a `c:& C` param of that type
+# copies its referent here: the aggregate register, as emit_expr gives for any
+# other struct value.  0 when `e` is anything else.  `c:& [2]C` names `C` as
+# well: an array is no `C`, so it stays the pointer, which clang refuses.  A
+# move-only C was refused on Sema (own_check.ritz's oc_lent_read, AGAST #3507).
+pub fn emit_lent_referent(s: *EmitterState, e: *Expr, name: StrView) -> i32
+    var loc: *LocalVar = lent_local(s, e)
+    if loc == null
+        loc = lent_self_local(s, e)
+    if loc == null or lv_var_type(loc) == TypeKind.Array
+        return 0
+    if name_eq(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, name) == 0
+        return 0
+    var src: i32 = emit_expr(s, e)
+    if lv_var_type(loc) == TypeKind.Ptr
+        # An impl's `self:& T` is a `*T` local, so its value is an i64.
+        let addr: i32 = next_reg(s)
+        format_into(s, "  %.{addr} = inttoptr i64 %.{src} to ptr  ; #2278 lent self\n")
+        src = addr
+    let val: i32 = next_reg(s)
+    emit_struct_load_or_defer(s, TypeKind.Struct, val, name, src, no_name())
+    return val
+
+# emit_expr, with `e` marked as a copy into a struct slot when `ty` is one (#2330).
+pub fn emit_struct_copy(s: *EmitterState, e: *Expr, ty: TypeKind) -> i32
+    let saved: *Expr = s.struct_copy_expr
+    if ty == TypeKind.Struct
+        s.struct_copy_expr = e
+    let reg: i32 = emit_expr(s, e)
+    s.struct_copy_expr = saved
+    return reg
+
+struct NdIndexPtr
+    reg: i32              # ptr register of the element / sub-array
+    depth: i32            # indices applied, 1..shape.rank
+    shape: *ArrayShape
+
+# AGAST #2570: `q[i][j][k]` with more indices than q's plane has dimensions.
+# index_through leaves a plane pointer to the N-D path, which can't take it,
+# and the rest read past q (it crashed): refused, located, as ritz0 refuses it.
+# Returns 1 with a full-depth *out over %0 when it refused (the error fails the
+# build; callers then don't report again), 0 when `e` isn't such a chain.
+fn nd_plane_overindex(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
+    if e == null or e.kind != ExprKind.Index
+        return 0
+    var chain: i32 = 0
+    let base: *Expr = nd_chain_base(s, e, @chain)   # AGAST #4122: `a[k]` a base
+    if chain == 0   # `a[k]` itself: the plane pointer, not an index into it
+        return 0
+    let sh: *ArrayShape = plane_ptr_shape(s, base)
+    if sh == null
+        return 0
+    emit_nd_error_sv(s, e.span.line, e.span.col, "this indexes more dimensions than the plane of the multi-dimensional array it points at has")
+    out.reg = 0
+    out.depth = sh.rank
+    out.shape = sh
+    return 1
+
+# Emit the GEP for an N-D index chain `e` into *out.  Returns 0 (emitting
+# nothing) when nd_index_shape does not recognise `e`.  The indices are
+# evaluated in source order, outermost dimension first.
+pub fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
+    var depth: i32 = 0
+    let sh: *ArrayShape = nd_index_shape(s, e, @depth)
+    if sh == null
+        return nd_plane_overindex(s, e, out)
+    var chain: i32 = 0
+    let base: *Expr = nd_chain_base(s, e, @chain)   # AGAST #4122: `a[k]` a base
+    # AGAST #2097: a field base `s.m` / `p.m` / `a.b.m` is addressed before
+    # the indices are evaluated, as ritz0 does.
+    var base_reg: i32 = 0
+    let plane_sh: *ArrayShape = plane_ptr_shape(s, base)   # #3635: `s.p[i][j]` is one
+    if base.kind == ExprKind.Member and plane_sh == null
+        var mp: MemberPtrResult
+        emit_member_ptr(s, base, @mp)
+        # Reported, then emitted anyway (over %.0) so callers do not fall
+        # through to a 1-D path and report again; the error fails the build.
+        if mp.success != 1
+            emit_nd_error_sv(s, e.span.line, e.span.col, "cannot address the multi-dimensional array field this index chain starts from in ritz1")
+        base_reg = mp.reg
+    # AGAST #2570: a plane pointer `q` is GEP'd from its value, not its slot.
+    # Loaded before the indices, as a field base is addressed before them.
+    var plane: i32 = 0
+    # AGAST #2098: `(*q)[i][j]` is `q[i][j]`; #3635: a field, global or call
+    # base too, and `(*r)[i][j]` through a `**`.
+    if plane_sh != null
+        plane = 1
+        base_reg = emit_plane_ptr(s, base)
+    var regs: [8]i32
+    var j: i32 = 0
+    while j < depth
+        # The j-th index (source order) sits depth-1-j levels below `e`.
+        var node: *Expr = e
+        var k: i32 = 0
+        while k < depth - 1 - j
+            node = node.left
+            k = k + 1
+        regs[j] = emit_expr(s, node.right)
+        j = j + 1
+    let r: i32 = next_reg(s)
+    format_into(s, "  %.{r} = getelementptr ")
+    emit_array_shape_llvm(s, sh, 0)
+    format_into(s, ", ptr ")
+    if plane == 1 or base.kind == ExprKind.Member
+        format_into(s, "%.{base_reg}")
+    else
+        let lv: *LocalVar = find_local_struct_name(s, base.ident)
+        if lv != null
+            format_into(s, "%.{lv.reg}")
+        else
+            let name_ir1: String = ir_name(base.ident)
+            format_into(s, "@{name_ir1.as_view()}")
+    format_into(s, ", i64 0")
+    j = 0
+    while j < depth
+        format_into(s, ", i64 %.{regs[j]}")
+        j = j + 1
+    format_into(s, "\n")
+    out.reg = r
+    out.depth = depth
+    out.shape = sh
+    return 1
+
+# The value of `e` = `g[i]..[k]` over an N-D array, in *out_reg.  Returns 0
+# when `e` is not an N-D index chain.  Only a full-depth chain to a leaf is a
+# value; a row (`g[i]` of `[N][M]T`) is a located error rather than a guess
+# at an aggregate load.  AGAST #3322: a row bound to an `[M]T` local
+# (`let r = g[i]`, annotated or not) or passed to an `[M]T` parameter is
+# copied by the whole-array paths and never reaches here.
+#
+# AGAST #3306: a full-depth chain to a struct leaf loads the `%P` at the
+# element's address, as #2099 stores one: a copy only (`let p: P = g[i][j]`,
+# `g[0][0] = g[2][1]`, `f(g[i][j])`), as a 1-D `[N]S` element is (#2330).
+# A leaf naming no struct (a generic clone that kept `T`, #3141) stays the
+# located error: `load %T` would be invalid IR.
+fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
+    var ndp: NdIndexPtr
+    if emit_nd_index_ptr(s, e, @ndp) == 0
+        return 0
+    let sh: *ArrayShape = ndp.shape
+    var leaf_st: *StructDef = null
+    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0
+        leaf_st = find_struct(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+    if ndp.depth < sh.rank or (sh.leaf_type == TypeKind.Struct and leaf_st == null)
+        emit_nd_error_sv(s, e.span.line, e.span.col, "a row or a struct element of a multi-dimensional array is not a value in ritz1 (index every dimension, use .field, or take its address with @)")
+        *out_reg = 0
+        return 1
+    if sh.leaf_type == TypeKind.Struct
+        *out_reg = 0
+        if whole_struct_elem_refused(s, e)
+            return 1
+        let sv: i32 = next_reg(s)
+        emit_struct_load_or_defer(s, TypeKind.Struct, sv, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, ndp.reg, no_name())
+        *out_reg = sv
+        return 1
+    let ty: StrView = elem_mem_llvm(sh.leaf_type)
+    let v: i32 = next_reg(s)
+    format_into(s, "  %.{v} = load {ty}, ptr %.{ndp.reg}\n")
+    *out_reg = emit_array_elem_widen(s, v, sh.leaf_type, elem_mem_llvm(sh.leaf_type))
+    return 1

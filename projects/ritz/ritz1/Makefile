@@ -59,6 +59,9 @@ SOURCES = \
 	deref_field \
 	ownership \
 	text_bridge \
+	emitter_seam \
+	emitter_aggregate \
+	emitter_dispatch \
 	emitter_expr_arith \
 	emitter_expr_access \
 	emitter_expr_call \

@@ -17,7 +17,7 @@ make arch-report    # modules, sizes, import graph and cycles, where each check 
 The gate (`make tools-unit`) holds this file to `tools/ritz1_arch.py
 --check`: every module in `ritz1/src` has an entry under
 [Module responsibilities](#module-responsibilities), every Sema check is in
-its **Checks** list, and no module joins the import cycle. The script's
+its **Checks** list, and `ritz1/src` has no import cycle. The script's
 docstring states the rules and the counting rules; `tools/test_ritz1_arch.py`
 pins them.
 
@@ -386,20 +386,17 @@ empty. A note that belongs to a move goes on that check's own entry.
 |---|---|
 | `emitter` | `emit_module`, `emit_fn`, impl methods; post-passes over the emitted IR text. |
 | `emitter_consts` | Module-level data: global initializers, integer const resolution, const arrays of struct literals, scalar struct consts. Split from `emitter` (AGAST #1818), which `pub import`s it. |
-| `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. Imports no emitter module above it (AGAST #1818), so it is outside the emitter import cycle: a fn that needs one belongs in `emitter_types`. |
-| `emitter_types` | What an expression's type, struct, pointee or element is, asked before it is emitted: the expression typing the old `emitter_core` did, the through-index views (the old `index_through`), and the method-callee and deref-pointee lookups (AGAST #1818). It reaches no emission module, so it and the Sema-side checks that read it sit below the emitter import cycle. |
+| `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. Imports no emitter module above it (AGAST #1818), so it sits below the emission modules: a fn that needs one belongs in `emitter_types`. |
+| `emitter_types` | What an expression's type, struct, pointee or element is, asked before it is emitted: the expression typing the old `emitter_core` did, the through-index views (the old `index_through`), and the method-callee and deref-pointee lookups (AGAST #1818). It reaches no emission module, so it and the Sema-side checks that read it sit below the emission modules. |
 | `emitter_abi` | How a struct or array crosses a call: sret returns and byval params (AGAST #1730, #1739, #2306, #3181), their attributes, and the deferred large-struct loads and copies. Above `emitter_core`, below the emitter modules (AGAST #1818). |
-| `emitter_call_lower` | The call path's parts that never recurse into `emit_expr`: argument and receiver place facts, arg conversions, `sizeof`, enum payload shapes, builtin method pieces, the `CALL_INTRINSICS` table. Below the emitter import cycle (AGAST #1818). |
-| `emitter_decl` | `let` / `var` typing and placement: what a declaration's slot is (the `decl_infer_*` phases, the `infer_*_let` views), tuple bindings. Below the emitter import cycle (AGAST #1818). |
-| `emitter_stmt_parts` | Statement lowering that never recurses into a statement or expression: `for` headers and element slots, if / match arm phi types, array and N-D row copies. Below the emitter import cycle (AGAST #1818). |
+| `emitter_call_lower` | The call path's parts that never recurse into `emit_expr`: argument and receiver place facts, arg conversions, `sizeof`, enum payload shapes, builtin method pieces, the `CALL_INTRINSICS` table. Below the emission modules (AGAST #1818). |
+| `emitter_decl` | `let` / `var` typing and placement: what a declaration's slot is (the `decl_infer_*` phases, the `infer_*_let` views), tuple bindings. Below the emission modules (AGAST #1818). |
+| `emitter_stmt_parts` | Statement lowering that never recurses into a statement or expression: `for` headers and element slots, if / match arm phi types, array and N-D row copies. Below the emission modules (AGAST #1818). |
 | `ir_operand` | What the text of an IR operand says: the digits of a register after `%.`, and whether it is the base of a GEP or the pointer of a load / store. The decisions behind the `format_into` sink, on StrViews alone so a unit test states them (AGAST #4696). A leaf module. |
 | `text_bridge` | The older `*u8` text APIs read as StrViews: the `(out_name, out_len)` lookups (`named_by`), C-string LLVM type spellings (`llvm_text`). A ported file calls these instead of carrying a `*u8`; each goes when the API it reads is ported (AGAST #4696). |
-| `emitter_ir` | Typed IR builders (casts, load/store, alloca, branches): the spelling of an instruction lives here, not at each site. A leaf module, so it stays out of the emitter import cycle (AGAST #1817). |
-| `emitter_expr` | `emit_expr` dispatch and struct literals. |
-| `emitter_expr_access`, `emitter_expr_arith`, `emitter_expr_call` | Identifiers/index/member; binary/unary; calls and methods. |
-| `emitter_stmt` | Statements: declarations, assignment, control flow, `for`. |
-| `emitter_match` | `match` lowered to an if-else chain. |
-| `emitter_print` | The `print` builtin, byte-identical to ritz0's output. |
+| `emitter_ir` | Typed IR builders (casts, load/store, alloca, branches): the spelling of an instruction lives here, not at each site. A leaf module, so it stays below the emission modules (AGAST #1817). |
+| `emitter_seam` | The emit table's wrappers (`emit_expr`, `emit_stmt`, `emit_lvalue_ptr`, `emit_member_ptr`, `emit_expr_into_slot` / `_into_field`, `emit_expr_method`, `emit_array_local_whole_assign`): each a call through `EmitterState.emit` (`EmitTable` in `emitter_core`), which `emit_module` wires to the `*_impl` fn doing the work. Statements and expressions nest, so emission recurses; it recurses through here, not through imports, and the emission modules below form no cycle (AGAST #4697). Imports only `emitter_core`. |
+| `emitter_expr_access`, `emitter_print`, `emitter_match`, `emitter_aggregate`, `emitter_expr`, `emitter_expr_arith`, `emitter_expr_call`, `emitter_dispatch`, `emitter_stmt` | The emission modules, in import order: each imports only those before it, and `emitter_seam` for the rest (AGAST #4697). Identifiers / index / member (and the n-d index pointers, spills, struct copies); the `print` builtin, byte-identical to ritz0's output; `match` lowered to an if-else chain; array and struct values written into a place (literals, fills, array-valued `if` / `match` / blocks); member pointers and casts; binary / unary and places; calls and methods; `emit_expr`'s switch over `ExprKind`; statements: declarations, assignment, control flow, `for`. |
 | `emitter_asm` | `asm` blocks to LLVM inline asm. |
 | `bool_kind` | The emitter's bool kind of an expression: bool_check's inference (`sema_bool_kind`), still read by codegen and the emitter-side checks. |
 | `frame_limit` | Text scan of a fn's allocas: refuses a stack frame over 8 MiB at its largest local or temporary (#3739). |
@@ -534,15 +531,13 @@ Tracked under AGAST #1812 (M1.3). `make arch-report` shows its shape.
 
 - **No semantic phase yet** — types are inferred during emission and most
   checks still run inside the emitter. Sema exists; the move is #1816.
-- **The emitter import cycle** — the emitter modules, the emitter-side checks
-  and monomorph form one strongly connected component (`make arch-report`,
-  "Import cycles"): the seven emission modules (`emitter_expr`, `_access`,
-  `_arith`, `_call`, `emitter_match`, `emitter_print`, `emitter_stmt`), which
-  call each other because statements and expressions nest. #1818 moved
-  `emitter_core`, the typing (`emitter_types`) and the checks out of it. No module may
-  join it (`CYCLE_BASELINE` in `tools/ritz1_arch.py`, checked by the gate).
-  Breaking it, dissolving `emitter_core` and splitting the long functions
-  the report lists is #1818.
+- **The emitter import cycle** is gone (AGAST #4697): #1818 took
+  `emitter_core`, the typing (`emitter_types`) and the checks out of it,
+  and #4697 broke the last seven modules' cycle with one dispatch seam
+  (`emitter_seam`, the emit table). `CYCLE_BASELINE` in
+  `tools/ritz1_arch.py` is empty, so the gate refuses any new cycle.
+  Dissolving `emitter_core` and splitting the long functions the report
+  lists is #1818's remainder.
 - **Raw IR text** — the emitter writes IR as string fragments and re-parses
   its own output in post-passes (the packed-align and frame-limit scans). A
   typed IR builder is #1817.

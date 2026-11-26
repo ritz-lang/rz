@@ -288,6 +288,14 @@ def test_the_real_doc_holds_the_invariants():
     assert violations(scan(DEFAULT_SRC), doc, CYCLE_BASELINE) == []
 
 
+def test_ritz1_has_no_import_cycle():
+    # AGAST #4697: statements and expressions nest, so the emitter recurses;
+    # it recurses through the emit table (emitter_seam.ritz), not through
+    # imports.  The baseline is empty: no module may join a cycle again.
+    assert cycles(scan(DEFAULT_SRC)) == []
+    assert CYCLE_BASELINE == frozenset()
+
+
 # --- acceptance: two sema rooms cherry-pick onto each other (#3896) --------
 
 

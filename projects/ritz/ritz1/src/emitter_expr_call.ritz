@@ -4,6 +4,8 @@ import ast
 import types           # the one primitive type table (AGAST #1889)
 import ast_helpers
 import emitter_core
+import emitter_seam   # emit_expr / emit_stmt / ...: the emit table (AGAST #4697)
+import emitter_aggregate   # array / struct values into a place (AGAST #4697)
 import text_bridge      # StrView views of the older *u8 text APIs (AGAST #4696)
 import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
 import emitter_types   # AGAST #1818: type inference moved out of emitter_core
@@ -14,7 +16,6 @@ import float_slot     # float_slot_unsigned (AGAST #2945, #4376)
 import emitter_expr
 import emitter_print
 import interp       # interp_lit_has_placeholder (AGAST #4381)
-import emitter_stmt   # the whole-array copy (AGAST #2287)
 import emitter_expr_access   # emit_whole_array_error (AGAST #2287)
 import emitter_expr_arith    # emit_nd_index_ptr (AGAST #3306)
 import narrowing
@@ -28,9 +29,9 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.string
 import ritzlib.strview    # strview_starts_with (was the local starts_with)
-import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
-import emitter_decl   # AGAST #1818: split out below the emitter cycle
-import emitter_stmt_parts   # AGAST #1818: split out below the emitter cycle
+import emitter_call_lower   # AGAST #1818: below the emission modules
+import emitter_decl   # AGAST #1818: below the emission modules
+import emitter_stmt_parts   # AGAST #1818: below the emission modules
 
 # AGAST #3125: `Span<T>` is `{ ptr, len }`, so `.ptr()`, `.is_empty()` and
 # `.slice(lo, hi)` are struct operations a module that only receives a span
@@ -214,7 +215,7 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
 # a ctor with no enum to land in is a ritz1 error, not invalid IR.  Without
 # this, `held = Some(..)` / `f.cmap = None` / `Font { cmap: Some(..) }`
 # emitted `add i64 0, 0 ; variant w/ no enum ctx` and clang rejected it.
-pub fn emit_expr_into_slot(s: *EmitterState, e: *Expr, ty: TypeKind, name: StrView) -> i32
+pub fn emit_expr_into_slot_impl(s: *EmitterState, e: *Expr, ty: TypeKind, name: StrView) -> i32
     if ty == TypeKind.Struct
         let referent: i32 = emit_lent_referent(s, e, name)
         if referent != 0
@@ -390,30 +391,6 @@ fn emit_array_arg_addr(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     format_into(s, "  %.{addr} = ptrtoint ptr %.{ptr} to i64  ; #2287 array by address\n")
     return addr
 
-# AGAST #2250: `e` read into a by-value slot of struct `name`.  `c:& C` reads
-# as the pointer, but the slot holds a `C`, so a `c:& C` param of that type
-# copies its referent here: the aggregate register, as emit_expr gives for any
-# other struct value.  0 when `e` is anything else.  `c:& [2]C` names `C` as
-# well: an array is no `C`, so it stays the pointer, which clang refuses.  A
-# move-only C was refused on Sema (own_check.ritz's oc_lent_read, AGAST #3507).
-pub fn emit_lent_referent(s: *EmitterState, e: *Expr, name: StrView) -> i32
-    var loc: *LocalVar = lent_local(s, e)
-    if loc == null
-        loc = lent_self_local(s, e)
-    if loc == null or lv_var_type(loc) == TypeKind.Array
-        return 0
-    if name_eq(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, name) == 0
-        return 0
-    var src: i32 = emit_expr(s, e)
-    if lv_var_type(loc) == TypeKind.Ptr
-        # An impl's `self:& T` is a `*T` local, so its value is an i64.
-        let addr: i32 = next_reg(s)
-        format_into(s, "  %.{addr} = inttoptr i64 %.{src} to ptr  ; #2278 lent self\n")
-        src = addr
-    let val: i32 = next_reg(s)
-    emit_struct_load_or_defer(s, TypeKind.Struct, val, name, src, no_name())
-    return val
-
 # AGAST #2279: `return c` or a tail `c` with `c:& C` in a fn returning `C`: the
 # value is the referent.  Emits the `ret` and returns 1; 0 when `e` is anything
 # else.  Only s.ret_type_name's slot reads it.
@@ -476,17 +453,8 @@ pub fn emit_expr_by_value(s: *EmitterState, e: *Expr, ty: TypeKind, name: StrVie
             return referent
     return emit_struct_copy(s, e, ty)
 
-# emit_expr, with `e` marked as a copy into a struct slot when `ty` is one (#2330).
-pub fn emit_struct_copy(s: *EmitterState, e: *Expr, ty: TypeKind) -> i32
-    let saved: *Expr = s.struct_copy_expr
-    if ty == TypeKind.Struct
-        s.struct_copy_expr = e
-    let reg: i32 = emit_expr(s, e)
-    s.struct_copy_expr = saved
-    return reg
-
 # emit_expr_into_slot for a struct field.
-pub fn emit_expr_into_field(s: *EmitterState, e: *Expr, field: *StructField) -> i32
+pub fn emit_expr_into_field_impl(s: *EmitterState, e: *Expr, field: *StructField) -> i32
     return emit_expr_into_slot(s, e, field.field_type, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
 
 # The address of a place borrowed by `p`, as an i64 like `@x`; every slot
@@ -3153,7 +3121,7 @@ fn emit_impl_method_call(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv
 
     return widen_method_result(s, result, rtype)
 
-pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
+pub fn emit_expr_method_impl(s: *EmitterState, e: *Expr) -> i32
     record_assert_site(s, e)   # AGAST #1869: in a [[test]] fn only
     # `m.f()`: no `module.item` access (§15.3, AGAST #2215); was "cannot
     # determine receiver type", unlocated.

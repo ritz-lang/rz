@@ -1,0 +1,181 @@
+# ritz1/src/emitter_dispatch.ritz - emit_expr's one switch over ExprKind
+#
+# AGAST #4697: the expression entry the emit table's `expr` names.  It sits
+# above every module it dispatches to (emitter_expr, _access, _arith, _call,
+# emitter_match), and those reach it back only through emitter_seam.ritz, so
+# the emitter's modules import each other without a cycle.
+
+import ritzlib.io
+
+import ast
+import emitter_core
+import emitter_seam
+import emitter_ir
+import ownership             # own_note_temp (AGAST #2165)
+import struct_index          # si_once_* (AGAST #1635)
+import sema_probe            # RITZ1_SEMA_PROBE (AGAST #3501)
+import emitter_expr_access   # emit_expr_ident, emit_expr_index, emit_expr_member
+import emitter_aggregate     # emit_struct_lit_value
+import emitter_expr
+import emitter_expr_arith    # emit_expr_binary, emit_expr_unary
+import emitter_expr_call     # emit_expr_call, emit_expr_method
+import emitter_match         # emit_match, emit_if_expr
+
+pub fn emit_expr_impl(s: *EmitterState, e: *Expr) -> i32
+    # AGAST #3739: a temporary's slot is located at the innermost expression
+    # being emitted when it was made (frame_limit.ritz).
+    if e == null or e.span.line == 0
+        return emit_expr_body(s, e)
+    let fm_line: i32 = s.fm_line
+    let fm_col: i32 = s.fm_col
+    frame_mark(s, e.span.line, e.span.col)
+    let r: i32 = emit_expr_body(s, e)
+    frame_mark(s, fm_line, fm_col)
+    r
+
+fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
+    # Safety check for null expression
+    if e == null
+        eprints("ERROR: emit_expr called with null expression!\n")
+        return 0
+    if sema_probe_on() == 1
+        var em: SemaProbeEmitter = SemaProbeEmitter { s: s as *u8, bool_kind: probe_bool_kind, slot_type: probe_slot_type, source_file: probe_source_file }
+        sema_probe_expr(s.mono.pctx, @em, e)
+    let ca_root: *Expr = call_array_index_root(s, e)
+    if ca_root != null
+        return emit_call_array_index(s, e, ca_root)
+    var kreg: i32 = 0
+    match e.kind
+        ExprKind.IntLit | ExprKind.CharLit =>
+            # A character literal's int_val holds its value; both are i64.
+            let result: i32 = next_reg(s)
+            format_into(s, "  %.{result} = add i64 0, {e.int_val}\n")
+            return result
+
+        ExprKind.FloatLit =>
+            # Float literal: emit as a `double` constant via `fadd 0.0, <lit>`.
+            # We default to double — narrowing to float happens at the call/store
+            # site via fptrunc when the target type is f32.  The raw decimal
+            # repr from the source is reused verbatim; LLVM accepts standard
+            # decimal float literals (e.g. `1.5`, `3.14`).
+            let result: i32 = next_reg(s)
+            let lit: StrView = e.string_val
+            format_into(s, "  %.{result} = fadd double 0.0, {lit}\n")
+            return result
+
+        ExprKind.Ident =>
+            return emit_expr_ident(s, e)
+        ExprKind.Binary =>
+            return emit_expr_binary(s, e)
+        ExprKind.Unary =>
+            return emit_expr_unary(s, e)
+        ExprKind.Call =>
+            # A call registered in si_once runs once; its second emission reuses
+            # the first's register. Two users:
+            #   - a Vec view's low bound, in both of its fields (AGAST #2501);
+            #   - a call in the place of `x op= v`, shared by its read and its
+            #     store (monomorph.ritz note_compound_calls, AGAST #2529).
+            let call_once: i32 = si_once_find(e)
+            if call_once >= 0
+                let call_prev: i32 = si_once_take(call_once)
+                if call_prev >= 0
+                    return call_prev
+            let call_lent: i32 = own_lent_mark()
+            let call_reg: i32 = emit_expr_call(s, e)
+            own_drop_lent(s, call_lent)     # AGAST #3050: what its args lent
+            own_note_temp(s, e, call_reg)   # AGAST #2165: a temporary's drop
+            if call_once >= 0
+                si_once_set(call_once, call_reg)
+            return call_reg
+        ExprKind.Index =>
+            return emit_expr_index(s, e)
+        ExprKind.Cast =>
+            return emit_cast_expr(s, e)
+
+        ExprKind.NilLit =>
+            # nil literal - emit as null pointer (0)
+            let zero: i32 = next_reg(s)
+            format_into(s, "  %.{zero} = add i64 0, 0  ; nil\n")
+            return zero
+
+        ExprKind.CstringLit =>
+            # A C-string literal lowers to *u8 (null-terminated). Emitted here as a GEP to the
+            # first element, cast to i64 for downstream integer-flavoured consumers.
+            let str_idx: i32 = add_string(s, e.string_val)
+            let gep_reg: i32 = next_reg(s)
+            let str_size: i64 = ((e.string_val.len as i32) + 1) as i64
+            format_into(s, "  %.{gep_reg} = getelementptr [{str_size} x i8], ptr @.str.{str_idx}, i64 0, i64 0\n")
+            return ir_ptrtoint_i64(s.out, @s.reg_counter, gep_reg)
+
+        ExprKind.StringLit =>
+            if emit_string_lit_expr(s, e, @kreg) == 1
+                return kreg
+
+        ExprKind.StructLit =>
+            # Struct literal as an rvalue: TypeName { field: value, ... }
+            # (e.ident = struct type name, e.args = FieldInit list).
+            # let/var, return, reassignment, nested-field and receiver literals
+            # are written straight into their destination slot elsewhere. Every
+            # other position (fn/method arg, variant-ctor payload, `[T{..}; N]`
+            # element) lands here: fill a temp through the shared field-store
+            # loop, then yield the loaded `%T` aggregate. (AGAST #1362)
+            return emit_struct_lit_value(s, e)
+
+        ExprKind.Member =>
+            return emit_expr_member(s, e)
+        ExprKind.Method =>
+            # Inline predicate intrinsics for Result$/Option$ (AGAST #134): the
+            # ritzlib `Result<T, E>` / `Option<T>` methods are generic and aren't
+            # monomorphized in isolation, so method dispatch would resolve to an
+            # undefined extern. Fall through to emit_expr_method for anything
+            # that isn't a tagged-enum predicate.
+            let pred_reg: i32 = try_emit_enum_is_ok(s, e)
+            if pred_reg >= 0
+                return pred_reg
+            # `m[k] op= x` on a struct: its `index_mut` call is shared by the
+            # store and the read, and runs once (struct_index.ritz, AGAST #1635).
+            let once: i32 = si_once_find(e)
+            if once >= 0
+                let prev: i32 = si_once_take(once)
+                if prev >= 0
+                    return prev
+                let first_lent: i32 = own_lent_mark()
+                let first: i32 = emit_expr_method(s, e)
+                own_drop_lent(s, first_lent)   # AGAST #3050
+                own_note_temp(s, e, first)   # AGAST #2262: a temporary's drop
+                si_once_set(once, first)
+                return first
+            let method_lent: i32 = own_lent_mark()
+            let method_reg: i32 = emit_expr_method(s, e)
+            own_drop_lent(s, method_lent)     # AGAST #3050: what its args lent
+            own_note_temp(s, e, method_reg)   # AGAST #2262: a temporary's drop
+            return method_reg
+        ExprKind.Match =>
+            # Match expression — scrutinee in `left`, arms in `args` (recast).
+            let arms: *MatchArm = e.args as *MatchArm
+            return emit_match(s, e.left, arms, e.span)
+        ExprKind.If =>
+            # If/else expression (AGAST #1613) — see emit_if_expr.
+            return emit_if_expr(s, e)
+        ExprKind.Try =>
+            return emit_expr_try(s, e)
+
+        ExprKind.ArrayFill =>
+            # Array fill `[v; N]` with no `[N]T` slot to build in.  Every slot that
+            # has one lowers the fill itself (emit_array_fill_into: a typed or
+            # inferred `let`, a field, an assignment).  This arm built a shadow
+            # `[N x i64]` and returned its ADDRESS as the value, so whatever took it
+            # (an enum or Option payload, an untyped pointer-element `let`) silently
+            # read garbage.  AGAST #3014: fail closed, located, instead.
+            return emit_array_no_slot_error(s, e)
+
+        ExprKind.ArrayLit =>
+            return emit_array_lit_value(s, e)
+        _ => pass
+
+    # A kind with no lowering here (or a string literal emit_string_lit_expr
+    # did not lower): a located error and a placeholder value.
+    emit_ir_error_sv(s, e.span, "unknown expression kind")
+    let zero: i32 = next_reg(s)
+    format_into(s, "  %.{zero} = add i64 0, 0\n")
+    zero
