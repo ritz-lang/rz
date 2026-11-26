@@ -1,0 +1,67 @@
+# udp-recv: one UDP datagram from the ring-2 network service (AGAST #4751)
+#
+# harland docs/RING2_NET.md "Ring-3 tools": NetAttach, ShmMap and NetAddr
+# (net_attach), then libnet's net_bind on the given port, waits for one
+# EV_DATAGRAM on that handle, prints its peer address, port and payload,
+# and net_close. A port another endpoint holds ends on Errno.Exist (exit
+# 17). With no network service NetAttach answers Errno.NoDev and udp-recv
+# exits 19 before publishing.
+
+import ritzlib.span { Span }
+import ritzlib.strview { StrView }
+import libnet.client { NetExchange, BindResult, RecvResult, CloseResult, ERRNO_BADF }
+import libnet.ring { AppBytes, app_req_ring, app_ev_ring }
+import net_attach { net_attach, parse_port, wait_round, usage_error, print_addr }
+import net_tool { fail, print_payload }
+
+# The attachment: a global, since NetExchange is over 1 MiB (libnet's
+# NetExchange.init comment).
+var g_exchange: NetExchange
+
+pub fn main(args: Span<StrView>) -> i32
+    let usage: StrView = "Usage: udp-recv <port>\n"
+    if args.len != 2
+        return usage_error(usage)
+    let arg: StrView = args.get(1)
+    if arg.eq("--help") or arg.eq("-h")
+        print("{usage}")
+        return 0
+    let port: u16 = match parse_port(arg)
+        Some(p) => p
+        None => return usage_error(usage)
+
+    match net_attach()
+        Ok(a) => g_exchange.init(app_req_ring(a.region), app_ev_ring(a.region))
+        Err(e) => return fail("udp-recv", e.call, e.errno)
+
+    var handle: u32 = 0
+    loop
+        match g_exchange.net_bind(port)
+            BindResult.Bound(h) =>
+                handle = h
+                break
+            BindResult.Err(e) => return fail("udp-recv", "net_bind", e)
+            BindResult.Pending => wait_round()
+
+    var payload: AppBytes = [0; 2048]     # APP_SLOT, written out as libnet does
+    loop
+        match g_exchange.net_recv_from(handle, @&payload)
+            RecvResult.Datagram(d) =>
+                let peer_port: u16 = d.port
+                let n: u32 = d.length
+                print("from ")
+                print_addr(d.addr)
+                print(":{peer_port}: {n} bytes: ")
+                print_payload(@payload, n)
+                print("\n")
+                break
+            RecvResult.Err(e) => return fail("udp-recv", "net_recv_from", e)
+            RecvResult.BadF => return fail("udp-recv", "net_recv_from", ERRNO_BADF)
+            RecvResult.Empty => wait_round()
+
+    loop
+        match g_exchange.net_close(handle)
+            CloseResult.Closed => return 0
+            CloseResult.Err(e) => return fail("udp-recv", "net_close", e)
+            CloseResult.BadF => return fail("udp-recv", "net_close", ERRNO_BADF)
+            CloseResult.Pending => wait_round()

@@ -1,0 +1,61 @@
+# udp-send: one UDP datagram through the ring-2 network service (AGAST #4751)
+#
+# harland docs/RING2_NET.md "Ring-3 tools": NetAttach, ShmMap and NetAddr
+# (net_attach), then libnet's net_bind on port 0 (the service picks one in
+# 49152..=65535), one net_send_to of the message, which returns once the
+# request is on the ring, and net_close. With no network service NetAttach
+# answers Errno.NoDev and udp-send exits 19 before publishing.
+
+import ritzlib.span { Span, span_from_strview }
+import ritzlib.strview { StrView }
+import libnet.client { NetExchange, BindResult, SendResult, CloseResult, ERRNO_BADF }
+import libnet.ring { app_req_ring, app_ev_ring }
+import net_attach { Ipv4, net_attach, link_mtu, parse_addr, parse_port, wait_round, usage_error }
+import net_tool { fail }
+
+# The attachment: a global, since NetExchange is over 1 MiB (libnet's
+# NetExchange.init comment).
+var g_exchange: NetExchange
+
+pub fn main(args: Span<StrView>) -> i32
+    let usage: StrView = "Usage: udp-send <address> <port> <message>\n"
+    if args.len == 2 and (args.get(1).eq("--help") or args.get(1).eq("-h"))
+        print("{usage}")
+        return 0
+    if args.len != 4
+        return usage_error(usage)
+    let addr: Ipv4 = match parse_addr(args.get(1))
+        Some(a) => a
+        None => return usage_error(usage)
+    let port: u16 = match parse_port(args.get(2))
+        Some(p) => p
+        None => return usage_error(usage)
+    let message: StrView = args.get(3)
+
+    match net_attach()
+        Ok(a) => g_exchange.init(app_req_ring(a.region), app_ev_ring(a.region))
+        Err(e) => return fail("udp-send", e.call, e.errno)
+
+    var handle: u32 = 0
+    loop
+        match g_exchange.net_bind(0)
+            BindResult.Bound(h) =>
+                handle = h
+                break
+            BindResult.Err(e) => return fail("udp-send", "net_bind", e)
+            BindResult.Pending => wait_round()
+
+    # Returns once the request is on the ring; a full ring waits for SPACE.
+    loop
+        match g_exchange.net_send_to(handle, span_from_strview(message), addr.octets, port, link_mtu())
+            SendResult.Sent => break
+            SendResult.Err(e) => return fail("udp-send", "net_send_to", e)
+            SendResult.BadF => return fail("udp-send", "net_send_to", ERRNO_BADF)
+            SendResult.Pending => wait_round()
+
+    loop
+        match g_exchange.net_close(handle)
+            CloseResult.Closed => return 0
+            CloseResult.Err(e) => return fail("udp-send", "net_close", e)
+            CloseResult.BadF => return fail("udp-send", "net_close", ERRNO_BADF)
+            CloseResult.Pending => wait_round()

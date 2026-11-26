@@ -1,0 +1,130 @@
+# The attach prologue indium's ring-3 net tools share (AGAST #4751)
+#
+# harland docs/RING2_NET.md "Ring-3 tools": ping, udp-send and udp-recv
+# each call NetAttach (228), ShmMap (227) and NetAddr (225), then harland's
+# libnet calls on the mapped exchange. NetAttach or NetAddr answering
+# Errno.NoDev ends the program before it publishes a request. This module
+# is those three calls, NetInfo's MTU and the argument parsing the tools
+# share; net_tool.ritz is the reporting. The net_* calls are libnet's and
+# are not wrapped again.
+#
+# This module does not import libnet.client: a module that does sees its
+# BindResult, SendResult, ... enums, and a bare `Err(x)` there builds one of
+# those rather than a Result (AGAST #2039), so the Result-returning calls
+# live here.
+#
+# Errors are the negative errno numbers RING2_NET.md and libnet use
+# (libnet.client's ERRNO_*); ritzlib's Errno does not carry NoDev or NFile.
+#
+# Waiting: libnet never blocks, and Harland has no ShmWait or user clock
+# yet, so a tool told Pending yields once and calls again (wait_round).
+# ping counts its deadline in those rounds; see PING_ROUNDS_PER_MS.
+
+import ritzlib.sys { syscall0, syscall1, sys_yield, SYS_NET_ATTACH, SYS_SHM_MAP, SYS_NET_ADDR, SYS_NET_INFO }
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview { StrView }
+import driver_abi.link { NetInfo, NetAddr }
+
+# A usage error's exit status. A failed call exits with its errno's
+# magnitude instead (net_tool.fail).
+pub const EXIT_USAGE: i32 = 2
+
+# A tool's stand-in clock until Harland has one: each wait_round() counts
+# as 1/PING_ROUNDS_PER_MS of a millisecond toward libnet's PING_DEADLINE_MS.
+pub const PING_ROUNDS_PER_MS: u64 = 64
+
+# Which call of net_attach failed, and its negative errno.
+pub struct AttachError
+    call: StrView
+    errno: i32
+
+# What a tool attached to: the mapped exchange region (APP_REGION_SIZE
+# bytes at this address) and the lease NetAddr copied out.
+pub struct Attached
+    region: u64
+    lease: NetAddr
+
+# NetAttach (228), ShmMap (227), NetAddr (225), in the spec's order.
+# Ok(the region and lease), or the first call that failed; nothing has
+# been published either way. The caller resets its NetExchange onto the
+# region (libnet.ring's app_req_ring / app_ev_ring).
+pub fn net_attach() -> Result<Attached, AttachError>
+    let handle: i64 = syscall0(SYS_NET_ATTACH)
+    if handle < 0
+        return Err(AttachError { call: "NetAttach", errno: handle as i32 })
+    let region: i64 = syscall1(SYS_SHM_MAP, handle)
+    if region < 0
+        return Err(AttachError { call: "ShmMap", errno: region as i32 })
+    var lease: NetAddr = NetAddr {
+        address: [0, 0, 0, 0], gateway: [0, 0, 0, 0], netmask: [0, 0, 0, 0], dns: [0, 0, 0, 0],
+        configured: 0, _pad: [0, 0, 0, 0, 0, 0, 0], generation: 0
+    }
+    let rc: i64 = syscall1(SYS_NET_ADDR, @&lease as i64)
+    if rc < 0
+        return Err(AttachError { call: "NetAddr", errno: rc as i32 })
+    Ok(Attached { region: region as u64, lease: lease })
+
+# The link MTU from NetInfo (224), or None while no driver has published
+# (Errno.NoDev): libnet's net_send_to takes exactly that Option.
+pub fn link_mtu() -> Option<u32>
+    var info: NetInfo = NetInfo { mac: [0, 0, 0, 0, 0, 0], link_up: 0, device_type: 0, mtu: 0 }
+    if syscall1(SYS_NET_INFO, @&info as i64) < 0
+        return None
+    Some(info.mtu)
+
+# One wait for a Pending call: yield the CPU, then the caller calls again.
+pub fn wait_round()
+    sys_yield()
+
+# An IPv4 address in wire order. A struct, not a bare [4]u8, so it can
+# ride in an Option and a match arm on ritz1 (a whole array can't).
+pub struct Ipv4
+    octets: [4]u8
+
+# A dotted-quad IPv4 address, or None: exactly four
+# dot-separated decimal octets of 1-3 digits, each at most 255.
+# (ritzlib.net's parse_ipv4 does the same but imports the Linux socket
+# layer, which a Harland build cannot compile.)
+pub fn parse_addr(s: StrView) -> Option<Ipv4>
+    var out: Ipv4 = Ipv4 { octets: [0, 0, 0, 0] }
+    var part: i64 = 0
+    var octet: u32 = 0
+    var digits: i32 = 0
+    for i in 0..s.len
+        let c: u8 = s.get(i)
+        if c >= '0' and c <= '9'
+            digits += 1
+            octet = octet * 10 + (c - '0') as u32
+            if digits > 3 or octet > 255
+                return None
+        else if c == '.' and digits > 0 and part < 3
+            out.octets[part] = octet as u8
+            part += 1
+            octet = 0
+            digits = 0
+        else
+            return None
+    if digits == 0 or part != 3
+        return None
+    out.octets[3] = octet as u8
+    Some(out)
+
+# A UDP port, 1..=65535, or None.
+pub fn parse_port(s: StrView) -> Option<u16>
+    match s.parse_i64()
+        Some(n) => if n >= 1 and n <= 65535 then Some(n as u16) else None
+        None => None
+
+# Print the usage line on stderr and return the usage exit status.
+pub fn usage_error(usage: StrView) -> i32
+    eprint("{usage}")
+    EXIT_USAGE
+
+# Print an address as a dotted quad (no newline).
+pub fn print_addr(a: [4]u8)
+    let b0: u8 = a[0]
+    let b1: u8 = a[1]
+    let b2: u8 = a[2]
+    let b3: u8 = a[3]
+    print("{b0}.{b1}.{b2}.{b3}")

@@ -674,6 +674,31 @@ all_passed() {
     fi
 }
 
+# net_nodev NAME: pass only if init ran indium's ping, udp-send and
+# udp-recv and each exited 19 (-Errno.NoDev): a Tier-1 boot runs no ring-2
+# service, so NetAttach answers NoDev and each tool ends before it publishes
+# a request (AGAST #4751, docs/RING2_NET.md "Ring-3 tools"). The kernel must
+# also have declared all three net calls: an undeclared number logs
+# "[syscall] unknown" and answers NoSys, which is not the spec's answer.
+net_nodev() {
+    local tool rc=0
+    for tool in ping udp-send udp-recv; do
+        # The tool's own stderr line lands between init's "[test] ... " and
+        # its verdict on the one serial console.
+        if ! grep -aPzq "\\[test\\] $tool nodev \\.\\.\\. $tool: NetAttach: Errno\\.NoDev [^\\n]*\\(-19\\)\\r?\\nPASS \\(exit=19\\)" "$WORK/$1.log"; then
+            grep -a "\[test\] $tool nodev" "$WORK/$1.log" | head -1
+            echo "FAIL ($1): $tool did not exit 19 (Errno.NoDev) without the net service"
+            rc=1
+        fi
+    done
+    if grep -aqE '\[syscall\] unknown: (224|225|227|228)\b' "$WORK/$1.log"; then
+        echo "FAIL ($1): a net call reached the kernel undeclared (NoSys, not NoDev)"
+        rc=1
+    fi
+    [ $rc = 0 ] && echo "PASS ($1): ping, udp-send and udp-recv exit 19 (Errno.NoDev) with no net service"
+    return $rc
+}
+
 # smp_stacks NAME: pass only if the kernel proved (AGAST #4192) that every
 # CPU -smp starts was inside a ring-3 SYSCALL at once, each on its own per-CPU
 # stack and with its own saved user frame. The self-test runs after
@@ -734,6 +759,7 @@ if [ "$MODE" != grub ]; then
         -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
         -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
     all_passed native || rc=1
+    net_nodev native || rc=1
     boot_tests_passed native || rc=1
     smp_stacks native || rc=1
     ring_holds_boot native || rc=1
@@ -771,6 +797,7 @@ EOF
         rc=1
     fi
     all_passed grub || rc=1
+    net_nodev grub || rc=1
     boot_tests_passed grub || rc=1
     smp_stacks grub || rc=1
     blk_transport grub legacy || rc=1

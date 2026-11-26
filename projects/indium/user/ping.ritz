@@ -1,20 +1,52 @@
-# Report userspace ICMP availability.
-import ritzlib.span { Span }
+# ping: one ICMP echo through the ring-2 network service (AGAST #4751)
+#
+# harland docs/RING2_NET.md "Ring-3 tools": NetAttach, ShmMap and NetAddr
+# (net_attach), then one libnet net_ping. Prints the echoed payload, or
+# ends on the errno net_ping answers: Errno.Io once PING_DEADLINE_MS has
+# passed with no reply. No count and no interval. With no network service
+# NetAttach answers Errno.NoDev and ping exits 19 before publishing.
+
+import ritzlib.span { Span, span_from_strview }
 import ritzlib.strview { StrView }
+import libnet.client { NetExchange, PingResult }
+import libnet.ring { AppBytes, app_req_ring, app_ev_ring }
+import net_attach { Ipv4, net_attach, parse_addr, wait_round, usage_error, print_addr, PING_ROUNDS_PER_MS }
+import net_tool { fail, print_payload }
+
+# The attachment: a global, since NetExchange is over 1 MiB (libnet's
+# NetExchange.init comment).
+var g_exchange: NetExchange
 
 pub fn main(args: Span<StrView>) -> i32
-    let usage: StrView = "Usage: ping <host>\n"
+    let usage: StrView = "Usage: ping <address>\n"
     if args.len != 2
-        eprint("{usage}")
-        return 2
-
+        return usage_error(usage)
     let host: StrView = args.get(1)
     if host.eq("--help") or host.eq("-h")
         print("{usage}")
         return 0
-    if host.is_empty() or host.starts_with("-")
-        eprint("{usage}")
-        return 2
+    let addr: Ipv4 = match parse_addr(host)
+        Some(a) => a
+        None => return usage_error(usage)
 
-    eprint("ping: ICMP is unavailable from Harland userspace\n")
-    1
+    match net_attach()
+        Ok(a) => g_exchange.init(app_req_ring(a.region), app_ev_ring(a.region))
+        Err(e) => return fail("ping", e.call, e.errno)
+
+    let payload: StrView = "ritz ping"
+    var reply: AppBytes = [0; 2048]       # APP_SLOT, written out as libnet does
+    var rounds: u64 = 0
+    loop
+        match g_exchange.net_ping(addr.octets, span_from_strview(payload), rounds / PING_ROUNDS_PER_MS, @&reply)
+            PingResult.Reply(d) =>
+                let n: u32 = d.length
+                print("reply from ")
+                print_addr(d.addr)
+                print(": {n} bytes: ")
+                print_payload(@reply, n)
+                print("\n")
+                return 0
+            PingResult.Err(e) => return fail("ping", "net_ping", e)
+            PingResult.Pending =>
+                wait_round()
+                rounds += 1

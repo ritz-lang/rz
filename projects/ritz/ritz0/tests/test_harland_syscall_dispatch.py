@@ -79,8 +79,13 @@ ABI = {
     "Sync": 162,
     "AcpiPoweroff": 200,
     "FbInfo": 210, "FbMap": 211,
+    # NetInfo (224), NetAddr (225) and NetAttach (228): the link record, the
+    # address record and the app exchange (RING1_DRIVER.md §7, RING2_NET.md).
+    # Until a driver publishes and a service registers, each answers
+    # Errno.NoDev (AGAST #4751; #4730, #4742 and #4728 give them bodies).
+    "NetInfo": 224, "NetAddr": 225, "NetAttach": 228,
     # ShmMap (227): map a CAP_TYPE_SHM handle into the caller (#4717,
-    # RING1_DRIVER.md §5). The 220-230 device group is otherwise unassigned.
+    # RING1_DRIVER.md §5).
     "ShmMap": 227,
     "Smp": 254,
     "DebugPrint": 255,
@@ -96,7 +101,7 @@ DISPATCHED = {
     "IpcRecv", "IpcClose", "CapGrant", "CapRevoke", "CapDerive", "CapInfo",
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
-    "Sync", "Smp", "ShmMap",
+    "Sync", "Smp", "ShmMap", "NetInfo", "NetAddr", "NetAttach",
 }
 
 
@@ -230,6 +235,37 @@ fn main() -> i32
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_dispatch_table(compiler, tmp_path):
     assert _run(compiler, tmp_path, DISPATCH, ["syscall.errno", "syscall.numbers", "syscall.dispatch"]) == 0
+
+
+# --- the net calls before a driver or service exists (AGAST #4751) ---------------
+
+NET_NODEV = """\
+import syscall.errno
+import syscall.runtime.net
+
+fn main() -> i32
+    if Errno.NoDev as i64 != -19
+        return 1
+    # No driver has published a link record: NetInfo copies nothing.
+    if sys_net_info_handler(0x1000, 0, 0, 0) != Errno.NoDev as i64
+        return 2
+    # No service has published an address record.
+    if sys_net_addr_handler(0x1000, 0, 0, 0) != Errno.NoDev as i64
+        return 3
+    # No service is registered to attach to.
+    if sys_net_attach_handler(0, 0, 0, 0) != Errno.NoDev as i64
+        return 4
+    0
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_net_calls_answer_nodev_without_a_service(compiler, tmp_path):
+    """indium's ping, udp-send and udp-recv end on NoDev, not NoSys, on every
+    boot that has no ring-2 service (RING2_NET.md "Ring-3 tools")."""
+    rc = _run(compiler, tmp_path, NET_NODEV, ["syscall.errno", "syscall.runtime.net"])
+    assert rc == 0, f"{compiler}: check {rc} failed"
 
 
 # --- the kernel's use of it ------------------------------------------------------
