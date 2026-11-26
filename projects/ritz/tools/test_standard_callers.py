@@ -76,7 +76,7 @@ PINS = {
     "rzsh": 5,
     "sage": 0,
     "spire": 0,
-    "squeeze": 2,
+    "squeeze": 0,
     "tempest": 0,
     "tome": 0,
     # valet: ritzlib.mapping's munmap x2, lib/valet.ritz: the request/response
