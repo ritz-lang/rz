@@ -20,10 +20,10 @@
 # left out of a child's environment. They are now a Vec<Token>, a
 # Vec<ShellVar> and an Envp built in a String, with no size limit but memory.
 
-import ritzlib.cstr
 import ritzlib.gvec
 import ritzlib.memory
 import ritzlib.option
+import ritzlib.span { Span }
 import ritzlib.ptr { ptr_read }
 import ritzlib.string
 import ritzlib.strview { StrView }
@@ -316,18 +316,24 @@ pub struct ShellVar
 var g_vars: *Vec<ShellVar> = null
 
 # A Vec (and the ShellVar elements it holds) has Drop, so it cannot live at
-# module level (§13.6: a module-level value is never dropped). The table is a
-# heap Vec allocated once; the global is the pointer to it.
+# module level (§13.6: a module-level value is never dropped). The table
+# lives in the ShellState main (or a test) owns on its frame (state.ritz);
+# the global points at it while it is installed.
 fn vars_vec() -> *Vec<ShellVar>
-    if g_vars == null
-        let p: *Vec<ShellVar> = malloc(sizeof(Vec<ShellVar>)) as *Vec<ShellVar>
-        *p = vec_new<ShellVar>()
-        g_vars = p
     g_vars
 
-# The environment rzsh was started with (NULL-terminated "K=V" array), or
-# null. Set once by main on Linux; harland has no environment.
-pub var g_environ: **u8 = null
+# Keep the variables in `v` (ShellState.install).
+pub fn vars_install(v: @&Vec<ShellVar>)
+    g_vars = v
+
+# Free every variable and forget `v` (ShellState's drop).
+pub fn vars_release()
+    vars_clear()
+    g_vars = null
+
+# The environment rzsh was started with ("K=V" entries), empty until main
+# sets it on Linux; harland has no environment.
+pub var g_environ: Span<StrView>
 
 fn var_at(idx: i64) -> *ShellVar
     return vars_vec().get_ptr(idx)
@@ -345,12 +351,13 @@ fn var_find(name: StrView) -> i64
         idx += 1
     return -1
 
-# Entry `k` of g_environ ("K=V"), or None past its end. The environ array is
-# C's, so this is where its NUL-terminated strings become StrViews.
+# Entry `k` of g_environ ("K=V"), or None past its end.
 fn environ_at(k: i64) -> Option<StrView>
-    if g_environ == null or *(g_environ + k) == null
+    # Through a local: ritz1 can't index a global Span.
+    let env: [StrView] = g_environ
+    if k >= env.len
         return None
-    return Some(strview_from_cstr(*(g_environ + k)))
+    return Some(env[k])
 
 # The value part of the environ entry for `name`, or None.
 fn env_find(name: StrView) -> Option<StrView>
@@ -470,9 +477,9 @@ pub fn var_value(idx: i64) -> StrView
 # Child environment
 # ============================================================================
 
-# A child's envp: `ptrs` is the NULL-terminated array to pass to exec. The
-# shell's own exported entries live in `buf` ("K=V\0K=V\0..."); inherited
-# entries point into g_environ.
+# A child's envp: `ptrs` is the NULL-terminated array to pass to exec. Its
+# entries live in `buf` ("K=V\0K=V\0..."): the shell's exported variables,
+# then the inherited entries they don't shadow.
 pub struct Envp
     buf: String
     ptrs: Vec<*u8>
@@ -488,14 +495,20 @@ pub fn envp_drop(e: @&Envp)
     (e.buf).deinit()
     e.ptrs.deinit()
 
+# Append "K=V\0" to `buf`, recording where it starts.
+fn envp_entry_add(buf: @&String, starts: @&Vec<i64>, entry: StrView)
+    starts.push(buf.len())
+    buf.push_str(entry)
+    buf.push('\0')
+
 # Inherited entries the shell table doesn't shadow (a tombstone shadows too).
-fn envp_add_inherited(e: @&Envp)
+fn envp_add_inherited(buf: @&String, starts: @&Vec<i64>)
     var k: i64 = 0
     while true
         match environ_at(k)
             Some(ent) =>
                 if var_find(ent.take(ent.find_byte('='))) < 0
-                    e.ptrs.push(ent.ptr)
+                    envp_entry_add(buf, starts, ent)
             None => return
         k += 1
 
@@ -505,28 +518,21 @@ pub fn vars_build_envp() -> Envp
     var e: Envp = Envp { buf: string_new(), ptrs: vec_new<*u8>() }
     # Pass 1 fills buf; its buffer may move as it grows, so the pointers to
     # the entries are taken in pass 2, once it's complete.
-    var count: i64 = 0
+    var starts: Vec<i64> = vec_new<i64>()
     var idx: i64 = 0
     while idx < vars_vec().len
         let v: *ShellVar = var_at(idx)
         if v.exported and not v.hidden
+            starts.push((e.buf).len())
             (e.buf).push_string(@v.name)
             (e.buf).push('=')
             (e.buf).push_string(@v.value)
             (e.buf).push('\0')
-            count += 1
         idx += 1
+    envp_add_inherited(@&e.buf, @&starts)
 
-    var p: *u8 = (e.buf).as_ptr()
-    idx = 0
-    while count > 0
-        let v: *ShellVar = var_at(idx)
-        if v.exported and not v.hidden
-            e.ptrs.push(p)
-            p = p + (v.name).len() + (v.value).len() + 2   # "K=V\0"
-            count -= 1
-        idx += 1
-
-    envp_add_inherited(@&e)
+    let base: *u8 = (e.buf).as_ptr()
+    for k in 0..starts.len()
+        e.ptrs.push(base + starts[k])
     e.ptrs.push(null)
     return e

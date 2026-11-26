@@ -9,10 +9,11 @@ import ritzlib.sys {
     sys_pipe, sys_fork, sys_dup2, sys_close, sys_exit, sys_wait4,
     sys_mkdir, sys_rmdir
 }
+import src.state { ShellState, shell_state_new }
 import src.rawio { shell_pid }
 import ritzlib.fd { fd_borrow }
 import ritzlib.fs { unlink }
-import ritzlib.span { span_from_ptr }
+import ritzlib.span { Span }
 import ritzlib.string
 import ritzlib.strview { StrView }
 
@@ -21,11 +22,11 @@ import src.shell { run_line }
 var g_out: [512]u8
 var g_out_len: i64 = 0
 
-fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+fn read_all(fd: i32, buf: [u8]) -> i64
     var got: i64 = 0
     var n: i64 = 1
-    while n > 0 and got < cap
-        n = match fd_borrow(fd).read(span_from_ptr<u8>(buf + got, cap - got))
+    while n > 0 and got < buf.len
+        n = match fd_borrow(fd).read(buf[got..buf.len])
             Ok(k) => k
             Err(_) => 0
         if n > 0
@@ -54,7 +55,7 @@ fn run(line: StrView) -> i32
         sys_close(o[1])
         sys_exit(run_line(line))
     sys_close(o[1])
-    g_out_len = read_all(o[0], @g_out[0], 512)
+    g_out_len = read_all(o[0], @g_out)
     sys_close(o[0])
     var status: i32 = 0
     sys_wait4(pid, @status, 0, null)
@@ -77,6 +78,8 @@ fn in_dir(dir: @String, name: StrView) -> String
 
 [[test]]
 fn test_cd_changes_directory() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     assert run("cd / ; pwd") == 0
     assert out_differs("/\n") == 0
     assert run("cd /nonexistent_2461 ; pwd") == 0
@@ -86,6 +89,8 @@ fn test_cd_changes_directory() -> i32
 
 [[test]]
 fn test_variables_expand() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     assert run("export X=5 ; echo X=$X") == 0
     assert out_differs("X=5\n") == 0
     assert run("Y=a ; Y=${Y}b ; echo \"$Y\" '$Y'") == 0
@@ -94,6 +99,8 @@ fn test_variables_expand() -> i32
 
 [[test]]
 fn test_exported_reaches_child() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     # Only exported variables go into an external command's environment.
     assert run("export X=5 ; L=1 ; env | grep -c -e ^X=5 -e ^L=") == 0
     assert out_differs("1\n") == 0
@@ -101,6 +108,8 @@ fn test_exported_reaches_child() -> i32
 
 [[test]]
 fn test_status_expands() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     assert run("false ; echo status=$?") == 0
     assert out_differs("status=1\n") == 0
     assert run("true ; echo status=$?") == 0
@@ -112,6 +121,8 @@ fn test_status_expands() -> i32
 
 [[test]]
 fn test_redirect_out_append_in() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     var dir: String = scratch_dir()
     # Paths name the scratch dir directly, so a broken `cd` or `;` can't
     # make the test write into its cwd.
@@ -132,6 +143,8 @@ fn test_redirect_out_append_in() -> i32
 
 [[test]]
 fn test_redirect_truncates_external() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     var dir: String = scratch_dir()
     var g: String = in_dir(@dir, "g.txt")
     var line: String = string_from("echo long-line > ")
@@ -149,6 +162,8 @@ fn test_redirect_truncates_external() -> i32
 
 [[test]]
 fn test_pipe() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     assert run("echo piped | tr p P") == 0
     assert out_differs("PiPed\n") == 0
     assert run("echo abc | tr a A | tr c C") == 0
@@ -166,6 +181,8 @@ fn test_pipe() -> i32
 
 [[test]]
 fn test_hundred_tokens_run() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     # `echo ok` plus 49 `< /dev/null` is 100 tokens; 64 was the cap.
     var long: String = string_from("echo ok")
     var i: i32 = 0
@@ -178,6 +195,8 @@ fn test_hundred_tokens_run() -> i32
 
 [[test]]
 fn test_sixty_four_variables() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     # V0=0 ; ... ; V63=63 ; echo $V0 $V31 $V32 $V63 — the 33rd failed.
     var long: String = string_new()
     var i: i64 = 0
@@ -195,6 +214,8 @@ fn test_sixty_four_variables() -> i32
 
 [[test]]
 fn test_exported_past_8k_reach_child() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     # 32 exported "EXPORTED_NN=<250 x>" entries are 263 bytes each, 8416 in
     # all: past the old 8 KB envp buffer, which silently dropped the last two.
     var long: String = string_new()
@@ -222,6 +243,8 @@ fn test_exported_past_8k_reach_child() -> i32
 
 [[test]]
 fn test_echo_hundred_args() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     # echo 0 1 ... 99 prints all hundred, space-separated.
     var long: String = string_from("echo")
     var want: String = string_new()
@@ -240,6 +263,8 @@ fn test_echo_hundred_args() -> i32
 
 [[test]]
 fn test_twenty_stage_pipeline() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     # echo deep | cat | ... — 20 stages; 16 was the cap.
     var long: String = string_from("echo deep")
     var i: i32 = 1
@@ -252,6 +277,8 @@ fn test_twenty_stage_pipeline() -> i32
 
 [[test]]
 fn test_syntax_errors() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
     assert run("echo 'open") == 2
     assert run("echo a | | cat") == 2
     assert run("echo a >") == 2

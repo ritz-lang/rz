@@ -66,7 +66,14 @@ PINS = {
     "ritz-lsp": 0,
     "ritzunit": 0,
     "rzrz": 3,
-    "rzsh": 12,
+    # rzsh: src/rawio.ritz's sys_write x2, sys_read, sys_getpid: src/ also
+    # builds the freestanding Harland bin, where ritzlib.fd / ritzlib.process
+    # don't build, so stdio and the pid stay raw in that one shim (RAW_OK).
+    # strview_from_cstr x1, src/os.ritz os_environ: the kernel's envp is a C
+    # array of NUL-terminated strings (ritzlib.os.env's env_iter would do it,
+    # but importing it pulls in ritzlib.io, whose println collides with
+    # common's).
+    "rzsh": 5,
     "sage": 0,
     "spire": 0,
     "squeeze": 2,
@@ -140,7 +147,7 @@ C_LITERAL_PINS = {
     "ritz-lsp": 0,
     "ritzunit": 63,
     "rzrz": 34,
-    "rzsh": 2,
+    "rzsh": 0,
     "sage": 0,
     "spire": 0,
     "tome": 0,

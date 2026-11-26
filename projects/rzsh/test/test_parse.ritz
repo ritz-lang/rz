@@ -3,12 +3,13 @@
 # Before #2461 a line was split on whitespace only, so `$X`, `$?`, `>` and
 # `|` reached the command as literal arguments.
 
-import ritzlib.cstr
+import ritzlib.span { Span, span_empty }
 import ritzlib.memory
 import ritzlib.option
 import ritzlib.string
 import ritzlib.strview { StrView }
 
+import src.state { ShellState, shell_state_new }
 import src.parse {
     TokKind, Tokens, tokenize, tokens_len, tokens_kind, tokens_word,
     tokens_drop, g_last_status, g_environ, PARSE_UNTERMINATED,
@@ -17,16 +18,14 @@ import src.parse {
 }
 
 # The last lex() result; lex() frees the one before. Tokens has Drop, so it
-# cannot live at module level (§13.6); the global is a pointer to a heap one.
+# cannot live at module level (§13.6): each test owns one on its frame and
+# points the global at it.
 var g_tk: *Tokens = null
 
 # Tokenizes `line` from `pos`: the token count, or PARSE_UNTERMINATED.
 fn lex(line: StrView, pos: i64) -> i64
     var tk: Tokens = tokenize(line, pos)
-    if g_tk == null
-        g_tk = malloc(sizeof(Tokens)) as *Tokens
-    else
-        tokens_drop(@&*g_tk)
+    tokens_drop(@&*g_tk)
     *g_tk = tk
     if g_tk.err != 0
         return g_tk.err as i64
@@ -53,6 +52,10 @@ fn lookup_is(name: StrView, want: StrView) -> bool
 
 [[test]]
 fn test_tokenize_words() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     assert lex("  echo   hello\tworld ", 0) == 3
     assert word_is(0, "echo")
@@ -62,6 +65,10 @@ fn test_tokenize_words() -> i32
 
 [[test]]
 fn test_tokenize_operators() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     # Operators split words even without surrounding blanks.
     assert lex("a|b>d>>e<f", 0) == 9
@@ -79,6 +86,10 @@ fn test_tokenize_operators() -> i32
 
 [[test]]
 fn test_tokenize_semicolon_items() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     # Each ';' item is tokenized on its own, so expansion in a later item
     # sees what an earlier item set.
@@ -97,6 +108,10 @@ fn test_tokenize_semicolon_items() -> i32
 
 [[test]]
 fn test_tokenize_quotes() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     var_set("X", "5", 0)
     # '' is literal, "" expands, \ escapes; quoted operators are words.
@@ -111,6 +126,10 @@ fn test_tokenize_quotes() -> i32
 
 [[test]]
 fn test_tokenize_comment() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     assert lex("echo a # b c", 0) == 2
     assert lex("echo a#b", 0) == 2
@@ -123,6 +142,10 @@ fn test_tokenize_comment() -> i32
 
 [[test]]
 fn test_expand_var() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     assert var_set("X", "5", 0) == 0
     assert lex("echo X=$X ${X}y $Xy", 0) == 3
@@ -133,6 +156,10 @@ fn test_expand_var() -> i32
 
 [[test]]
 fn test_expand_unset_and_literal_dollar() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     assert lex("echo $NOPE \"$NOPE\" $ a$ ${", 0) == 5
     assert word_is(1, "")
@@ -143,6 +170,10 @@ fn test_expand_unset_and_literal_dollar() -> i32
 
 [[test]]
 fn test_expand_status() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     g_last_status = 1
     assert lex("echo status=$?", 0) == 2
@@ -159,6 +190,10 @@ fn test_expand_status() -> i32
 
 [[test]]
 fn test_var_table() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     assert var_set("1X", "v", 0) == -1
     assert var_set("FOO", "one", 0) == 0
@@ -174,26 +209,31 @@ fn test_var_table() -> i32
     assert assignment_pos("echo") == -1
     0
 
-# Entry `k` of a child's envp: the C array exec takes, so a C string.
-fn envp_entry(out: **u8, k: i64) -> StrView
-    return strview_from_cstr(*(out + k))
-
-fn envp_has(out: **u8, want: StrView) -> bool
-    var k: i64 = 0
-    while *(out + k) != null
-        if envp_entry(out, k).eq(want)
+# Whether `want` is one of the child envp's entries: each is "K=V\0" in
+# e.buf, where its pointer in the exec array points.
+fn envp_has(e: @Envp, want: StrView) -> bool
+    var rest: StrView = (e.buf).as_view()
+    while rest.len > 0
+        let end: i64 = rest.find_byte(0)
+        if end < 0
+            return false
+        if rest.take(end).eq(want)
             return true
-        k += 1
+        rest = rest.skip(end + 1)
     false
 
 [[test]]
 fn test_envp_inherit_and_export() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
-    var env: [4]*u8
-    env[0] = c"HOME=/home/u"
-    env[1] = c"PATH=/bin"
-    env[2] = null
-    g_environ = @env[0]
+    var env: [2]StrView
+    env[0] = "HOME=/home/u"
+    env[1] = "PATH=/bin"
+    let inherited: [StrView] = @env
+    g_environ = inherited
 
     # Lookups fall back to the inherited environment.
     assert lookup_is("HOME", "/home/u")
@@ -210,8 +250,8 @@ fn test_envp_inherit_and_export() -> i32
     assert envp_len(@e) == 2
     let out: **u8 = envp_ptr(@e)
     assert *(out + 2) == null
-    assert envp_has(out, "X=5")
-    assert envp_has(out, "PATH=/usr/bin")
+    assert envp_has(@e, "X=5")
+    assert envp_has(@e, "PATH=/usr/bin")
     envp_drop(@&e)
 
     # export of an unset name fails; of a local one marks it exported.
@@ -221,7 +261,7 @@ fn test_envp_inherit_and_export() -> i32
     assert envp_len(@e) == 3
     envp_drop(@&e)
 
-    g_environ = null
+    g_environ = span_empty<StrView>()
     vars_clear()
     0
 
@@ -238,6 +278,10 @@ fn numbered(prefix: StrView, n: i64) -> String
 
 [[test]]
 fn test_tokenize_hundred_tokens() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     # 50 words alternating with 50 pipes: 100 tokens.
     var line: String = string_new()
@@ -261,6 +305,10 @@ fn test_tokenize_hundred_tokens() -> i32
 
 [[test]]
 fn test_sixty_four_variables() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     var i: i64 = 0
     while i < 64
@@ -279,6 +327,10 @@ fn test_sixty_four_variables() -> i32
 
 [[test]]
 fn test_envp_past_8k() -> i32
+    var sh_state: ShellState = shell_state_new()
+    sh_state.install()
+    var toks: Tokens = tokenize("", 0)
+    g_tk = @&toks
     vars_clear()
     # 30 exported 400-byte values (under the old 32-variable cap): ~12 KB of
     # environment, all of it present.
@@ -296,7 +348,10 @@ fn test_envp_past_8k() -> i32
     var e: Envp = vars_build_envp()
     assert envp_len(@e) == 30
     let out: **u8 = envp_ptr(@e)
-    assert envp_entry(out, 29).len == 404          # "E29=" + 400
+    var last: String = numbered("E", 29)          # "E29=" + 400
+    last.push('=')
+    last.push_str(big.as_view())
+    assert envp_has(@e, last.as_view())
     assert *(*(out + 29) + 4) == ('a' as i64 + 29 % 26) as u8
     assert *(out + 30) == null
     envp_drop(@&e)
