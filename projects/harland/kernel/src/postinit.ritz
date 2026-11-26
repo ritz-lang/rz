@@ -59,6 +59,7 @@ import proc.waitset { Notify, shm_notify, shm_latch_bits, shm_latch_held }
 import driver_abi.wait { EVENT_DATA, EVENT_SPACE, EVENT_LINK, EVENT_PEER_CLOSE }
 import driver_abi.link { NetInfo, NETDEV_TYPE_VIRTIO }
 import syscall.runtime.net { net_publish_for, net_attach_for, net_service_register, net_exchanges_reclaimed, net_frame_replace, net_link_register, net_frame_register, net_info_snapshot, ring_driver_published, snapshot_invalidate }
+import syscall.runtime.net { net_addr_register, net_addr_snapshot }
 import cap.types { CapEntry, CAP_RIGHT_PUBLISH, cap_handle_init }
 import cap.table { cap_table_lookup, cap_holds_object }
 import mm.shm { shm_retire }
@@ -1006,6 +1007,91 @@ fn net_info_self_test() -> bool
     klog("\n")
     return status == 0 and after == 0 and unpublished and matched and refused and linked and invalidated and dropped and freed
 
+# net-addr (#4742, RING2_NET.md "Address publication"): the service's
+# address object. Pid 1 makes a one-page address object, registers it, and
+# spawns the service stub (driver_stub.s mode 15), registered as the
+# service, with a publish-right handle on it; one stand-in app attaches, so
+# the stub's inbox holds one ATTACH record. The stub checks NetAddr is NoDev
+# before a publish, Again at seq 0 and 1, publishes generation 2 with
+# configured 0 and reads it back, finds its exchange handle's publish Perm,
+# publishes a lease at generation 4 and reads it back (and Fault on a kernel
+# pointer), then faults. The fault went through sys_exit_impl: NetAddr is
+# NoDev, the service and the address object are unregistered, so pid 1's
+# own publish-right handle on the object is Perm and an attach is NoDev,
+# and a second stub (mode 15, no handle) sees NoDev too.
+const DRIVER_STUB_ADDR: u64 = 15
+# The stub's address handle: a fresh table's first grant.
+const ADDR_TEST_H_PUBLISH: u64 = 1 << 32
+const ADDR_TEST_APP_PID: u32 = 0x47420
+# The stub passed every step and faulted (DRIVER_FAULT_STATUS, a #PF).
+const ADDR_TEST_STATUS: i64 = 142
+
+fn net_addr_self_test() -> bool
+    klog("\nTesting NetPublish and NetAddr on the service's address object...\n")
+    let object: u64 = shm_create(1).unwrap_or(0)
+    if object == 0 or cap_table_alloc(ADDR_TEST_APP_PID) == 0 as *CapTable
+        klog("  object or app table not made\n")
+        if object != 0
+            shm_destroy(object)
+        return false
+    let rights: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
+    net_addr_register(object)
+    let unpublished: bool = net_addr_snapshot().is_none()
+    sched_start(proc_current_slot())
+    var status: i64 = -1
+    var after: i64 = -1
+    var attached: bool = false
+    var invalidated: bool = false
+    var refused: bool = false
+    var detached: bool = false
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_ADDR, ADDR_TEST_H_PUBLISH)
+    if spawned > 0
+        let pid: u64 = spawned as u64
+        # It cannot run before pid 1 yields: the grant and the attach land
+        # first.
+        let hp: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rights | CAP_RIGHT_PUBLISH, object))
+        net_service_register(pid as u32)
+        attached = net_attach_for(ADDR_TEST_APP_PID) > 0
+        if hp != ADDR_TEST_H_PUBLISH or not attached
+            klog("  the grant or the attach went wrong\n")
+            process_mark_exit(pid)
+        status = drv_stub_status(pid)
+        invalidated = net_addr_snapshot().is_none()
+        # The service's exit retired the object (#4729), and it is no longer
+        # the address object: pid 1's publish-right handle on it is Perm.
+        let mine: CapHandle = cap_kernel_grant(1, CAP_TYPE_SHM, rights | CAP_RIGHT_PUBLISH, object)
+        refused = net_publish_for(1, packed_handle(mine)) == Errno.Perm as i64
+        cap_revoke(cap_table_get(1), mine)
+        detached = net_attach_for(ADDR_TEST_APP_PID + 1) == Errno.NoDev as i64
+        let second: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_ADDR, 0)
+        if second > 0
+            after = drv_stub_status(second as u64)
+    sched_stop()
+    net_addr_register(0)
+    net_service_register(0)
+    cap_table_free_pid(ADDR_TEST_APP_PID)
+    # The stub's exit retired the address object and its exchange and
+    # dropped their mappings: both reclaimed (#4729).
+    let freed: bool = not shm_exists(object) and net_exchanges_reclaimed()
+    klog("  status ")
+    klog_dec(status)
+    klog(", after the fault ")
+    klog_dec(after)
+    if not unpublished
+        klog(", an address was published before the test")
+    if not attached
+        klog(", the app's attach failed")
+    if not invalidated
+        klog(", the snapshot outlived the service's fault")
+    if not refused
+        klog(", a publish after the fault was not Perm")
+    if not detached
+        klog(", an attach after the fault was not NoDev")
+    if not freed
+        klog(", the objects outlived the test")
+    klog("\n")
+    return status == ADDR_TEST_STATUS and after == 0 and unpublished and attached and invalidated and refused and detached and freed
+
 # console-poll (#4829): poll(2) on fd 0 is the console's timed read. The stub
 # (modes 4 and 5, driver_stub.s) polls { 0, POLLIN } with the console raw
 # (one byte readable) and nothing typed:
@@ -1530,6 +1616,7 @@ fn driver_process_tests()
     boot_test_result("net-attach", net_attach_self_test())
     boot_test_result("net-info", net_info_self_test())
     boot_test_result("shm-retire", shm_retire_self_test())
+    boot_test_result("net-addr", net_addr_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before

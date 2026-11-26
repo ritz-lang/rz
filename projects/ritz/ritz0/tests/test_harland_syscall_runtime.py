@@ -90,7 +90,9 @@ AREAS = {
     # the exchange (#4728).
     "net": ["sys_net_info_handler", "sys_net_addr_handler", "sys_net_attach_handler",
             "sys_net_publish_handler", "net_attach_for", "net_publish_for",
-            "ring_driver_published", "snapshot_invalidate"],
+            "ring_driver_published", "snapshot_invalidate",
+            # the address snapshot NetAddr copies (#4742)
+            "net_addr_register", "net_addr_snapshot", "net_service_exited"],
     # Poll (7): the console's timed read (#4829).
     "poll": ["sys_poll_handler"],
 }

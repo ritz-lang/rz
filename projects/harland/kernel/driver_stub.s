@@ -104,6 +104,28 @@
 #                   driver's exit, 4 the page (kept while this process
 #                   maps it) holds RETIRE_MARKER2.
 #                   Exit 0.
+#   mode 15 (ADDR, #4742): the ring-2 service stand-in, registered by the
+#                   kernel. RSI is its address-object handle with
+#                   CAP_RIGHT_PUBLISH, or 0; the kernel has attached one
+#                   app, so one ATTACH record waits on the inbox. Exit
+#                   status: the number of the first failed step; when all
+#                   pass the stub reads address 0 and the #PF kills it
+#                   (status 142), the service's fault the kernel checks:
+#                   1  NetAddr                  -> Errno.NoDev (RSI 0: exit 0)
+#                   2  NetPublish, seq 0        -> Errno.Again
+#                   3  ShmMap(addr)             -> a VA
+#                   4  seq 1, NetPublish        -> Errno.Again
+#                      (then a cleared record, fence, seq 2)
+#                   5  NetPublish(addr)         -> 0
+#                   6  NetAddr                  -> 0: zero addresses,
+#                      configured 0, generation 2
+#                   7  ShmWait, no source       -> 2: one ATTACH record
+#                   8  NetPublish(exchange)     -> Errno.Perm
+#                   9  seq 3, the lease ADDR_LEASE_LO / _HI, configured 1
+#                      and a stray _pad byte, fence, seq 4, NetPublish -> 0
+#                   10 NetAddr                  -> 0: the lease,
+#                      configured 1, _pad zero, generation 4
+#                   11 NetAddr(kernel pointer)  -> Errno.Fault
 #   mode 21 (MMIO_MAP, #4720): RSI is a CAP_TYPE_MMIO handle on the
 #                   boot-test window double. Exit status: the number of the
 #                   first failed step, else 0:
@@ -156,6 +178,7 @@
 .equ SYS_SHM_NOTIFY, 230
 .equ SYS_NET_INFO, 224
 .equ SYS_NET_PUBLISH, 226
+.equ SYS_NET_ADDR, 225
 .equ SYS_SHM_MAP, 227
 .equ SYS_NET_ATTACH, 228
 .equ SYS_POLL,   7
@@ -178,6 +201,7 @@
 .equ DRIVER_STUB_HUNG, 12
 .equ DRIVER_STUB_REPLACED, 13
 .equ DRIVER_STUB_FRESH, 14
+.equ DRIVER_STUB_ADDR, 15
 .equ DRIVER_STUB_MMIO_MAP, 21
 .equ DRIVER_STUB_DMA_ALLOC, 22
 .equ DRIVER_STUB_DMA_FREE, 23
@@ -254,6 +278,14 @@
 .equ RETIRE_STRAY,    0x80000000  # a record for a handle the stub does not know
 .equ EVENT_DRIVER_GONE, 8
 .equ DRV_RING_BASE,   0x7D8000000000
+# Mode 15 (postinit.ritz ADDR_TEST_*; driver_abi/src/link.ritz NetAddr and
+# ADDR_SEQ_OFF)
+.equ ADDR_SEQ_OFF,    0x20
+.equ ADDR_LEASE_LO,   0x0202000A0F02000A   # 10.0.2.15, gateway 10.0.2.2
+.equ ADDR_LEASE_HI,   0x0302000A00FFFFFF   # 255.255.255.0, DNS 10.0.2.3
+.equ NA_CONFIGURED,   16
+.equ NA_GENERATION,   24
+.equ ADDR_BUF,        192         # the NetAddr buffer, after the records
 
 .global driver_stub_start
 .type driver_stub_start, @function
@@ -293,6 +325,8 @@ driver_stub_start:
     cmpq $DRIVER_STUB_FRESH, %r12
     jbe .Ldriver_stub_retire
 .Ldriver_stub_not_retire:
+    cmpq $DRIVER_STUB_ADDR, %r12
+    je .Ldriver_stub_addr
     cmpq $DRIVER_STUB_SPIN, %r12
     jne .Ldriver_stub_report
     rdtsc
@@ -982,6 +1016,142 @@ driver_stub_start:
 .Llink_publish:
     movq $SYS_NET_PUBLISH, %rax
     movq %r13, %rdi
+    syscall
+    ret
+
+# Mode 15. r14 = a wait request, eight out slots and a NetAddr buffer at
+# ADDR_BUF; r12 = the mapped address page; r15 = the step number reported
+# if a check fails.
+.Ldriver_stub_addr:
+    subq $256, %rsp
+    movq %rsp, %r14
+    movl $1, %r15d                       # 1: nothing published
+    call .Laddr_read
+    cmpq $ERRNO_NODEV, %rax
+    jne .Laddr_fail
+    testq %r13, %r13
+    jz .Laddr_done
+    movl $2, %r15d                       # 2: seq 0 is unpublished
+    call .Laddr_publish
+    cmpq $ERRNO_AGAIN, %rax
+    jne .Laddr_fail
+    movl $3, %r15d                       # 3: map the address page
+    movl $SYS_SHM_MAP, %eax
+    movq %r13, %rdi
+    syscall
+    testq %rax, %rax
+    jle .Laddr_fail
+    movq %rax, %r12
+    movl $4, %r15d                       # 4: seq 1, a write in progress
+    movq $1, ADDR_SEQ_OFF(%r12)
+    mfence
+    call .Laddr_publish
+    cmpq $ERRNO_AGAIN, %rax
+    jne .Laddr_fail
+    # The cleared record: the page is fresh, so its bytes are already 0.
+    mfence
+    movq $2, ADDR_SEQ_OFF(%r12)          # generation 2, configured 0
+    movl $5, %r15d                       # 5: the first publish
+    call .Laddr_publish
+    testq %rax, %rax
+    jne .Laddr_fail
+    movl $6, %r15d                       # 6: NetAddr copies the cleared record
+    call .Laddr_read
+    testq %rax, %rax
+    jne .Laddr_fail
+    cmpq $0, ADDR_BUF(%r14)
+    jne .Laddr_fail
+    cmpq $0, ADDR_BUF+8(%r14)
+    jne .Laddr_fail
+    cmpq $0, ADDR_BUF+NA_CONFIGURED(%r14)   # configured and _pad
+    jne .Laddr_fail
+    cmpq $2, ADDR_BUF+NA_GENERATION(%r14)
+    jne .Laddr_fail
+    movl $7, %r15d                       # 7: the attached app's record
+    xorl %eax, %eax                      # no sources, out_count and _pad 0
+    movq %rax, WR_SOURCES(%r14)
+    movl %eax, WR_SOURCE_COUNT(%r14)
+    movq %rax, WR_OUT_COUNT(%r14)
+    movl $SERVICE_OUT_CAP, WR_OUT_CAP(%r14)
+    leaq WR_EVENTS(%r14), %rax
+    movq %rax, WR_OUT(%r14)
+    movq $SHM_WAIT_LONG_MS, WR_DEADLINE(%r14)
+    movl $SYS_SHM_WAIT, %eax
+    movq %r14, %rdi
+    syscall
+    cmpq $2, %rax
+    jne .Laddr_fail
+    cmpl $1, WR_OUT_COUNT(%r14)
+    jne .Laddr_fail
+    cmpl $EVENT_ATTACH, WR_EVENTS+WE_BITS(%r14)
+    jne .Laddr_fail
+    movl $8, %r15d                       # 8: an exchange handle can't publish
+    movl $SYS_NET_PUBLISH, %eax
+    movq WR_EVENTS+WE_HANDLE(%r14), %rdi
+    syscall
+    cmpq $ERRNO_PERM, %rax
+    jne .Laddr_fail
+    movl $9, %r15d                       # 9: the lease, generation 4
+    movq $3, ADDR_SEQ_OFF(%r12)
+    mfence
+    movabsq $ADDR_LEASE_LO, %rax
+    movq %rax, 0(%r12)
+    movabsq $ADDR_LEASE_HI, %rax
+    movq %rax, 8(%r12)
+    movw $0xAA01, NA_CONFIGURED(%r12)   # configured 1, a stray _pad[0]
+    mfence
+    movq $4, ADDR_SEQ_OFF(%r12)
+    call .Laddr_publish
+    testq %rax, %rax
+    jne .Laddr_fail
+    movl $10, %r15d                      # 10: NetAddr copies the lease
+    call .Laddr_read
+    testq %rax, %rax
+    jne .Laddr_fail
+    movabsq $ADDR_LEASE_LO, %rax
+    cmpq %rax, ADDR_BUF(%r14)
+    jne .Laddr_fail
+    movabsq $ADDR_LEASE_HI, %rax
+    cmpq %rax, ADDR_BUF+8(%r14)
+    jne .Laddr_fail
+    cmpq $1, ADDR_BUF+NA_CONFIGURED(%r14)
+    jne .Laddr_fail
+    cmpq $4, ADDR_BUF+NA_GENERATION(%r14)
+    jne .Laddr_fail
+    movl $11, %r15d                      # 11: not the caller's memory
+    movl $SYS_NET_ADDR, %eax
+    movabsq $KERNEL_ADDR, %rdi
+    syscall
+    cmpq $ERRNO_FAULT, %rax
+    jne .Laddr_fail
+    xorl %eax, %eax
+    movq (%rax), %rax                    # the service faults: never returns
+    ud2
+.Laddr_done:
+    xorl %r15d, %r15d
+.Laddr_fail:
+    movl %r15d, %edi
+    movl $SYS_EXIT, %eax
+    syscall
+    ud2
+
+# NetPublish with the address handle (r13). RAX = the result.
+.Laddr_publish:
+    movl $SYS_NET_PUBLISH, %eax
+    movq %r13, %rdi
+    syscall
+    ret
+
+# NetAddr into the buffer, first filled with 0xEE bytes so a field the copy
+# skips shows. RAX = the result.
+.Laddr_read:
+    movabsq $0xEEEEEEEEEEEEEEEE, %rax
+    movq %rax, ADDR_BUF(%r14)
+    movq %rax, ADDR_BUF+8(%r14)
+    movq %rax, ADDR_BUF+16(%r14)
+    movq %rax, ADDR_BUF+24(%r14)
+    movl $SYS_NET_ADDR, %eax
+    leaq ADDR_BUF(%r14), %rdi
     syscall
     ret
 

@@ -1,6 +1,6 @@
 # Harland Syscall Runtime - Networking records and the app exchange
-# (AGAST #4751, #4728, #4730; docs/RING1_DRIVER.md "Grants", section 7,
-# docs/RING2_NET.md)
+# (AGAST #4751, #4728, #4730, #4742; docs/RING1_DRIVER.md "Grants", section
+# 7, docs/RING2_NET.md "Address publication")
 #
 # NetInfo (224): net_info(*NetInfo) copies the kernel's link snapshot. Any
 # process may call it. 0, or:
@@ -8,19 +8,25 @@
 #                yet, or snapshot_invalidate ran): nothing is written
 #   Errno.Fault  the NetInfo is not the caller's writable memory
 #
-# NetPublish (226): net_publish(link_handle) samples the ring-1 driver's
-# seqlocked NetInfo on the registered link object (driver_abi.link
-# link_sample, through the physmap) into the snapshot, and ORs EVENT_LINK
-# into the consumer's latch on the registered frame object. 0, or:
-#   Errno.Perm   the caller holds no CAP_TYPE_SHM handle `link_handle`, its
-#                object is not the registered link object, or the handle
-#                lacks CAP_RIGHT_PUBLISH (every app-exchange handle)
-#   Errno.Again  link_seq is odd, below 2, or changed during every bounded
-#                retry: the previous snapshot stays
-# The address object (NetAddr, 225) publishes through the same call once
-# #4742 registers it; until then only the link object is accepted.
+# NetPublish (226): net_publish(handle) samples a registered seqlocked
+# record (through the physmap) into its kernel snapshot. For the link
+# object, the ring-1 driver's NetInfo (driver_abi.link link_sample), and it
+# ORs EVENT_LINK into the consumer's latch on the registered frame object;
+# for the address object, the ring-2 service's NetAddr (addr_sample). 0, or:
+#   Errno.Perm   the caller holds no CAP_TYPE_SHM handle `handle`, its
+#                object is neither registered object, or the handle lacks
+#                CAP_RIGHT_PUBLISH (every app-exchange handle)
+#   Errno.Again  the seqlock word is odd, below 2, or changed during every
+#                bounded retry: the previous snapshot stays
 #
-# NetAddr (225): NoDev until #4742 gives it the service's address snapshot.
+# NetAddr (225): net_addr(*NetAddr) copies the kernel's address snapshot,
+# its generation the one NetPublish sampled. Any process may call it. It
+# never reads the service's page and never returns a zeroed record. 0, or:
+#   Errno.NoDev  no stable generation is in the snapshot: none published
+#                yet, or the service exited or faulted (sys_exit_impl calls
+#                net_service_exited), until a new service is registered and
+#                publishes
+#   Errno.Fault  the NetAddr is not the caller's writable memory
 #
 # NetAttach (228): net_attach() creates the caller's exchange with the
 # registered ring-2 service: a new ShmObject of APP_EXCHANGE_SIZE bytes, a
@@ -36,10 +42,10 @@
 #   Errno.Inval  the caller is the service
 #   Errno.NoMem  no object, exchange record or handle slot to be had
 #
-# The service, the link object and the frame object's consumer are
-# registered by the kernel (the boot that spawns them, and today the
-# net-attach and net-info boot tests); nothing else sets them. Each handler
-# is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
+# The service, the link object, the address object and the frame object's
+# consumer are registered by the kernel (the boot that spawns them, and
+# today the net-attach, net-info and net-addr boot tests); nothing else
+# sets them. Each handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
 import ritzlib.option
@@ -55,6 +61,7 @@ import proc.table { MAX_PROCS, proc_at, proc_current_pid }
 import proc.waitset { INBOX_CAP, waitset_inbox_len, waitset_inbox_post, shm_latch_post }
 import driver_abi.wait { EVENT_ATTACH, EVENT_LINK, APP_EXCHANGE_SIZE }
 import driver_abi.link { NetInfo, LinkSample, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, link_sample }
+import driver_abi.link { NetAddr, AddrSample, addr_sample }
 
 # ============================================================================
 # Registration (the kernel only)
@@ -67,6 +74,9 @@ var net_service: u32 = 0
 var net_link_object: u64 = 0
 var net_frame_object: u64 = 0
 var net_frame_consumer: u64 = 0
+# The service's address object (one page, mapped only into the service,
+# the publish right on the service's handle), or 0.
+var net_addr_object: u64 = 0
 
 # Process `pid` is the ring-2 service: NetAttach hands it each exchange.
 # 0 unregisters it.
@@ -77,6 +87,11 @@ pub fn net_service_register(pid: u32)
 # for a holder with CAP_RIGHT_PUBLISH. 0 unregisters it.
 pub fn net_link_register(object_id: u64)
     net_link_object = object_id
+
+# Shm object `object_id` is the service's address object: NetPublish
+# samples it for a holder with CAP_RIGHT_PUBLISH. 0 unregisters it.
+pub fn net_addr_register(object_id: u64)
+    net_addr_object = object_id
 
 # Shm object `object_id` is the frame object and `consumer` the process
 # whose latch on it NetPublish posts EVENT_LINK to. 0 unregisters it.
@@ -143,16 +158,22 @@ fn held_shm(pid: u32, packed: u64, rights: u32) -> Option<u64>
     Some(entry.object_id)
 
 # NetPublish for process `pid` (above).
-pub fn net_publish_for(pid: u32, link_handle: u64) -> i64
-    let object_id: u64 = match held_shm(pid, link_handle, CAP_RIGHT_PUBLISH)
+pub fn net_publish_for(pid: u32, handle: u64) -> i64
+    let object_id: u64 = match held_shm(pid, handle, CAP_RIGHT_PUBLISH)
         Some(id) => id
         None => return Errno.Perm as i64
-    if net_link_object == 0 or object_id != net_link_object
+    if object_id == 0 or (object_id != net_link_object and object_id != net_addr_object)
         return Errno.Perm as i64
     let frame: u64 = shm_page(object_id, 0)
     if frame == 0
         return Errno.Perm as i64
     let page: u64 = phys_to_virt(frame)
+    if object_id == net_addr_object
+        return addr_publish_page(page)
+    link_publish_page(page)
+
+# NetPublish of the link page at kernel address `page`.
+fn link_publish_page(page: u64) -> i64
     var got: LinkSample = link_sample(page)
     var tries: i32 = 1
     while got.generation == LINK_SEQ_UNPUBLISHED and tries < LINK_SAMPLE_TRIES
@@ -168,15 +189,77 @@ pub fn net_publish_for(pid: u32, link_handle: u64) -> i64
     enable_interrupts()
     0
 
+# ============================================================================
+# The address snapshot: NetAddr (225), #4742
+# ============================================================================
+
+var addr_snapshot: NetAddr
+# The generation the snapshot was taken at; LINK_SEQ_UNPUBLISHED (0) until
+# the service's first publish and after it exits or faults.
+var addr_generation: u64 = 0
+
+# NetPublish of the address page at kernel address `page`.
+fn addr_publish_page(page: u64) -> i64
+    var got: AddrSample = addr_sample(page)
+    var tries: i32 = 1
+    while got.generation == LINK_SEQ_UNPUBLISHED and tries < LINK_SAMPLE_TRIES
+        got = addr_sample(page)
+        tries = tries + 1
+    if got.generation == LINK_SEQ_UNPUBLISHED
+        return Errno.Again as i64
+    disable_interrupts()
+    addr_snapshot = got.addr
+    addr_generation = got.generation
+    enable_interrupts()
+    0
+
+# The address snapshot, if a stable generation is in it. Its _pad is zero
+# whatever the service's page held.
+pub fn net_addr_snapshot() -> Option<NetAddr>
+    disable_interrupts()
+    let published: bool = addr_generation >= LINK_SEQ_FIRST_STABLE
+    var copy: NetAddr = addr_snapshot
+    enable_interrupts()
+    if not published
+        return None
+    for i in 0..7
+        copy._pad[i] = 0
+    Some(copy)
+
+# The service's exit or fault path (sys_exit_impl, for every exiting
+# process): when `pid` is the registered service, NetAddr answers NoDev from
+# now on, the address object and the service are unregistered, so no later
+# publish revives the snapshot and no NetAttach reaches the dead pid. A
+# restarted service is registered, and publishes, anew. Nothing is written
+# to the page and no cleared record is stored.
+pub fn net_service_exited(pid: u32)
+    if pid == 0 or pid != net_service
+        return
+    disable_interrupts()
+    addr_generation = LINK_SEQ_UNPUBLISHED
+    net_addr_object = 0
+    net_service = 0
+    enable_interrupts()
+
+# NetAddr into `dst`, the caller's memory (checked here).
+fn net_addr(dst: *NetAddr) -> i64
+    let copy: NetAddr = match net_addr_snapshot()
+        Some(a) => a
+        None => return Errno.NoDev as i64
+    if uptr_check_write(dst as *u8, sizeof(NetAddr) as u64) != 0
+        return Errno.Fault as i64
+    *dst = copy
+    0
+
 # net_info(dst: *NetInfo) -> 0 or -errno
 pub fn sys_net_info_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     net_info(rdi as *NetInfo)
 
 # net_addr(dst: *NetAddr) -> 0 or -errno
 pub fn sys_net_addr_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    Errno.NoDev as i64
+    net_addr(rdi as *NetAddr)
 
-# net_publish(link_handle) -> 0 or -errno
+# net_publish(handle) -> 0 or -errno
 pub fn sys_net_publish_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     net_publish_for(proc_current_pid() as u32, rdi)
 

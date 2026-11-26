@@ -1,4 +1,6 @@
 # Harland link-record seqlock (AGAST #4730, docs/RING1_DRIVER.md section 7)
+# and the address page on the same seqlock (AGAST #4742, docs/RING2_NET.md
+# "Address publication")
 #
 # The ring-1 driver writes NetInfo on the link page under link_seq and the
 # kernel's NetPublish samples it. These host tests run both sides on a link
@@ -15,6 +17,7 @@
 # load invalidates the copy.
 
 import driver_abi.link { NetInfo, LINK_INFO_OFF, LINK_SEQ_OFF, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, NETDEV_TYPE_VIRTIO, link_write_begin, link_write_end, link_publish, link_sample, LinkSample, link_read_begin, link_read_copy, link_read_end }
+import driver_abi.link { NetAddr, ADDR_RECORD_OFF, ADDR_SEQ_OFF, AddrSample, addr_publish, addr_sample }
 
 # One link page, u64s so link_seq is 8-aligned.
 var g_page: [512]u64
@@ -113,4 +116,87 @@ fn test_a_write_during_the_copy_invalidates_it() -> i32
     let got = link_sample(page)
     assert got.generation == 4
     assert same(@got.info, @second)
+    0
+
+# ---------------------------------------------------------------------------
+# The address page (#4742): the ring-2 service's record on the same seqlock.
+
+# 10.0.2.<host> / gateway 10.0.2.2 / 255.255.255.0 / DNS 10.0.2.3, or a
+# cleared record (all zero, configured 0).
+fn lease(host: u8, configured: u8) -> NetAddr
+    var a: NetAddr
+    if configured != 0
+        a.address = [10, 0, 2, host]
+        a.gateway = [10, 0, 2, 2]
+        a.netmask = [255, 255, 255, 0]
+        a.dns = [10, 0, 2, 3]
+    a.configured = configured
+    a
+
+fn same_addr(a: *NetAddr, b: *NetAddr) -> bool
+    for i in 0..4
+        if a.address[i] != b.address[i] or a.gateway[i] != b.gateway[i]
+            return false
+        if a.netmask[i] != b.netmask[i] or a.dns[i] != b.dns[i]
+            return false
+    a.configured == b.configured
+
+# Zeroed is unpublished; the first publish (a cleared record, configured 0,
+# as the service's start publishes) is generation 2, the lease after it 4,
+# and each sample carries its generation in the record itself.
+[[test]]
+fn test_address_publishes_are_two_then_four() -> i32
+    let page = fresh_page()
+    assert addr_sample(page).generation == LINK_SEQ_UNPUBLISHED
+    let cleared = lease(0, 0)
+    assert addr_publish(page, @cleared) == LINK_SEQ_FIRST_STABLE
+    assert seq_of(page) == 2
+    let first = addr_sample(page)
+    assert first.generation == 2 and first.addr.generation == 2
+    assert same_addr(@first.addr, @cleared)
+    let acked = lease(15, 1)
+    assert addr_publish(page, @acked) == 4
+    let got = addr_sample(page)
+    assert got.generation == 4 and got.addr.generation == 4
+    assert same_addr(@got.addr, @acked)
+    0
+
+# The record sits below the seqlock word and never overlaps it: a publish
+# of a record whose own generation field is garbage leaves the word the
+# writer's, and the sample reports the word's generation, not the field.
+[[test]]
+fn test_address_record_does_not_touch_the_seqlock_word() -> i32
+    let page = fresh_page()
+    var junk = lease(15, 1)
+    junk.generation = 0xFFFFFFFFFFFFFFFF
+    assert addr_publish(page, @junk) == 2
+    assert seq_of(page) == 2
+    assert ((page + ADDR_RECORD_OFF) as *NetAddr).generation == 2
+    let got = addr_sample(page)
+    assert got.generation == 2 and got.addr.generation == 2
+    # A writer that leaves the field stale: the sample still reports the
+    # word's generation in the record.
+    let odd = link_write_begin(page)
+    *((page + ADDR_RECORD_OFF) as *NetAddr) = junk
+    link_write_end(page, odd)
+    let again = addr_sample(page)
+    assert again.generation == 4 and again.addr.generation == 4
+    0
+
+# Odd (a write in progress) is refused, and a write that starts during the
+# copy invalidates it, as on the link page.
+[[test]]
+fn test_address_odd_and_torn_samples_are_refused() -> i32
+    let page = fresh_page()
+    let acked = lease(15, 1)
+    addr_publish(page, @acked)
+    *((page + ADDR_SEQ_OFF) as *u64) = 3
+    assert addr_sample(page).generation == LINK_SEQ_UNPUBLISHED
+    *((page + ADDR_SEQ_OFF) as *u64) = 4
+    let s1 = link_read_begin(page)
+    assert s1 == 4
+    let odd = link_write_begin(page)
+    assert not link_read_end(page, s1)
+    link_write_end(page, odd)
+    assert addr_sample(page).generation == 6
     0

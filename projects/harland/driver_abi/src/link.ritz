@@ -1,4 +1,5 @@
-# Harland link snapshot ABI (AGAST #4718, docs/RING1_DRIVER.md section 7)
+# Harland link and address snapshot ABI (AGAST #4718, #4742;
+# docs/RING1_DRIVER.md section 7, docs/RING2_NET.md "Address publication")
 #
 # The link object is one page, mapped only into the ring-1 driver: NetInfo
 # at LINK_INFO_OFF and the seqlock word link_seq (a u64) at LINK_SEQ_OFF.
@@ -47,6 +48,15 @@ pub struct NetAddr
     configured: u8
     _pad: [7]u8                      # zero
     generation: u64
+
+# The address object is one page, mapped only into the ring-2 service, on
+# the link page's layout: the NetAddr record at ADDR_RECORD_OFF and the
+# seqlock word (a u64) at ADDR_SEQ_OFF, the same offset as link_seq, so the
+# link_write_* / link_read_* steps below run on either page. The page's
+# NetAddr.generation is not the seqlock word: the kernel's snapshot sets it
+# to the generation it sampled.
+pub const ADDR_RECORD_OFF: u64 = 0
+pub const ADDR_SEQ_OFF: u64 = 0x20
 
 # ============================================================================
 # The seqlock (section 7, AGAST #4730)
@@ -125,4 +135,49 @@ pub fn link_sample(page: u64) -> LinkSample
     if link_read_end(page, s1)
         got.generation = s1
         got.info = copy
+    got
+
+# ============================================================================
+# The address page (RING2_NET.md "Address publication", AGAST #4742)
+# ============================================================================
+#
+# The ring-2 service is the only writer, with the same seqlock as link_seq
+# (generation 0 unpublished, the first stable value 2); NetPublish (226)
+# with the page's handle samples it into the kernel's snapshot, which
+# NetAddr (225) copies out.
+
+fn addr_record(page: u64) -> *NetAddr
+    (page + ADDR_RECORD_OFF) as *NetAddr
+
+# Writer steps 1-4 for `rec`; returns the generation it published (2, 4,
+# ...). The page's copy of rec.generation is that generation too, so the
+# service reading its own page sees it. Step 5, NetPublish, is the
+# service's next call.
+pub fn addr_publish(page: u64, rec: *NetAddr) -> u64
+    let odd: u64 = link_write_begin(page)
+    let dst: *NetAddr = addr_record(page)
+    *dst = *rec
+    dst.generation = odd + 1
+    link_write_end(page, odd)
+    odd + 1
+
+# What one sample of an address page took: `addr` at stable `generation`
+# (addr.generation is it too), or generation LINK_SEQ_UNPUBLISHED and no
+# record.
+pub struct AddrSample
+    generation: u64
+    addr: NetAddr
+
+# One sample (reader steps 1-4) of an address page; as link_sample.
+pub fn addr_sample(page: u64) -> AddrSample
+    var got: AddrSample
+    got.generation = LINK_SEQ_UNPUBLISHED
+    let s1: u64 = link_read_begin(page)
+    if s1 == LINK_SEQ_UNPUBLISHED
+        return got
+    let copy: NetAddr = *addr_record(page)
+    if link_read_end(page, s1)
+        got.generation = s1
+        got.addr = copy
+        got.addr.generation = s1
     got
