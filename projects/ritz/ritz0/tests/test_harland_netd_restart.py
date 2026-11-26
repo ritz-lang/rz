@@ -175,5 +175,39 @@ def test_the_restart_test_is_a_boot_option_run_before_init():
 def test_the_restart_test_kills_after_each_lease_and_checks_nodev():
     body = _fn_body(_code(RING1), "net_netd_restart_test")
     _in_order(body, "if not enabled", "net_restart_armed()", "while round <= NETD_RESTARTS",
-              "net_addr_configured()", "process_mark_exit(", "net_service_pid() != pid",
+              "net_addr_configured_by(pid)", "process_mark_exit(", "net_service_pid() != pid",
               "net_addr_snapshot()", "NETD_BUDGET_SETTLE_US", "net_addr_snapshot()")
+
+
+# AGAST #4855: pid 1 killed restart 1 between its NetPublish and its
+# "[netd] configured" line. netd's loop publishes, logs the lease, then
+# parks in ShmWait: the kill waits for this instance's own configured
+# publish and for it to park after it, so the line is out first.
+NETD = HARLAND / "system" / "src" / "netd.ritz"
+
+
+@pytest.mark.unit
+def test_netd_logs_its_lease_after_the_publish_and_before_it_parks():
+    loop = _fn_body(_code(NETD), "main").split("while true", 1)[1]
+    _in_order(loop, "net_publish(g_boot.addr)", "log_address()", "wait_once(")
+
+
+@pytest.mark.unit
+def test_the_address_snapshot_remembers_its_publisher():
+    publish = _fn_body(_code(NET_RT), "net_publish_for")
+    _in_order(publish, "addr_publish_page(page)", "addr_publisher = pid")
+    exited = _fn_body(_code(NET_RT), "net_service_exited")
+    _in_order(exited, "disable_interrupts()", "addr_generation = LINK_SEQ_UNPUBLISHED",
+              "addr_publisher = 0", "enable_interrupts()")
+    by = _fn_body(_code(NET_RT), "net_addr_configured_by")
+    assert "addr_publisher == pid" in by and "net_addr_configured()" in by
+
+
+@pytest.mark.unit
+def test_the_kill_waits_for_this_netds_lease_and_its_park():
+    body = _fn_body(_code(RING1), "net_netd_restart_test")
+    rnd = body.split("while round <= NETD_RESTARTS", 1)[1]
+    _in_order(rnd, "pid = net_service_pid()", "net_addr_configured_by(pid)", "ring1_parked(pid as u64)",
+              "[net-restart] killing netd pid", "process_mark_exit(pid as u64)")
+    # Not any lease: the bare check would take a snapshot whatever published it.
+    assert "net_addr_configured()" not in rnd

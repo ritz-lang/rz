@@ -841,6 +841,10 @@ def test_netd_restart_passes_on_the_translating_boot(tree):
         # A replacement that never got a lease
         (VTD_OK.replace(netd_restarted(2, 5), netd_restarted(2, 5).replace(NETD_CONFIGURED, "")),
          "netd restart 2 did not reach configured"),
+        # Restart 1 killed between its publish and its lease line (#4855)
+        (VTD_OK.replace(netd_restarted(1, 4) + netd_killed(4),
+                        netd_restarted(1, 4).replace(NETD_CONFIGURED, "") + netd_killed(4) + NETD_CONFIGURED),
+         "netd restart 1 did not reach configured ([netd] configured A) before it was killed"),
         # The second restart came after the wrong backoff
         (VTD_OK.replace("restart 2 of 3 in 500 ms", "restart 2 of 3 in 250 ms"),
          "no \"[net] netd restart 2 of 3 in 500 ms\""),
@@ -849,7 +853,7 @@ def test_netd_restart_passes_on_the_translating_boot(tree):
         (VTD_OK.replace(RESTART_SETTLED, r"[net-restart] FAIL: netd pid 6 never reached configured\n"),
          "[net-restart] FAIL"),
     ],
-    ids=["no-kills", "no-nodev", "no-attach", "no-detach", "no-lease", "wrong-backoff",
+    ids=["no-kills", "no-nodev", "no-attach", "no-detach", "no-lease", "lease-after-kill", "wrong-backoff",
          "no-budget-log", "no-settle", "test-fail"],
 )
 def test_netd_restart_check_fails(tree, vtd, want):

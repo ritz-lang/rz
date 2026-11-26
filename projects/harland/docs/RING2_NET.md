@@ -485,7 +485,7 @@ The kernel owns restart policy for `netd`: three restarts per boot with the 250 
 
 The kernel does not restart a dead ring-1 driver in this cutover. The frame-seat section covers that case.
 
-The 21 per-CPU and syscall-stack checks exercise the current kernel. The handoff is implemented (AGAST #4744: `kernel/src/net/ring1.ritz` `net_seat_handoff`), and so is the exit-or-fault path with its restart policy (AGAST #4745: `kernel/src/syscall/runtime/process.ritz` `netd_restart`, `kernel/src/syscall/runtime/net.ritz` `net_service_install`). The kernel has no threads, so the backoff and the replacement's spawn run in the dead service's own exit path, after its handles, mappings and page table are gone. The `\harland\netd-restart` boot option has pid 1 kill each netd after its lease before init, which `tools/test_msix_boot.sh` checks.
+The 21 per-CPU and syscall-stack checks exercise the current kernel. The handoff is implemented (AGAST #4744: `kernel/src/net/ring1.ritz` `net_seat_handoff`), and so is the exit-or-fault path with its restart policy (AGAST #4745: `kernel/src/syscall/runtime/process.ritz` `netd_restart`, `kernel/src/syscall/runtime/net.ritz` `net_service_install`). The kernel has no threads, so the backoff and the replacement's spawn run in the dead service's own exit path, after its handles, mappings and page table are gone. The `\harland\netd-restart` boot option has pid 1 kill each netd after its lease before init (that netd's own configured NetPublish, once it has parked again, so its `[netd] configured` line is out first: AGAST #4855), which `tools/test_msix_boot.sh` checks.
 
 ## Userspace interface
 

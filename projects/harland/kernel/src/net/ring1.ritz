@@ -83,7 +83,7 @@ import net.dhcp { Release, dhcp_release_frame, dhcp_print_lease }
 import net.stack { net_stack_release }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import syscall.runtime.net { net_link_register, ring_driver_published, net_addr_register, net_service_register, net_handoff_arm, net_handoff_ready, net_handoff_done }
-import syscall.runtime.net { ServicePage, NETD_RESTARTS, net_service_page, net_service_boot, net_restart_arm, net_restart_armed, net_service_pid, net_addr_configured, net_addr_snapshot }
+import syscall.runtime.net { ServicePage, NETD_RESTARTS, net_service_page, net_service_boot, net_restart_arm, net_restart_armed, net_service_pid, net_addr_configured_by, net_addr_snapshot }
 import syscall.runtime.driver { drv_device_bind }
 import syscall.runtime.process { process_create_init, process_spawn_program, process_mark_exit }
 import drivers.virtio.net { NicGrant, virtio_net_ring1_probe }
@@ -413,10 +413,13 @@ fn restart_wait(us: u64)
         sched_yield()
 
 # As pid 1 after the handoff, before init (kernel_tail), when `enabled`:
-# NETD_RESTARTS + 1 rounds of waiting for the running netd's lease, killing
-# it ("[net-restart] killing netd pid P after its lease") and checking
-# that NetAddr answers NoDev once it is unregistered ("[net-restart] NetAddr
-# NoDev after netd pid P died"); the kernel restarts it between rounds.
+# NETD_RESTARTS + 1 rounds of waiting for the running netd's lease (its own
+# configured NetPublish, then its park in ShmWait: netd logs "[netd]
+# configured A" between the two, so the line is out before the kill,
+# AGAST #4855), killing it ("[net-restart] killing netd pid P after its
+# lease") and checking that NetAddr answers NoDev once it is unregistered
+# ("[net-restart] NetAddr NoDev after netd pid P died"); the kernel
+# restarts it between rounds.
 # Then NetAddr must still be NoDev NETD_BUDGET_SETTLE_US later ("[net-restart]
 # NetAddr still NoDev 2000 ms after the budget was spent"). Any other
 # outcome logs "[net-restart] FAIL: ..." and stops. Nothing on a boot with
@@ -429,10 +432,14 @@ pub fn net_netd_restart_test(enabled: bool)
     var round: u32 = 0
     while round <= NETD_RESTARTS
         let leased: u64 = deadline_after_us(NETD_LEASE_US)
-        while not net_addr_configured() and not deadline_passed(leased)
-            sched_yield()
-        let pid: u32 = net_service_pid()
-        if not net_addr_configured()
+        var pid: u32 = 0
+        var leased_here: bool = false
+        while not leased_here and not deadline_passed(leased)
+            pid = net_service_pid()
+            leased_here = net_addr_configured_by(pid) and ring1_parked(pid as u64)
+            if not leased_here
+                sched_yield()
+        if not leased_here
             restart_fail("never reached configured", pid)
             return
         klog("[net-restart] killing netd pid ")
