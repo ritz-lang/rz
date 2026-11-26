@@ -7,11 +7,14 @@ the modules exist, the editor does not yet.
 
 ## Layout
 
-- `src/core/`: the editor core (`buffer`, `screen`, `modes`, `commands`).
-  It does no terminal or OS I/O, so it is tested without a terminal.
+- `src/core/`: the editor core (`buffer` with its undo `history` and
+  `utf8` cursor stepping, `screen`, `modes`, `commands`). It does no
+  terminal or OS I/O, so it is tested without a terminal.
 - `src/platform/`: the platform adapters that do that I/O (`linux` so far).
 - `src/main.ritz`: the `buddhafinger` binary.
-- `test/`: the ritzunit suites.
+- `test/`: the ritzunit suites. `test_buffer_fuzz.ritz` runs seeded random
+  edits against a reference buffer; a failure prints its seed, and
+  `BF_FUZZ_SEED=<seed> make -C projects/buddhafinger test` replays it alone.
 
 ## Build and test
 

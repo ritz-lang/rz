@@ -1,0 +1,110 @@
+# core/history.ritz - a buffer's undo and redo records.
+#
+# An edit records only the bytes it touched: where it starts (a byte offset
+# into the file), the bytes it removed and the bytes it inserted. Undoing
+# one puts the removed bytes back over the inserted ones, so neither typing
+# nor undo copies the file (docs/BUDDHAFINGER_PROPOSAL.md, "Buffer
+# representation and performance"). Offsets, not (line, col): a CR and a
+# later LF read as one CRLF line, so line numbers can shift under an edit
+# while byte offsets can't.
+#
+# Edits group into undo steps. Outside a group each edit is its own step;
+# between begin_group and end_group (an Insert-mode session) they are one,
+# and consecutive typing merges into one record. The History lives in the
+# Buffer, so every view of a buffer shares it.
+# Core module: no terminal or OS I/O (see src/platform/).
+
+import ritzlib.gvec
+import ritzlib.span
+
+# Drop every element of `v`: a Vec frees only its own storage, so a Vec of
+# owning elements releases them first (as tome's List does).
+pub fn release_all<T>(v: @&Vec<T>)
+    while v.len() > 0
+        let gone = v.pop()      # dropped at the end of each iteration
+
+# Bytes off..off+removed.len() became `inserted`.
+pub struct Edit
+    off: i64
+    removed: Vec<u8>
+    inserted: Vec<u8>
+
+# One undo step: its edits in the order they were made. `id` names the file
+# state after the step, for the dirty flag.
+pub struct Group
+    id: i64
+    edits: Vec<Edit>
+
+impl Drop for Group
+    fn drop(self: @&Group)
+        release_all<Edit>(@&self.edits)
+
+pub struct History
+    undo: Vec<Group>
+    redo: Vec<Group>
+    next_id: i64
+    saved_id: i64       # the state id last saved (0: as loaded)
+    open: bool          # inside begin_group .. end_group
+    open_top: bool      # the open group is on top of `undo` already
+
+impl Drop for History
+    fn drop(self: @&History)
+        release_all<Group>(@&self.undo)
+        release_all<Group>(@&self.redo)
+
+pub fn history_new() -> History
+    History { undo: vec_new<Group>(), redo: vec_new<Group>(), next_id: 1, saved_id: 0, open: false, open_top: false }
+
+# Append `s` to `v`. `last.inserted.push_span(s)`, through the `@&` borrow
+# of an Edit in record(), is refused by ritz1_selfhosted as "cannot move
+# out of a reference" in Vec.push_span's body, as if instantiated at
+# T = Edit; a plain `@&Vec<u8>` parameter sidesteps it.
+fn push_all(v: @&Vec<u8>, s: [u8])
+    v.push_span(s)
+
+fn bytes_of_span(s: [u8]) -> Vec<u8>
+    var v: Vec<u8> = vec_with_cap<u8>(s.len)
+    v.push_span(s)
+    v
+
+impl History
+    # The id of the current file state: the top undo step's, or 0 as loaded.
+    pub fn current_id(self: @History) -> i64
+        let n = self.undo.len()
+        if n == 0 then 0 else self.undo[n - 1].id
+
+    pub fn is_dirty(self: @History) -> bool
+        self.current_id() != self.saved_id
+
+    # The current state is saved. An open group's later edits start a new
+    # step, so the saved state stays one undo away.
+    pub fn mark_saved(self: @&History)
+        self.saved_id = self.current_id()
+        self.open_top = false
+
+    pub fn begin_group(self: @&History)
+        self.open = true
+        self.open_top = false
+
+    pub fn end_group(self: @&History)
+        self.open = false
+        self.open_top = false
+
+    # Record an edit at `off` that replaced `removed` with `inserted`. A new
+    # edit drops the redo steps.
+    pub fn record(self: @&History, off: i64, removed: [u8], inserted: [u8])
+        release_all<Group>(@&self.redo)
+        if self.open and self.open_top
+            let top = @&self.undo[self.undo.len() - 1]
+            let last = @&top.edits[top.edits.len() - 1]
+            # Typing: an insert right after the previous insert grows it.
+            if removed.len == 0 and last.removed.len() == 0 and off == last.off + last.inserted.len()
+                push_all(@&last.inserted, inserted)
+                return
+            top.edits.push(Edit { off: off, removed: bytes_of_span(removed), inserted: bytes_of_span(inserted) })
+            return
+        var edits: Vec<Edit> = vec_new<Edit>()
+        edits.push(Edit { off: off, removed: bytes_of_span(removed), inserted: bytes_of_span(inserted) })
+        self.undo.push(Group { id: self.next_id, edits: edits })
+        self.next_id += 1
+        self.open_top = self.open

@@ -1,18 +1,470 @@
 # core/buffer.ritz - the text buffer.
 #
-# Lines are bytes (`Vec<u8>`, terminators in line metadata), not `String`
-# (docs/BUDDHAFINGER_PROPOSAL.md, "Buffer representation and performance").
-# This skeleton tracks only whether there are pending edits; the buffer-core
-# task adds line storage behind the buffer API.
+# Storage is a Vec of lines, each the line's bytes as a `Vec<u8>` with its
+# terminator (LF, CRLF, CR or none) in metadata (docs/BUDDHAFINGER_PROPOSAL.md,
+# "Buffer representation and performance"). Not `String`: a String is kept
+# NUL-terminated for C interop, and a zero byte is a legal file byte.
+#
+# The Buffer methods are the only seam the editor sees: read a line or a
+# range, replace a range, split and join lines, convert between byte
+# offsets and (line, col), undo and redo. The storage can change behind
+# them (fragments for very long lines, blocks of lines for huge files)
+# without callers noticing.
+#
+# Invariants:
+# - Every CR and LF in the file is part of a terminator, so no line's bytes
+#   hold one, and the lines are exactly what loading the serialized bytes
+#   would build: a CR followed by an LF is one CRLF terminator, however the
+#   two bytes arrived.
+# - There is always at least one line, and only the last has no
+#   terminator. A file ending in a newline has an empty last line, so every
+#   byte offset 0..=byte_len() has a position, and the final-newline state
+#   round-trips with the rest of the bytes.
+#
+# Positions are (line, col) with col a byte index 0..=line_len(line); the
+# cursor helpers step them by UTF-8 code point (core/utf8.ritz).
 # Core module: no terminal or OS I/O (see src/platform/).
 
-pub struct Buffer
-    dirty: bool
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.span
+import ritzlib.strview
 
+import core.history { History, history_new, release_all }
+import core.utf8 { utf8_next, utf8_prev }
+
+pub enum Term
+    NoEol       # the last line: no terminator
+    Lf
+    CrLf
+    Cr
+
+# The bytes a terminator writes.
+pub fn term_text(t: Term) -> StrView
+    match t
+        Term.NoEol => ""
+        Term.Lf => "\n"
+        Term.CrLf => "\r\n"
+        Term.Cr => "\r"
+
+pub struct Pos
+    line: i64
+    col: i64
+
+pub fn pos(line: i64, col: i64) -> Pos
+    Pos { line: line, col: col }
+
+fn pos_before(a: Pos, b: Pos) -> bool
+    a.line < b.line or (a.line == b.line and a.col < b.col)
+
+struct Line
+    bytes: Vec<u8>
+    term: Term
+
+fn line_empty() -> Line
+    Line { bytes: vec_new<u8>(), term: Term.NoEol }
+
+# `text` split at its terminators: one line per terminator and a last,
+# unterminated line (empty if `text` ends in one).
+fn parse_lines(text: [u8]) -> Vec<Line>
+    var out: Vec<Line> = vec_new<Line>()
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < text.len
+        let c = text[i]
+        if c == '\n' or c == '\r'
+            var bytes: Vec<u8> = vec_with_cap<u8>(i - start)
+            bytes.push_span(text[start..i])
+            var t = Term.Lf
+            if c == '\r'
+                if i + 1 < text.len and text[i + 1] == '\n'
+                    t = Term.CrLf
+                    i += 1
+                else
+                    t = Term.Cr
+            out.push(Line { bytes: bytes, term: t })
+            start = i + 1
+        i += 1
+    var last: Vec<u8> = vec_with_cap<u8>(text.len - start)
+    last.push_span(text[start..text.len])
+    out.push(Line { bytes: last, term: Term.NoEol })
+    out
+
+# True when `text` holds a CR or an LF.
+fn has_break(text: [u8]) -> bool
+    for i in 0..text.len
+        if text[i] == '\n' or text[i] == '\r'
+            return true
+    false
+
+# Replace v[at..at + n] with `ins`, moving only the bytes after the range.
+fn splice_bytes(v: @&Vec<u8>, at: i64, n: i64, ins: [u8])
+    let old_len = v.len()
+    let new_len = old_len - n + ins.len
+    while v.len() < new_len
+        v.push(0)
+    let all = span_from_vec<u8>(v)
+    all[at + ins.len..new_len].copy_from(all[at + n..old_len])
+    all[at..at + ins.len].copy_from(ins)
+    while v.len() > new_len
+        v.pop()
+
+# A byte offset's place: line and col, and `mid` when it falls between the
+# CR and the LF of a CRLF (col is then the line's length). Only undo and
+# redo, which work in offsets, edit at such a place.
+struct Loc
+    line: i64
+    col: i64
+    mid: bool
+
+pub struct Buffer
+    lines: Vec<Line>
+    total: i64              # bytes in the file, terminators included
+    # starts[l] is line l's byte offset, for l < starts.len(): filled on
+    # demand and cut back to the first line an edit moves, so typing on a
+    # line doesn't rescan the lines above it.
+    starts: Vec<i64>
+    history: History
+
+impl Drop for Buffer
+    fn drop(self: @&Buffer)
+        release_all<Line>(@&self.lines)
+
+# An empty buffer: one empty line.
 pub fn buffer_new() -> Buffer
-    Buffer { dirty: false }
+    var lines: Vec<Line> = vec_new<Line>()
+    lines.push(line_empty())
+    Buffer { lines: lines, total: 0, starts: vec_new<i64>(), history: history_new() }
+
+# A buffer holding `data` byte for byte: any terminators, NULs and
+# malformed UTF-8 come back out of serialize() unchanged.
+pub fn buffer_from_bytes(data: [u8]) -> Buffer
+    let lines = parse_lines(data)
+    Buffer { lines: lines, total: data.len, starts: vec_new<i64>(), history: history_new() }
 
 impl Buffer
-    # True while the buffer holds edits that are not saved: `:q` refuses.
+    # ------------------------------------------------------------------
+    # Reading
+    # ------------------------------------------------------------------
+
+    pub fn line_count(self: @Buffer) -> i64
+        self.lines.len()
+
+    # Line l's bytes, without its terminator. A view: good until the next edit.
+    pub fn line(self: @Buffer, l: i64) -> [u8]
+        span_from_vec(@self.lines[l].bytes)
+
+    pub fn line_len(self: @Buffer, l: i64) -> i64
+        self.lines[l].bytes.len()
+
+    pub fn line_term(self: @Buffer, l: i64) -> Term
+        self.lines[l].term
+
+    # Bytes in the file, terminators included.
+    pub fn byte_len(self: @Buffer) -> i64
+        self.total
+
+    # True when the file ends in a line terminator.
+    pub fn has_final_newline(self: @Buffer) -> bool
+        let n = self.lines.len()
+        n > 1 and self.lines[n - 1].bytes.len() == 0
+
+    # The file's bytes, as loaded or as edited: what a save writes.
+    pub fn serialize(self: @Buffer) -> Vec<u8>
+        var out: Vec<u8> = vec_with_cap<u8>(self.total)
+        for l in 0..self.lines.len()
+            out.push_span(self.line(l))
+            out.push_view(term_text(self.lines[l].term))
+        out
+
+    # The bytes from a to b (either order), terminators included.
+    pub fn text(self: @Buffer, a: Pos, b: Pos) -> Vec<u8>
+        var s = self.clamp(a)
+        var e = self.clamp(b)
+        if pos_before(e, s)
+            let t = s
+            s = e
+            e = t
+        var out: Vec<u8> = vec_new<u8>()
+        for l in s.line..=e.line
+            let from = if l == s.line then s.col else 0
+            let to = if l == e.line then e.col else self.line_len(l)
+            let whole = self.line(l)
+            out.push_span(whole[from..to])
+            if l != e.line
+                out.push_view(term_text(self.lines[l].term))
+        out
+
+    # ------------------------------------------------------------------
+    # Positions
+    # ------------------------------------------------------------------
+
+    # p moved onto the buffer: the line into 0..line_count(), the column
+    # into 0..=line_len().
+    pub fn clamp(self: @Buffer, p: Pos) -> Pos
+        var line = p.line
+        if line < 0
+            line = 0
+        if line >= self.lines.len()
+            line = self.lines.len() - 1
+        var col = p.col
+        if col < 0
+            col = 0
+        if col > self.line_len(line)
+            col = self.line_len(line)
+        pos(line, col)
+
+    # Line l's byte offset, filling `starts` as far as l.
+    fn start_of(self: @&Buffer, l: i64) -> i64
+        if self.starts.len() == 0
+            self.starts.push(0)
+        while self.starts.len() <= l
+            let k = self.starts.len() - 1
+            let next = self.starts[k] + self.lines[k].bytes.len() + term_text(self.lines[k].term).len
+            self.starts.push(next)
+        self.starts[l]
+
+    # Edits from line l on moved the lines after it: forget their offsets.
+    fn forget_starts_after(self: @&Buffer, l: i64)
+        while self.starts.len() > l + 1
+            self.starts.pop()
+
+    # The place of byte offset `off`, which is in 0..=byte_len().
+    fn locate(self: @&Buffer, off: i64) -> Loc
+        # Fill `starts` past `off`, or to the last line.
+        let last = self.lines.len() - 1
+        if self.starts.len() == 0
+            self.starts.push(0)
+        var known = self.starts.len() - 1
+        while known < last and self.start_of(known + 1) <= off
+            known += 1
+        # The last line starting at or before `off`.
+        var lo: i64 = 0
+        var hi: i64 = self.starts.len() - 1
+        while lo < hi
+            let mid = (lo + hi + 1) / 2
+            if self.starts[mid] <= off
+                lo = mid
+            else
+                hi = mid - 1
+        let col = off - self.starts[lo]
+        let len = self.lines[lo].bytes.len()
+        if col > len
+            # Inside the terminator: only a CRLF has a byte between.
+            return Loc { line: lo, col: len, mid: true }
+        Loc { line: lo, col: col, mid: false }
+
+    # The byte offset of p (clamped onto the buffer).
+    pub fn offset_of(self: @&Buffer, p: Pos) -> i64
+        let q = self.clamp(p)
+        self.start_of(q.line) + q.col
+
+    # The position of byte offset `off`, clamped into 0..=byte_len(). An
+    # offset between a CRLF's two bytes rounds down to the end of the line.
+    pub fn pos_at(self: @&Buffer, off: i64) -> Pos
+        var o = off
+        if o < 0
+            o = 0
+        if o > self.total
+            o = self.total
+        let at = self.locate(o)
+        pos(at.line, at.col)
+
+    # The position one UTF-8 code point after p; from the end of a line,
+    # the start of the next. A malformed byte is one unit.
+    pub fn next_char(self: @Buffer, p: Pos) -> Pos
+        let q = self.clamp(p)
+        let s = self.line(q.line)
+        if q.col < s.len
+            return pos(q.line, utf8_next(s, q.col))
+        if q.line + 1 < self.lines.len()
+            return pos(q.line + 1, 0)
+        q
+
+    # The position one UTF-8 code point before p; from the start of a line,
+    # the end of the one above.
+    pub fn prev_char(self: @Buffer, p: Pos) -> Pos
+        let q = self.clamp(p)
+        if q.col > 0
+            return pos(q.line, utf8_prev(self.line(q.line), q.col))
+        if q.line > 0
+            return pos(q.line - 1, self.line_len(q.line - 1))
+        q
+
+    # ------------------------------------------------------------------
+    # Editing
+    # ------------------------------------------------------------------
+
+    # Replace the text from a to b (either order) with `text`, which may
+    # hold line breaks, and record it for undo. Returns the position after
+    # the inserted text.
+    pub fn replace(self: @&Buffer, a: Pos, b: Pos, text: [u8]) -> Pos
+        var s = self.clamp(a)
+        var e = self.clamp(b)
+        if pos_before(e, s)
+            let t = s
+            s = e
+            e = t
+        let off = self.offset_of(s)
+        let end = self.offset_of(e)
+        if off == end and text.len == 0
+            return s
+        let removed = self.text(s, e)
+        self.history.record(off, span_from_vec<u8>(@removed), text)
+        if s.line == e.line and not has_break(text) and not self.joins_cr_lf(s.line, removed.len(), text.len)
+            # Line-local: splice the one line's bytes in place.
+            splice_bytes(@&self.lines[s.line].bytes, s.col, removed.len(), text)
+            self.total += text.len - removed.len()
+            self.forget_starts_after(s.line)
+        else
+            self.replace_bytes(off, end, text)
+        self.pos_at(off + text.len)
+
+    pub fn insert(self: @&Buffer, at: Pos, text: [u8]) -> Pos
+        self.replace(at, at, text)
+
+    # Delete the text from a to b (either order); returns where it was.
+    pub fn delete(self: @&Buffer, a: Pos, b: Pos) -> Pos
+        self.replace(a, b, span_from_strview(""))
+
+    # Break the line at p. The new terminator is the line's own, else the
+    # one above's (the last line has none), else LF. Returns the start of
+    # the new line.
+    pub fn split_line(self: @&Buffer, at: Pos) -> Pos
+        let p = self.clamp(at)
+        var t = self.lines[p.line].term
+        if t == Term.NoEol
+            t = if p.line > 0 then self.lines[p.line - 1].term else Term.Lf
+        self.replace(p, p, span_from_strview(term_text(t)))
+
+    # Join line l with the next by removing l's terminator; the last line
+    # has none, so joining it changes nothing. Returns the join point.
+    pub fn join_lines(self: @&Buffer, l: i64) -> Pos
+        let p = self.clamp(pos(l, 0))
+        let end = pos(p.line, self.line_len(p.line))
+        if p.line + 1 >= self.lines.len()
+            return end
+        self.replace(end, pos(p.line + 1, 0), span_from_strview(""))
+
+    # True when an in-line edit leaving line l `removed`/`inserted` bytes
+    # shorter/longer would empty an LF line under a CR line: the two
+    # terminators then read as one CRLF and the lines must merge.
+    fn joins_cr_lf(self: @Buffer, l: i64, removed: i64, inserted: i64) -> bool
+        l > 0 and self.lines[l].term == Term.Lf and self.lines[l - 1].term == Term.Cr and self.line_len(l) - removed + inserted == 0
+
+    # Replace bytes off..end with `text` by re-reading the lines the range
+    # touches, so terminators come out as a load would read them. Records
+    # nothing: replace() and undo/redo do that.
+    fn replace_bytes(self: @&Buffer, off: i64, end: i64, text: [u8])
+        let a = self.locate(off)
+        let z = self.locate(end)
+        var first = a.line
+        var joined: Vec<u8> = vec_new<u8>()
+        # A CR line above may pair with an LF at the front of the result.
+        if first > 0 and self.lines[first - 1].term == Term.Cr
+            first -= 1
+            joined.push_span(self.line(first))
+            joined.push('\r')
+        let head = self.line(a.line)
+        joined.push_span(head[0..a.col])
+        if a.mid
+            joined.push('\r')
+        joined.push_span(text)
+        if z.mid
+            joined.push('\n')
+        else
+            let tail = self.line(z.line)
+            joined.push_span(tail[z.col..tail.len])
+            joined.push_view(term_text(self.lines[z.line].term))
+        var fresh = parse_lines(span_from_vec<u8>(@joined))
+        # Unless z is on the last line, `joined` ends at the start of line
+        # z.line + 1, and the empty line parse_lines ended with is not one.
+        if z.line + 1 < self.lines.len()
+            let gone = fresh.pop()
+        self.total += text.len - (end - off)
+        self.splice_lines(first, z.line - first + 1, @&fresh)
+
+    # Replace lines first..first + n with the lines `fresh` holds, moving
+    # them out of it. The lines after shift by one move each.
+    fn splice_lines(self: @&Buffer, first: i64, n: i64, fresh: @&Vec<Line>)
+        let count = fresh.len()
+        let old = self.lines.len()
+        if count > n
+            let grow = count - n
+            for k in 0..grow
+                self.lines.push(line_empty())
+            var j = old - 1
+            while j >= first + n
+                let moved = self.lines.replace(j, line_empty())
+                let spare = self.lines.replace(j + grow, moved)
+                j -= 1
+        else if count < n
+            let shrink = n - count
+            for j in first + n..old
+                let moved = self.lines.replace(j, line_empty())
+                let gone = self.lines.replace(j - shrink, moved)
+            for k in 0..shrink
+                let gone = self.lines.pop()
+        var k = count - 1
+        while k >= 0
+            let gone = self.lines.replace(first + k, fresh.pop())
+            k -= 1
+        self.forget_starts_after(first)
+
+    # ------------------------------------------------------------------
+    # Undo and redo
+    # ------------------------------------------------------------------
+
+    # Make the edits until end_group one undo step (an Insert-mode session).
+    pub fn begin_group(self: @&Buffer)
+        self.history.begin_group()
+
+    pub fn end_group(self: @&Buffer)
+        self.history.end_group()
+
+    pub fn can_undo(self: @Buffer) -> bool
+        self.history.undo.len() > 0
+
+    pub fn can_redo(self: @Buffer) -> bool
+        self.history.redo.len() > 0
+
+    # Undo the last step (closing an open group first). Returns where its
+    # first edit was, or None with nothing to undo.
+    pub fn undo(self: @&Buffer) -> Option<Pos>
+        self.history.end_group()
+        if self.history.undo.len() == 0
+            return None
+        var g = self.history.undo.pop()
+        var k = g.edits.len() - 1
+        while k >= 0
+            let off = g.edits[k].off
+            let n = g.edits[k].inserted.len()
+            self.replace_bytes(off, off + n, span_from_vec<u8>(@g.edits[k].removed))
+            k -= 1
+        let at = g.edits[0].off
+        self.history.redo.push(g)
+        Some(self.pos_at(at))
+
+    # Redo the last undone step. Returns where its first edit was, or None
+    # with nothing to redo.
+    pub fn redo(self: @&Buffer) -> Option<Pos>
+        self.history.end_group()
+        if self.history.redo.len() == 0
+            return None
+        var g = self.history.redo.pop()
+        for k in 0..g.edits.len()
+            let off = g.edits[k].off
+            let n = g.edits[k].removed.len()
+            self.replace_bytes(off, off + n, span_from_vec<u8>(@g.edits[k].inserted))
+        let at = g.edits[0].off
+        self.history.undo.push(g)
+        Some(self.pos_at(at))
+
+    # True while the buffer differs from the state last saved (or loaded),
+    # as undo history sees it: `:q` refuses.
     pub fn is_dirty(self: @Buffer) -> bool
-        self.dirty
+        self.history.is_dirty()
+
+    # The current state is what is on disk.
+    pub fn mark_saved(self: @&Buffer)
+        self.history.mark_saved()

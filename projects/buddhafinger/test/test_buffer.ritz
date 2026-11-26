@@ -1,0 +1,454 @@
+# test/test_buffer.ritz - the buffer core's ritzunit suite (AGAST #4816).
+#
+# Edit ranges, split and join, undo/redo, round trips, mixed line endings,
+# zero bytes, malformed UTF-8, long files and long lines. The randomized
+# reference test is test_buffer_fuzz.ritz.
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.span
+import ritzlib.strview
+
+import core.buffer { Buffer, Pos, Term, buffer_new, buffer_from_bytes, pos }
+import core.utf8 { utf8_next, utf8_prev, utf8_unit_len }
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# The bytes `s` spells, with `~` standing for 0xFF and `^` for 0xC3: bytes a
+# "..." literal can't hold (it is UTF-8 text, and `\xNN` stops at `\x7F`).
+fn bytes_of(s: StrView) -> Vec<u8>
+    var v: Vec<u8> = vec_new<u8>()
+    for i in 0..s.len
+        let c = s.get(i)
+        if c == '~'
+            v.push(0xFF)
+        else if c == '^'
+            v.push(0xC3)
+        else
+            v.push(c)
+    v
+
+# True when `got` holds exactly the bytes `want` spells (see bytes_of).
+fn same(got: [u8], want: StrView) -> bool
+    let w = bytes_of(want)
+    if got.len != w.len()
+        return false
+    for i in 0..got.len
+        if got[i] != w.get(i)
+            return false
+    true
+
+fn load(s: StrView) -> Buffer
+    let data = bytes_of(s)
+    buffer_from_bytes(span_from_vec<u8>(@data))
+
+fn holds(b: @Buffer, want: StrView) -> bool
+    let out = b.serialize()
+    same(span_from_vec<u8>(@out), want)
+
+fn is_pos(p: Pos, line: i64, col: i64) -> bool
+    p.line == line and p.col == col
+
+fn is_some_pos(p: Option<Pos>, line: i64, col: i64) -> bool
+    match p
+        Some(q) => is_pos(q, line, col)
+        None => false
+
+# ============================================================================
+# Load, line metadata, serialize
+# ============================================================================
+
+[[test]]
+fn test_empty_buffer_is_one_empty_line() -> i32
+    let b = buffer_new()
+    assert b.line_count() == 1
+    assert b.line_len(0) == 0
+    assert b.line_term(0) == Term.NoEol
+    assert b.byte_len() == 0
+    assert not b.has_final_newline()
+    assert holds(@b, "")
+    0
+
+[[test]]
+fn test_terminators_live_in_metadata() -> i32
+    let b = load("a\nbb\r\nccc\rd")
+    assert b.line_count() == 4
+    assert same(b.line(0), "a") and b.line_term(0) == Term.Lf
+    assert same(b.line(1), "bb") and b.line_term(1) == Term.CrLf
+    assert same(b.line(2), "ccc") and b.line_term(2) == Term.Cr
+    assert same(b.line(3), "d") and b.line_term(3) == Term.NoEol
+    assert b.byte_len() == 11
+    0
+
+[[test]]
+fn test_final_newline_is_an_empty_last_line() -> i32
+    let b = load("x\n")
+    assert b.line_count() == 2
+    assert b.has_final_newline()
+    assert b.line_len(1) == 0 and b.line_term(1) == Term.NoEol
+    assert holds(@b, "x\n")
+    0
+
+[[test]]
+fn test_round_trip_mixed_endings_nul_and_malformed_utf8() -> i32
+    let text = "\r\n\r\r\n\n\0a\0\r~^bé\n\n\r"
+    let b = load(text)
+    assert holds(@b, text)
+    # Every \r and \n is a terminator, so no line holds one.
+    for l in 0..b.line_count()
+        let s = b.line(l)
+        for i in 0..s.len
+            assert s[i] != '\r' and s[i] != '\n'
+    assert b.line_count() == 9
+    assert same(b.line(4), "\0a\0")
+    assert same(b.line(5), "~^bé")
+    0
+
+[[test]]
+fn test_round_trip_utf8_text() -> i32
+    let text = "héllo wörld\r\n日本語\n"
+    let b = load(text)
+    assert holds(@b, text)
+    0
+
+# ============================================================================
+# Positions and offsets
+# ============================================================================
+
+[[test]]
+fn test_offsets_and_positions_convert_both_ways() -> i32
+    var b = load("ab\r\ncd\ne")
+    assert b.offset_of(pos(0, 0)) == 0
+    assert b.offset_of(pos(0, 2)) == 2
+    assert b.offset_of(pos(1, 0)) == 4
+    assert b.offset_of(pos(2, 1)) == 8
+    assert is_pos(b.pos_at(4), 1, 0)
+    assert is_pos(b.pos_at(6), 1, 2)
+    assert is_pos(b.pos_at(8), 2, 1)
+    # Between a CRLF's two bytes there is no column: it rounds down.
+    assert is_pos(b.pos_at(3), 0, 2)
+    # Out of range clamps.
+    assert is_pos(b.pos_at(99), 2, 1)
+    assert is_pos(b.clamp(pos(7, 7)), 2, 1)
+    assert is_pos(b.clamp(pos(0, 9)), 0, 2)
+    0
+
+[[test]]
+fn test_offsets_stay_right_after_edits_above() -> i32
+    var b = load("a\nb\nc\nd\n")
+    assert b.offset_of(pos(3, 0)) == 6
+    b.insert(pos(1, 0), "xyz\n")
+    assert b.offset_of(pos(4, 0)) == 10
+    assert is_pos(b.pos_at(10), 4, 0)
+    b.delete(pos(0, 0), pos(2, 0))
+    assert b.offset_of(pos(2, 0)) == 4
+    assert same(b.line(2), "d")
+    0
+
+# ============================================================================
+# Edit ranges
+# ============================================================================
+
+[[test]]
+fn test_insert_within_a_line() -> i32
+    var b = load("hello\n")
+    let end = b.insert(pos(0, 5), ", world")
+    assert is_pos(end, 0, 12)
+    assert holds(@b, "hello, world\n")
+    assert b.is_dirty()
+    0
+
+[[test]]
+fn test_insert_text_with_line_breaks() -> i32
+    var b = load("ad")
+    let end = b.insert(pos(0, 1), "b\r\nc\r")
+    assert is_pos(end, 2, 0)
+    assert holds(@b, "ab\r\nc\rd")
+    assert b.line_count() == 3
+    assert b.line_term(0) == Term.CrLf
+    assert b.line_term(1) == Term.Cr
+    0
+
+[[test]]
+fn test_replace_across_lines() -> i32
+    var b = load("one\ntwo\nthree\n")
+    let end = b.replace(pos(0, 1), pos(2, 2), "NE\nT")
+    assert is_pos(end, 1, 1)
+    assert holds(@b, "oNE\nTree\n")
+    let t = b.text(pos(0, 2), pos(1, 2))
+    assert same(span_from_vec<u8>(@t), "E\nTr")
+    0
+
+[[test]]
+fn test_delete_range_and_reversed_ends() -> i32
+    var b = load("abc\ndef")
+    b.delete(pos(1, 1), pos(0, 1))
+    assert holds(@b, "aef")
+    assert b.line_count() == 1
+    0
+
+[[test]]
+fn test_cr_then_lf_edits_keep_one_crlf_line() -> i32
+    # A CR line followed by an inserted LF reads as one CRLF line, as a
+    # reload of the same bytes would.
+    var b = load("a\rb")
+    b.insert(pos(1, 0), "\n")
+    assert b.line_count() == 2
+    assert b.line_term(0) == Term.CrLf
+    assert same(b.line(1), "b")
+    # Deleting a line's only text between a CR and an LF joins them too.
+    var c = load("a\rx\ny")
+    c.delete(pos(1, 0), pos(1, 1))
+    assert holds(@c, "a\r\ny")
+    assert c.line_count() == 2 and c.line_term(0) == Term.CrLf
+    0
+
+[[test]]
+fn test_split_and_join_lines() -> i32
+    var b = load("hello world\r\nnext")
+    let at = b.split_line(pos(0, 5))
+    assert is_pos(at, 1, 0)
+    # The split takes the line's own terminator.
+    assert holds(@b, "hello\r\n world\r\nnext")
+    let j = b.join_lines(0)
+    assert is_pos(j, 0, 5)
+    assert holds(@b, "hello world\r\nnext")
+    # The last line has no terminator: a split there takes the one above.
+    b.split_line(pos(1, 2))
+    assert holds(@b, "hello world\r\nne\r\nxt")
+    # Joining the last line is a no-op.
+    let k = b.join_lines(2)
+    assert is_pos(k, 2, 2)
+    assert b.line_count() == 3
+    0
+
+# ============================================================================
+# Undo and redo
+# ============================================================================
+
+[[test]]
+fn test_undo_and_redo_single_edits() -> i32
+    var b = load("abc\n")
+    b.insert(pos(0, 3), "d")
+    b.delete(pos(0, 0), pos(0, 1))
+    assert holds(@b, "bcd\n")
+    assert is_some_pos(b.undo(), 0, 0)
+    assert holds(@b, "abcd\n")
+    assert is_some_pos(b.undo(), 0, 3)
+    assert holds(@b, "abc\n")
+    assert b.undo().is_none()
+    assert not b.is_dirty()
+    assert is_some_pos(b.redo(), 0, 3)
+    assert holds(@b, "abcd\n")
+    assert b.redo().is_some()
+    assert b.redo().is_none()
+    assert holds(@b, "bcd\n")
+    0
+
+[[test]]
+fn test_insert_session_is_one_undo_step() -> i32
+    var b = load("x\n")
+    b.begin_group()
+    var at = pos(0, 1)
+    at = b.insert(at, "a")
+    at = b.insert(at, "b")
+    at = b.split_line(at)
+    at = b.insert(at, "c")
+    at = b.delete(pos(0, 2), at)
+    b.end_group()
+    assert holds(@b, "xa\n")
+    b.insert(pos(0, 0), "!")
+    assert b.undo().is_some()
+    assert holds(@b, "xa\n")
+    assert b.undo().is_some()
+    assert holds(@b, "x\n")
+    assert not b.can_undo()
+    assert b.redo().is_some()
+    assert holds(@b, "xa\n")
+    0
+
+[[test]]
+fn test_new_edit_drops_redo() -> i32
+    var b = load("ab")
+    b.insert(pos(0, 2), "c")
+    b.undo()
+    assert b.can_redo()
+    b.insert(pos(0, 0), "z")
+    assert not b.can_redo()
+    assert holds(@b, "zab")
+    0
+
+[[test]]
+fn test_undo_restores_crlf_split_across_edits() -> i32
+    # The CR and the LF were inserted by separate edits: undoing the LF must
+    # leave the CR line, though for a while they were one CRLF line.
+    var b = load("ab")
+    b.insert(pos(0, 1), "\r")
+    b.insert(pos(1, 0), "\n")
+    assert b.line_count() == 2 and b.line_term(0) == Term.CrLf
+    b.undo()
+    assert holds(@b, "a\rb")
+    assert b.line_term(0) == Term.Cr
+    b.undo()
+    assert holds(@b, "ab")
+    b.redo()
+    b.redo()
+    assert holds(@b, "a\r\nb")
+    0
+
+[[test]]
+fn test_empty_edits_record_nothing() -> i32
+    var b = load("ab")
+    b.insert(pos(0, 1), "")
+    b.delete(pos(0, 1), pos(0, 1))
+    b.begin_group()
+    b.end_group()
+    assert not b.can_undo()
+    assert not b.is_dirty()
+    0
+
+[[test]]
+fn test_dirty_follows_the_saved_state() -> i32
+    var b = load("ab")
+    b.insert(pos(0, 2), "c")
+    b.mark_saved()
+    assert not b.is_dirty()
+    b.insert(pos(0, 3), "d")
+    assert b.is_dirty()
+    b.undo()
+    assert not b.is_dirty()
+    b.undo()
+    assert b.is_dirty()
+    b.redo()
+    assert not b.is_dirty()
+    0
+
+# ============================================================================
+# Cursor helpers: UTF-8 code points, malformed bytes one unit each
+# ============================================================================
+
+[[test]]
+fn test_utf8_steps_by_code_point() -> i32
+    let s = bytes_of("aé日😀")
+    let v = span_from_vec<u8>(@s)
+    assert utf8_next(v, 0) == 1
+    assert utf8_next(v, 1) == 3
+    assert utf8_next(v, 3) == 6
+    assert utf8_next(v, 6) == 10
+    assert utf8_next(v, 10) == 10
+    assert utf8_prev(v, 10) == 6
+    assert utf8_prev(v, 6) == 3
+    assert utf8_prev(v, 3) == 1
+    assert utf8_prev(v, 1) == 0
+    assert utf8_prev(v, 0) == 0
+    0
+
+# RFC 3629's limits: no overlong forms, no surrogates, nothing past
+# U+10FFFF. Each refused lead counts as one unit.
+[[test]]
+fn test_utf8_unit_len_refuses_overlong_surrogate_and_out_of_range() -> i32
+    var v: Vec<u8> = vec_new<u8>()
+    v.push(0xC0)                # 0: overlong 2-byte lead
+    v.push(0x80)
+    v.push(0xE0)                # 2: overlong 3-byte (second byte < 0xA0)
+    v.push(0x80)
+    v.push(0x80)
+    v.push(0xED)                # 5: a surrogate (second byte > 0x9F)
+    v.push(0xA0)
+    v.push(0x80)
+    v.push(0xF4)                # 8: past U+10FFFF
+    v.push(0x90)
+    v.push(0x80)
+    v.push(0x80)
+    v.push(0xF0)                # 12: U+10000, well formed
+    v.push(0x90)
+    v.push(0x80)
+    v.push(0x80)
+    v.push(0xE2)                # 16: truncated at the end
+    v.push(0x82)
+    let s = span_from_vec<u8>(@v)
+    assert utf8_unit_len(s, 0) == 1
+    assert utf8_unit_len(s, 2) == 1
+    assert utf8_unit_len(s, 5) == 1
+    assert utf8_unit_len(s, 8) == 1
+    assert utf8_unit_len(s, 12) == 4
+    assert utf8_unit_len(s, 16) == 1
+    assert utf8_unit_len(s, 18) == 0
+    0
+
+[[test]]
+fn test_utf8_malformed_bytes_are_one_unit_each() -> i32
+    # A lone lead (0xC3), a stray 0xFF, a continuation byte with no lead.
+    let s = bytes_of("^~")
+    var v = span_from_vec<u8>(@s)
+    assert utf8_next(v, 0) == 1
+    assert utf8_next(v, 1) == 2
+    assert utf8_prev(v, 2) == 1
+    assert utf8_prev(v, 1) == 0
+    let t = bytes_of("é")
+    let w = span_from_vec<u8>(@t).slice(1, 2)
+    assert utf8_next(w, 0) == 1
+    0
+
+[[test]]
+fn test_cursor_moves_cross_line_ends() -> i32
+    let b = load("aé\r\n~b")
+    assert is_pos(b.next_char(pos(0, 1)), 0, 3)
+    assert is_pos(b.next_char(pos(0, 3)), 1, 0)
+    assert is_pos(b.prev_char(pos(1, 0)), 0, 3)
+    assert is_pos(b.prev_char(pos(0, 3)), 0, 1)
+    assert is_pos(b.next_char(pos(1, 0)), 1, 1)
+    assert is_pos(b.next_char(pos(1, 2)), 1, 2)
+    assert is_pos(b.prev_char(pos(0, 0)), 0, 0)
+    0
+
+# ============================================================================
+# Long files, long lines
+# ============================================================================
+
+[[test]]
+fn test_long_file_round_trip_and_edits() -> i32
+    var data: Vec<u8> = vec_new<u8>()
+    for i in 0..100000
+        data.push('a' + (i % 26) as u8)
+        if i % 3 == 0
+            data.push('\r')
+        data.push('\n')
+    var b = buffer_from_bytes(span_from_vec<u8>(@data))
+    assert b.line_count() == 100001
+    let out = b.serialize()
+    assert out.len() == data.len()
+    for i in 0..data.len()
+        assert out.get(i) == data.get(i)
+    # An edit at the end and one near the start, undone.
+    b.insert(pos(99999, 1), "Z")
+    b.insert(pos(1, 0), "Y")
+    assert b.line_len(99999) == 2
+    assert b.offset_of(pos(100000, 0)) == data.len() + 2
+    b.undo()
+    b.undo()
+    assert b.byte_len() == data.len()
+    assert not b.is_dirty()
+    0
+
+[[test]]
+fn test_long_line_typing_and_undo() -> i32
+    var data: Vec<u8> = vec_new<u8>()
+    for i in 0..2000000
+        data.push('a' + (i % 7) as u8)
+    var b = buffer_from_bytes(span_from_vec<u8>(@data))
+    b.begin_group()
+    var at = pos(0, 1000000)
+    for i in 0..1000
+        at = b.insert(at, "x")
+    b.end_group()
+    assert b.line_len(0) == 2001000
+    assert is_pos(at, 0, 1001000)
+    b.undo()
+    let out = b.serialize()
+    assert out.len() == data.len()
+    for i in 0..data.len()
+        assert out.get(i) == data.get(i)
+    0

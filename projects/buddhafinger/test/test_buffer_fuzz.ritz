@@ -1,0 +1,299 @@
+# test/test_buffer_fuzz.ritz - randomized edits against a reference buffer
+# (AGAST #4816).
+#
+# Each seed drives a deterministic sequence of replaces, splits, joins,
+# undos, redos and group boundaries through the Buffer API and through a
+# reference that keeps the file as one flat Vec<u8> and undo as whole-file
+# snapshots. After every step the buffer must serialize to the reference's
+# bytes, its lines must be the reference's bytes split at their terminators,
+# and position/offset conversion must round-trip. The bytes drawn include
+# CR, LF, NUL and malformed UTF-8.
+#
+# A failure prints its seed and step. Replay one seed alone with
+#   BF_FUZZ_SEED=<seed> make -C projects/buddhafinger test
+
+import ritzlib.gvec
+import ritzlib.io
+import ritzlib.option
+import ritzlib.os.env
+import ritzlib.span
+import ritzlib.strview
+
+import core.buffer { Buffer, Pos, Term, buffer_from_bytes, pos }
+
+const SEEDS: i64 = 200
+const STEPS: i64 = 300
+
+# ============================================================================
+# Deterministic generator (xorshift64)
+# ============================================================================
+
+struct Rng
+    state: u64
+
+fn rng_new(seed: i64) -> Rng
+    Rng { state: (seed as u64) * 2 + 1 }
+
+impl Rng
+    # A number in 0..n.
+    fn below(self: @&Rng, n: i64) -> i64
+        var x = self.state
+        x = x ^ (x << 13)
+        x = x ^ (x >> 7)
+        x = x ^ (x << 17)
+        self.state = x
+        (x % (n as u64)) as i64
+
+    # One byte from a set heavy in line breaks, NUL and malformed UTF-8:
+    # 0xC3 0xA9 is "é", but either alone is malformed, as is 0xFF.
+    fn byte(self: @&Rng) -> u8
+        match self.below(8)
+            0 => '\r'
+            1 => '\n'
+            2 => 0
+            3 => 0xC3
+            4 => 0xA9
+            5 => 0xFF
+            6 => 'a'
+            _ => 'b'
+
+    fn bytes(self: @&Rng, max: i64) -> Vec<u8>
+        var v: Vec<u8> = vec_new<u8>()
+        let n = self.below(max + 1)
+        for i in 0..n
+            v.push(self.byte())
+        v
+
+# ============================================================================
+# The reference: one flat Vec<u8>, undo and redo as whole-file snapshots
+# ============================================================================
+
+# A stack of byte snapshots kept flat: snapshot k is
+# bytes[starts[k]..starts[k + 1]] (the last runs to bytes.len()).
+struct Snapshots
+    bytes: Vec<u8>
+    starts: Vec<i64>
+
+fn snapshots_new() -> Snapshots
+    Snapshots { bytes: vec_new<u8>(), starts: vec_new<i64>() }
+
+impl Snapshots
+    fn push(self: @&Snapshots, text: @Vec<u8>)
+        self.starts.push(self.bytes.len())
+        self.bytes.push_span(span_from_vec<u8>(text))
+
+    # Pop the top snapshot.
+    fn pop(self: @&Snapshots) -> Vec<u8>
+        let start = self.starts.pop()
+        var text: Vec<u8> = vec_new<u8>()
+        text.push_span(span_from_vec<u8>(@self.bytes).from(start))
+        while self.bytes.len() > start
+            self.bytes.pop()
+        text
+
+    fn count(self: @Snapshots) -> i64
+        self.starts.len()
+
+    fn clear(self: @&Snapshots)
+        self.bytes.clear()
+        self.starts.clear()
+
+struct Reference
+    text: Vec<u8>
+    undo: Snapshots
+    redo: Snapshots
+    in_group: bool
+    group_recorded: bool    # the open group already pushed its snapshot
+
+fn reference_new(text: @Vec<u8>) -> Reference
+    var t: Vec<u8> = vec_new<u8>()
+    t.push_span(span_from_vec<u8>(text))
+    Reference { text: t, undo: snapshots_new(), redo: snapshots_new(), in_group: false, group_recorded: false }
+
+impl Reference
+    # Replace bytes start..end with `ins`, recording an undo step the way
+    # the buffer's history does: nothing for an empty edit, one snapshot per
+    # group.
+    fn edit(self: @&Reference, start: i64, end: i64, ins: [u8])
+        if start == end and ins.len == 0
+            return
+        if not (self.in_group and self.group_recorded)
+            self.undo.push(@self.text)
+            self.redo.clear()
+            self.group_recorded = self.in_group
+        var out: Vec<u8> = vec_new<u8>()
+        let old = span_from_vec<u8>(@self.text)
+        out.push_span(old.to(start))
+        out.push_span(ins)
+        out.push_span(old.from(end))
+        self.text = out
+
+    fn close_group(self: @&Reference)
+        self.in_group = false
+        self.group_recorded = false
+
+    fn undo(self: @&Reference)
+        self.close_group()
+        if self.undo.count() == 0
+            return
+        self.redo.push(@self.text)
+        self.text = self.undo.pop()
+
+    fn redo(self: @&Reference)
+        self.close_group()
+        if self.redo.count() == 0
+            return
+        self.undo.push(@self.text)
+        self.text = self.redo.pop()
+
+# ============================================================================
+# Checks
+# ============================================================================
+
+fn term_bytes(t: Term) -> StrView
+    match t
+        Term.NoEol => ""
+        Term.Lf => "\n"
+        Term.CrLf => "\r\n"
+        Term.Cr => "\r"
+
+# The buffer serializes to the reference's bytes, and its lines are those
+# bytes split at each LF, CRLF and CR: the line structure a reload builds.
+fn same_as_reference(b: @Buffer, r: @Reference) -> bool
+    let out = b.serialize()
+    if out.len() != r.text.len()
+        return false
+    for i in 0..out.len()
+        if out.get(i) != r.text.get(i)
+            return false
+    var at: i64 = 0
+    for l in 0..b.line_count()
+        let s = b.line(l)
+        for i in 0..s.len
+            if r.text.get(at + i) != s[i]
+                return false
+        at += s.len
+        let t = term_bytes(b.line_term(l))
+        # The reference's terminator here, read the way a load reads it.
+        var want: i64 = 0
+        if at < r.text.len() and r.text.get(at) == '\r'
+            want = if at + 1 < r.text.len() and r.text.get(at + 1) == '\n' then 2 else 1
+        else if at < r.text.len() and r.text.get(at) == '\n'
+            want = 1
+        if t.len != want
+            return false
+        at += t.len
+    at == r.text.len()
+
+fn random_pos(b: @Buffer, rng: @&Rng) -> Pos
+    let line = rng.below(b.line_count())
+    pos(line, rng.below(b.line_len(line) + 1))
+
+# ============================================================================
+# One seed
+# ============================================================================
+
+fn report(seed: i64, step: i64, what: StrView)
+    eprints("buffer fuzz: seed ")
+    eprint_int(seed)
+    eprints(" failed at step ")
+    eprint_int(step)
+    eprints(": ")
+    eprints(what)
+    eprints("; replay: BF_FUZZ_SEED=")
+    eprint_int(seed)
+    eprints(" make -C projects/buddhafinger test\n")
+
+# Run `steps` random operations from `seed`; true when every check held.
+fn fuzz_seed(seed: i64, steps: i64) -> bool
+    var rng = rng_new(seed)
+    let start = rng.bytes(40)
+    var b = buffer_from_bytes(span_from_vec<u8>(@start))
+    var r = reference_new(@start)
+    if not same_as_reference(@b, @r)
+        report(seed, 0, "load")
+        return false
+    for step in 1..=steps
+        let op = rng.below(12)
+        if op <= 4
+            let p = random_pos(@b, @&rng)
+            let q = random_pos(@b, @&rng)
+            let ins = rng.bytes(4)
+            var s = b.offset_of(p)
+            var e = b.offset_of(q)
+            if s > e
+                let t = s
+                s = e
+                e = t
+            b.replace(p, q, span_from_vec<u8>(@ins))
+            r.edit(s, e, span_from_vec<u8>(@ins))
+        else if op == 5
+            let p = random_pos(@b, @&rng)
+            let s = b.offset_of(p)
+            # The split takes the line's terminator, else the one above, else LF.
+            var t = b.line_term(p.line)
+            if t == Term.NoEol
+                t = if p.line > 0 then b.line_term(p.line - 1) else Term.Lf
+            b.split_line(p)
+            r.edit(s, s, span_from_strview(term_bytes(t)))
+        else if op == 6
+            let l = rng.below(b.line_count())
+            let s = b.offset_of(pos(l, b.line_len(l)))
+            let e = s + term_bytes(b.line_term(l)).len
+            b.join_lines(l)
+            r.edit(s, e, span_from_strview(""))
+        else if op == 7
+            b.undo()
+            r.undo()
+        else if op == 8
+            b.redo()
+            r.redo()
+        else if op == 9
+            b.begin_group()
+            r.close_group()
+            r.in_group = true
+        else if op == 10
+            b.end_group()
+            r.close_group()
+        else
+            # Typing: a run of one-byte inserts, each after the last.
+            var p = random_pos(@b, @&rng)
+            for k in 0..rng.below(6)
+                var one: Vec<u8> = vec_new<u8>()
+                one.push(rng.byte())
+                let s = b.offset_of(p)
+                p = b.insert(p, span_from_vec<u8>(@one))
+                r.edit(s, s, span_from_vec<u8>(@one))
+        if not same_as_reference(@b, @r)
+            report(seed, step, "buffer differs from the reference")
+            return false
+        let p = random_pos(@b, @&rng)
+        let back = b.pos_at(b.offset_of(p))
+        if back.line != p.line or back.col != p.col
+            report(seed, step, "pos_at(offset_of(p)) != p")
+            return false
+        if step % 50 == 0
+            let out = b.serialize()
+            let again = buffer_from_bytes(span_from_vec<u8>(@out))
+            let out2 = again.serialize()
+            if out2.len() != out.len() or again.line_count() != b.line_count()
+                report(seed, step, "reload round trip")
+                return false
+    true
+
+[[test]]
+fn test_randomized_edits_match_reference() -> i32
+    match env_get("BF_FUZZ_SEED")
+        Some(s) =>
+            match s.parse_i64()
+                Some(seed) =>
+                    assert fuzz_seed(seed, STEPS)
+                    return 0
+                None => pass
+        None => pass
+    var failed: i64 = 0
+    for seed in 1..=SEEDS
+        if not fuzz_seed(seed, STEPS)
+            failed += 1
+    assert failed == 0
+    0
