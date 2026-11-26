@@ -5,6 +5,10 @@
 # safe RESP framing helpers land in tome.client; the embedded mode is
 # the one we exercise here.
 
+import ritzlib.strview { StrView, strview_empty }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+
 import spire.repo.tome { Cache, cache_new }
 import spire.repo.tome { cache_init_embedded, cache_init_tcp, cache_connect, cache_close }
 import spire.repo.tome { cache_set, cache_setex, cache_get, cache_del }
@@ -34,8 +38,8 @@ fn test_embedded_init_sets_mode() -> i32
 [[test]]
 fn test_tcp_init_sets_mode() -> i32
     var c = cache_new()
-    let host: *u8 = c"127.0.0.1"
-    cache_init_tcp(@c, host, 9, 6379)
+    let host: StrView = "127.0.0.1"
+    cache_init_tcp(@c, host, 6379)
     if cache_mode(@c) != CACHE_MODE_TCP
         return -1
     # cache_connect is allowed to fail with NOT_IMPLEMENTED here — the
@@ -49,9 +53,9 @@ fn test_ops_before_connect_return_not_initialized() -> i32
     var c = cache_new()
     cache_init_embedded(@c, 0)
     # Deliberately do NOT call cache_connect.
-    let key: *u8 = c"foo"
-    let val: *u8 = c"bar"
-    let rc: i32 = cache_set(@c, key, 3, val, 3)
+    let key: StrView = "foo"
+    let val: StrView = "bar"
+    let rc: i32 = cache_set(@c, key, val)
     if rc != CACHE_ERR_NOT_INITIALIZED
         return -1
     0
@@ -60,56 +64,53 @@ fn test_ops_before_connect_return_not_initialized() -> i32
 # Basic CRUD on the embedded backend
 # ============================================================================
 
+# cache_get's value on a hit; an empty view on a miss or an error.
+fn hit_or_empty(c: *Cache, key: StrView) -> StrView
+    match cache_get(c, key)
+        Ok(found) =>
+            match found
+                Some(v) => v
+                None => strview_empty()
+        Err(_) => strview_empty()
+
 [[test]]
 fn test_embedded_set_then_get_round_trips() -> i32
     var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let key: *u8 = c"hello"
-    let val: *u8 = c"world"
-    let set_rc: i32 = cache_set(@c, key, 5, val, 5)
+    let key: StrView = "hello"
+    let val: StrView = "world"
+    let set_rc: i32 = cache_set(@c, key, val)
     if set_rc != CACHE_OK
         cache_close(@c)
         return -1
 
-    var data_out: *u8 = null
-    var len_out: i32 = 0
-    let hit: i32 = cache_get(@c, key, 5, @data_out, @len_out)
-    if hit != 1
-        cache_close(@c)
-        return -2
-    if len_out != 5
-        cache_close(@c)
-        return -3
-    if *(data_out + 0) != 'w' as u8
-        cache_close(@c)
-        return -4
-    if *(data_out + 4) != 'd' as u8
-        cache_close(@c)
-        return -5
-
+    # The hit is a view into the store: check it before cache_close clears it.
+    let hit: StrView = hit_or_empty(@c, key)
+    var rc: i32 = 0
+    if hit.is_empty()
+        rc = -2
+    else if not hit.eq("world")
+        rc = -3
     cache_close(@c)
-    0
+    rc
 
 [[test]]
-fn test_embedded_get_miss_returns_zero() -> i32
+fn test_embedded_get_miss_returns_none() -> i32
     var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let key: *u8 = c"never-set"
-    var data_out: *u8 = null
-    var len_out: i32 = 0
-    let hit: i32 = cache_get(@c, key, 9, @data_out, @len_out)
+    let key: StrView = "never-set"
+    let got: Result<Option<StrView>, i32> = cache_get(@c, key)
     cache_close(@c)
-    if hit != 0
-        return -1
-    if data_out != null
-        return -2
-    if len_out != 0
-        return -3
-    0
+    match got
+        Ok(found) =>
+            if found.is_some()
+                return -2
+            0
+        Err(_) => -1
 
 [[test]]
 fn test_embedded_del_removes_key() -> i32
@@ -117,18 +118,18 @@ fn test_embedded_del_removes_key() -> i32
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let key: *u8 = c"k1"
-    let val: *u8 = c"v1"
-    cache_set(@c, key, 2, val, 2)
+    let key: StrView = "k1"
+    let val: StrView = "v1"
+    cache_set(@c, key, val)
 
-    if cache_exists(@c, key, 2) != 1
+    if cache_exists(@c, key) != 1
         cache_close(@c)
         return -1
-    let del_rc: i32 = cache_del(@c, key, 2)
+    let del_rc: i32 = cache_del(@c, key)
     if del_rc != 1
         cache_close(@c)
         return -2
-    if cache_exists(@c, key, 2) != 0
+    if cache_exists(@c, key) != 0
         cache_close(@c)
         return -3
 
@@ -141,18 +142,16 @@ fn test_embedded_overwrite_replaces_value() -> i32
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let key: *u8 = c"k"
-    let v1: *u8 = c"first"
-    let v2: *u8 = c"updated"
-    cache_set(@c, key, 1, v1, 5)
-    cache_set(@c, key, 1, v2, 7)
+    let key: StrView = "k"
+    let v1: StrView = "first"
+    let v2: StrView = "updated"
+    cache_set(@c, key, v1)
+    cache_set(@c, key, v2)
 
-    var data_out: *u8 = null
-    var len_out: i32 = 0
-    cache_get(@c, key, 1, @data_out, @len_out)
+    let ok: bool = hit_or_empty(@c, key).eq("updated")
     cache_close(@c)
 
-    if len_out != 7
+    if not ok
         return -1
     0
 
@@ -179,11 +178,11 @@ fn test_embedded_setex_yields_positive_ttl() -> i32
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let key: *u8 = c"ephemeral"
-    let val: *u8 = c"v"
-    cache_setex(@c, key, 9, val, 1, 60)
+    let key: StrView = "ephemeral"
+    let val: StrView = "v"
+    cache_setex(@c, key, val, 60)
 
-    let ttl: i64 = cache_ttl(@c, key, 9)
+    let ttl: i64 = cache_ttl(@c, key)
     cache_close(@c)
     if ttl <= 0
         return -1
@@ -197,14 +196,14 @@ fn test_embedded_persist_strips_ttl() -> i32
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let key: *u8 = c"persistme"
-    let val: *u8 = c"x"
-    cache_setex(@c, key, 9, val, 1, 60)
-    if cache_persist(@c, key, 9) != 1
+    let key: StrView = "persistme"
+    let val: StrView = "x"
+    cache_setex(@c, key, val, 60)
+    if cache_persist(@c, key) != 1
         cache_close(@c)
         return -1
 
-    let ttl: i64 = cache_ttl(@c, key, 9)
+    let ttl: i64 = cache_ttl(@c, key)
     cache_close(@c)
     # tome convention: -1 = no TTL set
     if ttl != -1
@@ -217,16 +216,16 @@ fn test_embedded_expire_on_existing_key() -> i32
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let key: *u8 = c"perm"
-    let val: *u8 = c"v"
-    cache_set(@c, key, 4, val, 1)
+    let key: StrView = "perm"
+    let val: StrView = "v"
+    cache_set(@c, key, val)
 
-    let rc: i32 = cache_expire(@c, key, 4, 30)
+    let rc: i32 = cache_expire(@c, key, 30)
     if rc != 1
         cache_close(@c)
         return -1
 
-    let ttl: i64 = cache_ttl(@c, key, 4)
+    let ttl: i64 = cache_ttl(@c, key)
     cache_close(@c)
     if ttl <= 0
         return -2
@@ -240,8 +239,8 @@ fn test_embedded_expire_on_missing_key_returns_zero() -> i32
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let key: *u8 = c"ghost"
-    let rc: i32 = cache_expire(@c, key, 5, 30)
+    let key: StrView = "ghost"
+    let rc: i32 = cache_expire(@c, key, 30)
     cache_close(@c)
     if rc != 0
         return -1
@@ -257,11 +256,11 @@ fn test_embedded_len_tracks_inserts() -> i32
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
-    let k1: *u8 = c"a"
-    let k2: *u8 = c"b"
-    let v: *u8 = c"x"
-    cache_set(@c, k1, 1, v, 1)
-    cache_set(@c, k2, 1, v, 1)
+    let k1: StrView = "a"
+    let k2: StrView = "b"
+    let v: StrView = "x"
+    cache_set(@c, k1, v)
+    cache_set(@c, k2, v)
     let n: i64 = cache_len(@c)
     cache_close(@c)
     if n != 2
@@ -276,16 +275,16 @@ fn test_embedded_len_tracks_inserts() -> i32
 [[test]]
 fn test_tcp_set_returns_not_implemented_until_wired() -> i32
     var c = cache_new()
-    let host: *u8 = c"127.0.0.1"
-    cache_init_tcp(@c, host, 9, 6379)
+    let host: StrView = "127.0.0.1"
+    cache_init_tcp(@c, host, 6379)
     # cache_connect on TCP intentionally returns NOT_IMPLEMENTED
     # without dialing — but it leaves the struct in a state where
     # operations should still surface NOT_INITIALIZED (because connected
     # didn't transition to 1).  This test pins down that contract so a
     # future TCP wire-up doesn't silently regress.
-    let key: *u8 = c"x"
-    let val: *u8 = c"y"
-    let rc: i32 = cache_set(@c, key, 1, val, 1)
+    let key: StrView = "x"
+    let val: StrView = "y"
+    let rc: i32 = cache_set(@c, key, val)
     cache_close(@c)
     if rc != CACHE_ERR_NOT_INITIALIZED
         return -1
@@ -311,7 +310,7 @@ fn dirty_stack() -> i32
 [[noinline]]
 fn tcp_cache() -> Cache
     var c = cache_new()
-    cache_init_tcp(@c, c"127.0.0.1", 9, 6379)
+    cache_init_tcp(@c, "127.0.0.1", 6379)
     c
 
 [[noinline]]

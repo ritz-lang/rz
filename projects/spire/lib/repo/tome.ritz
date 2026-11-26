@@ -22,15 +22,14 @@
 #     cache_init_embedded(@cache, 64 * 1024 * 1024)  # 64 MiB
 #     cache_connect(@cache)
 #
-#     var hit_ptr: *u8 = null
-#     var hit_len: i32 = 0
-#     if cache_get(@cache, key, key_len, @hit_ptr, @hit_len) == 1
-#         return hit_ptr, hit_len
+#     match cache_get(@cache, key)
+#         Ok(Some(hit)) => return hit
+#         _ => pass
 #
 #     # miss — fall through to the DB
-#     let doc_ptr, doc_len = db_get_from_mausoleum(...)
-#     cache_setex(@cache, key, key_len, doc_ptr, doc_len, 60)
-#     return doc_ptr, doc_len
+#     let doc: StrView = db_get_from_mausoleum(...)
+#     cache_setex(@cache, key, doc, 60)
+#     return doc
 #
 # Status: embedded mode is fully functional. TCP mode is wired
 # structurally (init/connect/close) but the per-op send paths are
@@ -38,11 +37,10 @@
 # light up once binary-safe RESP framing helpers land in
 # `tome.client`.
 
-import ritzlib.sys
-import ritzlib.str
-import ritzlib.memory
-import ritzlib.io
-import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.strview { StrView }
+import ritzlib.span { Span, span_from_strview }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
 
 import tome.tome { Store, store_new, store_with_cap }
 import tome.tome { store_set_maxmemory, store_get_maxmemory, store_memory_usage }
@@ -55,9 +53,9 @@ import tome.tome { store_clear, store_len, store_is_empty }
 # symbols clash with mausoleum.client at the global linker level when a
 # binary uses both adapters (e.g. nexus, which uses mausoleum + tome).
 # TCP mode is structurally scaffolded but per-op routes return
-# CACHE_ERR_NOT_IMPLEMENTED — the client field is held as an opaque
-# `*u8` and lit up only when binary-safe RESP framing helpers land in
-# tome.client AND the client_* symbols are renamed (e.g. tome_client_*).
+# CACHE_ERR_NOT_IMPLEMENTED — a client is added to Cache only when
+# binary-safe RESP framing helpers land in tome.client AND the client_*
+# symbols are renamed (e.g. tome_client_*).
 
 # ============================================================================
 # Cache modes
@@ -92,9 +90,8 @@ pub struct Cache
     store: Store
 
     # TCP backing connection (used when mode == CACHE_MODE_TCP).
-    # Connection params + opaque client handle.  Held as `*u8` until
-    # tome.client's symbols are namespaced (see comment at top).
-    client: *u8
+    # Connection params only: no client is held until tome.client's
+    # symbols are namespaced (see comment at top).
     host: [64]u8
     host_len: i32
     port: i32
@@ -118,7 +115,6 @@ pub fn cache_init_embedded(c: *Cache, max_memory_bytes: i64) -> i32
     c.mode = CACHE_MODE_EMBEDDED
     c.initialized = 0
     c.connected = 0
-    c.client = null
     c.host_len = 0
     c.port = 0
 
@@ -132,19 +128,17 @@ pub fn cache_init_embedded(c: *Cache, max_memory_bytes: i64) -> i32
 # Initialize a TCP-mode cache pointed at a remote `tome-server`.  The
 # host/port are remembered now; the actual connect happens in
 # `cache_connect`.  Returns CACHE_OK on success.
-pub fn cache_init_tcp(c: *Cache, host: *u8, host_len: i32, port: i32) -> i32
+pub fn cache_init_tcp(c: *Cache, host: StrView, port: i32) -> i32
     c.mode = CACHE_MODE_TCP
     c.initialized = 0
     c.connected = 0
-    c.client = null
 
-    if host_len > 63
-        c.host_len = 63
-    else
-        c.host_len = host_len
-    for i in 0..c.host_len
-        c.host[i] = *(host + i)
-    c.host[c.host_len] = 0
+    # At most 63 bytes, so the field always keeps a trailing NUL.
+    let kept: StrView = host.take(63)
+    let dst: [u8] = @c.host
+    dst.zero()
+    dst.copy_from(span_from_strview(kept))
+    c.host_len = kept.len as i32
 
     c.port = port
     c.initialized = 1
@@ -170,8 +164,8 @@ pub fn cache_connect(c: *Cache) -> i32
     return CACHE_ERR_BAD_MODE
 
 # Close the cache.  Embedded: clears the store but keeps it allocated
-# (cheaper than re-allocating the entry table).  TCP: disconnects and
-# frees the client.
+# (cheaper than re-allocating the entry table).  TCP: marks it
+# disconnected (no client is held yet).
 pub fn cache_close(c: *Cache)
     if c.initialized == 0
         return
@@ -182,13 +176,9 @@ pub fn cache_close(c: *Cache)
         return
 
     if c.mode == CACHE_MODE_TCP
-        # No-op for now — TCP path never allocated a client (see
+        # No client to release — the TCP path never dials (see
         # cache_connect above).  When the symbol clash is resolved and
-        # we wire real connect, this branch will free the client and
-        # call client_disconnect.
-        if c.client != null
-            free(c.client)
-            c.client = null
+        # we wire real connect, this branch will disconnect and drop it.
         c.connected = 0
         return
 
@@ -218,108 +208,93 @@ pub fn cache_len(c: *Cache) -> i64
 # ----------------------------------------------------------------------------
 
 # Set a key to a value with no expiry.
-pub fn cache_set(c: *Cache, key: *u8, key_len: i32, val: *u8, val_len: i32) -> i32
+pub fn cache_set(c: *Cache, key: StrView, val: StrView) -> i32
     if c.connected == 0
         return CACHE_ERR_NOT_INITIALIZED
 
     if c.mode == CACHE_MODE_EMBEDDED
-        let key_sv: StrView = strview_from_ptr(key, key_len as i64)
-        let val_sv: StrView = strview_from_ptr(val, val_len as i64)
-        store_set(@c.store, key_sv, val_sv)
+        store_set(@c.store, key, val)
         return CACHE_OK
 
     return CACHE_ERR_NOT_IMPLEMENTED
 
 # Set a key to a value that expires in `ttl_secs` seconds.
-pub fn cache_setex(c: *Cache, key: *u8, key_len: i32, val: *u8, val_len: i32, ttl_secs: i64) -> i32
+pub fn cache_setex(c: *Cache, key: StrView, val: StrView, ttl_secs: i64) -> i32
     if c.connected == 0
         return CACHE_ERR_NOT_INITIALIZED
 
     if c.mode == CACHE_MODE_EMBEDDED
-        let key_sv: StrView = strview_from_ptr(key, key_len as i64)
-        let val_sv: StrView = strview_from_ptr(val, val_len as i64)
-        store_setex(@c.store, key_sv, val_sv, ttl_secs)
+        store_setex(@c.store, key, val, ttl_secs)
         return CACHE_OK
 
     return CACHE_ERR_NOT_IMPLEMENTED
 
-# Get a key.  On hit, sets `*data_out` to a borrowed pointer into the
-# cache's value buffer and `*len_out` to its length, then returns 1.
-# On miss returns 0.  On error returns < 0.
+# Get a key: Ok(Some(value)) on a hit, Ok(None) on a miss, Err(code < 0)
+# on error.
 #
-# Lifetime: the borrowed pointer is valid until the next mutating
-# operation on this cache (set/setex/del/clear).  Callers that need to
-# hold onto the value across mutations must copy it.
-pub fn cache_get(c: *Cache, key: *u8, key_len: i32, data_out: **u8, len_out: *i32) -> i32
+# Lifetime: the value is a view into the cache's value buffer, valid
+# until the next mutating operation on this cache (set/setex/del/clear).
+# Callers that need to hold onto it across mutations must copy it.
+pub fn cache_get(c: *Cache, key: StrView) -> Result<Option<StrView>, i32>
     if c.connected == 0
-        return CACHE_ERR_NOT_INITIALIZED
+        return Err(CACHE_ERR_NOT_INITIALIZED)
 
     if c.mode == CACHE_MODE_EMBEDDED
-        let key_sv: StrView = strview_from_ptr(key, key_len as i64)
-        let val_sv: StrView = store_get_strview(@c.store, key_sv)
-        if val_sv.ptr == null
-            *data_out = null
-            *len_out = 0
-            return 0  # miss
-        *data_out = val_sv.ptr
-        *len_out = val_sv.len as i32
-        return 1  # hit
+        let val: StrView = store_get_strview(@c.store, key)
+        if val.ptr == null
+            return Ok(None)
+        return Ok(Some(val))
 
-    return CACHE_ERR_NOT_IMPLEMENTED
+    return Err(CACHE_ERR_NOT_IMPLEMENTED)
 
 # Delete a key.  Returns 1 if a key was removed, 0 if it wasn't there.
-pub fn cache_del(c: *Cache, key: *u8, key_len: i32) -> i32
+pub fn cache_del(c: *Cache, key: StrView) -> i32
     if c.connected == 0
         return CACHE_ERR_NOT_INITIALIZED
 
     if c.mode == CACHE_MODE_EMBEDDED
-        let key_sv: StrView = strview_from_ptr(key, key_len as i64)
-        return store_del(@c.store, key_sv)
+        return store_del(@c.store, key)
 
     return CACHE_ERR_NOT_IMPLEMENTED
 
 # Probe whether a key exists (does NOT trigger lazy expiration; use
 # cache_get for that).  Returns 1 if present, 0 if absent.
-pub fn cache_exists(c: *Cache, key: *u8, key_len: i32) -> i32
+pub fn cache_exists(c: *Cache, key: StrView) -> i32
     if c.connected == 0
         return CACHE_ERR_NOT_INITIALIZED
 
     if c.mode == CACHE_MODE_EMBEDDED
-        let key_sv: StrView = strview_from_ptr(key, key_len as i64)
-        return store_exists(@c.store, key_sv)
+        return store_exists(@c.store, key)
 
     return CACHE_ERR_NOT_IMPLEMENTED
 
 # Set/refresh a TTL on an existing key.  Returns 1 on success,
 # 0 if the key doesn't exist.
-pub fn cache_expire(c: *Cache, key: *u8, key_len: i32, ttl_secs: i64) -> i32
+pub fn cache_expire(c: *Cache, key: StrView, ttl_secs: i64) -> i32
     if c.connected == 0
         return CACHE_ERR_NOT_INITIALIZED
 
     if c.mode == CACHE_MODE_EMBEDDED
-        let key_sv: StrView = strview_from_ptr(key, key_len as i64)
-        return store_expire(@c.store, key_sv, ttl_secs)
+        return store_expire(@c.store, key, ttl_secs)
 
     return CACHE_ERR_NOT_IMPLEMENTED
 
 # Time-to-live (seconds) for a key.  Returns -2 if the key doesn't
 # exist, -1 if it has no TTL, >=0 otherwise.  Mirrors Redis's TTL.
-pub fn cache_ttl(c: *Cache, key: *u8, key_len: i32) -> i64
+pub fn cache_ttl(c: *Cache, key: StrView) -> i64
     if c.connected == 0
         return -2
     if c.mode == CACHE_MODE_EMBEDDED
-        let key_sv: StrView = strview_from_ptr(key, key_len as i64)
-        return store_ttl(@c.store, key_sv)
+        return store_ttl(@c.store, key)
     return -2
 
 # Strip an existing TTL — make the key permanent.  Returns 1 on
 # success, 0 if the key didn't exist or had no TTL.
-pub fn cache_persist(c: *Cache, key: *u8, key_len: i32) -> i32
+pub fn cache_persist(c: *Cache, key: StrView) -> i32
     if c.connected == 0
         return CACHE_ERR_NOT_INITIALIZED
 
     if c.mode == CACHE_MODE_EMBEDDED
-        let key_sv: StrView = strview_from_ptr(key, key_len as i64)
-        return store_persist(@c.store, key_sv)
+        return store_persist(@c.store, key)
 
     return CACHE_ERR_NOT_IMPLEMENTED

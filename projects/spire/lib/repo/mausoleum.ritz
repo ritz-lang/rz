@@ -15,8 +15,8 @@
 #   var db: Db = db_empty()
 #   db_init(@db, "127.0.0.1", 7777, "my_collection")
 #
-#   # Insert a document
-#   var doc_id: i64 = db_insert(@db, data, len)
+#   # Insert a document (`doc` is a [u8] of serialized Document bytes)
+#   var doc_id: i64 = db_insert(@db, doc)
 #
 #   # Get a document
 #   var data: *u8 = null
@@ -29,11 +29,7 @@
 #   # Close connection
 #   db_close(@db)
 
-import ritzlib.sys
-import ritzlib.str
-import ritzlib.memory
-import ritzlib.io
-import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.strview { StrView }
 import ritzlib.span
 import ritzlib.box
 
@@ -81,8 +77,9 @@ pub fn db_empty() -> Db
     db.encrypted = 1
     return db
 
-# Initialize a database connection
-pub fn db_init(db: *Db, host: *u8, host_len: i32, port: i32, collection: *u8, collection_len: i32) -> i32
+# Initialize a database connection.  `host` and `collection` are copied
+# (at most 63 bytes each).
+pub fn db_init(db: *Db, host: StrView, port: i32, collection: StrView) -> i32
     db.client.drop()
     db.connected = 0
     db.port = port
@@ -90,26 +87,27 @@ pub fn db_init(db: *Db, host: *u8, host_len: i32, port: i32, collection: *u8, co
     # `wiki_store_init` (and equivalent callers) can flip this with
     # db_set_encryption before db_connect if they need plaintext.
     db.encrypted = 1
-
-    # Copy host
-    if host_len > 63
-        db.host_len = 63
-    else
-        db.host_len = host_len
-    for i in 0..db.host_len
-        db.host[i] = *(host + i)
-    db.host[db.host_len] = 0
-
-    # Copy collection name
-    if collection_len > 63
-        db.collection_len = 63
-    else
-        db.collection_len = collection_len
-    for i in 0..db.collection_len
-        db.collection[i] = *(collection + i)
-    db.collection[db.collection_len] = 0
-
+    db.host_len = name_copy(@db.host, host)
+    db.collection_len = name_copy(@db.collection, collection)
     return 0
+
+# `name` into a [64]u8 field, cut to 63 bytes so a NUL always follows it;
+# returns the length kept.
+fn name_copy(field: [u8], name: StrView) -> i32
+    let kept: StrView = name.take(field.len - 1)
+    field.zero()
+    field.copy_from(span_from_strview(kept))
+    return kept.len as i32
+
+# The host db_init was given (as kept: at most 63 bytes).
+pub fn db_host(db: *Db) -> StrView
+    let field: [u8] = @db.host
+    return field.to(db.host_len as i64).as_strview()
+
+# The collection db_init was given (as kept: at most 63 bytes).
+pub fn db_collection(db: *Db) -> StrView
+    let field: [u8] = @db.collection
+    return field.to(db.collection_len as i64).as_strview()
 
 # Toggle encrypted vs plaintext transport.  Must be called before
 # db_connect — flipping this on a connected client is a no-op (the
@@ -130,9 +128,9 @@ pub fn db_connect(db: *Db) -> i32
 
     var result: i32 = 0
     if db.encrypted != 0
-        result = client_connect_encrypted(db.client.as_ptr(), strview_from_ptr(@db.host[0], db.host_len as i64), db.port, strview_from_ptr(@db.collection[0], db.collection_len as i64))
+        result = client_connect_encrypted(db.client.as_ptr(), db_host(db), db.port, db_collection(db))
     else
-        result = client_connect(db.client.as_ptr(), strview_from_ptr(@db.host[0], db.host_len as i64), db.port, strview_from_ptr(@db.collection[0], db.collection_len as i64))
+        result = client_connect(db.client.as_ptr(), db_host(db), db.port, db_collection(db))
 
     if result < 0
         client_free(db.client.as_ptr())
@@ -159,12 +157,11 @@ pub fn db_is_connected(db: *Db) -> i32
 # CRUD Operations
 # ============================================================================
 
-# Insert raw document data, returns document ID or < 0 on error
-pub fn db_insert(db: *Db, data: *u8, data_len: i32) -> i64
+# Insert serialized document bytes, returns document ID or < 0 on error
+pub fn db_insert(db: *Db, doc: [u8]) -> i64
     if db.connected == 0
         return -1
-    # spire's API is still a raw pair (its own port, AGAST #4692)
-    return client_insert(db.client.as_ptr(), Span<u8> { ptr: data, len: data_len as i64 })
+    return client_insert(db.client.as_ptr(), doc)
 
 # Get raw document data by ID
 # Returns 1 if found, 0 if not found, < 0 on error
@@ -218,10 +215,10 @@ pub const DB_REFUSED: i32 = -1001
 # Ask the server to index `field`, building it from the documents already
 # stored.  Idempotent — safe to call on every reconnect.
 # Returns 0, DB_REFUSED, or < 0 on a transport/protocol failure.
-pub fn db_index_create(db: *Db, field: *u8, field_len: i32) -> i32
+pub fn db_index_create(db: *Db, field: StrView) -> i32
     if db.connected == 0
         return -1
-    let rc: i32 = client_index_create(db.client.as_ptr(), Span<u8> { ptr: field, len: field_len as i64 })
+    let rc: i32 = client_index_create(db.client.as_ptr(), span_from_strview(field))
     if rc == -4
         # The server answered with an error.  An old server does not know
         # MSG_INDEX_CREATE and says so; that is permanent, not transient.
@@ -232,12 +229,10 @@ pub fn db_index_create(db: *Db, field: *u8, field_len: i32) -> i32
 # Document ids whose `field` holds string `value`, ascending, up to `max`.
 # Returns the count, DB_REFUSED when there is no such index (so the caller
 # scans), or < 0 on a transport/protocol failure.
-pub fn db_find_ids(db: *Db, field: *u8, field_len: i32, value: *u8, value_len: i32, out: *i64, max: i32) -> i32
+pub fn db_find_ids(db: *Db, field: StrView, value: StrView, out: *i64, max: i32) -> i32
     if db.connected == 0
         return -1
-    if value_len < 0
-        return -4
-    let rc: i32 = client_find(db.client.as_ptr(), Span<u8> { ptr: field, len: field_len as i64 }, Span<u8> { ptr: value, len: value_len as i64 }, out, max)
+    let rc: i32 = client_find(db.client.as_ptr(), span_from_strview(field), span_from_strview(value), out, max)
     if rc == -4
         let err: i32 = client_last_error(db.client.as_ptr())
         if err == PROTO_ERR_NO_INDEX or err == PROTO_ERR_INVALID_MSG_TYPE
@@ -248,60 +243,43 @@ pub fn db_find_ids(db: *Db, field: *u8, field_len: i32, value: *u8, value_len: i
 # Document Helpers
 # ============================================================================
 
-# Create a document with string fields and serialize it
-# fields: array of (key, value) pairs where each is (key_ptr, key_len, val_ptr, val_len)
+# Create a document with string fields and serialize it into `buf`.
 # Returns serialized size, or < 0 on error
-pub fn db_serialize_doc(buf: *u8, buf_len: i64, fields: *DbField, field_count: i32) -> i64
+pub fn db_serialize_doc(buf: [u8], fields: [DbField]) -> i64
     var doc: Document
     var tmp_id: DocumentId = doc_id_invalid()
     doc_init(@doc, @tmp_id)
 
-    for i in 0..field_count
-        let f: *DbField = fields + i
-        var field: Field = field_string(StrView { ptr: f.value, len: f.value_len as i64 })
-        # Create StrView for key
-        let key_sv: StrView = strview_from_ptr(f.key, f.key_len as i64)
-        doc_set_field(@doc, key_sv, @field)
+    for i in 0..fields.len
+        let f: *DbField = fields.get_ptr(i)
+        var field: Field = field_string(f.value)
+        doc_set_field(@doc, f.key, @field)
 
-    return doc_serialize(@doc, Span<u8> { ptr: buf, len: buf_len })
+    return doc_serialize(@doc, buf)
 
-# Field descriptor for serialization
+# Field descriptor for serialization: views of the caller's key and value
 pub struct DbField
-    key: *u8
-    key_len: i32
-    value: *u8
-    value_len: i32
+    key: StrView
+    value: StrView
 
 # Create a DbField
-pub fn db_field(key: *u8, key_len: i32, value: *u8, value_len: i32) -> DbField
-    var f: DbField
-    f.key = key
-    f.key_len = key_len
-    f.value = value
-    f.value_len = value_len
-    return f
+pub fn db_field(key: StrView, value: StrView) -> DbField
+    return DbField { key: key, value: value }
 
-# Extract a string field from serialized document data
+# Extract string field `name` from serialized document `data` into `out`,
+# cut to out.len bytes.
 # Returns field length, or < 0 if not found
-pub fn db_extract_field(data: *u8, data_len: i32, field_name: *u8, field_name_len: i32, out_value: *u8, max_len: i32) -> i32
+pub fn db_extract_field(data: [u8], name: StrView, out: [u8]) -> i32
     var doc: Document
-    let result: i32 = doc_deserialize(Span<u8> { ptr: data, len: data_len as i64 }, @doc)
+    let result: i32 = doc_deserialize(data, @doc)
     if result != ERR_OK
         return -1
 
-    # Create StrView for field name
-    let name_sv: StrView = strview_from_ptr(field_name, field_name_len as i64)
-
     var field: Field
-    if doc_get_field(@doc, name_sv, @field) != ERR_OK
+    if doc_get_field(@doc, name, @field) != ERR_OK
         return -2
 
     if field.ftype != FIELD_STRING
         return -3
 
-    var len: i32 = field.bytes.len as i32
-    if len > max_len
-        len = max_len
-
-    memcpy(out_value, field.bytes.as_ptr(), len as i64)
-    return len
+    return out.copy_from(field.bytes) as i32

@@ -41,11 +41,11 @@ var g_err: [2048]u8
 var g_err_len: i64 = 0
 var g_pipe: Pipe = Pipe { read: Fd { fd: -1 }, write: Fd { fd: -1 } }
 
-fn read_all(f: @Fd, buf: *u8, cap: i64) -> i64
+fn read_all(f: @Fd, buf: [u8]) -> i64
     var got: i64 = 0
     var n: i64 = 1
-    while n > 0 and got < cap
-        match f.read(Span<u8> { ptr: buf + got, len: cap - got })
+    while n > 0 and got < buf.len
+        match f.read(buf.from(got))
             Ok(k) => n = k
             Err(_) => n = -1
         if n > 0
@@ -74,7 +74,8 @@ fn capture_begin() -> i32
 # was killed by a signal, as WEXITSTATUS reads it).
 fn capture_end(pid: i32) -> i32
     g_pipe.write.close()
-    g_err_len = read_all(@g_pipe.read, @g_err[0], 2048)
+    let all: [u8] = @g_err
+    g_err_len = read_all(@g_pipe.read, all)
     g_pipe.read.close()
     match wait_pid(pid)
         Ok(r) =>
@@ -83,27 +84,26 @@ fn capture_end(pid: i32) -> i32
             r.exit_code
         Err(_) => 0
 
+# The child's stderr as captured by capture_end.
+fn captured() -> StrView
+    let all: [u8] = @g_err
+    all.to(g_err_len).as_strview()
+
 # True when the captured stderr contains `want`.
 fn stderr_has(want: StrView) -> bool
-    let err: StrView = StrView { ptr: @g_err[0], len: g_err_len }
-    err.contains(want)
+    captured().contains(want)
 
 # The `<file>:<line>` that starts the "assertion failed" line, or an empty
 # view if there is none.
 fn failure_location() -> StrView
-    let marker: StrView = ": assertion failed"
-    var i: i64 = 0
-    while i + marker.len <= g_err_len
-        var j: i64 = 0
-        while j < marker.len and g_err[i + j] == *(marker.ptr + j)
-            j += 1
-        if j == marker.len
-            var start: i64 = i
-            while start > 0 and g_err[start - 1] != 10
-                start -= 1
-            return StrView { ptr: @g_err[start], len: i - start }
-        i += 1
-    StrView { ptr: @g_err[0], len: 0 }
+    let err: StrView = captured()
+    let i: i64 = err.find(": assertion failed")
+    if i >= err.len
+        return err.take(0)
+    var start: i64 = i
+    while start > 0 and err.get(start - 1) != 10
+        start -= 1
+    err.slice(start, i)
 
 # The diagnostic shape every failing helper must produce: located at the
 # calling test (not in test_utils.ritz), naming the helper that asserted.

@@ -48,7 +48,6 @@ PINS = {
     "ritz/ritz1": 511,
     "ritzunit": 7,
     "rzsh": 4,
-    "spire": 1,
 }
 
 

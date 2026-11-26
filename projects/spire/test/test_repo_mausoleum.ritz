@@ -1,0 +1,137 @@
+# spire/test/test_repo_mausoleum.ritz
+#
+# The mausoleum adapter's offline half: connection settings (db_init keeps
+# host and collection as views of its own fields) and the document helpers
+# (db_serialize_doc / db_extract_field over [u8] buffers).  Talking to a
+# live server is nexus's test_repos.
+
+import ritzlib.strview { StrView }
+import ritzlib.span { Span }
+
+import spire.repo.mausoleum { Db, db_empty, db_init, db_host, db_collection }
+import spire.repo.mausoleum { DbField, db_field, db_serialize_doc, db_extract_field }
+
+# ============================================================================
+# db_init
+# ============================================================================
+
+[[test]]
+fn test_db_init_keeps_host_and_collection() -> i32
+    var db: Db = db_empty()
+    db_init(@db, "127.0.0.1", 7777, "pages")
+    if not db_host(@db).eq("127.0.0.1")
+        return -1
+    if not db_collection(@db).eq("pages")
+        return -2
+    if db.port != 7777
+        return -3
+    0
+
+[[test]]
+fn test_db_init_cuts_names_to_63_bytes() -> i32
+    let long: StrView = "0123456789012345678901234567890123456789012345678901234567890123456789"
+    var db: Db = db_empty()
+    db_init(@db, long, 1, long)
+    if not db_host(@db).eq(long.take(63))
+        return -1
+    if not db_collection(@db).eq(long.take(63))
+        return -2
+    # The byte after the kept name is a NUL.
+    if db.host[63] != 0
+        return -3
+    0
+
+[[test]]
+fn test_db_init_again_replaces_a_longer_name() -> i32
+    var db: Db = db_empty()
+    db_init(@db, "a-much-longer-host", 1, "c")
+    db_init(@db, "short", 1, "c")
+    if not db_host(@db).eq("short")
+        return -1
+    if db.host[5] != 0
+        return -2
+    0
+
+# ============================================================================
+# Document helpers
+# ============================================================================
+
+# `fields` serialized into `out`; returns the document's bytes (empty on error).
+fn serialize(out: [u8], fields: [DbField]) -> [u8]
+    let n: i64 = db_serialize_doc(out, fields)
+    if n <= 0
+        return out.to(0)
+    out.to(n)
+
+[[test]]
+fn test_serialize_then_extract_round_trips() -> i32
+    var buf: [512]u8
+    var fields: [2]DbField
+    fields[0] = db_field("slug", "home")
+    fields[1] = db_field("content", "hello, world")
+    let doc: [u8] = serialize(@buf, @fields)
+    if doc.len == 0
+        return -1
+
+    var out: [64]u8
+    let dst: [u8] = @out
+    let n: i32 = db_extract_field(doc, "content", dst)
+    if n != 12
+        return -2
+    if not dst.to(n as i64).as_strview().eq("hello, world")
+        return -3
+    if db_extract_field(doc, "slug", dst) != 4
+        return -4
+    if not dst.to(4).as_strview().eq("home")
+        return -5
+    0
+
+[[test]]
+fn test_extract_cuts_to_the_output_span() -> i32
+    var buf: [512]u8
+    var fields: [1]DbField
+    fields[0] = db_field("content", "hello, world")
+    let doc: [u8] = serialize(@buf, @fields)
+
+    var out: [64]u8 = [0; 64]
+    let all: [u8] = @out
+    let dst: [u8] = all.to(5)
+    if db_extract_field(doc, "content", dst) != 5
+        return -1
+    if not dst.as_strview().eq("hello")
+        return -2
+    # Nothing written past the span.
+    if out[5] != 0
+        return -3
+    0
+
+[[test]]
+fn test_extract_missing_field_is_negative() -> i32
+    var buf: [512]u8
+    var fields: [1]DbField
+    fields[0] = db_field("slug", "home")
+    let doc: [u8] = serialize(@buf, @fields)
+
+    var out: [16]u8
+    if db_extract_field(doc, "title", @out) >= 0
+        return -1
+    0
+
+[[test]]
+fn test_extract_from_garbage_is_negative() -> i32
+    var junk: [64]u8
+    let doc: [u8] = @junk
+    doc.fill(0xFF)
+    var out: [16]u8
+    if db_extract_field(doc, "slug", @out) >= 0
+        return -1
+    0
+
+[[test]]
+fn test_serialize_refuses_a_buffer_too_small() -> i32
+    var buf: [8]u8
+    var fields: [1]DbField
+    fields[0] = db_field("content", "far more than eight bytes of text")
+    if db_serialize_doc(@buf, @fields) >= 0
+        return -1
+    0
