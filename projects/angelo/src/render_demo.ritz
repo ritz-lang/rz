@@ -7,6 +7,7 @@ import ritzlib.sys
 import ritzlib.fmt.digits { fmt_u64_into }
 import ritzlib.strview { StrView }
 import ritzlib.span { Span }
+import ritzlib.gvec
 import ritzlib.fd { Fd, fd_open, O_WRONLY, O_CREAT, O_TRUNC }
 import ritzlib.fmt
 import font { Font, load_font }
@@ -33,16 +34,16 @@ const TEXT_B: u8 = 255
 # Pixel buffer operations
 # ============================================================================
 
-fn set_pixel(buffer: *u8, x: u32, y: u32, r: u8, g: u8, b: u8)
+fn set_pixel(buffer: [u8], x: u32, y: u32, r: u8, g: u8, b: u8)
     if x >= WIDTH or y >= HEIGHT
         return
 
     let offset: i64 = ((y * WIDTH + x) * 3) as i64
-    *(buffer + offset) = r
-    *(buffer + offset + 1) = g
-    *(buffer + offset + 2) = b
+    buffer[offset] = r
+    buffer[offset + 1] = g
+    buffer[offset + 2] = b
 
-fn fill_background(buffer: *u8)
+fn fill_background(buffer: [u8])
     var y: u32 = 0
     while y < HEIGHT
         var x: u32 = 0
@@ -51,7 +52,7 @@ fn fill_background(buffer: *u8)
             x = x + 1
         y = y + 1
 
-fn blend_pixel(buffer: *u8, x: u32, y: u32, alpha: u8, fg_r: u8, fg_g: u8, fg_b: u8)
+fn blend_pixel(buffer: [u8], x: u32, y: u32, alpha: u8, fg_r: u8, fg_g: u8, fg_b: u8)
     if x >= WIDTH or y >= HEIGHT
         return
     if alpha as u32 == 0
@@ -61,14 +62,14 @@ fn blend_pixel(buffer: *u8, x: u32, y: u32, alpha: u8, fg_r: u8, fg_g: u8, fg_b:
 
     if alpha as u32 == 255
         # Fully opaque - just write
-        *(buffer + offset) = fg_r
-        *(buffer + offset + 1) = fg_g
-        *(buffer + offset + 2) = fg_b
+        buffer[offset] = fg_r
+        buffer[offset + 1] = fg_g
+        buffer[offset + 2] = fg_b
     else
         # Alpha blend
-        let bg_r: u32 = (*(buffer + offset)) as u32
-        let bg_g: u32 = (*(buffer + offset + 1)) as u32
-        let bg_b: u32 = (*(buffer + offset + 2)) as u32
+        let bg_r: u32 = (buffer[offset]) as u32
+        let bg_g: u32 = (buffer[offset + 1]) as u32
+        let bg_b: u32 = (buffer[offset + 2]) as u32
         let a: u32 = alpha as u32
         let inv_a: u32 = 255 - a
 
@@ -76,11 +77,11 @@ fn blend_pixel(buffer: *u8, x: u32, y: u32, alpha: u8, fg_r: u8, fg_g: u8, fg_b:
         let new_g: u8 = ((fg_g as u32 * a + bg_g * inv_a) / 255) as u8
         let new_b: u8 = ((fg_b as u32 * a + bg_b * inv_a) / 255) as u8
 
-        *(buffer + offset) = new_r
-        *(buffer + offset + 1) = new_g
-        *(buffer + offset + 2) = new_b
+        buffer[offset] = new_r
+        buffer[offset + 1] = new_g
+        buffer[offset + 2] = new_b
 
-fn blit_glyph(buffer: *u8, glyph: @RasterizedGlyph, x: i32, y: i32)
+fn blit_glyph(buffer: [u8], glyph: @RasterizedGlyph, x: i32, y: i32)
     var gy: u32 = 0
     while gy < glyph.height
         let dst_y: i32 = y + gy as i32
@@ -124,10 +125,11 @@ pub fn main(args: Span<StrView>) -> i32
             print("  Renders text with tests/fixtures/aadhunik.ttf (run from projects/angelo)\n")
             print("  and writes hello_angelo.ppm into the current directory.\n")
             return 0
-    # Allocate pixel buffer
-    let buffer: *u8 = sys_mmap(0, BUFFER_SIZE, 3, 34, -1, 0)
-    if buffer as i64 < 0
+    # Allocate pixel buffer (freed when `pixels` goes)
+    let pixels: Vec<u8> = vec_zeroed<u8>(BUFFER_SIZE)
+    if pixels.len() != BUFFER_SIZE
         return 1
+    let buffer: [u8] = pixels[0..BUFFER_SIZE]
 
     # Fill background
     fill_background(buffer)
@@ -141,7 +143,6 @@ pub fn main(args: Span<StrView>) -> i32
     var font: Font = match font_result
         Ok(f) => f
         Err(_) =>
-            sys_munmap(buffer, BUFFER_SIZE)
             return 2
 
     let metrics = font.metrics()
@@ -216,13 +217,11 @@ pub fn main(args: Span<StrView>) -> i32
     var out: Fd = match fd_open("hello_angelo.ppm", O_WRONLY + O_CREAT + O_TRUNC, 420)
         Ok(opened) => opened
         Err(_) =>
-            sys_munmap(buffer, BUFFER_SIZE)
             return 3
 
     write_ppm_header(@out, WIDTH, HEIGHT)
-    out.write(Span<u8> { ptr: buffer, len: BUFFER_SIZE })
+    out.write(buffer)
 
     out.close()
-    sys_munmap(buffer, BUFFER_SIZE)
 
     return 0

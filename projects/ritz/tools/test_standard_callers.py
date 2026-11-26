@@ -46,7 +46,7 @@ RITZ_ROOT = Path(__file__).resolve().parent.parent
 PROJECTS = RITZ_ROOT.parent
 
 PINS = {
-    "angelo": 4,
+    "angelo": 0,
     "cryptosec": 10,
     "goliath": 0,
     "harland": 11,
