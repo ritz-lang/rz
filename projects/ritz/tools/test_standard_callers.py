@@ -141,7 +141,7 @@ C_LITERAL_PINS = {
     "goliath": 0,
     "harland": 34,
     "http": 74,
-    "indium": 103,
+    "indium": 105,
     "iris": 1,
     "larb": 0,
     "mausoleum": 33,
