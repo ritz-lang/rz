@@ -17,6 +17,11 @@ took a whole element by value, `let x: Line = v[0]`, which gave it two owners:
 the binding and the Vec.  Every compiler now refuses that one at the program's
 own `v[0]`, as it does `p[0]` through a reference.
 
+AGAST #4838 is the same family on ritz1: `edits[0].bytes.push_span(s)` wanted
+`push_span` at Vec<Edit> as well as at Vec<u8>, as ritz1's monomorphizer typed
+no field of an element.  It types `v[i].f`, and `let e = @&v[i]`'s `e.f`, at
+the element's struct.
+
 Behind that error buddhafinger's buffer.ritz met a second one: an `@self` method
 on a slice, `all[a..b].copy_from(src)`, was "can't take the address of a slice"
 on ritz0.  A slice is a new value with no place, so it's lent a spill, as any
@@ -93,6 +98,43 @@ pub fn main() -> i32
 RUNS = [Row(f"a_vec_element_is_a_place[{k}]", (c,), Run(HEADER + READS[k], 3))
         for c in COMPILERS for k in sorted(READS)] + \
        [Row("a_slice_lends_an_at_self_method", (c,), Run(SLICE_RECEIVER, 9)) for c in COMPILERS]
+# AGAST #4838: a Vec method on a field of an element runs at the field's
+# type.  ritz1 resolved `edits[0].bytes.push_span(s)` at no instance, so wanted
+# `push_span` at every Vec's, Vec<Edit>'s too, whose body moves an Edit out of
+# a reference ("gvec.ritz:330:30: cannot move out of a reference").  Each row
+# checks the bytes landed in the element: "ab" then 7 is 97 + 98 + 7 - 199.
+EDITS = """\
+import ritzlib.gvec
+import ritzlib.span
+
+struct Edit
+    off: i64
+    bytes: Vec<u8>
+
+fn total(v: @Vec<u8>) -> i32
+    var t: i32 = 0
+    for i in 0..v.len()
+        t = t + (*(v.data + i) as i32)
+    t
+
+pub fn main() -> i32
+    var edits: Vec<Edit> = vec_new<Edit>()
+    edits.push(Edit { off: 0, bytes: vec_new<u8>() })
+    let s: [u8] = "ab"
+"""
+# (body, the element as the tail reads it: `e` while its `@&` is live)
+FIELD_METHODS = {
+    "push_span": ("    edits[0].bytes.push_span(s)\n    edits[0].bytes.push(7)\n", "edits[0]"),
+    "push": ("    edits[0].bytes.push(97)\n    edits[0].bytes.push(98)\n    edits[0].bytes.push(7)\n",
+             "edits[0]"),
+    "borrowed_push_span": ("    let e = @&edits[0]\n    e.bytes.push_span(s)\n    e.bytes.push(7)\n", "e"),
+}
+RUNS += [Row(f"a_method_on_a_field_of_an_element_runs_at_the_field[{k}]", (c,),
+             Run(EDITS + FIELD_METHODS[k][0]
+                 + "    total(@{x}.bytes) - 199 + ({x}.bytes.len() as i32)\n".format(x=FIELD_METHODS[k][1]),
+                 6))
+         for c in COMPILERS for k in sorted(FIELD_METHODS)]
+
 REFUSALS = [Row(f"a_move_only_element_does_not_move_out[{k}]", (c,),
                 _refusal(HEADER + MOVES[k], MOVE_OUT_OF_REF))
             for c in COMPILERS for k in sorted(MOVES)]

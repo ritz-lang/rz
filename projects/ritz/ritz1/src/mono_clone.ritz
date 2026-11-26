@@ -57,6 +57,15 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
             if rsv.ptr != null and rsv.len > 0
                 sname = rsv.ptr
                 sname_len = rsv.len as i32
+        # AGAST #4838: a field of a Vec's or Span's element, `edits[0].bytes`
+        # with `edits: Vec<Edit>`.  Untyped, `edits[0].bytes.push_span(s)`
+        # wanted `push_span` at every Vec instance, Vec$Edit's included, whose
+        # body moves an Edit out of a reference.
+        ExprKind.Index =>
+            let esv: StrView = indexed_element_name(mono, m, e.left)
+            if esv.ptr != null and esv.len > 0
+                sname = esv.ptr
+                sname_len = esv.len as i32
         ExprKind.Member =>
             let parent: *StructField = resolve_member_field(mono, m, left)
             if parent != null
@@ -554,6 +563,13 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
                 track_typed_local_through(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.var_type, s.var_pointee_type, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 })
             else if s.var_init != null and s.var_init.kind == ExprKind.Unary and (s.var_init.op == OpKind.Addr or s.var_init.op == OpKind.AddrMut)
                 track_address_of_local(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.var_init.operand)
+                # AGAST #4838: `let e = @&edits[0]` points at an element: `e.bytes`
+                # is that element's field, as with `let e: @&Edit = ..`.
+                let of: *Expr = s.var_init.operand
+                if of != null and of.kind == ExprKind.Index
+                    let ename: StrView = indexed_element_name(mono, m, of)
+                    if ename.ptr != null and ename.len > 0
+                        add_local_struct_var(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, ename)
             else if s.var_init != null and s.var_init.kind == ExprKind.StructLit
                 # Un-annotated `var r = R { ... }`: the literal names the type.
                 add_local_struct_var(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.var_init.ident)
@@ -1169,19 +1185,18 @@ fn slice_into_expected(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView)
 # generic's specialisation, which is left as it was.
 # (MonoCtx.mono_ret_name, .mono_ret_len, .mono_tail)
 
-# AGAST #2519: if `e` is `b[i]` (or `(*b)[i]`) on a Vec or Span whose element
-# is itself a Vec or Span, return that element's kind and write its "$T"
-# suffix to out; 0 otherwise.  `b` is a tracked local (the collection itself,
-# or a `*`/`@`/`@&` of it, one level: LARB R9) or a field of one.  A range
-# index is a slice, not an element.
-fn indexed_element_collection(mono: *MonoCtx, m: *Module, e: *Expr, out_suffix: **u8, out_suffix_len: *i32) -> i32
+# If `e` is `b[i]` (or `(*b)[i]`) on a Vec or Span, the collection's "$T"
+# suffix; empty otherwise.  `b` is a tracked local (the collection itself, or
+# a `*`/`@`/`@&` of it, one level: LARB R9) or a field of one.  A range index
+# is a slice, not an element.
+fn indexed_collection_suffix(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
     if e.left == null or e.right == null or e.right.kind == ExprKind.Range
-        return 0
+        return strview_empty()
     var b: *Expr = e.left
     if b.kind == ExprKind.Unary and b.op == OpKind.Deref
         b = b.operand
     if b == null
-        return 0
+        return strview_empty()
     var csuf: *u8 = null
     var csuf_len: i32 = 0
     match b.kind
@@ -1190,21 +1205,39 @@ fn indexed_element_collection(mono: *MonoCtx, m: *Module, e: *Expr, out_suffix: 
             # by_value 0 with a collection kind is a `**Vec<T>`: `b[i]` is a raw
             # buffer of pointers there, not an element of the Vec.
             if idx < 0 or *(mono.lv_prefix_kind + idx) == 0 or *(mono.lv_by_value + idx) == 0
-                return 0
+                return strview_empty()
             csuf = *(mono.lv_suffixes + idx)
             csuf_len = *(mono.lv_suffix_lens + idx)
         ExprKind.Member =>
             let rf: *StructField = resolve_member_field(mono, m, b)
             if rf == null or (rf.field_type != TypeKind.Struct and rf.field_type != TypeKind.Ptr)
-                return 0
+                return strview_empty()
             if classify_collection_type(StrView { ptr: (rf.field_type_name), len: (rf.field_type_name_len) as i64 }, @csuf, @csuf_len) == 0
-                return 0
+                return strview_empty()
         _ =>
-            return 0
-    # The collection's suffix is "$<element>": classify the element.
+            return strview_empty()
     if csuf == null or csuf_len < 2
+        return strview_empty()
+    StrView { ptr: (csuf), len: (csuf_len) as i64 }
+
+# AGAST #2519: if `e` is `b[i]` on a Vec or Span (indexed_collection_suffix)
+# whose element is itself a Vec or Span, return that element's kind and write
+# its "$T" suffix to out; 0 otherwise.
+fn indexed_element_collection(mono: *MonoCtx, m: *Module, e: *Expr, out_suffix: **u8, out_suffix_len: *i32) -> i32
+    let csuf: StrView = indexed_collection_suffix(mono, m, e)
+    if csuf.ptr == null
         return 0
-    return classify_collection_type(StrView { ptr: (csuf + 1), len: (csuf_len - 1) as i64 }, out_suffix, out_suffix_len)
+    # The collection's suffix is "$<element>": classify the element.
+    return classify_collection_type(StrView { ptr: (csuf.ptr + 1), len: csuf.len - 1 }, out_suffix, out_suffix_len)
+
+# AGAST #4838: the type name of the element `e` (`b[i]` on a Vec or Span,
+# indexed_collection_suffix) is: `edits[0]` of a `Vec<Edit>` is "Edit", so
+# `edits[0].bytes` is Edit's field.  Empty when `e` is no such element.
+fn indexed_element_name(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
+    let csuf: StrView = indexed_collection_suffix(mono, m, e)
+    if csuf.ptr == null
+        return strview_empty()
+    StrView { ptr: (csuf.ptr + 1), len: csuf.len - 1 }
 
 fn collect_from_expr(mono: *MonoCtx, m: *Module, e: *Expr)
     if e == null
