@@ -1,0 +1,157 @@
+# File metadata in the namespace: modified time, permission bits and stat
+# (AGAST #4832).
+#
+# A directory entry has always carried a size, a modified time and a mode
+# (goliath.dir_entry Metadata, serialized in DiskDirEntry), but every write
+# stored modified 0 and mode 0644. namespace_write_at stamps the time a
+# caller gives and keeps the file's mode; namespace_write_mode sets the mode
+# as well; namespace_stat reads the entry back. Harland's stat/fstat and
+# open(O_CREAT, mode) rest on these.
+
+import ritzlib.strview { StrView }
+import ritzlib.span { Span, span_from_strview }
+import ritzlib.result
+import goliath.blob_store { MemoryBlobStore, memory_store_free }
+import goliath.hosted { memory_store_new }
+import goliath.namespace { Namespace, NsStat, namespace_new, namespace_write, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_stat, namespace_max_modified, namespace_root }
+import goliath.blob_id { BlobId, blob_id_eq }
+import goliath.error { ErrorCode }
+
+const MODE_0644: u32 = 420
+const MODE_0600: u32 = 384
+const MODE_0755: u32 = 493
+
+fn write_at(ns: *Namespace, path: StrView, text: StrView, modified: u64) -> ErrorCode
+    let data: Span<u8> = span_from_strview(text)
+    namespace_write_at(ns, path, @data, modified)
+
+fn write_mode(ns: *Namespace, path: StrView, text: StrView, mode: u32, modified: u64) -> ErrorCode
+    let data: Span<u8> = span_from_strview(text)
+    namespace_write_mode(ns, path, @data, mode, modified)
+
+# The stat of `path`, which the test expects to exist.
+fn stat_of(ns: *Namespace, path: StrView) -> NsStat
+    match namespace_stat(ns, path)
+        Ok(st) => st
+        Err(_) => NsStat { is_dir: false, size: 999, modified: 999, mode: 999 }
+
+# The error namespace_stat gives for `path`, Ok if it found one.
+fn stat_err(ns: *Namespace, path: StrView) -> ErrorCode
+    match namespace_stat(ns, path)
+        Ok(_) => ErrorCode.Ok
+        Err(e) => e
+
+[[test]]
+fn test_write_at_stamps_modified_and_size() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert write_at(@ns, "/f", "hello", 1000) == ErrorCode.Ok
+    let st: NsStat = stat_of(@ns, "/f")
+    assert not st.is_dir
+    assert st.size == 5
+    assert st.modified == 1000
+    assert st.mode == MODE_0644
+    # A rewrite moves the time and the size
+    assert write_at(@ns, "/f", "hi", 2000) == ErrorCode.Ok
+    let st2: NsStat = stat_of(@ns, "/f")
+    assert st2.size == 2
+    assert st2.modified == 2000
+    memory_store_free(@store)
+    0
+
+[[test]]
+fn test_write_mode_sets_mode_and_rewrite_keeps_it() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert write_mode(@ns, "/secret", "", MODE_0600, 10) == ErrorCode.Ok
+    let st: NsStat = stat_of(@ns, "/secret")
+    assert st.mode == MODE_0600
+    assert st.size == 0
+    assert st.modified == 10
+    # A plain rewrite keeps the mode it was created with
+    assert write_at(@ns, "/secret", "data", 20) == ErrorCode.Ok
+    assert stat_of(@ns, "/secret").mode == MODE_0600
+    assert stat_of(@ns, "/secret").modified == 20
+    let data: Span<u8> = span_from_strview("more")
+    assert namespace_write(@ns, "/secret", @data) == ErrorCode.Ok
+    assert stat_of(@ns, "/secret").mode == MODE_0600
+    # Only the permission bits are kept: type bits in `mode` are dropped
+    assert write_mode(@ns, "/typed", "", 0x8000 | MODE_0755, 30) == ErrorCode.Ok
+    assert stat_of(@ns, "/typed").mode == MODE_0755
+    memory_store_free(@store)
+    0
+
+[[test]]
+fn test_stat_directories_and_root() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    let root: NsStat = stat_of(@ns, "/")
+    assert root.is_dir
+    assert root.mode == MODE_0755
+    assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
+    let d: NsStat = stat_of(@ns, "/d")
+    assert d.is_dir
+    assert d.mode == MODE_0755
+    assert d.size == 0
+    memory_store_free(@store)
+    0
+
+[[test]]
+fn test_nested_write_keeps_parent_metadata() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
+    assert write_mode(@ns, "/d/f", "x", MODE_0600, 5) == ErrorCode.Ok
+    assert write_at(@ns, "/d/f", "xy", 6) == ErrorCode.Ok
+    let f: NsStat = stat_of(@ns, "/d/f")
+    assert f.mode == MODE_0600
+    assert f.modified == 6
+    assert f.size == 2
+    assert stat_of(@ns, "/d").is_dir
+    assert stat_of(@ns, "/d").mode == MODE_0755
+    memory_store_free(@store)
+    0
+
+[[test]]
+fn test_stat_errors() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert write_at(@ns, "/f", "x", 1) == ErrorCode.Ok
+    assert stat_err(@ns, "/missing") == ErrorCode.NotFound
+    assert stat_err(@ns, "/f/below") == ErrorCode.NotADirectory
+    assert stat_err(@ns, "relative") == ErrorCode.InvalidPath
+    memory_store_free(@store)
+    0
+
+# A plain namespace_write stores what it always did (modified 0, mode 0644),
+# so trees written before #4832 hash the same.
+[[test]]
+fn test_plain_write_is_unstamped() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    let data: Span<u8> = span_from_strview("same")
+    assert namespace_write(@ns, "/f", @data) == ErrorCode.Ok
+    var plain: BlobId = namespace_root(@ns)
+    assert stat_of(@ns, "/f").modified == 0
+    var store2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace = namespace_new(@store2)
+    assert write_at(@ns2, "/f", "same", 0) == ErrorCode.Ok
+    var stamped: BlobId = namespace_root(@ns2)
+    assert blob_id_eq(@plain, @stamped)
+    memory_store_free(@store)
+    memory_store_free(@store2)
+    0
+
+[[test]]
+fn test_max_modified_walks_the_tree() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert namespace_max_modified(@ns) == 0
+    assert namespace_mkdir(@ns, "/a") == ErrorCode.Ok
+    assert namespace_mkdir(@ns, "/a/b") == ErrorCode.Ok
+    assert write_at(@ns, "/top", "1", 70) == ErrorCode.Ok
+    assert write_at(@ns, "/a/b/deep", "2", 900) == ErrorCode.Ok
+    assert write_at(@ns, "/a/mid", "3", 300) == ErrorCode.Ok
+    assert namespace_max_modified(@ns) == 900
+    memory_store_free(@store)
+    0

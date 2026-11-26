@@ -76,12 +76,13 @@ FAKE_QEMU = textwrap.dedent("""\
                 "[busy A] 3/8\\n[busy B] 3/8\\n[busy A] 4/8\\n[busy B] 4/8\\n"
                 "[busy A] 5/8\\n[busy B] 5/8\\n[busy A] 6/8\\n[busy B] 6/8\\n"
                 "[busy A] 7/8\\n[busy B] 7/8\\n[busy A] 8/8\\n[busy B] 8/8\\n"
-                "[sched] 350 ticks, 280 switches, 230 preemptions\\n"
+                "[sched] 350 ticks, 280 switches, 230 preemptions, 240 contended ticks\\n"
                 "[smp] syscall stacks OK: 4 CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\\n"
                 "[test] ping nodev ... ping: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"
                 "[test] udp-send nodev ... udp-send: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"
                 "[test] udp-recv nodev ... udp-recv: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"
                 "[test] write_empty_test ... [write_empty_test] PASS: /tmp and /var\\nPASS (exit=0)\\n"
+                "[test] stat_test ... [stat_test] PASS: /tmp and /var\\nPASS (exit=0)\\n"
                 "ALL TESTS PASSED\\n"
                 "[exit] init exited with code 0\\n")
     """)

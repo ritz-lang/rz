@@ -140,12 +140,12 @@ def test_uptr_faults_are_errno_fault(compiler, tmp_path):
 @pytest.mark.parametrize("compiler", ASM_DEPS)
 def test_vfs_errors_are_errno(compiler, tmp_path):
     # The fd table moved from vfs to fs/fd.ritz, one per process (#2753).
+    # vfs_stat, a stub that always failed, went with #4832: stat is fs/stat.ritz.
     cases = [
         ("fd_free(@t, -1)", "Errno.BadF as i32"),
         ("fd_free(@t, 256)", "Errno.BadF as i32"),
         ("fd_free(@t, 5)", "Errno.BadF as i32"),      # never allocated
         ("vfs_mount(c\"/\", 1, 0)", "Errno.Inval as i32"),  # before vfs_init
-        ("vfs_stat(c\"/x\", 2, 0 as *Stat)", "Errno.NoEnt as i32"),
         ("vfs_mkdir(c\"/x\", 2)", "Errno.NoEnt as i32"),
     ]
     _check(compiler, tmp_path, "import ritzlib.option\nimport syscall.errno\nimport fs.vfs\nimport fs.fd\n", cases,

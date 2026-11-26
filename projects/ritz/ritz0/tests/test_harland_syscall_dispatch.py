@@ -63,11 +63,13 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 # The syscall ABI, as user programs (ritzlib/sys.ritz, indium) encode it.
 # Changing a number here is an ABI break, not a refactor.
-# Stat (4), SpawnEx (28), Pipe (29), IpcCall (32), NetInfo (60) and NetPing (61)
-# were declared but never dispatched, so every call got an error (AGAST #2122):
-# they are gone, and their numbers are free.
+# SpawnEx (28), Pipe (29), IpcCall (32), NetInfo (60) and NetPing (61) were
+# declared but never dispatched, so every call got an error (AGAST #2122):
+# they are gone, and their numbers are free. Stat (4) was one of them; it
+# came back with a handler, beside Fstat (5): Linux's numbers and struct stat
+# (#4832).
 ABI = {
-    "Read": 0, "Write": 1, "Open": 2, "Close": 3,
+    "Read": 0, "Write": 1, "Open": 2, "Close": 3, "Stat": 4, "Fstat": 5,
     # Poll (7): Linux's poll(2); fd 0's POLLIN is the console's timed read
     # (#4829, ritzlib.timedread).
     "Poll": 7,
@@ -100,7 +102,8 @@ ABI = {
 
 # What the old `if rax ==` ladder dispatched (Write and DebugPrint shared an arm),
 # plus Lseek and Mkdir, whose fs/syscall.ritz implementations were never wired
-# up (AGAST #2122). Every declared syscall is dispatched: see
+# up (AGAST #2122), and Stat and Fstat (#4832). Every declared syscall is
+# dispatched: see
 # test_every_declared_syscall_is_dispatched.
 DISPATCHED = {
     "Exit", "Open", "Close", "Write", "DebugPrint", "Read", "Yield", "Getpid",
@@ -109,6 +112,7 @@ DISPATCHED = {
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
     "Sync", "Smp", "ShmMap", "DrvIrqWait", "NetInfo", "NetAddr", "NetAttach", "Poll",
+    "Stat", "Fstat",
 }
 
 

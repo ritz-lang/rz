@@ -26,7 +26,7 @@ These interfaces match POSIX semantics exactly. Code using these works identical
 | Category | Functions | Status |
 |----------|-----------|--------|
 | **Basic I/O** | `read`, `write`, `open`, `close` | Planned |
-| **File Info** | `stat`, `fstat`, `lstat` | Planned |
+| **File Info** | `stat`, `fstat`, `lstat` | `stat` (4) and `fstat` (5) fill Linux's `struct stat` (#4832); no symlinks, so ritzlib's `lstat` is `stat` |
 | **Directory** | `opendir`, `readdir`, `closedir` | Planned |
 | **Memory** | `mmap`, `munmap`, `mprotect` | Planned |
 | **Process** | `getpid`, `exit`, `_exit` | Planned |
@@ -327,11 +327,12 @@ pub fn prints(s: StrView) -> i64
 
 ```ritz
 # File I/O
-sys_open(path, len, flags) -> i64
+sys_open(path, len, flags, mode) -> i64
 sys_close(fd) -> i32
 sys_read(fd, buf, len) -> i64
 sys_write(fd, buf, len) -> i64
 sys_lseek(fd, offset, whence) -> i64
+sys_stat(path, len, stat_buf) -> i32
 sys_fstat(fd, stat_buf) -> i32
 
 # Process

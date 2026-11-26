@@ -37,7 +37,7 @@ import arch.x86_64.percpu { cpu_index }
 import arch.x86_64.apic { lapic_timer_start, lapic_timer_stop,lapic_tick_advance, lapic_watchdog_expired }
 import fs.syscall { fs_process_select }
 import syscall.stack { kstack_top }
-import proc.table { Proc, PROC_RUNNING, BLOCK_IRQ, proc_at, proc_current_slot, proc_pick_next, proc_set_current, proc_wake }
+import proc.table { Proc, PROC_RUNNING, BLOCK_IRQ, proc_at, proc_current_slot, proc_pick_next, proc_set_current, proc_wake, proc_runnable_count }
 import proc.waitset { waitset_tick }
 
 extern fn sched_switch(save_ksp: *u64, new_ksp: u64)
@@ -70,6 +70,12 @@ const KERNEL_RFLAGS: u64 = 0x2     # IF=0 until proc_first_entry's iretq
 var sched_ticks: u64 = 0
 var sched_switches: u64 = 0
 var sched_preemptions: u64 = 0
+# Ticks that found two or more processes runnable: each one a tick the
+# scheduler should have preempted on, whichever mode it interrupted. The
+# boot gate's #4332 check compares preemptions with these, not with every
+# tick: a program running alone (waiting on a slow disk, say) adds ticks
+# that no scheduler could preempt on (AGAST #4832).
+var sched_contended: u64 = 0
 var sched_running: bool = false
 
 # The process in `slot` runs on its own kernel stack from now on: TSS.rsp0
@@ -167,6 +173,8 @@ pub fn sched_exit()
 # process (any non-zero CPL), the only place a process is preempted.
 pub fn sched_tick(from_user: bool)
     sched_ticks = sched_ticks + 1
+    if sched_running and proc_runnable_count() >= 2
+        sched_contended = sched_contended + 1
     # The NVMe watchdog rides this tick instead of reprogramming the timer
     # (#4220): count the tick, and wake a parked driver wait when it expires.
     lapic_tick_advance()
@@ -224,4 +232,6 @@ pub fn sched_report()
     klog_dec(sched_switches)
     klog(" switches, ")
     klog_dec(sched_preemptions)
-    klog(" preemptions\n")
+    klog(" preemptions, ")
+    klog_dec(sched_contended)
+    klog(" contended ticks\n")

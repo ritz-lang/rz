@@ -1,6 +1,7 @@
 # Filesystem Syscalls
 #
-# Implements sys_open, sys_close, sys_read, sys_write for files.
+# Implements sys_open, sys_close, sys_read, sys_write and sys_fstat for files
+# (stat by path is fs/stat.ritz stat_at).
 # Integrates with the kernel namespace (fs/kfs.ritz) and the per-process fd tables (fs/fd.ritz).
 
 import klog { klog }
@@ -8,8 +9,11 @@ import serial { StrView }
 import fs.vfs { O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND }
 import fs.fd { FdTable, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_dup, fd_owner, fd_refs, fd_heir }
 import syscall.errno { Errno }
-import fs.kfs { KFS_OK, kfs_get, kfs_ns_for, kfs_local, kfs_is_persist, kfs_persist_write, kfs_persist_mkdir, kfs_save, kfs_save_later }
-import goliath.namespace { Namespace, namespace_resolve, namespace_store, namespace_hold, namespace_unhold }
+import fs.kfs { KFS_OK, kfs_get, kfs_ns_for, kfs_local, kfs_is_persist, kfs_persist_write, kfs_persist_create, kfs_persist_mkdir, kfs_save, kfs_save_later }
+import fs.stat { Stat, stat_of_entry, stat_console }
+import goliath.namespace { Namespace, NsStat, namespace_resolve, namespace_store, namespace_hold, namespace_unhold, namespace_stat }
+import ritzlib.result
+import ritzlib.option
 import goliath.blob_id { BlobId, blob_id_is_zero, blob_id_copy }
 import goliath.blob_store { MemoryBlobStore, memory_store_get, memory_store_get_size }
 import mm.heap { kalloc, kfree }
@@ -49,6 +53,7 @@ struct FsFile
     wbuf_cap: u64
     path: *u8               # Heap copy of the path, for writable fds (null if none)
     path_len: u64
+    meta: NsStat            # The entry as it was at open: what fstat reports
 
 struct FsProc
     pid: u64
@@ -185,12 +190,14 @@ pub fn fs_process_count() -> i32
 #   path_ptr: pointer to path string
 #   path_len: length of path
 #   flags: open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, etc.)
+#   mode: with O_CREAT, the permission bits (07777 of it) a file this open
+#         creates gets; an existing file keeps its own (AGAST #4832)
 #
 # Returns:
 #   >= 0: file descriptor
 #   < 0: error code
 
-pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
+pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
     let p: *FsProc = fs_current_proc()
     if p == 0 as *FsProc
         return Errno.Srch as i64
@@ -212,9 +219,8 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     if blob_id_is_zero(@blob_id)
         # File doesn't exist
         if (flags & O_CREAT) != 0
-            # Create the file with empty content
-            var empty: u8 = 0
-            let create_result: i32 = kfs_persist_write(path, @empty, 0)
+            # Create the file with empty content and the caller's mode
+            let create_result: i32 = kfs_persist_create(path, mode)
             if create_result != 0
                 return create_result as i64
             # Re-resolve to get the new blob ID
@@ -251,6 +257,7 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     (*f).wbuf_cap = 0
     (*f).path = 0 as *u8
     (*f).path_len = 0
+    (*f).meta = fs_open_meta(ns, local)
 
     # O_TRUNC on a writable fd: the fd reads the file as empty from here, and
     # close commits its write buffer even if it is empty (fs_close_commits).
@@ -278,6 +285,34 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
         (*f).path_len = path_len
 
     fd as i64
+
+# The entry at `local` in `ns` as an fd opened on it records it. The path
+# resolved a moment ago, so a failure here is not expected: then a regular
+# file with mode 0644 and modified 0.
+fn fs_open_meta(ns: *Namespace, local: StrView) -> NsStat
+    match namespace_stat(ns, local)
+        Ok(st) => st
+        Err(_) => NsStat { is_dir: false, size: 0, modified: 0, mode: 420 }
+
+# ============================================================================
+# sys_fstat - The status of an open fd (AGAST #4832)
+# ============================================================================
+#
+# A file fd reports the file as it was when the fd opened it: its type, mode
+# and modified time then, and the size the fd reads (0 after O_TRUNC). A
+# write fd's bytes reach the file only on close (see "What close commits"),
+# so a stat of the path after that close is what shows them. fds 0-2 that
+# are not files are the console (S_IFCHR). The Stat, or None for a number
+# that is neither (the handler's Errno.BadF); the handler writes it to the
+# caller's record.
+
+pub fn sys_fstat(fd: i32) -> Option<Stat>
+    let f: *FsFile = fs_file(fs_current_proc(), fd)
+    if f != 0 as *FsFile
+        return Some(stat_of_entry((*f).meta, (*f).size))
+    if fd >= 0 and fd <= 2
+        return Some(stat_console())
+    None
 
 # ============================================================================
 # sys_dup - A second fd for an open file
@@ -358,6 +393,7 @@ fn fs_file_move(src: *FsFile, dst: *FsFile)
     (*dst).wbuf_cap = (*src).wbuf_cap
     (*dst).path = (*src).path
     (*dst).path_len = (*src).path_len
+    (*dst).meta = (*src).meta
 
 # ============================================================================
 # sys_read - Read from a file

@@ -428,7 +428,8 @@ refused with `-EPERM`; the operation never reaches the subsystem.
 | SYS_OPEN | CAP_NAMESPACE | READ; CREATE too for O_CREAT |
 | SYS_READ (filesystem fd) | CAP_NAMESPACE | READ |
 | SYS_WRITE (filesystem fd) | CAP_NAMESPACE | WRITE |
-| SYS_LSEEK, SYS_CLOSE (filesystem fd) | CAP_NAMESPACE | READ or WRITE |
+| SYS_STAT | CAP_NAMESPACE | READ |
+| SYS_LSEEK, SYS_CLOSE, SYS_FSTAT (filesystem fd) | CAP_NAMESPACE | READ or WRITE |
 | SYS_READDIR | CAP_NAMESPACE | LIST |
 | SYS_MKDIR | CAP_NAMESPACE | CREATE |
 | SYS_SYNC | CAP_NAMESPACE | WRITE |

@@ -15,8 +15,8 @@ for init, spawn)
 and fs_process_end() when it exits, which closes what it left open, flushing
 writes as sys_close does, and makes the parent's table current again.
 
-The behaviour tests compile the real fs/fd.ritz, fs/syscall.ritz, fs/vfs.ritz
-and syscall/errno.ritz into host programs on every compiler, with stand-ins
+The behaviour tests compile the real fs/fd.ritz, fs/syscall.ritz, fs/vfs.ritz,
+fs/stat.ritz and syscall/errno.ritz into host programs on every compiler, with stand-ins
 for serial, the kernel heap (an arena that counts live allocations) and the
 namespace: fs/kfs.ritz and the goliath modules fs/syscall.ritz calls (a few
 named files; writes are recorded, and so are blob holds: every open holds its
@@ -167,9 +167,18 @@ NAMESPACE_STUB = """\
 import serial { StrView }
 import goliath.blob_id { BlobId }
 import goliath.blob_store { MemoryBlobStore, blob_stub_store, blob_stub_set, memory_store_get }
+import goliath.error { ErrorCode }
+import ritzlib.result
 
 pub struct Namespace
     count: i32
+
+# goliath's stat record (AGAST #4832): every stub file is a 0644 regular file.
+pub struct NsStat
+    is_dir: bool
+    size: u64
+    modified: u64
+    mode: u32
 
 var g_ns: Namespace
 var g_paths: [8][16]u8
@@ -240,6 +249,11 @@ pub fn ns_stub_write(path: StrView, data: *u8, size: u64) -> i32
         g_writes = g_writes + 1
     0
 
+pub fn namespace_stat(ns: *Namespace, path: StrView) -> Result<NsStat, ErrorCode>
+    if find(path) == 0
+        return Err(ErrorCode.NotFound)
+    Ok(NsStat { is_dir: false, size: 0, modified: 0, mode: 420 })
+
 # Writes that carried data, whether `path` now holds `want`, and blob holds
 # not yet dropped.
 pub fn stub_writes() -> i32
@@ -283,6 +297,10 @@ pub fn kfs_is_persist(path: StrView) -> bool
 pub fn kfs_persist_write(path: StrView, data: *u8, size: u64) -> i32
     ns_stub_write(path, data, size)
 
+pub fn kfs_persist_create(path: StrView, mode: u32) -> i32
+    var empty: u8 = 0
+    ns_stub_write(path, @empty, 0)
+
 pub fn kfs_persist_mkdir(path: StrView) -> i32
     0
 
@@ -299,6 +317,13 @@ pub fn kfs_save_later() -> i32
     0
 """
 
+# goliath's error enum, as far as the stubs use it.
+ERROR_STUB = """\
+pub enum ErrorCode: i32
+    Ok = 0
+    NotFound = 1
+"""
+
 STUBS = {
     "serial.ritz": SERIAL_STUB,
     "klog.ritz": KLOG_STUB,
@@ -307,8 +332,9 @@ STUBS = {
     "goliath/blob_store.ritz": BLOB_STORE_STUB,
     "goliath/namespace.ritz": NAMESPACE_STUB,
     "fs/kfs.ritz": KFS_STUB,
+    "goliath/error.ritz": ERROR_STUB,
 }
-REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "syscall/errno.ritz"]
+REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "syscall/errno.ritz"]
 
 
 def _compile(compiler, tmp_path, path, name, extra=()):
@@ -354,8 +380,8 @@ def _run(compiler, tmp_path, src, modules):
 
 FD_MODULES = ["fs/fd.ritz", "syscall/errno.ritz"]
 FS_MODULES = ["serial.ritz", "klog.ritz", "mm/heap.ritz", "goliath/blob_id.ritz", "goliath/blob_store.ritz",
-              "goliath/namespace.ritz", "fs/kfs.ritz", "fs/fd.ritz", "fs/syscall.ritz",
-              "fs/vfs.ritz", "syscall/errno.ritz"]
+              "goliath/error.ritz", "goliath/namespace.ritz", "fs/kfs.ritz", "fs/fd.ritz",
+              "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "syscall/errno.ritz"]
 
 # --- FdTable (fs/fd.ritz) ---------------------------------------------------------
 
@@ -452,15 +478,15 @@ fn main() -> i32
     let base: i64 = heap_live()
     if fs_process_start(1) != 0
         return 1
-    if sys_open(c"/a", 2, O_RDONLY) != 3
+    if sys_open(c"/a", 2, O_RDONLY, 420) != 3
         return 2
     if fs_process_start(2) != 0 or fs_process_pid() != 2
         return 3
-    if sys_open(c"/b", 2, O_RDONLY) != 3
+    if sys_open(c"/b", 2, O_RDONLY, 420) != 3
         return 4
     if not reads(3, c"bravo", 5)
         return 5
-    if sys_open(c"/w", 2, O_WRONLY | O_CREAT) != 4 or sys_fs_write(4, c"hello", 5) != 5
+    if sys_open(c"/w", 2, O_WRONLY | O_CREAT, 420) != 4 or sys_fs_write(4, c"hello", 5) != 5
         return 6
     let writes: i32 = stub_writes()
     if fs_process_end() != 2
@@ -473,7 +499,7 @@ fn main() -> i32
         return 10
     if is_fs_fd(4) or sys_close(4) != Errno.BadF as i64
         return 11
-    if sys_open(c"/b", 2, O_RDONLY) != 4
+    if sys_open(c"/b", 2, O_RDONLY, 420) != 4
         return 12
     if fs_process_end() != 2 or fs_process_pid() != 0 or fs_process_count() != 0
         return 13
@@ -513,7 +539,7 @@ fn main() -> i32
     while i < 3 * FS_MAX_PROCS
         if fs_process_start(2) != 0
             return 2
-        if sys_open(c"/a", 2, O_RDONLY) != 3
+        if sys_open(c"/a", 2, O_RDONLY, 420) != 3
             return 3
         if fs_process_end() != 1
             return 4
@@ -545,17 +571,17 @@ fn main() -> i32
         return 1
     var want: i64 = 3
     while want < 256
-        if sys_open(c"/a", 2, O_RDONLY) != want
+        if sys_open(c"/a", 2, O_RDONLY, 420) != want
             return 2
         want = want + 1
-    if sys_open(c"/a", 2, O_RDONLY) != Errno.NFile as i64
+    if sys_open(c"/a", 2, O_RDONLY, 420) != Errno.NFile as i64
         return 3
     var fd: i32 = 3
     while fd < 256
         if sys_close(fd) != 0
             return 4
         fd = fd + 1
-    if sys_open(c"/a", 2, O_RDONLY) != 3
+    if sys_open(c"/a", 2, O_RDONLY, 420) != 3
         return 5
     # stdio is not a filesystem fd
     if is_fs_fd(0) or is_fs_fd(2) or sys_close(1) != Errno.BadF as i64
@@ -585,7 +611,7 @@ fn main() -> i32
     let base: i64 = heap_live()
     if fs_process_start(1) != 0
         return 1
-    if sys_open(c"/a", 2, O_RDONLY) != 3 or sys_dup(3) != 4
+    if sys_open(c"/a", 2, O_RDONLY, 420) != 3 or sys_dup(3) != 4
         return 2
     if not reads(4, c"al", 2) or not reads(3, c"pha", 3)
         return 3
@@ -595,7 +621,7 @@ fn main() -> i32
         return 5
     if sys_close(4) != 0 or is_fs_fd(4) or sys_close(4) != Errno.BadF as i64
         return 6
-    if sys_open(c"/w", 2, O_WRONLY | O_CREAT) != 3 or sys_dup(3) != 4
+    if sys_open(c"/w", 2, O_WRONLY | O_CREAT, 420) != 3 or sys_dup(3) != 4
         return 7
     if sys_fs_write(3, c"he", 2) != 2 or sys_fs_write(4, c"llo", 3) != 3
         return 8
@@ -606,7 +632,7 @@ fn main() -> i32
         return 10
     if sys_dup(1) != Errno.BadF as i64 or sys_dup(9) != Errno.BadF as i64
         return 11
-    if sys_open(c"/a", 2, O_RDONLY) != 3 or sys_dup(3) != 4
+    if sys_open(c"/a", 2, O_RDONLY, 420) != 3 or sys_dup(3) != 4
         return 12
     if fs_process_end() != 2 or heap_live() != base
         return 13

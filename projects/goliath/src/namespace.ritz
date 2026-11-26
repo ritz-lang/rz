@@ -23,10 +23,11 @@
 import ritzlib.strview { StrView, strview_empty }
 import ritzlib.span { Span, span_empty }
 import ritzlib.memory { Allocator }
+import ritzlib.result
 import goliath.alloc { allocator_alloc, allocator_free }
 import goliath.blob_id { BlobId, blob_id_zero, blob_id_is_zero, blob_id_copy }
 import goliath.blob_store { MemoryBlobStore, memory_store_get, memory_store_get_size, memory_store_get_span, memory_store_put, memory_store_refs, memory_store_retain, memory_store_release, memory_store_allocator, memory_store_mark_begin, memory_store_mark, memory_store_sweep, memory_store_hold_children, memory_store_holds_children }
-import goliath.dir_entry { NsEntry, dir_entry_file, dir_entry_dir, dir_entry_is_dir, dir_entry_name_eq, dir_entry_serialize, dir_entry_deserialize, dir_serialized_size, dir_entry_at, dir_entry_disk_size, DIR_HEADER_SIZE }
+import goliath.dir_entry { NsEntry, Metadata, dir_entry_file, dir_entry_dir, dir_entry_is_dir, dir_entry_name_eq, dir_entry_serialize, dir_entry_deserialize, dir_serialized_size, dir_entry_at, dir_entry_disk_size, DIR_HEADER_SIZE }
 import goliath.path { path_is_absolute, path_is_root, path_validate, PathIter, path_iter_new, path_iter_next }
 import goliath.error { ErrorCode }
 
@@ -183,10 +184,10 @@ pub fn namespace_hold(ns: *Namespace, id: *BlobId) -> bool
 pub fn namespace_unhold(ns: *Namespace, id: *BlobId)
     release(ns, id)
 
-# A copy of directory `dir` with entry `name` set to `child` (or removed,
-# when `child` is null), stored, with one reference for the caller. Zero and
-# *err set on failure.
-fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_is_dir: bool, size: u64, err: *ErrorCode) -> BlobId
+# A copy of directory `dir` with entry `name` set to `child` with metadata
+# `meta` (or removed, when `child` is null), stored, with one reference for
+# the caller. Zero and *err set on failure.
+fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_is_dir: bool, meta: *Metadata, err: *ErrorCode) -> BlobId
     let old_count: i32 = read_dir_count(ns, dir)
     if old_count < 0
         *err = ErrorCode.NotFound
@@ -221,7 +222,7 @@ fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_i
     while i < old_count
         if i == idx
             if child != null
-                write_entry(buf, out, name, child, child_is_dir, size)
+                write_entry(buf, out, name, child, child_is_dir, meta)
                 out = out + 1
         else
             let src: *u8 = dir_entry_at(old, i)
@@ -233,7 +234,7 @@ fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_i
             out = out + 1
         i = i + 1
     if child != null and idx < 0
-        write_entry(buf, out, name, child, child_is_dir, size)
+        write_entry(buf, out, name, child, child_is_dir, meta)
 
     var id: BlobId = put_dir(ns, buf, new_size)
     allocator_free(alloc, buf, new_size as i64)
@@ -241,13 +242,18 @@ fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_i
         *err = ErrorCode.OutOfSpace
     id
 
-fn write_entry(buf: *u8, index: i32, name: StrView, child: *BlobId, is_dir: bool, size: u64)
+fn write_entry(buf: *u8, index: i32, name: StrView, child: *BlobId, is_dir: bool, meta: *Metadata)
     var entry: NsEntry
     if is_dir
         entry = dir_entry_dir(name, child)
     else
-        entry = dir_entry_file(name, child, size)
+        entry = dir_entry_file(name, child, (*meta).size)
+    entry.metadata = *meta
     dir_entry_serialize(@entry, dir_entry_at(buf, index))
+
+# The metadata a new entry starts with: `size`, created 0, `modified`, `mode`.
+fn new_meta(size: u64, modified: u64, mode: u32) -> Metadata
+    Metadata { size: size, created: 0, modified: modified, mode: mode }
 
 # ============================================================================
 # Rewriting a path
@@ -257,11 +263,19 @@ const OP_WRITE: i32 = 0
 const OP_MKDIR: i32 = 1
 const OP_DELETE: i32 = 2
 
+# Permission bits: what an entry's mode keeps of the mode it is given.
+const MODE_PERM_MASK: u32 = 4095   # 07777
+const MODE_FILE_DEFAULT: u32 = 420 # 0644
+const MODE_DIR_DEFAULT: u32 = 493  # 0755
+
 # What to do to the last component of a path
 struct Change
     op: i32
     id: BlobId      # OP_WRITE / OP_MKDIR: the blob to link (caller holds a ref)
     size: u64
+    modified: u64   # The entry's modified time (the caller's clock; 0 = unset)
+    mode: u32       # The entry's permission bits, unless keep_mode
+    keep_mode: bool # OP_WRITE over an existing file: keep that file's mode
 
 # The directory `dir` with the rest of the path (from `iter`) changed: a new
 # directory blob with one reference for the caller, or zero and *err.
@@ -287,7 +301,8 @@ fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: 
         var sub: BlobId = rewrite(ns, @entry.blob_id, iter, change, err)
         if blob_id_is_zero(@sub)
             return sub
-        var id: BlobId = dir_with(ns, dir, name, @sub, true, 0, err)
+        # The directory keeps its own metadata: only its contents changed
+        var id: BlobId = dir_with(ns, dir, name, @sub, true, @entry.metadata, err)
         release(ns, @sub)
         return id
 
@@ -299,8 +314,10 @@ fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: 
         if dir_entry_is_dir(@target) and read_dir_count(ns, @target.blob_id) != 0
             *err = ErrorCode.DirectoryNotEmpty
             return blob_id_zero()
-        return dir_with(ns, dir, name, null, false, 0, err)
+        var none: Metadata = new_meta(0, 0, 0)
+        return dir_with(ns, dir, name, null, false, @none, err)
 
+    var meta: Metadata = new_meta((*change).size, (*change).modified, (*change).mode)
     if idx >= 0
         var existing: NsEntry = read_dir_entry(ns, dir, idx)
         if (*change).op == OP_MKDIR
@@ -309,7 +326,10 @@ fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: 
         if dir_entry_is_dir(@existing)
             *err = ErrorCode.NotAFile
             return blob_id_zero()
-    dir_with(ns, dir, name, @(*change).id, (*change).op == OP_MKDIR, (*change).size, err)
+        if (*change).keep_mode
+            meta.mode = existing.metadata.mode
+        meta.created = existing.metadata.created
+    dir_with(ns, dir, name, @(*change).id, (*change).op == OP_MKDIR, @meta, err)
 
 # Apply `change` at `path` and repoint the root at the result
 fn commit(ns: *Namespace, path: StrView, change: *Change) -> ErrorCode
@@ -378,20 +398,38 @@ pub fn namespace_file_size(ns: *Namespace, path: StrView) -> u64
     memory_store_get_size((*ns).store, @id)
 
 # Write/create a file. Its directory must exist; a directory can't be
-# overwritten (ErrorCode.NotAFile).
+# overwritten (ErrorCode.NotAFile). The entry's modified time is 0 and its
+# mode is kept (0644 for a new file): namespace_write_at with no clock.
 pub fn namespace_write(ns: *Namespace, path: StrView, data: @Span<u8>) -> ErrorCode
+    namespace_write_at(ns, path, data, 0)
+
+# namespace_write, stamping the entry's modified time with `modified` (the
+# caller's clock: goliath keeps none). An existing file keeps its mode; a
+# new one gets 0644.
+pub fn namespace_write_at(ns: *Namespace, path: StrView, data: @Span<u8>, modified: u64) -> ErrorCode
+    var change: Change = Change { op: OP_WRITE, id: blob_id_zero(), size: data.len as u64, modified: modified, mode: MODE_FILE_DEFAULT, keep_mode: true }
+    write_change(ns, path, data, @change)
+
+# namespace_write_at that also sets the file's permission bits to `mode`
+# (only its 07777 bits: the type is the entry's kind), whether the file is
+# new or not. What a create with an explicit mode writes.
+pub fn namespace_write_mode(ns: *Namespace, path: StrView, data: @Span<u8>, mode: u32, modified: u64) -> ErrorCode
+    var change: Change = Change { op: OP_WRITE, id: blob_id_zero(), size: data.len as u64, modified: modified, mode: mode & MODE_PERM_MASK, keep_mode: false }
+    write_change(ns, path, data, @change)
+
+# Store `data` and link it at `path` as `change` says.
+fn write_change(ns: *Namespace, path: StrView, data: @Span<u8>, change: *Change) -> ErrorCode
     let rc: ErrorCode = check_path(path)
     if rc != ErrorCode.Ok
         return rc
     if path_is_root(path)
         return ErrorCode.NotAFile
-    var change: Change = Change { op: OP_WRITE, id: blob_id_zero(), size: data.len as u64 }
-    change.id = memory_store_put((*ns).store, data.ptr, data.len as u64)
-    if blob_id_is_zero(@change.id)
+    (*change).id = memory_store_put((*ns).store, data.ptr, data.len as u64)
+    if blob_id_is_zero(@(*change).id)
         return ErrorCode.OutOfSpace
-    let result: ErrorCode = commit(ns, path, @change)
+    let result: ErrorCode = commit(ns, path, change)
     # The new directory holds its own reference now (or the write failed)
-    release(ns, @change.id)
+    release(ns, @(*change).id)
     result
 
 # Create a directory
@@ -401,7 +439,7 @@ pub fn namespace_mkdir(ns: *Namespace, path: StrView) -> ErrorCode
         return rc
     if path_is_root(path)
         return ErrorCode.AlreadyExists
-    var change: Change = Change { op: OP_MKDIR, id: put_empty_dir(ns), size: 0 }
+    var change: Change = Change { op: OP_MKDIR, id: put_empty_dir(ns), size: 0, modified: 0, mode: MODE_DIR_DEFAULT, keep_mode: false }
     if blob_id_is_zero(@change.id)
         return ErrorCode.OutOfSpace
     let result: ErrorCode = commit(ns, path, @change)
@@ -417,7 +455,7 @@ pub fn namespace_delete(ns: *Namespace, path: StrView) -> ErrorCode
         return rc
     if path_is_root(path)
         return ErrorCode.PermissionDenied
-    var change: Change = Change { op: OP_DELETE, id: blob_id_zero(), size: 0 }
+    var change: Change = Change { op: OP_DELETE, id: blob_id_zero(), size: 0, modified: 0, mode: 0, keep_mode: false }
     commit(ns, path, @change)
 
 # List directory contents: copies up to `max_entries` entries, returns the
@@ -438,3 +476,59 @@ pub fn namespace_list(ns: *Namespace, path: StrView, entries: *NsEntry, max_entr
         *(entries + i) = read_dir_entry(ns, @dir_id, i)
         i = i + 1
     count
+
+# ============================================================================
+# Metadata (AGAST #4832)
+# ============================================================================
+
+# What namespace_stat reports for a path: its kind and its entry's metadata.
+# `modified` is the clock namespace_write_at was given (0 if none was);
+# `mode` is the permission bits (07777). The root has no entry: it is a
+# directory with mode 0755 and modified 0.
+pub struct NsStat
+    is_dir: bool
+    size: u64           # File size in bytes (0 for directories)
+    modified: u64
+    mode: u32
+
+# The entry at `path`: Err(InvalidPath) for a relative or malformed path,
+# Err(NotADirectory) if a component below the root is a file, Err(NotFound)
+# if a component is missing.
+pub fn namespace_stat(ns: *Namespace, path: StrView) -> Result<NsStat, ErrorCode>
+    if not path_is_absolute(path) or check_path(path) != ErrorCode.Ok
+        return Err(ErrorCode.InvalidPath)
+    var st: NsStat = NsStat { is_dir: true, size: 0, modified: 0, mode: MODE_DIR_DEFAULT }
+    var current: BlobId = blob_id_copy(@(*ns).root)
+    var iter: PathIter = path_iter_new(path)
+    var name: StrView = strview_empty()
+    while path_iter_next(@iter, @name)
+        if not st.is_dir
+            return Err(ErrorCode.NotADirectory)
+        let idx: i32 = find_entry_in_dir(ns, @current, name)
+        if idx < 0
+            return Err(ErrorCode.NotFound)
+        var entry: NsEntry = read_dir_entry(ns, @current, idx)
+        current = blob_id_copy(@entry.blob_id)
+        st = NsStat { is_dir: dir_entry_is_dir(@entry), size: entry.metadata.size, modified: entry.metadata.modified, mode: entry.metadata.mode }
+    Ok(st)
+
+# The newest modified time of any entry in the tree (0 for an empty or
+# unstamped one). A caller whose clock restarts (Harland's, every boot)
+# starts it past this, so a time it stamps never repeats one already stored.
+pub fn namespace_max_modified(ns: *Namespace) -> u64
+    max_modified_below(ns, @(*ns).root)
+
+fn max_modified_below(ns: *Namespace, dir: *BlobId) -> u64
+    var newest: u64 = 0
+    let count: i32 = read_dir_count(ns, dir)
+    var i: i32 = 0
+    while i < count
+        var entry: NsEntry = read_dir_entry(ns, dir, i)
+        if entry.metadata.modified > newest
+            newest = entry.metadata.modified
+        if dir_entry_is_dir(@entry)
+            let below: u64 = max_modified_below(ns, @entry.blob_id)
+            if below > newest
+                newest = below
+        i = i + 1
+    newest

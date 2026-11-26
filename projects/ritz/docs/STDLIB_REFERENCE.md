@@ -1798,6 +1798,11 @@ fs re-exports): `NoEnt`, `Exist`, ..., or `Other(n)`; no fs function returns
 a `-1` / `null` sentinel. A path of 4096 bytes or more fails with
 `NameTooLong` without making a syscall.
 
+**Targets.** `read_file`, `write_file`, `copy_file`, `stat` / `lstat`, the
+path checks below, `file_size`, the path utilities and the mode helpers
+compile for Linux and Harland (#4830, #4832); the rest is Linux-only. Harland
+has no symlinks: there `lstat` is `stat` and `is_symlink` is `false`.
+
 **Path Checking** (lstat: a symlink is reported as itself, so `is_dir` of a
 link to a directory is `false`):
 
@@ -1827,6 +1832,16 @@ link to a directory is `false`):
 |----------|-----------|-------------|
 | `stat` | `fn(path: StrView) -> Result<Stat, Errno>` | Status of `path`, following symlinks |
 | `lstat` | `fn(path: StrView) -> Result<Stat, Errno>` | Status of `path`; a symlink is reported as itself |
+
+`Stat` is Linux's x86-64 `struct stat` on both targets (`ritzlib.sys`), so a
+"has the file changed" check compares `st_size`, `st_mtime` and
+`st_mtime_ns` the same way on each. Harland (#4832) fills `st_mode` (type and
+permission bits: the `O_CREAT` mode a file was created with, 0644 otherwise,
+0755 for a directory), `st_size`, `st_nlink`, `st_blksize`, `st_blocks`, and
+`st_mtime` / `st_mtime_ns` from its file clock: nanoseconds that only move
+forward, across reboots too, and differ on every commit (a written fd's
+close), but are no wall-clock date. `st_atime` and `st_ctime` repeat
+`st_mtime`; the rest is 0.
 
 `Stat` is the kernel's x86_64 `struct stat`, defined once in `ritzlib.sys`
 (`st_dev`, `st_ino`, `st_nlink`, `st_mode`, `st_uid`, `st_gid`, `st_size`,
@@ -1991,6 +2006,14 @@ fn in_dir(dir: StrView) -> i32
 and a negative errno; the raw `sys_*` fd calls are the kernel-ABI layer under
 it. `ritzlib.fd` re-exports `ritzlib.errno`, the `O_*` open flags, `LOCK_*`
 and `Stat` from `ritzlib.sys`, and defines `SEEK_SET`, `SEEK_CUR`, `SEEK_END`.
+
+**Targets** (#4832): the module compiles for Linux and Harland. On Harland
+`fd_open` (a file `O_CREAT` makes gets `mode`), `read*`, `write*`, `seek`,
+`stat` and `close` reach the kernel; `stat` of a file fd reports the file as
+the fd opened it (a write fd's bytes land on close), and of fds 0-2 the
+console (`S_IFCHR`). `dup`, `dup_to`, `truncate`, `chmod`, `lock`,
+`sendfile`, the nonblocking calls and `pipe` are `Err(Other(38))` (ENOSYS)
+there, and `poll` is Linux-only (Harland: `ritzlib.timedread`).
 
 ```ritz
 struct Fd

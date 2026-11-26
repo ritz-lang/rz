@@ -58,7 +58,8 @@ AREAS = {
     ],
     "file": [
         "sys_readdir_impl",
-        "sys_close_handler", "sys_lseek_handler", "sys_mkdir_handler", "sys_write_handler",
+        "sys_close_handler", "sys_stat_handler", "sys_fstat_handler",
+        "sys_lseek_handler", "sys_mkdir_handler", "sys_write_handler",
         "sys_read_handler", "sys_readdir_handler", "tty_fd_ok",
         "sys_tty_getattr_handler", "sys_tty_setattr_handler", "sys_tty_setfg_handler",
         "sys_sync_handler",
@@ -228,8 +229,9 @@ def test_table_registers_handlers_imported_from_their_area():
     code = _code(_area("entry"))
     regs = re.findall(r"^\s+syscall_register\(Syscall\.(\w+),\s*(\w+)\)", _body(code, "syscall_table_init"), re.M)
     # 38 since ShmMap (227, #4717); 39 with DrvIrqWait (220, #4719);
-    # 42 with NetInfo, NetAddr, NetAttach (#4751); 43 with Poll (7, #4829).
-    assert len(regs) == 43, regs
+    # 42 with NetInfo, NetAddr, NetAttach (#4751); 43 with Poll (7, #4829);
+    # 45 with Stat and Fstat (4, 5, #4832).
+    assert len(regs) == 45, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"
@@ -247,11 +249,12 @@ def test_sys_open_handler_calls_sys_open_without_the_old_workaround():
     The save/restore of those globals that used to wrap the call is gone
     (#2761): what clobbered them was the 4 KiB syscall stack overrunning
     .data, fixed in syscall_entry.s. The flags have a name since #4472
-    because the O_CREAT path needs a second capability check."""
+    because the O_CREAT path needs a second capability check; r10 is the
+    O_CREAT mode since #4832."""
     code = _code(_area("process"))
     body = _body(code, "sys_open_handler")
     assert "cap_process_has(pid, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)" in body, body
-    assert re.search(r"return sys_open\(rdi as \*u8, rsi, flags\)", body), body
+    assert re.search(r"return sys_open\(rdi as \*u8, rsi, flags, r10 as u32\)", body), body
     assert "saved_child_pid" not in body and "saved_has_parent" not in body, body
     assert "WORKAROUND" not in _area("process").read_text()
 

@@ -520,15 +520,21 @@ if runs < 6:
 # guest and inflates ticks and preemptions together. 3 leaves margin on both
 # sides, and the run count above must pass as well, so neither a lone green
 # boot nor a lucky preemption can wave the regression through.
-sched = re.search(r"\[sched\] (\d+) ticks, (\d+) switches, (\d+) preemptions", text)
+# The ticks are the contended ones, those that found two or more processes
+# runnable (proc/sched.ritz, AGAST #4832): the boot's total also counts
+# every tick a Tier-1 program spends alone, waiting on the 100 ms disk say,
+# which no scheduler can preempt on. Counted against all ticks, the ratio
+# grew with the suite (2.96 once #4830's /var test joined it) until a test
+# that changed nothing in the scheduler failed it.
+sched = re.search(r"\[sched\] (\d+) ticks, (\d+) switches, (\d+) preemptions, (\d+) contended ticks", text)
 if not sched:
     print(f"FAIL ({name}): no [sched] tick/preemption counters to check the preempt path")
     sys.exit(1)
-ticks, switches, preemptions = map(int, sched.groups())
-if preemptions == 0 or ticks > preemptions * 3:
-    print(f"FAIL ({name}): one child ran alone: {ticks} ticks but only {preemptions} preemptions (ratio {ticks / max(preemptions, 1):.1f}; AGAST #4332)")
+ticks, switches, preemptions, contended = map(int, sched.groups())
+if preemptions == 0 or contended > preemptions * 3:
+    print(f"FAIL ({name}): one child ran alone: {contended} contended ticks but only {preemptions} preemptions (ratio {contended / max(preemptions, 1):.1f}; AGAST #4332)")
     sys.exit(1)
-print(f"PASS ({name}): two busy children preempted each other: {order} ({runs} runs, {ticks} ticks / {preemptions} preemptions)")
+print(f"PASS ({name}): two busy children preempted each other: {order} ({runs} runs, {contended} contended of {ticks} ticks / {preemptions} preemptions)")
 PY
 }
 
@@ -687,6 +693,20 @@ write_empty() {
     return 1
 }
 
+# stat_ok NAME: pass only if indium's stat_test checked /var as well as /tmp
+# (AGAST #4832): stat/fstat's size, mtime and mode, and open(O_CREAT)'s
+# mode. Its exit code already fails the suite; this stops a boot whose
+# storage disk came up from passing on the /tmp leg alone.
+stat_ok() {
+    if grep -aq "\[stat_test\] PASS: /tmp and /var" "$WORK/$1.log"; then
+        echo "PASS ($1): stat and fstat reported size, mtime and mode on /tmp and /var"
+        return 0
+    fi
+    grep -a "\[stat_test\]" "$WORK/$1.log" | head -3
+    echo "FAIL ($1): stat_test did not pass on both /tmp and /var"
+    return 1
+}
+
 # net_nodev NAME: pass only if init ran indium's ping, udp-send and
 # udp-recv and each exited 19 (-Errno.NoDev): a Tier-1 boot runs no ring-2
 # service, so NetAttach answers NoDev and each tool ends before it publishes
@@ -774,6 +794,7 @@ if [ "$MODE" != grub ]; then
     all_passed native || rc=1
     net_nodev native || rc=1
     write_empty native || rc=1
+    stat_ok native || rc=1
     boot_tests_passed native || rc=1
     smp_stacks native || rc=1
     ring_holds_boot native || rc=1
@@ -813,6 +834,7 @@ EOF
     all_passed grub || rc=1
     net_nodev grub || rc=1
     write_empty grub || rc=1
+    stat_ok grub || rc=1
     boot_tests_passed grub || rc=1
     smp_stacks grub || rc=1
     blk_transport grub legacy || rc=1

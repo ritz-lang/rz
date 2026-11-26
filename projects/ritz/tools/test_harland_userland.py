@@ -98,11 +98,12 @@ def _harland_fns(src: str) -> dict[str, str]:
 
 
 def test_ritzlib_has_harland_sys_open_and_close():
-    """Harland's open takes (path, path_len, flags): the wrapper passes the
-    length, so callers keep the (path, flags) signature linux has."""
+    """Harland's open takes (path, path_len, flags, mode): the wrapper passes
+    the length (and 0644, AGAST #4832), so callers keep the (path, flags)
+    signature linux has."""
     fns = _harland_fns(SYS_RITZ.read_text())
     assert "sys_open" in fns and "sys_close" in fns, sorted(fns)
-    assert re.search(r"syscall3\(SYS_OPEN, path as i64, \w+, flags as i64\)", fns["sys_open"]), (
+    assert re.search(r"syscall4\(SYS_OPEN, path as i64, \w+, flags as i64, 420\)", fns["sys_open"]), (
         fns["sys_open"]
     )
     assert "syscall1(SYS_CLOSE, fd as i64)" in fns["sys_close"], fns["sys_close"]

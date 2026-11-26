@@ -1,6 +1,6 @@
 # Harland Syscall Runtime - File (AGAST #2751, from main.ritz)
 #
-# read/write/close/lseek/mkdir/readdir: filesystem fds go to fs/syscall.ritz,
+# read/write/close/stat/fstat/lseek/mkdir/readdir: filesystem fds go to fs/syscall.ritz,
 # fds 0-2 to the serial console. (open lives in process.ritz: see there.)
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
@@ -9,12 +9,15 @@ import klog { klog }
 import serial { StrView, serial_buffer_write, serial_drain_output }
 import tty.console { tty_console_read, tty_console_get_flags, tty_console_set_flags, tty_console_set_fg }
 import mm.uptr { uptr_validate_string, uptr_check_read, uptr_check_write }
-import fs.kfs { kfs_ns_for, kfs_local, kfs_list }
+import fs.kfs { kfs_ns_for, kfs_local, kfs_list, kfs_errno }
 import goliath.namespace { Namespace }
 import goliath.dir_entry { NsEntry }
 import goliath.path { GOLIATH_PATH_MAX, PATH_SEP }
 import ritzlib.strview { strview_from_ptr }
-import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_lseek, sys_mkdir, is_fs_fd, fs_sync }
+import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_fstat, sys_lseek, sys_mkdir, is_fs_fd, fs_sync }
+import fs.stat { Stat, stat_at }
+import ritzlib.result
+import ritzlib.option
 import syscall.errno { Errno }
 import syscall.runtime.process { current_pid }
 import cap.table { cap_process_has, cap_process_has_any }
@@ -96,6 +99,52 @@ pub fn sys_close_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         return sys_close(fd)
     # Otherwise, return success (stdin/stdout/stderr don't close)
     return 0
+
+# stat(path, path_len, *Stat): fs/stat.ritz. Looking a path up needs READ in
+# the namespace, as open does (AGAST #4832).
+pub fn sys_stat_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)
+        klog("[syscall] stat denied (no namespace capability)\n")
+        return Errno.Perm as i64
+    # SECURITY: Validate the path (same contract as mkdir) and the record
+    if rsi == 0
+        return Errno.Inval as i64
+    if rsi > GOLIATH_PATH_MAX as u64
+        return Errno.NameTooLong as i64
+    if uptr_check_read(rdi as *u8, rsi as u64) != 0
+        return Errno.Fault as i64
+    if uptr_check_write(rdx as *u8, sizeof(Stat) as u64) != 0
+        return Errno.Fault as i64
+    # Absolute paths only: userspace resolves a relative one (AGAST #4776)
+    if *(rdi as *u8) != PATH_SEP
+        return Errno.Inval as i64
+    # /var and below are the persistent subtree's, as for open (fs/kfs.ritz)
+    let path: StrView = StrView { ptr: rdi as *u8, len: rsi as i64 }
+    let ns: *Namespace = kfs_ns_for(path)
+    if ns == 0 as *Namespace
+        return Errno.NoDev as i64
+    match stat_at(ns, kfs_local(path))
+        Ok(st) => return stat_to_user(st, rdx as *Stat)
+        Err(e) => return kfs_errno(e) as i64
+
+# fstat(fd, *Stat): a file fd's status needs a namespace right, as lseek
+# does; the console fds' stays ungated, as their read and write do.
+pub fn sys_fstat_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    let fd: i32 = rdi as i32
+    if uptr_check_write(rsi as *u8, sizeof(Stat) as u64) != 0
+        return Errno.Fault as i64
+    if is_fs_fd(fd) and not cap_process_has_any(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_READ | CAP_RIGHT_WRITE)
+        klog("[syscall] fstat denied (no namespace capability)\n")
+        return Errno.Perm as i64
+    match sys_fstat(fd)
+        Some(st) => return stat_to_user(st, rsi as *Stat)
+        None => return Errno.BadF as i64
+
+# Write `st` to the caller's record `out` (checked writable): stat's and
+# fstat's 0.
+fn stat_to_user(st: Stat, out: *Stat) -> i64
+    *out = st
+    0
 
 # lseek(fd, offset, whence): only filesystem fds have a position.
 pub fn sys_lseek_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

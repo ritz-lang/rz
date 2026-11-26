@@ -1,0 +1,96 @@
+# stat and fstat: a file's type, mode, size and modified time (AGAST #4832)
+#
+# Harland's stat (syscall 4) and fstat (5) fill Linux's x86-64 `struct
+# stat`, the 144-byte layout ritzlib/sys.ritz declares as `Stat`, so
+# ritzlib.fs stat and Fd.stat return one type on Linux and Harland. The
+# kernel can't import ritzlib.sys (its tables are per target), so Stat is
+# mirrored here field for field; ritz0/tests/test_harland_stat_abi.py diffs
+# the two.
+#
+# What each field holds on Harland:
+#   st_mode      S_IFREG or S_IFDIR (S_IFCHR for the console fds 0-2) | the
+#                entry's permission bits: what open(O_CREAT, mode) gave a
+#                file (0644 if it was made another way), 0755 for a
+#                directory. Recorded and reported; Harland has no users, so
+#                nothing enforces them.
+#   st_size      the file's bytes (0 for a directory)
+#   st_mtime     the file clock (fs/kfs.ritz kfs_clock) at the commit that
+#   st_mtime_ns  last wrote the file, as seconds and the nanoseconds within
+#                them; 0 for a directory or an initramfs file. st_atime and
+#                st_ctime repeat it: Harland keeps one time per file.
+#   st_nlink     1; st_blksize 4096; st_blocks the 512-byte blocks st_size
+#                needs. Every other field is 0.
+
+import serial { StrView }
+import fs.vfs { S_IFREG, S_IFDIR, S_IFCHR }
+import goliath.namespace { Namespace, NsStat, namespace_stat }
+import goliath.error { ErrorCode }
+import ritzlib.result
+
+# Linux x86-64 struct stat: ritzlib/sys.ritz `Stat`, in the same order.
+pub struct Stat
+    st_dev: i64       # 0: device ID
+    st_ino: i64       # 8: inode number
+    st_nlink: i64     # 16: number of hard links
+    st_mode: i32      # 24: file mode (permissions + type)
+    st_uid: i32       # 28: user ID of owner
+    st_gid: i32       # 32: group ID of owner
+    __pad0: i32       # 36: padding
+    st_rdev: i64      # 40: device ID (if special file)
+    st_size: i64      # 48: total size in bytes
+    st_blksize: i64   # 56: block size for filesystem I/O
+    st_blocks: i64    # 64: number of 512B blocks allocated
+    st_atime: i64     # 72: last access time (seconds)
+    st_atime_ns: i64  # 80: last access time (nanoseconds)
+    st_mtime: i64     # 88: last modification time (seconds)
+    st_mtime_ns: i64  # 96: last modification time (nanoseconds)
+    st_ctime: i64     # 104: last status change time (seconds)
+    st_ctime_ns: i64  # 112: last status change time (nanoseconds)
+    __reserved: i64   # 120: reserved
+    __reserved2: i64  # 128: reserved
+    __reserved3: i64  # 136: reserved
+
+const PERM_MASK: u32 = 4095        # 07777
+const CONSOLE_MODE: u32 = 400      # 0620, crw--w----
+const BLKSIZE: i64 = 4096
+const NS_PER_SEC: u64 = 1000000000
+
+# The Stat for an entry of type `type_bits` (S_IFREG, ...) with permission
+# bits `mode`, `size` bytes and modified time `mtime` (file-clock ns).
+pub fn stat_record(type_bits: u32, mode: u32, size: u64, mtime: u64) -> Stat
+    let sec: i64 = (mtime / NS_PER_SEC) as i64
+    let nsec: i64 = (mtime % NS_PER_SEC) as i64
+    Stat {
+        st_dev: 0, st_ino: 0, st_nlink: 1,
+        st_mode: (type_bits | (mode & PERM_MASK)) as i32,
+        st_uid: 0, st_gid: 0, __pad0: 0, st_rdev: 0,
+        st_size: size as i64, st_blksize: BLKSIZE, st_blocks: ((size + 511) / 512) as i64,
+        st_atime: sec, st_atime_ns: nsec,
+        st_mtime: sec, st_mtime_ns: nsec,
+        st_ctime: sec, st_ctime_ns: nsec,
+        __reserved: 0, __reserved2: 0, __reserved3: 0
+    }
+
+# The Stat for a namespace entry, with `size` in place of its own (fstat
+# reports the size its fd reads).
+pub fn stat_of_entry(st: NsStat, size: u64) -> Stat
+    if st.is_dir
+        return stat_record(S_IFDIR, st.mode, 0, st.modified)
+    stat_record(S_IFREG, st.mode, size, st.modified)
+
+# The Stat of the console, what fstat reports for fds 0-2.
+pub fn stat_console() -> Stat
+    stat_record(S_IFCHR, CONSOLE_MODE, 0, 0)
+
+# The Stat of the file or directory at `path` in `ns` (a path within it, as
+# fs/kfs.ritz kfs_local gives one), or the namespace's error: NotFound,
+# NotADirectory, InvalidPath. The stat handler (syscall/runtime/file.ritz)
+# picks the namespace and turns the error into an Errno.
+#
+# This module does not import fs.kfs: through its storage driver that reaches
+# drivers/iommu/vtd.ritz, whose VtdDma declares an `Ok` beside goliath's
+# ErrorCode.Ok, and a bare `Ok(...)` would then be ambiguous here.
+pub fn stat_at(ns: *Namespace, path: StrView) -> Result<Stat, ErrorCode>
+    match namespace_stat(ns, path)
+        Ok(st) => Ok(stat_of_entry(st, st.size))
+        Err(e) => Err(e)

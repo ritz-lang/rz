@@ -1,0 +1,167 @@
+# stat_test: Harland's stat and fstat, and open(O_CREAT)'s mode, through
+# ritzlib's portable stat and Fd.stat (AGAST #4832).
+#
+# Harland fills Linux's `struct stat` (ritzlib.sys Stat) with the file's
+# type and permission bits, its size and its modified time on the file clock
+# (kernel/src/fs/kfs.ritz kfs_clock: strictly increasing over every commit).
+# A write fd's bytes reach the file on close, so that is when stat sees a new
+# size and a new mtime. Each step runs on a RAM path (/tmp) and, when the
+# boot has a storage disk, on /var, which goes through the persistent subtree
+# too. Each exit code names the step that failed: 10 + step for /tmp, 30 +
+# step for /var, 50 + step for the console fd.
+#
+# The file is created fresh each run, so its mode is the O_CREAT mode: its
+# name carries the boot count (/var/boots), as a reboot keeps /var.
+# tools/test_tier1_boot.sh requires the final PASS line to name /var, so the
+# /var leg cannot skip unnoticed on a boot that has the disk.
+
+import ritzlib.fs { stat, read_file, mode_is_dir, mode_is_file, mode_is_char }
+import ritzlib.fd { Fd, fd_open, fd_stdout, Stat, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC }
+import ritzlib.errno { Errno }
+import ritzlib.option
+import ritzlib.span { span_from_strview }
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import tool_io { make_directory }
+
+const DIR_EXISTS: i64 = -17
+const MODE_0600: i32 = 384
+const PERM_MASK: i32 = 4095
+const NS_PER_SEC: i64 = 1000000000
+
+fn fail(step: i32, what: StrView) -> i32
+    print("[stat_test] FAIL step {step}: {what}\n")
+    step
+
+# A Stat's modified time as one number of file-clock nanoseconds.
+fn mtime_of(st: @Stat) -> i64
+    st.st_mtime * NS_PER_SEC + st.st_mtime_ns
+
+# Open `path` with `flags` (and `mode` if it creates it), write `text` and
+# close: the fd's own Stat, taken before the write, or None if any of it
+# failed.
+fn write_through(path: StrView, flags: i32, mode: i32, text: StrView) -> Option<Stat>
+    var f: Fd = match fd_open(path, flags, mode)
+        Ok(fd) => fd
+        Err(_) => return None
+    let opened: Stat = match f.stat()
+        Ok(st) => st
+        Err(_) =>
+            f.close()
+            return None
+    let wrote: bool = match f.write_all(span_from_strview(text))
+        Ok(_) => true
+        Err(_) => false
+    let closed: bool = match f.close()
+        Ok(_) => true
+        Err(_) => false
+    if not wrote or not closed
+        return None
+    Some(opened)
+
+# The steps on file `path` in directory `dir`; 0, or the failing step.
+fn run_steps(dir: StrView, path: StrView) -> i32
+    # 1. Create with mode 0600 and write: the fd's fstat is the new file,
+    #    empty and 0600, before close commits the bytes.
+    let opened: Stat = match write_through(path, O_WRONLY | O_CREAT | O_TRUNC, MODE_0600, "hello")
+        Some(st) => st
+        None => return fail(1, "create and write failed")
+    if not mode_is_file(opened.st_mode) or (opened.st_mode & PERM_MASK) != MODE_0600
+        return fail(1, "fstat of the created fd is not a 0600 regular file")
+    if opened.st_size != 0
+        return fail(1, "fstat of the created fd is not empty")
+
+    # 2. stat after close: the mode round-trips, the bytes and a time are in.
+    let first: Stat = match stat(path)
+        Ok(st) => st
+        Err(_) => return fail(2, "stat after create failed")
+    if not mode_is_file(first.st_mode) or (first.st_mode & PERM_MASK) != MODE_0600
+        return fail(2, "stat does not report the O_CREAT mode 0600")
+    if first.st_size != 5
+        return fail(2, "stat size after writing 5 bytes is not 5")
+    if mtime_of(@first) <= 0
+        return fail(2, "stat mtime after a write is 0")
+
+    # 3. Rewrite and close: size and mtime move, the mode stays.
+    match write_through(path, O_WRONLY | O_TRUNC, 420, "hello, world")
+        Some(_) => pass
+        None => return fail(3, "rewrite failed")
+    let second: Stat = match stat(path)
+        Ok(st) => st
+        Err(_) => return fail(4, "stat after rewrite failed")
+    if second.st_size != 12
+        return fail(4, "stat size after the rewrite is not 12")
+    if mtime_of(@second) <= mtime_of(@first)
+        return fail(5, "mtime did not move forward after write+close")
+    if (second.st_mode & PERM_MASK) != MODE_0600
+        return fail(6, "the rewrite changed the mode")
+
+    # 4. A read fd's fstat agrees with stat of the path.
+    var r: Fd = match fd_open(path, O_RDONLY, 0)
+        Ok(fd) => fd
+        Err(_) => return fail(7, "read open failed")
+    let held: Stat = match r.stat()
+        Ok(st) => st
+        Err(_) =>
+            r.close()
+            return fail(7, "fstat of the read fd failed")
+    r.close()
+    if held.st_size != 12 or mtime_of(@held) != mtime_of(@second) or held.st_mode != second.st_mode
+        return fail(7, "fstat of the read fd differs from stat of the path")
+
+    # 5. The directory is a directory; a missing path is NoEnt.
+    match stat(dir)
+        Ok(st) =>
+            if not mode_is_dir(st.st_mode)
+                return fail(8, "stat of the directory is not S_IFDIR")
+        Err(_) => return fail(8, "stat of the directory failed")
+    match stat("/no/such/file")
+        Ok(_) => return fail(9, "stat of a missing path succeeded")
+        Err(e) => match e
+            NoEnt => pass
+            _ => return fail(9, "stat of a missing path is not NoEnt")
+    0
+
+# `dir` + "/stat_" + `tag`: a name no earlier boot used.
+fn file_in(dir: StrView, tag: StrView) -> String
+    var s: String = string_from(dir)
+    s.push_str("/stat_")
+    s.push_str(tag)
+    s
+
+pub fn main() -> i32
+    # The console fd is a character device
+    match fd_stdout().stat()
+        Ok(st) =>
+            if not mode_is_char(st.st_mode)
+                return fail(51, "fstat of stdout is not S_IFCHR")
+        Err(_) => return fail(51, "fstat of stdout failed")
+
+    let mk: i64 = make_directory("/tmp")
+    if mk != 0 and mk != DIR_EXISTS
+        return fail(1, "mkdir /tmp failed")
+
+    # The boot count names this boot's files; no disk, no count, no /var leg.
+    var boots: String = match read_file("/var/boots")
+        Ok(s) => s
+        Err(_) => string_from("")
+    let has_var: bool = boots.len() > 0
+    if not has_var
+        boots = string_from("0")
+
+    let tmp_file: String = file_in("/tmp", boots.as_view())
+    let ram: i32 = run_steps("/tmp", tmp_file.as_view())
+    if ram != 0
+        return 10 + ram
+
+    if not has_var
+        print("[stat_test] PASS: /tmp (no storage disk, /var skipped)\n")
+        return 0
+
+    let var_file: String = file_in("/var", boots.as_view())
+    let persist: i32 = run_steps("/var", var_file.as_view())
+    if persist != 0
+        return 30 + persist
+
+    print("[stat_test] PASS: /tmp and /var\n")
+    0

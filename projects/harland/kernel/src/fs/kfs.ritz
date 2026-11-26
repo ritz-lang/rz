@@ -24,7 +24,7 @@ import ritzlib.span { Span, span_from_ptr }
 import ritzlib.fmt.digits { fmt_u64_into }
 import ritzlib.memory { Allocator }
 import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_count }
-import goliath.namespace { Namespace, namespace_new, namespace_exists, namespace_read, namespace_write, namespace_mkdir, namespace_list }
+import goliath.namespace { Namespace, namespace_new, namespace_exists, namespace_read, namespace_write, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_list, namespace_max_modified }
 import goliath.block_store { BlockDevice, block_store_save, block_store_load }
 import goliath.dir_entry { NsEntry }
 import goliath.error { ErrorCode }
@@ -96,6 +96,9 @@ var g_kfs_initialized: bool = false
 # was skipped since (fs_sync/power-off clear it).
 var g_kfs_last_save_ns: u64 = 0
 var g_kfs_save_pending: bool = false
+# The file clock (kfs_clock): this boot's offset, and the last time it gave.
+var g_kfs_clock_base: u64 = 0
+var g_kfs_clock_last: u64 = 0
 
 # Start the kernel namespace. The storage device holds the persistent /var
 # subtree's goliath image (what the last boot saved); a blank device starts
@@ -125,6 +128,9 @@ pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
             # A failed load may have stored part of the image
             g_kfs_pstore = memory_store_new_in(kfs_allocator())
             g_kfs_pns = namespace_new(@g_kfs_pstore)
+    # This boot's file clock starts past every time the image holds
+    g_kfs_clock_base = namespace_max_modified(@g_kfs_pns)
+    g_kfs_clock_last = g_kfs_clock_base
     g_kfs_initialized = true
     if namespace_exists(@g_kfs_ns, "/") == false
         return -1
@@ -186,6 +192,29 @@ pub fn kfs_save_later() -> i32
 # Whether a debounced save is owed to the storage device
 pub fn kfs_save_pending() -> bool
     g_kfs_save_pending
+
+# ============================================================================
+# The file clock: what a file's modified time is (AGAST #4832)
+# ============================================================================
+#
+# Harland has no wall clock (no RTC driver), so a file's modified time is
+# not a date. It is the file clock: nanoseconds of time_ns() (the TSC since
+# boot) plus this boot's base, the newest modified time in the persistent
+# subtree when it loaded. So it only moves forward, across reboots too: a
+# write today is later than anything the image kept from an earlier boot.
+# Every commit (a written fd's close, an O_CREAT, the boot count) takes a new
+# reading, strictly greater than the last, so two commits never share a time
+# and "has the file changed since I read it" is "is its mtime different".
+# Files the initramfs loads carry 0. stat reports it as st_mtime (seconds)
+# and st_mtime_ns (the nanoseconds within that second).
+
+# The next file-clock reading: past every earlier one.
+pub fn kfs_clock() -> u64
+    var now: u64 = g_kfs_clock_base + time_ns()
+    if now <= g_kfs_clock_last
+        now = g_kfs_clock_last + 1
+    g_kfs_clock_last = now
+    now
 
 # ============================================================================
 # The persistent subtree (/var)
@@ -262,12 +291,36 @@ pub fn kfs_list(ns: *Namespace, path: StrView, entries: *NsEntry, max_entries: i
 # the runtime tree, which is RAM and gone at reboot.
 
 # Write `path` as the running system sees it: the runtime tree, plus the
-# persistent subtree for /var and below. 0 or an Errno.
+# persistent subtree for /var and below. Both copies get one new file-clock
+# reading as their modified time and keep the file's mode (0644 if it is
+# new). 0 or an Errno.
 pub fn kfs_persist_write(path: StrView, data: *u8, size: u64) -> i32
-    let rc: i32 = kfs_write(kfs_get(), path, data, size)
+    kfs_commit(path, data, size, KfsMode.Keep, 0)
+
+# Create (or replace) `path` as an empty file with permission bits `mode`,
+# where kfs_persist_write would write: what open(O_CREAT, mode) does when the
+# path is missing. 0 or an Errno.
+pub fn kfs_persist_create(path: StrView, mode: u32) -> i32
+    var empty: u8 = 0
+    kfs_commit(path, @empty, 0, KfsMode.Set, mode)
+
+# Whether a commit keeps the file's mode or sets it
+enum KfsMode
+    Keep
+    Set
+
+fn kfs_commit(path: StrView, data: *u8, size: u64, how: KfsMode, mode: u32) -> i32
+    let mtime: u64 = kfs_clock()
+    let rc: i32 = kfs_write_meta(kfs_get(), path, data, size, how, mode, mtime)
     if rc != KFS_OK or not kfs_is_persist(path)
         return rc
-    kfs_write(@g_kfs_pns, kfs_local(path), data, size)
+    kfs_write_meta(@g_kfs_pns, kfs_local(path), data, size, how, mode, mtime)
+
+fn kfs_write_meta(ns: *Namespace, path: StrView, data: *u8, size: u64, how: KfsMode, mode: u32, mtime: u64) -> i32
+    let bytes: Span<u8> = span_from_ptr<u8>(data, size as i64)
+    match how
+        Keep => kfs_errno(namespace_write_at(ns, path, @bytes, mtime))
+        Set => kfs_errno(namespace_write_mode(ns, path, @bytes, mode, mtime))
 
 # mkdir `path` as the running system sees it: the runtime tree, plus the
 # persistent subtree for /var and below (Exist is fine in either). 0 or an

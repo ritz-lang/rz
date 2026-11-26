@@ -18,11 +18,12 @@
 # without a variant), never a -1 / null sentinel or a bare number (AGAST
 # #4248). A path of FS_PATH_MAX bytes or more fails with NameTooLong.
 #
-# Targets (AGAST #4830): read_file, write_file, copy_file, the path
-# utilities and the mode_is_* helpers compile for Linux and Harland. The rest
-# (stat, the predicates, mkdir/unlink/rmdir, access .. set_times, dir_open,
-# remove_dir_all) is [[target_os = "linux"]]: it rests on syscalls Harland
-# does not have.
+# Targets (AGAST #4830, #4832): read_file, write_file, copy_file, stat /
+# lstat, the predicates, file_size, the path utilities and the mode_is_*
+# helpers compile for Linux and Harland. The rest (mkdir/unlink/rmdir,
+# access .. set_times, dir_open, remove_dir_all) is [[target_os = "linux"]]:
+# it rests on syscalls Harland does not have. Harland has no symlinks, so
+# there lstat is stat and is_symlink is false.
 #
 # Note: Stat struct and STAT_SIZE are defined in ritzlib/sys.ritz
 
@@ -83,13 +84,24 @@ fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, Errno>
         return Err(errno_from_raw(ret))
     Ok(st)
 
+# Harland's stat takes the path's bytes and length, (path, path_len, *Stat),
+# so the view goes to the kernel as it is. No symlinks: `follow` changes
+# nothing (AGAST #4832).
+[[target_os = "harland"]]
+fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, Errno>
+    if path.len >= FS_PATH_MAX
+        return Err(errno_from_raw(FS_ENAMETOOLONG))
+    var st: Stat
+    let ret: i32 = syscall3(SYS_STAT, path.ptr as i64, path.len, @st as i64) as i32
+    if ret < 0
+        return Err(errno_from_raw(ret))
+    Ok(st)
+
 # Status of the file at `path`, following symlinks.
-[[target_os = "linux"]]
 pub fn stat(path: StrView) -> Result<Stat, Errno>
     fs_stat_impl(path, 1)
 
 # Status of the file at `path`; a symlink is reported as itself.
-[[target_os = "linux"]]
 pub fn lstat(path: StrView) -> Result<Stat, Errno>
     fs_stat_impl(path, 0)
 
@@ -132,7 +144,6 @@ pub fn mode_is_socket(mode: i32) -> bool
 # is_dir(link-to-dir) is false and a recursive walk does not follow links.
 
 # st_mode of `path` (lstat), or None if it cannot be statted.
-[[target_os = "linux"]]
 fn fs_lstat_mode(path: StrView) -> Option<i32>
     var r: Result<Stat, Errno> = fs_stat_impl(path, 0)
     match r
@@ -140,31 +151,26 @@ fn fs_lstat_mode(path: StrView) -> Option<i32>
         Err(_) => None
 
 # True if anything (file, directory, dangling symlink, ...) exists at `path`.
-[[target_os = "linux"]]
 pub fn path_exists(path: StrView) -> bool
     let m: Option<i32> = fs_lstat_mode(path)
     option_is_some<i32>(@m)
 
-[[target_os = "linux"]]
 pub fn is_dir(path: StrView) -> bool
     match fs_lstat_mode(path)
         Some(mode) => mode_is_dir(mode)
         None => false
 
-[[target_os = "linux"]]
 pub fn is_file(path: StrView) -> bool
     match fs_lstat_mode(path)
         Some(mode) => mode_is_file(mode)
         None => false
 
-[[target_os = "linux"]]
 pub fn is_symlink(path: StrView) -> bool
     match fs_lstat_mode(path)
         Some(mode) => mode_is_link(mode)
         None => false
 
 # Size in bytes of `path` (lstat: a symlink's own size).
-[[target_os = "linux"]]
 pub fn file_size(path: StrView) -> Result<i64, Errno>
     var r: Result<Stat, Errno> = fs_stat_impl(path, 0)
     match r
@@ -281,14 +287,15 @@ fn fs_open(path: StrView, flags: i32, mode: i32) -> i32
         return -perr
     sys_open3(@cpath[0], flags, mode)
 
-# Harland's open takes the path's bytes and length, (path, path_len, flags),
-# so the view goes to the kernel as it is: no copy, no NUL. Harland files
-# have no permission bits, so `mode` is unused. Returns the fd, or -errno.
+# Harland's open takes the path's bytes and length, (path, path_len, flags,
+# mode), so the view goes to the kernel as it is: no copy, no NUL. A file
+# the open creates gets permission bits `mode` (AGAST #4832). Returns the
+# fd, or -errno.
 [[target_os = "harland"]]
 fn fs_open(path: StrView, flags: i32, mode: i32) -> i32
     if path.len >= FS_PATH_MAX
         return -FS_ENAMETOOLONG
-    syscall3(SYS_OPEN, path.ptr as i64, path.len, flags as i64) as i32
+    syscall4(SYS_OPEN, path.ptr as i64, path.len, flags as i64, mode as i64) as i32
 
 # Write all `len` bytes at `data` to `fd`. Returns 0, or a positive errno.
 fn fs_write_all(fd: i32, data: *u8, len: i64) -> i32

@@ -11,7 +11,8 @@ import goliath.alloc { allocator_alloc, allocator_free }
 import goliath.blob_id { BlobId }
 import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_free, memory_store_count, memory_store_get_span }
 import goliath.hosted { memory_store_new, hosted_allocator }
-import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve }
+import ritzlib.result
+import goliath.namespace { Namespace, NsStat, namespace_new, namespace_read, namespace_write, namespace_write_mode, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve, namespace_stat }
 import goliath.block_store { BlockDevice, block_store_save, block_store_load, BLOCK_SECTOR_SIZE }
 import goliath.error { ErrorCode }
 
@@ -124,6 +125,34 @@ fn test_block_store_survives_reboot() -> i32
     assert block_store_load(@dev, @store3, @ns3) == ErrorCode.Ok
     assert reads_back(@ns3, "/etc/motd", "v2")
     memory_store_free(@store3)
+    ram_free(@disk)
+    0
+
+# A file's modified time and mode are in the image (DiskDirEntry), so they
+# survive a reboot: Harland's /var stat depends on it (AGAST #4832).
+[[test]]
+fn test_block_store_keeps_modified_and_mode() -> i32
+    var disk: RamDisk = ram_new(256)
+    var dev: BlockDevice = ram_device(@disk)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    let data: Span<u8> = span_from_strview("kept")
+    assert namespace_write_mode(@ns, "/f", @data, 384, 123456789) == ErrorCode.Ok
+    assert block_store_save(@dev, @ns) == ErrorCode.Ok
+    memory_store_free(@store)
+
+    var store2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace
+    assert block_store_load(@dev, @store2, @ns2) == ErrorCode.Ok
+    var st: NsStat = NsStat { is_dir: true, size: 0, modified: 0, mode: 0 }
+    match namespace_stat(@ns2, "/f")
+        Ok(s) => st = s
+        Err(_) => return 1
+    assert not st.is_dir
+    assert st.size == 4
+    assert st.modified == 123456789
+    assert st.mode == 384
+    memory_store_free(@store2)
     ram_free(@disk)
     0
 

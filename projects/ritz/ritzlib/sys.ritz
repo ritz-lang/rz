@@ -125,6 +125,21 @@ const SYS_EXIT: i64 = 20
 # numbers.ritz) with the same number. ritzlib can't import a kernel module, so
 # ritz0/test_harland_syscall_dispatch.py diffs the two (AGAST #2122).
 
+# stat(path, path_len, *Stat) and fstat(fd, *Stat): Linux's numbers, and the
+# Linux x86-64 `struct stat` below, which the kernel fills with st_mode,
+# st_size, st_mtime / st_mtime_ns (Harland's file clock), st_nlink,
+# st_blksize and st_blocks (AGAST #4832). The path goes as bytes and length,
+# as open's does.
+[[target_os = "harland"]]
+const SYS_STAT: i64 = 4
+
+[[target_os = "harland"]]
+const SYS_FSTAT: i64 = 5
+
+# lseek(fd, offset, whence): Linux's number and ABI.
+[[target_os = "harland"]]
+const SYS_LSEEK: i64 = 8
+
 # poll(fds, nfds, timeout_ms): Linux's number and ABI; on harland a file is
 # always ready and fd 0 (the console) waits for input (AGAST #4829).
 [[target_os = "harland"]]
@@ -773,8 +788,14 @@ const S_IXOTH: i32 = 1       # 0x001 - other execute
 # ============================================================================
 # Total size: 144 bytes
 # Layout verified against glibc sys/stat.h
+#
+# Ungated: Harland's stat and fstat fill this same layout (AGAST #4832), so
+# ritzlib.fs stat and Fd.stat return one type on both targets. Harland sets
+# st_mode, st_size, st_mtime / st_mtime_ns, st_nlink, st_blksize and
+# st_blocks and zeroes the rest; its kernel mirrors the struct field for field
+# (harland kernel/src/fs/stat.ritz; ritz0/tests/test_harland_stat_abi.py
+# diffs the two).
 
-[[target_os = "linux"]]
 struct Stat
     st_dev: i64       # 0: device ID
     st_ino: i64       # 8: inode number
@@ -888,16 +909,17 @@ pub fn sys_open(path: *u8, flags: i32) -> i32
     return syscall2(SYS_OPEN, path as i64, flags as i64) as i32
 
 # standard-exempt: raw-ptr-param: open(2) syscall ABI
-# Harland's open takes the path's length as well: (path, path_len, flags).
-# The wrapper measures the NUL-terminated path, so callers write the same
-# sys_open(path, flags) on both targets (AGAST #1871). The loop is inline
-# because sys.ritz imports nothing.
+# Harland's open takes the path's length as well: (path, path_len, flags,
+# mode). The wrapper measures the NUL-terminated path, so callers write the
+# same sys_open(path, flags) on both targets (AGAST #1871); a file it creates
+# gets 0644 (AGAST #4832). The loop is inline because sys.ritz imports
+# nothing. ritzlib.fd's fd_open passes another mode, and a StrView.
 [[target_os = "harland"]]
 pub fn sys_open(path: *u8, flags: i32) -> i32
     var path_len: i64 = 0
     while *(path + path_len) != 0
         path_len += 1
-    return syscall3(SYS_OPEN, path as i64, path_len, flags as i64) as i32
+    return syscall4(SYS_OPEN, path as i64, path_len, flags as i64, 420) as i32
 
 # standard-exempt: raw-ptr-param: open(2) syscall ABI
 [[target_os = "linux"]]
@@ -907,7 +929,6 @@ pub fn sys_open3(path: *u8, flags: i32, mode: i32) -> i32
 pub fn sys_close(fd: i32) -> i32
     return syscall1(SYS_CLOSE, fd as i64) as i32
 
-[[target_os = "linux"]]
 pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64
     return syscall3(SYS_LSEEK, fd as i64, offset, whence as i64)
 

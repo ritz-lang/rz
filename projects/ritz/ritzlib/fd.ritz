@@ -34,6 +34,12 @@
 # A read or write interrupted by a signal (EINTR) is retried, so Err(Intr)
 # never escapes these methods.
 #
+# Targets (AGAST #4832): the module compiles for Linux and Harland. On
+# Harland fd_open (with O_CREAT's mode), read, write, seek, stat and close
+# reach the kernel; dup, dup_to, truncate, chmod, lock, sendfile, the
+# nonblocking calls and pipe() are Err(Other(38)) (ENOSYS): Harland has no
+# such syscalls. poll is Linux-only (harland: ritzlib.timedread).
+#
 # Nonblocking I/O (AGAST #4815): set_nonblocking(true), then poll and
 # try_read / try_write, whose Ok tells "nothing yet" (WouldBlock) apart from
 # data, EOF (TryRead.Eof) and errors (Err(Pipe), ...):
@@ -74,6 +80,7 @@ const FD_EIO: i32 = 5
 const FD_EAGAIN: i32 = 11
 const FD_F_GETFL: i32 = 3
 const FD_F_SETFL: i32 = 4
+const FD_ENOSYS: i32 = 38
 
 # What a nonblocking read got (Fd.try_read): `Data(n)` bytes, `Eof` (the
 # writer is gone and the pipe is drained), or `WouldBlock` (nothing there
@@ -108,11 +115,76 @@ fn fd_unit(rc: i32) -> Result<(), Errno>
 # fcntl(2) with an integer argument (F_GETFL, F_SETFL): the call's
 # non-negative result, or Err. Private: Fd.set_nonblocking and
 # Fd.is_nonblocking are the public surface.
+[[target_os = "linux"]]
 fn fd_fcntl(fd: i32, cmd: i32, arg: i64) -> Result<i32, Errno>
     let rc: i64 = syscall3(SYS_FCNTL, fd as i64, cmd as i64, arg)
     if rc < 0
         return Err(errno_from_raw(rc as i32))
     Ok(rc as i32)
+
+[[target_os = "harland"]]
+fn fd_fcntl(fd: i32, cmd: i32, arg: i64) -> Result<i32, Errno>
+    Err(errno_from_raw(FD_ENOSYS))
+
+# ============================================================================
+# Harland stand-ins
+# ============================================================================
+#
+# The syscalls Fd's methods make that Harland lacks. An impl's methods can't
+# be gated one by one, so on Harland these answer -ENOSYS in place of
+# ritzlib.sys's Linux-only wrappers, and each such method is Err(Other(38)).
+# Same names and signatures as the sys.ritz wrappers; none exists on Linux.
+
+# set_nonblocking / is_nonblocking name O_NONBLOCK, which Harland's open
+# does not take; its fd_fcntl answers ENOSYS before the flag is used.
+[[target_os = "harland"]]
+const O_NONBLOCK: i32 = 2048
+
+[[target_os = "harland"]]
+fn sys_dup(oldfd: i32) -> i32
+    -FD_ENOSYS
+
+[[target_os = "harland"]]
+fn sys_dup2(oldfd: i32, newfd: i32) -> i32
+    -FD_ENOSYS
+
+[[target_os = "harland"]]
+fn sys_ftruncate(fd: i32, length: i64) -> i32
+    -FD_ENOSYS
+
+[[target_os = "harland"]]
+fn sys_fchmod(fd: i32, mode: i32) -> i32
+    -FD_ENOSYS
+
+[[target_os = "harland"]]
+fn sys_flock(fd: i32, operation: i32) -> i32
+    -FD_ENOSYS
+
+[[target_os = "harland"]]
+fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *i64, count: i64) -> i64
+    -(FD_ENOSYS as i64)
+
+[[target_os = "harland"]]
+fn sys_pipe(pipefd: *i32) -> i32
+    -FD_ENOSYS
+
+# fstat(2) of `fd`: Fd.stat's body. Harland's fstat is Linux's number and
+# struct stat (AGAST #4832), with no ritzlib.sys wrapper of its own.
+[[target_os = "linux"]]
+fn fd_fstat(fd: i32) -> Result<Stat, Errno>
+    var st: Stat
+    let rc: i32 = sys_fstat2(fd, @&st)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(st)
+
+[[target_os = "harland"]]
+fn fd_fstat(fd: i32) -> Result<Stat, Errno>
+    var st: Stat
+    let rc: i32 = syscall2(SYS_FSTAT, fd as i64, @st as i64) as i32
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(st)
 
 # Map a raw i64 syscall return (a count, or -errno) to Result<i64, Errno>.
 fn fd_count(rc: i64) -> Result<i64, Errno>
@@ -127,6 +199,7 @@ fn fd_count(rc: i64) -> Result<i64, Errno>
 # Open `path` with open(2) `flags` (O_RDONLY, O_WRONLY + O_CREAT + O_TRUNC, ...)
 # and, when O_CREAT creates it, permission bits `mode` (420 = 0644). Err
 # NameTooLong for a path of 4096 bytes or more, without a syscall.
+[[target_os = "linux"]]
 pub fn fd_open(path: StrView, flags: i32, mode: i32) -> Result<Fd, Errno>
     if path.len >= FD_PATH_MAX
         return Err(errno_from_raw(FD_ENAMETOOLONG))
@@ -136,6 +209,18 @@ pub fn fd_open(path: StrView, flags: i32, mode: i32) -> Result<Fd, Errno>
         cpath[i] = *(path.ptr + i)
     cpath[path.len] = 0
     let rc: i32 = sys_open3(@cpath[0], flags, mode)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(Fd { fd: rc })
+
+# Harland's open takes the path's bytes and length, (path, path_len, flags,
+# mode), so the view goes to the kernel as it is: no copy, no NUL. A file
+# O_CREAT makes gets permission bits `mode` (AGAST #4832).
+[[target_os = "harland"]]
+pub fn fd_open(path: StrView, flags: i32, mode: i32) -> Result<Fd, Errno>
+    if path.len >= FD_PATH_MAX
+        return Err(errno_from_raw(FD_ENAMETOOLONG))
+    let rc: i32 = syscall4(SYS_OPEN, path.ptr as i64, path.len, flags as i64, mode as i64) as i32
     if rc < 0
         return Err(errno_from_raw(rc))
     Ok(Fd { fd: rc })
@@ -312,13 +397,9 @@ impl Fd
 
     # The open file's status (fstat(2)).
     pub fn stat(self: @Fd) -> Result<Stat, Errno>
-        var st: Stat
         if self.fd < 0
             return Err(errno_from_raw(FD_EBADF))
-        let rc: i32 = sys_fstat2(self.fd, @&st)
-        if rc < 0
-            return Err(errno_from_raw(rc))
-        Ok(st)
+        fd_fstat(self.fd)
 
     # Set the file's length to `len` bytes (ftruncate(2)).
     pub fn truncate(self: @Fd, len: i64) -> Result<(), Errno>

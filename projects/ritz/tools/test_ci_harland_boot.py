@@ -190,6 +190,8 @@ NET_NODEV = "".join(
 )
 # indium's write_empty_test checked /var as well as /tmp (AGAST #4830).
 WRITE_EMPTY_OK = r"[test] write_empty_test ... [write_empty_test] PASS: /tmp and /var\nPASS (exit=0)\n"
+# indium's stat_test checked /var as well as /tmp (AGAST #4832).
+STAT_OK = r"[test] stat_test ... [stat_test] PASS: /tmp and /var\nPASS (exit=0)\n"
 # The native boot's virtio-blk is modern-only and offers 1024-entry queues;
 # the driver must take the MMIO transport and cap the queue (AGAST #3576).
 BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
@@ -207,7 +209,8 @@ TIMER_OK = r"[timer] LAPIC timer 62500000 Hz (bus/16, TSC-calibrated), periodic 
 # to 9 runs while preemption stays healthy, so the counter ratio is the real
 # invariant and 6 only has to separate that from the 2..4-run failure shapes.
 BUSY_OK = "".join(f"[busy A] {step}/8\n[busy B] {step}/8\n" for step in range(1, 9))
-SCHED_OK = "[sched] 356 ticks, 285 switches, 233 preemptions\n"
+# The ratio is contended ticks (two or more runnable) to preemptions (#4832).
+SCHED_OK = "[sched] 356 ticks, 285 switches, 233 preemptions, 250 contended ticks\n"
 # The kernel's SMP syscall-stack self-test (AGAST #4192): all four CPUs were
 # in a ring-3 SYSCALL at once, each on its own per-CPU stack.
 SMP_OK = "[smp] syscall stacks OK: 4 CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\n"
@@ -237,7 +240,7 @@ RING_DUMP_END = r"\n=== END RING BUFFER ===\n"
 # dump repeating it.
 RING_OK = (KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_START
            + KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_END)
-PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + SUITE_PASSED + INIT_EXIT
+PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -498,7 +501,7 @@ def test_busy_children_coarsely_paired_by_load_pass(tree):
     serial = (RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
               + BUSY_PAIRED_9
               + SCHED_OK
-              + SMP_OK + NET_NODEV + WRITE_EMPTY_OK
+              + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK
               + SUITE_PASSED + INIT_EXIT)
     r = _run(tree, serial)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -510,15 +513,45 @@ def test_busy_children_interleaved_but_one_ran_alone_fail(tree):
     """Interleave alone is timing-sensitive (AGAST #4332): the scheduler's own
     counters must also show it kept preempting. The #4332 regression gave one
     child 735 user ticks to the other's 98 (911 ticks, 195 preemptions), so the
-    lines still interleaved in spurts but one child ploughed through alone."""
+    lines still interleaved in spurts but one child ploughed through alone:
+    the other was runnable all along, so those ticks were contended."""
     serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
               + BUSY_OK
-              + "[sched] 911 ticks, 246 switches, 195 preemptions\n"
+              + "[sched] 911 ticks, 246 switches, 195 preemptions, 840 contended ticks\n"
               + SUITE_PASSED + INIT_EXIT)
     r = _run(tree, serial)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "PASS (native): init Tier-1 suite" in r.stdout
-    assert "one child ran alone: 911 ticks but only 195 preemptions" in r.stdout
+    assert "one child ran alone: 840 contended ticks but only 195 preemptions" in r.stdout
+
+
+@pytest.mark.integration
+def test_ticks_spent_alone_do_not_count_against_preemption(tree):
+    """A boot's total ticks include every tick a Tier-1 program runs alone
+    (waiting on the 100 ms storage disk, say), where no preemption is
+    possible. Those don't fail the #4332 check: only contended ticks, with
+    two or more processes runnable, are held against the preemptions
+    (AGAST #4832; #4830's /var test took the all-ticks ratio to 2.96)."""
+    serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
+              + BUSY_OK
+              + "[sched] 810 ticks, 300 switches, 237 preemptions, 255 contended ticks\n"
+              + SUITE_PASSED + INIT_EXIT)
+    r = _run(tree, serial)
+    assert "two busy children preempted each other" in r.stdout, r.stdout + r.stderr
+    assert "ran alone" not in r.stdout
+
+
+@pytest.mark.integration
+def test_sched_counters_without_contended_ticks_fail(tree):
+    """The kernel reports contended ticks; a log without them (an older
+    kernel) has nothing to hold the preemptions against."""
+    serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
+              + BUSY_OK
+              + "[sched] 356 ticks, 285 switches, 233 preemptions\n"
+              + SUITE_PASSED + INIT_EXIT)
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "no [sched] tick/preemption counters" in r.stdout
 
 
 @pytest.mark.integration
@@ -609,6 +642,16 @@ def test_write_empty_on_tmp_alone_fails(tree):
     r = _run(tree, PASSED.replace(WRITE_EMPTY_OK, tmp_only))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL (native): write_empty_test did not pass on both /tmp and /var" in r.stdout
+
+
+@pytest.mark.integration
+def test_stat_on_tmp_alone_fails(tree):
+    """stat_test passes with only /tmp when /var/boots is missing; a boot
+    whose storage disk came up must not pass that way (AGAST #4832)."""
+    tmp_only = r"[test] stat_test ... [stat_test] PASS: /tmp (no storage disk, /var skipped)\nPASS (exit=0)\n"
+    r = _run(tree, PASSED.replace(STAT_OK, tmp_only))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): stat_test did not pass on both /tmp and /var" in r.stdout
 
 
 @pytest.mark.integration

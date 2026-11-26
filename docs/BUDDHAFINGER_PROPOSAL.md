@@ -224,8 +224,20 @@ follows what the kernel does (`kernel/src/fs/syscall.ritz`):
   `sys_sync` in ritzlib) saves at once.
 - `ritzlib/fs.ritz` `write_file`, `read_file` and `copy_file` compile for
   Harland (#4830): `write_file` opens `O_WRONLY | O_CREAT | O_TRUNC`, writes
-  the whole buffer and returns the close result. The rest of `fs.ritz` (`stat`,
-  the predicates, directory iteration) stays Linux-only.
+  the whole buffer and returns the close result. `stat`, `lstat` and the
+  predicates do too (#4832); directory iteration and the rest stay
+  Linux-only.
+- `stat` (syscall 4) and `fstat` (5) fill Linux's `struct stat`, so
+  `ritzlib.fs.stat` and `Fd.stat` return one `Stat` type on both targets
+  (#4832). `st_mtime` / `st_mtime_ns` is the kernel's file clock, not a
+  date: nanoseconds that only move forward, across reboots too, and differ
+  on every commit, so comparing them (with `st_size`) against what was
+  recorded at open is the external-change check. `open` with `O_CREAT` sets
+  a new file's permission bits from its mode argument, and a rewrite keeps
+  them: the mode-on-create choice, over `chmod`, because the create already
+  takes a mode on Linux (`fd_open(path, flags, mode)`), so a save that
+  re-creates a file passes the mode it read and needs no second syscall.
+  Harland records and reports the bits; it has no users to enforce them on.
 
 So the Harland save builds the whole file in one buffer, opens the target
 `O_WRONLY | O_CREAT | O_TRUNC`, requires one full-length `write`, and checks
@@ -244,9 +256,11 @@ and report that the live file may already have changed. Keep transactional
 replacement across the two trees and storage failure recovery on the Harland
 save-parity track.
 
-Without `stat`, the Harland save cannot detect external changes or preserve
-permissions; it says so in the message area. Claim save parity only once the
-Harland save passes the same contract tests as Linux.
+With `stat` (#4832) the Harland save detects external changes as Linux's
+does, and preserves the mode: an existing file keeps its mode across the
+`O_TRUNC` rewrite, and a new one gets the mode passed to its `O_CREAT` open.
+Claim save parity only once the Harland save passes the same contract tests
+as Linux.
 
 ## Buffer representation and performance
 
@@ -353,8 +367,8 @@ on both targets.
 | Portable create-and-write in `ritzlib/fs.ritz` | Done (#4830) | Saving through ritzlib on Harland | First port |
 | Empty write commits on close | Done (#4830): an `O_TRUNC` fd commits its buffer, empty or not, on an explicit `close`; at process exit an empty buffer leaves the file | Saving an empty buffer | First port |
 | Larger raw input queue, or an overrun the reader can see | Bytes past 1024 dropped silently | Paste, fast input bursts | Paste support |
-| `stat` / `fstat` (size, mtime, mode) | Missing; number 4 free | External-change check, permissions | Save parity |
-| `chmod` or mode on create | Missing | Preserving permissions | Save parity |
+| `stat` / `fstat` (size, mtime, mode) | Done (#4832): syscalls 4 and 5, Linux's `struct stat`; mtime is the file clock | External-change check, permissions | Save parity |
+| `chmod` or mode on create | Done (#4832): `O_CREAT` takes the mode, a rewrite keeps it | Preserving permissions | Save parity |
 | Transactional replacement and storage failure recovery | Runtime and persistent namespace writes can fail independently | A defined save contract across close and sync failures | Save parity |
 | `rename`, `unlink` | Missing | Temporary-file saves, if Harland moves to a Linux-style save | Optional |
 | Console window size | Missing | Automatic viewport | Later (configurable viewport until then) |
@@ -475,8 +489,8 @@ table, a scratch directory, and a runnable ritz1.
 3. Approve the [Harland prerequisites](#harland-prerequisites) as a parallel
    track. The first port needs the timed console read, a Harland-capable
    ritzlib write path, and the empty-write fix, and saves with a single write
-   and checks `sync` for `/var`. Save parity waits for `stat`, modes, and a
-   transactional replacement and storage failure contract. ritz-lsp on Harland
+   and checks `sync` for `/var`. Save parity waits for a transactional
+   replacement and storage failure contract (`stat` and modes: #4832). ritz-lsp on Harland
    waits for pipes, a larger process table, a scratch directory, and ritz1.
 4. Approve the smaller first usable release (one buffer, Normal and Insert,
    save, quit), with counts, operators, Visual mode, and multiple buffers
