@@ -133,6 +133,11 @@ pub fn pci_find_capability_nth(dev: *PciDevice, cap_id: u8, n: i32) -> u8
 pub fn pci_dev_read_config8(dev: *PciDevice, offset: u8) -> u8
     0
 
+# vio_find_mmio_caps reads the MSI-X capability when it records a window
+# (#4720); the fake device is legacy, so it is never reached.
+pub fn pci_find_capability(dev: *PciDevice, cap_id: u8) -> u8
+    0
+
 pub fn pci_dev_read_config16(dev: *PciDevice, offset: u8) -> u16
     0
 
@@ -480,6 +485,8 @@ MSIX_STUB = """\
 import drivers.pci { PciDevice }
 import io { fake_msix_is_present, fake_msix_enable, fake_msix_set_entry, fake_msix_count }
 
+pub const PCI_CAP_MSIX: u8 = 0x11
+
 pub struct MsixInfo
     dev: *PciDevice
     cap: u8
@@ -527,7 +534,8 @@ STUBS = {
     "mm/vmm.ritz": VMM_STUB,
 }
 REAL = ["drivers/virtio/blk.ritz", "drivers/virtio/common.ritz",
-        "drivers/virtio/vmsix.ritz", "drivers/irq_wait.ritz"]
+        "drivers/virtio/vmsix.ritz", "drivers/irq_wait.ritz",
+        "drivers/virtio/window.ritz"]
 # The virtqueue and feature negotiation the drivers call (AGAST #4732): the
 # real virtio_abi package, at virtio_abi/<module>.ritz in the tree.
 VIRTIO_ABI_SRC = KERNEL_SRC.parents[1] / "virtio_abi" / "src"

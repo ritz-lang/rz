@@ -29,6 +29,26 @@
 #   mode 5 (POLL_NVAL, #4829): poll(2) on { -1, POLLIN } and { 63, POLLIN }
 #                   with no timeout; exit 0 if it returned 1 at once with
 #                   revents 0 and POLLNVAL, else 1.
+#   mode 21 (MMIO_MAP, #4720): RSI is a CAP_TYPE_MMIO handle on the
+#                   boot-test window double. Exit status: the number of the
+#                   first failed step, else 0:
+#                   1  handle 0 (not held)   -> Errno.Perm
+#                   2  the double            -> DRV_MMIO_BASE
+#                   3  the byte at VA + MMIO_TEST_OFFSET is MMIO_TEST_BYTE
+#                   4  the double again      -> DRV_MMIO_BASE + 4096
+#                   (The guarded window's refusal is the boot test's
+#                   scratch half: a second grant's generation is not
+#                   known when the stub's argument is chosen.)
+#   mode 22 (DMA_ALLOC, #4721): RSI is a CAP_TYPE_IRQ handle. Exit status:
+#                   the number of the first failed step, else 0:
+#                   1  handle 0 (not held)   -> Errno.Perm
+#                   2  size 0                -> Errno.Inval
+#                   3  size 4 MiB + 1        -> Errno.NoMem
+#                   4  a kernel DmaAlloc     -> Errno.Fault
+#                   5  size 8000             -> DRV_DMA_BASE, DmaAlloc
+#                      { iova 0, size 8192 }
+#                   6  all 8192 bytes read 0 (then are written)
+#                   7  size 1                -> DRV_DMA_BASE + 8192
 # Report: Getpid, the CPL from CS, and arg1, packed into the exit status
 #   (arg1 & 0x7FFF) << 16 | cpl << 8 | (pid & 0xFF)
 # which the kernel decodes and logs as "[driver] pid N cpl C arg1 K".
@@ -40,6 +60,8 @@
 .equ SYS_GETPID, 23
 .equ SYS_DRV_IRQ_WAIT, 220
 .equ SYS_POLL,   7
+.equ SYS_DRV_MMIO_MAP,  221
+.equ SYS_DRV_DMA_ALLOC, 222
 
 # Modes (postinit.ritz DRIVER_STUB_*)
 .equ DRIVER_STUB_FAULT, 1
@@ -47,6 +69,23 @@
 .equ DRIVER_STUB_IRQ_WAIT, 3
 .equ DRIVER_STUB_CONSOLE_POLL, 4
 .equ DRIVER_STUB_POLL_NVAL, 5
+.equ DRIVER_STUB_MMIO_MAP, 21
+.equ DRIVER_STUB_DMA_ALLOC, 22
+
+# DrvMmioMap and DrvDmaAlloc (mm/vmm.ritz, driver_abi/src/dma.ritz,
+# postinit.ritz MMIO_TEST_*)
+.equ DRV_MMIO_BASE,   0x7E8000000000
+.equ DRV_DMA_BASE,    0x7E0000000000
+.equ MMIO_TEST_OFFSET, 0x123
+.equ MMIO_TEST_BYTE,  0xA5
+.equ DA_IOVA,         0
+.equ DA_SIZE,         8
+.equ DMA_TEST_SIZE,   8000
+.equ DMA_TEST_PAGES_BYTES, 8192
+.equ DMA_OVER_MAX,    0x400001
+.equ KERNEL_ADDR,     0xFFFF800000000000
+.equ ERRNO_NOMEM,     -12
+.equ ERRNO_FAULT,     -14
 
 # ritzlib.sys PollFd (8 bytes): fd i32, events i16, revents i16
 .equ PFD_FD,      0
@@ -89,6 +128,10 @@ driver_stub_start:
 .Ldriver_stub_not_fault:
     cmpq $DRIVER_STUB_IRQ_WAIT, %r12
     je .Ldriver_stub_irq_wait
+    cmpq $DRIVER_STUB_MMIO_MAP, %r12
+    je .Ldriver_stub_mmio_map
+    cmpq $DRIVER_STUB_DMA_ALLOC, %r12
+    je .Ldriver_stub_dma_alloc
     cmpq $DRIVER_STUB_CONSOLE_POLL, %r12
     je .Ldriver_stub_console_poll
     cmpq $DRIVER_STUB_POLL_NVAL, %r12
@@ -259,6 +302,112 @@ driver_stub_start:
     movq $SYS_EXIT, %rax
     syscall
     ud2
+
+# Mode 21. r15 = the step reported if a check fails.
+.Ldriver_stub_mmio_map:
+    movl $1, %r15d                       # 1: a handle it does not hold
+    movq $SYS_DRV_MMIO_MAP, %rax
+    xorl %edi, %edi
+    syscall
+    cmpq $ERRNO_PERM, %rax
+    jne .Lmmio_fail
+    movl $2, %r15d                       # 2: the double, at the window base
+    movq $SYS_DRV_MMIO_MAP, %rax
+    movq %r13, %rdi
+    syscall
+    movabsq $DRV_MMIO_BASE, %rcx
+    cmpq %rcx, %rax
+    jne .Lmmio_fail
+    movl $3, %r15d                       # 3: its byte, read uncached
+    cmpb $MMIO_TEST_BYTE, MMIO_TEST_OFFSET(%rax)
+    jne .Lmmio_fail
+    movl $4, %r15d                       # 4: a second map, the next page
+    movq $SYS_DRV_MMIO_MAP, %rax
+    movq %r13, %rdi
+    syscall
+    movabsq $DRV_MMIO_BASE+4096, %rcx
+    cmpq %rcx, %rax
+    jne .Lmmio_fail
+    xorl %r15d, %r15d
+.Lmmio_fail:
+    movl %r15d, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# Mode 22. r14 = the DmaAlloc, on the user stack; r15 = the failing step.
+.Ldriver_stub_dma_alloc:
+    subq $16, %rsp
+    movq %rsp, %r14
+    movl $1, %r15d                       # 1: a handle it does not hold
+    xorl %edi, %edi
+    movl $4096, %esi
+    movq %r14, %rdx
+    call .Ldma_call
+    cmpq $ERRNO_PERM, %rax
+    jne .Ldma_fail
+    movl $2, %r15d                       # 2: size 0
+    movq %r13, %rdi
+    xorl %esi, %esi
+    movq %r14, %rdx
+    call .Ldma_call
+    cmpq $ERRNO_INVAL, %rax
+    jne .Ldma_fail
+    movl $3, %r15d                       # 3: above DMA_ALLOC_MAX
+    movq %r13, %rdi
+    movl $DMA_OVER_MAX, %esi
+    movq %r14, %rdx
+    call .Ldma_call
+    cmpq $ERRNO_NOMEM, %rax
+    jne .Ldma_fail
+    movl $4, %r15d                       # 4: a DmaAlloc it can't write
+    movq %r13, %rdi
+    movl $4096, %esi
+    movabsq $KERNEL_ADDR, %rdx
+    call .Ldma_call
+    cmpq $ERRNO_FAULT, %rax
+    jne .Ldma_fail
+    movl $5, %r15d                       # 5: two pages at the window base
+    movq %r13, %rdi
+    movl $DMA_TEST_SIZE, %esi
+    movq %r14, %rdx
+    call .Ldma_call
+    movabsq $DRV_DMA_BASE, %rcx
+    cmpq %rcx, %rax
+    jne .Ldma_fail
+    cmpq $0, DA_IOVA(%r14)
+    jne .Ldma_fail
+    cmpq $DMA_TEST_PAGES_BYTES, DA_SIZE(%r14)
+    jne .Ldma_fail
+    movl $6, %r15d                       # 6: zeroed, and writable
+    xorl %ecx, %ecx
+.Ldma_zeroed:
+    cmpq $0, (%rax,%rcx,8)
+    jne .Ldma_fail
+    notq (%rax,%rcx,8)
+    incq %rcx
+    cmpq $DMA_TEST_PAGES_BYTES/8, %rcx
+    jb .Ldma_zeroed
+    movl $7, %r15d                       # 7: the next run follows it
+    movq %r13, %rdi
+    movl $1, %esi
+    movq %r14, %rdx
+    call .Ldma_call
+    movabsq $DRV_DMA_BASE+DMA_TEST_PAGES_BYTES, %rcx
+    cmpq %rcx, %rax
+    jne .Ldma_fail
+    xorl %r15d, %r15d
+.Ldma_fail:
+    movl %r15d, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# DrvDmaAlloc(RDI, RSI, RDX): r10 is not an argument here. RAX = the result.
+.Ldma_call:
+    movq $SYS_DRV_DMA_ALLOC, %rax
+    syscall
+    ret
 
 .size driver_stub_start, . - driver_stub_start
 

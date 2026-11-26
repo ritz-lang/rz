@@ -38,7 +38,7 @@ import io { disable_interrupts, enable_interrupts }
 import mm.uptr { uptr_check_read, uptr_check_write }
 import ritzlib.option
 import syscall.errno { Errno }
-import cap.types { CapEntry, CAP_TYPE_IRQ, CAP_TYPE_SHM, cap_handle_init }
+import cap.types { CapEntry, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, cap_handle_init }
 import cap.table { CapTable, cap_table_get, cap_table_lookup }
 import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_reap_pending }
 import proc.sched { sched_block }
@@ -46,6 +46,11 @@ import proc.waitq { waitq_can_park }
 import proc.waitset { irq_object_known, irq_object_take, waitset_arm, waitset_disarm }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_DATA, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
+import mm.pmm { PAGE_SIZE }
+import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
+import mm.dma { dma_alloc_zeroed, dma_free_pages }
+import drivers.virtio.window { VioWindow, vio_window_find, vio_window_pages, vio_window_guarded }
+import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
 
 const US_PER_MS: u64 = 1000
 
@@ -149,3 +154,124 @@ fn drv_irq_wait(pid: u32, irq_handle: u64, ureq: *WaitRequest) -> i64
 # drv_irq_wait(irq_handle, request): the caller's page table is loaded.
 pub fn sys_drv_irq_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     drv_irq_wait(proc_current_pid() as u32, rdi, rsi as *WaitRequest)
+
+# ============================================================================
+# DrvMmioMap (221) and DrvDmaAlloc (222), AGAST #4720 and #4721
+# (docs/RING1_DRIVER.md §5 "MMIO and DMA syscalls", PR 5)
+# ============================================================================
+#
+# DrvMmioMap(mmio_handle) maps every page of the window that the caller's
+# CAP_TYPE_MMIO handle names, uncached, into the caller's PML4 only, from
+# the next free page of its MMIO window (DRV_MMIO_BASE, PML4[253]). It
+# returns the VA of the window's first page; the driver adds the window's
+# byte offset itself. The window is the kernel's record
+# (drivers/virtio/window.ritz); the advisory copy in the shared page is
+# never read.
+#
+#   Errno.Perm   the caller holds no CAP_TYPE_MMIO handle `mmio_handle`
+#   Errno.Inval  the object is no recorded window, or a page of it holds the
+#                MSI-X table or PBA: nothing is mapped
+#   Errno.NoMem  the window has no room, or a page table could not be had:
+#                the pages this call installed are unmapped again
+#
+# DrvDmaAlloc(irq_handle, size, *DmaAlloc) allocates one zeroed contiguous
+# run of `size` bytes rounded up to pages and maps it write-back into the
+# caller's DMA window (DRV_DMA_BASE, PML4[252]). It returns the run's VA and
+# copies out { iova, size }. Until the device's DMA domain exists (PR 5b,
+# ring plan T18) nothing the device can use is published: iova is 0, and the
+# run is for the CPU only. The run is not a DmaRegion: the PML4 owns it, and
+# exit frees it once (no PTE_DEVICE).
+#
+#   Errno.Perm   the caller holds no CAP_TYPE_IRQ handle `irq_handle`
+#   Errno.Inval  size 0
+#   Errno.NoMem  size above DMA_ALLOC_MAX (4 MiB), no contiguous run free, no
+#                room in the window, or no page table: nothing stays mapped
+#                or allocated
+#   Errno.Fault  the DmaAlloc is not the caller's writable memory (checked
+#                before anything is allocated)
+
+# MMIO leaves: the kernel's vmm_map_mmio type (PCD|PWT, uncached) plus user
+# and PTE_DEVICE, so the frame is never returned to the PMM on exit.
+pub fn drv_mmio_leaf() -> u64
+    PTE_WRITABLE | PTE_USER | PTE_WRITE_THROUGH | PTE_CACHE_DISABLE | PTE_DEVICE | vmm_nx_flag()
+
+# DMA leaves: write-back RAM the process owns (§5: virtio-pci on x86 is
+# DMA-coherent).
+pub fn drv_dma_leaf() -> u64
+    PTE_WRITABLE | PTE_USER | vmm_nx_flag()
+
+const SLOT_BYTES: u64 = 1 << 39        # one PML4 entry
+
+# The next free address in the window at `base`, if `pages` more fit.
+fn window_room(pml4: u64, base: u64, pages: u64) -> Option<u64>
+    let vaddr: u64 = vmm_slot_end(pml4, base)
+    if pages > (base + SLOT_BYTES - vaddr) / PAGE_SIZE
+        return None
+    Some(vaddr)
+
+# Map `pages` frames from `phys` at `vaddr` in `pml4`. On a failure the
+# leaves this call installed are cleared again (the frames stay the
+# caller's) and it returns false.
+fn map_run(pml4: u64, vaddr: u64, phys: u64, pages: u64, flags: u64) -> bool
+    var p: u64 = 0
+    while p < pages
+        if vmm_map_page_in(pml4, vaddr + p * PAGE_SIZE, phys + p * PAGE_SIZE, flags) != 0
+            var q: u64 = 0
+            while q < p
+                vmm_unmap_page_in(pml4, vaddr + q * PAGE_SIZE)
+                q = q + 1
+            return false
+        p = p + 1
+    true
+
+# DrvMmioMap for process `pid`, whose page table is `pml4` (above).
+pub fn drv_mmio_map(pid: u32, pml4: u64, mmio_handle: u64) -> i64
+    let object_id: u64 = match held_object(pid, mmio_handle, CAP_TYPE_MMIO)
+        Some(id) => id
+        None => return Errno.Perm as i64
+    let window: VioWindow = match vio_window_find(object_id)
+        Some(w) => w
+        None => return Errno.Inval as i64
+    if vio_window_guarded(window)
+        return Errno.Inval as i64
+    let pages: u64 = vio_window_pages(window)
+    let vaddr: u64 = match window_room(pml4, DRV_MMIO_BASE, pages)
+        Some(v) => v
+        None => return Errno.NoMem as i64
+    if not map_run(pml4, vaddr, window.page_base, pages, drv_mmio_leaf())
+        return Errno.NoMem as i64
+    vaddr as i64
+
+# DrvDmaAlloc for process `pid`, whose page table is `pml4` and loaded
+# (`out` is checked against it), above.
+fn drv_dma_alloc(pid: u32, pml4: u64, irq_handle: u64, size: u64, out: *DmaAlloc) -> i64
+    if held_object(pid, irq_handle, CAP_TYPE_IRQ).is_none()
+        return Errno.Perm as i64
+    if size == 0
+        return Errno.Inval as i64
+    if size > DMA_ALLOC_MAX
+        return Errno.NoMem as i64
+    if uptr_check_write(out as *u8, sizeof(DmaAlloc) as u64) != 0
+        return Errno.Fault as i64
+    let pages: u64 = (size + PAGE_SIZE - 1) / PAGE_SIZE
+    let vaddr: u64 = match window_room(pml4, DRV_DMA_BASE, pages)
+        Some(v) => v
+        None => return Errno.NoMem as i64
+    let phys: u64 = match dma_alloc_zeroed(pages as u32)
+        Some(p) => p
+        None => return Errno.NoMem as i64
+    if not map_run(pml4, vaddr, phys, pages, drv_dma_leaf())
+        dma_free_pages(phys, pages as u32)
+        return Errno.NoMem as i64
+    (*out).iova = 0                     # no DMA domain yet (PR 5b)
+    (*out).size = pages * PAGE_SIZE
+    vaddr as i64
+
+# drv_mmio_map(mmio_handle): the caller's page table is loaded.
+pub fn sys_drv_mmio_map_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    drv_mmio_map(proc_current_pid() as u32, vmm_get_current_pml4(), rdi)
+
+# drv_dma_alloc(irq_handle, size, *DmaAlloc): the caller's page table is
+# loaded.
+pub fn sys_drv_dma_alloc_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    drv_dma_alloc(proc_current_pid() as u32, vmm_get_current_pml4(), rdi, rsi, rdx as *DmaAlloc)

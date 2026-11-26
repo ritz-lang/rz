@@ -78,7 +78,9 @@ AREAS = {
     "input": ["sys_input_poll_impl", "sys_input_read_impl", "sys_input_poll_handler", "sys_input_read_handler"],
     "framebuffer": ["sys_fb_info_impl", "sys_fb_map_impl", "sys_fb_info_handler", "sys_fb_map_handler"],
     # DrvIrqWait (220), #4719
-    "driver": ["drv_irq_wait_park_count", "sys_drv_irq_wait_handler"],
+    "driver": ["drv_irq_wait_park_count", "sys_drv_irq_wait_handler",
+               # DrvMmioMap (221) #4720, DrvDmaAlloc (222) #4721
+               "drv_mmio_map", "sys_drv_mmio_map_handler", "sys_drv_dma_alloc_handler"],
     # NetInfo (224), NetAddr (225), NetAttach (228): NoDev until a driver
     # and service exist (#4751).
     "net": ["sys_net_info_handler", "sys_net_addr_handler", "sys_net_attach_handler"],
@@ -230,8 +232,9 @@ def test_table_registers_handlers_imported_from_their_area():
     regs = re.findall(r"^\s+syscall_register\(Syscall\.(\w+),\s*(\w+)\)", _body(code, "syscall_table_init"), re.M)
     # 38 since ShmMap (227, #4717); 39 with DrvIrqWait (220, #4719);
     # 42 with NetInfo, NetAddr, NetAttach (#4751); 43 with Poll (7, #4829);
-    # 45 with Stat and Fstat (4, 5, #4832).
-    assert len(regs) == 45, regs
+    # 45 with Stat and Fstat (4, 5, #4832); 47 with DrvMmioMap and
+    # DrvDmaAlloc (221, 222, #4720).
+    assert len(regs) == 47, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

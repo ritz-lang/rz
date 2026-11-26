@@ -1,5 +1,6 @@
 # drv_refuse_test: DrvIrqWait (220) refuses a process with no IRQ capability
-# (AGAST #4719, harland docs/RING1_DRIVER.md §4).
+# (AGAST #4719, harland docs/RING1_DRIVER.md §4), and so do DrvMmioMap (221)
+# and DrvDmaAlloc (222) without an MMIO or IRQ one (#4720, #4721, §5).
 #
 # The handle is the right to park on a device's interrupt. A process spawned
 # by sys_spawn inherits only its parent's ambient capabilities (DISPLAY,
@@ -15,14 +16,17 @@
 # wrote the request; each failure has its own code.
 
 import ritzlib.strview { StrView }
-import ritzlib.sys { syscall2 }
+import ritzlib.sys { syscall1, syscall2, syscall3 }
 import driver_abi.wait { WaitRequest, WaitEvent, WaitSource }
+import driver_abi.dma { DmaAlloc }
 
 # The kernel's Syscall.DrvIrqWait. ritzlib.sys wraps no driver syscall (its
 # SYS_DRV_IRQ_WAIT, which ritz0/test_harland_syscall_dispatch.py diffs
 # against the enum, is private), so the number is named here as
 # cap_ipc_child names the IPC ones.
 const NR_DRV_IRQ_WAIT: i64 = 220
+const NR_DRV_MMIO_MAP: i64 = 221
+const NR_DRV_DMA_ALLOC: i64 = 222
 const PERM: i64 = -1
 
 # No handle at all: index 0, generation 0 never names a live entry.
@@ -59,10 +63,44 @@ fn refused_untouched(name: StrView, handle: i64) -> bool
         return false
     true
 
+# DrvMmioMap with `handle`: refused with Errno.Perm. A refusal maps nothing,
+# which ring 3 can't see; the drv-mmio-map boot test checks that.
+fn mmio_refused(name: StrView, handle: i64) -> bool
+    let r: i64 = syscall1(NR_DRV_MMIO_MAP, handle)
+    print("[drv_refuse_test] drv_mmio_map({name}) -> {r}\n")
+    if r != PERM
+        print("[drv_refuse_test] FAIL: drv_mmio_map({name}) was not refused with Errno.Perm\n")
+        return false
+    true
+
+# DrvDmaAlloc of one page with `handle`: refused with Errno.Perm, the
+# DmaAlloc left as it was.
+fn dma_refused(name: StrView, handle: i64) -> bool
+    var out: DmaAlloc
+    out.iova = UNTOUCHED_HANDLE
+    out.size = UNTOUCHED_HANDLE
+    let r: i64 = syscall3(NR_DRV_DMA_ALLOC, handle, 4096, @out as i64)
+    print("[drv_refuse_test] drv_dma_alloc({name}) -> {r}\n")
+    if r != PERM
+        print("[drv_refuse_test] FAIL: drv_dma_alloc({name}) was not refused with Errno.Perm\n")
+        return false
+    if out.iova != UNTOUCHED_HANDLE or out.size != UNTOUCHED_HANDLE
+        print("[drv_refuse_test] FAIL: the refusal of drv_dma_alloc({name}) wrote the DmaAlloc\n")
+        return false
+    true
+
 pub fn main() -> i32
     if not refused_untouched("no handle", NO_HANDLE)
         return 1
     if not refused_untouched("the display handle", DISPLAY_HANDLE)
         return 2
-    print("[drv_refuse_test] PASS: DrvIrqWait refused without an IRQ capability\n")
+    if not mmio_refused("no handle", NO_HANDLE)
+        return 3
+    if not mmio_refused("the display handle", DISPLAY_HANDLE)
+        return 4
+    if not dma_refused("no handle", NO_HANDLE)
+        return 5
+    if not dma_refused("the display handle", DISPLAY_HANDLE)
+        return 6
+    print("[drv_refuse_test] PASS: DrvIrqWait, DrvMmioMap and DrvDmaAlloc refused without a device capability\n")
     return 0

@@ -11,8 +11,8 @@
 
 import klog { klog, klog_dec, klog_hex }
 import serial { StrView }
-import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages }
-import mm.vmm { PTE_WRITABLE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, phys_to_virt }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_alloc_contig, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_range_has_free }
+import mm.vmm { PTE_PRESENT, PTE_ACCESSED, PTE_DIRTY, PTE_ADDR_MASK, PTE_WRITABLE, DRV_MMIO_BASE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, phys_to_virt, vmm_create_user_pml4, vmm_free_pml4, vmm_pte_in }
 import mm.heap { KERNEL_VIRT_BASE, kalloc, kfree, heap_get_free, heap_check }
 import ipc.message { Message, MSG_FLAG_NONE }
 import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv, channel_close, channel_debug_print }
@@ -46,11 +46,12 @@ import fs.syscall { fs_process_pid }
 import syscall.stack { kstack_top }
 import syscall.runtime.process { PROC_REAP_STATUS, process_create_init, process_destroy_init, process_spawn_image, process_wait, process_mark_exit }
 import ritzlib.span { Span, span_from_ptr }
-import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_RIGHT_READ }
-import cap.table { cap_kernel_grant }
+import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_RIGHT_READ, CAP_RIGHT_ALL }
+import cap.table { CapTable, cap_kernel_grant, cap_table_alloc, cap_table_free_pid }
 import proc.waitset { IRQ_NO_VECTOR, irq_object_register, irq_object_unregister, irq_object_latch }
-import syscall.runtime.driver { drv_irq_wait_park_count }
+import syscall.runtime.driver { drv_irq_wait_park_count, drv_mmio_map, drv_mmio_leaf }
 import driver_abi.wait { DEVICE_WAIT_MS }
+import drivers.virtio.window { phys_range, phys_range_none, vio_window_add, vio_window_remove }
 
 # ============================================================================
 # Boot-test mode self-tests (AGAST #1887)
@@ -403,6 +404,8 @@ const DRIVER_STUB_SPIN: u64 = 2
 const DRIVER_STUB_IRQ_WAIT: u64 = 3
 const DRIVER_STUB_CONSOLE_POLL: u64 = 4
 const DRIVER_STUB_POLL_NVAL: u64 = 5
+const DRIVER_STUB_MMIO_MAP: u64 = 21
+const DRIVER_STUB_DMA_ALLOC: u64 = 22
 const DRIVER_STUB_COOKIE: u64 = 0x4713
 # SCHED_HZ is 100: a 50 ms spin spans five ticks.
 const DRIVER_SPIN_MS: u64 = 50
@@ -750,6 +753,149 @@ fn await_wait_set(pid: u64, us: u64) -> bool
         sched_yield()
     parked_on_wait_set(pid)
 
+# drv-mmio-map (#4720, RING1_DRIVER.md §5 and PR 5): DrvMmioMap maps a
+# recorded window uncached into the caller only. No BAR is granted on this
+# boot, so the window is a double: one RAM page with MMIO_TEST_BYTE at
+# MMIO_TEST_OFFSET, recorded with no MSI-X table, beside a two-page window
+# whose second page holds a (pretend) MSI-X table. On a scratch process
+# (its own capability table and user PML4) the guarded window is refused
+# and maps nothing, the double maps at DRV_MMIO_BASE onto the page with the
+# MMIO leaf flags, and freeing the PML4 leaves the page allocated
+# (PTE_DEVICE). The stub (mode 21, driver_stub.s) runs first: from ring 3
+# it is refused without the handle, maps the double at DRV_MMIO_BASE and
+# reads the byte, and a second map takes the next page; it exits with its
+# first failed step, else 0.
+const MMIO_TEST_OFFSET: u64 = 0x123
+const MMIO_TEST_BYTE: u8 = 0xA5
+const MMIO_TEST_LEN: u64 = 0x20
+const MMIO_GUARDED_LEN: u64 = 0x1800
+const MMIO_TABLE_BYTES: u64 = 16
+const MMIO_SCRATCH_PID: u32 = 0xFFFFFD00
+const PTE_HW_BITS: u64 = PTE_ACCESSED | PTE_DIRTY
+
+# The scratch-process half: 0 if every check held, else its step.
+fn mmio_scratch_steps(page: u64, double: u64, guarded: u64) -> i64
+    if cap_table_alloc(MMIO_SCRATCH_PID) == 0 as *CapTable
+        return 1
+    let pml4: u64 = vmm_create_user_pml4()
+    var step: i64 = 0
+    if pml4 == 0
+        step = 2
+    else
+        let d: u64 = packed_handle(cap_kernel_grant(MMIO_SCRATCH_PID, CAP_TYPE_MMIO, CAP_RIGHT_ALL, double))
+        let g: u64 = packed_handle(cap_kernel_grant(MMIO_SCRATCH_PID, CAP_TYPE_MMIO, CAP_RIGHT_ALL, guarded))
+        if drv_mmio_map(MMIO_SCRATCH_PID, pml4, g) != Errno.Inval as i64 or vmm_pte_in(pml4, DRV_MMIO_BASE) != 0
+            step = 3
+        else if drv_mmio_map(MMIO_SCRATCH_PID, pml4, d) != DRV_MMIO_BASE as i64
+            step = 4
+        else
+            let pte: u64 = vmm_pte_in(pml4, DRV_MMIO_BASE)
+            if (pte & PTE_ADDR_MASK) != page or (pte & ~PTE_ADDR_MASK & ~PTE_HW_BITS) != (drv_mmio_leaf() | PTE_PRESENT)
+                step = 5
+        vmm_free_pml4(pml4)
+    cap_table_free_pid(MMIO_SCRATCH_PID)
+    if step == 0 and pmm_range_has_free(page, PAGE_SIZE)
+        step = 6                        # the exit freed a device frame
+    step
+
+fn drv_mmio_map_self_test() -> bool
+    klog("\nTesting DrvMmioMap on a window double...\n")
+    let page: u64 = pmm_alloc_page()
+    if page == 0
+        klog("  no page for the double\n")
+        return false
+    *(phys_to_virt(page + MMIO_TEST_OFFSET) as *u8) = MMIO_TEST_BYTE
+    let double: u64 = vio_window_add(page + MMIO_TEST_OFFSET, MMIO_TEST_LEN, 0, phys_range_none(), phys_range_none()).unwrap_or(0)
+    let guarded: u64 = vio_window_add(page, MMIO_GUARDED_LEN, 0, phys_range(page + PAGE_SIZE, MMIO_TABLE_BYTES), phys_range_none()).unwrap_or(0)
+    var scratch: i64 = -1
+    var status: i64 = -1
+    if double != 0 and guarded != 0
+        # The stub first: the scratch half frees a capability table, and a
+        # table slot freed before the spawn would give the stub's grants a
+        # later generation than the handles it was given.
+        sched_start(proc_current_slot())
+        let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_MMIO_MAP, DRV_TEST_HANDLE_A)
+        if spawned > 0
+            let pid: u64 = spawned as u64
+            let d: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_MMIO, CAP_RIGHT_ALL, double))
+            if d != DRV_TEST_HANDLE_A
+                klog("  grant gave handle 0x")
+                klog_hex(d)
+                klog("\n")
+                process_mark_exit(pid)
+            status = drv_stub_status(pid)
+        sched_stop()
+        scratch = mmio_scratch_steps(page, double, guarded)
+    vio_window_remove(double)
+    vio_window_remove(guarded)
+    let kept: bool = not pmm_range_has_free(page, PAGE_SIZE)
+    pmm_free_page(page)
+    klog("  scratch step ")
+    klog_dec(scratch)
+    klog(", stub status ")
+    klog_dec(status)
+    if not kept
+        klog(", the stub's exit freed the device page")
+    klog("\n")
+    scratch == 0 and status == 0 and kept
+
+# drv-dma-alloc (#4721, RING1_DRIVER.md §5 and PR 5): DrvDmaAlloc gives the
+# holder of an IRQ handle a zeroed contiguous run, write-back, at
+# DRV_DMA_BASE. The stub (mode 22) checks the refusals (Perm, Inval, NoMem
+# over 4 MiB, Fault), that the first run is zeroed at the window base with
+# { iova 0, size 8192 } copied out, and that the next follows it. Its exit
+# must give every page back: the PMM's free count is what it was before the
+# spawn (the runs are freed once, by the PML4's teardown). Fresh RAM reads
+# zero anyway, so the test first dirties the lowest free run of
+# DMA_DIRTY_PAGES and frees it: the PMM allocates lowest-first, so the
+# spawn's pages and then the stub's run come out of that block, and only
+# zeroing makes them read 0.
+const DRV_TEST_IRQ_DMA: u64 = 0xFFFF4721A
+const DMA_DIRTY_PAGES: u64 = 256
+
+fn dirty_free_run(pages: u64)
+    let first: u64 = pmm_alloc_contig(pages)
+    if first == 0
+        klog("  no run to dirty: the zeroing check is weaker\n")
+        return
+    let words: *u64 = phys_to_virt(first) as *u64
+    var w: u64 = 0
+    while w < pages * PAGE_SIZE / 8
+        *(words + w) = 0xFFFFFFFFFFFFFFFF
+        w = w + 1
+    var p: u64 = 0
+    while p < pages
+        pmm_free_page(first + p * PAGE_SIZE)
+        p = p + 1
+
+fn drv_dma_alloc_self_test() -> bool
+    klog("\nTesting DrvDmaAlloc on a kernel-spawned process...\n")
+    if not irq_object_register(DRV_TEST_IRQ_DMA, IRQ_NO_VECTOR)
+        klog("  IRQ object not registered\n")
+        return false
+    sched_start(proc_current_slot())
+    dirty_free_run(DMA_DIRTY_PAGES)
+    let free: u64 = pmm_get_free_pages()
+    var status: i64 = -1
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_DMA_ALLOC, DRV_TEST_HANDLE_A)
+    if spawned > 0
+        let pid: u64 = spawned as u64
+        if packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, DRV_TEST_IRQ_DMA)) != DRV_TEST_HANDLE_A
+            klog("  grant gave another handle\n")
+            process_mark_exit(pid)
+        status = drv_stub_status(pid)
+    let after: u64 = pmm_get_free_pages()
+    sched_stop()
+    irq_object_unregister(DRV_TEST_IRQ_DMA)
+    klog("  status ")
+    klog_dec(status)
+    klog(", free pages ")
+    klog_dec(free as i64)
+    klog(" before, ")
+    klog_dec(after as i64)
+    klog(" after\n")
+    status == 0 and after == free
+
 # The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
 # stack: boot_process_tests).
 fn driver_process_tests()
@@ -759,6 +905,8 @@ fn driver_process_tests()
     boot_test_result("driver-reap", driver_reap_self_test())
     boot_test_result("drv-irq-wait", drv_irq_wait_self_test())
     boot_test_result("console-poll", console_poll_self_test())
+    boot_test_result("drv-mmio-map", drv_mmio_map_self_test())
+    boot_test_result("drv-dma-alloc", drv_dma_alloc_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before
