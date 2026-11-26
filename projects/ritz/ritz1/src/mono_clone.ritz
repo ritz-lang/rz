@@ -386,8 +386,8 @@ fn collect_struct_types_from_stmts(mono: *MonoCtx, m: *Module, body: *Stmt)
         let k: StmtKind = s.kind
         match k
             StmtKind.VarDecl =>
-                if s.var_type_name != null
-                    add_struct_from_mangled_name(mono, m, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 })
+                if s.var_type_name.ptr != null
+                    add_struct_from_mangled_name(mono, m, s.var_type_name)
             StmtKind.If =>
                 collect_struct_types_from_stmts(mono, m, s.if_then)
                 collect_struct_types_from_stmts(mono, m, s.if_else)
@@ -520,8 +520,8 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
                 rewrite_value_slice(mono, m, s.var_init)
             # Check if variable type is a generic struct — by value or behind a
             # pointer/reference (`var v: *Vec<u8>` needs Vec$u8 just the same).
-            if s.var_type_name != null
-                add_struct_from_mangled_name(mono, m, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 })
+            if s.var_type_name.ptr != null
+                add_struct_from_mangled_name(mono, m, s.var_type_name)
             collect_struct_types_from_signature(mono, m, s.var_fn_sig)   # AGAST #3979: `let f: fn() -> Slot<P>`
             add_struct_from_array_shape(mono, m, s.var_array_shape)   # AGAST #3110
             # Record local-var → Vec/Span suffix mapping for UFCS-driven generic
@@ -533,8 +533,8 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
             var lv_kind: i32 = 0
             var lv_suf: *u8 = null
             var lv_suf_len: i32 = 0
-            if s.var_type == TypeKind.Struct and s.var_type_name != null
-                lv_kind = classify_collection_type(StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 }, @lv_suf, @lv_suf_len)
+            if s.var_type == TypeKind.Struct and s.var_type_name.ptr != null
+                lv_kind = classify_collection_type(s.var_type_name, @lv_suf, @lv_suf_len)
             if lv_kind == 0 and s.var_init != null
                 if s.var_init.kind == ExprKind.Call
                     if s.var_init.call_type_suffix.len > 0
@@ -553,26 +553,26 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
                                     lv_suf = s.var_init.call_type_suffix.ptr
                                     lv_suf_len = s.var_init.call_type_suffix.len as i32
             if lv_kind > 0 and lv_suf != null and lv_suf_len > 0
-                add_local_var(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, lv_kind, StrView { ptr: (lv_suf), len: (lv_suf_len) as i64 })
+                add_local_var(mono, s.var_name, lv_kind, StrView { ptr: (lv_suf), len: (lv_suf_len) as i64 })
                 mark_last_local_by_value(mono)
-            else if s.var_type == TypeKind.Array and s.var_type_name != null and s.var_type_name_len > 0
+            else if s.var_type == TypeKind.Array and s.var_type_name.ptr != null and s.var_type_name.len > 0
                 # `[N]S`: an element receiver `a[i].m()` is an S (AGAST #4231).
-                track_array_local(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 })
-            else if s.var_type_name != null and s.var_type_name_len > 0
+                track_array_local(mono, s.var_name, s.var_type_name)
+            else if s.var_type_name.ptr != null and s.var_type_name.len > 0
                 # Plain struct (or pointer/ref to one): root of a field receiver.
-                track_typed_local_through(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.var_type, s.var_pointee_type, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 })
+                track_typed_local_through(mono, s.var_name, s.var_type, s.var_pointee_type, s.var_type_name)
             else if s.var_init != null and s.var_init.kind == ExprKind.Unary and (s.var_init.op == OpKind.Addr or s.var_init.op == OpKind.AddrMut)
-                track_address_of_local(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.var_init.operand)
+                track_address_of_local(mono, s.var_name, s.var_init.operand)
                 # AGAST #4838: `let e = @&edits[0]` points at an element: `e.bytes`
                 # is that element's field, as with `let e: @&Edit = ..`.
                 let of: *Expr = s.var_init.operand
                 if of != null and of.kind == ExprKind.Index
                     let ename: StrView = indexed_element_name(mono, m, of)
                     if ename.ptr != null and ename.len > 0
-                        add_local_struct_var(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, ename)
+                        add_local_struct_var(mono, s.var_name, ename)
             else if s.var_init != null and s.var_init.kind == ExprKind.StructLit
                 # Un-annotated `var r = R { ... }`: the literal names the type.
-                add_local_struct_var(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.var_init.ident)
+                add_local_struct_var(mono, s.var_name, s.var_init.ident)
             else if s.var_init != null and s.var_init.kind == ExprKind.Index
                 # Un-annotated `let w = p[1]` of a Vec<Vec<T>>: `w` is the element,
                 # a Vec<T>, so `w.get(1)` registers vec_get$T (AGAST #2519).
@@ -580,10 +580,10 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
                 var esuf_len: i32 = 0
                 let ekind: i32 = indexed_element_collection(mono, m, s.var_init, @esuf, @esuf_len)
                 if ekind > 0
-                    add_local_var(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, ekind, StrView { ptr: (esuf), len: (esuf_len) as i64 })
+                    add_local_var(mono, s.var_name, ekind, StrView { ptr: (esuf), len: (esuf_len) as i64 })
                     mark_last_local_by_value(mono)
             else if s.var_init != null and s.var_init.kind == ExprKind.Method
-                track_method_init_local(mono, m, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.var_init)
+                track_method_init_local(mono, m, s.var_name, s.var_init)
             else if s.var_init != null and s.var_init.kind == ExprKind.Call and s.var_init.call_type_suffix.len == 0
                 # `var w = ms()`: a plain fn's return type, as an annotation of it.
                 var call_fn: *FnDef = find_fn_in_module(m, s.var_init.func_name)
@@ -591,7 +591,7 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
                 if call_fn == null
                     call_fn = find_impl_method_by_symbol(m, s.var_init.func_name)
                 if call_fn != null and call_fn.type_params == null
-                    track_typed_local(mono, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, call_fn.return_type, StrView { ptr: (call_fn.return_type_name), len: (call_fn.return_type_name_len) as i64 })
+                    track_typed_local(mono, s.var_name, call_fn.return_type, StrView { ptr: (call_fn.return_type_name), len: (call_fn.return_type_name_len) as i64 })
             if s.var_init != null
                 collect_from_expr(mono, m, s.var_init)
         StmtKind.Assign =>
@@ -599,7 +599,7 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
             # `h.at(0).b = 9` wants `at`, which nothing else here asks for
             # unless the program also reads `h.at(..)`.  A compound target is
             # the value's left, walked with it.
-            if s.assign_target_len == 0 and s.if_cond != null
+            if s.assign_target.len == 0 and s.if_cond != null
                 let tv: *Expr = s.assign_value
                 if tv == null or tv.kind != ExprKind.Binary or tv.left != s.if_cond
                     collect_from_expr(mono, m, s.if_cond)
@@ -877,7 +877,7 @@ fn note_compound_calls(s: *Stmt)
         StmtKind.MemberAssign =>
             a = s.if_cond
         _ =>
-            if k == StmtKind.Assign and s.assign_target_len == 0
+            if k == StmtKind.Assign and s.assign_target.len == 0
                 a = s.if_cond
             else
                 return
@@ -921,8 +921,7 @@ fn si_rewrite_assign(mono: *MonoCtx, m: *Module, s: *Stmt, base: *Expr, key: *Ex
         value.left = si_deref(call, line, col)
     s.kind = StmtKind.Assign
     s.if_cond = si_deref(call, line, col)
-    s.assign_target = null
-    s.assign_target_len = 0
+    s.assign_target = strview_empty()
     s.assign_value = value
     return 1
 
@@ -934,7 +933,7 @@ fn rewrite_struct_index_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
         StmtKind.IndexAssign =>
             # `name[k] = v` keeps the name, not an expression.
             let base: *Expr = si_new_expr(ExprKind.Ident, s.span.line, s.span.col)
-            base.ident = StrView { ptr: s.assign_target, len: s.assign_target_len as i64 }
+            base.ident = s.assign_target
             let key: *Expr = s.while_cond
             let v: *Expr = s.assign_value
             var compound: i32 = 0
@@ -949,14 +948,14 @@ fn rewrite_struct_index_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
             var owner: *Expr = null
             if s.kind == StmtKind.LocalFieldIndexAssign
                 owner = si_new_expr(ExprKind.Ident, s.span.line, s.span.col)
-                owner.ident = StrView { ptr: s.var_name, len: s.var_name_len as i64 }
+                owner.ident = s.var_name
             else
                 owner = s.if_cond
             if owner == null
                 return
             let fbase: *Expr = si_new_expr(ExprKind.Member, owner.span.line, owner.span.col)
             fbase.left = owner
-            fbase.ident = StrView { ptr: s.assign_target, len: s.assign_target_len as i64 }
+            fbase.ident = s.assign_target
             let fkey: *Expr = s.while_cond
             let fv: *Expr = s.assign_value
             var fcompound: i32 = 0
@@ -966,7 +965,7 @@ fn rewrite_struct_index_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
                 collect_from_expr(mono, m, fkey)
             return
         _ => pass
-    if s.kind != StmtKind.Assign or s.assign_target_len != 0 or s.if_cond == null
+    if s.kind != StmtKind.Assign or s.assign_target.len != 0 or s.if_cond == null
         return
     let t: *Expr = s.if_cond
     let v: *Expr = s.assign_value
@@ -1097,7 +1096,7 @@ fn rewrite_value_slice(mono: *MonoCtx, m: *Module, e: *Expr)
 # a let; it's rewritten when its bound allows, and is otherwise left as an
 # index for the emitter to refuse, located.
 fn slice_into_span_annotation(mono: *MonoCtx, m: *Module, s: *Stmt) -> i32
-    return slice_into_span_slot(mono, m, s.var_init, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 })
+    return slice_into_span_slot(mono, m, s.var_init, s.var_type_name)
 
 # The same view of `e` into any slot of type `tn` (AGAST #2877).
 fn slice_into_span_slot(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView) -> i32
@@ -2311,78 +2310,58 @@ fn ptr_local_take_ptr_arg(s: *Stmt, cloned: *Stmt, subst_type: TypeKind, name_sv
     cloned.var_declared_type = TypeKind.PtrPtr
     cloned.var_pointee_type = TypeKind.Ptr
     cloned.var_inner_pointee_type = ptr_slot_deepen((inner as i32), extra)
-    cloned.var_type_name = rest
-    cloned.var_type_name_len = rest_len
+    cloned.var_type_name = StrView { ptr: rest, len: rest_len as i64 }
     if inner != TypeKind.Struct
-        cloned.var_type_name = null
-        cloned.var_type_name_len = 0
+        cloned.var_type_name = strview_empty()
     return 1
 
 # AGAST #1551: a pointer/reference local's pointee at T = the argument.  A
 # bare `*T` (pointee parsed as struct "T") points at the argument type
 # itself; `*Vec<T>` keeps its pointee and has T substituted in its name.
 fn clone_ptr_local_type(mono: *MonoCtx, s: *Stmt, cloned: *Stmt, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView, suffix_sv: StrView)
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
-    var subst_name: *u8 = subst_name_sv.ptr
-    var subst_len: i32 = subst_name_sv.len as i32
-    if s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+    if s.var_type_name.eq(type_param_sv)
         # `*[N]T` and other non-struct pointees naming T are not this path
         # (AGAST #3663).
         if s.var_pointee_type != TypeKind.Struct
             cloned.var_type_name = s.var_type_name
-            cloned.var_type_name_len = s.var_type_name_len
             return
         if ptr_local_take_ptr_arg(s, cloned, subst_type, subst_name_sv) == 1
             return
         cloned.var_pointee_type = subst_type
-        cloned.var_type_name = subst_name
-        cloned.var_type_name_len = subst_len
+        cloned.var_type_name = subst_name_sv
         # A written `*u8` carries no name: a named pointer local is taken to
         # point at a struct, and `*p` was typed i64 while it loaded an i8.
         if type_is_below_struct_nonptr(subst_type)
-            cloned.var_type_name = null
-            cloned.var_type_name_len = 0
+            cloned.var_type_name = strview_empty()
         # `*T` at T = `[N]E` points at that array, as a param does (#2832).
         var arr: ArrayArg
         if subst_type == TypeKind.Array and array_arg_decode(subst_name_sv, @arr) == 1
             cloned.var_pointee_array_size = arr.size
             cloned.var_pointee_array_elem_type = arr.elem
             cloned.var_pointee_array_elem_pointee = arr.pointee
-            cloned.var_type_name = arr.name
-            cloned.var_type_name_len = arr.name_len
+            cloned.var_type_name = StrView { ptr: arr.name, len: arr.name_len as i64 }
         return
     var new_name: *u8 = null
     var new_len: i32 = 0
-    substitute_type_param_in_name(mono, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 }, type_param_sv, suffix_sv, @new_name, @new_len)
-    cloned.var_type_name = new_name
-    cloned.var_type_name_len = new_len
+    substitute_type_param_in_name(mono, s.var_type_name, type_param_sv, suffix_sv, @new_name, @new_len)
+    cloned.var_type_name = StrView { ptr: new_name, len: new_len as i64 }
 
 # AGAST #3663: a `*[N]T` local's element is the argument type, as a `*[N]T`
 # param's is (#2321), and `*[N]*T`'s element points at it (#2378).  The local
 # named no T (its type name is null), so the element stayed a struct "T" and
 # `p[1]` was refused as "a whole struct element".
 fn clone_ptr_array_local_elem(s: *Stmt, cloned: *Stmt, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView)
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
-    var subst_name: *u8 = subst_name_sv.ptr
-    var subst_len: i32 = subst_name_sv.len as i32
     if s.var_type != TypeKind.Ptr or s.var_pointee_type != TypeKind.Array
         return
-    if s.var_pointee_array_elem_name_len != type_param_len or memcmp(s.var_pointee_array_elem_name, type_param, type_param_len as i64) != 0
+    if not s.var_pointee_array_elem_name.eq(type_param_sv)
         return
     if s.var_pointee_array_elem_type == TypeKind.Ptr
         cloned.var_pointee_array_elem_pointee = subst_type
     else
         cloned.var_pointee_array_elem_type = subst_type
-    cloned.var_pointee_array_elem_name = subst_name
-    cloned.var_pointee_array_elem_name_len = subst_len
+    cloned.var_pointee_array_elem_name = subst_name_sv
 
 fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView, suffix_sv: StrView) -> *Stmt
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
-    var subst_name: *u8 = subst_name_sv.ptr
-    var subst_len: i32 = subst_name_sv.len as i32
     var suffix: *u8 = suffix_sv.ptr
     let cloned: *Stmt = malloc(sizeof(Stmt)) as *Stmt
     memcpy(cloned as *u8, s as *u8, sizeof(Stmt))  # AGAST #1925
@@ -2404,7 +2383,6 @@ fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: Type
                 cloned.return_value = null
         StmtKind.VarDecl =>
             cloned.var_name = s.var_name
-            cloned.var_name_len = s.var_name_len
             cloned.var_type = s.var_type
             cloned.var_declared_type = s.var_declared_type  # AGAST #1364
             cloned.var_src_file = s.var_src_file
@@ -2415,20 +2393,19 @@ fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: Type
             # AGAST #1924: `let pp: **T` concretizes T like a `**T` param.
             var pp_local_subst: i32 = 0
             if s.var_type == TypeKind.PtrPtr and ptr_ptr_slot_inner(s.var_inner_pointee_type) == TypeKind.Struct
-                if s.var_type_name != null and s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+                if s.var_type_name.eq(type_param_sv)
                     cloned.var_inner_pointee_type = ptr_ptr_slot_subst(s.var_inner_pointee_type, subst_type)
                     pp_local_subst = 1
             cloned.var_fn_sig = clone_fn_sig(mono, s.var_fn_sig, type_param_sv, subst_type, subst_name_sv, suffix_sv)  # AGAST #1671
             # Substitute type param in variable type name (e.g., Vec<T> -> Vec$u8)
-            if s.var_type == TypeKind.Struct and s.var_type_name != null and s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+            if s.var_type == TypeKind.Struct and s.var_type_name.eq(type_param_sv)
                 # A bare `T` local (`let item: T`, vec_slice<T>) becomes the
                 # argument type itself, as clone_params_with_suffix does for a
                 # bare `T` param.  The name path below would append the suffix
                 # and declare the struct `%T$i32` (AGAST #1794).
                 cloned.var_type = subst_type
                 cloned.var_declared_type = subst_type
-                cloned.var_type_name = subst_name
-                cloned.var_type_name_len = subst_len
+                cloned.var_type_name = subst_name_sv
                 # AGAST #2305: `var x: T` at T = `[N]E` is the `[N]E` local.
                 var vaa: ArrayArg
                 if subst_type == TypeKind.Array and array_arg_decode(subst_name_sv, @vaa) == 1
@@ -2436,18 +2413,15 @@ fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: Type
                     cloned.var_array_elem_type = vaa.elem
                     cloned.var_array_elem_pointee = vaa.pointee
                     cloned.var_array_shape = vaa.shape   # AGAST #3634
-                    cloned.var_type_name = vaa.name
-                    cloned.var_type_name_len = vaa.name_len
-            else if s.var_type == TypeKind.Struct and s.var_type_name != null
+                    cloned.var_type_name = StrView { ptr: vaa.name, len: vaa.name_len as i64 }
+            else if s.var_type == TypeKind.Struct and s.var_type_name.ptr != null
                 var new_name_ptr: *u8 = null
                 var new_name_len: i32 = 0
-                substitute_type_param_in_name(mono, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 }, type_param_sv, suffix_sv, @new_name_ptr, @new_name_len)
-                cloned.var_type_name = new_name_ptr
-                cloned.var_type_name_len = new_name_len
+                substitute_type_param_in_name(mono, s.var_type_name, type_param_sv, suffix_sv, @new_name_ptr, @new_name_len)
+                cloned.var_type_name = StrView { ptr: new_name_ptr, len: new_name_len as i64 }
             else if pp_local_subst == 1
-                cloned.var_type_name = subst_name
-                cloned.var_type_name_len = subst_len
-            else if (s.var_type == TypeKind.Ptr or s.var_type == TypeKind.Ref or s.var_type == TypeKind.MutRef) and s.var_type_name != null
+                cloned.var_type_name = subst_name_sv
+            else if (s.var_type == TypeKind.Ptr or s.var_type == TypeKind.Ref or s.var_type == TypeKind.MutRef) and s.var_type_name.ptr != null
                 # AGAST #1551: `let p: *T` / `*Vec<T>` concretizes T as the same
                 # param does (clone_params_with_suffix).  It kept the name "T" and
                 # a TypeKind.Struct pointee, a struct that does not exist, so `p + 1`
@@ -2455,19 +2429,16 @@ fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: Type
                 clone_ptr_local_type(mono, s, cloned, type_param_sv, subst_type, subst_name_sv, suffix_sv)
             else
                 cloned.var_type_name = s.var_type_name
-                cloned.var_type_name_len = s.var_type_name_len
             clone_ptr_array_local_elem(s, cloned, type_param_sv, subst_type, subst_name_sv)
             # AGAST #2996: `var a: [N]T` at T = the argument, as a `[N]T` param is.
             # It kept `[N x %T]`, a placeholder struct, so `a[i]` loaded a `%T`.
-            if s.var_type == TypeKind.Array and s.var_array_elem_type == TypeKind.Struct and s.var_type_name != null and s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+            if s.var_type == TypeKind.Array and s.var_array_elem_type == TypeKind.Struct and s.var_type_name.eq(type_param_sv)
                 cloned.var_array_elem_type = subst_type
-                cloned.var_type_name = subst_name
-                cloned.var_type_name_len = subst_len
+                cloned.var_type_name = subst_name_sv
             # AGAST #2332: `var a: [N]*T` at T = the argument.
-            if s.var_array_elem_pointee == TypeKind.Struct and s.var_type_name != null and s.var_type_name_len == type_param_len and memcmp(s.var_type_name, type_param, type_param_len as i64) == 0
+            if s.var_array_elem_pointee == TypeKind.Struct and s.var_type_name.eq(type_param_sv)
                 cloned.var_array_elem_pointee = subst_type
-                cloned.var_type_name = subst_name
-                cloned.var_type_name_len = subst_len
+                cloned.var_type_name = subst_name_sv
             # AGAST #3120: `var a: [2][3]T` / `[2][3]P<T>` at T = the argument.  The
             # leaf lives only in the shape; kept as `T` / `P$T`, P$i64 was never
             # instantiated and `a[1][2].v` was "unhandled EXPR_MEMBER".
@@ -2485,10 +2456,9 @@ fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: Type
                 cloned.var_init = null
         StmtKind.Assign =>
             cloned.assign_target = s.assign_target
-            cloned.assign_target_len = s.assign_target_len
             cloned.assign_value = clone_expr(mono, s.assign_value, type_param_sv, subst_type, subst_name_sv, suffix_sv)
             # When assign_target_len == 0, target expression is stored in if_cond
-            if s.assign_target_len == 0
+            if s.assign_target.len == 0
                 cloned.if_cond = clone_expr(mono, s.if_cond as *Expr, type_param_sv, subst_type, subst_name_sv, suffix_sv)
         StmtKind.If =>
             cloned.if_cond = clone_expr(mono, s.if_cond, type_param_sv, subst_type, subst_name_sv, suffix_sv)
@@ -2502,7 +2472,6 @@ fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: Type
             cloned.while_body = clone_body(mono, s.while_body, type_param_sv, subst_type, subst_name_sv, suffix_sv)
         StmtKind.For =>
             cloned.for_var = s.for_var
-            cloned.for_var_len = s.for_var_len
             cloned.for_inclusive = s.for_inclusive
             cloned.for_start = clone_expr(mono, s.for_start, type_param_sv, subst_type, subst_name_sv, suffix_sv)
             cloned.for_end = clone_expr(mono, s.for_end, type_param_sv, subst_type, subst_name_sv, suffix_sv)
@@ -2537,16 +2506,12 @@ fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: Type
         StmtKind.LocalFieldAssign =>
             # v.field = value
             cloned.var_name = s.var_name
-            cloned.var_name_len = s.var_name_len
             cloned.assign_target = s.assign_target
-            cloned.assign_target_len = s.assign_target_len
             cloned.assign_value = clone_expr(mono, s.assign_value, type_param_sv, subst_type, subst_name_sv, suffix_sv)
         StmtKind.LocalFieldIndexAssign =>
             # v.field[idx] = value
             cloned.var_name = s.var_name
-            cloned.var_name_len = s.var_name_len
             cloned.assign_target = s.assign_target
-            cloned.assign_target_len = s.assign_target_len
             # Index expression is stored in while_cond (reused field)
             cloned.while_cond = clone_expr(mono, s.while_cond, type_param_sv, subst_type, subst_name_sv, suffix_sv)
             cloned.assign_value = clone_expr(mono, s.assign_value, type_param_sv, subst_type, subst_name_sv, suffix_sv)
@@ -2819,10 +2784,8 @@ fn clone_match_arms(mono: *MonoCtx, arms: *MatchArm, type_param_sv: StrView, sub
     cloned.pattern_kind = arms.pattern_kind
     cloned.pattern_int = arms.pattern_int
     cloned.pattern_name = arms.pattern_name
-    cloned.pattern_name_len = arms.pattern_name_len
     cloned.pattern_inner_kind = arms.pattern_inner_kind
     cloned.pattern_inner_name = arms.pattern_inner_name
-    cloned.pattern_inner_name_len = arms.pattern_inner_name_len
     cloned.pattern_inner_span.line = arms.pattern_inner_span.line   # AGAST #2405
     cloned.pattern_inner_span.col = arms.pattern_inner_span.col
     cloned.pattern_binds = arms.pattern_binds   # AGAST #1295 (shared: never mutated)

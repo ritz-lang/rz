@@ -91,11 +91,11 @@ fn variant_is_tag_one(name: StrView) -> bool
 
 # `arm`'s pattern name, as a StrView.
 fn arm_name(arm: *MatchArm) -> StrView
-    StrView { ptr: arm.pattern_name, len: arm.pattern_name_len as i64 }
+    arm.pattern_name
 
 # `arm`'s inner (payload binding) name, as a StrView.
 fn arm_inner_name(arm: *MatchArm) -> StrView
-    StrView { ptr: arm.pattern_inner_name, len: arm.pattern_inner_name_len as i64 }
+    arm.pattern_inner_name
 
 # The payload selector (variant_sel) `arm`'s variant occupies: 0 for the
 # carrier side (Ok / Some), 1 for the null side (Err / None).
@@ -659,9 +659,9 @@ fn user_arm_arity_ok(s: *EmitterState, arm: *MatchArm, enum_name: StrView) -> bo
 # Bind the payload binding `arm` has selected (arm_select_bind), as a local
 # of the field's type for the rest of the arm.
 fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: StrView)
-    if arm.pattern_inner_kind != PAT_IDENT or arm.pattern_inner_name_len <= 0
+    if arm.pattern_inner_kind != PAT_IDENT or arm.pattern_inner_name.len <= 0
         return
-    let is_wildcard_name: bool = arm.pattern_inner_name_len == 1 and *arm.pattern_inner_name == '_'
+    let is_wildcard_name: bool = arm.pattern_inner_name.len == 1 and *arm.pattern_inner_name.ptr == '_'
     if is_wildcard_name
         return
     var pay_struct: StrView = no_name()
@@ -984,9 +984,9 @@ fn emit_str_pattern_test(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, miss:
     let len_reg: i32 = next_reg(s)
     format_into(s, "  %.{len_reg} = extractvalue %StrView %.{scrut_reg}, 1\n")
     let same_len: i32 = next_reg(s)
-    let want_len: i64 = arm.pattern_name_len as i64
+    let want_len: i64 = arm.pattern_name.len
     format_into(s, "  %.{same_len} = icmp eq i64 %.{len_reg}, {want_len}\n")
-    if arm.pattern_name_len == 0
+    if arm.pattern_name.len == 0
         return same_len
     let bytes_label: i32 = next_label(s)
     format_into(s, "  br i1 %.{same_len}, label %L{bytes_label}, label %L{miss}\n")
@@ -994,13 +994,13 @@ fn emit_str_pattern_test(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, miss:
     let ptr_reg: i32 = next_reg(s)
     format_into(s, "  %.{ptr_reg} = extractvalue %StrView %.{scrut_reg}, 0\n")
     var acc: i32 = 0
-    for k in 0..arm.pattern_name_len
+    for k in 0..(arm.pattern_name.len as i32)
         let at_reg: i32 = next_reg(s)
         format_into(s, "  %.{at_reg} = getelementptr i8, ptr %.{ptr_reg}, i64 {k as i64}\n")
         let byte_reg: i32 = next_reg(s)
         emit_load_into(s, "i8", byte_reg, at_reg)
         let hit: i32 = next_reg(s)
-        let want_byte: i64 = *(arm.pattern_name + k) as i64
+        let want_byte: i64 = *(arm.pattern_name.ptr + k) as i64
         format_into(s, "  %.{hit} = icmp eq i8 %.{byte_reg}, {want_byte}\n")
         if acc == 0
             acc = hit
@@ -1322,7 +1322,7 @@ fn match_arms_enum_arm(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> *MatchA
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_VARIANT or arm.pattern_kind == PAT_IDENT
-            if user_enum_declares(s.sym.mono.pctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
+            if user_enum_declares(s.sym.mono.pctx, arm.pattern_name) == 1
                 return arm
         arm = arm.next
     null
@@ -1356,10 +1356,10 @@ fn user_enums_declaring(ctx: *ParseCtx, name_sv: StrView) -> i32
 # (match_refuse_ambiguous_arms refuses that match instead).
 fn match_arms_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
     let arm: *MatchArm = match_arms_enum_arm(s, scr, arms)
-    if arm == null or user_enums_declaring(s.sym.mono.pctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) != 1
+    if arm == null or user_enums_declaring(s.sym.mono.pctx, arm.pattern_name) != 1
         return 0 - 1
     for ei in 0..enum_count(s.sym.mono.pctx)
-        if enum_declares_variant(s.sym.mono.pctx, ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
+        if enum_declares_variant(s.sym.mono.pctx, ei, arm.pattern_name) == 1
             return ei
     0 - 1
 
@@ -1367,7 +1367,7 @@ fn match_arms_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
 # the scrutinee's enum and two or more enums declare the name they give.
 fn match_refuse_ambiguous_arms(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
     let arm: *MatchArm = match_arms_enum_arm(s, scr, arms)
-    if arm == null or user_enums_declaring(s.sym.mono.pctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) < 2
+    if arm == null or user_enums_declaring(s.sym.mono.pctx, arm.pattern_name) < 2
         return 0
     eprints(fn_source_file(emitter_current_fn()))
     eprint_char(':')
@@ -1375,11 +1375,11 @@ fn match_refuse_ambiguous_arms(s: *EmitterState, scr: *Expr, arms: *MatchArm) ->
     eprint_char(':')
     eprint_i64(arm.head_span.col as i64)
     eprints(": error: cannot tell which enum ")
-    eprint_bytes(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+    eprint_bytes(arm.pattern_name)
     eprints(" is of: ")
     var seen: i32 = 0
     for ei in 0..enum_count(s.sym.mono.pctx)
-        if declared_enum_has_variant(s.sym.mono.pctx, ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
+        if declared_enum_has_variant(s.sym.mono.pctx, ei, arm.pattern_name) == 1
             if seen > 0
                 eprints(", ")
             var nlen: i32 = 0
@@ -1880,7 +1880,7 @@ fn match_arm_int_value(s: *EmitterState, arm: *MatchArm, out: *i64) -> i32
         *out = arm.pattern_int
         return 1
     if arm.pattern_kind == PAT_IDENT and not match_arm_is_catch_all(s, arm)
-        let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+        let ce: *ConstEntry = find_const_entry(s, arm.pattern_name)
         *out = ce.value
         return 1
     0
@@ -2001,9 +2001,9 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
         let qualified: bool = pat.pattern_kind == PAT_IDENT and pat.pattern_span.line == 0
         # `mod.CONST =>` (angelo's `instructions.POP`, #2409) is module access,
         # refused at the arm (§15.3, AGAST #2215); the bare `CONST =>` compares.
-        if qualified and pat.qualifier != null
-            if is_module_item(s, pat.qualifier, pat.qualifier_len, pat.pattern_name, pat.pattern_name_len) == 1
-                emit_module_item_error(s, pat.qualifier, pat.qualifier_len, pat.pattern_name, pat.pattern_name_len, pat.head_span.line, pat.head_span.col)
+        if qualified and pat.qualifier.ptr != null
+            if is_module_item(s, pat.qualifier.ptr, (pat.qualifier.len as i32), pat.pattern_name.ptr, (pat.pattern_name.len as i32)) == 1
+                emit_module_item_error(s, pat.qualifier.ptr, (pat.qualifier.len as i32), pat.pattern_name.ptr, (pat.pattern_name.len as i32), pat.head_span.line, pat.head_span.col)
                 return
         if scalar and (pat.pattern_kind == PAT_VARIANT or qualified)
             match_err_prefix(pat.head_span.line, pat.head_span.col)

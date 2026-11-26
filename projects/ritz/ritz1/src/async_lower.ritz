@@ -601,8 +601,8 @@ fn al_an_decl(a: *AlFn, s: *Stmt, top: i32)
     if s.var_declared_type != TypeKind.Void
         typed = 1
         t.ty = s.var_type
-        t.type_name = s.var_type_name
-        t.type_name_len = s.var_type_name_len
+        t.type_name = s.var_type_name.ptr
+        t.type_name_len = s.var_type_name.len as i32
         t.pointee = s.var_pointee_type
         t.inner_pointee = s.var_inner_pointee_type
         t.inner_ref = s.var_inner_ref
@@ -614,7 +614,7 @@ fn al_an_decl(a: *AlFn, s: *Stmt, top: i32)
     else if a.untyped == null
         a.untyped = s
     al_an_expr(a, s.var_init)
-    let l: *AlLocal = al_local(a, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.span)
+    let l: *AlLocal = al_local(a, s.var_name, s.span)
     if typed == 1
         l.ty = t.ty
         l.type_name = t.type_name
@@ -951,7 +951,7 @@ fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
 
 # A scalar local's zero (0, false, null); null for an array or struct.
 fn al_zero_of(a: *AlFn, s: *Stmt) -> *Expr
-    let l: *AlLocal = al_local_find(a, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
+    let l: *AlLocal = al_local_find(a, s.var_name)
     if l == null or l.ty == TypeKind.Struct or l.ty == TypeKind.Array
         return null
     if l.ty == TypeKind.Ptr or l.ty == TypeKind.PtrPtr
@@ -973,9 +973,9 @@ fn al_rw_target(a: *AlFn, s: *Stmt, hoist: i32)
     let k: StmtKind = s.kind
     match k
         StmtKind.Assign =>
-            if s.assign_target == null
+            if s.assign_target.ptr == null
                 s.if_cond = al_rw_part(a, s.if_cond, hoist)
-            else if al_is_field(a, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }) == 1
+            else if al_is_field(a, s.assign_target) == 1
                 s.kind = StmtKind.MemberAssign
                 s.if_cond = al_ident("self", s.span)
                 s.bracket = s.span
@@ -986,15 +986,15 @@ fn al_rw_target(a: *AlFn, s: *Stmt, hoist: i32)
             s.while_cond = al_rw_part(a, s.while_cond, hoist)
         StmtKind.IndexAssign =>
             s.while_cond = al_rw_part(a, s.while_cond, hoist)
-            if al_is_field(a, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }) == 1
+            if al_is_field(a, s.assign_target) == 1
                 s.kind = StmtKind.MemberIndexAssign
                 s.if_cond = al_ident("self", s.span)
                 s.index_at = s.bracket   # its `[` (AGAST #2847)
         StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
             if k == StmtKind.LocalFieldIndexAssign
                 s.while_cond = al_rw_part(a, s.while_cond, hoist)
-            if al_is_field(a, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }) == 1
-                s.if_cond = al_self_field(StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, s.span)
+            if al_is_field(a, s.var_name) == 1
+                s.if_cond = al_self_field(s.var_name, s.span)
                 if k == StmtKind.LocalFieldAssign
                     s.kind = StmtKind.MemberAssign
                 else
@@ -1026,7 +1026,7 @@ fn al_rw_stmt(a: *AlFn, s: *Stmt) -> *Stmt
     match k
         StmtKind.VarDecl =>
             s.var_init = al_rw_expr(a, s.var_init)
-            if al_is_field(a, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }) == 1
+            if al_is_field(a, s.var_name) == 1
                 # The local lives in the future, where its uses read it.  One with
                 # no value is zeroed if a scalar; an array or struct is only its
                 # field (ritz0 alike).
@@ -1036,7 +1036,7 @@ fn al_rw_stmt(a: *AlFn, s: *Stmt) -> *Stmt
                     if v == null
                         s.kind = StmtKind.Stripped
                         return s
-                return al_assign_self(StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, v, s.span)
+                return al_assign_self(s.var_name, v, s.span)
         StmtKind.Assign | StmtKind.MemberAssign | StmtKind.MemberIndexAssign | StmtKind.IndexAssign | StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
             al_rw_target(a, s, 0)
             s.assign_value = al_rw_expr(a, s.assign_value)
@@ -1433,117 +1433,117 @@ fn al_jump_in_stmt(s: *Stmt) -> *Stmt
 # boundary, stays a field as before.  ritz0's al_poll_locals is the same.
 
 # Whether `name` is read or written in `e`.
-fn al_mentions_expr(e: *Expr, name: *u8, len: i32) -> i32
+fn al_mentions_expr(e: *Expr, name: StrView) -> i32
     if e == null
         return 0
     let k: ExprKind = e.kind
     if k == ExprKind.Ident
-        return al_eq(e.ident, StrView { ptr: (name), len: (len) as i64 })
+        return al_eq(e.ident, name)
     var r: i32 = 0
     match k
         ExprKind.Binary | ExprKind.Range | ExprKind.Index =>
-            r = al_mentions_expr(e.left, name, len)
+            r = al_mentions_expr(e.left, name)
             if r == 0
-                r = al_mentions_expr(e.right, name, len)
+                r = al_mentions_expr(e.right, name)
         ExprKind.Unary =>
-            r = al_mentions_expr(e.operand, name, len)
+            r = al_mentions_expr(e.operand, name)
         ExprKind.Call =>
             if e.func_name.ptr == null
-                r = al_mentions_expr(e.left, name, len)
+                r = al_mentions_expr(e.left, name)
             if r == 0
-                r = al_mentions_list(e.args, name, len)
+                r = al_mentions_list(e.args, name)
         ExprKind.Method =>
-            r = al_mentions_expr(e.left, name, len)
+            r = al_mentions_expr(e.left, name)
             if r == 0
-                r = al_mentions_list(e.args, name, len)
+                r = al_mentions_list(e.args, name)
         ExprKind.Member | ExprKind.Cast | ExprKind.Try | ExprKind.ArrayFill =>
-            r = al_mentions_expr(e.left, name, len)
+            r = al_mentions_expr(e.left, name)
         ExprKind.If | ExprKind.Match =>
-            r = al_mentions_expr(e.left, name, len)
+            r = al_mentions_expr(e.left, name)
             if r == 0
-                r = al_mentions_arms(e.args as *MatchArm, name, len)
+                r = al_mentions_arms(e.args as *MatchArm, name)
         ExprKind.StructLit =>
             var fi: *FieldInit = e.args as *FieldInit
             while fi != null and r == 0
-                r = al_mentions_expr(fi.value, name, len)
+                r = al_mentions_expr(fi.value, name)
                 fi = fi.next
         ExprKind.ArrayLit =>
-            r = al_mentions_list(e.args, name, len)
+            r = al_mentions_list(e.args, name)
         _ => pass
     r
 
-fn al_mentions_list(e: *Expr, name: *u8, len: i32) -> i32
+fn al_mentions_list(e: *Expr, name: StrView) -> i32
     var cur: *Expr = e
     while cur != null
-        if al_mentions_expr(cur, name, len) == 1
+        if al_mentions_expr(cur, name) == 1
             return 1
         cur = cur.next
     0
 
-fn al_mentions_arms(arm: *MatchArm, name: *u8, len: i32) -> i32
+fn al_mentions_arms(arm: *MatchArm, name: StrView) -> i32
     var cur: *MatchArm = arm
     while cur != null
-        if al_mentions_stmts(cur.body_stmts, name, len) == 1
+        if al_mentions_stmts(cur.body_stmts, name) == 1
             return 1
-        if al_mentions_expr(cur.body, name, len) == 1
+        if al_mentions_expr(cur.body, name) == 1
             return 1
         cur = cur.next
     0
 
-fn al_mentions_stmts(s: *Stmt, name: *u8, len: i32) -> i32
+fn al_mentions_stmts(s: *Stmt, name: StrView) -> i32
     var cur: *Stmt = s
     while cur != null
-        if al_mentions_stmt(cur, name, len) == 1
+        if al_mentions_stmt(cur, name) == 1
             return 1
         cur = cur.next
     0
 
-fn al_mentions_stmt(s: *Stmt, name: *u8, len: i32) -> i32
+fn al_mentions_stmt(s: *Stmt, name: StrView) -> i32
     let k: StmtKind = s.kind
     match k
         StmtKind.VarDecl =>
             # Its own name is a declaration, not a use.  A `let x = x + 1`'s
             # initializer still reads the outer `x`.
-            return al_mentions_expr(s.var_init, name, len)
+            return al_mentions_expr(s.var_init, name)
         StmtKind.Expr =>
-            return al_mentions_expr(s.expr, name, len)
+            return al_mentions_expr(s.expr, name)
         StmtKind.Return =>
-            return al_mentions_expr(s.return_value, name, len)
+            return al_mentions_expr(s.return_value, name)
         StmtKind.If =>
-            if al_mentions_expr(s.if_cond, name, len) == 1
+            if al_mentions_expr(s.if_cond, name) == 1
                 return 1
-            if al_mentions_stmts(s.if_then, name, len) == 1
+            if al_mentions_stmts(s.if_then, name) == 1
                 return 1
-            return al_mentions_stmts(s.if_else, name, len)
+            return al_mentions_stmts(s.if_else, name)
         StmtKind.While =>
-            if al_mentions_expr(s.while_cond, name, len) == 1
+            if al_mentions_expr(s.while_cond, name) == 1
                 return 1
-            return al_mentions_stmts(s.while_body, name, len)
+            return al_mentions_stmts(s.while_body, name)
         StmtKind.For =>
-            if al_mentions_expr(s.for_start, name, len) == 1
+            if al_mentions_expr(s.for_start, name) == 1
                 return 1
-            if al_mentions_expr(s.for_end, name, len) == 1
+            if al_mentions_expr(s.for_end, name) == 1
                 return 1
-            return al_mentions_stmts(s.for_body, name, len)
+            return al_mentions_stmts(s.for_body, name)
         StmtKind.Loop | StmtKind.Defer | StmtKind.Unsafe =>
-            return al_mentions_stmts(s.while_body, name, len)
+            return al_mentions_stmts(s.while_body, name)
         StmtKind.Match =>
-            if al_mentions_expr(s.if_cond, name, len) == 1
+            if al_mentions_expr(s.if_cond, name) == 1
                 return 1
-            return al_mentions_arms(s.if_then as *MatchArm, name, len)
+            return al_mentions_arms(s.if_then as *MatchArm, name)
         StmtKind.Assert =>
-            return al_mentions_expr(s.if_cond, name, len)
+            return al_mentions_expr(s.if_cond, name)
         StmtKind.Assign | StmtKind.MemberAssign | StmtKind.MemberIndexAssign | StmtKind.IndexAssign | StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
-            if s.assign_target != null and al_eq(StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+            if al_eq(s.assign_target, name) == 1
                 return 1
             # The base and index of the other forms, as al_await_in_stmt reads them.
             if k != StmtKind.IndexAssign and k != StmtKind.LocalFieldAssign and k != StmtKind.LocalFieldIndexAssign
-                if al_mentions_expr(s.if_cond, name, len) == 1
+                if al_mentions_expr(s.if_cond, name) == 1
                     return 1
             if k != StmtKind.Assign and k != StmtKind.MemberAssign and k != StmtKind.LocalFieldAssign
-                if al_mentions_expr(s.while_cond, name, len) == 1
+                if al_mentions_expr(s.while_cond, name) == 1
                     return 1
-            return al_mentions_expr(s.assign_value, name, len)
+            return al_mentions_expr(s.assign_value, name)
         _ => pass
     0
 
@@ -1564,32 +1564,32 @@ fn al_splits_stmt(s: *Stmt) -> i32
     (al_jump_in_stmt(s) != null) as i32
 
 # Whether `s` uses `name` in a state other than the one before it.
-fn al_uses_across_stmt(s: *Stmt, name: *u8, len: i32, split: i32) -> i32
+fn al_uses_across_stmt(s: *Stmt, name: StrView, split: i32) -> i32
     let k: StmtKind = s.kind
     match k
         StmtKind.Defer =>
             # A defer body runs at exits, after any await on the way out.
-            return al_mentions_stmts(s.while_body, name, len)
+            return al_mentions_stmts(s.while_body, name)
         StmtKind.While | StmtKind.For | StmtKind.Loop =>
             if al_splits_stmt(s) == 1 or split == 1
-                return al_mentions_stmt(s, name, len)
+                return al_mentions_stmt(s, name)
             return 0
         _ => pass
     if al_splits_stmt(s) == 1
-        return al_mentions_stmt(s, name, len)
+        return al_mentions_stmt(s, name)
     if split == 1
-        return al_mentions_stmt(s, name, len)
+        return al_mentions_stmt(s, name)
     0
 
 # Whether `name`, declared before `rest`, is used after a state boundary in
 # the same activation.
-fn al_crosses_after(name: *u8, len: i32, rest: *Stmt) -> i32
+fn al_crosses_after(name: StrView, rest: *Stmt) -> i32
     var split: i32 = 0
     var cur: *Stmt = rest
     while cur != null
-        if cur.kind == StmtKind.VarDecl and al_eq(StrView { ptr: (cur.var_name), len: (cur.var_name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if cur.kind == StmtKind.VarDecl and al_eq(cur.var_name, name) == 1
             return 0   # a redeclaration shadows it; its own decl is checked
-        if al_uses_across_stmt(cur, name, len, split) == 1
+        if al_uses_across_stmt(cur, name, split) == 1
             return 1
         if al_splits_stmt(cur) == 1
             split = 1
@@ -1606,8 +1606,8 @@ fn al_mark_walk_stmts(a: *AlFn, s: *Stmt, reentered: i32)
             if al_await_in(cur.var_init) != null
                 crosses = 1
             else
-                crosses = al_crosses_after(cur.var_name, cur.var_name_len, cur.next)
-            let l: *AlLocal = al_local_find(a, StrView { ptr: (cur.var_name), len: (cur.var_name_len) as i64 })
+                crosses = al_crosses_after(cur.var_name, cur.next)
+            let l: *AlLocal = al_local_find(a, cur.var_name)
             if l != null
                 if reentered == 0 or crosses == 1
                     l.poll_ok = 0
@@ -2316,7 +2316,7 @@ fn al_lower_for(a: *AlFn, s: *Stmt)
     if al_for_type(a, s, @t) == 0
         var m: String = string_new()
         m.push_str("cannot infer the type of `")
-        m.push_span(Span<u8> { ptr: (s.for_var), len: (s.for_var_len as i64) as i64 })
+        m.push_span(Span<u8> { ptr: s.for_var.ptr, len: (s.for_var.len) as i64 })
         m.push_str("`, which `")
         m.push_span(Span<u8> { ptr: (a.f.name), len: (a.f.name_len as i64) as i64 })
         m.push_str("`'s future holds across an `await`: cast a bound of its range (`0..(n as i64)`)")
@@ -2347,8 +2347,8 @@ fn al_lower_for(a: *AlFn, s: *Stmt)
     al_branch(a, cond, body_b, exit_b, span)
     a.cur = body_b
     let r: *AlRename = al_zalloc(sizeof(AlRename)) as *AlRename
-    r.name = s.for_var
-    r.len = s.for_var_len
+    r.name = s.for_var.ptr
+    r.len = s.for_var.len as i32
     r.field = var_f.ptr
     r.flen = var_f.len as i32
     r.next = a.renames
@@ -2393,15 +2393,15 @@ fn al_hide(a: *AlFn, name_sv: StrView)
 # variant (`None`), which ritz0's parser can't tell either: it counts.
 # ritz0's _pattern_names.
 fn al_arm_names(a: *AlFn, arm: *MatchArm) -> i32
-    if arm.pattern_kind == PAT_IDENT and arm.qualifier == null
-        al_hide(a, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+    if arm.pattern_kind == PAT_IDENT and arm.qualifier.ptr == null
+        al_hide(a, arm.pattern_name)
         return 1
     if arm.pattern_kind != PAT_VARIANT
         return 0
     if arm.pattern_binds == null
         if arm.pattern_inner_kind != PAT_IDENT
             return 0
-        al_hide(a, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 })
+        al_hide(a, arm.pattern_inner_name)
         return 1
     var n: i32 = 0
     var t: *TupleName = arm.pattern_binds
@@ -2622,8 +2622,8 @@ fn al_lower_stmt(a: *AlFn, s: *Stmt, lp: *AlLoop)
     match k
         StmtKind.VarDecl =>
             var d: AlDest = al_dest(AL_TO_FIELD, s.span)
-            d.name = s.var_name
-            d.len = s.var_name_len
+            d.name = s.var_name.ptr
+            d.len = s.var_name.len as i32
             al_lower_value(a, s.var_init, @d, lp)
         StmtKind.Assign | StmtKind.MemberAssign | StmtKind.MemberIndexAssign | StmtKind.IndexAssign | StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
             al_rw_target(a, s, 1)
@@ -2905,13 +2905,13 @@ fn al_analyse(a: *AlFn) -> i32
         let s: *Stmt = a.untyped
         var m: String = string_new()
         m.push_str("cannot infer the type of `")
-        m.push_span(Span<u8> { ptr: (s.var_name), len: (s.var_name_len as i64) as i64 })
+        m.push_span(Span<u8> { ptr: s.var_name.ptr, len: (s.var_name.len) as i64 })
         m.push_str("`, which `")
         m.push_span(Span<u8> { ptr: (f.name), len: (f.name_len as i64) as i64 })
         m.push_str("`'s future holds across an `await`: give `")
-        m.push_span(Span<u8> { ptr: (s.var_name), len: (s.var_name_len as i64) as i64 })
+        m.push_span(Span<u8> { ptr: s.var_name.ptr, len: (s.var_name.len) as i64 })
         m.push_str("` a type (`let ")
-        m.push_span(Span<u8> { ptr: (s.var_name), len: (s.var_name_len as i64) as i64 })
+        m.push_span(Span<u8> { ptr: s.var_name.ptr, len: (s.var_name.len) as i64 })
         m.push_str(": T = ...`)")
         diag_error_buf(a.file, s.span, @m)
         return 1
@@ -3010,12 +3010,12 @@ fn al_push_type(m: @&String, s: *Stmt)
     let t: TypeKind = s.var_declared_type
     match t
         TypeKind.Struct =>
-            m.push_span(Span<u8> { ptr: (s.var_type_name), len: (s.var_type_name_len as i64) as i64 })
+            m.push_span(Span<u8> { ptr: s.var_type_name.ptr, len: (s.var_type_name.len) as i64 })
             return
         TypeKind.Ptr =>
             m.push_str("*")
             if s.var_pointee_type == TypeKind.Struct
-                m.push_span(Span<u8> { ptr: (s.var_type_name), len: (s.var_type_name_len as i64) as i64 })
+                m.push_span(Span<u8> { ptr: s.var_type_name.ptr, len: (s.var_type_name.len) as i64 })
                 return
             let pn: StrView = al_prim_name(s.var_pointee_type)
             if pn.ptr != null
@@ -3039,7 +3039,7 @@ fn al_bare_call_error(file: StrView, call: *Expr) -> i32
 fn al_typed_let_error(file: StrView, s: *Stmt, call: *Expr) -> i32
     var m: String = string_new()
     m.push_str("`")
-    m.push_span(Span<u8> { ptr: (s.var_name), len: (s.var_name_len as i64) as i64 })
+    m.push_span(Span<u8> { ptr: s.var_name.ptr, len: (s.var_name.len) as i64 })
     m.push_str("` is declared `")
     al_push_type(@&m, s)
     m.push_str("` but `")
@@ -3069,9 +3069,9 @@ fn al_bare_stmts(file: StrView, s: *Stmt, value: i32) -> i32
                 if g != null and cur.var_declared_type != TypeKind.Void
                     let fut: StrView = al_future_struct_name(StrView { ptr: (g.name), len: (g.len) as i64 })
                     # R79: a by-value `Future` is Sema's refusal, at the name.
-                    let byval_future: i32 = (cur.var_declared_type == TypeKind.Struct and al_eq(StrView { ptr: (cur.var_type_name), len: (cur.var_type_name_len) as i64 }, "Future") == 1) as i32
+                    let byval_future: i32 = (cur.var_declared_type == TypeKind.Struct and al_eq(cur.var_type_name, "Future") == 1) as i32
                     if byval_future == 0
-                        if cur.var_declared_type != TypeKind.Struct or al_eq(StrView { ptr: (cur.var_type_name), len: (cur.var_type_name_len) as i64 }, fut) == 0
+                        if cur.var_declared_type != TypeKind.Struct or al_eq(cur.var_type_name, fut) == 0
                             errs += al_typed_let_error(file, cur, cur.var_init)
             StmtKind.If =>
                 errs += al_bare_stmts(file, cur.if_then, tail)
@@ -3182,7 +3182,7 @@ fn al_future_stmt(s: *Stmt) -> i32
     let k: StmtKind = s.kind
     match k
         StmtKind.VarDecl =>
-            if al_future_name(s.var_type_name, s.var_type_name_len) == 1
+            if al_future_name(s.var_type_name.ptr, (s.var_type_name.len as i32)) == 1
                 return 1
             if s.var_array != null and al_future_name(s.var_array.name.ptr, (s.var_array.name.len as i32)) == 1
                 return 1

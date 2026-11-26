@@ -1885,10 +1885,10 @@ fn tuple_split_pick(ctx: *ParseCtx, leaves: **Expr, n: i32, j: i32, k_sv: StrVie
 fn tuple_split_let(ctx: *ParseCtx, s: *Stmt, which: i32, init: *Expr) -> *Stmt
     var d: *Stmt = null
     if which == 0
-        d = stmt_let_decl(ctx.tuple_p, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, 0, init, s.span.line, s.span.col)
+        d = stmt_let_decl(ctx.tuple_p, s.var_name, 0, init, s.span.line, s.span.col)
         d.name_span = s.name_span
     else if which == 1
-        d = stmt_let_decl(ctx.tuple_p, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }, 0, init, s.span.line, s.span.col)
+        d = stmt_let_decl(ctx.tuple_p, s.assign_target, 0, init, s.span.line, s.span.col)
         d.name_span = s.name2_span
     else
         var t: *TupleName = s.tuple_more
@@ -1965,7 +1965,7 @@ fn tuple_resolve_stmts(ctx: *ParseCtx, first: *Stmt, tail: *StructDef)
             StmtKind.Return =>
                 tuple_resolve_expr(ctx, s.return_value, ctx.tuple_ret_slot)
             StmtKind.VarDecl =>
-                tuple_resolve_expr(ctx, s.var_init, tuple_slot(ctx, s.var_type, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 }))
+                tuple_resolve_expr(ctx, s.var_init, tuple_slot(ctx, s.var_type, s.var_type_name))
             StmtKind.TupleDecl =>
                 tuple_split_decl(ctx, s)   # AGAST #2974
             StmtKind.If =>
@@ -2140,8 +2140,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
         s.var_fn_sig = p.var_fn_sig
     s.span.line = line
     s.span.col = col
-    s.var_name = name as *u8
-    s.var_name_len = len
+    s.var_name = name_sv
     s.var_ty = tr   # AGAST #4528: the parsed chain lowering types the local from
     # AGAST #1364: keep the written annotation for the narrowing check.
     s.var_declared_type = ty
@@ -2168,27 +2167,21 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     # This prevents the type name from being clobbered by generic calls in the initializer
     if ty == TypeKind.Struct
         if p.var_type_name != null
-            s.var_type_name = p.var_type_name as *u8
-            s.var_type_name_len = p.var_type_name_len
+            s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
         else
-            s.var_type_name = facts.type_name
-            s.var_type_name_len = facts.type_name_len
+            s.var_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
     else if ty == TypeKind.Ptr and p.var_pointee == TypeKind.Struct and p.var_type_name != null
         # AGAST #2822: `*S`, latched by capture_var_type (every typed decl
         # goes through it) before a `<*B>` in the initializer re-set it.
-        s.var_type_name = p.var_type_name as *u8
-        s.var_type_name_len = p.var_type_name_len
+        s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
     else if (ty == TypeKind.Ref or ty == TypeKind.MutRef) and p.var_type_name != null
         # AGAST #1754: reference to struct, latched by capture_var_type.
-        s.var_type_name = p.var_type_name as *u8
-        s.var_type_name_len = p.var_type_name_len
+        s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
     else if ty == TypeKind.PtrPtr and p.var_type_name != null
         # AGAST #1933: `**S` local, latched by capture_var_type.
-        s.var_type_name = p.var_type_name as *u8
-        s.var_type_name_len = p.var_type_name_len
+        s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
     else
-        s.var_type_name = null
-        s.var_type_name_len = 0
+        s.var_type_name = strview_empty()
     # Copy array info from parser state if this is an array type
     s.var_array_shape = null
     s.var_pointee_array_shape = null   # AGAST #2570: inference sets it; #2098: or `*[N][M]T` below
@@ -2206,14 +2199,12 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
         # For arrays of structs, store the struct name in var_type_name
         # so the emitter can allocate with correct element size
         if arr.elem == TypeKind.Struct
-            s.var_type_name = arr.name.ptr
-            s.var_type_name_len = arr.name.len as i32
+            s.var_type_name = arr.name
         else if (arr.elem == TypeKind.Ptr or arr.elem == TypeKind.PtrPtr or arr.elem == TypeKind.Ref or arr.elem == TypeKind.MutRef) and arr.name.len > 0
             # AGAST #184: [N]*Foo arrays (#2369: and [N]@Foo / [N]@&Foo) —
             # propagate the inner pointee
             # struct name so emit_member_ptr can resolve `arr[i].field`.
-            s.var_type_name = arr.name.ptr
-            s.var_type_name_len = arr.name.len as i32
+            s.var_type_name = arr.name
     else
         s.var_array_size = 0
         s.var_array_elem_type = TypeKind.Void
@@ -2224,7 +2215,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
         s.var_pointee_type = p.var_pointee
     else if ty == TypeKind.Ptr or ty == TypeKind.PtrPtr
         s.var_pointee_type = facts.pointee_type
-    else if (ty == TypeKind.Ref or ty == TypeKind.MutRef) and s.var_type_name_len > 0
+    else if (ty == TypeKind.Ref or ty == TypeKind.MutRef) and s.var_type_name.len > 0
         s.var_pointee_type = TypeKind.Struct  # AGAST #1754, as param_new
     else
         s.var_pointee_type = TypeKind.I64  # Default
@@ -2241,11 +2232,9 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     s.var_pointee_array_size = 0
     s.var_pointee_array_elem_type = TypeKind.Void
     s.var_pointee_array_elem_pointee = TypeKind.Void
-    s.var_pointee_array_elem_name = null
-    s.var_pointee_array_elem_name_len = 0
+    s.var_pointee_array_elem_name = strview_empty()
     if ty != TypeKind.Void
-        s.var_pointee_array_elem_name = p.ctx.var_ptr_array_elem_name
-        s.var_pointee_array_elem_name_len = p.ctx.var_ptr_array_elem_name_len
+        s.var_pointee_array_elem_name = StrView { ptr: p.ctx.var_ptr_array_elem_name, len: p.ctx.var_ptr_array_elem_name_len as i64 }
         s.var_pointee_array_size = p.ctx.var_ptr_array_size
         s.var_pointee_array_elem_type = p.ctx.var_ptr_array_elem
         s.var_pointee_array_elem_pointee = p.ctx.var_ptr_array_elem_pointee
@@ -2269,8 +2258,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
 # where the same type on a param stored one.
 pub fn stmt_take_var_ref(s: *Stmt)
     let r: *Param = s.var_ref
-    s.var_type_name = r.param_type_name
-    s.var_type_name_len = r.param_type_name_len
+    s.var_type_name = StrView { ptr: r.param_type_name, len: r.param_type_name_len as i64 }
     s.var_pointee_type = r.param_pointee_type
     s.var_pointee_array_size = r.param_pointee_array_size
     s.var_pointee_array_elem_type = r.param_pointee_array_elem_type
