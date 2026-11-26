@@ -20,7 +20,7 @@ The inbox covers first attach and driver rebind. Latches start at handle inserti
 
 **Round 3 pushback.** Both declined items are accepted.
 - **Item 12.** Reporting a failed UDP send as a `send_drops` count matches ordinary socket behavior, where a finished `sendto` does not report a later ARP failure. The MTU check in the library catches the failure an app can act on before the request is published.
-- **Item 15.** Limiting `PROC_REAP` to `DrvIrqWait` and `ShmWait` is sound for this cutover, as long as the driver and the service really block nowhere else. A lint or a test that the two binaries make no other blocking syscall would hold that line when the call sites are wired.
+- **Item 15.** Limiting `PROC_REAP` to `DrvIrqWait` and `ShmWait` is sound for this cutover, as long as the driver and the service really block nowhere else. A lint or a test that the two binaries make no other blocking syscall would hold that line when the call sites are wired. Held by `projects/ritz/ritz0/tests/test_harland_ring_blocking.py` (AGAST #4746): every syscall the two binaries can reach, through their imports, is one of the two waits or a non-blocking call.
 
 **Round 3 fixes.** Items 13, 14, and 16 landed as written:
 - The latch is keyed by `(object, pid)` and is created when the handle is inserted.
