@@ -1,7 +1,6 @@
 # Buddhafinger editor proposal
 
-**Status** Draft for review. Folds in the second review (findings 1–10) and
-the checks made against the tree at `01f22e650`.
+**Status** Draft for review.
 
 Buddhafinger is a terminal code editor written in Ritz for Linux and Harland.
 Spec and build the Linux editor first. Build the Harland kernel and ritzlib
@@ -101,18 +100,20 @@ With `ISIG` (or `TTY_ISIG`) cleared, Ctrl-C reaches the editor as a key. With
 
 ### Event loop
 
-Drive the editor from one loop that waits on the terminal, the language
-server's stdout, a signal fd, and the next timer deadline.
+Drive the editor from one loop using ritzlib's `poll` and signalfd support.
+On Linux, poll terminal input and the signal fd alongside the server's stdout
+and stderr. Watch the server's stdin for `POLLOUT` only while bytes are queued,
+and use the next timer deadline as the poll timeout.
 
-On Linux the pieces exist except one:
-
-- `poll` is in `ritzlib/fd.ritz`.
-- `SigSet.block`, `SigSet.signalfd`, and `signalfd_read` are in
-  `ritzlib/process.ritz`.
-- `Process` keeps its pipe fds as private `i32` fields and reads them with
-  blocking `read`. Add borrowed `Fd` accessors for the child's stdin, stdout,
-  and stderr and a way to put them in non-blocking mode, with tests. That is
-  the missing piece, not a new wait API.
+Add borrowed `Fd` accessors to `Process` for the three pipes and a way to
+put the parent ends in nonblocking mode. Retain the bytes and offset of a
+partially written JSON-RPC frame until it is sent. Coalesce only snapshots
+whose frames have yet to start, and cap queued bytes. Read stdout
+incrementally and drain stderr separately into a bounded log. Limit pipe
+work per iteration so terminal input and redraws keep moving. Block
+`SIGPIPE` in the editor so a closed server stdin returns `EPIPE`. On stdout
+EOF or `EPIPE`, end the server session and report the failure in the status
+area. Restore the inherited signal mask in the child before exec.
 
 On Harland, the loop waits on the console with a timeout until subprocess
 pipes exist (see the prerequisites).
@@ -175,8 +176,9 @@ open and save, and terminal restoration on each target. Probe capabilities
 such as alternate screen, bracketed paste, color, and resize. Restore terminal
 mode on normal exit, on handled errors, and on the Linux signals above. Use the
 existing Indium shell image as the port's test environment, then package the
-editor by adding it to `projects/indium/initramfs.pkgs` and passing
-`test_indium_initramfs_pkgs.py`. [Terminal library](../projects/ritzlib/term.ritz) ·
+editor by adding it to `projects/indium/initramfs.pkgs` once the staging
+path uses the packaged compiler described under
+[Tests and build isolation](#tests-and-build-isolation). [Terminal library](../projects/ritzlib/term.ritz) ·
 [Harland line discipline](../projects/harland/kernel/src/tty/ldisc.ritz) ·
 [rzsh terminal code](../projects/rzsh/src/os.ritz) ·
 [Indium shell image](../projects/indium/README.md)
@@ -218,12 +220,21 @@ follows what the kernel does (`kernel/src/fs/syscall.ritz`):
   on Linux, so it does not compile for Harland today.
 
 So the Harland save builds the whole file in one buffer, opens the target
-`O_WRONLY | O_CREAT | O_TRUNC`, issues one `write`, closes, and calls `sync`.
-A kill before the write keeps the old file; a kill after it commits the whole
-new file. This is effectively atomic without `rename`, at the cost of holding
-the file twice in memory (once in the editor, once in the kernel buffer).
-Until the kernel commits an empty write on close, saving an empty buffer on
-Harland fails with a message rather than appearing to succeed.
+`O_WRONLY | O_CREAT | O_TRUNC`, requires one full-length `write`, and checks
+the final `close` result. A single write avoids a process kill between chunks
+committing a prefix of an existing file. It requires a contiguous snapshot in
+the editor and a kernel write buffer. Until the empty-write fix lands, refuse
+an empty save before opening the target.
+
+For RAM-only paths, a successful close completes the save. For `/var`,
+require both a successful close and a successful `sync` before marking the
+buffer clean. Close updates the runtime tree before updating the persistent
+subtree. If the second update fails, the new bytes may be visible in the
+running system while a reboot still loads the old file. A failed sync can
+also leave the on-disk version behind. Keep the buffer dirty in either case
+and report that the live file may already have changed. Keep transactional
+replacement across the two trees and storage failure recovery on the Harland
+save-parity track.
 
 Without `stat`, the Harland save cannot detect external changes or preserve
 permissions; it says so in the message area. Claim save parity only once the
@@ -336,6 +347,7 @@ on both targets.
 | Larger raw input queue, or an overrun the reader can see | Bytes past 1024 dropped silently | Paste, fast input bursts | Paste support |
 | `stat` / `fstat` (size, mtime, mode) | Missing; number 4 free | External-change check, permissions | Save parity |
 | `chmod` or mode on create | Missing | Preserving permissions | Save parity |
+| Transactional replacement and storage failure recovery | Runtime and persistent namespace writes can fail independently | A defined save contract across close and sync failures | Save parity |
 | `rename`, `unlink` | Missing | Temporary-file saves, if Harland moves to a Linux-style save | Optional |
 | Console window size | Missing | Automatic viewport | Later (configurable viewport until then) |
 | Signal delivery or exit hook | Ctrl-C with `TTY_ISIG` kills outright | Terminal restoration after a kill | Later |
@@ -347,16 +359,22 @@ on both targets.
 The first Harland port needs the console flags (available now), the
 configurable viewport, the timed console read, a ritzlib write path that
 compiles for Harland, and the empty-write fix. Its save is the single-write
-save described above.
+save described above, with separate RAM-only and persistent success criteria.
 
 ## Tests and build isolation
 
 Use a dedicated Buddhafinger test entry point and CI job. Build the editor,
 Ritz test binaries, and the real server used by editor tests with
-`ritz1_selfhosted` only. Pass the compiler explicitly at every build entry
-point and set `RITZ1` explicitly for real-server tests. Use one compiler
-artifact for Linux and Harland targets. Compiler bootstrap remains an upstream
-toolchain dependency. Keep Buddhafinger out of the compiler regression
+`ritz1_selfhosted` only. Assume a Docker image supplies the packaged compiler
+and its build dependencies. Use the same image and compiler artifact for
+Linux and Harland targets, pass the compiler explicitly at each build entry
+point, and set `RITZ1` to the packaged compiler for real-server tests.
+
+Indium's initramfs build currently invokes `rz build` with the default
+compiler for each manifest entry. Before registering Buddhafinger there,
+give its staging path an explicit `ritz1_selfhosted` build using the image.
+Have the packaging test verify the compiler selection and that the resulting
+Harland ELF is staged. Compiler bootstrap belongs to the upstream image build. Keep Buddhafinger out of the compiler regression
 suites and generic workspace multi-compiler build and test sweeps through a
 reasoned `[workspace.exclude]` entry in `rz.toml`. `rz` refuses an empty
 reason or a stale path, and `test_nested_packages.py` fails if a `ritz.toml`
@@ -378,6 +396,9 @@ actually runs its suite. [Workspace CLI](../rz) ·
   short writes, storage exhaustion, and concurrent file changes.
 - **Language tests.** Use a scripted server for partial frames, rapid edits,
   delayed replies, stale results, capability negotiation, and server exit.
+  Stall server stdin reads during a full-text update and flood stderr. Verify
+  terminal input and repaint continue, queued bytes stay bounded, and a
+  partially written frame arrives intact when the server resumes reading.
   Smoke-test the real ritz-lsp with a Ritz file that produces a diagnostic
   without any request after the change, and that supports hover and
   definition lookup. Fail when the compiler's keyword set and the editor
@@ -387,8 +408,11 @@ actually runs its suite. [Workspace CLI](../rz) ·
   verify the saved bytes and the shell's terminal state after exit. Leave
   Insert mode with a bare Escape. Reboot and verify the file persisted. Kill
   the editor before and after the save's write and verify the file holds the
-  old or the new contents, never a prefix. Repeat against the packaged Indium
-  image when distribution integration lands.
+  old or the new contents, never a prefix. Cover empty saves and RAM-only
+  saves without a storage device. Inject failure during the persistent
+  subtree update and during sync, then check the dirty flag, error message,
+  live contents, and rebooted contents. Repeat the console acceptance test
+  against the packaged Indium image when distribution integration lands.
 - **Performance tests.** Track the buffer workloads separately from functional
   tests. Set regression limits after collecting repeatable baseline results.
 
@@ -402,7 +426,8 @@ Linux editor:
 1. Terminal-session module in ritzlib, lifted from rzsh (raw mode, restore,
    key decoding, Escape timeout, cursor and style output), with rzsh moved
    onto it.
-2. `Process` fd accessors and non-blocking pipe reads in `ritzlib/process.ritz`.
+2. `Process` fd accessors and nonblocking pipe reads and writes in
+   `ritzlib/process.ritz`.
 3. Buffer core: line storage, buffer API, edit transactions, undo/redo,
    round-trip preservation, randomized reference tests.
 4. Screen: cell grid, diff output, gutter, scrolling, status and message
@@ -414,7 +439,7 @@ Linux editor:
    check, permissions.
 8. Editor lexer and lexical colors, with the keyword-drift test.
 9. ritz-lsp client: framing, revisions, diagnostics overlay, hover,
-   definition, scripted-server tests.
+   definition, pipe backpressure and scripted-server tests.
 10. Benchmarks and the dedicated CI job with the `[workspace.exclude]` entry.
 
 Harland track:
@@ -425,7 +450,9 @@ Harland track:
 13. Raw input queue growth or overrun reporting.
 14. `stat`/`fstat` and mode on create.
 15. Harland adapter, single-write save, QEMU acceptance test, and Indium
-    packaging.
+    packaging with the Docker-packaged self-hosted compiler.
+16. Transactional Harland replacement and storage failure recovery for save
+    parity.
 
 ritz-lsp on Harland (later): pipes and fd-redirected spawn, a larger process
 table, a scratch directory, and a runnable ritz1.
@@ -440,7 +467,8 @@ table, a scratch directory, and a runnable ritz1.
 3. Approve the [Harland prerequisites](#harland-prerequisites) as a parallel
    track. The first port needs the timed console read, a Harland-capable
    ritzlib write path, and the empty-write fix, and saves with a single write
-   and `sync`. Save parity waits for `stat` and modes. ritz-lsp on Harland
+   and checks `sync` for `/var`. Save parity waits for `stat`, modes, and a
+   transactional replacement and storage failure contract. ritz-lsp on Harland
    waits for pipes, a larger process table, a scratch directory, and ritz1.
 4. Approve the smaller first usable release (one buffer, Normal and Insert,
    save, quit), with counts, operators, Visual mode, and multiple buffers
