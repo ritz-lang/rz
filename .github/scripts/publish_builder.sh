@@ -2,7 +2,7 @@
 # Tag and push the builder image that projects/builder/test.sh built and
 # tested (AGAST #4824).  .github/workflows/builder.yml runs it.
 #
-#   publish_builder.sh [--dry-run] <commit> <image> <ref>
+#   publish_builder.sh [--dry-run] [--commit-only] <commit> <image> <ref>
 #
 #   <commit>  the full 40-hex rz commit the image was built from
 #   <image>   the registry repository, no tag (ghcr.io/ritz-lang/rz-builder)
@@ -23,6 +23,11 @@
 # characters.  A tag that comes out as `main`, `ritz1-*` or a 40-hex commit
 # is refused: those tags are this script's, and a git tag must not move them.
 #
+# --commit-only (AGAST #4846) pushes <image>:<commit> alone, for a push to
+# main only: main.yml's builder-image job publishes every main commit's image
+# for huburght's Woodpecker, whose steps run it, and leaves :main to
+# builder.yml.
+#
 # --dry-run prints the tags and pushes nothing; the workflow runs that on
 # every run.  Without --dry-run, inside Actions (GITHUB_ACTIONS=true) it
 # refuses anything but a push event for <ref> itself, under the job's own
@@ -34,10 +39,11 @@
 set -euo pipefail
 export LC_ALL=C   # the sanitiser's character class is per byte
 
-dry=0
+dry=0 commit_only=0
 if [[ "${1:-}" == "--dry-run" ]]; then dry=1; shift; fi
+if [[ "${1:-}" == "--commit-only" ]]; then commit_only=1; shift; fi
 if [[ $# -ne 3 ]]; then
-    echo "usage: publish_builder.sh [--dry-run] <commit> <image> <ref>" >&2; exit 2
+    echo "usage: publish_builder.sh [--dry-run] [--commit-only] <commit> <image> <ref>" >&2; exit 2
 fi
 commit="$1" image="$2" ref="$3"
 if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
@@ -75,6 +81,12 @@ refs/heads/?*)   kind=branch publishable=0 ;;
     exit 2 ;;
 esac
 
+if [[ $commit_only -eq 1 && $kind != main ]]; then
+    publishable=0
+    if [[ $dry -eq 0 ]]; then
+        echo "publish_builder: --commit-only publishes a push to main only, not $ref" >&2; exit 1
+    fi
+fi
 if [[ $dry -eq 0 ]]; then
     if [[ $publishable -eq 0 ]]; then
         echo "publish_builder: only a push to main or a tag publishes, not $ref" >&2; exit 1
@@ -104,6 +116,7 @@ tag)    tags=("$image:$tag" "$image:ritz1-${sha:0:12}" "$image:$commit") ;;
 main)   tags=("$image:main" "$image:$commit") ;;
 branch) tags=("$image:$commit") ;;
 esac
+[[ $commit_only -eq 1 ]] && tags=("$image:$commit")
 if [[ $dry -eq 1 ]]; then
     for t in "${tags[@]}"; do echo "would push $t (from $src)"; done
     [[ $publishable -eq 0 ]] && echo "$ref publishes nothing: only a push to main or a tag does"

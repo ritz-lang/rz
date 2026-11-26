@@ -706,16 +706,18 @@ default command). So:
 | `test-all` (`./rz test --all`) | yes (#3969, Aaron 2026-11-18) | yes |
 | `bootstrap` (matrix-full, regression.sh, ...) | yes | yes |
 | `read-set-audit` (strace of the two scoped regression steps) | no (#4315: ~15 min traced; it checks the gate's own skip rule, not the change) | yes |
+| `builder-fleet` (asks huburght's Woodpecker whether it can run the builder matrix; the hosted `builder-packages` / `builder-matrix` run only when it can't) | no (#4846: an HTTP probe of `ci.fucken.ninja`, which the room gate's sandbox has no network for) | yes |
 | `builder-packages` (computes the builder-matrix package list) | no (#4825: needs no toolchain, but is read by `builder-matrix`, which does need network) | yes |
-| `builder-image` (builds and tests the builder image of the commit, `projects/builder/test.sh`, for `builder-matrix`) | no (#4847: Docker and apt's network; smoke-plan.sh's `builder` target runs the same test.sh before a merge that touches `projects/builder`) | yes |
-| `builder-matrix` (one run per package in `builder-image`'s image, the checkout mounted as its workspace; buddhafinger is #4826's first opt-in) | no (#4825, #4826, #4847: runs Docker, which the room gate's sandbox doesn't give it) | yes |
+| `builder-image` (builds and tests the builder image of the commit, `projects/builder/test.sh`, for `builder-matrix`; for a push to main, publishes it as `ghcr.io/ritz-lang/rz-builder:<commit>`, the image of every `.woodpecker/builder.yml` step, #4846) | no (#4847: Docker and apt's network; smoke-plan.sh's `builder` target runs the same test.sh before a merge that touches `projects/builder`) | yes |
+| `builder-matrix` (one run per package in `builder-image`'s image, the checkout mounted as its workspace; buddhafinger is #4826's first opt-in; hosted only when `builder-fleet` finds Woodpecker down, else `.woodpecker/builder.yml` runs the same list on huburght, #4846) | no (#4825, #4826, #4847: runs Docker, which the room gate's sandbox doesn't give it) | yes |
 
 The one other workflow, `.github/workflows/builder.yml` (#4824), is where
 `ghcr.io/ritz-lang/rz-builder` comes from. Out of band from main.yml, it
 builds and tests the image (`projects/builder/test.sh`), then pushes
 `:<tag>`, `:ritz1-<sha12>` and `:<commit>` for any git tag, or `:main` and
 `:<commit>` for a push to main that changes the builder. It isn't in the gate
-or in this table. Before a merge that touches `projects/builder`,
+or in this table. main.yml's `builder-image` adds `:<commit>` for every push
+to main (#4846), for huburght's Woodpecker. Before a merge that touches `projects/builder`,
 smoke-plan.sh's `builder` target runs the same test.sh.
 
 **A budget-only gate verdict is terminal, and `rz` accepts that REAP.** A gate

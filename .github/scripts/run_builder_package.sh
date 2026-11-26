@@ -31,7 +31,8 @@
 #
 # The container's own exit status is already 0 only when the build
 # succeeded and every test passed (projects/builder/README.md); this script
-# adds one more check the image can't make for itself: a package whose
+# adds, through check_builder_summary.py (shared with Woodpecker's
+# woodpecker_builder_step.sh, AGAST #4846), one more check the image can't make for itself: a package whose
 # summary reports zero tests passed is a silently-empty run, not a green
 # one, so it fails here even though the container exited 0 (projects/
 # builder/summary.py's "No tests found, skipping" parses to passed=0,
@@ -83,27 +84,4 @@ summary="$out/summary.json"
     echo "run_builder_package: $pkg: $summary is missing after the run" >&2
     exit 1
 }
-python3 - "$summary" "$pkg" "$build_only" <<'PY'
-import json
-import sys
-
-summary_path, pkg, build_only = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
-summary = json.loads(open(summary_path).read())
-if not summary.get("ok"):
-    print(f"run_builder_package: {pkg}: run not ok: {json.dumps(summary)}", file=sys.stderr)
-    sys.exit(1)
-if build_only:
-    print(f"run_builder_package: {pkg}: built (build only): the package has no tests")
-    sys.exit(0)
-test = summary.get("test", {})
-passed = test.get("passed", 0)
-if passed <= 0 and test.get("test_sh") == "pass":
-    # A test.sh-only suite (rllvm's pytest): summary.py counts ritzunit
-    # tests, and records the script's verdict apart.
-    print(f"run_builder_package: {pkg}: test.sh passed (no ritzunit tests)")
-    sys.exit(0)
-if passed <= 0:
-    print(f"run_builder_package: {pkg}: ran zero tests: {json.dumps(summary)}", file=sys.stderr)
-    sys.exit(1)
-print(f"run_builder_package: {pkg}: {passed} test(s) passed")
-PY
+python3 "$(dirname "$0")/check_builder_summary.py" "$summary" "$pkg" "$build_only"

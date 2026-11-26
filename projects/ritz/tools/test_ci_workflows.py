@@ -75,9 +75,11 @@ def test_no_job_or_step_is_continue_on_error():
 #: runner ships; main.yml's builder-image (AGAST #4847) is builder.yml's
 #: image build for the commit under test, and builder-matrix (AGAST #4825,
 #: #4826) builds and tests inside that image's container, never the host's
-#: compiler.
+#: compiler; builder-fleet (AGAST #4846) only asks huburght's Woodpecker over
+#: HTTP whether it can run the matrix instead.
 NO_SETUP_JOBS = {
     ("builder.yml", "builder"),
+    ("main.yml", "builder-fleet"),
     ("main.yml", "builder-packages"),
     ("main.yml", "builder-image"),
     ("main.yml", "builder-matrix"),
@@ -156,8 +158,10 @@ def test_gate_coverage_is_documented_where_main_yml_points():
     # run Docker, which a room gate's sandbox does not give them (no
     # network, no systemd-run), the same reason builder.yml's own image
     # build is out of band and outside this table entirely.
-    not_gated = {"read-set-audit", "builder-packages", "builder-image",
-                 "builder-matrix"}
+    # builder-fleet (AGAST #4846) only probes huburght's Woodpecker over the
+    # network for builder-matrix.
+    not_gated = {"read-set-audit", "builder-fleet", "builder-packages",
+                 "builder-image", "builder-matrix"}
     for job, row in rows.items():
         gated = row.split("|")[2].strip()
         assert gated.startswith("no" if job in not_gated else "yes"), row

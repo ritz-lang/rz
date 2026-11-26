@@ -81,8 +81,9 @@ Linux bin, tome, one indium PIC bin, and harland's kernel ELF (build
 only). The two sides must agree on pass/fail and on the test counts.
 
 main.yml's `builder-image` job builds the image of every commit it
-validates with `test.sh`, for that run's `builder-matrix` (AGAST #4847). It
-publishes nothing. The published image comes from
+validates with `test.sh`, for that run's `builder-matrix` (AGAST #4847). For
+a push to main it publishes that image as `:<commit>` alone, for huburght's
+Woodpecker (#4846, below). Every other tag comes from
 `.github/workflows/builder.yml` (#4824), out of band from the compiler CI. Each run builds and tests the image
 with `test.sh`, including its size budget. A push of any git tag publishes
 `ghcr.io/ritz-lang/rz-builder:<tag>`, `:ritz1-<sha12>` and `:<commit>`; the
@@ -96,6 +97,91 @@ This directory is not a Ritz package and has no `ritz.toml`. `rz`'s
 (`tools/test_nested_packages.py` passes with it present). smoke-plan.sh maps
 `projects/builder/**` to its own `builder` target, which runs `test.sh`,
 instead of `pkg:builder`.
+
+## CI on huburght's Woodpecker
+
+AGAST #4846 (Aaron, 2026-11-26). The per-package matrix runs on the
+Woodpecker at `https://ci.fucken.ninja` (adele's stack: kubernetes backend
+on huburght, forge `git.fucken.ninja`; adele's `docs/gitea.md`). GitHub stays
+canonical, and its hosted `builder-matrix` is the fallback.
+
+On a push to main:
+
+1. main.yml's `builder-fleet` runs `.github/scripts/woodpecker_fleet.py`. It
+   says `hosted=false` when `/api/healthz` answers, `ritz-lang/rz` is
+   activated there, and no pipeline of it has been `pending` for 30 minutes
+   (that means no agent is taking work). Anything else, including a
+   `workflow_dispatch` run, says `hosted=true`.
+2. `builder-image` builds and tests the image (`test.sh`) and pushes
+   `ghcr.io/ritz-lang/rz-builder:<commit>`. It hands the image to the hosted
+   matrix only when `hosted=true`.
+3. `builder-packages` and `builder-matrix` run only when `hosted=true`, so
+   GitHub spends no matrix minutes while the fleet is up.
+4. Gitea's pull mirror of `ritz-lang/rz` syncs, and its push webhook starts
+   `.woodpecker/builder.yml`:
+   - `wait-for-image` polls ghcr anonymously until `:<commit>` exists, for
+     up to 40 minutes. A step whose pod can't pull its image fails at once.
+   - Then comes one step per package, in the order `builder_matrix.py matrix`
+     gives. Each step is a pod whose image is
+     `ghcr.io/ritz-lang/rz-builder:${CI_COMMIT_SHA}`, running
+     `.github/scripts/woodpecker_builder_step.sh`. That script calls the
+     entrypoint with `RZ_ROOT` set to the clone, then applies the same
+     zero-test check as `run_builder_package.sh`
+     (`check_builder_summary.py`).
+   - Steps have no `depends_on`, so they run one at a time. Every package
+     runs whatever the one before it did.
+
+The pipeline is generated, so don't edit it. When the matrix moves (a
+package, or a known-failures `build`/`parity` entry under
+ritz1_selfhosted), regenerate it:
+
+```bash
+python3 projects/ritz/tools/builder_matrix.py woodpecker --write
+```
+
+`tools/test_woodpecker_builder.py` fails while it is stale. It also pins the
+cluster's rules:
+- no privileged step, volume (so no hostPath or docker.sock), service or
+  secret;
+- uid 1000 (`runAsNonRoot`, no privilege escalation);
+- an 8Gi memory limit and no CPU request or limit (adele's no-CPU-limits
+  rule; without a request, a step gets the smallest CPU weight on the box,
+  below train gates and rooms);
+- no seccomp profile;
+- `labels: pool: rz-builder`.
+
+The seccomp profile matters. Under a RuntimeDefault-style profile (Docker's
+default), the image of 31d73e00e fails 19 of ritzlib's 896 tests, because
+they call io_uring. Pod Security `baseline` forbids naming `Unconfined`, so
+the pods depend on the kubelet's default staying unset (no
+`--seccomp-default`).
+
+Checked locally on the image of 31d73e00e: each step command ran in the
+image with its entrypoint replaced, as uid 1000, the clone as the working
+directory, and no seccomp profile.
+
+### Cluster side (adele's cluster, applied by adele)
+
+- A public Gitea pull mirror `ritz-lang/rz` of
+  `https://github.com/ritz-lang/rz`. No credential is needed, since the
+  source is public.
+- An rz agent, `woodpecker-agent-rz`:
+  - `WOODPECKER_AGENT_LABELS=pool=rz-builder` and `WOODPECKER_MAX_WORKFLOWS=1`;
+  - its own steps namespace (Pod Security `baseline`, tokenless default
+    ServiceAccount, the agent's Role only there);
+  - a LimitRange (memory only) and a ResourceQuota.
+
+  The existing agents and `woodpecker-steps` don't change.
+
+### What only Aaron can do
+
+- Make the `rz-builder` package public on ghcr.io (package settings,
+  "Change visibility"). Today an anonymous pull is refused (401), and step
+  pods have no pull secret.
+- Activate `ritz-lang/rz` in Woodpecker (Gitea OAuth login as an owner of
+  the mirror), and set it public, so `woodpecker_fleet.py` can read it
+  anonymously.
+- Neither step puts a token in this repo.
 
 ## Files
 

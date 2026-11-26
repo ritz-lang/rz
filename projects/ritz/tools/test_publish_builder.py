@@ -163,6 +163,35 @@ def test_a_branch_dry_run_names_only_the_commit_tag(tmp_path):
     assert _writes(calls) == [], calls
 
 
+@pytest.mark.integration
+def test_commit_only_pushes_just_the_commit_tag_for_main(tmp_path):
+    """AGAST #4846: main.yml's builder-image job publishes the image of every
+    main commit for huburght's Woodpecker, whose steps run
+    <image>:<commit>. :main stays builder.yml's."""
+    r, calls = _run(tmp_path, [LOCAL], "--commit-only", COMMIT, IMAGE, MAIN,
+                    env=_actions(MAIN))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _writes(calls) == [f"tag {SRC} {IMAGE}:{COMMIT}", f"push {IMAGE}:{COMMIT}"], calls
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("ref", ["refs/tags/v1.2.0", "refs/heads/ritz-task-4846"],
+                         ids=["tag", "branch"])
+def test_commit_only_publishes_for_main_alone(tmp_path, ref):
+    r, calls = _run(tmp_path, [LOCAL], "--commit-only", COMMIT, IMAGE, ref, env=_actions(ref))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "--commit-only publishes a push to main only" in r.stderr, r.stderr
+    assert _writes(calls) == [], calls
+
+
+@pytest.mark.integration
+def test_commit_only_dry_run_names_only_the_commit_tag(tmp_path):
+    r, calls = _run(tmp_path, [LOCAL], "--dry-run", "--commit-only", COMMIT, IMAGE, MAIN)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert re.findall(r"^would push (\S+)", r.stdout, re.M) == [f"{IMAGE}:{COMMIT}"]
+    assert _writes(calls) == [], calls
+
+
 # --- git tag name -> Docker tag --------------------------------------------
 
 @pytest.mark.integration
@@ -291,24 +320,53 @@ def _step(pattern: str):
     return hits[0]
 
 
+def _main_jobs():
+    return yaml.safe_load(MAIN_WORKFLOW.read_text())["jobs"]
+
+
 @pytest.mark.unit
-def test_main_yml_builds_the_image_only_for_its_matrix_and_never_publishes():
-    """Compiler CI never publishes: builder.yml alone pushes to ghcr.io.
-    Since AGAST #4847 main.yml's builder-image job builds the image of the
-    commit under test (test.sh, ~4 min) for builder-matrix, which ran a stale
-    :main before; no other job builds it and no job holds a registry right."""
-    main = MAIN_WORKFLOW.read_text()
-    jobs = yaml.safe_load(main)["jobs"]
+def test_main_yml_builds_the_image_once_and_publishes_only_its_commit_tag():
+    """Since AGAST #4847 main.yml's builder-image job builds the image of the
+    commit under test (test.sh, ~4 min); since #4846 it also pushes that
+    image as :<commit> for a push to main, for huburght's Woodpecker, whose
+    steps run it. Nothing else in main.yml builds it, holds a registry
+    right or pushes; :main and the tag tags stay builder.yml's."""
+    jobs = _main_jobs()
     assert "builder" not in jobs
-    assert "publish_builder" not in main and "docker login" not in main
-    assert "ghcr.io" not in main
     builds = [name for name, job in jobs.items()
               if any("projects/builder/test.sh" in str(st.get("run", ""))
                      for st in job.get("steps") or [])]
     assert builds == ["builder-image"], builds
     for name, job in jobs.items():
-        assert "packages" not in (job.get("permissions") or {}), name
-    assert jobs["builder-matrix"]["needs"] == ["builder-packages", "builder-image"]
+        if name != "builder-image":
+            assert "packages" not in (job.get("permissions") or {}), name
+            assert "docker login" not in str(job) and "publish_builder" not in str(job), name
+    image = jobs["builder-image"]
+    assert image["permissions"] == {"contents": "read", "packages": "write"}
+    publish = [s for s in image["steps"] if "publish_builder.sh" in str(s.get("run", ""))]
+    assert len(publish) == 1, publish
+    assert re.search(r'publish_builder\.sh --commit-only "\$\{\{ github\.sha \}\}" '
+                     r'ghcr\.io/ritz-lang/rz-builder refs/heads/main', publish[0]["run"]), publish
+
+
+@pytest.mark.unit
+def test_main_yml_registry_steps_run_on_a_push_to_main_only():
+    steps = _main_jobs()["builder-image"]["steps"]
+    touching = [s for s in steps
+                if re.search(r"docker (login|logout|push)|publish_builder", s.get("run") or "")]
+    assert len(touching) == 3, [s.get("name") for s in touching]
+    for s in touching:
+        assert "github.event_name == 'push' && github.ref == 'refs/heads/main'" in s["if"], s
+        assert "runner.temp" in str((s.get("env") or {}).get("DOCKER_CONFIG")), s
+    login, _, logout = touching
+    assert "--password-stdin" in login["run"] and "secrets." not in login["run"], login
+    assert "secrets.GITHUB_TOKEN" in str(login["env"]), login
+    assert "always()" in logout["if"] and 'rm -rf "$DOCKER_CONFIG"' in logout["run"], logout
+    # The publish finds its image by label among rz-builder:* images; it runs
+    # before the hosted path re-tags the image as rz-builder:ci.
+    names = [s.get("name") for s in steps]
+    retag = next(i for i, s in enumerate(steps) if "rz-builder:ci" in str(s.get("run", "")))
+    assert names.index(touching[1].get("name")) < retag, names
 
 
 @pytest.mark.unit
@@ -379,7 +437,9 @@ def test_only_the_builder_job_may_write_packages():
     assert spec["permissions"] == {"contents": "read"}, spec.get("permissions")
     assert list(spec["jobs"]) == ["builder"]
     assert _job()["permissions"] == {"contents": "read", "packages": "write"}
-    assert not re.search(r"packages:\s*write", MAIN_WORKFLOW.read_text())
+    # main.yml's one exception, builder-image (AGAST #4846), is pinned by
+    # test_main_yml_builds_the_image_once_and_publishes_only_its_commit_tag.
+    assert len(re.findall(r"packages:\s*write", MAIN_WORKFLOW.read_text())) == 1
 
 
 @pytest.mark.unit

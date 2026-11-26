@@ -644,9 +644,35 @@ jobs:
   # AGAST #4825, epic #4783 ("this will eventually become a CI unit",
   # Aaron). The builder image's per-package CI unit: one container run per
   # package, alongside the ritz0/ritz1 gate above, replacing none of it.
-  # GitHub-hosted ubuntu-latest for now (Aaron, 2026-11-26); the self-hosted
-  # fleet is a separate, later ticket.
   #
+  # AGAST #4846 (Aaron, 2026-11-26): the matrix runs on huburght's Woodpecker
+  # (https://ci.fucken.ninja, .woodpecker/builder.yml, one step per package,
+  # each step's pod running the builder image of the commit). These hosted
+  # jobs are the fallback: builder-fleet asks Woodpecker whether it can run
+  # it, and builder-packages and builder-matrix run here only when it can't,
+  # so hosted minutes go to the matrix only while the fleet is down.
+  # builder-image runs either way: it publishes the image Woodpecker pulls.
+  # projects/builder/README.md, "CI on huburght's Woodpecker".
+  builder-fleet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      hosted: ${{ steps.probe.outputs.hosted }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Server healthy, rz activated there, no pipeline stuck pending (an
+      # agent down): else hosted. A workflow_dispatch run is GitHub's alone,
+      # since Woodpecker runs only pushes to main.
+      - name: Can huburght's Woodpecker run the builder matrix?
+        id: probe
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" != push ]]; then
+            echo "hosted=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 .github/scripts/woodpecker_fleet.py https://ci.fucken.ninja ritz-lang/rz >> "$GITHUB_OUTPUT"
+
   # tools/builder_matrix.py computes the matrix: every workspace package
   # that builds with ritz1_selfhosted (an open known-failures `build` or
   # `parity` excuse under it skips a package here rather than turning every
@@ -658,6 +684,8 @@ jobs:
   # like builder.yml's own job (which builds inside Docker), this needs no
   # setup action.
   builder-packages:
+    needs: builder-fleet
+    if: needs.builder-fleet.outputs.hosted == 'true'
     runs-on: ubuntu-latest
     outputs:
       packages: ${{ steps.list.outputs.packages }}
@@ -676,23 +704,66 @@ jobs:
   # goliath's `(*d).data[a..b]` from #4836 "can't be sliced"). This builds
   # the image the way builder.yml does (test.sh: git archive of the commit,
   # bootstrap in Docker, every in-image check, the size budget; ~4 min) and
-  # hands it to the matrix as an artifact, so no registry and no token.
+  # hands it to the hosted matrix as an artifact, no registry involved.
+  #
+  # AGAST #4846: for a push to main it also pushes the image as
+  # ghcr.io/ritz-lang/rz-builder:<commit>, the image of every step of
+  # .woodpecker/builder.yml, and only that tag (:main and the tag tags stay
+  # builder.yml's). The registry token is this job's GITHUB_TOKEN
+  # (write access to packages here only), read by `docker login --password-stdin`
+  # into a DOCKER_CONFIG under runner.temp that the always() logout removes,
+  # as in builder.yml. The image is saved and uploaded only for the hosted
+  # matrix.
   builder-image:
+    needs: [builder-fleet]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
       - name: Build and test the builder image of this commit
+        id: build
         run: |
           set -o pipefail
           bash projects/builder/test.sh --keep "${{ github.sha }}" | tee "$RUNNER_TEMP/builder-test.log"
           tag=$(sed -n 's/^builder image \(rz-builder:[^:]*\): all checks passed$/\1/p' "$RUNNER_TEMP/builder-test.log")
           test -n "$tag"
-          docker tag "$tag" rz-builder:ci
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Before the re-tag below: the script wants exactly one rz-builder:*
+      # image labelled with the commit.
+      - name: Publish the image for huburght's Woodpecker (:<commit> only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: bash .github/scripts/publish_builder.sh --commit-only "${{ github.sha }}" ghcr.io/ritz-lang/rz-builder refs/heads/main
+
+      - name: Log out of ghcr.io
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: |
+          docker logout ghcr.io || true
+          rm -rf "$DOCKER_CONFIG"
+
+      - name: Save the builder image for the hosted matrix
+        if: needs.builder-fleet.outputs.hosted == 'true'
+        run: |
+          docker tag "${{ steps.build.outputs.tag }}" rz-builder:ci
           docker save rz-builder:ci | gzip -1 > "$RUNNER_TEMP/rz-builder.tar.gz"
 
       - name: Upload the builder image
+        if: needs.builder-fleet.outputs.hosted == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: rz-builder-image
@@ -714,7 +785,8 @@ jobs:
   # projects/buddhafinger test` in the bootstrap job above).
   builder-matrix:
     name: builder-matrix (${{ matrix.package }})
-    needs: [builder-packages, builder-image]
+    needs: [builder-fleet, builder-packages, builder-image]
+    if: needs.builder-fleet.outputs.hosted == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
