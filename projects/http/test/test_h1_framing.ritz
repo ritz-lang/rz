@@ -7,23 +7,25 @@
 # Transfer-Encoding, and the smuggling cases RFC 9112 6.3 says to reject.
 
 import ritzlib.strview
+import ritzlib.span
 import lib.h1_framing
 
+# The first `n` bytes of `s`.
+fn bytes_to(s: StrView, n: i64) -> [u8]
+    return span_from_strview(s).to(n)
+
 fn frame(s: StrView, max_body: i64, f: *H1Frame) -> i64
-    return h1_frame_request(s.as_ptr(), s.len(), max_body, f)
+    return h1_frame_request(span_from_strview(s), max_body, f)
 
 fn frame_of(s: StrView) -> i64
     var f: H1Frame
     return frame(s, 0, @f)
 
-# 1 when buf[0..n) equals `want`.
-fn bytes_eq(buf: *u8, n: i64, want: StrView) -> i32
-    if n != want.len()
-        return 0
-    for i in 0..n
-        if *(buf + i) != want.get(i)
-            return 0
-    return 1
+# 1 when `got` equals `want`.
+fn bytes_eq(got: [u8], want: StrView) -> i32
+    if got.as_strview().eq(want)
+        return 1
+    return 0
 
 
 # ============================================================================
@@ -221,21 +223,22 @@ fn test_chunked_body() -> i32
 
 [[test]]
 fn test_chunked_dechunk_in_place() -> i32
-    var buf: [128]u8
+    var storage: [128]u8
+    let buf: [u8] = @storage
     let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nA\r\n, world!!!\r\n0\r\n\r\nGET /next"
     let n: i64 = r.len()
     for i in 0..n
         buf[i] = r.get(i)
     var f: H1Frame
-    let total: i64 = h1_frame_request(@buf[0], n, 0, @f)
+    let total: i64 = h1_frame_request(buf.to(n), 0, @f)
     if total != n - 9
         return 1
-    if h1_frame_dechunk(@buf[0], @f) != 15
+    if h1_frame_dechunk(buf.to(n), @f) != 15
         return 2
-    if bytes_eq(@buf[f.headers_end], 15, "hello, world!!!") == 0
+    if bytes_eq(buf.slice(f.headers_end, f.headers_end + 15), "hello, world!!!") == 0
         return 3
     # The pipelined bytes behind it are untouched.
-    if bytes_eq(@buf[total], 9, "GET /next") == 0
+    if bytes_eq(buf.slice(total, total + 9), "GET /next") == 0
         return 4
     return 0
 
@@ -247,9 +250,9 @@ fn test_chunked_incomplete_at_every_split() -> i32
     let n: i64 = r.len()
     var f: H1Frame
     for cut in 0..n
-        if h1_frame_request(r.as_ptr(), cut, 0, @f) != H1F_INCOMPLETE
+        if h1_frame_request(bytes_to(r, cut), 0, @f) != H1F_INCOMPLETE
             return (cut + 1) as i32
-    if h1_frame_request(r.as_ptr(), n, 0, @f) != n
+    if h1_frame_request(bytes_to(r, n), 0, @f) != n
         return 1000
     if f.body_len != 20
         return 1001
@@ -261,9 +264,9 @@ fn test_content_length_incomplete_at_every_split() -> i32
     let n: i64 = r.len()
     var f: H1Frame
     for cut in 0..n
-        if h1_frame_request(r.as_ptr(), cut, 0, @f) != H1F_INCOMPLETE
+        if h1_frame_request(bytes_to(r, cut), 0, @f) != H1F_INCOMPLETE
             return (cut + 1) as i32
-    if h1_frame_request(r.as_ptr(), n, 0, @f) != n
+    if h1_frame_request(bytes_to(r, n), 0, @f) != n
         return 1000
     return 0
 
@@ -319,13 +322,13 @@ fn test_pipelined_requests_frame_one_at_a_time() -> i32
     let r = "POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\nPOST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n"
     let n: i64 = r.len()
     var f: H1Frame
-    let a: i64 = h1_frame_request(r.as_ptr(), n, 0, @f)
+    let a: i64 = h1_frame_request(bytes_to(r, n), 0, @f)
     if a != 42
         return 1
-    let b: i64 = h1_frame_request(r.as_ptr() + a, n - a, 0, @f)
+    let b: i64 = h1_frame_request(span_from_strview(r).slice(a, n), 0, @f)
     if b != 19
         return 2
-    let c: i64 = h1_frame_request(r.as_ptr() + a + b, n - a - b, 0, @f)
+    let c: i64 = h1_frame_request(span_from_strview(r).slice(a + b, n), 0, @f)
     if c != n - a - b
         return 3
     if f.body_kind != H1F_BODY_CHUNKED or f.body_len != 1
@@ -361,8 +364,8 @@ fn test_continue_matches_fresh_at_every_length() -> i32
     h1_frame_init(@f)
     var fresh: H1Frame
     for cut in 0..n + 1
-        let a: i64 = h1_frame_continue(r.as_ptr(), cut, 0, @f)
-        let b: i64 = h1_frame_request(r.as_ptr(), cut, 0, @fresh)
+        let a: i64 = h1_frame_continue(bytes_to(r, cut), 0, @f)
+        let b: i64 = h1_frame_request(bytes_to(r, cut), 0, @fresh)
         if a != b
             return (cut + 1) as i32
     if f.body_len != 21 or f.total != n - 3
@@ -371,14 +374,15 @@ fn test_continue_matches_fresh_at_every_length() -> i32
 
 [[test]]
 fn test_continue_resumes_after_the_last_whole_chunk() -> i32
-    var buf: [128]u8
+    var storage: [128]u8
+    let buf: [u8] = @storage
     let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n"
     let n: i64 = r.len()
     for i in 0..n
         buf[i] = r.get(i)
     var f: H1Frame
     h1_frame_init(@f)
-    if h1_frame_continue(@buf[0], n, 0, @f) != H1F_INCOMPLETE
+    if h1_frame_continue(buf.to(n), 0, @f) != H1F_INCOMPLETE
         return 1
     if f.walk_pos != n or f.walk_sum != 6
         return 2
@@ -387,7 +391,7 @@ fn test_continue_resumes_after_the_last_whole_chunk() -> i32
     let tail = "0\r\n\r\n"
     for i in 0..5
         buf[n + i] = tail.get(i)
-    if h1_frame_continue(@buf[0], n + 5, 0, @f) != n + 5
+    if h1_frame_continue(buf.to(n + 5), 0, @f) != n + 5
         return 3
     if f.body_len != 6
         return 4
@@ -398,9 +402,9 @@ fn test_continue_content_length_waits_without_rescanning() -> i32
     var f: H1Frame
     h1_frame_init(@f)
     let r = "POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nab"
-    if h1_frame_continue(r.as_ptr(), r.len(), 0, @f) != H1F_INCOMPLETE
+    if h1_frame_continue(bytes_to(r, r.len()), 0, @f) != H1F_INCOMPLETE
         return 1
-    if h1_frame_continue("garbage, never rescanned......................".as_ptr(), r.len() + 2, 0, @f) != r.len() + 2
+    if h1_frame_continue(bytes_to("garbage, never rescanned......................", r.len() + 2), 0, @f) != r.len() + 2
         return 2
     return 0
 
@@ -409,8 +413,8 @@ fn test_continue_limit_applies_across_calls() -> i32
     let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello!\r\n6\r\nhello!\r\n0\r\n\r\n"
     var f: H1Frame
     h1_frame_init(@f)
-    if h1_frame_continue(r.as_ptr(), 60, 10, @f) != H1F_INCOMPLETE
+    if h1_frame_continue(bytes_to(r, 60), 10, @f) != H1F_INCOMPLETE
         return 1
-    if h1_frame_continue(r.as_ptr(), r.len(), 10, @f) != H1F_TOO_LARGE
+    if h1_frame_continue(bytes_to(r, r.len()), 10, @f) != H1F_TOO_LARGE
         return 2
     return 0
