@@ -76,9 +76,11 @@ def test_no_job_or_step_is_continue_on_error():
 #: image build for the commit under test, and builder-matrix (AGAST #4825,
 #: #4826) builds and tests inside that image's container, never the host's
 #: compiler; builder-fleet (AGAST #4846) only asks huburght's Woodpecker over
-#: HTTP whether it can run the matrix instead.
+#: HTTP whether it can run the matrix instead, and gitea-push (#4846) only
+#: runs git push.
 NO_SETUP_JOBS = {
     ("builder.yml", "builder"),
+    ("main.yml", "gitea-push"),
     ("main.yml", "builder-fleet"),
     ("main.yml", "builder-packages"),
     ("main.yml", "builder-image"),
@@ -159,8 +161,9 @@ def test_gate_coverage_is_documented_where_main_yml_points():
     # network, no systemd-run), the same reason builder.yml's own image
     # build is out of band and outside this table entirely.
     # builder-fleet (AGAST #4846) only probes huburght's Woodpecker over the
-    # network for builder-matrix.
-    not_gated = {"read-set-audit", "builder-fleet", "builder-packages",
+    # network for builder-matrix, and gitea-push (#4846) pushes main to
+    # git.fucken.ninja, which only a push to main does.
+    not_gated = {"read-set-audit", "gitea-push", "builder-fleet", "builder-packages",
                  "builder-image", "builder-matrix"}
     for job, row in rows.items():
         gated = row.split("|")[2].strip()

@@ -653,7 +653,43 @@ jobs:
   # so hosted minutes go to the matrix only while the fleet is down.
   # builder-image runs either way: it publishes the image Woodpecker pulls.
   # projects/builder/README.md, "CI on huburght's Woodpecker".
+  #
+  # gitea-push is how Woodpecker hears of a commit (Aaron, 2026-11-26): GitHub
+  # stays canonical, and this pushes main to ritz-lang/rz on git.fucken.ninja,
+  # whose push webhook starts .woodpecker/builder.yml. Not a pull mirror, not
+  # train.sh. The token is the GITEA_PUSH_TOKEN secret, read by the push step
+  # alone and handed to git by a credential helper (push_to_gitea.sh), never
+  # argv; the checkout keeps no GitHub credential. Without the secret it
+  # warns and says pushed=false. Queued, never cancelled mid-push, so pushes
+  # land on Gitea in GitHub's order; no force, so Gitea's main never moves
+  # back.
+  gitea-push:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: gitea-push
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    outputs:
+      pushed: ${{ steps.push.outputs.pushed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Push main to git.fucken.ninja (starts huburght's Woodpecker)
+        id: push
+        env:
+          GITEA_PUSH_TOKEN: ${{ secrets.GITEA_PUSH_TOKEN }}
+        run: bash .github/scripts/push_to_gitea.sh https://git.fucken.ninja/ritz-lang/rz.git "${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
   builder-fleet:
+    needs: [gitea-push]
+    # Also after a failed or skipped push: that is a hosted run.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 3
     outputs:
@@ -661,13 +697,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Server healthy, rz activated there, no pipeline stuck pending (an
-      # agent down): else hosted. A workflow_dispatch run is GitHub's alone,
-      # since Woodpecker runs only pushes to main.
+      # No push to Gitea (a workflow_dispatch run, no secret, a failed
+      # push), no Woodpecker run: hosted. Else server healthy, rz activated
+      # there, no pipeline stuck pending (an agent down): else hosted.
       - name: Can huburght's Woodpecker run the builder matrix?
         id: probe
+        env:
+          PUSHED: ${{ needs.gitea-push.outputs.pushed }}
         run: |
-          if [[ "$GITHUB_EVENT_NAME" != push ]]; then
+          if [[ "$PUSHED" != true ]]; then
             echo "hosted=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi

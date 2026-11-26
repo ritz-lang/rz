@@ -10,7 +10,7 @@
 # .woodpecker/builder.yml's first step. Every later step's pod runs
 # <image>:<commit> as its image, and Woodpecker's kubernetes backend fails a
 # step the moment its pod can't pull (ImagePullBackOff), so the pipeline
-# waits here first: Gitea's mirror can sync, and Woodpecker start, before
+# waits here first: main.yml's gitea-push can land, and Woodpecker start, before
 # GitHub has built and pushed the image (~5 min after the push).
 #
 # Anonymous: ghcr hands a pull token for a public package to anyone. POSIX

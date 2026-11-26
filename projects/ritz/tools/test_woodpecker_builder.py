@@ -444,10 +444,10 @@ def _main_jobs() -> dict:
 
 
 @pytest.mark.unit
-def test_builder_fleet_probes_woodpecker_on_a_push_and_says_hosted_otherwise():
-    """A workflow_dispatch run (any branch) is GitHub's alone: Woodpecker
-    runs pushes to main and its own manual runs, so the probe only asks for
-    a push."""
+def test_builder_fleet_probes_woodpecker_only_after_a_gitea_push():
+    """Woodpecker runs what gitea-push pushed (test_gitea_push.py pins that
+    side): with no push (a workflow_dispatch run, no secret, a failed push)
+    the run is GitHub's alone, so the probe only asks after one."""
     job = _main_jobs()["builder-fleet"]
     assert job["outputs"] == {"hosted": "${{ steps.probe.outputs.hosted }}"}
     assert job["timeout-minutes"] <= 5
@@ -455,7 +455,7 @@ def test_builder_fleet_probes_woodpecker_on_a_push_and_says_hosted_otherwise():
     run = probe["run"]
     assert ('python3 .github/scripts/woodpecker_fleet.py https://ci.fucken.ninja '
             'ritz-lang/rz >> "$GITHUB_OUTPUT"') in run, run
-    assert re.search(r'if \[\[ "\$GITHUB_EVENT_NAME" != push \]\]; then\s+'
+    assert re.search(r'if \[\[ "\$PUSHED" != true \]\]; then\s+'
                      r'echo "hosted=true" >> "\$GITHUB_OUTPUT"', run), run
 
 

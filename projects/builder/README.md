@@ -107,17 +107,26 @@ canonical, and its hosted `builder-matrix` is the fallback.
 
 On a push to main:
 
-1. main.yml's `builder-fleet` runs `.github/scripts/woodpecker_fleet.py`. It
-   says `hosted=false` when `/api/healthz` answers, `ritz-lang/rz` is
-   activated there, and no pipeline of it has been `pending` for 30 minutes
-   (that means no agent is taking work). Anything else, including a
-   `workflow_dispatch` run, says `hosted=true`.
-2. `builder-image` builds and tests the image (`test.sh`) and pushes
+1. main.yml's `gitea-push` pushes the commit to `main` of
+   `https://git.fucken.ninja/ritz-lang/rz.git` (Aaron, 2026-11-26: GitHub
+   stays canonical and pushes; not a pull mirror, not `train.sh`). It runs
+   `.github/scripts/push_to_gitea.sh` with the GitHub secret
+   `GITEA_PUSH_TOKEN`. The script gives the token to git through a
+   credential helper, never argv or the URL, and never forces. Runs queue in
+   order (`concurrency: gitea-push`). Without the secret it warns, pushes
+   nothing and says `pushed=false`; a rejected push fails the job.
+2. `builder-fleet` runs `.github/scripts/woodpecker_fleet.py` only after a
+   push that happened (`pushed=true`). It says `hosted=false` when
+   `/api/healthz` answers, `ritz-lang/rz` is activated there, and no
+   pipeline of it has been `pending` for 30 minutes (that means no agent is
+   taking work). Anything else, including no push or a `workflow_dispatch`
+   run, says `hosted=true`.
+3. `builder-image` builds and tests the image (`test.sh`) and pushes
    `ghcr.io/ritz-lang/rz-builder:<commit>`. It hands the image to the hosted
    matrix only when `hosted=true`.
-3. `builder-packages` and `builder-matrix` run only when `hosted=true`, so
+4. `builder-packages` and `builder-matrix` run only when `hosted=true`, so
    GitHub spends no matrix minutes while the fleet is up.
-4. Gitea's pull mirror of `ritz-lang/rz` syncs, and its push webhook starts
+5. The push's webhook (Gitea to Woodpecker) starts
    `.woodpecker/builder.yml`:
    - `wait-for-image` polls ghcr anonymously until `:<commit>` exists, for
      up to 40 minutes. A step whose pod can't pull its image fails at once.
@@ -162,9 +171,9 @@ directory, and no seccomp profile.
 
 ### Cluster side (adele's cluster, applied by adele)
 
-- A public Gitea pull mirror `ritz-lang/rz` of
-  `https://github.com/ritz-lang/rz`. No credential is needed, since the
-  source is public.
+- A public, empty Gitea repo `ritz-lang/rz` (no README or licence, so the
+  first push, of GitHub's full history, is a fast-forward), with no branch
+  protection on `main` that refuses the push account.
 - An rz agent, `woodpecker-agent-rz`:
   - `WOODPECKER_AGENT_LABELS=pool=rz-builder` and `WOODPECKER_MAX_WORKFLOWS=1`;
   - its own steps namespace (Pod Security `baseline`, tokenless default
@@ -173,15 +182,21 @@ directory, and no seccomp profile.
 
   The existing agents and `woodpecker-steps` don't change.
 
-### What only Aaron can do
+### What only Aaron or adele can do
 
 - Make the `rz-builder` package public on ghcr.io (package settings,
   "Change visibility"). Today an anonymous pull is refused (401), and step
   pods have no pull secret.
+- The push token. Gitea has no repo-scoped deploy token, so: a Gitea
+  account with write access to `ritz-lang/rz` only (a bot user is safest),
+  and an access token of it with scope `write:repository`. Store it as the
+  GitHub Actions repository secret `GITEA_PUSH_TOKEN` of `ritz-lang/rz`
+  (`gh secret set GITEA_PUSH_TOKEN -R ritz-lang/rz`). Until then
+  `gitea-push` warns and the hosted matrix runs.
 - Activate `ritz-lang/rz` in Woodpecker (Gitea OAuth login as an owner of
-  the mirror), and set it public, so `woodpecker_fleet.py` can read it
-  anonymously.
-- Neither step puts a token in this repo.
+  the repo; that adds the push webhook), and set it public, so
+  `woodpecker_fleet.py` can read it anonymously.
+- None of these puts a token in this repo.
 
 ## Files
 
