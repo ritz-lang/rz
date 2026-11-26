@@ -31,6 +31,20 @@
 #
 # None of these count the error: each pass keeps its own count (s.error_count,
 # g_si_errors, ...) and bumps it at the call.
+#
+# AGAST #4844: an error inside a generic's instance (cell_get$T, the
+# Vec$T.get method) is located in the generic's file, which doesn't say
+# which call in the user's code made the instance.  A pass that checks fn
+# bodies says which fn it is in (diag_enter_fn: Sema's walk, the emitter);
+# an error raised there is followed by one line per instantiation step,
+# innermost first, down to the first non-generic body:
+#
+#     <gvec.ritz>:235:16: error: cannot move out of a reference
+#     <main.ritz>:11:16: note: `Vec<T>.get` instantiated here (and 1 more)
+#
+# A message is printed piecewise after diag_error_at, so the notes wait for
+# its end: diag_error* print them after their newline, and a message built
+# by hand gets them at the next diag_error_at or diag_enter_fn.
 
 import ritzlib.cstr
 import ritzlib.sys
@@ -45,6 +59,16 @@ import ast
 # exposes the old emitter_set_source_file / emitter_source_file names as
 # wrappers over it, so emitter call sites are unchanged.
 var g_source_file: *u8 = null
+# AGAST #4844: the fn the checking pass is in, and the one whose notes the
+# error being printed still owes.
+var g_diag_fn: *FnDef = null
+var g_diag_pending: *FnDef = null
+# The input's path for a note's site in one of its fns, set before Sema runs
+# (g_source_file is set only for emission).
+var g_note_file: StrView = StrView { ptr: (null), len: (0) as i64 }
+
+pub fn diag_set_note_file(path: StrView)
+    g_note_file = path
 
 pub fn diag_set_source_file(path: *u8)
     g_source_file = path
@@ -85,8 +109,83 @@ fn diag_file_view(file: *u8) -> StrView
 
 # `<file>:<line>:<col>: error: ` -- the prefix of every ritz1 error.
 pub fn diag_error_at(file: *u8, span: SrcSpan)
+    diag_flush_notes()
     diag_loc(file, span)
     eprints(": error: ")
+    if g_diag_fn != null and g_diag_fn.inst_site != null
+        g_diag_pending = g_diag_fn
+
+# AGAST #4844: the checking pass is now in `f`'s body (null: in none).  The
+# last error's notes, if it owes any, go first.
+pub fn diag_enter_fn(f: *FnDef)
+    diag_flush_notes()
+    g_diag_fn = f
+
+# The notes the last error owes, if any: its message has ended.
+pub fn diag_flush_notes()
+    if g_diag_pending == null
+        return
+    let f: *FnDef = g_diag_pending
+    g_diag_pending = null
+    diag_inst_notes(f)
+
+# One `<file>:<line>:<col>: note: ...` line per instantiation step from
+# instance `f` out, innermost first, ending at the first non-generic body.
+pub fn diag_inst_notes(f: *FnDef)
+    var m: String = string_new()
+    diag_inst_notes_into(@&m, f)
+    eprint_string(@m)
+
+# diag_inst_notes' lines, appended to `out`: own_check holds its errors in a
+# buffer until the module's walk is done, and their notes go with them.
+pub fn diag_inst_notes_into(out: @&String, f: *FnDef)
+    var at: *FnDef = f
+    var depth: i32 = 0
+    while at != null and at.inst_site != null and depth < 64   # MAX_INSTANCE_DEPTH
+        let site: *InstSite = at.inst_site
+        var from: *FnDef = site.from
+        if from == null and site.from_site != null
+            from = site.from_site.inst
+        if from == null or site.line <= 0
+            return   # named by no body (a trait impl, a type): nothing to point at
+        diag_inst_note(out, site, from)
+        at = from
+        depth += 1
+
+# `<file>:<line>:<col>: note: `<instance>` instantiated here`, the site in
+# `from`'s file, plus "(and N more)" when other places name it too.
+fn diag_inst_note(out: @&String, site: *InstSite, from: *FnDef)
+    var file: StrView = g_note_file
+    if from.def_file != null or file.len == 0
+        file = diag_file_view(diag_fn_source_file(from))
+    let line: i32 = site.line
+    let col: i32 = site.col
+    let name: StrView = site.name
+    format_into(out, "{file}:{line}:{col}: note: `{name}")
+    diag_inst_args(out, site.args)
+    if site.method.len > 0
+        out.push('.')
+        out.push_str(site.method)
+    out.push_str("` instantiated here")
+    if site.more > 0
+        let more: i32 = site.more
+        format_into(out, " (and {more} more)")
+    out.push('\n')
+
+# A mangled suffix as written: "$Line" is `<Line>`, "$K$V" is `<K, V>`.
+fn diag_inst_args(out: @&String, args: StrView)
+    if args.len < 2 or *args.ptr != '$'
+        return
+    out.push('<')
+    var i: i64 = 1
+    while i < args.len
+        let c: u8 = *(args.ptr + i)
+        if c == '$'
+            out.push_str(", ")
+        else
+            out.push(c)
+        i += 1
+    out.push('>')
 
 # `<file>: error: `, for an error about the file as a whole (a tally, say),
 # which has no line or column to give (AGAST #3621).
@@ -99,6 +198,7 @@ pub fn diag_error(file: *u8, span: SrcSpan, msg: StrView)
     diag_error_at(file, span)
     eprints(msg)
     eprint_char('\n')
+    diag_flush_notes()
 
 # `<file>:<line>:<col>: error: <head><name><tail>`, one line: the common
 # "`x` ..." shape, `name` a token or identifier from the source.
@@ -108,6 +208,7 @@ pub fn diag_error_name(file: *u8, span: SrcSpan, head: StrView, name: StrView, t
     eprints(name)
     eprints(tail)
     eprint_char('\n')
+    diag_flush_notes()
 
 # The name a diagnostic shows for fn `f` (AGAST #4018).  main_abi_rename
 # renames an adapted main `__ritz_main`, but the user wrote `main`, so every
@@ -133,6 +234,7 @@ pub fn diag_error_buf(file: *u8, span: SrcSpan, msg: @String)
     diag_error_at(file, span)
     eprint_string(msg)
     eprint_char('\n')
+    diag_flush_notes()
 
 # `e` as written, for naming a lent argument: ritz0's _render_lent.  Shared by
 # ref_check and struct_index (AGAST #2847).

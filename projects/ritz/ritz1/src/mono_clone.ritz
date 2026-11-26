@@ -406,7 +406,9 @@ fn collect_instantiations_from_module(mono: *MonoCtx, m: *Module)
                 pp = pp.next
             # Walk function body
             set_mono_fn_context(mono, f)
+            mono.req_fn = f   # AGAST #4844: what it names is named from f
             collect_from_fn_body(mono, m, f.body)
+            mono.req_fn = null
             set_mono_fn_context(mono, null)
         f = f.next
 
@@ -440,7 +442,9 @@ fn collect_instantiations_from_module(mono: *MonoCtx, m: *Module)
                         track_typed_local_through(mono, StrView { ptr: (ipp.name), len: (ipp.name_len) as i64 }, ipp.param_type, ipp.param_pointee_type, StrView { ptr: (ipp.param_type_name), len: (ipp.param_type_name_len) as i64 })
                     ipp = ipp.next
                 set_mono_fn_context(mono, method)
+                mono.req_fn = method   # AGAST #4844
                 collect_from_fn_body(mono, m, method.body)
+                mono.req_fn = null
                 set_mono_fn_context(mono, null)
                 method = method.next
         ib = ib.next
@@ -1220,6 +1224,7 @@ fn collect_from_expr(mono: *MonoCtx, m: *Module, e: *Expr)
     match k
         ExprKind.Call =>
             # Check if this is a generic call (has type suffix)
+            inst_site_at(mono, e)   # AGAST #4844: what this call names, it names here
             if e.call_type_suffix.len > 0
                 add_instantiation(mono, e.func_name, e.call_type_suffix)
             # AGAST #1824: format_into(sink, "...") appends through
@@ -1287,6 +1292,7 @@ fn collect_from_expr(mono: *MonoCtx, m: *Module, e: *Expr)
         ExprKind.Method =>
             # `v.push(..)` names the impl method Vec<T>.push; specialising it
             # instantiates the vec_push<T> its body calls (AGAST #3617, #4303).
+            inst_site_at(mono, e)   # AGAST #4844
             want_receiver_method(mono, m, e.left, e.ident)   # AGAST #3617
             collect_from_expr(mono, m, e.left)  # receiver
             # Each argument into its parameter's slot, as a call's are (AGAST
@@ -1695,6 +1701,7 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
     specialized.is_pub = 1   # AGAST #3419: an instance has no declaration to mark `pub`
     specialized.col = template.col
     specialized.extern_decl = 0
+    specialized.inst_site = null   # AGAST #4844: its caller sets it
     fn_copy_instance_attrs(mono.pctx, specialized, template)   # [[callconv]] / [[test_helper]] / inline family (#1879, #1869, #1961)
 
     # Handle return type struct name substitution
@@ -2684,6 +2691,7 @@ fn clone_expr(mono: *MonoCtx, e: *Expr, type_param_sv: StrView, subst_type: Type
                     # may still name a later parameter (AGAST #1612; the finished
                     # body is collected instead).
                     if mono.mono_component_mode == 0
+                        inst_site_at(mono, e)   # AGAST #4844: in the instance being made
                         add_instantiation(mono, cloned.func_name, subst_suffix_sv)
 
             # Special case: sizeof(T) where T is a type parameter
@@ -3331,7 +3339,13 @@ fn specialize_wanted_methods(mono: *MonoCtx, m: *Module) -> i32
                     if wanted_in(mono.wanted_methods, name_sv, suffix_sv, StrView { ptr: (method.name), len: (method.name_len) as i64 }) == 1 and wanted_in(mono.done_methods, name_sv, suffix_sv, StrView { ptr: (method.name), len: (method.name_len) as i64 }) == 0
                         mono.done_methods = push_wanted(mono.done_methods, name_sv, suffix_sv, StrView { ptr: (method.name), len: (method.name_len) as i64 })
                         mono.cur_gen = *(mono.struct_gens + si)
-                        add_specialized_method(mono, m, specialize_impl_method(mono, m, ib, method, name_sv, suffix_sv))
+                        # AGAST #4844: the method's instance, from where it was wanted.
+                        let method_sv: StrView = StrView { ptr: (method.name), len: (method.name_len) as i64 }
+                        let site: *InstSite = inst_site_made(wanted_site(mono.wanted_methods, name_sv, suffix_sv, method_sv), name_sv, suffix_sv, method_sv)
+                        let saved: *InstSite = inst_site_enter(mono, site)
+                        let made_fn: *FnDef = specialize_impl_method(mono, m, ib, method, name_sv, suffix_sv)
+                        inst_site_leave(mono, site, made_fn, saved)
+                        add_specialized_method(mono, m, made_fn)
                         made = made + 1
                     method = method.next
             ib = find_generic_impl(ib.next, name_sv)
@@ -3459,8 +3473,12 @@ fn specialize_pending_fns(mono: *MonoCtx, m: *Module, start: i32) -> i32
         # Find the generic template
         let template: *FnDef = find_generic_function(m, name_sv)
         if template != null
-            # Generate specialized version
+            # Generate specialized version, which names what it names from
+            # where it was instantiated (AGAST #4844).
+            let site: *InstSite = inst_site_made(*(mono.inst_sites + i), name_sv, suffix_sv, strview_empty())
+            let saved: *InstSite = inst_site_enter(mono, site)
             let specialized: *FnDef = clone_and_specialize_function(mono, m, template, suffix_sv)
+            inst_site_leave(mono, site, specialized, saved)
 
             # Add to module's function list
             if specialized != null

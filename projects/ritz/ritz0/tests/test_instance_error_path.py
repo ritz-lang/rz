@@ -19,6 +19,15 @@ only pins where the refusal points.  A user module (`cell.ritz`, written beside
 main.ritz) is checked as well as ritzlib, so the rule isn't "ritzlib paths",
 and so is an error inside a generic impl's method (#2913), whose instance
 ritz1 located in main.ritz because impl methods carried no def_file.
+
+AGAST #4844: such an error is followed by where the instance was
+instantiated, one `<file>:<line>:<col>: note:` line per step, innermost
+first, down to the first non-generic body: `p.get()` in main.ritz, and in
+`user_module` first `cell_get<T>(self)` in cell.ritz's `Cell<T>.get`, and
+`v.get(0)` for ritzlib's `Vec<T>.get` (gvec.ritz) on a move-only T.  An instance several places name reports the first, with
+"(and N more)" (`ritzlib_vec`); an error in a non-generic body gets no note
+(`main_method`, `plain_fn`).  Every error class carries them: the move
+checker's, a slot rule's (`slot_rule`) and the emitter's (`emit_match`).
 """
 
 import os
@@ -90,6 +99,51 @@ impl S
         self.v.push(3 as u8)
 """
 
+# AGAST #4844: two calls make one instance, Vec<T>.get, reported at the first.
+VEC_GET = f"""import ritzlib.gvec
+
+{DROP_T}
+fn f(v: @Vec<T>) -> i32
+    let x: T = v.get(0)
+    return 0
+
+fn g(v: @Vec<T>) -> i32
+    let y: T = v.get(1)
+    return 0
+"""
+
+# A non-generic body's own refusal: no instance, so no note.
+PLAIN = f"""{DROP_T}
+fn f(p: *T) -> i32
+    let x: T = *p
+    return 0
+"""
+
+# Every error class carries the notes, not only the move checker's: a slot
+# rule the typing pass judges per instance (§13.2), and a match the emitter
+# finds non-exhaustive while lowering the instance.
+SLOT = """struct C
+    x: i32
+
+fn g<T>(r: *T) -> T
+    return r
+
+fn f(r: *C) -> C
+    g<C>(r)
+"""
+
+MATCH = """enum E
+    A
+    B
+
+fn g<T>(x: T, e: E) -> i32
+    match e
+        E.A => 1
+
+fn f() -> i32
+    g<i32>(1, E.A)
+"""
+
 MOVE_OUT = "cannot move out of a reference"
 
 # Each case pins the owning file, the column and the message.  The *line* is
@@ -98,7 +152,11 @@ MOVE_OUT = "cannot move out of a reference"
 # shifts both the compiler's report and the expectation together instead of
 # redding the gate with a stale pin that looks like a regression (AGAST #4554).
 #
-# (main.ritz, extra files, the file the error belongs to, marker, column, message)
+# `notes` is the instantiation chain the error is followed by, innermost first
+# (AGAST #4844): each (file, marker, column, tail), located as the error is;
+# `tail` is what follows "instantiated here", "(and N more)" for a deduped one.
+#
+# (main.ritz, extra files, the file the error belongs to, marker, column, message, notes)
 CASES = {
     "ritzlib_span": (
         f"import ritzlib.span\n\n{DROP_T}\nfn f(p: @Span<T>) -> i32\n    let x: T = p.get(0)\n    return 0\n",
@@ -107,6 +165,7 @@ CASES = {
         "return *(self.ptr + idx)",
         16,
         MOVE_OUT,
+        [("main.ritz", "p.get(0)", 16, "")],
     ),
     "user_module": (
         f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    let x: T = p.get()\n    return 0\n",
@@ -115,6 +174,10 @@ CASES = {
         "return *(c.ptr + 0)",
         12,
         MOVE_OUT,
+        [
+            ("cell.ritz", "return cell_get<T>(self)", 16, ""),
+            ("main.ritz", "p.get()", 16, ""),
+        ],
     ),
     "user_method": (
         f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    let x: T = p.get()\n    return 0\n",
@@ -123,6 +186,7 @@ CASES = {
         "return *(self.ptr + 0)",
         16,
         MOVE_OUT,
+        [("main.ritz", "p.get()", 16, "")],
     ),
     "user_method_binder": (
         "import cell\n\nfn f(p: *Cell<i32>) -> i32\n    return p.get()\n",
@@ -131,6 +195,7 @@ CASES = {
         "let K: i32 = 1",
         13,
         "a local can't take the name of a const: 'K'",
+        None,  # judged on the template, not an instance: notes or none
     ),
     "main_method": (
         METHOD,
@@ -139,17 +204,56 @@ CASES = {
         "self.v.push(3 as u8)",
         9,
         "an `@T` doesn't fit an `@&T` slot",
+        [],
+    ),
+    "ritzlib_vec": (
+        VEC_GET,
+        {},
+        str(RITZ_ROOT / "ritzlib" / "gvec.ritz"),
+        "return *(self.data + idx)",
+        16,
+        MOVE_OUT,
+        [("main.ritz", "v.get(0)", 16, " (and 1 more)")],
+    ),
+    "slot_rule": (
+        SLOT,
+        {},
+        "main.ritz",
+        "    return r",
+        12,
+        "a reference or pointer doesn't fit a by-value slot",
+        [("main.ritz", "g<C>(r)", 5, "")],
+    ),
+    "emit_match": (
+        MATCH,
+        {},
+        "main.ritz",
+        "    match e",
+        5,
+        "non-exhaustive match: missing B",
+        [("main.ritz", "g<i32>(1, E.A)", 5, "")],
+    ),
+    "plain_fn": (
+        PLAIN,
+        {},
+        "main.ritz",
+        "let x: T = *p",
+        16,
+        MOVE_OUT,
+        [],
     ),
 }
 
 ENTRY = "\npub fn main() -> i32\n    0\n"
 LOC = re.compile(r"(\S+\.ritz):(\d+:\d+): (?:error: )?(.*)")
+PASS = re.compile(r"^[A-Z]\w* error: ")
+NOTE = re.compile(r"(\S+\.ritz):(\d+:\d+): note: `[^`]+` instantiated here(.*)$")
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_instance_error_names_its_module(compiler, case, tmp_path):
-    main, extra, owner, marker, column, message = CASES[case]
+    main, extra, owner, marker, column, message, notes = CASES[case]
     where = _where(_source(main, extra, owner), marker, column)
     work = tmp_path / f"{case}_{compiler}"
     work.mkdir()
@@ -172,6 +276,53 @@ def test_instance_error_names_its_module(compiler, case, tmp_path):
     if owner != "main.ritz":
         blamed = [(f, w) for f, w in found if _same_file(f, str(path), work)]
         assert not blamed, f"{compiler}: {case} blamed main.ritz: {blamed}"
+    if notes is not None:
+        _assert_notes(
+            compiler,
+            case,
+            out,
+            owner_path,
+            where,
+            message,
+            [_note_at(main, extra, n) for n in notes],
+            work,
+        )
+
+
+def _note_at(main, extra, note):
+    """(file, `line:col`, tail) a `notes` entry names."""
+    file, marker, column, tail = note
+    return file, _where(_source(main, extra, file), marker, column), tail
+
+
+def _assert_notes(compiler, case, out, owner_path, where, message, want, work):
+    """The error at `owner_path:where` is followed by `want`'s note lines,
+    in order, and no others (AGAST #4844)."""
+    # ritz0 heads the first line with its pass ("Compiler error: ").
+    lines = [PASS.sub("", line) for line in out.splitlines()]
+    starts = [
+        i
+        for i, line in enumerate(lines)
+        if (m := LOC.match(line))
+        and m.group(2) == where
+        and m.group(3).startswith(message)
+        and _same_file(m.group(1), owner_path, work)
+    ]
+    assert starts, f"{compiler}: {case} no error at {where}:\n{out[-2000:]}"
+    got = []
+    for line in lines[starts[0] + 1 :]:
+        m = NOTE.match(line)
+        if m is None:
+            break
+        got.append((m.group(1), m.group(2), m.group(3)))
+    assert len(got) == len(want), (
+        f"{compiler}: {case} notes {got}, wanted {want}:\n{out[-2000:]}"
+    )
+    for (gf, gw, gt), (wf, ww, wt) in zip(got, want):
+        wanted = wf if os.path.isabs(wf) else str(work / wf)
+        assert _same_file(gf, wanted, work) and gw == ww and gt == wt, (
+            f"{compiler}: {case} note {gf}:{gw}{gt}, wanted {wf}:{ww}{wt}"
+        )
 
 
 def _source(main, extra, owner):

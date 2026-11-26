@@ -26,6 +26,7 @@ import float_rules
 import future_rules
 import ref_rules
 import ritz_ast as rast
+from instance_site import add_notes
 from monomorph import bind_type_params, mangle_generic_name, TypeSubstitution
 from monomorph_core import display_generic_name, instance_display_name
 from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS, NameResolver
@@ -372,7 +373,11 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 self.lent_locals[param.name] = param.type
 
         # Check body
+        first_error = len(self.errors)
         self._check_block(fn.body, fn.ret_type)
+        # An instance's errors name where it was instantiated (AGAST #4844).
+        for error in self.errors[first_error:]:
+            add_notes(error, fn)
 
         self.typed.enter(None)
         self.current_fn = None

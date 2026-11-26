@@ -15,6 +15,7 @@ This runs after parsing/name resolution, before code generation.
 import copy
 from typing import Dict, Set, List, Optional, Tuple
 import array_rules
+from instance_site import add_notes
 import ref_rules
 from metadata import type_to_string
 import ritz_ast as rast
@@ -145,7 +146,11 @@ class MoveChecker(MoveWalk):
                 body = copy.deepcopy(fn)
                 # The copy's own types: the table holds the original's nodes.
                 self.typed = typed.type_bodies(module, [(body, impls.get(id(fn)))])
+                first_error = len(self.errors)
                 self._check_fn(body)
+                # Each names where the instance was instantiated (AGAST #4844).
+                for error in self.errors[first_error:]:
+                    add_notes(error, fn)
         kept = (ref_rules.MOVE_OUT_OF_REF, array_rules.FILL_MOVE_ONLY,
                 array_rules.MOVE_OUT_OF_ELEMENT)
         self.errors = [e for e in self.errors if e.reason in kept or e.after_move]

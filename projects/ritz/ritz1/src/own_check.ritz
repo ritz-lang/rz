@@ -84,6 +84,8 @@ import ref_loan       # rl_qualified_variant
 import bool_check     # sbk_global
 import sema
 import sema_type
+import diag           # diag_inst_notes_into (AGAST #4844)
+import ritzlib.string
 
 const OC_INIT_CAP: i32 = 16
 # Deeper than any real struct nesting; stops a malformed recursive type.
@@ -197,6 +199,9 @@ struct OcState
     out_len: i64
     out_cap: i64
     errors: i32
+    # AGAST #4844: the instance whose instantiation notes the last error
+    # still owes (oc_note_flush), or null.
+    note_fn: *FnDef
     # The last "cannot move out" place reported: one report per place.
     last_line: i32
     last_col: i32
@@ -398,10 +403,25 @@ fn oc_put_loc(sm: *Sema, line: i32, col: i32)
 
 # `<file>:<line>:<col>: error: `, counted.
 fn oc_error_at(sm: *Sema, line: i32, col: i32)
+    oc_note_flush()
     oc_put_loc(sm, line, col)
     oc_puts(": error: ")
     let o: *OcState = oc()
     o.errors = o.errors + 1
+    if sm.cur_fn != null and sm.cur_fn.inst_site != null
+        o.note_fn = sm.cur_fn
+
+# AGAST #4844: the last error's message has ended; an error inside an
+# instance is followed by where that instance was instantiated, as diag's are.
+fn oc_note_flush()
+    let o: *OcState = oc()
+    if o.note_fn == null
+        return
+    var m: String = string_new()
+    diag_inst_notes_into(@&m, o.note_fn)
+    o.note_fn = null
+    let v: StrView = m.as_view()
+    oc_put(v.ptr, v.len)
 
 # --- Move-only types ------------------------------------------------------------------
 
@@ -3386,6 +3406,7 @@ pub fn own_check_begin_fn(sm: *Sema, f: *FnDef)
 # The fn is done (its `ret` ran its deferred statements at the body's end,
 # own_check_block_leave).
 pub fn own_check_end_fn(sm: *Sema, f: *FnDef)
+    oc_note_flush()   # AGAST #4844
     let o: *OcState = oc()
     o.live_count = 0
     o.scope_count = 0
@@ -3541,6 +3562,7 @@ pub fn own_check_errors() -> i32
 # The walk is done: print the move check's errors if no other check reported
 # one (the emitter only ran on a module Sema passed), counting them.
 pub fn own_check_flush(sm: *Sema)
+    oc_note_flush()   # AGAST #4844
     let o: *OcState = oc()
     if sm.error_count == 0 and o.errors > 0
         sys_write(STDERR, o.out, o.out_len)
