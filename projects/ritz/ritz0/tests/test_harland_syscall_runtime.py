@@ -76,6 +76,8 @@ AREAS = {
     "cwd": ["sys_getcwd_impl", "sys_chdir_impl", "sys_getcwd_handler", "sys_chdir_handler"],
     "input": ["sys_input_poll_impl", "sys_input_read_impl", "sys_input_poll_handler", "sys_input_read_handler"],
     "framebuffer": ["sys_fb_info_impl", "sys_fb_map_impl", "sys_fb_info_handler", "sys_fb_map_handler"],
+    # DrvIrqWait (220), #4719
+    "driver": ["drv_irq_wait_park_count", "sys_drv_irq_wait_handler"],
     # NetInfo (224), NetAddr (225), NetAttach (228): NoDev until a driver
     # and service exist (#4751).
     "net": ["sys_net_info_handler", "sys_net_addr_handler", "sys_net_attach_handler"],
@@ -223,8 +225,9 @@ def test_table_registers_handlers_imported_from_their_area():
     each taken from the area module that defines it."""
     code = _code(_area("entry"))
     regs = re.findall(r"^\s+syscall_register\(Syscall\.(\w+),\s*(\w+)\)", _body(code, "syscall_table_init"), re.M)
-    # 38 since ShmMap (227, #4717); 41 since NetInfo, NetAddr, NetAttach (#4751).
-    assert len(regs) == 41, regs
+    # 38 since ShmMap (227, #4717); 39 with DrvIrqWait (220, #4719);
+    # 42 with NetInfo, NetAddr, NetAttach (#4751).
+    assert len(regs) == 42, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

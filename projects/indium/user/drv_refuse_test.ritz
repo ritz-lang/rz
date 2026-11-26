@@ -1,0 +1,68 @@
+# drv_refuse_test: DrvIrqWait (220) refuses a process with no IRQ capability
+# (AGAST #4719, harland docs/RING1_DRIVER.md §4).
+#
+# The handle is the right to park on a device's interrupt. A process spawned
+# by sys_spawn inherits only its parent's ambient capabilities (DISPLAY,
+# CHANNEL, NAMESPACE: cap_inherit_ambient) and never a CAP_TYPE_IRQ one: the
+# kernel grants that to the process it spawned for the device, and CapGrant
+# refuses to pass it on. So every ring-3 process gets Errno.Perm, both for a
+# handle it does not hold and for one it holds that is not an IRQ handle.
+# The request is valid in both calls, so only the authority check can
+# refuse them, and a refusal consumes nothing: out_count and the out slot
+# keep the values this program put there.
+#
+# Exit 0 only if both calls are refused with Errno.Perm (-1) and neither
+# wrote the request; each failure has its own code.
+
+import ritzlib.strview { StrView }
+import ritzlib.sys { syscall2 }
+import driver_abi.wait { WaitRequest, WaitEvent, WaitSource }
+
+# The kernel's Syscall.DrvIrqWait. ritzlib.sys wraps no driver syscall (its
+# SYS_DRV_IRQ_WAIT, which ritz0/test_harland_syscall_dispatch.py diffs
+# against the enum, is private), so the number is named here as
+# cap_ipc_child names the IPC ones.
+const NR_DRV_IRQ_WAIT: i64 = 220
+const PERM: i64 = -1
+
+# No handle at all: index 0, generation 0 never names a live entry.
+const NO_HANDLE: i64 = 0
+# The first inherited handle, DISPLAY (index 0, generation 1): held, but
+# not CAP_TYPE_IRQ (cap_ipc_child names the same insertion order).
+const DISPLAY_HANDLE: i64 = 1 << 32
+
+# What the kernel must leave in place on a refusal.
+const UNTOUCHED_COUNT: u32 = 0x5A
+const UNTOUCHED_HANDLE: u64 = 0xEEEEEEEEEEEEEEEE
+
+# A one-slot request: no shm sources, out_cap 1.
+fn refused_untouched(name: StrView, handle: i64) -> bool
+    var event: WaitEvent
+    event.handle = UNTOUCHED_HANDLE
+    event.bits = 0
+    event._pad = 0
+    var req: WaitRequest
+    req.sources = 0 as *WaitSource
+    req.source_count = 0
+    req.out_cap = 1
+    req.out = @event
+    req.deadline = 0
+    req.out_count = UNTOUCHED_COUNT
+    req._pad = 0
+    let r: i64 = syscall2(NR_DRV_IRQ_WAIT, handle, @req as i64)
+    print("[drv_refuse_test] drv_irq_wait({name}) -> {r}\n")
+    if r != PERM
+        print("[drv_refuse_test] FAIL: {name} was not refused with Errno.Perm\n")
+        return false
+    if req.out_count != UNTOUCHED_COUNT or event.handle != UNTOUCHED_HANDLE
+        print("[drv_refuse_test] FAIL: the refusal of {name} wrote the request\n")
+        return false
+    true
+
+pub fn main() -> i32
+    if not refused_untouched("no handle", NO_HANDLE)
+        return 1
+    if not refused_untouched("the display handle", DISPLAY_HANDLE)
+        return 2
+    print("[drv_refuse_test] PASS: DrvIrqWait refused without an IRQ capability\n")
+    return 0

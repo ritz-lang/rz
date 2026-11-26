@@ -1,0 +1,156 @@
+# Harland per-process wait set and IRQ objects (AGAST #4719,
+# docs/RING1_DRIVER.md §4 "One waitable interrupt")
+#
+# A driver process parks in DrvIrqWait (syscall/runtime/driver.ritz) on its
+# own wait set, not on the shared BLOCK_IRQ queue that every MSI-X and the
+# LAPIC watchdog wake (proc/waitq.ritz). The set has two things here:
+#
+#   * IRQ objects. One per CAP_TYPE_IRQ object id the kernel registered,
+#     with `latched`, bumped for that object only (by msix_dispatch for the
+#     vector bound to it, or by a kernel post), and `seen`, set to `latched`
+#     when a wait returns the IRQ record. `latched != seen` is "hot": an
+#     interrupt that lands before the park is held here, and the same one is
+#     returned once. A latch wakes the process that owns the object
+#     (cap/table.ritz cap_irq_owner), and only while it is parked on its wait
+#     set (BLOCK_WAIT); an interrupt for another object wakes that object's
+#     owner, never this one.
+#   * A deadline per process slot, as a TSC value. sched_tick passes the TSC
+#     to waitset_tick, which wakes the parked set whose deadline has passed
+#     and no other. The shared LAPIC watchdog is not used, so two device
+#     waits cannot clear each other's timeouts.
+#
+# A wake only makes the process runnable: DrvIrqWait re-checks its own
+# object and deadline under cli, and parks again when neither is due. The
+# shm sources and the inbox join this set in RING1_DRIVER.md PR 6b (T21).
+#
+# Processes run on the BSP only (proc/sched.ritz). A latch on another CPU
+# is recorded but wakes nobody, as waitq_wake_irq does.
+
+import proc.table { MAX_PROCS, BLOCK_WAIT, proc_at, proc_wake_pid }
+
+# Declared, not imported: the kernel's are cap/table.ritz and
+# arch/x86_64/apic.ritz. msix.ritz calls in here from irq_handler, and the
+# cap table pulls in the shm and page-table code; the extern keeps this
+# module at proc/table.ritz alone, so test_harland_waitset.py compiles it
+# on the host with stand-ins.
+extern fn cap_irq_owner(object_id: u64) -> u32
+extern fn lapic_is_bsp() -> bool
+
+# How many IRQ objects the kernel registers at once: one per device
+# interrupt it hands a process, as cap/table.ritz MAX_IRQ_CAP_OWNERS.
+const IRQ_OBJECT_MAX: i32 = 16
+
+# irq_object_register's vector for an object with no MSI-X vector of its
+# own: only a kernel post (irq_object_latch) latches it. 0 is never an
+# MSI-X vector (drivers/msix.ritz hands out 64 and up).
+pub const IRQ_NO_VECTOR: u8 = 0
+
+# A slot's deadline when it is not parked on a wait: no TSC reading is 0.
+const NO_DEADLINE: u64 = 0
+
+struct IrqObject
+    object_id: u64
+    latched: u64            # interrupts posted to the object
+    seen: u64               # latched, as the last wait that returned it saw it
+    vector: u8              # the MSI-X vector that latches it, or IRQ_NO_VECTOR
+    in_use: bool
+    _pad: [6]u8
+
+var irq_objects: [16]IrqObject      # IRQ_OBJECT_MAX
+var waitset_deadline: [8]u64        # MAX_PROCS, by process slot; NO_DEADLINE = unarmed
+
+# The slot holding `object_id`, or -1.
+fn irq_object_slot(object_id: u64) -> i32
+    var i: i32 = 0
+    while i < IRQ_OBJECT_MAX
+        if irq_objects[i].in_use and irq_objects[i].object_id == object_id
+            return i
+        i = i + 1
+    -1
+
+# The kernel makes `object_id` a waitable IRQ object, latched by MSI-X
+# `vector` (IRQ_NO_VECTOR: by kernel posts only). It starts cold. False if
+# the id is already registered or the registry is full.
+pub fn irq_object_register(object_id: u64, vector: u8) -> bool
+    if irq_object_slot(object_id) >= 0
+        return false
+    var i: i32 = 0
+    while i < IRQ_OBJECT_MAX
+        if not irq_objects[i].in_use
+            irq_objects[i].object_id = object_id
+            irq_objects[i].latched = 0
+            irq_objects[i].seen = 0
+            irq_objects[i].vector = vector
+            irq_objects[i].in_use = true
+            return true
+        i = i + 1
+    false
+
+# Forget `object_id`: nothing latches it, and a wait on it finds no object.
+pub fn irq_object_unregister(object_id: u64)
+    let slot: i32 = irq_object_slot(object_id)
+    if slot >= 0
+        irq_objects[slot].in_use = false
+        irq_objects[slot].vector = IRQ_NO_VECTOR
+
+# `object_id` is a registered IRQ object.
+pub fn irq_object_known(object_id: u64) -> bool
+    irq_object_slot(object_id) >= 0
+
+# Latch the object in `slot` and wake its owner if it is parked on its wait
+# set. IF=0 (an interrupt handler, or the kernel under cli).
+fn irq_object_post(slot: i32)
+    irq_objects[slot].latched = irq_objects[slot].latched + 1
+    if lapic_is_bsp()
+        proc_wake_pid(cap_irq_owner(irq_objects[slot].object_id) as u64, BLOCK_WAIT)
+
+# A kernel post to `object_id`: the same latch and wake an MSI-X on its
+# vector makes. False (and nothing latched) for an unregistered id. Call
+# with interrupts off.
+pub fn irq_object_latch(object_id: u64) -> bool
+    let slot: i32 = irq_object_slot(object_id)
+    if slot < 0
+        return false
+    irq_object_post(slot)
+    true
+
+# MSI-X `vector` fired (msix_dispatch, from irq_handler before the EOI):
+# latch the objects bound to it, and only those.
+pub fn irq_object_fire_vector(vector: u64)
+    if vector == IRQ_NO_VECTOR as u64
+        return
+    var i: i32 = 0
+    while i < IRQ_OBJECT_MAX
+        if irq_objects[i].in_use and irq_objects[i].vector as u64 == vector
+            irq_object_post(i)
+        i = i + 1
+
+# If `object_id` is hot (latched since a wait last returned it), take it:
+# seen = latched, so the same interrupt does not complete the next wait.
+# False, and nothing changed, when it is cold or unregistered. IF=0.
+pub fn irq_object_take(object_id: u64) -> bool
+    let slot: i32 = irq_object_slot(object_id)
+    if slot < 0 or irq_objects[slot].latched == irq_objects[slot].seen
+        return false
+    irq_objects[slot].seen = irq_objects[slot].latched
+    true
+
+# The process in `slot` parks on its wait set until TSC `deadline` (never
+# NO_DEADLINE). IF=0.
+pub fn waitset_arm(slot: i32, deadline: u64)
+    waitset_deadline[slot] = deadline
+
+# The process in `slot` is no longer waiting: the tick leaves it alone.
+pub fn waitset_disarm(slot: i32)
+    waitset_deadline[slot] = NO_DEADLINE
+
+# The scheduler tick, with the TSC reading `now` (sched_tick, IF=0): wake
+# each process parked on its wait set whose deadline has passed. A process
+# blocked for anything else, or with no deadline armed, is not touched.
+pub fn waitset_tick(now: u64)
+    var slot: i32 = 0
+    while slot < MAX_PROCS
+        let deadline: u64 = waitset_deadline[slot]
+        if deadline != NO_DEADLINE and now >= deadline
+            proc_wake_pid(proc_at(slot).pid, BLOCK_WAIT)
+        slot = slot + 1

@@ -13,6 +13,16 @@
 #   mode 1 (FAULT): read address 0; the #PF kills the process (status 142).
 #   mode 2 (SPIN):  busy-wait RSI TSC cycles at CPL 3 (the timer preempts
 #                   it), then report and exit.
+#   mode 3 (IRQ_WAIT, #4719): RSI is a CAP_TYPE_IRQ handle the kernel
+#                   granted. Five DrvIrqWait calls, each checked; the exit
+#                   status is the number of the first that failed, else 0:
+#                   1  out_cap 0             -> Errno.Inval, out_count kept
+#                   2  out_cap 9             -> Errno.Inval, out_count kept
+#                   3  handle 0 (not held)   -> Errno.Perm, out_count kept
+#                   4  out_cap 2, parks      -> 0: out_count 1, out[0] =
+#                      { handle, EVENT_DATA }, out[1] kept
+#                   5  the same again        -> 1 at the deadline:
+#                      out_count 0, out[0] kept
 # Report: Getpid, the CPL from CS, and arg1, packed into the exit status
 #   (arg1 & 0x7FFF) << 16 | cpl << 8 | (pid & 0xFF)
 # which the kernel decodes and logs as "[driver] pid N cpl C arg1 K".
@@ -22,10 +32,29 @@
 # Syscall numbers (kernel/src/syscall/numbers.ritz, enum Syscall)
 .equ SYS_EXIT,   20
 .equ SYS_GETPID, 23
+.equ SYS_DRV_IRQ_WAIT, 220
 
 # Modes (postinit.ritz DRIVER_STUB_*)
 .equ DRIVER_STUB_FAULT, 1
 .equ DRIVER_STUB_SPIN,  2
+.equ DRIVER_STUB_IRQ_WAIT, 3
+
+# driver_abi/src/wait.ritz: WaitRequest (40 bytes) and WaitEvent (16)
+.equ WR_SOURCES,      0
+.equ WR_SOURCE_COUNT, 8
+.equ WR_OUT_CAP,      12
+.equ WR_OUT,          16
+.equ WR_DEADLINE,     24
+.equ WR_OUT_COUNT,    32
+.equ WR_PAD,          36
+.equ WR_EVENTS,       48          # two WaitEvents after the request
+.equ WE_HANDLE,       0
+.equ WE_BITS,         8
+.equ WE_SIZE,         16
+.equ EVENT_DATA,      1
+.equ ERRNO_PERM,      -1
+.equ ERRNO_INVAL,     -22
+.equ KEPT_COUNT,      0x5A        # out_count before a call that must not write it
 
 .global driver_stub_start
 .type driver_stub_start, @function
@@ -40,6 +69,8 @@ driver_stub_start:
     movq (%rax), %rax            # #PF at CPL 3: never returns
     ud2
 .Ldriver_stub_not_fault:
+    cmpq $DRIVER_STUB_IRQ_WAIT, %r12
+    je .Ldriver_stub_irq_wait
     cmpq $DRIVER_STUB_SPIN, %r12
     jne .Ldriver_stub_report
     rdtsc
@@ -68,6 +99,98 @@ driver_stub_start:
     movq $SYS_EXIT, %rax
     syscall
     ud2                          # exit does not return
+
+# Mode 3. r14 = the request and its two out slots, on the user stack; r15 =
+# the step number reported if a check fails.
+.Ldriver_stub_irq_wait:
+    subq $80, %rsp
+    movq %rsp, %r14
+    movabsq $0xEEEEEEEEEEEEEEEE, %rbx   # the untouched out-slot pattern
+
+    movl $1, %r15d                       # 1: out_cap 0
+    xorl %esi, %esi
+    call .Lirq_wait_call_cap
+    cmpq $ERRNO_INVAL, %rax
+    jne .Lirq_wait_fail
+    cmpl $KEPT_COUNT, WR_OUT_COUNT(%r14)
+    jne .Lirq_wait_fail
+
+    movl $2, %r15d                       # 2: out_cap 9
+    movl $9, %esi
+    call .Lirq_wait_call_cap
+    cmpq $ERRNO_INVAL, %rax
+    jne .Lirq_wait_fail
+    cmpl $KEPT_COUNT, WR_OUT_COUNT(%r14)
+    jne .Lirq_wait_fail
+
+    movl $3, %r15d                       # 3: a handle it does not hold
+    movl $2, %esi
+    call .Lirq_wait_fill
+    movq $SYS_DRV_IRQ_WAIT, %rax
+    xorl %edi, %edi
+    movq %r14, %rsi
+    syscall
+    cmpq $ERRNO_PERM, %rax
+    jne .Lirq_wait_fail
+    cmpl $KEPT_COUNT, WR_OUT_COUNT(%r14)
+    jne .Lirq_wait_fail
+
+    movl $4, %r15d                       # 4: parks until its IRQ is latched
+    movl $2, %esi
+    call .Lirq_wait_call_cap
+    cmpq $0, %rax
+    jne .Lirq_wait_fail
+    cmpl $1, WR_OUT_COUNT(%r14)
+    jne .Lirq_wait_fail
+    cmpq %r13, WR_EVENTS+WE_HANDLE(%r14)
+    jne .Lirq_wait_fail
+    cmpl $EVENT_DATA, WR_EVENTS+WE_BITS(%r14)
+    jne .Lirq_wait_fail
+    cmpq %rbx, WR_EVENTS+WE_SIZE+WE_HANDLE(%r14)
+    jne .Lirq_wait_fail
+
+    movl $5, %r15d                       # 5: seen = latched: the deadline
+    movl $2, %esi
+    call .Lirq_wait_call_cap
+    cmpq $1, %rax
+    jne .Lirq_wait_fail
+    cmpl $0, WR_OUT_COUNT(%r14)
+    jne .Lirq_wait_fail
+    cmpq %rbx, WR_EVENTS+WE_HANDLE(%r14)
+    jne .Lirq_wait_fail
+
+    xorl %r15d, %r15d                    # every check held
+.Lirq_wait_fail:
+    movl %r15d, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# Fill the request for out_cap ESI (no sources, out = the two slots,
+# out_count KEPT_COUNT, both slots the untouched pattern) and call
+# DrvIrqWait with the granted handle (r13). RAX = the result.
+.Lirq_wait_call_cap:
+    call .Lirq_wait_fill
+    movq $SYS_DRV_IRQ_WAIT, %rax
+    movq %r13, %rdi
+    movq %r14, %rsi
+    syscall
+    ret
+
+.Lirq_wait_fill:
+    movq $0, WR_SOURCES(%r14)
+    movl $0, WR_SOURCE_COUNT(%r14)
+    movl %esi, WR_OUT_CAP(%r14)
+    leaq WR_EVENTS(%r14), %rax
+    movq %rax, WR_OUT(%r14)
+    movq $0, WR_DEADLINE(%r14)
+    movl $KEPT_COUNT, WR_OUT_COUNT(%r14)
+    movl $0, WR_PAD(%r14)
+    movq %rbx, WR_EVENTS+WE_HANDLE(%r14)
+    movq %rbx, WR_EVENTS+WE_BITS(%r14)
+    movq %rbx, WR_EVENTS+WE_SIZE+WE_HANDLE(%r14)
+    movq %rbx, WR_EVENTS+WE_SIZE+WE_BITS(%r14)
+    ret
 
 .size driver_stub_start, . - driver_stub_start
 

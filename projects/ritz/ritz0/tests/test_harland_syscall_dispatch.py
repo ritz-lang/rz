@@ -79,6 +79,9 @@ ABI = {
     "Sync": 162,
     "AcpiPoweroff": 200,
     "FbInfo": 210, "FbMap": 211,
+    # DrvIrqWait (220): park a driver on its own IRQ object's latch and the
+    # DEVICE_WAIT_MS deadline (#4719, RING1_DRIVER.md §4).
+    "DrvIrqWait": 220,
     # NetInfo (224), NetAddr (225) and NetAttach (228): the link record, the
     # address record and the app exchange (RING1_DRIVER.md §7, RING2_NET.md).
     # Until a driver publishes and a service registers, each answers
@@ -101,7 +104,7 @@ DISPATCHED = {
     "IpcRecv", "IpcClose", "CapGrant", "CapRevoke", "CapDerive", "CapInfo",
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
-    "Sync", "Smp", "ShmMap", "NetInfo", "NetAddr", "NetAttach",
+    "Sync", "Smp", "ShmMap", "DrvIrqWait", "NetInfo", "NetAddr", "NetAttach",
 }
 
 

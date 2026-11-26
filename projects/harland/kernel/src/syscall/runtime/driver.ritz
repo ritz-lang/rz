@@ -1,0 +1,151 @@
+# Harland Syscall Runtime - driver waits (AGAST #4719, docs/RING1_DRIVER.md
+# §4 "One waitable interrupt" and "Wait and notify")
+#
+# DrvIrqWait (220): drv_irq_wait(irq_handle, *WaitRequest). A driver process
+# parks on its own wait set (proc/waitset.ritz) until the IRQ object its
+# CAP_TYPE_IRQ handle names is hot, or DEVICE_WAIT_MS has passed:
+#
+#   0   the IRQ record was copied: out[0] = { irq_handle, EVENT_DATA },
+#       out_count = 1, and seen = latched, so the same interrupt does not
+#       complete the next call
+#   1   the deadline passed: out_count = 0 and out is not written
+#   <0  an errno, with nothing consumed and nothing written:
+#       Errno.Perm   the caller holds no CAP_TYPE_IRQ handle `irq_handle`
+#                    (every process the kernel did not spawn for a device),
+#                    or lists a source that is not its CAP_TYPE_SHM handle
+#       Errno.Fault  the request, the source array or the out range is not
+#                    the caller's memory
+#       Errno.Inval  source_count above WAIT_SOURCE_CAP, out_cap 0 or above
+#                    WAIT_OUT_CAP
+#       Errno.NoDev  the handle names no registered IRQ object
+#       Errno.Again  this CPU cannot park (not the BSP, or no process)
+#
+# The request and the source array are copied into kernel memory before a
+# latch is cleared; the user source array is never written. The deadline is
+# now + DEVICE_WAIT_MS on this process's wait set; WaitRequest.deadline is
+# ShmWait's (229) and is ignored here. A wake that leaves the object cold
+# before the deadline (another object's interrupt reaching this owner, or a
+# kernel post) parks again; it is not a return of 1. The shared LAPIC
+# watchdog and the BLOCK_IRQ queue that irq_wait_vector (NVMe, virtio) uses
+# are not touched. A process marked PROC_REAP stops waiting: its return to
+# user exits instead (syscall_entry.s reap_if_marked).
+#
+# Listed shm sources are checked and copied, but nothing posts to a shm
+# latch until ShmNotify and the inbox land (RING1_DRIVER.md PR 6b), so they
+# never match yet, and return 2 (shm or inbox events only) does not occur.
+
+import io { disable_interrupts, enable_interrupts }
+import mm.uptr { uptr_check_read, uptr_check_write }
+import ritzlib.option
+import syscall.errno { Errno }
+import cap.types { CapEntry, CAP_TYPE_IRQ, CAP_TYPE_SHM, cap_handle_init }
+import cap.table { CapTable, cap_table_get, cap_table_lookup }
+import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_reap_pending }
+import proc.sched { sched_block }
+import proc.waitq { waitq_can_park }
+import proc.waitset { irq_object_known, irq_object_take, waitset_arm, waitset_disarm }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_DATA, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
+
+const US_PER_MS: u64 = 1000
+
+# Parks DrvIrqWait has made, re-parks included (the drv-irq-wait boot test
+# reads it to see a non-matching wake park again).
+var drv_irq_wait_parks: u64 = 0
+
+pub fn drv_irq_wait_park_count() -> u64
+    drv_irq_wait_parks
+
+# The object id behind packed handle `packed` (index | generation << 32) in
+# `pid`'s table, if it is a `cap_type` handle the process holds.
+fn held_object(pid: u32, packed: u64, cap_type: u8) -> Option<u64>
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return None
+    let index: u32 = (packed & 0xFFFFFFFF) as u32
+    let generation: u32 = (packed >> 32) as u32
+    let entry: *CapEntry = cap_table_lookup(table, cap_handle_init(index, generation))
+    if entry == 0 as *CapEntry or entry.cap_type != cap_type
+        return None
+    Some(entry.object_id)
+
+# What copy_request found. Not a Result: VtdDma and goliath's ErrorCode,
+# both in this module's import closure, declare `Ok` too, so a bare `Ok(x)`
+# is ambiguous here and Result has no qualified constructor.
+enum RequestCheck
+    Valid(WaitRequest)
+    Refused(Errno)
+
+# The caller's request (`ureq`), copied into kernel memory and checked, or
+# the errno that refuses it: Fault, Inval or Perm (above). Each listed source
+# is copied before its handle is checked, so the check reads the kernel's
+# copy and never a second read of the user array; the copies are not used
+# again until shm latches exist (PR 6b). The out range is checked too, so
+# storing the result cannot fault.
+fn copy_request(pid: u32, ureq: *WaitRequest) -> RequestCheck
+    # Writable, for out_count.
+    if uptr_check_write(ureq as *u8, sizeof(WaitRequest) as u64) != 0
+        return RequestCheck.Refused(Errno.Fault)
+    let req: WaitRequest = *ureq
+    if req.source_count > WAIT_SOURCE_CAP or req.out_cap == 0 or req.out_cap > WAIT_OUT_CAP
+        return RequestCheck.Refused(Errno.Inval)
+    let count: u64 = req.source_count as u64
+    if count > 0 and uptr_check_read(req.sources as *u8, count * sizeof(WaitSource) as u64) != 0
+        return RequestCheck.Refused(Errno.Fault)
+    var sources: [8]WaitSource          # WAIT_SOURCE_CAP
+    var i: u64 = 0
+    while i < count
+        sources[i as i32] = *(req.sources + i)
+        if held_object(pid, sources[i as i32].handle, CAP_TYPE_SHM).is_none()
+            return RequestCheck.Refused(Errno.Perm)
+        i = i + 1
+    if uptr_check_write(req.out as *u8, req.out_cap as u64 * sizeof(WaitEvent) as u64) != 0
+        return RequestCheck.Refused(Errno.Fault)
+    RequestCheck.Valid(req)
+
+# drv_irq_wait for process `pid` (above). `ureq` is the caller's request.
+fn drv_irq_wait(pid: u32, irq_handle: u64, ureq: *WaitRequest) -> i64
+    # Authority first: a process without the handle learns nothing else.
+    let object_id: u64 = match held_object(pid, irq_handle, CAP_TYPE_IRQ)
+        Some(id) => id
+        None => return Errno.Perm as i64
+    let req: WaitRequest = match copy_request(pid, ureq)
+        RequestCheck.Valid(r) => r
+        RequestCheck.Refused(e) => return e as i64
+    if not irq_object_known(object_id)
+        return Errno.NoDev as i64
+    disable_interrupts()
+    if not waitq_can_park()
+        enable_interrupts()
+        return Errno.Again as i64
+
+    let deadline: u64 = deadline_after_us(DEVICE_WAIT_MS * US_PER_MS)
+    let slot: i32 = proc_current_slot()
+    var result: i64 = 1
+    while true
+        if proc_reap_pending(proc_current())
+            # Nothing consumed; the return to user exits instead.
+            result = Errno.Again as i64
+            break
+        if irq_object_take(object_id)
+            (*req.out).handle = irq_handle
+            (*req.out).bits = EVENT_DATA
+            (*req.out)._pad = 0
+            (*ureq).out_count = 1
+            result = 0
+            break
+        if deadline_passed(deadline)
+            (*ureq).out_count = 0
+            result = 1
+            break
+        waitset_arm(slot, deadline)
+        drv_irq_wait_parks = drv_irq_wait_parks + 1
+        proc_block(BLOCK_WAIT, 0)
+        sched_block()
+    waitset_disarm(slot)
+    enable_interrupts()
+    result
+
+# drv_irq_wait(irq_handle, request): the caller's page table is loaded.
+pub fn sys_drv_irq_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    drv_irq_wait(proc_current_pid() as u32, rdi, rsi as *WaitRequest)

@@ -18,7 +18,7 @@ import ipc.message { Message, MSG_FLAG_NONE }
 import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv, channel_close, channel_debug_print }
 import syscall.errno { Errno }
 import drivers.pci { pci_print_all_devices }
-import drivers.msix { msix_print_all }
+import drivers.msix { msix_print_all, msix_vector_alloc, msix_vector_count }
 import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop }
@@ -37,13 +37,18 @@ import arch.x86_64.nmi_probe { ist_nest_selftest, nmi_gs_selftest, nmi_nest_self
 import cap.selftest { cap_device_selftest }
 import cap.shm_selftest { shm_map_selftest }
 import arch.x86_64.percpu { CPU_KSTACK, cpu_index, cpu_stack_guard }
-import arch.x86_64.apic { x2apic_mode, lapic_id, lapic_icr_lo_mmio }
-import proc.table { Proc, PROC_CHILD_LIVE, proc_child_status, proc_at, proc_current, proc_current_pid, proc_current_slot, proc_is_init, proc_live_count, proc_reap_pending, MarkError }
+import arch.x86_64.apic { x2apic_mode, lapic_id, lapic_icr_lo_mmio, lapic_send_fixed_ipi }
+import proc.table { Proc, MAX_PROCS, PROC_BLOCKED, BLOCK_WAIT, PROC_CHILD_LIVE, proc_child_status, proc_at, proc_current, proc_current_pid, proc_current_slot, proc_is_init, proc_live_count, proc_reap_pending, MarkError }
 import proc.sched { sched_is_running, sched_start, sched_stop, sched_yield, sched_preemption_count }
 import fs.syscall { fs_process_pid }
 import syscall.stack { kstack_top }
 import syscall.runtime.process { PROC_REAP_STATUS, process_create_init, process_destroy_init, process_spawn_image, process_wait, process_mark_exit }
 import ritzlib.span { Span, span_from_ptr }
+import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_RIGHT_READ }
+import cap.table { cap_kernel_grant }
+import proc.waitset { IRQ_NO_VECTOR, irq_object_register, irq_object_unregister, irq_object_latch }
+import syscall.runtime.driver { drv_irq_wait_park_count }
+import driver_abi.wait { DEVICE_WAIT_MS }
 
 # ============================================================================
 # Boot-test mode self-tests (AGAST #1887)
@@ -393,6 +398,7 @@ extern fn kstack_call(body: u64, top: u64)
 const DRIVER_STUB_ENTER: u64 = 0
 const DRIVER_STUB_FAULT: u64 = 1
 const DRIVER_STUB_SPIN: u64 = 2
+const DRIVER_STUB_IRQ_WAIT: u64 = 3
 const DRIVER_STUB_COOKIE: u64 = 0x4713
 # SCHED_HZ is 100: a 50 ms spin spans five ticks.
 const DRIVER_SPIN_MS: u64 = 50
@@ -522,6 +528,122 @@ fn driver_reap_self_test() -> bool
     klog("\n")
     return spun and refused and marked and status == PROC_REAP_STATUS as i64 and runs_on
 
+# drv-irq-wait (#4719, RING1_DRIVER.md §4 and PR 4): DrvIrqWait parks a
+# kernel-spawned process on its own IRQ object. Pid 1 registers two IRQ
+# objects, A on an MSI-X vector of its own and B with none, grants both to
+# the stub (mode 3, driver_stub.s), and lets it run. The stub's first three
+# calls are refused (out_cap 0 and 9: Inval; a handle it does not hold:
+# Perm), then its fourth parks on A. A kernel post to B wakes the stub (it
+# owns B) without completing the wait: it parks again. A self-IPI on A's
+# vector, through irq_handler's msix_dispatch, completes it with return 0
+# and A's record. The fifth call finds A taken (seen = latched) and returns
+# 1 at the DEVICE_WAIT_MS deadline, which only the wait set's deadline (no
+# watchdog, no other wake) can end. The stub exits 0 only if each return
+# and what it wrote matched; else the number of the failing call. A's
+# vector is taken from the MSI-X pool for good (msix.ritz frees none): one
+# of sixteen, in boot-test mode only.
+const DRV_TEST_IRQ_A: u64 = 0xFFFF4719A
+const DRV_TEST_IRQ_B: u64 = 0xFFFF4719B
+# A fresh table's first handle: index 0, generation 1 (cap/table.ritz).
+# The stub's argument is chosen before the grant, so the grant is checked
+# against it.
+const DRV_TEST_HANDLE_A: u64 = 1 << 32
+# Bounds on each step; the re-park must come well inside DEVICE_WAIT_MS.
+const DRV_TEST_PARK_US: u64 = 1000000
+const DRV_TEST_REPARK_US: u64 = 50000
+const US_PER_MS: u64 = 1000
+
+fn packed_handle(h: CapHandle) -> u64
+    let index: u32 = h.index
+    let generation: u32 = h.generation
+    (index as u64) | ((generation as u64) << 32)
+
+# Process `pid` is parked on its wait set.
+fn parked_on_wait_set(pid: u64) -> bool
+    var i: i32 = 0
+    while i < MAX_PROCS
+        let p: *Proc = proc_at(i)
+        if p.pid == pid and p.state == PROC_BLOCKED and p.block == BLOCK_WAIT
+            return true
+        i = i + 1
+    false
+
+# Yield to the stub until `pid` is parked on its wait set and DrvIrqWait
+# has parked more than `parks` times, or `us` has passed.
+fn await_park(pid: u64, parks: u64, us: u64) -> bool
+    let deadline: u64 = deadline_after_us(us)
+    while not (parked_on_wait_set(pid) and drv_irq_wait_park_count() > parks) and not deadline_passed(deadline)
+        sched_yield()
+    parked_on_wait_set(pid) and drv_irq_wait_park_count() > parks
+
+# The stub's exit status, marking it to exit first if it is still running
+# after DRV_TEST_PARK_US (a wait that never ended).
+fn drv_stub_status(pid: u64) -> i64
+    var code: i64 = 0
+    let deadline: u64 = deadline_after_us(DRV_TEST_PARK_US)
+    while proc_child_status(pid, @code) == PROC_CHILD_LIVE and not deadline_passed(deadline)
+        sched_yield()
+    if proc_child_status(pid, @code) == PROC_CHILD_LIVE
+        klog("  the stub's wait never ended\n")
+        process_mark_exit(pid)
+    process_wait(pid as i32)
+
+fn drv_irq_wait_self_test() -> bool
+    klog("\nTesting DrvIrqWait on a kernel-spawned process...\n")
+    let vector: u8 = msix_vector_alloc()
+    if vector == 0
+        klog("  no free MSI-X vector\n")
+        return false
+    if not irq_object_register(DRV_TEST_IRQ_A, vector) or not irq_object_register(DRV_TEST_IRQ_B, IRQ_NO_VECTOR)
+        klog("  IRQ objects not registered\n")
+        irq_object_unregister(DRV_TEST_IRQ_A)
+        return false
+    sched_start(proc_current_slot())
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_IRQ_WAIT, DRV_TEST_HANDLE_A)
+    var ok: bool = spawned > 0
+    var reparked: bool = false
+    var waited: bool = false
+    var status: i64 = -1                # the stub's exit status, once it exits
+    if ok
+        let pid: u64 = spawned as u64
+        # It cannot run before pid 1 yields: the grants land first.
+        let a: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, DRV_TEST_IRQ_A))
+        let b: u64 = packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, DRV_TEST_IRQ_B))
+        if a != DRV_TEST_HANDLE_A or b == a
+            klog("  grant gave handle 0x")
+            klog_hex(a)
+            klog("\n")
+            process_mark_exit(pid)
+            status = drv_stub_status(pid)
+        else if await_park(pid, drv_irq_wait_park_count(), DRV_TEST_PARK_US)
+            # B's post wakes its owner; A is cold, so the stub parks again.
+            let parks: u64 = drv_irq_wait_park_count()
+            disable_interrupts()
+            irq_object_latch(DRV_TEST_IRQ_B)
+            enable_interrupts()
+            reparked = await_park(pid, parks, DRV_TEST_REPARK_US)
+            # The fifth call can end no sooner than this.
+            let late: u64 = deadline_after_us(DEVICE_WAIT_MS * US_PER_MS)
+            let irqs: u64 = msix_vector_count(vector)
+            lapic_send_fixed_ipi(lapic_id(), vector)
+            status = drv_stub_status(pid)
+            waited = deadline_passed(late) and msix_vector_count(vector) == irqs + 1
+        else
+            klog("  the stub never parked\n")
+            process_mark_exit(pid)
+            status = drv_stub_status(pid)
+    sched_stop()
+    irq_object_unregister(DRV_TEST_IRQ_A)
+    irq_object_unregister(DRV_TEST_IRQ_B)
+    klog("  status ")
+    klog_dec(status)
+    if not reparked
+        klog(", a post to another IRQ object did not re-park the wait")
+    if not waited
+        klog(", the IRQ return or the deadline came too soon")
+    klog("\n")
+    return ok and status == 0 and reparked and waited
+
 # The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
 # stack: boot_process_tests).
 fn driver_process_tests()
@@ -529,6 +651,7 @@ fn driver_process_tests()
     boot_test_result("driver-fault", driver_fault_self_test())
     boot_test_result("driver-preempt", driver_preempt_self_test())
     boot_test_result("driver-reap", driver_reap_self_test())
+    boot_test_result("drv-irq-wait", drv_irq_wait_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before
