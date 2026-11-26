@@ -6,27 +6,20 @@
 # TODO and every overwrite leaked the superseded file and directory blobs.
 
 import ritzlib.strview { StrView }
-import ritzlib.span { Span, span_from_ptr }
+import ritzlib.span { Span, Bytes, span_from_strview }
 import goliath.blob_id { BlobId }
 import goliath.blob_store { MemoryBlobStore, memory_store_free, memory_store_count, memory_store_get }
 import goliath.hosted { memory_store_new }
 import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve, namespace_hold, namespace_unhold }
 import goliath.error { ErrorCode }
 
-# 1 if `path` reads back exactly the `len` bytes at `want`.
-fn reads_back(ns: *Namespace, path: StrView, want: *u8, len: i64) -> bool
+# Whether `path` reads back exactly `want`.
+fn reads_back(ns: *Namespace, path: StrView, want: StrView) -> bool
     let got: Span<u8> = namespace_read(ns, path)
-    if got.ptr == null or got.len != len
-        return false
-    var i: i64 = 0
-    while i < len
-        if *(got.ptr + i) != *(want + i)
-            return false
-        i = i + 1
-    true
+    got.ptr != null and got.as_strview().eq(want)
 
-fn write_cstr(ns: *Namespace, path: StrView, text: *u8, len: i64) -> ErrorCode
-    let data: Span<u8> = span_from_ptr<u8>(text, len)
+fn write_text(ns: *Namespace, path: StrView, text: StrView) -> ErrorCode
+    let data: Span<u8> = span_from_strview(text)
     namespace_write(ns, path, @data)
 
 # The ticket's RED case: a write below the root is readable afterwards.
@@ -35,17 +28,17 @@ fn test_nested_write_reads_back() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
     assert namespace_mkdir(@ns, "/a") == ErrorCode.Ok
-    assert write_cstr(@ns, "/a/b", c"nested", 6) == ErrorCode.Ok
-    assert reads_back(@ns, "/a/b", c"nested", 6)
+    assert write_text(@ns, "/a/b", "nested") == ErrorCode.Ok
+    assert reads_back(@ns, "/a/b", "nested")
     # Two levels down, and a sibling written earlier survives the rewrite
     assert namespace_mkdir(@ns, "/a/c") == ErrorCode.Ok
-    assert write_cstr(@ns, "/a/c/d", c"deep", 4) == ErrorCode.Ok
-    assert write_cstr(@ns, "/a/b", c"again", 5) == ErrorCode.Ok
-    assert reads_back(@ns, "/a/c/d", c"deep", 4)
-    assert reads_back(@ns, "/a/b", c"again", 5)
+    assert write_text(@ns, "/a/c/d", "deep") == ErrorCode.Ok
+    assert write_text(@ns, "/a/b", "again") == ErrorCode.Ok
+    assert reads_back(@ns, "/a/c/d", "deep")
+    assert reads_back(@ns, "/a/b", "again")
     # A write under a missing directory, or over a directory, is refused
-    assert write_cstr(@ns, "/nope/x", c"x", 1) == ErrorCode.NotFound
-    assert write_cstr(@ns, "/a/c", c"x", 1) == ErrorCode.NotAFile
+    assert write_text(@ns, "/nope/x", "x") == ErrorCode.NotFound
+    assert write_text(@ns, "/a/c", "x") == ErrorCode.NotAFile
     memory_store_free(@store)
     0
 
@@ -57,7 +50,7 @@ fn test_delete_frees_blobs() -> i32
     var ns: Namespace = namespace_new(@store)
     let empty: i32 = memory_store_count(@store)
     assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
-    assert write_cstr(@ns, "/d/f", c"to be deleted", 13) == ErrorCode.Ok
+    assert write_text(@ns, "/d/f", "to be deleted") == ErrorCode.Ok
     assert memory_store_count(@store) > empty
 
     assert namespace_delete(@ns, "/d") == ErrorCode.DirectoryNotEmpty
@@ -76,10 +69,10 @@ fn test_delete_frees_blobs() -> i32
 fn test_delete_keeps_shared_content() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
-    assert write_cstr(@ns, "/one", c"same", 4) == ErrorCode.Ok
-    assert write_cstr(@ns, "/two", c"same", 4) == ErrorCode.Ok
+    assert write_text(@ns, "/one", "same") == ErrorCode.Ok
+    assert write_text(@ns, "/two", "same") == ErrorCode.Ok
     assert namespace_delete(@ns, "/one") == ErrorCode.Ok
-    assert reads_back(@ns, "/two", c"same", 4)
+    assert reads_back(@ns, "/two", "same")
     memory_store_free(@store)
     0
 
@@ -91,15 +84,17 @@ fn test_overwrite_reclaims_superseded_blobs() -> i32
     var ns: Namespace = namespace_new(@store)
     assert namespace_mkdir(@ns, "/log") == ErrorCode.Ok
     var buf: [8]u8
+    let all: [u8] = @buf
+    let two: [u8] = all[0..2]
     var k: i32 = 0
     while k < 300
-        buf[0] = (k & 255) as u8
-        buf[1] = (k >> 8) as u8
-        assert write_cstr(@ns, "/log/cur", @buf[0], 2) == ErrorCode.Ok
+        two[0] = (k & 255) as u8
+        two[1] = (k >> 8) as u8
+        assert namespace_write(@ns, "/log/cur", @two) == ErrorCode.Ok
         k = k + 1
     # root, /log and /log/cur
     assert memory_store_count(@store) == 3
-    assert reads_back(@ns, "/log/cur", @buf[0], 2)
+    assert reads_back(@ns, "/log/cur", two.as_strview())
     memory_store_free(@store)
     0
 
@@ -111,10 +106,10 @@ fn test_hold_outlives_overwrite_and_delete() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
     let empty: i32 = memory_store_count(@store)
-    assert write_cstr(@ns, "/f", c"old", 3) == ErrorCode.Ok
+    assert write_text(@ns, "/f", "old") == ErrorCode.Ok
     var file: BlobId = namespace_resolve(@ns, "/f")
     assert namespace_hold(@ns, @file)
-    assert write_cstr(@ns, "/f", c"new", 3) == ErrorCode.Ok
+    assert write_text(@ns, "/f", "new") == ErrorCode.Ok
     let old: *u8 = memory_store_get(@store, @file)
     assert old != null
     assert *old == 111 and *(old + 2) == 100
@@ -122,7 +117,7 @@ fn test_hold_outlives_overwrite_and_delete() -> i32
     assert memory_store_get(@store, @file) == null
 
     assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
-    assert write_cstr(@ns, "/d/x", c"child", 5) == ErrorCode.Ok
+    assert write_text(@ns, "/d/x", "child") == ErrorCode.Ok
     var dir: BlobId = namespace_resolve(@ns, "/d")
     assert namespace_hold(@ns, @dir)
     assert namespace_delete(@ns, "/d/x") == ErrorCode.Ok

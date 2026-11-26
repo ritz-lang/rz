@@ -48,7 +48,7 @@ PROJECTS = RITZ_ROOT.parent
 PINS = {
     "angelo": 4,
     "cryptosec": 10,
-    "goliath": 31,
+    "goliath": 0,
     "harland": 11,
     "http": 2,
     "indium": 120,
@@ -124,7 +124,7 @@ def test_wrapped_syscalls_have_no_hosted_callers():
 # #4691, nexus/ritz-lsp/ritzunit/mausoleum/goliath by #4688).  Down only.
 C_LITERAL_PINS = {
     "cryptosec": 295,
-    "goliath": 36,
+    "goliath": 0,
     "harland": 34,
     "http": 77,
     "indium": 157,

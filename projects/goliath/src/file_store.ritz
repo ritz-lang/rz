@@ -15,67 +15,45 @@
 # `<path>.lock` sidecar: the store itself can't carry it, since each save
 # renames a new inode over it. Plain readers need no lock.
 
-import ritzlib.sys { sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
-import ritzlib.fd { Fd, fd_open, fd_adopt, fd_borrow, SEEK_SET, SEEK_END, O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_CLOEXEC, LOCK_EX }
+import ritzlib.fd { Fd, fd_open, fd_adopt, fd_borrow, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_CLOEXEC, LOCK_EX }
 import ritzlib.process { process_id }
-import ritzlib.fs { unlink, rename }
+import ritzlib.fs { read_file, unlink, rename }
 import ritzlib.span { Span }
-import ritzlib.strview { StrView, strview_from_ptr, strview_empty }
+import ritzlib.string { String, string_new }
+import ritzlib.strview { StrView }
 import goliath.blob_store { MemoryBlobStore }
 import goliath.namespace { Namespace, namespace_new }
 import goliath.image { ImageSink, image_write, image_load, IMAGE_HEADER_SIZE, IMAGE_VERSION }
 import goliath.error { ErrorCode }
 
 pub const FILE_STORE_VERSION: u32 = IMAGE_VERSION
-const FS_PATH_BUF: i64 = 4096
+const FS_PATH_MAX: i64 = 4096
 const FS_ENOENT: i32 = 2
 
 # ============================================================================
 # Helpers
 # ============================================================================
 
-# `path` + `suffix` + NUL into `buf` (FS_PATH_BUF bytes), as a view of `buf`
-# (without the NUL). An empty view if `path` is empty, holds a NUL, or the
-# pair doesn't fit.
-fn fs_path_join(path: StrView, suffix: StrView, buf: *u8) -> StrView
-    if path.len == 0 or path.len + suffix.len >= FS_PATH_BUF
-        return strview_empty()
-    var i: i64 = 0
-    while i < path.len
-        if *(path.ptr + i) == 0
-            return strview_empty()
-        *(buf + i) = *(path.ptr + i)
-        i = i + 1
-    var j: i64 = 0
-    while j < suffix.len
-        *(buf + i + j) = *(suffix.ptr + j)
-        j = j + 1
-    *(buf + i + j) = 0
-    strview_from_ptr(buf, i + j)
+# `path` + `suffix`, or an empty String if `path` is empty, holds a NUL, or
+# the pair is too long for a host path.
+fn fs_path_join(path: StrView, suffix: StrView) -> String
+    var out: String = string_new()
+    if path.len == 0 or path.len + suffix.len >= FS_PATH_MAX or path.find_byte(0) < path.len
+        return out
+    out.push_str(path)
+    out.push_str(suffix)
+    out
 
-# `path` + ".tmp." + the decimal pid into `buf` (FS_PATH_BUF bytes): a temp
-# name no other live process will pick. Empty if it doesn't fit.
-fn fs_tmp_path(path: StrView, buf: *u8) -> StrView
-    var suffix: [32]u8
-    let prefix: StrView = ".tmp."
-    var n: i64 = 0
-    while n < prefix.len
-        suffix[n] = *(prefix.ptr + n)
-        n = n + 1
-    var digits: [16]u8
-    var d: i64 = 0
-    var pid: i64 = process_id() as i64
+# `path` + ".tmp." + the decimal pid: a temp name no other live process will
+# pick. Empty if it doesn't fit.
+fn fs_tmp_path(path: StrView) -> String
+    let pid: i64 = process_id() as i64
     if pid <= 0
-        return strview_empty()
-    while pid > 0
-        digits[d] = (48 + pid % 10) as u8
-        pid = pid / 10
-        d = d + 1
-    while d > 0
-        d = d - 1
-        suffix[n] = digits[d]
-        n = n + 1
-    fs_path_join(path, strview_from_ptr(@suffix[0], n), buf)
+        return string_new()
+    var suffix: String = string_new()
+    suffix.push_str(".tmp.")
+    suffix.push_i64(pid)
+    fs_path_join(path, suffix.as_view())
 
 # ============================================================================
 # Load
@@ -88,55 +66,21 @@ fn fs_tmp_path(path: StrView, buf: *u8) -> StrView
 # ErrorCode.Ok, ErrorCode.CorruptBlob (not a whole, intact store file),
 # ErrorCode.IoError (can't read it) or ErrorCode.PathTooLong.
 pub fn file_store_open(path: StrView, store: *MemoryBlobStore, ns_out: *Namespace) -> ErrorCode
-    var cpath: [4096]u8
-    let full: StrView = fs_path_join(path, "", @cpath[0])
-    if full.len == 0
+    let full: String = fs_path_join(path, "")
+    if full.len() == 0
         return ErrorCode.PathTooLong
 
-    var f: Fd = fd_adopt(-1)
-    match fd_open(full, O_RDONLY, 0)
-        Ok(opened) => f = opened
+    let image: String = match read_file(full.as_view())
+        Ok(bytes) => bytes
         Err(e) =>
             if e.code() == FS_ENOENT
                 *ns_out = namespace_new(store)
                 return ErrorCode.Ok
             return ErrorCode.IoError
-
-    var len: i64 = -1
-    match f.seek(0, SEEK_END)
-        Ok(end) => len = end
-        Err(_) => pass
-    var rewound: bool = false
-    match f.seek(0, SEEK_SET)
-        Ok(at) => rewound = at == 0
-        Err(_) => pass
-    if len < 0 or not rewound
-        f.close()
-        return ErrorCode.IoError
-    if len < IMAGE_HEADER_SIZE
-        f.close()
+    if image.len() < IMAGE_HEADER_SIZE
         return ErrorCode.CorruptBlob
-
-    let buf: *u8 = sys_mmap(0, len, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
-    if (buf as i64) < 0
-        f.close()
-        return ErrorCode.IoError
-    var got: i64 = 0
-    while got < len
-        var n: i64 = 0
-        match f.read(Span<u8> { ptr: buf + got, len: len - got })
-            Ok(k) => n = k
-            Err(_) => pass
-        if n <= 0
-            break
-        got = got + n
-    f.close()
-
-    var rc: ErrorCode = ErrorCode.IoError
-    if got == len
-        rc = image_load(buf, len, store, ns_out)
-    sys_munmap(buf, len)
-    rc
+    let bytes: StrView = image.as_view()
+    image_load(bytes.ptr, bytes.len, store, ns_out)
 
 # ============================================================================
 # Save
@@ -158,10 +102,10 @@ fn fs_save_to_fd(f: @Fd, ns: *Namespace) -> bool
 # (atomically replacing it). ErrorCode.Ok, ErrorCode.IoError,
 # ErrorCode.PathTooLong.
 pub fn file_store_save(path: StrView, ns: *Namespace) -> ErrorCode
-    var cpath: [4096]u8
-    var ctmp: [4096]u8
-    let full: StrView = fs_path_join(path, "", @cpath[0])
-    let tmp: StrView = fs_tmp_path(path, @ctmp[0])
+    let full_path: String = fs_path_join(path, "")
+    let tmp_path: String = fs_tmp_path(path)
+    let full: StrView = full_path.as_view()
+    let tmp: StrView = tmp_path.as_view()
     if full.len == 0 or tmp.len == 0
         return ErrorCode.PathTooLong
 
@@ -202,12 +146,11 @@ fn discard_tmp(tmp: StrView)
 # leaves it in place: removing it would let a waiter lock an unlinked inode
 # while a newcomer locks a new one.
 pub fn file_store_lock(path: StrView) -> Fd
-    var clock: [4096]u8
-    let lock_path: StrView = fs_path_join(path, ".lock", @clock[0])
-    if lock_path.len == 0
+    let lock_path: String = fs_path_join(path, ".lock")
+    if lock_path.len() == 0
         return fd_adopt(-1)
     var f: Fd = fd_adopt(-1)
-    match fd_open(lock_path, O_RDWR + O_CREAT + O_CLOEXEC, 420)
+    match fd_open(lock_path.as_view(), O_RDWR + O_CREAT + O_CLOEXEC, 420)
         Ok(opened) => f = opened
         Err(_) => return fd_adopt(-1)
     match f.lock(LOCK_EX)

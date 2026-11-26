@@ -2,12 +2,15 @@
 # (AGAST #1881). The device here is a RAM disk behind the same BlockDevice
 # interface the kernel's virtio-blk driver fills in.
 
-import ritzlib.memory { Allocator, heap_alloc, heap_free }
+import ritzlib.memory { Allocator }
 import ritzlib.strview { StrView }
-import ritzlib.span { Span, span_from_ptr }
+import ritzlib.span { Span, Bytes, span_from_strview }
+import ritzlib.gvec { Vec, vec_zeroed }
+import ritzlib.string { String, string_from_bytes }
+import goliath.alloc { allocator_alloc, allocator_free }
 import goliath.blob_id { BlobId }
-import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_free, memory_store_count, memory_store_get, memory_store_get_size }
-import goliath.hosted { memory_store_new }
+import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_free, memory_store_count, memory_store_get_span }
+import goliath.hosted { memory_store_new, hosted_allocator }
 import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve }
 import goliath.block_store { BlockDevice, block_store_save, block_store_load, BLOCK_SECTOR_SIZE }
 import goliath.error { ErrorCode }
@@ -17,7 +20,7 @@ import goliath.error { ErrorCode }
 # ---------------------------------------------------------------------------
 
 struct RamDisk
-    data: *u8
+    data: Vec<u8>
     sectors: u64
     fail_io: bool
     # Power loss: sectors written so far, and how many may be written before
@@ -32,10 +35,11 @@ fn ram_read(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
     let d: *RamDisk = dev as *RamDisk
     if (*d).fail_io or lba + count as u64 > (*d).sectors
         return -5
-    let base: *u8 = (*d).data + (lba * 512) as i64
+    let base: i64 = (lba * 512) as i64
+    let disk: [u8] = (*d).data[base..base + count as i64 * 512]
     var i: i64 = 0
-    while i < count as i64 * 512
-        *(buf + i) = *(base + i)
+    while i < disk.len
+        *(buf + i) = disk[i]
         i = i + 1
     0
 
@@ -43,7 +47,8 @@ fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
     let d: *RamDisk = dev as *RamDisk
     if (*d).fail_io or lba + count as u64 > (*d).sectors
         return -5
-    let base: *u8 = (*d).data + (lba * 512) as i64
+    let base: i64 = (lba * 512) as i64
+    let disk: [u8] = (*d).data[base..base + count as i64 * 512]
     var s: i64 = 0
     while s < count as i64
         var bytes: i64 = 512
@@ -53,7 +58,7 @@ fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
             bytes = 256
         var i: i64 = s * 512
         while i < s * 512 + bytes
-            *(base + i) = *(buf + i)
+            disk[i] = *(buf + i)
             i = i + 1
         if bytes < 512
             return -5
@@ -63,28 +68,22 @@ fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
 
 # A zeroed (blank) disk of `sectors` sectors
 fn ram_new(sectors: u64) -> RamDisk
-    RamDisk { data: heap_alloc((sectors * 512) as i64), sectors: sectors, fail_io: false, written: 0, write_budget: -1, torn: false }
+    RamDisk { data: vec_zeroed<u8>((sectors * 512) as i64), sectors: sectors, fail_io: false, written: 0, write_budget: -1, torn: false }
 
 fn ram_device(d: *RamDisk) -> BlockDevice
     BlockDevice { dev: d as *u8, sectors: (*d).sectors, read: ram_read, write: ram_write }
 
 fn ram_free(d: *RamDisk)
-    heap_free((*d).data, ((*d).sectors * 512) as i64)
+    (*d).data.deinit()
 
-fn write_text(ns: *Namespace, path: StrView, text: *u8, len: i64) -> ErrorCode
-    let data: Span<u8> = span_from_ptr<u8>(text, len)
+fn write_text(ns: *Namespace, path: StrView, text: StrView) -> ErrorCode
+    let data: Span<u8> = span_from_strview(text)
     namespace_write(ns, path, @data)
 
-fn reads_back(ns: *Namespace, path: StrView, want: *u8, len: i64) -> bool
+# Whether `path` reads back exactly `want`.
+fn reads_back(ns: *Namespace, path: StrView, want: StrView) -> bool
     let got: Span<u8> = namespace_read(ns, path)
-    if got.ptr == null or got.len != len
-        return false
-    var i: i64 = 0
-    while i < len
-        if *(got.ptr + i) != *(want + i)
-            return false
-        i = i + 1
-    true
+    got.ptr != null and got.as_strview().eq(want)
 
 # ---------------------------------------------------------------------------
 # Persistence
@@ -100,10 +99,10 @@ fn test_block_store_survives_reboot() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
     assert namespace_mkdir(@ns, "/etc") == ErrorCode.Ok
-    assert write_text(@ns, "/etc/motd", c"hello harland", 13) == ErrorCode.Ok
-    assert write_text(@ns, "/etc/gone", c"bye", 3) == ErrorCode.Ok
+    assert write_text(@ns, "/etc/motd", "hello harland") == ErrorCode.Ok
+    assert write_text(@ns, "/etc/gone", "bye") == ErrorCode.Ok
     assert namespace_delete(@ns, "/etc/gone") == ErrorCode.Ok
-    assert write_text(@ns, "/top", c"t", 1) == ErrorCode.Ok
+    assert write_text(@ns, "/top", "t") == ErrorCode.Ok
     let blobs: i32 = memory_store_count(@store)
     assert block_store_save(@dev, @ns) == ErrorCode.Ok
     memory_store_free(@store)
@@ -111,19 +110,19 @@ fn test_block_store_survives_reboot() -> i32
     var store2: MemoryBlobStore = memory_store_new()
     var ns2: Namespace
     assert block_store_load(@dev, @store2, @ns2) == ErrorCode.Ok
-    assert reads_back(@ns2, "/etc/motd", c"hello harland", 13)
-    assert reads_back(@ns2, "/top", c"t", 1)
+    assert reads_back(@ns2, "/etc/motd", "hello harland")
+    assert reads_back(@ns2, "/top", "t")
     assert not namespace_exists(@ns2, "/etc/gone")
     assert memory_store_count(@store2) == blobs
     # The loaded tree is live: change it and round-trip again
-    assert write_text(@ns2, "/etc/motd", c"v2", 2) == ErrorCode.Ok
+    assert write_text(@ns2, "/etc/motd", "v2") == ErrorCode.Ok
     assert block_store_save(@dev, @ns2) == ErrorCode.Ok
     memory_store_free(@store2)
 
     var store3: MemoryBlobStore = memory_store_new()
     var ns3: Namespace
     assert block_store_load(@dev, @store3, @ns3) == ErrorCode.Ok
-    assert reads_back(@ns3, "/etc/motd", c"v2", 2)
+    assert reads_back(@ns3, "/etc/motd", "v2")
     memory_store_free(@store3)
     ram_free(@disk)
     0
@@ -139,11 +138,11 @@ fn test_block_store_refuses_blank_damaged_and_full() -> i32
     assert block_store_load(@dev, @store, @ns) == ErrorCode.NotFound
 
     ns = namespace_new(@store)
-    assert write_text(@ns, "/f", c"payload", 7) == ErrorCode.Ok
+    assert write_text(@ns, "/f", "payload") == ErrorCode.Ok
     assert block_store_save(@dev, @ns) == ErrorCode.Ok
 
     # One flipped byte in the image (the first save puts it at sector 2)
-    *((disk.data) + 1024 + 100) = *((disk.data) + 1024 + 100) ^ 1
+    disk.data.set(1124, disk.data.get(1124) ^ 1)
     var s2: MemoryBlobStore = memory_store_new()
     var ns2: Namespace
     assert block_store_load(@dev, @s2, @ns2) == ErrorCode.CorruptBlob
@@ -160,12 +159,11 @@ fn test_block_store_refuses_blank_damaged_and_full() -> i32
     # 8 KiB of content can't fit a 4-sector device; the device is untouched
     var tiny: RamDisk = ram_new(4)
     var tdev: BlockDevice = ram_device(@tiny)
-    let big: *u8 = heap_alloc(8192)
-    let big_span: Span<u8> = span_from_ptr<u8>(big, 8192)
+    let big: Vec<u8> = vec_zeroed<u8>(8192)
+    let big_span: Span<u8> = big[0..8192]
     assert namespace_write(@ns, "/big", @big_span) == ErrorCode.Ok
     assert block_store_save(@tdev, @ns) == ErrorCode.OutOfSpace
-    assert *(tiny.data) == 0
-    heap_free(big, 8192)
+    assert tiny.data.get(0) == 0
 
     memory_store_free(@store)
     ram_free(@tiny)
@@ -185,17 +183,17 @@ fn crash_tree(ns: *Namespace, g: u8, pad: i64) -> ErrorCode
     v[2] = 110
     v[3] = 45
     v[4] = 48 + g
-    var rc: ErrorCode = write_text(ns, "/v", @v[0], 5)
+    let vs: Span<u8> = @v
+    var rc: ErrorCode = namespace_write(ns, "/v", @vs)
     if rc != ErrorCode.Ok
         return rc
-    let p: *u8 = heap_alloc(pad + 1)
+    var p: Vec<u8> = vec_zeroed<u8>(pad + 1)
     var i: i64 = 0
     while i < pad + 1
-        *(p + i) = (i * 7 + g as i64) as u8
+        p.set(i, (i * 7 + g as i64) as u8)
         i = i + 1
-    rc = write_text(ns, "/pad", p, pad)
-    heap_free(p, pad + 1)
-    rc
+    let padding: Span<u8> = p[0..pad]
+    namespace_write(ns, "/pad", @padding)
 
 # Which generation the disk loads: 0..9, or -1 if it doesn't load whole
 fn loaded_gen(dev: *BlockDevice) -> i32
@@ -319,19 +317,22 @@ fn test_block_store_out_of_space_keeps_previous() -> i32
 
 var g_outstanding: i64 = 0
 var g_budget: i64 = 0
+# Where the counted blocks really come from
+var g_counted: Allocator
 
 fn counting_alloc(ctx: *u8, len: i64) -> *u8
     if g_outstanding + len > g_budget
         return null
     g_outstanding = g_outstanding + len
-    heap_alloc(len)
+    allocator_alloc(@g_counted, len)
 
 fn counting_free(ctx: *u8, p: *u8, len: i64) -> i32
     g_outstanding = g_outstanding - len
-    heap_free(p, len)
+    allocator_free(@g_counted, p, len)
     0
 
 fn counting() -> Allocator
+    g_counted = hosted_allocator()
     Allocator { ctx: null, alloc: counting_alloc, free: counting_free }
 
 # Every byte goliath takes comes from its allocator and goes back to it:
@@ -348,10 +349,12 @@ fn test_all_memory_goes_through_the_allocator() -> i32
     assert namespace_mkdir(@ns, "/a/b") == ErrorCode.Ok
     var k: i32 = 0
     var buf: [4]u8
+    let all: Span<u8> = @buf
+    let one: Span<u8> = all[0..1]
     while k < 100
-        buf[0] = k as u8
-        assert write_text(@ns, "/a/b/f", @buf[0], 1) == ErrorCode.Ok
-        assert write_text(@ns, "/a/g", @buf[0], 1) == ErrorCode.Ok
+        one[0] = k as u8
+        assert namespace_write(@ns, "/a/b/f", @one) == ErrorCode.Ok
+        assert namespace_write(@ns, "/a/g", @one) == ErrorCode.Ok
         k = k + 1
     assert namespace_delete(@ns, "/a/g") == ErrorCode.Ok
     memory_store_free(@store)
@@ -365,11 +368,11 @@ fn test_out_of_memory_is_reported() -> i32
     g_budget = 1 << 30
     var store: MemoryBlobStore = memory_store_new_in(counting())
     var ns: Namespace = namespace_new(@store)
-    assert write_text(@ns, "/kept", c"kept", 4) == ErrorCode.Ok
+    assert write_text(@ns, "/kept", "kept") == ErrorCode.Ok
     g_budget = g_outstanding
-    assert write_text(@ns, "/new", c"new", 3) == ErrorCode.OutOfSpace
+    assert write_text(@ns, "/new", "new") == ErrorCode.OutOfSpace
     assert not namespace_exists(@ns, "/new")
-    assert reads_back(@ns, "/kept", c"kept", 4)
+    assert reads_back(@ns, "/kept", "kept")
     g_budget = 1 << 30
     memory_store_free(@store)
     assert g_outstanding == 0
@@ -384,39 +387,26 @@ fn test_file_equal_to_a_directory_blob() -> i32
     var ns: Namespace = namespace_new(@store)
     let empty: i32 = memory_store_count(@store)
     assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
-    assert write_text(@ns, "/d/f", c"inner", 5) == ErrorCode.Ok
+    assert write_text(@ns, "/d/f", "inner") == ErrorCode.Ok
     var dir_id: BlobId = namespace_resolve(@ns, "/d")
-    let dir_size: u64 = memory_store_get_size(@store, @dir_id)
-    let copy: *u8 = heap_alloc(dir_size as i64)
-    let src: *u8 = memory_store_get(@store, @dir_id)
-    var i: u64 = 0
-    while i < dir_size
-        *(copy + i) = *(src + i)
-        i = i + 1
-    assert write_text(@ns, "/copy", copy, dir_size as i64) == ErrorCode.Ok
+    let copy: String = string_from_bytes(memory_store_get_span(@store, @dir_id))
+    assert copy.len() > 0
+    assert write_text(@ns, "/copy", copy.as_view()) == ErrorCode.Ok
     assert namespace_delete(@ns, "/d/f") == ErrorCode.Ok
     assert namespace_delete(@ns, "/d") == ErrorCode.Ok
-    assert reads_back(@ns, "/copy", copy, dir_size as i64)
+    assert reads_back(@ns, "/copy", copy.as_view())
     assert namespace_delete(@ns, "/copy") == ErrorCode.Ok
     assert memory_store_count(@store) == empty
-    heap_free(copy, dir_size as i64)
 
     # Bytes that parse as a directory but were never stored as one hold no
     # references: dropping such a file mustn't release what they name.
-    assert write_text(@ns, "/x", c"x content", 9) == ErrorCode.Ok
+    assert write_text(@ns, "/x", "x content") == ErrorCode.Ok
     var root_id: BlobId = namespace_resolve(@ns, "/")
-    let root_size: u64 = memory_store_get_size(@store, @root_id)
-    let old_root: *u8 = heap_alloc(root_size as i64)
-    let root_src: *u8 = memory_store_get(@store, @root_id)
-    i = 0
-    while i < root_size
-        *(old_root + i) = *(root_src + i)
-        i = i + 1
+    let old_root: String = string_from_bytes(memory_store_get_span(@store, @root_id))
     # Replace the root (freeing that blob), then store its bytes as a file
-    assert write_text(@ns, "/y", c"y", 1) == ErrorCode.Ok
-    assert write_text(@ns, "/fake", old_root, root_size as i64) == ErrorCode.Ok
+    assert write_text(@ns, "/y", "y") == ErrorCode.Ok
+    assert write_text(@ns, "/fake", old_root.as_view()) == ErrorCode.Ok
     assert namespace_delete(@ns, "/fake") == ErrorCode.Ok
-    assert reads_back(@ns, "/x", c"x content", 9)
-    heap_free(old_root, root_size as i64)
+    assert reads_back(@ns, "/x", "x content")
     memory_store_free(@store)
     0

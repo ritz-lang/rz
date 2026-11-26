@@ -41,16 +41,16 @@ pub import goliath.path { path_is_absolute, path_is_root, path_validate }
 # rewrites it; `get` and `ls` only read it, and a missing store is empty.
 # Exit status: 0 done, 1 failed, 2 usage error.
 #
-import ritzlib.cstr
-import ritzlib.sys { sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
 import ritzlib.fmt
-import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new }
 import ritzlib.os.env { env_get_or }
-import ritzlib.span { Span, span_from_ptr }
-import ritzlib.fd { Fd, fd_open, fd_stdout, O_RDONLY }
+import ritzlib.span { Span, Bytes, span_from_strview }
+import ritzlib.fd { Fd, fd_stdout }
+import ritzlib.fs { read_file }
 import goliath.blob_id { BlobId, BLOB_ID_HEX_LEN, blob_id_compute, blob_id_eq, blob_id_is_zero, blob_id_to_hex, blob_id_from_hex }
 import goliath.hosted { memory_store_new }
-import goliath.blob_store { MemoryBlobStore, memory_store_exists, memory_store_get, memory_store_get_size, memory_store_free }
+import goliath.blob_store { MemoryBlobStore, memory_store_exists, memory_store_get_span, memory_store_free }
 import goliath.namespace { Namespace, namespace_resolve, namespace_write, namespace_list }
 import goliath.dir_entry { NsEntry, dir_entry_is_dir, dir_entry_name, dir_entry_name_eq }
 import goliath.path { path_is_absolute, path_is_root, path_validate, path_parent, path_leaf }
@@ -103,106 +103,55 @@ fn open_store(cmd: StrView, path: StrView, store: *MemoryBlobStore, ns: *Namespa
 fn print_hex_id(id: *BlobId)
     var hex: [65]u8
     blob_id_to_hex(id, @hex[0])
-    let h: StrView = strview_from_cstr(@hex[0])
+    let buf: [u8] = @hex
+    let digits: [u8] = buf[0..BLOB_ID_HEX_LEN]
+    let h: StrView = digits.as_strview()
     print("{h}")
 
 # ============================================================================
 # put FILE
 # ============================================================================
 
-# Read the whole host file `path` into fresh mmap'd memory. Returns the
-# buffer (*len_out bytes, capacity *cap_out) or null.
-fn read_host_file(path: StrView, len_out: *i64, cap_out: *i64) -> *u8
-    var f: Fd = match fd_open(path, O_RDONLY, 0)
-        Ok(opened) => opened
-        Err(_) => return null
-    let prot: i32 = PROT_READ + PROT_WRITE
-    let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
-    var cap: i64 = 65536
-    var buf: *u8 = sys_mmap(0, cap, prot, flags, -1, 0)
-    var len: i64 = 0
-    loop
-        if (buf as i64) < 0
-            f.close()
-            return null
-        if len == cap
-            let bigger: *u8 = sys_mmap(0, cap * 2, prot, flags, -1, 0)
-            if (bigger as i64) < 0
-                sys_munmap(buf, cap)
-                f.close()
-                return null
-            var i: i64 = 0
-            while i < len
-                *(bigger + i) = *(buf + i)
-                i = i + 1
-            sys_munmap(buf, cap)
-            buf = bigger
-            cap = cap * 2
-        var n: i64 = 0
-        match f.read(Span<u8> { ptr: buf + len, len: cap - len })
-            Ok(k) => n = k
-            Err(_) =>
-                # e.g. EISDIR
-                sys_munmap(buf, cap)
-                f.close()
-                return null
-        if n == 0
-            break
-        len = len + n
-    f.close()
-    *len_out = len
-    *cap_out = cap
-    buf
-
 fn cmd_put(file: StrView, store_file: StrView) -> i32
     if file.len >= CLI_PATH_MAX
         return fail("put", file, "path too long")
-    var len: i64 = 0
-    var cap: i64 = 0
-    let data: *u8 = read_host_file(file, @len, @cap)
-    if data == null
-        return fail("put", file, "cannot read file")
+    let data: String = match read_file(file)
+        Ok(bytes) => bytes
+        Err(_) => return fail("put", file, "cannot read file")
 
     # Link it at /<basename>
     let name: StrView = path_leaf(file)
-    var nspath: [258]u8
     if name.len == 0 or name.len > 255
-        sys_munmap(data, cap)
         return fail("put", file, "no usable file name to store it under")
-    nspath[0] = 47  # '/'
-    var i: i64 = 0
-    while i < name.len
-        nspath[1 + i] = *(name.ptr + i)
-        i = i + 1
-    let path: StrView = strview_from_ptr(@nspath[0], name.len + 1)
+    var nspath: String = string_new()
+    nspath.push_str("/")
+    nspath.push_str(name)
+    let path: StrView = nspath.as_view()
     if not path_validate(path)
-        sys_munmap(data, cap)
         return fail("put", name, "not a valid goliath file name")
 
     # Hold the writer lock from load to save, so a concurrent put can't load
     # the same old store and rename its copy over ours (#3882)
     var lock: Fd = file_store_lock(store_file)
     if not lock.valid()
-        sys_munmap(data, cap)
         return fail("put", store_file, "cannot lock store file")
-    let rc: i32 = put_locked(file, path, data, len, store_file)
+    let rc: i32 = put_locked(file, path, data.as_view(), store_file)
     file_store_unlock(@&lock)
-    sys_munmap(data, cap)
     rc
 
-# cmd_put's read-modify-write, under the store lock. Doesn't free `data`.
-fn put_locked(file: StrView, path: StrView, data: *u8, len: i64, store_file: StrView) -> i32
+# cmd_put's read-modify-write, under the store lock.
+fn put_locked(file: StrView, path: StrView, data: StrView, store_file: StrView) -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace
     if open_store("put", store_file, @store, @ns) != 0
         memory_store_free(@store)
         return 1
 
-    var id: BlobId = blob_id_compute(data, len as u64)
+    var id: BlobId = blob_id_compute(data.ptr, data.len as u64)
     # Already stored under that name: nothing to write
     var linked: BlobId = namespace_resolve(@ns, path)
     if not blob_id_eq(@linked, @id)
-        let span: Span<u8> = span_from_ptr<u8>(data, len)
+        let span: Span<u8> = span_from_strview(data)
         let wrc: ErrorCode = namespace_write(@ns, path, @span)
         if wrc != ErrorCode.Ok
             memory_store_free(@store)
@@ -235,9 +184,7 @@ fn cmd_get(hex: StrView, store_file: StrView) -> i32
         memory_store_free(@store)
         return fail("get", hex, "not found")
 
-    let data: *u8 = memory_store_get(@store, @id)
-    let size: i64 = memory_store_get_size(@store, @id) as i64
-    match fd_stdout().write_all(Span<u8> { ptr: data, len: size })
+    match fd_stdout().write_all(memory_store_get_span(@store, @id))
         Ok(_) => pass
         Err(_) =>
             memory_store_free(@store)
