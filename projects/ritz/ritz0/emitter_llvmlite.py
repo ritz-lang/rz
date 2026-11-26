@@ -9701,6 +9701,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 elem = self._vec_element_ritz_type(base_type, name)
                 return rast.NamedType(base_type.span, 'Span', [elem])
             return base_type
+        if name == 'String' and self._expects_span():
+            return rast.NamedType(base_type.span, 'Span', [rast.NamedType(base_type.span, 'u8', [])])
         if name in ('Span', 'String') or name.startswith('Span$'):
             return base_type
         return None
@@ -9731,6 +9733,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
                     # Handle String slicing
                     if type_name == 'String':
+                        if self._expects_span():
+                            return self._emit_string_span_slice(expr)
                         return self._emit_string_slice(expr)
 
                     # Handle Vec<T> slicing. A range index over a Vec copies
@@ -9756,6 +9760,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if inferred.name == 'Span' or inferred.name.startswith('Span$'):
                 return self._emit_span_slice(expr)
             if inferred.name == 'String':
+                if self._expects_span():
+                    return self._emit_string_span_slice(expr)
                 return self._emit_string_slice(expr)
             if inferred.name == 'Vec' or inferred.name.startswith('Vec$'):
                 if self._expects_span():
@@ -9917,19 +9923,30 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         return self.builder.call(fn, [vec_ptr, start, end])
 
+    def _emit_string_span_slice(self, expr: rast.SliceExpr) -> ir.Value:
+        """`s[a..b]` on a String where a Span is expected: a view of its bytes,
+        the `data` Vec it holds (LANGUAGE_SPEC §3.4, AGAST #4837)."""
+        zero = ir.Constant(self.i32, 0)
+        bytes_vec = self.builder.gep(self._emit_lvalue_addr(expr.expr), [zero, zero])
+        u8 = rast.NamedType(expr.span, 'u8', [])
+        return self._emit_vec_span_slice(expr, rast.NamedType(expr.span, 'Vec', [u8]), 'Vec',
+                                         vec_ptr=bytes_vec)
+
     def _emit_vec_span_slice(self, expr: rast.SliceExpr,
                              base_ritz_type: rast.NamedType,
-                             type_name: str) -> ir.Value:
+                             type_name: str, vec_ptr: Optional[ir.Value] = None) -> ir.Value:
         """Emit `v[a..b]` on a Vec<T> as a zero-copy `Span<T>` view.
 
         `v[a..b]` normally produces an owned `Vec<T>` copy (`vec_slice<T>`).
         When the surrounding context asks for a span - `let s: Span<u8> = v[a..b]`,
         or a `[u8]` payload/return - copying would be wrong twice over: the
         shapes differ, and the caller asked for a view of `v`, not a clone.
+        `vec_ptr` is the Vec's address, when it isn't `expr.expr`'s.
         """
         elem_ty = self._vec_element_ritz_type(base_ritz_type, type_name)
 
-        vec_ptr = self._emit_lvalue_addr(expr.expr)
+        if vec_ptr is None:
+            vec_ptr = self._emit_lvalue_addr(expr.expr)
         zero = ir.Constant(self.i32, 0)
         data_ptr = self.builder.load(
             self.builder.gep(vec_ptr, [zero, ir.Constant(self.i32, 0)]))

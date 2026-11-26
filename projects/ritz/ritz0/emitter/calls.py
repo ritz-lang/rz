@@ -418,24 +418,27 @@ class CallEmitter:
                 # enum - variant names are global, so otherwise `Some`
                 # resolves to whichever Option was specialized last, or
                 # to an enclosing let's enum (AGAST #1577).
-                def emit_plain(a, slot=param_def.type):
-                    if (self._is_range_index(a)
-                            or self._builtin_type_receiver(a) is not None
-                            or self._is_generic_static_call(a)):
-                        # AGAST #2877: a Vec slice into a `Span<T>` param is
-                        # a view (_emit_vec_span_slice), as into a Span let.
-                        # AGAST #2296: `Span.empty()` takes its T from the
-                        # param, not from whatever slot encloses the call;
-                        # so does `Slot.mk(5)` (AGAST #2185).
-                        return self._emit_slice_into(a, slot)
-                    return self._emit_into_array_slot(a, slot)
                 with self._int_slot_context(param_def.type, arg):
-                    val = self._emit_value_arg(arg, param_def.type, emit_plain)
+                    val = self._emit_value_arg(
+                        arg, param_def.type, lambda a, s=param_def.type: self._emit_param_value(a, s))
                 self._check_arg_narrowing(arg, val, expected_type,
                                           param_def.type, fname, i)
                 val = self._convert_type(val, expected_type, arg, arg=True)
             args.append(val)
         return args
+
+    def _emit_param_value(self, a: rast.Expr, slot: Optional[rast.Type]) -> ir.Value:
+        """Emit the argument `a` into a by-value param of type `slot`, a fn's
+        or a method's alike (AGAST #4837: a method's took the copy)."""
+        if (self._is_range_index(a)
+                or self._builtin_type_receiver(a) is not None
+                or self._is_generic_static_call(a)):
+            # AGAST #2877: a Vec slice into a `Span<T>` param is a view
+            # (_emit_vec_span_slice), as into a Span let.  AGAST #2296:
+            # `Span.empty()` takes its T from the param, not from whatever
+            # slot encloses the call; so does `Slot.mk(5)` (AGAST #2185).
+            return self._emit_slice_into(a, slot)
+        return self._emit_into_array_slot(a, slot)
 
     def _emit_extern_call(self, call: rast.Call, fname: str) -> ir.Value:
         """Emit a call to a declared extern fn."""
@@ -831,7 +834,7 @@ class CallEmitter:
                 # AGAST #1577: at the param's enum, not an outer let's.
                 with self._int_slot_context(slot, arg):
                     all_args.append(self._emit_value_arg(
-                        arg, slot, lambda a, s=slot: self._emit_into_array_slot(a, s)))
+                        arg, slot, lambda a, s=slot: self._emit_param_value(a, s)))
 
         # Convert argument types as needed
         converted_args = []
@@ -1016,7 +1019,7 @@ class CallEmitter:
                 # AGAST #1577: at the param's enum, not an outer let's.
                 with self._int_slot_context(slot, arg):
                     all_args.append(self._emit_value_arg(
-                        arg, slot, lambda a, s=slot: self._emit_into_array_slot(a, s)))
+                        arg, slot, lambda a, s=slot: self._emit_param_value(a, s)))
 
     def _convert_method_args(self, expr: rast.MethodCall, fn: ir.Function,
                              fn_def, all_args: list) -> list:

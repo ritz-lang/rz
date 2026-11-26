@@ -1090,9 +1090,15 @@ fn slice_into_span_slot(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView) ->
         return 0
     var suf: *u8 = null
     var suf_len: i32 = 0
+    # A String's slice is a view of its bytes, its `data` Vec (AGAST #4837).
+    var string: bool = false
     if base.kind == ExprKind.Ident
         let idx: i32 = find_local_var_idx(mono, base.ident)
-        if idx < 0 or *(mono.lv_prefix_kind + idx) != 1
+        if idx < 0
+            return 0
+        let kind: i32 = *(mono.lv_prefix_kind + idx)
+        string = kind == 0 and name_eq(StrView { ptr: (*(mono.lv_type_names + idx)), len: (*(mono.lv_type_name_lens + idx)) as i64 }, "String") == 1
+        if kind != 1 and not string
             return 0
         # The Vec itself, or one level from it (`(*p)` needs the level).
         let by_value: i32 = *(mono.lv_by_value + idx)
@@ -1101,11 +1107,13 @@ fn slice_into_span_slot(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView) ->
         suf = *(mono.lv_suffixes + idx)
         suf_len = *(mono.lv_suffix_lens + idx)
     else if base == e.left and base.kind == ExprKind.Member
-        # A by-value Vec field, `b.data[0..2]`: the same view of it.
+        # A by-value Vec or String field, `b.data[0..2]`: the same view of it.
         let rf: *StructField = resolve_member_field(mono, m, e.left)
         if rf == null or rf.field_type != TypeKind.Struct
             return 0
-        if classify_collection_type(StrView { ptr: (rf.field_type_name), len: (rf.field_type_name_len) as i64 }, @suf, @suf_len) != 1
+        let ftn: StrView = StrView { ptr: (rf.field_type_name), len: (rf.field_type_name_len) as i64 }
+        string = name_eq(ftn, "String") == 1
+        if not string and classify_collection_type(ftn, @suf, @suf_len) != 1
             return 0
     else
         return 0
@@ -1115,6 +1123,12 @@ fn slice_into_span_slot(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView) ->
     else if slice_bound_rereadable(lo) == 0
         return 1
     e.left = base
+    if string
+        let bytes: StrView = "$u8"
+        suf = bytes.ptr
+        suf_len = bytes.len as i32
+        e.left = slice_node(ExprKind.Member, e, base, null)
+        e.left.ident = "data"
     span_view_in_place(e, "data", StrView { ptr: (suf), len: (suf_len) as i64 })
     return 1
 
@@ -1269,8 +1283,15 @@ fn collect_from_expr(mono: *MonoCtx, m: *Module, e: *Expr)
             # instantiates the vec_push<T> its body calls (AGAST #3617, #4303).
             want_receiver_method(mono, m, e.left, e.ident)   # AGAST #3617
             collect_from_expr(mono, m, e.left)  # receiver
+            # Each argument into its parameter's slot, as a call's are (AGAST
+            # #4837): `h.rec(v[0..n])` into `a: [u8]` is a view, not a copy.
+            var par: *Param = method_slot_params(mono, m, e)
             var arg: *Expr = e.args
             while arg != null
+                if par != null
+                    if par.param_type == TypeKind.Struct
+                        slice_into_expected(mono, m, arg, StrView { ptr: (par.param_type_name), len: (par.param_type_name_len) as i64 })
+                    par = par.next
                 collect_from_expr(mono, m, arg)
                 arg = arg.next
         ExprKind.Cast =>
@@ -3201,6 +3222,24 @@ fn receiver_instance(mono: *MonoCtx, m: *Module, recv: *Expr) -> StrView
             return method_result_type_name(m, inner_sv, r.ident)
         _ => pass
     strview_empty()
+
+# The params the arguments of method call `e` land in: its impl method's,
+# after `self`.  `Type.f(..)` (no local named `Type`) is a static call, and
+# all of `f`'s params take arguments.  null when the method isn't found.
+fn method_slot_params(mono: *MonoCtx, m: *Module, e: *Expr) -> *Param
+    let meth: StrView = e.ident
+    var tn: StrView = receiver_instance(mono, m, e.left)
+    if tn.len <= 0 and e.left != null and e.left.kind == ExprKind.Ident and find_local_var_idx(mono, e.left.ident) < 0
+        tn = e.left.ident
+    if tn.ptr == null or tn.len <= 0
+        return null
+    let ib: *ImplBlock = impl_with_method(m, tn, meth, true)
+    if ib == null
+        return null
+    let f: *FnDef = impl_method_named(ib, meth)
+    if param_is_self(f.params) == 1
+        return f.params.next
+    f.params
 
 # `recv.meth(..)`: the instance the tracker types `recv` as, or every one.
 fn want_receiver_method(mono: *MonoCtx, m: *Module, recv: *Expr, meth_sv: StrView)
