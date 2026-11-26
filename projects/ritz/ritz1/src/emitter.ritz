@@ -617,7 +617,9 @@ fn emit_odr_comdat_start(s: *EmitterState, name_sv: StrView, suffix_sv: StrView)
 #     external with its file in the symbol (fn_symbol), like ritz0, so a
 #     generic's instance in another object can call it.  A private impl
 #     method still lands here: two types of one name may not both define
-#     `m` (type_twins.ritz), so `T_m` cannot clash.
+#     `m` (type_twins.ritz), so `T_m` cannot clash.  emit_impl_method passes it
+#     as pub in a module exporting a generic (AGAST #4839), whose instances
+#     in other objects call it.
 fn fn_linkage(is_main: bool, is_monomorph: bool, is_pub: i32, from_generated: i32) -> StrView
     if is_main
         return "define "
@@ -954,6 +956,27 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
 # Impl Block Method Emission
 # =============================================================================
 
+# AGAST #4839: whether `m` defines a pub generic body another module's object
+# instantiates: a `pub fn f<T>`, or a pub method of an `impl<T>` (a method
+# has no type params of its own).
+fn module_exports_generic(m: *Module) -> bool
+    if m == null
+        return false
+    var f: *FnDef = m.functions
+    while f != null
+        if f.is_local == 1 and f.is_pub == 1 and f.type_params != null
+            return true
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var meth: *FnDef = ib.methods
+        while meth != null
+            if meth.is_local == 1 and meth.is_pub == 1 and ib.type_params != null
+                return true
+            meth = meth.next
+        ib = ib.next
+    false
+
 # Emit an impl block method with mangled name: Type_method
 # For `impl Point { fn sum(...) }` we emit `Point_sum`
 fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
@@ -1024,6 +1047,12 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # so it is external with or without `pub` (AGAST #3386).
     var im_pub: i32 = method.is_pub
     if ib.trait_name != null
+        im_pub = 1
+    # AGAST #4839: a pub generic's instance is emitted in each importer's
+    # object, and calls the private methods its body names there: in a
+    # module exporting one, a private method is external too, as ritz0's
+    # `--no-runtime` object makes it.  Internal, it failed to link.
+    if im_pub == 0 and not im_is_monomorph and module_exports_generic(s.module)
         im_pub = 1
     if fn_is_odr(false, im_is_monomorph, im_pub, 0)
         emit_odr_comdat_start(s, StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (method.name), len: (method.name_len) as i64 })
