@@ -1,0 +1,234 @@
+# Host tests of the service's app endpoint table and request decode
+# (AGAST #4748, harland docs/RING2_NET.md "Ring-3 app exchange")
+#
+# src/app.ritz alone: ports across every attachment, handles per
+# attachment, and the private copy of one request turned into an action.
+
+import net_abi.app { AppDesc, APP_BIND, APP_SEND_TO, APP_PING, APP_CLOSE, APP_CONNECT, APP_WRITE, APP_F_NONE, MAX_ENDPOINTS }
+import netstack.app { AppPorts, AppBound, BindError, AppOwner, AppReq, APP_PORT_EPHEMERAL_MIN, APP_ATTACH_CAP, app_request }
+
+var g_ports: AppPorts
+
+fn fresh() -> @&AppPorts
+    g_ports.init()
+    for a in 0..APP_ATTACH_CAP
+        g_ports.attach(a)
+    @&g_ports
+
+fn bound_handle(r: Result<AppBound, BindError>) -> u32
+    match r
+        Ok(b) => b.handle
+        Err(_) => 0
+
+fn bound_port(r: Result<AppBound, BindError>) -> u16
+    match r
+        Ok(b) => b.port
+        Err(_) => 0
+
+fn is_err(r: Result<AppBound, BindError>, want: BindError) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e == want
+
+fn req(kind: u16, id: u32, handle: u32, port: u16, length: u32) -> AppDesc
+    AppDesc { kind: kind, flags: APP_F_NONE, id: id, handle: handle, port: port, status: 0, addr: [0, 0, 0, 0], length: length, arena_off: 0, _pad: 0 }
+
+fn is_bad(r: AppReq) -> bool
+    match r
+        AppReq.Bad => true
+        _ => false
+
+# ---------------------------------------------------------------------------
+# Bind
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_bind_assigns_handles_from_1() -> i32
+    let p = fresh()
+    let a = p.bind(0, 5000)
+    if bound_handle(a) != 1 or bound_port(a) != 5000
+        return 1
+    if bound_handle(p.bind(0, 5001)) != 2
+        return 2
+    # Another attachment's handles are its own, also from 1.
+    if bound_handle(p.bind(1, 5002)) != 1
+        return 3
+    0
+
+[[test]]
+fn test_second_bind_of_a_live_port_is_exist() -> i32
+    let p = fresh()
+    if bound_handle(p.bind(0, 7000)) != 1
+        return 1
+    if not is_err(p.bind(0, 7000), BindError.Exist)
+        return 2
+    # Live on another attachment is live too.
+    if not is_err(p.bind(2, 7000), BindError.Exist)
+        return 3
+    # No handle was allocated by the failures.
+    if bound_handle(p.bind(0, 7001)) != 2
+        return 4
+    0
+
+[[test]]
+fn test_dhcp_ports_are_exist() -> i32
+    let p = fresh()
+    if not is_err(p.bind(0, 67), BindError.Exist) or not is_err(p.bind(0, 68), BindError.Exist)
+        return 1
+    if bound_handle(p.bind(0, 69)) != 1
+        return 2
+    0
+
+[[test]]
+fn test_port_0_assigns_an_ephemeral_port_not_bound() -> i32
+    let p = fresh()
+    let first = bound_port(p.bind(0, 0))
+    if first < APP_PORT_EPHEMERAL_MIN
+        return 1
+    # The next ephemeral port, taken explicitly, is skipped by port 0.
+    let taken = bound_port(p.bind(1, first + 1))
+    if taken != first + 1
+        return 2
+    let second = bound_port(p.bind(0, 0))
+    if second < APP_PORT_EPHEMERAL_MIN or second == first or second == taken
+        return 3
+    0
+
+[[test]]
+fn test_seventeenth_endpoint_is_nfile_and_close_frees_one() -> i32
+    let p = fresh()
+    for i in 0..MAX_ENDPOINTS
+        if bound_handle(p.bind(0, (6000 + i) as u16)) != i + 1
+            return 1
+    if not is_err(p.bind(0, 6100), BindError.NFile)
+        return 2
+    # A full attachment does not stop another one.
+    if bound_handle(p.bind(1, 6100)) != 1
+        return 3
+    # A closed endpoint does not count; the new handle is not a reused one.
+    if p.close(0, 3).is_none()
+        return 4
+    let again = p.bind(0, 6101)
+    if bound_handle(again) != MAX_ENDPOINTS + 1
+        return 5
+    0
+
+# ---------------------------------------------------------------------------
+# Close, rebind, lookup, detach
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_repeated_close_and_rebind() -> i32
+    let p = fresh()
+    var want: u32 = 1
+    for round in 0..3
+        let b = p.bind(0, 8000)
+        if bound_handle(b) != want
+            return 1
+        match p.close(0, want)
+            Some(port) =>
+                if port != 8000
+                    return 2
+            None => return 3
+        # The second close of the same handle finds nothing.
+        if p.close(0, want).is_some()
+            return 4
+        want += 1
+    0
+
+[[test]]
+fn test_owner_and_port_lookups_are_per_attachment() -> i32
+    let p = fresh()
+    p.bind(0, 9000)
+    let h = bound_handle(p.bind(3, 9001))
+    match p.owner(9001)
+        Some(o) =>
+            if o.att != 3 or o.handle != h
+                return 1
+        None => return 2
+    if p.owner(9002).is_some()
+        return 3
+    # Handle 1 of attachment 3 is not attachment 0's handle 1.
+    match p.port_of(3, 1)
+        Some(port) =>
+            if port != 9001
+                return 4
+        None => return 5
+    if p.port_of(1, 1).is_some() or p.close(1, 1).is_some()
+        return 6
+    0
+
+[[test]]
+fn test_detach_frees_ports_and_a_new_attach_starts_at_1() -> i32
+    let p = fresh()
+    p.bind(2, 4000)
+    p.bind(2, 4001)
+    p.detach(2)
+    if p.owner(4000).is_some() or p.owner(4001).is_some()
+        return 1
+    p.attach(2)
+    let b = p.bind(2, 4000)
+    if bound_handle(b) != 1
+        return 2
+    0
+
+# ---------------------------------------------------------------------------
+# Request decode
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_request_kinds() -> i32
+    match app_request(req(APP_BIND, 1, 0, 53, 0))
+        AppReq.Bind(id, port) =>
+            if id != 1 or port != 53
+                return 1
+        _ => return 2
+    match app_request(req(APP_CLOSE, 2, 4, 0, 0))
+        AppReq.Close(id, h) =>
+            if id != 2 or h != 4
+                return 3
+        _ => return 4
+    match app_request(req(APP_SEND_TO, 0, 4, 99, 10))
+        AppReq.SendTo => pass
+        _ => return 5
+    # Reserved stream kinds and the ping (AGAST #4749) answer NoSys.
+    let kinds: [3]u16 = [APP_CONNECT, APP_WRITE, APP_PING]
+    for i in 0..3
+        match app_request(req(kinds[i], 3, 0, 0, 0))
+            AppReq.NoSys(id) =>
+                if id != 3
+                    return 6
+            _ => return 7
+    0
+
+[[test]]
+fn test_bad_requests_are_not_dispatched() -> i32
+    # Kind 3 and an event kind are not requests.
+    if not is_bad(app_request(req(3, 1, 0, 0, 0)))
+        return 1
+    if not is_bad(app_request(req(18, 1, 0, 0, 0)))
+        return 2
+    # A reply-producing request needs an id to answer.
+    if not is_bad(app_request(req(APP_BIND, 0, 0, 0, 0)))
+        return 3
+    # A non-zero status in a request.
+    var d = req(APP_BIND, 1, 0, 0, 0)
+    d.status = -1
+    if not is_bad(app_request(d))
+        return 4
+    # A bind that names a handle or carries bytes is Inval, answered.
+    match app_request(req(APP_BIND, 5, 2, 0, 0))
+        AppReq.Inval(id) =>
+            if id != 5
+                return 5
+        _ => return 6
+    match app_request(req(APP_BIND, 6, 0, 0, 4))
+        AppReq.Inval(_) => pass
+        _ => return 7
+    # A close of handle 0 is not a live endpoint: BadF.
+    match app_request(req(APP_CLOSE, 7, 0, 0, 0))
+        AppReq.BadF(id) =>
+            if id != 7
+                return 8
+        _ => return 9
+    0

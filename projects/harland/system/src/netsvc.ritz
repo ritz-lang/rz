@@ -24,20 +24,36 @@
 # service "keeps the pending send and finishes it when the reply arrives")
 # and is dropped when ARP gives up on that hop.
 #
-# Scope: the app exchange (net_bind and the rest) is not served yet, so a
-# UDP datagram for any port but the DHCP client's is dropped and counted,
-# and an echo reply (APP_PING's) is dropped.
+# The app exchanges (RING2_NET.md "Ring-3 app exchange", AGAST #4748): at
+# most APP_ATTACH_CAP attachments, each a request ring the service consumes
+# and an event ring it produces (libnet.ring's halves over net_abi's
+# AppDesc). A pass drains each attachment's requests: one private copy,
+# validated; a bad slot is skipped and the index advances; an impossible
+# occupancy closes that attachment only. A reply-producing request is
+# consumed at that read and its reply is owed in private state until the
+# event ring has a slot; an APP_SEND_TO behind it is not held up. A UDP
+# datagram for a bound port is posted as EV_DATAGRAM only while one event
+# slot stays free for a reply, else dropped and counted. The endpoint table
+# is netstack.app's AppPorts; netd maps an ATTACH record, lists each
+# attachment in its wait, posts the notifies this file asks for and
+# CapRevokes an attachment this file closed.
+#
+# Scope: APP_PING (AGAST #4749) is answered EV_ERROR NoSys until it is
+# served, and an echo reply is dropped.
 
 import driver_abi.frame_ring { FRAME_MAX, FRAME_RING_CAP }
 import driver_abi.link { NetInfo, NetAddr, addr_publish }
 import driver_abi.spsc { SpscProducer, SpscConsumer, SpscClose, Publish, Take, FrameBytes, spsc_rx_ring, spsc_tx_ring }
-import driver_abi.wait { WaitEvent, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK }
+import driver_abi.wait { WaitEvent, WaitSource, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK }
 import netstack.ethernet { MacAddr, EtherType, EthRx, SendError, ETH_PAYLOAD_OFF, eth_demux }
 import netstack.arp { ArpOp, ArpRx, ArpLearn, ArpSend, ArpEvent, ArpTable, ARP_HOP_CAP, arp_parse, arp_request_write, arp_reply_write, arp_should_reply, arp_broadcast_mac }
 import netstack.ipv4 { Ipv4Config, Ipv4Rx, IpProto, IPV4_HEADER_MIN, IPV4_BROADCAST, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, ipv4_parse, ipv4_next_hop }
 import netstack.icmp { IcmpRx, IcmpType, icmp_parse, icmp_should_reply, icmp_reply_next_hop, icmp_echo_reply_frame_write }
 import netstack.udp { UdpRx, UDP_HEADER_LEN, udp_parse, udp_frame_write }
 import netstack.dhcp { DhcpClient, DhcpStep, DhcpSend, DhcpRecord, DhcpTx, DhcpLease }
+import netstack.app { AppPorts, AppOwner, AppReq, BindError, APP_ATTACH_CAP, APP_EBADF, APP_EEXIST, APP_EINVAL, APP_ENFILE, APP_ENOSYS, app_request }
+import net_abi.app { AppDesc, APP_DEPTH, EV_DATAGRAM, EV_BOUND, EV_CLOSED, EV_ERROR }
+import libnet.ring { AppConsumer, AppProducer, AppPoll, AppTake, AppPublish, AppBytes, app_req_ring, app_ev_ring }
 import ritzlib.span
 
 # The pending-TX queue's depth: one virtio posted pool (RING2_NET.md
@@ -62,6 +78,15 @@ pub const RX_BUDGET: i64 = FRAME_RING_CAP as i64
 # message the client writes.
 const DHCP_BUF_LEN: i64 = 576
 
+# Replies owed to one attachment, consumed requests whose event has not
+# found an event slot. One per request slot: a drain stops taking requests
+# from an attachment whose owed replies fill this.
+pub const OWED_CAP: i64 = 32
+
+# The longest the service parks while a reply is owed to an app that has
+# not freed an event slot: the app frees slots without a notify.
+pub const OWED_RETRY_MS: u64 = 100
+
 # What happened to one send.
 pub enum Sent
     Published                        # on the TX ring
@@ -75,6 +100,11 @@ pub struct ArpWait
     len: u32
     hop: u32
     live: bool
+    # The attachment whose APP_SEND_TO this is (None: the service's own)
+    # and its serial, so a give-up counts in that attachment's send_drops
+    # and not in a later one's in the same slot.
+    app: Option<i64>
+    serial: u32
 
 pub struct NetCounters
     rx_frames: u64                   # taken off the RX ring
@@ -85,6 +115,47 @@ pub struct NetCounters
     tx_queued: u64                   # sends that waited on the pending-TX queue
     send_fails: u64                  # sends that failed to their caller
     arp_drops: u64                   # frames dropped when ARP gave up
+
+# One reply owed to an attachment.
+pub struct Owed
+    kind: u16
+    id: u32
+    handle: u32
+    port: u16
+    status: i16
+
+pub struct AppCounters
+    requests: u64                    # requests dispatched
+    rejects: u64                     # bad slots and requests not dispatched
+    send_drops: u64                  # APP_SEND_TOs that did not reach the wire
+    ev_drops: u64                    # datagrams dropped to keep the reply slot
+
+# One app attachment.
+pub struct AppAttach
+    live: bool
+    # The service closed or detached it and netd still holds the handle:
+    # netd CapRevokes it (take_revoke) before the slot is reused.
+    revoke: bool
+    handle: u64                      # netd's CAP_TYPE_SHM handle
+    serial: u32                      # which attachment this slot holds
+    req: AppConsumer
+    ev: AppProducer
+    owed: [32]Owed                   # OWED_CAP, a FIFO
+    owed_head: i64
+    owed_count: i64
+    taken: u32                       # requests consumed since the last notify
+    posted: u32                      # events posted since the last notify
+    counters: AppCounters
+
+# A ShmNotify netd owes an attachment: DATA for posted events, SPACE for
+# consumed requests.
+pub struct AppNotify
+    handle: u64
+    bits: u32
+
+# The IPv4 address in wire-order bytes `b` as a u32.
+fn ip_of(b: [4]u8) -> u32
+    ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
 
 # What a wait's events mean to the service.
 pub struct Wake
@@ -172,6 +243,15 @@ pub struct NetSvc
     rx_buf: FrameBytes               # the private copy of one RX slot
     out: FrameBytes                  # where one TX frame is built
     dhcp_buf: [576]u8                # DHCP_BUF_LEN
+    # The app exchanges.
+    apps: [5]AppAttach               # APP_ATTACH_CAP
+    ports: AppPorts
+    app_serial: u32
+    # The last pass stopped draining an attachment at APP_DEPTH requests.
+    app_more: bool
+    # The attachment whose send is being built.
+    out_app: Option<i64>
+    req_buf: AppBytes                # the private copy of one request's payload
 
 impl NetSvc
     # The service over the frame region at `region` and the address page
@@ -189,6 +269,13 @@ impl NetSvc
         self.pend_count = 0
         for i in 0..ARP_WAIT_CAP
             self.waits[i].live = false
+        for a in 0..APP_ATTACH_CAP
+            self.apps[a].live = false
+            self.apps[a].revoke = false
+        self.ports.init()
+        self.app_serial = 0
+        self.app_more = false
+        self.out_app = None
         self.generation = 0
         self.publish_due = false
         self.published = 0
@@ -233,6 +320,7 @@ impl NetSvc
         self.flush()
         self.rx_pass(now)
         self.tick(now)
+        self.apps_pass(now)
         self.flush()
         match self.closed
             Some(why) => Err(why)
@@ -249,9 +337,12 @@ impl NetSvc
     # last RX pass left frames, else the nearest DHCP or ARP timer, at most
     # WAIT_IDLE_MS.
     pub fn deadline(self: @&NetSvc, now: u64) -> u64
-        if self.rx_more
+        if self.rx_more or self.app_more
             return 0
         var at: u64 = now + WAIT_IDLE_MS
+        for a in 0..APP_ATTACH_CAP
+            if self.apps[a].live and self.apps[a].owed_count > 0 and now + OWED_RETRY_MS < at
+                at = now + OWED_RETRY_MS
         match self.dhcp.next_deadline()
             Some(d) =>
                 if d < at
@@ -384,6 +475,10 @@ impl NetSvc
                 self.waits[w].len = len as u32
                 self.waits[w].hop = hop
                 self.waits[w].live = true
+                self.waits[w].app = self.out_app
+                self.waits[w].serial = match self.out_app
+                    Some(a) => self.apps[a].serial
+                    None => 0
                 return Sent.Queued
         self.counters.send_fails += 1
         Sent.Failed
@@ -404,6 +499,11 @@ impl NetSvc
             if self.waits[w].live and self.waits[w].hop == hop
                 self.waits[w].live = false
                 self.counters.arp_drops += 1
+                match self.waits[w].app
+                    Some(a) =>
+                        if self.apps[a].live and self.apps[a].serial == self.waits[w].serial
+                            self.apps[a].counters.send_drops += 1
+                    None => pass
 
     fn our_ip(self: @&NetSvc) -> Option<u32>
         self.dhcp.config().addr
@@ -489,8 +589,10 @@ impl NetSvc
                 self.counters.rx_drops += 1
                 return
         if udp.src_port != DHCP_SERVER_PORT or udp.dst_port != DHCP_CLIENT_PORT
-            # No app exchange yet: no port is bound.
-            self.counters.udp_unbound += 1
+            match self.ports.owner(udp.dst_port)
+                Some(o) => self.deliver(o, ip.src, udp.src_port, udp.payload)
+                None =>
+                    self.counters.udp_unbound += 1
             return
         let r = self.next_rand()
         match self.dhcp.receive(udp.payload, now, r)
@@ -519,6 +621,251 @@ impl NetSvc
             Ok(len) => self.send_ip(hop, len, now)
             Err(_) =>
                 self.counters.send_fails += 1
+
+    # ------------------------------------------------------------------
+    # The app exchanges
+    # ------------------------------------------------------------------
+
+    # Serve the exchange netd mapped at `region` for its handle `handle`
+    # (an ATTACH record). The next pass drains its requests before netd
+    # parks. False when APP_ATTACH_CAP attachments are live: netd revokes
+    # the handle. A handle already attached is true and changes nothing.
+    pub fn attach(self: @&NetSvc, handle: u64, region: u64) -> bool
+        if self.app_slot(handle).is_some()
+            return true
+        for a in 0..APP_ATTACH_CAP
+            if not self.apps[a].live and not self.apps[a].revoke
+                self.app_serial += 1
+                self.apps[a].live = true
+                self.apps[a].handle = handle
+                self.apps[a].serial = self.app_serial
+                self.apps[a].req = AppConsumer.new(app_req_ring(region))
+                self.apps[a].ev = AppProducer.new(app_ev_ring(region))
+                self.apps[a].owed_head = 0
+                self.apps[a].owed_count = 0
+                self.apps[a].taken = 0
+                self.apps[a].posted = 0
+                self.apps[a].counters = AppCounters { requests: 0, rejects: 0, send_drops: 0, ev_drops: 0 }
+                self.ports.attach(a)
+                self.app_more = true
+                return true
+        false
+
+    # The live attachment for `handle`.
+    pub fn app_slot(self: @NetSvc, handle: u64) -> Option<i64>
+        for a in 0..APP_ATTACH_CAP
+            if self.apps[a].live and self.apps[a].handle == handle
+                return Some(a)
+        None
+
+    pub fn app_count(self: @NetSvc) -> i64
+        var n: i64 = 0
+        for a in 0..APP_ATTACH_CAP
+            if self.apps[a].live
+                n += 1
+        n
+
+    # A wait's events for the exchanges: PEER_CLOSE (the app exited or
+    # revoked) or DRIVER_GONE on one detaches it, without a slot ack.
+    pub fn app_wake(self: @&NetSvc, events: [WaitEvent])
+        for i in 0..events.len
+            if (events[i].bits & (EVENT_PEER_CLOSE | EVENT_DRIVER_GONE)) != 0
+                match self.app_slot(events[i].handle)
+                    Some(a) => self.close_app(a)
+                    None => pass
+
+    # The wait sources for the live attachments, written to `out` from 0;
+    # their count. DATA is a request; SPACE joins while a reply is owed.
+    pub fn app_sources(self: @NetSvc, out: [WaitSource]) -> i64
+        var n: i64 = 0
+        for a in 0..APP_ATTACH_CAP
+            if self.apps[a].live and n < out.len
+                var mask = EVENT_DATA
+                if self.apps[a].owed_count > 0
+                    mask = EVENT_DATA | EVENT_SPACE
+                out[n] = WaitSource { handle: self.apps[a].handle, mask: mask, _pad: 0 }
+                n += 1
+        n
+
+    # The next notify netd owes an attachment, cleared as it is taken.
+    pub fn take_notify(self: @&NetSvc) -> Option<AppNotify>
+        for a in 0..APP_ATTACH_CAP
+            if self.apps[a].live and (self.apps[a].posted > 0 or self.apps[a].taken > 0)
+                var bits: u32 = 0
+                if self.apps[a].posted > 0
+                    bits = bits | EVENT_DATA
+                if self.apps[a].taken > 0
+                    bits = bits | EVENT_SPACE
+                self.apps[a].posted = 0
+                self.apps[a].taken = 0
+                return Some(AppNotify { handle: self.apps[a].handle, bits: bits })
+        None
+
+    # The next handle of an attachment this service closed or detached:
+    # netd CapRevokes it, which frees the slot.
+    pub fn take_revoke(self: @&NetSvc) -> Option<u64>
+        for a in 0..APP_ATTACH_CAP
+            if self.apps[a].revoke
+                self.apps[a].revoke = false
+                return Some(self.apps[a].handle)
+        None
+
+    # Stop serving attachment `a`: its ports are free, its owed replies
+    # and unread requests are discarded, and netd revokes its handle.
+    fn close_app(self: @&NetSvc, a: i64)
+        if not self.apps[a].live
+            return
+        self.apps[a].live = false
+        self.apps[a].revoke = true
+        self.apps[a].owed_count = 0
+        self.ports.detach(a)
+
+    fn apps_pass(self: @&NetSvc, now: u64)
+        self.app_more = false
+        for a in 0..APP_ATTACH_CAP
+            if self.apps[a].live
+                self.post_owed(a)
+                self.drain(a, now)
+                self.post_owed(a)
+
+    # Take up to APP_DEPTH requests of attachment `a`. Stops while its
+    # owed replies fill OWED_CAP: the app is not reading events.
+    fn drain(self: @&NetSvc, a: i64, now: u64)
+        var n: u64 = 0
+        while n < APP_DEPTH
+            if not self.apps[a].live or self.apps[a].owed_count >= OWED_CAP
+                return
+            # The consumer is copied out and back: one private read_idx.
+            var req = self.apps[a].req
+            let polled = req.poll()
+            let d = match polled
+                AppPoll.Ready(desc) => desc
+                AppPoll.Empty => return
+                AppPoll.Close(_) =>
+                    self.close_app(a)
+                    return
+            let took = req.take(d, @&self.req_buf)
+            self.apps[a].req = req
+            self.apps[a].taken += 1
+            match took
+                AppTake.Desc(desc, len) => self.dispatch(a, desc, len, now)
+                AppTake.Rejected(_) =>
+                    self.apps[a].counters.rejects += 1
+                AppTake.Close(_) =>
+                    self.close_app(a)
+                    return
+            n += 1
+        self.app_more = true
+
+    # One validated request of attachment `a`, its payload `len` bytes of
+    # req_buf.
+    fn dispatch(self: @&NetSvc, a: i64, d: AppDesc, len: u32, now: u64)
+        self.apps[a].counters.requests += 1
+        match app_request(d)
+            AppReq.Bind(id, port) =>
+                match self.ports.bind(a, port)
+                    Ok(b) => self.owe(a, EV_BOUND, id, b.handle, b.port, 0)
+                    Err(e) =>
+                        let status = match e
+                            BindError.Exist => APP_EEXIST
+                            BindError.NFile => APP_ENFILE
+                        self.owe(a, EV_ERROR, id, 0, 0, status)
+            AppReq.Close(id, handle) =>
+                # The port is free at once; no datagram is held unposted
+                # (delivery posts or drops at RX), so none follows.
+                match self.ports.close(a, handle)
+                    Some(port) => self.owe(a, EV_CLOSED, id, handle, port, 0)
+                    None => self.owe(a, EV_ERROR, id, 0, 0, APP_EBADF)
+            AppReq.SendTo =>
+                if not self.app_send(a, d, len, now)
+                    self.apps[a].counters.send_drops += 1
+            AppReq.NoSys(id) => self.owe(a, EV_ERROR, id, 0, 0, APP_ENOSYS)
+            AppReq.Inval(id) => self.owe(a, EV_ERROR, id, 0, 0, APP_EINVAL)
+            AppReq.BadF(id) => self.owe(a, EV_ERROR, id, 0, 0, APP_EBADF)
+            AppReq.Bad =>
+                self.apps[a].counters.rejects += 1
+
+    fn owe(self: @&NetSvc, a: i64, kind: u16, id: u32, handle: u32, port: u16, status: i16)
+        let slot = (self.apps[a].owed_head + self.apps[a].owed_count) % OWED_CAP
+        self.apps[a].owed[slot] = Owed { kind: kind, id: id, handle: handle, port: port, status: status }
+        self.apps[a].owed_count += 1
+
+    # Post attachment `a`'s owed replies, oldest first, while the event
+    # ring has a slot.
+    fn post_owed(self: @&NetSvc, a: i64)
+        let none: [u8] = @self.req_buf
+        while self.apps[a].live and self.apps[a].owed_count > 0
+            let o = self.apps[a].owed[self.apps[a].owed_head]
+            var ev = self.apps[a].ev
+            let r = ev.publish(o.kind, o.id, o.handle, o.port, o.status, [0, 0, 0, 0], none[0..0])
+            self.apps[a].ev = ev
+            match r
+                AppPublish.Done =>
+                    self.apps[a].posted += 1
+                AppPublish.Full => return
+                AppPublish.BadLength => pass
+                AppPublish.Close(_) =>
+                    self.close_app(a)
+                    return
+            self.apps[a].owed_head = (self.apps[a].owed_head + 1) % OWED_CAP
+            self.apps[a].owed_count -= 1
+
+    # A UDP datagram for `o`'s port from `src`:`src_port`. Posted as
+    # EV_DATAGRAM only while one event slot stays free for a reply. `o` is
+    # live: AppPorts holds only live attachments' ports.
+    fn deliver(self: @&NetSvc, o: AppOwner, src: u32, src_port: u16, payload: [u8])
+        let a = o.att
+        self.post_owed(a)
+        var ev = self.apps[a].ev
+        let used = match ev.used()
+            Ok(n) => n
+            Err(_) =>
+                self.close_app(a)
+                return
+        # post_owed ran first: a reply still owed means the ring is full.
+        if used + 1 >= APP_DEPTH
+            self.apps[a].counters.ev_drops += 1
+            return
+        match ev.publish(EV_DATAGRAM, 0, o.handle, src_port, 0, ip_bytes(src), payload)
+            AppPublish.Done =>
+                self.apps[a].posted += 1
+            AppPublish.Full =>
+                self.apps[a].counters.ev_drops += 1
+            AppPublish.BadLength =>
+                self.apps[a].counters.ev_drops += 1
+            AppPublish.Close(_) =>
+                self.apps[a].ev = ev
+                self.close_app(a)
+                return
+        self.apps[a].ev = ev
+
+    # Wrap attachment `a`'s APP_SEND_TO payload (req_buf[0..len]) in UDP,
+    # IPv4 and Ethernet. False when it cannot reach the wire: no live
+    # handle, no address, unroutable, over the MTU (udp_frame_write's
+    # check: IPv4 + UDP + payload), or no room.
+    fn app_send(self: @&NetSvc, a: i64, d: AppDesc, len: u32, now: u64) -> bool
+        let port = match self.ports.port_of(a, d.handle)
+            Some(p) => p
+            None => return false
+        let cfg = self.dhcp.config()
+        let src = match cfg.addr
+            Some(s) => s
+            None => return false
+        let dst = ip_of(d.addr)
+        let hop = match ipv4_next_hop(cfg, dst)
+            Ok(h) => h
+            Err(_) => return false
+        let buf: [u8] = @self.req_buf
+        let out: [u8] = @self.out
+        let n = match udp_frame_write(out, self.link, [0, 0, 0, 0, 0, 0], src, dst, port, d.port, buf[0..len as i64])
+            Ok(n) => n
+            Err(_) => return false
+        self.out_app = Some(a)
+        let sent = self.send_ip(hop, n, now)
+        self.out_app = None
+        match sent
+            Sent.Failed => false
+            _ => true
 
     # ------------------------------------------------------------------
     # DHCP, timers and the address record

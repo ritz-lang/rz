@@ -12,7 +12,7 @@
 import driver_abi.frame_ring { FRAME_MAX, FRAME_RING_CAP, FRAME_RX_ARENA_OFF, FRAME_REGION_SIZE }
 import driver_abi.link { NetInfo, NetAddr, AddrSample, addr_sample }
 import driver_abi.spsc { SpscProducer, SpscConsumer, Publish, Take, FrameBytes, spsc_rx_ring, spsc_tx_ring }
-import driver_abi.wait { WaitEvent, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_ATTACH }
+import driver_abi.wait { WaitEvent, WaitSource, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_ATTACH }
 import netstack.bytes { be16_get, be16_put, be32_get, be32_put }
 import netstack.ethernet { MacAddr, ETH_PAYLOAD_OFF, mac_eq, mac_is_broadcast }
 import netstack.ipv4 { IPV4_HEADER_MIN, IPV4_BROADCAST }
@@ -21,7 +21,9 @@ import netstack.icmp { icmp_echo_request_write }
 import netstack.ipv4 { IpProto, ipv4_frame_write }
 import netstack.arp { ARP_RETRY_INTERVAL_MS, ARP_RETRY_LIMIT }
 import netstack.dhcp { DHCP_MAGIC, DhcpState }
-import system.netsvc { NetSvc, Sent, Wake, PENDING_TX_CAP, WAIT_IDLE_MS, RX_BUDGET, wake_of, addr_record }
+import system.netsvc { NetSvc, Sent, Wake, PENDING_TX_CAP, WAIT_IDLE_MS, RX_BUDGET, OWED_RETRY_MS, wake_of, addr_record }
+import net_abi.app { AppDesc, APP_DEPTH, APP_REQ_DESC_OFF, APP_BIND, APP_SEND_TO, APP_CLOSE, APP_CONNECT, APP_WRITE, EV_DATAGRAM, EV_BOUND, EV_CLOSED, EV_ERROR }
+import libnet.ring { AppProducer, AppConsumer, AppPublish, AppPoll, AppTake, AppBytes, app_req_ring, app_ev_ring }
 
 const SERVER_IP: u32 = 0x0A000202      # 10.0.2.2, also the router
 const OUR_IP: u32 = 0x0A00020F         # 10.0.2.15
@@ -611,4 +613,394 @@ fn test_wake_of_sorts_the_frame_object_events() -> i32
     let none = wake_of(all[1..2], FRAME_HANDLE)
     if none.gone or none.link
         return 4
+    0
+
+# ---------------------------------------------------------------------------
+# App exchanges (AGAST #4748)
+# ---------------------------------------------------------------------------
+
+const APP_H: u64 = 21
+const APP_H2: u64 = 22
+
+var g_app: [0x23000 / 8]u64
+var g_app2: [0x23000 / 8]u64
+var g_req: AppProducer                 # the app's halves of g_app
+var g_ev: AppConsumer
+var g_evbuf: AppBytes
+var g_evd: AppDesc
+
+fn zero_app(r: u64)
+    let words = r as *[0x600]u64           # the controls and both descriptor pages
+    for i in 0..0x600
+        (*words)[i] = 0
+
+# A fresh exchange at g_app, the app's halves over it, and the service
+# attached to it as APP_H.
+fn app_attach(svc: @&NetSvc) -> u64
+    let r: u64 = @g_app as u64
+    zero_app(r)
+    g_req = AppProducer.new(app_req_ring(r))
+    g_ev = AppConsumer.new(app_ev_ring(r))
+    if not svc.attach(APP_H, r)
+        return 0
+    r
+
+fn no_addr() -> [4]u8
+    [0, 0, 0, 0]
+
+fn app_req(kind: u16, id: u32, handle: u32, port: u16, addr: [4]u8, payload: [u8]) -> bool
+    match g_req.publish(kind, id, handle, port, 0, addr, payload)
+        AppPublish.Done => true
+        _ => false
+
+fn app_bind(id: u32, port: u16) -> bool
+    let none: [u8] = @g_evbuf
+    app_req(APP_BIND, id, 0, port, no_addr(), none[0..0])
+
+fn app_close(id: u32, handle: u32) -> bool
+    let none: [u8] = @g_evbuf
+    app_req(APP_CLOSE, id, handle, 0, no_addr(), none[0..0])
+
+# The app takes one event into g_evd (payload in g_evbuf); false for none.
+fn app_event() -> bool
+    let d = match g_ev.poll()
+        AppPoll.Ready(d) => d
+        _ => return false
+    match g_ev.take(d, @&g_evbuf)
+        AppTake.Desc(desc, _) =>
+            g_evd = desc
+            true
+        _ => false
+
+fn ev_is(kind: u16, id: u32, status: i16) -> bool
+    g_evd.kind == kind and g_evd.id == id and g_evd.status == status
+
+# A UDP datagram from PEER_IP:`src_port` to us at `dst_port` on the RX ring.
+fn drv_udp(src_port: u16, dst_port: u16, body: [u8]) -> bool
+    let f: [u8] = @g_frame
+    let peer = NetInfo { mac: peer_mac(), link_up: 1, device_type: 1, mtu: 1500 }
+    match udp_frame_write(f, peer, our_mac(), PEER_IP, OUR_IP, src_port, dst_port, body)
+        Ok(len) => drv_publish(f[0..len])
+        Err(_) => false
+
+[[test]]
+fn test_attach_drains_a_request_published_before_it() -> i32
+    let svc = bound(0)
+    # The app binds before the service has seen the ATTACH record.
+    let r: u64 = @g_app as u64
+    zero_app(r)
+    g_req = AppProducer.new(app_req_ring(r))
+    g_ev = AppConsumer.new(app_ev_ring(r))
+    if not app_bind(1, 5000)
+        return 1
+    if not svc.attach(APP_H, r)
+        return 2
+    # Attach alone asks for a pass before the park.
+    if svc.deadline(0) != 0
+        return 3
+    svc.service(1)
+    if not app_event() or not ev_is(EV_BOUND, 1, 0) or g_evd.handle != 1 or g_evd.port != 5000
+        return 4
+    # One notify: DATA for the event, SPACE for the consumed request.
+    match svc.take_notify()
+        Some(n) =>
+            if n.handle != APP_H or n.bits != (EVENT_DATA | EVENT_SPACE)
+                return 5
+        None => return 6
+    if svc.take_notify().is_some()
+        return 7
+    # The wait lists the exchange with DATA.
+    var srcs: [5]WaitSource
+    if svc.app_sources(@srcs) != 1 or srcs[0].handle != APP_H or srcs[0].mask != EVENT_DATA
+        return 8
+    0
+
+[[test]]
+fn test_second_bind_is_exist_and_allocates_no_handle() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    app_bind(1, 5000)
+    app_bind(2, 5000)
+    app_bind(3, 67)
+    app_bind(4, 5001)
+    svc.service(1)
+    if not app_event() or not ev_is(EV_BOUND, 1, 0) or g_evd.handle != 1
+        return 1
+    if not app_event() or not ev_is(EV_ERROR, 2, -17) or g_evd.handle != 0
+        return 2
+    if not app_event() or not ev_is(EV_ERROR, 3, -17)
+        return 3
+    if not app_event() or not ev_is(EV_BOUND, 4, 0) or g_evd.handle != 2
+        return 4
+    0
+
+[[test]]
+fn test_repeated_close_and_rebind() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    var id: u32 = 1
+    for round in 0..3
+        app_bind(id, 5000)
+        svc.service(1)
+        if not app_event() or not ev_is(EV_BOUND, id, 0) or g_evd.handle != round as u32 + 1
+            return 1
+        let h = g_evd.handle
+        app_close(id + 1, h)
+        app_close(id + 2, h)
+        svc.service(1)
+        if not app_event() or not ev_is(EV_CLOSED, id + 1, 0) or g_evd.handle != h
+            return 2
+        # The second close of the same handle is BadF.
+        if not app_event() or not ev_is(EV_ERROR, id + 2, -9)
+            return 3
+        id += 3
+    # A closed port takes no datagram.
+    drv_udp(4000, 5000, "x")
+    svc.service(2)
+    if app_event() or svc.counters.udp_unbound != 1
+        return 4
+    0
+
+[[test]]
+fn test_datagram_is_delivered_with_its_peer() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    app_bind(1, 5000)
+    svc.service(1)
+    app_event()
+    svc.take_notify()
+    drv_udp(4000, 5000, "hello")
+    svc.service(2)
+    if not app_event() or not ev_is(EV_DATAGRAM, 0, 0) or g_evd.handle != 1 or g_evd.port != 4000 or g_evd.length != 5
+        return 1
+    if not bytes_are(g_evd.addr, PEER_IP) or g_evbuf[0] != 'h' as u8 or g_evbuf[4] != 'o' as u8
+        return 2
+    match svc.take_notify()
+        Some(n) =>
+            if n.bits != EVENT_DATA
+                return 3
+        None => return 4
+    0
+
+[[test]]
+fn test_full_event_ring_still_fits_a_reply() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    app_bind(1, 5000)
+    svc.service(1)
+    app_event()
+    # The app stops reading: 32 datagrams, 31 posted, the last dropped.
+    for i in 0..APP_DEPTH
+        drv_udp(4000, 5000, "d")
+    svc.service(2)
+    let a = svc.app_slot(APP_H).unwrap_or(0)
+    if svc.apps[a].counters.ev_drops != 1
+        return 1
+    # The reply still fits, in the last slot.
+    app_close(2, 1)
+    svc.service(3)
+    for i in 0..APP_DEPTH - 1
+        if not app_event() or g_evd.kind != EV_DATAGRAM
+            return 2
+    if not app_event() or not ev_is(EV_CLOSED, 2, 0)
+        return 3
+    if app_event()
+        return 4
+    0
+
+[[test]]
+fn test_owed_reply_waits_for_an_event_slot() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    # 65 binds with no event read: 32 replies fill the event ring, 32 are
+    # owed, and the 65th stays on the request ring: owed replies cap the
+    # drain.
+    for i in 0..2 * APP_DEPTH + 1
+        if i > 0 and i % APP_DEPTH == 0
+            svc.service(1)
+        if not app_bind(i as u32 + 1, (6000 + i) as u16)
+            return 1
+    svc.service(1)
+    let a = svc.app_slot(APP_H).unwrap_or(0)
+    if svc.apps[a].owed_count != OWED_CAP or svc.apps[a].counters.requests != 2 * APP_DEPTH
+        return 2
+    # The owed replies keep SPACE in the mask and the wait short.
+    var srcs: [5]WaitSource
+    svc.app_sources(@srcs)
+    if srcs[0].mask != (EVENT_DATA | EVENT_SPACE) or svc.deadline(1) != OWED_RETRY_MS
+        return 3
+    # Reading the ring posts the owed replies in order, then the 65th.
+    var want: u32 = 1
+    for round in 0..3
+        while app_event()
+            if g_evd.id != want
+                return 4
+            want += 1
+        svc.service(2)
+    if want != 2 * APP_DEPTH as u32 + 2 or svc.apps[a].owed_count != 0
+        return 5
+    0
+
+[[test]]
+fn test_bad_appdesc_is_skipped() -> i32
+    let svc = bound(0)
+    let r = app_attach(svc)
+    # Slot 0 is bad (flags), slot 1 is a good bind.
+    let none: [u8] = @g_evbuf
+    match g_req.stage(APP_BIND, 1, 0, 5000, 0, no_addr(), none[0..0])
+        AppPublish.Done => pass
+        _ => return 1
+    let descs = (r + APP_REQ_DESC_OFF) as *[32]AppDesc
+    (*descs)[0].flags = 1
+    g_req.commit()
+    app_bind(2, 5001)
+    svc.service(1)
+    let a = svc.app_slot(APP_H).unwrap_or(0)
+    if svc.apps[a].counters.rejects != 1
+        return 2
+    if not app_event() or not ev_is(EV_BOUND, 2, 0) or g_evd.port != 5001
+        return 3
+    if app_event()
+        return 4
+    0
+
+[[test]]
+fn test_overfull_request_ring_closes_that_attachment_only() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    let r2: u64 = @g_app2 as u64
+    zero_app(r2)
+    if not svc.attach(APP_H2, r2)
+        return 1
+    # APP_H's app stores an impossible write_idx.
+    let ctrl = (@g_app as u64) as *u64
+    atomic_store(ctrl, APP_DEPTH + 1)
+    svc.service(1)
+    if svc.app_slot(APP_H).is_some() or svc.app_count() != 1
+        return 2
+    match svc.take_revoke()
+        Some(h) =>
+            if h != APP_H
+                return 3
+        None => return 4
+    if svc.take_revoke().is_some()
+        return 5
+    # The other attachment still serves.
+    g_req = AppProducer.new(app_req_ring(r2))
+    g_ev = AppConsumer.new(app_ev_ring(r2))
+    app_bind(1, 5000)
+    svc.service(2)
+    if not app_event() or not ev_is(EV_BOUND, 1, 0)
+        return 6
+    0
+
+[[test]]
+fn test_peer_close_detaches_and_frees_its_ports() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    app_bind(1, 5000)
+    svc.service(1)
+    var evs: [1]WaitEvent
+    evs[0] = WaitEvent { handle: APP_H, bits: EVENT_PEER_CLOSE, _pad: 0 }
+    svc.app_wake(@evs)
+    if svc.app_slot(APP_H).is_some()
+        return 1
+    match svc.take_revoke()
+        Some(h) =>
+            if h != APP_H
+                return 2
+        None => return 3
+    # A new attachment can bind the port, and its handles start at 1.
+    app_attach(svc)
+    app_bind(1, 5000)
+    svc.service(2)
+    if not app_event() or not ev_is(EV_BOUND, 1, 0) or g_evd.handle != 1
+        return 4
+    0
+
+[[test]]
+fn test_sixth_attachment_is_refused() -> i32
+    let svc = bound(0)
+    let r: u64 = @g_app as u64
+    zero_app(r)
+    for i in 0..5
+        if not svc.attach(30 + i as u64, r)
+            return 1
+    if svc.attach(40, r)
+        return 2
+    0
+
+[[test]]
+fn test_reserved_kinds_answer_nosys() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    let none: [u8] = @g_evbuf
+    app_req(APP_CONNECT, 1, 0, 80, no_addr(), none[0..0])
+    app_req(APP_WRITE, 2, 0, 0, no_addr(), none[0..0])
+    svc.service(1)
+    if not app_event() or not ev_is(EV_ERROR, 1, -38)
+        return 1
+    if not app_event() or not ev_is(EV_ERROR, 2, -38)
+        return 2
+    0
+
+[[test]]
+fn test_send_to_wraps_udp_ipv4_ethernet() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    app_bind(1, 5000)
+    svc.service(1)
+    app_event()
+    let body: [u8] = "abc"
+    let peer: [4]u8 = [10, 0, 2, 3]
+    if not app_req(APP_SEND_TO, 0, 1, 7000, peer, body)
+        return 1
+    svc.service(2)
+    # The peer is not cached: one ARP request, the datagram waits.
+    if drv_take() != 14 + 28 or drv_take() != 0
+        return 2
+    drv_arp(2, our_mac(), PEER_IP, peer_mac(), OUR_IP)
+    svc.service(3)
+    let n = drv_take()
+    if n != PAYLOAD_AT + 3
+        return 3
+    if not mac_eq(got_mac(0), peer_mac()) or got_ip_dst() != PEER_IP
+        return 4
+    let g = got()
+    if be16_get(g, UDP_AT) != 5000 or be16_get(g, UDP_AT + 2) != 7000 or g[PAYLOAD_AT] != 'a' as u8 or g[PAYLOAD_AT + 2] != 'c' as u8
+        return 5
+    # No event for a send.
+    if app_event()
+        return 6
+    0
+
+[[test]]
+fn test_send_to_failures_count_in_send_drops_with_no_event() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    let body: [u8] = "abc"
+    let peer: [4]u8 = [10, 0, 2, 3]
+    # Handle 1 is not bound yet.
+    app_req(APP_SEND_TO, 0, 1, 7000, peer, body)
+    svc.service(1)
+    app_bind(1, 5000)
+    svc.service(2)
+    app_event()
+    # Over the MTU (1500 - 28).
+    let big: [u8] = @g_frame
+    app_req(APP_SEND_TO, 0, 1, 7000, peer, big[0..1473])
+    svc.service(3)
+    let a = svc.app_slot(APP_H).unwrap_or(0)
+    if svc.apps[a].counters.send_drops != 2 or app_event() or drv_take() != 0
+        return 1
+    # ARP gives up on an unanswered hop: the waiting datagram is a drop.
+    app_req(APP_SEND_TO, 0, 1, 7000, peer, body)
+    svc.service(4)
+    drv_take_all()
+    var t: u64 = 4
+    for i in 0..ARP_RETRY_LIMIT + 2
+        t += ARP_RETRY_INTERVAL_MS
+        svc.service(t)
+    if svc.apps[a].counters.send_drops != 3 or app_event()
+        return 2
     0

@@ -15,15 +15,18 @@
 #   4. Ready: publish the cleared record (generation 2, configured 0) and
 #      NetPublish it, then start DHCP if the link is up.
 #   5. Loop: one service pass (src/netsvc.ritz), DATA to the driver when
-#      TX slots were published, NetPublish when the record changed, then one
-#      ShmWait over the frame object (DATA, and SPACE only while the
-#      pending-TX queue holds a frame) and the inbox, with the deadline at
-#      the nearest protocol timer.
+#      TX slots were published, DATA/SPACE to each app exchange that got
+#      events or had requests consumed, CapRevoke of each exchange the pass
+#      closed, NetPublish when the record changed, then one ShmWait over
+#      the frame object (DATA, and SPACE only while the pending-TX queue
+#      holds a frame), every live app exchange (at most five) and the
+#      inbox, with the deadline at the nearest protocol timer.
 #
 # DRIVER_GONE or PEER_CLOSE on the frame object ends the service: this
 # cutover does not replace a dead driver. An ATTACH record (an app's
-# exchange) is dropped with CapRevoke, so the app sees PEER_CLOSE, until
-# the app exchange is served.
+# exchange, AGAST #4748) is ShmMapped and attached, and the next pass
+# drains its requests before netd parks; one that will not map, or a
+# sixth, is dropped with CapRevoke. PEER_CLOSE on an exchange detaches it.
 #
 # The clock: Harland has no user clock syscall, so netd reads the TSC
 # (CR4.TSD is clear) and divides by the kernel's calibration, which the
@@ -127,7 +130,7 @@ fn now_ms() -> u64
 
 var g_boot: ServiceBoot
 var g_svc: NetSvc
-var g_sources: [1]WaitSource
+var g_sources: [6]WaitSource         # the frame object, then APP_ATTACH_CAP exchanges
 var g_events: [8]WaitEvent
 
 # Why netd exits before it ever serves. The status is 10 + the position.
@@ -164,13 +167,23 @@ fn read_boot() -> Result<u64, InitError>
         Ok(va) => Ok(va)
         Err(e) => Err(InitError.Frame(e))
 
-# One wait over the frame object with `mask` and the inbox, at most
-# `deadline` ms. ATTACH records are revoked here (no app exchange yet).
+# An ATTACH record's exchange: map it and serve it, or drop it.
+fn attach(h: u64)
+    match shm_map(h)
+        Ok(va) =>
+            if not g_svc.attach(h, va)
+                cap_revoke(h)
+        Err(_) => cap_revoke(h)
+
+# One wait over the frame object with `mask`, the live app exchanges and
+# the inbox, at most `deadline` ms.
 fn wait_once(mask: u32, deadline: u64) -> Result<Wake, Errno>
     g_sources[0] = WaitSource { handle: g_boot.frame, mask: mask, _pad: 0 }
+    let sources: [WaitSource] = @g_sources
+    let apps = g_svc.app_sources(sources[1..sources.len])
     var req: WaitRequest
     req.sources = @g_sources[0]
-    req.source_count = 1
+    req.source_count = (1 + apps) as u32
     req.out_cap = WAIT_OUT_CAP
     req.out = @g_events[0]
     req.deadline = deadline
@@ -181,9 +194,10 @@ fn wait_once(mask: u32, deadline: u64) -> Result<Wake, Errno>
         Woke.Events(n) =>
             let events: [WaitEvent] = @g_events
             let got = events[0..n as i64]
+            g_svc.app_wake(got)
             for i in 0..got.len
                 if (got[i].bits & EVENT_ATTACH) != 0 and got[i].handle != g_boot.frame
-                    cap_revoke(got[i].handle)
+                    attach(got[i].handle)
             Ok(wake_of(got, g_boot.frame))
 
 # 3. The driver's link snapshot, waiting for its LINK post if NetInfo is
@@ -231,6 +245,14 @@ pub fn main(args: Span<StrView>) -> i32
                 return 2
         if g_svc.take_published() > 0
             shm_notify(g_boot.frame, EVENT_DATA)
+        while true
+            match g_svc.take_notify()
+                Some(n) => shm_notify(n.handle, n.bits)
+                None => break
+        while true
+            match g_svc.take_revoke()
+                Some(h) => cap_revoke(h)
+                None => break
         if g_svc.take_publish_due()
             match net_publish(g_boot.addr)
                 Ok(_) => pass

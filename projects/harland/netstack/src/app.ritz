@@ -1,0 +1,177 @@
+# The ring-2 service's side of the app exchange that is not ring plumbing
+# (AGAST #4748, docs/RING2_NET.md "Ring-3 app exchange")
+#
+# Two pure pieces /bin/netd's loop body (system/src/netsvc.ritz) runs:
+#
+#   - AppPorts: the UDP endpoints of every attachment. A port is live in
+#     at most one endpoint across all of them; handles belong to one
+#     attachment, start at 1 and are never reused within it. Ports 67 and
+#     68 are the DHCP client's. Port 0 asks for one in 49152..=65535.
+#   - app_request: one request's validated private copy (libnet.ring has
+#     checked flags, _pad, length and arena_off) turned into what the
+#     service does with it.
+#
+# The status values are the negative Errno numbers RING2_NET.md names;
+# this package imports no ritzlib, so they are constants here.
+
+import net_abi.app { AppDesc, APP_BIND, APP_SEND_TO, APP_PING, APP_CLOSE, APP_CONNECT, APP_WRITE, MAX_ENDPOINTS }
+import netstack.ipv4 { DHCP_SERVER_PORT, DHCP_CLIENT_PORT }
+
+# AppDesc.status values of an EV_ERROR.
+pub const APP_EBADF: i16 = -9
+pub const APP_EEXIST: i16 = -17
+pub const APP_EINVAL: i16 = -22
+pub const APP_ENFILE: i16 = -23
+pub const APP_ENOSYS: i16 = -38
+
+# At most five apps attach (MAX_PROCS 8 less init, the driver and netd).
+pub const APP_ATTACH_CAP: i64 = 5
+
+# The ports port 0 is assigned from, inclusive.
+pub const APP_PORT_EPHEMERAL_MIN: u16 = 49152
+pub const APP_PORT_EPHEMERAL_MAX: u16 = 65535
+
+# Every live endpoint of every attachment: APP_ATTACH_CAP * MAX_ENDPOINTS.
+pub const APP_ENDPOINT_CAP: i64 = 80
+
+pub enum BindError
+    Exist                            # 67, 68, a live port, or no ephemeral port free
+    NFile                            # MAX_ENDPOINTS live on this attachment
+
+pub struct AppBound
+    handle: u32
+    port: u16
+
+# Who serves a bound port.
+pub struct AppOwner
+    att: i64
+    handle: u32
+
+pub struct AppEndpoint
+    live: bool
+    att: i64
+    handle: u32
+    port: u16
+
+pub struct AppPorts
+    eps: [80]AppEndpoint             # APP_ENDPOINT_CAP
+    next_handle: [5]u32              # APP_ATTACH_CAP; the next handle of each
+    cursor: u16                      # where the next port-0 search starts
+
+impl AppPorts
+    pub fn init(self: @&AppPorts)
+        for i in 0..APP_ENDPOINT_CAP
+            self.eps[i].live = false
+        for a in 0..APP_ATTACH_CAP
+            self.next_handle[a] = 1
+        self.cursor = APP_PORT_EPHEMERAL_MIN
+
+    # A new attachment in slot `att`: no endpoints, handles from 1. A
+    # restart into a reused slot inherits nothing.
+    pub fn attach(self: @&AppPorts, att: i64)
+        self.detach(att)
+        self.next_handle[att] = 1
+
+    # Free every endpoint of `att`.
+    pub fn detach(self: @&AppPorts, att: i64)
+        for i in 0..APP_ENDPOINT_CAP
+            if self.eps[i].live and self.eps[i].att == att
+                self.eps[i].live = false
+
+    pub fn live_count(self: @AppPorts, att: i64) -> u32
+        var n: u32 = 0
+        for i in 0..APP_ENDPOINT_CAP
+            if self.eps[i].live and self.eps[i].att == att
+                n += 1
+        n
+
+    # Bind `port` (0: an ephemeral one) for `att`. A failure allocates no
+    # handle.
+    pub fn bind(self: @&AppPorts, att: i64, port: u16) -> Result<AppBound, BindError>
+        if port == DHCP_SERVER_PORT or port == DHCP_CLIENT_PORT
+            return Err(BindError.Exist)
+        if port != 0 and self.owner(port).is_some()
+            return Err(BindError.Exist)
+        if self.live_count(att) >= MAX_ENDPOINTS
+            return Err(BindError.NFile)
+        var want = port
+        if want == 0
+            match self.ephemeral()
+                Some(p) => want = p
+                None => return Err(BindError.Exist)
+        for i in 0..APP_ENDPOINT_CAP
+            if not self.eps[i].live
+                let h = self.next_handle[att]
+                self.next_handle[att] = h + 1
+                self.eps[i] = AppEndpoint { live: true, att: att, handle: h, port: want }
+                return Ok(AppBound { handle: h, port: want })
+        # Unreachable: APP_ENDPOINT_CAP covers MAX_ENDPOINTS per attachment.
+        Err(BindError.NFile)
+
+    # Close `att`'s endpoint `handle`; its port, or None when that handle
+    # is not live on `att`.
+    pub fn close(self: @&AppPorts, att: i64, handle: u32) -> Option<u16>
+        for i in 0..APP_ENDPOINT_CAP
+            if self.eps[i].live and self.eps[i].att == att and self.eps[i].handle == handle
+                self.eps[i].live = false
+                return Some(self.eps[i].port)
+        None
+
+    # The local port of `att`'s live endpoint `handle`.
+    pub fn port_of(self: @AppPorts, att: i64, handle: u32) -> Option<u16>
+        for i in 0..APP_ENDPOINT_CAP
+            if self.eps[i].live and self.eps[i].att == att and self.eps[i].handle == handle
+                return Some(self.eps[i].port)
+        None
+
+    # The endpoint bound to `port`.
+    pub fn owner(self: @AppPorts, port: u16) -> Option<AppOwner>
+        for i in 0..APP_ENDPOINT_CAP
+            if self.eps[i].live and self.eps[i].port == port
+                return Some(AppOwner { att: self.eps[i].att, handle: self.eps[i].handle })
+        None
+
+    # The next unbound port at or after the cursor, wrapping once through
+    # the ephemeral range.
+    fn ephemeral(self: @&AppPorts) -> Option<u16>
+        let span: u32 = (APP_PORT_EPHEMERAL_MAX - APP_PORT_EPHEMERAL_MIN) as u32 + 1
+        for _ in 0..span
+            let p = self.cursor
+            if self.cursor == APP_PORT_EPHEMERAL_MAX
+                self.cursor = APP_PORT_EPHEMERAL_MIN
+            else
+                self.cursor = self.cursor + 1
+            if self.owner(p).is_none()
+                return Some(p)
+        None
+
+# What the service does with one request.
+pub enum AppReq
+    Bind(u32, u16)                   # id, port (0: assign)
+    Close(u32, u32)                  # id, handle
+    # APP_SEND_TO: the desc's handle, port, addr and payload. No reply.
+    SendTo
+    NoSys(u32)                       # id: a reserved stream kind, or APP_PING until #4749
+    Inval(u32)                       # id: a reply kind whose fields are wrong
+    BadF(u32)                        # id: a close of handle 0
+    Bad                              # not dispatched: no kind, no id, or a status
+
+# Decode `d`, a validated private copy. Only a request with an id can be
+# answered, so a reply kind without one is Bad.
+pub fn app_request(d: AppDesc) -> AppReq
+    if d.status != 0
+        return AppReq.Bad
+    if d.kind == APP_SEND_TO
+        return AppReq.SendTo
+    let reply_kind = d.kind == APP_BIND or d.kind == APP_CLOSE or d.kind == APP_PING or d.kind == APP_CONNECT or d.kind == APP_WRITE
+    if not reply_kind or d.id == 0
+        return AppReq.Bad
+    if d.kind == APP_BIND
+        if d.handle != 0 or d.length != 0
+            return AppReq.Inval(d.id)
+        return AppReq.Bind(d.id, d.port)
+    if d.kind == APP_CLOSE
+        if d.handle == 0
+            return AppReq.BadF(d.id)
+        return AppReq.Close(d.id, d.handle)
+    AppReq.NoSys(d.id)
