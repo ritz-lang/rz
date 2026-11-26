@@ -79,3 +79,12 @@ def test_razm_cli_errors_exit_1(razm, tmp_path, argv, message):
                        capture_output=True, text=True, timeout=60)
     assert p.returncode == 1, p
     assert message in p.stderr
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_razm_help_prints_usage_to_stdout_and_exits_0(razm, flag):
+    # The stack smoke runs every [[bin]] with --help and needs exit 0.
+    p = subprocess.run([*razm, flag], capture_output=True, text=True, timeout=60)
+    assert p.returncode == 0, p
+    assert "Usage: razm --64 -o OUT FILE.s" in p.stdout
+    assert p.stderr == ""
