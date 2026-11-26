@@ -134,6 +134,40 @@ class TestRecursiveMembers:
         fake_ws(["projects/**"], ["projects/a"])
         assert rz.discover_projects() == ["a"]
 
+    def test_build_output_trees_are_not_packages(self, rz, fake_ws):
+        # #4849: `build.py test` plants build/linked/<name>-<hash>/cwd-<profile>/
+        # with a symlink to the package's ritz.toml. A worker doing that while
+        # another compared two discover_projects() calls made
+        # test_builder_matrix flaky, and `rz test --all` swept the stale tree
+        # as a phantom package.
+        root = fake_ws(["projects/**"], ["projects/a"])
+        cwd = root / "projects/a/build/linked/x-0/cwd-debug"
+        cwd.mkdir(parents=True)
+        (cwd / "ritz.toml").symlink_to(root / "projects/a/ritz.toml")
+        plain = root / "projects/a/build/debug/y"
+        plain.mkdir(parents=True)
+        (plain / "ritz.toml").write_text('[package]\nname = "y"\n')
+        assert rz.discover_projects() == ["a"]
+
+    def test_build_is_matched_by_path_component(self, rz, fake_ws):
+        # Only a directory named exactly `build` is output; `builder` and
+        # `rebuild` are package names like any other.
+        fake_ws(["projects/**"], ["projects/builder", "projects/a/rebuild"])
+        assert rz.discover_projects() == ["a/rebuild", "builder"]
+
+    def test_member_pattern_matching_only_build_output_is_an_error(self, rz, fake_ws):
+        # A member whose only hits are build output has vanished, as far as
+        # the gate is concerned: same rule as a pattern matching nothing.
+        root = fake_ws(["projects/*"], ["projects/a"])
+        (root / "rz.toml").write_text(
+            '[workspace]\nmembers = ["projects/*", "projects/a/build/*"]\n')
+        out = root / "projects/a/build/debug"
+        out.mkdir(parents=True)
+        (out / "ritz.toml").write_text('[package]\nname = "debug"\n')
+        with pytest.raises(SystemExit) as exc:
+            rz.discover_projects()
+        assert "projects/a/build/*" in str(exc.value)
+
 
 @pytest.mark.unit
 class TestRealWorkspace:
@@ -180,6 +214,8 @@ class TestRealWorkspace:
             pkg = manifest.parent
             pid = pkg.relative_to(projects).as_posix()
             rel = pkg.relative_to(WORKSPACE)
+            if "build" in rel.parts:
+                continue  # build output, never a package (#4849)
             covered = any(rel == Path(e) or Path(e) in rel.parents
                           for e in excluded)
             if pid not in found and not covered:
