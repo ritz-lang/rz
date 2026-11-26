@@ -285,16 +285,22 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64) -> i64
     proc_start(slot)
     return child_pid as i64
 
+# The most pages process_spawn_image maps for an image (AGAST #4731): the
+# boot-test stub grew past one page when the frame-ring modes landed beside
+# NetAddr's, and #4733's modes follow. 16 KiB, so a runaway image still fails.
+pub const SPAWN_IMAGE_MAX_PAGES: u64 = 4
+
 # Start a program the kernel chose as a child of the running process
 # (RING1_DRIVER.md section 2, AGAST #4713): `image`, position-independent
-# code of at most one page, copied into a user page at USER_IMAGE_BASE of
-# its own page table and entered there at CPL 3, through the ordinary
-# sched_prepare_user frame (CS 0x23, SS 0x1B), on a fresh user stack, with
-# the kernel's arg0/arg1 in RDI/RSI. It inherits no capabilities: what it
-# holds, the kernel grants. The child is runnable when this returns: its
-# pid, or a negative errno with nothing changed.
+# code of at most SPAWN_IMAGE_MAX_PAGES pages, copied into consecutive user
+# pages from USER_IMAGE_BASE of its own page table and entered at
+# USER_IMAGE_BASE at CPL 3, through the ordinary sched_prepare_user frame
+# (CS 0x23, SS 0x1B), on a fresh user stack, with the kernel's arg0/arg1 in
+# RDI/RSI. It inherits no capabilities: what it holds, the kernel grants.
+# The child is runnable when this returns: its pid, or a negative errno with
+# nothing changed.
 pub fn process_spawn_image(image: Span<u8>, arg0: u64, arg1: u64) -> i64
-    if image.is_empty() or image.len() as u64 > PAGE_SIZE
+    if image.is_empty() or image.len() as u64 > SPAWN_IMAGE_MAX_PAGES * PAGE_SIZE
         return Errno.Inval as i64
     let parent: *Proc = proc_current()
     if parent == 0 as *Proc
@@ -303,28 +309,17 @@ pub fn process_spawn_image(image: Span<u8>, arg0: u64, arg1: u64) -> i64
     let parent_pml4: u64 = vmm_get_current_pml4()
     (*parent).pml4 = parent_pml4
 
-    # The code page, filled through the physmap before it is mapped (as
-    # alloc_user_stack does, #4332): read-only and executable for the child.
-    let code_phys: u64 = pmm_alloc_page()
-    if code_phys == 0
-        return Errno.NoMem as i64
-    let code: Span<u8> = span_from_ptr<u8>(phys_to_virt(code_phys) as *u8, PAGE_SIZE as i64)
-    code.zero()
-    code.copy_from(image)
-
     let begun: i64 = spawn_child_begin(parent_pid, false)
     if begun < 0
-        pmm_free_page(code_phys)
         return begun
     let slot: i32 = begun as i32
     let child_pid: u64 = proc_at(slot).pid
 
-    # Map in the child's address space; from here its exit, or spawn_undo,
-    # frees the page with the page table.
+    # Map in the child's address space; from each page's map on, the
+    # child's exit, or spawn_undo, frees it with the page table.
     vmm_switch_pml4(proc_at(slot).pml4)
-    if vmm_map_page(USER_IMAGE_BASE, code_phys, PTE_USER) != 0
+    if not spawn_map_image(image)
         vmm_switch_pml4(parent_pml4)
-        pmm_free_page(code_phys)
         spawn_undo(slot, parent_pid)
         return Errno.NoMem as i64
     let user_rsp: u64 = alloc_user_stack()
@@ -336,6 +331,27 @@ pub fn process_spawn_image(image: Span<u8>, arg0: u64, arg1: u64) -> i64
     sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1)
     proc_start(slot)
     return child_pid as i64
+
+# Copy `image` into user pages from USER_IMAGE_BASE of the current page
+# table, read-only and executable, each filled through the physmap before
+# it is mapped (as alloc_user_stack does, #4332), the tail of the last one
+# zeroed. False when a page could not be had: the pages mapped so far stay
+# for the page table's free.
+fn spawn_map_image(image: Span<u8>) -> bool
+    let page: i64 = PAGE_SIZE as i64
+    var off: i64 = 0
+    while off < image.len()
+        let phys: u64 = pmm_alloc_page()
+        if phys == 0
+            return false
+        let code: Span<u8> = span_from_ptr<u8>(phys_to_virt(phys) as *u8, page)
+        code.zero()
+        code.copy_from(image.slice(off, off + page))
+        if vmm_map_page(USER_IMAGE_BASE + off as u64, phys, PTE_USER) != 0
+            pmm_free_page(phys)
+            return false
+        off = off + page
+    true
 
 # Sleep until the running process's child `pid` exits (or at once if it
 # has): PROC_CHILD_EXITED with its code in *code, or Errno.Child if pid is

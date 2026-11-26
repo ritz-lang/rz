@@ -27,7 +27,9 @@ import tty.ldisc { ldisc_input, ldisc_read }
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed, tsc_hz }
 import arch.x86_64.apcall { ap_run_nvme_probe }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test, virtio_blk_read, virtio_blk_msix_vector, virtio_blk_irq_count, virtio_blk_irq_wait_count, virtio_blk_irq_halt_count }
-import net.stack { net_stack_init, net_poll, net_wait_rx, net_configure_dhcp, net_is_configured, net_device_type }
+import net.ring { RxWait, SeatOpen, ring_seat_open, ring_driver_gone, take_rx, ring_seat_object, ring_driver_registered, ring_rx_rejects, ring_tx_full_yields, ring_endpoint_fails }
+import driver_abi.spsc { FrameBytes }
+import net.stack { net_ring_select, net_send, net_is_ready, net_stack_init, net_poll, net_wait_rx, net_configure_dhcp, net_is_configured, net_device_type }
 import net.ip { ip_get_gateway, ip_print_config }
 import net.icmp { icmp_ping, icmp_distinct_reply_count, icmp_echo_request_count, icmp_echo_reply_sent_count }
 import net.arp { arp_cache_lookup, arp_send_request }
@@ -44,7 +46,7 @@ import proc.table { Proc, MAX_PROCS, PROC_BLOCKED, BLOCK_WAIT, PROC_CHILD_LIVE, 
 import proc.sched { sched_is_running, sched_start, sched_stop, sched_yield, sched_preemption_count }
 import fs.syscall { fs_process_pid }
 import syscall.stack { kstack_top }
-import syscall.runtime.process { PROC_REAP_STATUS, process_create_init, process_destroy_init, process_spawn_image, process_wait, process_mark_exit }
+import syscall.runtime.process { PROC_REAP_STATUS, process_create_init, process_destroy_init, process_spawn_image, process_wait, process_mark_exit, SPAWN_IMAGE_MAX_PAGES }
 import ritzlib.span { Span, span_from_ptr }
 import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_RIGHT_READ, CAP_RIGHT_ALL }
 import cap.table { CapTable, cap_kernel_grant, cap_table_alloc, cap_table_free_pid }
@@ -410,6 +412,7 @@ fn proc_create_init_self_test() -> bool
 # (arg1 & 0x7FFF) << 16 | cpl << 8 | (pid & 0xFF).
 extern fn driver_stub_start()
 extern fn driver_stub_end()
+extern fn driver_stub_tail()
 extern fn kstack_call(body: u64, top: u64)
 
 const DRIVER_STUB_ENTER: u64 = 0
@@ -422,6 +425,7 @@ const DRIVER_STUB_SHM_WAIT: u64 = 6
 const DRIVER_STUB_MMIO_MAP: u64 = 21
 const DRIVER_STUB_DMA_ALLOC: u64 = 22
 const DRIVER_STUB_DMA_FREE: u64 = 23
+const DRIVER_STUB_TAIL: u64 = 33
 const DRIVER_STUB_COOKIE: u64 = 0x4713
 # SCHED_HZ is 100: a 50 ms spin spans five ticks.
 const DRIVER_SPIN_MS: u64 = 50
@@ -463,6 +467,41 @@ fn driver_enter_self_test() -> bool
         klog("  spawn failed\n")
         return false
     return driver_check(pid, process_wait(pid as i32), DRIVER_STUB_COOKIE)
+
+# spawn-pages (#4731): an image over one page spawns whole. Mode 33's code
+# is the stub's last, at least PAGE_SIZE bytes in, so the child reports
+# only if the page after the first is mapped and holds the image's bytes.
+# An image over SPAWN_IMAGE_MAX_PAGES pages is refused with Errno.Inval
+# before anything is taken, and the reaped child leaves the PMM as it found
+# it.
+fn spawn_pages_self_test() -> bool
+    klog("\nTesting a kernel-spawned image over one page...\n")
+    let stub: Span<u8> = driver_stub()
+    let tail_off: u64 = driver_stub_tail as u64 - driver_stub_start as u64
+    klog("  stub ")
+    klog_dec(stub.len())
+    klog(" bytes, mode 33 at ")
+    klog_dec(tail_off as i64)
+    klog("\n")
+    if tail_off < PAGE_SIZE
+        klog("  mode 33 is in the first page\n")
+        return false
+    let free_before: u64 = pmm_get_free_pages()
+    let over: Span<u8> = span_from_ptr<u8>(stub.as_ptr(), (SPAWN_IMAGE_MAX_PAGES * PAGE_SIZE + 1) as i64)
+    let refused: i64 = process_spawn_image(over, DRIVER_STUB_ENTER, 0)
+    if refused != Errno.Inval as i64
+        klog("  an image over the limit was not refused with Inval\n")
+        return false
+    let pid: i64 = process_spawn_image(stub, DRIVER_STUB_TAIL, DRIVER_STUB_COOKIE)
+    if pid <= 0
+        klog("  spawn failed\n")
+        return false
+    if not driver_check(pid, process_wait(pid as i32), DRIVER_STUB_COOKIE)
+        return false
+    if pmm_get_free_pages() != free_before
+        klog("  the child's pages were not all freed\n")
+        return false
+    true
 
 # driver-fault: a null read at CPL 3 kills only the stub, with status 142;
 # the kernel does not panic and pid 1 runs on.
@@ -1600,6 +1639,220 @@ fn shm_retire_self_test() -> bool
     irq_object_unregister(RETIRE_TEST_IRQ)
     producer_first and consumer_first and hung and replaced
 
+# frame-ring (#4731, RING1_DRIVER.md section 6 take_rx, the TX full-ring
+# rule and endpoint_fail, section 8): pid 1 is the kernel seat on a frame
+# object ring_seat_open made for a kernel-spawned CPL-3 stub (driver_stub.s
+# modes 30-32), with the scheduler running so a deadline wakes a park.
+#   * RX: take_rx parks until the stub publishes three slots; it returns
+#     the two good frames (the bad slot is skipped and counted), then
+#     Timeout on the empty ring. Pid 1's DATA lets the stub exit; its exit
+#     retires the object, so take_rx returns NoDriver, driver_registered
+#     is clear and the object is reclaimed.
+#   * Overfull: the stub's RX write_idx 257 closes the endpoint and marks
+#     the stub (PROC_REAP_STATUS); pid 1 is not the one that exits.
+#   * TX: net_send (net_via_ring) publishes RING_TX_FRAMES frames, more
+#     than the ring holds, so a full ring yields to the stub, which checks
+#     each one. Once it has exited, net_send is Errno.NoDev, net_poll 0 and
+#     net_wait_rx NoDriver.
+#   * Driver gone: ring_driver_gone (driver_quiesce's) makes take_rx
+#     answer NoDriver while the stub is still alive, and closes the seat.
+const DRIVER_STUB_RING_RX: u64 = 30
+const DRIVER_STUB_RING_OVERFULL: u64 = 31
+const DRIVER_STUB_RING_TX: u64 = 32
+const RING_FRAME_LEN: u32 = 60
+const RING_MARKER: u64 = 0x474E495246000001
+const RING_TX_FRAMES: u64 = 300
+# The longest any step waits for the stub, and the quiet-link deadline.
+const RING_WAIT_US: u64 = 2000000
+const RING_QUIET_US: u64 = 50000
+
+var ring_buf: FrameBytes
+
+# A stub spawned in `mode`, with the seat open on its frame object.
+struct RingStub
+    pid: u64
+    obj: u64
+
+# Spawn the stub in `mode` and open the seat on it.
+fn ring_spawn(mode: u64, arg: u64) -> Option<RingStub>
+    let spawned: i64 = process_spawn_image(driver_stub(), mode, arg)
+    if spawned <= 0
+        klog("  the stub was not spawned\n")
+        return None
+    let pid: u64 = spawned as u64
+    match ring_seat_open(pid)
+        SeatOpen.Opened(h) =>
+            if h == RETIRE_H
+                return Some(RingStub { pid: pid, obj: ring_seat_object().unwrap_or(0) })
+            klog("  the stub's frame handle is not its first grant\n")
+        _ => klog("  ring_seat_open refused\n")
+    process_mark_exit(pid)
+    drv_stub_status(pid)
+    None
+
+fn ring_wait() -> RxWait
+    take_rx(deadline_after_us(RING_WAIT_US), @&ring_buf)
+
+# `got` is a RING_FRAME_LEN-byte frame that starts with `marker`.
+fn ring_frame_is(got: RxWait, marker: u64) -> bool
+    match got
+        RxWait.Frame(n) => n == RING_FRAME_LEN and *(@ring_buf[0] as *u64) == marker
+        _ => false
+
+fn ring_no_driver(got: RxWait) -> bool
+    match got
+        RxWait.NoDriver => true
+        _ => false
+
+fn ring_timed_out(got: RxWait) -> bool
+    match got
+        RxWait.Timeout => true
+        _ => false
+
+fn frame_ring_rx() -> bool
+    let rejects: u64 = ring_rx_rejects()
+    let stub: RingStub = match ring_spawn(DRIVER_STUB_RING_RX, 0)
+        Some(r) => r
+        None => return false
+    let pid: u64 = stub.pid
+    let obj: u64 = stub.obj
+    let first: bool = ring_frame_is(ring_wait(), RING_MARKER)
+    let second: bool = ring_frame_is(ring_wait(), RING_MARKER + 1)
+    let skipped: bool = ring_rx_rejects() == rejects + 1
+    let quiet: bool = ring_timed_out(take_rx(deadline_after_us(RING_QUIET_US), @&ring_buf))
+    disable_interrupts()
+    shm_latch_post(obj, pid, EVENT_DATA)
+    enable_interrupts()
+    let gone: bool = ring_no_driver(ring_wait()) and not ring_driver_registered()
+    let status: i64 = drv_stub_status(pid)
+    let reclaimed: bool = not shm_exists(obj)
+    klog("  rx: stub ")
+    klog_dec(status)
+    if not (first and second)
+        klog(", the good frames were not returned")
+    if not skipped
+        klog(", the bad slot was not skipped once")
+    if not quiet
+        klog(", the empty ring did not time out")
+    if not gone
+        klog(", the stub's exit did not return NoDriver")
+    if not reclaimed
+        klog(", the object was not reclaimed")
+    klog("\n")
+    status == 0 and first and second and skipped and quiet and gone and reclaimed
+
+# Process `pid` is live and marked PROC_REAP.
+fn ring_stub_marked(pid: u64) -> bool
+    var i: i32 = 0
+    while i < MAX_PROCS
+        let p: *Proc = proc_at(i)
+        if p.pid == pid
+            return proc_reap_pending(p)
+        i = i + 1
+    false
+
+fn frame_ring_overfull() -> bool
+    let fails: u64 = ring_endpoint_fails()
+    let stub: RingStub = match ring_spawn(DRIVER_STUB_RING_OVERFULL, 0)
+        Some(r) => r
+        None => return false
+    let pid: u64 = stub.pid
+    let obj: u64 = stub.obj
+    let closed: bool = ring_no_driver(ring_wait()) and ring_endpoint_fails() == fails + 1
+    # endpoint_fail marked it; drv_stub_status would mark it only later.
+    let marked: bool = ring_stub_marked(pid)
+    let status: i64 = drv_stub_status(pid)
+    let seat: bool = proc_current_pid() == 1 and ring_seat_object().is_none()
+    let reclaimed: bool = not shm_exists(obj)
+    klog("  overfull: stub ")
+    klog_dec(status)
+    if not closed
+        klog(", the endpoint did not close")
+    if not marked
+        klog(", the stub was not marked")
+    if not seat
+        klog(", the seat is still open")
+    if not reclaimed
+        klog(", the object was not reclaimed")
+    klog("\n")
+    closed and marked and status == PROC_REAP_STATUS as i64 and seat and reclaimed
+
+fn frame_ring_tx() -> bool
+    let yields: u64 = ring_tx_full_yields()
+    let stub: RingStub = match ring_spawn(DRIVER_STUB_RING_TX, RING_TX_FRAMES)
+        Some(r) => r
+        None => return false
+    let pid: u64 = stub.pid
+    let obj: u64 = stub.obj
+    net_ring_select(true)
+    var frame: [60]u8
+    for i in 0..60
+        frame[i] = 0
+    var sent: u64 = 0
+    while sent < RING_TX_FRAMES
+        frame[0] = sent as u8
+        if net_send(@frame[0], RING_FRAME_LEN) != 0
+            break
+        sent = sent + 1
+    let full: bool = ring_tx_full_yields() > yields
+    let status: i64 = drv_stub_status(pid)
+    let nodev: bool = net_send(@frame[0], RING_FRAME_LEN) == Errno.NoDev as i32
+    let quiet: bool = net_poll() == 0 and ring_no_driver(net_wait_rx(deadline_after_us(RING_QUIET_US)))
+    let ready: bool = net_is_ready()
+    net_ring_select(false)
+    let reclaimed: bool = not shm_exists(obj)
+    klog("  tx: sent ")
+    klog_dec(sent as i64)
+    klog(", stub ")
+    klog_dec(status)
+    if not full
+        klog(", a full ring never yielded")
+    if not nodev
+        klog(", a send with no driver was not NoDev")
+    if not quiet
+        klog(", net_poll or net_wait_rx saw a driver")
+    if not ready
+        klog(", net_is_ready ignored the ring")
+    if not reclaimed
+        klog(", the object was not reclaimed")
+    klog("\n")
+    sent == RING_TX_FRAMES and status == 0 and full and nodev and quiet and ready and reclaimed
+
+# driver_quiesce's ring_driver_gone (#4733): with the driver still alive,
+# take_rx answers NoDriver at once and the seat closes; pid 1's DATA then
+# lets the stub exit 0.
+fn frame_ring_gone() -> bool
+    let stub: RingStub = match ring_spawn(DRIVER_STUB_RING_RX, 0)
+        Some(r) => r
+        None => return false
+    let published: bool = ring_frame_is(ring_wait(), RING_MARKER)
+    ring_driver_gone()
+    let fails: u64 = ring_endpoint_fails()
+    let closed: bool = ring_no_driver(ring_wait()) and ring_seat_object().is_none() and ring_endpoint_fails() == fails
+    disable_interrupts()
+    shm_latch_post(stub.obj, stub.pid, EVENT_DATA)
+    enable_interrupts()
+    let status: i64 = drv_stub_status(stub.pid)
+    let reclaimed: bool = not shm_exists(stub.obj)
+    klog("  driver gone: stub ")
+    klog_dec(status)
+    if not (published and closed)
+        klog(", take_rx did not answer NoDriver and close the seat")
+    if not reclaimed
+        klog(", the object was not reclaimed")
+    klog("\n")
+    status == 0 and published and closed and reclaimed
+
+fn frame_ring_self_test() -> bool
+    klog("\nTesting the kernel seat on a frame ring...\n")
+    sched_start(proc_current_slot())
+    let rx: bool = frame_ring_rx()
+    let overfull: bool = frame_ring_overfull()
+    let tx: bool = frame_ring_tx()
+    let gone: bool = frame_ring_gone()
+    sched_stop()
+    rx and overfull and tx and gone
+
 # The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
 # stack: boot_process_tests).
 fn driver_process_tests()
@@ -1617,6 +1870,8 @@ fn driver_process_tests()
     boot_test_result("net-info", net_info_self_test())
     boot_test_result("shm-retire", shm_retire_self_test())
     boot_test_result("net-addr", net_addr_self_test())
+    boot_test_result("frame-ring", frame_ring_self_test())
+    boot_test_result("spawn-pages", spawn_pages_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before
@@ -1745,8 +2000,14 @@ fn network_dhcp_ping(run_net_responder: bool)
         var arp_pending: u8 = 0
         while not deadline_passed(window_end)
             net_poll()
-            if not net_wait_rx()
-                delay_us(2000)
+            # The sooner of the window's end and the deferred ping, until
+            # that ping is due: a quiet ring link still reaches both.
+            var wait_until: u64 = window_end
+            if ping_sent == 0 and ping_after < window_end and not deadline_passed(ping_after)
+                wait_until = ping_after
+            match net_wait_rx(wait_until)
+                RxWait.NoDriver => break
+                _ => pass
 
             # If we got configured, try a ping
             if net_is_configured() and ping_sent == 0 and deadline_passed(ping_after)

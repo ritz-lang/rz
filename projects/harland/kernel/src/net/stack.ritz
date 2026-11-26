@@ -5,6 +5,11 @@
 #
 # Uses the netdev abstraction layer to support multiple network backends
 # (VirtIO-net, ENA, etc) without protocol-level changes.
+#
+# With net_via_ring set, net_get_mac, net_send, net_poll and net_wait_rx are
+# instead the kernel seat on the ring-1 driver's frame rings (net/ring.ritz,
+# RING1_DRIVER.md section 8, #4731). It defaults to false; only the
+# frame-ring boot test sets it until the section 9 cutover.
 
 import klog { klog }
 import net.types { ETHERTYPE_ARP, ETHERTYPE_IPV4, IP_PROTO_ICMP, IP_PROTO_UDP, IP_PROTO_TCP, IP_HEADER_SIZE, ETH_HEADER_SIZE, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, UDP_HEADER_SIZE }
@@ -14,15 +19,32 @@ import net.ip { ip_init, ip_is_configured, ip_print_config, ip_get_header_len, i
 import net.icmp { icmp_handle_packet }
 import net.udp { udp_get_src_port, udp_get_dst_port }
 import net.dhcp { dhcp_discover, dhcp_handle_packet, dhcp_is_configured }
+import net.ring { RxWait, Send, take_rx, ring_poll, ring_send }
+import driver_abi.spsc { FrameBytes }
+import syscall.runtime.net { net_info_snapshot }
+import syscall.errno { Errno }
+import ritzlib.option
+import ritzlib.span { span_from_ptr }
+import arch.x86_64.tsc { delay_us }
 import drivers.netdev { NetDevice, NETDEV_TYPE_NONE, netdev_init, netdev_get_default, netdev_poll, netdev_wait_rx, netdev_send, netdev_is_running, netdev_print_mac, netdev_type, netdev_type_name, netdev_get_mac }
 
 # ============================================================================
 # Network Stack State
 # ============================================================================
 
-var net_rx_buf: [2048]u8
+var net_rx_buf: FrameBytes          # FRAME_MAX (2048) bytes
 var net_initialized: bool = false
 var net_device: *NetDevice = 0 as *NetDevice
+# The I/O functions are the frame-ring seat (net/ring.ritz), not netdev_*.
+var net_via_ring: bool = false
+
+# Boot tests only (frame-ring): route the stack's I/O through the ring seat
+# (`on`) or back to the netdev path. Marks the stack initialized with no
+# NetDevice, as net_stack_init's ring branch will at the cutover.
+pub fn net_ring_select(on: bool)
+    net_via_ring = on
+    net_initialized = on
+    net_device = 0 as *NetDevice
 
 # ============================================================================
 # Initialization
@@ -72,11 +94,22 @@ pub fn net_poll() -> i32
     if not net_initialized
         return 0
 
+    if net_via_ring
+        # One frame published now; never parks. A bad slot is skipped.
+        return match ring_poll(@&net_rx_buf)
+            RxWait.Frame(n) => net_dispatch(n as i32)
+            RxWait.Timeout => 0
+            RxWait.NoDriver => 0
+
     # Poll via netdev abstraction
     let len: i32 = netdev_poll(net_device, @net_rx_buf[0], 2048)
     if len <= 0
         return 0
+    net_dispatch(len)
 
+# Dispatch the `len`-byte frame in net_rx_buf through the Ethernet switch:
+# 1 when a layer took it, else 0.
+fn net_dispatch(len: i32) -> i32
     # Parse Ethernet header
     if len < ETH_HEADER_SIZE as i32
         return 0
@@ -159,7 +192,7 @@ fn handle_udp_packet(udp_data: *u8, udp_len: u32, src_ip: *u8) -> i32
 # ============================================================================
 
 pub fn net_is_ready() -> bool
-    return net_initialized and net_device != 0 as *NetDevice and netdev_is_running(net_device)
+    return net_initialized and (net_via_ring or (net_device != 0 as *NetDevice and netdev_is_running(net_device)))
 
 pub fn net_is_configured() -> bool
     return ip_is_configured()
@@ -171,25 +204,56 @@ pub fn net_get_device() -> *NetDevice
 # The active device's NETDEV_TYPE_* (NETDEV_TYPE_NONE before init). The EC2
 # peer-ping responder window (#1851) only runs over ENA: QEMU's virtio-net
 # gate must not wait for a peer that is not there.
-# Sleep until the NIC may have a frame for net_poll (AGAST #3631). False,
-# without waiting, when the NIC can't wait on its RX interrupt.
-pub fn net_wait_rx() -> bool
+# Wait for RX until TSC `deadline` (RING1_DRIVER.md section 8).
+#   Ring: take_rx. Frame(n) means a frame was taken and dispatched;
+#   Timeout is a quiet link at the deadline; NoDriver, the driver is gone.
+#   netdev: sleep until the NIC may have a frame for net_poll (AGAST #3631),
+#   then Frame(0); a NIC that can't wait on its RX interrupt (ENA) waits
+#   2 ms and returns Timeout. Not initialized: NoDriver.
+pub fn net_wait_rx(deadline: u64) -> RxWait
     if not net_initialized
-        return false
-    netdev_wait_rx(net_device)
+        return RxWait.NoDriver
+    if net_via_ring
+        let got: RxWait = take_rx(deadline, @&net_rx_buf)
+        match got
+            RxWait.Frame(n) => net_dispatch(n as i32)
+            _ => pass
+        return got
+    if netdev_wait_rx(net_device)
+        return RxWait.Frame(0)
+    delay_us(NET_NO_WAIT_US)
+    RxWait.Timeout
+
+# How long net_wait_rx sleeps for a NIC that can't wait on its interrupt.
+const NET_NO_WAIT_US: u64 = 2000
 
 pub fn net_device_type() -> u8
     if net_device == 0 as *NetDevice
         return NETDEV_TYPE_NONE
     netdev_type(net_device)
 
-# Get the MAC address of the active network device
+# Get the MAC address of the active network device. On the ring: the
+# kernel snapshot's MAC (NetPublish, generation >= 2), else six zeros.
 pub fn net_get_mac(mac_out: *u8)
+    if net_via_ring
+        let mac: [6]u8 = match net_info_snapshot()
+            Some(info) => info.mac
+            None => [0, 0, 0, 0, 0, 0]
+        for i in 0..6
+            *(mac_out + i as i64) = mac[i]
+        return
     netdev_get_mac(net_device, mac_out)
     return
 
-# Send a packet through the active network device
+# Send a packet through the active network device: >= 0 when sent. On the
+# ring, 0 is the TX index store (ring_send's full-ring yield included);
+# Errno.NoDev with no driver, Errno.Inval for a bad length.
 pub fn net_send(data: *u8, len: u32) -> i32
+    if net_via_ring
+        return match ring_send(span_from_ptr<u8>(data, len as i64))
+            Send.Sent => 0
+            Send.NoDriver => Errno.NoDev as i32
+            Send.BadLength => Errno.Inval as i32
     if net_device == 0 as *NetDevice
         return -1
     netdev_send(net_device, data, len)
@@ -207,7 +271,9 @@ pub fn net_print_status()
         klog("no\n")
 
     klog("  Device:      ")
-    if net_device != 0 as *NetDevice
+    if net_via_ring
+        klog("frame ring\n")
+    else if net_device != 0 as *NetDevice
         klog(netdev_type_name(net_device))
         klog(" (")
         netdev_print_mac(net_device)

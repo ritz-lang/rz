@@ -1,0 +1,328 @@
+# net/ring.ritz - the kernel seat on the ring-1 driver's frame rings
+# (AGAST #4731, ring plan T25; docs/RING1_DRIVER.md section 6 "take_rx",
+# the TX full-ring rule and endpoint_fail, and section 8's I/O functions)
+#
+# Until the ring-2 service takes the seat, pid 1 at CPL 0 is the RX
+# consumer and the TX producer of the frame object the ring-1 driver
+# publishes into. This module is that seat, on driver_abi.spsc's halves:
+#
+#   * ring_seat_open, the spawn helper: makes the FRAME_REGION_SIZE frame
+#     object (zeroed, both indexes 0), grants it read-write to the driver and
+#     to pid 1, maps it into the driver with the ShmMap path and into pid 1's
+#     page table, and registers the object with pid 1 as its consumer (the
+#     latch NetPublish posts LINK to). driver_registered is set.
+#   * take_rx(deadline, dst): one frame into dst, or the reason there is
+#     none (RxWait). An empty ring parks pid 1 under cli on its wait set
+#     until the driver's ShmNotify, the deadline (sched_tick), or the
+#     driver's exit wakes it. A bad slot is skipped and counted; it is never
+#     returned. A backwards index or an occupancy above FRAME_RING_CAP is
+#     endpoint_fail.
+#   * ring_send(frame): the TX publish. While the TX ring is full it posts
+#     DATA on the driver's latch and yields, so the driver drains; success
+#     is the index store. No driver is Errno.NoDev.
+#   * endpoint_fail: the seat closes the endpoint and stops using it, and
+#     the peer (never pid 1) is marked with process_mark_exit. It does not
+#     call process_kill_current, which would exit pid 1.
+#
+# driver_registered is cleared by driver_quiesce (ring_driver_gone, #4733)
+# and by the seat itself when it finds the frame object retired: the
+# driver's exit retires every shm object it held (#4729) and posts
+# PEER_CLOSE or DRIVER_GONE on pid 1's latch, which wakes a parked take_rx.
+# The seat then detaches (drops pid 1's handle, which unmaps it), so the
+# object is reclaimed once the driver's mapping is gone too.
+#
+# net/stack.ritz dispatches net_get_mac, net_send, net_poll and
+# net_wait_rx here when net_via_ring is set. Only the frame-ring boot test
+# sets it (RING1_DRIVER.md section 9's cutover is a later change).
+#
+# Every ring access runs as pid 1, whose page table holds the seat's
+# mapping: the seat functions refuse any other caller.
+
+import ritzlib.option
+import klog { klog, klog_dec }
+import io { disable_interrupts, enable_interrupts, interrupts_enabled, rdtsc }
+import mm.pmm { PAGE_SIZE }
+import mm.vmm { vmm_get_current_pml4 }
+import mm.shm { shm_create, shm_destroy, shm_map, shm_live }
+import cap.types { CapHandle, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, cap_handle_init }
+import cap.table { CapTable, cap_kernel_grant, cap_revoke, cap_table_get }
+import proc.table { MAX_PROCS, BLOCK_WAIT, proc_at, proc_block, proc_current_pid, proc_current_slot, proc_mark_exit }
+import proc.sched { sched_yield, sched_block }
+import proc.waitq { waitq_can_park }
+import proc.waitset { waitset_arm, waitset_disarm, shm_latch_post_peers }
+import syscall.runtime.net { net_frame_register }
+import driver_abi.wait { EVENT_DATA }
+import driver_abi.frame_ring { FRAME_REGION_SIZE }
+import driver_abi.spsc { SpscConsumer, SpscProducer, SpscClose, Publish, Take, FrameBytes, spsc_rx_ring, spsc_tx_ring }
+
+# What take_rx found. Not a syscall return: Frame, Timeout and NoDriver are
+# not 1, 0 and -1, which collide with an errno.
+pub enum RxWait
+    # A validated frame of this many bytes was copied into the caller's
+    # buffer from the private descriptor, and read_idx is past it.
+    Frame(u32)
+    # The deadline passed with the ring empty: a quiet link.
+    Timeout
+    # No driver: none registered, its object retired (it exited), or the
+    # endpoint closed (endpoint_fail).
+    NoDriver
+
+# What ring_seat_open did. Not a Result: VtdDma and goliath's ErrorCode,
+# in this module's import closure, declare `Ok` too, so a bare `Ok(x)` is
+# ambiguous here (as syscall/runtime/driver.ritz RequestCheck).
+pub enum SeatOpen
+    Opened(u64)             # the driver's packed handle, for its entry arguments
+    NotSeat                 # the caller is not pid 1
+    Busy                    # a seat is open
+    NoDriver                # no live process `driver_pid` with a cap table
+    NoMem                   # no object, handle or mapping to be had
+
+# The seat is pid 1.
+const SEAT_PID: u64 = 1
+
+# The ring-1 driver is registered and has not exited (RING1_DRIVER.md
+# section 6: a bool, not a Proc u8 flag).
+var driver_registered: bool = false
+
+var seat_open: bool = false
+var seat_object: u64 = 0
+var seat_driver: u64 = 0
+var seat_handle: CapHandle          # pid 1's handle for seat_object
+var seat_rx: SpscConsumer
+var seat_tx: SpscProducer
+
+# Counters the frame-ring boot test reads.
+var rx_rejects: u64 = 0
+var tx_full_yields: u64 = 0
+var endpoint_fails: u64 = 0
+
+# ============================================================================
+# Opening and closing the seat
+# ============================================================================
+
+fn packed(h: CapHandle) -> u64
+    let index: u32 = h.index
+    let generation: u32 = h.generation
+    (index as u64) | ((generation as u64) << 32)
+
+fn handle_ok(h: CapHandle) -> bool
+    let index: u32 = h.index
+    index != 0xFFFFFFFF
+
+fn revoke(pid: u64, h: CapHandle)
+    if handle_ok(h)
+        let index: u32 = h.index
+        let generation: u32 = h.generation
+        cap_revoke(cap_table_get(pid as u32), cap_handle_init(index, generation))
+
+# The page table of live process `pid`.
+fn pml4_of(pid: u64) -> Option<u64>
+    var slot: i32 = 0
+    while slot < MAX_PROCS
+        if proc_at(slot).pid == pid and proc_at(slot).pml4 != 0
+            return Some(proc_at(slot).pml4)
+        slot = slot + 1
+    None
+
+# The spawn helper: the frame object for ring-1 driver `driver_pid`, a
+# child pid 1 spawned and that has not run. Both get a read-write handle
+# (each insert makes that process's latch); the driver's mapping is made
+# with the ShmMap path before it runs, and pid 1's in its own page table.
+# Opened with the driver's packed handle, or (nothing left made) why not.
+pub fn ring_seat_open(driver_pid: u64) -> SeatOpen
+    if proc_current_pid() != SEAT_PID
+        return SeatOpen.NotSeat
+    if seat_open
+        return SeatOpen.Busy
+    if driver_pid == SEAT_PID or cap_table_get(driver_pid as u32) == 0 as *CapTable
+        return SeatOpen.NoDriver
+    let driver_pml4: u64 = match pml4_of(driver_pid)
+        Some(p) => p
+        None => return SeatOpen.NoDriver
+    let object_id: u64 = match shm_create(FRAME_REGION_SIZE / PAGE_SIZE)
+        Some(id) => id
+        None => return SeatOpen.NoMem
+    let rights: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
+    let drv: CapHandle = cap_kernel_grant(driver_pid as u32, CAP_TYPE_SHM, rights, object_id)
+    let mine: CapHandle = cap_kernel_grant(SEAT_PID as u32, CAP_TYPE_SHM, rights, object_id)
+    var va: i64 = -1
+    if handle_ok(drv) and handle_ok(mine) and shm_map(driver_pid as u32, driver_pml4, object_id, true) > 0
+        va = shm_map(SEAT_PID as u32, vmm_get_current_pml4(), object_id, true)
+    if va <= 0
+        # Each revoke of a last handle unmaps that process; then nothing
+        # maps the object.
+        revoke(driver_pid, drv)
+        revoke(SEAT_PID, mine)
+        shm_destroy(object_id)
+        return SeatOpen.NoMem
+    seat_rx = SpscConsumer.new(spsc_rx_ring(va as u64))
+    seat_tx = SpscProducer.new(spsc_tx_ring(va as u64))
+    seat_object = object_id
+    seat_driver = driver_pid
+    seat_handle = mine
+    seat_open = true
+    driver_registered = true
+    net_frame_register(object_id, SEAT_PID)
+    SeatOpen.Opened(packed(drv))
+
+# The seat stops using the frame object: pid 1 drops its handle, which
+# unmaps it, so the object is reclaimed once it is retired and the driver's
+# mapping is gone too. A second call does nothing.
+fn seat_close()
+    if not seat_open
+        return
+    seat_open = false
+    net_frame_register(0, 0)
+    revoke(SEAT_PID, seat_handle)
+
+# driver_quiesce's step 4 (#4733): the driver is gone. A parked take_rx is
+# woken by the DRIVER_GONE post on the retired object and returns NoDriver.
+pub fn ring_driver_gone()
+    driver_registered = false
+
+# The seat has a live driver to talk to. A retired frame object is a driver
+# that exited: driver_registered goes and the seat closes.
+fn seat_live() -> bool
+    if not seat_open
+        return false
+    if driver_registered and shm_live(seat_object)
+        return true
+    driver_registered = false
+    seat_close()
+    false
+
+# endpoint_fail: the peer's shared index is impossible. Close the endpoint
+# and stop using it, and mark the peer to exit; pid 1, the seat, never
+# exits this way (process_mark_exit, here its proc_mark_exit, refuses it).
+# IF=0.
+fn endpoint_fail(why: SpscClose)
+    endpoint_fails = endpoint_fails + 1
+    klog("[ring] endpoint closed: ")
+    match why
+        SpscClose.Backwards => klog("index went backwards")
+        SpscClose.Overfull => klog("occupancy above 256")
+    klog(", driver pid ")
+    klog_dec(seat_driver as i64)
+    klog(" marked\n")
+    if seat_driver != SEAT_PID
+        proc_mark_exit(seat_driver)
+    seat_close()
+
+# ============================================================================
+# RX: take_rx
+# ============================================================================
+
+# One RX frame into `dst`. With `park`, an empty ring parks pid 1 on its
+# wait set until `deadline` (a TSC value; 0 or a passed one checks once).
+# IF=0.
+fn take_locked(deadline: u64, dst: @&FrameBytes, park: bool) -> RxWait
+    let slot: i32 = proc_current_slot()
+    while true
+        if not seat_live()
+            return RxWait.NoDriver
+        match seat_rx.next(dst, rdtsc(), deadline)
+            Take.Frame(len) => return RxWait.Frame(len)
+            Take.Rejected(_) =>
+                rx_rejects = rx_rejects + 1
+                klog("[ring] rx slot rejected\n")
+            Take.Close(why) =>
+                endpoint_fail(why)
+                return RxWait.NoDriver
+            Take.Timeout => return RxWait.Timeout
+            Take.Empty =>
+                if not park or not waitq_can_park()
+                    return RxWait.Timeout
+                # Checked under cli: a notify cannot land between the empty
+                # check and the block. The driver's DATA, its exit's
+                # retire post, and the deadline each wake this wait.
+                waitset_arm(slot, deadline)
+                proc_block(BLOCK_WAIT, 0)
+                sched_block()
+                waitset_disarm(slot)
+
+# take_rx: one frame into `dst`, waiting until TSC `deadline` for it.
+# Returns with the caller's IF.
+pub fn take_rx(deadline: u64, dst: @&FrameBytes) -> RxWait
+    if proc_current_pid() != SEAT_PID
+        return RxWait.NoDriver
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
+    let got: RxWait = take_locked(deadline, dst, true)
+    if was
+        enable_interrupts()
+    got
+
+# One RX frame into `dst` if one is published now; never parks (net_poll).
+pub fn ring_poll(dst: @&FrameBytes) -> RxWait
+    if proc_current_pid() != SEAT_PID
+        return RxWait.NoDriver
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
+    let got: RxWait = take_locked(0, dst, false)
+    if was
+        enable_interrupts()
+    got
+
+# ============================================================================
+# TX: the full-ring rule
+# ============================================================================
+
+# What ring_send did (a named enum for the reason SeatOpen is).
+pub enum Send
+    Sent                    # the private write_idx was stored
+    NoDriver                # no registered driver, or the endpoint closed
+    BadLength               # empty, or longer than FRAME_MAX: nothing written
+
+# Publish `frame` on the TX ring. While the ring is full and the driver is
+# registered, DATA goes on the driver's latch (the wake: a proc_wake of a
+# running driver would post nothing) and pid 1 yields so the driver drains,
+# then rechecks; each recheck is under cli. Sent is the store of the
+# private write_idx, after which DATA is posted again. Returns with the
+# caller's IF.
+pub fn ring_send(frame: [u8]) -> Send
+    if proc_current_pid() != SEAT_PID
+        return Send.NoDriver
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
+    var result: Send = Send.NoDriver
+    while seat_live()
+        match seat_tx.publish(frame)
+            Publish.Done =>
+                shm_latch_post_peers(seat_object, SEAT_PID, EVENT_DATA)
+                result = Send.Sent
+                break
+            Publish.Full =>
+                shm_latch_post_peers(seat_object, SEAT_PID, EVENT_DATA)
+                tx_full_yields = tx_full_yields + 1
+                sched_yield()
+            Publish.BadLength =>
+                result = Send.BadLength
+                break
+            Publish.Close(why) =>
+                endpoint_fail(why)
+                break
+    if was
+        enable_interrupts()
+    result
+
+# ============================================================================
+# State the boot test reads
+# ============================================================================
+
+pub fn ring_driver_registered() -> bool
+    driver_registered
+
+# The seat's frame object, while a seat is open.
+pub fn ring_seat_object() -> Option<u64>
+    if not seat_open
+        return None
+    Some(seat_object)
+
+pub fn ring_rx_rejects() -> u64
+    rx_rejects
+
+pub fn ring_tx_full_yields() -> u64
+    tx_full_yields
+
+pub fn ring_endpoint_fails() -> u64
+    endpoint_fails

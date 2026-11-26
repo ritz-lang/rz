@@ -2,7 +2,7 @@
 # RING1_DRIVER.md section 2, Tests 1-3).
 #
 # postinit.ritz's driver-* boot tests copy the bytes between
-# driver_stub_start and driver_stub_end into one user page of a child of
+# driver_stub_start and driver_stub_end into the user pages of a child of
 # pid 1 (syscall/runtime/process.ritz process_spawn_image) and enter it at
 # CPL 3 through sched_prepare_user's ordinary frame (CS 0x23, SS 0x1B). The
 # code is position-independent and uses no data outside the copied range.
@@ -126,6 +126,24 @@
 #                   10 NetAddr                  -> 0: the lease,
 #                      configured 1, _pad zero, generation 4
 #                   11 NetAddr(kernel pointer)  -> Errno.Fault
+#   modes 30-32 (#4731, postinit.ritz frame-ring): the ring-1 driver on
+#                   the frame object ring_seat_open made, RETIRE_H (its
+#                   first grant), whose RX consumer and TX producer is pid
+#                   1. Step 1 is the ShmMap, as in modes 10-14; the exit
+#                   status is the number of the first failed step:
+#   mode 30 (RING_RX): publishes three RX slots, the middle one bad
+#                   (arena_off 0, not 2048), each good one carrying
+#                   RING_MARKER (+1) in its first bytes; 2 ShmNotify DATA
+#                   is 0; 3 a wait for pid 1's DATA returns 2. Exit 0.
+#   mode 31 (RING_OVERFULL): stores RX write_idx 257 (occupancy above
+#                   256) and notifies DATA (2), then parks: pid 1's
+#                   endpoint_fail marks it (PROC_REAP_STATUS).
+#   mode 32 (RING_TX): consumes RSI TX frames, waiting for DATA when the
+#                   ring is empty (5): each must be RING_FRAME_LEN bytes,
+#                   flags 0, at its slot's arena offset, with its sequence
+#                   number's low byte first (4). Exit 0 after the last.
+#   mode 33 (TAIL, #4731, postinit.ritz spawn-pages): code at the end of
+#                   the image, past its first page: report as mode 0.
 #   mode 21 (MMIO_MAP, #4720): RSI is a CAP_TYPE_MMIO handle on the
 #                   boot-test window double. Exit status: the number of the
 #                   first failed step, else 0:
@@ -202,6 +220,10 @@
 .equ DRIVER_STUB_REPLACED, 13
 .equ DRIVER_STUB_FRESH, 14
 .equ DRIVER_STUB_ADDR, 15
+.equ DRIVER_STUB_RING_RX, 30
+.equ DRIVER_STUB_RING_OVERFULL, 31
+.equ DRIVER_STUB_RING_TX, 32
+.equ DRIVER_STUB_TAIL, 33
 .equ DRIVER_STUB_MMIO_MAP, 21
 .equ DRIVER_STUB_DMA_ALLOC, 22
 .equ DRIVER_STUB_DMA_FREE, 23
@@ -286,6 +308,15 @@
 .equ NA_CONFIGURED,   16
 .equ NA_GENERATION,   24
 .equ ADDR_BUF,        192         # the NetAddr buffer, after the records
+# Modes 30-32 (postinit.ritz RING_*; driver_abi/src/frame_ring.ritz)
+.equ RING_TX_CTRL,    0x100       # TX write_idx; its read_idx is 0x40 on
+.equ RING_RX_DESC,    0x1000
+.equ RING_TX_DESC,    0x2000
+.equ RING_RX_ARENA,   0x3000
+.equ RING_TX_ARENA,   0x83000
+.equ RING_FRAME_LEN,  60
+.equ RING_OVERFULL,   257
+.equ RING_MARKER,     0x474E495246000001
 
 .global driver_stub_start
 .type driver_stub_start, @function
@@ -324,7 +355,13 @@ driver_stub_start:
     jb .Ldriver_stub_not_retire
     cmpq $DRIVER_STUB_FRESH, %r12
     jbe .Ldriver_stub_retire
+    cmpq $DRIVER_STUB_RING_RX, %r12
+    jb .Ldriver_stub_not_retire
+    cmpq $DRIVER_STUB_RING_TX, %r12
+    jbe .Ldriver_stub_retire
 .Ldriver_stub_not_retire:
+    cmpq $DRIVER_STUB_TAIL, %r12
+    je driver_stub_tail
     cmpq $DRIVER_STUB_ADDR, %r12
     je .Ldriver_stub_addr
     cmpq $DRIVER_STUB_SPIN, %r12
@@ -1180,6 +1217,8 @@ driver_stub_start:
     je .Lretire_replaced
     cmpq $DRIVER_STUB_FRESH, %r12
     je .Lretire_fresh
+    cmpq $DRIVER_STUB_RING_RX, %r12
+    jae .Lring
 
     # Mode 10: the kernel bit and DATA, and nothing else
     movl $2, %r15d
@@ -1298,6 +1337,71 @@ driver_stub_start:
     syscall
     ud2
 
+# Modes 30-32: rbp = the frame region.
+.Lring:
+    movl $2, %r15d
+    cmpq $DRIVER_STUB_RING_TX, %r12
+    je .Lring_tx
+    movl $RING_OVERFULL, %eax
+    cmpq $DRIVER_STUB_RING_OVERFULL, %r12
+    je .Lring_publish
+    # Mode 30: slot 0 good, slot 1 at arena_off 0 (bad), slot 2 good
+    movq $RING_FRAME_LEN, RING_RX_DESC(%rbp)          # length; flags 0
+    movq $RING_FRAME_LEN, RING_RX_DESC+16(%rbp)
+    movq $RING_FRAME_LEN, RING_RX_DESC+32(%rbp)
+    movl $4096, RING_RX_DESC+40(%rbp)                 # slot 2's arena_off
+    movabsq $RING_MARKER, %rax
+    movq %rax, RING_RX_ARENA(%rbp)
+    incq %rax
+    movq %rax, RING_RX_ARENA+4096(%rbp)
+    movl $3, %eax
+.Lring_publish:
+    xchgq %rax, (%rbp)                   # RX write_idx, a seq_cst store
+    movq $SYS_SHM_NOTIFY, %rax
+    movabsq $RETIRE_H, %rdi
+    movl $EVENT_DATA, %esi
+    syscall
+    testq %rax, %rax
+    jnz .Lretire_fail
+    movl $3, %r15d
+    call .Lretire_wait
+    cmpq $2, %rax
+    jne .Lretire_fail
+    jmp .Lretire_pass
+
+# Mode 32: r12 = the private TX read_idx, r13 = the frames to take.
+.Lring_tx:
+    xorl %r12d, %r12d
+.Lring_tx_load:
+    movq RING_TX_CTRL(%rbp), %rcx        # pid 1's write_idx
+.Lring_tx_slot:
+    cmpq %rcx, %r12
+    jae .Lring_tx_wait
+    movl $4, %r15d
+    movzbl %r12b, %eax                   # the slot, seq & 255
+    movq %rax, %rdx
+    shlq $4, %rdx                        # its FrameDesc
+    shlq $11, %rax                       # its arena offset
+    cmpl $RING_FRAME_LEN, RING_TX_DESC(%rbp,%rdx)
+    jne .Lretire_fail
+    cmpl $0, RING_TX_DESC+4(%rbp,%rdx)
+    jne .Lretire_fail
+    cmpl %eax, RING_TX_DESC+8(%rbp,%rdx)
+    jne .Lretire_fail
+    cmpb %r12b, RING_TX_ARENA(%rbp,%rax)
+    jne .Lretire_fail
+    incq %r12
+    movq %r12, RING_TX_CTRL+0x40(%rbp)   # read_idx
+    cmpq %r13, %r12
+    jb .Lring_tx_slot
+    jmp .Lretire_pass
+.Lring_tx_wait:
+    movl $5, %r15d
+    call .Lretire_wait
+    cmpq $2, %rax
+    jne .Lretire_fail
+    jmp .Lring_tx_load
+
 # One ShmWait listing RETIRE_H for DATA; rax = its return. On 2, each
 # record's bits go into rbx (an ATTACH record's handle into r13; a record
 # for another handle adds RETIRE_STRAY).
@@ -1342,6 +1446,12 @@ driver_stub_start:
     jmp .Lretire_record
 .Lretire_wait_done:
     ret
+
+# Mode 33, last in the image so it lies past its first page (postinit.ritz
+# spawn-pages checks the offset): report as mode 0 does.
+.global driver_stub_tail
+driver_stub_tail:
+    jmp .Ldriver_stub_report
 
 .global driver_stub_end
 driver_stub_end:
