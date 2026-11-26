@@ -1,0 +1,614 @@
+# Host tests of the ring-2 network service's loop body (AGAST #4743,
+# harland docs/RING2_NET.md "Service wait", "Ethernet demux", "Address
+# publication", "Frame seat")
+#
+# src/netsvc.ritz against a frame region and an address page that are host
+# globals. The driver's halves of the rings (the RX producer, the TX
+# consumer) are driver_abi.spsc halves in this process, and the clock is a
+# number the test advances, in the stack_example style: the required case
+# fills both rings at once and still sees a DHCP retransmit fire on a link
+# that delivers nothing but foreign frames.
+
+import driver_abi.frame_ring { FRAME_MAX, FRAME_RING_CAP, FRAME_RX_ARENA_OFF, FRAME_REGION_SIZE }
+import driver_abi.link { NetInfo, NetAddr, AddrSample, addr_sample }
+import driver_abi.spsc { SpscProducer, SpscConsumer, Publish, Take, FrameBytes, spsc_rx_ring, spsc_tx_ring }
+import driver_abi.wait { WaitEvent, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_ATTACH }
+import netstack.bytes { be16_get, be16_put, be32_get, be32_put }
+import netstack.ethernet { MacAddr, ETH_PAYLOAD_OFF, mac_eq, mac_is_broadcast }
+import netstack.ipv4 { IPV4_HEADER_MIN, IPV4_BROADCAST }
+import netstack.udp { UDP_HEADER_LEN, udp_frame_write }
+import netstack.icmp { icmp_echo_request_write }
+import netstack.ipv4 { IpProto, ipv4_frame_write }
+import netstack.arp { ARP_RETRY_INTERVAL_MS, ARP_RETRY_LIMIT }
+import netstack.dhcp { DHCP_MAGIC, DhcpState }
+import system.netsvc { NetSvc, Sent, Wake, PENDING_TX_CAP, WAIT_IDLE_MS, RX_BUDGET, wake_of, addr_record }
+
+const SERVER_IP: u32 = 0x0A000202      # 10.0.2.2, also the router
+const OUR_IP: u32 = 0x0A00020F         # 10.0.2.15
+const PEER_IP: u32 = 0x0A000203        # 10.0.2.3, on-link
+const NETMASK: u32 = 0xFFFFFF00
+const DNS_IP: u32 = 0x0A000203
+const FRAME_HANDLE: u64 = 7
+
+# The UDP payload offset in a frame netsvc writes (no IPv4 options).
+const UDP_AT: i64 = 14 + 20
+const PAYLOAD_AT: i64 = 14 + 20 + 8
+
+var g_region: [FRAME_REGION_SIZE / 8]u64
+var g_page: [512]u64
+var g_svc: NetSvc
+var g_drv_rx: SpscProducer
+var g_drv_tx: SpscConsumer
+var g_got: FrameBytes
+var g_frame: [2048]u8
+var g_msg: [576]u8
+var g_at: i64 = 0
+
+fn our_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+
+fn server_mac() -> MacAddr
+    [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02]
+
+fn peer_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC]
+
+fn link_info(up: u8) -> NetInfo
+    NetInfo { mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], link_up: up, device_type: 1, mtu: 1500 }
+
+fn server_link() -> NetInfo
+    NetInfo { mac: [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02], link_up: 1, device_type: 1, mtu: 1500 }
+
+fn page() -> u64
+    @g_page as u64
+
+# A zeroed region and page and a service over them, plus the driver's ring
+# halves. Only the control and descriptor pages need zeroing: no slot is
+# read before it is written.
+fn fresh() -> @&NetSvc
+    for i in 0..FRAME_RX_ARENA_OFF / 8
+        g_region[i] = 0
+    for i in 0..512
+        g_page[i] = 0
+    let region: u64 = @g_region as u64
+    g_svc.init(region, page(), 0x1234)
+    g_drv_rx = SpscProducer.new(spsc_rx_ring(region))
+    g_drv_tx = SpscConsumer.new(spsc_tx_ring(region))
+    @&g_svc
+
+# ready + link up at `now`: one discover on the TX ring.
+fn started(now: u64) -> @&NetSvc
+    let svc = fresh()
+    svc.ready(link_info(1))
+    svc.set_link(link_info(1), now)
+    svc
+
+# The driver takes one TX frame into g_got; its length, or 0 for none.
+fn drv_take() -> i64
+    match g_drv_tx.next(@&g_got, 0, 1)
+        Take.Frame(len) => len as i64
+        _ => 0
+
+fn drv_take_all() -> i64
+    var n: i64 = 0
+    while drv_take() > 0
+        n += 1
+    n
+
+fn got() -> [u8]
+    let g: [u8] = @g_got
+    g
+
+fn got_mac(at: i64) -> MacAddr
+    let g = got()
+    [g[at], g[at + 1], g[at + 2], g[at + 3], g[at + 4], g[at + 5]]
+
+# g_got is a UDP 68 -> 67 frame (a DHCP message) of DHCP type `kind`.
+fn got_is_dhcp(kind: u8) -> bool
+    let g = got()
+    if be16_get(g, 12) != 0x0800 or g[14 + 9] != 17
+        return false
+    if be16_get(g, UDP_AT) != 68 or be16_get(g, UDP_AT + 2) != 67
+        return false
+    # Option 53 is the first option the client writes.
+    g[PAYLOAD_AT + 240] == 53 and g[PAYLOAD_AT + 242] == kind
+
+fn got_ip_dst() -> u32
+    be32_get(got(), 14 + 16)
+
+# ---------------------------------------------------------------------------
+# Frames from the network, published by the driver on the RX ring
+# ---------------------------------------------------------------------------
+
+fn drv_publish(frame: [u8]) -> bool
+    match g_drv_rx.publish(frame)
+        Publish.Done => true
+        _ => false
+
+# A server reply in g_msg: reply_begin, options, reply_end.
+fn reply_begin(kind: u8, xid: u32)
+    let m: [u8] = @g_msg
+    for i in 0..m.len
+        m[i] = 0
+    m[0] = 2
+    m[1] = 1
+    m[2] = 6
+    be32_put(m, 4, xid)
+    be32_put(m, 16, OUR_IP)
+    let mac = our_mac()
+    for i in 0..6
+        m[28 + i] = mac[i]
+    be32_put(m, 236, DHCP_MAGIC)
+    m[240] = 53
+    m[241] = 1
+    m[242] = kind
+    g_at = 243
+
+fn opt4(code: u8, v: u32)
+    let m: [u8] = @g_msg
+    m[g_at] = code
+    m[g_at + 1] = 4
+    be32_put(m, g_at + 2, v)
+    g_at += 6
+
+fn reply_end() -> [u8]
+    let m: [u8] = @g_msg
+    m[g_at] = 255
+    m[0..g_at + 1]
+
+# A DHCP server message as a broadcast UDP 67 -> 68 frame on the RX ring.
+fn drv_dhcp(kind: u8, lease: u32) -> bool
+    reply_begin(kind, g_svc.dhcp.xid)
+    opt4(54, SERVER_IP)
+    if kind != 6
+        opt4(51, lease)
+        opt4(1, NETMASK)
+        opt4(3, SERVER_IP)
+        opt4(6, DNS_IP)
+    let payload = reply_end()
+    let f: [u8] = @g_frame
+    match udp_frame_write(f, server_link(), [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], SERVER_IP, IPV4_BROADCAST, 67, 68, payload)
+        Ok(len) => drv_publish(f[0..len])
+        Err(_) => false
+
+# A 28-byte ARP packet from `sender` in an Ethernet frame to `eth_dst`.
+fn drv_arp(op: u16, eth_dst: MacAddr, sender_ip: u32, sender_mac: MacAddr, target_ip: u32) -> bool
+    let f: [u8] = @g_frame
+    for i in 0..6
+        f[i] = eth_dst[i]
+        f[6 + i] = sender_mac[i]
+    be16_put(f, 12, 0x0806)
+    let a = f[14..f.len]
+    be16_put(a, 0, 1)
+    be16_put(a, 2, 0x0800)
+    a[4] = 6
+    a[5] = 4
+    be16_put(a, 6, op)
+    for i in 0..6
+        a[8 + i] = sender_mac[i]
+        a[18 + i] = 0
+    be32_put(a, 14, sender_ip)
+    be32_put(a, 24, target_ip)
+    drv_publish(f[0..14 + 28])
+
+# An echo request from `src` to us, from `src_mac`.
+fn drv_ping(src: u32, src_mac: MacAddr) -> bool
+    let f: [u8] = @g_frame
+    let body: [u8] = "ping"
+    let icmp = f[14 + 20..f.len]
+    let len = match icmp_echo_request_write(icmp, 0x77, 1, body)
+        Ok(n) => n
+        Err(_) => return false
+    let peer = NetInfo { mac: src_mac, link_up: 1, device_type: 1, mtu: 1500 }
+    match ipv4_frame_write(f, peer, our_mac(), IpProto.Icmp, src, OUR_IP, len)
+        Ok(n) => drv_publish(f[0..n])
+        Err(_) => false
+
+# A frame for some other NIC: the link's noise.
+fn drv_foreign(n: i64) -> bool
+    let f: [u8] = @g_frame
+    for i in 0..64
+        f[i] = 0x11
+    be16_put(f, 12, 0x0800)
+    drv_publish(f[0..n])
+
+# A filler frame the service sends, tagged with `tag` in its last byte.
+fn filler(tag: u8) -> [u8]
+    let f: [u8] = @g_frame
+    for i in 0..60
+        f[i] = 0
+    f[59] = tag
+    f[0..60]
+
+# The service bound: discover, offer -> request, ack. The lease is 3600 s.
+fn bound(now: u64) -> @&NetSvc
+    let svc = started(now)
+    drv_take_all()
+    drv_dhcp(2, 3600)
+    svc.service(now)
+    drv_take_all()
+    drv_dhcp(5, 3600)
+    svc.service(now)
+    drv_take_all()
+    svc.take_published()
+    svc.take_publish_due()
+    svc
+
+fn sample() -> AddrSample
+    addr_sample(page())
+
+fn bytes_are(b: [4]u8, ip: u32) -> bool
+    b[0] == (ip >> 24) as u8 and b[1] == ((ip >> 16) & 0xFF) as u8 and b[2] == ((ip >> 8) & 0xFF) as u8 and b[3] == (ip & 0xFF) as u8
+
+# ---------------------------------------------------------------------------
+# Ready, DHCP and the address record
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_ready_publishes_generation_2_unconfigured() -> i32
+    let svc = fresh()
+    if svc.ready(link_info(1)) != 2
+        return 1
+    let s = sample()
+    if s.generation != 2 or s.addr.configured != 0 or s.addr.generation != 2
+        return 2
+    if not bytes_are(s.addr.address, 0) or not bytes_are(s.addr.gateway, 0)
+        return 3
+    # NetPublish is due once.
+    if not svc.take_publish_due() or svc.take_publish_due()
+        return 4
+    # A refused NetPublish is due again on the next pass.
+    svc.publish_failed()
+    if not svc.take_publish_due()
+        return 6
+    # Ready is before DHCP: nothing on the TX ring yet.
+    if drv_take() != 0 or svc.take_published() != 0
+        return 5
+    0
+
+[[test]]
+fn test_link_up_broadcasts_one_discover() -> i32
+    let svc = started(100)
+    if svc.take_published() != 1
+        return 1
+    if drv_take() == 0 or not got_is_dhcp(1)
+        return 2
+    if not mac_is_broadcast(got_mac(0)) or not mac_eq(got_mac(6), our_mac())
+        return 3
+    if got_ip_dst() != IPV4_BROADCAST
+        return 4
+    # The discover went out, so SPACE is not in the mask; the deadline is
+    # the first retransmit, 4 s +-1 s.
+    if svc.wait_mask() != EVENT_DATA
+        return 5
+    let d = svc.deadline(100)
+    if d < 3000 or d > 5000
+        return 6
+    # A second link-up snapshot starts nothing.
+    svc.set_link(link_info(1), 200)
+    if drv_take() != 0
+        return 7
+    0
+
+[[test]]
+fn test_link_down_before_up_sends_nothing_and_waits_idle() -> i32
+    let svc = fresh()
+    svc.ready(link_info(0))
+    svc.set_link(link_info(0), 0)
+    if drv_take() != 0
+        return 1
+    if svc.deadline(0) != WAIT_IDLE_MS
+        return 2
+    # The link comes up later: discover.
+    svc.set_link(link_info(1), 500)
+    if drv_take() == 0 or not got_is_dhcp(1)
+        return 3
+    0
+
+[[test]]
+fn test_offer_and_ack_write_the_lease() -> i32
+    let svc = started(0)
+    drv_take_all()
+    if not drv_dhcp(2, 3600)
+        return 1
+    if svc.service(10).is_err()
+        return 2
+    # The offer is answered with a broadcast request.
+    if drv_take() == 0 or not got_is_dhcp(3) or got_ip_dst() != IPV4_BROADCAST
+        return 3
+    if svc.take_publish_due() and sample().generation != 2
+        return 4
+    drv_dhcp(5, 3600)
+    svc.service(20)
+    if svc.dhcp.state != DhcpState.Bound
+        return 5
+    let s = sample()
+    if s.generation != 4 or s.addr.configured != 1
+        return 6
+    if not bytes_are(s.addr.address, OUR_IP) or not bytes_are(s.addr.gateway, SERVER_IP)
+        return 7
+    if not bytes_are(s.addr.netmask, NETMASK) or not bytes_are(s.addr.dns, DNS_IP)
+        return 8
+    if not svc.take_publish_due()
+        return 9
+    # Bound: the next timer is T1, half the lease from the request (10 ms),
+    # past the idle cap, so the wait is the cap.
+    match svc.dhcp.next_deadline()
+        Some(d) =>
+            if d != 10 + 1800000
+                return 10
+        None => return 11
+    if svc.deadline(20) != WAIT_IDLE_MS
+        return 12
+    0
+
+[[test]]
+fn test_link_down_publishes_a_cleared_record() -> i32
+    let svc = bound(0)
+    svc.set_link(link_info(0), 50)
+    let s = sample()
+    if s.generation != 6 or s.addr.configured != 0 or not bytes_are(s.addr.address, 0)
+        return 1
+    if not svc.take_publish_due()
+        return 2
+    if svc.dhcp.state != DhcpState.Idle
+        return 3
+    0
+
+[[test]]
+fn test_addr_record_carries_only_what_the_lease_has() -> i32
+    let cleared = addr_record(None)
+    if cleared.configured != 0 or not bytes_are(cleared.address, 0)
+        return 1
+    0
+
+# ---------------------------------------------------------------------------
+# The pending-TX queue and SPACE
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_full_tx_ring_queues_32_then_fails_the_send() -> i32
+    let svc = fresh()
+    svc.ready(link_info(1))
+    for i in 0..FRAME_RING_CAP
+        if svc.send_frame(filler(0)) != Sent.Published
+            return 1
+    if svc.wait_mask() != EVENT_DATA
+        return 2
+    for i in 0..PENDING_TX_CAP
+        if svc.send_frame(filler((i + 1) as u8)) != Sent.Queued
+            return 3
+    if svc.pending_count() != PENDING_TX_CAP
+        return 4
+    # The queue is full: the send fails to its caller.
+    if svc.send_frame(filler(0xEE)) != Sent.Failed
+        return 5
+    if svc.counters.send_fails != 1
+        return 6
+    # SPACE is listed while the queue is non-empty.
+    if svc.wait_mask() != (EVENT_DATA | EVENT_SPACE)
+        return 7
+    0
+
+[[test]]
+fn test_space_alone_moves_the_queue_in_order() -> i32
+    let svc = fresh()
+    svc.ready(link_info(1))
+    for i in 0..FRAME_RING_CAP
+        svc.send_frame(filler(0))
+    svc.send_frame(filler(1))
+    svc.send_frame(filler(2))
+    svc.take_published()
+    # The driver frees one slot (its SPACE notify); no RX frame arrives.
+    drv_take()
+    let rx_before = svc.counters.rx_frames
+    svc.service(0)
+    if svc.pending_count() != 1 or svc.take_published() != 1
+        return 1
+    if svc.counters.rx_frames != rx_before
+        return 2
+    # A send behind a non-empty queue stays behind it, even with a free slot.
+    drv_take()
+    if svc.send_frame(filler(3)) != Sent.Queued
+        return 3
+    # Drain the 254 fillers still ahead, then the queued ones in order.
+    for i in 0..FRAME_RING_CAP - 2
+        drv_take()
+    svc.service(0)
+    if svc.pending_count() != 0 or svc.wait_mask() != EVENT_DATA
+        return 4
+    for tag in 1..4
+        if drv_take() != 60 or got()[59] != tag as u8
+            return 5
+    0
+
+# The required case (RING2_NET.md "Ethernet demux"): both rings full at
+# once, on a link that delivers only foreign frames, and the DHCP
+# retransmit still fires and its frame still reaches the TX ring.
+[[test]]
+fn test_both_rings_full_still_fire_the_dhcp_retransmit() -> i32
+    let svc = started(0)
+    let first_deadline = svc.dhcp.next_deadline().unwrap_or(0)
+    if first_deadline == 0 or svc.deadline(0) != first_deadline
+        return 12
+    # The driver stops taking TX: fill the rest of the ring and some queue.
+    for i in 0..FRAME_RING_CAP - 1
+        svc.send_frame(filler(0))
+    svc.send_frame(filler(9))
+    if svc.pending_count() != 1
+        return 1
+    # ...and keeps the RX ring full.
+    for i in 0..FRAME_RING_CAP
+        if not drv_foreign(60)
+            return 2
+    if drv_foreign(60)
+        return 3
+    let xid_before = svc.dhcp.xid
+    # A pass before the deadline drains RX and sends nothing new.
+    svc.service(first_deadline - 1)
+    if svc.counters.rx_frames != FRAME_RING_CAP or svc.pending_count() != 1
+        return 4
+    # The ring is full again when the timer is due.
+    for i in 0..FRAME_RING_CAP
+        drv_foreign(60)
+    if svc.service(first_deadline).is_err()
+        return 5
+    # The retransmit fired: a second discover, queued behind the filler,
+    # and the next retransmit is armed past now.
+    if svc.pending_count() != 2 or svc.dhcp.xid != xid_before
+        return 6
+    match svc.dhcp.next_deadline()
+        Some(d) =>
+            if d <= first_deadline
+                return 7
+        None => return 7
+    if svc.wait_mask() != (EVENT_DATA | EVENT_SPACE)
+        return 8
+    # SPACE with no RX frame: the queued frames leave, the discover last.
+    let rx_before = svc.counters.rx_frames
+    drv_take_all()
+    svc.service(first_deadline + 1)
+    if svc.counters.rx_frames != rx_before or svc.pending_count() != 0
+        return 9
+    if drv_take() != 60 or got()[59] != 9
+        return 10
+    if drv_take() == 0 or not got_is_dhcp(1)
+        return 11
+    0
+
+[[test]]
+fn test_rx_pass_stops_at_the_budget_and_does_not_park() -> i32
+    let svc = started(0)
+    drv_take_all()
+    for i in 0..FRAME_RING_CAP
+        drv_foreign(60)
+    svc.service(1)
+    # Exactly one ring's worth taken: the pass cannot know the ring is
+    # empty, so the next wait checks once.
+    if svc.counters.rx_frames != RX_BUDGET as u64 or svc.deadline(1) != 0
+        return 1
+    svc.service(2)
+    if svc.deadline(2) == 0
+        return 2
+    0
+
+# ---------------------------------------------------------------------------
+# ARP and ICMP through the loop
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_arp_request_for_us_is_answered_once_configured() -> i32
+    let svc = started(0)
+    drv_take_all()
+    # Unconfigured: not answered.
+    drv_arp(1, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], PEER_IP, peer_mac(), OUR_IP)
+    svc.service(1)
+    if drv_take() != 0
+        return 1
+    let b = bound(0)
+    drv_arp(1, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], PEER_IP, peer_mac(), OUR_IP)
+    b.service(10)
+    if drv_take() != 42 or be16_get(got(), 12) != 0x0806
+        return 2
+    if not mac_eq(got_mac(0), peer_mac()) or be16_get(got(), 14 + 6) != 2
+        return 3
+    0
+
+[[test]]
+fn test_echo_request_is_answered_through_a_cached_hop() -> i32
+    let svc = bound(0)
+    # The peer ARPs us first, so it is cached.
+    drv_arp(1, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], PEER_IP, peer_mac(), OUR_IP)
+    svc.service(10)
+    drv_take_all()
+    drv_ping(PEER_IP, peer_mac())
+    svc.service(20)
+    if drv_take() == 0 or be16_get(got(), 12) != 0x0800 or got()[14 + 9] != 1
+        return 1
+    if not mac_eq(got_mac(0), peer_mac()) or got_ip_dst() != PEER_IP
+        return 2
+    # Type 0, echo reply.
+    if got()[14 + 20] != 0
+        return 3
+    0
+
+[[test]]
+fn test_echo_reply_waits_for_arp_and_leaves_on_the_reply() -> i32
+    let svc = bound(0)
+    # An uncached requester: the reply waits and a broadcast request goes.
+    drv_ping(PEER_IP, peer_mac())
+    svc.service(10)
+    if drv_take() != 42 or not mac_is_broadcast(got_mac(0)) or be16_get(got(), 14 + 6) != 1
+        return 1
+    if drv_take() != 0
+        return 2
+    # The ARP reply resolves the hop and releases the echo reply.
+    drv_arp(2, our_mac(), PEER_IP, peer_mac(), OUR_IP)
+    svc.service(20)
+    if drv_take() == 0 or got()[14 + 20] != 0 or not mac_eq(got_mac(0), peer_mac())
+        return 3
+    0
+
+[[test]]
+fn test_arp_give_up_drops_the_waiting_frame() -> i32
+    let svc = bound(0)
+    drv_ping(PEER_IP, peer_mac())
+    svc.service(10)
+    drv_take_all()
+    # The ARP timer is the nearest deadline.
+    if svc.deadline(10) != ARP_RETRY_INTERVAL_MS
+        return 1
+    var now: u64 = 10
+    for i in 0..ARP_RETRY_LIMIT
+        now += ARP_RETRY_INTERVAL_MS
+        svc.service(now)
+        if drv_take() != 42
+            return 2
+    now += ARP_RETRY_INTERVAL_MS
+    svc.service(now)
+    if drv_take() != 0 or svc.counters.arp_drops != 1
+        return 3
+    0
+
+[[test]]
+fn test_foreign_and_unbound_frames_are_dropped() -> i32
+    let svc = bound(0)
+    drv_foreign(60)
+    let f: [u8] = @g_frame
+    let body: [u8] = "x"
+    match udp_frame_write(f, server_link(), our_mac(), SERVER_IP, OUR_IP, 4000, 5000, body)
+        Ok(len) => drv_publish(f[0..len])
+        Err(_) => return 1
+    svc.service(10)
+    if svc.counters.rx_drops != 1 or svc.counters.udp_unbound != 1
+        return 2
+    if drv_take() != 0
+        return 3
+    0
+
+# ---------------------------------------------------------------------------
+# Wakes
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_wake_of_sorts_the_frame_object_events() -> i32
+    var evs: [3]WaitEvent
+    evs[0] = WaitEvent { handle: FRAME_HANDLE, bits: EVENT_DATA | EVENT_SPACE, _pad: 0 }
+    evs[1] = WaitEvent { handle: 99, bits: EVENT_ATTACH | EVENT_DRIVER_GONE, _pad: 0 }
+    evs[2] = WaitEvent { handle: FRAME_HANDLE, bits: EVENT_LINK, _pad: 0 }
+    let w = wake_of(@evs, FRAME_HANDLE)
+    if w.gone or not w.link
+        return 1
+    evs[2] = WaitEvent { handle: FRAME_HANDLE, bits: EVENT_DRIVER_GONE, _pad: 0 }
+    if not wake_of(@evs, FRAME_HANDLE).gone
+        return 2
+    evs[2] = WaitEvent { handle: FRAME_HANDLE, bits: EVENT_PEER_CLOSE, _pad: 0 }
+    let pc = wake_of(@evs, FRAME_HANDLE)
+    if not pc.gone or pc.link
+        return 3
+    # Another handle's bits are not the frame object's.
+    let all: [WaitEvent] = @evs
+    let none = wake_of(all[1..2], FRAME_HANDLE)
+    if none.gone or none.link
+        return 4
+    0

@@ -814,3 +814,72 @@ fn test_payload_write_bounds_and_needs() -> i32
                 return 8
         Ok(_) => return 9
     0
+
+# ---------------------------------------------------------------------------
+# next_deadline (AGAST #4743): the one timer the service's ShmWait wakes for.
+
+fn next_is(c: DhcpClient, at: u64) -> bool
+    match c.next_deadline()
+        Some(d) => d == at
+        None => false
+
+[[test]]
+fn test_next_deadline_follows_the_state() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    # Idle before start: nothing to wake for.
+    if c.next_deadline().is_some()
+        return 1
+    # Selecting and Requesting: the retransmit.
+    c.start(0, NO_JITTER)
+    if not next_is(c, 4000)
+        return 2
+    c.receive(offer(SERVER_A, XID), 1000, NO_JITTER)
+    if not next_is(c, 5000)
+        return 3
+    # Bound: T1 (half the 3600 s lease, from the request at 1000 ms).
+    c.receive(ack(SERVER_A, XID, 3600), 1500, NO_JITTER)
+    if c.state != DhcpState.Bound or not next_is(c, 1000 + 1800000)
+        return 4
+    # Renewing: T1 has passed and is not a deadline again; the renew
+    # retransmit comes before T2.
+    let t1 = 1000 + 1800000
+    c.tick(t1, NO_JITTER)
+    if c.state != DhcpState.Renewing
+        return 5
+    match c.next_deadline()
+        Some(d) =>
+            if d <= t1 or d > 1000 + 3150000
+                return 6
+        None => return 7
+    # Rebinding: T2 has passed; the next is the rebind retransmit or expiry.
+    let t2 = 1000 + 3150000
+    c.tick(t2, NO_JITTER)
+    if c.state != DhcpState.Rebinding
+        return 8
+    match c.next_deadline()
+        Some(d) =>
+            if d <= t2 or d > 1000 + 3600000
+                return 9
+        None => return 10
+    # Link down: Idle with no restart pending.
+    c.link_down()
+    if c.next_deadline().is_some()
+        return 11
+    0
+
+[[test]]
+fn test_next_deadline_of_an_infinite_lease_is_none() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    c.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    c.receive(ack(SERVER_A, XID, 0xFFFFFFFF), 0, NO_JITTER)
+    if c.state != DhcpState.Bound or c.next_deadline().is_some()
+        return 1
+    # A NAK's restart is a deadline in Idle.
+    var n = DhcpClient.new(our_mac(), XID)
+    n.start(0, NO_JITTER)
+    n.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    n.receive(nak(SERVER_A, XID), 100, NO_JITTER)
+    if n.state != DhcpState.Idle or not next_is(n, 4100)
+        return 2
+    0

@@ -1,0 +1,249 @@
+# /bin/netd: the ring-2 network service (AGAST #4743, harland
+# docs/RING2_NET.md "Service wait", "Frame seat", "Address publication")
+#
+# A CPL-3 process the kernel spawns on a translating boot, after the ring-1
+# driver (the frame-seat handoff, AGAST #4744: nothing spawns it yet). It
+# holds two CAP_TYPE_SHM handles, the frame object and its address page,
+# and no MMIO, IRQ or port I/O:
+#
+#   1. Copy the boot record (driver_abi.boot ServiceBoot) out of the
+#      address page the kernel mapped at DRV_RING_BASE, and check it.
+#   2. ShmMap the address page (it must be the page at DRV_RING_BASE) and
+#      the frame object.
+#   3. Take the link snapshot (NetInfo, 224) the driver published, waiting
+#      for LINK if it has not yet.
+#   4. Ready: publish the cleared record (generation 2, configured 0) and
+#      NetPublish it, then start DHCP if the link is up.
+#   5. Loop: one service pass (src/netsvc.ritz), DATA to the driver when
+#      TX slots were published, NetPublish when the record changed, then one
+#      ShmWait over the frame object (DATA, and SPACE only while the
+#      pending-TX queue holds a frame) and the inbox, with the deadline at
+#      the nearest protocol timer.
+#
+# DRIVER_GONE or PEER_CLOSE on the frame object ends the service: this
+# cutover does not replace a dead driver. An ATTACH record (an app's
+# exchange) is dropped with CapRevoke, so the app sees PEER_CLOSE, until
+# the app exchange is served.
+#
+# The clock: Harland has no user clock syscall, so netd reads the TSC
+# (CR4.TSD is clear) and divides by the kernel's calibration, which the
+# boot record carries.
+
+import ritzlib.strview { StrView }
+import ritzlib.errno { Errno, errno_from_raw }
+import ritzlib.sys { syscall1, syscall2 }
+import driver_abi.boot { ServiceBoot, DRV_RING_BASE, SERVICE_BOOT_MAGIC, SERVICE_BOOT_TSC_MIN_HZ, service_boot_at }
+import driver_abi.link { NetInfo }
+import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_DATA, EVENT_ATTACH, WAIT_OUT_CAP }
+import system.netsvc { NetSvc, Wake, WAIT_IDLE_MS, wake_of }
+
+# ============================================================================
+# Syscalls (harland numbers; netd is their one ring-2 caller)
+# ============================================================================
+
+const NR_CAP_REVOKE: i64 = 41
+const NR_NET_INFO: i64 = 224
+const NR_NET_PUBLISH: i64 = 226
+const NR_SHM_MAP: i64 = 227
+const NR_SHM_WAIT: i64 = 229
+const NR_SHM_NOTIFY: i64 = 230
+
+# ENODEV: ritzlib's Errno has no variant for it, so it arrives as Other(19).
+const ENODEV: i32 = 19
+
+fn is_nodev(e: Errno) -> bool
+    match e
+        Errno.Other(n) => n == ENODEV
+        _ => false
+
+fn sys_result(r: i64) -> Result<u64, Errno>
+    if r < 0
+        return Err(errno_from_raw(r as i32))
+    Ok(r as u64)
+
+fn shm_map(h: u64) -> Result<u64, Errno>
+    sys_result(syscall1(NR_SHM_MAP, h as i64))
+
+# Post `bits` to the driver's latch. NoDev (the driver is gone) is the
+# DRIVER_GONE the next wait returns, not an error here.
+fn shm_notify(h: u64, bits: u32)
+    match sys_result(syscall2(NR_SHM_NOTIFY, h as i64, bits as i64))
+        Ok(_) => pass
+        Err(_) => pass
+
+fn net_publish(h: u64) -> Result<u64, Errno>
+    sys_result(syscall1(NR_NET_PUBLISH, h as i64))
+
+# The kernel's link snapshot; NoDev until the driver has published.
+fn net_info() -> Result<NetInfo, Errno>
+    var info = NetInfo { mac: [0, 0, 0, 0, 0, 0], link_up: 0, device_type: 0, mtu: 0 }
+    sys_result(syscall1(NR_NET_INFO, @info as i64))?
+    Ok(info)
+
+# What a ShmWait that did not fail saw.
+enum Woke
+    Deadline                         # 1: nothing matched before the deadline
+    Events(u32)                      # 2: this many WaitEvents in g_events
+
+fn shm_wait(req: *WaitRequest) -> Result<Woke, Errno>
+    let r: u64 = sys_result(syscall1(NR_SHM_WAIT, req as i64))?
+    if r == 1
+        return Ok(Woke.Deadline)
+    Ok(Woke.Events(req.out_count))
+
+# Drop handle `h`. One the kernel already dropped is not an error.
+fn cap_revoke(h: u64)
+    match sys_result(syscall1(NR_CAP_REVOKE, h as i64))
+        Ok(_) => pass
+        Err(_) => pass
+
+# ============================================================================
+# The clock
+# ============================================================================
+
+var g_tsc_per_ms: u64 = 1
+
+fn rdtsc() -> u64
+    var low: u32 = 0
+    var high: u32 = 0
+    var low_ptr: *u32 = @low
+    var high_ptr: *u32 = @high
+    asm x86_64:
+        rdtsc
+        movq {low_ptr}, %r8
+        movl %eax, (%r8)
+        movq {high_ptr}, %r8
+        movl %edx, (%r8)
+    ((high as u64) << 32) | (low as u64)
+
+# Milliseconds on the TSC: any epoch, monotonic on this CPU (processes run
+# on the BSP only).
+fn now_ms() -> u64
+    rdtsc() / g_tsc_per_ms
+
+# ============================================================================
+# State
+# ============================================================================
+
+var g_boot: ServiceBoot
+var g_svc: NetSvc
+var g_sources: [1]WaitSource
+var g_events: [8]WaitEvent
+
+# Why netd exits before it ever serves. The status is 10 + the position.
+enum InitError
+    Boot                             # 10: no ServiceBoot, or an unusable TSC rate
+    Addr(Errno)                      # 11: the address page is not the page at DRV_RING_BASE
+    Frame(Errno)                     # 12: the frame object would not map
+    Link(Errno)                      # 13: no link snapshot, or the wait for one failed
+    Gone                             # 14: the driver went away before a snapshot
+    Publish(Errno)                   # 15: NetPublish refused the ready generation
+
+fn init_status(e: InitError) -> i32
+    match e
+        InitError.Boot => 10
+        InitError.Addr(_) => 11
+        InitError.Frame(_) => 12
+        InitError.Link(_) => 13
+        InitError.Gone => 14
+        InitError.Publish(_) => 15
+
+# 1-2. The boot record, copied once into private memory, and both
+# mappings. Returns the frame region's address.
+fn read_boot() -> Result<u64, InitError>
+    g_boot = *service_boot_at(DRV_RING_BASE)
+    if g_boot.magic != SERVICE_BOOT_MAGIC or g_boot.tsc_hz < SERVICE_BOOT_TSC_MIN_HZ
+        return Err(InitError.Boot)
+    match shm_map(g_boot.addr)
+        Ok(va) =>
+            if va != DRV_RING_BASE
+                return Err(InitError.Addr(Errno.Inval))
+        Err(e) => return Err(InitError.Addr(e))
+    g_tsc_per_ms = g_boot.tsc_hz / 1000
+    match shm_map(g_boot.frame)
+        Ok(va) => Ok(va)
+        Err(e) => Err(InitError.Frame(e))
+
+# One wait over the frame object with `mask` and the inbox, at most
+# `deadline` ms. ATTACH records are revoked here (no app exchange yet).
+fn wait_once(mask: u32, deadline: u64) -> Result<Wake, Errno>
+    g_sources[0] = WaitSource { handle: g_boot.frame, mask: mask, _pad: 0 }
+    var req: WaitRequest
+    req.sources = @g_sources[0]
+    req.source_count = 1
+    req.out_cap = WAIT_OUT_CAP
+    req.out = @g_events[0]
+    req.deadline = deadline
+    req.out_count = 0
+    req._pad = 0
+    match shm_wait(@req)?
+        Woke.Deadline => Ok(Wake { gone: false, link: false })
+        Woke.Events(n) =>
+            let events: [WaitEvent] = @g_events
+            let got = events[0..n as i64]
+            for i in 0..got.len
+                if (got[i].bits & EVENT_ATTACH) != 0 and got[i].handle != g_boot.frame
+                    cap_revoke(got[i].handle)
+            Ok(wake_of(got, g_boot.frame))
+
+# 3. The driver's link snapshot, waiting for its LINK post if NetInfo is
+# not published yet.
+fn first_link() -> Result<NetInfo, InitError>
+    while true
+        match net_info()
+            Ok(info) => return Ok(info)
+            Err(e) =>
+                if not is_nodev(e)
+                    return Err(InitError.Link(e))
+        match wait_once(EVENT_DATA, WAIT_IDLE_MS)
+            Ok(w) =>
+                if w.gone
+                    return Err(InitError.Gone)
+            Err(e) => return Err(InitError.Link(e))
+
+fn bring_up() -> Result<(), InitError>
+    let region: u64 = read_boot()?
+    g_svc.init(region, DRV_RING_BASE, (rdtsc() & 0xFFFFFFFF) as u32)
+    let link: NetInfo = first_link()?
+    # 4. Ready, then DHCP.
+    g_svc.ready(link)
+    g_svc.take_publish_due()
+    match net_publish(g_boot.addr)
+        Ok(_) => pass
+        Err(e) => return Err(InitError.Publish(e))
+    g_svc.set_link(link, now_ms())
+    Ok(())
+
+pub fn main(args: Span<StrView>) -> i32
+    match bring_up()
+        Ok(_) => pass
+        Err(e) =>
+            let code: i32 = init_status(e)
+            print("[netd] bring-up failed: exit {code}\n")
+            return code
+    print("[netd] ready: generation 2 published\n")
+    while true
+        let now = now_ms()
+        match g_svc.service(now)
+            Ok(_) => pass
+            Err(_) =>
+                print("[netd] frame ring closed: impossible driver index\n")
+                return 2
+        if g_svc.take_published() > 0
+            shm_notify(g_boot.frame, EVENT_DATA)
+        if g_svc.take_publish_due()
+            match net_publish(g_boot.addr)
+                Ok(_) => pass
+                Err(_) => g_svc.publish_failed()
+        match wait_once(g_svc.wait_mask(), g_svc.deadline(now))
+            Ok(w) =>
+                if w.gone
+                    print("[netd] driver gone: exiting\n")
+                    return 0
+                if w.link
+                    match net_info()
+                        Ok(info) => g_svc.set_link(info, now_ms())
+                        Err(_) => pass
+            Err(_) =>
+                print("[netd] ShmWait failed: exiting\n")
+                return 1

@@ -12,7 +12,7 @@
 import driver_abi.frame_ring { FrameDesc, SpscCtrl, FRAME_RING_CAP, FRAME_RING_MASK, FRAME_MAX, FRAME_F_NONE, FRAME_ARENA_SIZE, FRAME_REGION_SIZE, FRAME_RX_CTRL_OFF, FRAME_TX_CTRL_OFF, FRAME_UNUSED_OFF, FRAME_ADVISORY_OFF, FRAME_RX_DESC_OFF, FRAME_TX_DESC_OFF, FRAME_RX_ARENA_OFF, FRAME_TX_ARENA_OFF, CACHE_LINE }
 import driver_abi.wait { WaitSource, WaitEvent, WaitRequest, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_RESERVED_32, EVENT_ATTACH, EVENT_USER_MASK, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS, SHM_DETACH_TIMEOUT_MS, APP_EXCHANGE_SIZE }
 import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
-import driver_abi.boot { DriverBoot, DriverWindow, DRV_RING_BASE, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_NOTIFY, VIRTIO_WINDOW_ISR, VIRTIO_WINDOW_DEVICE, driver_boot_at }
+import driver_abi.boot { DriverBoot, DriverWindow, DRV_RING_BASE, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_NOTIFY, VIRTIO_WINDOW_ISR, VIRTIO_WINDOW_DEVICE, driver_boot_at, ServiceBoot, SERVICE_BOOT_MAGIC, SERVICE_BOOT_TSC_MIN_HZ, ADDR_BOOT_OFF, service_boot_at }
 import driver_abi.link { NetInfo, NetAddr, LINK_INFO_OFF, LINK_SEQ_OFF, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, NETINFO_MTU_MAX, NETDEV_TYPE_VIRTIO, ETH_HEADER_LEN, ADDR_RECORD_OFF, ADDR_SEQ_OFF }
 
 var g_desc: FrameDesc
@@ -24,6 +24,7 @@ var g_dma: DmaAlloc
 var g_net: NetInfo
 var g_addr: NetAddr
 var g_boot: DriverBoot
+var g_sboot: ServiceBoot
 
 fn off(field: u64, base: u64) -> u64
     return field - base
@@ -346,4 +347,34 @@ fn test_driver_boot_fits_advisory_span() -> i32
         return 1
     if FRAME_ADVISORY_OFF + (sizeof(DriverBoot) as u64) > FRAME_RX_DESC_OFF
         return 2
+    return 0
+
+# ---------------------------------------------------------------------------
+# The ring-2 service's boot record (AGAST #4743)
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_service_boot_layout() -> i32
+    if sizeof(ServiceBoot) != 32
+        return 1
+    let b: u64 = @g_sboot as u64
+    if off(@g_sboot.magic as u64, b) != 0 or off(@g_sboot.frame as u64, b) != 8
+        return 2
+    if off(@g_sboot.addr as u64, b) != 16 or off(@g_sboot.tsc_hz as u64, b) != 24
+        return 3
+    # "NSB1" in memory order; a millisecond is at least 1000 ticks.
+    if SERVICE_BOOT_MAGIC != 0x3142534E or SERVICE_BOOT_TSC_MIN_HZ != 1000000
+        return 4
+    return 0
+
+[[test]]
+fn test_service_boot_fits_past_the_address_record() -> i32
+    # Past NetAddr and the seqlock word, which NetPublish samples, and
+    # inside the one page.
+    if ADDR_BOOT_OFF < ADDR_SEQ_OFF + 8 or ADDR_RECORD_OFF + (sizeof(NetAddr) as u64) > ADDR_BOOT_OFF
+        return 1
+    if ADDR_BOOT_OFF + (sizeof(ServiceBoot) as u64) > 4096
+        return 2
+    if service_boot_at(0x10000) as u64 != 0x10000 + ADDR_BOOT_OFF
+        return 3
     return 0

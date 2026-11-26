@@ -67,3 +67,50 @@ pub struct DriverBoot
 # The record's address in a frame region mapped at `region`.
 pub fn driver_boot_at(region: u64) -> *DriverBoot
     (region + FRAME_ADVISORY_OFF) as *DriverBoot
+
+# ============================================================================
+# The ring-2 service's boot record (AGAST #4743, docs/RING2_NET.md "Service
+# binary and respawn")
+# ============================================================================
+#
+# What /bin/netd is handed besides its capabilities. netd holds no frame
+# region's advisory span of its own (that span is the driver's DriverBoot),
+# so the record lives in netd's address page instead: before netd first
+# runs, the kernel maps that page into it at DRV_RING_BASE (the ShmMap path,
+# so it is the process's first shared mapping) and writes one ServiceBoot at
+# ADDR_BOOT_OFF, past the NetAddr record and its seqlock word. The kernel's
+# NetPublish samples only the record and the word, never these bytes.
+#
+# Harland has no user clock (ShmWait's deadline is relative for that
+# reason), and netd runs DHCP and ARP timers, so the record also carries the
+# kernel's TSC calibration: netd reads the TSC (CR4.TSD is clear) and
+# divides by tsc_hz / 1000 for its millisecond clock.
+#
+# As with DriverBoot the record is advisory, never authority: a handle netd
+# does not hold is Errno.Perm whatever the record says. netd copies it into
+# private memory once, before it publishes anything, and checks the copy
+# (the magic, a usable tsc_hz, the address handle's ShmMap returning
+# DRV_RING_BASE).
+
+# ServiceBoot.magic: "NSB1", the first layout.
+pub const SERVICE_BOOT_MAGIC: u32 = 0x3142534E
+
+# The record's offset in the address page: the first cache line past
+# NetAddr (0x00..0x20) and the seqlock word (0x20..0x28).
+pub const ADDR_BOOT_OFF: u64 = 0x40
+
+# The slowest TSC netd accepts: 1 MHz, so a millisecond is at least 1000
+# ticks and the clock never divides by zero.
+pub const SERVICE_BOOT_TSC_MIN_HZ: u64 = 1000000
+
+# The record at ADDR_BOOT_OFF of the address page.
+pub struct ServiceBoot
+    magic: u32                       # SERVICE_BOOT_MAGIC
+    _pad: u32
+    frame: u64                       # CAP_TYPE_SHM: the frame object
+    addr: u64                        # CAP_TYPE_SHM with CAP_RIGHT_PUBLISH: this page
+    tsc_hz: u64                      # the kernel's calibrated TSC rate
+
+# The record's address in an address page mapped at `page`.
+pub fn service_boot_at(page: u64) -> *ServiceBoot
+    (page + ADDR_BOOT_OFF) as *ServiceBoot
