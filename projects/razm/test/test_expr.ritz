@@ -1,0 +1,304 @@
+# razm expressions: GNU as precedence, 64-bit two's complement, and the
+# Absolute / Relocatable / error classification (DESIGN.md "Text razm
+# accepts"). Each case parses `.quad <expr>` after some setup lines and
+# evaluates the value the parser kept.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new, string_from }
+import razm.expr { Expr, ExprError, ExprErrorKind, SymDef, Value, eval }
+import razm.insn { Insn, Operand }
+import razm.parse { Item, ParseError, Program, Stmt, parse }
+
+const I64_MIN: i64 = -9223372036854775807 - 1
+
+fn source(setup: StrView, expr: StrView) -> String
+    var text: String = string_from(setup)
+    text.push_str("\n.quad ")
+    text.push_str(expr)
+    text.push('\n')
+    text
+
+# The last `.quad`'s value, with each label in `labels` (as `name@offset`,
+# all in section 0, or `name@s1:offset` in section 1) laid out.
+[[test_helper]]
+fn value_in(p: @&Program, labels: Vec<StrView>) -> Result<Value, ExprError>
+    for i in 0..labels.len
+        let spec: StrView = labels.get(i)
+        let at: i64 = spec.find_byte('@')
+        let name: StrView = spec.take(at)
+        var place: StrView = spec.skip(at + 1)
+        var section: i64 = 0
+        if place.starts_with("s1:")
+            section = 1
+            place = place.skip(3)
+        var offset: i64 = 0
+        match place.parse_i64()
+            Some(n) => offset = n
+            None =>
+                assert false
+        p.syms.define(name, SymDef.Label(section, offset))
+    p.syms.set_here(SymDef.Label(0, 100))
+    let last: Stmt = p.stmts.get(p.stmts.len - 1)
+    match last.item
+        Item.Data(_, e) => eval(@p.exprs, e, @p.syms)
+        _ => eval(@p.exprs, p.exprs.num(0), @p.syms)
+
+[[test_helper]]
+fn eval_text(setup: StrView, expr: StrView, labels: Vec<StrView>) -> Result<Value, ExprError>
+    let text: String = source(setup, expr)
+    match parse(text.as_view())
+        Ok(prog) =>
+            var p: Program = prog
+            value_in(@&p, labels)
+        Err(e) =>
+            let line: i64 = e.line
+            print("parse failed at {line}: {e.what.as_view()}\n")
+            assert false
+            Err(ExprError { kind: ExprErrorKind.DivideByZero, sym: "", op: "" })
+
+fn no_labels() -> Vec<StrView>
+    vec_new<StrView>()
+
+# The absolute value of `expr` after `setup`.
+[[test_helper]]
+fn abs_value(setup: StrView, expr: StrView) -> i64
+    match eval_text(setup, expr, no_labels())
+        Ok(v) =>
+            match v
+                Absolute(n) => return n
+                Relocatable(r) =>
+                    print("relocatable against {r.sym}\n")
+                    assert false
+        Err(e) =>
+            print("eval failed: {e.message().as_view()}\n")
+            assert false
+    0
+
+# The error `expr` evaluates to, with `labels` laid out.
+[[test_helper]]
+fn eval_error(setup: StrView, expr: StrView, labels: Vec<StrView>) -> ExprErrorKind
+    match eval_text(setup, expr, labels)
+        Ok(_) =>
+            print("`{expr}` evaluated, expected an error\n")
+            assert false
+            ExprErrorKind.DivideByZero
+        Err(e) => e.kind
+
+# The parse error message for `text`.
+[[test_helper]]
+fn parse_error(text: StrView) -> String
+    match parse(text)
+        Ok(_) =>
+            print("`{text}` parsed, expected an error\n")
+            assert false
+            string_new()
+        Err(e) => e.what
+
+fn labels2(a: StrView, b: StrView) -> Vec<StrView>
+    var v: Vec<StrView> = vec_new<StrView>()
+    v.push(a)
+    v.push(b)
+    v
+
+# --- precedence --------------------------------------------------------------
+
+[[test]]
+fn test_or_binds_tighter_than_add() -> i32
+    # GNU as: `a + b | c` is `a + (b | c)`.
+    assert abs_value(".set a, 1\n.set b, 1\n.set c, 2", "a + b | c") == 4
+    assert abs_value(".set a, 1\n.set b, 1\n.set c, 2", "(a + b) | c") == 2
+    assert abs_value("", "1 | 2 + 4") == 7
+    0
+
+[[test]]
+fn test_mul_div_shl_share_a_level_left_to_right() -> i32
+    assert abs_value("", "2 + 3 * 4") == 14
+    assert abs_value("", "1 << 2 * 3") == 12        # (1 << 2) * 3
+    assert abs_value("", "8 / 2 << 1") == 8         # (8 / 2) << 1
+    assert abs_value("", "3 * 1 << 4") == 48
+    assert abs_value("", "10 - 4 - 3") == 3         # left-associative
+    0
+
+[[test]]
+fn test_unary_minus_binds_tightest() -> i32
+    assert abs_value("", "-2 * 3") == -6
+    assert abs_value("", "-(1 + 2)") == -3
+    assert abs_value("", "- -5") == 5
+    assert abs_value("", "4 - -1") == 5
+    0
+
+# --- the corpus's real expressions ---------------------------------------------
+
+[[test]]
+fn test_kernel_cs_selector() -> i32
+    let setup: StrView = ".set KERNEL_CS, 0x08\n.set SYSRET_BASE, 0x10"
+    assert abs_value(setup, "(KERNEL_CS | (SYSRET_BASE << 16))") == 0x100008
+    0
+
+[[test]]
+fn test_multiboot_checksum() -> i32
+    let setup: StrView = "multiboot_header:\n.long 0xE85250D6\n.long 0\nmultiboot_header_end:"
+    let labels: Vec<StrView> = labels2("multiboot_header@0", "multiboot_header_end@24")
+    match eval_text(setup, "-(0xE85250D6 + 0 + (multiboot_header_end - multiboot_header))", labels)
+        Ok(v) =>
+            match v
+                Absolute(n) =>
+                    assert n == 0 - (0xE85250D6 + 24)
+                    # The header's four longs sum to 0 mod 2^32.
+                    assert ((0xE85250D6 + 0 + 24 + n) & 0xFFFFFFFF) == 0
+                Relocatable(_) =>
+                    assert false
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_corpus_shift_and_divide() -> i32
+    assert abs_value("", "(1 << 31)") == 2147483648
+    assert abs_value("", "(4096 * 4 / 4)") == 4096
+    assert abs_value(".set KERNEL_VIRT_BASE, 0xFFFFFFFF80000000", "KERNEL_VIRT_BASE") == -2147483648
+    0
+
+[[test]]
+fn test_character_literal() -> i32
+    assert abs_value("", "'K'") == 75
+    assert abs_value("", "'\\\\'") == 92
+    0
+
+# --- 64-bit two's complement -------------------------------------------------
+
+[[test]]
+fn test_division_truncates_toward_zero() -> i32
+    assert abs_value("", "-7 / 2") == -3
+    assert abs_value("", "7 / -2") == -3
+    assert abs_value("", "-7 / -2") == 3
+    0
+
+[[test]]
+fn test_arithmetic_wraps_at_64_bits() -> i32
+    assert abs_value("", "0x7fffffffffffffff + 1") == I64_MIN
+    assert abs_value("", "0xffffffffffffffff") == -1
+    assert abs_value("", "18446744073709551615") == -1
+    assert abs_value("", "(-0x7fffffffffffffff - 1) / -1") == I64_MIN
+    assert abs_value("", "0x4000000000000000 * 4") == 0
+    assert abs_value("", "1 << 63") == I64_MIN
+    assert abs_value("", "1 << 64") == 0
+    0
+
+[[test]]
+fn test_divide_by_zero_is_an_error() -> i32
+    match eval_error("", "1 / 0", no_labels())
+        DivideByZero => pass
+        _ =>
+            assert false
+    let what: String = parse_error(".space 4 / (2 - 2)")
+    assert what.contains("division by zero")
+    0
+
+# --- classification ----------------------------------------------------------
+
+[[test]]
+fn test_symbol_plus_absolute_is_relocatable() -> i32
+    match eval_text("", "4 + ext - 1", no_labels())
+        Ok(v) =>
+            match v
+                Relocatable(r) =>
+                    assert r.sym.eq("ext")
+                    assert r.addend == 3
+                Absolute(_) =>
+                    assert false
+        Err(_) =>
+            assert false
+    match eval_text("", "ext - 8", no_labels())
+        Ok(v) =>
+            match v
+                Relocatable(r) =>
+                    assert r.addend == -8
+                Absolute(_) =>
+                    assert false
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_same_section_difference_is_absolute() -> i32
+    match eval_text("", "(b - a) * 2 + 1", labels2("a@8", "b@20"))
+        Ok(v) =>
+            match v
+                Absolute(n) =>
+                    assert n == 25
+                Relocatable(_) =>
+                    assert false
+        Err(_) =>
+            assert false
+    # `.` is the current location (offset 100 in section 0 here).
+    match eval_text("", ". - a", labels2("a@8", "b@20"))
+        Ok(v) =>
+            match v
+                Absolute(n) =>
+                    assert n == 92
+                Relocatable(_) =>
+                    assert false
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_invalid_combinations_are_errors() -> i32
+    match eval_error("", "b - a", labels2("a@8", "b@s1:20"))
+        CrossSection => pass
+        _ =>
+            assert false
+    match eval_error("", "a + b", labels2("a@8", "b@20"))
+        SymbolPlusSymbol => pass
+        _ =>
+            assert false
+    match eval_error("", "a * 2", labels2("a@8", "b@20"))
+        SymbolOperand => pass
+        _ =>
+            assert false
+    match eval_error("", "a << 1", labels2("a@8", "b@20"))
+        SymbolOperand => pass
+        _ =>
+            assert false
+    match eval_error("", "ext | 1", no_labels())
+        SymbolOperand => pass
+        _ =>
+            assert false
+    match eval_error("", "-ext", no_labels())
+        SymbolOperand => pass
+        _ =>
+            assert false
+    match eval_error("", "1 - a", labels2("a@8", "b@20"))
+        SymbolOperand => pass
+        _ =>
+            assert false
+    match eval_error("", "ext - a", labels2("a@8", "b@20"))
+        UndefinedDifference => pass
+        _ =>
+            assert false
+    0
+
+# --- syntax ------------------------------------------------------------------
+
+[[test]]
+fn test_operators_outside_the_dialect_are_named() -> i32
+    assert parse_error(".quad 5 % 2").contains("operator `%`")
+    assert parse_error(".quad 1 & 2").contains("operator `&`")
+    assert parse_error(".quad 1 ^ 2").contains("operator `^`")
+    assert parse_error(".quad 8 >> 1").contains("operator `>>`")
+    assert parse_error(".quad ~1").contains("operator `~`")
+    assert parse_error(".quad 1 == 1").contains("operator `=`")
+    0
+
+[[test]]
+fn test_malformed_expressions_are_errors() -> i32
+    assert parse_error(".quad (1 + 2").contains("missing `)`")
+    assert parse_error(".quad 1 +").contains("ends early")
+    assert parse_error(".quad 0x").contains("hex digits")
+    assert parse_error(".quad 12abc").contains("`12abc`")
+    assert parse_error(".quad 18446744073709551616").contains("does not fit in 64 bits")
+    assert parse_error(".quad 1 2").contains("unexpected `2`")
+    0

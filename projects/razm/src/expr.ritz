@@ -1,0 +1,280 @@
+# expr: razm's expressions and their evaluation (DESIGN.md "Text razm
+# accepts").
+#
+# An expression is a tree of integer literals, symbol names, `.` (the current
+# location), unary `-` and the binary `*` `/` `<<` `|` `+` `-`. Its nodes live
+# in an `Exprs` arena and an `Expr` is a node's handle, so an expression, an
+# operand and an instruction are all copy types: encode and rllvm pass them
+# around freely, and the arena owns the one allocation.
+#
+# `eval` computes 64-bit two's-complement values and classifies the result:
+#
+# - Absolute: no symbol, or a difference `a - b` of two symbols defined in the
+#   same section, combined with constants by any operator;
+# - Relocatable: one symbol plus or minus an absolute value;
+# - anything else is an `ExprError`.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new }
+
+# A binary operator. Precedence (highest first) is GNU as's: unary `-`; then
+# `*`, `/`, `<<`; then `|`; then `+`, `-`. The parser builds the tree; the
+# enum only names the operation.
+pub enum BinOp
+    Mul
+    Div
+    Shl
+    Or
+    Add
+    Sub
+
+impl BinOp
+    pub fn spelling(self: BinOp) -> StrView
+        match self
+            Mul => "*"
+            Div => "/"
+            Shl => "<<"
+            Or => "|"
+            Add => "+"
+            Sub => "-"
+
+# A handle to one node of an `Exprs` arena.
+pub struct Expr
+    id: i64
+
+pub enum ExprNode
+    Num(i64)
+    Sym(StrView)
+    Here                        # `.`, the current location
+    Neg(Expr)
+    Bin(BinOp, Expr, Expr)
+
+# The nodes of every expression in one parse (or one rllvm function).
+pub struct Exprs
+    nodes: Vec<ExprNode>
+
+pub fn exprs_new() -> Exprs
+    Exprs { nodes: vec_new<ExprNode>() }
+
+impl Exprs
+    pub fn add(self: @&Exprs, node: ExprNode) -> Expr
+        self.nodes.push(node)
+        Expr { id: self.nodes.len - 1 }
+
+    pub fn num(self: @&Exprs, n: i64) -> Expr
+        self.add(ExprNode.Num(n))
+
+    pub fn sym(self: @&Exprs, name: StrView) -> Expr
+        self.add(ExprNode.Sym(name))
+
+    pub fn node(self: @Exprs, e: Expr) -> ExprNode
+        self.nodes.get(e.id)
+
+# What a symbol name means where an expression is evaluated.
+pub enum SymDef
+    Undefined
+    Constant(i64)               # `.set` / `.equ` / `=` to an absolute value
+    Label(i64, i64)             # section index, offset in that section
+    Unplaced(i64)               # a label in that section, offset not laid out yet
+
+struct SymEntry
+    name: StrView
+    def: SymDef
+
+# Symbol names to their definitions, and the location `.` stands for.
+pub struct SymTable
+    entries: Vec<SymEntry>
+    here: SymDef
+
+pub fn symtable_new() -> SymTable
+    SymTable { entries: vec_new<SymEntry>(), here: SymDef.Undefined }
+
+impl SymTable
+    pub fn lookup(self: @SymTable, name: StrView) -> SymDef
+        var i: i64 = self.entries.len - 1
+        while i >= 0
+            let e: SymEntry = self.entries.get(i)
+            if e.name.eq(name)
+                return e.def
+            i -= 1
+        SymDef.Undefined
+
+    # Define or redefine `name` (`.set` may redefine; the latest wins).
+    pub fn define(self: @&SymTable, name: StrView, def: SymDef)
+        var i: i64 = 0
+        while i < self.entries.len
+            let e: SymEntry = self.entries.get(i)
+            if e.name.eq(name)
+                self.entries.set(i, SymEntry { name: name, def: def })
+                return
+            i += 1
+        self.entries.push(SymEntry { name: name, def: def })
+
+    pub fn set_here(self: @&SymTable, def: SymDef)
+        self.here = def
+
+# A symbol plus an addend: what a relocation is made against.
+pub struct Reloc
+    sym: StrView
+    addend: i64
+
+pub enum Value
+    Absolute(i64)
+    Relocatable(Reloc)
+
+pub enum ExprErrorKind
+    DivideByZero
+    SymbolPlusSymbol            # `a + b`, both symbols
+    CrossSection                # `a - b` with a and b in different sections
+    UndefinedDifference         # `a - b` with either one undefined
+    SymbolOperand               # `*`, `/`, `<<`, `|` or unary `-` on a symbol
+    NotLaidOut                  # needs a label's offset, which is not known yet
+
+pub struct ExprError
+    kind: ExprErrorKind
+    sym: StrView                # the symbol involved, or ""
+    op: StrView                 # the operator involved, or ""
+
+impl ExprError
+    pub fn message(self: @ExprError) -> String
+        var out: String = string_new()
+        let sym: StrView = self.sym
+        let op: StrView = self.op
+        match self.kind
+            DivideByZero =>
+                format_into(@&out, "division by zero")
+            SymbolPlusSymbol =>
+                format_into(@&out, "two symbols added (`{sym}`)")
+            CrossSection =>
+                format_into(@&out, "difference of symbols in different sections (`{sym}`)")
+            UndefinedDifference =>
+                format_into(@&out, "difference with the undefined symbol `{sym}`")
+            SymbolOperand =>
+                format_into(@&out, "`{op}` applied to the symbol `{sym}`")
+            NotLaidOut =>
+                format_into(@&out, "`{sym}` has no offset yet: the value is not known before layout")
+        out
+
+# A partly evaluated value: absolute, or a symbol (`section` is -1 when the
+# symbol is undefined) with the label's offset `base` and an addend.
+enum Term
+    Abs(i64)
+    Rel(StrView, i64, i64, i64)     # symbol, section, base, addend
+
+fn expr_err(kind: ExprErrorKind, sym: StrView, op: StrView) -> ExprError
+    ExprError { kind: kind, sym: sym, op: op }
+
+fn term_of(name: StrView, def: SymDef) -> Result<Term, ExprError>
+    match def
+        Undefined => Ok(Term.Rel(name, -1, 0, 0))
+        Constant(n) => Ok(Term.Abs(n))
+        Label(section, offset) => Ok(Term.Rel(name, section, offset, 0))
+        Unplaced(section) => Err(expr_err(ExprErrorKind.NotLaidOut, name, ""))
+
+fn term_sym(t: Term) -> StrView
+    match t
+        Rel(sym, _, _, _) => sym
+        Abs(_) => ""
+
+# `/` is signed and truncates toward zero. The one quotient outside i64
+# (the minimum divided by -1) wraps to the minimum, as two's complement does.
+fn div_trunc(a: i64, b: i64) -> i64
+    if b == -1
+        return 0 -% a
+    a / b
+
+# `<<` shifts bits out; a count outside 0..63 shifts every bit out.
+fn shl64(a: i64, n: i64) -> i64
+    if n < 0 or n > 63
+        return 0
+    ((a as u64) << (n as u64)) as i64
+
+fn bin_abs(op: BinOp, a: i64, b: i64) -> Result<i64, ExprError>
+    match op
+        Mul => Ok(a *% b)
+        Div =>
+            if b == 0
+                return Err(expr_err(ExprErrorKind.DivideByZero, "", "/"))
+            Ok(div_trunc(a, b))
+        Shl => Ok(shl64(a, b))
+        Or => Ok(a | b)
+        Add => Ok(a +% b)
+        Sub => Ok(a -% b)
+
+fn add_terms(a: Term, b: Term) -> Result<Term, ExprError>
+    match a
+        Abs(x) =>
+            match b
+                Abs(y) => Ok(Term.Abs(x +% y))
+                Rel(sym, sec, base, add) => Ok(Term.Rel(sym, sec, base, add +% x))
+        Rel(sym, sec, base, add) =>
+            match b
+                Abs(y) => Ok(Term.Rel(sym, sec, base, add +% y))
+                Rel(other, _, _, _) => Err(expr_err(ExprErrorKind.SymbolPlusSymbol, other, "+"))
+
+fn sub_terms(a: Term, b: Term) -> Result<Term, ExprError>
+    match b
+        Abs(y) =>
+            match a
+                Abs(x) => Ok(Term.Abs(x -% y))
+                Rel(sym, sec, base, add) => Ok(Term.Rel(sym, sec, base, add -% y))
+        Rel(bsym, bsec, bbase, badd) =>
+            match a
+                Abs(_) => Err(expr_err(ExprErrorKind.SymbolOperand, bsym, "-"))
+                Rel(asym, asec, abase, aadd) =>
+                    if asec < 0
+                        return Err(expr_err(ExprErrorKind.UndefinedDifference, asym, "-"))
+                    if bsec < 0
+                        return Err(expr_err(ExprErrorKind.UndefinedDifference, bsym, "-"))
+                    if asec != bsec
+                        return Err(expr_err(ExprErrorKind.CrossSection, bsym, "-"))
+                    Ok(Term.Abs((abase +% aadd) -% (bbase +% badd)))
+
+fn eval_term(exprs: @Exprs, e: Expr, syms: @SymTable) -> Result<Term, ExprError>
+    match exprs.node(e)
+        Num(n) => Ok(Term.Abs(n))
+        Sym(name) => term_of(name, syms.lookup(name))
+        Here => term_of(".", syms.here)
+        Neg(inner) =>
+            let t: Term = eval_term(exprs, inner, syms)?
+            match t
+                Abs(n) => Ok(Term.Abs(0 -% n))
+                Rel(sym, _, _, _) => Err(expr_err(ExprErrorKind.SymbolOperand, sym, "-"))
+        Bin(op, l, r) =>
+            let a: Term = eval_term(exprs, l, syms)?
+            let b: Term = eval_term(exprs, r, syms)?
+            match op
+                Add => add_terms(a, b)
+                Sub => sub_terms(a, b)
+                Mul | Div | Shl | Or => abs_terms(op, a, b)
+
+# `*`, `/`, `<<` and `|` take absolute operands only.
+fn abs_terms(op: BinOp, a: Term, b: Term) -> Result<Term, ExprError>
+    match a
+        Rel(sym, _, _, _) => Err(expr_err(ExprErrorKind.SymbolOperand, sym, op.spelling()))
+        Abs(x) =>
+            match b
+                Rel(sym, _, _, _) => Err(expr_err(ExprErrorKind.SymbolOperand, sym, op.spelling()))
+                Abs(y) => Ok(Term.Abs(bin_abs(op, x, y)?))
+
+# Evaluate `e` against `syms`. A relocatable result names the symbol and the
+# addend; a label's own offset is the linker's (or the object writer's) to add.
+pub fn eval(exprs: @Exprs, e: Expr, syms: @SymTable) -> Result<Value, ExprError>
+    match eval_term(exprs, e, syms)?
+        Abs(n) => Ok(Value.Absolute(n))
+        Rel(sym, _, _, add) => Ok(Value.Relocatable(Reloc { sym: sym, addend: add }))
+
+# The first symbol `e` names that `syms` leaves undefined, if any. Operands
+# that must be absolute use it to name what was not defined earlier.
+pub fn first_undefined(exprs: @Exprs, e: Expr, syms: @SymTable) -> Option<StrView>
+    match exprs.node(e)
+        Sym(name) =>
+            match syms.lookup(name)
+                Undefined => Some(name)
+                _ => None
+        Neg(inner) => first_undefined(exprs, inner, syms)
+        Bin(_, l, r) =>
+            match first_undefined(exprs, l, syms)
+                Some(name) => Some(name)
+                None => first_undefined(exprs, r, syms)
+        _ => None

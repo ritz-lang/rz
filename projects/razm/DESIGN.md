@@ -52,11 +52,11 @@ Directives and assignments:
 - `.align N` is alignment to N bytes, which is how `as` reads it for x86-64 ELF. `.align 8` is 8 bytes. `.align 4096` is 4096 bytes.
 - `.set`, `.equ`, and `name = expr`.
 - `.byte`, `.word`, `.long`, `.quad`, `.ascii`, `.asciz`, `.space`.
-- `.macro` / `.endm` with `\param` and a macro body that calls another macro. `.rept` / `.endr` with a constant count.
+- `.macro` / `.endm` with `\param` and a macro body that calls another macro. Parameters are names; a call's arguments are separated by commas when it has any (`IRQ_STUB 1, 33`) and by whitespace otherwise (`SWAPGS_IF_USER_AT 8`), and a missing one is empty. `\()` separates a parameter from the text after it. `.rept` / `.endr` with a constant count.
 - `.incbin "path"`, relative to the working directory.
-- `#` through end of line is a comment. A label is `name:` or `.Lname:`. A numeric local label is `N:` and a reference is `Nb` / `Nf`.
+- `#` through end of line is a comment. A label is `name:`, `.Lname:`, or another name starting with `.` (`.setup_pd_loop:`). A numeric local label is `N:` and a reference is `Nb` / `Nf`.
 
-Expressions are integer literals (decimal and `0x`), symbol names, `.` for the current location, parentheses, unary `-`, and the binary operators `*`, `/`, `<<`, `|`, `+`, `-`. That is the set the corpus uses: the multiboot checksum `-(0xE85250D6 + 0 + (multiboot_header_end - multiboot_header))`, `$(1 << 31)`, `$(4096 * 4 / 4)`, `$(KERNEL_CS | (SYSRET_BASE << 16))`, and `.space PERCPU_SIZE * PERCPU_SLOTS`. Precedence is GNU as's, highest first: unary `-`; then `*`, `/`, `<<`; then `|`; then `+`, `-`. Binary operators are left-associative. Arithmetic is 64-bit two's complement. `/` is signed and truncates toward zero; division by zero is an error. Note that under these rules `a + b | c` is `a + (b | c)`.
+Expressions are integer literals (decimal and `0x`, up to 2^64 - 1), character literals (`movb $'K', %al` in `boot.s`), symbol names, `.` for the current location, parentheses, unary `-`, and the binary operators `*`, `/`, `<<`, `|`, `+`, `-`. That is the set the corpus uses: the multiboot checksum `-(0xE85250D6 + 0 + (multiboot_header_end - multiboot_header))`, `$(1 << 31)`, `$(4096 * 4 / 4)`, `$(KERNEL_CS | (SYSRET_BASE << 16))`, and `.space PERCPU_SIZE * PERCPU_SLOTS`. Precedence is GNU as's, highest first: unary `-`; then `*`, `/`, `<<`; then `|`; then `+`, `-`. Binary operators are left-associative. Arithmetic is 64-bit two's complement. `/` is signed and truncates toward zero; division by zero is an error. Note that under these rules `a + b | c` is `a + (b | c)`.
 
 An expression evaluates to one of three kinds:
 
@@ -64,7 +64,7 @@ An expression evaluates to one of three kinds:
 - Relocatable: one symbol plus or minus an absolute value. This becomes a relocation against that symbol (against the section symbol plus offset when the symbol is local, as `as` does).
 - Anything else is an error: a difference across sections, a product or shift involving a relocatable value, or two symbols added.
 
-The operands of `.space`, `.rept`, `.align`, `.set`/`.equ`/`=` used in those operands, and `.incbin` must be absolute, with every symbol defined earlier in the file.
+The operands of `.space`, `.rept`, `.align`, `.set`/`.equ`/`=` used in those operands, and `.incbin` must be absolute, with every symbol defined earlier in the file. `parse` evaluates them, before any layout, so a symbol in one is a constant from `.set`/`.equ`/`=`: a label difference there is an error, and the corpus has none.
 
 Relocation types follow from the field and the mode, matching GNU as:
 
@@ -90,7 +90,7 @@ Mnemonics, the union of those `.s` files and the inline-asm templates:
 
 `jmp` and `jmpq` are the same instruction, and so are `call`/`callq`, `ret`/`retq`, and `lea`/`leaq`. The current `.code16` / `.code32` / `.code64` selects the default operand size.
 
-Operands are a GPR at any width; `%cr0`, `%cr2`, `%cr3`, `%cr4`; the segment registers `%cs`, `%ds`, `%es`, `%fs`, `%gs`, `%ss`; an immediate `$expr`; `*%reg`; AT&T memory `disp(%base,%index,scale)` with any part omitted; `sym(%rip)`; and an absolute memory operand whose address is an expression (`lgdt gdt64_ptr`, `lgdt (ap_gdt32_ptr - ap_trampoline_start + AP_TRAMPOLINE_BASE)`). In a macro body, `\param` substitutes into any token, including an identifier (`isr_stub_\num:`) and an immediate (`pushq $\num`).
+Operands are a GPR at any width; `%cr0`, `%cr2`, `%cr3`, `%cr4`; the segment registers `%cs`, `%ds`, `%es`, `%fs`, `%gs`, `%ss`; an immediate `$expr`; `*%reg`; AT&T memory `disp(%base,%index,scale)` with any part omitted, and with an optional segment override (`%gs:PC_USER_RIP` in `syscall_entry.s`); `sym(%rip)`; and an absolute memory operand whose address is an expression (`lgdt gdt64_ptr`, `lgdt (ap_gdt32_ptr - ap_trampoline_start + AP_TRAMPOLINE_BASE)`). In a macro body, `\param` substitutes into any token, including an identifier (`isr_stub_\num:`) and an immediate (`pushq $\num`).
 
 ### Library
 

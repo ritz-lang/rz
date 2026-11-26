@@ -1,0 +1,714 @@
+# razm's parser: each construct of the dialect (DESIGN.md "Text razm
+# accepts"), the rejections that keep the dialect closed, the macro
+# expansion of isr_stubs.s, and every corpus file.
+import ritzlib.fs { read_file, write_file }
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new, string_from }
+import razm.expr { Expr, ExprNode, Value, eval }
+import razm.insn { Insn, Mem, OpSize, Operand, Prefix, Reg, RegClass }
+import razm.parse { Item, Mode, ParseError, Program, SectionDecl, SectionFlags, Stmt, parse, parse_in }
+
+const CORPUS_DIR: StrView = "tests/corpus"
+const CORPUS: [9]StrView = [
+    "boot/uefi_entry.s",
+    "kernel/ap_trampoline.s",
+    "kernel/boot.s",
+    "kernel/driver_stub.s",
+    "kernel/isr_stubs.s",
+    "kernel/proc_switch.s",
+    "kernel/syscall_entry.s",
+    "kernel/user_program.s",
+    "synthetic/incbin.s"
+]
+
+# --- helpers -----------------------------------------------------------------
+
+[[test_helper]]
+fn parsed(text: StrView) -> Program
+    match parse(text)
+        Ok(p) => return p
+        Err(e) =>
+            let line: i64 = e.line
+            print("parse failed at line {line}: {e.what.as_view()}\n")
+            assert false
+    # Unreachable: the assert stopped the test. An empty parse satisfies the type.
+    match parse("")
+        Ok(p) => p
+        Err(_) => parsed("")
+
+# The parse error for `text`; `line` is the line it must name.
+[[test_helper]]
+fn parse_error(text: StrView, line: i64) -> String
+    match parse(text)
+        Ok(_) =>
+            print("`{text}` parsed, expected an error\n")
+            assert false
+            string_new()
+        Err(e) =>
+            if e.line != line
+                let got: i64 = e.line
+                print("error `{e.what.as_view()}` at line {got}, expected line {line}\n")
+            assert e.line == line
+            e.what
+
+[[test_helper]]
+fn rejects(text: StrView, line: i64, needle: StrView)
+    let what: String = parse_error(text, line)
+    if not what.contains(needle)
+        print("error `{what.as_view()}` does not mention `{needle}`\n")
+    assert what.contains(needle)
+
+[[test_helper]]
+fn item(p: @Program, i: i64) -> Item
+    assert i < p.stmts.len
+    p.stmts.get(i).item
+
+[[test_helper]]
+fn label_at(p: @Program, i: i64) -> StrView
+    match item(p, i)
+        Item.Label(name) => return name
+        _ =>
+            print("statement {i} is not a label\n")
+            assert false
+    ""
+
+[[test_helper]]
+fn insn_at(p: @Program, i: i64) -> Insn
+    match item(p, i)
+        Item.Instruction(insn) => return insn
+        _ =>
+            print("statement {i} is not an instruction\n")
+            assert false
+    match parse("nop")
+        Ok(q) => insn_at(@q, 0)
+        Err(_) => insn_at(p, i)
+
+[[test_helper]]
+fn section_at(p: @Program, i: i64) -> SectionDecl
+    match item(p, i)
+        Item.Section(decl) => return decl
+        _ =>
+            print("statement {i} is not a section\n")
+            assert false
+    SectionDecl { name: "", flags: SectionFlags { alloc: false, write: false, exec: false }, nobits: false }
+
+[[test_helper]]
+fn operand(insn: Insn, i: i64) -> Operand
+    match insn.operand(i)
+        Some(op) => return op
+        None =>
+            print("no operand {i}\n")
+            assert false
+    Operand.Imm(Expr { id: -1 })
+
+[[test_helper]]
+fn absolute(p: @Program, e: Expr) -> i64
+    match eval(@p.exprs, e, @p.syms)
+        Ok(v) =>
+            match v
+                Absolute(n) => return n
+                Relocatable(_) =>
+                    assert false
+        Err(_) =>
+            assert false
+    0
+
+# The immediate operand `i`'s value.
+[[test_helper]]
+fn imm(p: @Program, insn: Insn, i: i64) -> i64
+    match operand(insn, i)
+        Imm(e) => return absolute(p, e)
+        _ =>
+            assert false
+    0
+
+[[test_helper]]
+fn sym_name(p: @Program, e: Expr) -> StrView
+    match p.exprs.node(e)
+        Sym(name) => return name
+        _ =>
+            assert false
+    ""
+
+# A memory operand's displacement, as a symbol name.
+[[test_helper]]
+fn target(p: @Program, insn: Insn) -> StrView
+    match operand(insn, 0)
+        Memory(m) =>
+            match m.disp
+                Some(e) => return sym_name(p, e)
+                None =>
+                    assert false
+        _ =>
+            assert false
+    ""
+
+fn reg_is(r: Reg, class: RegClass, num: u8) -> bool
+    (r.class as i32) == (class as i32) and r.num == num
+
+[[test_helper]]
+fn register(insn: Insn, i: i64, class: RegClass, num: u8) -> bool
+    match operand(insn, i)
+        Register(r) => reg_is(r, class, num)
+        _ => false
+
+[[test_helper]]
+fn memory(insn: Insn, i: i64) -> Mem
+    match operand(insn, i)
+        Memory(m) => return m
+        _ =>
+            assert false
+    Mem { seg: None, disp: None, base: None, index: None, scale: 1 }
+
+fn opt_reg_is(r: Option<Reg>, class: RegClass, num: u8) -> bool
+    match r
+        Some(x) => reg_is(x, class, num)
+        None => false
+
+fn size_is(insn: Insn, want: OpSize) -> bool
+    (insn.size as i32) == (want as i32)
+
+[[test_helper]]
+fn read_corpus(rel: StrView) -> String
+    var path: String = string_from(CORPUS_DIR)
+    path.push('/')
+    path.push_str(rel)
+    match read_file(path.as_view())
+        Ok(text) => return text
+        Err(_) =>
+            print("cannot read {path.as_view()}\n")
+            assert false
+    string_new()
+
+# --- labels ------------------------------------------------------------------
+
+[[test]]
+fn test_labels() -> i32
+    let p: Program = parsed("foo:\n.Lbar:\n.setup_pd_loop:\na: b: nop  # two labels and an insn\n")
+    assert label_at(@p, 0).eq("foo")
+    assert label_at(@p, 1).eq(".Lbar")
+    assert label_at(@p, 2).eq(".setup_pd_loop")
+    assert label_at(@p, 3).eq("a")
+    assert label_at(@p, 4).eq("b")
+    assert insn_at(@p, 5).name.eq("nop")
+    assert p.stmts.len == 6
+    assert p.stmts.get(5).line == 4
+    0
+
+[[test]]
+fn test_label_defined_twice_is_an_error() -> i32
+    rejects("foo:\nnop\nfoo:\n", 3, "`foo` is already defined")
+    0
+
+[[test]]
+fn test_numeric_local_labels() -> i32
+    let p: Program = parsed("1:  nop\n    jmp 1b\n    jmp 1f\n1:  jz 1b\n2:\n    loop 2b\n")
+    let first: StrView = label_at(@p, 0)
+    let second: StrView = label_at(@p, 4)
+    assert not first.eq(second)
+    assert first.starts_with(".L")
+    assert target(@p, insn_at(@p, 2)).eq(first)        # 1b: the one above
+    assert target(@p, insn_at(@p, 3)).eq(second)       # 1f: the next one
+    assert target(@p, insn_at(@p, 5)).eq(second)       # 1b after the second 1:
+    assert target(@p, insn_at(@p, 7)).eq(label_at(@p, 6))
+    0
+
+[[test]]
+fn test_numeric_local_back_reference_needs_a_definition() -> i32
+    rejects("nop\njmp 3b\n", 2, "`3b` refers back to no `3:`")
+    0
+
+# --- directives ----------------------------------------------------------------
+
+[[test]]
+fn test_section_flags_and_nobits() -> i32
+    let p: Program = parsed(".section .multiboot, \"a\"\n.section .boot.bss, \"aw\", @nobits\n.section .ap_trampoline, \"ax\"\n.section .bss, \"aw\"\n")
+    let mb: SectionDecl = section_at(@p, 0)
+    assert mb.name.eq(".multiboot")
+    assert mb.flags.alloc and not mb.flags.write and not mb.flags.exec and not mb.nobits
+    let bss: SectionDecl = section_at(@p, 1)
+    assert bss.flags.alloc and bss.flags.write and not bss.flags.exec and bss.nobits
+    let tramp: SectionDecl = section_at(@p, 2)
+    assert tramp.flags.alloc and tramp.flags.exec and not tramp.flags.write
+    assert section_at(@p, 3).nobits                     # the name .bss is NOBITS
+    0
+
+[[test]]
+fn test_section_implicit_flags() -> i32
+    let p: Program = parsed(".section .text\n.section .data\n.section .bss\n.section .rodata\n.section .boot\n.text\n.data\n.bss\n")
+    let text: SectionDecl = section_at(@p, 0)
+    assert text.flags.alloc and text.flags.exec and not text.flags.write and not text.nobits
+    let data: SectionDecl = section_at(@p, 1)
+    assert data.flags.alloc and data.flags.write and not data.flags.exec and not data.nobits
+    let bss: SectionDecl = section_at(@p, 2)
+    assert bss.flags.alloc and bss.flags.write and bss.nobits
+    let ro: SectionDecl = section_at(@p, 3)
+    assert ro.flags.alloc and not ro.flags.write and not ro.flags.exec
+    let other: SectionDecl = section_at(@p, 4)          # any other name: no flags
+    assert not other.flags.alloc and not other.flags.write and not other.flags.exec
+    assert section_at(@p, 5).flags.exec                 # bare .text
+    assert section_at(@p, 6).flags.write                # bare .data
+    assert section_at(@p, 7).nobits                     # bare .bss
+    0
+
+[[test]]
+fn test_section_rejections() -> i32
+    rejects(".section .x, \"aG\"\n", 1, "section flag `G`")
+    rejects(".section .x, \"a\", @note\n", 1, "section type `@note`")
+    rejects(".section .x, a\n", 1, "must be a string")
+    rejects(".text 1\n", 1, "`.text` takes no operands")
+    0
+
+[[test]]
+fn test_code_modes() -> i32
+    let p: Program = parsed(".code16\n.code32\n.code64\n")
+    match item(@p, 0)
+        CodeMode(m) =>
+            match m
+                Code16 => pass
+                _ =>
+                    assert false
+        _ =>
+            assert false
+    match item(@p, 1)
+        CodeMode(m) =>
+            match m
+                Code32 => pass
+                _ =>
+                    assert false
+        _ =>
+            assert false
+    match item(@p, 2)
+        CodeMode(m) =>
+            match m
+                Code64 => pass
+                _ =>
+                    assert false
+        _ =>
+            assert false
+    rejects("nop\n.code64 x\n", 2, "`.code64` takes no operands")
+    0
+
+[[test]]
+fn test_symbol_directives() -> i32
+    let p: Program = parsed(".global f\n.extern g\n.type f, @function\nf:\n  ret\n.size f, . - f\n")
+    match item(@p, 0)
+        Global(name) =>
+            assert name.eq("f")
+        _ =>
+            assert false
+    match item(@p, 1)
+        Extern(name) =>
+            assert name.eq("g")
+        _ =>
+            assert false
+    match item(@p, 2)
+        TypeFunction(name) =>
+            assert name.eq("f")
+        _ =>
+            assert false
+    match item(@p, 5)
+        Size(name, e) =>
+            assert name.eq("f")
+            match p.exprs.node(e)
+                Bin(_, _, _) => pass
+                _ =>
+                    assert false
+        _ =>
+            assert false
+    rejects(".type f, @object\n", 1, "`.type` kind `@object`")
+    rejects(".global\n", 1, "`.global` takes one symbol name")
+    rejects(".size f\n", 1, "`.size` takes `name, expr`")
+    0
+
+[[test]]
+fn test_align_is_in_bytes() -> i32
+    let p: Program = parsed(".align 8\n.align 4096\n.set A, 16\n.align A\n")
+    match item(@p, 0)
+        Align(n) =>
+            assert n == 8
+        _ =>
+            assert false
+    match item(@p, 1)
+        Align(n) =>
+            assert n == 4096
+        _ =>
+            assert false
+    match item(@p, 3)
+        Align(n) =>
+            assert n == 16
+        _ =>
+            assert false
+    rejects(".align 3\n", 1, "not a power of two")
+    rejects(".align 0\n", 1, "not a power of two")
+    rejects(".align 8, 0x90\n", 1, "`.align` takes one operand")
+    0
+
+[[test]]
+fn test_set_equ_and_assignment() -> i32
+    let p: Program = parsed(".set A, 1\n.equ B, A + 1\nC = B * 2\n.set A, 5\n.space C\n.space A\n")
+    match item(@p, 2)
+        Set(name, e) =>
+            assert name.eq("C")
+            assert absolute(@p, e) == 4
+        _ =>
+            assert false
+    match item(@p, 4)
+        Space(n, fill) =>
+            assert n == 4
+            assert fill == 0
+        _ =>
+            assert false
+    match item(@p, 5)
+        Space(n, _) =>
+            assert n == 5                               # .set redefines
+        _ =>
+            assert false
+    rejects(".set A\n", 1, "`.set` takes `name, expr`")
+    rejects(". = 4\n", 1, "cannot assign to `.`")
+    0
+
+[[test]]
+fn test_data_directives() -> i32
+    let p: Program = parsed(".byte 1, 2\n.word 0x1234\n.long sym - .\n.quad 0xFFFFFFFF80000000\n")
+    var widths: [5]i64 = [1, 1, 2, 4, 8]
+    for i in 0..5
+        match item(@p, i)
+            Data(w, _) =>
+                assert w == widths[i]
+            _ =>
+                assert false
+    match item(@p, 1)
+        Data(_, e) =>
+            assert absolute(@p, e) == 2
+        _ =>
+            assert false
+    rejects(".long\n", 1, "`.long` needs a value")
+    0
+
+[[test_helper]]
+fn bytes_at(p: @Program, i: i64) -> StrView
+    match item(p, i)
+        Bytes(b) => return b
+        _ =>
+            assert false
+    ""
+
+[[test]]
+fn test_ascii_and_asciz() -> i32
+    let p: Program = parsed(".ascii \"a\\n\"\n.asciz \"hi\"\n.ascii \"\\x41\\101\\\"\\\\\"\n.ascii \"a#b\"  # comment\n")
+    let a: StrView = bytes_at(@p, 0)
+    assert a.len == 2 and a.get(0) == 'a' and a.get(1) == '\n'
+    let z: StrView = bytes_at(@p, 1)
+    assert z.len == 3 and z.get(2) == 0
+    assert bytes_at(@p, 2).eq("AA\"\\")
+    assert bytes_at(@p, 3).eq("a#b")
+    rejects(".ascii hello\n", 1, "expected a string literal")
+    rejects(".ascii \"\\q\"\n", 1, "string escape `\\q`")
+    0
+
+[[test]]
+fn test_space() -> i32
+    let p: Program = parsed(".set PERCPU_SIZE, 64\n.set PERCPU_SLOTS, 4\n.space PERCPU_SIZE * PERCPU_SLOTS\n.space 4, 0x1ff\n")
+    match item(@p, 2)
+        Space(n, fill) =>
+            assert n == 256
+            assert fill == 0
+        _ =>
+            assert false
+    match item(@p, 3)
+        Space(n, fill) =>
+            assert n == 4
+            assert fill == 0xff
+        _ =>
+            assert false
+    rejects(".space -1\n", 1, "negative")
+    0
+
+[[test]]
+fn test_absolute_operands_need_earlier_constants() -> i32
+    rejects(".space N\n.set N, 4\n", 1, "`N` is not defined before this line")
+    rejects("here:\n.space here\n", 2, "`here` has no offset yet")
+    rejects(".rept ext + 1\nnop\n.endr\n", 1, "`ext` is not defined before this line")
+    rejects(".incbin \"x\", SKIP\n", 1, "`SKIP` is not defined before this line")
+    0
+
+[[test]]
+fn test_incbin() -> i32
+    let path: StrView = "/tmp/razm-test-incbin.bin"
+    match write_file(path, "ABCDEF")
+        Ok(_) => pass
+        Err(_) =>
+            assert false
+    let p: Program = parsed(".incbin \"/tmp/razm-test-incbin.bin\"\n.incbin \"/tmp/razm-test-incbin.bin\", 1, 2\n.incbin \"/tmp/razm-test-incbin.bin\", 4\n")
+    assert bytes_at(@p, 0).eq("ABCDEF")
+    assert bytes_at(@p, 1).eq("BC")
+    assert bytes_at(@p, 2).eq("EF")
+    rejects(".incbin \"/tmp/razm-test-incbin.bin\", 4, 3\n", 1, "outside the file's 6 bytes")
+    rejects("\n.incbin \"/nonexistent/razm.bin\"\n", 2, "cannot read `.incbin` file `/nonexistent/razm.bin`")
+    # Relative to the directory given (the working directory by default).
+    let blob: String = read_corpus("synthetic/blob.bin")
+    match parse_in(".incbin \"synthetic/blob.bin\"\n", CORPUS_DIR)
+        Ok(q) =>
+            assert bytes_at(@q, 0).eq(blob.as_view())
+        Err(_) =>
+            assert false
+    0
+
+# --- macros and .rept --------------------------------------------------------
+
+[[test]]
+fn test_macro_substitutes_into_identifiers_and_immediates() -> i32
+    let p: Program = parsed(".macro STUB num\n.global stub_\\num\nstub_\\num:\n    pushq $\\num\n.endm\nSTUB 7\n")
+    match item(@p, 0)
+        Global(name) =>
+            assert name.eq("stub_7")
+        _ =>
+            assert false
+    assert label_at(@p, 1).eq("stub_7")
+    assert imm(@p, insn_at(@p, 2), 0) == 7
+    assert p.stmts.len == 3
+    0
+
+[[test]]
+fn test_nested_macro_calls_and_argument_forms() -> i32
+    let src: StrView = ".macro INNER a\n    pushq $\\a\n.endm\n.macro OUTER x y\n    INNER \\x\n    INNER \\y\n.endm\nOUTER 1, 2\nOUTER 3 4\n"
+    let p: Program = parsed(src)
+    assert p.stmts.len == 4
+    for i in 0..4
+        assert imm(@p, insn_at(@p, i), 0) == i + 1
+    0
+
+[[test]]
+fn test_macro_separator_and_missing_argument() -> i32
+    let p: Program = parsed(".macro M num, m\nlab_\\num\\()x\\m:\n.ascii \"\\n\"\n.endm\nM 5\n")
+    assert label_at(@p, 0).eq("lab_5x")                 # \m left out: empty
+    assert bytes_at(@p, 1).eq("\n")                     # \n names no parameter: kept
+    # A parameter named like an escape is substituted, as in GNU as.
+    let q: Program = parsed(".macro E n\n.ascii \"\\n\"\n.endm\nE 7\n")
+    assert bytes_at(@q, 0).eq("7")
+    0
+
+[[test]]
+fn test_macro_rejections() -> i32
+    rejects(".macro M a\nnop\n.endm\nM 1, 2\n", 4, "macro `M` takes 1 argument(s), given 2")
+    rejects("nop\n.macro M\nnop\n", 2, "`.macro` without `.endm`")
+    rejects(".macro R\nR\n.endm\nR\n", 2, "macro `R` nests deeper than")
+    rejects(".macro M\n.endm\n.macro M\n.endm\n", 3, "macro `M` is defined twice")
+    rejects(".endm\n", 1, "`.endm` without `.macro`")
+    rejects(".macro M a=1\n.endm\n", 1, "macro parameter `a=1`")
+    0
+
+[[test]]
+fn test_rept() -> i32
+    let p: Program = parsed(".set N, 2\n.rept N + 1\n    nop\n    .rept 2\n    pause\n    .endr\n.endr\n")
+    assert p.stmts.len == 10                            # the .set, then 3 x (nop, pause, pause)
+    assert insn_at(@p, 1).name.eq("nop")
+    assert insn_at(@p, 2).name.eq("pause")
+    assert insn_at(@p, 4).name.eq("nop")
+    assert p.stmts.get(2).line == 5
+    let none: Program = parsed(".rept 0\nnop\n.endr\n")
+    assert none.stmts.len == 0
+    rejects(".rept 2\nnop\n", 1, "`.rept` without `.endr`")
+    rejects(".rept -1\n.endr\n", 1, "negative")
+    rejects(".endr\n", 1, "`.endr` without `.rept`")
+    0
+
+# --- instructions and operands -------------------------------------------------
+
+[[test]]
+fn test_mnemonics_split_into_base_and_size() -> i32
+    let p: Program = parsed("movq %rax, %rbx\nmovzbl %al, %eax\nretq\njmpq *%rax\nlea 8(%rsp), %rdi\nleaq 8(%rsp), %rdi\ninb %dx, %al\niretq\n")
+    let mov: Insn = insn_at(@p, 0)
+    assert mov.name.eq("mov") and size_is(mov, OpSize.Quad) and mov.n_ops == 2
+    assert register(mov, 0, RegClass.Gpr64, 0) and register(mov, 1, RegClass.Gpr64, 3)
+    let movz: Insn = insn_at(@p, 1)
+    assert movz.name.eq("movzb") and size_is(movz, OpSize.Long)
+    let ret: Insn = insn_at(@p, 2)
+    assert ret.name.eq("ret") and size_is(ret, OpSize.Unsized) and ret.n_ops == 0
+    let jmp: Insn = insn_at(@p, 3)
+    assert jmp.name.eq("jmp") and size_is(jmp, OpSize.Unsized)
+    match operand(jmp, 0)
+        Indirect(r) =>
+            assert reg_is(r, RegClass.Gpr64, 0)
+        _ =>
+            assert false
+    assert size_is(insn_at(@p, 4), OpSize.Unsized) and size_is(insn_at(@p, 5), OpSize.Quad)
+    assert insn_at(@p, 6).name.eq("in") and size_is(insn_at(@p, 6), OpSize.Byte)
+    assert insn_at(@p, 7).name.eq("iret") and size_is(insn_at(@p, 7), OpSize.Quad)
+    0
+
+[[test]]
+fn test_prefixes() -> i32
+    let p: Program = parsed("lock incl nmi_repeats_latched(%rip)\nrep stosl\n")
+    let inc: Insn = insn_at(@p, 0)
+    assert inc.name.eq("inc") and size_is(inc, OpSize.Long)
+    match inc.prefix
+        Lock => pass
+        _ =>
+            assert false
+    let stos: Insn = insn_at(@p, 1)
+    assert stos.name.eq("stos") and stos.n_ops == 0
+    match stos.prefix
+        Rep => pass
+        _ =>
+            assert false
+    rejects("lock\n", 1, "prefix `lock` without an instruction")
+    rejects("repne scasb\n", 1, "mnemonic `repne`")
+    rejects("data16 nop\n", 1, "mnemonic `data16`")
+    0
+
+[[test]]
+fn test_memory_operands() -> i32
+    let src: StrView = "movq %gs:PC_USER_RIP, %rax\nleaq sym(%rip), %rax\nmovl $0, 4(%edi)\nmovq (%rax,%rbx,8), %rcx\nmovq (,%rax,4), %rcx\nlgdt (a - b + 0x8000)\nlgdt gdt64_ptr\nmovq -8(%rbp,%rcx), %rax\n"
+    let p: Program = parsed(src)
+    let gs: Mem = memory(insn_at(@p, 0), 0)
+    assert opt_reg_is(gs.seg, RegClass.Segment, 5)
+    assert sym_name(@p, gs.disp.unwrap_or(Expr { id: -1 })).eq("PC_USER_RIP")
+    assert gs.base.is_none()
+    let rip: Mem = memory(insn_at(@p, 1), 0)
+    assert opt_reg_is(rip.base, RegClass.Rip, 0) and rip.index.is_none()
+    let edi: Mem = memory(insn_at(@p, 2), 1)
+    assert opt_reg_is(edi.base, RegClass.Gpr32, 7)
+    assert absolute(@p, edi.disp.unwrap_or(Expr { id: -1 })) == 4
+    let sib: Mem = memory(insn_at(@p, 3), 0)
+    assert sib.disp.is_none() and opt_reg_is(sib.base, RegClass.Gpr64, 0)
+    assert opt_reg_is(sib.index, RegClass.Gpr64, 3) and sib.scale == 8
+    let nobase: Mem = memory(insn_at(@p, 4), 0)
+    assert nobase.base.is_none() and opt_reg_is(nobase.index, RegClass.Gpr64, 0) and nobase.scale == 4
+    let abs_paren: Mem = memory(insn_at(@p, 5), 0)  # a parenthesised expression, not a base
+    assert abs_paren.base.is_none() and abs_paren.disp.is_some()
+    let abs_sym: Mem = memory(insn_at(@p, 6), 0)
+    assert abs_sym.base.is_none() and sym_name(@p, abs_sym.disp.unwrap_or(Expr { id: -1 })).eq("gdt64_ptr")
+    let neg: Mem = memory(insn_at(@p, 7), 0)
+    assert absolute(@p, neg.disp.unwrap_or(Expr { id: -1 })) == -8 and neg.scale == 1
+    0
+
+[[test]]
+fn test_register_operands() -> i32
+    let p: Program = parsed("movb %ah, %al\nmovq %cr3, %rax\nmovw %ds, %ax\nmovb %sil, %r15b\nmovl %r8d, %r9d\nmovw %r10w, %sp\n")
+    let b: Insn = insn_at(@p, 0)
+    assert register(b, 0, RegClass.Gpr8High, 4) and register(b, 1, RegClass.Gpr8, 0)
+    assert register(insn_at(@p, 1), 0, RegClass.Control, 3)
+    assert register(insn_at(@p, 2), 0, RegClass.Segment, 3)
+    let rex8: Insn = insn_at(@p, 3)
+    assert register(rex8, 0, RegClass.Gpr8, 6) and register(rex8, 1, RegClass.Gpr8, 15)
+    assert register(insn_at(@p, 4), 1, RegClass.Gpr32, 9)
+    assert register(insn_at(@p, 5), 0, RegClass.Gpr16, 10) and register(insn_at(@p, 5), 1, RegClass.Gpr16, 4)
+    0
+
+[[test]]
+fn test_immediates() -> i32
+    let p: Program = parsed(".set KERNEL_CS, 0x08\n.set SYSRET_BASE, 0x10\nmovl $(KERNEL_CS | (SYSRET_BASE << 16)), %edx\nmovb $'K', %al\nandq $-16, %rsp\n")
+    assert imm(@p, insn_at(@p, 2), 0) == 0x100008
+    assert imm(@p, insn_at(@p, 3), 0) == 75
+    assert imm(@p, insn_at(@p, 4), 0) == -16
+    0
+
+[[test]]
+fn test_operand_rejections() -> i32
+    rejects("nop\nmovdqa %xmm0, %xmm1\n", 2, "mnemonic `movdqa`")
+    rejects("movq %xmm0, %rax\n", 1, "register `%xmm0`")
+    rejects("jmp *sym\n", 1, "only `*%reg`")
+    rejects("movq (%rax,%rbx,3), %rcx\n", 1, "scale `3`")
+    rejects("movq %rip, %rax\n", 1, "`%rip` is only a memory base")
+    rejects("movq (%rip,%rax), %rcx\n", 1, "`%rip` takes no index")
+    rejects("movq (%cr3), %rax\n", 1, "`%cr3` cannot address memory")
+    rejects("movq %rax:4, %rax\n", 1, "after a register")
+    rejects("movq $1, %rax, %rbx, %rcx\n", 1, "more than three operands")
+    0
+
+[[test]]
+fn test_encoder_only_mnemonics_are_parse_errors() -> i32
+    # DESIGN.md "Library": a mnemonic the encoder knows but the dialect does
+    # not list is still a parse error.
+    rejects("imul %eax, %ebx\n", 1, "mnemonic `imul` is outside razm's dialect")
+    rejects("movss %xmm0, %xmm1\n", 1, "mnemonic `movss`")
+    rejects("movl %eax, %ebx\naddb $1, %al\n", 2, "mnemonic `addb`")
+    0
+
+[[test]]
+fn test_directives_outside_the_dialect() -> i32
+    rejects("nop\n.cfi_startproc\n", 2, "directive `.cfi_startproc` is outside razm's dialect")
+    rejects(".globl f\n", 1, "directive `.globl`")
+    rejects(".p2align 4\n", 1, "directive `.p2align`")
+    rejects("f: .macro M\n.endm\n", 1, "`.macro` must start its line")
+    0
+
+# --- the corpus --------------------------------------------------------------
+
+# The `k`th push-immediate value after `label`.
+[[test_helper]]
+fn pushed_after(p: @Program, label: StrView, k: i64) -> i64
+    var seen: bool = false
+    var n: i64 = 0
+    for i in 0..p.stmts.len
+        match p.stmts.get(i).item
+            Item.Label(name) =>
+                if name.eq(label)
+                    seen = true
+            Item.Instruction(insn) =>
+                if seen and insn.name.eq("push")
+                    match operand(insn, 0)
+                        Imm(e) =>
+                            if n == k
+                                return absolute(p, e)
+                            n += 1
+                        _ => pass
+            _ => pass
+    print("no push {k} after {label}\n")
+    assert false
+    -1
+
+[[test_helper]]
+fn count_labels_with_prefix(p: @Program, prefix: StrView) -> i64
+    var n: i64 = 0
+    for i in 0..p.stmts.len
+        match p.stmts.get(i).item
+            Item.Label(name) =>
+                if name.starts_with(prefix)
+                    n += 1
+            _ => pass
+    n
+
+[[test]]
+fn test_isr_stubs_macro_expansion() -> i32
+    let text: String = read_corpus("kernel/isr_stubs.s")
+    let p: Program = parsed(text.as_view())
+    assert count_labels_with_prefix(@p, "isr_stub_") == 32
+    assert count_labels_with_prefix(@p, "irq_stub_") >= 31
+    assert pushed_after(@p, "isr_stub_3", 0) == 0        # ISR_NOERR: dummy error, then the vector
+    assert pushed_after(@p, "isr_stub_3", 1) == 3
+    assert pushed_after(@p, "isr_stub_14", 0) == 14      # ISR_ERR: the CPU pushed the error
+    assert pushed_after(@p, "isr_stub_18", 1) == 18      # ISR_PARANOID via PARANOID_BODY
+    assert pushed_after(@p, "irq_stub_12", 1) == 44      # IRQ_STUB 12, 44
+    assert pushed_after(@p, "irq_stub_32", 1) == 64
+    # SWAPGS_IF_USER's `jz 8f` in each expansion reaches that expansion's `8:`.
+    var at: i64 = 0
+    while not label_at_is(@p, at, "isr_stub_3")
+        at += 1
+    let jz: Insn = insn_at(@p, at + 2)
+    assert jz.name.eq("jz")
+    assert target(@p, jz).eq(label_at(@p, at + 4))
+    0
+
+fn label_at_is(p: @Program, i: i64, want: StrView) -> bool
+    match p.stmts.get(i).item
+        Item.Label(name) => name.eq(want)
+        _ => false
+
+[[test]]
+fn test_every_corpus_file_parses() -> i32
+    for rel in CORPUS
+        let text: String = read_corpus(rel)
+        match parse_in(text.as_view(), CORPUS_DIR)
+            Ok(p) =>
+                assert p.stmts.len > 0
+            Err(e) =>
+                let line: i64 = e.line
+                print("{rel}:{line}: {e.what.as_view()}\n")
+                assert false
+    0

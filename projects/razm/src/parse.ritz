@@ -1,12 +1,1343 @@
 # parse: AT&T text in razm's dialect (DESIGN.md "Text razm accepts") to
-# structured instructions and directives.
+# structured statements: labels, directives and instructions.
+#
+# One pass over the lines. `.macro` bodies are kept as lines and expanded at
+# each call (with `\param` substituted into any token), `.rept` bodies are
+# run their count of times, numeric local labels (`N:`, `Nb`, `Nf`) get
+# unique `.L` names, and the operands that must be absolute (`.rept`,
+# `.space`, `.align`, `.incbin`) are evaluated here, against the constants
+# defined earlier in the file. Everything else keeps its expression for the
+# layout to evaluate.
+#
+# Anything outside the dialect is a `ParseError` naming the construct and its
+# line: a directive, a prefix, a register, an operator, or a mnemonic, even
+# one the encoder knows.
+import ritzlib.fs { read_file }
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.option { Option }
+import ritzlib.ptr { ptr_read }
+import ritzlib.result { Result }
 import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new, string_from }
+import razm.expr { BinOp, Expr, ExprNode, Exprs, SymDef, SymTable, Value, eval, exprs_new, first_undefined, symtable_new }
+import razm.insn { Insn, Mem, OpSize, Operand, Prefix, Reg, RegClass, insn_new, reg_from_name }
 
-# The first construct razm does not accept, and its 1-based line.
-pub struct Unsupported
+# Macro calls and `.rept` blocks nest at most this deep: a macro that calls
+# itself is an error, not a hang.
+const MAX_NEST: i64 = 64
+
+# ---------------------------------------------------------------------------
+# What a parse produces
+# ---------------------------------------------------------------------------
+
+pub struct SectionFlags
+    alloc: bool                 # a
+    write: bool                 # w
+    exec: bool                  # x
+
+pub struct SectionDecl
+    name: StrView
+    flags: SectionFlags
+    nobits: bool                # SHT_NOBITS: `@nobits`, or the name `.bss`
+
+pub enum Mode
+    Code16
+    Code32
+    Code64
+
+# One statement. Statements before the first `.section` are in `.text`, and
+# the mode starts at `.code64`.
+pub enum Item
+    Label(StrView)              # `name:`; a numeric local's unique `.L` name
+    Instruction(Insn)
+    Section(SectionDecl)
+    CodeMode(Mode)
+    Global(StrView)
+    Extern(StrView)
+    TypeFunction(StrView)       # `.type name, @function`
+    Size(StrView, Expr)
+    Align(i64)                  # bytes, a power of two
+    Set(StrView, Expr)          # `.set`, `.equ`, `name = expr`
+    Data(i64, Expr)             # width in bytes (1, 2, 4, 8), value
+    Bytes(StrView)              # `.ascii` / `.asciz` (decoded), `.incbin` contents
+    Space(i64, u8)              # count, fill byte
+
+pub struct Stmt
+    line: i64                   # 1-based source line
+    item: Item
+
+# Text a parse made: substituted macro lines, numeric local names, decoded
+# strings and `.incbin` contents. A Vec frees its buffer, not its elements,
+# so the pool drops each String itself. The views it hands out stay valid
+# while the pool lives: moving a String into the Vec does not move its bytes.
+pub struct TextPool
+    texts: Vec<String>
+
+impl Drop for TextPool
+    fn drop(self: @&TextPool)
+        let base: *String = self.texts.as_ptr()
+        let n: i64 = self.texts.len
+        self.texts.len = 0
+        var i: i64 = 0
+        while i < n
+            let text: String = ptr_read<String>(base + i)
+            i += 1
+
+impl TextPool
+    pub fn keep(self: @&TextPool, text: String) -> StrView
+        self.texts.push(text)
+        let kept: *String = self.texts.get_ptr(self.texts.len - 1)
+        kept.as_view()
+
+# A parsed file. Its views point into the source text and into `texts`, so
+# the source must outlive it. `syms` holds what the parse could evaluate:
+# constants, and labels by section (not yet laid out).
+pub struct Program
+    stmts: Vec<Stmt>
+    exprs: Exprs
+    syms: SymTable
+    texts: TextPool
+
+pub struct ParseError
     line: i64
-    what: StrView
+    what: String
 
-# Parse a whole file. Nothing is accepted yet, so every file stops at line 1.
-pub fn parse(text: StrView) -> Result<i64, Unsupported>
-    Err(Unsupported { line: 1, what: "the parser is not implemented" })
+fn error(line: i64, what: String) -> ParseError
+    ParseError { line: line, what: what }
+
+# ---------------------------------------------------------------------------
+# The dialect's mnemonics
+# ---------------------------------------------------------------------------
+
+# A mnemonic as written, its base and its operand size in bytes (0: none).
+# Aliases fold: `jmpq` is `jmp`, `callq` is `call`, `retq` is `ret`.
+struct Mnemonic
+    spelled: StrView
+    base: StrView
+    bytes: i64
+
+const MNEMONICS: [96]Mnemonic = [
+    Mnemonic { spelled: "addl", base: "add", bytes: 4 },
+    Mnemonic { spelled: "addq", base: "add", bytes: 8 },
+    Mnemonic { spelled: "andb", base: "and", bytes: 1 },
+    Mnemonic { spelled: "andl", base: "and", bytes: 4 },
+    Mnemonic { spelled: "andq", base: "and", bytes: 8 },
+    Mnemonic { spelled: "btl", base: "bt", bytes: 4 },
+    Mnemonic { spelled: "call", base: "call", bytes: 0 },
+    Mnemonic { spelled: "callq", base: "call", bytes: 0 },
+    Mnemonic { spelled: "cld", base: "cld", bytes: 0 },
+    Mnemonic { spelled: "clflush", base: "clflush", bytes: 0 },
+    Mnemonic { spelled: "cli", base: "cli", bytes: 0 },
+    Mnemonic { spelled: "cmpl", base: "cmp", bytes: 4 },
+    Mnemonic { spelled: "cmpq", base: "cmp", bytes: 8 },
+    Mnemonic { spelled: "cpuid", base: "cpuid", bytes: 0 },
+    Mnemonic { spelled: "decl", base: "dec", bytes: 4 },
+    Mnemonic { spelled: "decq", base: "dec", bytes: 8 },
+    Mnemonic { spelled: "hlt", base: "hlt", bytes: 0 },
+    Mnemonic { spelled: "inb", base: "in", bytes: 1 },
+    Mnemonic { spelled: "incl", base: "inc", bytes: 4 },
+    Mnemonic { spelled: "incq", base: "inc", bytes: 8 },
+    Mnemonic { spelled: "inl", base: "in", bytes: 4 },
+    Mnemonic { spelled: "invlpg", base: "invlpg", bytes: 0 },
+    Mnemonic { spelled: "inw", base: "in", bytes: 2 },
+    Mnemonic { spelled: "iretq", base: "iret", bytes: 8 },
+    Mnemonic { spelled: "ja", base: "ja", bytes: 0 },
+    Mnemonic { spelled: "jb", base: "jb", bytes: 0 },
+    Mnemonic { spelled: "jc", base: "jc", bytes: 0 },
+    Mnemonic { spelled: "je", base: "je", bytes: 0 },
+    Mnemonic { spelled: "jmp", base: "jmp", bytes: 0 },
+    Mnemonic { spelled: "jmpq", base: "jmp", bytes: 0 },
+    Mnemonic { spelled: "jnc", base: "jnc", bytes: 0 },
+    Mnemonic { spelled: "jne", base: "jne", bytes: 0 },
+    Mnemonic { spelled: "jnz", base: "jnz", bytes: 0 },
+    Mnemonic { spelled: "jz", base: "jz", bytes: 0 },
+    Mnemonic { spelled: "lea", base: "lea", bytes: 0 },
+    Mnemonic { spelled: "leaq", base: "lea", bytes: 8 },
+    Mnemonic { spelled: "lfence", base: "lfence", bytes: 0 },
+    Mnemonic { spelled: "lgdt", base: "lgdt", bytes: 0 },
+    Mnemonic { spelled: "lidt", base: "lidt", bytes: 0 },
+    Mnemonic { spelled: "lodsb", base: "lods", bytes: 1 },
+    Mnemonic { spelled: "ltr", base: "ltr", bytes: 0 },
+    Mnemonic { spelled: "loop", base: "loop", bytes: 0 },
+    Mnemonic { spelled: "lretq", base: "lret", bytes: 8 },
+    Mnemonic { spelled: "mfence", base: "mfence", bytes: 0 },
+    Mnemonic { spelled: "movabsq", base: "movabs", bytes: 8 },
+    Mnemonic { spelled: "movb", base: "mov", bytes: 1 },
+    Mnemonic { spelled: "movl", base: "mov", bytes: 4 },
+    Mnemonic { spelled: "movq", base: "mov", bytes: 8 },
+    Mnemonic { spelled: "movw", base: "mov", bytes: 2 },
+    Mnemonic { spelled: "movzbl", base: "movzb", bytes: 4 },
+    Mnemonic { spelled: "nop", base: "nop", bytes: 0 },
+    Mnemonic { spelled: "nopl", base: "nop", bytes: 4 },
+    Mnemonic { spelled: "orb", base: "or", bytes: 1 },
+    Mnemonic { spelled: "orl", base: "or", bytes: 4 },
+    Mnemonic { spelled: "orq", base: "or", bytes: 8 },
+    Mnemonic { spelled: "outb", base: "out", bytes: 1 },
+    Mnemonic { spelled: "outl", base: "out", bytes: 4 },
+    Mnemonic { spelled: "outw", base: "out", bytes: 2 },
+    Mnemonic { spelled: "pause", base: "pause", bytes: 0 },
+    Mnemonic { spelled: "popfl", base: "popf", bytes: 4 },
+    Mnemonic { spelled: "popfq", base: "popf", bytes: 8 },
+    Mnemonic { spelled: "popl", base: "pop", bytes: 4 },
+    Mnemonic { spelled: "popq", base: "pop", bytes: 8 },
+    Mnemonic { spelled: "pushfl", base: "pushf", bytes: 4 },
+    Mnemonic { spelled: "pushfq", base: "pushf", bytes: 8 },
+    Mnemonic { spelled: "pushl", base: "push", bytes: 4 },
+    Mnemonic { spelled: "pushq", base: "push", bytes: 8 },
+    Mnemonic { spelled: "rdmsr", base: "rdmsr", bytes: 0 },
+    Mnemonic { spelled: "rdrand", base: "rdrand", bytes: 0 },
+    Mnemonic { spelled: "rdtsc", base: "rdtsc", bytes: 0 },
+    Mnemonic { spelled: "ret", base: "ret", bytes: 0 },
+    Mnemonic { spelled: "retq", base: "ret", bytes: 0 },
+    Mnemonic { spelled: "sarq", base: "sar", bytes: 8 },
+    Mnemonic { spelled: "sfence", base: "sfence", bytes: 0 },
+    Mnemonic { spelled: "shll", base: "shl", bytes: 4 },
+    Mnemonic { spelled: "shlq", base: "shl", bytes: 8 },
+    Mnemonic { spelled: "shrq", base: "shr", bytes: 8 },
+    Mnemonic { spelled: "std", base: "std", bytes: 0 },
+    Mnemonic { spelled: "sti", base: "sti", bytes: 0 },
+    Mnemonic { spelled: "stosl", base: "stos", bytes: 4 },
+    Mnemonic { spelled: "stosw", base: "stos", bytes: 2 },
+    Mnemonic { spelled: "subq", base: "sub", bytes: 8 },
+    Mnemonic { spelled: "swapgs", base: "swapgs", bytes: 0 },
+    Mnemonic { spelled: "syscall", base: "syscall", bytes: 0 },
+    Mnemonic { spelled: "sysretq", base: "sysret", bytes: 8 },
+    Mnemonic { spelled: "testb", base: "test", bytes: 1 },
+    Mnemonic { spelled: "testl", base: "test", bytes: 4 },
+    Mnemonic { spelled: "testq", base: "test", bytes: 8 },
+    Mnemonic { spelled: "ud2", base: "ud2", bytes: 0 },
+    Mnemonic { spelled: "wrmsr", base: "wrmsr", bytes: 0 },
+    Mnemonic { spelled: "xchgq", base: "xchg", bytes: 8 },
+    Mnemonic { spelled: "xgetbv", base: "xgetbv", bytes: 0 },
+    Mnemonic { spelled: "xorb", base: "xor", bytes: 1 },
+    Mnemonic { spelled: "xorl", base: "xor", bytes: 4 },
+    Mnemonic { spelled: "xorq", base: "xor", bytes: 8 },
+    Mnemonic { spelled: "xorw", base: "xor", bytes: 2 }
+]
+
+fn find_mnemonic(word: StrView) -> Option<Mnemonic>
+    for m in MNEMONICS
+        if m.spelled.eq(word)
+            return Some(m)
+    None
+
+fn op_size(bytes: i64) -> OpSize
+    match bytes
+        1 => OpSize.Byte
+        2 => OpSize.Word
+        4 => OpSize.Long
+        8 => OpSize.Quad
+        _ => OpSize.Unsized
+
+# ---------------------------------------------------------------------------
+# Lexical helpers
+# ---------------------------------------------------------------------------
+
+fn is_digit(c: u8) -> bool
+    c >= '0' and c <= '9'
+
+fn is_ident_start(c: u8) -> bool
+    (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '.'
+
+fn is_ident_char(c: u8) -> bool
+    is_ident_start(c) or is_digit(c)
+
+fn is_space(c: u8) -> bool
+    c == ' ' or c == '\t' or c == '\r'
+
+# The length of the identifier at the start of `s` (0 if there is none).
+fn ident_len(s: StrView) -> i64
+    if s.len == 0 or not is_ident_start(s.get(0))
+        return 0
+    var n: i64 = 1
+    while n < s.len and is_ident_char(s.get(n))
+        n += 1
+    n
+
+fn digits_len(s: StrView) -> i64
+    var n: i64 = 0
+    while n < s.len and is_digit(s.get(n))
+        n += 1
+    n
+
+fn is_name(s: StrView) -> bool
+    s.len > 0 and ident_len(s) == s.len
+
+# The length of a label name at the start of `s` that a `:` follows at once
+# (`name:`, `.Lname:`, `N:`), or 0.
+fn label_len(s: StrView) -> i64
+    var n: i64 = ident_len(s)
+    if n == 0
+        n = digits_len(s)
+    if n > 0 and n < s.len and s.get(n) == ':'
+        return n
+    0
+
+# `text` up to a `#` that is outside a string literal.
+fn strip_comment(text: StrView) -> StrView
+    var in_string: bool = false
+    var i: i64 = 0
+    while i < text.len
+        let c: u8 = text.get(i)
+        if in_string
+            if c == '\\'
+                i += 1
+            else if c == '"'
+                in_string = false
+        else if c == '"'
+            in_string = true
+        else if c == '#'
+            return text.take(i)
+        i += 1
+    text
+
+fn has_byte(s: StrView, c: u8) -> bool
+    s.find_byte(c) < s.len
+
+fn first_word(s: StrView) -> StrView
+    var n: i64 = 0
+    while n < s.len and not is_space(s.get(n))
+        n += 1
+    s.take(n)
+
+# Split `s` at the commas outside parentheses and string literals, each part
+# trimmed. An empty `s` has no parts.
+fn split_args(s: StrView) -> Vec<StrView>
+    var parts: Vec<StrView> = vec_new<StrView>()
+    if s.trim().len == 0
+        return parts
+    var depth: i64 = 0
+    var in_string: bool = false
+    var start: i64 = 0
+    var i: i64 = 0
+    while i < s.len
+        let c: u8 = s.get(i)
+        if in_string
+            if c == '\\'
+                i += 1
+            else if c == '"'
+                in_string = false
+        else if c == '"'
+            in_string = true
+        else if c == '('
+            depth += 1
+        else if c == ')'
+            depth -= 1
+        else if c == ',' and depth == 0
+            parts.push(s.slice(start, i).trim())
+            start = i + 1
+        i += 1
+    parts.push(s.slice(start, s.len).trim())
+    parts
+
+# A macro call's arguments: split at commas when there are any, else at
+# whitespace (`IRQ_STUB 1, 33` and `SWAPGS_IF_USER_AT 8`).
+fn macro_args(s: StrView) -> Vec<StrView>
+    if has_byte(s, ',')
+        return split_args(s)
+    var parts: Vec<StrView> = vec_new<StrView>()
+    var i: i64 = 0
+    while i < s.len
+        while i < s.len and is_space(s.get(i))
+            i += 1
+        let start: i64 = i
+        while i < s.len and not is_space(s.get(i))
+            i += 1
+        if i > start
+            parts.push(s.slice(start, i))
+    parts
+
+fn hex_value(c: u8) -> i64
+    if c >= '0' and c <= '9'
+        return (c - '0') as i64
+    if c >= 'a' and c <= 'f'
+        return (c - 'a') as i64 + 10
+    if c >= 'A' and c <= 'F'
+        return (c - 'A') as i64 + 10
+    -1
+
+# ---------------------------------------------------------------------------
+# The parser
+# ---------------------------------------------------------------------------
+
+struct Line
+    text: StrView
+    line: i64
+
+struct Macro
+    name: StrView
+    params_at: i64              # first parameter in Parser.params
+    n_params: i64
+    body_at: i64                # first body line in Parser.bodies
+    body_len: i64
+
+# A numeric local label N and how many times `N:` has been defined so far.
+struct LocalLabel
+    n: i64
+    defined: i64
+
+struct Cursor
+    s: StrView
+    pos: i64
+    line: i64
+
+impl Cursor
+    fn skip_space(self: @&Cursor)
+        while self.pos < self.s.len and is_space(self.s.get(self.pos))
+            self.pos += 1
+
+    fn at_end(self: @&Cursor) -> bool
+        self.skip_space()
+        self.pos >= self.s.len
+
+    # The byte at the cursor after spaces, or 0 at the end.
+    fn peek(self: @&Cursor) -> u8
+        self.skip_space()
+        if self.pos >= self.s.len
+            return 0
+        self.s.get(self.pos)
+
+    fn peek2(self: @&Cursor) -> u8
+        if self.pos + 1 >= self.s.len
+            return 0
+        self.s.get(self.pos + 1)
+
+    fn rest(self: @Cursor) -> StrView
+        self.s.skip(self.pos)
+
+struct Parser
+    prog: Program
+    sections: Vec<StrView>
+    section: i64
+    macros: Vec<Macro>
+    params: Vec<StrView>
+    bodies: Vec<Line>
+    locals: Vec<LocalLabel>
+    incbin_dir: StrView
+
+fn parser_new(incbin_dir: StrView) -> Parser
+    let prog: Program = Program {
+        stmts: vec_new<Stmt>(),
+        exprs: exprs_new(),
+        syms: symtable_new(),
+        texts: TextPool { texts: vec_new<String>() }
+    }
+    var p: Parser = Parser {
+        prog: prog,
+        sections: vec_new<StrView>(),
+        section: 0,
+        macros: vec_new<Macro>(),
+        params: vec_new<StrView>(),
+        bodies: vec_new<Line>(),
+        locals: vec_new<LocalLabel>(),
+        incbin_dir: incbin_dir
+    }
+    p.sections.push(".text")
+    p.prog.syms.set_here(SymDef.Unplaced(0))
+    p
+
+fn split_lines(text: StrView) -> Vec<Line>
+    var lines: Vec<Line> = vec_new<Line>()
+    var start: i64 = 0
+    var n: i64 = 1
+    var i: i64 = 0
+    while i < text.len
+        if text.get(i) == '\n'
+            lines.push(Line { text: text.slice(start, i), line: n })
+            start = i + 1
+            n += 1
+        i += 1
+    if start < text.len
+        lines.push(Line { text: text.slice(start, text.len), line: n })
+    lines
+
+# Parse a whole file. `.incbin` paths are relative to the working directory.
+pub fn parse(text: StrView) -> Result<Program, ParseError>
+    parse_in(text, "")
+
+# Parse a whole file, with `.incbin` paths relative to `incbin_dir` (the
+# working directory when it is empty).
+pub fn parse_in(text: StrView, incbin_dir: StrView) -> Result<Program, ParseError>
+    var p: Parser = parser_new(incbin_dir)
+    let lines: Vec<Line> = split_lines(text)
+    p.run(@lines, 0)?
+    Ok(p.prog)
+
+impl Parser
+    fn push(self: @&Parser, line: i64, item: Item)
+        self.prog.stmts.push(Stmt { line: line, item: item })
+
+    fn keep(self: @&Parser, text: String) -> StrView
+        self.prog.texts.keep(text)
+
+    # -- lines, blocks and macros -------------------------------------------
+
+    fn run(self: @&Parser, lines: @Vec<Line>, depth: i64) -> Result<(), ParseError>
+        var i: i64 = 0
+        while i < lines.len
+            let ln: Line = lines.get(i)
+            let word: StrView = first_word(strip_comment(ln.text).trim())
+            if word.eq(".macro")
+                i = self.define_macro(lines, i)?
+            else if word.eq(".rept")
+                i = self.rept(lines, i, depth)?
+            else
+                self.statement(ln, depth)?
+                i += 1
+        Ok(())
+
+    # The index of the line closing the block opened at `lines[at]`, counting
+    # nested `open` / `close` pairs.
+    fn block_end(self: @Parser, lines: @Vec<Line>, at: i64, open: StrView, close: StrView) -> Result<i64, ParseError>
+        var depth: i64 = 0
+        var i: i64 = at + 1
+        while i < lines.len
+            let word: StrView = first_word(strip_comment(lines.get(i).text).trim())
+            if word.eq(open)
+                depth += 1
+            else if word.eq(close)
+                if depth == 0
+                    return Ok(i)
+                depth -= 1
+            i += 1
+        var what: String = string_new()
+        format_into(@&what, "`{open}` without `{close}`")
+        Err(error(lines.get(at).line, what))
+
+    fn find_macro(self: @Parser, name: StrView) -> Option<Macro>
+        for i in 0..self.macros.len
+            let m: Macro = self.macros.get(i)
+            if m.name.eq(name)
+                return Some(m)
+        None
+
+    fn define_macro(self: @&Parser, lines: @Vec<Line>, at: i64) -> Result<i64, ParseError>
+        let ln: Line = lines.get(at)
+        let header: StrView = strip_comment(ln.text).trim().skip(6).trim()
+        let name: StrView = first_word(header)
+        if not is_name(name)
+            var what: String = string_new()
+            format_into(@&what, "`.macro` needs a name, not `{name}`")
+            return Err(error(ln.line, what))
+        if self.find_macro(name).is_some()
+            var what: String = string_new()
+            format_into(@&what, "macro `{name}` is defined twice")
+            return Err(error(ln.line, what))
+        let end: i64 = self.block_end(lines, at, ".macro", ".endm")?
+        let params_at: i64 = self.params.len
+        let params: Vec<StrView> = macro_args(header.skip(name.len))
+        for i in 0..params.len
+            let param: StrView = params.get(i)
+            if not is_name(param)
+                var what: String = string_new()
+                format_into(@&what, "macro parameter `{param}` is outside razm's dialect (a name only)")
+                return Err(error(ln.line, what))
+            self.params.push(param)
+        let body_at: i64 = self.bodies.len
+        for i in (at + 1)..end
+            self.bodies.push(lines.get(i))
+        self.macros.push(Macro {
+            name: name,
+            params_at: params_at,
+            n_params: params.len,
+            body_at: body_at,
+            body_len: end - at - 1
+        })
+        Ok(end + 1)
+
+    fn rept(self: @&Parser, lines: @Vec<Line>, at: i64, depth: i64) -> Result<i64, ParseError>
+        let ln: Line = lines.get(at)
+        if depth >= MAX_NEST
+            return Err(error(ln.line, string_from("`.rept` nests too deep")))
+        let count: i64 = self.absolute(strip_comment(ln.text).trim().skip(5), ln.line, ".rept")?
+        if count < 0
+            var what: String = string_new()
+            format_into(@&what, "`.rept` count {count} is negative")
+            return Err(error(ln.line, what))
+        let end: i64 = self.block_end(lines, at, ".rept", ".endr")?
+        var body: Vec<Line> = vec_new<Line>()
+        for i in (at + 1)..end
+            body.push(lines.get(i))
+        for k in 0..count
+            self.run(@body, depth + 1)?
+        Ok(end + 1)
+
+    fn invoke(self: @&Parser, m: Macro, args: StrView, ln: Line, depth: i64) -> Result<(), ParseError>
+        let name: StrView = m.name
+        if depth >= MAX_NEST
+            var what: String = string_new()
+            format_into(@&what, "macro `{name}` nests deeper than {MAX_NEST} calls")
+            return Err(error(ln.line, what))
+        let values: Vec<StrView> = macro_args(args)
+        if values.len > m.n_params
+            let want: i64 = m.n_params
+            let got: i64 = values.len
+            var what: String = string_new()
+            format_into(@&what, "macro `{name}` takes {want} argument(s), given {got}")
+            return Err(error(ln.line, what))
+        var body: Vec<Line> = vec_new<Line>()
+        for k in 0..m.body_len
+            let bl: Line = self.bodies.get(m.body_at + k)
+            let text: StrView = self.substitute(strip_comment(bl.text), m, @values)
+            body.push(Line { text: text, line: bl.line })
+        self.run(@body, depth + 1)
+
+    # `text` with each `\param` replaced by its argument (empty when the call
+    # left it out) and each `\()` removed. A `\` naming no parameter stays,
+    # as in GNU as, so `.ascii "\n"` in a body keeps its escape.
+    fn substitute(self: @&Parser, text: StrView, m: Macro, values: @Vec<StrView>) -> StrView
+        if not has_byte(text, '\\')
+            return text
+        var out: String = string_new()
+        var i: i64 = 0
+        while i < text.len
+            let c: u8 = text.get(i)
+            if c != '\\'
+                out.push(c)
+                i += 1
+                continue
+            let after: StrView = text.skip(i + 1)
+            if after.starts_with("()")
+                i += 3
+                continue
+            let n: i64 = ident_len(after)
+            var found: bool = false
+            if n > 0
+                for k in 0..m.n_params
+                    if not found and self.params.get(m.params_at + k).eq(after.take(n))
+                        if k < values.len
+                            out.push_str(values.get(k))
+                        found = true
+            if found
+                i += 1 + n
+            else
+                out.push(c)
+                i += 1
+        self.keep(out)
+
+    # -- statements -----------------------------------------------------------
+
+    fn statement(self: @&Parser, ln: Line, depth: i64) -> Result<(), ParseError>
+        var s: StrView = strip_comment(ln.text).trim()
+        var n: i64 = label_len(s)
+        while n > 0
+            self.label(s.take(n), ln.line)?
+            s = s.skip(n + 1).trim()
+            n = label_len(s)
+        if s.len == 0
+            return Ok(())
+        let id: i64 = ident_len(s)
+        if id > 0
+            let after: StrView = s.skip(id).trim_start()
+            if after.starts_with("=") and not after.starts_with("==")
+                return self.assign(s.take(id), after.skip(1), ln.line)
+        let word: StrView = first_word(s)
+        let args: StrView = s.skip(word.len).trim()
+        if word.get(0) == '.'
+            return self.directive(word, args, ln.line)
+        match self.find_macro(word)
+            Some(m) => return self.invoke(m, args, ln, depth)
+            None => pass
+        self.instruction(word, args, ln.line)
+
+    fn local_index(self: @&Parser, n: i64) -> i64
+        for i in 0..self.locals.len
+            if self.locals.get(i).n == n
+                return i
+        self.locals.push(LocalLabel { n: n, defined: 0 })
+        self.locals.len - 1
+
+    # The unique name of the `instance`th definition of numeric label `n`.
+    fn local_name(self: @&Parser, n: i64, instance: i64) -> StrView
+        var name: String = string_from(".L")
+        format_into(@&name, "{n}")
+        name.push(2)                # GNU as's separator: no source name has it
+        format_into(@&name, "{instance}")
+        self.keep(name)
+
+    fn label(self: @&Parser, written: StrView, line: i64) -> Result<(), ParseError>
+        var name: StrView = written
+        if is_digit(written.get(0))
+            let n: i64 = self.number(written, line)?
+            let at: i64 = self.local_index(n)
+            let instance: i64 = self.locals.get(at).defined + 1
+            self.locals.set(at, LocalLabel { n: n, defined: instance })
+            name = self.local_name(n, instance)
+        else
+            match self.prog.syms.lookup(name)
+                Undefined => pass
+                _ =>
+                    var what: String = string_new()
+                    format_into(@&what, "symbol `{name}` is already defined")
+                    return Err(error(line, what))
+        self.prog.syms.define(name, SymDef.Unplaced(self.section))
+        self.push(line, Item.Label(name))
+        Ok(())
+
+    fn assign(self: @&Parser, name: StrView, value: StrView, line: i64) -> Result<(), ParseError>
+        if not is_name(name) or name.eq(".")
+            var what: String = string_new()
+            format_into(@&what, "cannot assign to `{name}`")
+            return Err(error(line, what))
+        let e: Expr = self.expr(value, line)?
+        self.push(line, Item.Set(name, e))
+        # A constant is usable by later absolute operands; anything else
+        # (a label, a symbol not defined yet) waits for the layout.
+        match eval(@self.prog.exprs, e, @self.prog.syms)
+            Ok(v) =>
+                match v
+                    Absolute(n) => self.prog.syms.define(name, SymDef.Constant(n))
+                    Relocatable(_) => self.prog.syms.define(name, SymDef.Unplaced(-1))
+            Err(_) => self.prog.syms.define(name, SymDef.Unplaced(-1))
+        Ok(())
+
+    # -- directives -----------------------------------------------------------
+
+    fn directive(self: @&Parser, word: StrView, args: StrView, line: i64) -> Result<(), ParseError>
+        match word
+            ".section" => self.section(args, line)
+            ".text" => self.bare_section(word, args, line)
+            ".data" => self.bare_section(word, args, line)
+            ".bss" => self.bare_section(word, args, line)
+            ".code16" => self.code_mode(Mode.Code16, word, args, line)
+            ".code32" => self.code_mode(Mode.Code32, word, args, line)
+            ".code64" => self.code_mode(Mode.Code64, word, args, line)
+            ".global" =>
+                let name: StrView = self.one_name(word, args, line)?
+                self.push(line, Item.Global(name))
+                Ok(())
+            ".extern" =>
+                let name: StrView = self.one_name(word, args, line)?
+                self.push(line, Item.Extern(name))
+                Ok(())
+            ".type" => self.type_directive(args, line)
+            ".size" =>
+                let parts: Vec<StrView> = split_args(args)
+                if parts.len != 2 or not is_name(parts.get(0))
+                    return Err(error(line, string_from("`.size` takes `name, expr`")))
+                let e: Expr = self.expr(parts.get(1), line)?
+                self.push(line, Item.Size(parts.get(0), e))
+                Ok(())
+            ".align" => self.align(args, line)
+            ".set" => self.set_directive(word, args, line)
+            ".equ" => self.set_directive(word, args, line)
+            ".byte" => self.data(1, word, args, line)
+            ".word" => self.data(2, word, args, line)
+            ".long" => self.data(4, word, args, line)
+            ".quad" => self.data(8, word, args, line)
+            ".ascii" => self.ascii(false, word, args, line)
+            ".asciz" => self.ascii(true, word, args, line)
+            ".space" => self.space(args, line)
+            ".incbin" => self.incbin(args, line)
+            ".macro" => Err(error(line, string_from("`.macro` must start its line")))
+            ".rept" => Err(error(line, string_from("`.rept` must start its line")))
+            ".endm" => Err(error(line, string_from("`.endm` without `.macro`")))
+            ".endr" => Err(error(line, string_from("`.endr` without `.rept`")))
+            _ =>
+                var what: String = string_new()
+                format_into(@&what, "directive `{word}` is outside razm's dialect")
+                Err(error(line, what))
+
+    fn no_args(self: @Parser, word: StrView, args: StrView, line: i64) -> Result<(), ParseError>
+        if args.len > 0
+            var what: String = string_new()
+            format_into(@&what, "`{word}` takes no operands")
+            return Err(error(line, what))
+        Ok(())
+
+    fn one_name(self: @Parser, word: StrView, args: StrView, line: i64) -> Result<StrView, ParseError>
+        if not is_name(args)
+            var what: String = string_new()
+            format_into(@&what, "`{word}` takes one symbol name, not `{args}`")
+            return Err(error(line, what))
+        Ok(args)
+
+    fn code_mode(self: @&Parser, mode: Mode, word: StrView, args: StrView, line: i64) -> Result<(), ParseError>
+        self.no_args(word, args, line)?
+        self.push(line, Item.CodeMode(mode))
+        Ok(())
+
+    fn enter_section(self: @&Parser, decl: SectionDecl, line: i64)
+        var found: i64 = -1
+        for i in 0..self.sections.len
+            if self.sections.get(i).eq(decl.name)
+                found = i
+        if found < 0
+            self.sections.push(decl.name)
+            found = self.sections.len - 1
+        self.section = found
+        self.prog.syms.set_here(SymDef.Unplaced(found))
+        self.push(line, Item.Section(decl))
+
+    fn bare_section(self: @&Parser, word: StrView, args: StrView, line: i64) -> Result<(), ParseError>
+        self.no_args(word, args, line)?
+        self.enter_section(implicit_section(word), line)
+        Ok(())
+
+    fn section(self: @&Parser, args: StrView, line: i64) -> Result<(), ParseError>
+        let parts: Vec<StrView> = split_args(args)
+        if parts.len == 0 or not is_name(parts.get(0))
+            return Err(error(line, string_from("`.section` needs a section name")))
+        let name: StrView = parts.get(0)
+        if parts.len == 1
+            self.enter_section(implicit_section(name), line)
+            return Ok(())
+        if parts.len > 3
+            return Err(error(line, string_from("`.section` takes a name, a flags string and `@nobits`")))
+        let quoted: StrView = parts.get(1)
+        if quoted.len < 2 or quoted.get(0) != '"' or quoted.get(quoted.len - 1) != '"'
+            var what: String = string_new()
+            format_into(@&what, "section flags must be a string, not `{quoted}`")
+            return Err(error(line, what))
+        var flags: SectionFlags = SectionFlags { alloc: false, write: false, exec: false }
+        let letters: StrView = quoted.slice(1, quoted.len - 1)
+        for i in 0..letters.len
+            let c: u8 = letters.get(i)
+            if c == 'a'
+                flags.alloc = true
+            else if c == 'w'
+                flags.write = true
+            else if c == 'x'
+                flags.exec = true
+            else
+                var what: String = string_new()
+                format_into(@&what, "section flag `{letters.slice(i, i + 1)}` is outside razm's dialect")
+                return Err(error(line, what))
+        var nobits: bool = name.eq(".bss")
+        if parts.len == 3
+            let kind: StrView = parts.get(2)
+            if not kind.eq("@nobits")
+                var what: String = string_new()
+                format_into(@&what, "section type `{kind}` is outside razm's dialect")
+                return Err(error(line, what))
+            nobits = true
+        self.enter_section(SectionDecl { name: name, flags: flags, nobits: nobits }, line)
+        Ok(())
+
+    fn type_directive(self: @&Parser, args: StrView, line: i64) -> Result<(), ParseError>
+        let parts: Vec<StrView> = split_args(args)
+        if parts.len != 2 or not is_name(parts.get(0))
+            return Err(error(line, string_from("`.type` takes `name, @function`")))
+        let kind: StrView = parts.get(1)
+        if not kind.eq("@function")
+            var what: String = string_new()
+            format_into(@&what, "`.type` kind `{kind}` is outside razm's dialect")
+            return Err(error(line, what))
+        self.push(line, Item.TypeFunction(parts.get(0)))
+        Ok(())
+
+    fn set_directive(self: @&Parser, word: StrView, args: StrView, line: i64) -> Result<(), ParseError>
+        let parts: Vec<StrView> = split_args(args)
+        if parts.len != 2
+            var what: String = string_new()
+            format_into(@&what, "`{word}` takes `name, expr`")
+            return Err(error(line, what))
+        self.assign(parts.get(0), parts.get(1), line)
+
+    fn align(self: @&Parser, args: StrView, line: i64) -> Result<(), ParseError>
+        let parts: Vec<StrView> = split_args(args)
+        if parts.len != 1
+            return Err(error(line, string_from("`.align` takes one operand, the alignment in bytes")))
+        let n: i64 = self.absolute(parts.get(0), line, ".align")?
+        if n <= 0 or (n & (n - 1)) != 0
+            var what: String = string_new()
+            format_into(@&what, "`.align {n}` is not a power of two")
+            return Err(error(line, what))
+        self.push(line, Item.Align(n))
+        Ok(())
+
+    fn data(self: @&Parser, width: i64, word: StrView, args: StrView, line: i64) -> Result<(), ParseError>
+        let parts: Vec<StrView> = split_args(args)
+        if parts.len == 0
+            var what: String = string_new()
+            format_into(@&what, "`{word}` needs a value")
+            return Err(error(line, what))
+        for i in 0..parts.len
+            let e: Expr = self.expr(parts.get(i), line)?
+            self.push(line, Item.Data(width, e))
+        Ok(())
+
+    # A `"..."` literal's bytes, escapes decoded: \n \t \r \\ \" \0-\377
+    # (octal) and \xHH.
+    fn string_literal(self: @Parser, quoted: StrView, line: i64) -> Result<String, ParseError>
+        if quoted.len < 2 or quoted.get(0) != '"' or quoted.get(quoted.len - 1) != '"'
+            var what: String = string_new()
+            format_into(@&what, "expected a string literal, not `{quoted}`")
+            return Err(error(line, what))
+        let body: StrView = quoted.slice(1, quoted.len - 1)
+        var out: String = string_new()
+        var i: i64 = 0
+        while i < body.len
+            let c: u8 = body.get(i)
+            i += 1
+            if c != '\\'
+                out.push(c)
+                continue
+            if i >= body.len
+                return Err(error(line, string_from("a string literal ends in `\\`")))
+            let e: u8 = body.get(i)
+            i += 1
+            if e == 'n'
+                out.push('\n')
+            else if e == 't'
+                out.push('\t')
+            else if e == 'r'
+                out.push('\r')
+            else if e == '\\' or e == '"'
+                out.push(e)
+            else if e >= '0' and e <= '7'
+                var v: i64 = (e - '0') as i64
+                var k: i64 = 0
+                while k < 2 and i < body.len and body.get(i) >= '0' and body.get(i) <= '7'
+                    v = v * 8 + (body.get(i) - '0') as i64
+                    i += 1
+                    k += 1
+                out.push((v & 255) as u8)
+            else if e == 'x'
+                var v: i64 = 0
+                var k: i64 = 0
+                while i < body.len and hex_value(body.get(i)) >= 0
+                    v = (v * 16 + hex_value(body.get(i))) & 255
+                    i += 1
+                    k += 1
+                if k == 0
+                    return Err(error(line, string_from("`\\x` needs hex digits")))
+                out.push(v as u8)
+            else
+                var what: String = string_new()
+                format_into(@&what, "string escape `\\{body.slice(i - 1, i)}` is outside razm's dialect")
+                return Err(error(line, what))
+        Ok(out)
+
+    fn ascii(self: @&Parser, zero: bool, word: StrView, args: StrView, line: i64) -> Result<(), ParseError>
+        let parts: Vec<StrView> = split_args(args)
+        if parts.len == 0
+            var what: String = string_new()
+            format_into(@&what, "`{word}` needs a string")
+            return Err(error(line, what))
+        for i in 0..parts.len
+            var bytes: String = self.string_literal(parts.get(i), line)?
+            if zero
+                bytes.push(0)
+            let kept: StrView = self.keep(bytes)
+            self.push(line, Item.Bytes(kept))
+        Ok(())
+
+    fn space(self: @&Parser, args: StrView, line: i64) -> Result<(), ParseError>
+        let parts: Vec<StrView> = split_args(args)
+        if parts.len < 1 or parts.len > 2
+            return Err(error(line, string_from("`.space` takes a size and an optional fill byte")))
+        let n: i64 = self.absolute(parts.get(0), line, ".space")?
+        if n < 0
+            var what: String = string_new()
+            format_into(@&what, "`.space` size {n} is negative")
+            return Err(error(line, what))
+        var fill: i64 = 0
+        if parts.len == 2
+            fill = self.absolute(parts.get(1), line, ".space")?
+        self.push(line, Item.Space(n, (fill & 255) as u8))
+        Ok(())
+
+    fn incbin(self: @&Parser, args: StrView, line: i64) -> Result<(), ParseError>
+        let parts: Vec<StrView> = split_args(args)
+        if parts.len < 1 or parts.len > 3
+            return Err(error(line, string_from("`.incbin` takes \"path\" and an optional skip and count")))
+        let path: String = self.string_literal(parts.get(0), line)?
+        var skip: i64 = 0
+        if parts.len >= 2
+            skip = self.absolute(parts.get(1), line, ".incbin")?
+        var full: String = string_new()
+        if self.incbin_dir.len > 0
+            full.push_str(self.incbin_dir)
+            full.push('/')
+        full.push_str(path.as_view())
+        let contents: String = match read_file(full.as_view())
+            Ok(bytes) => bytes
+            Err(_) =>
+                var what: String = string_new()
+                format_into(@&what, "cannot read `.incbin` file `{full.as_view()}`")
+                return Err(error(line, what))
+        let size: i64 = contents.len()
+        var count: i64 = size - skip
+        if parts.len == 3
+            count = self.absolute(parts.get(2), line, ".incbin")?
+        if skip < 0 or count < 0 or skip + count > size
+            var what: String = string_new()
+            format_into(@&what, "`.incbin` skip {skip} and count {count} are outside the file's {size} bytes")
+            return Err(error(line, what))
+        let all: StrView = self.keep(contents)
+        self.push(line, Item.Bytes(all.slice(skip, skip + count)))
+        Ok(())
+
+    # -- instructions and operands -------------------------------------------
+
+    fn instruction(self: @&Parser, word: StrView, args: StrView, line: i64) -> Result<(), ParseError>
+        var prefix: Prefix = Prefix.NoPrefix
+        var mnemonic: StrView = word
+        var rest: StrView = args
+        if word.eq("lock") or word.eq("rep")
+            prefix = if word.eq("lock") then Prefix.Lock else Prefix.Rep
+            mnemonic = first_word(args)
+            rest = args.skip(mnemonic.len).trim()
+            if mnemonic.len == 0
+                var what: String = string_new()
+                format_into(@&what, "prefix `{word}` without an instruction")
+                return Err(error(line, what))
+        let m: Mnemonic = match find_mnemonic(mnemonic)
+            Some(found) => found
+            None =>
+                var what: String = string_new()
+                format_into(@&what, "mnemonic `{mnemonic}` is outside razm's dialect")
+                return Err(error(line, what))
+        var insn: Insn = insn_new(prefix, m.base, op_size(m.bytes))
+        let parts: Vec<StrView> = split_args(rest)
+        for i in 0..parts.len
+            let op: Operand = self.operand(parts.get(i), line)?
+            if not insn.push(op)
+                var what: String = string_new()
+                format_into(@&what, "`{mnemonic}` has more than three operands")
+                return Err(error(line, what))
+        self.push(line, Item.Instruction(insn))
+        Ok(())
+
+    # The register `%name` at the start of `s`, and its length with the `%`.
+    fn register(self: @Parser, s: StrView, line: i64) -> Result<Reg, ParseError>
+        var n: i64 = 1
+        while n < s.len and is_ident_char(s.get(n))
+            n += 1
+        let name: StrView = s.slice(1, n)
+        match reg_from_name(name)
+            Some(r) => Ok(r)
+            None =>
+                var what: String = string_new()
+                format_into(@&what, "register `%{name}` is outside razm's dialect")
+                Err(error(line, what))
+
+    fn register_len(s: StrView) -> i64
+        var n: i64 = 1
+        while n < s.len and is_ident_char(s.get(n))
+            n += 1
+        n
+
+    fn operand(self: @&Parser, text: StrView, line: i64) -> Result<Operand, ParseError>
+        let t: StrView = text.trim()
+        if t.len == 0
+            return Err(error(line, string_from("empty operand")))
+        let c: u8 = t.get(0)
+        if c == '$'
+            let e: Expr = self.expr(t.skip(1), line)?
+            return Ok(Operand.Imm(e))
+        if c == '*'
+            let target: StrView = t.skip(1).trim()
+            if target.len == 0 or target.get(0) != '%' or Parser.register_len(target) != target.len
+                var what: String = string_new()
+                format_into(@&what, "indirect operand `{t}` is outside razm's dialect (only `*%reg`)")
+                return Err(error(line, what))
+            let r: Reg = self.register(target, line)?
+            return Ok(Operand.Indirect(r))
+        if c == '%'
+            let r: Reg = self.register(t, line)?
+            let after: StrView = t.skip(Parser.register_len(t)).trim_start()
+            if after.len == 0
+                match r.class
+                    Rip => return Err(error(line, string_from("`%rip` is only a memory base: `sym(%rip)`")))
+                    _ => return Ok(Operand.Register(r))
+            match r.class
+                Segment =>
+                    if after.get(0) == ':'
+                        return self.memory(after.skip(1), Some(r), line)
+                _ => pass
+            var what: String = string_new()
+            format_into(@&what, "unexpected `{after}` after a register")
+            return Err(error(line, what))
+        self.memory(t, None, line)
+
+    # A memory operand after any segment override: `disp(base, index, scale)`
+    # with parts omitted, or an absolute address expression.
+    fn memory(self: @&Parser, text: StrView, seg: Option<Reg>, line: i64) -> Result<Operand, ParseError>
+        let t: StrView = text.trim()
+        var mem: Mem = Mem { seg: seg, disp: None, base: None, index: None, scale: 1 }
+        if t.len > 0 and t.get(t.len - 1) == ')'
+            # The `(` matching the final `)`.
+            var depth: i64 = 0
+            var open: i64 = t.len - 1
+            while open >= 0
+                let c: u8 = t.get(open)
+                if c == ')'
+                    depth += 1
+                else if c == '('
+                    depth -= 1
+                    if depth == 0
+                        break
+                open -= 1
+            if open < 0
+                var what: String = string_new()
+                format_into(@&what, "unbalanced `)` in `{t}`")
+                return Err(error(line, what))
+            let inner: StrView = t.slice(open + 1, t.len - 1).trim()
+            if inner.starts_with("%") or inner.starts_with(",")
+                let disp: StrView = t.take(open).trim()
+                if disp.len > 0
+                    mem.disp = Some(self.expr(disp, line)?)
+                return Ok(Operand.Memory(self.address(inner, mem, line)?))
+        if t.len == 0
+            return Err(error(line, string_from("empty memory operand")))
+        mem.disp = Some(self.expr(t, line)?)
+        Ok(Operand.Memory(mem))
+
+    # `mem` with the `base, index, scale` inside its parentheses.
+    fn address(self: @Parser, inner: StrView, partial: Mem, line: i64) -> Result<Mem, ParseError>
+        var mem: Mem = partial
+        let parts: Vec<StrView> = split_args(inner)
+        if parts.len > 3
+            var what: String = string_new()
+            format_into(@&what, "`({inner})` has more than base, index and scale")
+            return Err(error(line, what))
+        let base: StrView = parts.get(0)
+        if base.len > 0
+            mem.base = Some(self.address_reg(base, true, line)?)
+        if parts.len >= 2
+            mem.index = Some(self.address_reg(parts.get(1), false, line)?)
+            match mem.base
+                Some(b) =>
+                    match b.class
+                        Rip => return Err(error(line, string_from("`%rip` takes no index")))
+                        _ => pass
+                None => pass
+        if parts.len == 3
+            let scale: StrView = parts.get(2)
+            if scale.eq("1") or scale.eq("2") or scale.eq("4") or scale.eq("8")
+                mem.scale = (scale.get(0) - '0') as u8
+            else
+                var what: String = string_new()
+                format_into(@&what, "scale `{scale}` is not 1, 2, 4 or 8")
+                return Err(error(line, what))
+        Ok(mem)
+
+    fn address_reg(self: @Parser, text: StrView, is_base: bool, line: i64) -> Result<Reg, ParseError>
+        if text.len == 0 or text.get(0) != '%' or Parser.register_len(text) != text.len
+            var what: String = string_new()
+            format_into(@&what, "expected a register in an address, not `{text}`")
+            return Err(error(line, what))
+        let r: Reg = self.register(text, line)?
+        match r.class
+            Gpr16 => Ok(r)
+            Gpr32 => Ok(r)
+            Gpr64 => Ok(r)
+            Rip =>
+                if is_base
+                    return Ok(r)
+                Err(error(line, string_from("`%rip` cannot be an index")))
+            _ =>
+                var what: String = string_new()
+                format_into(@&what, "`{text}` cannot address memory")
+                Err(error(line, what))
+
+    # -- expressions ----------------------------------------------------------
+
+    # The value of an operand that must be absolute, with every symbol in it
+    # defined earlier in the file.
+    fn absolute(self: @&Parser, text: StrView, line: i64, what_for: StrView) -> Result<i64, ParseError>
+        let e: Expr = self.expr(text, line)?
+        match first_undefined(@self.prog.exprs, e, @self.prog.syms)
+            Some(name) =>
+                var what: String = string_new()
+                format_into(@&what, "`{what_for}` needs an absolute value: `{name}` is not defined before this line")
+                return Err(error(line, what))
+            None => pass
+        match eval(@self.prog.exprs, e, @self.prog.syms)
+            Ok(v) =>
+                match v
+                    Absolute(n) => Ok(n)
+                    Relocatable(r) =>
+                        let sym: StrView = r.sym
+                        var what: String = string_new()
+                        format_into(@&what, "`{what_for}` needs an absolute value, not one relative to `{sym}`")
+                        Err(error(line, what))
+            Err(bad) =>
+                var what: String = string_new()
+                format_into(@&what, "`{what_for}`: ")
+                what.push_str(bad.message().as_view())
+                Err(error(line, what))
+
+    # Parse all of `text` as one expression.
+    fn expr(self: @&Parser, text: StrView, line: i64) -> Result<Expr, ParseError>
+        var c: Cursor = Cursor { s: text, pos: 0, line: line }
+        if c.at_end()
+            return Err(error(line, string_from("missing expression")))
+        let e: Expr = self.expr_add(@&c)?
+        if not c.at_end()
+            return Err(self.unexpected(@&c))
+        Ok(e)
+
+    # An error for what stands at the cursor: an operator outside the
+    # dialect is named as one.
+    fn unexpected(self: @Parser, c: @&Cursor) -> ParseError
+        let rest: StrView = c.rest()
+        var what: String = string_new()
+        let ch: u8 = rest.get(0)
+        if ch == '>' and rest.starts_with(">>")
+            format_into(@&what, "operator `>>` is outside razm's dialect")
+        else if ch == '%' or ch == '&' or ch == '^' or ch == '!' or ch == '~' or ch == '<' or ch == '>' or ch == '='
+            format_into(@&what, "operator `{rest.take(1)}` is outside razm's dialect")
+        else
+            format_into(@&what, "unexpected `{rest}` in an expression")
+        error(c.line, what)
+
+    fn expr_add(self: @&Parser, c: @&Cursor) -> Result<Expr, ParseError>
+        var left: Expr = self.expr_or(c)?
+        loop
+            let ch: u8 = c.peek()
+            var op: BinOp = BinOp.Add
+            if ch == '+'
+                op = BinOp.Add
+            else if ch == '-'
+                op = BinOp.Sub
+            else
+                return Ok(left)
+            c.pos += 1
+            let right: Expr = self.expr_or(c)?
+            left = self.prog.exprs.add(ExprNode.Bin(op, left, right))
+
+    fn expr_or(self: @&Parser, c: @&Cursor) -> Result<Expr, ParseError>
+        var left: Expr = self.expr_mul(c)?
+        while c.peek() == '|' and c.peek2() != '|'
+            c.pos += 1
+            let right: Expr = self.expr_mul(c)?
+            left = self.prog.exprs.add(ExprNode.Bin(BinOp.Or, left, right))
+        Ok(left)
+
+    fn expr_mul(self: @&Parser, c: @&Cursor) -> Result<Expr, ParseError>
+        var left: Expr = self.expr_unary(c)?
+        loop
+            let ch: u8 = c.peek()
+            var op: BinOp = BinOp.Mul
+            if ch == '*'
+                c.pos += 1
+            else if ch == '/'
+                op = BinOp.Div
+                c.pos += 1
+            else if ch == '<' and c.peek2() == '<'
+                op = BinOp.Shl
+                c.pos += 2
+            else
+                return Ok(left)
+            let right: Expr = self.expr_unary(c)?
+            left = self.prog.exprs.add(ExprNode.Bin(op, left, right))
+
+    fn expr_unary(self: @&Parser, c: @&Cursor) -> Result<Expr, ParseError>
+        if c.peek() == '-'
+            c.pos += 1
+            let inner: Expr = self.expr_unary(c)?
+            return Ok(self.prog.exprs.add(ExprNode.Neg(inner)))
+        self.expr_primary(c)
+
+    fn expr_primary(self: @&Parser, c: @&Cursor) -> Result<Expr, ParseError>
+        let ch: u8 = c.peek()
+        if ch == '('
+            c.pos += 1
+            let inner: Expr = self.expr_add(c)?
+            if c.peek() != ')'
+                if c.at_end()
+                    return Err(error(c.line, string_from("missing `)` in an expression")))
+                return Err(self.unexpected(c))
+            c.pos += 1
+            return Ok(inner)
+        if is_digit(ch)
+            return self.expr_number(c)
+        if ch == '\''
+            return self.expr_char(c)
+        let n: i64 = ident_len(c.rest())
+        if n > 0
+            let name: StrView = c.rest().take(n)
+            c.pos += n
+            if name.eq(".")
+                return Ok(self.prog.exprs.add(ExprNode.Here))
+            return Ok(self.prog.exprs.sym(name))
+        if c.at_end()
+            return Err(error(c.line, string_from("an expression ends early")))
+        Err(self.unexpected(c))
+
+    # A decimal or `0x` literal, or a numeric local reference `Nb` / `Nf`.
+    fn expr_number(self: @&Parser, c: @&Cursor) -> Result<Expr, ParseError>
+        let rest: StrView = c.rest()
+        var n: i64 = 0
+        if rest.starts_with("0x") or rest.starts_with("0X")
+            n = 2
+            while n < rest.len and hex_value(rest.get(n)) >= 0
+                n += 1
+        else
+            n = digits_len(rest)
+            if n < rest.len and (rest.get(n) == 'b' or rest.get(n) == 'f') and (n + 1 >= rest.len or not is_ident_char(rest.get(n + 1)))
+                let label: i64 = self.number(rest.take(n), c.line)?
+                let backward: bool = rest.get(n) == 'b'
+                c.pos += n + 1
+                return self.local_ref(label, backward, rest.take(n + 1), c.line)
+        if n < rest.len and is_ident_char(rest.get(n))
+            var end: i64 = n
+            while end < rest.len and is_ident_char(rest.get(end))
+                end += 1
+            var what: String = string_new()
+            format_into(@&what, "`{rest.take(end)}` is not a number razm accepts (decimal, or hex with 0x)")
+            return Err(error(c.line, what))
+        let value: i64 = self.number(rest.take(n), c.line)?
+        c.pos += n
+        Ok(self.prog.exprs.num(value))
+
+    # A character literal `'c'`, its byte's value; `\\` and `\'` escape.
+    fn expr_char(self: @&Parser, c: @&Cursor) -> Result<Expr, ParseError>
+        let rest: StrView = c.rest()
+        var n: i64 = 1
+        if n < rest.len and rest.get(n) == '\\'
+            n += 1
+        if n + 1 >= rest.len or rest.get(n + 1) != '\''
+            var what: String = string_new()
+            format_into(@&what, "character literal `{rest}` is outside razm's dialect (one character in quotes)")
+            return Err(error(c.line, what))
+        let value: u8 = rest.get(n)
+        c.pos += n + 2
+        Ok(self.prog.exprs.num(value as i64))
+
+    fn local_ref(self: @&Parser, label: i64, backward: bool, written: StrView, line: i64) -> Result<Expr, ParseError>
+        let at: i64 = self.local_index(label)
+        let defined: i64 = self.locals.get(at).defined
+        if backward
+            if defined == 0
+                var what: String = string_new()
+                format_into(@&what, "`{written}` refers back to no `{label}:`")
+                return Err(error(line, what))
+            return Ok(self.prog.exprs.sym(self.local_name(label, defined)))
+        Ok(self.prog.exprs.sym(self.local_name(label, defined + 1)))
+
+    # A decimal or `0x` literal's 64-bit value. Hex and decimal literals up to
+    # 2^64 - 1 are accepted and read as two's complement.
+    fn number(self: @Parser, text: StrView, line: i64) -> Result<i64, ParseError>
+        var v: u64 = 0
+        var base: u64 = 10
+        var i: i64 = 0
+        if text.starts_with("0x") or text.starts_with("0X")
+            base = 16
+            i = 2
+            if text.len == 2
+                return Err(error(line, string_from("`0x` needs hex digits")))
+        while i < text.len
+            let d: u64 = hex_value(text.get(i)) as u64
+            if v > (18446744073709551615 - d) / base
+                var what: String = string_new()
+                format_into(@&what, "`{text}` does not fit in 64 bits")
+                return Err(error(line, what))
+            v = v * base + d
+            i += 1
+        Ok(v as i64)
+
+fn implicit_section(name: StrView) -> SectionDecl
+    var flags: SectionFlags = SectionFlags { alloc: false, write: false, exec: false }
+    if name.eq(".text")
+        flags.alloc = true
+        flags.exec = true
+    else if name.eq(".data") or name.eq(".bss")
+        flags.alloc = true
+        flags.write = true
+    else if name.eq(".rodata")
+        flags.alloc = true
+    SectionDecl { name: name, flags: flags, nobits: name.eq(".bss") }
