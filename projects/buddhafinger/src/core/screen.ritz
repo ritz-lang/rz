@@ -1,10 +1,44 @@
-# core/screen.ritz - screen layout.
+# core/screen.ritz - the screen: a grid of styled cells and the bytes that draw it.
 #
-# The editor renders to a grid of styled cells and a platform adapter emits
-# the cells that changed (docs/BUDDHAFINGER_PROPOSAL.md, "Ritz and platform
-# boundaries"). Below the text area sit a status line and a command and
-# message line.
-# Core module: no terminal or OS I/O (see src/platform/).
+# The editor renders each frame into a Grid of Cells, then emits only the
+# cells that changed since the last frame through ritzlib.termsession's
+# TermOut (docs/BUDDHAFINGER_PROPOSAL.md, "Ritz and platform boundaries").
+# TermOut only buffers: the platform adapter flushes it to the terminal, so
+# this module still does no terminal or OS I/O (see src/platform/).
+#
+#   var scr = screen_new(Size { rows: 24, cols: 80 })
+#   var view = view_new()
+#   render(@&scr, @lines, @&view, status, "")    # compose the frame
+#   var out = term_out()
+#   scr.emit(@&out)                               # the changed cells
+#   out.flush(STDOUT)
+#
+# Layout, top to bottom: the text area (a line-number gutter, then the
+# lines from view.top, horizontally scrolled by view.left cells; rows past
+# the last line show `~`), the status line, and the command/message line.
+# render() scrolls the view so the cursor is on screen.
+#
+# Buffer bytes are display data, never terminal commands: a C0 control byte
+# or DEL shows as `^X` (`^[` for ESC, `^?` for DEL), and a byte that does
+# not start well-formed UTF-8 shows as `<xx>`, both in the escape style. The
+# C1 controls (U+0080..U+009F) are well-formed UTF-8 but terminals act on
+# them, so their two bytes show as `<c2><xx>`. Tab advances to the next tab
+# stop (every TAB_STOP cells); every other code point is one cell (grapheme
+# width is out of scope, see the proposal's "Buffer representation").
+#
+# Only the viewport is measured. Lines of CHECKPOINT_STRIDE bytes or more
+# keep byte->cell checkpoints (Checkpoints, below), so scrolling far right
+# in a long line resumes from the nearest one instead of the line's start.
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string
+import ritzlib.fmt.digits { fmt_i64_into }
+import ritzlib.termsession { TermOut, Style, Color, style_plain }
+
+import core.modes { Mode, mode_label }
 
 pub struct Size
     rows: i32
@@ -16,3 +50,657 @@ pub const CHROME_ROWS: i32 = 2
 # Rows left for buffer text in a viewport of `size`.
 pub fn text_rows(size: Size) -> i32
     if size.rows > CHROME_ROWS then size.rows - CHROME_ROWS else 0
+
+# Cells between tab stops.
+pub const TAB_STOP: i64 = 8
+
+# The fewest digits the gutter holds, so it doesn't widen at line 10 and 100.
+pub const GUTTER_MIN_DIGITS: i64 = 3
+
+# ============================================================================
+# The text a renderer reads
+# ============================================================================
+
+# The read-only view of a buffer the screen draws from: its lines, as bytes
+# without their terminators. core.buffer's Buffer has this shape.
+pub trait LineSource
+    fn line_count(self: @Self) -> i64
+    fn line(self: @Self, l: i64) -> [u8]
+
+# ============================================================================
+# Styles
+# ============================================================================
+
+# Buffer and message text, the gutter's numbers, the `~` past the last
+# line, escape glyphs and the status line.
+fn style_text() -> Style
+    style_plain()
+
+pub fn style_gutter() -> Style
+    var s = style_plain()
+    s.fg = Color.Index(3)
+    s
+
+pub fn style_filler() -> Style
+    var s = style_plain()
+    s.fg = Color.Index(4)
+    s
+
+pub fn style_escape() -> Style
+    var s = style_plain()
+    s.fg = Color.Index(6)
+    s
+
+pub fn style_status() -> Style
+    var s = style_plain()
+    s.reverse = true
+    s
+
+pub fn color_eq(a: Color, b: Color) -> bool
+    match a
+        Color.Default =>
+            match b
+                Color.Default => true
+                Color.Index(_) => false
+        Color.Index(i) =>
+            match b
+                Color.Default => false
+                Color.Index(j) => i == j
+
+pub fn style_eq(a: Style, b: Style) -> bool
+    color_eq(a.fg, b.fg) and color_eq(a.bg, b.bg) and a.bold == b.bold and a.underline == b.underline and a.reverse == b.reverse
+
+# ============================================================================
+# Cells and the grid
+# ============================================================================
+
+# One screen cell: the code point drawn there and its style. An escape glyph
+# (`^[`, `<ff>`) or a tab spans several cells, one code point each.
+pub struct Cell
+    ch: u32
+    style: Style
+
+pub fn cell_blank() -> Cell
+    Cell { ch: ' ' as u32, style: style_plain() }
+
+impl Cell
+    pub fn eq(self: @Cell, other: Cell) -> bool
+        self.ch == other.ch and style_eq(self.style, other.style)
+
+# rows x cols cells, row-major.
+pub struct Grid
+    rows: i64
+    cols: i64
+    cells: Vec<Cell>
+
+pub fn grid_new(size: Size) -> Grid
+    let rows: i64 = if size.rows > 0 then size.rows as i64 else 0
+    let cols: i64 = if size.cols > 0 then size.cols as i64 else 0
+    var cells: Vec<Cell> = vec_with_cap<Cell>(rows * cols)
+    for i in 0..rows * cols
+        cells.push(cell_blank())
+    Grid { rows: rows, cols: cols, cells: cells }
+
+impl Grid
+    # The cell at (r, c), 0-based; blank outside the grid.
+    pub fn get(self: @Grid, r: i64, c: i64) -> Cell
+        if r < 0 or r >= self.rows or c < 0 or c >= self.cols
+            return cell_blank()
+        self.cells.get(r * self.cols + c)
+
+    # Set (r, c); a cell outside the grid is clipped.
+    pub fn set(self: @&Grid, r: i64, c: i64, cell: Cell)
+        if r >= 0 and r < self.rows and c >= 0 and c < self.cols
+            self.cells.set(r * self.cols + c, cell)
+
+    pub fn clear(self: @&Grid)
+        for i in 0..self.cells.len()
+            self.cells.set(i, cell_blank())
+
+    # Copy every cell of `src`, a grid of the same size.
+    fn copy_from(self: @&Grid, src: @Grid)
+        for i in 0..self.cells.len()
+            self.cells.set(i, src.cells.get(i))
+
+    # Row r's code points as UTF-8 text (for tests and debugging).
+    pub fn row_text(self: @Grid, r: i64) -> String
+        var s = string_new()
+        for c in 0..self.cols
+            push_utf8(@&s, self.get(r, c).ch)
+        s
+
+    # Write `text` from (r, c) in `style`, escaping as buffer text is but
+    # with Tab shown as `^I`: status and message text is one line. Cells at
+    # or past `end` are clipped. Returns the column after the text.
+    # (pub: render<L> is instantiated in its caller's module, and a private
+    # method only it calls is never emitted here.)
+    pub fn put(self: @&Grid, r: i64, c: i64, end: i64, text: [u8], style: Style) -> i64
+        var col: i64 = c
+        var i: i64 = 0
+        while i < text.len and col < end
+            let u = unit_at(text, i, col, false)
+            for k in 0..u.width
+                if col + k < end
+                    self.set(r, col + k, Cell { ch: glyph_char(u, k), style: unit_style(u, style) })
+            i += u.len
+            col += u.width
+        col
+
+# Append code point `cp` to `s` as UTF-8.
+fn push_utf8(s: @&String, cp: u32)
+    if cp < 0x80
+        s.push(cp as u8)
+    else if cp < 0x800
+        s.push((0xC0 | (cp >> 6)) as u8)
+        s.push((0x80 | (cp & 0x3F)) as u8)
+    else if cp < 0x10000
+        s.push((0xE0 | (cp >> 12)) as u8)
+        s.push((0x80 | ((cp >> 6) & 0x3F)) as u8)
+        s.push((0x80 | (cp & 0x3F)) as u8)
+    else
+        s.push((0xF0 | (cp >> 18)) as u8)
+        s.push((0x80 | ((cp >> 12) & 0x3F)) as u8)
+        s.push((0x80 | ((cp >> 6) & 0x3F)) as u8)
+        s.push((0x80 | (cp & 0x3F)) as u8)
+
+# ============================================================================
+# Units: what one step through a line's bytes draws
+# ============================================================================
+
+enum Glyph
+    Text(u32)       # a code point, one cell
+    Tab             # blank cells to the next tab stop
+    Control(u8)     # a C0 control byte or DEL: `^X`, two cells
+    Bad(u8)         # a byte that isn't (displayable) UTF-8: `<xx>`, four cells
+
+# One step: `len` bytes of the line drawing `width` cells.
+struct Unit
+    len: i64
+    width: i64
+    glyph: Glyph
+
+# The unit at s[i], drawn at cell column `cell` (for the tab stop). With
+# `tabs` false a Tab is a control byte. i must be below s.len.
+fn unit_at(s: [u8], i: i64, cell: i64, tabs: bool) -> Unit
+    let b = s[i]
+    if b == '\t' and tabs
+        return Unit { len: 1, width: TAB_STOP - cell % TAB_STOP, glyph: Glyph.Tab }
+    if b < 0x20 or b == 0x7F
+        return Unit { len: 1, width: 2, glyph: Glyph.Control(b) }
+    if b < 0x80
+        return Unit { len: 1, width: 1, glyph: Glyph.Text(b as u32) }
+    # A multi-byte sequence (RFC 3629: no overlongs, no surrogates, nothing
+    # above U+10FFFF): its length, the range its second byte must be in, and
+    # the lead byte's value bits.
+    var n: i64 = 0
+    var lo: u8 = 0x80
+    var hi: u8 = 0xBF
+    var cp: u32 = 0
+    if b >= 0xC2 and b <= 0xDF
+        n = 2
+        cp = (b & 0x1F) as u32
+        # U+0080..U+009F are the C1 controls: shown as their bytes.
+        if b == 0xC2
+            lo = 0xA0
+    else if b >= 0xE0 and b <= 0xEF
+        n = 3
+        cp = (b & 0x0F) as u32
+        if b == 0xE0
+            lo = 0xA0
+        else if b == 0xED
+            hi = 0x9F
+    else if b >= 0xF0 and b <= 0xF4
+        n = 4
+        cp = (b & 0x07) as u32
+        if b == 0xF0
+            lo = 0x90
+        else if b == 0xF4
+            hi = 0x8F
+    else
+        return bad(b)
+    if i + n > s.len or s[i + 1] < lo or s[i + 1] > hi
+        return bad(b)
+    for k in 1..n
+        let c = s[i + k]
+        if c < 0x80 or c > 0xBF
+            return bad(b)
+        cp = (cp << 6) | (c & 0x3F) as u32
+    Unit { len: n, width: 1, glyph: Glyph.Text(cp) }
+
+fn bad(b: u8) -> Unit
+    Unit { len: 1, width: 4, glyph: Glyph.Bad(b) }
+
+fn hex_digit(n: u8) -> u32
+    if n < 10 then ('0' + n) as u32 else ('a' + n - 10) as u32
+
+# The code point in cell k of the unit's glyph.
+fn glyph_char(u: Unit, k: i64) -> u32
+    match u.glyph
+        Glyph.Text(cp) => cp
+        Glyph.Tab => ' ' as u32
+        Glyph.Control(b) => if k == 0 then '^' as u32 else (b ^ 0x40) as u32
+        Glyph.Bad(b) =>
+            if k == 0
+                return '<' as u32
+            if k == 1
+                return hex_digit(b >> 4)
+            if k == 2
+                return hex_digit(b & 0x0F)
+            '>' as u32
+
+# Text and tabs keep `style`; escape glyphs take the escape style.
+fn unit_style(u: Unit, style: Style) -> Style
+    match u.glyph
+        Glyph.Text(_) => style
+        Glyph.Tab => style
+        Glyph.Control(_) => style_escape()
+        Glyph.Bad(_) => style_escape()
+
+# ============================================================================
+# Checkpoints: bounded, lazy byte->cell marks for long lines
+# ============================================================================
+
+# A unit boundary: the cell column `cell` starts at byte `byte`.
+struct Mark
+    byte: i64
+    cell: i64
+
+# One cached line: its marks are marks[slot * per_slot ..][0..count], every
+# `stride` bytes or more apart and ascending.
+struct Slot
+    line: i64       # -1: free
+    count: i64
+    stride: i64
+    used: i64       # the tick it was last used at, for eviction
+
+# Lines this long or longer get checkpoints; shorter ones are scanned.
+pub const CHECKPOINT_STRIDE: i64 = 1024
+pub const CHECKPOINT_LINES: i64 = 8
+pub const CHECKPOINTS_PER_LINE: i64 = 256
+
+# Marks are made lazily, as a scan passes the last one, so a line is only
+# measured as far as the view has been. Memory is bounded: `lines` cached
+# lines (the least recently used is evicted) of `per_line` marks; a full
+# line drops every other mark and doubles its stride, so a multi-megabyte
+# line still keeps marks across all of it.
+pub struct Checkpoints
+    slots: Vec<Slot>
+    marks: Vec<Mark>
+    per_line: i64
+    stride: i64
+    tick: i64
+
+pub fn checkpoints_new() -> Checkpoints
+    checkpoints_with(CHECKPOINT_LINES, CHECKPOINTS_PER_LINE, CHECKPOINT_STRIDE)
+
+# A cache of `lines` lines, `per_line` marks each (at least 2), first
+# `stride` bytes apart.
+pub fn checkpoints_with(lines: i64, per_line: i64, stride: i64) -> Checkpoints
+    let per = if per_line < 2 then 2 else per_line
+    var slots: Vec<Slot> = vec_new<Slot>()
+    for i in 0..lines
+        slots.push(Slot { line: -1, count: 0, stride: stride, used: 0 })
+    var marks: Vec<Mark> = vec_with_cap<Mark>(lines * per)
+    for i in 0..lines * per
+        marks.push(Mark { byte: 0, cell: 0 })
+    Checkpoints { slots: slots, marks: marks, per_line: per, stride: if stride < 1 then 1 else stride, tick: 0 }
+
+impl Checkpoints
+    # How many marks line l has (0 when it isn't cached).
+    pub fn marks_for(self: @Checkpoints, l: i64) -> i64
+        match self.find(l)
+            Some(k) => self.slots.get(k).count
+            None => 0
+
+    # The text changed at byte `byte` of line l: drop that line's marks from
+    # the edit onward, and those a UTF-8 sequence's length before it (the
+    # unit there may now end elsewhere), and every later line's (lines after
+    # a split or join are other lines now).
+    pub fn invalidate(self: @&Checkpoints, l: i64, byte: i64)
+        for k in 0..self.slots.len()
+            var s = self.slots.get(k)
+            if s.line > l
+                s.line = -1
+                s.count = 0
+            else if s.line == l
+                var keep: i64 = 0
+                while keep < s.count and self.marks.get(k * self.per_line + keep).byte + 4 <= byte
+                    keep += 1
+                s.count = keep
+            self.slots.set(k, s)
+
+    fn find(self: @Checkpoints, l: i64) -> Option<i64>
+        for k in 0..self.slots.len()
+            if self.slots.get(k).line == l
+                return Some(k)
+        None
+
+    # The slot for line l, taking a free or the least recently used one.
+    fn slot_for(self: @&Checkpoints, l: i64) -> Option<i64>
+        if self.slots.len() == 0
+            return None
+        self.tick += 1
+        var pick: i64 = 0
+        match self.find(l)
+            Some(k) => pick = k
+            None =>
+                for k in 1..self.slots.len()
+                    if self.slots.get(k).used < self.slots.get(pick).used
+                        pick = k
+                self.slots.set(pick, Slot { line: l, count: 0, stride: self.stride, used: 0 })
+        var s = self.slots.get(pick)
+        s.used = self.tick
+        self.slots.set(pick, s)
+        Some(pick)
+
+    # The last mark of slot k at or before byte `byte` (by_cell false) or
+    # cell `cell` (by_cell true); the line's start when there is none.
+    fn start(self: @Checkpoints, k: i64, by_cell: bool, at: i64) -> Mark
+        var best = Mark { byte: 0, cell: 0 }
+        let s = self.slots.get(k)
+        for i in 0..s.count
+            let m = self.marks.get(k * self.per_line + i)
+            let pos = if by_cell then m.cell else m.byte
+            if pos > at
+                return best
+            best = m
+        best
+
+    # A scan of slot k's line reached a unit boundary: mark it if it is a
+    # stride past the last mark.
+    fn note(self: @&Checkpoints, k: i64, byte: i64, cell: i64)
+        var s = self.slots.get(k)
+        let base = k * self.per_line
+        let last: i64 = if s.count > 0 then self.marks.get(base + s.count - 1).byte else 0
+        if byte < last + s.stride
+            return
+        if s.count == self.per_line
+            # Full: keep marks 1, 3, 5... (2, 4, 6... strides in) and double
+            # the stride.
+            var kept: i64 = 0
+            var i: i64 = 1
+            while i < s.count
+                self.marks.set(base + kept, self.marks.get(base + i))
+                kept += 1
+                i += 2
+            s.count = kept
+            s.stride = s.stride * 2
+            let new_last: i64 = if kept > 0 then self.marks.get(base + kept - 1).byte else 0
+            if byte < new_last + s.stride
+                self.slots.set(k, s)
+                return
+        self.marks.set(base + s.count, Mark { byte: byte, cell: cell })
+        s.count += 1
+        self.slots.set(k, s)
+
+# Walks line l's units from a checkpoint, noting new ones as it goes.
+struct Scan
+    bytes: [u8]
+    slot: Option<i64>
+    byte: i64
+    cell: i64
+
+fn scan_from(cp: @&Checkpoints, l: i64, bytes: [u8], by_cell: bool, at: i64) -> Scan
+    if bytes.len < cp.stride
+        return Scan { bytes: bytes, slot: None, byte: 0, cell: 0 }
+    let slot = cp.slot_for(l)
+    var m = Mark { byte: 0, cell: 0 }
+    match slot
+        Some(k) => m = cp.start(k, by_cell, at)
+        None => pass
+    Scan { bytes: bytes, slot: slot, byte: m.byte, cell: m.cell }
+
+impl Scan
+    fn done(self: @Scan) -> bool
+        self.byte >= self.bytes.len
+
+    fn unit(self: @Scan) -> Unit
+        unit_at(self.bytes, self.byte, self.cell, true)
+
+    fn advance(self: @&Scan, cp: @&Checkpoints, u: Unit)
+        self.byte += u.len
+        self.cell += u.width
+        match self.slot
+            Some(k) => cp.note(k, self.byte, self.cell)
+            None => pass
+
+# The cell column byte `byte` of line l starts at: the cell after the line
+# when it is at or past the end.
+fn cell_of(cp: @&Checkpoints, l: i64, bytes: [u8], byte: i64) -> i64
+    var sc = scan_from(cp, l, bytes, false, byte)
+    while not sc.done() and sc.byte < byte
+        let u = sc.unit()
+        if sc.byte + u.len > byte
+            return sc.cell
+        sc.advance(cp, u)
+    sc.cell
+
+# ============================================================================
+# The view and the status line
+# ============================================================================
+
+# Where the window onto the buffer is: the first line shown, the first cell
+# column shown, and the cursor (a line and a byte in it).
+pub struct View
+    top: i64
+    left: i64
+    cursor_line: i64
+    cursor_byte: i64
+
+pub fn view_new() -> View
+    View { top: 0, left: 0, cursor_line: 0, cursor_byte: 0 }
+
+# What the status line shows besides the cursor position.
+pub struct Status
+    name: StrView       # the file name; empty for a new buffer
+    dirty: bool
+    mode: Mode
+
+# ============================================================================
+# Screen: compose a frame, emit the difference
+# ============================================================================
+
+pub struct Screen
+    size: Size
+    back: Grid          # the frame being composed
+    front: Grid         # what the terminal shows (valid when painted)
+    painted: bool
+    pen: Style          # the terminal's current SGR (valid when pen_known)
+    pen_known: bool
+    at_row: i64         # where the terminal's cursor is; -1: unknown
+    at_col: i64
+    cursor_row: i64     # where the frame puts the cursor
+    cursor_col: i64
+    marks: Checkpoints
+    run: String         # cell text waiting for one TermOut.text
+
+pub fn screen_new(size: Size) -> Screen
+    screen_with(size, checkpoints_new())
+
+pub fn screen_with(size: Size, marks: Checkpoints) -> Screen
+    Screen { size: size, back: grid_new(size), front: grid_new(size), painted: false, pen: style_plain(), pen_known: false, at_row: -1, at_col: -1, cursor_row: 0, cursor_col: 0, marks: marks, run: string_new() }
+
+# The gutter's width for a source of `lines` lines: the digits and a space,
+# or 0 when that leaves no text column.
+pub fn gutter_width(lines: i64, cols: i64) -> i64
+    var digits: i64 = 1
+    var n: i64 = lines
+    while n >= 10
+        n = n / 10
+        digits += 1
+    if digits < GUTTER_MIN_DIGITS
+        digits = GUTTER_MIN_DIGITS
+    if digits + 1 >= cols then 0 else digits + 1
+
+impl Screen
+    # A new terminal size: the next emit repaints everything.
+    pub fn resize(self: @&Screen, size: Size)
+        self.size = size
+        self.back = grid_new(size)
+        self.front = grid_new(size)
+        self.painted = false
+
+    # The terminal's contents are unknown (another program drew on it): the
+    # next emit repaints everything.
+    pub fn invalidate_terminal(self: @&Screen)
+        self.painted = false
+
+    # The composed frame.
+    pub fn cell(self: @Screen, r: i64, c: i64) -> Cell
+        self.back.get(r, c)
+
+    pub fn row_text(self: @Screen, r: i64) -> String
+        self.back.row_text(r)
+
+    # The cursor's cell in the composed frame, 0-based.
+    pub fn cursor_row(self: @Screen) -> i64
+        self.cursor_row
+
+    pub fn cursor_col(self: @Screen) -> i64
+        self.cursor_col
+
+    # The buffer changed at line l, byte `byte` (see Checkpoints.invalidate).
+    pub fn text_changed(self: @&Screen, l: i64, byte: i64)
+        self.marks.invalidate(l, byte)
+
+    pub fn marks_for(self: @Screen, l: i64) -> i64
+        self.marks.marks_for(l)
+
+    # Append to `out` what turns the terminal's screen into the composed
+    # frame: the changed cells, each run after one cursor move and the SGR
+    # its style needs, then the cursor. Nothing when nothing changed. After
+    # a resize (or before the first frame) it clears and draws everything.
+    pub fn emit(self: @&Screen, out: @&TermOut)
+        if not self.painted
+            out.reset_style()
+            out.clear_screen()
+            self.front.clear()
+            self.pen = style_plain()
+            self.pen_known = true
+            self.at_row = -1
+            self.at_col = -1
+            self.painted = true
+        for r in 0..self.back.rows
+            for c in 0..self.back.cols
+                let want = self.back.get(r, c)
+                if not want.eq(self.front.get(r, c))
+                    self.draw(out, r, c, want)
+        self.flush_run(out)
+        self.front.copy_from(@self.back)
+        if self.at_row != self.cursor_row or self.at_col != self.cursor_col
+            out.cursor_to((self.cursor_row + 1) as i32, (self.cursor_col + 1) as i32)
+            self.at_row = self.cursor_row
+            self.at_col = self.cursor_col
+
+    fn draw(self: @&Screen, out: @&TermOut, r: i64, c: i64, cell: Cell)
+        if self.at_row != r or self.at_col != c
+            self.flush_run(out)
+            out.cursor_to((r + 1) as i32, (c + 1) as i32)
+        if not self.pen_known or not style_eq(self.pen, cell.style)
+            self.flush_run(out)
+            out.style(cell.style)
+            self.pen = cell.style
+            self.pen_known = true
+        push_utf8(@&self.run, cell.ch)
+        # Past the last column the cursor waits to wrap, and at_col (== cols)
+        # matches no cell: the next draw moves there explicitly.
+        self.at_row = r
+        self.at_col = c + 1
+
+    fn flush_run(self: @&Screen, out: @&TermOut)
+        if not self.run.is_empty()
+            out.text(self.run.as_view())
+            self.run.clear()
+
+# Compose the frame for `src` through `view` into `scr`, scrolling the view
+# so its cursor is on screen, with `status` and `message` below the text.
+pub fn render<L: LineSource>(scr: @&Screen, src: @L, view: @&View, status: Status, message: StrView)
+    scr.back.clear()
+    let rows: i64 = text_rows(scr.size) as i64
+    let cols: i64 = scr.back.cols
+    let count: i64 = src.line_count()
+    let gutter: i64 = gutter_width(count, cols)
+    let width: i64 = cols - gutter
+
+    # The cursor: clamped to the source, then scrolled into view.
+    if view.cursor_line >= count
+        view.cursor_line = if count > 0 then count - 1 else 0
+    if view.cursor_line < 0
+        view.cursor_line = 0
+    var cursor_cell: i64 = 0
+    if view.cursor_line < count
+        cursor_cell = cell_of(@&scr.marks, view.cursor_line, src.line(view.cursor_line), view.cursor_byte)
+    if view.cursor_line < view.top
+        view.top = view.cursor_line
+    if rows > 0 and view.cursor_line >= view.top + rows
+        view.top = view.cursor_line - rows + 1
+    if cursor_cell < view.left
+        view.left = cursor_cell
+    if width > 0 and cursor_cell >= view.left + width
+        view.left = cursor_cell - width + 1
+    if view.top < 0
+        view.top = 0
+    if view.left < 0
+        view.left = 0
+    scr.cursor_row = view.cursor_line - view.top
+    scr.cursor_col = gutter + cursor_cell - view.left
+
+    for r in 0..rows
+        let l = view.top + r
+        if l < count
+            draw_number(@&scr.back, r, gutter, l + 1)
+            draw_line(scr, r, gutter, l, src.line(l), view.left)
+        else
+            scr.back.set(r, 0, Cell { ch: '~' as u32, style: style_filler() })
+
+    if scr.back.rows >= 2
+        draw_status(@&scr.back, scr.back.rows - 2, status, view.cursor_line + 1, cursor_cell + 1)
+    if scr.back.rows >= 1
+        scr.back.put(scr.back.rows - 1, 0, cols, span_from_strview(message), style_text())
+        if rows == 0
+            # No text area: the cursor sits on the message line.
+            scr.cursor_row = scr.back.rows - 1
+            scr.cursor_col = 0
+
+# Line number n, right-aligned in the gutter's digits.
+fn draw_number(g: @&Grid, r: i64, gutter: i64, n: i64)
+    if gutter == 0
+        return
+    var buf: [20]u8
+    let digits = fmt_i64_into(@buf, n)
+    g.put(r, gutter - 1 - digits.len, gutter - 1, span_from_strview(digits), style_gutter())
+
+# Line l's cells from cell column `left`, at columns gutter.. of row r.
+fn draw_line(scr: @&Screen, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64)
+    let end = left + scr.back.cols - gutter
+    var sc = scan_from(@&scr.marks, l, bytes, true, left)
+    while not sc.done() and sc.cell < end
+        let u = sc.unit()
+        for k in 0..u.width
+            let at = sc.cell + k
+            if at >= left and at < end
+                scr.back.set(r, gutter + at - left, Cell { ch: glyph_char(u, k), style: unit_style(u, style_text()) })
+        sc.advance(@&scr.marks, u)
+
+# ` MODE  name [+]` from the left, `line:col ` from the right, reversed.
+fn draw_status(g: @&Grid, r: i64, status: Status, line: i64, col: i64)
+    let cols = g.cols
+    for c in 0..cols
+        g.set(r, c, Cell { ch: ' ' as u32, style: style_status() })
+    var left = string_from(" ")
+    left.push_str(mode_label(status.mode))
+    left.push_str("  ")
+    var at = g.put(r, 0, cols, span_from_strview(left.as_view()), style_status())
+    let name: StrView = if status.name.is_empty() then "[No Name]" else status.name
+    at = g.put(r, at, cols, span_from_strview(name), style_status())
+    if status.dirty
+        at = g.put(r, at, cols, span_from_strview(" [+]"), style_status())
+    var pos = string_new()
+    pos.push_i64(line)
+    pos.push(':')
+    pos.push_i64(col)
+    pos.push(' ')
+    # The position only where it fits after a gap: never over the mode.
+    let start = cols - pos.len()
+    if start > at
+        g.put(r, start, cols, span_from_strview(pos.as_view()), style_status())

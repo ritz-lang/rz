@@ -1,0 +1,531 @@
+# test/test_screen.ritz - the screen's ritzunit suite (AGAST #4817).
+#
+# Cell grids for the gutter, clipping, tabs, control-byte and malformed
+# UTF-8 escaping, scrolling, the status and message lines and resize; the
+# checkpoints' laziness, bounds and invalidation; and the diff: an unchanged
+# frame emits nothing, a one-cell change a minimal sequence.
+
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.string
+import ritzlib.termsession { TermOut, term_out, style_plain }
+
+import core.modes { Mode }
+import core.screen { LineSource, Screen, Size, View, Status, Cell, render, screen_new, screen_with, view_new, checkpoints_with, gutter_width, style_eq, style_escape, style_filler, style_gutter, style_status, text_rows }
+
+# ============================================================================
+# A line source: lines of bytes, `\n`-separated, `~` standing for 0xFF and
+# `^` for 0xC2 (bytes a "..." literal can't hold).
+# ============================================================================
+
+struct Lines
+    data: Vec<u8>
+    starts: Vec<i64>    # each line's first byte, then data.len() + 1
+
+impl LineSource for Lines
+    fn line_count(self: @Lines) -> i64
+        self.starts.len() - 1
+
+    fn line(self: @Lines, l: i64) -> [u8]
+        let all = span_from_vec<u8>(@self.data)
+        all.slice(self.starts.get(l), self.starts.get(l + 1) - 1)
+
+fn lines(s: StrView) -> Lines
+    var data: Vec<u8> = vec_new<u8>()
+    var starts: Vec<i64> = vec_new<i64>()
+    starts.push(0)
+    for i in 0..s.len
+        let c = s.get(i)
+        if c == '\n'
+            starts.push(data.len() + 1)
+            data.push('\n')
+        else if c == '~'
+            data.push(0xFF)
+        else if c == '^'
+            data.push(0xC2)
+        else
+            data.push(c)
+    starts.push(data.len() + 1)
+    Lines { data: data, starts: starts }
+
+# n lines numbered "l1".."ln".
+fn numbered(n: i64) -> Lines
+    var s = string_new()
+    for i in 0..n
+        if i > 0
+            s.push('\n')
+        s.push('l')
+        s.push_i64(i + 1)
+    lines(s.as_view())
+
+# A line of n bytes: `unit` repeated.
+fn repeat(unit: StrView, n: i64) -> Lines
+    var s = string_new()
+    while s.len() < n
+        s.push_str(unit)
+    lines(s.as_view())
+
+fn size(rows: i32, cols: i32) -> Size
+    Size { rows: rows, cols: cols }
+
+fn status() -> Status
+    Status { name: "a.ritz", dirty: false, mode: Mode.Normal }
+
+fn show(scr: @&Screen, src: @Lines, view: @&View)
+    render(scr, src, view, status(), "")
+
+fn row_is(scr: @Screen, r: i64, want: StrView) -> bool
+    let got = scr.row_text(r)
+    got.eq(want)
+
+fn emitted(scr: @&Screen) -> TermOut
+    var out = term_out()
+    scr.emit(@&out)
+    out
+
+# ============================================================================
+# Layout: gutter, filler, clipping
+# ============================================================================
+
+[[test]]
+fn test_text_rows_leave_room_for_status_and_command_lines() -> i32
+    assert text_rows(Size { rows: 24, cols: 80 }) == 22
+    assert text_rows(Size { rows: 1, cols: 80 }) == 0
+    0
+
+[[test]]
+fn test_gutter_numbers_lines_and_fills_past_the_end() -> i32
+    var scr = screen_new(size(5, 12))
+    var view = view_new()
+    let src = lines("one\ntwo")
+    show(@&scr, @src, @&view)
+    assert row_is(@scr, 0, "  1 one     ")
+    assert row_is(@scr, 1, "  2 two     ")
+    assert row_is(@scr, 2, "~           ")
+    assert style_eq(scr.cell(0, 2).style, style_gutter())
+    assert style_eq(scr.cell(0, 4).style, style_plain())
+    assert style_eq(scr.cell(2, 0).style, style_filler())
+    0
+
+[[test]]
+fn test_gutter_widens_past_three_digits_and_drops_on_a_narrow_screen() -> i32
+    assert gutter_width(1, 80) == 4
+    assert gutter_width(999, 80) == 4
+    assert gutter_width(1000, 80) == 5
+    assert gutter_width(1, 4) == 0
+    var scr = screen_new(size(4, 10))
+    var view = view_new()
+    view.cursor_line = 1499
+    let src = numbered(1500)
+    show(@&scr, @src, @&view)
+    assert row_is(@scr, 0, "1499 l1499")
+    assert row_is(@scr, 1, "1500 l1500")
+    0
+
+[[test]]
+fn test_long_lines_clip_at_the_right_edge() -> i32
+    var scr = screen_new(size(4, 8))
+    var view = view_new()
+    let src = lines("abcdefghij\nxy")
+    show(@&scr, @src, @&view)
+    assert row_is(@scr, 0, "  1 abcd")
+    assert row_is(@scr, 1, "  2 xy  ")
+    assert view.left == 0
+    0
+
+# ============================================================================
+# Tabs and escaping
+# ============================================================================
+
+[[test]]
+fn test_tab_advances_to_the_next_stop() -> i32
+    var scr = screen_new(size(5, 24))
+    var view = view_new()
+    let src = lines("a\tb\n\tc\nabcdefgh\ti")
+    show(@&scr, @src, @&view)
+    assert row_is(@scr, 0, "  1 a       b           ")
+    assert row_is(@scr, 1, "  2         c           ")
+    assert row_is(@scr, 2, "  3 abcdefgh        i   ")
+    0
+
+[[test]]
+fn test_control_bytes_show_as_caret_glyphs() -> i32
+    var scr = screen_new(size(3, 16))
+    var view = view_new()
+    let src = lines("a\eb\x01\x7f\r")
+    show(@&scr, @src, @&view)
+    assert row_is(@scr, 0, "  1 a^[b^A^?^M  ")
+    assert style_eq(scr.cell(0, 5).style, style_escape())
+    assert style_eq(scr.cell(0, 6).style, style_escape())
+    assert style_eq(scr.cell(0, 7).style, style_plain())
+    0
+
+[[test]]
+fn test_malformed_utf8_and_c1_controls_show_as_hex_bytes() -> i32
+    var scr = screen_new(size(3, 30))
+    var view = view_new()
+    # 0xFF; C2 9B (CSI as a C1 control); a lone C2 before 'x'; U+00E9.
+    let src = lines("~^\x1b^xé")
+    show(@&scr, @src, @&view)
+    # The 0x1B after C2 isn't a continuation byte: C2 is bad on its own.
+    assert row_is(@scr, 0, "  1 <ff><c2>^[<c2>xé          ")
+    assert scr.cell(0, 19).ch == 0xE9
+    assert style_eq(scr.cell(0, 4).style, style_escape())
+    0
+
+[[test]]
+fn test_c1_control_bytes_are_escaped() -> i32
+    var data: Vec<u8> = vec_new<u8>()
+    data.push(0xC2)
+    data.push(0x9B)
+    data.push('A')
+    # E2 82 then FF: a third byte that isn't a continuation byte.
+    data.push(0xE2)
+    data.push(0x82)
+    data.push(0xFF)
+    var starts: Vec<i64> = vec_new<i64>()
+    starts.push(0)
+    starts.push(data.len() + 1)
+    let src = Lines { data: data, starts: starts }
+    var scr = screen_new(size(3, 30))
+    var view = view_new()
+    show(@&scr, @src, @&view)
+    assert row_is(@scr, 0, "  1 <c2><9b>A<e2><82><ff>     ")
+    0
+
+[[test]]
+fn test_status_and_message_text_is_escaped_too() -> i32
+    var scr = screen_new(size(3, 30))
+    var view = view_new()
+    let src = lines("x")
+    render(@&scr, @src, @&view, Status { name: "a\e]0;t\x07", dirty: false, mode: Mode.Normal }, "m\tn\e")
+    assert row_is(@scr, 1, " NORMAL  a^[]0;t^G        1:1 ")
+    assert row_is(@scr, 2, "m^In^[                        ")
+    0
+
+# ============================================================================
+# Status line, message line, cursor
+# ============================================================================
+
+[[test]]
+fn test_status_line_shows_mode_name_dirty_and_position() -> i32
+    var scr = screen_new(size(4, 30))
+    var view = view_new()
+    view.cursor_line = 1
+    view.cursor_byte = 2
+    let src = lines("abc\nd\tef")
+    render(@&scr, @src, @&view, Status { name: "main.ritz", dirty: true, mode: Mode.Insert }, "saved")
+    assert row_is(@scr, 2, " INSERT  main.ritz [+]    2:9 ")
+    assert style_eq(scr.cell(2, 0).style, style_status())
+    assert style_eq(scr.cell(2, 29).style, style_status())
+    assert row_is(@scr, 3, "saved                         ")
+    # Byte 2 of "d\tef" is 'e', after the tab: cell 8, past the 4-cell gutter.
+    assert scr.cursor_row() == 1
+    assert scr.cursor_col() == 12
+    render(@&scr, @src, @&view, Status { name: "", dirty: false, mode: Mode.Normal }, "")
+    assert row_is(@scr, 2, " NORMAL  [No Name]        2:9 ")
+    0
+
+# ============================================================================
+# Scrolling
+# ============================================================================
+
+[[test]]
+fn test_vertical_scroll_follows_the_cursor() -> i32
+    var scr = screen_new(size(5, 10))
+    var view = view_new()
+    let src = numbered(50)
+    view.cursor_line = 10
+    show(@&scr, @src, @&view)
+    assert view.top == 8
+    assert row_is(@scr, 0, "  9 l9    ")
+    assert row_is(@scr, 2, " 11 l11   ")
+    assert scr.cursor_row() == 2
+    view.cursor_line = 3
+    show(@&scr, @src, @&view)
+    assert view.top == 3
+    assert row_is(@scr, 0, "  4 l4    ")
+    # Past the last line the cursor is clamped to it.
+    view.cursor_line = 99
+    show(@&scr, @src, @&view)
+    assert view.cursor_line == 49
+    assert row_is(@scr, 2, " 50 l50   ")
+    0
+
+[[test]]
+fn test_horizontal_scroll_follows_the_cursor() -> i32
+    var scr = screen_new(size(4, 10))
+    var view = view_new()
+    let src = lines("0123456789abcdef\nxy")
+    view.cursor_byte = 8
+    show(@&scr, @src, @&view)
+    # Six text columns: cell 8 is the last one shown.
+    assert view.left == 3
+    assert row_is(@scr, 0, "  1 345678")
+    assert row_is(@scr, 1, "  2       ")
+    assert scr.cursor_col() == 9
+    view.cursor_byte = 1
+    show(@&scr, @src, @&view)
+    assert view.left == 1
+    assert row_is(@scr, 0, "  1 123456")
+    0
+
+[[test]]
+fn test_horizontal_scroll_cuts_glyphs_at_the_left_edge() -> i32
+    var scr = screen_new(size(3, 10))
+    var view = view_new()
+    let src = lines("\tab\x01cdefghij")
+    view.left = 6
+    view.cursor_byte = 3
+    show(@&scr, @src, @&view)
+    # The tab is cells 0-7, 'a' 8, 'b' 9, ^A 10-11.
+    assert view.left == 6
+    assert row_is(@scr, 0, "  1   ab^A")
+    view.left = 11
+    view.cursor_byte = 6
+    show(@&scr, @src, @&view)
+    assert row_is(@scr, 0, "  1 Acdefg")
+    assert style_eq(scr.cell(0, 4).style, style_escape())
+    0
+
+# ============================================================================
+# Resize
+# ============================================================================
+
+[[test]]
+fn test_resize_relays_out_the_frame() -> i32
+    var scr = screen_new(size(6, 20))
+    var view = view_new()
+    let src = numbered(10)
+    view.cursor_line = 3
+    show(@&scr, @src, @&view)
+    assert view.top == 0
+    let first = emitted(@&scr)
+    scr.resize(size(4, 8))
+    show(@&scr, @src, @&view)
+    assert view.top == 2
+    assert row_is(@scr, 0, "  3 l3  ")
+    assert row_is(@scr, 1, "  4 l4  ")
+    assert row_is(@scr, 2, " NORMAL ")
+    assert row_is(@scr, 3, "        ")
+    # A resize repaints the whole screen.
+    let out = emitted(@&scr)
+    assert out.as_view().starts_with("\e[0m\e[2J")
+    # The terminal was drawn on (a suspended editor resumed): repaint all.
+    show(@&scr, @src, @&view)
+    let same = emitted(@&scr)
+    assert same.as_view().len == 0
+    scr.invalidate_terminal()
+    let again = emitted(@&scr)
+    assert again.as_view().starts_with("\e[0m\e[2J")
+    assert again.as_view().contains(" NORMAL ")
+    # One row: no text area, the message line only.
+    scr.resize(size(1, 8))
+    show(@&scr, @src, @&view)
+    assert scr.cursor_row() == 0
+    0
+
+# ============================================================================
+# Checkpoints
+# ============================================================================
+
+[[test]]
+fn test_checkpoints_are_lazy_and_bounded() -> i32
+    # 2 lines of 4 marks each, every 16 bytes.
+    var scr = screen_with(size(3, 14), checkpoints_with(2, 4, 16))
+    var view = view_new()
+    let src = repeat("a\tb", 600)
+    show(@&scr, @src, @&view)
+    # Only the first ten cells were drawn: no stride was crossed.
+    assert scr.marks_for(0) == 0
+    view.cursor_byte = 99
+    show(@&scr, @src, @&view)
+    assert scr.marks_for(0) > 0
+    assert scr.marks_for(0) <= 4
+    view.cursor_byte = 598
+    show(@&scr, @src, @&view)
+    assert scr.marks_for(0) <= 4
+    # Short lines never take a slot: with one slot, drawing a short line
+    # keeps the long line's marks.
+    var scr2 = screen_with(size(4, 14), checkpoints_with(1, 4, 16))
+    let two = lines("a\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\ta\nab")
+    var v2 = view_new()
+    v2.cursor_byte = 40
+    show(@&scr2, @two, @&v2)
+    assert scr2.marks_for(0) > 0
+    v2.cursor_line = 1
+    v2.cursor_byte = 0
+    show(@&scr2, @two, @&v2)
+    assert scr2.marks_for(0) > 0
+    assert scr2.marks_for(1) == 0
+    0
+
+fn same_rows(a: @Screen, b: @Screen, rows: i64) -> bool
+    for r in 0..rows
+        let x = a.row_text(r)
+        let y = b.row_text(r)
+        if not x.eq_string(@y)
+            return false
+    true
+
+[[test]]
+fn test_checkpoints_give_the_same_cells_as_a_scan_from_the_start() -> i32
+    # Tabs and escapes, so cells and bytes differ; mark-thinning on.
+    let src = repeat("ab\t\x01~écd", 3000)
+    var cached = screen_with(size(3, 20), checkpoints_with(2, 4, 16))
+    var cv = view_new()
+    var pos: i64 = 0
+    while pos < 3000
+        cv.cursor_byte = pos
+        cv.left = 0
+        cv.top = 0
+        show(@&cached, @src, @&cv)
+        # A fresh cache measures from byte 0.
+        var fresh = screen_with(size(3, 20), checkpoints_with(2, 4, 1000000))
+        var fv = view_new()
+        fv.cursor_byte = pos
+        show(@&fresh, @src, @&fv)
+        assert fv.left == cv.left
+        assert same_rows(@cached, @fresh, 3)
+        pos += 137
+    0
+
+[[test]]
+fn test_checkpoints_evict_the_least_recently_used_line() -> i32
+    var scr = screen_with(size(5, 10), checkpoints_with(2, 8, 4))
+    var view = view_new()
+    let src = lines("aaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbb\ncccccccccccccccccccc")
+    show(@&scr, @src, @&view)
+    # Two slots for three long lines: line 0 was used first and is evicted.
+    assert scr.marks_for(0) == 0
+    assert scr.marks_for(1) > 0
+    assert scr.marks_for(2) > 0
+    0
+
+[[test]]
+fn test_an_edit_invalidates_checkpoints_from_its_byte_onward() -> i32
+    var scr = screen_with(size(5, 10), checkpoints_with(4, 64, 4))
+    var view = view_new()
+    view.cursor_byte = 39
+    var two = string_new()
+    two.push_str("0123456789012345678901234567890123456789\n")
+    two.push_str("0123456789012345678901234567890123456789")
+    let src2 = lines(two.as_view())
+    show(@&scr, @src2, @&view)
+    view.cursor_line = 1
+    show(@&scr, @src2, @&view)
+    let before = scr.marks_for(0)
+    assert before >= 9
+    assert scr.marks_for(1) >= 9
+    # An edit at byte 20 of line 0 keeps marks up to byte 16 there and drops
+    # line 1's.
+    scr.text_changed(0, 20)
+    assert scr.marks_for(0) == 4
+    assert scr.marks_for(1) == 0
+    # After an insert of a tab at byte 2 the cells are measured afresh.
+    let edited = lines("01\t23456789012345678901234567890123456789")
+    scr.text_changed(0, 2)
+    assert scr.marks_for(0) == 0
+    view.cursor_line = 0
+    view.cursor_byte = 40
+    show(@&scr, @edited, @&view)
+    # The tab is cells 2-7, so byte 40 (past it) is cell 45.
+    assert scr.cursor_col() - 4 + view.left == 45
+    0
+
+# ============================================================================
+# Diff output
+# ============================================================================
+
+[[test]]
+fn test_first_frame_clears_and_draws_the_non_blank_cells() -> i32
+    var scr = screen_new(size(3, 8))
+    var view = view_new()
+    let src = lines("hi")
+    show(@&scr, @src, @&view)
+    let out = emitted(@&scr)
+    let s = out.as_view()
+    assert s.starts_with("\e[0m\e[2J")
+    assert s.contains("hi")
+    assert s.contains(" NORMAL ")
+    # And ends on the cursor: line 1, the cell after the gutter.
+    assert s.ends_with("\e[1;5H")
+    0
+
+[[test]]
+fn test_an_unchanged_frame_emits_nothing() -> i32
+    var scr = screen_new(size(5, 20))
+    var view = view_new()
+    let src = lines("fn main()\n\treturn 0")
+    show(@&scr, @src, @&view)
+    let first = emitted(@&scr)
+    assert first.as_view().len > 0
+    show(@&scr, @src, @&view)
+    let second = emitted(@&scr)
+    assert second.as_view().len == 0
+    0
+
+[[test]]
+fn test_a_one_cell_change_emits_a_minimal_sequence() -> i32
+    var scr = screen_new(size(4, 12))
+    var view = view_new()
+    view.cursor_line = 1
+    let a = lines("abc\nxyz")
+    show(@&scr, @a, @&view)
+    let first = emitted(@&scr)
+    let b = lines("aXc\nxyz")
+    show(@&scr, @b, @&view)
+    let out = emitted(@&scr)
+    # Move to row 1 column 6, back to text style (the status line was
+    # drawn last), the cell, and the cursor back to line 2's first cell.
+    assert out.as_view().eq("\e[1;6H\e[0mX\e[2;5H")
+    # The same style as the pen needs no SGR.
+    let c = lines("aXY\nxyz")
+    show(@&scr, @c, @&view)
+    let out2 = emitted(@&scr)
+    assert out2.as_view().eq("\e[1;7HY\e[2;5H")
+    0
+
+[[test]]
+fn test_a_shorter_line_blanks_the_cells_it_left() -> i32
+    var scr = screen_new(size(4, 12))
+    var view = view_new()
+    view.cursor_line = 1
+    let a = lines("abcdef\nx")
+    show(@&scr, @a, @&view)
+    let first = emitted(@&scr)
+    let b = lines("ab\nx")
+    show(@&scr, @b, @&view)
+    assert row_is(@scr, 0, "  1 ab      ")
+    let out = emitted(@&scr)
+    assert out.as_view().eq("\e[1;7H\e[0m    \e[2;5H")
+    0
+
+[[test]]
+fn test_a_cursor_move_alone_emits_only_the_move() -> i32
+    var scr = screen_new(size(4, 20))
+    var view = view_new()
+    let a = lines("abc\nxyz")
+    show(@&scr, @a, @&view)
+    let first = emitted(@&scr)
+    view.cursor_byte = 2
+    show(@&scr, @a, @&view)
+    let out = emitted(@&scr)
+    # The status line's position changed too: 1:1 to 1:3.
+    assert out.as_view().eq("\e[3;19H3\e[1;7H")
+    0
+
+[[test]]
+fn test_changed_cells_are_written_in_runs() -> i32
+    var scr = screen_new(size(3, 12))
+    var view = view_new()
+    let a = lines("aaaa")
+    show(@&scr, @a, @&view)
+    let first = emitted(@&scr)
+    let b = lines("bbbb")
+    show(@&scr, @b, @&view)
+    let out = emitted(@&scr)
+    # The cursor already waits at the first changed cell: no move before it.
+    assert out.as_view().eq("\e[0mbbbb\e[1;5H")
+    0
