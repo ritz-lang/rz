@@ -13,10 +13,13 @@
 # Then, in the image:
 #   - the labels name the commit and the shipped binary's sha256;
 #   - every native tool the survey found runs, and clang is CI's major;
+#   - pytest runs (a package's test.sh may call it);
 #   - ritz1_selfhosted runs (usage) and compiles a file to IR;
 #   - the entrypoint builds and tests a hello package mounted read-only,
 #     writes /out, and the binary prints the expected line;
 #   - a package that does not compile exits non-zero, with summary.json ok false;
+#   - with the commit's tree mounted as RZ_ROOT, an in-tree package outside
+#     projects/ builds with the image's compiler and the mount is unchanged;
 #   - no package argument exits 2;
 #   - `rz build --all --compiler ritz1_selfhosted` builds every package the
 #     image ships, so the shipped sources are complete;
@@ -123,9 +126,11 @@ label() { docker image inspect "$tag" --format "{{ index .Config.Labels \"$1\" }
     || bad "label dev.ritz.ritz1-selfhosted.sha256 is '$(label dev.ritz.ritz1-selfhosted.sha256)', want $sha"
 
 # Every tool the survey found a build calling (README.md, "Native tools").
-for t in clang ld.lld lld-link llvm-ar as ld readelf objcopy ar python3; do
+for t in clang ld.lld lld-link llvm-ar as ld readelf objcopy ar nm objdump python3; do
     if out="$(run "$t" --version 2>&1)"; then ok "$t runs: $(head -1 <<<"$out")"; else bad "$t --version: $out"; fi
 done
+# rllvm's and razm's test.sh run `python3 -m pytest` (AGAST #4847).
+if out="$(run python3 -m pytest --version 2>&1)"; then ok "pytest runs: $(head -1 <<<"$out")"; else bad "python3 -m pytest --version: $out"; fi
 major="$(run clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)"
 [[ "$major" == "$LLVM_MAJOR" ]] && ok "clang is LLVM $LLVM_MAJOR" || bad "clang is LLVM '$major', want $LLVM_MAJOR"
 
@@ -221,6 +226,30 @@ if [[ $bad_rc -ne 0 && $bad_ok == False ]]; then
 else
     bad "bad package rc=$bad_rc summary ok=$bad_ok, want non-zero and false"
     sed 's/^/     | /' "$work/bad-entry.log" | tail -20
+fi
+
+# main.yml's builder-matrix form (AGAST #4847): the commit's whole tree
+# mounted read-only as RZ_ROOT, an in-tree package outside projects/, built
+# only (it has no tests), by the image's own compiler, which the checkout
+# lacks. The mount must not change.
+mkdir -p "$work/ws" "$work/ws-out"
+tar -C "$work/ws" -xf "$work/context.tar"
+ws_pkg=bench/regressions/2026-05-04/s2_module_init
+ws_before=$(find "$work/ws" -type f -print0 | sort -z | xargs -0 sha256sum)
+set +e
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    -e RZ_ROOT=/ws -v "$work/ws:/ws:ro" -v "$work/ws-out:/out" \
+    "$tag" --build-only "$ws_pkg" >"$work/ws-entry.log" 2>&1
+ws_rc=$?
+set -e
+ws_after=$(find "$work/ws" -type f -print0 | sort -z | xargs -0 sha256sum)
+ws_ritz1=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ritz1_sha256"))' \
+    "$work/ws-out/summary.json" 2>/dev/null || echo missing)
+if [[ $ws_rc -eq 0 && $ws_ritz1 == "$sha" && $ws_before == "$ws_after" ]]; then
+    ok "a mounted workspace (RZ_ROOT): $ws_pkg builds with the image's ritz1_selfhosted, mount unchanged"
+else
+    bad "mounted workspace rc=$ws_rc ritz1=$ws_ritz1 (want $sha) mount-unchanged=$([[ $ws_before == "$ws_after" ]] && echo yes || echo no)"
+    sed 's/^/     | /' "$work/ws-entry.log" | tail -30
 fi
 
 set +e

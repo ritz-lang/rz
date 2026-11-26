@@ -124,3 +124,86 @@ def test_cli_list_runs_and_includes_buddhafinger():
     packages = json.loads(r.stdout)
     assert isinstance(packages, list) and packages == sorted(packages)
     assert "buddhafinger" in packages
+
+
+# --- AGAST #4847: what each matrix entry runs -------------------------------
+
+
+@pytest.mark.unit
+def test_the_compiler_package_itself_is_never_in_the_matrix():
+    """`ritz` is the compiler: the entrypoint replaces the image's own
+    projects/ritz with the mounted one, so its ritz1_selfhosted check can
+    never pass (run 45804261861, exit 2). The bootstrap job gates it."""
+    rz = _fake_rz(["ritz", "ritz/ritzlib/tests", "sage"], {})
+    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    assert got == ["ritz/ritzlib/tests", "sage"]
+    assert "ritz" in builder_matrix.NOT_IN_MATRIX
+
+
+def _pkg(root: Path, rel: str, *, test_file: bool = False, test_sh: bool = False) -> Path:
+    d = root / rel
+    (d / "src").mkdir(parents=True)
+    (d / "ritz.toml").write_text('[package]\nname = "x"\nversion = "0.1.0"\n')
+    (d / "src" / "main.ritz").write_text("fn main() -> i32\n    0\n")
+    if test_file:
+        (d / "test").mkdir()
+        (d / "test" / "test_x.ritz").write_text("[[test]]\nfn test_x() -> i32\n    0\n")
+    if test_sh:
+        (d / "test.sh").write_text("#!/bin/bash\nexit 0\n")
+    return d
+
+
+@pytest.mark.unit
+def test_a_package_with_no_tests_is_build_only(tmp_path):
+    """indium, bench s2/s3: `rz test` says "No tests found", which the zero-
+    test guard rightly fails; such a package is built, not tested."""
+    _pkg(tmp_path / "projects", "lib")
+    assert builder_matrix.has_tests(tmp_path / "projects" / "lib") is False
+
+
+@pytest.mark.unit
+def test_a_test_file_or_a_test_sh_is_tests(tmp_path):
+    _pkg(tmp_path / "projects", "a", test_file=True)
+    _pkg(tmp_path / "projects", "b", test_sh=True)
+    assert builder_matrix.has_tests(tmp_path / "projects" / "a") is True
+    assert builder_matrix.has_tests(tmp_path / "projects" / "b") is True
+
+
+@pytest.mark.unit
+def test_entries_carry_a_normalized_workspace_path_and_build_only(tmp_path):
+    """A bench package's id is "../bench/..."; "projects/../bench/..." does not
+    exist in the container (run 45804261861: "no ritz.toml in
+    /src/projects/../bench/..."), so the entry carries bench/... itself."""
+    projects = tmp_path / "projects"
+    _pkg(projects, "sage", test_file=True)
+    _pkg(tmp_path, "bench/r/s2")
+    rz = _fake_rz(["sage", "../bench/r/s2"], {})
+    got = builder_matrix.matrix_entries(rz=rz, known=_FakeKnown(), workspace=tmp_path)
+    assert got == [
+        {"package": "../bench/r/s2", "path": "bench/r/s2", "build_only": True},
+        {"package": "sage", "path": "projects/sage", "build_only": False},
+    ]
+
+
+@pytest.mark.integration
+def test_the_real_matrix_builds_only_the_packages_without_tests():
+    got = {e["package"]: e for e in builder_matrix.matrix_entries()}
+    assert "ritz" not in got
+    assert got["indium"]["build_only"] is True
+    assert got["buddhafinger"]["build_only"] is False
+    assert got["rllvm"]["build_only"] is False  # test.sh, pytest in the image
+    s2 = got["../bench/regressions/2026-05-04/s2_module_init"]
+    assert s2 == {"package": "../bench/regressions/2026-05-04/s2_module_init",
+                  "path": "bench/regressions/2026-05-04/s2_module_init",
+                  "build_only": True}
+    for e in got.values():
+        assert (REPO_ROOT / e["path"] / "ritz.toml").is_file(), e
+
+
+@pytest.mark.integration
+def test_cli_matrix_prints_the_entries():
+    r = subprocess.run([sys.executable, str(TOOLS_DIR / "builder_matrix.py"), "matrix"],
+                       cwd=REPO_ROOT, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    entries = json.loads(r.stdout)
+    assert [e["package"] for e in entries] == builder_matrix.list_packages()

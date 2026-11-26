@@ -10,8 +10,8 @@
 #     -v "$PWD/out:/out" \
 #     rz-builder:<tag> --build-only projects/harland
 #
-# The package is an in-tree path under the image's /rz (projects/sage), or
-# an absolute path of a mounted directory. A mounted package is copied into
+# The package is an in-tree path under the workspace (projects/sage,
+# bench/regressions/...), or an absolute path of a mounted directory. A mounted package is copied into
 # a private workspace; its path dependencies and ritzlib resolve against the
 # image's sources. The mount is only read. Binaries, object files, the two
 # logs and summary.json go to /out (or $RZ_OUT). Exit 0 only when the build
@@ -21,6 +21,12 @@
 # The compiler is the image's ritz1_selfhosted, named by $RITZ1 and by
 # `./rz build|test --compiler ritz1_selfhosted`. The default compiler is
 # never used. The two must be the same file.
+#
+# The workspace is the image's /rz, or $RZ_ROOT: a whole checkout mounted
+# read-only (main.yml's builder-matrix, AGAST #4847), whose sources then
+# replace the image's. The compiler stays the image's: a checkout's own
+# ritz1/build is never used, and the image's ritz1_selfhosted is linked where
+# the pipeline looks for it.
 set -euo pipefail
 
 RZ_ROOT=${RZ_ROOT:-/rz}
@@ -56,14 +62,29 @@ else
     exit 2
 fi
 
-RITZ1=${RITZ1:-$RZ_ROOT/projects/ritz/ritz1/build/ritz1_selfhosted}
+SELFHOSTED=projects/ritz/ritz1/build/ritz1_selfhosted
+IMAGE_RITZ1=/rz/$SELFHOSTED
+if [[ -z ${RITZ1:-} ]]; then
+    if [[ $RZ_ROOT != /rz && -x $IMAGE_RITZ1 ]]; then
+        RITZ1=$IMAGE_RITZ1
+    else
+        RITZ1=$RZ_ROOT/$SELFHOSTED
+    fi
+fi
 [[ -x $RITZ1 ]] || { echo "rz-builder: ritz1_selfhosted is not executable at $RITZ1" >&2; exit 2; }
 [[ -d $RZ_ROOT/projects/ritz ]] || { echo "rz-builder: $RZ_ROOT is not a builder workspace" >&2; exit 2; }
 
 if [[ $PKG_ARG == /* ]]; then
     SRC=$PKG_ARG
 else
-    SRC=$RZ_ROOT/$PKG_ARG
+    # An in-tree path names its own place in the workspace, under projects/
+    # or not (bench/regressions/...). -s: lexical; refuse one that leaves.
+    IN_TREE=$(realpath -ms --relative-to=/ "/$PKG_ARG")
+    if [[ $IN_TREE == .. || $IN_TREE == ../* || $IN_TREE == . ]]; then
+        echo "rz-builder: $PKG_ARG is outside the workspace" >&2
+        exit 2
+    fi
+    SRC=$RZ_ROOT/$IN_TREE
 fi
 [[ -f $SRC/ritz.toml ]] || { echo "rz-builder: no ritz.toml in $SRC" >&2; exit 2; }
 
@@ -88,7 +109,11 @@ rel_of() {
     done
     printf 'projects/%s\n' "$(basename "$src")"
 }
-REL=$(rel_of "$SRC")
+if [[ -n ${IN_TREE:-} ]]; then
+    REL=$IN_TREE
+else
+    REL=$(rel_of "$SRC")
+fi
 
 if ! mkdir -p "$OUT" || ! touch "$OUT/.write-test"; then
     echo "rz-builder: $OUT is not writable" >&2
@@ -115,8 +140,25 @@ if [[ -d $RZ_ROOT/known-failures ]]; then
     ln -s "$RZ_ROOT/known-failures" "$WS/known-failures"
 fi
 
-# A symlink to a directory, replaced by a real directory of links, so a new
-# file created inside it (a build/, a runtime .o) stays in the workspace.
+# One entry of a source directory, placed in the workspace: a Python file is
+# copied, anything else linked. Python resolves a script's symlink, so a
+# linked build.py would import build_pipeline from the source tree, look for
+# ritz1_selfhosted there and put the runtime objects next to it, in a
+# read-only mount (AGAST #4847). Ritz sources stay links: the import
+# resolver names a module by its real path, and a copy beside a link would
+# be two definitions of one module.
+place() {
+    local child=$1 dest=$2
+    if [[ $child == *.py && -f $child && ! -L $child ]]; then
+        cp -p "$child" "$dest"
+    else
+        ln -s "$child" "$dest"
+    fi
+}
+
+# A symlink to a directory, replaced by a real directory of its entries
+# (place), so a new file created inside it (a build/, a runtime .o) stays in
+# the workspace.
 explode() {
     local link=$1 target child
     [[ -L $link ]] || return 0
@@ -129,7 +171,7 @@ explode() {
         case $(basename "$child") in
             build|.ritz-cache*) continue ;;
         esac
-        ln -s "$child" "$link/$(basename "$child")"
+        place "$child" "$link/$(basename "$child")"
     done
 }
 
@@ -157,7 +199,7 @@ materialize() {
                     build|.ritz-cache*) continue ;;
                 esac
                 if [[ ! -e $dest_parent/$part/$name ]]; then
-                    ln -s "$child" "$dest_parent/$part/$name"
+                    place "$child" "$dest_parent/$part/$name"
                 fi
             done
         fi
@@ -173,8 +215,23 @@ materialize() {
 }
 
 materialize "$REL" "$SRC"
+# A package outside projects/ (bench/...) has no projects/ of its own:
+# materialize only fills its own parents. Link the workspace's, then make it
+# a real directory like the rest.
+if [[ ! -e $WS/projects ]]; then
+    ln -s "$RZ_ROOT/projects" "$WS/projects"
+fi
+explode "$WS/projects"
 explode "$WS/projects/ritz"
 explode "$WS/projects/ritz/runtime"
+
+# A mounted workspace's compiler is the image's (header): link it where the
+# pipeline looks, unless the workspace's own path already is $RITZ1.
+if [[ $(readlink -f "$WS/$SELFHOSTED") != $(readlink -f "$RITZ1") ]]; then
+    explode "$WS/projects/ritz/ritz1"
+    mkdir -p "$WS/projects/ritz/ritz1/build"
+    ln -sfn "$RITZ1" "$WS/$SELFHOSTED"
+fi
 
 # The binary --compiler ritz1_selfhosted will execute, by the pipeline's
 # own path, must be the file $RITZ1 names.

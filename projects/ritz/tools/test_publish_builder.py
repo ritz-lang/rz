@@ -292,11 +292,23 @@ def _step(pattern: str):
 
 
 @pytest.mark.unit
-def test_main_yml_no_longer_builds_the_image():
-    """Compiler CI neither runs nor waits on the image build."""
+def test_main_yml_builds_the_image_only_for_its_matrix_and_never_publishes():
+    """Compiler CI never publishes: builder.yml alone pushes to ghcr.io.
+    Since AGAST #4847 main.yml's builder-image job builds the image of the
+    commit under test (test.sh, ~4 min) for builder-matrix, which ran a stale
+    :main before; no other job builds it and no job holds a registry right."""
     main = MAIN_WORKFLOW.read_text()
-    assert "builder" not in yaml.safe_load(main)["jobs"]
-    assert "publish_builder" not in main and "projects/builder/test.sh" not in main
+    jobs = yaml.safe_load(main)["jobs"]
+    assert "builder" not in jobs
+    assert "publish_builder" not in main and "docker login" not in main
+    assert "ghcr.io" not in main
+    builds = [name for name, job in jobs.items()
+              if any("projects/builder/test.sh" in str(st.get("run", ""))
+                     for st in job.get("steps") or [])]
+    assert builds == ["builder-image"], builds
+    for name, job in jobs.items():
+        assert "packages" not in (job.get("permissions") or {}), name
+    assert jobs["builder-matrix"]["needs"] == ["builder-packages", "builder-image"]
 
 
 @pytest.mark.unit

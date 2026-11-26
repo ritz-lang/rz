@@ -58,6 +58,12 @@ ARG LLVM_MAJOR
 COPY projects/ritz/requirements.lock /tmp/requirements.lock
 RUN python3 -m venv /opt/venv \
  && /opt/venv/bin/pip install --no-cache-dir -c /tmp/requirements.lock llvmlite
+# pytest, CI's pinned one, for the packages whose test.sh runs it (rllvm,
+# razm: AGAST #4847). Pure Python, so it is installed apart and copied into
+# the runtime's dist-packages; the image has no pip and no venv.
+RUN /opt/venv/bin/pip install --no-cache-dir --no-compile --target /pytest \
+        -c /tmp/requirements.lock pytest \
+ && rm -rf /pytest/bin
 ENV PATH=/opt/venv/bin:$PATH \
     RITZ_CACHE_DIR=/tmp/ritz-cas
 COPY . /src
@@ -72,7 +78,7 @@ RUN make -C projects/ritz ritz1-bootstrap
 RUN bash projects/builder/check_fixed_point.sh projects/ritz/ritz1
 RUN python3 projects/builder/stage_tree.py /src /stage \
  && bash projects/builder/collect_toolchain.sh /toolchain \
-        clang ld.lld lld-link llvm-ar as ld readelf objcopy ar \
+        clang ld.lld lld-link llvm-ar as ld readelf objcopy ar nm objdump \
  && { echo "ritz1_selfhosted $(sha256sum < /stage/projects/ritz/ritz1/build/ritz1_selfhosted | cut -d' ' -f1)"; \
       echo "clang $(clang --version | head -1)"; \
       echo "binutils $(ld --version | head -1)"; } > /stage/BUILDER_INFO \
@@ -90,6 +96,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt /var/log/dpkg.log
 COPY --from=bootstrap /toolchain/ /
 COPY --from=bootstrap /stage/ /rz/
+COPY --from=bootstrap /pytest/ /usr/lib/python3/dist-packages/
 # The single-package entrypoint (AGAST #4823). It is not part of /rz: a
 # package build runs ./rz from a private workspace copied out of /rz.
 COPY projects/builder/entrypoint.sh /usr/local/bin/rz-builder

@@ -1,23 +1,33 @@
 #!/usr/bin/env bash
-# Run one package through the published builder image and fail on a build
-# or test failure, or a run that reports zero tests (AGAST #4825, #4826).
-# main.yml's builder-matrix job calls this once per matrix entry.
+# Run one package through a builder image and fail on a build or test
+# failure, or a run that reports zero tests (AGAST #4825, #4826, #4847).
+# main.yml's builder-matrix job calls this once per matrix entry, from the
+# root of the checkout under test.
 #
-#   run_builder_package.sh <image> <package-rel-path> <out-dir>
+#   run_builder_package.sh [--build-only] <image> <package-rel-path> <out-dir>
 #
-#   <image>              the builder image ref to run, e.g.
-#                        ghcr.io/ritz-lang/rz-builder:main
+#   --build-only         build, don't test: the package has no tests
+#                        (tools/builder_matrix.py's `build_only`)
+#   <image>              the builder image ref to run, e.g. rz-builder:ci,
+#                        main.yml's builder-image job's build of this commit
 #   <package-rel-path>   workspace-relative package path, e.g.
-#                        projects/buddhafinger
+#                        projects/buddhafinger; normalized, so
+#                        projects/../bench/x is bench/x, and refused if it
+#                        leaves the workspace
 #   <out-dir>            host directory for the container's /out; created
 #                        if missing
 #
-# Mounts <package-rel-path> read-only and runs the image's entrypoint
-# (AGAST #4823) on it, which builds and tests with ritz1_selfhosted, the
-# image's own compiler, never the default. --network=none: the run needs
-# none. --security-opt seccomp=unconfined: Docker's default profile returns
-# EPERM for io_uring_setup / io_uring_enter / io_uring_register, and
-# ritzlib's tests call them.
+# Mounts the whole checkout read-only as the entrypoint's workspace
+# (RZ_ROOT=/ws, AGAST #4847) and runs the image's entrypoint (AGAST #4823)
+# on the package's in-tree path. The sources are this commit's, all of them:
+# a package's tests read other packages' files (prism reads angelo's font
+# fixture, buddhafinger ritz1's keyword table), and the image's /rz ships
+# only what a build imports. The compiler is still the image's own
+# ritz1_selfhosted, which the entrypoint links into its private workspace;
+# the checkout has none. --network=none: the run needs none.
+# --security-opt seccomp=unconfined: Docker's default profile returns EPERM
+# for io_uring_setup / io_uring_enter / io_uring_register, and ritzlib's
+# tests call them.
 #
 # The container's own exit status is already 0 only when the build
 # succeeded and every test passed (projects/builder/README.md); this script
@@ -27,42 +37,71 @@
 # builder/summary.py's "No tests found, skipping" parses to passed=0,
 # ok=true -- correct for a library with none, but a result this script
 # cannot tell apart from the suite not running at all without the count).
+# A passing test.sh is a suite that ran, counted or not (rllvm's is pytest).
+# A package with no tests at all is run --build-only instead, which the
+# matrix decides from the package's files, not from the run.
 #
-# Exit: 0 built, tested, at least one test passed; 1 the container's own
-# failure, a missing summary.json, or zero tests passed; 2 bad arguments.
+# Exit: 0 built (and, unless --build-only, tested, at least one test
+# passed); 1 the container's own failure, a missing summary.json, or zero
+# tests passed; 2 bad arguments.
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-    echo "usage: run_builder_package.sh <image> <package-rel-path> <out-dir>" >&2
+usage() {
+    echo "usage: run_builder_package.sh [--build-only] <image> <package-rel-path> <out-dir>" >&2
+    exit 2
+}
+build_only=0
+if [[ ${1:-} == --build-only ]]; then
+    build_only=1
+    shift
+fi
+[[ $# -eq 3 ]] || usage
+image=$1 pkg=$2 out=$3
+
+# -s: lexical, no symlink is followed out of the workspace.
+pkg=$(realpath -ms --relative-to="$PWD" "$PWD/$pkg")
+if [[ $pkg == .. || $pkg == ../* || $pkg == . ]]; then
+    echo "run_builder_package: '$2' is outside the workspace" >&2
     exit 2
 fi
-image=$1 pkg=$2 out=$3
 [[ -f "$pkg/ritz.toml" ]] || {
     echo "run_builder_package: no ritz.toml in '$pkg'" >&2
     exit 2
 }
 
+mode=()
+[[ $build_only -eq 1 ]] && mode=(--build-only)
 mkdir -p "$out"
 docker run --rm --network=none --security-opt seccomp=unconfined \
-    -v "$PWD/$pkg:/src/$pkg:ro" \
+    -e RZ_ROOT=/ws \
+    -v "$PWD:/ws:ro" \
     -v "$out:/out" \
-    "$image" "/src/$pkg"
+    "$image" "${mode[@]}" "$pkg"
 
 summary="$out/summary.json"
 [[ -f "$summary" ]] || {
     echo "run_builder_package: $pkg: $summary is missing after the run" >&2
     exit 1
 }
-python3 - "$summary" "$pkg" <<'PY'
+python3 - "$summary" "$pkg" "$build_only" <<'PY'
 import json
 import sys
 
-summary_path, pkg = sys.argv[1], sys.argv[2]
+summary_path, pkg, build_only = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
 summary = json.loads(open(summary_path).read())
 if not summary.get("ok"):
     print(f"run_builder_package: {pkg}: run not ok: {json.dumps(summary)}", file=sys.stderr)
     sys.exit(1)
-passed = summary.get("test", {}).get("passed", 0)
+if build_only:
+    print(f"run_builder_package: {pkg}: built (build only): the package has no tests")
+    sys.exit(0)
+test = summary.get("test", {})
+passed = test.get("passed", 0)
+if passed <= 0 and test.get("test_sh") == "pass":
+    # A test.sh-only suite (rllvm's pytest): summary.py counts ritzunit
+    # tests, and records the script's verdict apart.
+    print(f"run_builder_package: {pkg}: test.sh passed (no ritzunit tests)")
+    sys.exit(0)
 if passed <= 0:
     print(f"run_builder_package: {pkg}: ran zero tests: {json.dumps(summary)}", file=sys.stderr)
     sys.exit(1)

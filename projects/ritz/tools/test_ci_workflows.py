@@ -72,12 +72,14 @@ def test_no_job_or_step_is_continue_on_error():
 #: action entirely: builder.yml's builder job (AGAST #4824) builds inside
 #: Docker, whose image installs its own clang; main.yml's builder-packages
 #: (AGAST #4825) only reads rz.toml and known-failures/ with the Python the
-#: runner ships; main.yml's builder-matrix (AGAST #4825, #4826) also builds
-#: and tests inside the published builder image's container, never the
-#: host's compiler.
+#: runner ships; main.yml's builder-image (AGAST #4847) is builder.yml's
+#: image build for the commit under test, and builder-matrix (AGAST #4825,
+#: #4826) builds and tests inside that image's container, never the host's
+#: compiler.
 NO_SETUP_JOBS = {
     ("builder.yml", "builder"),
     ("main.yml", "builder-packages"),
+    ("main.yml", "builder-image"),
     ("main.yml", "builder-matrix"),
 }
 
@@ -149,12 +151,13 @@ def test_gate_coverage_is_documented_where_main_yml_points():
     assert sorted(rows) == jobs, sorted(rows)
     # read-set-audit (AGAST #4315) is one job a merge does not wait on: ~15
     # min under strace, and it audits the gate's skip rule, not a change.
-    # builder-packages / builder-matrix (AGAST #4825, #4826) are the other
-    # two: they pull a published image over the network and run Docker,
-    # which a room gate's sandbox does not give them (no network, no
-    # systemd-run), the same reason builder.yml's own image build is out
-    # of band and outside this table entirely.
-    not_gated = {"read-set-audit", "builder-packages", "builder-matrix"}
+    # builder-packages / builder-image / builder-matrix (AGAST #4825, #4826,
+    # #4847) are the others: they build an image (apt and the network) and
+    # run Docker, which a room gate's sandbox does not give them (no
+    # network, no systemd-run), the same reason builder.yml's own image
+    # build is out of band and outside this table entirely.
+    not_gated = {"read-set-audit", "builder-packages", "builder-image",
+                 "builder-matrix"}
     for job, row in rows.items():
         gated = row.split("|")[2].strip()
         assert gated.startswith("no" if job in not_gated else "yes"), row

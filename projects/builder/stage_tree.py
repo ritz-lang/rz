@@ -52,6 +52,7 @@ PYTHON_FILES = [
     "projects/ritz/ritz0/emitter/fn_cache.py",
     "projects/ritz/ritz0/import_resolver.py",
     "projects/ritz/ritz0/index_rules.py",
+    "projects/ritz/ritz0/instance_site.py",
     "projects/ritz/ritz0/interp_spec.py",
     "projects/ritz/ritz0/lexer.py",
     "projects/ritz/ritz0/list_deps.py",

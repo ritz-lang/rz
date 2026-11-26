@@ -15,8 +15,16 @@ package is in the list if either:
   not this generic one, and this is how it asks for this one too.
   Buddhafinger (AGAST #4826) is the first such package.
 
+`ritz`, the compiler's own package, is never in the list (NOT_IN_MATRIX).
+
 `list_packages()` returns project ids (rz's own id form: the package
 directory relative to projects/, so "buddhafinger", "ritz/ritzlib/tests").
+`matrix` prints what the job runs (AGAST #4847): one entry per package, with
+the package's workspace-relative `path` (a bench package's id is
+"../bench/...", which is not a path inside the container) and `build_only`,
+true for a package with no tests. `rz test` prints "No tests found" for such a
+package (indium, the bench regressions), and run_builder_package.sh's zero-test
+guard would fail it, so the job builds it and doesn't test it.
 """
 
 from __future__ import annotations
@@ -24,10 +32,12 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent
+PKG_DIR = TOOLS_DIR.parent
 WORKSPACE = TOOLS_DIR.parents[2]
 RZ_PATH = WORKSPACE / "rz"
 
@@ -35,7 +45,20 @@ if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 import known_failures  # noqa: E402
 
+if str(PKG_DIR) not in sys.path:
+    sys.path.insert(0, str(PKG_DIR))
+import manifest  # noqa: E402
+
 OPT_IN_MARKER = "uses the builder (AGAST #4825)"
+
+#: Swept packages the builder can't run, and why (AGAST #4847).
+NOT_IN_MATRIX = {
+    # The entrypoint copies the mounted package over the workspace's
+    # projects/ritz, which then has no ritz1/build/ritz1_selfhosted: the
+    # entrypoint's own compiler check refuses the run (exit 2). The compiler
+    # is the image, and main.yml's bootstrap job gates it.
+    "ritz": "the compiler's own package, gated by the bootstrap job",
+}
 
 
 def load_rz():
@@ -67,15 +90,40 @@ def list_packages(rz=None, known=None) -> list[str]:
     known = known or known_failures
     excused = (set(known.entries_for("build", "ritz1_selfhosted")) |
               set(known.entries_for("parity", "ritz1_selfhosted")))
-    swept = {p for p in rz.discover_projects() if p not in excused}
+    swept = {p for p in rz.discover_projects()
+             if p not in excused and p not in NOT_IN_MATRIX}
     return sorted(swept | _opted_in_excluded(rz))
+
+
+def has_tests(pkg_dir: Path) -> bool:
+    """What `rz test` would run: a .ritz test file (manifest's discovery, the
+    one `run_tests` uses) or a test.sh."""
+    if (pkg_dir / "test.sh").exists():
+        return True
+    config = manifest.load(pkg_dir / "ritz.toml")
+    return bool(manifest.discover_test_files(pkg_dir, config))
+
+
+def matrix_entries(rz=None, known=None, workspace: Path = WORKSPACE) -> list[dict]:
+    """One entry per list_packages() id, in that order."""
+    entries = []
+    for pkg in list_packages(rz=rz, known=known):
+        # normpath, not resolve(): "projects/../bench/x" -> "bench/x" without
+        # following a symlink out of the workspace.
+        path = Path(os.path.normpath(f"projects/{pkg}")).as_posix()
+        entries.append({"package": pkg, "path": path,
+                        "build_only": not has_tests(workspace / path)})
+    return entries
 
 
 def main(argv: list[str]) -> int:
     if argv[1:] == ["list"]:
         print(json.dumps(list_packages()))
         return 0
-    print(f"usage: {argv[0]} list", file=sys.stderr)
+    if argv[1:] == ["matrix"]:
+        print(json.dumps(matrix_entries()))
+        return 0
+    print(f"usage: {argv[0]} list|matrix", file=sys.stderr)
     return 2
 
 

@@ -46,6 +46,22 @@ docker run --rm --network=none --security-opt seccomp=unconfined \
     rz-builder:<tag> --build-only projects/harland
 ```
 
+A whole checkout can stand in for the image's sources (AGAST #4847): mount
+it read-only and name it as `RZ_ROOT`, and pass the package's in-tree path,
+under `projects/` or not. The compiler is still the image's
+`ritz1_selfhosted`, linked into the private workspace; the checkout's own
+`ritz1/build` is never used. That is how main.yml's `builder-matrix` runs
+every package (`.github/scripts/run_builder_package.sh`): a package's tests
+may read files the image doesn't ship (prism reads angelo's font fixture,
+buddhafinger ritz1's keyword table).
+
+```bash
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    -e RZ_ROOT=/ws -v "$PWD:/ws:ro" \
+    -v "$PWD/out:/out" \
+    rz-builder:<tag> projects/prism
+```
+
 The exit status is 0 only when the build succeeded and every test passed.
 `--build-only` skips tests and is 0 when the build succeeded. The source
 mount is not written. The run needs no network.
@@ -64,8 +80,10 @@ That compares the host's `./rz build` and `./rz test` under
 Linux bin, tome, one indium PIC bin, and harland's kernel ELF (build
 only). The two sides must agree on pass/fail and on the test counts.
 
-The published image comes from `.github/workflows/builder.yml`
-(#4824), out of band from the compiler CI. Each run builds and tests the image
+main.yml's `builder-image` job builds the image of every commit it
+validates with `test.sh`, for that run's `builder-matrix` (AGAST #4847). It
+publishes nothing. The published image comes from
+`.github/workflows/builder.yml` (#4824), out of band from the compiler CI. Each run builds and tests the image
 with `test.sh`, including its size budget. A push of any git tag publishes
 `ghcr.io/ritz-lang/rz-builder:<tag>`, `:ritz1-<sha12>` and `:<commit>`; the
 tag is sanitised to a Docker tag, and one that would land on `main`,
@@ -109,14 +127,20 @@ child process.
 pulls in ritz0's front end: lexer, parser, AST, monomorph. ritz0's back end
 (`emitter_llvmlite` and the rest) and llvmlite are **not** loaded when the
 compiler is ritz1_selfhosted, so the image has no llvmlite and no ritz0
-compiler. `stage_tree.PYTHON_FILES` lists the 34 files: `rz`, nine
-`projects/ritz/*.py` modules, `tools/known_failures.py`, and 23 ritz0
+compiler. `stage_tree.PYTHON_FILES` lists the 35 files: `rz`, nine
+`projects/ritz/*.py` modules, `tools/known_failures.py`, and 24 ritz0
 modules. Nothing outside the standard library is imported.
 
 The standard library modules include `tomllib`, `shutil`, `tempfile`,
 `concurrent.futures`, `uuid`, `lzma` and `bz2`. Debian's `python3-minimal`
 lacks those, so the runtime installs `python3-minimal` plus
 `libpython3.13-stdlib` (Python 3.13; rz needs ≥ 3.11 for `tomllib`).
+
+A build never imports pytest, but a package's `test.sh` may: rllvm's and
+razm's run `python3 -m pytest` (AGAST #4847). The bootstrap stage installs
+CI's pinned pytest (`requirements.lock`) and its pure-Python dependencies
+with `pip --target`, and the runtime copies them into
+`/usr/lib/python3/dist-packages`. The image has no pip and no venv.
 
 ### Native tools
 
@@ -130,6 +154,7 @@ lacks those, so the runtime installs `python3-minimal` plus
 | `as` (binutils) | `build_pipeline` | freestanding `.s` files (harland kernel) |
 | `ld`, `readelf`, `objcopy` (binutils) | `build_testrun` | `rz test`'s ritzunit runner: `ld -r`, symbol listing, `--keep-global-symbols` |
 | `bash` | `build_testrun` | a package's `test.sh` |
+| `nm`, `objdump` (binutils), pytest | rllvm's `test.sh` (pytest) | its oracle checks: symbol tables and disassembly (AGAST #4847) |
 
 `make` is not called by `rz build` or `rz test`; it only builds ritz1, in the
 bootstrap stage. `opt`/`llvm-as` run only under `RITZ_VERIFY_IR`, a gate

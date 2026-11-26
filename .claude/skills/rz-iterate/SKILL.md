@@ -697,7 +697,8 @@ default command). So:
 | `bootstrap` (matrix-full, regression.sh, ...) | yes | yes |
 | `read-set-audit` (strace of the two scoped regression steps) | no (#4315: ~15 min traced; it checks the gate's own skip rule, not the change) | yes |
 | `builder-packages` (computes the builder-matrix package list) | no (#4825: needs no toolchain, but is read by `builder-matrix`, which does need network) | yes |
-| `builder-matrix` (one builder-image container run per package; buddhafinger is #4826's first opt-in) | no (#4825, #4826: pulls `ghcr.io/ritz-lang/rz-builder` and runs Docker, which the room gate's sandbox gives neither) | yes |
+| `builder-image` (builds and tests the builder image of the commit, `projects/builder/test.sh`, for `builder-matrix`) | no (#4847: Docker and apt's network; smoke-plan.sh's `builder` target runs the same test.sh before a merge that touches `projects/builder`) | yes |
+| `builder-matrix` (one run per package in `builder-image`'s image, the checkout mounted as its workspace; buddhafinger is #4826's first opt-in) | no (#4825, #4826, #4847: runs Docker, which the room gate's sandbox doesn't give it) | yes |
 
 The one other workflow, `.github/workflows/builder.yml` (#4824), is where
 `ghcr.io/ritz-lang/rz-builder` comes from. Out of band from main.yml, it
