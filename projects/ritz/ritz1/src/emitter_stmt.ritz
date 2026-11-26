@@ -235,7 +235,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             format_into(s, "[{n} x %{elem.as_view()}]")
         else
             # The spelling every access over the local uses (#1564, #1966).
-            format_into(s, "[{n} x {llvm_text(elem_mem_llvm(dt.var_array_elem_type))}]")
+            format_into(s, "[{n} x {elem_mem_llvm(dt.var_array_elem_type)}]")
     else
         emit_llvm_type_struct(s, var_type, StrView { ptr: dt.var_type_name, len: dt.var_type_name_len as i64 })
     format_into(s, "\n")
@@ -495,15 +495,15 @@ fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
         own_drop_old_elem(s, arr, dst.reg, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
         emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, sval, dst.reg)
         return
-    let ty_c: *u8 = elem_mem_llvm(sh.leaf_type)
+    let ty: StrView = elem_mem_llvm(sh.leaf_type)
     set_match_float_hint(s, stmt.assign_value, sh.leaf_type, StrView { ptr: (null), len: (0) as i64 })   # AGAST #4028
     let val: i32 = emit_expr(s, stmt.assign_value)
     var store_val: i32 = val
     if array_elem_typed_scalar(sh.leaf_type) == 1
         store_val = emit_field_elem_narrow(s, val, sh.leaf_type, stmt.assign_value)
     else
-        store_val = emit_array_elem_narrow(s, val, sh.leaf_type, ty_c)
-    format_into(s, "  store {llvm_text(ty_c)} %.{store_val}, ptr %.{dst.reg}\n")
+        store_val = emit_array_elem_narrow(s, val, sh.leaf_type, ty)
+    format_into(s, "  store {ty} %.{store_val}, ptr %.{dst.reg}\n")
 
 # AGAST #2440: `p[i] = v` with `p` a local.  True when it took `stmt`: it's
 # `*(p.data + i) = v`, or refused.
@@ -632,7 +632,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 # the post-monomorph TypeKind.Struct-with-primitive-name shape.
                 emit_struct_store_or_copy(s, var_type, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, stored_reg, loc)
             else
-                emit_store_typed(s, IR_TY_I64, val, loc)
+                emit_store_typed(s, "i64", val, loc)
             return
         # AGAST #2035 / #2169: `a = x.f` / `= [..]` / `= c` copy the whole
         # array into local `a`.
@@ -648,7 +648,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         let val: i32 = ptr_slot_value(s, var_type, stmt.assign_value, assign_raw)
         if ty_int_bits(var_type) == 32
             let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val)
-            emit_store_typed(s, IR_TY_I32, trunc, loc)
+            emit_store_typed(s, "i32", trunc, loc)
         else if var_type == TypeKind.Ptr or var_type == TypeKind.PtrPtr or var_type == TypeKind.Ref or var_type == TypeKind.MutRef
             # Store i64 directly (pointers are stored as i64).  AGAST #2337:
             # into a reference, `p = @&c` and `p = m` are a `ptr` already;
@@ -656,15 +656,15 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             var ival: i32 = val
             if var_type == TypeKind.Ref or var_type == TypeKind.MutRef
                 ival = ptr_value_to_i64(s, stmt.assign_value, val)
-            emit_store_typed(s, IR_TY_I64, ival, loc)
+            emit_store_typed(s, "i64", ival, loc)
         else if ty_int_bits(var_type) == 16
             # Truncate i64 (unified value model) back to i16 for the slot.
             let trunc: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, val)
-            emit_store_typed(s, IR_TY_I16, trunc, loc)
+            emit_store_typed(s, "i16", trunc, loc)
         else if ty_int_bits(var_type) == 8
             # Truncate i64 to i8 for byte types
             let trunc: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, val)
-            emit_store_typed(s, IR_TY_I8, trunc, loc)
+            emit_store_typed(s, "i8", trunc, loc)
         else if var_type == TypeKind.Bool
             # AGAST #2994: only a `b:& bool` param is a TypeKind.Bool local
             # (bind_scalar_borrow_param): one byte, whatever place it borrows.
@@ -702,20 +702,20 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             let val: i32 = emit_expr(s, stmt.assign_value)
             if ty_int_bits(glob.var_type) == 32
                 let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val)
-                emit_store_global(s, IR_TY_I32, trunc, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+                emit_store_global(s, "i32", trunc, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
             else if ty_int_bits(glob.var_type) == 16
                 # i16 store via global — trunc i64 → i16 (unified value model).
                 let trunc: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, val)
-                emit_store_global(s, IR_TY_I16, trunc, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+                emit_store_global(s, "i16", trunc, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
             else if ty_int_bits(glob.var_type) == 8
                 # i8 store via global — trunc i64 → i8.
                 let trunc: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, val)
-                emit_store_global(s, IR_TY_I8, trunc, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+                emit_store_global(s, "i8", trunc, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
             else if glob.var_type == TypeKind.Bool
                 # AGAST #3001: a bool global is one i1 byte, as on ritz0; the
                 # value is the i64 every bool lives in (#1646).
                 let btrunc: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val)
-                emit_store_global(s, IR_TY_I1, btrunc, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+                emit_store_global(s, "i1", btrunc, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
             else
                 # AGAST #2065: f32 / f64 global, as the local arm above.
                 # AGAST #2399: and a pointer global's value is an i64, as a
@@ -761,15 +761,15 @@ fn assign_to_member(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_targ
             # Store value based on field type
             if ty_int_bits(field.field_type) == 32
                 let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val)
-                emit_store_typed(s, IR_TY_I32, trunc, member_result.reg)
+                emit_store_typed(s, "i32", trunc, member_result.reg)
             else if ty_int_bits(field.field_type) == 16
                 # Narrow field — value reg is always i64 (unified value
                 # model in emit_expr); trunc before store.
                 let trunc: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, val)
-                emit_store_typed(s, IR_TY_I16, trunc, member_result.reg)
+                emit_store_typed(s, "i16", trunc, member_result.reg)
             else if ty_int_bits(field.field_type) == 8
                 let trunc: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, val)
-                emit_store_typed(s, IR_TY_I8, trunc, member_result.reg)
+                emit_store_typed(s, "i8", trunc, member_result.reg)
             else
                 match field.field_type
                     TypeKind.Bool =>
@@ -778,7 +778,7 @@ fn assign_to_member(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_targ
                         # the 8-byte `store i64` default and clobbered the next
                         # 7 bytes.  Mirrors StmtKind.LocalFieldAssign's i1 arm.
                         let trunc1: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val)
-                        emit_store_typed(s, IR_TY_I1, trunc1, member_result.reg)
+                        emit_store_typed(s, "i1", trunc1, member_result.reg)
                     TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
                         # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`.
                         # AGAST #2329: so is `h.r = @&a` into an `@&[N]T`, which
@@ -786,7 +786,7 @@ fn assign_to_member(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_targ
                         # `store i64` of the `ptr`.
                         let ival: i32 = ptr_value_to_i64(s, stmt.assign_value, val)
                         let ptr_val: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, ival)
-                        emit_store_typed(s, IR_TY_PTR, ptr_val, member_result.reg)
+                        emit_store_typed(s, "ptr", ptr_val, member_result.reg)
                     _ =>
                         if field.field_type == TypeKind.Struct and field.field_type_name_len > 0
                             # AGAST #188: struct-typed field assigned a struct value
@@ -802,7 +802,7 @@ fn assign_to_member(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_targ
                             emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }, agg, member_result.reg)
                         else
                             # Default: store i64
-                            emit_store_typed(s, IR_TY_I64, val, member_result.reg)
+                            emit_store_typed(s, "i64", val, member_result.reg)
             return 1
         # Fall through to emit error if member access failed
         if primitive_member_refused(s, target_expr)   # AGAST #4155
@@ -1049,33 +1049,33 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
                 # AGAST #2062: an integer value (`*p = 3`) is sitofp'd by
                 # emit_field_elem_narrow (#2065).
                 let fval: i32 = emit_field_elem_narrow(s, val, value_type, stmt.assign_value)
-                format_into(s, "  store {llvm_text(elem_mem_llvm(value_type))} %.{fval}, ptr %.{ptr}\n")
+                format_into(s, "  store {elem_mem_llvm(value_type)} %.{fval}, ptr %.{ptr}\n")
             TypeKind.Bool =>
                 # AGAST #2053: a `*bool` pointee is an `i1` (ritz0's layout, a
                 # bool struct field).  The i64 default overwrote the 7 bytes
                 # after it -- the neighbouring fields.
                 let bval: i32 = emit_field_elem_narrow(s, val, TypeKind.Bool, stmt.assign_value)
-                emit_store_typed(s, IR_TY_I1, bval, ptr)
+                emit_store_typed(s, "i1", bval, ptr)
             _ =>
                 if ty_int_bits(value_type) == 32
                     # i32 store
                     let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val)
-                    emit_store_typed(s, IR_TY_I32, trunc, ptr)
+                    emit_store_typed(s, "i32", trunc, ptr)
                 else if ty_int_bits(value_type) == 16
                     # i16 store via deref — trunc i64 → i16
                     let trunc: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, val)
-                    emit_store_typed(s, IR_TY_I16, trunc, ptr)
+                    emit_store_typed(s, "i16", trunc, ptr)
                 else if ty_int_bits(value_type) == 8
                     # Byte store
                     let trunc: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, val)
-                    emit_store_typed(s, IR_TY_I8, trunc, ptr)
+                    emit_store_typed(s, "i8", trunc, ptr)
                 else if value_type == TypeKind.Ptr or value_type == TypeKind.PtrPtr
                     # Pointer store.  AGAST #2308: `*p = @&d` is a `ptr` already.
                     let ptr_val: i32 = i64_value_to_ptr(s, stmt.assign_value, val)
-                    emit_store_typed(s, IR_TY_PTR, ptr_val, ptr)
+                    emit_store_typed(s, "ptr", ptr_val, ptr)
                 else
                     # Default: store i64 (for i64, u64, and unknown types)
-                    emit_store_typed(s, IR_TY_I64, val, ptr)
+                    emit_store_typed(s, "i64", val, ptr)
 
 # The type name a local records, as text.
 fn local_type_sv(lv: *LocalVar) -> StrView
@@ -1722,7 +1722,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     entry_alloca_reg_begin(s, idx_reg)
     format_into(s, "i64\n")
     entry_alloca_reg_end(s)
-    emit_store_imm(s, IR_TY_I64, 0, idx_reg)
+    emit_store_imm(s, "i64", 0, idx_reg)
 
     # Loop variable — typed to elem_type so body reads get the right width.
     let var_reg: i32 = next_reg(s)
@@ -1779,7 +1779,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     # cond: idx < len
     begin_block(s, cond_label)
     let idx_val: i32 = next_reg(s)
-    emit_load_into(s, IR_TY_I64, idx_val, idx_reg)
+    emit_load_into(s, "i64", idx_val, idx_reg)
 
     let len_val: i32 = emit_for_len(s, @src)
 
@@ -1791,7 +1791,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     begin_block(s, body_label)
 
     let idx_val2: i32 = next_reg(s)
-    emit_load_into(s, IR_TY_I64, idx_val2, idx_reg)
+    emit_load_into(s, "i64", idx_val2, idx_reg)
 
     let elem_ptr: i32 = next_reg(s)
     emit_for_elem_ptr(s, @src, elem_ptr, idx_val2)
@@ -1820,10 +1820,10 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     # incr: idx = idx + 1
     begin_block(s, incr_label)
     let load2_reg: i32 = next_reg(s)
-    emit_load_into(s, IR_TY_I64, load2_reg, idx_reg)
+    emit_load_into(s, "i64", load2_reg, idx_reg)
     let incr_val: i32 = next_reg(s)
     format_into(s, "  %.{incr_val} = add i64 %.{load2_reg}, 1\n")
-    emit_store_typed(s, IR_TY_I64, incr_val, idx_reg)
+    emit_store_typed(s, "i64", incr_val, idx_reg)
     format_into(s, "  br label %L{cond_label}\n")
 
     # end
@@ -1849,7 +1849,7 @@ fn emit_for_len(s: *EmitterState, src: *ForIterSrc) -> i32
             gep_struct_open(s, len_ptr, StrView { ptr: src.type_name, len: src.type_name_len as i64 })
             format_into(s, ", ptr %.{src.data_reg}, i32 0, i32 1\n")
             let len: i32 = next_reg(s)
-            emit_load_into(s, IR_TY_I64, len, len_ptr)
+            emit_load_into(s, "i64", len, len_ptr)
             return len
         ForIterKind.Unsupported => pass   # for_iter_resolve refused it, before the loop
     0
@@ -1965,7 +1965,7 @@ fn emit_ptr_elem_store(s: *EmitterState, idx_expr: *Expr, value: *Expr, base_ptr
         if expr_is_ptr_valued(s, value) == 0
             ptr_val = next_reg(s)
             format_into(s, "  %.{ptr_val} = inttoptr i64 %.{val_reg} to ptr\n")
-        emit_store_typed(s, IR_TY_PTR, ptr_val, elem_ptr)
+        emit_store_typed(s, "ptr", ptr_val, elem_ptr)
         return
     if array_elem_typed_scalar(pointee) == 1
         # AGAST #1973: `p[i] = v` through a *f32 / *f64 GEPs and stores a
@@ -1974,7 +1974,7 @@ fn emit_ptr_elem_store(s: *EmitterState, idx_expr: *Expr, value: *Expr, base_ptr
         # i64 arm below: `getelementptr i64` + `store i64 %float`.  A
         # *bool strides and stores one `i1`, as every bool array element
         # is laid out (#2063); it stored an i64 8 bytes apart.
-        let fty: StrView = llvm_text(elem_mem_llvm(pointee))
+        let fty: StrView = elem_mem_llvm(pointee)
         let fval: i32 = emit_field_elem_narrow(s, val_reg, pointee, value)
         format_into(s, "  %.{elem_ptr} = getelementptr {fty}, ptr %.{base_ptr}, i64 %.{idx_reg}\n")
         format_into(s, "  store {fty} %.{fval}, ptr %.{elem_ptr}\n")
@@ -1983,7 +1983,7 @@ fn emit_ptr_elem_store(s: *EmitterState, idx_expr: *Expr, value: *Expr, base_ptr
     let elem_ty: StrView = narrow_int_llvm(ty_int_bits(pointee))
     if unnamed(elem_ty)
         format_into(s, "  %.{elem_ptr} = getelementptr i64, ptr %.{base_ptr}, i64 %.{idx_reg}\n")
-        emit_store_typed(s, IR_TY_I64, val_reg, elem_ptr)
+        emit_store_typed(s, "i64", val_reg, elem_ptr)
         return
     format_into(s, "  %.{elem_ptr} = getelementptr {elem_ty}, ptr %.{base_ptr}, i64 %.{idx_reg}\n")
     let trunc: i32 = next_reg(s)
@@ -2564,7 +2564,7 @@ fn emit_ptr_field_index_store(s: *EmitterState, field_slot: i32, field: *StructF
         # Narrow the i64 value to the element width (trunc / inttoptr).
         # AGAST #3170: `h.f[i] = @&x` into a `**T` field is a `ptr` already.
         stored = emit_array_elem_narrow(s, val, kind, elem_mem_llvm(kind))
-    let elem_ty: StrView = llvm_text(elem_mem_llvm(kind))
+    let elem_ty: StrView = elem_mem_llvm(kind)
     format_into(s, "  store {elem_ty} %.{stored}, ptr %.{elem_ptr}\n")
     true
 
@@ -2800,7 +2800,7 @@ fn emit_return_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
 fn if_phi_scalar_type(float_ty: TypeKind) -> StrView
     if float_ty == TypeKind.Void
         return "i64"
-    llvm_text(float_llvm_name(float_ty))
+    float_llvm_name(float_ty)
 
 # An `if` statement (or the value-giving `if` a fn tail is).
 fn emit_if_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
@@ -3150,7 +3150,7 @@ fn local_field_ptr(s: *EmitterState, lf: *LocalField) -> i32
     let levels: i32 = local_struct_levels(lf.loc)
     if levels > 0
         let loaded: i32 = next_reg(s)
-        emit_load_into(s, IR_TY_I64, loaded, lf.loc.reg)
+        emit_load_into(s, "i64", loaded, lf.loc.reg)
         base = next_reg(s)
         format_into(s, "  %.{base} = inttoptr i64 %.{loaded} to ptr\n")
         base = emit_load_levels(s, base, levels - 1)
@@ -3198,20 +3198,20 @@ fn emit_local_field_assign_stmt(s: *EmitterState, stmt: *Stmt)
 fn emit_field_value_store(s: *EmitterState, field_ptr: i32, field: *StructField, val_reg: i32, value: *Expr)
     let bits: i32 = ty_int_bits(field.field_type)
     if bits == 32
-        emit_store_typed(s, IR_TY_I32, ir_trunc_i64_i32(s.out, @s.reg_counter, val_reg), field_ptr)
+        emit_store_typed(s, "i32", ir_trunc_i64_i32(s.out, @s.reg_counter, val_reg), field_ptr)
     else if bits == 16
-        emit_store_typed(s, IR_TY_I16, ir_trunc_i64_i16(s.out, @s.reg_counter, val_reg), field_ptr)
+        emit_store_typed(s, "i16", ir_trunc_i64_i16(s.out, @s.reg_counter, val_reg), field_ptr)
     else if bits == 8
-        emit_store_typed(s, IR_TY_I8, ir_trunc_i64_i8(s.out, @s.reg_counter, val_reg), field_ptr)
+        emit_store_typed(s, "i8", ir_trunc_i64_i8(s.out, @s.reg_counter, val_reg), field_ptr)
     else
         match field.field_type
             TypeKind.Bool =>
-                emit_store_typed(s, IR_TY_I1, ir_trunc_i64_i1(s.out, @s.reg_counter, val_reg), field_ptr)
+                emit_store_typed(s, "i1", ir_trunc_i64_i1(s.out, @s.reg_counter, val_reg), field_ptr)
             TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
                 # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`,
                 # and so is `h.r = @&a` into an `@&[N]T` (#2329).
                 let ival: i32 = ptr_value_to_i64(s, value, val_reg)
-                emit_store_typed(s, IR_TY_PTR, ir_inttoptr_ptr(s.out, @s.reg_counter, ival), field_ptr)
+                emit_store_typed(s, "ptr", ir_inttoptr_ptr(s.out, @s.reg_counter, ival), field_ptr)
             _ =>
                 if field.field_type == TypeKind.Struct and field.field_type_name_len > 0
                     # A bare "..." is a %Span$u8: a StrView field needs it
@@ -3220,7 +3220,7 @@ fn emit_field_value_store(s: *EmitterState, field_ptr: i32, field: *StructField,
                     let agg: i32 = coerce_struct_ret_value(s, value, val_reg, ty_name)
                     emit_struct_store_or_copy(s, TypeKind.Struct, ty_name, agg, field_ptr)
                 else
-                    emit_store_typed(s, IR_TY_I64, val_reg, field_ptr)
+                    emit_store_typed(s, "i64", val_reg, field_ptr)
 
 # A field `x.f[i]` indexes through rather than into: a pointer field
 # (AGAST #1596), an `@[N]T` / `@&[N]T` one lower_ref_fields leaves a
@@ -3286,7 +3286,7 @@ fn emit_index_assign_plain(s: *EmitterState, stmt: *Stmt)
     # i64` + `store i64` for every non-** pointer, byte-smearing *i32/*u8
     # stores).
     let loaded_i64: i32 = next_reg(s)
-    emit_load_into(s, IR_TY_I64, loaded_i64, base_reg)
+    emit_load_into(s, "i64", loaded_i64, base_reg)
     let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, loaded_i64)
     var pointee: TypeKind = TypeKind.Unknown
     var pointee_name: StrView = no_name()
@@ -3308,7 +3308,7 @@ fn emit_local_array_index_assign(s: *EmitterState, stmt: *Stmt, local: *LocalVar
     let struct_elem: bool = et == TypeKind.Struct and et_name.len > 0
     # AGAST #1564: every other element uses the alloca's own spelling
     # (array_elem_llvm); u32/u16/i16 used to fall to i64.
-    let elem_ty: StrView = llvm_text(elem_mem_llvm(et))
+    let elem_ty: StrView = elem_mem_llvm(et)
     let elem_ptr: i32 = next_reg(s)
     let n: i32 = lv_array_size(local)
     format_into(s, "  %.{elem_ptr} = getelementptr [{n} x ")
@@ -3360,7 +3360,7 @@ fn emit_global_index_assign(s: *EmitterState, stmt: *Stmt, target: StrView)
     # slot, convert to ptr, then share the pointee-width store path with the
     # local arm.
     let gloaded: i32 = next_reg(s)
-    emit_load_global(s, IR_TY_I64, gloaded, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+    emit_load_global(s, "i64", gloaded, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
     let gbase_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, gloaded)
     emit_index_assign_ptr_store(s, stmt, gbase_ptr, glob.var_type, glob.pointee_type, StrView { ptr: (glob.pointee_type_name), len: (glob.pointee_type_name_len) as i64 })
 
@@ -3390,7 +3390,7 @@ fn emit_global_array_scalar_store(s: *EmitterState, stmt: *Stmt, glob: *GlobalVa
     let gidx: i32 = emit_expr(s, stmt.while_cond)
     set_match_float_hint(s, stmt.assign_value, get, no_name())   # AGAST #4028
     let gval: i32 = emit_expr(s, stmt.assign_value)
-    let gty: StrView = llvm_text(elem_mem_llvm(get))
+    let gty: StrView = elem_mem_llvm(get)
     let gptr: i32 = next_reg(s)
     let n: i32 = glob.array_size
     let g: String = ir_name(StrView { ptr: (glob.name), len: (glob.name_len) as i64 })

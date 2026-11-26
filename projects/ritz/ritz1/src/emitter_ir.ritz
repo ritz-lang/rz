@@ -1,16 +1,8 @@
 # ritz1/src/emitter_ir.ritz - typed IR builders
 #
 # AGAST #1817.  The emitter used to write every LLVM instruction as a handful
-# of raw fragments:
-#
-#     let ext: i32 = next_reg(s)
-#     emit_str(s, c"  ")
-#     emit_reg(s, ext)
-#     emit_str(s, c" = sext i32 ")
-#     emit_reg(s, val)
-#     emit_str(s, c" to i64\n")
-#
-# Every cast, load, store and branch was spelled out inline at each site, so
+# of raw fragments, one call per separator, register and type (AGAST #4766
+# deleted that shim).  Every cast, load, store and branch was spelled out inline at each site, so
 # the same widen/narrow ladder was copy-pasted 10-19 times across the emitter
 # modules (the duplicate clusters ritz-metrics reported).  A change to one
 # spelling meant finding every copy.
@@ -23,11 +15,11 @@
 #
 # It is a LEAF: it imports no emitter module, so it does not join the
 # emitter_core/emitter_expr/... import cycle (AGAST #1818).  The caller passes
-# `s.out` and `@s.reg_counter`; emitter_core names the lexical fragments
-# (IR_INDENT, IR_NL, ...) every emitter module shares.
+# `s.out` and `@s.reg_counter`.
 #
-# `ret` deliberately has no builder: emit_str is the only writer of a `ret`
-# and it runs the ownership drop hook (AGAST #1625, #3508).
+# `ret` deliberately has no builder: a `ret` is written through the
+# EmitterState sink (format_into(s, ...)), which runs the ownership drop hook
+# first (AGAST #1625, #3508).
 
 import ritzlib.gvec
 import ritzlib.string
@@ -37,7 +29,7 @@ import ritzlib.string
 # =============================================================================
 #
 # `%.{r} = <op> <from> %.{v} to <to>` in one format_into rather than five
-# emit_str/emit_reg calls.  Each builder is specialized on its types so a call
+# fragment calls.  Each builder is specialized on its types so a call
 # site carries no IR text at all.
 
 pub fn ir_sext_i8_i64(out: *String, regs: *i32, v: i32) -> i32
@@ -170,28 +162,17 @@ pub fn ir_store_ptr(out: *String, val: i32, ptr: i32)
 # STATIC alloca that is the function's entry-block buffer
 # (EmitterState.entry_allocas; AGAST #4460), for a dynamic one `s.out`.
 # Emitter_core's entry_alloca wraps this for the static case.
-pub fn ir_alloca(out: *String, regs: *i32, ty: *u8) -> i32
+pub fn ir_alloca(out: *String, regs: *i32, ty: StrView) -> i32
     let r: i32 = *regs
     *regs = *regs + 1
     format_into(out, "  %.{r} = alloca {ty}\n")
-    r
-
-# As ir_alloca, with the trailing `  ; <comment>` the emitter's slots carry.
-# The comment is part of the line in the emitted IR, so it must be kept.
-pub fn ir_alloca_c(out: *String, regs: *i32, ty: *u8, comment: *u8) -> i32
-    let r: i32 = *regs
-    *regs = *regs + 1
-    format_into(out, "  %.{r} = alloca {ty}  ; {comment}\n")
     r
 
 # As ir_alloca, for a register the SITE already allocated with next_reg: the
 # same line, with no register allocated here, so a site's register numbering
 # stays exactly where it was (the prefix it replaces emitted nothing else).
-pub fn ir_alloca_at(out: *String, r: i32, ty: *u8)
+pub fn ir_alloca_at(out: *String, r: i32, ty: StrView)
     format_into(out, "  %.{r} = alloca {ty}\n")
-
-pub fn ir_alloca_at_c(out: *String, r: i32, ty: *u8, comment: *u8)
-    format_into(out, "  %.{r} = alloca {ty}  ; {comment}\n")
 
 # =============================================================================
 # Terminators and branches

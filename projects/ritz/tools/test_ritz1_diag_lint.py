@@ -113,7 +113,7 @@ def test_diag_module_prints_the_prefix():
 
 # AGAST #3621: every emit_ir_error* entry point that starts a message takes
 # the span it prints at.  (_end finishes a _begin and prints no prefix.)
-EMIT_IR_ERROR_FNS = ("emit_ir_error", "emit_ir_error_begin", "emit_ir_error_kind")
+EMIT_IR_ERROR_FNS = ("emit_ir_error_sv", "emit_ir_error_begin")
 
 def emit_ir_error_signatures(text: str) -> dict[str, str]:
     """name -> parameter list of each `pub fn emit_ir_error*(...)`."""

@@ -46,12 +46,12 @@ ROWS = {
         "extern fn get() -> *void\n\npub fn main() -> i32\n    let i: i64 = 1\n"
         "    let p: i64 = (get() + i) as i64\n    return 0\n",
         "5:19", _CANNOT + "pointer arithmetic: element size of pointee unknown for 'get'", []),
-    # emit_nd_error
+    # emit_nd_error_sv
     "nd_error": (
         "fn main() -> i32\n    let a: [3]i32 = [1, 2, 3]\n    let b: i64 = a\n    0\n",
         "3:18", "a whole array is not a value here (index it, copy it into an array "
         "of the same type, or take its address with @)", []),
-    # emit_qualified_variant_error (a miscounted `E.B(3)` is payload_count's
+    # emit_qualified_variant_error_sv (a miscounted `E.B(3)` is payload_count's
     # since AGAST #4153; a generic enum's qualified value still lands here)
     "qualified_variant": (
         _SLOT + "fn main() -> i32\n    let a: Slot<i32> = Slot.Full(3)\n    0\n",

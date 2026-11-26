@@ -29,67 +29,6 @@ import ir_operand      # what a register operand is (AGAST #4696)
 import monomorph       # MonoCtx, EmitterState.mono (AGAST #4454)
 
 # =============================================================================
-# IR lexical fragments (AGAST #1817)
-# =============================================================================
-#
-# The pieces every emitted instruction shares.  They were spelled as raw
-# `c"..."` literals at hundreds of call sites; naming them here gives the IR
-# spelling one home and lets the typed builders in emitter_ir.ritz read as
-# instructions rather than as a pile of separators.
-#
-# These are the exact bytes the old literals held, so naming one changes no
-# output.  `ret` is NOT here: emit_str runs the ownership drop hook when it
-# sees `  ret` (AGAST #1625, #3508), so a ret never goes through a fragment.
-
-pub const IR_INDENT: *u8 = c"  "          # a statement's two-space indent
-pub const IR_NL: *u8 = c"\n"              # end of an instruction
-pub const IR_PTR_SEP: *u8 = c", ptr "     # the pointer operand separator
-pub const IR_SP: *u8 = c" "
-pub const IR_TO_I64: *u8 = c" to i64\n"
-pub const IR_COMMA: *u8 = c", "
-pub const IR_I64_SEP: *u8 = c", i64 "
-pub const IR_TO_PTR: *u8 = c" to ptr\n"
-pub const IR_COMMA_0: *u8 = c", 0\n"
-pub const IR_X: *u8 = c" x "
-pub const IR_LABEL_SEP: *u8 = c", label %"
-pub const IR_CLOSE: *u8 = c")\n"
-pub const IR_I32_ZERO: *u8 = c", i32 0, i32 "
-pub const IR_I64_ZERO: *u8 = c", i64 0, i64 "
-pub const IR_COMMA_1: *u8 = c", 1\n"
-pub const IR_TO_SP: *u8 = c" to "
-# Instruction-open fragments.  A builder in emitter_ir.ritz covers the shapes
-# whose types the caller already holds as a *u8; these name the prefixes the
-# remaining sites share, so the spelling still has one home.
-pub const IR_GEP_NAMED: *u8 = c" = getelementptr %"
-pub const IR_GEP_ARRAY: *u8 = c" = getelementptr ["
-pub const IR_STORE_IND: *u8 = c"  store "
-pub const IR_STORE_STRUCT: *u8 = c"  store %"
-pub const IR_LOAD: *u8 = c" = load "
-pub const IR_LOAD_NAMED: *u8 = c" = load %"
-pub const IR_LOAD_PTR: *u8 = c" = load ptr, ptr "
-pub const IR_INTTOPTR: *u8 = c" = inttoptr i64 "
-pub const IR_TRUNC: *u8 = c" = trunc i64 "
-pub const IR_BR: *u8 = c"  br label %"
-pub const IR_ADD_ZERO: *u8 = c" = add i64 0, 0\n"
-pub const IR_ALLOCA_NAMED: *u8 = c" = alloca %"
-pub const IR_ALLOCA: *u8 = c" = alloca "
-pub const IR_RBRACK_PTR: *u8 = c"], ptr "
-pub const IR_PCT: *u8 = c"%"
-pub const IR_AT: *u8 = c"@"
-pub const IR_CALL: *u8 = c" = call "
-# LLVM type spellings the load/store builders take (AGAST #4464).  A call
-# site names one of these instead of its own `c"i64"`, so the spelling is
-# written once; `IR_LOAD_PTR` below is the two-fragment equivalent.
-pub const IR_TY_I1: *u8 = c"i1"
-pub const IR_TY_I8: *u8 = c"i8"
-pub const IR_TY_I16: *u8 = c"i16"
-pub const IR_TY_I32: *u8 = c"i32"
-pub const IR_TY_I64: *u8 = c"i64"
-pub const IR_TY_PTR: *u8 = c"ptr"
-pub const IR_TY_SPAN_U8: *u8 = c"%Span$u8"
-pub const IR_TY_STRVIEW: *u8 = c"%StrView"
-
-# =============================================================================
 # Emitter State
 # =============================================================================
 
@@ -145,13 +84,12 @@ struct DeferredLoad
     ty: *u8          # the struct type name, internal (pre-emit_name) spelling
     ty_len: i32
     state: i32
-    used: i32         # 1 once emit_reg referenced the register
+    used: i32         # 1 once the IR referenced the register as an operand
 
 struct EmitterState
     # The IR text.  A String drawn from the module's Arena (main.ritz), written
-    # through format_into(s, "...") (EmitterState.push_bytes) in ported code and
-    # through emit_str (the legacy shim) in the rest.  Points at entry_allocas
-    # while a redirect is in effect (#4460).
+    # through format_into(s, "...") (EmitterState.push_bytes).  Points at
+    # entry_allocas while a redirect is in effect (#4460).
     out: *String
     # AGAST #4460 — this fn's STATIC allocas, in emission order, and the
     # (buffer offset, source span) of each (frame_limit still locates the
@@ -348,7 +286,7 @@ struct EmitterState
     # returned success.  ritz1 then exited 0, build.py printed its tick, and
     # the program segfaulted or silently computed the wrong answer.
     # emit_module returns this count and main refuses to write the output when
-    # it is non-zero.  See emit_ir_error().
+    # it is non-zero.  See emit_ir_error_sv().
     error_count: i32
     # AGAST #3362 — the last undeclared struct name already reported (by the
     # member access rule, or #3347's literal rule for `String`), so one
@@ -576,7 +514,7 @@ pub fn set_no_red_zone_attr(on: i32)
 # ` noredzone` after a define's `)` (or its other attributes), when on.
 pub fn emit_no_red_zone_attr(s: *EmitterState)
     if g_no_red_zone == 1
-        emit_str(s, c" noredzone")
+        format_into(s, " noredzone")
 
 # =============================================================================
 # Packed-struct pointer provenance (AGAST #4462)
@@ -594,10 +532,10 @@ pub fn emit_no_red_zone_attr(s: *EmitterState)
 #
 #   * emit_name, when it emits the source type of a `getelementptr %<name>`
 #     line, marks the GEP's result if find_struct(<name>) is packed;
-#   * emit_reg, when it emits the base of a getelementptr, marks the result if
+#   * push_bytes, when it writes the base of a getelementptr, marks the result if
 #     the base register is marked (so `p.inner.x` propagates: `p.inner` is
 #     packed, `Inner` itself is not);
-#   * emit_reg, when it emits the pointer operand of a load/store, appends
+#   * push_bytes, when it writes the pointer operand of a load/store, appends
 #     `, align 1` if that register is marked.
 #
 # A pointer LOADED from memory is a new register and starts afresh, exactly as
@@ -647,7 +585,7 @@ fn packed_line_at_ptr_sep(s: *EmitterState) -> i32
     let line: StrView = packed_line(s)
     if line.len < 6
         return 0
-    if line.ends_with(strview_from_cstr(c", ptr "))
+    if line.ends_with(", ptr ")
         return 1
     0
 
@@ -700,28 +638,16 @@ pub fn packed_marks_reset(s: *EmitterState)
     if s.packed_marks != null and s.packed_marks_cap > 0
         memzero(s.packed_marks, s.packed_marks_cap as i64)
 
-# The legacy text shim for the files not yet ported (AGAST #4695): NUL-terminated
-# `c"..."` text, one call per fragment.  New and ported code does not call it:
-# it writes whole instructions with `format_into(s, "  %.{r} = add i64 %.{a}, %.{b}\n")`
-# (EmitterState.push_bytes, below), whose text is a StrView and whose values are
-# interpolated.  ritz1/ARCHITECTURE.md "Emitter style" has the pattern.
-pub fn emit_str(s: *EmitterState, text: *u8)
-    # AGAST #1625, #3508: every way out of a fn is a `ret`, written from
-    # dozens of sites once the return value is computed.  The live owned
-    # bindings and temporaries drop, and a registered `defer` runs, there:
-    # after the value and before the `ret` (own_before_ret).  A `ret` must
-    # therefore start the string it is emitted in.
-    if *text == ' '
-        if emit_str_is_ret(text) == 1
-            let before_ret: fn(*EmitterState) = s.own_before_ret_fn
-            before_ret(s)
-    var i: i32 = 0
-    while *(text + i) != 0
-        i += 1
-    out_append(s, StrView { ptr: (text), len: (i as i64) })
-
-# AGAST #4666: emit_str for a StrView (`"..."`, no NUL needed), with the
-# same `ret` hook.
+# `text` appended to the IR as is: a whole piece with no value in it, such as a
+# type spelling a lookup returned.  Instructions are written with
+# `format_into(s, "  %.{r} = add i64 %.{a}, %.{b}\n")` (EmitterState.push_bytes,
+# below); ritz1/ARCHITECTURE.md "Emitter style" has the pattern.
+#
+# AGAST #1625, #3508: every way out of a fn is a `ret`, written from dozens of
+# sites once the return value is computed.  The live owned bindings and
+# temporaries drop, and a registered `defer` runs, there: after the value and
+# before the `ret` (own_before_ret).  A `ret` must therefore start the piece it
+# is emitted in.
 pub fn emit_sv(s: *EmitterState, text: StrView)
     if text.starts_with("  ret ") or text.starts_with("  ret\n")
         let before_ret: fn(*EmitterState) = s.own_before_ret_fn
@@ -742,13 +668,12 @@ fn emit_out_exhausted()
 # format_into's sink (LANGUAGE_SPEC §2.6): `format_into(s, "  %.{r} = add {ty} ...")`
 # appends to the module's IR, one call per piece of the literal, text or value.
 #
-# This is the one place IR text becomes IR, so the two hooks emit_str and
-# emit_reg used to carry between them live here once:
+# This is the one place IR text becomes IR, so its two hooks live here once:
 #   * a piece that starts a `ret` first drops the live owned bindings
 #     (own_before_ret; AGAST #1625, #3508);
 #   * a register operand, which is the digits right after `%.`, is noted as
 #     used by the deferred struct loads (#4461) and, after a `ptr` operand,
-#     by the packed-align tracking (#4462), exactly as emit_reg notes it.
+#     by the packed-align tracking (#4462).
 impl EmitterState
     pub fn push_bytes(self: @&EmitterState, data: Span<u8>)
         let text: StrView = StrView { ptr: data.ptr, len: data.len }
@@ -756,25 +681,10 @@ impl EmitterState
         if reg < 0
             emit_sv(self, text)
             return
-        let kind: i32 = reg_operand_kind(self, 2)
+        let kind: i32 = reg_operand_kind(self)
         dload_note_use(self, reg)
         out_append(self, text)
         reg_operand_after(self, reg, kind)
-
-# `  ret ...` / `  ret\n`: the start of a `ret` instruction.
-fn emit_str_is_ret(text: *u8) -> i32
-    if *(text + 1) != ' '
-        return 0
-    if *(text + 2) != 'r'
-        return 0
-    if *(text + 3) != 'e'
-        return 0
-    if *(text + 4) != 't'
-        return 0
-    let c: u8 = *(text + 5)
-    if c == ' ' or c == 10
-        return 1
-    0
 
 # AGAST #3446: every name reaches the IR through here, spelled as LANGUAGE_SPEC
 # §11.4 and ritz0 spell it: the first `$` splits the base from its type
@@ -790,7 +700,7 @@ pub fn emit_name(s: *EmitterState, name_sv: StrView)
     # AGAST #4462: the source type of `  %.N = getelementptr %<name>` decides
     # whether N is a pointer into packed memory.
     let line: StrView = packed_line(s)
-    if line.ends_with(strview_from_cstr(c" = getelementptr %"))
+    if line.ends_with(" = getelementptr %")
         if struct_is_packed(s.mono.pctx, find_struct(s, name_sv)) == 1
             packed_mark(s, packed_gep_dst(s))
     var name: *u8 = name_sv.ptr
@@ -855,7 +765,7 @@ pub fn count_unlocated_error(s: *EmitterState, n: i32)
 
 # AGAST #1369 — record that the emitter could not lower something.
 #
-# Every caller used to be a bare `emit_str(s, c"  ; ERROR: ...")` that wrote
+# Every caller used to write a bare `  ; ERROR: ...` IR comment that wrote
 # the failure into the IR as a COMMENT and carried on.  A comment is not a
 # diagnostic: llvm ignores it, the process exits 0, and the caller links
 # whatever came out.  For `unknown identifier` the emitter went on to
@@ -873,53 +783,26 @@ pub fn count_unlocated_error(s: *EmitterState, n: i32)
 # ritz1 cannot emit: <msg>` (diag.ritz), at `span`: the construct that could
 # not be lowered.  It was the one unlocated error ritz1 printed, so it no
 # longer counts toward main's "emitted N unlowerable" summary (#3257).
-pub fn emit_ir_error(s: *EmitterState, span: SrcSpan, msg: *u8)
-    emit_ir_error_begin(s, span, msg)
-    emit_str(s, IR_NL)
-    eprint_char('\n')
-    s.error_count = s.error_count + 1
-
-# AGAST #4666: emit_ir_error for a StrView message.
 pub fn emit_ir_error_sv(s: *EmitterState, span: SrcSpan, msg: StrView)
-    emit_sv(s, "  ; ERROR: ")
-    emit_sv(s, msg)
-    emit_str(s, IR_NL)
-    diag_error_at(diag_source_file(), span)
-    eprints("ritz1 cannot emit: ")
-    eprints(msg)
+    emit_ir_error_begin(s, span, msg)
+    format_into(s, "\n")
     eprints("\n")
     s.error_count = s.error_count + 1
 
 # Same, for the sites that append a name to the message before the newline.
 # The caller follows this with emit_ir_error_end, which counts the error.
-pub fn emit_ir_error_begin(s: *EmitterState, span: SrcSpan, msg: *u8)
-    emit_str(s, c"  ; ERROR: ")
-    emit_str(s, msg)
+pub fn emit_ir_error_begin(s: *EmitterState, span: SrcSpan, msg: StrView)
+    format_into(s, "  ; ERROR: {msg}")
     diag_error_at(diag_source_file(), span)
     eprints("ritz1 cannot emit: ")
-    eprints_cstr(msg)
+    eprints(msg)
 
-pub fn emit_ir_error_end(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c"'\n")
-    var i: i32 = 0
-    while i < len
-        eprint_char(*(name + i))
-        i += 1
+pub fn emit_ir_error_end(s: *EmitterState, name: StrView)
+    emit_name(s, name)
+    format_into(s, "'\n")
+    eprint_bytes(name)
     eprints("'\n")
     s.error_count = s.error_count + 1
-
-# Same, for a message followed by an integer (a kind number, say).
-pub fn emit_ir_error_kind(s: *EmitterState, span: SrcSpan, msg: *u8, kind: i32)
-    emit_ir_error_begin(s, span, msg)
-    emit_int(s, kind as i64)
-    emit_str(s, IR_NL)
-    eprint_int(kind as i64)
-    eprint_char('\n')
-    s.error_count = s.error_count + 1
-
 # AGAST #2296: EmitterState.ctx_slot_*, saved around a slot.
 struct SlotCtx
     name: *u8
@@ -958,27 +841,21 @@ pub fn slot_struct_name(s: *EmitterState, out_len: *i32) -> *u8
     return s.ret_type_name
 
 # AGAST #1509: a multi-dimensional array use ritz1 does not lower, as
-# `<file>:<line>:<col>: error: <msg>`.  Counts like emit_ir_error, so the
+# `<file>:<line>:<col>: error: <msg>`.  Counts like emit_ir_error_sv, so the
 # driver refuses to write the output.
-pub fn emit_nd_error(s: *EmitterState, line: i32, col: i32, msg: *u8)
-    emit_nd_error_begin(s, line, col)
-    eprints_cstr(msg)
-    eprints("\n")
-
-# AGAST #4666: emit_nd_error for a StrView message.
 pub fn emit_nd_error_sv(s: *EmitterState, line: i32, col: i32, msg: StrView)
     emit_nd_error_begin(s, line, col)
     eprints(msg)
     eprints("\n")
 
-# AGAST #1295: emit_nd_error for a message the caller finishes itself (it
+# AGAST #1295: emit_nd_error_sv for a message the caller finishes itself (it
 # prints the rest, then a newline): `<file>:<line>:<col>: error: `, counted.
 pub fn emit_nd_error_begin(s: *EmitterState, line: i32, col: i32)
-    emit_str(s, c"  ; ERROR\n")
+    format_into(s, "  ; ERROR\n")
     diag_error_at(diag_source_file(), diag_span(line, col))
     s.error_count = s.error_count + 1
 
-# AGAST #1813 — where the emitter is, for fatal capacity errors: the input
+# AGAST #1813 — where the emitter is, for its located errors: the input
 # file and the function being emitted (set by emit_fn).  The file itself
 # moved to diag (AGAST #4319), so a check module can read it without
 # importing the emitter; these names stay as wrappers for emitter call sites.
@@ -1001,59 +878,14 @@ const ASSERT_FN_PLAIN: i32 = 0    # not allowed
 const ASSERT_FN_TEST: i32 = 1     # [[test]]: records call sites for helpers
 const ASSERT_FN_HELPER: i32 = 2   # [[test_helper]]: reports the test's call site
 
-# A fixed ritz1 table is full.  Print a located error and exit: carrying on
-# without the entry is exactly the silent miscompile this replaces, and the
-# driver has not written the output yet.
-#
-# `<file>:<line>: error: in fn 'f': <what> ...`.  A FnDef records its line
-# but no column, so this is the one emitter error diag_loc can't print
-# (#3445): it would have to invent the column.
-fn emit_fatal_limit(what: *u8, limit: i32)
-    let file: *u8 = diag_source_file()
-    if file != null
-        eprints_cstr(file)
-    else
-        eprints("<input>")
-    # Through a local: ritz1 cannot lower a member read on a global pointer.
-    let f: *FnDef = g_emit_fn
-    if f != null
-        eprint_char(':')
-        eprint("{f.line as i64}: error: in fn '")
-        let shown: StrView = fn_display_name(f)
-        eprint_bytes(StrView { ptr: (shown.ptr), len: (shown.len as i32) as i64 })
-        eprints("': ")
-    else
-        eprints(": error: ")
-    eprints_cstr(what)
-    eprint(" (ritz1's limit is {limit as i64})\n")
-    sys_exit(1)
-
-# n in decimal, through ritzlib.fmt. A hand-written `'-' then 0 - n` here
-# recursed forever on i64::MIN (0 - n wraps to itself), so a u64 literal
-# 9223372036854775808 / 0x8000000000000000 hung ritz1 (AGAST #2129).
-pub fn emit_int(s: *EmitterState, n: i64)
-    var buf: [20]u8
-    let digits: StrView = fmt_i64_into(@buf, n)
-    for i in 0..digits.len
-        s.out.push(buf[i])
-
-pub fn emit_reg(s: *EmitterState, reg: i32)
-    # AGAST #4461: any use of a deferred load's register means the copy
-    # rewrite cannot fire; the load is written back at fn end.
-    dload_note_use(s, reg)
-    let kind: i32 = reg_operand_kind(s, 0)
-    emit_str(s, c"%.")
-    emit_int(s, reg as i64)
-    reg_operand_after(s, reg, kind)
-
 # What a register operand about to be written means to the packed-align
 # tracking (AGAST #4462): REG_PLAIN, or after a `, ptr ` the base of a
 # getelementptr (REG_GEP_BASE) or the pointer of a load/store (REG_ACCESS_PTR).
-# Decided from the line so far, before the register's text is appended;
-# `written` is how many bytes of that text (`%.`) are already on the line.
-fn reg_operand_kind(s: *EmitterState, written: i64) -> i32
+# Decided from the line before the register: its `%.` is already written,
+# its digits are not.
+fn reg_operand_kind(s: *EmitterState) -> i32
     let whole: StrView = packed_line(s)
-    reg_operand_kind_of(StrView { ptr: whole.ptr, len: whole.len - written })
+    reg_operand_kind_of(StrView { ptr: whole.ptr, len: whole.len - 2 })
 
 # After `%.reg` is written: a packed-derived register keeps its provenance
 # through a GEP and is accessed `align 1`.
@@ -1076,8 +908,6 @@ fn reg_operand_of(s: *EmitterState, text: StrView) -> i32
     if have < 2 or *(s.out.data.data + (have - 2)) != '%' or *(s.out.data.data + (have - 1)) != '.'
         return 0 - 1
     reg
-
-
 
 pub fn next_reg(s: *EmitterState) -> i32
     let r: i32 = s.reg_counter
@@ -1242,17 +1072,16 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
             var line: String = string_new()
             let saved: *String = s.out
             s.out = @line
-            emit_str(s, c"  ")
-            emit_reg(s, r.reg)
-            emit_str(s, c" = load %")
+            let dst: i32 = r.reg
+            format_into(s, "  %.{dst} = load %")
             emit_name(s, StrView { ptr: (r.ty), len: (r.ty_len) as i64 })
-            emit_str(s, IR_PTR_SEP)
             if r.src_reg >= 0
-                emit_reg(s, r.src_reg)
+                let src: i32 = r.src_reg
+                format_into(s, ", ptr %.{src}\n")
             else
-                emit_str(s, c"@")
+                format_into(s, ", ptr @")
                 emit_name(s, StrView { ptr: (r.src_name), len: (r.src_name_len) as i64 })
-            emit_str(s, IR_NL)
+                format_into(s, "\n")
             s.out = saved
             let at: i64 = r.off + shift
             out_insert(s, at, line.as_view())
@@ -1311,32 +1140,23 @@ pub fn entry_alloca_begin(s: *EmitterState) -> i32
     s.entry_out_saved = s.out
     s.out = s.entry_allocas
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, IR_ALLOCA)
+    format_into(s, "  %.{r} = alloca ")
     r
 
 pub fn entry_alloca_end(s: *EmitterState)
     s.out = s.entry_out_saved
 
-# A whole static alloca line whose LLVM type is a C string, with an optional
-# `  ; <comment>` suffix (null for none).
-pub fn entry_alloca(s: *EmitterState, ty: *u8, comment: *u8) -> i32
+# A whole static alloca line of LLVM type `ty`.
+pub fn entry_alloca(s: *EmitterState, ty: StrView) -> i32
     entry_alloca_mark(s)
-    if comment == null
-        ir_alloca(s.entry_allocas, @s.reg_counter, ty)
-    else
-        ir_alloca_c(s.entry_allocas, @s.reg_counter, ty, comment)
+    ir_alloca(s.entry_allocas, @s.reg_counter, ty)
 
 # The same line for a register the caller already took with next_reg.  The
 # sites that allocate early (one slot for every branch of a type switch, say)
 # keep their next_reg exactly where it was; only the line's destination moves.
-pub fn entry_alloca_reg(s: *EmitterState, r: i32, ty: *u8, comment: *u8)
+pub fn entry_alloca_reg(s: *EmitterState, r: i32, ty: StrView)
     entry_alloca_mark(s)
-    if comment == null
-        ir_alloca_at(s.entry_allocas, r, ty)
-    else
-        ir_alloca_at_c(s.entry_allocas, r, ty, comment)
+    ir_alloca_at(s.entry_allocas, r, ty)
 
 # entry_alloca_begin for a register already taken: redirect, write the
 # `  %.{r} = alloca ` prefix with no new register, then entry_alloca_reg_end.
@@ -1344,9 +1164,7 @@ pub fn entry_alloca_reg_begin(s: *EmitterState, r: i32)
     entry_alloca_mark(s)
     s.entry_out_saved = s.out
     s.out = s.entry_allocas
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, IR_ALLOCA)
+    format_into(s, "  %.{r} = alloca ")
 
 # entry_alloca_reg_begin when the type starts with a bare struct name
 # (`emit_name` emits no `%`): the prefix is `  %.{r} = alloca %`.
@@ -1354,9 +1172,7 @@ pub fn entry_alloca_reg_begin_named(s: *EmitterState, r: i32)
     entry_alloca_mark(s)
     s.entry_out_saved = s.out
     s.out = s.entry_allocas
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, IR_ALLOCA_NAMED)
+    format_into(s, "  %.{r} = alloca %")
 
 pub fn entry_alloca_reg_end(s: *EmitterState)
     s.out = s.entry_out_saved
@@ -1376,7 +1192,7 @@ pub fn entry_alloca_reg_end(s: *EmitterState)
 # next_label never returns a negative number, so -1 can never equal any block
 # opened by begin_block: an entry-block value only matches while we are still
 # in the entry block.  emit_fn, emit_method and emit_module set this at every
-# function boundary.  It is never passed to emit_label/begin_block.
+# function boundary.  It is never passed to begin_block.
 # The only place a stale label still shows is a dead merge block, so the
 # guard is an IR test: ritz0/test_ritz1_entry_block_label.py (AGAST #3526).
 const ENTRY_BLOCK_LABEL: i32 = -1
@@ -1386,14 +1202,10 @@ pub fn next_label(s: *EmitterState) -> i32
     s.label_counter = s.label_counter + 1
     l
 
-pub fn emit_label(s: *EmitterState, label: i32)
-    emit_str(s, c"L")
-    emit_int(s, label as i64)
-
 # ritz-task-1267 — Open a new basic block.
 #
 # This is the ONLY sanctioned way to start a basic block.  Emitting
-# `L<n>:` by hand (emit_label + ":\n") is a bug: `s.current_label` is the
+# `L<n>:` by hand is a bug: `s.current_label` is the
 # emitter's insertion point, and every PHI predecessor label we write is
 # derived from it.  If a construct opens a block without refreshing
 # `s.current_label`, an enclosing IF/short-circuit emitter later names a
@@ -1409,8 +1221,7 @@ pub fn emit_label(s: *EmitterState, label: i32)
 # "emit the label" and "record the insertion point" steps welded together
 # makes that whole class of bug unrepresentable.
 pub fn begin_block(s: *EmitterState, label: i32)
-    emit_label(s, label)
-    emit_str(s, c":\n")
+    format_into(s, "L{label}:\n")
     s.current_label = label
 
 # ritz-task-1309 — the three sanctioned accessors for `last_expr_reg`.
@@ -1629,11 +1440,7 @@ pub fn ptr_value_to_i64(s: *EmitterState, e: *Expr, reg: i32) -> i32
     if expr_is_ptr_valued(s, e) == 0
         return reg
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, c" = ptrtoint ptr ")
-    emit_reg(s, reg)
-    emit_str(s, c" to i64  ; #1652 @&T->*T\n")
+    format_into(s, "  %.{r} = ptrtoint ptr %.{reg} to i64  ; #1652 @&T->*T\n")
     return r
 
 # AGAST #1754: the inverse -- bring `reg` into an `@&T` (`ptr`) slot.  A
@@ -1643,11 +1450,7 @@ pub fn i64_value_to_ptr(s: *EmitterState, e: *Expr, reg: i32) -> i32
     if expr_is_ptr_valued(s, e) == 1
         return reg
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, IR_INTTOPTR)
-    emit_reg(s, reg)
-    emit_str(s, c" to ptr  ; #1754 *T->@&T\n")
+    format_into(s, "  %.{r} = inttoptr i64 %.{reg} to ptr  ; #1754 *T->@&T\n")
     return r
 
 # ptr_value_to_i64, but only when the destination slot is i64-lowered
@@ -2040,7 +1843,7 @@ pub fn fn_private_free(f: *FnDef) -> i32
         return 0
     if f.def_file == null or *(f.def_file) == '<'   # '<input>': no real file
         return 0
-    if f.name_len == 4 and name_eq(StrView { ptr: (f.name), len: (4) as i64 }, StrView { ptr: (c"main"), len: (4) as i64 }) == 1
+    if f.name_len == 4 and name_eq(StrView { ptr: (f.name), len: (4) as i64 }, "main") == 1
         return 0
     var i: i32 = 0
     while i < f.name_len
@@ -2248,7 +2051,7 @@ pub fn reject_procedure_value(s: *EmitterState, e: *Expr, name_sv: StrView)
             eprint_char(*(name + i))
         eprint_char('`')
     eprints(" returns nothing, so its call has no value to use here\n")
-    emit_str(s, c"  ; ERROR: a procedure call has no value\n")
+    format_into(s, "  ; ERROR: a procedure call has no value\n")
     s.error_count = s.error_count + 1
 
 # Call `e`, to `name`, resolved to `fd`: a procedure's call has no value to
@@ -2569,83 +2372,62 @@ pub fn nd_elem_leaks() -> i32
 # primitives (#1564 u16/i16/u32, #1814 fields, #1966 f32/f64, #2063 bool).
 # A struct element is spelled `%T` by its caller; anything else unknown is
 # an i64 slot.
-pub fn elem_mem_llvm(t: TypeKind) -> *u8
+pub fn elem_mem_llvm(t: TypeKind) -> StrView
     if t == TypeKind.Array
         # AGAST #1509: every lowered N-D access goes through
         # emit_nd_index_ptr / emit_array_shape_llvm; anything else used to
         # treat the inner array as one i64 and miscompile silently.
         # emit_module turns the count into a hard error.
         g_nd_elem_leaks = g_nd_elem_leaks + 1
-        return c"i64"
+        return "i64"
     let m: *u8 = ty_mem_llvm(t)
     if m == null
-        return c"i64"
-    m
+        return "i64"
+    strview_from_cstr(m)
 
 # AGAST #1509: the LLVM type of `sh` from dimension `from` inward:
 # `[4 x [8 x i8]]` for `[4][8]u8` from 0, `[8 x i8]` from 1, and the bare
 # leaf at from == rank.  The same spelling the alloca / global declares, so
 # every GEP over the array agrees with its layout (ritz0's layout).
 pub fn emit_array_shape_llvm(s: *EmitterState, sh: *ArrayShape, from: i32)
-    var d: i32 = from
-    while d < sh.rank
-        emit_str(s, c"[")
-        emit_int(s, sh.dims[d] as i64)
-        emit_str(s, IR_X)
-        d = d + 1
+    for d in from..sh.rank
+        let n: i64 = sh.dims[d] as i64
+        format_into(s, "[{n} x ")
     if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0
         emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
     else
-        emit_str(s, elem_mem_llvm(sh.leaf_type))
-    d = from
-    while d < sh.rank
-        emit_str(s, c"]")
-        d = d + 1
+        emit_sv(s, elem_mem_llvm(sh.leaf_type))
+    for d in from..sh.rank
+        format_into(s, "]")
 
 # Widen an array element just loaded as `ty` (elem_mem_llvm(t)) to the i64
 # every expression value is carried in: zext unsigned, sext signed, ptrtoint
 # pointers. i64 elements are returned as-is.  A bool element (`i1`, #2063)
 # is zero-extended.
-pub fn emit_array_elem_widen(s: *EmitterState, val: i32, t: TypeKind, ty: *u8) -> i32
-    var op: *u8 = null
+pub fn emit_array_elem_widen(s: *EmitterState, val: i32, t: TypeKind, ty: StrView) -> i32
     if ty_bits(t) == 64
         return val
+    var op: StrView = "ptrtoint"
     if ty_is_signed(t) == 1
-        op = c" = sext "
+        op = "sext"
     else if ty_bits(t) > 0
-        op = c" = zext "   # unsigned, and bool's i1 (#2063)
-    else if ty_is_ptr(t) == 1
-        op = c" = ptrtoint "
-    if op == null
+        op = "zext"   # unsigned, and bool's i1 (#2063)
+    else if ty_is_ptr(t) == 0
         return val
     let wide: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, wide)
-    emit_str(s, op)
-    emit_str(s, ty)
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_TO_I64)
+    format_into(s, "  %.{wide} = {op} {ty} %.{val} to i64\n")
     return wide
 
 # The inverse of emit_array_elem_widen for a store: narrow an i64 value to the
 # element type `ty` (trunc ints, inttoptr pointers). i64 is returned as-is.
-pub fn emit_array_elem_narrow(s: *EmitterState, val: i32, t: TypeKind, ty: *u8) -> i32
-    var op: *u8 = null
-    if ty_int_in(t, 8, 32) == 1
-        op = c" = trunc i64 "
-    else if t == TypeKind.Ptr or t == TypeKind.PtrPtr
-        op = c" = inttoptr i64 "
-    if op == null
+pub fn emit_array_elem_narrow(s: *EmitterState, val: i32, t: TypeKind, ty: StrView) -> i32
+    var op: StrView = "trunc"
+    if t == TypeKind.Ptr or t == TypeKind.PtrPtr
+        op = "inttoptr"
+    else if ty_int_in(t, 8, 32) == 0
         return val
     let narrow: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, narrow)
-    emit_str(s, op)
-    emit_reg(s, val)
-    emit_str(s, IR_TO_SP)
-    emit_str(s, ty)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{narrow} = {op} i64 %.{val} to {ty}\n")
     return narrow
 
 # AGAST #3972: 1 when `f` is a `*S` field whose element `x.f[i]` is an S, a
@@ -2664,20 +2446,14 @@ pub fn ptr_field_struct_elem(s: *EmitterState, f: *StructField) -> i32
 # slot itself as an inline `[0 x T]` array, writing into the struct.
 pub fn emit_ptr_field_elem_addr(s: *EmitterState, field_slot: i32, field: *StructField, kind: TypeKind, idx: i32) -> i32
     let base: i32 = next_reg(s)
-    emit_load_into(s, IR_TY_PTR, base, field_slot)
+    emit_load_into(s, "ptr", base, field_slot)
     let elem_ptr: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, elem_ptr)
-    emit_str(s, c" = getelementptr ")
+    format_into(s, "  %.{elem_ptr} = getelementptr ")
     if kind == TypeKind.Struct
         emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
     else
-        emit_str(s, elem_mem_llvm(kind))
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, base)
-    emit_str(s, IR_I64_SEP)
-    emit_reg(s, idx)
-    emit_str(s, IR_NL)
+        emit_sv(s, elem_mem_llvm(kind))
+    format_into(s, ", ptr %.{base}, i64 %.{idx}\n")
     return elem_ptr
 
 # Centralised float-type predicate for arith / cmp / cast dispatch.
@@ -2850,7 +2626,7 @@ pub fn tagged_enum_arg(s: *EmitterState, name_sv: StrView, variant: i32, out_len
 pub fn is_unit_arg(name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"unit"), len: (4) as i64 })
+    name_eq(StrView { ptr: (name), len: (len) as i64 }, "unit")
 
 # Size and alignment (to *align) of the type one mangled argument spells,
 # laid out as ritz0 does; 0 when it cannot be measured.
@@ -2901,7 +2677,7 @@ pub fn tagged_enum_layout(s: *EmitterState, name_sv: StrView, pad: *i64) -> i64
     var size: i64 = mangled_type_size_align(s, StrView { ptr: (t), len: (t_len) as i64 }, @align)
     if size == 0 and is_unit_arg(StrView { ptr: (t), len: (t_len) as i64 }) == 0
         return TAGGED_ENUM_FALLBACK_BYTES
-    if name_eq(StrView { ptr: (name), len: (6) as i64 }, StrView { ptr: (c"Result"), len: (6) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (6) as i64 }, "Result") == 1
         var e_len: i32 = 0
         let e: *u8 = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, 1, @e_len)
         if e == null
@@ -3039,11 +2815,11 @@ pub fn user_enum_size(s: *EmitterState, ei: i32) -> i64
 # the value variant index `vi` stores there -- the repr type and the
 # discriminant for an `enum E: <int>`, else i8 and the index (Option /
 # Result and generic instances included).
-pub fn enum_tag_ty_named(ctx: *ParseCtx, name_sv: StrView) -> *u8
+pub fn enum_tag_ty_named(ctx: *ParseCtx, name_sv: StrView) -> StrView
     let ei: i32 = user_enum_index(ctx, name_sv)
     if ei < 0
-        return IR_TY_I8
-    enum_tag_llvm(ctx, ei)
+        return "i8"
+    strview_from_cstr(enum_tag_llvm(ctx, ei))
 
 pub fn enum_tag_value_named(ctx: *ParseCtx, name_sv: StrView, vi: i32) -> i64
     let ei: i32 = user_enum_index(ctx, name_sv)
@@ -3086,28 +2862,15 @@ pub fn variant_sel_offset(s: *EmitterState, name_sv: StrView, sel: i32) -> i64
 # byte offset into it.  The buffer is reached by GEP over the enum struct
 # and then by an `i8` GEP, never a single index on the array (the stride
 # trap of ENUM_VARIANTS.md section 3.3).
-pub fn emit_payload_ptr(s: *EmitterState, slot_reg: i32, name_sv: StrView, sel: i32) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn emit_payload_ptr(s: *EmitterState, slot_reg: i32, name: StrView, sel: i32) -> i32
     let pay_ptr: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, pay_ptr)
-    emit_str(s, IR_GEP_NAMED)
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, slot_reg)
-    emit_str(s, c", i32 0, i32 2\n")
-    let off: i64 = variant_sel_offset(s, StrView { ptr: (name), len: (len) as i64 }, sel)
+    gep_struct_open(s, pay_ptr, name)
+    format_into(s, ", ptr %.{slot_reg}, i32 0, i32 2\n")
+    let off: i64 = variant_sel_offset(s, name, sel)
     if off == 0
         return pay_ptr
     let fld: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, fld)
-    emit_str(s, c" = getelementptr i8, ptr ")
-    emit_reg(s, pay_ptr)
-    emit_str(s, IR_I64_SEP)
-    emit_int(s, off)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{fld} = getelementptr i8, ptr %.{pay_ptr}, i64 {off}\n")
     fld
 
 # Integer width in bits of a scalar payload narrower than i64 — the width it
@@ -3129,18 +2892,18 @@ pub fn tagged_enum_scalar_bits(s: *EmitterState, name_sv: StrView, variant: i32,
     let c: *u8 = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, variant, @c_len)
     if c == null
         return 64
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
+    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i8") == 1
         return 8
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"i16"), len: (3) as i64 }) == 1
+    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i16") == 1
         return 16
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"i32"), len: (3) as i64 }) == 1
+    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i32") == 1
         return 32
     *signed = 0
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"u8"), len: (2) as i64 }) == 1 or name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"bool"), len: (4) as i64 }) == 1
+    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u8") == 1 or name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "bool") == 1
         return 8
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"u16"), len: (3) as i64 }) == 1
+    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u16") == 1
         return 16
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"u32"), len: (3) as i64 }) == 1
+    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u32") == 1
         return 32
     *signed = 1
     64
@@ -3181,21 +2944,21 @@ pub fn tagged_enum_int_type_in(ctx: *ParseCtx, structs: *HashMapI64, m: *Module,
         let c: *u8 = tagged_enum_arg_in(ctx, structs, m, StrView { ptr: (name), len: (len) as i64 }, variant, @c_len)
         if c == null
             return TypeKind.Void
-        if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
+        if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i8") == 1
             t = TypeKind.I8
-        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"u8"), len: (2) as i64 }) == 1
+        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u8") == 1
             t = TypeKind.U8
-        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"i16"), len: (3) as i64 }) == 1
+        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i16") == 1
             t = TypeKind.I16
-        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"u16"), len: (3) as i64 }) == 1
+        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u16") == 1
             t = TypeKind.U16
-        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"i32"), len: (3) as i64 }) == 1
+        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i32") == 1
             t = TypeKind.I32
-        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"u32"), len: (3) as i64 }) == 1
+        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u32") == 1
             t = TypeKind.U32
-        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"i64"), len: (3) as i64 }) == 1
+        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i64") == 1
             t = TypeKind.I64
-        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"u64"), len: (3) as i64 }) == 1
+        else if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u64") == 1
             t = TypeKind.U64
     if ty_int_in(t, 8, 32) == 1
         return t
@@ -3220,17 +2983,17 @@ pub fn tagged_enum_float_type(s: *EmitterState, name_sv: StrView, variant: i32) 
     let c: *u8 = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, variant, @c_len)
     if c == null
         return TypeKind.Void
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"f32"), len: (3) as i64 }) == 1
+    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "f32") == 1
         return TypeKind.F32
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"f64"), len: (3) as i64 }) == 1
+    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "f64") == 1
         return TypeKind.F64
     TypeKind.Void
 
 # The LLVM spelling of float type code `t` (TypeKind.F32 or TypeKind.F64).
-pub fn float_llvm_name(t: TypeKind) -> *u8
+pub fn float_llvm_name(t: TypeKind) -> StrView
     if t == TypeKind.F32
-        return c"float"
-    c"double"
+        return "float"
+    "double"
 
 # Convert register `val`, of expression type `src_ty`, to float type `dst_ty`
 # (TypeKind.F32 / TypeKind.F64): passthrough, fptrunc, fpext, or sitofp from the i64
@@ -3239,18 +3002,12 @@ pub fn emit_float_coerce(s: *EmitterState, val: i32, src_ty: TypeKind, dst_ty: T
     if src_ty == dst_ty
         return val
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
+    var op: StrView = "sitofp i64"
     if src_ty == TypeKind.F64 and dst_ty == TypeKind.F32
-        emit_str(s, c" = fptrunc double ")
+        op = "fptrunc double"
     else if src_ty == TypeKind.F32 and dst_ty == TypeKind.F64
-        emit_str(s, c" = fpext float ")
-    else
-        emit_str(s, c" = sitofp i64 ")
-    emit_reg(s, val)
-    emit_str(s, IR_TO_SP)
-    emit_str(s, float_llvm_name(dst_ty))
-    emit_str(s, IR_NL)
+        op = "fpext float"
+    format_into(s, "  %.{r} = {op} %.{val} to {float_llvm_name(dst_ty)}\n")
     r
 
 # `val_reg`, the i64 register integer expression `value` was emitted into,
@@ -3264,141 +3021,95 @@ pub fn emit_int_into_float_slot(s: *EmitterState, val_reg: i32, unsigned: i32, d
     if unsigned == 0
         return emit_float_coerce(s, val_reg, TypeKind.I64, dst_ty)
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, c" = uitofp i64 ")
-    emit_reg(s, val_reg)
-    emit_str(s, IR_TO_SP)
-    emit_str(s, float_llvm_name(dst_ty))
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{r} = uitofp i64 %.{val_reg} to {float_llvm_name(dst_ty)}\n")
     r
 
 
 # `<dst> = load i<bits>, ptr <pay_ptr>` widened to i64 for a scalar payload
 # of `variant`; returns the i64 register.  See tagged_enum_scalar_bits.
-pub fn emit_tagged_payload_load(s: *EmitterState, pay_ptr: i32, name_sv: StrView, variant: i32) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn emit_tagged_payload_load(s: *EmitterState, pay_ptr: i32, name: StrView, variant: i32) -> i32
     # AGAST #1945: a float payload loads as float / double, unwidened.
-    let ft: TypeKind = tagged_enum_float_type(s, StrView { ptr: (name), len: (len) as i64 }, variant)
+    let ft: TypeKind = tagged_enum_float_type(s, name, variant)
     if ft != TypeKind.Void
-        let fr: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, fr)
-        emit_str(s, IR_LOAD)
-        emit_str(s, float_llvm_name(ft))
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, pay_ptr)
-        emit_str(s, IR_NL)
-        return fr
+        return emit_load_new(s, float_llvm_name(ft), pay_ptr)
     var signed: i32 = 1
-    let bits: i32 = tagged_enum_scalar_bits(s, StrView { ptr: (name), len: (len) as i64 }, variant, @signed)
+    let bits: i32 = tagged_enum_scalar_bits(s, name, variant, @signed)
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, c" = load i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, pay_ptr)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{r} = load i{bits}, ptr %.{pay_ptr}\n")
     if bits == 64
         return r
     let w: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, w)
-    if signed == 1
-        emit_str(s, c" = sext i")
-    else
-        emit_str(s, c" = zext i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_SP)
-    emit_reg(s, r)
-    emit_str(s, IR_TO_I64)
+    let ext: StrView = if signed == 1 then "sext" else "zext"
+    format_into(s, "  %.{w} = {ext} i{bits} %.{r} to i64\n")
     w
 
 # `store i<bits>` of the i64 register `val` into a scalar payload of
 # `variant`, truncating first when the payload is narrower.
-pub fn emit_tagged_payload_store(s: *EmitterState, val: i32, pay_ptr: i32, name_sv: StrView, variant: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn emit_tagged_payload_store(s: *EmitterState, val: i32, pay_ptr: i32, name: StrView, variant: i32)
     # AGAST #1945: a float payload stores as float / double; `val` must
     # already be of that type (see emit_float_coerce).
-    let ft: TypeKind = tagged_enum_float_type(s, StrView { ptr: (name), len: (len) as i64 }, variant)
+    let ft: TypeKind = tagged_enum_float_type(s, name, variant)
     if ft != TypeKind.Void
-        emit_str(s, IR_STORE_IND)
-        emit_str(s, float_llvm_name(ft))
-        emit_str(s, IR_SP)
-        emit_reg(s, val)
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, pay_ptr)
-        emit_str(s, IR_NL)
+        emit_store_typed(s, float_llvm_name(ft), val, pay_ptr)
         return
     var signed: i32 = 1
-    let bits: i32 = tagged_enum_scalar_bits(s, StrView { ptr: (name), len: (len) as i64 }, variant, @signed)
+    let bits: i32 = tagged_enum_scalar_bits(s, name, variant, @signed)
     var v: i32 = val
     if bits != 64
         v = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, v)
-        emit_str(s, IR_TRUNC)
-        emit_reg(s, val)
-        emit_str(s, c" to i")
-        emit_int(s, bits as i64)
-        emit_str(s, IR_NL)
-    emit_str(s, c"  store i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_SP)
-    emit_reg(s, v)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, pay_ptr)
-    emit_str(s, IR_NL)
+        format_into(s, "  %.{v} = trunc i64 %.{val} to i{bits}\n")
+    format_into(s, "  store i{bits} %.{v}, ptr %.{pay_ptr}\n")
 
 # Emit LLVM type with struct name support.  Tagged-enum types emit as the
 # named struct so variant constructors / match / return paths share the same
 # declared layout.
 
+# The LLVM `<N x iM>` spelling of SIMD vector type `name`; empty for a name
+# that is not one.
+pub fn simd_vec_llvm(name: StrView) -> StrView
+    if name_eq(name, "v16i8") == 1
+        return "<16 x i8>"
+    if name_eq(name, "v8i16") == 1
+        return "<8 x i16>"
+    if name_eq(name, "v4i32") == 1
+        return "<4 x i32>"
+    if name_eq(name, "v2i64") == 1
+        return "<2 x i64>"
+    if name_eq(name, "v32i8") == 1
+        return "<32 x i8>"
+    if name_eq(name, "v16i16") == 1
+        return "<16 x i16>"
+    if name_eq(name, "v8i32") == 1
+        return "<8 x i32>"
+    if name_eq(name, "v4i64") == 1
+        return "<4 x i64>"
+    ""
+
 # Emit the LLVM `<N x iM>` syntax for a SIMD vector type name.  Caller must
-# ensure `is_simd_vector_type_name(name, len) == 1` first.
-pub fn emit_simd_vector_type(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v16i8"), len: (5) as i64 }) == 1
-        emit_str(s, c"<16 x i8>")
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v8i16"), len: (5) as i64 }) == 1
-        emit_str(s, c"<8 x i16>")
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v4i32"), len: (5) as i64 }) == 1
-        emit_str(s, c"<4 x i32>")
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v2i64"), len: (5) as i64 }) == 1
-        emit_str(s, c"<2 x i64>")
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v32i8"), len: (5) as i64 }) == 1
-        emit_str(s, c"<32 x i8>")
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v16i16"), len: (6) as i64 }) == 1
-        emit_str(s, c"<16 x i16>")
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v8i32"), len: (5) as i64 }) == 1
-        emit_str(s, c"<8 x i32>")
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v4i64"), len: (5) as i64 }) == 1
-        emit_str(s, c"<4 x i64>")
+# ensure `is_simd_vector_type_name(name) == 1` first.
+pub fn emit_simd_vector_type(s: *EmitterState, name: StrView)
+    emit_sv(s, simd_vec_llvm(name))
 
 # Element bit width for a SIMD vector type — used by `simd_rotl` to compute
 # the wrap-around shift constants.  Returns 0 for non-SIMD names.
 pub fn simd_vector_elem_bits(name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v16i8"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v16i8") == 1
         return 8
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v8i16"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v8i16") == 1
         return 16
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v4i32"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v4i32") == 1
         return 32
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v2i64"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v2i64") == 1
         return 64
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v32i8"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v32i8") == 1
         return 8
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v16i16"), len: (6) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v16i16") == 1
         return 16
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v8i32"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v8i32") == 1
         return 32
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v4i64"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v4i64") == 1
         return 64
     0
 
@@ -3407,42 +3118,35 @@ pub fn simd_vector_elem_bits(name_sv: StrView) -> i32
 pub fn simd_vector_elem_count(name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v16i8"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v16i8") == 1
         return 16
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v8i16"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v8i16") == 1
         return 8
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v4i32"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v4i32") == 1
         return 4
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v2i64"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v2i64") == 1
         return 2
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v32i8"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v32i8") == 1
         return 32
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v16i16"), len: (6) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v16i16") == 1
         return 16
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v8i32"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v8i32") == 1
         return 8
-    if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"v4i64"), len: (5) as i64 }) == 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "v4i64") == 1
         return 4
     0
 
-# Element scalar LLVM type ("i8"/"i16"/"i32"/"i64") for a SIMD vector name —
-# used for extractelement/insertelement opcodes.
-pub fn emit_simd_elem_type(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let bits: i32 = simd_vector_elem_bits(StrView { ptr: (name), len: (len) as i64 })
-    if bits == 8
-        emit_str(s, c"i8")
-    else if bits == 16
-        emit_str(s, c"i16")
-    else if bits == 32
-        emit_str(s, c"i32")
-    else if bits == 64
-        emit_str(s, c"i64")
+# The element type (`i32`) of SIMD vector type `name`, for
+# extractelement/insertelement; empty for a name that is not one.
+pub fn simd_elem_llvm(name: StrView) -> StrView
+    match simd_vector_elem_bits(name)
+        8 => "i8"
+        16 => "i16"
+        32 => "i32"
+        64 => "i64"
+        _ => ""
 
-pub fn emit_llvm_type_struct(s: *EmitterState, t: TypeKind, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
+pub fn emit_llvm_type_struct(s: *EmitterState, t: TypeKind, name: StrView)
     if t == TypeKind.Struct
         # Post-monomorphization (and pre-monomorph for explicit primitive
         # type annotations like `let x: f32`), TypeKind.Struct + name="u16"/
@@ -3450,29 +3154,29 @@ pub fn emit_llvm_type_struct(s: *EmitterState, t: TypeKind, name_sv: StrView)
         # have dedicated tokens for primitive types — they're parsed as
         # generic struct-name annotations. Map them back to LLVM
         # primitives so signatures/calls match.
-        let prim: TypeKind = ty_from_name(StrView { ptr: (name), len: (name_len) as i64 })
+        let prim: TypeKind = ty_from_name(name)
         if prim != TypeKind.Void
-            emit_str(s, ty_mem_llvm(prim))
+            emit_sv(s, strview_from_cstr(ty_mem_llvm(prim)))
             return
-        if name_eq(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"void"), len: (4) as i64 }) == 1
+        if name_eq(name, "void") == 1
             # `-> void` parses as TypeKind.Struct with name "void" because the
             # parser uses the generic type-name slot for unknown names.
             # cryptosec.aes / cryptosec.aes_gcm have `pub fn foo(...) -> void`
             # — without this branch we emit `%void = type { i8 }` and
             # `ret void` mismatches the function signature.
-            emit_str(s, c"void")
+            format_into(s, "void")
             return
         # AGAST #167: SIMD vector types (`v4i32`, `v16i8`, etc) lower to
         # native LLVM `<N x iM>` rather than the named-struct fallback.
         # Without this, `let v: v4i32 = simd_loadu(...)` allocas a bogus
         # `%v4i32 = type { i8 }` and stores type-mismatch the call result.
-        if is_simd_vector_type_name(StrView { ptr: (name), len: (name_len) as i64 }) == 1
-            emit_simd_vector_type(s, StrView { ptr: (name), len: (name_len) as i64 })
+        if is_simd_vector_type_name(name) == 1
+            emit_simd_vector_type(s, name)
             return
-        emit_str(s, IR_PCT)
-        emit_name(s, StrView { ptr: (name), len: (name_len) as i64 })
+        format_into(s, "%")
+        emit_name(s, name)
     else
-        emit_str(s, ty_value_llvm(t))
+        emit_sv(s, strview_from_cstr(ty_value_llvm(t)))
 
 # =============================================================================
 # AGAST #168: layout-equivalence coercion for Span$u8 ↔ StrView.
@@ -3501,10 +3205,10 @@ pub fn is_layout_equiv_pair(src_name_sv: StrView, dst_name_sv: StrView) -> i32
         return 0
     if dst_len == 0
         return 0
-    let src_is_span_u8: i32 = name_eq(StrView { ptr: (src_name), len: (src_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 })
-    let src_is_strview: i32 = name_eq(StrView { ptr: (src_name), len: (src_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 })
-    let dst_is_span_u8: i32 = name_eq(StrView { ptr: (dst_name), len: (dst_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 })
-    let dst_is_strview: i32 = name_eq(StrView { ptr: (dst_name), len: (dst_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 })
+    let src_is_span_u8: i32 = name_eq(StrView { ptr: (src_name), len: (src_len) as i64 }, "Span$u8")
+    let src_is_strview: i32 = name_eq(StrView { ptr: (src_name), len: (src_len) as i64 }, "StrView")
+    let dst_is_span_u8: i32 = name_eq(StrView { ptr: (dst_name), len: (dst_len) as i64 }, "Span$u8")
+    let dst_is_strview: i32 = name_eq(StrView { ptr: (dst_name), len: (dst_len) as i64 }, "StrView")
     if src_is_span_u8 == 1 and dst_is_strview == 1
         return 1
     if src_is_strview == 1 and dst_is_span_u8 == 1
@@ -3514,45 +3218,23 @@ pub fn is_layout_equiv_pair(src_name_sv: StrView, dst_name_sv: StrView) -> i32
 # Decompose `%src_name { ptr, i64 }` and rebuild as `%dst_name { ptr, i64 }`.
 # Caller must verify is_layout_equiv_pair == 1 before invoking.  Returns
 # the register holding the rebuilt aggregate.
-pub fn rebuild_layout_equiv(s: *EmitterState, src_reg: i32, src_name_sv: StrView, dst_name_sv: StrView) -> i32
-    var src_name: *u8 = src_name_sv.ptr
-    var src_len: i32 = src_name_sv.len as i32
-    var dst_name: *u8 = dst_name_sv.ptr
-    var dst_len: i32 = dst_name_sv.len as i32
+pub fn rebuild_layout_equiv(s: *EmitterState, src_reg: i32, src_name: StrView, dst_name: StrView) -> i32
     let p: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, p)
-    emit_str(s, c" = extractvalue %")
-    emit_name(s, StrView { ptr: (src_name), len: (src_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, src_reg)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{p} = extractvalue %")
+    emit_name(s, src_name)
+    format_into(s, " %.{src_reg}, 0\n")
     let l: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, l)
-    emit_str(s, c" = extractvalue %")
-    emit_name(s, StrView { ptr: (src_name), len: (src_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, src_reg)
-    emit_str(s, IR_COMMA_1)
+    format_into(s, "  %.{l} = extractvalue %")
+    emit_name(s, src_name)
+    format_into(s, " %.{src_reg}, 1\n")
     let r1: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r1)
-    emit_str(s, c" = insertvalue %")
-    emit_name(s, StrView { ptr: (dst_name), len: (dst_len) as i64 })
-    emit_str(s, c" undef, ptr ")
-    emit_reg(s, p)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{r1} = insertvalue %")
+    emit_name(s, dst_name)
+    format_into(s, " undef, ptr %.{p}, 0\n")
     let r2: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r2)
-    emit_str(s, c" = insertvalue %")
-    emit_name(s, StrView { ptr: (dst_name), len: (dst_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, r1)
-    emit_str(s, IR_I64_SEP)
-    emit_reg(s, l)
-    emit_str(s, IR_COMMA_1)
+    format_into(s, "  %.{r2} = insertvalue %")
+    emit_name(s, dst_name)
+    format_into(s, " %.{r1}, i64 %.{l}, 1\n")
     r2
 
 # =============================================================================
@@ -3634,10 +3316,6 @@ pub fn qualified_variant_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_le
 # `<file>:<line>:<col>: error: 'E.V' <msg>`.  Counted like emit_ir_error, so
 # no output is written; returns a placeholder register.  Also `'Span.empty'`
 # with no slot to type it (AGAST #2296): any `Type.method` call fits.
-pub fn emit_qualified_variant_error(s: *EmitterState, e: *Expr, msg: *u8) -> i32
-    emit_qualified_variant_error_sv(s, e, strview_from_cstr(msg))
-
-# AGAST #4759: emit_qualified_variant_error for a StrView message.
 pub fn emit_qualified_variant_error_sv(s: *EmitterState, e: *Expr, msg: StrView) -> i32
     format_into(s, "  ; ERROR: qualified variant {msg}\n")
     diag_error_at(emitter_source_file(), e.span)
@@ -3664,9 +3342,9 @@ pub fn is_module_item(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32) -> i32
         return 0
     if is_enum_type(s.mono.pctx, StrView { ptr: (q), len: (ql) as i64 }) == 1 or find_struct(s, StrView { ptr: (q), len: (ql) as i64 }) != null
         return 0
-    if name_eq(StrView { ptr: (q), len: (ql) as i64 }, StrView { ptr: (c"Span"), len: (4) as i64 }) == 1 or name_eq(StrView { ptr: (q), len: (ql) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1
+    if name_eq(StrView { ptr: (q), len: (ql) as i64 }, "Span") == 1 or name_eq(StrView { ptr: (q), len: (ql) as i64 }, "StrView") == 1
         return 0
-    if name_eq(StrView { ptr: (q), len: (ql) as i64 }, StrView { ptr: (c"Option"), len: (6) as i64 }) == 1 or name_eq(StrView { ptr: (q), len: (ql) as i64 }, StrView { ptr: (c"Result"), len: (6) as i64 }) == 1
+    if name_eq(StrView { ptr: (q), len: (ql) as i64 }, "Option") == 1 or name_eq(StrView { ptr: (q), len: (ql) as i64 }, "Result") == 1
         return 0
     var ib: *ImplBlock = s.module.impls
     while ib != null
@@ -3681,7 +3359,7 @@ pub fn is_module_item(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32) -> i32
 # module_item_access_removed (ritz0/qualified_access.py).  Counted like
 # emit_ir_error, so no output is written.  Returns a dummy register.
 pub fn emit_module_item_error(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32, line: i32, col: i32) -> i32
-    emit_str(s, c"  ; ERROR: module.item access\n")
+    format_into(s, "  ; ERROR: module.item access\n")
     diag_error_at(emitter_source_file(), diag_span(line, col))
     eprint_char('`')
     eprint_bytes(StrView { ptr: (q), len: (ql) as i64 })
@@ -3693,9 +3371,7 @@ pub fn emit_module_item_error(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32
     eprints("`\n")
     s.error_count = s.error_count + 1
     let z: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, z)
-    emit_str(s, IR_ADD_ZERO)
+    format_into(s, "  %.{z} = add i64 0, 0\n")
     z
 
 # AGAST #1600 / #2039: `name` (a bare variant used as a value, or the callee
@@ -3710,9 +3386,9 @@ pub fn emit_ambiguous_variant_error(s: *EmitterState, name_sv: StrView, span: Sr
     let a: *u8 = enum_name_at(s.mono.pctx, ea, @a_len)
     var b_len: i32 = 0
     let b: *u8 = enum_name_at(s.mono.pctx, eb, @b_len)
-    emit_str(s, c"  ; ERROR: ambiguous enum variant '")
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c"'\n")
+    format_into(s, "  ; ERROR: ambiguous enum variant '")
+    emit_name(s, name_sv)
+    format_into(s, "'\n")
     diag_error_at(emitter_source_file(), span)
     eprints("ambiguous enum variant '")
     eprint_bytes(StrView { ptr: (name), len: (len) as i64 })
@@ -3727,9 +3403,7 @@ pub fn emit_ambiguous_variant_error(s: *EmitterState, name_sv: StrView, span: Sr
     eprints("'\n")
     s.error_count = s.error_count + 1
     let zero: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, zero)
-    emit_str(s, IR_ADD_ZERO)
+    format_into(s, "  %.{zero} = add i64 0, 0\n")
     return zero
 
 # AGAST #4666: the struct a bare "..." lowers to: `Span$u8` (AGAST #98), or
@@ -3824,73 +3498,41 @@ pub fn is_elem_aggregate_name(s: *EmitterState, name_sv: StrView) -> i32
 # Emit `  %.dst = load <ty>, ptr %.ptr` for a destination the site has
 # already allocated with next_reg.  The instruction shape lives here rather
 # than in emitter_ir.ritz's ir_load because the pointer operand must go
-# through emit_reg: #4462 appends `, align 1` for a packed-derived register
-# and #4461 notes a deferred load's use.  A leaf builder writing raw bytes
-# would silently drop both, so the state-aware spelling is emitter_core's.
-pub fn emit_load_into(s: *EmitterState, ty: *u8, dst: i32, ptr: i32)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, dst)
-    emit_str(s, IR_LOAD)
-    emit_str(s, ty)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, ptr)
-    emit_str(s, IR_NL)
+# through the state's sink: #4462 appends `, align 1` for a packed-derived
+# register and #4461 notes a deferred load's use.  A leaf builder writing raw
+# bytes would silently drop both, so the state-aware spelling is emitter_core's.
+pub fn emit_load_into(s: *EmitterState, ty: StrView, dst: i32, ptr: i32)
+    format_into(s, "  %.{dst} = load {ty}, ptr %.{ptr}\n")
 
 # As emit_load_into, allocating the destination: `%.N = load <ty>, ptr %.ptr`.
-pub fn emit_load_new(s: *EmitterState, ty: *u8, ptr: i32) -> i32
+pub fn emit_load_new(s: *EmitterState, ty: StrView, ptr: i32) -> i32
     let dst: i32 = next_reg(s)
     emit_load_into(s, ty, dst, ptr)
     dst
 
 # Emit `  store <ty> %.val, ptr %.ptr`.
-pub fn emit_store_typed(s: *EmitterState, ty: *u8, val: i32, ptr: i32)
-    emit_str(s, IR_STORE_IND)
-    emit_str(s, ty)
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, ptr)
-    emit_str(s, IR_NL)
+pub fn emit_store_typed(s: *EmitterState, ty: StrView, val: i32, ptr: i32)
+    format_into(s, "  store {ty} %.{val}, ptr %.{ptr}\n")
 
 # Emit `  store <ty> <imm>, ptr %.ptr` (a constant store).
-pub fn emit_store_imm(s: *EmitterState, ty: *u8, imm: i64, ptr: i32)
-    emit_str(s, IR_STORE_IND)
-    emit_str(s, ty)
-    emit_str(s, IR_SP)
-    emit_int(s, imm)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, ptr)
-    emit_str(s, IR_NL)
+pub fn emit_store_imm(s: *EmitterState, ty: StrView, imm: i64, ptr: i32)
+    format_into(s, "  store {ty} {imm}, ptr %.{ptr}\n")
 
 # Emit `  %.dst = load <ty>, ptr @<name>` (a global's storage).
-pub fn emit_load_global(s: *EmitterState, ty: *u8, dst: i32, name_sv: StrView)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, dst)
-    emit_str(s, IR_LOAD)
-    emit_str(s, ty)
-    emit_str(s, IR_PTR_SEP)
-    emit_str(s, IR_AT)
-    emit_name(s, name_sv)
-    emit_str(s, IR_NL)
+pub fn emit_load_global(s: *EmitterState, ty: StrView, dst: i32, name: StrView)
+    format_into(s, "  %.{dst} = load {ty}, ptr @")
+    emit_name(s, name)
+    format_into(s, "\n")
 
 # Emit `  store <ty> %.val, ptr @<name>` (a global's storage).
-pub fn emit_store_global(s: *EmitterState, ty: *u8, val: i32, name_sv: StrView)
-    emit_str(s, IR_STORE_IND)
-    emit_str(s, ty)
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_PTR_SEP)
-    emit_str(s, IR_AT)
-    emit_name(s, name_sv)
-    emit_str(s, IR_NL)
+pub fn emit_store_global(s: *EmitterState, ty: StrView, val: i32, name: StrView)
+    format_into(s, "  store {ty} %.{val}, ptr @")
+    emit_name(s, name)
+    format_into(s, "\n")
 
 # Emit `%result = load ptr, ptr %slot_reg` and return the new register index.
 pub fn emit_load_ptr(s: *EmitterState, slot_reg: i32) -> i32
-    emit_load_new(s, IR_TY_PTR, slot_reg)
-
-# Emit `store ptr %val_reg, ptr %slot_reg`.
-fn emit_store_ptr(s: *EmitterState, val_reg: i32, slot_reg: i32)
-    emit_store_typed(s, IR_TY_PTR, val_reg, slot_reg)
+    emit_load_new(s, "ptr", slot_reg)
 
 # `text` as a string-table entry the emitter composed itself: copied into the
 # heap (never freed: one module per process), since the table keeps the pointer
@@ -4075,7 +3717,7 @@ pub fn ptr_pointee_size(s: *EmitterState, pointee: TypeKind, name_sv: StrView) -
 pub fn ptr_elem_size_unknown(s: *EmitterState, span: SrcSpan, name_sv: StrView) -> i64
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
-    emit_ir_error_begin(s, span, c"pointer arithmetic: element size of pointee unknown for '")
+    emit_ir_error_begin(s, span, "pointer arithmetic: element size of pointee unknown for '")
     emit_ir_error_end(s, StrView { ptr: (name), len: (name_len) as i64 })
     return 1
 
@@ -4261,15 +3903,12 @@ pub fn lent_struct_local(s: *EmitterState, e: *Expr) -> *LocalVar
     return loc
 
 # `<file>:<line>:<col>: error: <builtin name> <msg>` (AGAST #1879).
-pub fn mem_builtin_error(s: *EmitterState, e: *Expr, msg: *u8)
-    emit_str(s, c"  ; ERROR: memory builtin\n")
+pub fn mem_builtin_error(s: *EmitterState, e: *Expr, msg: StrView)
+    format_into(s, "  ; ERROR: memory builtin\n")
     diag_error_at(diag_source_file(), e.span)
-    var i: i32 = 0
-    while i < e.func_name_len
-        eprint_char(*(e.func_name + i))
-        i += 1
+    eprint_bytes(StrView { ptr: e.func_name, len: e.func_name_len as i64 })
     eprints(" ")
-    eprints_cstr(msg)
+    eprints(msg)
     eprints("\n")
     s.error_count = s.error_count + 1
 
@@ -4299,7 +3938,7 @@ fn get_deref_struct_type(s: *EmitterState, e: *Expr) -> *StructField
 pub fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
     let prim: *u8 = ty_mem_llvm(f.field_type)
     if prim != null
-        emit_str(s, prim)
+        emit_sv(s, strview_from_cstr(prim))
     else if f.field_type == TypeKind.Struct
         # Primitive types parsed as struct names (parser has no dedicated
         # tokens) — route through emit_llvm_type_struct for consistent
@@ -4310,19 +3949,19 @@ pub fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
         emit_array_shape_llvm(s, f.array_shape, 0)
     else if f.field_type == TypeKind.Array
         # Emit array type: [N x elem_type]
-        emit_str(s, c"[")
-        emit_int(s, f.array_size as i64)
-        emit_str(s, IR_X)
-        if f.array_elem_type == TypeKind.Struct and is_simd_vector_type_name(StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 }) == 1
+        let n: i64 = f.array_size as i64
+        format_into(s, "[{n} x ")
+        let elem_name: StrView = StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 }
+        if f.array_elem_type == TypeKind.Struct and is_simd_vector_type_name(elem_name) == 1
             # AGAST #3656: `[8]v4i64` is `[8 x <4 x i64>]`; no `%v4i64`
             # type is declared, so `%v4i64` would not assemble.
-            emit_simd_vector_type(s, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
+            emit_simd_vector_type(s, elem_name)
         else if f.array_elem_type == TypeKind.Struct
             # Emit struct type reference: %StructName
-            emit_str(s, IR_PCT)
-            emit_name(s, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
+            format_into(s, "%")
+            emit_name(s, elem_name)
         else
-            emit_str(s, elem_mem_llvm(f.array_elem_type))
-        emit_str(s, c"]")
+            emit_sv(s, elem_mem_llvm(f.array_elem_type))
+        format_into(s, "]")
     else
-        emit_str(s, c"i64")
+        format_into(s, "i64")

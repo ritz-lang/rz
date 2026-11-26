@@ -2,7 +2,7 @@
 
 THE DEFECT
 
-`emit_str` runs `own_before_ret` at every `ret` so a fn's live owned bindings
+The IR sink (`EmitterState.push_bytes`) runs `own_before_ret` at every `ret` so a fn's live owned bindings
 drop there (#3508).  That state is per fn: `own_begin_fn` resets it at a fn's
 start, and `own_end_fn` used to reset it at a fn's end.  #4463 deleted
 `own_end_fn` as "vestigial" because `own_begin_fn` resets the same fields --

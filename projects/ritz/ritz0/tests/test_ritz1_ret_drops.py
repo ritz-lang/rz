@@ -132,7 +132,7 @@ def test_ret_drop_order_pending_temp(request, tmp_path, compiler):
 
 # An array-valued tail `if` returns through emit_array_return_from, whose
 # `ret` (by value, and `ret void` after the sret copy) must start the string
-# it is emitted in, or emit_str never sees it and `t` is not dropped.
+# it is emitted in, or the IR sink never sees it and `t` is not dropped.
 ARRAY_TAIL = """\
 fn small(x: i32) -> [2]i32
     let t = make(5)

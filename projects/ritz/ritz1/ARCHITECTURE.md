@@ -416,9 +416,10 @@ of it to compare.
 ## Emitter style
 
 ritz1 is written in Ritz, so its emitter reads as Ritz: `emitter_expr_arith` is the
-reference, and a file ported after it follows what it does (AGAST #4695, #4696).
-The old form was `emit_str(s, c"...")` fragments of NUL-terminated text, with a
-`*u8` for every type name; the counts left of it are pinned down-only per file
+reference, and every emitter file follows what it does (AGAST #4695, #4696; #4766
+ported the last one and deleted the old shim).  The old form was one call per
+fragment of NUL-terminated `c"..."` text, with a `*u8` for every type name; what
+is left of it (`c""` literals, `*u8` parameters) is pinned down-only per file
 (`tools/ritz1_text_ratchet.py`, run by `make tools-ratchets`).
 
 **Where the IR goes.** One `Arena` per emitted module (`main.ritz` opens it and
@@ -445,16 +446,16 @@ format_into(s, "  %.{left_as_ptr} = inttoptr i64 %.{left_reg} to ptr\n")
 ```
 
 The sink is where IR text becomes IR: a piece that starts a `ret` drops the live
-owned bindings first (what `emit_str` did), and the digits after `%.` are a
-register operand, noted as used by the deferred struct loads and the packed-align
-tracking (what `emit_reg` did).  So `%.{r}` is a register, and nothing else in a
-ported file calls `emit_reg`.  `emit_str` stays only as the shim for the files not
-yet ported, and says so.
+owned bindings first, and the digits after `%.` are a register operand, noted as
+used by the deferred struct loads and the packed-align tracking.  So `%.{r}` is a
+register.  A piece with no value in it that a lookup returned (a type spelling) is
+written with `emit_sv(s, ty)`, which runs the same `ret` hook.
 
 **Rules for a ported file.**
 
-1. No `emit_str`, `emit_reg`, `emit_int`, `emit_label`, and no `c"..."`: a `c""`
-   belongs only at a C boundary, which an emitter file has none of.
+1. No `c"..."`: a `c""` belongs only at a C boundary, which an emitter file has
+   none of.  The fragment shim (`emit_str`, `emit_reg`, `emit_int`, `emit_label`)
+   and its `IR_*` fragments are gone; don't bring them back.
 2. No `*u8` (or `**u8` out-parameter) in a signature: a name or a type spelling is
    a `StrView`; a message is a `String` built with `format_into(@&msg, "...")`.  A
    lookup that still speaks `*u8` is read through `text_bridge`.

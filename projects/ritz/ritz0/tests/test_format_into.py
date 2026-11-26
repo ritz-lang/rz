@@ -4,7 +4,7 @@ THE GAP
 
 `{expr}` interpolation worked only in a literal passed to print / eprint, so
 nothing could format into a String or GrowBuf. ritz1's emitter builds each IR
-line from 5-8 emit_str / emit_reg calls for want of it.
+line from 5-8 fragment calls for want of it (the shim AGAST #4766 deleted).
 
 THE FEATURE (LANGUAGE_SPEC "Formatting into a buffer")
 
