@@ -55,7 +55,9 @@
 #                   SHM_WAIT_LONG_MS) and must return 2; every record must
 #                   be ATTACH, and the stub ShmMaps its handle: a VA counts
 #                   as a map, Errno.Perm (the handle was dropped with a
-#                   retired record) as a refused map, anything else fails.
+#                   retired record) or Errno.NoDev (the app exited after
+#                   the copy-out, #4729) as a refused map, anything else
+#                   fails.
 #                   Exit status: records << 16 | refused << 8 | maps, or
 #                   0xFF on a failure.
 #   mode 8 (APP, #4728): NetAttach must return a handle, and a second
@@ -76,6 +78,32 @@
 #                   9  link_seq 3, the MAC zeroed, NetPublish -> Errno.Again
 #                      (the kernel then checks the snapshot kept generation
 #                      2's bytes)
+#   modes 10-14 (#4729, postinit.ritz shm-retire): RETIRE_H (a fresh
+#                   table's first grant) names a shm object; each mode
+#                   ShmMaps it first (step 1), and each ShmWait lists it
+#                   for DATA (deadline SHM_WAIT_LONG_MS, out_cap 2). The
+#                   exit status is the number of the first failed step:
+#   mode 10 (SURVIVOR): RSI is the kernel bit its peer's exit posts
+#                   (DRIVER_GONE or PEER_CLOSE). 2 waits until that bit
+#                   and pid 1's DATA are seen, 3 nothing else was, 4 the
+#                   page still holds the exited peer's RETIRE_MARKER, 5
+#                   CapRevoke (the detach) is 0, 6 ShmMap is then
+#                   Errno.Perm. Exit 0.
+#   mode 11 (EXITER): stores RETIRE_MARKER at the mapping and exits 0.
+#   mode 12 (HUNG): 2 a wait returns PEER_CLOSE; then it loads from the
+#                   mapping forever, never detaching: the detach timeout
+#                   unmaps it and the load's #PF kills it (status 142).
+#   mode 13 (REPLACED): the surviving driver. 2 waits until PEER_CLOSE on
+#                   RETIRE_H and an ATTACH record, 3 whose handle is new,
+#                   4 CapRevoke(RETIRE_H) is 0, 5 ShmMap(new) is an
+#                   address above the old one, where it stores
+#                   RETIRE_MARKER2, 6 ShmNotify(new, DATA) is 0. Exit 0.
+#   mode 14 (FRESH): the replacement service, mapped by the kernel before
+#                   it ran: 1 ShmMap is DRV_RING_BASE, 2 waits for DATA,
+#                   3 nothing came but DATA and the PEER_CLOSE of the
+#                   driver's exit, 4 the page (kept while this process
+#                   maps it) holds RETIRE_MARKER2.
+#                   Exit 0.
 #   mode 21 (MMIO_MAP, #4720): RSI is a CAP_TYPE_MMIO handle on the
 #                   boot-test window double. Exit status: the number of the
 #                   first failed step, else 0:
@@ -145,6 +173,11 @@
 .equ DRIVER_STUB_SERVICE, 7
 .equ DRIVER_STUB_APP, 8
 .equ DRIVER_STUB_LINK, 9
+.equ DRIVER_STUB_SURVIVOR, 10
+.equ DRIVER_STUB_EXITER, 11
+.equ DRIVER_STUB_HUNG, 12
+.equ DRIVER_STUB_REPLACED, 13
+.equ DRIVER_STUB_FRESH, 14
 .equ DRIVER_STUB_MMIO_MAP, 21
 .equ DRIVER_STUB_DMA_ALLOC, 22
 .equ DRIVER_STUB_DMA_FREE, 23
@@ -212,6 +245,15 @@
 .equ LINK_H_PLAIN,    0x200000001
 .equ LINK_MAC_WORD,   0x0101013047005452   # 52:54:00:47:30:01, link_up 1, type 1
 .equ LINK_MTU,        1500
+# Modes 10-14 (postinit.ritz RETIRE_*)
+.equ SYS_CAP_REVOKE,  41
+.equ RETIRE_H,        0x100000000
+.equ RETIRE_MARKER,   0x5245544952450001
+.equ RETIRE_MARKER2,  0x5245504C41430002
+.equ RETIRE_FRAME,    96          # the request, two out slots, one source
+.equ RETIRE_STRAY,    0x80000000  # a record for a handle the stub does not know
+.equ EVENT_DRIVER_GONE, 8
+.equ DRV_RING_BASE,   0x7D8000000000
 
 .global driver_stub_start
 .type driver_stub_start, @function
@@ -246,6 +288,11 @@ driver_stub_start:
     je .Ldriver_stub_app
     cmpq $DRIVER_STUB_LINK, %r12
     je .Ldriver_stub_link
+    cmpq $DRIVER_STUB_SURVIVOR, %r12
+    jb .Ldriver_stub_not_retire
+    cmpq $DRIVER_STUB_FRESH, %r12
+    jbe .Ldriver_stub_retire
+.Ldriver_stub_not_retire:
     cmpq $DRIVER_STUB_SPIN, %r12
     jne .Ldriver_stub_report
     rdtsc
@@ -807,6 +854,8 @@ driver_stub_start:
     syscall
     cmpq $ERRNO_PERM, %rax
     je .Lservice_refused
+    cmpq $ERRNO_NODEV, %rax              # retired since the copy-out (#4729)
+    je .Lservice_refused
     testq %rax, %rax
     jle .Lservice_fail
     incq %rbx                            # mapped
@@ -937,6 +986,192 @@ driver_stub_start:
     ret
 
 .size driver_stub_start, . - driver_stub_start
+
+# Modes 10-14. r14 = a WaitRequest, its two out slots and one WaitSource on
+# the user stack; rbp = the address RETIRE_H is mapped at; rbx = the bits
+# the waits have returned on RETIRE_H (an ATTACH record adds EVENT_ATTACH
+# and leaves its handle in r13); r15 = the step reported if a check fails.
+.Ldriver_stub_retire:
+    subq $RETIRE_FRAME, %rsp
+    movq %rsp, %r14
+    xorl %ebx, %ebx
+    movl $1, %r15d                       # 1: map the object
+    movq $SYS_SHM_MAP, %rax
+    movabsq $RETIRE_H, %rdi
+    syscall
+    testq %rax, %rax
+    jle .Lretire_fail
+    movq %rax, %rbp
+    cmpq $DRIVER_STUB_EXITER, %r12
+    je .Lretire_exiter
+    cmpq $DRIVER_STUB_HUNG, %r12
+    je .Lretire_hung
+    cmpq $DRIVER_STUB_REPLACED, %r12
+    je .Lretire_replaced
+    cmpq $DRIVER_STUB_FRESH, %r12
+    je .Lretire_fresh
+
+    # Mode 10: the kernel bit and DATA, and nothing else
+    movl $2, %r15d
+.Lsurvivor_wait:
+    call .Lretire_wait
+    cmpq $2, %rax
+    jne .Lretire_fail
+    movq %r13, %rax
+    orq $EVENT_DATA, %rax
+    movq %rbx, %rcx
+    andq %rax, %rcx
+    cmpq %rax, %rcx
+    jne .Lsurvivor_wait
+    movl $3, %r15d
+    notq %rax
+    testq %rax, %rbx
+    jnz .Lretire_fail
+    movl $4, %r15d                       # 4: the exited peer's store is there
+    movabsq $RETIRE_MARKER, %rax
+    cmpq %rax, (%rbp)
+    jne .Lretire_fail
+    movl $5, %r15d                       # 5: detach
+    movq $SYS_CAP_REVOKE, %rax
+    movabsq $RETIRE_H, %rdi
+    syscall
+    testq %rax, %rax
+    jnz .Lretire_fail
+    movl $6, %r15d                       # 6: the handle is gone
+    movq $SYS_SHM_MAP, %rax
+    movabsq $RETIRE_H, %rdi
+    syscall
+    cmpq $ERRNO_PERM, %rax
+    jne .Lretire_fail
+    jmp .Lretire_pass
+
+.Lretire_exiter:
+    movabsq $RETIRE_MARKER, %rax
+    movq %rax, (%rbp)
+    jmp .Lretire_pass
+
+.Lretire_hung:
+    movl $2, %r15d
+    call .Lretire_wait
+    cmpq $2, %rax
+    jne .Lretire_fail
+    testq $EVENT_PEER_CLOSE, %rbx
+    jz .Lretire_fail
+.Lhung_spin:                             # never detaches
+    movq (%rbp), %rax
+    pause
+    jmp .Lhung_spin
+
+.Lretire_replaced:
+    movl $2, %r15d
+    xorl %r13d, %r13d
+.Lreplaced_wait:
+    call .Lretire_wait
+    cmpq $2, %rax
+    jne .Lretire_fail
+    movq %rbx, %rax
+    andq $(EVENT_PEER_CLOSE | EVENT_ATTACH), %rax
+    cmpq $(EVENT_PEER_CLOSE | EVENT_ATTACH), %rax
+    jne .Lreplaced_wait
+    movl $3, %r15d                       # 3: a new handle
+    testq %r13, %r13
+    jz .Lretire_fail
+    movabsq $RETIRE_H, %rax
+    cmpq %rax, %r13
+    je .Lretire_fail
+    movl $4, %r15d                       # 4: detach from the retired object
+    movq $SYS_CAP_REVOKE, %rax
+    movabsq $RETIRE_H, %rdi
+    syscall
+    testq %rax, %rax
+    jnz .Lretire_fail
+    movl $5, %r15d                       # 5: map the new one at a new address
+    movq $SYS_SHM_MAP, %rax
+    movq %r13, %rdi
+    syscall
+    cmpq %rbp, %rax
+    jle .Lretire_fail
+    movabsq $RETIRE_MARKER2, %rcx
+    movq %rcx, (%rax)
+    movl $6, %r15d                       # 6: publish on it
+    movq $SYS_SHM_NOTIFY, %rax
+    movq %r13, %rdi
+    movq $EVENT_DATA, %rsi
+    syscall
+    testq %rax, %rax
+    jnz .Lretire_fail
+    jmp .Lretire_pass
+
+.Lretire_fresh:
+    movabsq $DRV_RING_BASE, %rax         # 1: the kernel's mapping
+    cmpq %rax, %rbp
+    jne .Lretire_fail
+    movl $2, %r15d
+.Lfresh_wait:
+    call .Lretire_wait
+    cmpq $2, %rax
+    jne .Lretire_fail
+    testq $EVENT_DATA, %rbx
+    jz .Lfresh_wait
+    movl $3, %r15d                       # 3: DATA, and the driver's exit at most
+    testq $~(EVENT_DATA | EVENT_PEER_CLOSE), %rbx
+    jnz .Lretire_fail
+    movl $4, %r15d
+    movabsq $RETIRE_MARKER2, %rax
+    cmpq %rax, (%rbp)
+    jne .Lretire_fail
+.Lretire_pass:
+    xorl %r15d, %r15d
+.Lretire_fail:
+    movl %r15d, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# One ShmWait listing RETIRE_H for DATA; rax = its return. On 2, each
+# record's bits go into rbx (an ATTACH record's handle into r13; a record
+# for another handle adds RETIRE_STRAY).
+.Lretire_wait:
+    leaq WR_SOURCE(%r14), %rax
+    movq %rax, WR_SOURCES(%r14)
+    movl $1, WR_SOURCE_COUNT(%r14)
+    movl $2, WR_OUT_CAP(%r14)
+    leaq WR_EVENTS(%r14), %rax
+    movq %rax, WR_OUT(%r14)
+    movq $SHM_WAIT_LONG_MS, WR_DEADLINE(%r14)
+    movl $0, WR_OUT_COUNT(%r14)
+    movl $0, WR_PAD(%r14)
+    movabsq $RETIRE_H, %rax
+    movq %rax, WR_SOURCE+WS_HANDLE(%r14)
+    movl $EVENT_DATA, WR_SOURCE+WS_MASK(%r14)
+    movl $0, WR_SOURCE+WS_PAD(%r14)
+    movq $SYS_SHM_WAIT, %rax
+    movq %r14, %rdi
+    syscall
+    cmpq $2, %rax
+    jne .Lretire_wait_done
+    leaq WR_EVENTS(%r14), %rcx
+    movl WR_OUT_COUNT(%r14), %edx
+.Lretire_record:
+    testl %edx, %edx
+    jz .Lretire_wait_done
+    movl WE_BITS(%rcx), %esi
+    movabsq $RETIRE_H, %rdi
+    cmpq %rdi, WE_HANDLE(%rcx)
+    je .Lretire_bits
+    cmpl $EVENT_ATTACH, %esi
+    jne .Lretire_stray
+    movq WE_HANDLE(%rcx), %r13
+    jmp .Lretire_bits
+.Lretire_stray:
+    movl $RETIRE_STRAY, %esi
+.Lretire_bits:
+    orq %rsi, %rbx
+    addq $WE_SIZE, %rcx
+    decl %edx
+    jmp .Lretire_record
+.Lretire_wait_done:
+    ret
 
 .global driver_stub_end
 driver_stub_end:

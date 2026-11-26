@@ -17,16 +17,31 @@
 #
 # Each holder's event latch for an object is proc/waitset.ritz's, made when
 # the cap table inserts the handle (#4727). NetAttach (228) creates each app
-# exchange here (syscall/runtime/net.ritz, #4728). shm_retire only sets the
+# exchange here (syscall/runtime/net.ritz, #4728).
+#
+# Retire, detach and reclaim (#4729, ring plan T23): shm_retire sets the
 # flag a retired object is refused by (ShmMap, and the copy-out of an
-# ATTACH record, drop the caller's handle for it); the PEER_CLOSE and
-# DRIVER_GONE posts, detach, the detach timeout and reclaim are ring plan
-# T23's (#4729).
+# ATTACH record, drop the caller's handle for it) and posts PEER_CLOSE or
+# DRIVER_GONE on every other holder's latch. A holder exits (the exit hook
+# retires each object it held) or detaches (CapRevoke of its last handle,
+# shm_unmap) when it observes the bit; one that has not detached within
+# SHM_DETACH_TIMEOUT_MS is unmapped by shm_detach_expired, so its next
+# access to that address is a user fault that kills it. The pages go back
+# to the PMM only when the object is retired and its mapping count is 0,
+# whichever of those comes last. A retired id is never reused: a
+# replacement is a new object (net.ritz net_frame_replace).
 #
 # Like the capability tables, these tables take no lock: they are reached
-# from syscalls of the calling process and from boot, as the cap tables are.
+# from syscalls of the calling process and from boot, as the cap tables are,
+# and from the scheduler tick only over CPL-3 code (shm_detach_expired),
+# when no kernel path on this CPU is part-way through them.
 
 import ritzlib.option
+import io { disable_interrupts, enable_interrupts, interrupts_enabled }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import proc.table { BLOCK_WAIT, proc_wake_pid }
+import proc.waitset { shm_latch_post_peers }
+import driver_abi.wait { SHM_DETACH_TIMEOUT_MS }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
 import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_SHM, DRV_RING_BASE, DRV_DMA_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, phys_to_virt }
 import syscall.errno { Errno }
@@ -45,6 +60,7 @@ pub struct ShmObject
     pages: [35]u64          # SHM_MAX_PAGES physical frames, owned by the object
     page_count: u64
     map_count: u32          # live mappings: one per process that mapped it
+    detach_deadline: u64    # TSC: a mapping left after it is unmapped by force
     retired: bool           # set by shm_retire; a retired object maps nothing
     in_use: bool
     _padding: [2]u8
@@ -71,6 +87,10 @@ var shm_objects: [16]ShmObject
 var shm_maps: [32]ShmMapping
 var shm_cursors: [16]ShmCursor
 var shm_next_id: u64 = 1
+# Mappings shm_detach_expired has unmapped by force, since boot.
+var shm_detach_timeouts: u64 = 0
+
+const US_PER_MS: u64 = 1000
 
 # ============================================================================
 # Objects
@@ -122,22 +142,38 @@ pub fn shm_create(page_count: u64) -> Option<u64>
     shm_objects[slot].id = id
     shm_objects[slot].page_count = page_count
     shm_objects[slot].map_count = 0
+    shm_objects[slot].detach_deadline = 0
     shm_objects[slot].retired = false
     shm_objects[slot].in_use = true
     return Some(id)
 
-# Free object `id` and its pages. Only an object no process maps: false (and
-# nothing freed) while any mapping is live, or for an unknown id. Until
-# reclaim lands (T23, #4729) only the boot tests and NetAttach's undo free
-# an object.
+# The object in `slot` gives its pages back and its slot up.
+fn shm_release(slot: i32)
+    shm_free_pages(slot, shm_objects[slot].page_count)
+    shm_objects[slot].in_use = false
+    shm_objects[slot].page_count = 0
+    shm_objects[slot].retired = false
+
+# Reclaim: the object in `slot` is retired and no process maps it any more,
+# so its pages go back to the PMM (#4729). Anything else is left.
+fn shm_reclaim_if_done(slot: i32)
+    if shm_objects[slot].in_use and shm_objects[slot].retired and shm_objects[slot].map_count == 0
+        shm_release(slot)
+
+# Free object `id` and its pages at once, without retiring it. Only an
+# object no process maps: false (and nothing freed) while any mapping is
+# live, or for an unknown (or already reclaimed) id. NetAttach's undo and
+# the boot tests use it; everything else ends through shm_retire.
 pub fn shm_destroy(id: u64) -> bool
     let slot: i32 = shm_object_slot(id)
     if slot < 0 or shm_objects[slot].map_count != 0
         return false
-    shm_free_pages(slot, shm_objects[slot].page_count)
-    shm_objects[slot].in_use = false
-    shm_objects[slot].page_count = 0
+    shm_release(slot)
     return true
+
+# Object `id` still exists: created, and not destroyed or reclaimed.
+pub fn shm_exists(id: u64) -> bool
+    shm_object_slot(id) >= 0
 
 # Frame `index` of object `id`, or 0.
 pub fn shm_page(id: u64, index: u64) -> u64
@@ -153,15 +189,31 @@ pub fn shm_map_count(id: u64) -> u32
         return 0
     return shm_objects[slot].map_count
 
-# Retire object `id`: it maps nothing from now on, and a holder that copies
-# out an ATTACH record for it, or calls ShmMap on it, loses its handle
-# (RING1_DRIVER.md "Grants"). Mappings already made stay. False for an
-# unknown id. The latch posts, detach and reclaim are T23's (#4729).
-pub fn shm_retire(id: u64) -> bool
+# Retire object `id` (#4729): it maps nothing from now on, and a holder
+# that copies out an ATTACH record for it, or calls ShmMap on it, loses its
+# handle (RING1_DRIVER.md "Grants"). `bits` (PEER_CLOSE or DRIVER_GONE; 0
+# posts nothing) goes on the latch of every holder but `from_pid`, waking
+# each one parked on its wait set. Mappings already made stay until their
+# process detaches or exits, or SHM_DETACH_TIMEOUT_MS from now has passed
+# (shm_detach_expired); with none left the pages are reclaimed here. A
+# second retire changes nothing: no second post, and the first deadline
+# stands. False for an unknown (or reclaimed) id. Any IF.
+pub fn shm_retire(id: u64, from_pid: u64, bits: u32) -> bool
     let slot: i32 = shm_object_slot(id)
     if slot < 0
         return false
+    if shm_objects[slot].retired
+        return true
+    let deadline: u64 = deadline_after_us(SHM_DETACH_TIMEOUT_MS * US_PER_MS)
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
     shm_objects[slot].retired = true
+    shm_objects[slot].detach_deadline = deadline
+    if bits != 0
+        shm_latch_post_peers(id, from_pid, bits)
+    shm_reclaim_if_done(slot)
+    if was
+        enable_interrupts()
     return true
 
 # Object `id` exists and is not retired: a handle for it is still worth
@@ -211,19 +263,21 @@ fn shm_clear_leaves(pml4: u64, vaddr: u64, pages: u64)
 # as user, NX, write-back leaves (writable if `writable`), from the
 # process's ring-window cursor. The address, or a negative errno:
 #   - the address it already has when `pid` maps `id` (no new mapping, and
-#     `writable` is not revisited);
-#   - Errno.NoDev for an unknown or retired object;
+#     `writable` is not revisited), retired or not: a replacement service
+#     the kernel mapped before it ran learns its address this way even if
+#     its peer has already exited (#4729);
+#   - Errno.NoDev for an unknown or retired object `pid` does not map;
 #   - Errno.NoMem when the mapping or cursor table is full, the ring window
 #     has no room left, or a page table could not be had (no leaf is left).
 # The syscall's argument checks (the caller holds a shm handle) are
 # sys_shm_map's, in cap/syscall.ritz.
 pub fn shm_map(pid: u32, pml4: u64, id: u64, writable: bool) -> i64
-    let slot: i32 = shm_object_slot(id)
-    if slot < 0 or shm_objects[slot].retired
-        return Errno.NoDev as i64
     let mapped: i32 = shm_mapping_slot(pid, id)
     if mapped >= 0
         return shm_maps[mapped].vaddr as i64
+    let slot: i32 = shm_object_slot(id)
+    if slot < 0 or shm_objects[slot].retired
+        return Errno.NoDev as i64
     var m: i32 = 0
     while m < MAX_SHM_MAPS and shm_maps[m].in_use
         m = m + 1
@@ -256,19 +310,22 @@ pub fn shm_map(pid: u32, pml4: u64, id: u64, writable: bool) -> i64
     shm_cursors[c].next = vaddr + pages * PAGE_SIZE
     return vaddr as i64
 
-# Drop mapping record `m` and its count on the object.
+# Drop mapping record `m` and its count on the object, reclaiming a retired
+# object it was the last mapping of.
 fn shm_drop_mapping(m: i32)
     let slot: i32 = shm_object_slot(shm_maps[m].object_id)
-    if slot >= 0 and shm_objects[slot].map_count > 0
-        shm_objects[slot].map_count = shm_objects[slot].map_count - 1
     shm_maps[m].in_use = false
     shm_maps[m].pid = 0
     shm_maps[m].object_id = 0
+    if slot >= 0 and shm_objects[slot].map_count > 0
+        shm_objects[slot].map_count = shm_objects[slot].map_count - 1
+        shm_reclaim_if_done(slot)
 
 # Unmap object `id` from process `pid` only: clear its leaves (the frames
 # stay the object's) and drop its mapping. Another process's mapping is not
 # touched. False when `pid` doesn't map `id`. CapRevoke of `pid`'s last
-# handle for the object calls it (cap/table.ritz).
+# handle for the object calls it (cap/table.ritz): that is how a peer
+# detaches from a retired object, and the last detach reclaims it.
 pub fn shm_unmap(pid: u32, id: u64) -> bool
     let m: i32 = shm_mapping_slot(pid, id)
     if m < 0
@@ -280,8 +337,10 @@ pub fn shm_unmap(pid: u32, id: u64) -> bool
     return true
 
 # Process `pid` is going away (its capability table is being freed: exit or
-# a spawn undone): drop its mappings and its cursor. Its leaves are left in
-# place: its PML4 is freed next, and vmm_free_user_pt skips PTE_SHM frames.
+# a spawn undone): drop its mappings and its cursor, reclaiming each retired
+# object it was the last to map. Its leaves are left in place: its PML4 is
+# freed next on the kernel's (sys_exit_impl switched away from it), it never
+# runs again, and vmm_free_user_pt skips PTE_SHM frames.
 pub fn shm_forget_pid(pid: u32)
     var m: i32 = 0
     while m < MAX_SHM_MAPS
@@ -294,3 +353,57 @@ pub fn shm_forget_pid(pid: u32)
             shm_cursors[c].in_use = false
             shm_cursors[c].pid = 0
         c = c + 1
+
+# ============================================================================
+# The detach timeout (#4729)
+# ============================================================================
+
+# The object in `slot` is retired, still mapped, and past its detach
+# deadline.
+fn shm_detach_due(slot: i32) -> bool
+    let o: *ShmObject = @shm_objects[slot]
+    o.in_use and o.retired and o.map_count > 0 and deadline_passed(o.detach_deadline)
+
+# Unmap by force every mapping of a retired object whose holder has not
+# detached within SHM_DETACH_TIMEOUT_MS: its leaves go (with the TLB entry,
+# when it is the running process), so its next load or store there is a
+# user #PF that kills it, and the last one reclaims the object. The fault
+# is not pointed at a replacement. Runs where no kernel path on this CPU is
+# part-way through the PMM or a page-table edit: the tick over CPL-3 code
+# (proc/sched.ritz sched_tick) and a wait about to collect (driver.ritz
+# wait_collect). IF=0. How many mappings it unmapped.
+pub fn shm_detach_expired() -> u32
+    var unmapped: u32 = 0
+    var slot: i32 = 0
+    while slot < MAX_SHM_OBJECTS
+        if shm_detach_due(slot)
+            let id: u64 = shm_objects[slot].id
+            let pages: u64 = shm_objects[slot].page_count
+            var m: i32 = 0
+            while m < MAX_SHM_MAPS
+                if shm_maps[m].in_use and shm_maps[m].object_id == id
+                    shm_clear_leaves(shm_maps[m].pml4, shm_maps[m].vaddr, pages)
+                    shm_drop_mapping(m)
+                    unmapped = unmapped + 1
+                m = m + 1
+        slot = slot + 1
+    shm_detach_timeouts = shm_detach_timeouts + unmapped as u64
+    unmapped
+
+# The tick over kernel code may not unmap (shm_detach_expired): it wakes
+# each holder of an expired mapping that is parked on its wait set instead,
+# whose wait then runs the sweep before it collects. IF=0.
+pub fn shm_detach_wake_due()
+    var slot: i32 = 0
+    while slot < MAX_SHM_OBJECTS
+        if shm_detach_due(slot)
+            var m: i32 = 0
+            while m < MAX_SHM_MAPS
+                if shm_maps[m].in_use and shm_maps[m].object_id == shm_objects[slot].id
+                    proc_wake_pid(shm_maps[m].pid as u64, BLOCK_WAIT)
+                m = m + 1
+        slot = slot + 1
+
+# Mappings the detach timeout has unmapped by force since boot.
+pub fn shm_detach_timeout_count() -> u64
+    shm_detach_timeouts

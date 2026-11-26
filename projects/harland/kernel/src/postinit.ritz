@@ -54,16 +54,16 @@ import mm.dma { dma_quarantined_pages }
 import mm.dma_runs { dma_runs_held }
 import cap.types { CAP_TYPE_SHM, CAP_RIGHT_WRITE }
 import cap.table { CapTable, cap_table_get, cap_revoke }
-import mm.shm { shm_create, shm_destroy }
+import mm.shm { shm_create, shm_destroy, shm_exists, shm_page, shm_map_count, shm_detach_timeout_count }
 import proc.waitset { Notify, shm_notify, shm_latch_bits, shm_latch_held }
-import driver_abi.wait { EVENT_DATA, EVENT_SPACE, EVENT_LINK }
+import driver_abi.wait { EVENT_DATA, EVENT_SPACE, EVENT_LINK, EVENT_PEER_CLOSE }
 import driver_abi.link { NetInfo, NETDEV_TYPE_VIRTIO }
-import syscall.runtime.net { net_publish_for, net_attach_for, net_service_register, net_exchanges_destroy, net_link_register, net_frame_register, net_info_snapshot, ring_driver_published, snapshot_invalidate }
+import syscall.runtime.net { net_publish_for, net_attach_for, net_service_register, net_exchanges_reclaimed, net_frame_replace, net_link_register, net_frame_register, net_info_snapshot, ring_driver_published, snapshot_invalidate }
 import cap.types { CapEntry, CAP_RIGHT_PUBLISH, cap_handle_init }
 import cap.table { cap_table_lookup, cap_holds_object }
 import mm.shm { shm_retire }
-import proc.waitset { waitset_inbox_len }
-import driver_abi.wait { DEVICE_WAIT_MS }
+import proc.waitset { waitset_inbox_len, shm_latch_post }
+import driver_abi.wait { DEVICE_WAIT_MS, EVENT_DRIVER_GONE, SHM_DETACH_TIMEOUT_MS }
 import drivers.virtio.window { phys_range, phys_range_none, vio_window_add, vio_window_remove }
 
 # ============================================================================
@@ -739,9 +739,16 @@ fn shm_wait_self_test() -> bool
             status = drv_stub_status(pid)
             one_park = drv_irq_wait_park_count() == parks + 1
     sched_stop()
+    # The stub's exit retired both objects (#4729): it held the IRQ cap, so
+    # DRIVER_GONE on pid 1's latch; nobody mapped either, so both are
+    # reclaimed already.
+    let closed: bool = (shm_latch_bits(frame, SHM_TEST_PEER as u64) & EVENT_DRIVER_GONE) != 0
     let table: *CapTable = cap_table_get(SHM_TEST_PEER)
     let dropped: bool = cap_revoke(table, mine) and not shm_latch_held(frame, SHM_TEST_PEER as u64)
-    let freed: bool = shm_destroy(frame) and shm_destroy(lone)
+    let freed: bool = not shm_exists(frame) and not shm_exists(lone)
+    if not freed
+        shm_destroy(frame)
+        shm_destroy(lone)
     irq_object_unregister(SHM_TEST_IRQ)
     klog("  status ")
     klog_dec(status)
@@ -751,10 +758,12 @@ fn shm_wait_self_test() -> bool
         klog(", pid 1's latch did not hold the stub's SPACE alone")
     if not one_park
         klog(", a wait parked that should have returned")
+    if not closed
+        klog(", the stub's exit left no DRIVER_GONE on pid 1's latch")
     if not dropped or not freed
         klog(", the objects outlived the test")
     klog("\n")
-    return status == 0 and posted and spaced and one_park and dropped and freed
+    return status == 0 and posted and spaced and one_park and closed and dropped and freed
 
 # net-attach (#4728, RING1_DRIVER.md "Grants" and "Wait and notify"):
 # NetAttach and the service's inbox. Before a service is registered an
@@ -768,8 +777,10 @@ fn shm_wait_self_test() -> bool
 # eight and loses each handle before it returns: the stub's ShmMap of each
 # is Perm. Then two real apps (mode 8), one after the other in the same
 # process slot, attach (a second attach of each, still holding its handle,
-# is Exist) and exit; the service maps both exchanges and exits with
-# records << 16 | refused maps << 8 | maps.
+# is Exist) and exit, and the exit retires each exchange (#4729); the
+# service maps each it reaches before that exit, refuses the others, and
+# exits with records << 16 | refused maps << 8 | maps. Once it has exited
+# too, every exchange object has been reclaimed.
 const DRIVER_STUB_SERVICE: u64 = 7
 const DRIVER_STUB_APP: u64 = 8
 # The stand-in apps' pids: no process has them.
@@ -777,7 +788,6 @@ const ATTACH_FAKE_PID: u32 = 0x47280
 const ATTACH_FAKES: u32 = 9
 const ATTACH_RETIRED: u32 = 8
 const ATTACH_APPS: u64 = 2
-const ATTACH_SERVICE_STATUS: i64 = 0x0A0802     # 10 records, 8 refused maps, 2 maps
 
 fn net_attach_self_test() -> bool
     klog("\nTesting NetAttach and the service inbox...\n")
@@ -814,7 +824,7 @@ fn net_attach_self_test() -> bool
         again = net_attach_for(ninth) == Errno.Again as i64 and cap_table_get(ninth).active_count == 0 and waitset_inbox_len(service) == ATTACH_RETIRED
         i = 0
         while i < ATTACH_RETIRED
-            shm_retire(objects[i as i32])
+            shm_retire(objects[i as i32], (ATTACH_FAKE_PID + i) as u64, EVENT_PEER_CLOSE)
             i = i + 1
         # The stand-ins are gone; their records stay on the inbox.
         f = 0
@@ -847,7 +857,7 @@ fn net_attach_self_test() -> bool
             f = f + 1
     sched_stop()
     net_service_register(0)
-    let freed: bool = net_exchanges_destroy()
+    let freed: bool = net_exchanges_reclaimed()
     klog("  status ")
     klog_hex(status as u64)
     if not nodev
@@ -865,7 +875,17 @@ fn net_attach_self_test() -> bool
     if not freed
         klog(", an exchange outlived the test")
     klog("\n")
-    return status == ATTACH_SERVICE_STATUS and nodev and queued and exist and again and dropped and apps_ok and freed
+    return attach_status_ok(status) and nodev and queued and exist and again and dropped and apps_ok and freed
+
+# The service stub's status: ten records, the eight retired ones refused.
+# Each real app's exit retires its exchange (#4729): the service maps it if
+# it ran before that exit, else the record or the map drops the handle, so
+# the two real apps are two maps or refusals between them.
+fn attach_status_ok(status: i64) -> bool
+    let maps: i64 = status & 0xFF
+    let refused: i64 = (status >> 8) & 0xFF
+    let records: i64 = status >> 16
+    records == ATTACH_RETIRED as i64 + ATTACH_APPS as i64 and refused >= ATTACH_RETIRED as i64 and refused + maps == records
 
 # The object behind `pid`'s shm handle `packed` (a NetAttach return), or 0.
 fn held_shm_object(pid: u32, packed: i64) -> u64
@@ -964,7 +984,9 @@ fn net_info_self_test() -> bool
     net_link_register(0)
     net_frame_register(0, 0)
     let dropped: bool = cap_revoke(cap_table_get(LINK_TEST_CONSUMER), mine)
-    let freed: bool = shm_destroy(link) and shm_destroy(frame)
+    # The stub's exit retired the link object and dropped its one mapping:
+    # reclaimed (#4729). Only pid 1 held the frame object.
+    let freed: bool = not shm_exists(link) and shm_destroy(frame)
     klog("  status ")
     klog_dec(status)
     klog(", after invalidation ")
@@ -1279,6 +1301,219 @@ fn drv_dma_free_self_test() -> bool
     klog(" runs left\n")
     status == 0 and after == free - 1 and newly == 1 and held == 0
 
+# shm-retire (#4729, RING1_DRIVER.md "Shared object" and "Wait and notify",
+# PR 6b): retire, the detach timeout, reclaim and the replacement handoff on
+# kernel-spawned processes (driver_stub.s modes 10-14). Each process's
+# handle is a fresh table's first grant, RETIRE_H.
+#   * Producer-first and consumer-first: an exiter (mode 11) and a survivor
+#     (mode 10) map one object; the one that holds the IRQ cap is the
+#     driver. The exiter stores a marker and exits: its exit retires the
+#     object and posts DRIVER_GONE (the driver exited) or PEER_CLOSE (the
+#     driver survives) on the survivor. With the exiter gone the object
+#     still exists, mapped once, its page not free; pid 1 then posts DATA,
+#     and the survivor reads the marker and detaches, which reclaims it.
+#   * A hung peer (mode 12) sees PEER_CLOSE and keeps loading from the
+#     mapping. Half the timeout later it is still alive and mapped; the
+#     timeout unmaps it, its load faults (status 142), and the object is
+#     reclaimed.
+#   * Replacement: the service (mode 11) exits under a surviving driver
+#     (mode 13). net_frame_replace makes a new object for the replacement
+#     service (mode 14), mapped in it before it runs and not in the driver,
+#     whose inbox gets {handle, ATTACH}; the retired object stays while the
+#     driver maps it. The driver detaches, maps the new handle at a new
+#     address and publishes there; the service reads it.
+const DRIVER_STUB_SURVIVOR: u64 = 10
+const DRIVER_STUB_EXITER: u64 = 11
+const DRIVER_STUB_HUNG: u64 = 12
+const DRIVER_STUB_REPLACED: u64 = 13
+const DRIVER_STUB_FRESH: u64 = 14
+const RETIRE_H: u64 = 1 << 32
+const RETIRE_TEST_IRQ: u64 = 0xFFFF4729A
+# How long the hung peer gets to die after its object retires: the timeout,
+# and room for the tick that runs the sweep.
+const RETIRE_HUNG_WAIT_US: u64 = 3000000
+
+# A read-write shm handle for `obj` in `pid`, packed.
+fn retire_grant(pid: u64, obj: u64) -> u64
+    packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_WRITE, obj))
+
+# The device IRQ cap that makes `pid` the driver.
+fn retire_grant_irq(pid: u64)
+    cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, RETIRE_TEST_IRQ)
+
+# Spawn the exiter on `obj` (the driver if `driver`) and wait for its exit;
+# its status, or -1.
+fn retire_run_exiter(obj: u64, driver: bool) -> i64
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_EXITER, 0)
+    if spawned <= 0
+        return -1
+    let pid: u64 = spawned as u64
+    if retire_grant(pid, obj) != RETIRE_H
+        process_mark_exit(pid)
+    if driver
+        retire_grant_irq(pid)
+    process_wait(spawned as i32)
+
+# Producer-first (`driver_exits`) or consumer-first.
+fn retire_pair(driver_exits: bool) -> bool
+    let obj: u64 = shm_create(1).unwrap_or(0)
+    if obj == 0
+        klog("  no object\n")
+        return false
+    let frame: u64 = shm_page(obj, 0)
+    var bit: u32 = EVENT_PEER_CLOSE
+    if driver_exits
+        bit = EVENT_DRIVER_GONE
+    var kept: bool = false
+    var exiter: i64 = -1
+    var survivor: i64 = -1
+    let parks: u64 = drv_irq_wait_park_count()
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_SURVIVOR, bit as u64)
+    if spawned > 0
+        let pid: u64 = spawned as u64
+        let h: u64 = retire_grant(pid, obj)
+        if not driver_exits
+            retire_grant_irq(pid)
+        if h == RETIRE_H and await_park(pid, parks, DRV_TEST_PARK_US)
+            exiter = retire_run_exiter(obj, driver_exits)
+            # The exiter is gone and the survivor has not detached: the
+            # object and its page stay.
+            kept = shm_exists(obj) and shm_map_count(obj) == 1 and not pmm_range_has_free(frame, PAGE_SIZE)
+            disable_interrupts()
+            shm_latch_post(obj, pid, EVENT_DATA)
+            enable_interrupts()
+        else
+            process_mark_exit(pid)
+        survivor = drv_stub_status(pid)
+    let reclaimed: bool = not shm_exists(obj)
+    if not reclaimed
+        shm_retire(obj, 0, 0)
+    klog("  ")
+    if driver_exits
+        klog("driver exits first")
+    else
+        klog("service exits first")
+    klog(": exiter ")
+    klog_dec(exiter)
+    klog(", survivor ")
+    klog_dec(survivor)
+    if not kept
+        klog(", the object did not outlive the exiter")
+    if not reclaimed
+        klog(", the survivor's detach did not reclaim it")
+    klog("\n")
+    exiter == 0 and survivor == 0 and kept and reclaimed
+
+fn retire_hung() -> bool
+    let obj: u64 = shm_create(1).unwrap_or(0)
+    if obj == 0
+        klog("  no object\n")
+        return false
+    var exiter: i64 = -1
+    var status: i64 = -1
+    var mapped: bool = false
+    var timed_out: bool = false
+    let parks: u64 = drv_irq_wait_park_count()
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_HUNG, 0)
+    if spawned > 0
+        let pid: u64 = spawned as u64
+        if retire_grant(pid, obj) == RETIRE_H and await_park(pid, parks, DRV_TEST_PARK_US)
+            let timeouts: u64 = shm_detach_timeout_count()
+            exiter = retire_run_exiter(obj, false)
+            # Half the timeout after the retire, the hung peer still maps it.
+            let half: u64 = deadline_after_us(SHM_DETACH_TIMEOUT_MS * US_PER_MS / 2)
+            while not deadline_passed(half)
+                sched_yield()
+            var code: i64 = 0
+            mapped = proc_child_status(pid, @code) == PROC_CHILD_LIVE and shm_exists(obj) and shm_map_count(obj) == 1
+            let limit: u64 = deadline_after_us(RETIRE_HUNG_WAIT_US)
+            while proc_child_status(pid, @code) == PROC_CHILD_LIVE and not deadline_passed(limit)
+                sched_yield()
+            timed_out = shm_detach_timeout_count() == timeouts + 1
+            if proc_child_status(pid, @code) == PROC_CHILD_LIVE
+                process_mark_exit(pid)
+        else
+            process_mark_exit(pid)
+        status = process_wait(spawned as i32)
+    let reclaimed: bool = not shm_exists(obj)
+    if not reclaimed
+        shm_retire(obj, 0, 0)
+    klog("  hung peer: exiter ")
+    klog_dec(exiter)
+    klog(", hung ")
+    klog_dec(status)
+    if not mapped
+        klog(", it was unmapped before the timeout")
+    if not timed_out
+        klog(", the timeout did not unmap it")
+    if not reclaimed
+        klog(", the object was not reclaimed")
+    klog("\n")
+    exiter == 0 and status == DRIVER_FAULT_STATUS and mapped and timed_out and reclaimed
+
+fn retire_replace() -> bool
+    let old: u64 = shm_create(1).unwrap_or(0)
+    if old == 0
+        klog("  no object\n")
+        return false
+    var service: i64 = -1
+    var driver: i64 = -1
+    var fresh: i64 = -1
+    var handed: bool = false
+    var new_obj: u64 = 0
+    let parks: u64 = drv_irq_wait_park_count()
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_REPLACED, 0)
+    if spawned > 0
+        let drv: u64 = spawned as u64
+        if retire_grant(drv, old) == RETIRE_H and await_park(drv, parks, DRV_TEST_PARK_US)
+            service = retire_run_exiter(old, false)
+            let second: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_FRESH, 0)
+            if second > 0
+                let h: i64 = net_frame_replace(second as u32, drv as u32, 1)
+                new_obj = held_shm_object(second as u32, h)
+                # A new id, mapped in the new service only, a latch and an
+                # ATTACH record for the driver; the retired object stays
+                # while the driver maps it.
+                handed = h == RETIRE_H as i64 and new_obj > old and shm_map_count(new_obj) == 1 and shm_latch_held(new_obj, drv) and waitset_inbox_len(drv) == 1 and shm_exists(old) and shm_map_count(old) == 1
+                if h < 0
+                    process_mark_exit(second as u64)
+                fresh = drv_stub_status(second as u64)
+        else
+            process_mark_exit(drv)
+        driver = drv_stub_status(drv)
+    net_frame_register(0, 0)
+    let reclaimed: bool = not shm_exists(old) and (new_obj == 0 or not shm_exists(new_obj))
+    if shm_exists(old)
+        shm_retire(old, 0, 0)
+    if new_obj != 0 and shm_exists(new_obj)
+        shm_retire(new_obj, 0, 0)
+    klog("  replacement: service ")
+    klog_dec(service)
+    klog(", driver ")
+    klog_dec(driver)
+    klog(", new service ")
+    klog_dec(fresh)
+    if not handed
+        klog(", the handoff was not a new object with an ATTACH record")
+    if not reclaimed
+        klog(", an object outlived its holders")
+    klog("\n")
+    service == 0 and driver == 0 and fresh == 0 and handed and reclaimed
+
+fn shm_retire_self_test() -> bool
+    klog("\nTesting shared-object retire, detach timeout and replacement...\n")
+    if not irq_object_register(RETIRE_TEST_IRQ, IRQ_NO_VECTOR)
+        klog("  IRQ object not registered\n")
+        return false
+    sched_start(proc_current_slot())
+    let producer_first: bool = retire_pair(true)
+    let consumer_first: bool = retire_pair(false)
+    let hung: bool = retire_hung()
+    let replaced: bool = retire_replace()
+    sched_stop()
+    irq_object_unregister(RETIRE_TEST_IRQ)
+    producer_first and consumer_first and hung and replaced
+
 # The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
 # stack: boot_process_tests).
 fn driver_process_tests()
@@ -1294,6 +1529,7 @@ fn driver_process_tests()
     boot_test_result("shm-wait", shm_wait_self_test())
     boot_test_result("net-attach", net_attach_self_test())
     boot_test_result("net-info", net_info_self_test())
+    boot_test_result("shm-retire", shm_retire_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before

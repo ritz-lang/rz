@@ -5,8 +5,10 @@
 # same process returns the same address and allocates nothing, and the
 # other's map allocates no page for the object; CapRevoke of a process's
 # last handle unmaps that process only; when one process exits, the
-# other keeps its mapping and the pages stay allocated; and ShmMap of a
-# retired object maps nothing and drops the caller's handle (#4728).
+# other keeps its mapping and the pages stay allocated; retiring an object
+# nobody maps posts PEER_CLOSE to the holder and reclaims it at once
+# (#4729); and ShmMap of a retired object maps nothing and drops the
+# caller's handle (#4728).
 #
 # The two processes are what the kernel builds for a CPL-3 process (D8 =
 # (b)): a capability table and an isolated user PML4 each. The test drives
@@ -19,7 +21,9 @@
 import ritzlib.option
 import mm.pmm { PAGE_SIZE, pmm_get_free_pages, pmm_range_has_free }
 import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_NO_EXECUTE, PTE_DEVICE, PTE_SHM, PTE_ADDR_MASK, DRV_RING_BASE, vmm_create_user_pml4, vmm_free_pml4, vmm_pte_in, vmm_nx_flag, phys_to_virt }
-import mm.shm { shm_create, shm_destroy, shm_page, shm_map_count, shm_retire }
+import mm.shm { shm_create, shm_destroy, shm_page, shm_map_count, shm_retire, shm_exists }
+import proc.waitset { shm_latch_bits }
+import driver_abi.wait { EVENT_PEER_CLOSE }
 import syscall.errno { Errno }
 import cap.types { CapHandle, CAP_TYPE_SHM, CAP_TYPE_MMIO, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_ALL }
 import cap.table { CapTable, cap_table_alloc, cap_table_free_pid, cap_kernel_grant }
@@ -158,9 +162,15 @@ fn shm_map_steps() -> i32
     # RING1_DRIVER.md "Grants"): NoDev, nothing mapped, and the handle is
     # gone, so the same call again is Perm
     let late: u64 = shm_granted(SHM_PID_B, g_obj)
-    if shm_invalid(late) or not shm_retire(g_obj)
+    if shm_invalid(late) or not shm_retire(g_obj, SHM_PID_A as u64, EVENT_PEER_CLOSE)
         return 29
-    if sys_shm_map(SHM_PID_B, g_pml4_b, late) != Errno.NoDev as i64 or shm_map_count(g_obj) != 0
+    # Retired with no mapping left: reclaimed at once (#4729), and its
+    # pages are free again
+    if shm_exists(g_obj) or shm_latch_bits(g_obj, SHM_PID_B as u64) != EVENT_PEER_CLOSE
+        return 31
+    let gone: u64 = g_obj
+    g_obj = 0
+    if sys_shm_map(SHM_PID_B, g_pml4_b, late) != Errno.NoDev as i64 or shm_map_count(gone) != 0
         return 29
     if sys_shm_map(SHM_PID_B, g_pml4_b, late) != Errno.Perm as i64
         return 30

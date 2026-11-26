@@ -48,10 +48,10 @@ import syscall.errno { Errno }
 import mm.uptr { uptr_check_write }
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { phys_to_virt }
-import mm.shm { shm_create, shm_destroy, shm_page }
+import mm.shm { shm_create, shm_destroy, shm_page, shm_map, shm_exists }
 import cap.types { CapHandle, CapEntry, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_PUBLISH, cap_handle_init }
 import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_kernel_grant, cap_revoke, cap_holds_object }
-import proc.table { proc_current_pid }
+import proc.table { MAX_PROCS, proc_at, proc_current_pid }
 import proc.waitset { INBOX_CAP, waitset_inbox_len, waitset_inbox_post, shm_latch_post }
 import driver_abi.wait { EVENT_ATTACH, EVENT_LINK, APP_EXCHANGE_SIZE }
 import driver_abi.link { NetInfo, LinkSample, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, link_sample }
@@ -291,20 +291,86 @@ fn attach_locked(app_pid: u32, service: u32) -> i64
     exchanges[slot].in_use = true
     packed(app) as i64
 
-# Boot tests only (net-attach): free every exchange object the kernel
-# recorded. True when each one was freed (none still mapped).
-pub fn net_exchanges_destroy() -> bool
+# Boot tests only (net-attach): true when every exchange object the kernel
+# recorded has been reclaimed (#4729: each app's exit retired its exchange,
+# and the service's exit dropped its last mapping), freeing any that was
+# not. The records are cleared either way.
+pub fn net_exchanges_reclaimed() -> bool
     var all: bool = true
     var i: i32 = 0
     while i < EXCHANGE_MAX
         if exchanges[i].in_use
-            if not shm_destroy(exchanges[i].object_id)
+            if shm_exists(exchanges[i].object_id)
                 all = false
+                shm_destroy(exchanges[i].object_id)
             exchanges[i].in_use = false
             exchanges[i].object_id = 0
             exchanges[i].app_pid = 0
         i = i + 1
     all
+
+# ============================================================================
+# The replacement frame object, #4729
+# ============================================================================
+
+# The page table of live process `pid`, or 0.
+fn pml4_of(pid: u32) -> u64
+    var slot: i32 = 0
+    while slot < MAX_PROCS
+        if proc_at(slot).pid == pid as u64
+            return proc_at(slot).pml4
+        slot = slot + 1
+    0
+
+fn revoke_packed(pid: u32, h: CapHandle)
+    if handle_ok(h)
+        let index: u32 = h.index
+        let generation: u32 = h.generation
+        cap_revoke(cap_table_get(pid), cap_handle_init(index, generation))
+
+# A replacement service `service_pid` was spawned while ring-1 driver
+# `driver_pid` survives (RING1_DRIVER.md "Shared object"): a new frame
+# object of `page_count` zeroed pages (both ring indexes 0) at a new id,
+# never the retired one's, created without waiting for the driver to
+# detach from the old. The service gets a read-write handle and its mapping
+# now, before it runs (it learns the address from ShmMap, which returns the
+# one it has). The driver gets a read-write handle, whose insert makes its
+# latch, and {handle, ATTACH} on its inbox, and no mapping: it ShmMaps the
+# handle itself, with no ack and no ready bit. The new object is registered
+# as the frame object, the service as its consumer. Returns the service's
+# packed handle, for its entry arguments, or (each leaving nothing made):
+#   Errno.NoDev  no live service process, or the driver has no table or
+#                no process to queue the record on
+#   Errno.Again  the driver's inbox holds INBOX_CAP records
+#   Errno.NoMem  no object, handle or mapping to be had
+pub fn net_frame_replace(service_pid: u32, driver_pid: u32, page_count: u64) -> i64
+    let pml4: u64 = pml4_of(service_pid)
+    if pml4 == 0 or cap_table_get(service_pid) == 0 as *CapTable or cap_table_get(driver_pid) == 0 as *CapTable
+        return Errno.NoDev as i64
+    if waitset_inbox_len(driver_pid as u64) >= INBOX_CAP
+        return Errno.Again as i64
+    let object_id: u64 = match shm_create(page_count)
+        Some(id) => id
+        None => return Errno.NoMem as i64
+    let rights: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
+    let svc: CapHandle = cap_kernel_grant(service_pid, CAP_TYPE_SHM, rights, object_id)
+    let drv: CapHandle = cap_kernel_grant(driver_pid, CAP_TYPE_SHM, rights, object_id)
+    var result: i64 = Errno.NoMem as i64
+    if handle_ok(svc) and handle_ok(drv) and shm_map(service_pid, pml4, object_id, true) > 0
+        disable_interrupts()
+        if waitset_inbox_post(driver_pid as u64, packed(drv), EVENT_ATTACH)
+            result = packed(svc) as i64
+        else
+            result = Errno.NoDev as i64
+        enable_interrupts()
+    if result < 0
+        # The service's revoke unmaps it; then nothing maps the object.
+        revoke_packed(driver_pid, drv)
+        revoke_packed(service_pid, svc)
+        shm_destroy(object_id)
+        return result
+    net_frame_register(object_id, service_pid as u64)
+    result
 
 # net_attach() -> the caller's exchange handle or -errno
 pub fn sys_net_attach_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

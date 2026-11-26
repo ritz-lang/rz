@@ -457,6 +457,24 @@ fn main() -> i32
     if shm_latch_bits(FRAME, SERVICE) != EVENT_SPACE
         return 30
 
+    # Retire's kernel post (#4729): PEER_CLOSE or DRIVER_GONE lands on every
+    # other holder's latch, never the poster's own, and wakes a parked
+    # holder. A kernel bit is not BadBits here. With no other holder it
+    # posts nothing.
+    park(s)
+    if not shm_latch_post_peers(APP1, APP, EVENT_PEER_CLOSE)
+        return 41
+    if shm_latch_bits(APP1, SERVICE) != EVENT_PEER_CLOSE or shm_latch_bits(APP1, APP) != 0 or not running(s)
+        return 42
+    if shm_latch_post_peers(LONE, DRIVER, EVENT_DRIVER_GONE) or shm_latch_bits(LONE, DRIVER) != 0
+        return 43
+    # A listed source reports it whatever the mask, and the copy clears it.
+    var closed: WaitPlan = wait_plan_new()
+    wait_plan_add(@closed, H_APP1, APP1, EVENT_SPACE)
+    got = waitset_collect(@closed, SERVICE, 1)
+    if got.count != 1 or not has(@got, 0, H_APP1, EVENT_PEER_CLOSE) or shm_latch_bits(APP1, SERVICE) != 0
+        return 44
+
     # The inbox holds eight records: a ninth is refused. A wait with no
     # sources copies them in order, as many as fit; the rest stay queued.
     var h: u64 = 1
@@ -551,3 +569,31 @@ def test_console_input_wakes_console_watchers():
 def test_entry_registers_poll():
     src = ENTRY.read_text()
     assert "syscall_register(Syscall.Poll, sys_poll_handler)" in src
+
+
+PROCESS = KERNEL_SRC / "syscall" / "runtime" / "process.ritz"
+
+
+def test_sched_tick_runs_the_detach_timeout_only_over_user_code():
+    """#4729: SHM_DETACH_TIMEOUT_MS unmaps a peer from the tick, but only a
+    tick that interrupted CPL 3: the PMM and vmm_unmap_page_in are not
+    reentrant, so a tick over kernel code only wakes the parked holders."""
+    body = _fn_body(SCHED.read_text(), "sched_tick")
+    assert "if from_user\n        shm_detach_expired()" in body, body
+    assert "shm_detach_wake_due()" in body, body
+
+
+def test_wait_runs_the_detach_timeout_before_it_collects():
+    """A holder parked in a wait sweeps before it collects, so no wait
+    returns to user with a mapping the timeout should have taken."""
+    body = _fn_body(DRIVER.read_text(), "wait_collect")
+    assert body.index("shm_detach_expired()") < body.index("waitset_collect("), body
+
+
+def test_exit_retires_held_objects_before_freeing_the_table():
+    """App, service or driver exit retires each shm object it held (posting
+    PEER_CLOSE, or DRIVER_GONE for an IRQ owner) before its capability table,
+    latches and mappings go."""
+    body = _fn_body(PROCESS.read_text(), "sys_exit_impl")
+    assert "cap_retire_held_shm(me.pid as u32)" in body, body
+    assert body.index("cap_retire_held_shm(") < body.index("cap_table_free_pid("), body

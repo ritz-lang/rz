@@ -28,8 +28,9 @@
 #     (shm object, holding pid), made when the kernel inserts that process's
 #     handle (cap/table.ritz cap_table_insert), so a notify reaches a peer
 #     that has not mapped the object or listed it yet. ShmNotify ORs DATA or
-#     SPACE into every other holder's latch; kernel posts add PEER_CLOSE,
-#     DRIVER_GONE and LINK. The bits live here, not in a wait call.
+#     SPACE into every other holder's latch; kernel posts add PEER_CLOSE
+#     and DRIVER_GONE (mm/shm.ritz shm_retire, #4729) and LINK. The bits
+#     live here, not in a wait call.
 #   * An inbox per process slot: up to INBOX_CAP {handle, bits} records the
 #     kernel queues (ATTACH), scanned by every wait, sources listed or not.
 #
@@ -313,6 +314,16 @@ pub fn shm_latch_post(object_id: u64, pid: u64, bits: u32) -> bool
 pub fn shm_notify(object_id: u64, from_pid: u64, bits: u32) -> Notify
     if bits == 0 or (bits & ~EVENT_USER_MASK) != 0
         return Notify.BadBits
+    if shm_latch_post_peers(object_id, from_pid, bits)
+        return Notify.Posted
+    Notify.NoPeer
+
+# The kernel's post of `bits` from `from_pid` onto every other holder's
+# latch for `object_id`, mapped or not, waking each one parked on its wait
+# set: ShmNotify's DATA and SPACE, and mm/shm.ritz shm_retire's PEER_CLOSE
+# or DRIVER_GONE (#4729), which no user bit check refuses. False, and
+# nothing posted, when no other process holds the object. IF=0.
+pub fn shm_latch_post_peers(object_id: u64, from_pid: u64, bits: u32) -> bool
     var posted: bool = false
     var i: i32 = 0
     while i < SHM_LATCH_MAX
@@ -320,9 +331,7 @@ pub fn shm_notify(object_id: u64, from_pid: u64, bits: u32) -> Notify
             latch_post(i, bits)
             posted = true
         i = i + 1
-    if posted
-        return Notify.Posted
-    Notify.NoPeer
+    posted
 
 # The process slot of `pid` with its inbox ready, or -1 when no process has
 # that pid. A slot's records belong to the pid they were queued for: a new

@@ -39,6 +39,7 @@ import fs.syscall { fs_process_select }
 import syscall.stack { kstack_top }
 import proc.table { Proc, PROC_RUNNING, BLOCK_IRQ, proc_at, proc_current_slot, proc_pick_next, proc_set_current, proc_wake, proc_runnable_count }
 import proc.waitset { waitset_tick }
+import mm.shm { shm_detach_expired, shm_detach_wake_due }
 
 extern fn sched_switch(save_ksp: *u64, new_ksp: u64)
 extern fn proc_first_entry()
@@ -183,6 +184,15 @@ pub fn sched_tick(from_user: bool)
     # A DrvIrqWait deadline lives on its process's wait set, not on that
     # watchdog (#4719): wake the set whose deadline has passed.
     waitset_tick(rdtsc())
+    # SHM_DETACH_TIMEOUT_MS (#4729): a retired object's mapping its holder
+    # has not detached is unmapped here, but only over CPL-3 code: a tick
+    # over kernel code may have interrupted the PMM or a page-table edit,
+    # neither reentrant, so it only wakes the parked holders, whose waits
+    # sweep before they collect.
+    if from_user
+        shm_detach_expired()
+    else
+        shm_detach_wake_due()
     if not from_user or not sched_running
         return
     let next: i32 = proc_pick_next()

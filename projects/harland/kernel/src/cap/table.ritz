@@ -4,7 +4,8 @@
 # kernel objects with associated rights.
 
 import klog { klog, klog_dec }
-import mm.shm { shm_unmap, shm_forget_pid }
+import mm.shm { shm_unmap, shm_forget_pid, shm_retire }
+import driver_abi.wait { EVENT_PEER_CLOSE, EVENT_DRIVER_GONE }
 import proc.waitset { shm_latch_create, shm_latch_drop, waitset_forget_pid }
 import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_IRQ, CAP_TYPE_SHM, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid, cap_type_is_device, cap_type_is_kernel_granted }
 
@@ -109,6 +110,35 @@ pub fn cap_table_free(table: *CapTable) -> i32
     (*table).active_count = 0
     cap_tables_count = cap_tables_count - 1
     return 0
+
+# Process `pid` is exiting (sys_exit_impl, before cap_table_free): retire
+# each shm object it holds a handle for, posting PEER_CLOSE on every other
+# holder's latch, or DRIVER_GONE when `pid` owns a device IRQ (it is a
+# ring-1 driver, RING1_DRIVER.md "Driver death"). An app's exit closes its
+# exchange and wakes the service; the service's closes every exchange and
+# the frame object. An object already retired is left as it is.
+pub fn cap_retire_held_shm(pid: u32)
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return
+    var bits: u32 = EVENT_PEER_CLOSE
+    if cap_table_holds_type(table, CAP_TYPE_IRQ)
+        bits = EVENT_DRIVER_GONE
+    var i: i32 = 0
+    while i < 64
+        let entry: *CapEntry = @(*table).entries[i]
+        if (*entry).cap_type == CAP_TYPE_SHM
+            shm_retire((*entry).object_id, pid as u64, bits)
+        i = i + 1
+
+# True if `table` holds any handle of `cap_type`.
+fn cap_table_holds_type(table: *CapTable, cap_type: u8) -> bool
+    var i: i32 = 0
+    while i < 64
+        if (*table).entries[i].cap_type == cap_type
+            return true
+        i = i + 1
+    return false
 
 # Look up a process's capability table
 pub fn cap_table_get(pid: u32) -> *CapTable
