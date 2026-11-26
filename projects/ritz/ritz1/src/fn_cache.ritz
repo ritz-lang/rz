@@ -73,6 +73,8 @@ import ritzlib.result
 import ritzlib.json
 import ritzlib.os.env
 import ritzlib.timer   # clock_gettime: the exe-id memo's write rule (AGAST #4851)
+import ritzlib.fd
+import ritzlib.fs { stat, mkdir, rename, unlink, read_link, path_basename }
 import iface_text   # iface_text_path, iface_text_derive (AGAST #2113)
 
 
@@ -138,26 +140,31 @@ pub fn compiler_fingerprint() -> u64
     # The clock BEFORE the stat: see exe_ctime_settled.
     var now: Timespec = Timespec { tv_sec: 0, tv_nsec: 0 }
     let clock_ok: bool = clock_gettime(CLOCK_REALTIME, @&now) == 0
-    # S-TEXT-1: sys_open is a raw syscall and needs a NUL-terminated path.
-    let fd: i32 = sys_open(c"/proc/self/exe", O_RDONLY)
-    if fd < 0
+    var file: Fd = fd_open("/proc/self/exe", O_RDONLY, 0).unwrap_or(fd_adopt(-1))
+    if not file.valid()
         return 0
     # The open file's identity, not the path's: under valgrind `open` is
     # redirected to the client binary while a path stat would describe
     # memcheck (#1663).
     var st: Stat
-    if sys_fstat2(fd, @&st) != 0
-        sys_close(fd)
+    var have_st: bool = false
+    match file.stat()
+        Ok(got) =>
+            st = got
+            have_st = true
+        Err(e) => have_st = false
+    if not have_st
+        file.close()
         return 0
     var memo: String = exe_memo_path(@&st)
     var record: String = exe_memo_record(@&st)
     let hit: u64 = exe_memo_read(@&memo, @&record)
     if hit != 0
-        sys_close(fd)
+        file.close()
         return hit
     let old_enough: bool = clock_ok and exe_ctime_settled(@&st, @&now)
-    let bytes: Vec<u8> = read_fd_to_vec(fd, st.st_size)
-    sys_close(fd)
+    let bytes: Vec<u8> = read_fd_to_vec(@file, st.st_size)
+    file.close()
     if bytes.len == 0
         return 0
     let sz: i64 = bytes.len
@@ -239,7 +246,7 @@ fn exe_memo_record(st: @&Stat) -> String
 # if the file is absent, for another stat, or malformed in any way.
 fn exe_memo_read(memo: @&String, record: @&String) -> u64
     var sz: i64 = 0
-    let buf: *u8 = read_file_to_buf(memo.as_ptr(), @sz)
+    let buf: *u8 = read_file_to_buf(memo.as_view(), @sz)
     if buf == null
         return 0
     let rlen: i64 = record.len()
@@ -260,8 +267,8 @@ fn exe_memo_write(memo: @&String, record: @&String, h: u64)
     u64_to_hex16(h, @hex[0])
     line.push_span(Span<u8> { ptr: (@hex[0]), len: 16 })
     line.push('\n')
-    mkdir_parents(memo.as_ptr())
-    write_file_atomic(memo, StrView { ptr: (line.as_ptr()), len: (line.len()) })
+    mkdir_parents(memo.as_view())
+    write_file_atomic(memo.as_view(), StrView { ptr: (line.as_ptr()), len: (line.len()) })
 
 # True when the binary's ctime `st` is over a second before `now`, read before
 # the stat, so a memo of it can't be aliased by a later rewrite: any write
@@ -310,7 +317,7 @@ fn hex16_strict(s: StrView) -> u64
 #     when set, likewise.
 #   - `--no-red-zone` (#4308): the IR carries noredzone.  Likewise.
 # 0 (unknown) whenever the compiler fingerprint is.
-pub fn cache_fingerprint(target_os_sv: StrView, target_arch_sv: StrView, ritz_path_sv: StrView, input_path: *u8, deps_sv: StrView, stack_protector: i32, no_red_zone: i32, freestanding: i32) -> u64
+pub fn cache_fingerprint(target_os_sv: StrView, target_arch_sv: StrView, ritz_path_sv: StrView, input_path: StrView, deps_sv: StrView, stack_protector: i32, no_red_zone: i32, freestanding: i32) -> u64
     var target_os: *u8 = target_os_sv.ptr
     var target_os_len: i64 = target_os_sv.len
     var target_arch: *u8 = target_arch_sv.ptr
@@ -342,17 +349,12 @@ pub fn cache_fingerprint(target_os_sv: StrView, target_arch_sv: StrView, ritz_pa
 
     # The source's directory, as main.ritz's path_dir() computes it: up to
     # and including the last '/', empty (never probed) when there is none.
-    var dir_len: i64 = 0
-    var k: i64 = 0
-    while *(input_path + k) != 0
-        if *(input_path + k) == '/'
-            dir_len = k + 1
-        k = k + 1
-    h = fnv1a_mix_bytes(fnv1a_mix_u64(h, 3), input_path, dir_len)
+    let dir_len: i64 = input_path.len - path_basename(input_path).len
+    h = fnv1a_mix_bytes(fnv1a_mix_u64(h, 3), input_path.ptr, dir_len)
     if dir_len > 0
-        if *input_path != '/'
+        if *(input_path.ptr) != '/'
             h = fnv1a_mix_cwd(h)
-        h = fnv1a_mix_dir(h, StrView { ptr: (input_path), len: (dir_len) })
+        h = fnv1a_mix_dir(h, StrView { ptr: input_path.ptr, len: dir_len })
 
     # `--dep` entries: `name=dir`, `:`-separated (main.ritz checks each has
     # its `=`).  The name by its bytes, the dir as a RITZ_PATH entry is.
@@ -393,28 +395,19 @@ fn fnv1a_mix_bytes(h: u64, p: *u8, n: i64) -> u64
 # Fold the canonical current directory into `h`.
 fn fnv1a_mix_cwd(h: u64) -> u64
     var cwd: String = string_new()
-    # S-TEXT-1: push_canonical_path forwards `path` straight into sys_open.
-    push_canonical_path(@cwd, c".")
+    push_canonical_path(@cwd, ".")
     let acc: u64 = fnv1a_mix_bytes(fnv1a_mix_u64(h, 4), cwd.as_ptr(), cwd.len())
     return acc
 
-# Fold the canonical path of the directory `dir[0..len)` into `h`.  A
+# Fold the canonical path of the directory `dir` into `h`.  A
 # directory that does not exist resolves no import, so it is left out exactly
 # like an absent entry; once created it contributes its path, so the
-# fingerprint changes.  Returns 0 (unknown) if out of memory.
-fn fnv1a_mix_dir(h: u64, dir_sv: StrView) -> u64
-    var dir: *u8 = dir_sv.ptr
-    var len: i64 = dir_sv.len
-    let cstr: *u8 = malloc(len + 1)
-    if cstr == null
-        return 0
-    memcpy(cstr, dir, len)
-    *(cstr + len) = 0
+# fingerprint changes.
+fn fnv1a_mix_dir(h: u64, dir: StrView) -> u64
     var canon: String = string_new()
     var acc: u64 = h
-    if push_canonical_path(@canon, cstr) == 1
+    if push_canonical_path(@canon, dir) == 1
         acc = fnv1a_mix_bytes(fnv1a_mix_u64(acc, 1), canon.as_ptr(), canon.len())
-    free(cstr)
     return acc
 
 # Fold the 8 little-endian bytes of `v` into an in-progress FNV1a-64 state.
@@ -492,19 +485,14 @@ fn push_cache_root(out: *String)
 # compiler hashes; sharing one namespace would have them evict each other on
 # every alternation, which is the #1280 problem again one level down.
 fn push_compiler_namespace(out: *String)
-    var buf: [4096]u8
-    # S-TEXT-1: sys_readlink is a raw syscall and needs a NUL-terminated path.
-    let n: i64 = sys_readlink(c"/proc/self/exe", @buf[0], 4096)
-    var start: i64 = 0
-    var i: i64 = 0
-    while i < n
-        if buf[i] == '/'      # '/'
-            start = i + 1
-        i = i + 1
-    if n <= 0 or n >= 4096 or start >= n
-        out.push_str("ritz1")
-        return
-    out.push_span(Span<u8> { ptr: (@buf[start]), len: (n - start) as i64 })
+    match read_link("/proc/self/exe")
+        Ok(exe) =>
+            let base: StrView = path_basename(exe.as_view())
+            if base.len == 0
+                out.push_str("ritz1")
+            else
+                out.push_str(base)
+        Err(e) => out.push_str("ritz1")
 
 # Append the canonical absolute path of the existing file `path` to `out`.
 # Returns 1 on success, 0 if the file cannot be opened.
@@ -512,23 +500,25 @@ fn push_compiler_namespace(out: *String)
 # The kernel does the canonicalising: open the file and read back
 # /proc/self/fd/<n>, which has symlinks, `.` and `..` already resolved —
 # the same answer as Python's os.path.realpath, which ritz0 uses.
-pub fn push_canonical_path(out: *String, path: *u8) -> i32
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
+pub fn push_canonical_path(out: *String, path: StrView) -> i32
+    var file: Fd = fd_open(path, O_RDONLY, 0).unwrap_or(fd_adopt(-1))
+    if not file.valid()
         return 0
     var link: String = string_from("/proc/self/fd/")
-    link.push_i64(fd as i64)
-    var buf: [4096]u8
-    let n: i64 = sys_readlink(link.as_ptr(), @buf[0], 4096)
-    sys_close(fd)
-    if n <= 0 or n >= 4096
-        return 0
-    out.push_span(Span<u8> { ptr: (@buf[0]), len: (n) as i64 })
-    return 1
+    link.push_i64(file.raw() as i64)
+    let target: Result<String, Errno> = read_link(link.as_view())
+    file.close()
+    match target
+        Ok(t) =>
+            if t.len() == 0
+                return 0
+            out.push_str(t.as_view())
+            return 1
+        Err(e) => return 0
 
 # The sig path for `src_path` (see the header), or an empty String when the
 # source cannot be canonicalised — callers then neither read nor write a sig.
-pub fn sig_path_from_src(src_path: *u8) -> String
+pub fn sig_path_from_src(src_path: StrView) -> String
     var s: String = string_new()
     push_cache_root(@s)
     s.push('/')
@@ -543,8 +533,8 @@ pub fn sig_path_from_src(src_path: *u8) -> String
 # Build "<sig_path>.tmp.<pid>" — used for atomic writes.  The pid keeps two
 # concurrent compiles of one source (xdist workers, parallel gates) from
 # writing into each other's temp file.
-fn sig_tmp_path(sig_path: *u8) -> String
-    var s: String = string_from_cstr(sig_path)
+fn sig_tmp_path(sig_path: StrView) -> String
+    var s: String = string_from_strview(sig_path)
     s.push_str(".tmp.")
     s.push_i64(sys_getpid() as i64)
     return s
@@ -552,20 +542,12 @@ fn sig_tmp_path(sig_path: *u8) -> String
 # `mkdir -p` the directory part of `path`.  Errors (EEXIST included) are
 # ignored: if a directory really is missing, the write that follows fails
 # and the caller handles that.
-fn mkdir_parents(path: *u8)
-    let len: i64 = strlen(path)
-    let buf: *u8 = malloc(len + 1)
-    if buf == null
-        return
-    memcpy(buf, path, len + 1)
+fn mkdir_parents(path: StrView)
     var i: i64 = 1
-    while i < len
-        if *(buf + i) == '/'      # '/'
-            *(buf + i) = 0
-            sys_mkdir(buf, 493)  # 0755
-            *(buf + i) = 47
+    while i < path.len
+        if *(path.ptr + i) == '/'
+            mkdir(StrView { ptr: path.ptr, len: i }, 493)   # 0755
         i = i + 1
-    free(buf)
 
 
 # ============================================================================
@@ -581,8 +563,8 @@ struct SigData
     # FNV1a-64 of the compiler binary + target OS + import search path that
     # produced `module_ir` (AGAST #1279).  0 means "unknown" and never matches.
     compiler_hash: u64
-    # Transitive imports: canonical path (heap cstring) and content hash.
-    dep_paths:     **u8
+    # Transitive imports: canonical path (a heap copy) and content hash.
+    dep_paths:     *StrView
     dep_hashes:    *u64
     dep_count:     i32
     dep_cap:       i32
@@ -590,8 +572,8 @@ struct SigData
     # cannot vouch for its imports and is never reused.
     has_deps:      i32
     # Candidates import resolution probed and missed (AGAST #2030): absolute
-    # path (heap cstring) and its FNV1a-64, which only speeds up de-duping.
-    miss_paths:    **u8
+    # path (a heap copy) and its FNV1a-64, which only speeds up de-duping.
+    miss_paths:    *StrView
     miss_hashes:   *u64
     miss_count:    i32
     miss_cap:      i32
@@ -624,9 +606,9 @@ pub fn sig_data_new() -> *SigData
 fn sig_data_free_deps(sd: *SigData)
     var i: i32 = 0
     while i < sd.dep_count
-        let p: *u8 = *(sd.dep_paths + i)
-        if p != null
-            free(p)
+        let p: StrView = *(sd.dep_paths + i)
+        if p.ptr != null
+            free(p.ptr)
         i = i + 1
     if sd.dep_paths != null
         free(sd.dep_paths as *u8)
@@ -640,9 +622,9 @@ fn sig_data_free_deps(sd: *SigData)
 fn sig_data_free_misses(sd: *SigData)
     var i: i32 = 0
     while i < sd.miss_count
-        let p: *u8 = *(sd.miss_paths + i)
-        if p != null
-            free(p)
+        let p: StrView = *(sd.miss_paths + i)
+        if p.ptr != null
+            free(p.ptr)
         i = i + 1
     if sd.miss_paths != null
         free(sd.miss_paths as *u8)
@@ -671,12 +653,12 @@ fn sig_data_add_dep(sd: *SigData, path_sv: StrView, h: u64)
         var new_cap: i32 = sd.dep_cap * 2
         if new_cap < 16
             new_cap = 16
-        let np: **u8 = malloc((new_cap as i64) * 8) as **u8
+        let np: *StrView = malloc((new_cap as i64) * sizeof(StrView)) as *StrView
         let nh: *u64 = malloc((new_cap as i64) * 8) as *u64
         if np == null or nh == null
             return
         if sd.dep_count > 0
-            memcpy(np as *u8, sd.dep_paths as *u8, (sd.dep_count as i64) * 8)
+            memcpy(np as *u8, sd.dep_paths as *u8, (sd.dep_count as i64) * sizeof(StrView))
             memcpy(nh as *u8, sd.dep_hashes as *u8, (sd.dep_count as i64) * 8)
         if sd.dep_paths != null
             free(sd.dep_paths as *u8)
@@ -689,8 +671,7 @@ fn sig_data_add_dep(sd: *SigData, path_sv: StrView, h: u64)
     if copy == null
         return
     memcpy(copy, path, path_len)
-    *(copy + path_len) = 0
-    *(sd.dep_paths + sd.dep_count) = copy
+    *(sd.dep_paths + sd.dep_count) = StrView { ptr: copy, len: path_len }
     *(sd.dep_hashes + sd.dep_count) = h
     sd.dep_count = sd.dep_count + 1
 
@@ -704,20 +685,19 @@ fn sig_data_add_miss(sd: *SigData, path_sv: StrView) -> i32
     var i: i32 = 0
     while i < sd.miss_count
         if *(sd.miss_hashes + i) == h
-            let p: *u8 = *(sd.miss_paths + i)
-            if strlen(p) == path_len and memcmp(p, path, path_len) == 0
+            if (*(sd.miss_paths + i)).eq(path_sv)
                 return 1
         i = i + 1
     if sd.miss_count >= sd.miss_cap
         var new_cap: i32 = sd.miss_cap * 2
         if new_cap < 16
             new_cap = 16
-        let np: **u8 = malloc((new_cap as i64) * 8) as **u8
+        let np: *StrView = malloc((new_cap as i64) * sizeof(StrView)) as *StrView
         let nh: *u64 = malloc((new_cap as i64) * 8) as *u64
         if np == null or nh == null
             return 0
         if sd.miss_count > 0
-            memcpy(np as *u8, sd.miss_paths as *u8, (sd.miss_count as i64) * 8)
+            memcpy(np as *u8, sd.miss_paths as *u8, (sd.miss_count as i64) * sizeof(StrView))
             memcpy(nh as *u8, sd.miss_hashes as *u8, (sd.miss_count as i64) * 8)
         if sd.miss_paths != null
             free(sd.miss_paths as *u8)
@@ -730,8 +710,7 @@ fn sig_data_add_miss(sd: *SigData, path_sv: StrView) -> i32
     if copy == null
         return 0
     memcpy(copy, path, path_len)
-    *(copy + path_len) = 0
-    *(sd.miss_paths + sd.miss_count) = copy
+    *(sd.miss_paths + sd.miss_count) = StrView { ptr: copy, len: path_len }
     *(sd.miss_hashes + sd.miss_count) = h
     sd.miss_count = sd.miss_count + 1
     return 1
@@ -769,24 +748,23 @@ pub fn dep_record_reset()
 # Record that import resolution probed `path` and found nothing there.  A
 # relative path is made absolute against the current directory, which is
 # where the resolver's probe looked.
-pub fn dep_record_miss(path: *u8)
+pub fn dep_record_miss(path: StrView)
     if g_dep_record == null
         g_dep_record = sig_data_new()
         if g_dep_record == null
             g_miss_lost = 1
             return
     var abs: String = string_new()
-    if *path != '/'
-        # S-TEXT-1: push_canonical_path forwards `path` straight into sys_open.
-        if push_canonical_path(@abs, c".") == 0
+    if path.len == 0 or *(path.ptr) != '/'
+        if push_canonical_path(@abs, ".") == 0
             g_miss_lost = 1
             return
         abs.push('/')
-    abs.push_str(strview_from_cstr(path))
-    if sig_data_add_miss(g_dep_record, StrView { ptr: (abs.as_ptr()), len: (abs.len()) }) == 0
+    abs.push_str(path)
+    if sig_data_add_miss(g_dep_record, abs.as_view()) == 0
         g_miss_lost = 1
 
-pub fn dep_record_note(path: *u8, data_sv: StrView)
+pub fn dep_record_note(path: StrView, data_sv: StrView)
     var data: *u8 = data_sv.ptr
     var len: i64 = data_sv.len
     if g_dep_record == null
@@ -795,7 +773,7 @@ pub fn dep_record_note(path: *u8, data_sv: StrView)
             return
     var canon: String = string_new()
     if push_canonical_path(@canon, path) == 1
-        sig_data_add_dep(g_dep_record, StrView { ptr: (canon.as_ptr()), len: (canon.len()) }, fnv1a_bytes(StrView { ptr: (data), len: (len) }))
+        sig_data_add_dep(g_dep_record, canon.as_view(), fnv1a_bytes(StrView { ptr: (data), len: (len) }))
     else
         # Unresolvable: record it under a path that can never be read back,
         # so the next fast-path check fails closed.
@@ -836,21 +814,19 @@ pub fn sig_take_deps(sd: *SigData)
 
 # Read entire file into a malloced buffer.  Returns null on missing/empty.
 # Sets `*out_len` to the number of bytes read.
-fn read_file_to_buf(path: *u8, out_len: *i64) -> *u8
+fn read_file_to_buf(path: StrView, out_len: *i64) -> *u8
     *out_len = 0
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
+    var file: Fd = fd_open(path, O_RDONLY, 0).unwrap_or(fd_adopt(-1))
+    if not file.valid()
         return null
-    # Use stat to learn size.  It is only an upper bound: the file can shrink
-    # before we read it, and under valgrind `stat("/proc/self/exe")`
-    # describes memcheck while `open` is redirected to the client binary.
-    var st: Stat
-    let stres: i32 = sys_stat2(path, @&st)
-    if stres != 0
-        sys_close(fd)
-        return null
-    var bytes: Vec<u8> = read_fd_to_vec(fd, st.st_size)
-    sys_close(fd)
+    # The open file's size.  It is only an upper bound: the file can shrink
+    # before we read it.
+    var sz: i64 = 0
+    match file.stat()
+        Ok(st) => sz = st.st_size
+        Err(e) => sz = 0
+    var bytes: Vec<u8> = read_fd_to_vec(@file, sz)
+    file.close()
     if bytes.len == 0
         return null
     # Hand the buffer to the caller, who frees it.
@@ -859,11 +835,11 @@ fn read_file_to_buf(path: *u8, out_len: *i64) -> *u8
     bytes.data = null
     buf
 
-# Every byte of the open file `fd`, read to EOF, with a NUL past the last
+# Every byte of the open `file`, read to EOF, with a NUL past the last
 # one (in the capacity, not counted in `len`).  Capacity starts at
 # `size_hint`.  Empty when the file is, when the hint is not positive, or
-# when a read fails.  Does not close `fd`.
-fn read_fd_to_vec(fd: i32, size_hint: i64) -> Vec<u8>
+# when a read fails.  Does not close `file`.
+fn read_fd_to_vec(file: @Fd, size_hint: i64) -> Vec<u8>
     var bytes: Vec<u8> = vec_new<u8>()
     if size_hint <= 0 or not bytes.grow(size_hint + 1)
         return bytes
@@ -879,7 +855,7 @@ fn read_fd_to_vec(fd: i32, size_hint: i64) -> Vec<u8>
         if bytes.len + 1 == bytes.cap and not bytes.grow(bytes.cap * 2)
             bytes.clear()
             return bytes
-        let n: i64 = sys_read(fd, bytes.data + bytes.len, bytes.cap - 1 - bytes.len)
+        let n: i64 = file.read(Span<u8> { ptr: bytes.data + bytes.len, len: bytes.cap - 1 - bytes.len }).unwrap_or(-1)
         if n < 0
             bytes.clear()
             return bytes
@@ -896,7 +872,7 @@ fn read_fd_to_vec(fd: i32, size_hint: i64) -> Vec<u8>
 
 # Parse a sig file.  Returns null on missing/corrupt/structurally unexpected —
 # the caller treats null as "no cache, cold start".
-pub fn read_sig_file(sig_path: *u8) -> *SigData
+pub fn read_sig_file(sig_path: StrView) -> *SigData
     var sz: i64 = 0
     let buf: *u8 = read_file_to_buf(sig_path, @sz)
     if buf == null or sz <= 0
@@ -1056,8 +1032,7 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
         var i: i32 = 0
         while i < sd.dep_count
             buf.push_view("    ")
-            let p: *u8 = *(sd.dep_paths + i)
-            emit_sig_string(buf, StrView { ptr: (p), len: (strlen(p)) })
+            emit_sig_string(buf, *(sd.dep_paths + i))
             buf.push_view(": ")
             emit_hex16(buf, *(sd.dep_hashes + i))
             if i + 1 < sd.dep_count
@@ -1072,8 +1047,7 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
         var j: i32 = 0
         while j < sd.miss_count
             buf.push_view("\n    ")
-            let mp: *u8 = *(sd.miss_paths + j)
-            emit_sig_string(buf, StrView { ptr: (mp), len: (strlen(mp)) })
+            emit_sig_string(buf, *(sd.miss_paths + j))
             if j + 1 < sd.miss_count
                 buf.push(44)   # ','
             j = j + 1
@@ -1084,34 +1058,26 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
 
 # Atomic write: serialize, then write_file_atomic.  Creates the sig's
 # directory first.  Returns 0 on success, -1 on failure.
-pub fn write_sig_file(sig_path: *u8, sd: *SigData) -> i32
-    if sd == null or sig_path == null
-        return -1
-    if *sig_path == 0
+pub fn write_sig_file(sig_path: StrView, sd: *SigData) -> i32
+    if sd == null or sig_path.len == 0
         return -1
     mkdir_parents(sig_path)
     var buf: Vec<u8> = vec_with_cap<u8>(8192)
     sig_serialize(sd, @buf)
-    var path: String = string_from_cstr(sig_path)
-    return write_file_atomic(@&path, StrView { ptr: (buf.data), len: (buf.len) as i64 })
+    return write_file_atomic(sig_path, StrView { ptr: (buf.data), len: (buf.len) as i64 })
 
 # Write `data` to "<path>.tmp.<pid>" and rename it over `path`, so a reader
 # sees the old file or the whole new one, never a torn one.  The directory
 # must exist.  Returns 0 on success, -1 on failure.
-fn write_file_atomic(path: @&String, data: StrView) -> i32
-    var tmp: String = sig_tmp_path(path.as_ptr())
-    let tmp_ptr: *u8 = tmp.as_ptr()
-    let fd: i32 = sys_open3(tmp_ptr, O_WRONLY + O_CREAT + O_TRUNC, 420)
-    if fd < 0
+fn write_file_atomic(path: StrView, data: StrView) -> i32
+    var tmp: String = sig_tmp_path(path)
+    var file: Fd = fd_open(tmp.as_view(), O_WRONLY + O_CREAT + O_TRUNC, 420).unwrap_or(fd_adopt(-1))
+    if not file.valid()
         return -1
-    let n: i64 = sys_write(fd, data.ptr, data.len)
-    sys_close(fd)
-    if n != data.len
-        sys_unlink(tmp_ptr)
-        return -1
-    let r: i32 = sys_rename(tmp_ptr, path.as_ptr())
-    if r != 0
-        sys_unlink(tmp_ptr)
+    let wrote: bool = file.write_all(Span<u8> { ptr: data.ptr, len: data.len }).is_ok()
+    file.close()
+    if not wrote or rename(tmp.as_view(), path).is_err()
+        unlink(tmp.as_view())
         return -1
     return 0
 
@@ -1128,7 +1094,7 @@ fn dep_text_matches(buf: *u8, sz: i64, want: u64) -> i32
     var tsz: i64 = 0
     var text: *u8 = null
     if path.len() > 0
-        text = read_file_to_buf(path.as_ptr(), @tsz)
+        text = read_file_to_buf(path.as_view(), @tsz)
     var h: u64 = 0
     if text != null
         h = fnv1a_bytes(StrView { ptr: (text), len: (tsz) })
@@ -1177,9 +1143,9 @@ fn sig_misses_absent(sd: *SigData) -> i32
         return 0
     var i: i32 = 0
     while i < sd.miss_count
-        let fd: i32 = sys_open(*(sd.miss_paths + i), O_RDONLY)
-        if fd >= 0
-            sys_close(fd)
+        var file: Fd = fd_open(*(sd.miss_paths + i), O_RDONLY, 0).unwrap_or(fd_adopt(-1))
+        if file.valid()
+            file.close()
             return 0
         i = i + 1
     return 1
@@ -1195,16 +1161,16 @@ fn sig_misses_absent(sd: *SigData) -> i32
 # (AGAST #1807) and missed candidates (AGAST #2030).  Gating only (a) would be worse than useless — (b) is the
 # branch that *materialises* stale IR, re-creating a `.ll` that make had
 # just deleted and filling it with output that no longer matches the inputs.
-pub fn check_source_unchanged(src_path: *u8, src_sv: StrView, ll_path: *u8, self_fp: u64) -> i32
+pub fn check_source_unchanged(src_path: StrView, src_sv: StrView, ll_path: StrView, self_fp: u64) -> i32
     var src: *u8 = src_sv.ptr
     var src_len: i64 = src_sv.len
-    if src_path == null or ll_path == null or src == null
+    if src_path.len == 0 or ll_path.len == 0 or src == null
         return 0
 
     var sig_path: String = sig_path_from_src(src_path)
     if sig_path.is_empty()
         return 0
-    let sd: *SigData = read_sig_file(sig_path.as_ptr())
+    let sd: *SigData = read_sig_file(sig_path.as_view())
     if sd == null
         return 0
 
@@ -1250,31 +1216,38 @@ pub fn check_source_unchanged(src_path: *u8, src_sv: StrView, ll_path: *u8, self
     # itself, under this mode's fingerprint, so a byte comparison is the same
     # check with nothing extra to keep in step.
     if file_equals(ll_path, StrView { ptr: (sd.module_ir), len: (sd.module_ir_len) }) == 1
-        var ll_st: Stat
-        var src_st: Stat
-        if sys_stat2(ll_path, @&ll_st) == 0 and sys_stat2(src_path, @&src_st) == 0
-            if ll_st.st_mtime > src_st.st_mtime
-                sig_data_free(sd)
-                return 1
-            if ll_st.st_mtime == src_st.st_mtime and ll_st.st_mtime_ns >= src_st.st_mtime_ns
-                sig_data_free(sd)
-                return 1
+        if ll_not_older(ll_path, src_path)
+            sig_data_free(sd)
+            return 1
 
     # Path (b): the on-disk .ll is missing, different, or older than the
     # source.  Splice the cached IR to the requested output path.
-    let fd: i32 = sys_open3(ll_path, O_WRONLY + O_CREAT + O_TRUNC, 420)
-    if fd >= 0
-        let n: i64 = sys_write(fd, sd.module_ir, sd.module_ir_len)
-        sys_close(fd)
-        if n == sd.module_ir_len
+    var file: Fd = fd_open(ll_path, O_WRONLY + O_CREAT + O_TRUNC, 420).unwrap_or(fd_adopt(-1))
+    if file.valid()
+        let wrote: bool = file.write_all(Span<u8> { ptr: sd.module_ir, len: sd.module_ir_len }).is_ok()
+        file.close()
+        if wrote
             sig_data_free(sd)
             return 1
 
     sig_data_free(sd)
     return 0
 
+# Is the .ll at `ll_path` at least as new as the source at `src_path`?  False
+# when either cannot be stat'ed.
+fn ll_not_older(ll_path: StrView, src_path: StrView) -> bool
+    match stat(ll_path)
+        Ok(ll_st) =>
+            match stat(src_path)
+                Ok(src_st) =>
+                    if ll_st.st_mtime != src_st.st_mtime
+                        return ll_st.st_mtime > src_st.st_mtime
+                    return ll_st.st_mtime_ns >= src_st.st_mtime_ns
+                Err(e) => return false
+        Err(e) => return false
+
 # 1 when the file at `path` holds exactly `data[0..len)`, else 0.
-fn file_equals(path: *u8, data_sv: StrView) -> i32
+fn file_equals(path: StrView, data_sv: StrView) -> i32
     var data: *u8 = data_sv.ptr
     var len: i64 = data_sv.len
     var sz: i64 = 0

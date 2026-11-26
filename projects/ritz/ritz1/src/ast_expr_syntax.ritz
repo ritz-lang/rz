@@ -43,21 +43,16 @@ pub fn parse_span_at(p: *Parser, pos: i32) -> SrcSpan
         return diag_span(tok.line, tok.col)
     diag_span(0, 0)
 
-# Copy of the current parse file's path in the parser arena, or null.
+# Copy of the current parse file's path in the parser arena, or empty.
 # ctx.parse_file itself is borrowed: for an import it points into a String the
 # driver drops as soon as that import is parsed, long before emission.
 pub fn parse_file_copy(p: *Parser) -> StrView
-    if p.ctx.parse_file == null
+    let file: StrView = p.ctx.parse_file
+    if file.len == 0
         return strview_empty()
-    var n: i64 = 0
-    while *(p.ctx.parse_file + n) != 0
-        n = n + 1
-    let buf: *u8 = parser_alloc(p, n + 1)
-    var i: i64 = 0
-    while i <= n
-        *(buf + i) = *(p.ctx.parse_file + i)
-        i = i + 1
-    StrView { ptr: (buf), len: (n) as i64 }
+    let buf: *u8 = parser_alloc(p, file.len)
+    memcpy(buf, file.ptr, file.len)
+    StrView { ptr: buf, len: file.len }
 
 # parse_file_copy, shared between consecutive callers that see the same path.
 # AGAST #1364 records a path on every narrow-integer let/var, and a fresh copy
@@ -67,14 +62,10 @@ pub fn parse_file_copy(p: *Parser) -> StrView
 # State: ParseCtx.shared_file_copy
 
 pub fn parse_file_copy_shared(p: *Parser) -> StrView
-    if p.ctx.parse_file == null
+    if p.ctx.parse_file.len == 0
         return strview_empty()
-    if p.ctx.shared_file_copy.ptr != null
-        var i: i64 = 0
-        while i < p.ctx.shared_file_copy.len and *(p.ctx.parse_file + i) == *(p.ctx.shared_file_copy.ptr + i)
-            i = i + 1
-        if i == p.ctx.shared_file_copy.len and *(p.ctx.parse_file + i) == 0
-            return p.ctx.shared_file_copy
+    if p.ctx.shared_file_copy.ptr != null and p.ctx.shared_file_copy.eq(p.ctx.parse_file)
+        return p.ctx.shared_file_copy
     p.ctx.shared_file_copy = parse_file_copy(p)
     p.ctx.shared_file_copy
 
@@ -494,7 +485,7 @@ pub fn const_overflow_site(consts: *ConstEntry, e: *Expr, resolve: i32) -> *Expr
 
 # `<file>:<line>:<col>: error: integer overflow in `+` in constant
 # expression`, ritz0's ConstEvalError text, at the operation.
-pub fn const_overflow_report(file: *u8, site: *Expr)
+pub fn const_overflow_report(file: StrView, site: *Expr)
     diag_error_at(file, diag_span(site.span.line, site.span.col))
     eprints("integer overflow in `")
     eprints(arith_op_cstr(site.op))
@@ -949,7 +940,7 @@ pub fn note_type_name_written(p: *Parser, name: *u8, line: i32, col: i32)
     at.name = name
     at.line = line
     at.col = col
-    at.file = parse_file_copy_shared(p).ptr
+    at.file = parse_file_copy_shared(p)
     at.reported = 0
     at.next = p.ctx.type_name_at
     p.ctx.type_name_at = at
@@ -1473,7 +1464,7 @@ pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericAr
         cur = cur.next
     let mangled_sv: StrView = mangle_generic_args(p, base_name_sv, ga)
     if p.skip_item == 0
-        generic_use_note_mangled(p.ctx, mangled_sv, ga, diag_span(0, 0), parse_file_copy_shared(p).ptr)
+        generic_use_note_mangled(p.ctx, mangled_sv, ga, diag_span(0, 0), parse_file_copy_shared(p))
     let t: *TypeRef = typeref_new(p, TypeKind.Struct)
     t.name = mangled_sv.ptr
     t.name_len = mangled_sv.len as i32
@@ -1495,7 +1486,7 @@ pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericAr
 
 # State: ParseCtx.generic_uses
 
-pub fn generic_use_note(ctx: *ParseCtx, name_sv: StrView, suffix_sv: StrView, args: *GenericArg, at: SrcSpan, file: *u8)
+pub fn generic_use_note(ctx: *ParseCtx, name_sv: StrView, suffix_sv: StrView, args: *GenericArg, at: SrcSpan, file: StrView)
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     var suffix: *u8 = suffix_sv.ptr
@@ -1515,7 +1506,7 @@ pub fn generic_use_note(ctx: *ParseCtx, name_sv: StrView, suffix_sv: StrView, ar
 
 # A generic type's mangled name `Holder$Nope` is the instance `Holder` with
 # suffix `$Nope`, as monomorph tracks it.
-fn generic_use_note_mangled(ctx: *ParseCtx, mangled_sv: StrView, args: *GenericArg, at: SrcSpan, file: *u8)
+fn generic_use_note_mangled(ctx: *ParseCtx, mangled_sv: StrView, args: *GenericArg, at: SrcSpan, file: StrView)
     var mangled: *u8 = mangled_sv.ptr
     var len: i32 = mangled_sv.len as i32
     var k: i32 = 0
@@ -2323,7 +2314,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
                     result.call_type_suffix = op.call_type_suffix
                     result.args = op.args
                     if op.call_type_suffix.ptr != null and p.skip_item == 0
-                        generic_use_note(p.ctx, result.func_name, op.call_type_suffix, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p).ptr)
+                        generic_use_note(p.ctx, result.func_name, op.call_type_suffix, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p))
                 ExprKind.Member =>
                     # Method call: expr.method(args)
                     # ExprKind.Member has: left = receiver, ident = method name
@@ -2513,7 +2504,7 @@ fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv:
     f.qual_len = qual_len
     f.span.line = head.line
     f.span.col = head.col
-    f.file = parse_file_copy_shared(p).ptr
+    f.file = parse_file_copy_shared(p)
     f.next = p.ctx.named_forms
     p.ctx.named_forms = f
 

@@ -35,6 +35,7 @@ import ritzlib.io
 import ast
 import ast_helpers   # the enum / alias / trait declaration logs (#3907, #3467)
 import diag          # R54's located errors (AGAST #3467)
+import ritzlib.fs { path_basename }
 
 struct VisName
     name: *u8
@@ -51,7 +52,7 @@ struct VisEdge
     next: *VisEdge
 
 struct VisMod
-    key: *u8          # the canonical path (import_key)
+    key: StrView      # the canonical path (import_key)
     names: *VisName
     edges: *VisEdge
     visible: i32
@@ -111,14 +112,14 @@ fn vis_copy(p_sv: StrView) -> StrView
     StrView { ptr: (out), len: (len) }
 
 # The module of canonical path `key`, made on first sight.
-pub fn vis_module(key: *u8) -> *VisMod
+pub fn vis_module(key: StrView) -> *VisMod
     var vm: *VisMod = g_vis_mods
     while vm != null
-        if streq(vm.key, key)
+        if vm.key.eq(key)
             return vm
         vm = vm.next
     vm = malloc(sizeof(VisMod)) as *VisMod
-    vm.key = vis_copy(StrView { ptr: (key), len: (strlen(key)) }).ptr
+    vm.key = vis_copy(key)
     vm.names = null
     vm.edges = null
     vm.visible = 0
@@ -213,7 +214,7 @@ pub fn vis_edges_reset(vm: *VisMod)
     vm.edges = null
 
 # `from`'s import of the module at canonical path `key`, written `imp`.
-pub fn vis_edge(from: *VisMod, key: *u8, imp: *ImportDecl)
+pub fn vis_edge(from: *VisMod, key: StrView, imp: *ImportDecl)
     let e: *VisEdge = malloc(sizeof(VisEdge)) as *VisEdge
     e.target = vis_module(key)
     var shown: String = string_new()
@@ -382,7 +383,7 @@ pub fn vis_hidden(name_sv: StrView) -> *VisEntry
 fn vis_private_fn(fd: *FnDef) -> i32
     if fd == null or fd.is_pub == 1 or fd.body == null or fd.extern_decl == 1
         return 0
-    (fd.from_generated == 0 and fd.def_file != null) as i32
+    (fd.from_generated == 0 and fd.def_file.len > 0) as i32
 
 # `name` in `n`'s list.  Of [[target_os]] variants, one that isn't a private
 # fn wins, so the private-fn error needs every variant private.
@@ -440,13 +441,13 @@ fn vis_defined(vm: *VisMod, name_sv: StrView) -> *VisName
 # that does).  main.ritz fns_coexist's question (AGAST #1858).  Every edge of
 # a module is recorded before an import of it is merged, and the input's up
 # to the import being merged, which is the one that brings `fd` in.
-pub fn vis_sees(key: *u8, fd: *FnDef) -> i32
+pub fn vis_sees(key: StrView, fd: *FnDef) -> i32
     let vm: *VisMod = vis_module(key)
     var e: *VisEdge = vm.edges
     while e != null
         let n: *VisName = vis_defined(e.target, StrView { ptr: (fd.name), len: (fd.name_len) as i64 })
         if n != null and n.fd != null
-            if n.fd.is_pub == 1 and n.fd.def_file != null and streq(n.fd.def_file, fd.def_file)
+            if n.fd.is_pub == 1 and n.fd.def_file.len > 0 and n.fd.def_file.eq(fd.def_file)
                 return 1
         e = e.next
     0
@@ -487,18 +488,9 @@ fn vis_eprint(p_sv: StrView)
     for i in 0..len
         eprint_char(p[i])
 
-fn vis_basename(path: *u8) -> StrView
-    var base: *u8 = path
-    var i: i64 = 0
-    while path[i] != 0
-        if path[i] == '/'
-            base = path + i + 1
-        i = i + 1
-    StrView { ptr: (base), len: (path + i - base) as i64 }
-
 # Check the input's selective lists; `main` is its module, `file` its path as
 # diagnostics name it.  The number of errors reported.
-pub fn vis_selective_check(main: *VisMod, file: *u8) -> i32
+pub fn vis_selective_check(main: *VisMod, file: StrView) -> i32
     var errors: i32 = 0
     var e: *VisEdge = main.edges
     while e != null
@@ -518,9 +510,9 @@ pub fn vis_selective_check(main: *VisMod, file: *u8) -> i32
                 eprint_char('`')
                 vis_eprint(StrView { ptr: (it.name), len: (it.name_len) as i64 })
                 eprints("` is private to ")
-                eprints(vis_basename(d.fd.def_file))
+                eprints(path_basename(d.fd.def_file))
                 eprints("; mark it `pub` (#3413)\n")
-                eprints_cstr(d.fd.def_file)
+                eprints(d.fd.def_file)
                 eprint_char(':')
                 eprint_int(d.fd.line as i64)
                 eprint_char(':')

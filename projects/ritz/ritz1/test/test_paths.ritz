@@ -1,0 +1,89 @@
+# ritz1/test/test_paths.ritz - a path is a StrView up to the syscall (AGAST #4774)
+#
+# ritz1 carries every source, import and cache path as a StrView from argv
+# on, and hands it to ritzlib's fd_open / fs, which terminate it for the
+# kernel (ritzlib/tests/test_fd.ritz pins that boundary: an unterminated
+# slice, a path too long for the buffer).  These pin that ritz1's own path
+# code takes a view whose bytes go on past it and means the file the view
+# spells, not the longer string around it.  Run by `make ritz1-unit`
+# (tools/ritz1_unit.py).
+
+import ritzlib.process { process_id }
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.fd
+import ritzlib.fs { mkdir, rmdir, unlink }
+import diag
+import fn_cache
+
+# A scratch path unique to this run: /tmp/ritz1-paths-<pid>-<tag>.
+fn scratch(tag: StrView) -> String
+    var s: String = string_from("/tmp/ritz1-paths-")
+    s.push_i64(process_id() as i64)
+    s.push('-')
+    s.push_str(tag)
+    s
+
+# The first `len` bytes of `s`: a view with more bytes after it, no NUL.
+fn prefix(s: @String, len: i64) -> StrView
+    strview_from_ptr(s.as_view().ptr, len)
+
+# Create `path` holding "ritz": true if it was written.
+fn make_file(path: StrView) -> bool
+    var file: Fd = fd_open(path, O_WRONLY + O_CREAT + O_TRUNC, 420).unwrap_or(fd_adopt(-1))
+    if not file.valid()
+        return false
+    let wrote: bool = file.write_str("ritz").is_ok()
+    file.close()
+    wrote
+
+# fn_cache keys a sig by the canonical path of the source it was handed.
+[[test]]
+fn test_canonical_path_of_a_view_is_the_file_it_spells() -> i32
+    var path: String = scratch("canon.ritz")
+    let n: i64 = path.len()
+    assert make_file(path.as_view())
+    # `<path>.not-this` holds `<path>` as a prefix with no NUL after it.
+    var longer: String = string_from_strview(path.as_view())
+    longer.push_str(".not-this")
+    var want: String = string_new()
+    assert push_canonical_path(@want, path.as_view()) == 1
+    var got: String = string_new()
+    assert push_canonical_path(@got, prefix(@longer, n)) == 1
+    assert got.as_view().eq(want.as_view())
+    # The longer string names no file.
+    var none: String = string_new()
+    assert push_canonical_path(@none, longer.as_view()) == 0
+    assert none.len() == 0
+    unlink(path.as_view())
+    0
+
+# diag_symbol_file_key: the path below the nearest `.git` above it, else the
+# whole path (AGAST #4626), probing with views of the path's prefixes.
+[[test]]
+fn test_symbol_file_key_is_the_path_below_the_git_root() -> i32
+    var root: String = scratch("key")
+    var git: String = string_from_strview(root.as_view())
+    git.push_str("/.git")
+    var sub: String = string_from_strview(root.as_view())
+    sub.push_str("/a")
+    assert mkdir(root.as_view(), 493).is_ok()
+    assert mkdir(git.as_view(), 493).is_ok()
+    assert mkdir(sub.as_view(), 493).is_ok()
+    var src: String = string_from_strview(sub.as_view())
+    src.push_str("/b.ritz")
+    assert diag_symbol_file_key(src.as_view()).eq("a/b.ritz")
+    # No `.git` above: the whole path.
+    var bare: String = scratch("nogit.ritz")
+    assert diag_symbol_file_key(bare.as_view()).eq(bare.as_view())
+    rmdir(sub.as_view())
+    rmdir(git.as_view())
+    rmdir(root.as_view())
+    0
+
+# A diagnostic for a source with no path names `<input>`.
+[[test]]
+fn test_a_diagnostic_for_no_path_names_input() -> i32
+    assert diag_file_view(strview_empty()).eq("<input>")
+    assert diag_file_view("lib/x.ritz").eq("lib/x.ritz")
+    0

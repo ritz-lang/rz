@@ -6,11 +6,11 @@ Three contracts of the `ritz1 src -o out.ll` driver, on both ritz1 binaries
 * A successful compile writes NOTHING to stderr.  The `[MONOMORPH]` debug
   prints that once went there are gone (#1820); this pins that no other
   chatter takes their place, so a clean build log stays clean.
-* The output is written whole or the compile fails.  `write_file` used to
+* The output is written whole or the compile fails.  `write_output_file` used to
   issue one `sys_write` and ignore what it returned: a full disk
   (`/dev/full`, ENOSPC) or a file-size limit that cut the write short left
   a missing or truncated `.ll` behind an exit code of 0.
-* A source bigger than the read chunk compiles: `read_file` appends whole
+* A source bigger than the read chunk compiles: `read_source_file` appends whole
   chunks (`push_bytes`), not one `push` per byte.  The source check pins
   the per-byte loop gone; the large-source compile pins the chunking right.
 """
@@ -128,7 +128,7 @@ def _fn_body(text: str, name: str) -> str:
 
 @pytest.mark.unit
 @pytest.mark.parametrize("path,fn", [
-    ("main.ritz", "read_file"),
+    ("main.ritz", "read_source_file"),
     ("no_effect.ritz", "ne_read_file"),
 ])
 def test_read_helpers_append_whole_chunks(path, fn):

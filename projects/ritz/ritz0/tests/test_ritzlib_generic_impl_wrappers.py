@@ -195,8 +195,39 @@ SHAPES = {
 }
 
 
-def _shape_program(body: str) -> str:
-    return (MOVE_ONLY + "pub fn main() -> i32\n"
+# A global receiver (AGAST #4774): `g.m()` / `(*gp).m()`, where `g` is a
+# struct global by value or `gp` one behind a pointer.  binder_check's
+# `(*g_binder_map).get(k).unwrap_or(0)` was untyped, so once diag imported
+# ritzlib.fs (a move-only Result<DirIter, Errno>) ritz1 refused its own source.
+GLOBALS = """\
+struct Box2
+    a: i32
+    b: i32
+
+impl Box2
+    fn first(self: @Box2) -> Option<i32>
+        return Some(self.a)
+
+var g_box: Box2 = Box2 { a: 0, b: 0 }
+var g_boxp: *Box2 = null
+
+"""
+
+GLOBAL_SHAPES = {
+    "global": ("""\
+    g_box = Box2 { a: 7, b: 1 }
+    return g_box.first().unwrap_or(0) + 8
+""", 15),
+    "deref_of_global_pointer": ("""\
+    var local: Box2 = Box2 { a: 9, b: 2 }
+    g_boxp = @local
+    return (*g_boxp).first().unwrap_or(0) + 7
+""", 16),
+}
+
+
+def _shape_program(body: str, prelude: str = "") -> str:
+    return (MOVE_ONLY + prelude + "pub fn main() -> i32\n"
             "    var mo: Vec<Res> = vec_new<Res>()\n"
             "    let om: Option<Res> = None\n"
             "    if mo.len != 0\n"
@@ -236,6 +267,8 @@ EVERY_METHOD_EXIT = 4 + 26 + 7 + 13
 
 ROWS = ([Row(f"receiver[{name}]", COMPILERS, Run(_shape_program(body), code))
          for name, (body, code) in SHAPES.items()]
+        + [Row(f"receiver[{name}]", COMPILERS, Run(_shape_program(body, GLOBALS), code))
+           for name, (body, code) in GLOBAL_SHAPES.items()]
         + [Row("every_method", COMPILERS, Run(EVERY_METHOD, EVERY_METHOD_EXIT))])
 
 

@@ -113,3 +113,62 @@ def test_no_c_literal_text_outside_the_emitter():
         for line in c_text_forms(p.read_text())
     ]
     assert found == []
+
+
+# AGAST #4774: a source or import path is a StrView from argv on; ritzlib's
+# fd_open and fs terminate it for the kernel, so no ritz1 module holds one as
+# NUL-terminated `*u8`.
+_PATH_NAME = r"(?:[a-z_]*_)?(?:file|path)"
+_PATH_PARAM = re.compile(rf"\b{_PATH_NAME}\s*:\s*\*u8\b")
+_PATH_SLOT = re.compile(rf"^\s*(?:(?:pub\s+)?var\s+g_[a-z_]*(?:file|path|input)|{_PATH_NAME})\s*:\s*\*u8\b")
+_PATH_RETURN = re.compile(rf"^\s*(?:pub\s+)?fn\s+\w*(?:file|path)\s*\(.*\)\s*->\s*\*u8\b")
+
+
+def c_path_forms(text: str) -> list[str]:
+    out = []
+    for raw in text.splitlines():
+        line = rt._code(raw)
+        if rt._FN_LINE.match(line) and (_PATH_PARAM.search(line) or _PATH_RETURN.match(line)):
+            out.append(raw.strip())
+        elif _PATH_SLOT.match(line):
+            out.append(raw.strip())
+    return out
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "fn read_file(path: *u8) -> Vec<u8>",
+        "pub fn diag_error(file: *u8, span: SrcSpan, msg: StrView)",
+        "fn tt_key(main_path: *u8) -> String",
+        "pub fn diag_source_file() -> *u8",
+        "    def_file: *u8",
+        "    file: *u8          # null: the main file",
+        "var g_si_file: *u8 = null",
+        "var g_gi_input: *u8 = null",
+    ],
+)
+def test_a_c_path_param_field_or_global_is_found(line):
+    assert c_path_forms(line) == [line.strip()]
+
+
+def test_a_view_path_and_a_non_path_pointer_are_not():
+    text = (
+        "fn read_file(path: StrView) -> Vec<u8>\n"
+        "fn read_file_to_buf(path: StrView, out_len: *i64) -> *u8\n"
+        "    def_file: StrView\n"
+        "fn emit(name: *u8, profile: i32)\n"
+        "    name: *u8\n"
+        "var g_count: i32 = 0\n"
+    )
+    assert c_path_forms(text) == []
+
+
+def test_no_c_path_in_ritz1():
+    found = [
+        f"{p.name}: {line}"
+        for p in sorted(rt.DEFAULT_SRC.glob("*.ritz"))
+        if not p.name.startswith("emitter") and p.stem not in rt.GENERATED_MODULES
+        for line in c_path_forms(p.read_text())
+    ]
+    assert found == []

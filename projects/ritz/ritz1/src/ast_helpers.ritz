@@ -246,13 +246,13 @@ pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
     # AGAST #4055: a fn gated out never reaches the module, so main's
     # fn-conflict checks can't see two gated to one other target; note it.
     if p.skip_item != 0 and (p.ctx.attr_bits & ATTR_TARGET_ANY) != 0 and fn_def.body != null
-        fn_variant_note(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, fn_def.line, parse_file_copy_shared(p).ptr, attr_target_key(p.ctx))
+        fn_variant_note(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, fn_def.line, parse_file_copy_shared(p), attr_target_key(p.ctx))
     if p.skip_item != 0
         gated_decl_log(p.ctx, StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
         module_add_fn(p.ctx, p.module, fn_def)
         # AGAST #2148: what main.ritz's fn-conflict checks read.
-        fn_def.def_file = parse_file_copy_shared(p).ptr
+        fn_def.def_file = parse_file_copy_shared(p)
         if (p.ctx.attr_bits & ATTR_TARGET_ANY) != 0
             fn_def.target_gated = 1
         if (p.ctx.attr_bits & ATTR_TEST) != 0
@@ -280,7 +280,7 @@ pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
     var exists: i32 = 1
     if p.skip_item != 0
         exists = 0
-    struct_variant_note(p.tokens, p.pos, StrView { ptr: (st.name), len: (st.name_len) as i64 }, parse_file_copy_shared(p).ptr, target, exists)
+    struct_variant_note(p.tokens, p.pos, StrView { ptr: (st.name), len: (st.name_len) as i64 }, parse_file_copy_shared(p), target, exists)
     if p.skip_item != 0
         gated_decl_log(p.ctx, StrView { ptr: (st.name), len: (st.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
@@ -366,7 +366,7 @@ pub fn item_dispatch_enum(p: *Parser) -> i32
 # driver prints its own fallback only when this is 0.
 # State: ParseCtx.parse_reported
 
-pub fn parser_set_source_file(ctx: *ParseCtx, path: *u8)
+pub fn parser_set_source_file(ctx: *ParseCtx, path: StrView)
     ctx.parse_file = path
 
 pub fn parser_reset_diagnostics(ctx: *ParseCtx)
@@ -1440,7 +1440,7 @@ fn impl_block_core(p: *Parser, trait_name_sv: StrView, type_name_sv: StrView, ty
     if trait_name != null
         impl_trait_span(p, trait_name, @ib.trait_span)   # AGAST #3015, #4211
     impl_keyword_span(p, type_name, @ib.impl_span, @ib.type_span)   # AGAST #3162, #3264
-    ib.def_file = parse_file_copy_shared(p).ptr
+    ib.def_file = parse_file_copy_shared(p)
     ib.trait_name = trait_name
     ib.trait_name_len = trait_len
     ib.type_name = type_name
@@ -1456,7 +1456,7 @@ fn impl_block_core(p: *Parser, trait_name_sv: StrView, type_name_sv: StrView, ty
         # (fn_source_file; specialize_impl_method's clone copies it).  Methods
         # never reach main.ritz's fn-conflict checks: those run on
         # m.functions before monomorph appends the specialised methods.
-        mt.def_file = parse_file_copy_shared(p).ptr
+        mt.def_file = parse_file_copy_shared(p)
         if mt.type_params != null
             generic_method_error(p.ctx, tok_span_of(p, mt.name, mt.line), mt, type_name_sv)
         if type_params != null and fn_is_decl(p.ctx, mt) == 1
@@ -1707,18 +1707,12 @@ pub fn decl_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, pa
 # primitive/built-in can be admitted only in the trait's file.
 # State: ParseCtx.trait_files, .trait_count, .trait_cap
 
-fn dup_parse_file_name(path: *u8) -> StrView
-    if path == null
+fn dup_parse_file_name(path: StrView) -> StrView
+    if path.len == 0
         return strview_empty()
-    var n: i64 = 0
-    while *(path + n) != 0
-        n = n + 1
-    let buf: *u8 = malloc(n + 1)
-    var i: i64 = 0
-    while i <= n
-        *(buf + i) = *(path + i)
-        i = i + 1
-    StrView { ptr: (buf), len: (n) as i64 }
+    let buf: *u8 = malloc(path.len)
+    memcpy(buf, path.ptr, path.len)
+    StrView { ptr: buf, len: path.len }
 
 pub fn trait_declared_record(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
@@ -1729,11 +1723,11 @@ pub fn trait_declared_record(ctx: *ParseCtx, name_sv: StrView) -> i32
             cap = 64
         ctx.trait_names = realloc(ctx.trait_names as *u8, (cap as i64) * 8) as **u8
         ctx.trait_lens = realloc(ctx.trait_lens as *u8, (cap as i64) * 4) as *i32
-        ctx.trait_files = realloc(ctx.trait_files as *u8, (cap as i64) * 8) as **u8
+        ctx.trait_files = realloc(ctx.trait_files as *u8, (cap as i64) * sizeof(StrView)) as *StrView
         ctx.trait_cap = cap
     *(ctx.trait_names + ctx.trait_count) = name
     *(ctx.trait_lens + ctx.trait_count) = len
-    *(ctx.trait_files + ctx.trait_count) = dup_parse_file_name(ctx.parse_file).ptr
+    *(ctx.trait_files + ctx.trait_count) = dup_parse_file_name(ctx.parse_file)
     ctx.trait_count = ctx.trait_count + 1
     0
 
@@ -1755,27 +1749,18 @@ pub fn trait_declared(ctx: *ParseCtx, name_sv: StrView) -> i32
         i += 1
     0
 
-fn cstr_eq(a: *u8, b: *u8) -> i32
-    if a == null or b == null
-        return 0
-    var i: i64 = 0
-    while *(a + i) != 0 and *(b + i) != 0
-        if *(a + i) != *(b + i)
-            return 0
-        i = i + 1
-    (*(a + i) == *(b + i)) as i32
-
 # AGAST #4294: is `name` a trait declared in `file`?  The file of the impl
 # (ImplBlock.def_file) is compared with the file the trait was parsed from.
-pub fn trait_declared_in_file(ctx: *ParseCtx, name_sv: StrView, file: *u8) -> i32
+pub fn trait_declared_in_file(ctx: *ParseCtx, name_sv: StrView, file: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if file == null
+    if file.len == 0
         return 0
     var i: i32 = 0
     while i < ctx.trait_count
         if (StrView { ptr: (*(ctx.trait_names + i)), len: (*(ctx.trait_lens + i)) as i64 }).eq(name_sv)
-            if cstr_eq(*(ctx.trait_files + i), file) == 1
+            let tf: StrView = *(ctx.trait_files + i)
+            if tf.len > 0 and tf.eq(file)
                 return 1
         i += 1
     0
@@ -1876,7 +1861,7 @@ pub fn global_var_new(p: *Parser, name_sv: StrView, tr: *TypeRef, init_expr: *Ex
         g.pointee_type_name = f.type_name
         g.pointee_type_name_len = f.type_name_len
     g.init_expr = init_expr
-    g.src_file = parse_file_copy(p).ptr
+    g.src_file = parse_file_copy(p)
     g.line = line
     g.col = col
     g.next = null
@@ -2004,7 +1989,7 @@ pub fn fn_def_new(p: *Parser, name_sv: StrView, params: *Param, ret: *TypeRef, b
     f.next = null
     f.type_params = null  # Non-generic function (field at end to preserve layout)
     f.is_local = 0  # AGAST #194: main() flips this to 1 for the input file's fns.
-    f.def_file = null  # AGAST #2148: item_dispatch_fn sets these three
+    f.def_file = strview_empty()  # AGAST #2148: item_dispatch_fn sets these three
     f.target_gated = 0
     f.from_generated = 0
     f.is_pub = 0   # AGAST #3419: fn_pub sets it for a `pub fn`
@@ -2032,7 +2017,7 @@ pub fn extern_fn_def_new(p: *Parser, name_sv: StrView, params: *Param, ret: *Typ
     f.next = null
     f.type_params = null  # Non-generic function (field at end to preserve layout)
     f.is_local = 0
-    f.def_file = null
+    f.def_file = strview_empty()
     f.target_gated = 0
     f.from_generated = 0
     f.is_pub = 0
@@ -2190,7 +2175,7 @@ pub fn trait_bound_new(p: *Parser, name_sv: StrView, line: i32, col: i32, rest: 
     b.name = name
     b.name_len = len
     b.span = diag_span(line, col)
-    b.file = parse_file_copy_shared(p).ptr
+    b.file = parse_file_copy_shared(p)
     b.next = rest
     return b
 
@@ -2218,7 +2203,7 @@ pub fn generic_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam,
     f.next = null
     f.type_params = type_params  # Generic type parameters
     f.is_local = 0  # AGAST #194: generic templates are skipped in emit
-    f.def_file = null
+    f.def_file = strview_empty()
     f.target_gated = 0
     f.from_generated = 0
     f.is_pub = 0
@@ -2237,7 +2222,7 @@ pub fn generic_struct_def_new(p: *Parser, name_sv: StrView, type_params: *TypePa
     s.fields = fields
     s.next = null
     s.type_params = type_params  # Generic type parameters (field at end to preserve layout)
-    s.def_file = parse_file_copy_shared(p).ptr   # AGAST #3494 (R65)
+    s.def_file = parse_file_copy_shared(p)   # AGAST #3494 (R65)
     tn_claim(p, type_params, null)   # AGAST #4021
     return s
 
@@ -2271,7 +2256,7 @@ pub fn const_new(p: *Parser, name_sv: StrView, tr: *TypeRef, val: *Expr, line: i
     # ConstEntry for non-integer constants (value_expr, array_size, etc.).
     let c: *ConstEntry = parser_alloc(p, sizeof(ConstEntry)) as *ConstEntry
     c.name = name as *u8
-    c.def_file = parse_file_copy_shared(p).ptr
+    c.def_file = parse_file_copy_shared(p)
     c.target_gated = 0  # item_dispatch_const sets it
     c.name_len = len
     c.const_type = ty
@@ -2281,7 +2266,7 @@ pub fn const_new(p: *Parser, name_sv: StrView, tr: *TypeRef, val: *Expr, line: i
     # int_val is 0, so every negative const silently became 0.
     c.value = 0
     c.fold_state = CONST_FOLD_DONE
-    c.src_file = null
+    c.src_file = strview_empty()
     c.line = line
     c.col = col
     var folded: i64 = 0
@@ -2292,7 +2277,7 @@ pub fn const_new(p: *Parser, name_sv: StrView, tr: *TypeRef, val: *Expr, line: i
         # is not a constant at all: the emitter decides once every module is
         # merged, and reports a located error if it still does not fold.
         c.fold_state = CONST_FOLD_PENDING
-        c.src_file = parse_file_copy(p).ptr
+        c.src_file = parse_file_copy(p)
     else if val != null and val.kind == ExprKind.IntLit
         # Non-integer declared types (float, struct/alias, ...) keep the
         # legacy literal fast path; their real lowering reads value_expr.
@@ -2832,7 +2817,7 @@ fn enum_new(p: *Parser, name_sv: StrView, generic: i32, repr: TypeKind, line: i3
     e.line = line
     e.variants = null
     e.next = null
-    e.def_file = parse_file_copy_shared(p).ptr   # AGAST #3494 (R65)
+    e.def_file = parse_file_copy_shared(p)   # AGAST #3494 (R65)
     if p.module.enums == null
         p.module.enums = e
     else
@@ -3186,7 +3171,7 @@ pub fn enum_record_instance(ctx: *ParseCtx, base: i32, name_sv: StrView, fields:
     e.line = be.line
     e.variants = null
     e.next = null
-    e.def_file = null   # AGAST #3494 (R65): an instance is declared by no file
+    e.def_file = strview_empty()   # AGAST #3494 (R65): an instance is declared by no file
     if ctx.program_enums == null
         ctx.program_enums = e
     else
@@ -3439,22 +3424,22 @@ fn enum_variant_slot_node(e: *EnumDef, name_sv: StrView) -> i32
 # seen alone is the variant's enum, as ritz0's `_qualify_seen_variants`
 # writes it qualified.  type_twins.ritz fills the table, only for the enums
 # that share a variant name; with none, nothing is filtered.
-pub fn variant_view_add(ctx: *ParseCtx, site: *u8, e: *EnumDef, seen: i32)
+pub fn variant_view_add(ctx: *ParseCtx, site: StrView, e: *EnumDef, seen: i32)
     ctx.variant_views.push(VariantView { site: site, e: e, seen: seen })
 
 pub fn variant_views_reset(ctx: *ParseCtx)
     ctx.variant_views.len = 0
 
-pub fn variant_site_set(ctx: *ParseCtx, site: *u8)
+pub fn variant_site_set(ctx: *ParseCtx, site: StrView)
     ctx.variant_site = site
 
 fn variant_seen_at_site(ctx: *ParseCtx, e: *EnumDef) -> i32
-    if ctx.variant_site == null
+    if ctx.variant_site.len == 0
         return 1
     var i: i64 = 0
     while i < ctx.variant_views.len
         let v: *VariantView = ctx.variant_views.get_ptr(i)
-        if v.e == e and v.site == ctx.variant_site
+        if v.e == e and v.site.ptr == ctx.variant_site.ptr   # one parse's shared copy
             return v.seen
         i = i + 1
     1

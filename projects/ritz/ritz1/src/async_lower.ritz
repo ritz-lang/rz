@@ -80,7 +80,7 @@ struct AlAsync
 
 var g_al_async: *AlAsync = null
 var g_al_module: *Module = null
-var g_al_path: *u8 = null
+var g_al_path: StrView
 
 fn al_find_async(name_sv: StrView) -> *AlAsync
     var name: *u8 = name_sv.ptr
@@ -133,11 +133,9 @@ fn al_find_fn(name_sv: StrView) -> *FnDef
 
 # The file a fn's diagnostics name.
 fn al_file(f: *FnDef) -> StrView
-    if f.is_local == 0 and f.def_file != null
-        return strview_from_cstr(f.def_file)
-    if g_al_path == null
-        return strview_empty()
-    strview_from_cstr(g_al_path)
+    if f.is_local == 0 and f.def_file.len > 0
+        return f.def_file
+    g_al_path
 
 # ---------------------------------------------------------------------------
 # Analysis: the await points and the locals of one async fn
@@ -214,7 +212,7 @@ struct AlDest
 
 struct AlFn
     f: *FnDef
-    file: *u8
+    file: StrView
     locals: *AlLocal
     points: *AlPoint
     npoints: i32        # the awaits in the body
@@ -237,7 +235,7 @@ struct AlFn
 
 fn al_fn_init(a: *AlFn, f: *FnDef, sync: i32)
     a.f = f
-    a.file = al_file(f).ptr
+    a.file = al_file(f)
     a.locals = null
     a.points = null
     a.npoints = 0
@@ -778,7 +776,7 @@ fn al_await_helper(g: *AlAsync, span: SrcSpan) -> *FnDef
     orig.col = span.col
     orig.is_local = 1
     orig.is_pub = 0
-    orig.def_file = null   # private to this file, which defines it
+    orig.def_file = strview_empty()   # private to this file, which defines it
     orig.target_gated = 0
     let f: *FnDef = al_fn(@orig, name, params, g.f.return_type, StrView { ptr: (g.f.return_type_name), len: (g.f.return_type_name_len) as i64 }, body)
     module_append_fn(g_al_module, f)
@@ -817,7 +815,7 @@ fn al_held_helper(g: *AlAsync, span: SrcSpan) -> *FnDef
     orig.col = span.col
     orig.is_local = 1
     orig.is_pub = 0
-    orig.def_file = null   # private to this file, which defines it
+    orig.def_file = strview_empty()   # private to this file, which defines it
     orig.target_gated = 0
     let f: *FnDef = al_fn(@orig, name, p, g.f.return_type, StrView { ptr: (g.f.return_type_name), len: (g.f.return_type_name_len) as i64 }, body)
     module_append_fn(g_al_module, f)
@@ -829,7 +827,7 @@ fn al_held_helper(g: *AlAsync, span: SrcSpan) -> *FnDef
 #         continue
 #     __future.__result              # as `tail` says
 fn al_drive_body(ctor_sv: StrView, args: *Expr, fut_sv: StrView, poll_sv: StrView, tail: i32, span: SrcSpan) -> *Stmt
-    var body: *Stmt = al_decl("__future", TypeKind.Struct, fut_sv, al_call(ctor_sv, args, span), 0, null, span)
+    var body: *Stmt = al_decl("__future", TypeKind.Struct, fut_sv, al_call(ctor_sv, args, span), 0, strview_empty(), span)
     let w: *Stmt = al_stmt(StmtKind.While, span)
     w.while_cond = al_poll_not_ready(al_call(poll_sv, al_addr_of("__future", span), span))
     w.while_body = al_stmt(StmtKind.Continue, span)
@@ -2869,7 +2867,7 @@ fn al_poll(a: *AlFn, name_sv: StrView, fut_sv: StrView) -> *FnDef
     # A private async fn is refused once, at the call of its constructor:
     # cc_private skips a fn with no file.  (Not from_generated, which would
     # make a pub poll weak_odr.)  A local poll's file is the input's anyway.
-    poll.def_file = null
+    poll.def_file = strview_empty()
     poll
 
 # Analyse async fn `f`; 0, or the errors it reported.
@@ -3028,7 +3026,7 @@ fn al_push_type(m: @&String, s: *Stmt)
     if n.ptr != null
         m.push_span(Span<u8> { ptr: (n.ptr), len: (n.len) as i64 })
 
-fn al_bare_call_error(file: *u8, call: *Expr) -> i32
+fn al_bare_call_error(file: StrView, call: *Expr) -> i32
     var m: String = string_new()
     m.push_str("calling async fn `")
     m.push_span(Span<u8> { ptr: call.func_name.ptr, len: (call.func_name.len) as i64 })
@@ -3038,7 +3036,7 @@ fn al_bare_call_error(file: *u8, call: *Expr) -> i32
     diag_error_buf(file, call.span, @m)
     1
 
-fn al_typed_let_error(file: *u8, s: *Stmt, call: *Expr) -> i32
+fn al_typed_let_error(file: StrView, s: *Stmt, call: *Expr) -> i32
     var m: String = string_new()
     m.push_str("`")
     m.push_span(Span<u8> { ptr: (s.var_name), len: (s.var_name_len as i64) as i64 })
@@ -3054,7 +3052,7 @@ fn al_typed_let_error(file: *u8, s: *Stmt, call: *Expr) -> i32
 
 # The bare async calls of a statement list.  `value` is 1 when the list's
 # last statement is the value of its fn (a `-> T` fn's tail, or an arm of one).
-fn al_bare_stmts(file: *u8, s: *Stmt, value: i32) -> i32
+fn al_bare_stmts(file: StrView, s: *Stmt, value: i32) -> i32
     var errs: i32 = 0
     var cur: *Stmt = s
     while cur != null
@@ -3088,7 +3086,7 @@ fn al_bare_stmts(file: *u8, s: *Stmt, value: i32) -> i32
         cur = cur.next
     errs
 
-fn al_bare_arms(file: *u8, arm: *MatchArm, value: i32) -> i32
+fn al_bare_arms(file: StrView, arm: *MatchArm, value: i32) -> i32
     var errs: i32 = 0
     var cur: *MatchArm = arm
     while cur != null
@@ -3284,7 +3282,7 @@ fn al_inject_future(m: *Module)
     orig.col = 1
     orig.is_local = 1
     orig.is_pub = 0
-    orig.def_file = null
+    orig.def_file = strview_empty()
     orig.target_gated = 0
     let st: *StructDef = al_zalloc(sizeof(StructDef)) as *StructDef
     st.name = c"Future"
@@ -3335,7 +3333,7 @@ fn al_inject_future(m: *Module)
 # Lower every async fn of `m` and every await, after refusing each bare call
 # to an async fn.  `path` is the input file.  Returns the errors it reported;
 # main stops on any.
-pub fn async_lower_module(m: *Module, path: *u8) -> i32
+pub fn async_lower_module(m: *Module, path: StrView) -> i32
     g_al_module = m
     g_al_path = path
     g_al_async = null

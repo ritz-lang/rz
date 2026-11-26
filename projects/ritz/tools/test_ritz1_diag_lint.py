@@ -106,7 +106,7 @@ def test_allowlist_only_names_files_that_still_need_it():
 @pytest.mark.unit
 def test_diag_module_prints_the_prefix():
     text = (SRC / DIAG).read_text()
-    assert "pub fn diag_error(file: *u8, span: SrcSpan, msg: StrView)" in text
+    assert "pub fn diag_error(file: StrView, span: SrcSpan, msg: StrView)" in text
     assert 'eprints(": error: ")' in text
 
 

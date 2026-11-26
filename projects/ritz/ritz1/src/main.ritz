@@ -55,6 +55,8 @@ import import_vis     # a plain import is private (AGAST #3891)
 import sema_probe     # RITZ1_SEMA_PROBE (AGAST #3501)
 import emitter
 import fn_cache
+import ritzlib.fd   # every path is a StrView up to fd_open (AGAST #4774)
+import ritzlib.fs { path_basename }
 import sha256
 import iface_text   # interface texts ritz1 writes (AGAST #2113)
 import emitter_core
@@ -64,17 +66,9 @@ import emitter_core
 # =============================================================================
 
 # Print "prefix<path>suffix\n" as a single error line.
-fn err2(prefix: StrView, path: *u8) -> i32
+fn err2(prefix: StrView, path: StrView) -> i32
     var s: String = string_from_strview(prefix)
-    s.push_str(strview_from_cstr(path))
-    eprintln_string(@s)
-    -1
-
-# Print "prefix<path>middle<extra>\n" as a single error line.
-fn err3(prefix: StrView, path: *u8, extra: *u8) -> i32
-    var s: String = string_from_strview(prefix)
-    s.push_str(strview_from_cstr(path))
-    s.push_str(strview_from_cstr(extra))
+    s.push_str(path)
     eprintln_string(@s)
     -1
 
@@ -102,10 +96,10 @@ fn ir_arena_open() -> Arena
         sys_exit(1)
     arena
 
-fn read_file(path: *u8) -> Vec<u8>
+fn read_source_file(path: StrView) -> Vec<u8>
     var buf: Vec<u8> = vec_new<u8>()
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
+    var file: Fd = fd_open(path, O_RDONLY, 0).unwrap_or(fd_adopt(-1))
+    if not file.valid()
         err2("Error: Cannot open file: ", path)
         return buf
 
@@ -114,32 +108,26 @@ fn read_file(path: *u8) -> Vec<u8>
     let chunk_ptr: *u8 = @chunk[0]
     var n: i64 = 1
     while n > 0
-        n = sys_read(fd, chunk_ptr, 4096)
+        n = file.read(Span<u8> { ptr: chunk_ptr, len: 4096 }).unwrap_or(0)
         if n > 0
             buf.push_bytes(chunk_ptr, n)
 
-    sys_close(fd)
+    file.close()
     # Add null terminator
     buf.push(0)
     buf
 
-fn write_file(path: *u8, data_sv: StrView) -> i32
-    var data: *u8 = data_sv.ptr
-    var len: i64 = data_sv.len
-    let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 420)
-    if fd < 0
+fn write_output_file(path: StrView, data: StrView) -> i32
+    var file: Fd = fd_open(path, O_WRONLY + O_CREAT + O_TRUNC, 420).unwrap_or(fd_adopt(-1))
+    if not file.valid()
         return err2("Error: Cannot create output file: ", path)
     # A write may take only part of the bytes (a file-size limit, a signal):
-    # write the rest, and fail on an error such as ENOSPC rather than leave a
-    # truncated .ll behind exit 0 (AGAST #4454).
-    while len > 0
-        let n: i64 = sys_write(fd, data, len)
-        if n <= 0
-            sys_close(fd)
-            return err2("Error: Cannot write output file: ", path)
-        data = data + n
-        len = len - n
-    if sys_close(fd) < 0
+    # write_all writes the rest, and an error such as ENOSPC fails rather
+    # than leave a truncated .ll behind exit 0 (AGAST #4454).
+    if file.write_str(data).is_err()
+        file.close()
+        return err2("Error: Cannot write output file: ", path)
+    if file.close().is_err()
         return err2("Error: Cannot write output file: ", path)
     0
 
@@ -147,7 +135,7 @@ fn write_file(path: *u8, data_sv: StrView) -> i32
 # Tokenizer
 # =============================================================================
 
-fn tokenize(path: *u8, src_sv: StrView, tokens: *Vec<Token>) -> i32
+fn tokenize(path: StrView, src_sv: StrView, tokens: *Vec<Token>) -> i32
     var src: *u8 = src_sv.ptr
     var src_len: i64 = src_sv.len
     # The scanner is code: nothing to build per file (AGAST #1821).
@@ -176,7 +164,7 @@ fn tokenize(path: *u8, src_sv: StrView, tokens: *Vec<Token>) -> i32
             # "error: <path>:<line>:<col>: <what>", like the parser's
             # diagnostics (AGAST #1813).
             var msg: String = string_from("error: ")
-            msg.push_str(strview_from_cstr(path))
+            msg.push_str(path)
             msg.push_str(":")
             msg.push_i64(line as i64)
             msg.push_str(":")
@@ -245,7 +233,7 @@ fn imports_option(m: *Module) -> i32
 # its source: ritz0 does the same (parser.py, _enum_from_fns).  Only for a
 # module that imports ritzlib.option; elsewhere `E.from` is a located error
 # (emit_expr_method).  Returns -1 on a lex/parse failure of the generated text.
-fn add_enum_from_fns(ctx: *ParseCtx, m: *Module, path: *u8) -> i32
+fn add_enum_from_fns(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
     if imports_option(m) == 0
         return 0
     var text: String = string_new()
@@ -293,7 +281,7 @@ var g_test_table: i32 = 0
 # local and go through every later pass like any other.  An async main is
 # left to async_lower, which gives it its own synchronous wrapper.  Returns
 # -1 on an error (already reported); the module is unchanged then.
-fn lower_main(ctx: *ParseCtx, m: *Module, path: *u8) -> i32
+fn lower_main(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
     if g_test_table == 1
         return 0
     let f: *FnDef = main_abi_find(m)
@@ -370,28 +358,16 @@ fn mark_import_processed(path: String)
 # reached by two spellings (a relative import and the RITZ_PATH symlink farm,
 # or an import cycle back to the main file) is merged once.  The raw path if
 # it cannot be canonicalised.
-fn import_key(path: *u8) -> String
+fn import_key(path: StrView) -> String
     var key: String = string_new()
     if push_canonical_path(@key, path) == 0
-        key.push_str(strview_from_cstr(path))
+        key.push_str(path)
     key
 
 # Return the directory portion (up to and including the trailing '/'), or
 # an empty StrView if path has no directory component.
-fn path_dir(path: *u8) -> StrView
-    var len: i64 = 0
-    var last_slash: i64 = -1
-    while *(path + len) != 0
-        if *(path + len) == '/'
-            last_slash = len
-        len += 1
-    var sv: StrView
-    sv.ptr = path
-    if last_slash >= 0
-        sv.len = last_slash + 1
-    else
-        sv.len = 0
-    sv
+fn path_dir(path: StrView) -> StrView
+    StrView { ptr: path.ptr, len: path.len - path_basename(path).len }
 
 # Return the parent directory view of `dir` (which is expected to end in '/').
 # E.g. parent_dir_view("/a/b/c/") -> "/a/b/" with len pointing at trailing slash.
@@ -434,7 +410,7 @@ fn build_import_path(dir: StrView, imp: *ImportPath) -> String
 # probes the two values that every workspace project actually uses (lib, src).
 # Returns an empty String when there is no remaining segment after the pkg
 # name (e.g. bare `import pkg`) — the subdir probe would be meaningless.
-fn build_import_path_with_sub(dir: StrView, imp: *ImportPath, sub: *u8) -> String
+fn build_import_path_with_sub(dir: StrView, imp: *ImportPath, sub: StrView) -> String
     if imp == null
         return string_new()
     if imp.next == null
@@ -447,7 +423,7 @@ fn build_import_path_with_sub(dir: StrView, imp: *ImportPath, sub: *u8) -> Strin
     out.push_span(Span<u8> { ptr: (imp.segment), len: (imp.segment_len as i64) as i64 })
     out.push('/')
     # The subdir (e.g. "lib" or "src").
-    out.push_str(strview_from_cstr(sub))
+    out.push_str(sub)
     out.push('/')
     # Remaining segments.
     var seg: *ImportPath = imp.next
@@ -458,6 +434,16 @@ fn build_import_path_with_sub(dir: StrView, imp: *ImportPath, sub: *u8) -> Strin
         seg = seg.next
     out.push_str(".ritz")
     out
+
+# 1 when the import candidate at `candidate` opens.  A miss is recorded for
+# the sig's fast path (dep_record_miss, AGAST #2030).
+fn probe_candidate(candidate: StrView) -> bool
+    var file: Fd = fd_open(candidate, O_RDONLY, 0).unwrap_or(fd_adopt(-1))
+    if file.valid()
+        file.close()
+        return true
+    dep_record_miss(candidate)
+    false
 
 # Does the first segment of this import path equal "ritzlib"?
 fn import_is_ritzlib(imp: *ImportPath) -> i32
@@ -503,11 +489,8 @@ fn try_open_dep_import(imp: *ImportPath) -> String
                     dir.ptr = g_dep_ptr + eq + 1
                     dir.len = di - eq - 1
                     var candidate: String = build_import_path(dir, imp.next)
-                    let fd: i32 = sys_open(candidate.as_ptr(), O_RDONLY)
-                    if fd >= 0
-                        sys_close(fd)
+                    if probe_candidate(candidate.as_view())
                         return candidate
-                    dep_record_miss(candidate.as_ptr())
             ds = di + 1
         di = di + 1
     string_new()
@@ -556,11 +539,8 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
                 dir_view.ptr = sd_ptr
                 dir_view.len = sd_len
                 var candidate: String = build_import_path(dir_view, imp)
-                let fd: i32 = sys_open(candidate.as_ptr(), O_RDONLY)
-                if fd >= 0
-                    sys_close(fd)
+                if probe_candidate(candidate.as_view())
                     return candidate
-                dep_record_miss(candidate.as_ptr())
 
                 # Climb to parent directory.
                 var parent_view: StrView
@@ -603,12 +583,9 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
                 seg_direct.ptr = seg_ptr
                 seg_direct.len = seg_len
                 var candidate: String = build_import_path(seg_direct, imp)
-                let fd: i32 = sys_open(candidate.as_ptr(), O_RDONLY)
-                if fd >= 0
-                    sys_close(fd)
+                if probe_candidate(candidate.as_view())
                     *found_via_ritz_path = 1
                     return candidate
-                dep_record_miss(candidate.as_ptr())
 
                 # Workspace probes: <entry>/<pkg>/lib/<rest>.ritz and
                 # <entry>/<pkg>/src/<rest>.ritz. Mirrors ritz0's
@@ -620,26 +597,18 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
                 var seg_lib: StrView
                 seg_lib.ptr = seg_ptr
                 seg_lib.len = seg_len
-                var c_lib: String = build_import_path_with_sub(seg_lib, imp, c"lib")
-                if c_lib.len() > 0
-                    let fd_lib: i32 = sys_open(c_lib.as_ptr(), O_RDONLY)
-                    if fd_lib >= 0
-                        sys_close(fd_lib)
-                        *found_via_ritz_path = 1
-                        return c_lib
-                    dep_record_miss(c_lib.as_ptr())
+                var c_lib: String = build_import_path_with_sub(seg_lib, imp, "lib")
+                if c_lib.len() > 0 and probe_candidate(c_lib.as_view())
+                    *found_via_ritz_path = 1
+                    return c_lib
 
                 var seg_src: StrView
                 seg_src.ptr = seg_ptr
                 seg_src.len = seg_len
-                var c_src: String = build_import_path_with_sub(seg_src, imp, c"src")
-                if c_src.len() > 0
-                    let fd_src: i32 = sys_open(c_src.as_ptr(), O_RDONLY)
-                    if fd_src >= 0
-                        sys_close(fd_src)
-                        *found_via_ritz_path = 1
-                        return c_src
-                    dep_record_miss(c_src.as_ptr())
+                var c_src: String = build_import_path_with_sub(seg_src, imp, "src")
+                if c_src.len() > 0 and probe_candidate(c_src.as_view())
+                    *found_via_ritz_path = 1
+                    return c_src
 
             if had_delim == 0
                 # No more delimiters; we already tried `seg` (the full
@@ -759,7 +728,7 @@ fn consts_same(a: *ConstEntry, b: *ConstEntry) -> i32
 # Report every const of `other` (the import at `path`, with everything it
 # imported merged in) that `m` already defines differently, at the
 # definition's own file:line:col.  Returns -1 if there was one, else 0.
-fn check_const_conflicts(m: *Module, other: *Module, path: *u8) -> i32
+fn check_const_conflicts(m: *Module, other: *Module, path: StrView) -> i32
     var bad: i32 = 0
     var c: *ConstEntry = other.constants
     while c != null
@@ -768,10 +737,10 @@ fn check_const_conflicts(m: *Module, other: *Module, path: *u8) -> i32
             if e.target_gated == c.target_gated and bytes_same(StrView { ptr: (e.name), len: (e.name_len) as i64 }, StrView { ptr: (c.name), len: (c.name_len) as i64 }) == 1
                 if consts_same(e, c) == 0
                     var msg: String = string_from("Error: ")
-                    if c.def_file != null
-                        msg.push_str(strview_from_cstr(c.def_file))
+                    if c.def_file.len > 0
+                        msg.push_str(c.def_file)
                     else
-                        msg.push_str(strview_from_cstr(path))
+                        msg.push_str(path)
                     msg.push(':')
                     msg.push_i64(c.line as i64)
                     msg.push(':')
@@ -815,7 +784,7 @@ fn check_const_conflicts(m: *Module, other: *Module, path: *u8) -> i32
 
 # 1 if `a` and `b` are two definitions of one fn name that may not coexist.
 fn fns_conflict(a: *FnDef, b: *FnDef) -> i32
-    if a.def_file == null or b.def_file == null
+    if a.def_file.len == 0 or b.def_file.len == 0
         return 0
     if a.body == null or b.body == null
         return 0
@@ -833,7 +802,7 @@ fn fns_conflict(a: *FnDef, b: *FnDef) -> i32
 # #1858): a private fn is in its own file's namespace only, so it clashes
 # only with a `pub` fn its file imports (directly, or by `pub import`).
 fn fns_coexist(a: *FnDef, b: *FnDef) -> i32
-    if streq(a.def_file, b.def_file)
+    if a.def_file.eq(b.def_file)
         return 0
     if a.is_pub == 1 and b.is_pub == 1
         return 0
@@ -845,7 +814,7 @@ fn fns_coexist(a: *FnDef, b: *FnDef) -> i32
         private = b
         public = a
     var key: String = import_key(private.def_file)
-    let sees: i32 = vis_sees(key.as_ptr(), public)
+    let sees: i32 = vis_sees(key.as_view(), public)
     1 - sees
 
 # Of the ungated fns of one name fns_coexist let through, keep the one the
@@ -900,15 +869,15 @@ fn keep_one_fn(m: *Module)
 # both <earlier> and <later>"
 fn report_fn_conflict(earlier: *FnDef, later: *FnDef)
     var msg: String = string_from("Error: ")
-    msg.push_str(strview_from_cstr(later.def_file))
+    msg.push_str(later.def_file)
     msg.push(':')
     msg.push_i64(later.line as i64)
     msg.push_str(": Conflicting function definition for '")
     msg.push_span(Span<u8> { ptr: (later.name), len: (later.name_len as i64) as i64 })
     msg.push_str("': defined in both ")
-    msg.push_str(strview_from_cstr(earlier.def_file))
+    msg.push_str(earlier.def_file)
     msg.push_str(" and ")
-    msg.push_str(strview_from_cstr(later.def_file))
+    msg.push_str(later.def_file)
     eprintln_string(@msg)
 
 # Two definitions of one name inside a single freshly parsed file `m` (its
@@ -933,14 +902,14 @@ fn check_fn_dups_in_file(m: *Module) -> i32
 # imported merged in) that `m` already defines.  `m` holds m_path's own fns
 # and those of its earlier imports; m_path's own come after `other`'s.
 # Returns -1 if there was a conflict, else 0.
-fn check_fn_conflicts(m: *Module, other: *Module, m_path: *u8) -> i32
+fn check_fn_conflicts(m: *Module, other: *Module, m_path: StrView) -> i32
     var bad: i32 = 0
     var c: *FnDef = other.functions
     while c != null
         var e: *FnDef = m.functions
         while e != null
             if fns_conflict(e, c) == 1
-                if streq(e.def_file, m_path)
+                if e.def_file.eq(m_path)
                     report_fn_conflict(c, e)
                 else
                     report_fn_conflict(e, c)
@@ -1035,27 +1004,26 @@ fn merge_module_into(m: *Module, other: *Module)
 fn read_iface_text(path: @&String) -> Vec<u8>
     if path.len() == 0
         return vec_new<u8>()
-    let fd: i32 = sys_open(path.as_ptr(), O_RDONLY)
-    if fd < 0
+    var file: Fd = fd_open(path.as_view(), O_RDONLY, 0).unwrap_or(fd_adopt(-1))
+    if not file.valid()
         return vec_new<u8>()
-    sys_close(fd)
-    let text: Vec<u8> = read_file(path.as_ptr())
+    file.close()
+    let text: Vec<u8> = read_source_file(path.as_view())
     text
 
 # RITZ1_PARSE_LOG: note that `path`'s source is being lexed and parsed.
-fn parse_log_note(path: *u8)
+fn parse_log_note(path: StrView)
     let log: StrView = env_get_or("RITZ1_PARSE_LOG", strview_empty())
     if log.len == 0
         return
-    var log_path: String = string_from_strview(log)
-    let fd: i32 = sys_open3(log_path.as_ptr(), O_WRONLY + O_CREAT + O_APPEND, 420)
-    if fd < 0
+    var file: Fd = fd_open(log, O_WRONLY + O_CREAT + O_APPEND, 420).unwrap_or(fd_adopt(-1))
+    if not file.valid()
         return
     var line: String = string_new()
-    line.push_str(strview_from_cstr(path))
+    line.push_str(path)
     line.push('\n')
-    sys_write(fd, line.as_ptr(), line.len() as i64)
-    sys_close(fd)
+    file.write_str(line.as_view())
+    file.close()
 
 # 1 when environment variable `name` holds a truthy value; 0 when it is
 # unset, empty or "0".  (RITZ1_PARSE_ONLY, AGAST #4379.)
@@ -1156,8 +1124,8 @@ fn iface_fix_extern_decls(m: *Module, text_sv: StrView, src_sv: StrView)
 # failure (already reported to stderr).  Steals the buffers' data to keep
 # the AST-pointed-into bytes alive via keep_source_alive().
 fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
-    let path_ptr: *u8 = path.as_ptr()
-    var src: Vec<u8> = read_file(path_ptr)
+    let file: StrView = path.as_view()
+    var src: Vec<u8> = read_source_file(file)
     if src.len == 0
         return null
 
@@ -1171,12 +1139,12 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
         lex_buf = text.data
         lex_len = text.len - 1
     else
-        parse_log_note(path_ptr)
+        parse_log_note(file)
 
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
-    let lex_err: i32 = tokenize(path_ptr, StrView { ptr: (lex_buf), len: (lex_len) }, @tokens)
+    let lex_err: i32 = tokenize(file, StrView { ptr: (lex_buf), len: (lex_len) }, @tokens)
     if lex_err > 0
-        err2("Lexer errors in: ", path_ptr)
+        err2("Lexer errors in: ", file)
         return null
 
     # A miss: the interface text, from the tokens as the lexer made them.
@@ -1187,13 +1155,13 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
 
     # AGAST #4609: the twins this file sees, renamed for the second pass;
     # after the interface text is made, which keeps the source's names.
-    twin_rename_tokens(ctx, path_ptr, tokens.data, tokens.len)
+    twin_rename_tokens(ctx, file, tokens.data, tokens.len)
 
     # Name the file in parse diagnostics (AGAST #1301).
-    parser_set_source_file(ctx, path_ptr)
+    parser_set_source_file(ctx, file)
     let mod: *Module = parse_tokens(ctx, @tokens)
     if mod == null
-        err2("Parse error in: ", path_ptr)
+        err2("Parse error in: ", file)
         return null
     # The cached IR depends on the interface text (AGAST #1807, #2113): the
     # one read, or the one stored now.  If none could be stored, on the
@@ -1209,10 +1177,10 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
         if iface_text_store(@&text_path, StrView { ptr: (made.data), len: (made.len) }) == 0
             dep_buf = made.data
             dep_len = made.len
-    if add_enum_from_fns(ctx, mod, path_ptr) < 0
+    if add_enum_from_fns(ctx, mod, file) < 0
         return null
 
-    dep_record_note(path_ptr, StrView { ptr: (dep_buf), len: (dep_len) })
+    dep_record_note(file, StrView { ptr: (dep_buf), len: (dep_len) })
 
     # Keep the lexed buffer alive: AST nodes point into it.
     keep_source_alive(lex_buf)
@@ -1275,9 +1243,9 @@ fn strip_to_interface(ctx: *ParseCtx, m: *Module)
 
 # Resolve imports recursively, merging into the main module.
 # `m_path` is m's own file (AGAST #2148: check_fn_conflicts' ordering).
-fn resolve_imports(ctx: *ParseCtx, m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrView) -> i32
+fn resolve_imports(ctx: *ParseCtx, m: *Module, m_path: StrView, source_dir: StrView, ritz_path: StrView) -> i32
     var m_key: String = import_key(m_path)
-    let vm: *VisMod = vis_module(m_key.as_ptr())
+    let vm: *VisMod = vis_module(m_key.as_view())
     var imp: *ImportDecl = m.imports
     while imp != null
         # Find the import file.
@@ -1291,9 +1259,9 @@ fn resolve_imports(ctx: *ParseCtx, m: *Module, m_path: *u8, source_dir: StrView,
             return -1
 
         # Cycle detection.
-        var key: String = import_key(path.as_ptr())
-        vis_edge(vm, key.as_ptr(), imp)   # AGAST #3891
-        let import_vm: *VisMod = vis_module(key.as_ptr())
+        var key: String = import_key(path.as_view())
+        vis_edge(vm, key.as_view(), imp)   # AGAST #3891
+        let import_vm: *VisMod = vis_module(key.as_view())
         if was_import_processed(@key) == 1
             imp = imp.next
             continue
@@ -1324,12 +1292,12 @@ fn resolve_imports(ctx: *ParseCtx, m: *Module, m_path: *u8, source_dir: StrView,
         # ritzlib's internal imports are not affected — try_open_import
         # special-cases ritzlib.* and skips source_dir for those, so
         # they continue to flow through RITZ_PATH.
-        let child_dir: StrView = path_dir(path.as_ptr())
-        let res: i32 = resolve_imports(ctx, import_module, path.as_ptr(), child_dir, ritz_path)
+        let child_dir: StrView = path_dir(path.as_view())
+        let res: i32 = resolve_imports(ctx, import_module, path.as_view(), child_dir, ritz_path)
         if res < 0
             return -1
 
-        if check_const_conflicts(m, import_module, path.as_ptr()) < 0
+        if check_const_conflicts(m, import_module, path.as_view()) < 0
             return -1
         if check_fn_conflicts(m, import_module, m_path) < 0
             return -1
@@ -1344,8 +1312,8 @@ fn resolve_imports(ctx: *ParseCtx, m: *Module, m_path: *u8, source_dir: StrView,
 # =============================================================================
 
 struct CliArgs
-    input_path: *u8
-    output_path: *u8
+    input_path: StrView
+    output_path: StrView
     ritz_path: StrView    # .len == 0 if none was supplied
     dash_dash: i32
     # `--target-os <os>` (AGAST #1550): selects `[[target_os = "..."]]`
@@ -1439,12 +1407,13 @@ fn dashdash_output_path() -> StrView
     *(dst + i) = 0
     StrView { ptr: (dst), len: (i) as i64 }
 
-# `argv` is main's `args` (#204): each view points into the kernel's argv,
-# so its `.ptr` is NUL-terminated and serves as a `*u8` path.
+# `argv` is main's `args` (#204): each view points into the kernel's argv.
+# A path stays a StrView from here on (AGAST #4774); ritzlib's fd_open and
+# fs terminate it for the syscall.
 fn parse_cli(argv: Span<StrView>) -> CliArgs
     var args: CliArgs
-    args.input_path = null
-    args.output_path = null
+    args.input_path = strview_empty()
+    args.output_path = strview_empty()
     args.ritz_path.ptr = null
     args.ritz_path.len = 0
     args.dash_dash = 0
@@ -1469,20 +1438,20 @@ fn parse_cli(argv: Span<StrView>) -> CliArgs
         args.dash_dash = 1
         if argv.len < 3
             return args
-        args.input_path = argv[2].ptr
-        args.output_path = dashdash_output_path().ptr
+        args.input_path = argv[2]
+        args.output_path = dashdash_output_path()
         return args
 
     if argv.len < 4
         return args
 
-    args.input_path = argv[1].ptr
+    args.input_path = argv[1]
     let flag: StrView = argv[2]
     if not flag.eq("-o")
         eprintln("Error: Expected -o flag")
-        args.input_path = null
+        args.input_path = strview_empty()
         return args
-    args.output_path = argv[3].ptr
+    args.output_path = argv[3]
 
     # Options after `-o <out>`, in any order:
     #   -I <path>          additive to RITZ_PATH, not a replacement.  Treats
@@ -1526,7 +1495,7 @@ fn parse_cli(argv: Span<StrView>) -> CliArgs
         else if is_dep
             if i + 1 >= argv.len or dep_entry_ok(argv[i + 1].ptr) == 0
                 eprintln("Error: --dep needs <name>=<dir>")
-                args.input_path = null
+                args.input_path = strview_empty()
                 return args
             deps_append(@&args.deps_ptr, @&args.deps_len, argv[i + 1].ptr)
             i = i + 2
@@ -1540,7 +1509,7 @@ fn parse_cli(argv: Span<StrView>) -> CliArgs
                     eprintln("Error: --target needs a target triple")
                 else
                     eprintln("Error: --target-arch needs an architecture name")
-                args.input_path = null
+                args.input_path = strview_empty()
                 return args
             if is_dash_i
                 dash_i_view = argv[i + 1]
@@ -1619,7 +1588,7 @@ fn print_usage()
 # Parse the main file's tokens, mark its fns local, and resolve (parse and
 # merge) its imports.  Returns null on any failure (already reported).
 # Called twice when the first pass records a type alias (AGAST #1475).
-fn parse_program(ctx: *ParseCtx, tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz_path: StrView) -> *Module
+fn parse_program(ctx: *ParseCtx, tokens: *Vec<Token>, input_path: StrView, source_dir: StrView, ritz_path: StrView) -> *Module
     # Parse
     parser_set_source_file(ctx, input_path)
     let decl_mark: i32 = type_decl_log_count(ctx)   # AGAST #3907
@@ -1662,7 +1631,7 @@ fn parse_program(ctx: *ParseCtx, tokens: *Vec<Token>, input_path: *u8, source_di
     # resolve() adds the main file to processed_files first): its fns would
     # conflict with themselves (AGAST #2148).
     var main_key: String = import_key(input_path)
-    let main_vm: *VisMod = vis_module(main_key.as_ptr())
+    let main_vm: *VisMod = vis_module(main_key.as_view())
     vis_edges_reset(main_vm)   # a second pass lists its imports afresh
     vis_names(main_vm, m)   # AGAST #3891: before its imports merge in
     vis_type_names(ctx, main_vm, decl_mark)   # AGAST #3907: its enums and aliases
@@ -1697,7 +1666,7 @@ fn parse_program(ctx: *ParseCtx, tokens: *Vec<Token>, input_path: *u8, source_di
 pub fn main(argv: Span<StrView>) -> i32
     let ctx: *ParseCtx = parse_ctx_new()   # AGAST #4623: the compile's parse state
     let args: CliArgs = parse_cli(argv)
-    if args.input_path == null
+    if args.input_path.len == 0
         print_usage()
         return 1
     set_target_os(ctx, StrView { ptr: (args.target_os.ptr), len: (args.target_os.len as i32) as i64 })
@@ -1713,7 +1682,7 @@ pub fn main(argv: Span<StrView>) -> i32
     let cache_fp: u64 = cache_fingerprint(StrView { ptr: (args.target_os.ptr), len: (args.target_os.len) }, StrView { ptr: (args.target_arch.ptr), len: (args.target_arch.len) }, StrView { ptr: (args.ritz_path.ptr), len: (args.ritz_path.len) }, args.input_path, StrView { ptr: (args.deps_ptr), len: (args.deps_len) }, args.stack_protector, args.no_red_zone, freestanding)
 
     # Read source file
-    var src: Vec<u8> = read_file(args.input_path)
+    var src: Vec<u8> = read_source_file(args.input_path)
     if src.len == 0
         return 1
 
@@ -1726,7 +1695,7 @@ pub fn main(argv: Span<StrView>) -> i32
         if iface_text_build(StrView { ptr: (src.data), len: (src.len - 1) }, itoks.data, itoks.len, @&itext) < 0
             err2("Error: a declared fn has no body lines in: ", args.input_path)
             return 1
-        if write_file(args.output_path, StrView { ptr: (itext.data), len: (itext.len) }) < 0
+        if write_output_file(args.output_path, StrView { ptr: (itext.data), len: (itext.len) }) < 0
             return 1
         return 0
 
@@ -1746,7 +1715,7 @@ pub fn main(argv: Span<StrView>) -> i32
     # (ritz0 skips its fn cache in test mode too).
     if parse_only == 0 and args.test_table == 0 and check_source_unchanged(args.input_path, StrView { ptr: (src.data), len: (src.len - 1) }, args.output_path, cache_fp) == 1
         var skip_msg: String = string_from("Skipped (unchanged): ")
-        skip_msg.push_str(strview_from_cstr(args.input_path))
+        skip_msg.push_str(args.input_path)
         println_string(@skip_msg)
         return 0
 
@@ -1825,7 +1794,7 @@ pub fn main(argv: Span<StrView>) -> i32
     # the wall time and stop with success, writing neither IR nor a sig.
     if parse_only == 1
         eprints("ritz1 parse-only: path=")
-        eprints_cstr(args.input_path)
+        eprints(args.input_path)
         eprint(" lex_ns={lex_end - lex_start} parse_ns={parse_end - parse_start}\n")
         return 0
 
@@ -1894,7 +1863,7 @@ pub fn main(argv: Span<StrView>) -> i32
     # AGAST #4844: the input's path, for an instantiation note Sema prints
     # about a site in a fn of this file (diag_source_file is set only for
     # emission, and Sema's variant sites read it).
-    diag_set_note_file(strview_from_cstr(args.input_path))
+    diag_set_note_file(args.input_path)
     let mono: *MonoCtx = mono_ctx_new(ctx)
     if infer_generic_calls(mono, m, args.input_path) > 0
         return 1
@@ -1959,7 +1928,7 @@ pub fn main(argv: Span<StrView>) -> i32
         return 1
 
     # Write output
-    if write_file(args.output_path, ir.as_view()) < 0
+    if write_output_file(args.output_path, ir.as_view()) < 0
         return 1
 
     # Write the sig: source hash, compiler identity, import hashes and a
@@ -1989,7 +1958,7 @@ pub fn main(argv: Span<StrView>) -> i32
         # Every file the resolver loaded, with the bytes it parsed (#1807).
         sig_take_deps(sig_out)
         var sig_path: String = sig_path_from_src(args.input_path)
-        write_sig_file(sig_path.as_ptr(), sig_out)
+        write_sig_file(sig_path.as_view(), sig_out)
         sig_data_free(sig_out)
 
     0

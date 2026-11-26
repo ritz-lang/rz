@@ -35,6 +35,8 @@ import ritzlib.os.env
 import tokens_gen
 import lexer
 import sha256
+import ritzlib.fd
+import ritzlib.fs { mkdir, rename, unlink }
 
 struct IfaceScan
     toks: *Token
@@ -354,20 +356,12 @@ pub fn iface_text_path(src_sv: StrView) -> String
 
 # Make every missing directory of `path` up to its last '/' (mkdir -p of
 # its parent).  Errors are left to the open that follows.
-fn it_mkdirs(path_sv: StrView)
-    var path: *u8 = path_sv.ptr
-    var len: i64 = path_sv.len
-    let buf: *u8 = malloc(len + 1)
-    memcpy(buf, path, len)
-    *(buf + len) = 0
+fn it_mkdirs(path: StrView)
     var i: i64 = 1
-    while i < len
-        if *(buf + i) == '/'
-            *(buf + i) = 0
-            sys_mkdir(buf, 493)   # 0755
-            *(buf + i) = '/'
+    while i < path.len
+        if *(path.ptr + i) == '/'
+            mkdir(StrView { ptr: path.ptr, len: i }, 493)   # 0755
         i = i + 1
-    free(buf)
 
 # Store an interface text at `path`, the iface_text_path of its module's
 # source bytes, as ritz0's cas._atomic_write does: a temp file in the
@@ -380,26 +374,20 @@ pub fn iface_text_store(path: @&String, text_sv: StrView) -> i32
     var text_len: i64 = text_sv.len
     if path.len() == 0
         return -1
-    it_mkdirs(StrView { ptr: (path.as_ptr()), len: (path.len()) })
+    it_mkdirs(path.as_view())
     var tmp: String = string_new()
     tmp.push_span(Span<u8> { ptr: (path.as_ptr()), len: (path.len()) as i64 })
     tmp.push_str(".tmp.")
     tmp.push_i64(sys_getpid() as i64)
-    let fd: i32 = sys_open3(tmp.as_ptr(), O_WRONLY + O_CREAT + O_TRUNC, 420)
-    var rc: i32 = -1
-    if fd >= 0
-        var off: i64 = 0
-        while off < text_len
-            let w: i64 = sys_write(fd, text + off, text_len - off)
-            if w <= 0
-                break
-            off = off + w
-        sys_close(fd)
-        if off == text_len and sys_rename(tmp.as_ptr(), path.as_ptr()) == 0
-            rc = 0
-        else
-            sys_unlink(tmp.as_ptr())
-    rc
+    var file: Fd = fd_open(tmp.as_view(), O_WRONLY + O_CREAT + O_TRUNC, 420).unwrap_or(fd_adopt(-1))
+    if not file.valid()
+        return -1
+    let wrote: bool = file.write_all(Span<u8> { ptr: text, len: text_len }).is_ok()
+    file.close()
+    if wrote and rename(tmp.as_view(), path.as_view()).is_ok()
+        return 0
+    unlink(tmp.as_view())
+    -1
 
 # The interface text of src[0..len), lexed here (fn_cache re-derives an
 # import's text when none is stored for its current source).  Returns 0, or
