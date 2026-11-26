@@ -109,8 +109,10 @@ pub fn fs_process_start(pid: u64) -> i32
     0
 
 # The current process exits: close every fd it left open, flushing pending
-# writes exactly as sys_close does, free its FsProc and make its parent's
-# current. Returns how many fds it closed, or Errno.Srch if none is current.
+# writes as sys_close does except that an O_TRUNC fd that wrote nothing
+# leaves its file (see "What close commits"), free its FsProc and make its
+# parent's current. Returns how many fds it closed, or Errno.Srch if none is
+# current.
 pub fn fs_process_end() -> i32
     let p: *FsProc = fs_current_proc()
     if p == 0 as *FsProc
@@ -119,7 +121,7 @@ pub fn fs_process_end() -> i32
     var fd: i32 = 3
     while fd < MAX_FDS
         if fs_file(p, fd) != 0 as *FsFile
-            fs_close_file(p, fd)
+            fs_close_file(p, fd, CloseBy.Exit)
             closed = closed + 1
         fd = fd + 1
     fs_procs[fs_current] = 0 as *FsProc
@@ -302,13 +304,20 @@ pub fn sys_close(fd: i32) -> i64
     let p: *FsProc = fs_current_proc()
     if fs_file(p, fd) == 0 as *FsFile
         return Errno.BadF as i64
-    fs_close_file(p, fd) as i64
+    fs_close_file(p, fd, CloseBy.Close) as i64
+
+# Who closes an fd: the process's close(2), or its exit (fs_process_end).
+# Only the first commits an O_TRUNC fd that wrote nothing.
+enum CloseBy
+    Close
+    Exit
 
 # Free fd. Its open file's state goes only with the file's last fd: then
 # flush its pending writes and release it (0, or the flush's Errno). While
 # other fds share it, it stays; if fd owned it, it moves to the fd that
-# fd_free makes the new owner. Shared by sys_close and fs_process_end.
-fn fs_close_file(p: *FsProc, fd: i32) -> i32
+# fd_free makes the new owner. Shared by sys_close and fs_process_end; `by`
+# says which, for fs_close_commits.
+fn fs_close_file(p: *FsProc, fd: i32, by: CloseBy) -> i32
     let owner_fd: i32 = fd_owner(@(*p).table, fd)
     if fd_refs(@(*p).table, fd) > 1
         if owner_fd == fd
@@ -318,9 +327,9 @@ fn fs_close_file(p: *FsProc, fd: i32) -> i32
     let f: *FsFile = @(*p).files[owner_fd]
     # Whether closing this fd committed bytes to the persistent subtree, and
     # so owes the storage device a (debounced) save.
-    let wrote: bool = fs_close_commits(f)
+    let wrote: bool = fs_close_commits(f, by)
     let persist: bool = (*f).path != 0 as *u8 and kfs_is_persist(StrView { ptr: (*f).path, len: (*f).path_len as i64 })
-    let flush_result: i32 = fs_flush_write_buffer(f)
+    let flush_result: i32 = fs_flush_write_buffer(f, by)
     if (*f).path != 0 as *u8
         kfree((*f).path)
         (*f).path = 0 as *u8
@@ -472,28 +481,36 @@ pub fn sys_fs_write(fd: i32, buf: *u8, count: u64) -> i64
 # the last close of the fd (sys_close, or fs_process_end at exit) replaces
 # the whole file with that buffer. Close commits the buffer when
 #
-#   - any byte was written to the fd, or
-#   - the fd was opened writable (O_WRONLY or O_RDWR) with O_TRUNC: then an
-#     empty buffer commits an empty file.
+#   - any byte was written to the fd (on either path), or
+#   - the fd was opened writable (O_WRONLY or O_RDWR) with O_TRUNC and the
+#     process closed it with close(2): then an empty buffer commits an empty
+#     file.
 #
 # Otherwise close leaves the file as it was: an fd opened for writing
 # without O_TRUNC that writes nothing (or only zero-byte writes) does not
-# truncate it. So write_file's O_WRONLY | O_CREAT | O_TRUNC open and
-# zero-byte write empties the file, and a process killed before its first
-# write to an fd opened without O_TRUNC leaves the old file.
+# truncate it, and neither does an O_TRUNC fd that wrote nothing and is
+# closed by its process's exit. So write_file's O_WRONLY | O_CREAT | O_TRUNC
+# open, zero-byte write and close empties the file, while a save killed (or
+# exiting) between its open and its first write leaves the old file: old or
+# new, never a prefix, the empty one included (BUDDHAFINGER_PROPOSAL.md
+# §Harland).
 
 # Whether open flags truncate: O_TRUNC on a writable open.
 fn fs_truncates(flags: i32) -> bool
     (flags & O_TRUNC) != 0 and ((flags & O_WRONLY) != 0 or (flags & O_RDWR) != 0)
 
-# Whether closing f's last fd replaces the file (the rule above).
-fn fs_close_commits(f: *FsFile) -> bool
-    ((*f).wbuf != 0 as *u8 and (*f).wbuf_size > 0) or fs_truncates((*f).flags)
+# Whether closing f's last fd, by `by`, replaces the file (the rule above).
+fn fs_close_commits(f: *FsFile, by: CloseBy) -> bool
+    if (*f).wbuf != 0 as *u8 and (*f).wbuf_size > 0
+        return true
+    match by
+        CloseBy.Close => fs_truncates((*f).flags)
+        CloseBy.Exit => false
 
 # Commit f's write buffer to the namespace if fs_close_commits says so, and
 # free it: 0, or an Errno that sys_close returns.
-fn fs_flush_write_buffer(f: *FsFile) -> i32
-    let commits: bool = fs_close_commits(f)
+fn fs_flush_write_buffer(f: *FsFile, by: CloseBy) -> i32
+    let commits: bool = fs_close_commits(f, by)
     let wbuf: *u8 = (*f).wbuf
     let wsize: u64 = (*f).wbuf_size
     (*f).wbuf = 0 as *u8

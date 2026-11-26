@@ -6,8 +6,11 @@
 # nothing, so writing an empty file left the old bytes. The rule now:
 #
 #   close commits the buffer if any byte was written, or if the fd was opened
-#   with O_TRUNC (an empty buffer then commits an empty file). An fd opened
-#   for writing without O_TRUNC that writes nothing leaves the file as it was.
+#   with O_TRUNC and closed explicitly (an empty buffer then commits an empty
+#   file). An fd opened for writing without O_TRUNC that writes nothing leaves
+#   the file as it was, and so does an O_TRUNC fd that writes nothing and is
+#   closed only by its process's exit: a save killed between its open and its
+#   write leaves the old file, never an empty prefix (step 5).
 #
 # Each step runs on a RAM path (/tmp) and, when the boot has a storage disk,
 # on /var, which goes through the persistent subtree as well. Each exit code
@@ -16,10 +19,12 @@
 # /var leg cannot skip unnoticed on a boot that has the disk.
 
 import ritzlib.fs { write_file, read_file }
+import ritzlib.string { String }
 import ritzlib.strview { StrView }
 # Raw sys_close: steps 3 and 4 test the kernel's open-flag rules, which no
-# ritzlib fs API exposes (write_file always opens with O_TRUNC).
-import ritzlib.sys { sys_close, O_WRONLY, O_RDWR, O_TRUNC }
+# ritzlib fs API exposes (write_file always opens with O_TRUNC). Raw
+# sys_spawn_args / sys_wait: step 5's child, see kill_after_open.
+import ritzlib.sys { sys_close, sys_spawn_args, sys_wait, O_WRONLY, O_RDWR, O_TRUNC }
 import tool_io { open_path, make_directory }
 
 const DIR_EXISTS: i64 = -17
@@ -40,7 +45,7 @@ fn open_close(path: StrView, flags: i32) -> bool
     let fd: i32 = open_path(path, flags)
     fd >= 0 and sys_close(fd) == 0
 
-# The steps on one path; 0, or the failing step (1..7).
+# The steps on one path; 0, or the failing step (1..9).
 fn run_steps(path: StrView) -> i32
     # 1. A file with bytes in it, through the portable create-and-write.
     match write_file(path, "hello")
@@ -74,7 +79,42 @@ fn run_steps(path: StrView) -> i32
         return fail(7, "O_RDWR | O_TRUNC open/close failed")
     if not reads_back(path, "")
         return fail(7, "O_RDWR | O_TRUNC with no write left the old bytes")
+
+    # 5. A save killed between its O_TRUNC open and its write leaves the old
+    #    file: the exit-time close of an empty O_TRUNC buffer commits nothing.
+    match write_file(path, "old")
+        Ok(_) => pass
+        Err(_) => return fail(8, "write_file old failed")
+    let code: i64 = kill_after_open(path)
+    if code != KILLED_BY_FAULT
+        print("[write_empty_test] trunc_kill_child exited {code}, want {KILLED_BY_FAULT}\n")
+        return fail(8, "trunc_kill_child was not killed after its open")
+    if not reads_back(path, "old")
+        return fail(9, "a kill between the O_TRUNC open and the write lost the old bytes")
     0
+
+# A ring-3 page fault's exit status: 128 + vector 14 (#2755).
+const KILLED_BY_FAULT: i64 = 142
+
+# kill_after_open's result when the child did not spawn.
+const SPAWN_FAILED: i64 = -1000
+
+# Run trunc_kill_child on `path` and wait for it: its exit status, or
+# SPAWN_FAILED. Raw spawn/wait: Harland has no typed process API in ritzlib.
+fn kill_after_open(path: StrView) -> i64
+    # argv entries are NUL-terminated for the kernel: String.as_ptr adds the
+    # NUL (so the String is var: it may grow by that byte).
+    var path_arg: String = String.from(path)
+    let raw: *u8 = path_arg.as_ptr()
+    if raw == null
+        return SPAWN_FAILED
+    var argv: [2]*u8
+    argv[0] = "trunc_kill_child"
+    argv[1] = raw
+    let pid: i64 = sys_spawn_args("/bin/trunc_kill_child", @argv[0], 2)
+    if pid <= 0
+        return SPAWN_FAILED
+    sys_wait(pid as i32)
 
 # Whether this boot has a storage disk: the kernel counts boots in /var/boots.
 fn has_var() -> bool
