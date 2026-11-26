@@ -1,7 +1,8 @@
 # razm's parser: each construct of the dialect (DESIGN.md "Text razm
 # accepts"), the rejections that keep the dialect closed, the macro
 # expansion of isr_stubs.s, and every corpus file.
-import ritzlib.fs { read_file, write_file }
+import ritzlib.fs { read_file, unlink, write_file }
+import ritzlib.testlib { sandbox_path }
 import ritzlib.gvec { Vec, vec_new }
 import ritzlib.option { Option }
 import ritzlib.result { Result }
@@ -436,18 +437,34 @@ fn test_absolute_operands_need_earlier_constants() -> i32
     rejects(".incbin \"x\", SKIP\n", 1, "`SKIP` is not defined before this line")
     0
 
+# `.incbin "<path>"` followed by `rest` (operands and a newline).
+[[test_helper]]
+fn incbin_line(path: StrView, rest: StrView) -> String
+    var s: String = string_from(".incbin \"")
+    s.push_str(path)
+    s.push('"')
+    s.push_str(rest)
+    s
+
 [[test]]
 fn test_incbin() -> i32
-    let path: StrView = "/tmp/razm-test-incbin.bin"
+    # Per-pid path: a fixed /tmp name races concurrent test runs.
+    let file: String = sandbox_path("razm", "incbin.bin")
+    let path: StrView = file.as_view()
     match write_file(path, "ABCDEF")
         Ok(_) => pass
         Err(_) =>
             assert false
-    let p: Program = parsed(".incbin \"/tmp/razm-test-incbin.bin\"\n.incbin \"/tmp/razm-test-incbin.bin\", 1, 2\n.incbin \"/tmp/razm-test-incbin.bin\", 4\n")
+    var text: String = incbin_line(path, "\n")
+    text.push_string(@incbin_line(path, ", 1, 2\n"))
+    text.push_string(@incbin_line(path, ", 4\n"))
+    let p: Program = parsed(text.as_view())
     assert bytes_at(@p, 0).eq("ABCDEF")
     assert bytes_at(@p, 1).eq("BC")
     assert bytes_at(@p, 2).eq("EF")
-    rejects(".incbin \"/tmp/razm-test-incbin.bin\", 4, 3\n", 1, "outside the file's 6 bytes")
+    let bad: String = incbin_line(path, ", 4, 3\n")
+    rejects(bad.as_view(), 1, "outside the file's 6 bytes")
+    unlink(path)
     rejects("\n.incbin \"/nonexistent/razm.bin\"\n", 2, "cannot read `.incbin` file `/nonexistent/razm.bin`")
     # Relative to the directory given (the working directory by default).
     let blob: String = read_corpus("synthetic/blob.bin")
