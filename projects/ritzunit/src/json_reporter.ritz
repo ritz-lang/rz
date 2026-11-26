@@ -14,8 +14,9 @@
 # }
 
 import ritzlib.io
-import ritzlib.memory
 import ritzlib.sys
+import ritzlib.gvec
+import ritzlib.span
 import ritzlib.strview
 import ritzunit.reporter
 
@@ -43,53 +44,18 @@ struct JsonTestResult
     duration_ms: i64
     exit_code: i32
     signal: i32
-    output: StrView      # captured stdout+stderr of a test that did not pass
+    out_start: i64       # captured stdout+stderr of a test that did not
+    out_len: i64         # pass: JsonReport.outputs[out_start, + out_len)
 
-# Results, grown as needed: there is no cap on the number of tests.
-var g_json_results: *JsonTestResult = 0 as *JsonTestResult
-var g_json_result_count: i32 = 0
-var g_json_result_cap: i32 = 0
+# The run's results, in report order: there is no cap on the number of
+# tests. The report keeps its own copy of each output (the runner's capture
+# buffer moves as it grows); the names must outlive the report's print.
+pub struct JsonReport
+    results: Vec<JsonTestResult>
+    outputs: Vec<u8>
 
-# ============================================================================
-# Result Collection
-# ============================================================================
-
-fn json_record_result(name: StrView, status: StrView, duration_ms: i64, exit_code: i32, signal: i32, output: StrView)
-    if g_json_result_count == g_json_result_cap
-        var cap: i32 = g_json_result_cap * 2
-        if cap == 0
-            cap = 64
-        let grown: *u8 = realloc(g_json_results as *u8, (cap as i64) * sizeof(JsonTestResult))
-        if grown == null
-            eprints("ritzunit: out of memory recording results\n")
-            sys_exit(2)
-        g_json_results = grown as *JsonTestResult
-        g_json_result_cap = cap
-    let r: *JsonTestResult = @g_json_results[g_json_result_count]
-    r.name = name
-    r.status = status
-    r.duration_ms = duration_ms
-    r.exit_code = exit_code
-    r.signal = signal
-    r.output = output
-    g_json_result_count += 1
-
-pub fn json_record_pass(name: StrView, duration_ms: i64)
-    var st: StrView = status_pass()
-    var none: StrView = strview_empty()
-    json_record_result(name, st, duration_ms, 0, 0, none)
-
-pub fn json_record_fail(name: StrView, duration_ms: i64, exit_code: i32, output: StrView)
-    var st: StrView = status_fail()
-    json_record_result(name, st, duration_ms, exit_code, 0, output)
-
-pub fn json_record_crash(name: StrView, duration_ms: i64, signal: i32, output: StrView)
-    var st: StrView = status_crash()
-    json_record_result(name, st, duration_ms, 0, signal, output)
-
-pub fn json_record_timeout(name: StrView, duration_ms: i64, output: StrView)
-    var st: StrView = status_timeout()
-    json_record_result(name, st, duration_ms, 0, 0, output)
+pub fn json_report_new() -> JsonReport
+    JsonReport { results: vec_new<JsonTestResult>(), outputs: vec_new<u8>() }
 
 # ============================================================================
 # JSON Output Helpers
@@ -110,7 +76,7 @@ pub fn print_json_string_sv(s: StrView)
         let c: u8 = s.get(i)
         if c < 32 || c == 34 || c == 92
             if i > run_start
-                out_write(s.ptr + run_start, i - run_start)
+                out_str(s.slice(run_start, i))
             run_start = i + 1
             if c == 34
                 out_str("\\\"")
@@ -130,76 +96,96 @@ pub fn print_json_string_sv(s: StrView)
                 esc[3] = '0'
                 esc[4] = hex_digit(c >> 4)
                 esc[5] = hex_digit(c & 15)
-                out_write(@esc[0], 6)
+                let e: [u8] = @esc
+                out_str(e.as_strview())
     if s.len > run_start
-        out_write(s.ptr + run_start, s.len - run_start)
+        out_str(s.skip(run_start))
     out_str("\"")
 
 # ============================================================================
-# JSON Output
+# Result Collection and JSON Output
 # ============================================================================
 
-# Print full JSON report
-pub fn json_print_report(total: i32, passed: i32, failed: i32, crashed: i32, timeout: i32, skipped: i32, duration_ms: i64)
-    # `\{` / `\}` are literal braces everywhere. `{{` collapses to one brace
-    # only inside print/eprint; here it would be two (#1374, #1913).
-    out_str("\{\n")
-    out_str("  \"version\": \"0.1.0\",\n")
+impl JsonReport
+    fn record(self: @&JsonReport, name: StrView, status: StrView, duration_ms: i64, exit_code: i32, signal: i32, output: StrView)
+        let start: i64 = self.outputs.len()
+        let kept: bool = self.outputs.push_view(output)
+        let r = JsonTestResult { name: name, status: status, duration_ms: duration_ms, exit_code: exit_code, signal: signal, out_start: start, out_len: output.len }
+        if not kept or not self.results.push(r)
+            eprints("ritzunit: out of memory recording results\n")
+            sys_exit(2)
 
-    # Summary
-    out_str("  \"summary\": \{\n")
+    pub fn record_pass(self: @&JsonReport, name: StrView, duration_ms: i64)
+        self.record(name, status_pass(), duration_ms, 0, 0, "")
 
-    out_str("    \"total\": ")
-    out_int(total as i64)
+    pub fn record_fail(self: @&JsonReport, name: StrView, duration_ms: i64, exit_code: i32, output: StrView)
+        self.record(name, status_fail(), duration_ms, exit_code, 0, output)
 
-    out_str(",\n    \"passed\": ")
-    out_int(passed as i64)
+    pub fn record_crash(self: @&JsonReport, name: StrView, duration_ms: i64, signal: i32, output: StrView)
+        self.record(name, status_crash(), duration_ms, 0, signal, output)
 
-    out_str(",\n    \"failed\": ")
-    out_int(failed as i64)
+    pub fn record_timeout(self: @&JsonReport, name: StrView, duration_ms: i64, output: StrView)
+        self.record(name, status_timeout(), duration_ms, 0, 0, output)
 
-    out_str(",\n    \"crashed\": ")
-    out_int(crashed as i64)
+    # Print full JSON report
+    pub fn print(self: @JsonReport, total: i32, passed: i32, failed: i32, crashed: i32, timeout: i32, skipped: i32, duration_ms: i64)
+        # `\{` / `\}` are literal braces everywhere. `{{` collapses to one brace
+        # only inside print/eprint; here it would be two (#1374, #1913).
+        out_str("\{\n")
+        out_str("  \"version\": \"0.1.0\",\n")
 
-    out_str(",\n    \"timeout\": ")
-    out_int(timeout as i64)
+        # Summary
+        out_str("  \"summary\": \{\n")
 
-    out_str(",\n    \"skipped\": ")
-    out_int(skipped as i64)
+        out_str("    \"total\": ")
+        out_int(total as i64)
 
-    out_str(",\n    \"duration_ms\": ")
-    out_int(duration_ms)
+        out_str(",\n    \"passed\": ")
+        out_int(passed as i64)
 
-    out_str("\n  \},\n")
+        out_str(",\n    \"failed\": ")
+        out_int(failed as i64)
 
-    # Tests array
-    out_str("  \"tests\": [\n")
+        out_str(",\n    \"crashed\": ")
+        out_int(crashed as i64)
 
-    for i in 0..g_json_result_count
-        let r: *JsonTestResult = @g_json_results[i]
-        out_str("    \{\"name\": ")
-        print_json_string_sv(r.name)
-        out_str(", \"status\": ")
-        print_json_string_sv(r.status)
-        out_str(", \"duration_ms\": ")
-        out_int(r.duration_ms)
-        if r.exit_code != 0
-            out_str(", \"exit_code\": ")
-            out_int(r.exit_code as i64)
-        if r.signal != 0
-            out_str(", \"signal\": ")
-            out_int(r.signal as i64)
-        if r.output.len != 0
-            out_str(", \"output\": ")
-            print_json_string_sv(r.output)
-        out_str("\}")
-        if i < g_json_result_count - 1
-            out_str(",")
-        out_str("\n")
+        out_str(",\n    \"timeout\": ")
+        out_int(timeout as i64)
 
-    out_str("  ]\n")
-    out_str("\}\n")
+        out_str(",\n    \"skipped\": ")
+        out_int(skipped as i64)
 
-# Drop every recorded result.
-pub fn json_reset()
-    g_json_result_count = 0
+        out_str(",\n    \"duration_ms\": ")
+        out_int(duration_ms)
+
+        out_str("\n  \},\n")
+
+        # Tests array
+        out_str("  \"tests\": [\n")
+
+        let count: i64 = self.results.len()
+        for i in 0..count
+            let r = @self.results[i]
+            out_str("    \{\"name\": ")
+            print_json_string_sv(r.name)
+            out_str(", \"status\": ")
+            print_json_string_sv(r.status)
+            out_str(", \"duration_ms\": ")
+            out_int(r.duration_ms)
+            if r.exit_code != 0
+                out_str(", \"exit_code\": ")
+                out_int(r.exit_code as i64)
+            if r.signal != 0
+                out_str(", \"signal\": ")
+                out_int(r.signal as i64)
+            if r.out_len != 0
+                let output: [u8] = self.outputs[r.out_start..r.out_start + r.out_len]
+                out_str(", \"output\": ")
+                print_json_string_sv(output.as_strview())
+            out_str("\}")
+            if i < count - 1
+                out_str(",")
+            out_str("\n")
+
+        out_str("  ]\n")
+        out_str("\}\n")

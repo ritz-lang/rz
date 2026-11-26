@@ -64,7 +64,7 @@ PINS = {
     # process.exec (execve; owns the argv block) in 35_nohup.
     "ritz": 1357,
     "ritz-lsp": 0,
-    "ritzunit": 18,
+    "ritzunit": 0,
     "rzrz": 3,
     "rzsh": 12,
     "sage": 0,
@@ -138,7 +138,7 @@ C_LITERAL_PINS = {
     "prism": 1,
     "ritz": 3876,
     "ritz-lsp": 0,
-    "ritzunit": 85,
+    "ritzunit": 63,
     "rzrz": 34,
     "rzsh": 2,
     "sage": 0,

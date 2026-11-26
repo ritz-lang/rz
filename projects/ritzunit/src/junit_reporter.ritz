@@ -13,8 +13,8 @@
 # </testsuite>
 
 import ritzlib.io
-import ritzlib.memory
 import ritzlib.sys
+import ritzlib.gvec
 import ritzlib.strview
 import ritzunit.reporter
 
@@ -36,48 +36,13 @@ struct JunitTestResult
     signal: i32
     message: StrView     # Error message for failures
 
-# Results, grown as needed: there is no cap on the number of tests.
-var g_junit_results: *JunitTestResult = 0 as *JunitTestResult
-var g_junit_result_count: i32 = 0
-var g_junit_result_cap: i32 = 0
+# The run's results, in report order: there is no cap on the number of
+# tests. The name views must outlive the report's print.
+pub struct JunitReport
+    results: Vec<JunitTestResult>
 
-# ============================================================================
-# Result Collection
-# ============================================================================
-
-fn junit_record_result(name: StrView, status: i32, duration_ms: i64, exit_code: i32, signal: i32, message: StrView)
-    if g_junit_result_count == g_junit_result_cap
-        var cap: i32 = g_junit_result_cap * 2
-        if cap == 0
-            cap = 64
-        let grown: *u8 = realloc(g_junit_results as *u8, (cap as i64) * sizeof(JunitTestResult))
-        if grown == null
-            eprints("ritzunit: out of memory recording results\n")
-            sys_exit(2)
-        g_junit_results = grown as *JunitTestResult
-        g_junit_result_cap = cap
-    g_junit_results[g_junit_result_count].name = name
-    g_junit_results[g_junit_result_count].status = status
-    g_junit_results[g_junit_result_count].duration_ms = duration_ms
-    g_junit_results[g_junit_result_count].exit_code = exit_code
-    g_junit_results[g_junit_result_count].signal = signal
-    g_junit_results[g_junit_result_count].message = message
-    g_junit_result_count += 1
-
-pub fn junit_record_pass(name: StrView, duration_ms: i64)
-    var empty: StrView = strview_empty()
-    junit_record_result(name, JUNIT_PASS, duration_ms, 0, 0, empty)
-
-pub fn junit_record_fail(name: StrView, duration_ms: i64, exit_code: i32)
-    var msg: StrView = "Test assertion failed"
-    junit_record_result(name, JUNIT_FAIL, duration_ms, exit_code, 0, msg)
-
-pub fn junit_record_crash(name: StrView, duration_ms: i64, signal: i32, signal_name: StrView)
-    junit_record_result(name, JUNIT_ERROR, duration_ms, 0, signal, signal_name)
-
-pub fn junit_record_timeout(name: StrView, duration_ms: i64)
-    var msg: StrView = "Test timed out"
-    junit_record_result(name, JUNIT_ERROR, duration_ms, 0, 0, msg)
+pub fn junit_report_new() -> JunitReport
+    JunitReport { results: vec_new<JunitTestResult>() }
 
 # ============================================================================
 # XML Output Helpers
@@ -121,59 +86,73 @@ fn print_time_seconds(ms: i64)
 # JUnit XML Output
 # ============================================================================
 
-# Print full JUnit XML report
-pub fn junit_print_report(total: i32, passed: i32, failed: i32, errors: i32, duration_ms: i64)
-    # XML declaration
-    out_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+impl JunitReport
+    fn record(self: @&JunitReport, r: JunitTestResult)
+        if not self.results.push(r)
+            eprints("ritzunit: out of memory recording results\n")
+            sys_exit(2)
 
-    # Testsuite element
-    out_str("<testsuite name=\"ritzunit\" tests=\"")
-    out_int(total as i64)
-    out_str("\" failures=\"")
-    out_int(failed as i64)
-    out_str("\" errors=\"")
-    out_int(errors as i64)
-    out_str("\" time=\"")
-    print_time_seconds(duration_ms)
-    out_str("\">\n")
+    pub fn record_pass(self: @&JunitReport, name: StrView, duration_ms: i64)
+        self.record(JunitTestResult { name: name, status: JUNIT_PASS, duration_ms: duration_ms, exit_code: 0, signal: 0, message: strview_empty() })
 
-    # Individual test cases
-    for i in 0..g_junit_result_count
-        let r: *JunitTestResult = @g_junit_results[i]
+    pub fn record_fail(self: @&JunitReport, name: StrView, duration_ms: i64, exit_code: i32)
+        self.record(JunitTestResult { name: name, status: JUNIT_FAIL, duration_ms: duration_ms, exit_code: exit_code, signal: 0, message: "Test assertion failed" })
 
-        out_str("  <testcase name=\"")
-        print_xml_escaped_sv(r.name)
+    pub fn record_crash(self: @&JunitReport, name: StrView, duration_ms: i64, signal: i32, signal_name: StrView)
+        self.record(JunitTestResult { name: name, status: JUNIT_ERROR, duration_ms: duration_ms, exit_code: 0, signal: signal, message: signal_name })
+
+    pub fn record_timeout(self: @&JunitReport, name: StrView, duration_ms: i64)
+        self.record(JunitTestResult { name: name, status: JUNIT_ERROR, duration_ms: duration_ms, exit_code: 0, signal: 0, message: "Test timed out" })
+
+    # Print full JUnit XML report
+    pub fn print(self: @JunitReport, total: i32, passed: i32, failed: i32, errors: i32, duration_ms: i64)
+        # XML declaration
+        out_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+
+        # Testsuite element
+        out_str("<testsuite name=\"ritzunit\" tests=\"")
+        out_int(total as i64)
+        out_str("\" failures=\"")
+        out_int(failed as i64)
+        out_str("\" errors=\"")
+        out_int(errors as i64)
         out_str("\" time=\"")
-        print_time_seconds(r.duration_ms)
-        out_str("\"")
+        print_time_seconds(duration_ms)
+        out_str("\">\n")
 
-        if r.status == JUNIT_PASS
-            # Self-closing tag for passing tests
-            out_str("/>\n")
-        else if r.status == JUNIT_FAIL
-            out_str(">\n")
-            out_str("    <failure message=\"exit code ")
-            out_int(r.exit_code as i64)
-            out_str("\">")
-            print_xml_escaped_sv(r.message)
-            out_str("</failure>\n")
-            out_str("  </testcase>\n")
-        else
-            # JUNIT_ERROR (crash or timeout)
-            out_str(">\n")
-            out_str("    <error message=\"")
-            if r.signal != 0
-                out_str("signal ")
-                out_int(r.signal as i64)
+        # Individual test cases
+        for i in 0..self.results.len()
+            let r = @self.results[i]
+
+            out_str("  <testcase name=\"")
+            print_xml_escaped_sv(r.name)
+            out_str("\" time=\"")
+            print_time_seconds(r.duration_ms)
+            out_str("\"")
+
+            if r.status == JUNIT_PASS
+                # Self-closing tag for passing tests
+                out_str("/>\n")
+            else if r.status == JUNIT_FAIL
+                out_str(">\n")
+                out_str("    <failure message=\"exit code ")
+                out_int(r.exit_code as i64)
+                out_str("\">")
+                print_xml_escaped_sv(r.message)
+                out_str("</failure>\n")
+                out_str("  </testcase>\n")
             else
-                out_str("timeout")
-            out_str("\">")
-            print_xml_escaped_sv(r.message)
-            out_str("</error>\n")
-            out_str("  </testcase>\n")
+                # JUNIT_ERROR (crash or timeout)
+                out_str(">\n")
+                out_str("    <error message=\"")
+                if r.signal != 0
+                    out_str("signal ")
+                    out_int(r.signal as i64)
+                else
+                    out_str("timeout")
+                out_str("\">")
+                print_xml_escaped_sv(r.message)
+                out_str("</error>\n")
+                out_str("  </testcase>\n")
 
-    out_str("</testsuite>\n")
-
-# Drop every recorded result.
-pub fn junit_reset()
-    g_junit_result_count = 0
+        out_str("</testsuite>\n")

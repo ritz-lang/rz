@@ -38,12 +38,13 @@ ASSERTIONS = RITZUNIT_DIR / "src" / "assertions.ritz"
 
 # The whole public surface: the string checks `assert` cannot express.
 STRING_HELPERS = [
-    "assert_str_eq", "assert_starts_with", "assert_contains",
     "assert_str_eq_sv", "assert_starts_with_sv", "assert_contains_sv",
 ]
 
-# Replaced by `assert a OP b` / `assert cond` / `assert p == null`.
+# Replaced by `assert a OP b` / `assert cond` / `assert p == null`, and the
+# NUL-terminated (*u8) string forms by the StrView ones (AGAST #4692).
 REMOVED = [
+    "assert_str_eq", "assert_starts_with", "assert_contains",
     "assert_eq_i32", "assert_eq_i64", "assert_ne_i32", "assert_ne_i64",
     "assert_lt_i32", "assert_le_i32", "assert_gt_i32", "assert_ge_i32",
     "assert_true", "assert_false", "assert_null", "assert_not_null",
@@ -136,16 +137,6 @@ import ritzlib.strview
 import ritzunit.assertions
 
 [[test]]
-fn cstr_helpers_hold() -> i32
-    assert_str_eq(c"abc", c"abc")
-    assert_str_eq(c"", c"")
-    assert_starts_with(c"hello world", c"hello")
-    assert_starts_with(c"hello", c"")
-    assert_contains(c"hello world", c"o w")
-    assert_contains(c"hello", c"hello")
-    0
-
-[[test]]
 fn view_helpers_hold() -> i32
     var a: StrView = "needle in haystack"
     var b: StrView = "needle in haystack"
@@ -161,18 +152,11 @@ fn view_helpers_hold() -> i32
 @pytest.mark.integration
 def test_helpers_pass_when_they_hold(package, tmp_path):
     results = _results(_build(package(PASSING), tmp_path))
-    assert results == {"cstr_helpers_hold": ("pass", ""),
-                       "view_helpers_hold": ("pass", "")}, results
+    assert results == {"view_helpers_hold": ("pass", "")}, results
 
 
 # helper -> (a failing call, text the diagnostic must show).
 FAILING = {
-    "assert_str_eq": ('assert_str_eq(c"abc", c"abd")',
-                      ['expected: "abd"', 'actual:   "abc"']),
-    "assert_starts_with": ('assert_starts_with(c"hello", c"help")',
-                           ['string: "hello"', 'prefix: "help"']),
-    "assert_contains": ('assert_contains(c"hello", c"xyz")',
-                        ['haystack: "hello"', 'needle:   "xyz"']),
     "assert_str_eq_sv": ("assert_str_eq_sv(a, b)",
                          ['expected: "abd"', 'actual:   "abc"']),
     "assert_starts_with_sv": ("assert_starts_with_sv(a, b)",
@@ -180,16 +164,6 @@ FAILING = {
     "assert_contains_sv": ("assert_contains_sv(a, b)",
                            ['haystack: "abc"', 'needle:   "abd"']),
 }
-
-CSTR_SOURCE = """\
-import ritzlib.strview
-import ritzunit.assertions
-
-[[test]]
-fn fails() -> i32
-    {call}
-    0
-"""
 
 VIEW_SOURCE = """\
 import ritzlib.strview
@@ -205,13 +179,12 @@ fn fails() -> i32
 
 
 def _failing_source(call: str) -> str:
-    view = call.endswith("(a, b)")
-    return (VIEW_SOURCE if view else CSTR_SOURCE).format(call=call)
+    return VIEW_SOURCE.format(call=call)
 
 
 def _failing_line(call: str) -> int:
     """The line `{call}` lands on: the test's line the diagnostic must name."""
-    return 8 if call.endswith("(a, b)") else 6
+    return 8
 
 
 @pytest.mark.integration
@@ -235,7 +208,7 @@ def test_a_failure_fails_the_test_at_the_callers_line(package, tmp_path,
 
 @pytest.mark.integration
 def test_junit_reports_a_helper_failure_as_an_assertion(package, tmp_path):
-    exe = _build(package(_failing_source(FAILING["assert_contains"][0])), tmp_path)
+    exe = _build(package(_failing_source(FAILING["assert_contains_sv"][0])), tmp_path)
     proc = subprocess.run([exe, "--junit"], capture_output=True, timeout=120)
     assert proc.returncode == 1
     assert b'<failure message="exit code 1">Test assertion failed</failure>' \

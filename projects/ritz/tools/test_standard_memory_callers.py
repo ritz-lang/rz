@@ -41,7 +41,6 @@ PINS = {
     "prism": 3,
     "ritz/ritz0": 18,
     "ritz/ritz1": 511,
-    "ritzunit": 7,
     "rzsh": 4,
 }
 

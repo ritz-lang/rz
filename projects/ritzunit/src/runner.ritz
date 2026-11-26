@@ -30,7 +30,6 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.memory
 import ritzlib.option
 import ritzlib.result
 import ritzlib.span
@@ -40,7 +39,7 @@ import ritzlib.str
 import ritzlib.strview
 import ritzlib.os.env
 import ritzlib.fd { Fd, fd_adopt, SEEK_SET, SEEK_END }
-import ritzlib.process { fork, kill, wait_pid, SigSet, sigset_empty, sigset_of }
+import ritzlib.process { fork, kill, wait_pid, try_wait_any, Reaped, ProcessResult, SigSet, sigset_empty, sigset_of }
 import ritzlib.time { now, now_unix_ms }
 import ritzunit.wait_status
 
@@ -48,7 +47,7 @@ import ritzunit.wait_status
 # The compiler-emitted test table (LANGUAGE_SPEC §17.1)
 # ============================================================================
 
-# One `[[test]]` function. `name` is NUL-terminated (`len` excludes the NUL).
+# One `[[test]]` function.
 struct RitzTest
     name: StrView
     run: fn() -> i32
@@ -78,7 +77,7 @@ struct RunOptions
     verbose: i32         # -v: show detailed output
     quiet: i32           # -q: minimal output
     list_only: i32       # -l: list tests without running
-    filter: *u8          # -f: filter pattern (null = no filter)
+    filter: Option<StrView>  # -f: filter pattern (None = no filter)
     timeout_ms: i64      # -t: timeout per test in ms
     no_fork: i32         # --no-fork: disable fork isolation
     fail_fast: i32       # --fail-fast: stop on first failure
@@ -94,7 +93,7 @@ pub fn options_default() -> RunOptions
     o.verbose = 0
     o.quiet = 0
     o.list_only = 0
-    o.filter = null
+    o.filter = None
     o.timeout_ms = 5000
     o.no_fork = 0
     o.fail_fast = 0
@@ -142,14 +141,13 @@ fn rng_next() -> i64
     return g_rng_state
 
 # Fisher-Yates shuffle of the run order
-fn shuffle_order(order: *i64, count: i64)
+fn shuffle_order(order: @&Vec<i64>)
+    let count: i64 = order.len()
     if count <= 1
         return
     for i in 0..(count - 1)
         let j: i64 = i + (rng_next() % (count - i))
-        let tmp: i64 = order[i]
-        order[i] = order[j]
-        order[j] = tmp
+        order.swap(i, j)
 
 # ============================================================================
 # Test Execution
@@ -179,38 +177,24 @@ fn capture_reset(f: @Fd)
     f.truncate(0)
     f.seek(0, SEEK_SET)
 
-# The last CAPTURE_KEEP bytes a child wrote to `f`, in a fresh allocation.
-fn capture_take(f: @Fd) -> StrView
-    var out: StrView = strview_empty()
+# Append the last CAPTURE_KEEP bytes a child wrote to `f` to `into`.
+fn capture_take(f: @Fd, into: @&Vec<u8>)
     if not f.valid()
-        return out
+        return
     var size: i64 = 0
     match f.seek(0, SEEK_END)
         Ok(end) => size = end
         Err(_) => pass
     if size <= 0
-        return out
+        return
     var start: i64 = 0
     if size > CAPTURE_KEEP
         start = size - CAPTURE_KEEP
-    let want: i64 = size - start
-    let buf: *u8 = malloc(want + 1)
-    if buf == null
-        return out
     f.seek(start, SEEK_SET)
-    var got: i64 = 0
-    while got < want
-        var n: i64 = 0
-        match f.read(Span<u8> { ptr: buf + got, len: want - got })
-            Ok(k) => n = k
-            Err(_) => pass
-        if n <= 0
-            break
-        got += n
-    buf[got] = 0
-    out.ptr = buf
-    out.len = got
-    return out
+    # A failed read keeps what was read before it.
+    match vec_read_all_fd(f.raw(), into)
+        Ok(_) => pass
+        Err(_) => pass
 
 # A forked test child may not dump core (AGAST #2072). The kernel runs the
 # core handler before the runner sees the crash; a piped core_pattern (apport,
@@ -257,19 +241,35 @@ struct Outcome
     done: i32
     result: TestRunResult
     elapsed: i64
-    output: StrView      # captured output, only for a test that did not pass
+    out_start: i64       # captured output (only for a test that did not
+    out_len: i64         # pass): Outcomes.captured[out_start, + out_len)
 
-fn outcome_fail_to_start(out: *Outcome)
+fn outcome_new() -> Outcome
+    Outcome { done: 0, result: TestRunResult { status: TEST_RESULT_PASS, exit_code: 0, signal: 0 }, elapsed: 0, out_start: 0, out_len: 0 }
+
+fn outcome_fail_to_start(out: @&Outcome)
     out.done = 1
     out.result.status = TEST_RESULT_FAIL
     out.result.exit_code = -1
     out.result.signal = 0
     out.elapsed = 0
-    out.output = strview_empty()
+    out.out_len = 0
+
+# Every test's outcome in run order, and the output captured from the ones
+# that did not pass, one buffer for the run.
+struct Outcomes
+    list: Vec<Outcome>
+    captured: Vec<u8>
+
+# Outcome `pos`'s captured output as text.
+fn outcome_output(outcomes: @Outcomes, pos: i64) -> StrView
+    let o = @outcomes.list[pos]
+    let bytes: [u8] = outcomes.captured[o.out_start..o.out_start + o.out_len]
+    bytes.as_strview()
 
 # Fork the test at run-list position `pos` into `slot`. A failed fork records
 # the test as failed at once.
-fn pool_launch(opts: @RunOptions, slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_mask: @SigSet) -> i32
+fn pool_launch(opts: @RunOptions, slot: @&PoolSlot, test: *RitzTest, pos: i64, out: @&Outcome, old_mask: @SigSet) -> i32
     capture_reset(@slot.capture_fd)
     # A child without a capture file writes to our stdout: the report so far
     # must be there first. With one, the report stays buffered.
@@ -306,45 +306,48 @@ fn pool_launch(opts: @RunOptions, slot: *PoolSlot, test: *RitzTest, pos: i64, ou
     return 1
 
 # Record a reaped child's outcome and free its slot.
-fn pool_record(slot: *PoolSlot, status: i32, outcomes: *Outcome)
-    let out: *Outcome = @outcomes[slot.pos]
+fn pool_record(slot: @&PoolSlot, pr: ProcessResult, outcomes: @&Outcomes)
+    let result: TestRunResult = result_from_reap(pr, slot.killed)
+    let start: i64 = outcomes.captured.len()
+    if result.status != TEST_RESULT_PASS
+        capture_take(@slot.capture_fd, @&outcomes.captured)
+    let out = @&outcomes.list[slot.pos]
     out.elapsed = get_time_ms() - slot.start_ms
-    result_from_reap(status, slot.killed, @out.result)
-    out.output = strview_empty()
-    if out.result.status != TEST_RESULT_PASS
-        out.output = capture_take(@slot.capture_fd)
+    out.result = result
+    out.out_start = start
+    out.out_len = outcomes.captured.len() - start
     out.done = 1
     slot.pid = 0
 
 # Reap every child that has exited; the number reaped.
-fn pool_reap(slots: *PoolSlot, nslots: i64, outcomes: *Outcome) -> i32
+fn pool_reap(slots: @&Vec<PoolSlot>, outcomes: @&Outcomes) -> i32
     var reaped: i32 = 0
     loop
-        var status: i32 = 0
-        # Raw: process.try_wait_pid reaps one pid; this reaps any child and
-        # needs which one it was, and its status for result_from_reap.
-        let pid: i32 = sys_wait4(-1, @status, WNOHANG, null)
-        if pid <= 0
-            return reaped
-        for i in 0..nslots
-            let slot: *PoolSlot = @slots[i]
-            if slot.pid == pid
-                pool_record(slot, status, outcomes)
-                reaped += 1
-                break
+        let next: Option<Reaped> = match try_wait_any()
+            Ok(o) => o
+            Err(_) => None
+        match next
+            Some(r) =>
+                for i in 0..slots.len()
+                    if (@slots[i]).pid == r.pid
+                        pool_record(@&slots[i], r.result, outcomes)
+                        reaped += 1
+                        break
+            None =>
+                return reaped
 
 # Block until at least one child is reaped. Children past their deadline are
 # killed (and reaped once they are gone); the wait ends no later than the
 # earliest deadline still pending.
-fn pool_wait(slots: *PoolSlot, nslots: i64, outcomes: *Outcome)
+fn pool_wait(slots: @&Vec<PoolSlot>, outcomes: @&Outcomes)
     let mask: SigSet = sigset_of(SIGCHLD)
     loop
-        if pool_reap(slots, nslots, outcomes) > 0
+        if pool_reap(slots, outcomes) > 0
             return
         let now: i64 = get_time_ms()
         var earliest: i64 = -1
-        for i in 0..nslots
-            let slot: *PoolSlot = @slots[i]
+        for i in 0..slots.len()
+            let slot = @&slots[i]
             if slot.pid != 0 && slot.killed == 0
                 if slot.deadline_ms <= now
                     kill(slot.pid, SIGKILL)
@@ -363,9 +366,9 @@ fn pool_wait(slots: *PoolSlot, nslots: i64, outcomes: *Outcome)
             syscall4(SYS_RT_SIGTIMEDWAIT, @mask.bits as i64, 0, @ts[0] as i64, 8)
 
 # Kill and reap every live child (--fail-fast stopped the run).
-fn pool_abandon(slots: *PoolSlot, nslots: i64)
-    for i in 0..nslots
-        let slot: *PoolSlot = @slots[i]
+fn pool_abandon(slots: @&Vec<PoolSlot>)
+    for i in 0..slots.len()
+        let slot = @&slots[i]
         if slot.pid != 0
             kill(slot.pid, SIGKILL)
             wait_pid(slot.pid)
@@ -409,48 +412,55 @@ fn print_captured(output: StrView)
     if output.len == 0
         return
     out_str(output)
-    if output.ptr[output.len - 1] != 10
+    if output.get(output.len - 1) != 10
         out_str("\n")
 
+# The --json / --junit reports a run fills (only the one asked for gets
+# records) and prints at its end.
+struct Reports
+    json: JsonReport
+    junit: JunitReport
+
 # Report one test's outcome; 1 if it did not pass.
-fn report_outcome(opts: @RunOptions, test: *RitzTest, out: *Outcome, summary: *TestSummary) -> i32
+fn report_outcome(opts: @RunOptions, test: *RitzTest, outcomes: @Outcomes, pos: i64, summary: *TestSummary, reports: @&Reports) -> i32
+    let out = @outcomes.list[pos]
     var name: StrView = test.name
     let elapsed: i64 = out.elapsed
     if out.result.status == TEST_RESULT_PASS
         if opts.json != 0
-            json_record_pass(name, elapsed)
+            reports.json.record_pass(name, elapsed)
         else if opts.junit != 0
-            junit_record_pass(name, elapsed)
+            reports.junit.record_pass(name, elapsed)
         else if opts.quiet == 0
             print_test_pass(name, elapsed)
         summary_record(summary, TEST_PASS, elapsed)
         return 0
 
-    var output: StrView = out.output
+    var output: StrView = outcome_output(outcomes, pos)
     if out.result.status == TEST_RESULT_SIGNAL
         var sig_name: StrView = signal_name(out.result.signal)
         if opts.json != 0
-            json_record_crash(name, elapsed, out.result.signal, output)
+            reports.json.record_crash(name, elapsed, out.result.signal, output)
         else if opts.junit != 0
-            junit_record_crash(name, elapsed, out.result.signal, sig_name)
+            reports.junit.record_crash(name, elapsed, out.result.signal, sig_name)
         else
             print_test_crash(name, elapsed, out.result.signal, sig_name)
             print_captured(output)
         summary_record(summary, TEST_CRASH, elapsed)
     else if out.result.status == TEST_RESULT_TIMEOUT
         if opts.json != 0
-            json_record_timeout(name, elapsed, output)
+            reports.json.record_timeout(name, elapsed, output)
         else if opts.junit != 0
-            junit_record_timeout(name, elapsed)
+            reports.junit.record_timeout(name, elapsed)
         else
             print_test_timeout(name, opts.timeout_ms)
             print_captured(output)
         summary_record(summary, TEST_TIMEOUT, elapsed)
     else
         if opts.json != 0
-            json_record_fail(name, elapsed, out.result.exit_code, output)
+            reports.json.record_fail(name, elapsed, out.result.exit_code, output)
         else if opts.junit != 0
-            junit_record_fail(name, elapsed, out.result.exit_code)
+            reports.junit.record_fail(name, elapsed, out.result.exit_code)
         else
             print_test_fail(name, elapsed, out.result.exit_code)
             print_captured(output)
@@ -458,19 +468,19 @@ fn report_outcome(opts: @RunOptions, test: *RitzTest, out: *Outcome, summary: *T
     return 1
 
 # Run the run list in a pool of up to opts.jobs children, reporting in run order.
-fn run_pool(opts: @RunOptions, tests: *RitzTest, run: *i64, nrun: i64, outcomes: *Outcome, summary: *TestSummary)
+fn run_pool(opts: @RunOptions, tests: *RitzTest, run: @Vec<i64>, outcomes: @&Outcomes, summary: *TestSummary, reports: @&Reports)
+    let nrun: i64 = run.len()
     var nslots: i64 = opts.jobs
     if nslots > nrun
         nslots = nrun
     if nslots <= 0
         return
-    var slots: *PoolSlot = malloc(nslots * sizeof(PoolSlot)) as *PoolSlot
-    if slots == null
-        eprints("ritzunit: out of memory\n")
-        return
+    var slots: Vec<PoolSlot> = vec_new<PoolSlot>()
     for i in 0..nslots
-        slots[i].pid = 0
-        slots[i].capture_fd = capture_open()
+        let slot = PoolSlot { pid: 0, pos: 0, start_ms: 0, deadline_ms: 0, killed: 0, capture_fd: capture_open() }
+        if not slots.push(slot)
+            eprints("ritzunit: out of memory\n")
+            return
 
     # On Err nothing was blocked: restoring the empty set is what the raw
     # call's zeroed old mask did.
@@ -485,33 +495,34 @@ fn run_pool(opts: @RunOptions, tests: *RitzTest, run: *i64, nrun: i64, outcomes:
     while reported < nrun
         # Fill free slots.
         for i in 0..nslots
-            if next < nrun && slots[i].pid == 0
-                if pool_launch(opts, @slots[i], @tests[run[next]], next, @outcomes[next], @old_mask) != 0
+            if next < nrun && (@slots[i]).pid == 0
+                if pool_launch(opts, @&slots[i], @tests[run[next]], next, @&outcomes.list[next], @old_mask) != 0
                     live += 1
                 next += 1
         # Report whatever is finished, in order.
         var stop: i32 = 0
-        while reported < next && outcomes[reported].done != 0
-            let failed: i32 = report_outcome(opts, @tests[run[reported]], @outcomes[reported], summary)
+        while reported < next && outcomes.list[reported].done != 0
+            let failed: i32 = report_outcome(opts, @tests[run[reported]], outcomes, reported, summary, reports)
             reported += 1
             if failed != 0 && opts.fail_fast != 0
                 stop = 1
                 break
         if stop != 0
-            pool_abandon(slots, nslots)
+            pool_abandon(@&slots)
             break
         if reported < nrun && live > 0
-            pool_wait(slots, nslots, outcomes)
+            pool_wait(@&slots, outcomes)
             live = 0
             for i in 0..nslots
-                if slots[i].pid != 0
+                if (@slots[i]).pid != 0
                     live += 1
 
     match old_mask.set_mask()
         Ok(_) => pass
         Err(_) => pass
     for i in 0..nslots
-        slots[i].capture_fd.close()
+        let slot = @&slots[i]
+        slot.capture_fd.close()
 
 # ============================================================================
 # Main Test Runner
@@ -530,24 +541,24 @@ fn run_selected(opts: @RunOptions, tests: *RitzTest, count: i64) -> i32
 
     if count == 0
         if opts.json != 0
-            json_print_report(0, 0, 0, 0, 0, 0, 0)
+            let empty: JsonReport = json_report_new()
+            empty.print(0, 0, 0, 0, 0, 0, 0)
         else
             out_str("No tests found.\n")
         return 0
 
-    var order: *i64 = malloc(count * 8) as *i64
-    if order == null
-        eprints("ritzunit: out of memory\n")
-        return 1
+    var order: Vec<i64> = vec_new<i64>()
     for i in 0..count
-        order[i] = i
+        if not order.push(i)
+            eprints("ritzunit: out of memory\n")
+            return 1
 
     if opts.shuffle != 0
         var seed: i64 = opts.seed
         if seed == 0
             seed = get_time_us()
         rng_seed(seed)
-        shuffle_order(order, count)
+        shuffle_order(@&order)
         if opts.verbose != 0
             out_str("Shuffled tests with seed: ")
             out_int(seed)
@@ -559,7 +570,7 @@ fn run_selected(opts: @RunOptions, tests: *RitzTest, count: i64) -> i32
         out_str(" test(s):\n")
         for i in 0..count
             let test: *RitzTest = @tests[order[i]]
-            if filter_match(opts.filter, test.name.ptr) != 0
+            if filter_match(opts.filter, test.name) != 0
                 out_str("  ")
                 out_str(test.name)
                 out_str("\n")
@@ -569,20 +580,21 @@ fn run_selected(opts: @RunOptions, tests: *RitzTest, count: i64) -> i32
         print_suite_header("tests")
 
     # The run list: the selected tests, in run order.
-    var run: *i64 = malloc(count * 8) as *i64
-    var outcomes: *Outcome = malloc(count * sizeof(Outcome)) as *Outcome
-    if run == null || outcomes == null
-        eprints("ritzunit: out of memory\n")
-        return 1
-    var nrun: i64 = 0
+    var run: Vec<i64> = vec_new<i64>()
     var skipped_by_filter: i32 = 0
     for i in 0..count
-        if filter_match(opts.filter, tests[order[i]].name.ptr) == 0
+        if filter_match(opts.filter, (@tests[order[i]]).name) == 0
             skipped_by_filter += 1
-        else
-            run[nrun] = order[i]
-            outcomes[nrun].done = 0
-            nrun += 1
+        else if not run.push(order[i])
+            eprints("ritzunit: out of memory\n")
+            return 1
+    let nrun: i64 = run.len()
+    var outcomes = Outcomes { list: vec_new<Outcome>(), captured: vec_new<u8>() }
+    for k in 0..nrun
+        if not outcomes.list.push(outcome_new())
+            eprints("ritzunit: out of memory\n")
+            return 1
+    var reports = Reports { json: json_report_new(), junit: junit_report_new() }
 
     # Load ritzlib.os.env's cache here, in the runner, before any fork (AGAST
     # #3725). A child is not dumpable (child_disable_core), and the kernel
@@ -597,31 +609,27 @@ fn run_selected(opts: @RunOptions, tests: *RitzTest, count: i64) -> i32
 
     if opts.no_fork != 0
         for k in 0..nrun
-            let out: *Outcome = @outcomes[k]
             # The test writes to our stdout: the report so far goes first.
             out_flush()
             let start: i64 = get_time_ms()
             let ret: i32 = test_exit_status(run_test_direct(@tests[run[k]]))
-            out.elapsed = get_time_ms() - start
-            out.result.exit_code = ret
-            out.result.signal = 0
-            out.result.status = TEST_RESULT_PASS
+            outcomes.list[k].elapsed = get_time_ms() - start
+            outcomes.list[k].result = TestRunResult { status: TEST_RESULT_PASS, exit_code: ret, signal: 0 }
             if ret != 0
-                out.result.status = TEST_RESULT_FAIL
-            out.output = strview_empty()
-            if report_outcome(opts, @tests[run[k]], out, @summary) != 0 && opts.fail_fast != 0
+                outcomes.list[k].result.status = TEST_RESULT_FAIL
+            if report_outcome(opts, @tests[run[k]], @outcomes, k, @summary, @&reports) != 0 && opts.fail_fast != 0
                 break
     else
-        run_pool(opts, tests, run, nrun, outcomes, @summary)
+        run_pool(opts, tests, @run, @&outcomes, @summary, @&reports)
 
     summary.duration_ms = get_time_ms() - total_start
 
     if opts.json != 0
-        json_print_report(summary.total, summary.passed, summary.failed, summary.crashed, summary.timeout, skipped_by_filter, summary.duration_ms)
+        reports.json.print(summary.total, summary.passed, summary.failed, summary.crashed, summary.timeout, skipped_by_filter, summary.duration_ms)
     else if opts.junit != 0
         # JUnit combines crashed and timeout as "errors"
         let errors: i32 = summary.crashed + summary.timeout
-        junit_print_report(summary.total, summary.passed, summary.failed, errors, summary.duration_ms)
+        reports.junit.print(summary.total, summary.passed, summary.failed, errors, summary.duration_ms)
     else
         if opts.quiet == 0
             print_suite_divider()
@@ -683,14 +691,6 @@ fn int_option(spec: @ArgSpec, p: @ParsedArgs, name: StrView, out: *i64) -> i32
         Ok(n) => store_i64(out, n)
         Err(e) => usage_error(spec, e)
 
-# The filter as RunOptions holds it: null when not given. A value is a view
-# into argv (`-f EXPR`, or the tail of `--filter=EXPR`), so its bytes end at
-# argv's own NUL and `.ptr` is a C string.
-fn filter_cstr(v: Option<StrView>) -> *u8
-    match v
-        Some(s) => s.ptr
-        None => null
-
 # Fill `opts` from the command line: 0 to run, 1 if help was shown, -1 on a
 # usage error (reported on stderr). ritzunit takes no positional arguments.
 pub fn parse_args(all: Span<StrView>, opts: *RunOptions) -> i32
@@ -716,7 +716,7 @@ fn fill_options(spec: @ArgSpec, p: @ParsedArgs, opts: *RunOptions) -> i32
     opts.verbose = switch_flag(p, "verbose")
     opts.quiet = switch_flag(p, "quiet")
     opts.list_only = switch_flag(p, "list")
-    opts.filter = filter_cstr(p.value("filter"))
+    opts.filter = p.value("filter")
     if int_option(spec, p, "timeout", @opts.timeout_ms) != 0
         return -1
     opts.no_fork = switch_flag(p, "no-fork")
