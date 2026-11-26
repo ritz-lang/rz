@@ -72,6 +72,16 @@ rubout = os.environ.get("FAKE_NO_RUBOUT") != "1"
 intr = os.environ.get("FAKE_NO_INTR") != "1"
 window_kills = os.environ.get("FAKE_WINDOW_KILLS") == "1"
 window = False
+
+
+def reply(cmd):
+    # A list answers a repeated command (pwd) in order; its last item repeats.
+    r = replies.get(cmd, "")
+    if isinstance(r, list):
+        r = r.pop(0) if len(r) > 1 else r[0]
+    return r.replace("\n", "\r\n").encode()
+
+
 s.sendall(os.environ.get("FAKE_BANNER", "").encode())
 if os.environ.get("FAKE_NO_PROMPT") == "1":
     time.sleep(30)
@@ -107,7 +117,7 @@ while True:
         continue
     cmd, line = line.decode(), b""
     if isinstance(fg, tuple):  # the window's read ends; rzsh spawns
-        s.sendall(b"\r\n" + replies.get(fg[1], "").replace("\n", "\r\n").encode() + prompt)
+        s.sendall(b"\r\n" + reply(fg[1]) + prompt)
         fg = None
         continue
     if fg == "cat":  # cooked mode echoes CR as CR LF; cat writes the line
@@ -135,7 +145,7 @@ while True:
         fg = "spin"
         s.sendall(b"spin: running\r\n")
         continue
-    s.sendall(replies.get(cmd, "").replace("\n", "\r\n").encode() + prompt)
+    s.sendall(reply(cmd) + prompt)
 """
 QEMU_IMG_STUB = """#!/usr/bin/env bash
 for a in "$@"; do last="$a"; done
@@ -148,13 +158,22 @@ open(out, "wb").close()
 
 REPLIES = {
     "echo hi": "hi\n",
-    "pwd": "/\n",
+    # SESSION's pwd, then PATH_SESSION's (#4776), in the order they run.
+    "pwd": ["/\n", "/etc\n", "/\n", "/\n", "/bin\n", "/etc\n", "/etc\n", "/x\n", "/x\n"],
     "ls": "cat   init  rzsh\n",
     "ls -1": "cat\ninit\nrzsh\n",
     "cat /etc/motd": "Welcome to Harland!\n",
-    "ping --help": "Usage: ping <host>\n",
-    "ping 1.1.1.1": "ping: ICMP is unavailable from Harland userspace\n",
+    "ping --help": "Usage: ping <address>\n",
+    "ping 1.1.1.1": "ping: NetAttach: Errno.NoDev (no network service) (-19)\n",
     "ls -1 /shell-fs-test": "child\n",
+    "ls etc": "hostname  motd\n",
+    "cat etc/hostname": "harland\n",
+    "cat hostname": "harland\n",
+    "cat ./motd": "Welcome to Harland!\n",
+    "cat ../etc/hostname": "harland\n",
+    "./cat ./../etc//hostname": "harland\n",
+    "ls ..": "bin  etc\n",
+    "cd nowhere": "cd: nowhere: cannot change directory\n",
     "echo after-cat": "after-cat\n",
 }
 # tty_session()'s commands (#4254), kept apart so the wrong-answer cases above

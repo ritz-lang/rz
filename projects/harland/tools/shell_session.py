@@ -126,10 +126,12 @@ SESSION = [
      lambda ls: "Welcome to Harland!" in ls
      and not any(line.startswith(("[spawn]", "[spawn_args]")) for line in ls)),
     ("ping --help", "prints usage",
-     lambda ls: [line for line in ls if line] == ["Usage: ping <host>"]),
-    ("ping 1.1.1.1", "reports unavailable ICMP",
+     lambda ls: [line for line in ls if line] == ["Usage: ping <address>"]),
+    # No network service runs in this boot, so ping's first call (NetAttach)
+    # answers NoDev (#4751).
+    ("ping 1.1.1.1", "reports NetAttach NoDev with no network service",
      lambda ls: [line for line in ls if line]
-     == ["ping: ICMP is unavailable from Harland userspace"]),
+     == ["ping: NetAttach: Errno.NoDev (no network service) (-19)"]),
     ("mkdir /shell-fs-test", "creates a directory",
      lambda ls: not any(line.startswith("mkdir:") for line in ls)),
     ("cd /shell-fs-test", "enters the created directory",

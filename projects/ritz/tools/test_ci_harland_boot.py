@@ -180,6 +180,14 @@ KEY_OK = (
     r"key event code=30 value=1\n"
 )
 SUITE_PASSED = r"[test] hello ... PASS (exit=0)\n  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
+# init runs indium's ping, udp-send and udp-recv with no ring-2 net service:
+# each prints its NetAttach NoDev line between init's "[test] ..." and its
+# verdict, and exits 19 (AGAST #4751).
+NET_TOOLS = ("ping", "udp-send", "udp-recv")
+NET_NODEV = "".join(
+    rf"[test] {t} nodev ... {t}: NetAttach: Errno.NoDev (no network service) (-19)\nPASS (exit=19)\n"
+    for t in NET_TOOLS
+)
 # The native boot's virtio-blk is modern-only and offers 1024-entry queues;
 # the driver must take the MMIO transport and cap the queue (AGAST #3576).
 BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
@@ -227,7 +235,7 @@ RING_DUMP_END = r"\n=== END RING BUFFER ===\n"
 # dump repeating it.
 RING_OK = (KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_START
            + KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_END)
-PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + SUITE_PASSED + INIT_EXIT
+PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -488,7 +496,7 @@ def test_busy_children_coarsely_paired_by_load_pass(tree):
     serial = (RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
               + BUSY_PAIRED_9
               + SCHED_OK
-              + SMP_OK
+              + SMP_OK + NET_NODEV
               + SUITE_PASSED + INIT_EXIT)
     r = _run(tree, serial)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -577,6 +585,25 @@ def test_suite_passed_but_key_never_arrived_fails(tree):
     assert r.returncode == 1, r.stdout + r.stderr
     assert "PASS (native): init Tier-1 suite" in r.stdout
     assert "injected key A never reached the kernel input queue" in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("tool", NET_TOOLS)
+def test_net_tool_that_did_not_answer_nodev_fails(tree, tool):
+    """A net tool that exits 19 without NetAttach's NoDev line (or that
+    reached the kernel undeclared) fails the gate, though the suite passed."""
+    bad = rf"[test] {tool} nodev ... PASS (exit=19)\n"
+    good = rf"[test] {tool} nodev ... {tool}: NetAttach: Errno.NoDev (no network service) (-19)\nPASS (exit=19)\n"
+    r = _run(tree, PASSED.replace(good, bad))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"FAIL (native): {tool} did not exit 19 (Errno.NoDev)" in r.stdout
+
+
+@pytest.mark.integration
+def test_net_call_reaching_the_kernel_undeclared_fails(tree):
+    r = _run(tree, r"[syscall] unknown: 228\n" + PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "a net call reached the kernel undeclared" in r.stdout
 
 
 @pytest.mark.integration

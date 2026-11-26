@@ -96,6 +96,7 @@ pub fn main() -> i32
 | `net.ritz` | `ritzlib.net` | Networking primitives for TCP/IP communication |
 | `option.ritz` | `ritzlib.option` | `Option<T>`, a value that may be absent |
 | `os/env.ritz` | `ritzlib.os.env` | Environment variable access (Ritz-native) |
+| `path.ritz` | `ritzlib.path` | lexical path resolution (AGAST #4776) |
 | `process.ritz` | `ritzlib.process` | Process spawning and I/O |
 | `ptr.ritz` | `ritzlib.ptr` | reads through a raw pointer that take ownership |
 | `result.ritz` | `ritzlib.result` | `Result<T, E>`, a success value or an error |

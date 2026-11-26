@@ -147,7 +147,9 @@ UEFI-bootable AMI with `ena_support`, and an instance booted from it.
 | `wc` | Count words, lines, and bytes |
 | `seq10` | Print numbers 1 through 10 |
 | `cat_motd` | Display the message of the day |
-| `ping` | Reports that userspace ICMP is unavailable |
+| `ping` | Send one ICMP echo through harland's libnet (`NoDev` without a net service) |
+| `udp-send` | Send one UDP datagram through harland's libnet |
+| `udp-recv` | Receive and print one UDP datagram through harland's libnet |
 | `writefile` | Write a line to a file and flush Goliath storage |
 | `mkdir` | Create directories using absolute paths or the current working directory |
 | `args_test` | Test argument passing |
