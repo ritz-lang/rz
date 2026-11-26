@@ -9,6 +9,8 @@ import ritzlib.sys
 import ritzlib.fmt.digits { fmt_u64_into }
 import ritzlib.fd { Fd, fd_open, O_WRONLY, O_CREAT, O_TRUNC }
 import ritzlib.span { Span }
+import ritzlib.gvec
+import ritzlib.strview { StrView }
 
 # ============================================================================
 # Constants
@@ -188,7 +190,7 @@ fn get_char_row(ch: u8, row: i32) -> u8
 # Pixel buffer operations
 # ============================================================================
 
-fn set_pixel(buffer: *u8, x: u32, y: u32, color: u32)
+fn set_pixel(buffer: [u8], x: u32, y: u32, color: u32)
     if x >= WIDTH || y >= HEIGHT
         return
 
@@ -198,11 +200,11 @@ fn set_pixel(buffer: *u8, x: u32, y: u32, color: u32)
     let b: u8 = (color % 256) as u8
 
     # Correct extraction
-    *(buffer + offset) = ((color >> 16) as u32 % 256) as u8      # R
-    *(buffer + offset + 1) = ((color >> 8) as u32 % 256) as u8   # G
-    *(buffer + offset + 2) = (color as u32 % 256) as u8          # B
+    buffer[offset] = ((color >> 16) as u32 % 256) as u8      # R
+    buffer[offset + 1] = ((color >> 8) as u32 % 256) as u8   # G
+    buffer[offset + 2] = (color as u32 % 256) as u8          # B
 
-fn fill_rect(buffer: *u8, x: u32, y: u32, w: u32, h: u32, color: u32)
+fn fill_rect(buffer: [u8], x: u32, y: u32, w: u32, h: u32, color: u32)
     var py: u32 = 0
     while py < h
         var px: u32 = 0
@@ -211,7 +213,7 @@ fn fill_rect(buffer: *u8, x: u32, y: u32, w: u32, h: u32, color: u32)
             px = px + 1
         py = py + 1
 
-fn draw_char(buffer: *u8, ch: u8, x: u32, y: u32, color: u32, scale: u32)
+fn draw_char(buffer: [u8], ch: u8, x: u32, y: u32, color: u32, scale: u32)
     var row: i32 = 0
     while row < 7
         let row_bits: u8 = get_char_row(ch, row)
@@ -238,11 +240,11 @@ fn draw_char(buffer: *u8, ch: u8, x: u32, y: u32, color: u32, scale: u32)
             col = col + 1
         row = row + 1
 
-fn draw_string(buffer: *u8, text: *u8, text_len: i64, x: u32, y: u32, color: u32, scale: u32)
+fn draw_string(buffer: [u8], text: StrView, x: u32, y: u32, color: u32, scale: u32)
     var cursor_x: u32 = x
     var i: i64 = 0
-    while i < text_len
-        let ch: u8 = *(text + i)
+    while i < text.len
+        let ch: u8 = text.get(i)
         draw_char(buffer, ch, cursor_x, y, color, scale)
         cursor_x = cursor_x + (6 * scale)  # 5 pixels + 1 pixel gap
         i = i + 1
@@ -270,10 +272,12 @@ fn write_ppm_header(f: @Fd, width: u32, height: u32)
 # ============================================================================
 
 pub fn main() -> i32
-    # Allocate pixel buffer using mmap (RGB format, 3 bytes per pixel)
-    let buffer: *u8 = sys_mmap(0, BUFFER_SIZE, 3, 34, -1, 0)  # PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS
-    if buffer as i64 < 0
+    # Allocate pixel buffer (RGB format, 3 bytes per pixel), freed when
+    # `pixels` goes
+    let pixels: Vec<u8> = vec_zeroed<u8>(BUFFER_SIZE)
+    if pixels.len() != BUFFER_SIZE
         return 1
+    let buffer: [u8] = pixels[0..BUFFER_SIZE]
 
     # Fill background
     fill_rect(buffer, 0, 0, WIDTH, HEIGHT, BG_COLOR)
@@ -282,38 +286,21 @@ pub fn main() -> i32
     # 5x7 font * 2 scale = 10x14 pixels per character
     # Position: centered vertically, starting at x=10
 
-    # "Hello World!" - stored as bytes
-    var text: [12]u8
-    text[0] = 72    # 'H'
-    text[1] = 101   # 'e'
-    text[2] = 108   # 'l'
-    text[3] = 108   # 'l'
-    text[4] = 111   # 'o'
-    text[5] = 32    # ' '
-    text[6] = 87    # 'W'
-    text[7] = 111   # 'o'
-    text[8] = 114   # 'r'
-    text[9] = 108   # 'l'
-    text[10] = 100  # 'd'
-    text[11] = 33   # '!'
-
-    draw_string(buffer, @text[0], 12, 10, 18, TEXT_COLOR, 2)
+    draw_string(buffer, "Hello World!", 10, 18, TEXT_COLOR, 2)
 
     # Open output file: O_WRONLY | O_CREAT | O_TRUNC, mode 0644
     var out: Fd = match fd_open("hello.ppm", O_WRONLY + O_CREAT + O_TRUNC, 420)
         Ok(opened) => opened
         Err(_) =>
-            sys_munmap(buffer, BUFFER_SIZE)
             return 2
 
     # Write PPM header
     write_ppm_header(@out, WIDTH, HEIGHT)
 
     # Write pixel data
-    out.write(Span<u8> { ptr: buffer, len: BUFFER_SIZE })
+    out.write(buffer)
 
     # Cleanup
     out.close()
-    sys_munmap(buffer, BUFFER_SIZE)
 
     return 0

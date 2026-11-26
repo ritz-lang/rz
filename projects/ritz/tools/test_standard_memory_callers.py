@@ -37,7 +37,6 @@ MEMORY_APIS = frozenset({
 PINS = {
     "cryptosec": 0,
     "indium": 16,
-    "prism": 3,
     "ritz/ritz0": 18,
     "ritz/ritz1": 511,
 }

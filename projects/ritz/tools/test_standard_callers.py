@@ -58,7 +58,7 @@ PINS = {
     # server binary; ritzlib.process.exec is that process boundary.
     "mausoleum": 2,
     "nexus": 0,
-    "prism": 3,
+    "prism": 0,
     # ritz/examples keeps 3, typed wrappers at a syscall boundary: time.sleep
     # (nanosleep; exempt only for its free-fn name) in 10_sleep and 40_watch,
     # process.exec (execve; owns the argv block) in 35_nohup.
