@@ -1,0 +1,69 @@
+# Harland ring-1 driver boot record (AGAST #4734, docs/RING1_DRIVER.md
+# sections 5 and 8)
+#
+# What a kernel-spawned virtio driver is handed besides its capabilities:
+# the handles the kernel granted it and the MSI-X table indexes it may
+# program into the device. Before the driver first runs, the kernel maps
+# the frame region into it at DRV_RING_BASE (the ShmMap path an attach
+# uses, so that is the process's first shared mapping) and writes one
+# DriverBoot at FRAME_ADVISORY_OFF in that region: the span section 6
+# names for the advisory copy of the window list and the MSI-X indexes.
+#
+# The record is advisory to the kernel, never authority: DrvMmioMap maps a
+# window from the kernel's own record of it (drivers/virtio/window.ritz),
+# and a handle the driver does not hold is Errno.Perm whatever the record
+# says. The page is peer-writable once the consumer maps the region, so the
+# driver copies the record into private memory once, before it publishes
+# anything, and checks the copy (the frame handle's ShmMap must return
+# DRV_RING_BASE, every window's offset and length must fit the pages
+# DrvMmioMap grants). Imports only this package.
+
+import driver_abi.frame_ring { FRAME_ADVISORY_OFF }
+
+# Where the kernel maps the frame region before the driver runs: the first
+# address of the shared-object window (kernel mm/vmm.ritz DRV_RING_BASE,
+# PML4[251]).
+pub const DRV_RING_BASE: u64 = 0x7D8000000000
+
+# DriverBoot.magic: "VBR1", the first layout. A record with any other value
+# is not one the kernel wrote; the driver exits.
+pub const DRIVER_BOOT_MAGIC: u32 = 0x31524256
+
+# The most windows a record carries. A modern virtio-pci device has four
+# that matter (common, notify, ISR, device config).
+pub const DRIVER_BOOT_WINDOWS: u32 = 8
+
+# DriverWindow.cfg_type: the virtio PCI capability's cfg_type (virtio 1.1
+# section 4.1.4), so the driver knows which register block a window holds.
+pub const VIRTIO_WINDOW_COMMON: u8 = 1
+pub const VIRTIO_WINDOW_NOTIFY: u8 = 2
+pub const VIRTIO_WINDOW_ISR: u8 = 3
+pub const VIRTIO_WINDOW_DEVICE: u8 = 4
+
+# One granted MMIO window: its CAP_TYPE_MMIO handle and where its register
+# block sits in the pages DrvMmioMap (221) returns (the capability's byte
+# offset within the first page, and its length).
+pub struct DriverWindow
+    handle: u64                      # CAP_TYPE_MMIO
+    offset: u32                      # < 4096: first byte within the first page
+    length: u32                      # bytes of the capability
+    notify_multiplier: u32           # VIRTIO_WINDOW_NOTIFY only, else 0
+    cfg_type: u8                     # VIRTIO_WINDOW_*
+    _pad: [3]u8
+
+# The record at FRAME_ADVISORY_OFF of the frame region.
+pub struct DriverBoot
+    magic: u32                       # DRIVER_BOOT_MAGIC
+    window_count: u32                # 0..=DRIVER_BOOT_WINDOWS
+    irq: u64                         # CAP_TYPE_IRQ: DrvIrqWait, DrvDmaAlloc
+    frame: u64                       # CAP_TYPE_SHM: this frame region
+    link: u64                        # CAP_TYPE_SHM with CAP_RIGHT_PUBLISH
+    msix_config: u16                 # MSI-X table index for config changes
+    msix_rx: u16                     # ... for the RX queue (queue 0)
+    msix_tx: u16                     # ... for the TX queue (queue 1)
+    _pad: u16
+    windows: [8]DriverWindow
+
+# The record's address in a frame region mapped at `region`.
+pub fn driver_boot_at(region: u64) -> *DriverBoot
+    (region + FRAME_ADVISORY_OFF) as *DriverBoot

@@ -190,7 +190,9 @@ def fake_world(tmp_path: Path):
     for pkg in pkgs:
         d = pkgs_root / pkg / "build" / "debug"
         d.mkdir(parents=True)
-        (d / f"{pkg}.elf").write_bytes(b"\x7fELF fake")
+        # A nested package (harland/system) builds into its own dir; its
+        # fake ELF takes the last path component.
+        (d / f"{Path(pkg).name}.elf").write_bytes(b"\x7fELF fake")
     bindir = tmp_path / "bin"
     bindir.mkdir()
     log = tmp_path / "rz.log"
@@ -228,7 +230,7 @@ def test_mkiso_builds_with_every_package(fake_world):
     assert r.returncode == 0, r.stdout + r.stderr
     assert (fake_world["build"] / "indium.iso").is_file()
     staged = sorted(p.name for p in (fake_world["build"] / "initramfs-bin").iterdir())
-    assert staged == sorted(f"{p}.elf" for p in fake_world["pkgs"])
+    assert staged == sorted(f"{Path(p).name}.elf" for p in fake_world["pkgs"])
 
 
 def test_mkiso_loads_the_initramfs_as_a_multiboot2_module(fake_world):

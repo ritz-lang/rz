@@ -1,0 +1,532 @@
+# /bin/virtio-net: the ring-1 virtio-net driver (AGAST #4734,
+# harland docs/RING1_DRIVER.md sections 4-9)
+#
+# A CPL-3 process the kernel spawns on a boot whose NIC sits in a private,
+# translated DMA domain (the cutover, AGAST #4735: nothing spawns it yet).
+# The kernel keeps PCI, bus mastering, the MSI-X table and the IDT; this
+# program owns the device from reset on:
+#
+#   1. Copy the boot record (driver_abi.boot) out of the frame region the
+#      kernel mapped at DRV_RING_BASE, and check it.
+#   2. DrvMmioMap the common, notify and device-config windows. A device
+#      with no common or notify window is legacy-only: exit.
+#   3. Reset; ACKNOWLEDGE | DRIVER; negotiate VERSION_1 (bit 32),
+#      ACCESS_PLATFORM (bit 33: DMA through the domain), MAC, STATUS and
+#      MTU; FEATURES_OK.
+#   4. Both queues' rings and both buffer pools in DrvDmaAlloc memory,
+#      programmed with their IOVAs; the config and queue MSI-X vectors are
+#      the table indexes the kernel handed over. DRIVER_OK.
+#   5. Publish NetInfo on the link page (link_seq 2) and NetPublish it.
+#   6. Post the 32 RX buffers and drain TX, then wait in DrvIrqWait on the
+#      device's IRQ and the frame object.
+#
+# The loop: RX completions go to the RX frame ring with the virtio-net
+# header stripped (DATA to the consumer); a full ring leaves the
+# completion on the device queue, keeps draining TX and yields. TX slots
+# are validated on one private copy and posted with a header added; a
+# buffer is reclaimed only when the used ring returns it (AGAST #4073).
+# PEER_CLOSE detaches the frame object; ATTACH maps its replacement and
+# starts its private indexes at 0. src/vnet.ritz is the part that is not a
+# syscall or a register, and is what the host tests drive.
+
+import ritzlib.strview { StrView }
+import ritzlib.errno { Errno, errno_from_raw }
+import ritzlib.sys { syscall0, syscall1, syscall2, syscall3 }
+import driver_abi.boot { DriverBoot, DriverWindow, DRV_RING_BASE, driver_boot_at }
+import driver_abi.dma { DmaAlloc }
+import driver_abi.link { NetInfo, link_publish }
+import driver_abi.spsc { SpscProducer, SpscConsumer, FrameBytes, spsc_rx_ring, spsc_tx_ring }
+import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_ATTACH, WAIT_OUT_CAP }
+import virtio_abi.features { VIRTIO_F_VERSION_1, VIRTIO_F_ACCESS_PLATFORM, virtio_driver_features, virtio_features_lo, virtio_features_hi, virtio_features_join }
+import virtio_abi.virtq { Virtqueue, VIRTQ_MAX_SIZE, virtq_ring_bytes, virtq_init, virtq_desc_phys, virtq_avail_phys, virtq_used_phys, tx_slots_init }
+import system.vnet { NetQueues, FrameSeat, Pool, BootWindows, BootBad, RxDrain, TxDrain, RX_BUFFERS, TX_BUFFERS, vnet_hdr_len, pool_bytes, net_info, boot_windows, rx_post_all, rx_drain, tx_drain }
+
+# ============================================================================
+# Syscalls (harland numbers; ritzlib.sys names them and leaves the
+# wrappers to the driver, the one caller)
+# ============================================================================
+
+const NR_YIELD: i64 = 24
+const NR_CAP_REVOKE: i64 = 41
+const NR_DRV_IRQ_WAIT: i64 = 220
+const NR_DRV_MMIO_MAP: i64 = 221
+const NR_DRV_DMA_ALLOC: i64 = 222
+const NR_NET_PUBLISH: i64 = 226
+const NR_SHM_MAP: i64 = 227
+const NR_SHM_NOTIFY: i64 = 230
+
+# A syscall's return: its non-negative value, or the errno.
+fn sys_result(r: i64) -> Result<u64, Errno>
+    if r < 0
+        return Err(errno_from_raw(r as i32))
+    Ok(r as u64)
+
+fn sys_unit(r: i64) -> Result<(), Errno>
+    if r < 0
+        return Err(errno_from_raw(r as i32))
+    Ok(())
+
+# What a DrvIrqWait that did not fail saw.
+enum Woke
+    Irq                              # 0: the IRQ record is among the events
+    Deadline                         # 1: DEVICE_WAIT_MS passed, nothing consumed
+    Events                           # 2: shm or inbox events only
+
+fn drv_irq_wait(irq: u64, req: *WaitRequest) -> Result<Woke, Errno>
+    let r: u64 = sys_result(syscall2(NR_DRV_IRQ_WAIT, irq as i64, req as i64))?
+    if r == 0
+        return Ok(Woke.Irq)
+    if r == 1
+        return Ok(Woke.Deadline)
+    Ok(Woke.Events)
+
+# The user VA of the first page of MMIO window `h`.
+fn drv_mmio_map(h: u64) -> Result<u64, Errno>
+    sys_result(syscall1(NR_DRV_MMIO_MAP, h as i64))
+
+# One zeroed DMA run: the CPU's address and the device's.
+struct DmaRun
+    virt: u64
+    iova: u64
+
+fn drv_dma_alloc(irq: u64, size: u64) -> Result<DmaRun, Errno>
+    var got: DmaAlloc = DmaAlloc { iova: 0, size: 0 }
+    match sys_result(syscall3(NR_DRV_DMA_ALLOC, irq as i64, size as i64, @got as i64))
+        Ok(va) => Ok(DmaRun { virt: va, iova: got.iova })
+        Err(e) => Err(e)
+
+fn shm_map(h: u64) -> Result<u64, Errno>
+    sys_result(syscall1(NR_SHM_MAP, h as i64))
+
+# Post `bits` to the other holder's latch. Errno.NoDev (no other holder)
+# is not the driver's problem: the bits are for a consumer, if one exists.
+fn shm_notify(h: u64, bits: u32)
+    match sys_unit(syscall2(NR_SHM_NOTIFY, h as i64, bits as i64))
+        Ok(_) => pass
+        Err(_) => pass
+
+fn net_publish(link: u64) -> Result<(), Errno>
+    sys_unit(syscall1(NR_NET_PUBLISH, link as i64))
+
+# Drop handle `h` (and with it this process's mapping). A handle already
+# gone (the kernel drops a retired one) is not an error to the driver.
+# Yield (24): let the consumer run. It switches even before sched_start
+# (RING1_DRIVER.md section 6, the full-RX-ring rule) and cannot fail.
+fn yield_cpu()
+    syscall0(NR_YIELD)
+
+fn cap_revoke(h: u64)
+    match sys_result(syscall1(NR_CAP_REVOKE, h as i64))
+        Ok(_) => pass
+        Err(_) => pass
+
+# ============================================================================
+# Registers (virtio 1.1 sections 4.1.4.3 and 5.1.4)
+# ============================================================================
+
+# Common configuration
+const COMMON_DEVICE_FEATURE_SELECT: u64 = 0x00
+const COMMON_DEVICE_FEATURE: u64 = 0x04
+const COMMON_DRIVER_FEATURE_SELECT: u64 = 0x08
+const COMMON_DRIVER_FEATURE: u64 = 0x0C
+const COMMON_MSIX_CONFIG: u64 = 0x10
+const COMMON_DEVICE_STATUS: u64 = 0x14
+const COMMON_QUEUE_SELECT: u64 = 0x16
+const COMMON_QUEUE_SIZE: u64 = 0x18
+const COMMON_QUEUE_MSIX_VECTOR: u64 = 0x1A
+const COMMON_QUEUE_ENABLE: u64 = 0x1C
+const COMMON_QUEUE_NOTIFY_OFF: u64 = 0x1E
+const COMMON_QUEUE_DESC: u64 = 0x20
+const COMMON_QUEUE_DRIVER: u64 = 0x28
+const COMMON_QUEUE_DEVICE: u64 = 0x30
+# The bytes of the common configuration this driver touches.
+const COMMON_LEN: u32 = 0x38
+
+const STATUS_ACKNOWLEDGE: u8 = 1
+const STATUS_DRIVER: u8 = 2
+const STATUS_DRIVER_OK: u8 = 4
+const STATUS_FEATURES_OK: u8 = 8
+const STATUS_NEEDS_RESET: u8 = 64
+const STATUS_FAILED: u8 = 128
+
+const MSI_NO_VECTOR: u16 = 0xFFFF
+
+# virtio-net device configuration: mac[6], status u16, max pairs u16, mtu u16
+const NET_CFG_MAC: u64 = 0
+const NET_CFG_STATUS: u64 = 6
+const NET_CFG_MTU: u64 = 10
+const NET_CFG_LEN: u32 = 12
+const NET_STATUS_LINK_UP: u16 = 1
+
+const VIRTIO_NET_F_MTU: u64 = 0x8
+const VIRTIO_NET_F_MAC: u64 = 0x20
+const VIRTIO_NET_F_STATUS: u64 = 0x10000
+
+const RX_QUEUE: u16 = 0
+const TX_QUEUE: u16 = 1
+
+# How many reads of device_status the reset waits for 0 (virtio 1.1
+# 4.1.4.3.2). It cannot yield: until its first DrvIrqWait the driver is
+# the only runnable process besides pid 1, which must not run mid-init
+# (section 9 step 3).
+const RESET_POLLS: u32 = 10000000
+
+# Where the device's register blocks are mapped, with the bytes each holds.
+struct Regs
+    common: u64
+    notify: u64
+    notify_len: u32
+    notify_mult: u32
+    device: u64
+
+fn rd8(a: u64) -> u8
+    volatile_load(a as *u8)
+
+fn rd16(a: u64) -> u16
+    volatile_load(a as *u16)
+
+fn rd32(a: u64) -> u32
+    volatile_load(a as *u32)
+
+fn wr8(a: u64, v: u8)
+    volatile_store(a as *u8, v)
+
+fn wr16(a: u64, v: u16)
+    volatile_store(a as *u16, v)
+
+fn wr32(a: u64, v: u32)
+    volatile_store(a as *u32, v)
+
+fn wr64(a: u64, v: u64)
+    wr32(a, (v & 0xFFFFFFFF) as u32)
+    wr32(a + 4, (v >> 32) as u32)
+
+fn status(r: Regs) -> u8
+    rd8(r.common + COMMON_DEVICE_STATUS)
+
+fn add_status(r: Regs, bits: u8)
+    wr8(r.common + COMMON_DEVICE_STATUS, status(r) | bits)
+
+# ============================================================================
+# State
+# ============================================================================
+
+var g_boot: DriverBoot
+var g_regs: Regs
+var g_q: NetQueues
+var g_seat: FrameSeat
+var g_scratch: FrameBytes
+# Each queue's doorbell: notify + queue_notify_off * notify_multiplier.
+var g_rx_doorbell: u64
+var g_tx_doorbell: u64
+var g_features: u64
+var g_mac: [6]u8
+var g_mtu: Option<u16>
+var g_link_va: u64
+var g_link_up: bool
+var g_sources: [1]WaitSource
+var g_events: [8]WaitEvent
+
+# ============================================================================
+# Bring-up
+# ============================================================================
+
+# Why the driver exits before it ever waits. The exit status is
+# 10 + the variant's position, so a boot log names the step.
+enum InitError
+    Boot(BootBad)                    # 10
+    Frame                            # 11: the frame handle is not the region at DRV_RING_BASE
+    Map(Errno)                    # 12: a window would not map
+    Window                           # 13: a register block is shorter than its registers
+    Reset                            # 14: device_status never read 0
+    Features                         # 15: no VERSION_1, ACCESS_PLATFORM or MAC
+    FeaturesOk                       # 16: the device refused the features
+    Vector                           # 17: an MSI-X vector read back NO_VECTOR
+    Queue                            # 18: a queue is missing or its doorbell is outside the window
+    Dma(Errno)                    # 19
+    NeedsReset                       # 20: DEVICE_NEEDS_RESET after DRIVER_OK
+    Link(Errno)                   # 21: the link page would not map or publish
+
+fn init_status(e: InitError) -> i32
+    match e
+        InitError.Boot(_) => 10
+        InitError.Frame => 11
+        InitError.Map(_) => 12
+        InitError.Window => 13
+        InitError.Reset => 14
+        InitError.Features => 15
+        InitError.FeaturesOk => 16
+        InitError.Vector => 17
+        InitError.Queue => 18
+        InitError.Dma(_) => 19
+        InitError.NeedsReset => 20
+        InitError.Link(_) => 21
+
+# 1. The boot record, copied once into private memory before anything is
+# published (the page is peer-writable once the consumer maps it), and the
+# frame handle it names must be the region it was found in.
+fn read_boot() -> Result<BootWindows, InitError>
+    g_boot = *driver_boot_at(DRV_RING_BASE)
+    let w: BootWindows = match boot_windows(g_boot)
+        Ok(x) => x
+        Err(why) => return Err(InitError.Boot(why))
+    match shm_map(g_boot.frame)
+        Ok(va) =>
+            if va != DRV_RING_BASE
+                return Err(InitError.Frame)
+        Err(_) => return Err(InitError.Frame)
+    Ok(w)
+
+# The CPU address of window `i`'s register block, at least `need` bytes.
+fn map_window(i: u32, need: u32) -> Result<u64, InitError>
+    let w: DriverWindow = g_boot.windows[i]
+    if w.length < need
+        return Err(InitError.Window)
+    match drv_mmio_map(w.handle)
+        Ok(va) => Ok(va + w.offset as u64)
+        Err(e) => Err(InitError.Map(e))
+
+# 2. The common, notify and device-config windows.
+fn map_regs(w: BootWindows) -> Result<Regs, InitError>
+    let device_idx: u32 = match w.device
+        Some(d) => d
+        None => return Err(InitError.Window)
+    let common: u64 = map_window(w.common, COMMON_LEN)?
+    let notify: u64 = map_window(w.notify, 2)?
+    let device: u64 = map_window(device_idx, NET_CFG_LEN)?
+    let n: DriverWindow = g_boot.windows[w.notify]
+    Ok(Regs { common: common, notify: notify, notify_len: n.length, notify_mult: n.notify_multiplier, device: device })
+
+# 3. Reset, then negotiate. Returns the accepted features.
+fn negotiate(r: Regs) -> Result<u64, InitError>
+    wr8(r.common + COMMON_DEVICE_STATUS, 0)
+    var polls: u32 = 0
+    while status(r) != 0
+        polls = polls + 1
+        if polls >= RESET_POLLS
+            return Err(InitError.Reset)
+    add_status(r, STATUS_ACKNOWLEDGE)
+    add_status(r, STATUS_DRIVER)
+    wr32(r.common + COMMON_DEVICE_FEATURE_SELECT, 0)
+    let lo: u32 = rd32(r.common + COMMON_DEVICE_FEATURE)
+    wr32(r.common + COMMON_DEVICE_FEATURE_SELECT, 1)
+    let hi: u32 = rd32(r.common + COMMON_DEVICE_FEATURE)
+    let wanted: u64 = VIRTIO_F_ACCESS_PLATFORM | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_NET_F_MTU
+    let accepted: u64 = virtio_driver_features(virtio_features_join(lo, hi), wanted)
+    # Modern only; DMA only through the domain (without bit 33 the device
+    # would DMA to guest-physical addresses, not these IOVAs); and a MAC.
+    let required: u64 = VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM | VIRTIO_NET_F_MAC
+    if (accepted & required) != required
+        add_status(r, STATUS_FAILED)
+        return Err(InitError.Features)
+    wr32(r.common + COMMON_DRIVER_FEATURE_SELECT, 0)
+    wr32(r.common + COMMON_DRIVER_FEATURE, virtio_features_lo(accepted))
+    wr32(r.common + COMMON_DRIVER_FEATURE_SELECT, 1)
+    wr32(r.common + COMMON_DRIVER_FEATURE, virtio_features_hi(accepted))
+    add_status(r, STATUS_FEATURES_OK)
+    if (status(r) & STATUS_FEATURES_OK) == 0
+        add_status(r, STATUS_FAILED)
+        return Err(InitError.FeaturesOk)
+    Ok(accepted)
+
+# Lay queue `idx` over a fresh DrvDmaAlloc run and tell the device where it
+# is, signalling MSI-X table index `vector`. Returns its doorbell.
+fn setup_queue(r: Regs, vq: *Virtqueue, idx: u16, vector: u16) -> Result<u64, InitError>
+    wr16(r.common + COMMON_QUEUE_SELECT, idx)
+    var num: u16 = rd16(r.common + COMMON_QUEUE_SIZE)
+    if num == 0
+        return Err(InitError.Queue)
+    if num > VIRTQ_MAX_SIZE
+        num = VIRTQ_MAX_SIZE
+    let run: DmaRun = match drv_dma_alloc(g_boot.irq, virtq_ring_bytes(num))
+        Ok(x) => x
+        Err(e) => return Err(InitError.Dma(e))
+    virtq_init(vq, idx, num, run.virt, run.iova)
+    wr16(r.common + COMMON_QUEUE_SIZE, num)
+    wr16(r.common + COMMON_QUEUE_MSIX_VECTOR, vector)
+    if rd16(r.common + COMMON_QUEUE_MSIX_VECTOR) == MSI_NO_VECTOR
+        return Err(InitError.Vector)
+    let off: u64 = (rd16(r.common + COMMON_QUEUE_NOTIFY_OFF) as u64) * (r.notify_mult as u64)
+    if off + 2 > r.notify_len as u64
+        return Err(InitError.Queue)
+    wr64(r.common + COMMON_QUEUE_DESC, virtq_desc_phys(vq))
+    wr64(r.common + COMMON_QUEUE_DRIVER, virtq_avail_phys(vq))
+    wr64(r.common + COMMON_QUEUE_DEVICE, virtq_used_phys(vq))
+    wr16(r.common + COMMON_QUEUE_ENABLE, 1)
+    Ok(r.notify + off)
+
+fn pool_new(count: u32) -> Result<Pool, InitError>
+    match drv_dma_alloc(g_boot.irq, pool_bytes(count))
+        Ok(run) => Ok(Pool { virt: run.virt, iova: run.iova, count: count })
+        Err(e) => Err(InitError.Dma(e))
+
+# 4. The config vector, both queues and both pools; DRIVER_OK.
+fn setup_device(r: Regs) -> Result<(), InitError>
+    wr16(r.common + COMMON_MSIX_CONFIG, g_boot.msix_config)
+    if rd16(r.common + COMMON_MSIX_CONFIG) == MSI_NO_VECTOR
+        return Err(InitError.Vector)
+    g_rx_doorbell = setup_queue(r, @g_q.rx, RX_QUEUE, g_boot.msix_rx)?
+    g_tx_doorbell = setup_queue(r, @g_q.tx, TX_QUEUE, g_boot.msix_tx)?
+    g_q.rx_pool = pool_new(RX_BUFFERS)?
+    g_q.tx_pool = pool_new(TX_BUFFERS)?
+    # Never more buffers in flight than the queue has descriptors.
+    var tx_count: u32 = TX_BUFFERS
+    if (g_q.tx.num as u32) < tx_count
+        tx_count = g_q.tx.num as u32
+    tx_slots_init(@g_q.tx_slots, tx_count)
+    g_q.hdr = vnet_hdr_len(true)
+    add_status(r, STATUS_DRIVER_OK)
+    if (status(r) & STATUS_NEEDS_RESET) != 0
+        return Err(InitError.NeedsReset)
+    Ok(())
+
+fn read_link_up(r: Regs) -> bool
+    # Without VIRTIO_NET_F_STATUS the link is assumed up (virtio 1.1 5.1.4.2).
+    if (g_features & VIRTIO_NET_F_STATUS) == 0
+        return true
+    (rd16(r.device + NET_CFG_STATUS) & NET_STATUS_LINK_UP) != 0
+
+# 5. NetInfo on the link page, generation 2 on a fresh page, then
+# NetPublish: the kernel's snapshot is what makes the ring the NIC.
+# g_link_up follows only a publish the kernel took, so a refused one is
+# tried again on the next pass.
+fn publish_link(r: Regs) -> Result<(), Errno>
+    let up: bool = read_link_up(r)
+    let info: NetInfo = net_info(g_mac, up, g_mtu)
+    link_publish(g_link_va, @info)
+    net_publish(g_boot.link)?
+    g_link_up = up
+    Ok(())
+
+fn bring_up() -> Result<(), InitError>
+    let w: BootWindows = read_boot()?
+    g_regs = map_regs(w)?
+    g_features = negotiate(g_regs)?
+    for i in 0..6
+        g_mac[i] = rd8(g_regs.device + NET_CFG_MAC + i as u64)
+    g_mtu = None
+    if (g_features & VIRTIO_NET_F_MTU) != 0
+        g_mtu = Some(rd16(g_regs.device + NET_CFG_MTU))
+    setup_device(g_regs)?
+    g_link_va = match shm_map(g_boot.link)
+        Ok(va) => va
+        Err(e) => return Err(InitError.Link(e))
+    match publish_link(g_regs)
+        Ok(_) => pass
+        Err(e) => return Err(InitError.Link(e))
+    let region: u64 = DRV_RING_BASE
+    g_seat = FrameSeat { attached: true, handle: g_boot.frame, rx: SpscProducer.new(spsc_rx_ring(region)), tx: SpscConsumer.new(spsc_tx_ring(region)) }
+    Ok(())
+
+# ============================================================================
+# The loop
+# ============================================================================
+
+fn kick(doorbell: u64, queue: u16)
+    # The avail idx vq_submit stored is visible before the doorbell.
+    fence()
+    wr16(doorbell, queue)
+
+# Stop using the frame object: drop the handle, which unmaps it.
+fn detach()
+    if g_seat.attached
+        cap_revoke(g_seat.handle)
+        g_seat.attached = false
+
+# A replacement frame object: map it, and start both private indexes at 0.
+fn attach(h: u64)
+    if g_seat.attached and g_seat.handle == h
+        return
+    detach()
+    match shm_map(h)
+        Ok(va) =>
+            g_seat = FrameSeat { attached: true, handle: h, rx: SpscProducer.new(spsc_rx_ring(va)), tx: SpscConsumer.new(spsc_tx_ring(va)) }
+        Err(_) =>
+            # A retired object: the kernel already dropped the handle.
+            print("[virtio-net] ATTACH: the new frame object would not map\n")
+
+fn handle_events(count: u32)
+    for i in 0..count
+        let ev: WaitEvent = g_events[i]
+        if ev.handle == g_boot.irq
+            continue
+        if (ev.bits & EVENT_ATTACH) != 0
+            attach(ev.handle)
+        else if (ev.bits & (EVENT_PEER_CLOSE | EVENT_DRIVER_GONE)) != 0
+            if g_seat.attached and ev.handle == g_seat.handle
+                detach()
+            else
+                cap_revoke(ev.handle)
+
+# One pass over both queues. True when RX stopped on a full frame ring.
+fn service() -> bool
+    let rx: RxDrain = rx_drain(@g_q, @&g_seat)
+    if rx.kick
+        kick(g_rx_doorbell, RX_QUEUE)
+    if rx.published > 0
+        shm_notify(g_seat.handle, EVENT_DATA)
+    if rx.closed.is_some()
+        print("[virtio-net] RX ring closed: impossible read_idx\n")
+        detach()
+    let tx: TxDrain = tx_drain(@g_q, @&g_seat, @&g_scratch)
+    if tx.kick
+        kick(g_tx_doorbell, TX_QUEUE)
+    if tx.sent + tx.rejected > 0
+        shm_notify(g_seat.handle, EVENT_SPACE)
+    if tx.closed.is_some()
+        print("[virtio-net] TX ring closed: impossible write_idx\n")
+        detach()
+    # A config interrupt may mean the link changed: publish the new state.
+    if read_link_up(g_regs) != g_link_up
+        match publish_link(g_regs)
+            Ok(_) => pass
+            Err(_) => print("[virtio-net] NetPublish refused the link change\n")
+    rx.full and g_seat.attached
+
+# Wait on the IRQ, the frame object and the inbox; then handle the events.
+# An errno other than Again ends the driver.
+fn wait_once() -> Result<(), Errno>
+    var req: WaitRequest
+    req.sources = @g_sources[0]
+    req.source_count = 0
+    if g_seat.attached
+        g_sources[0] = WaitSource { handle: g_seat.handle, mask: EVENT_DATA, _pad: 0 }
+        req.source_count = 1
+    req.out_cap = WAIT_OUT_CAP
+    req.out = @g_events[0]
+    req.deadline = 0
+    req.out_count = 0
+    req._pad = 0
+    match drv_irq_wait(g_boot.irq, @req)
+        Ok(woke) =>
+            match woke
+                Woke.Deadline => pass
+                _ => handle_events(req.out_count)
+            Ok(())
+        Err(e) =>
+            match e
+                Errno.Again =>
+                    yield_cpu()
+                    Ok(())
+                _ => Err(e)
+
+pub fn main(args: Span<StrView>) -> i32
+    match bring_up()
+        Ok(_) => pass
+        Err(e) =>
+            let code: i32 = init_status(e)
+            print("[virtio-net] bring-up failed: exit {code}\n")
+            return code
+    rx_post_all(@g_q)
+    kick(g_rx_doorbell, RX_QUEUE)
+    print("[virtio-net] up: MAC published, 32 RX buffers posted\n")
+    while true
+        # A full RX ring: TX was drained in this pass; let the consumer run.
+        if service()
+            yield_cpu()
+            continue
+        match wait_once()
+            Ok(_) => pass
+            Err(_) =>
+                print("[virtio-net] DrvIrqWait failed: exiting\n")
+                return 1

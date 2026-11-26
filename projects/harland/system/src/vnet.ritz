@@ -1,0 +1,356 @@
+# The ring-1 virtio-net driver's device-independent half (AGAST #4734,
+# docs/RING1_DRIVER.md sections 6 and 8)
+#
+# Everything /bin/virtio-net does that is not a syscall or an MMIO access:
+# checking the boot record the kernel left, building the NetInfo it
+# publishes, stripping the virtio-net header off a received frame and
+# publishing it on the RX frame ring, validating a TX slot (one private
+# copy) and posting it to the device with a header added, and reclaiming
+# TX buffers by the AGAST #4073 rule. The rings and buffers are plain
+# memory here, so test/test_vnet.ritz drives this file against a "device"
+# that is stores to the used ring, with no kernel at all; the program
+# (virtio_net.ritz) adds the doorbells, the notifies and the waits.
+
+import driver_abi.boot { DriverBoot, DriverWindow, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_NOTIFY, VIRTIO_WINDOW_ISR, VIRTIO_WINDOW_DEVICE }
+import driver_abi.frame_ring { FRAME_MAX }
+import driver_abi.link { NetInfo, NETINFO_MTU_MAX, NETDEV_TYPE_VIRTIO, ETH_HEADER_LEN }
+import driver_abi.spsc { SpscProducer, SpscConsumer, SpscClose, Publish, Poll, Take, FrameBytes }
+import virtio_abi.virtq { Virtqueue, VringDesc, VringUsedElem, TxSlots, VRING_DESC_F_WRITE, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_get_used, vq_peek_used, tx_slots_take, tx_slots_post, vq_reclaim_tx }
+import ritzlib.span
+
+# ============================================================================
+# The virtio-net header (virtio 1.1 section 5.1.6)
+# ============================================================================
+
+# Without VIRTIO_F_VERSION_1 and MRG_RXBUF the header is 10 bytes; with
+# VERSION_1 it always carries num_buffers and is 12. This driver drives
+# modern devices only, so it is 12 in practice; both are handled.
+pub const VNET_HDR_LEGACY: u32 = 10
+pub const VNET_HDR_V1: u32 = 12
+
+pub fn vnet_hdr_len(version_1: bool) -> u32
+    if version_1
+        return VNET_HDR_V1
+    VNET_HDR_LEGACY
+
+# ============================================================================
+# Buffers
+# ============================================================================
+
+# RX and TX buffers posted to the device: RING1_DRIVER.md section 6's
+# "posted virtio pool is only 32 buffers".
+pub const RX_BUFFERS: u32 = 32
+pub const TX_BUFFERS: u32 = 32
+
+# One device buffer: a whole frame slot (FRAME_MAX) plus the largest
+# header, rounded up to a cache line, so every frame the TX ring can
+# validate fits behind its header and RX never truncates one the RX ring
+# could carry.
+pub const VNET_BUF_SIZE: u64 = 2112
+
+# Bytes of one pool of `count` buffers: what the driver asks DrvDmaAlloc for.
+pub fn pool_bytes(count: u32) -> u64
+    (count as u64) * VNET_BUF_SIZE
+
+# One DrvDmaAlloc run of buffers: the CPU's address and the device's (the
+# IOVA in the NIC's domain). Buffer b is VNET_BUF_SIZE bytes at b * that.
+pub struct Pool
+    virt: u64
+    iova: u64
+    count: u32
+
+pub fn pool_buf_iova(p: Pool, b: u32) -> u64
+    p.iova + (b as u64) * VNET_BUF_SIZE
+
+pub fn pool_buf(p: Pool, b: u32) -> [u8]
+    span_from_ptr<u8>((p.virt + (b as u64) * VNET_BUF_SIZE) as *u8, VNET_BUF_SIZE as i64)
+
+# Which buffer a descriptor's device address names, or None for an address
+# that is not the start of one of this pool's buffers. The descriptor table
+# is device-writable memory, so it is checked, not trusted.
+pub fn pool_index_of(p: Pool, iova: u64) -> Option<u32>
+    if iova < p.iova
+        return None
+    let off: u64 = iova - p.iova
+    if off % VNET_BUF_SIZE != 0 or off / VNET_BUF_SIZE >= p.count as u64
+        return None
+    Some((off / VNET_BUF_SIZE) as u32)
+
+# ============================================================================
+# RX: strip the header
+# ============================================================================
+
+# Why a received completion carries no frame. Each is counted and the
+# buffer goes straight back to the device.
+pub enum RxBad
+    Short                            # the device wrote the header or less
+    Overlong                         # more than the buffer, or than a frame slot
+    Buffer                           # the used id or its address names no RX buffer
+
+# The frame in RX buffer `buf` after the device wrote `used_len` bytes:
+# the bytes after the `hdr`-byte virtio-net header.
+pub fn rx_frame(buf: [u8], used_len: u32, hdr: u32) -> Result<[u8], RxBad>
+    if used_len <= hdr
+        return Err(RxBad.Short)
+    if used_len as i64 > buf.len or (used_len - hdr) as u64 > FRAME_MAX
+        return Err(RxBad.Overlong)
+    Ok(buf[hdr as i64..used_len as i64])
+
+# ============================================================================
+# TX: validate and add the header
+# ============================================================================
+
+# Why a TX slot is not given to the NIC. The slot is consumed (its
+# read_idx stored past it) and counted, never posted.
+# (A slot driver_abi's one-copy checks refuse is a Take.Rejected; this is
+# what the driver adds on top.)
+pub enum TxBad
+    Runt                             # shorter than an Ethernet header
+    Overlong                         # header plus frame exceed the buffer
+
+# Write a zero virtio-net header (no checksum offload, GSO_NONE,
+# num_buffers 0) and then `frame` into TX buffer `buf`. Ok is the bytes the
+# descriptor covers.
+pub fn tx_fill(buf: [u8], hdr: u32, frame: [u8]) -> Result<u32, TxBad>
+    if frame.len < ETH_HEADER_LEN as i64
+        return Err(TxBad.Runt)
+    if (hdr as i64) + frame.len > buf.len
+        return Err(TxBad.Overlong)
+    buf.slice(0, hdr as i64).zero()
+    buf.slice(hdr as i64, hdr as i64 + frame.len).copy_from(frame)
+    Ok(hdr + frame.len as u32)
+
+# ============================================================================
+# The link record
+# ============================================================================
+
+# The NetInfo the driver publishes (section 7): the device's MAC, link_up
+# from status bit 0, NETDEV_TYPE_VIRTIO, and the MTU clamped to what a frame
+# slot holds. A device without VIRTIO_NET_F_MTU reports none: 1500.
+pub const VNET_DEFAULT_MTU: u32 = 1500
+
+pub fn net_info(mac: [6]u8, link_up: bool, device_mtu: Option<u16>) -> NetInfo
+    var mtu: u32 = VNET_DEFAULT_MTU
+    match device_mtu
+        Some(m) => mtu = m as u32
+        None => mtu = VNET_DEFAULT_MTU
+    if mtu > NETINFO_MTU_MAX
+        mtu = NETINFO_MTU_MAX
+    var link: u8 = 0
+    if link_up
+        link = 1
+    NetInfo { mac: mac, link_up: link, device_type: NETDEV_TYPE_VIRTIO, mtu: mtu }
+
+# ============================================================================
+# The boot record
+# ============================================================================
+
+# Why the driver will not drive what the boot record describes. It exits.
+pub enum BootBad
+    Magic                            # not a record the kernel wrote
+    Count                            # more windows than the record holds
+    Window                           # an offset outside the first page, or length 0
+    Legacy                           # no common or notify window: not a modern device
+
+# The windows the driver maps: indexes into DriverBoot.windows. ISR and
+# device config are optional to the transport; the driver needs the device
+# config for the MAC, and runs on MSI-X without the ISR.
+pub struct BootWindows
+    common: u32
+    notify: u32
+    isr: Option<u32>
+    device: Option<u32>
+
+const WINDOW_PAGE: u32 = 4096
+
+# Check the private copy of the boot record and pick the first window of
+# each kind.
+pub fn boot_windows(b: DriverBoot) -> Result<BootWindows, BootBad>
+    if b.magic != DRIVER_BOOT_MAGIC
+        return Err(BootBad.Magic)
+    if b.window_count > DRIVER_BOOT_WINDOWS
+        return Err(BootBad.Count)
+    var common: Option<u32> = None
+    var notify: Option<u32> = None
+    var isr: Option<u32> = None
+    var device: Option<u32> = None
+    for i in 0..b.window_count
+        let w: DriverWindow = b.windows[i]
+        if w.offset >= WINDOW_PAGE or w.length == 0
+            return Err(BootBad.Window)
+        if w.cfg_type == VIRTIO_WINDOW_COMMON and common.is_none()
+            common = Some(i)
+        else if w.cfg_type == VIRTIO_WINDOW_NOTIFY and notify.is_none()
+            notify = Some(i)
+        else if w.cfg_type == VIRTIO_WINDOW_ISR and isr.is_none()
+            isr = Some(i)
+        else if w.cfg_type == VIRTIO_WINDOW_DEVICE and device.is_none()
+            device = Some(i)
+    match common
+        Some(c) =>
+            match notify
+                Some(n) => Ok(BootWindows { common: c, notify: n, isr: isr, device: device })
+                None => Err(BootBad.Legacy)
+        None => Err(BootBad.Legacy)
+
+# ============================================================================
+# The queues and the frame seat
+# ============================================================================
+
+# Both device queues and their buffer pools. Queue 0 is RX, queue 1 TX.
+# RX descriptors are allocated once, one per RX buffer, and reposted as
+# they come back; TX descriptors come off the free list per send and go
+# back on it when the used ring returns them (vq_reclaim_tx).
+pub struct NetQueues
+    rx: Virtqueue
+    tx: Virtqueue
+    rx_pool: Pool
+    tx_pool: Pool
+    tx_slots: TxSlots
+    hdr: u32
+
+# The frame object the driver produces RX into and consumes TX from, with
+# its private indexes. A replacement object (ATTACH) is a new seat at index
+# 0; until one is attached nothing is published or consumed.
+pub struct FrameSeat
+    attached: bool
+    handle: u64
+    rx: SpscProducer
+    tx: SpscConsumer
+
+# Post every RX buffer on its own descriptor. The caller kicks the RX
+# queue once the device is DRIVER_OK. Returns how many it posted.
+pub fn rx_post_all(q: *NetQueues) -> u32
+    var n: u32 = 0
+    while n < q.rx_pool.count
+        let d: i32 = vq_alloc_desc(@q.rx)
+        if d < 0
+            return n
+        rx_post(q, d as u16, n)
+        n = n + 1
+    n
+
+# Give RX buffer `b` to the device on descriptor `d`.
+fn rx_post(q: *NetQueues, d: u16, b: u32)
+    let desc: *VringDesc = vq_get_desc(@q.rx, d)
+    desc.addr = pool_buf_iova(q.rx_pool, b)
+    desc.len = VNET_BUF_SIZE as u32
+    desc.flags = VRING_DESC_F_WRITE
+    desc.next = 0
+    vq_submit(@q.rx, d)
+
+# What one RX drain did.
+pub struct RxDrain
+    published: u32                   # frames stored on the RX ring
+    dropped: u32                     # completions with no frame (RxBad, or no seat)
+    full: bool                       # stopped on a full RX ring: the element stays
+    closed: Option<SpscClose>        # the RX ring is unusable
+    kick: bool                       # a buffer was reposted: notify the RX queue
+
+fn rx_drain_none() -> RxDrain
+    RxDrain { published: 0, dropped: 0, full: false, closed: None, kick: false }
+
+# Move every completed RX buffer to the frame ring, header stripped, and
+# repost it. On a full ring the used element is not taken (vq_peek_used):
+# the frame stays on the device queue and the caller drains TX and yields
+# (section 6). With no seat attached a frame has nowhere to go and is
+# dropped, so the device keeps receiving.
+pub fn rx_drain(q: *NetQueues, seat: @&FrameSeat) -> RxDrain
+    var out: RxDrain = rx_drain_none()
+    # The used idx the device stored is read before its elements.
+    fence()
+    while true
+        let elem: VringUsedElem = match vq_peek_used(@q.rx)
+            Some(e) => e
+            None => return out
+        if elem.id >= q.rx.num as u32
+            # Names no descriptor: nothing to repost.
+            vq_get_used(@q.rx)
+            out.dropped = out.dropped + 1
+            continue
+        let d: u16 = elem.id as u16
+        let b: u32 = match pool_index_of(q.rx_pool, vq_get_desc(@q.rx, d).addr)
+            Some(x) => x
+            None =>
+                vq_get_used(@q.rx)
+                out.dropped = out.dropped + 1
+                continue
+        if seat.attached
+            match rx_frame(pool_buf(q.rx_pool, b), elem.len, q.hdr)
+                Ok(frame) =>
+                    match seat.rx.publish(frame)
+                        Publish.Done => out.published = out.published + 1
+                        Publish.Full =>
+                            out.full = true
+                            return out
+                        Publish.BadLength => out.dropped = out.dropped + 1
+                        Publish.Close(why) =>
+                            out.closed = Some(why)
+                            return out
+                Err(_) => out.dropped = out.dropped + 1
+        else
+            out.dropped = out.dropped + 1
+        vq_get_used(@q.rx)
+        rx_post(q, d, b)
+        out.kick = true
+
+# What one TX drain did.
+pub struct TxDrain
+    sent: u32                        # frames posted to the device
+    rejected: u32                    # slots consumed and not posted (TxBad)
+    reclaimed: u32                   # buffers the used ring returned
+    closed: Option<SpscClose>        # the TX ring is unusable
+    kick: bool                       # notify the TX queue
+
+# Reclaim what the device has sent, then post every TX slot that has a
+# free buffer and a free descriptor. Each slot is validated on one private
+# copy of its descriptor (SpscConsumer.poll and take) into `scratch`, and a
+# bad one is consumed without reaching the NIC. A buffer stays busy until
+# the used ring returns it (AGAST #4073).
+pub fn tx_drain(q: *NetQueues, seat: @&FrameSeat, scratch: @&FrameBytes) -> TxDrain
+    var out: TxDrain = TxDrain { sent: 0, rejected: 0, reclaimed: 0, closed: None, kick: false }
+    fence()
+    out.reclaimed = vq_reclaim_tx(@q.tx, @q.tx_slots)
+    if not seat.attached
+        return out
+    while true
+        let b: u32 = match tx_slots_take(@q.tx_slots)
+            Some(x) => x
+            None => return out
+        let d: i32 = vq_alloc_desc(@q.tx)
+        if d < 0
+            return out
+        let polled: Poll = seat.tx.poll(0, 1)
+        let desc_copy = match polled
+            Poll.Ready(c) => c
+            Poll.Close(why) =>
+                vq_free_desc(@q.tx, d as u16)
+                out.closed = Some(why)
+                return out
+            _ =>
+                vq_free_desc(@q.tx, d as u16)
+                return out
+        let len: u32 = match seat.tx.take(desc_copy, scratch)
+            Take.Frame(n) => n
+            Take.Rejected(_) =>
+                vq_free_desc(@q.tx, d as u16)
+                out.rejected = out.rejected + 1
+                continue
+            _ =>
+                vq_free_desc(@q.tx, d as u16)
+                return out
+        let frame: [u8] = span_from_ptr<u8>(scratch as *u8, len as i64)
+        match tx_fill(pool_buf(q.tx_pool, b), q.hdr, frame)
+            Ok(total) =>
+                let desc: *VringDesc = vq_get_desc(@q.tx, d as u16)
+                desc.addr = pool_buf_iova(q.tx_pool, b)
+                desc.len = total
+                desc.flags = 0
+                desc.next = 0
+                vq_submit(@q.tx, d as u16)
+                tx_slots_post(@q.tx_slots, b, d as u16)
+                out.sent = out.sent + 1
+                out.kick = true
+            Err(_) =>
+                vq_free_desc(@q.tx, d as u16)
+                out.rejected = out.rejected + 1

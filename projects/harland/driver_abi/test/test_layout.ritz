@@ -12,6 +12,7 @@
 import driver_abi.frame_ring { FrameDesc, SpscCtrl, FRAME_RING_CAP, FRAME_RING_MASK, FRAME_MAX, FRAME_F_NONE, FRAME_ARENA_SIZE, FRAME_REGION_SIZE, FRAME_RX_CTRL_OFF, FRAME_TX_CTRL_OFF, FRAME_UNUSED_OFF, FRAME_ADVISORY_OFF, FRAME_RX_DESC_OFF, FRAME_TX_DESC_OFF, FRAME_RX_ARENA_OFF, FRAME_TX_ARENA_OFF, CACHE_LINE }
 import driver_abi.wait { WaitSource, WaitEvent, WaitRequest, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_RESERVED_32, EVENT_ATTACH, EVENT_USER_MASK, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS, SHM_DETACH_TIMEOUT_MS, APP_EXCHANGE_SIZE }
 import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
+import driver_abi.boot { DriverBoot, DriverWindow, DRV_RING_BASE, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_NOTIFY, VIRTIO_WINDOW_ISR, VIRTIO_WINDOW_DEVICE, driver_boot_at }
 import driver_abi.link { NetInfo, NetAddr, LINK_INFO_OFF, LINK_SEQ_OFF, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, NETINFO_MTU_MAX, NETDEV_TYPE_VIRTIO, ETH_HEADER_LEN, ADDR_RECORD_OFF, ADDR_SEQ_OFF }
 
 var g_desc: FrameDesc
@@ -22,6 +23,7 @@ var g_req: WaitRequest
 var g_dma: DmaAlloc
 var g_net: NetInfo
 var g_addr: NetAddr
+var g_boot: DriverBoot
 
 fn off(field: u64, base: u64) -> u64
     return field - base
@@ -297,4 +299,51 @@ fn test_link_page() -> i32
         return 5
     if NETDEV_TYPE_VIRTIO != 1
         return 6
+    return 0
+
+# ---------------------------------------------------------------------------
+# The driver boot record (AGAST #4734)
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_driver_window_layout() -> i32
+    if sizeof(DriverWindow) != 24
+        return 1
+    let w: u64 = @g_boot.windows[0] as u64
+    if off(@g_boot.windows[0].handle as u64, w) != 0 or off(@g_boot.windows[0].offset as u64, w) != 8
+        return 2
+    if off(@g_boot.windows[0].length as u64, w) != 12 or off(@g_boot.windows[0].notify_multiplier as u64, w) != 16
+        return 3
+    if off(@g_boot.windows[0].cfg_type as u64, w) != 20
+        return 4
+    # The virtio 1.1 section 4.1.4 cfg_type values.
+    if VIRTIO_WINDOW_COMMON != 1 or VIRTIO_WINDOW_NOTIFY != 2 or VIRTIO_WINDOW_ISR != 3 or VIRTIO_WINDOW_DEVICE != 4
+        return 5
+    return 0
+
+[[test]]
+fn test_driver_boot_layout() -> i32
+    if sizeof(DriverBoot) != 232
+        return 1
+    let b: u64 = @g_boot as u64
+    if off(@g_boot.magic as u64, b) != 0 or off(@g_boot.window_count as u64, b) != 4
+        return 2
+    if off(@g_boot.irq as u64, b) != 8 or off(@g_boot.frame as u64, b) != 16 or off(@g_boot.link as u64, b) != 24
+        return 3
+    if off(@g_boot.msix_config as u64, b) != 32 or off(@g_boot.msix_rx as u64, b) != 34 or off(@g_boot.msix_tx as u64, b) != 36
+        return 4
+    if off(@g_boot.windows as u64, b) != 40 or DRIVER_BOOT_WINDOWS != 8
+        return 5
+    # "VBR1" in memory order, and the window the kernel maps the region at.
+    if DRIVER_BOOT_MAGIC != 0x31524256 or DRV_RING_BASE != 0x7D8000000000
+        return 6
+    return 0
+
+[[test]]
+fn test_driver_boot_fits_advisory_span() -> i32
+    # The record sits in the advisory span, which ends at the RX descriptors.
+    if driver_boot_at(0x10000) as u64 != 0x10000 + FRAME_ADVISORY_OFF
+        return 1
+    if FRAME_ADVISORY_OFF + (sizeof(DriverBoot) as u64) > FRAME_RX_DESC_OFF
+        return 2
     return 0
