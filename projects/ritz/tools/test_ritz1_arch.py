@@ -296,6 +296,32 @@ def test_ritz1_has_no_import_cycle():
     assert CYCLE_BASELINE == frozenset()
 
 
+def _reach(mods, start):
+    """Every module `start` imports, directly or through others."""
+    seen, todo = set(), [start]
+    while todo:
+        for dep in mods[todo.pop()].imports:
+            if dep in mods and dep not in seen:
+                seen.add(dep)
+                todo.append(dep)
+    return seen
+
+
+def test_no_emitter_module_reaches_the_parser():
+    # AGAST #4697: Sema parses print placeholders (call_check) and notes each
+    # parse on the literal (Expr.interp); the emitter reads that, so nothing
+    # it imports can parse.  Before, emitter_print -> interp -> parser_gen.
+    # The placeholder text rules every pass shares are interp_text, which
+    # does not import the parser.
+    mods = scan(DEFAULT_SRC)
+    assert "parser_gen" not in _reach(mods, "interp_text")
+    reached = {
+        name: sorted({"interp", "parser_gen"} & _reach(mods, name))
+        for name in mods if name.startswith("emitter")
+    }
+    assert {n: r for n, r in reached.items() if r} == {}
+
+
 # --- acceptance: two sema rooms cherry-pick onto each other (#3896) --------
 
 

@@ -35,6 +35,7 @@ SOURCES = \
 	import_vis \
 	parser_gen \
 	interp \
+	interp_text \
 	struct_index \
 	struct_variants \
 	monomorph \

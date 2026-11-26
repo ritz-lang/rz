@@ -142,7 +142,8 @@ an entry here, and every entry names a module that exists (`--check`).
 | `async_lower` | `async fn` / `await` lowered, AST to AST, to ritz0's state machine (`<f>$Future`, `<f>`, `<f>$poll`; `async fn main` polled by a sync `main`), and a bare call to an async fn refused (§16.2). Run by main once, after imports merge. |
 | `async_ast` | `async_lower`'s node builders and names: the AST nodes the lowering writes (`self.<field>`, `let`, `if`, a call, a generated fn) and the names it makes (`<f>$Future`, `<f>$poll`, `__poll_<k>`). Leaf code, reading only `ast`. |
 | `named_variants` | A struct variant's named forms (§10.3, #4187): `V { b, a } =>` gets its bindings in field order and the literal `V { a: 1, b: 2 }` becomes the call `V(1, 2)`, in place, from the forms the parser noted (`named_form_note`); a missing, unknown or repeated field is refused at the name. Run by main once, after imports merge. |
-| `interp` | Reads `{expr}` placeholders in print strings; re-enters the lexer/parser for each placeholder expression. |
+| `interp` | Parses one `{expr}` placeholder of a print string: re-enters the lexer/parser for its text. Called by Sema (`call_check`, which notes each parse on its literal as `Expr.interp`) and by monomorphisation through `MonoCtx.interp_parse` (set by `main`); no emitter module reaches it (AGAST #4697). |
+| `interp_text` | The placeholder text rules every pass shares: where a placeholder is (`interp_next_slot`, `interp_match_brace`), its spec, which call's literal is split (`interp_split_literal`), and Sema's parse noted on it (`interp_parsed_at`). Imports no parser, so the emitter reads placeholders through it (AGAST #4697). |
 
 **Driver and caching**
 

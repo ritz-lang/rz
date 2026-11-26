@@ -1,0 +1,122 @@
+# ritz1/test/test_interp_text.ritz - the placeholder rules Sema and the emitter share (AGAST #4697)
+#
+# Sema parses each print placeholder and notes the parse on its literal
+# (Expr.interp); the emitter looks it up by the placeholder's raw offset.  The
+# two agree only if they find the same placeholders in the same literals of
+# the same calls: interp_next_slot, interp_split_literal and
+# interp_spec_parsed are that agreement, and interp_note_parse /
+# interp_parsed_at the hand-off.  Run by `make ritz1-unit`
+# (tools/ritz1_unit.py).
+
+import ritzlib.strview
+import ritzlib.option
+import ast
+import interp_text
+
+# The open brace of the first placeholder at or after `from`, or -1.
+fn open_at(body: StrView, from: i32) -> i32
+    match interp_next_slot(body, from)
+        Some(slot) => slot.open
+        None => -1
+
+fn close_at(body: StrView, from: i32) -> i32
+    match interp_next_slot(body, from)
+        Some(slot) => slot.close
+        None => -1
+
+[[test]]
+fn test_a_slot_is_a_brace_and_its_match() -> i32
+    assert open_at("x={x}", 0) == 2
+    assert close_at("x={x}", 0) == 4
+    assert open_at("{a{b}}", 0) == 0     # nested braces are one placeholder
+    assert close_at("{a{b}}", 0) == 5
+    assert open_at("{a} {b}", 1) == 4    # from past the first
+    0
+
+[[test]]
+fn test_literal_braces_hold_no_slot() -> i32
+    assert open_at("", 0) == -1
+    assert open_at("{{x}}", 0) == -1     # doubled braces are literal
+    assert open_at("}{", 0) == -1        # a lone `}`, and a `{` never closed
+    assert open_at("\\{x}", 0) == -1     # an escaped brace
+    # An escape is skipped whole, as wide as the lexer reads it
+    # (lexer_escape_width): `\xNN` is three bytes after the backslash, so in
+    # `\x{y}` the `{` is escape text and the `}` a lone brace.  ritz1 has no
+    # `\u{..}` escape: there `{41}` is a placeholder, in the emitter too.
+    assert open_at("\\x{y}", 0) == -1
+    assert open_at("\\x41{y}", 0) == 4
+    assert open_at("\\u{41}", 0) == 2
+    0
+
+[[test]]
+fn test_the_emitter_reads_a_placeholder_with_no_spec_or_debug() -> i32
+    let none: StrView = ""
+    assert interp_spec_parsed(false, none, false)
+    assert interp_spec_parsed(false, none, true)
+    assert interp_spec_parsed(true, "?", false)       # print's Debug
+    assert not interp_spec_parsed(true, "?", true)    # format_into refuses every spec
+    assert not interp_spec_parsed(true, "x", false)   # refused before it is read
+    0
+
+fn lit(text: StrView) -> Expr
+    Expr { kind: ExprKind.StringLit, ident: text }
+
+fn call(name: StrView, args: *Expr) -> Expr
+    Expr { kind: ExprKind.Call, func_name: name, args: args }
+
+fn split_is(e: *Expr, want: *Expr) -> bool
+    match interp_split_literal(e)
+        Some(x) => x == want
+        None => want == null
+
+[[test]]
+fn test_print_and_format_into_split_their_literal() -> i32
+    var plain: Expr = lit("\"a\"")
+    var p: Expr = call("print", @plain)
+    assert split_is(@p, @plain)               # print splits a literal with no placeholder too
+    var sink: Expr = Expr { kind: ExprKind.Ident, ident: "s" }
+    var fl: Expr = lit("\"{x}\"")
+    sink.next = @fl
+    var f: Expr = call("format_into", @sink)
+    assert split_is(@f, @fl)
+    0
+
+[[test]]
+fn test_println_and_write_split_only_a_placeholder_literal() -> i32
+    var plain: Expr = lit("\"a\"")
+    var pl: Expr = call("println", @plain)
+    assert split_is(@pl, null)                # ritzlib.io's println, not the builtin
+    var held: Expr = lit("\"{x}\"")
+    var pl2: Expr = call("println", @held)
+    assert split_is(@pl2, @held)
+    var w: Expr = Expr { kind: ExprKind.Ident, ident: "w" }
+    var wl: Expr = lit("\"{x}\"")
+    w.next = @wl
+    var wr: Expr = call("writeln", @w)
+    assert split_is(@wr, @wl)
+    var c: Expr = Expr { kind: ExprKind.CstringLit, ident: "c\"{x}\"" }
+    var pc: Expr = call("print", @c)
+    assert split_is(@pc, null)                # a c"..." literal does not interpolate
+    var other: Expr = call("show", @held)
+    assert split_is(@other, null)
+    0
+
+fn parsed_is(l: *Expr, at: i32, want: *Expr) -> bool
+    match interp_parsed_at(l, at)
+        Some(x) => x == want
+        None => want == null
+
+[[test]]
+fn test_a_noted_parse_is_found_at_its_offset() -> i32
+    var l: Expr = lit("\"{a}{b}\"")
+    var a: Expr = Expr { kind: ExprKind.Ident, ident: "a" }
+    var b: Expr = Expr { kind: ExprKind.Ident, ident: "b" }
+    assert parsed_is(@l, 2, null)
+    interp_note_parse(@l, 2, @a)
+    interp_note_parse(@l, 5, @b)
+    assert parsed_is(@l, 2, @a)
+    assert parsed_is(@l, 5, @b)
+    assert parsed_is(@l, 3, null)
+    assert l.interp.at == 2                   # in source order
+    assert l.interp.next.at == 5
+    0

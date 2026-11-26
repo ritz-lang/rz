@@ -1,0 +1,296 @@
+# ritz1/src/interp_text.ritz - the text rules of print interpolation (AGAST #1521, #4697)
+#
+# Where a `{...}` placeholder is in a print-family literal, what its spec is,
+# and which call's literal is split at all.  Pure text: every pass that reads
+# placeholders shares these, the emitter included, and none of it parses.
+# Parsing a placeholder is interp.ritz's, and only Sema (call_check.ritz) and
+# monomorphisation's method wants (through MonoCtx.interp_parse) do it; the
+# emitter reads Sema's parse off the literal (Expr.interp).
+#
+# The rules are ritz0's, copied rather than reinvented (ritz0/lexer.py
+# `_lex_string` and emitter_llvmlite.py `_has_interp_placeholder`):
+#
+#   * `{` opens a placeholder only when a matching `}` follows before the
+#     closing quote or end of line. Nested braces count, so `{a{b}}` is one.
+#   * `{{` and `}}` are one literal brace each. A lone `}` is literal.
+#   * `\{` and `\}` are literal braces (ritz1's lexer already cooks an
+#     unknown escape to its own character).
+#   * The text between the braces is trimmed, then lexed and parsed as one
+#     expression. Empty or unparseable text is an error, not literal text.
+#
+# Placeholders belong to the print BUILTIN, not to the literal (#1374): a
+# `"..."` or `c"..."` used anywhere else keeps its braces as plain bytes.
+# ritz1's own emitter depends on that (`"={rax},{rax},{rdi}"` inline-asm
+# constraints), so nothing here runs at lex or parse time.
+
+import ritzlib.sys
+import ritzlib.memory   # malloc, for an InterpParse
+import ritzlib.option
+import tokens_gen
+import lexer          # lexer_escape_width
+import ast
+import ast_helpers
+
+# Python's str.strip() whitespace, which ritz0 trims the expression with:
+# space, \t, \n, \v, \f, \r.
+pub fn interp_is_space(c: i32) -> i32
+    if c == ' ' or (c >= 9 and c <= 13)
+        return 1
+    0
+
+# `raw[open]` is a `{` in a "..." literal's raw source text. Return the index
+# of the `}` that closes it, or -1 if the literal ends first (in which case
+# the `{` is a literal brace). Stops at `"` and newline as ritz0's lexer
+# does; the raw text cannot hold an unescaped `"`, so a `"` here is the
+# second half of `\"`.
+pub fn interp_match_brace(raw_sv: StrView, open: i32) -> i32
+    var raw: *u8 = raw_sv.ptr
+    var len: i32 = raw_sv.len as i32
+    var depth: i32 = 1
+    var j: i32 = open + 1
+    while j < len
+        let c: i32 = *(raw + j) as i32
+        if c == '"' or c == 10
+            return -1
+        if c == '{'
+            depth = depth + 1
+        else if c == '}'
+            depth = depth - 1
+            if depth == 0
+                return j
+        j = j + 1
+    -1
+
+# Would this c"..." text have interpolated had it been a "..." literal?
+# ritz0's `_has_interp_placeholder`, run on the cooked bytes. `{{` is not
+# collapsed in a c-string, so it is skipped here as an escaped brace.
+pub fn interp_cstr_has_placeholder(text_sv: StrView) -> i32
+    var text: *u8 = text_sv.ptr
+    var len: i32 = text_sv.len as i32
+    var i: i32 = 0
+    while i < len
+        if *(text + i) == '{'
+            if i + 1 < len and *(text + i + 1) == '{'
+                i = i + 2
+                continue
+            var depth: i32 = 1
+            var j: i32 = i + 1
+            while j < len
+                let c: i32 = *(text + j) as i32
+                if c == '{'
+                    depth = depth + 1
+                else if c == '}'
+                    depth = depth - 1
+                    if depth == 0
+                        return 1
+                j = j + 1
+        i = i + 1
+    0
+
+# Index of the last top-level `:` in a placeholder's raw text, or -1.
+pub fn interp_spec_colon(text_sv: StrView) -> i32
+    var text: *u8 = text_sv.ptr
+    var len: i32 = text_sv.len as i32
+    var depth: i32 = 0
+    var quote: i32 = 0
+    var found: i32 = -1
+    var i: i32 = 0
+    while i < len
+        let c: i32 = *(text + i) as i32
+        if c == '\\'   # `\`: the next byte is escaped
+            i = i + 2
+            continue
+        if quote != 0
+            if c == quote
+                quote = 0
+        else if c == '"' or c == '\''   # `"` `'`
+            quote = c
+        else if c == '(' or c == '[' or c == '{'   # ( [ {
+            depth = depth + 1
+        else if c == ')' or c == ']' or c == '}'   # ) ] }
+            depth = depth - 1
+        else if c == ':' and depth == 0   # `:`
+            found = i
+        i = i + 1
+    found
+
+fn interp_is_digit(c: i32) -> i32
+    if c >= '0' and c <= '9'
+        return 1
+    0
+
+# Is the `len`-byte spec (the text after the colon) one of the v1 specs?
+pub fn interp_spec_valid(spec_sv: StrView) -> i32
+    var spec: *u8 = spec_sv.ptr
+    var len: i32 = spec_sv.len as i32
+    if len == 1 and *spec as i32 == 63   # `?`
+        return 1
+    var i: i32 = 0
+    var align: i32 = 0
+    var zero: i32 = 0
+    if len > 0
+        let first: i32 = *spec as i32
+        if first == 60 or first == 62 or first == 94   # < > ^
+            align = 1
+            i = 1
+        else if first == 48 and len > 1   # `0` before a width
+            zero = 1
+            i = 1
+    let digits_at: i32 = i
+    var width: i32 = 0
+    while i < len and interp_is_digit(*(spec + i) as i32) == 1
+        width = width * 10 + (*(spec + i) as i32 - 48)
+        if width > 4096
+            return 0
+        i = i + 1
+    let has_width: bool = i > digits_at
+    if align == 1
+        if has_width and i == len
+            return 1
+        return 0
+    if zero == 1 and not has_width
+        return 0
+    if i != len - 1
+        return 0
+    let r: i32 = *(spec + i) as i32
+    if r == 120 or r == 88 or r == 98 or r == 111   # x X b o
+        return 1
+    0
+
+# The placeholder text `text[0..len]` trimmed as interp_parse_expr trims it:
+# the start in *out_lo, the length returned.
+pub fn interp_trim(text_sv: StrView, out_lo: *i32) -> i32
+    var text: *u8 = text_sv.ptr
+    var len: i32 = text_sv.len as i32
+    var lo: i32 = 0
+    var hi: i32 = len
+    while lo < hi and interp_is_space(*(text + lo) as i32) == 1
+        lo = lo + 1
+    while hi > lo and interp_is_space(*(text + hi - 1) as i32) == 1
+        hi = hi - 1
+    *out_lo = lo
+    hi - lo
+
+# Does the string literal have a `{...}` placeholder? `{{`/`}}` are literal
+# braces, and an escaped brace is not a placeholder. ritz0 supplies
+# `InterpString` for exactly these (AGAST #4381: ritz1's print/write
+# lowering and call_check's shape test share this rule).
+pub fn interp_lit_has_placeholder(lit: *Expr) -> i32
+    if lit == null or lit.kind != ExprKind.StringLit
+        return 0
+    let raw: *u8 = lit.ident.ptr
+    if raw == null or lit.ident.len < 3
+        return 0
+    let body: *u8 = raw + 1
+    let n: i32 = (lit.ident.len as i32) - 2
+    var i: i32 = 0
+    while i < n
+        let c: i32 = *(body + i) as i32
+        if c == '\\' and i + 1 < n
+            let esc_p: *u8 = body + i + 1
+            i = i + 1 + lexer_escape_width(((*esc_p) as i32) & 255)
+        else if c == '{' and i + 1 < n and *(body + i + 1) == '{'
+            i = i + 2
+        else if c == '}' and i + 1 < n and *(body + i + 1) == '}'
+            i = i + 2
+        else if c == '{' and interp_match_brace(StrView { ptr: (body), len: (n) as i64 }, i) >= 0
+            return 1
+        else
+            i = i + 1
+    0
+
+# ---------------------------------------------------------------------------
+# Which literal a call splits, and Sema's parse of it (AGAST #4697)
+
+# The "..." literal the emitter splits into placeholders for call `e`, or
+# None when it splits none: emitter_expr_call.ritz's try_emit_print_call /
+# try_emit_call_builtin and emit_format_into route these calls, and Sema
+# (call_check.ritz) parses what this names, so the two agree by construction.
+#
+#   print / eprint (lit)              its literal, placeholders or not
+#   println / eprintln (lit)          one literal with a placeholder
+#   write / writeln (w, lit)          a literal with a placeholder
+#   format_into (sink, lit)           its literal
+pub fn interp_split_literal(e: *Expr) -> Option<*Expr>
+    if e == null or e.kind != ExprKind.Call or e.args == null
+        return None
+    let name: StrView = e.func_name
+    var lit: *Expr = null
+    if name.eq("print") or name.eq("eprint")
+        lit = e.args
+    else if name.eq("println") or name.eq("eprintln")
+        if e.args.next != null or interp_lit_has_placeholder(e.args) == 0
+            return None
+        lit = e.args
+    else if name.eq("write") or name.eq("writeln")
+        if e.args.next == null or e.args.next.next != null or interp_lit_has_placeholder(e.args.next) == 0
+            return None
+        lit = e.args.next
+    else if name.eq("format_into")
+        if e.args.next == null or e.args.next.next != null
+            return None
+        lit = e.args.next
+    if lit == null or lit.kind != ExprKind.StringLit
+        return None
+    Some(lit)
+
+# Does the emitter parse a placeholder whose text has `spec` after its `:`?
+# emitter_print.ritz's piece_value reads the expression of one with no spec,
+# and of `{x:?}` in a print (Debug); it refuses every other spec, and every
+# spec in format_into, before it reads the expression.
+pub fn interp_spec_parsed(has_spec: bool, spec: StrView, is_format: bool) -> bool
+    if not has_spec
+        return true
+    not is_format and spec.eq("?")
+
+# Sema's parse of the placeholder at `at` in `lit` (InterpParse), if any.
+pub fn interp_parsed_at(lit: *Expr, at: i32) -> Option<*Expr>
+    var p: *InterpParse = lit.interp
+    while p != null
+        if p.at == at
+            return Some(p.expr)
+        p = p.next
+    None
+
+# Note `expr` as `lit`'s parse at `at`, after those already noted.  The node
+# lives as long as the AST it annotates, which is never freed (the parse
+# arena and every source buffer stay for the compile; keep_source_alive in
+# main.ritz), so it is a bare malloc like the parse it points at.
+pub fn interp_note_parse(lit: *Expr, at: i32, expr: *Expr)
+    let node: *InterpParse = malloc(sizeof(InterpParse)) as *InterpParse
+    node.at = at
+    node.expr = expr
+    node.next = null
+    if lit.interp == null
+        lit.interp = node
+        return
+    var tail: *InterpParse = lit.interp
+    while tail.next != null
+        tail = tail.next
+    tail.next = node
+
+# A placeholder in a literal's raw body: the indices of its `{` and of the
+# `}` that closes it.
+pub struct InterpSlot
+    open: i32
+    close: i32
+
+# The first placeholder in raw body `body` at or after `from`, read as
+# emitter_print.ritz's split_literal reads it: an escape is skipped whole
+# (lexer_escape_width, so `\u{41}` holds no placeholder), `{{` / `}}` are
+# literal braces, and a `{` with no closing `}` is a literal brace.
+pub fn interp_next_slot(body: StrView, from: i32) -> Option<InterpSlot>
+    let n: i32 = body.len as i32
+    var i: i32 = from
+    while i < n
+        let c: u8 = body.get(i as i64)
+        let next: u8 = if i + 1 < n then body.get((i + 1) as i64) else 0
+        if c == '\\' and i + 1 < n
+            i = i + 1 + lexer_escape_width((next as i32) & 255)
+        else if (c == '{' or c == '}') and next == c
+            i = i + 2
+        else if c == '{' and interp_match_brace(body, i) >= 0
+            return Some(InterpSlot { open: i, close: interp_match_brace(body, i) })
+        else
+            i = i + 1
+    None

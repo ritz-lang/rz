@@ -28,7 +28,10 @@
 # The module helpers (`@__ritz_print_*`, the implicit Writer's fd sink) are
 # defined once per module that uses them, by emit_print_helpers.
 #
-# interp.ritz holds the placeholder rules and the expression parser.
+# interp_text.ritz holds the placeholder rules.  The emitter parses no
+# placeholder: Sema parsed each one and noted it on its literal (Expr.interp,
+# read by fmt_parse), and refused one that is not exactly one expression
+# (AGAST #4697).
 
 import ritzlib.cstr    # strview_from_cstr: the source file's name
 import ritzlib.sys
@@ -49,7 +52,7 @@ import emitter_types   # AGAST #1818: type inference moved out of emitter_core
 import emitter_ir
 import diag   # diag_error_at (AGAST #3445), fn_display_name (AGAST #4018)
 import lexer
-import interp
+import interp_text   # placeholders' text rules and Sema's parse of them (AGAST #4697)
 import bool_check   # AGAST #2342
 import bool_kind
 import ast_helpers   # is_test_fn / is_test_helper_fn (AGAST #1869)
@@ -366,12 +369,17 @@ fn fmt_note_slots(s: *EmitterState, e: *Expr)
     fmt_note_slots(s, e.args)
     fmt_note_slots(s, e.next)
 
-# interp_parse_expr, with the parsed nodes' slot types noted.
-fn fmt_parse(s: *EmitterState, text: StrView, line: i32, col: i32) -> *Expr
-    let e: *Expr = interp_parse_expr(s.sym.mono.pctx, text, line, col)
-    if e != null
-        fmt_note_slots(s, e)
-    e
+# Sema's parse of the placeholder whose text `text` is (a slice of the raw
+# literal `lit.ident`), with the parsed nodes' slot types noted.  Sema parses
+# every placeholder the emitter reads and refused one that is not exactly one
+# expression (call_check.ritz, cc_interp_names; AGAST #4697), so None here
+# is a literal Sema never reached.
+fn fmt_parse(s: *EmitterState, lit: *Expr, text: StrView) -> Option<*Expr>
+    let parsed: Option<*Expr> = interp_parsed_at(lit, (text.ptr - lit.ident.ptr) as i32)
+    match parsed
+        Some(e) => fmt_note_slots(s, e)
+        None => pass
+    parsed
 
 # The Ritz type of `e`'s value and the name a Display/Debug impl for it would
 # be registered under (unnamed when none is derivable).
@@ -1010,10 +1018,12 @@ fn piece_value(s: *EmitterState, out: *Pieces, lit: *Expr, text: StrView)
     emit_spec_error(s, lit, expr, spec)
 
 fn piece_expr(s: *EmitterState, out: *Pieces, lit: *Expr, text: StrView, debug: bool)
-    let e: *Expr = fmt_parse(s, text, lit.span.line, lit.span.col)
-    if e == null
-        emit_print_error(s, lit, "invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)")
-        return
+    match fmt_parse(s, lit, text)
+        Some(e) => piece_lower(s, out, lit, e, debug)
+        None => emit_print_error(s, lit, "this placeholder was not parsed by Sema (call_check.ritz cc_interp_names), so there is no expression to print")
+
+# One placeholder's value `e`, on print's sink or appended by format_into.
+fn piece_lower(s: *EmitterState, out: *Pieces, lit: *Expr, e: *Expr, debug: bool)
     match out.dest
         PieceDest.Print =>
             out.total = fmt_sink_add(s, out.total, fmt_print_value(s, out.sink, e, debug))

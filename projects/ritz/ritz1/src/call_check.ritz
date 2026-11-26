@@ -60,7 +60,8 @@ import ast
 import types
 import diag          # the error prefix (AGAST #3445)
 import ast_helpers
-import interp        # interp_lit_has_placeholder (AGAST #4381)
+import interp        # interp_parse_expr: Sema parses print placeholders (AGAST #4697)
+import interp_text   # interp_lit_has_placeholder (AGAST #4381), interp_split_literal
 import main_abi      # main_abi_call_msg (AGAST #4198)
 import ast_query     # name_eq, eprint_bytes, mem_builtin_id, is_tagged_enum_type,
                      # LocalVar and the array-dims helpers, lent_self_call_view_in
@@ -75,6 +76,7 @@ import ritzlib.memory
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.fs { path_basename }
+import ritzlib.option   # interp_split_literal, interp_parsed_at (AGAST #4697)
 
 # >0 inside an operand emit_expr_call never lowers (`sizeof(x)`, a
 # non-literal `print(x)`): its calls aren't judged.
@@ -1123,8 +1125,13 @@ pub fn call_check_names_nothing(sm: *Sema, e: *Expr) -> i32
     (cc_named_fn(sm, e) == null) as i32
 
 # The names in a print / format_into / println / write literal's `{expr}`
-# placeholders (ritz0's InterpString, name_resolver.py): the emitter parses
-# them only as it lowers the call, so it was the first to see `{nope}`.
+# placeholders (ritz0's InterpString, name_resolver.py).  Sema is the pass
+# that parses them (AGAST #4697): each parse of the literal the emitter
+# splits (interp_split_literal) is noted on it (Expr.interp) for the emitter
+# to lower, and one that is not exactly one expression is refused here,
+# where the emitter would have read it (interp_spec_parsed).  The emitter
+# used to parse and refuse it, so it was reported only once every Sema
+# check had passed.
 fn cc_interp_names(sm: *Sema, e: *Expr)
     if e.args == null
         return
@@ -1135,25 +1142,49 @@ fn cc_interp_names(sm: *Sema, e: *Expr)
         lit = e.args.next
     if lit == null or lit.kind != ExprKind.StringLit or lit.ident.ptr == null or lit.ident.len < 3
         return
-    let body: *u8 = lit.ident.ptr + 1
-    let size: i32 = (lit.ident.len as i32) - 2
-    var i: i32 = 0
-    while i < size
-        let c: i32 = *(body + i) as i32
-        if c == '\\'
-            i = i + 2
-        else if (c == '{' or c == '}') and i + 1 < size and *(body + i + 1) as i32 == c
-            i = i + 2
-        else if c == '{' and interp_match_brace(StrView { ptr: (body), len: (size) as i64 }, i) >= 0
-            let close: i32 = interp_match_brace(StrView { ptr: (body), len: (size) as i64 }, i)
-            var plen: i32 = close - i - 1
-            let colon: i32 = interp_spec_colon(StrView { ptr: (body + i + 1), len: (plen) as i64 })
-            if colon >= 0
-                plen = colon
-            cc_interp_walk(sm, interp_parse_expr(sm.pctx, StrView { ptr: (body + i + 1), len: (plen) as i64 }, lit.span.line, lit.span.col))
-            i = close + 1
-        else
-            i = i + 1
+    let split: bool = match interp_split_literal(e)
+        Some(x) => x == lit
+        None => false
+    let is_format: bool = e.func_name.eq("format_into")
+    let body: StrView = lit.ident.skip(1).take(lit.ident.len - 2)
+    var from: i32 = 0
+    loop
+        let slot: InterpSlot = match interp_next_slot(body, from)
+            Some(found) => found
+            None => break
+        let text: StrView = StrView { ptr: body.ptr + slot.open + 1, len: (slot.close - slot.open - 1) as i64 }
+        let colon: i32 = interp_spec_colon(text)
+        var expr: StrView = text
+        var spec: StrView = strview_empty()
+        if colon >= 0
+            expr = text.take(colon as i64)
+            spec = text.skip((colon + 1) as i64)
+        # The expression's offset in the raw literal, quotes included.
+        let at: i32 = slot.open + 2
+        match cc_interp_parse(sm, lit, split, at, expr.len as i32, interp_spec_parsed(colon >= 0, spec, is_format))
+            Some(x) => cc_interp_walk(sm, x)
+            None => pass
+        from = slot.close + 1
+
+# The placeholder of `lit` whose expression is the `len` bytes at raw offset
+# `at` (InterpParse.at), parsed: Sema's earlier parse when the literal has
+# one, else a new one, noted on a literal the emitter splits.  None when the
+# text is not exactly one expression; `lowered`: the emitter reads this one,
+# so that is refused, as the emitter refused it until AGAST #4697.
+fn cc_interp_parse(sm: *Sema, lit: *Expr, split: bool, at: i32, len: i32, lowered: bool) -> Option<*Expr>
+    if split
+        match interp_parsed_at(lit, at)
+            Some(seen) => return Some(seen)
+            None => pass
+    let x: *Expr = interp_parse_expr(sm.pctx, StrView { ptr: lit.ident.ptr + at, len: len as i64 }, lit.span.line, lit.span.col)
+    if x != null
+        if split
+            interp_note_parse(lit, at, x)
+        return Some(x)
+    if split and lowered
+        sema_error_at(sm, lit.span.line, lit.span.col)
+        eprints("invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)\n")
+    None
 
 # A placeholder's names, as sema_walk would judge them: a qualifier (`E.V`,
 # `T.m(..)`) names no value.
