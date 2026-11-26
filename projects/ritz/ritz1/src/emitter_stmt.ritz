@@ -308,7 +308,7 @@ fn decl_pre_emit_arms(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: T
 # A struct literal initialiser, written field by field into the slot.
 fn decl_emit_struct_lit_init(s: *EmitterState, stmt: *Stmt, alloca_reg: i32)
     # Struct literal: emit field-by-field initialization
-    # e.ident_ptr/ident_len = the parse's struct type name; a nameless
+    # e.ident = the parse's struct type name; a nameless
     # tuple literal's is decided here and returned (#4408).
     # e.args = pointer to FieldInit list (recast)
     let e: *Expr = stmt.var_init
@@ -514,8 +514,7 @@ fn emit_through_index_assign(s: *EmitterState, stmt: *Stmt) -> bool
     memset(@target as *u8, 0, sizeof(Expr))
     root.kind = ExprKind.Ident
     root.span = stmt.span
-    root.ident_ptr = stmt.assign_target
-    root.ident_len = stmt.assign_target_len
+    root.ident = StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }
     target.kind = ExprKind.Index
     target.span = stmt.span
     target.bracket = stmt.bracket   # AGAST #2886
@@ -864,8 +863,8 @@ fn assign_to_deref(s: *EmitterState, stmt: *Stmt, target_expr: *Expr) -> i32
         if lent_scalar_ident(s, target_expr.operand) != null
             let saved_name: *u8 = stmt.assign_target
             let saved_len: i32 = stmt.assign_target_len
-            stmt.assign_target = target_expr.operand.ident_ptr
-            stmt.assign_target_len = target_expr.operand.ident_len
+            stmt.assign_target = target_expr.operand.ident.ptr
+            stmt.assign_target_len = target_expr.operand.ident.len as i32
             emit_assign(s, stmt)
             stmt.assign_target = saved_name
             stmt.assign_target_len = saved_len
@@ -902,7 +901,7 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
 
     # Prefer the destination's pointee type when available
     if target_expr.kind == ExprKind.Ident
-        let dst_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.ident_ptr), len: (target_expr.ident_len) as i64 })
+        let dst_loc: *LocalVar = find_local_struct_name(s, target_expr.ident)
         if dst_loc != null and lv_pointee_type(dst_loc) != TypeKind.I64
             value_type = lv_pointee_type(dst_loc)
             if lv_pointee_type(dst_loc) == TypeKind.Struct
@@ -928,7 +927,7 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
         # emit_llvm_type_struct.
         var rhs_is_named_type: bool = false
         if stmt.assign_value.kind == ExprKind.Ident
-            let rhs_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: stmt.assign_value.ident_ptr, len: stmt.assign_value.ident_len as i64 })
+            let rhs_loc: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident)
             rhs_is_named_type = rhs_loc != null and lv_var_type(rhs_loc) == TypeKind.Struct
         let dst_type: TypeKind = get_deref_store_type(s, target_expr.operand)
         if not rhs_is_named_type
@@ -951,7 +950,7 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
         # pointee TypeKind.Struct with a primitive name ("u16") that
         # find_struct rejects; emit_llvm_type_struct maps it to i16.
         else if target_expr.operand.kind == ExprKind.Ident
-            let dst_loc2: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.operand.ident_ptr), len: (target_expr.operand.ident_len) as i64 })
+            let dst_loc2: *LocalVar = find_local_struct_name(s, target_expr.operand.ident)
             if dst_loc2 != null and lv_pointee_type(dst_loc2) == TypeKind.Struct
                 value_type = TypeKind.Struct
                 struct_name = local_type_sv(dst_loc2)
@@ -961,14 +960,14 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
         # Check if value is an identifier - look up its type
         match stmt.assign_value.kind
             ExprKind.Ident =>
-                let local: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.assign_value.ident_ptr), len: (stmt.assign_value.ident_len) as i64 })
+                let local: *LocalVar = find_local_struct_name(s, stmt.assign_value.ident)
                 if local != null
                     value_type = lv_var_type(local)
                     if lv_var_type(local) == TypeKind.Struct
                         struct_name = local_type_sv(local)
             # Check if value is a function call - look up the function's return type
             ExprKind.Call =>
-                let fn_def: *FnDef = find_fn(s, StrView { ptr: (stmt.assign_value.func_name), len: (stmt.assign_value.func_name_len) as i64 })
+                let fn_def: *FnDef = find_fn(s, stmt.assign_value.func_name)
                 if fn_def != null
                     if fn_def.return_type == TypeKind.Struct
                         value_type = TypeKind.Struct
@@ -976,7 +975,7 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
             # Check if value is a struct literal
             ExprKind.StructLit =>
                 value_type = TypeKind.Struct
-                struct_name = StrView { ptr: stmt.assign_value.ident_ptr, len: stmt.assign_value.ident_len as i64 }
+                struct_name = stmt.assign_value.ident
             _ => pass
 
     # LARB R61 (§13.6): the place, then the value.  `*f() = v` calls
@@ -994,13 +993,13 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
     # %p is already `ptr` — LLVM rejects (AGAST #173).
     var addr_is_ptr: bool = false
     if target_expr.kind == ExprKind.Ident
-        let opd_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.ident_ptr), len: (target_expr.ident_len) as i64 })
+        let opd_loc: *LocalVar = find_local_struct_name(s, target_expr.ident)
         if opd_loc != null and lv_var_type(opd_loc) == TypeKind.MutRef
             addr_is_ptr = true
         addr = emit_expr(s, target_expr)
     else if target_expr.kind == ExprKind.Unary and target_expr.op == OpKind.Deref
         if target_expr.operand.kind == ExprKind.Ident
-            let opd_loc2: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.operand.ident_ptr), len: (target_expr.operand.ident_len) as i64 })
+            let opd_loc2: *LocalVar = find_local_struct_name(s, target_expr.operand.ident)
             if opd_loc2 != null and lv_var_type(opd_loc2) == TypeKind.MutRef
                 addr_is_ptr = true
         # `*@&x = v`: `@&` is a `ptr` where `@` is an i64 (AGAST #2338).
@@ -1218,7 +1217,7 @@ fn emit_struct_return(s: *EmitterState, stmt: *Stmt)
     # A struct literal (`return NFAFragment { start: s0, end: s0 }`), built in
     # a slot of its own.
     if stmt.return_value.kind == ExprKind.StructLit
-        let lit_name: StrView = StrView { ptr: stmt.return_value.ident_ptr, len: stmt.return_value.ident_len as i64 }
+        let lit_name: StrView = stmt.return_value.ident
         let alloca_reg: i32 = next_reg(s)
         entry_alloca_reg_begin_named(s, alloca_reg)
         emit_name(s, lit_name)
@@ -1236,7 +1235,7 @@ fn emit_struct_return(s: *EmitterState, stmt: *Stmt)
     # A local: emit_llvm_type_struct spells the type, so a tagged enum
     # (Result$ / Option$) is an `i64`, not `%<name>` (task-99 cluster #3).
     if stmt.return_value.kind == ExprKind.Ident and struct_value_local(s, stmt.return_value) != null
-        let loc: i32 = find_local(s, StrView { ptr: stmt.return_value.ident_ptr, len: stmt.return_value.ident_len as i64 })
+        let loc: i32 = find_local(s, stmt.return_value.ident)
         if loc >= 0
             if s.ret_sret == 1
                 emit_sret_ret_from_ptr(s, loc)   # AGAST #1730
@@ -1294,7 +1293,7 @@ fn ret_struct_value(s: *EmitterState, ret_name: StrView, reg: i32)
 # A bare name holding a header, or a reference to one.  A local hides a global of
 # its name.
 fn emit_for_ident_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
-    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let loc: *LocalVar = find_local_struct_name(s, e.ident)
     if loc != null
         let st: *StructDef = for_header_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
         if st == null
@@ -1306,7 +1305,7 @@ fn emit_for_ident_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
             *out = st
             return emit_load_ptr(s, loc.reg)
         return 0
-    let glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let glob: *GlobalVarDef = find_global(s, e.ident)
     if glob != null
         if glob.var_type == TypeKind.Struct
             let gst: *StructDef = for_header_struct(s, StrView { ptr: (glob.type_name), len: (glob.type_name_len) as i64 })
@@ -1321,7 +1320,7 @@ fn emit_for_ident_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
                 *out = pst
                 return emit_deref_operand_ptr(s, e, @unused, @levels)
         return 0
-    let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let ce: *ConstEntry = find_const_entry(s, e.ident)
     if ce != null and ce.const_type == TypeKind.Struct
         let cst: *StructDef = for_header_struct(s, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 })
         if cst != null
@@ -1346,7 +1345,7 @@ fn emit_for_addr_header(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, out: *
                 return 0
             *out = lst
             return emit_load_ptr(s, lent.reg)
-        let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (op.ident_ptr), len: (op.ident_len) as i64 })
+        let loc: *LocalVar = find_local_struct_name(s, op.ident)
         if loc != null
             if lv_var_type(loc) != TypeKind.Struct
                 return 0
@@ -1355,7 +1354,7 @@ fn emit_for_addr_header(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, out: *
                 *out = st
                 return loc.reg
             return 0
-        let glob: *GlobalVarDef = find_global(s, StrView { ptr: (op.ident_ptr), len: (op.ident_len) as i64 })
+        let glob: *GlobalVarDef = find_global(s, op.ident)
         if glob != null and glob.var_type == TypeKind.Struct
             let gst: *StructDef = for_header_struct(s, StrView { ptr: (glob.type_name), len: (glob.type_name_len) as i64 })
             if gst != null
@@ -1613,7 +1612,7 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
                     # AGAST #2410: `*p` is the array `p` points at, not a copy of it.
                     var ap: *LocalVar = null
                     if iter.operand.kind == ExprKind.Ident
-                        ap = array_ptr_named(s, StrView { ptr: (iter.operand.ident_ptr), len: (iter.operand.ident_len) as i64 })
+                        ap = array_ptr_named(s, iter.operand.ident)
                     if ap != null
                         src.data_reg = for_array_ptr(s, ap, src)
                         src.iter_kind = ForIterKind.ArrayReg
@@ -2019,10 +2018,10 @@ pub fn emit_array_place_ptr(s: *EmitterState, value: *Expr) -> i32
     let lent: *LocalVar = lent_array_local(s, value)
     if lent != null
         return lent.reg
-    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (value.ident_ptr), len: (value.ident_len) as i64 })
+    let loc: *LocalVar = find_local_struct_name(s, value.ident)
     if loc != null
         return loc.reg
-    return emit_global_array_ptr(s, find_global(s, StrView { ptr: (value.ident_ptr), len: (value.ident_len) as i64 }))
+    return emit_global_array_ptr(s, find_global(s, value.ident))
 
 # AGAST #2302: store the `[N x T]` that call `value` returns (`ra` is its
 # return as a param) at `dst_ptr`.  AGAST #3181: a large one's call value is
@@ -2195,11 +2194,11 @@ fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, valu
                 return true
             src_ptr = mr.reg
         _ =>
-            let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (value.ident_ptr), len: (value.ident_len) as i64 })
+            let loc: *LocalVar = find_local_struct_name(s, value.ident)
             if loc != null
                 src_ptr = loc.reg
             else
-                src_ptr = emit_global_array_ptr(s, find_global(s, StrView { ptr: (value.ident_ptr), len: (value.ident_len) as i64 }))
+                src_ptr = emit_global_array_ptr(s, find_global(s, value.ident))
     emit_nd_plane_copy(s, sh, 0, dst_ptr, src_ptr)
     true
 
@@ -2595,15 +2594,13 @@ fn emit_local_field_store_fallback(s: *EmitterState, stmt: *Stmt, with_index: bo
     var fb_base: Expr
     fb_base.kind = ExprKind.Ident
     fb_base.span = stmt.span
-    fb_base.ident_ptr = stmt.var_name
-    fb_base.ident_len = stmt.var_name_len
+    fb_base.ident = StrView { ptr: stmt.var_name, len: stmt.var_name_len as i64 }
     fb_base.next = null
     var fb_mem: Expr
     fb_mem.kind = ExprKind.Member
     fb_mem.span = stmt.span
     fb_mem.left = @fb_base
-    fb_mem.ident_ptr = stmt.assign_target
-    fb_mem.ident_len = stmt.assign_target_len
+    fb_mem.ident = StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }
     fb_mem.next = null
     if not with_index
         emit_assign_to(s, stmt, @fb_mem)
@@ -3237,8 +3234,8 @@ fn emit_local_field_index_assign_stmt(s: *EmitterState, stmt: *Stmt)
         # AGAST #2097: `s.m[i] = v` with m an N-D field assigns a whole row
         # (`s.m[i][j] = v` is an expression assignment, see emit_assign).
         # AGAST #4666: copied over it (emit_nd_sub_store).
-        var rf_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident_ptr: stmt.var_name, ident_len: stmt.var_name_len }
-        var rf_field: Expr = Expr { kind: ExprKind.Member, span: stmt.span, left: @rf_var, ident_ptr: stmt.assign_target, ident_len: stmt.assign_target_len }
+        var rf_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident: StrView { ptr: stmt.var_name, len: stmt.var_name_len as i64 }}
+        var rf_field: Expr = Expr { kind: ExprKind.Member, span: stmt.span, left: @rf_var, ident: StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }}
         var rf_place: Expr = Expr { kind: ExprKind.Index, span: stmt.span, left: @rf_field, right: stmt.while_cond }
         emit_nd_stmt_row_store(s, stmt, @rf_place)
         return
@@ -3257,15 +3254,13 @@ fn emit_local_field_index_assign_stmt(s: *EmitterState, stmt: *Stmt)
     memset(@lfia_base as *u8, 0, sizeof(Expr))
     lfia_base.kind = ExprKind.Ident
     lfia_base.span = stmt.span
-    lfia_base.ident_ptr = stmt.var_name
-    lfia_base.ident_len = stmt.var_name_len
+    lfia_base.ident = StrView { ptr: stmt.var_name, len: stmt.var_name_len as i64 }
     var lfia_place: Expr
     memset(@lfia_place as *u8, 0, sizeof(Expr))
     lfia_place.kind = ExprKind.Member
     lfia_place.span = stmt.span
     lfia_place.left = @lfia_base
-    lfia_place.ident_ptr = stmt.assign_target
-    lfia_place.ident_len = stmt.assign_target_len
+    lfia_place.ident = StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }
     emit_field_array_elem_store(s, field_ptr, field, idx_reg, val_reg, stmt.assign_value, @lfia_place)
 
 # `a[i] = v` on a local, global or pointer that no special case above took.
@@ -3323,8 +3318,7 @@ fn emit_local_array_index_assign(s: *EmitterState, stmt: *Stmt, local: *LocalVar
         memset(@ia_place as *u8, 0, sizeof(Expr))
         ia_place.kind = ExprKind.Ident
         ia_place.span = stmt.span
-        ia_place.ident_ptr = stmt.assign_target
-        ia_place.ident_len = stmt.assign_target_len
+        ia_place.ident = StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }
         own_drop_old_elem(s, @ia_place, elem_ptr, et_name)
         # AGAST #190: `store %T %val`, the element struct type's value.
         emit_struct_store_or_copy(s, TypeKind.Struct, et_name, val_reg, elem_ptr)
@@ -3422,7 +3416,7 @@ fn emit_index_assign_stmt(s: *EmitterState, stmt: *Stmt)
         # AGAST #1509: `g[i] = v` with g multi-dimensional assigns a whole
         # row (`g[i][j] = v` is an expression assignment, see emit_assign).
         # AGAST #4666: copied over it (emit_nd_sub_store).
-        var rg_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident_ptr: stmt.assign_target, ident_len: stmt.assign_target_len }
+        var rg_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident: StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }}
         var rg_place: Expr = Expr { kind: ExprKind.Index, span: stmt.span, left: @rg_var, right: stmt.while_cond }
         emit_nd_stmt_row_store(s, stmt, @rg_place)
     else if array_ptr_named(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) != null
@@ -3447,8 +3441,7 @@ fn member_of_target(stmt: *Stmt, left: *Expr, out: *Expr)
     out.kind = ExprKind.Member
     out.span = stmt.span
     out.left = left
-    out.ident_ptr = stmt.assign_target
-    out.ident_len = stmt.assign_target_len
+    out.ident = StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }
     out.next = null
 
 # `e.f = v` lowered as an expression assignment.

@@ -134,12 +134,11 @@ fn rl_add(root: i32, place: *Expr, mutable: i32, depth: i32) -> *RefLoan
 
 # The index of the innermost local named `name` in Sema's scope, or -1.
 fn rl_local_idx(sm: *Sema, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var i: i32 = sm.scope_top - 1
     while i >= 0
         let v: *SemaVar = @sm.scope[i]
-        if name_eq(StrView { ptr: (v.name), len: (v.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (v.name), len: (v.name_len) as i64 }, name_sv) == 1
             return i
         i = i - 1
     0 - 1
@@ -171,7 +170,7 @@ fn rl_root(sm: *Sema, e0: *Expr) -> i32
     var e: *Expr = e0
     while e != null
         if e.kind == ExprKind.Ident
-            return rl_local_idx(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            return rl_local_idx(sm, e.ident)
         # AGAST #3015: a step through `Deref` (R17 rule 6) is a step of its
         # receiver's place.
         let through: *Expr = df_deref_step_recv(e)
@@ -214,7 +213,7 @@ fn rl_step_eq(a: *Expr, b: *Expr) -> i32
         return 0
     if a.kind == ExprKind.Index
         return 1
-    name_eq(StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 }, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
+    name_eq(a.ident, b.ident)
 
 # Do places `a0` and `b0`, of one root, overlap: is one's path a prefix of the
 # other's?  Trim the longer to the shorter's length, then compare step by step.
@@ -267,12 +266,12 @@ fn rl_eprint_place(e: *Expr)
         ExprKind.Member =>
             rl_eprint_place(e.left)
             eprint_char('.')
-            eprint_bytes(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            eprint_bytes(e.ident)
         ExprKind.Index =>
             rl_eprint_place(e.left)
             eprints("[_]")
         _ =>
-            eprint_bytes(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            eprint_bytes(e.ident)
 
 # A borrow of `place`, on local `root`, at line:col: `what` is 0 for a borrow,
 # 1 for a write and 2 for a move (LARB R57: moving a place conflicts with a
@@ -391,12 +390,12 @@ pub fn rl_qualified_variant(sm: *Sema, e: *Expr) -> i32
     let q: *Expr = e.left
     if q == null or q.kind != ExprKind.Ident
         return 0
-    if sema_find_local(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) != null or sbk_global(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) != null
+    if sema_find_local(sm, q.ident) != null or sbk_global(sm, q.ident) != null
         return 0
-    let ei: i32 = enum_find(sm.pctx, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 })
+    let ei: i32 = enum_find(sm.pctx, q.ident)
     if ei < 0
         return 0
-    (enum_variant_index(sm.pctx, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0) as i32
+    (enum_variant_index(sm.pctx, q.ident, e.ident) >= 0) as i32
 
 # Every borrow inside `e`.  An `if` or `match` is its condition here: its arms
 # are statement lists and values the walk reaches with their bindings.
@@ -406,7 +405,7 @@ fn rl_walk(sm: *Sema, e: *Expr)
     let k: ExprKind = e.kind
     match k
         ExprKind.Call =>
-            if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "sizeof") == 1
+            if e.func_name.len == 6 and name_eq(e.func_name, "sizeof") == 1
                 return
             # AGAST #3015: `S_deref(@b)` made for `b.f` (R17) is a step of the
             # place `b.f`, which the borrow it's in is of; it lends nothing itself.
@@ -526,27 +525,21 @@ fn rl_store_ty(sm: *Sema, p: *Expr, call: *Expr, out: *SemaTy) -> i32
     let st: *StructDef = sema_find_struct(sm, StrView { ptr: (b.name), len: (b.name_len) as i64 })
     if st == null
         return 0
-    let fi: i32 = find_field_index(st, StrView { ptr: (p.ident_ptr), len: (p.ident_len) as i64 })
+    let fi: i32 = find_field_index(st, p.ident)
     if fi < 0
         return 0
     rs_of_field(get_field_type(st, fi), out)
 
 pub fn rl_expr_ident(e: *Expr, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     memset(e as *u8, 0, sizeof(Expr))
     e.kind = ExprKind.Ident
-    e.ident_ptr = name
-    e.ident_len = len
+    e.ident = name_sv
 
 pub fn rl_expr_member(e: *Expr, base: *Expr, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     memset(e as *u8, 0, sizeof(Expr))
     e.kind = ExprKind.Member
     e.left = base
-    e.ident_ptr = name
-    e.ident_len = len
+    e.ident = name_sv
 
 pub fn rl_expr_index(e: *Expr, base: *Expr, index: *Expr)
     memset(e as *u8, 0, sizeof(Expr))

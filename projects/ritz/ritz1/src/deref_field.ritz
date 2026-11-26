@@ -42,6 +42,7 @@ import struct_index
 import ast_query   # name_eq & co., off emitter_core (AGAST #3513)
 import sema
 import sema_type
+import ritzlib.strview
 
 # Which traits a struct implements, as a mask.
 const DF_DEREF: i32 = 1
@@ -137,11 +138,10 @@ fn df_put_ellipsis(b: *DfBuf)
 
 # How many type parameters the generic struct `head` declares, 0 for any other name.
 fn df_arity(sm: *Sema, head_sv: StrView) -> i32
-    var head: *u8 = head_sv.ptr
     var len: i32 = head_sv.len as i32
     var st: *StructDef = sm.module.structs
     while st != null
-        if st.type_params != null and name_eq(StrView { ptr: (st.name), len: (st.name_len) as i64 }, StrView { ptr: (head), len: (len) as i64 }) == 1
+        if st.type_params != null and name_eq(StrView { ptr: (st.name), len: (st.name_len) as i64 }, head_sv) == 1
             var n: i32 = 0
             var tp: *TypeParam = st.type_params
             while tp != null
@@ -175,7 +175,7 @@ fn df_display_take(sm: *Sema, name_sv: StrView, pos: *i32, out: *DfBuf) -> i32
         *pos = *pos + 1   # the `$`
         if k > 0
             df_put_sv(out, ", ")
-        if df_display_take(sm, StrView { ptr: (name), len: (len) as i64 }, pos, out) == 0
+        if df_display_take(sm, name_sv, pos, out) == 0
             return 0
         k += 1
     df_putc(out, '>')
@@ -189,7 +189,7 @@ fn df_display(sm: *Sema, name_sv: StrView, out: *DfBuf)
     var tmp: DfBuf
     df_buf_init(@tmp)
     var pos: i32 = 0
-    if df_display_take(sm, StrView { ptr: (name), len: (len) as i64 }, @pos, @tmp) == 1 and pos == len
+    if df_display_take(sm, name_sv, @pos, @tmp) == 1 and pos == len
         df_put(out, tmp.data, tmp.len)
     else
         df_put(out, name, len)
@@ -210,7 +210,7 @@ fn df_spell_plain(x: *Expr, out: *DfBuf)
     if x.kind == ExprKind.Member
         df_spell_plain(x.left, out)
         df_putc(out, '.')
-    df_put(out, x.ident_ptr, x.ident_len)
+    df_put_sv(out, x.ident)
 
 # The receiver `x` as the source writes it, or `s`.
 fn df_spell(x: *Expr, out: *DfBuf)
@@ -330,10 +330,9 @@ fn df_deref_fn(sm: *Sema, st: *StructDef) -> *FnDef
 
 fn df_field(st: *StructDef, name_sv: StrView) -> *StructField
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     if st == null
         return null
-    let fi: i32 = find_field_index(st, StrView { ptr: (name), len: (len) as i64 })
+    let fi: i32 = find_field_index(st, name_sv)
     if fi < 0
         return null
     get_field_type(st, fi)
@@ -347,7 +346,7 @@ pub fn df_member_field(sm: *Sema, e: *Expr) -> *StructField
         return null
     var r: SemaTy
     sema_expr_ty(sm, e.left, @r)
-    df_field(sema_recv_struct(sm, @r), StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    df_field(sema_recv_struct(sm, @r), e.ident)
 
 # The struct a field of that type is, by value or behind a pointer or reference.
 fn df_field_struct(sm: *Sema, f: *StructField) -> *StructDef
@@ -365,11 +364,11 @@ fn df_peek_struct(sm: *Sema, x: *Expr) -> *StructDef
     if x.kind == ExprKind.Member and x.left != null
         let bst: *StructDef = df_peek_struct(sm, x.left)
         if bst != null
-            var f: *StructField = df_field(bst, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+            var f: *StructField = df_field(bst, x.ident)
             if f == null and (df_traits(sm, bst) & DF_DEREF) != 0
                 let dfd: *FnDef = df_deref_fn(sm, bst)
                 if dfd != null
-                    f = df_field(sema_find_struct(sm, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 }), StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+                    f = df_field(sema_find_struct(sm, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 }), x.ident)
             return df_field_struct(sm, f)
     df_struct_of(sm, x)
 
@@ -393,19 +392,19 @@ fn df_no_field_text(sm: *Sema, e: *Expr, st: *StructDef) -> StrView
     df_putc(@m, '`')
     df_display(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, @m)
     df_put_sv(@m, "` has no field `")
-    df_put(@m, e.ident_ptr, e.ident_len)
+    df_put_sv(@m, e.ident)
     df_putc(@m, '`')
     # A `*T` field whose T has it: the hint names the step.
     var f: *StructField = st.fields
     while f != null
         if f.field_type == TypeKind.Ptr and f.field_type_name_len > 0
-            if df_field(sema_find_struct(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }), StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
+            if df_field(sema_find_struct(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }), e.ident) != null
                 df_put_sv(@m, ": it points at one: `")
                 df_spell(e.left, @m)
                 df_putc(@m, '.')
                 df_put(@m, f.name, f.name_len)
                 df_putc(@m, '.')
-                df_put(@m, e.ident_ptr, e.ident_len)
+                df_put_sv(@m, e.ident)
                 df_put_sv(@m, "`, or implement `Deref`")
                 f = null
         if f != null
@@ -445,16 +444,14 @@ pub fn df_no_field_once(ctx: *ParseCtx, m: *Module, e: *Expr, st: *StructDef) ->
     df_no_field_text(g_df_emit_sema, e, st).ptr
 
 fn df_neither(sm: *Sema, e: *Expr, st: *StructDef, t_sv: StrView)
-    var t: *u8 = t_sv.ptr
-    var t_len: i32 = t_sv.len as i32
     var m: DfBuf
     df_buf_init(@m)
     df_put_sv(@m, "neither `")
     df_display(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, @m)
     df_put_sv(@m, "` nor `")
-    df_display(sm, StrView { ptr: (t), len: (t_len) as i64 }, @m)
+    df_display(sm, t_sv, @m)
     df_put_sv(@m, "` has a field `")
-    df_put(@m, e.ident_ptr, e.ident_len)
+    df_put_sv(@m, e.ident)
     df_putc(@m, '`')
     df_report(sm, df_line(e), df_col(e), df_view(@m))
 
@@ -468,7 +465,7 @@ fn df_needs_mut(sm: *Sema, e: *Expr, st: *StructDef, ctx: i32, is_method: i32)
         df_put_sv(@m, "@&")
     df_spell(e.left, @m)
     df_putc(@m, '.')
-    df_put(@m, e.ident_ptr, e.ident_len)
+    df_put_sv(@m, e.ident)
     if is_method == 1
         df_put_sv(@m, "()")
     else if ctx == DF_STORE
@@ -505,10 +502,8 @@ fn df_step(sm: *Sema, x: *Expr, st: *StructDef, mutable: i32) -> *Expr
     memcpy(name + st.name_len + 1, meth, meth_len as i64)
     *(name + n) = 0
     let call: *Expr = si_new_expr(ExprKind.Call, x.span.line, x.span.col)
-    call.func_name = name
-    call.func_name_len = n
-    call.call_type_suffix = null
-    call.call_type_suffix_len = 0
+    call.func_name = StrView { ptr: name, len: n as i64 }
+    call.call_type_suffix = strview_empty()
     var recv: *Expr = null
     var arg: *Expr = x
     var t: SemaTy
@@ -544,7 +539,7 @@ fn df_member(sm: *Sema, e: *Expr, ctx: i32)
     if x == null
         return
     let st: *StructDef = df_struct_of(sm, x)
-    if st == null or find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
+    if st == null or find_field_index(st, e.ident) >= 0
         return
     let mask: i32 = df_traits(sm, st)
     var dfd: *FnDef = null
@@ -554,7 +549,7 @@ fn df_member(sm: *Sema, e: *Expr, ctx: i32)
         df_no_field(sm, e, st)
         return
     let tst: *StructDef = sema_find_struct(sm, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 })
-    if df_field(tst, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == null
+    if df_field(tst, e.ident) == null
         df_neither(sm, e, st, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 })
         return
     let mutable: i32 = df_mutable(ctx)
@@ -591,8 +586,8 @@ fn df_args(sm: *Sema, a0: *Expr, p0: *Param)
 # `x` as ritz0's _field_call_text spells it: a name, an integer, else `...`.
 fn df_put_call_part(x: *Expr, out: *DfBuf)
     if x != null and x.kind == ExprKind.Ident
-        df_put(out, x.ident_ptr, x.ident_len)
-    else if x != null and x.kind == ExprKind.IntLit and x.ident_ptr == null
+        df_put_sv(out, x.ident)
+    else if x != null and x.kind == ExprKind.IntLit and x.ident.ptr == null
         # A literal is never negative (`-5` is a Neg over `5`); a u64 literal
         # of 2^63 and up is held as a negative i64, so read it as u64
         # (AGAST #4572: `0 - v` stopped ritz1 on 0x8000000000000000).
@@ -613,13 +608,13 @@ fn df_method_and_field(sm: *Sema, e: *Expr, st: *StructDef)
     var m: DfBuf
     df_buf_init(@m)
     df_putc(@m, '`')
-    df_put(@m, e.ident_ptr, e.ident_len)
+    df_put_sv(@m, e.ident)
     df_put_sv(@m, "` is both a method and a field of `")
     df_display(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, @m)
     df_put_sv(@m, "`: write `(")
     df_put_call_part(e.left, @m)
     df_putc(@m, '.')
-    df_put(@m, e.ident_ptr, e.ident_len)
+    df_put_sv(@m, e.ident)
     df_put_sv(@m, ")(")
     var a: *Expr = e.args
     while a != null
@@ -635,25 +630,21 @@ fn df_fn_field_call(sm: *Sema, e: *Expr) -> i32
     let st: *StructDef = df_peek_struct(sm, e.left)
     if st == null
         return 0
-    let f: *StructField = df_field(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let f: *StructField = df_field(st, e.ident)
     if f == null or f.fn_sig == null
         return 0
-    if sema_method_fn(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
+    if sema_method_fn(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, e.ident) != null
         df_method_and_field(sm, e, st)
         return 0
     let callee: *Expr = si_new_expr(ExprKind.Member, e.left.span.line, e.left.span.col)
     callee.left = e.left
-    callee.ident_ptr = e.ident_ptr
-    callee.ident_len = e.ident_len
+    callee.ident = e.ident
     callee.bracket = e.bracket
     e.kind = ExprKind.Call
     e.left = callee
-    e.ident_ptr = null
-    e.ident_len = 0
-    e.func_name = null
-    e.func_name_len = 0
-    e.call_type_suffix = null
-    e.call_type_suffix_len = 0
+    e.ident = strview_empty()
+    e.func_name = strview_empty()
+    e.call_type_suffix = strview_empty()
     1
 
 # `x.m(args)`: S's own method, else T's through the trait, whose receiver is
@@ -667,21 +658,21 @@ fn df_method(sm: *Sema, e: *Expr)
     var through: i32 = 0
     let rst: *StructDef = df_peek_struct(sm, x)
     if rst != null
-        fd = sema_method_fn(sm, StrView { ptr: (rst.name), len: (rst.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        fd = sema_method_fn(sm, StrView { ptr: (rst.name), len: (rst.name_len) as i64 }, e.ident)
         if fd == null and (df_traits(sm, rst) & DF_DEREF) != 0
             let dfd: *FnDef = df_deref_fn(sm, rst)
             if dfd != null
                 let tst: *StructDef = sema_find_struct(sm, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 })
                 if tst != null
-                    fd = sema_method_fn(sm, StrView { ptr: (tst.name), len: (tst.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                    fd = sema_method_fn(sm, StrView { ptr: (tst.name), len: (tst.name_len) as i64 }, e.ident)
                     if fd != null
                         through = 1
     let mutates: i32 = df_fn_mutates(fd)
     let saved: *u8 = g_df_call
     let saved_len: i32 = g_df_call_len
     if mutates == 1
-        g_df_call = e.ident_ptr
-        g_df_call_len = e.ident_len
+        g_df_call = e.ident.ptr
+        g_df_call_len = e.ident.len as i32
         df_walk(sm, x, DF_MUT_CALL)
     else
         df_walk(sm, x, DF_READ)
@@ -702,8 +693,8 @@ fn df_method(sm: *Sema, e: *Expr)
 # The fn a named call calls, as the emitter's find_call_fn has it: a typed
 # fn-pointer local of that name first (AGAST #3666), else sema_call_fn.
 fn df_call_fn(sm: *Sema, e: *Expr) -> *FnDef
-    if e.call_type_suffix_len <= 0
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    if e.call_type_suffix.len <= 0
+        let v: *SemaVar = sema_find_local(sm, e.func_name)
         if v != null and v.fn_sig != null and v.kind != TypeKind.Array
             return v.fn_sig
     sema_call_fn(sm, e)
@@ -730,7 +721,7 @@ fn df_walk(sm: *Sema, e: *Expr, ctx: i32)
         ExprKind.Call =>
             if df_is_step(e) == 1
                 return
-            if e.func_name_len == 0
+            if e.func_name.len == 0
                 df_walk(sm, e.left, DF_READ)
                 df_args(sm, e.args, null)
                 return
@@ -778,20 +769,14 @@ pub fn deref_field_expr(sm: *Sema, e: *Expr)
     df_walk(sm, e, DF_READ)
 
 fn df_ident(name_sv: StrView, line: i32, col: i32) -> *Expr
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let id: *Expr = si_new_expr(ExprKind.Ident, line, col)
-    id.ident_ptr = name
-    id.ident_len = len
+    id.ident = name_sv
     id
 
 fn df_member_node(base: *Expr, name_sv: StrView, at: *Stmt) -> *Expr
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let m: *Expr = si_new_expr(ExprKind.Member, base.span.line, base.span.col)
     m.left = base
-    m.ident_ptr = name
-    m.ident_len = len
+    m.ident = name_sv
     m.bracket.line = at.bracket.line
     m.bracket.col = at.bracket.col
     m
@@ -854,7 +839,7 @@ pub fn deref_field_stmt(sm: *Sema, stmt: *Stmt)
         StmtKind.LocalFieldAssign =>
             var t: *Expr = null
             var compound: i32 = 0
-            if df_is_compound(v) == 1 and v.left.kind == ExprKind.Member and v.left.ident_ptr == stmt.assign_target and v.left.left != null and v.left.left.kind == ExprKind.Ident and v.left.left.ident_ptr == stmt.var_name
+            if df_is_compound(v) == 1 and v.left.kind == ExprKind.Member and v.left.ident.ptr == stmt.assign_target and v.left.left != null and v.left.left.kind == ExprKind.Ident and v.left.left.ident.ptr == stmt.var_name
                 compound = 1
                 t = v.left
             else
@@ -919,11 +904,10 @@ fn df_impl_type(ib: *ImplBlock, out: *DfBuf)
     df_putc(out, '>')
 
 fn df_impl_method(ib: *ImplBlock, name_sv: StrView) -> *FnDef
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var f: *FnDef = ib.methods
     while f != null
-        if name_eq(StrView { ptr: (f.name), len: (f.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (f.name), len: (f.name_len) as i64 }, name_sv) == 1
             return f
         f = f.next
     null

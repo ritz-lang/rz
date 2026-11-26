@@ -25,10 +25,10 @@ import bool_check          # BK_*, bk_of_type, bk_tagged_payload
 fn bk_name(s: *EmitterState, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (name), len: (len) as i64 })
+    let ce: *ConstEntry = find_const_entry(s, name_sv)
     if ce != null
         return bk_of_type(ce.const_type, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 })
-    let idx: i32 = find_local_idx(s, StrView { ptr: (name), len: (len) as i64 })
+    let idx: i32 = find_local_idx(s, name_sv)
     if idx >= 0
         let loc: *LocalVar = local_at(s, idx)
         if loc.is_bool == 1
@@ -38,22 +38,21 @@ fn bk_name(s: *EmitterState, name_sv: StrView) -> i32
         if lv_bk_unsure(loc) == 1
             return BK_UNSURE
         return bk_of_type(lv_var_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
-    let g: *GlobalVarDef = find_global(s, StrView { ptr: (name), len: (len) as i64 })
+    let g: *GlobalVarDef = find_global(s, name_sv)
     if g != null
         return bk_of_type(g.var_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
-    if find_fn(s, StrView { ptr: (name), len: (len) as i64 }) != null
+    if find_fn(s, name_sv) != null
         return BK_PTR
     BK_UNSURE
 
 # What `name[i]` is, for a local or global `name`.
 pub fn bk_element(s: *EmitterState, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     # AGAST #2440: through a pointer or reference, the buffer's element.
-    let through: TypeKind = through_named_elem(s, StrView { ptr: (name), len: (len) as i64 })
+    let through: TypeKind = through_named_elem(s, name_sv)
     if through != TypeKind.Void
         return bk_of_type(through, StrView { ptr: (null), len: (0) as i64 })
-    let idx: i32 = find_local_idx(s, StrView { ptr: (name), len: (len) as i64 })
+    let idx: i32 = find_local_idx(s, name_sv)
     if idx >= 0
         let loc: *LocalVar = local_at(s, idx)
         match lv_var_type(loc)
@@ -66,12 +65,12 @@ pub fn bk_element(s: *EmitterState, name_sv: StrView) -> i32
                 return bk_of_type(lv_pointee_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
             _ => pass
         return BK_UNSURE
-    let g: *GlobalVarDef = find_global(s, StrView { ptr: (name), len: (len) as i64 })
+    let g: *GlobalVarDef = find_global(s, name_sv)
     if g == null
         # AGAST #4403: `KS[i]` of `const KS: [N]T` takes its element T from
         # the ConstEntry, as Sema's sbk_element does.  get_expr_type guessed
         # an i64 for a struct element, so a `const [N]StrView` was BK_INT.
-        let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (name), len: (len) as i64 })
+        let ce: *ConstEntry = find_const_entry(s, name_sv)
         if ce != null and ce.const_type == TypeKind.Array
             return bk_of_type(ce.array_elem_type, StrView { ptr: (ce.array_elem_type_name), len: (ce.array_elem_type_name_len) as i64 })
         return BK_UNSURE
@@ -106,7 +105,7 @@ fn bk_index(s: *EmitterState, e: *Expr) -> i32
     let base: *Expr = e.left
     match base.kind
         ExprKind.Ident =>
-            let k: i32 = bk_element(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            let k: i32 = bk_element(s, base.ident)
             if k != BK_UNSURE
                 return k
         ExprKind.Member =>
@@ -144,7 +143,7 @@ pub fn bk_method_def(s: *EmitterState, e: *Expr) -> *FnDef
     let tn: StrView = bk_method_recv(s, e)
     if tn.ptr == null
         return null
-    method_callee_def(s, tn, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    method_callee_def(s, tn, e.ident)
 
 # The type name method call `e` dispatches on, or `strview_empty()`.
 fn bk_method_recv(s: *EmitterState, e: *Expr) -> StrView
@@ -158,12 +157,12 @@ fn bk_method_recv(s: *EmitterState, e: *Expr) -> StrView
     StrView { ptr: (tn), len: (tn_len) as i64 }
 
 fn bk_method(s: *EmitterState, e: *Expr) -> i32
-    if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "is_some") == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "is_none") == 1
+    if name_eq(e.ident, "is_some") == 1 or name_eq(e.ident, "is_none") == 1
         return BK_BOOL
-    if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "is_ok") == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "is_err") == 1
+    if name_eq(e.ident, "is_ok") == 1 or name_eq(e.ident, "is_err") == 1
         return BK_BOOL
     # The carrier's own methods hand back its payload.
-    if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "unwrap") == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "unwrap_or") == 1
+    if name_eq(e.ident, "unwrap") == 1 or name_eq(e.ident, "unwrap_or") == 1
         let pk: i32 = bk_payload_of(s, e.left)
         if pk != BK_UNSURE
             return pk
@@ -177,14 +176,14 @@ fn bk_method(s: *EmitterState, e: *Expr) -> i32
 
 fn bk_call(s: *EmitterState, e: *Expr) -> i32
     # A call through a local: its signature, not a fn of that name.
-    if e.func_name_len > 0
-        let idx: i32 = find_local_idx(s, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    if e.func_name.len > 0
+        let idx: i32 = find_local_idx(s, e.func_name)
         if idx >= 0
             let loc: *LocalVar = local_at(s, idx)
             if lv_fn_sig(loc) != null
                 return bk_of_fn(lv_fn_sig(loc))
             return BK_UNSURE
-    if mem_builtin_id(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) != 0
+    if mem_builtin_id(e.func_name) != 0
         return bk_of_type(expr_slot_ty(e), StrView { ptr: (null), len: (0) as i64 })
     let fd: *FnDef = find_call_fn(s, e)
     if fd == null
@@ -212,19 +211,19 @@ fn bk_receiver(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
         *out_len = elem_sv.len as i32
         if *out_name == null
             bk_receiver(s, e.left, out_name, out_len)
-    else if e.kind == ExprKind.Cast and e.ident_len > 0
-        *out_name = e.ident_ptr
-        *out_len = e.ident_len
+    else if e.kind == ExprKind.Cast and (e.ident.len as i32) > 0
+        *out_name = e.ident.ptr
+        *out_len = e.ident.len as i32
     else
         match e.kind
             ExprKind.Ident =>
-                let idx: i32 = find_local_idx(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                let idx: i32 = find_local_idx(s, e.ident)
                 if idx >= 0
                     let loc: *LocalVar = local_at(s, idx)
                     *out_name = lv_type_name(loc)
                     *out_len = lv_type_name_len(loc)
                 else
-                    let g: *GlobalVarDef = find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                    let g: *GlobalVarDef = find_global(s, e.ident)
                     if g != null
                         *out_name = g.type_name
                         *out_len = g.type_name_len
@@ -245,8 +244,8 @@ fn bk_receiver(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
 fn bk_member(s: *EmitterState, e: *Expr) -> i32
     var f: *StructField = member_field_def(s, e)
     # `colors.ON`: a const reached through its module.
-    if f == null and e.left.kind == ExprKind.Ident and find_local_idx(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) < 0
-        let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    if f == null and e.left.kind == ExprKind.Ident and find_local_idx(s, e.left.ident) < 0
+        let ce: *ConstEntry = find_const_entry(s, e.ident)
         if ce != null
             return bk_of_type(ce.const_type, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 })
     if f == null
@@ -258,7 +257,7 @@ fn bk_member(s: *EmitterState, e: *Expr) -> i32
         let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
         if st == null
             return BK_UNSURE
-        let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        let idx: i32 = find_field_index(st, e.ident)
         if idx < 0
             return BK_UNSURE
         f = get_field_type(st, idx)
@@ -285,7 +284,7 @@ pub fn bool_kind(s: *EmitterState, e: *Expr) -> i32
         ExprKind.StringLit | ExprKind.StructLit | ExprKind.ArrayLit | ExprKind.ArrayFill =>
             return BK_OTHER
         ExprKind.Ident =>
-            return bk_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            return bk_name(s, e.ident)
         ExprKind.Binary =>
             if op_is_cmp_or_logic(e.op)
                 return BK_BOOL
@@ -313,7 +312,7 @@ pub fn bool_kind(s: *EmitterState, e: *Expr) -> i32
                 return bool_kind(s, e.operand)
             return bk_of_type(expr_slot_ty(e), StrView { ptr: (null), len: (0) as i64 })
         ExprKind.Cast =>
-            return bk_of_type(e.type_kind, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            return bk_of_type(e.type_kind, e.ident)
         ExprKind.Member =>
             return bk_member(s, e)
         ExprKind.Index =>

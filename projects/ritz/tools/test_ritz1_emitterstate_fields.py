@@ -75,7 +75,7 @@ MEASURED_FIELDS = 102
 GREP_NAMES = ("last_match_agg_name", "ctx_enum_name", "sret_last_val")
 
 # The AST annotations that are the Sema->lowering channel.
-AST_ANNOTATIONS = ("sema_ty", "value_ty_name", "value_ty_name_len", "sema_levels")
+AST_ANNOTATIONS = ("sema_ty", "value_ty_name", "sema_levels")
 
 
 def _struct_fields(text: str, name: str) -> dict[str, str]:

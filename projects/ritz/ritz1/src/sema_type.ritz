@@ -73,9 +73,8 @@ fn sema_is_int_lit(e: *Expr) -> i32
 # The type of the name `name`: a local, a global or a typed const (AGAST #3755
 # reads it for `n[i] = v`, whose target is a name, not an Expr).
 pub fn sema_name_ty(sm: *Sema, name_sv: StrView, t: *SemaTy) -> TypeKind
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, name_sv)
     if v != null
         if v.kind == TypeKind.Array
             sema_arr_ty(t, v.index_elem, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, v.shape)
@@ -84,7 +83,7 @@ pub fn sema_name_ty(sm: *Sema, name_sv: StrView, t: *SemaTy) -> TypeKind
         return sema_ty_set(t, v.kind, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, v.pointee, v.fn_sig)
     var g: *GlobalVarDef = sm.module.globals
     while g != null
-        if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, name_sv) == 1
             if g.var_type == TypeKind.Array
                 sema_arr_ty(t, g.array_elem_type, StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 }, g.array_shape)
                 t.fn_sig = g.fn_sig   # AGAST #4324: `var g: [N]fn(..) -> T`
@@ -98,7 +97,7 @@ pub fn sema_name_ty(sm: *Sema, name_sv: StrView, t: *SemaTy) -> TypeKind
     # and a float const are left to the emitter's folding.
     var c: *ConstEntry = sm.module.constants
     while c != null
-        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, name_sv) == 1
             # AGAST #4403: a `const KS: [N]T` is an array of T, so `KS[i]`
             # is T (sema_arr_elem).  The parser records T on the entry.
             if c.const_type == TypeKind.Array
@@ -123,7 +122,7 @@ fn sema_fn_ret_ty(fd: *FnDef, t: *SemaTy) -> TypeKind
     sema_ty_set(t, fd.return_type, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }, pointee, fd.ret_fn_sig)
 
 fn sema_call_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
-    if e.func_name_len == 0
+    if e.func_name.len == 0
         return sema_ty_none(t)
     # AGAST #3995: a user-enum variant ctor `One(3)` builds its enum, ahead
     # of a local or fn of that name (emit_expr_call's order).
@@ -133,14 +132,14 @@ fn sema_call_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
     if en != null
         return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (en), len: (en_len) as i64 }, TypeKind.Void, null)
     # A call through a local is its signature's, never a fn of that name.
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, e.func_name)
     if v != null
         if v.fn_sig != null
             return sema_fn_ret_ty(v.fn_sig, t)
         return sema_ty_none(t)
-    if mem_builtin_id(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) != 0
+    if mem_builtin_id(e.func_name) != 0
         return sema_ty_none(t)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "xgetbv") == 1
+    if name_eq(e.func_name, "xgetbv") == 1
         return sema_ty_set(t, TypeKind.U64, StrView { ptr: null, len: 0 }, TypeKind.Void, null)   # AGAST #4657
     let fd: *FnDef = sema_call_fn(sm, e)
     if fd == null
@@ -152,9 +151,9 @@ fn sema_is_ptr_kind(k: TypeKind) -> i32
 
 # `x`, when it names a (non-generic) user enum and no local; else null.
 pub fn sema_enum_name(sm: *Sema, x: *Expr) -> *Expr
-    if x == null or x.kind != ExprKind.Ident or sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) != null
+    if x == null or x.kind != ExprKind.Ident or sema_find_local(sm, x.ident) != null
         return null
-    if user_enum_index(sm.pctx, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) < 0
+    if user_enum_index(sm.pctx, x.ident) < 0
         return null
     x
 
@@ -177,8 +176,8 @@ fn sema_member_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
         return sema_ty_none(t)
     # AGAST #4251: `E.V`, a user enum's unit variant, builds the enum E.
     let en: *Expr = sema_enum_name(sm, e.left)
-    if en != null and enum_variant_index(sm.pctx, StrView { ptr: (en.ident_ptr), len: (en.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
-        return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (en.ident_ptr), len: (en.ident_len) as i64 }, TypeKind.Void, null)
+    if en != null and enum_variant_index(sm.pctx, en.ident, e.ident) >= 0
+        return sema_ty_set(t, TypeKind.Struct, en.ident, TypeKind.Void, null)
     var r: SemaTy
     if sema_expr_ty(sm, e.left, @r) == TypeKind.Unknown
         # AGAST #3824: `K.f` on `const K: StrView = "..."`, a `%S` global the
@@ -189,18 +188,18 @@ fn sema_member_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
         if ce == null
             return sema_ty_none(t)
         sema_ty_set(@r, TypeKind.Struct, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 }, TypeKind.Void, null)
-    sema_field_ty(sm, @r, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, t)
+    sema_field_ty(sm, @r, e.ident, t)
 
 # AGAST #3824: the const `id` names, if it is a string-initialised struct
 # const (emitter_core's struct_const_global, over Sema's module); else null.
 fn sema_struct_const(sm: *Sema, id: *Expr) -> *ConstEntry
     if id == null or id.kind != ExprKind.Ident
         return null
-    if sema_find_local(sm, StrView { ptr: (id.ident_ptr), len: (id.ident_len) as i64 }) != null
+    if sema_find_local(sm, id.ident) != null
         return null
     var c: *ConstEntry = sm.module.constants
     while c != null
-        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, StrView { ptr: (id.ident_ptr), len: (id.ident_len) as i64 }) == 1
+        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, id.ident) == 1
             if c.const_type == TypeKind.Struct and c.type_name_len > 0 and c.value_expr != null and c.value_expr.kind == ExprKind.StringLit
                 return c
             return null
@@ -210,14 +209,13 @@ fn sema_struct_const(sm: *Sema, id: *Expr) -> *ConstEntry
 # The type of field `name` of `r`, a struct or a pointer or reference to one
 # (AGAST #3799 reads it for `s.f[i] = v`, whose target is a field name).
 pub fn sema_field_ty(sm: *Sema, r: *SemaTy, name_sv: StrView, t: *SemaTy) -> TypeKind
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if r.kind == TypeKind.Unknown
         return sema_ty_none(t)
     let st: *StructDef = sema_recv_struct(sm, r)
     if st == null
         return sema_ty_none(t)
-    let idx: i32 = find_field_index(st, StrView { ptr: (name), len: (len) as i64 })
+    let idx: i32 = find_field_index(st, name_sv)
     if idx < 0
         return sema_ty_none(t)
     let f: *StructField = get_field_type(st, idx)
@@ -280,7 +278,7 @@ fn sema_unary_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
                 # pointee is T.  The emitter records T as the pointer's pointee.
                 var bet: TypeKind = TypeKind.Void
                 if ok == TypeKind.Unknown and e.operand != null and e.operand.kind == ExprKind.Ident
-                    let bv: *SemaVar = sema_find_local(sm, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
+                    let bv: *SemaVar = sema_find_local(sm, e.operand.ident)
                     if bv != null and bv.lent != null
                         bet = bv.lent.param_pointee_type
                 return sema_ty_set(t, kind, StrView { ptr: (null), len: (0) as i64 }, bet, null)
@@ -318,7 +316,7 @@ pub fn sema_arr_ty(t: *SemaTy, elem: TypeKind, name_sv: StrView, shape: *ArraySh
         sema_ty_set(t, TypeKind.Array, StrView { ptr: (shape.leaf_name), len: (shape.leaf_name_len) as i64 }, shape.leaf_type, null)
         t.shape = shape
         return TypeKind.Array
-    sema_ty_set(t, TypeKind.Array, StrView { ptr: (name), len: (len) as i64 }, elem, null)
+    sema_ty_set(t, TypeKind.Array, name_sv, elem, null)
 
 # `a[i]` of the array `a`, typed as above: a row of an N-D array, else its
 # element (a struct, a scalar, or a pointer, to the struct its name says).
@@ -378,7 +376,7 @@ pub fn sema_elem_ty(sm: *Sema, b: *Expr, t: *SemaTy) -> TypeKind
         return sema_arr_elem(@bt, t)
     if b.kind == ExprKind.Ident
         # A `*[N]T` (`@[N]T`, `@&[N]T`): its `[N]T`'s element.
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(sm, b.ident)
         if v != null and sema_is_ptr_kind(v.kind) == 1 and v.index_elem != TypeKind.Void
             var a: SemaTy
             sema_arr_ty(@a, v.index_elem, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, v.shape)
@@ -405,24 +403,23 @@ fn sema_index_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
 pub fn sema_span_method_ty(tn_sv: StrView, e: *Expr, t: *SemaTy) -> TypeKind
     var tn: *u8 = tn_sv.ptr
     var tn_len: i32 = tn_sv.len as i32
-    if tn == null or tn_len <= 5 or not (StrView { ptr: (tn), len: (tn_len) as i64 }).starts_with("Span$")
+    if tn == null or tn_len <= 5 or not tn_sv.starts_with("Span$")
         return sema_ty_none(t)
-    if e.args == null and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "len") == 1
+    if e.args == null and name_eq(e.ident, "len") == 1
         return sema_ty_set(t, TypeKind.I64, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Void, null)
-    if e.args == null and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "is_empty") == 1
+    if e.args == null and name_eq(e.ident, "is_empty") == 1
         return sema_ty_set(t, TypeKind.Bool, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Void, null)
-    if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "slice") == 1 and e.args != null and e.args.next != null and e.args.next.next == null
-        return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (tn), len: (tn_len) as i64 }, TypeKind.Void, null)
+    if name_eq(e.ident, "slice") == 1 and e.args != null and e.args.next != null and e.args.next.next == null
+        return sema_ty_set(t, TypeKind.Struct, tn_sv, TypeKind.Void, null)
     sema_ty_none(t)
 
 # 1 when `r` is the struct `name` or a pointer or reference to one.
 fn sema_recv_named(r: *SemaTy, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if r.kind == TypeKind.Struct
-        return name_eq(StrView { ptr: (r.name), len: (r.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 })
+        return name_eq(StrView { ptr: (r.name), len: (r.name_len) as i64 }, name_sv)
     if sema_is_ptr_kind(r.kind) == 1 and (r.pointee == TypeKind.Struct or r.pointee == TypeKind.Void)
-        return name_eq(StrView { ptr: (r.name), len: (r.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 })
+        return name_eq(StrView { ptr: (r.name), len: (r.name_len) as i64 }, name_sv)
     0
 
 # `x.m(..)`: the method's result, on a struct or a pointer to one; `E.V(..)`
@@ -432,19 +429,19 @@ fn sema_method_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
     if el == null
         return sema_ty_none(t)
     if sema_enum_name(sm, el) != null
-        return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (el.ident_ptr), len: (el.ident_len) as i64 }, TypeKind.Void, null)
+        return sema_ty_set(t, TypeKind.Struct, el.ident, TypeKind.Void, null)
     var r: SemaTy
     sema_expr_ty(sm, el, @r)
     # AGAST #4403: StrView.as_bytes() is an emitter intrinsic
     # (try_emit_strview_as_bytes) with no FnDef, so sema_method_fn finds
     # nothing and `let bytes = s.as_bytes()` stayed untyped.  It is the
     # `Span$u8` the emitter lowers, as bool_check's bk_is_strview_as_bytes.
-    if e.args == null and sema_recv_named(@r, "StrView") == 1 and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "as_bytes") == 1
+    if e.args == null and sema_recv_named(@r, "StrView") == 1 and name_eq(e.ident, "as_bytes") == 1
         return sema_ty_set(t, TypeKind.Struct, "Span$u8", TypeKind.Void, null)
     var st: *StructDef = sema_recv_struct(sm, @r)
-    if st == null and el.kind == ExprKind.Ident and r.kind == TypeKind.Unknown and sema_find_local(sm, StrView { ptr: (el.ident_ptr), len: (el.ident_len) as i64 }) == null
+    if st == null and el.kind == ExprKind.Ident and r.kind == TypeKind.Unknown and sema_find_local(sm, el.ident) == null
         # AGAST #4251: `T.f(..)`, a static method of the struct T.
-        st = sema_find_struct(sm, StrView { ptr: (el.ident_ptr), len: (el.ident_len) as i64 })
+        st = sema_find_struct(sm, el.ident)
     # AGAST #4403: a monomorphised Span (`bytes: Span$u8`, `s.as_bytes()`)
     # may name no StructDef in Sema's map, which the emitter only spells as
     # it lowers.  Its accessors are still typeable (the specialised
@@ -464,7 +461,7 @@ fn sema_method_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
             return sema_ty_none(t)
         tn = r.name
         tn_len = r.name_len
-    let fd: *FnDef = sema_method_fn(sm, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let fd: *FnDef = sema_method_fn(sm, StrView { ptr: (tn), len: (tn_len) as i64 }, e.ident)
     if fd != null
         return sema_fn_ret_ty(fd, t)
     sema_span_method_ty(StrView { ptr: (tn), len: (tn_len) as i64 }, e, t)
@@ -477,9 +474,7 @@ fn sema_struct_ty(st: *StructDef, t: *SemaTy) -> TypeKind
 # The struct named `name`, unless it is a generic's template: a monomorphised
 # name (`Span$u8`) never names one, so `Result$Span$u8$i32` splits after `u8`.
 fn sema_find_concrete(sm: *Sema, name_sv: StrView) -> *StructDef
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let st: *StructDef = sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 })
+    let st: *StructDef = sema_find_struct(sm, name_sv)
     if st != null and st.type_params != null
         return null
     st
@@ -671,8 +666,8 @@ pub fn sema_named_payload_ty(sm: *Sema, arm: *MatchArm, name_sv: StrView, t: *Se
 fn sema_ctor_payload_ty(sm: *Sema, arm: *MatchArm, scrut: *Expr, t: *SemaTy) -> TypeKind
     if scrut.kind != ExprKind.Call or scrut.args == null or scrut.args.next != null
         return sema_ty_none(t)
-    let n: *u8 = scrut.func_name
-    let l: i32 = scrut.func_name_len
+    let n: *u8 = scrut.func_name.ptr
+    let l: i32 = scrut.func_name.len as i32
     if name_eq(StrView { ptr: (n), len: (l) as i64 }, "Some") == 0 and name_eq(StrView { ptr: (n), len: (l) as i64 }, "Ok") == 0 and name_eq(StrView { ptr: (n), len: (l) as i64 }, "Err") == 0
         return sema_ty_none(t)
     if name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (n), len: (l) as i64 }) == 0
@@ -810,11 +805,11 @@ pub fn sema_expr_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
         ExprKind.StringLit =>
             return sema_ty_set(t, TypeKind.Struct, "StrView", TypeKind.Void, null)
         ExprKind.StructLit =>
-            if e.ident_len == 0
+            if e.ident.len == 0
                 return sema_tuple_ty(sm, e, t)
-            return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, TypeKind.Void, null)
+            return sema_ty_set(t, TypeKind.Struct, e.ident, TypeKind.Void, null)
         ExprKind.Ident =>
-            return sema_name_ty(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, t)
+            return sema_name_ty(sm, e.ident, t)
         ExprKind.Binary =>
             if op_is_cmp_or_logic(e.op)
                 return sema_ty_set(t, TypeKind.Bool, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Void, null)
@@ -822,16 +817,16 @@ pub fn sema_expr_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
         ExprKind.Unary =>
             return sema_unary_ty(sm, e, t)
         ExprKind.Cast =>
-            return sema_ty_set(t, e.type_kind, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, ptr_slot_flat(e.cast_ptr_kind), e.fn_sig)
+            return sema_ty_set(t, e.type_kind, e.ident, ptr_slot_flat(e.cast_ptr_kind), e.fn_sig)
         ExprKind.Call =>
             return sema_call_ty(sm, e, t)
         ExprKind.Member =>
             return sema_member_ty(sm, e, t)
         _ => pass
-    if (k == ExprKind.If or k == ExprKind.Match) and e.value_ty_name != null
+    if (k == ExprKind.If or k == ExprKind.Match) and e.value_ty_name.ptr != null
         # AGAST #3042: the struct its first typed arm yields, which the walk
         # notes as it leaves that arm (sema_note_arm_value); unknown before.
-        return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (e.value_ty_name), len: (e.value_ty_name_len) as i64 }, TypeKind.Void, null)
+        return sema_ty_set(t, TypeKind.Struct, e.value_ty_name, TypeKind.Void, null)
     match k
         ExprKind.Index =>
             return sema_index_ty(sm, e, t)
@@ -877,21 +872,19 @@ fn sx_starts(name_sv: StrView, prefix_sv: StrView) -> i32
 # 1 when a struct of this name indexes: a Vec, Span or String (#2440, #2442).
 pub fn name_is_indexable(name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     if name == null
         return 0
-    if sx_starts(StrView { ptr: (name), len: (len) as i64 }, "Vec$") == 1 or sx_starts(StrView { ptr: (name), len: (len) as i64 }, "Span$") == 1
+    if sx_starts(name_sv, "Vec$") == 1 or sx_starts(name_sv, "Span$") == 1
         return 1
-    name_eq(StrView { ptr: (name), len: (len) as i64 }, "String")
+    name_eq(name_sv, "String")
 
 # The element kind of a Vec, Span or String named `name`, as through_elem_kind
 # answers for one: a String's bytes are u8, a Vec's or Span's the pointee of its
 # `data` / `ptr` field.  TypeKind.Unknown when the struct or field isn't found.
 pub fn sema_buffer_elem(sm: *Sema, name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     var bt: SemaTy
-    sema_ty_set(@bt, TypeKind.Struct, StrView { ptr: (name), len: (len) as i64 }, TypeKind.Void, null)
+    sema_ty_set(@bt, TypeKind.Struct, name_sv, TypeKind.Void, null)
     var t: SemaTy
     sema_buffer_ty(sm, @bt, @t)
 
@@ -901,24 +894,22 @@ pub fn sema_buffer_elem(sm: *Sema, name_sv: StrView) -> TypeKind
 # indexes_itself.
 pub fn sema_through_elem(sm: *Sema, kind: TypeKind, pointee: TypeKind, name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     if kind != TypeKind.Struct
         if kind != TypeKind.Ptr and kind != TypeKind.Ref and kind != TypeKind.MutRef
             return TypeKind.Void
         if pointee != TypeKind.Struct
             return TypeKind.Void
-    if name_is_indexable(StrView { ptr: (name), len: (len) as i64 }) == 0
+    if name_is_indexable(name_sv) == 0
         return TypeKind.Void
-    sema_buffer_elem(sm, StrView { ptr: (name), len: (len) as i64 })
+    sema_buffer_elem(sm, name_sv)
 
 # 1 when an array of `elem` named `name` gets the emitter's `p#` view
 # (add_array_view's array_view_elem_ok): a scalar, a pointer, or a known struct.
 pub fn sx_view_elem_ok(sm: *Sema, elem: TypeKind, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     match elem
         TypeKind.Struct =>
-            return (len > 0 and sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) != null) as i32
+            return (len > 0 and sema_find_struct(sm, name_sv) != null) as i32
         TypeKind.Ptr =>
             return 1
         TypeKind.PtrPtr | TypeKind.Void | TypeKind.Unknown | TypeKind.Array =>
@@ -962,7 +953,7 @@ pub fn sema_named_elem(sm: *Sema, name_sv: StrView, kind: *TypeKind, pointee: *T
     var len: i32 = name_sv.len as i32
     *kind = TypeKind.Void
     *pointee = TypeKind.Void
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, name_sv)
     if v != null
         let k: TypeKind = v.kind
         let view: TypeKind = sema_view_elem(sm, v)
@@ -984,7 +975,7 @@ pub fn sema_named_elem(sm: *Sema, name_sv: StrView, kind: *TypeKind, pointee: *T
         return
     var g: *GlobalVarDef = sm.module.globals
     while g != null
-        if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, name_sv) == 1
             if g.var_type == TypeKind.Array
                 var a: SemaTy
                 sema_arr_ty(@a, g.array_elem_type, StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 }, g.array_shape)
@@ -1004,7 +995,7 @@ pub fn sema_index_slot(sm: *Sema, e: *Expr, kind: *TypeKind, pointee: *TypeKind)
     let base: *Expr = e.left
     if base.kind == ExprKind.Index and base.left != null and base.left.kind == ExprKind.Ident
         # `a[i][j]`: an `a: [N]*T` element is a pointer, indexed at T (#2332).
-        let av: *SemaVar = sema_find_local(sm, StrView { ptr: (base.left.ident_ptr), len: (base.left.ident_len) as i64 })
+        let av: *SemaVar = sema_find_local(sm, base.left.ident)
         if av != null and av.kind == TypeKind.Array and av.index_elem == TypeKind.Ptr and av.elem_pointee != TypeKind.Void
             *kind = av.elem_pointee
             return
@@ -1016,7 +1007,7 @@ pub fn sema_index_slot(sm: *Sema, e: *Expr, kind: *TypeKind, pointee: *TypeKind)
         return
     if base.kind == ExprKind.Unary and base.op == OpKind.Deref and base.operand != null and base.operand.kind == ExprKind.Ident
         # `(*p)[i]` with `p` a pointer to a Vec, Span or String, or to a `[N]T`.
-        let pv: *SemaVar = sema_find_local(sm, StrView { ptr: (base.operand.ident_ptr), len: (base.operand.ident_len) as i64 })
+        let pv: *SemaVar = sema_find_local(sm, base.operand.ident)
         if pv == null or pv.kind == TypeKind.Struct
             return
         if pv.index_elem != TypeKind.Void and sx_view_elem_ok(sm, pv.index_elem, StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }) == 1
@@ -1025,7 +1016,7 @@ pub fn sema_index_slot(sm: *Sema, e: *Expr, kind: *TypeKind, pointee: *TypeKind)
         *kind = sema_through_elem(sm, pv.kind, pv.pointee, StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 })
         return
     if base.kind == ExprKind.Ident
-        sema_named_elem(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 }, kind, pointee)
+        sema_named_elem(sm, base.ident, kind, pointee)
         return
     if base.kind == ExprKind.Member
         var r: SemaTy
@@ -1034,7 +1025,7 @@ pub fn sema_index_slot(sm: *Sema, e: *Expr, kind: *TypeKind, pointee: *TypeKind)
         let st: *StructDef = sx_recv_struct(sm, @r)
         if st == null
             return
-        let idx: i32 = find_field_index(st, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+        let idx: i32 = find_field_index(st, base.ident)
         if idx < 0
             return
         sema_field_elem(sm, get_field_type(st, idx), kind, pointee)
@@ -1139,7 +1130,7 @@ fn sx_init_elem(sm: *Sema, init: *Expr, shape: **ArrayShape, pointee: *TypeKind)
     if x == null
         return TypeKind.Void
     if x.kind == ExprKind.Unary and (x.op == OpKind.Addr or x.op == OpKind.AddrMut) and x.operand != null and x.operand.kind == ExprKind.Ident
-        let a: *SemaVar = sema_find_local(sm, StrView { ptr: (x.operand.ident_ptr), len: (x.operand.ident_len) as i64 })
+        let a: *SemaVar = sema_find_local(sm, x.operand.ident)
         if a != null and a.kind == TypeKind.Array
             *shape = a.shape
             *pointee = a.elem_pointee
@@ -1147,7 +1138,7 @@ fn sx_init_elem(sm: *Sema, init: *Expr, shape: **ArrayShape, pointee: *TypeKind)
         return TypeKind.Void
     if x.kind != ExprKind.Ident
         return TypeKind.Void
-    let p: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+    let p: *SemaVar = sema_find_local(sm, x.ident)
     if p == null or p.kind == TypeKind.Array
         return TypeKind.Void
     *shape = p.shape
@@ -1193,12 +1184,9 @@ fn sema_note_ptr_levels(lv: *SemaVar, levels: i32, inner: TypeKind, name_sv: Str
 # initialiser node itself, for emit_var_decl to apply where its own views
 # can't name a base (a `& [N]**T` borrow param).
 fn sx_note_init_levels(init: *Expr, levels: i32, inner: TypeKind, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     init.sema_levels = levels
     init.sema_inner = (inner as i32)
-    init.sema_ptr_name = name
-    init.sema_ptr_name_len = name_len
+    init.sema_ptr_name = name_sv
 
 # AGAST #4428: the type an unannotated `let` / `var` takes from an
 # array-element or element-address initialiser, as emit_var_decl's
@@ -1255,7 +1243,7 @@ pub fn sema_note_elem_init(sm: *Sema, st: *Stmt)
     # `let p = *r` with `r: **[N]T` is the `*[N]T` (array_ptr_ptr_deref_base).
     # Its element and shape come from r's recorded pointee array.
     if init.kind == ExprKind.Unary and init.op == OpKind.Deref and init.operand != null and init.operand.kind == ExprKind.Ident
-        let rv: *SemaVar = sema_find_local(sm, StrView { ptr: (init.operand.ident_ptr), len: (init.operand.ident_len) as i64 })
+        let rv: *SemaVar = sema_find_local(sm, init.operand.ident)
         if rv != null and rv.kind == TypeKind.PtrPtr and rv.index_elem != TypeKind.Void
             lv.kind = TypeKind.Ptr
             lv.pointee = TypeKind.Array
@@ -1331,18 +1319,17 @@ fn sx_find_const(sm: *Sema, name_sv: StrView) -> *ConstEntry
     var len: i32 = name_sv.len as i32
     var c: *ConstEntry = sm.module.constants
     while c != null
-        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, name_sv) == 1
             return c
         c = c.next
     null
 
 # The global `name` names, or null.
 fn sx_find_global(sm: *Sema, name_sv: StrView) -> *GlobalVarDef
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var g: *GlobalVarDef = sm.module.globals
     while g != null
-        if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, name_sv) == 1
             return g
         g = g.next
     null
@@ -1405,13 +1392,13 @@ fn sx_var_slot_ty(v: *SemaVar) -> TypeKind
 # the emitter's i64.  An integer const is i64 there (only the float folders
 # are read).
 fn sx_ident_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, e.ident)
     if v != null
         return sx_var_slot_ty(v)
-    let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let g: *GlobalVarDef = sx_find_global(sm, e.ident)
     if g != null
         return g.var_type
-    let ce: *ConstEntry = sx_find_const(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let ce: *ConstEntry = sx_find_const(sm, e.ident)
     let cft: TypeKind = sx_const_int_init_float_ty(sm, ce)
     if cft != TypeKind.Void
         return cft
@@ -1422,9 +1409,9 @@ fn sx_ident_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
 
 # The fn a call names, as the emitter's find_call_fn resolves it.
 fn sx_call_fn(sm: *Sema, e: *Expr) -> *FnDef
-    if e.func_name_len == 0
+    if e.func_name.len == 0
         return null
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, e.func_name)
     if v != null
         return v.fn_sig
     sema_call_fn(sm, e)
@@ -1444,17 +1431,17 @@ fn sx_method_fn(sm: *Sema, e: *Expr) -> *FnDef
         return null
     var r: SemaTy
     if sema_expr_ty(sm, e.left, @r) == TypeKind.Unknown
-        if e.left.kind == ExprKind.Ident and sema_find_local(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == null
-            let st: *StructDef = sema_find_struct(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+        if e.left.kind == ExprKind.Ident and sema_find_local(sm, e.left.ident) == null
+            let st: *StructDef = sema_find_struct(sm, e.left.ident)
             if st != null
-                return sema_impl_method(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                return sema_impl_method(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, e.ident)
         return null
     let st: *StructDef = sema_recv_struct(sm, @r)
     if st == null
         if r.name_len <= 5 or not (StrView { ptr: (r.name), len: (r.name_len) as i64 }).starts_with("Span$")
             return null
-        return sema_impl_method(sm, StrView { ptr: (r.name), len: (r.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    sema_impl_method(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return sema_impl_method(sm, StrView { ptr: (r.name), len: (r.name_len) as i64 }, e.ident)
+    sema_impl_method(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, e.ident)
 
 # The field a member chain names, as emitter_core's member_field_def: a local
 # or global receiver's struct (or the struct it points at), a struct const,
@@ -1474,7 +1461,7 @@ fn sx_member_field(sm: *Sema, e: *Expr) -> *StructField
         if ien_sv.ptr != null and ien_sv.len > 0
             let ist: *StructDef = sema_find_struct(sm, ien_sv)
             if ist != null
-                let iidx: i32 = find_field_index(ist, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                let iidx: i32 = find_field_index(ist, e.ident)
                 if iidx >= 0
                     return get_field_type(ist, iidx)
         # Fall through to the general receiver path when the element isn't
@@ -1496,20 +1483,20 @@ fn sx_member_field(sm: *Sema, e: *Expr) -> *StructField
         # type_name at any pointer level (`**K` too; `sema_recv_struct` stops
         # at one), else a struct const (`K.f`).  A tuple's name finds no
         # StructDef and stays null, as before.
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(sm, e.left.ident)
         if v != null and v.type_name_len > 0
             st = sema_find_struct(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })
         else
-            let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+            let g: *GlobalVarDef = sx_find_global(sm, e.left.ident)
             if g != null and g.type_name_len > 0
                 st = sema_find_struct(sm, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
             else
-                let ce: *ConstEntry = sx_find_const(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+                let ce: *ConstEntry = sx_find_const(sm, e.left.ident)
                 if ce != null and ce.const_type == TypeKind.Struct and ce.type_name_len > 0
                     st = sema_find_struct(sm, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 })
     if st == null
         return null
-    let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let idx: i32 = find_field_index(st, e.ident)
     if idx < 0
         return null
     get_field_type(st, idx)
@@ -1520,7 +1507,7 @@ fn sx_member_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
     if e.left == null
         return TypeKind.I64
     let en: *Expr = sema_enum_name(sm, e.left)
-    if en != null and enum_variant_index(sm.pctx, StrView { ptr: (en.ident_ptr), len: (en.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
+    if en != null and enum_variant_index(sm.pctx, en.ident, e.ident) >= 0
         return TypeKind.I64
     let f: *StructField = sx_member_field(sm, e)
     if f != null and f.field_type != TypeKind.Unknown and f.field_type != TypeKind.Void
@@ -1547,7 +1534,7 @@ fn sx_index_struct_name(sm: *Sema, ie: *Expr) -> StrView
                 if sema_expr_ty(sm, rb.left, @rr) != TypeKind.Unknown
                     let rst: *StructDef = sema_recv_struct(sm, @rr)
                     if rst != null
-                        let ridx: i32 = find_field_index(rst, StrView { ptr: (rb.ident_ptr), len: (rb.ident_len) as i64 })
+                        let ridx: i32 = find_field_index(rst, rb.ident)
                         if ridx >= 0
                             let rf: *StructField = get_field_type(rst, ridx)
                             if rf.array_shape != null and depth + 1 == rf.array_shape.rank and rf.array_shape.leaf_type == TypeKind.Struct and rf.array_shape.leaf_name_len > 0
@@ -1564,7 +1551,7 @@ fn sx_index_struct_name(sm: *Sema, ie: *Expr) -> StrView
             let mst: *StructDef = sema_recv_struct(sm, @r)
             if mst == null
                 return strview_empty()
-            let midx: i32 = find_field_index(mst, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
+            let midx: i32 = find_field_index(mst, b.ident)
             if midx < 0
                 return strview_empty()
             let f: *StructField = get_field_type(mst, midx)
@@ -1587,7 +1574,7 @@ fn sx_index_struct_name(sm: *Sema, ie: *Expr) -> StrView
                     return StrView { ptr: (fet.name), len: (fet.name_len) as i64 }
             return strview_empty()
         ExprKind.Ident =>
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
+            let v: *SemaVar = sema_find_local(sm, b.ident)
             if v != null
                 if v.kind == TypeKind.Array or v.kind == TypeKind.Ptr or v.kind == TypeKind.PtrPtr
                     if v.type_name_len <= 0
@@ -1605,7 +1592,7 @@ fn sx_index_struct_name(sm: *Sema, ie: *Expr) -> StrView
                     if sema_buffer_ty(sm, @bt, @et) != TypeKind.Unknown and et.kind == TypeKind.Struct and et.name_len > 0
                         return StrView { ptr: (et.name), len: (et.name_len) as i64 }
                 return strview_empty()
-            let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
+            let g: *GlobalVarDef = sx_find_global(sm, b.ident)
             if g != null and g.var_type == TypeKind.Array and g.array_elem_type == TypeKind.Struct and g.array_elem_type_name_len > 0
                 return StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 }
             return strview_empty()
@@ -1637,14 +1624,14 @@ fn sema_index_slot_pointee(sm: *Sema, x: *Expr) -> TypeKind
             if sema_expr_ty(sm, nd_root.left, @nr) != TypeKind.Unknown
                 let nst: *StructDef = sema_recv_struct(sm, @nr)
                 if nst != null
-                    let nidx: i32 = find_field_index(nst, StrView { ptr: (nd_root.ident_ptr), len: (nd_root.ident_len) as i64 })
+                    let nidx: i32 = find_field_index(nst, nd_root.ident)
                     if nidx >= 0
                         let nf: *StructField = get_field_type(nst, nidx)
                         if nf.array_shape != null and nd_depth + 1 == nf.array_shape.rank and nf.array_shape.leaf_type == TypeKind.Ptr
                             return nf.array_shape.leaf_pointee
     # An untyped `let a = [@p, ..]` (`[N]*T`): its element points at T.
     if x.left.kind == ExprKind.Ident
-        let av: *SemaVar = sema_find_local(sm, StrView { ptr: (x.left.ident_ptr), len: (x.left.ident_len) as i64 })
+        let av: *SemaVar = sema_find_local(sm, x.left.ident)
         if av != null and av.kind == TypeKind.Unknown and av.let_kind == TypeKind.Array and av.let_elem == TypeKind.Ptr and av.pointee != TypeKind.Void
             return av.pointee
         # A `b:& [N]*T` borrow param binds as an `[N]*T` array local.  A
@@ -1653,8 +1640,8 @@ fn sema_index_slot_pointee(sm: *Sema, x: *Expr) -> TypeKind
             if av.lent.param_pointee_array_elem_type == TypeKind.Ptr and av.lent.param_pointee_array_elem_pointee != TypeKind.Void
                 return av.lent.param_pointee_array_elem_pointee
     # A module const's `[N]*U` table: `T[i]` points at a U (AGAST #1866).
-    if x.left.kind == ExprKind.Ident and sema_find_local(sm, StrView { ptr: (x.left.ident_ptr), len: (x.left.ident_len) as i64 }) == null and sx_find_global(sm, StrView { ptr: (x.left.ident_ptr), len: (x.left.ident_len) as i64 }) == null
-        let ce: *ConstEntry = sx_find_const(sm, StrView { ptr: (x.left.ident_ptr), len: (x.left.ident_len) as i64 })
+    if x.left.kind == ExprKind.Ident and sema_find_local(sm, x.left.ident) == null and sx_find_global(sm, x.left.ident) == null
+        let ce: *ConstEntry = sx_find_const(sm, x.left.ident)
         if ce != null and ce.const_type == TypeKind.Array and ce.array_elem_type == TypeKind.Ptr
             return ce.array_elem_pointee
     var kind: TypeKind = TypeKind.Void
@@ -1792,9 +1779,9 @@ fn sx_base_array_elem(sm: *Sema, base: *Expr) -> TypeKind
         return TypeKind.Void
     match base.kind
         ExprKind.Ident =>
-            if sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 }) != null
+            if sema_find_local(sm, base.ident) != null
                 return TypeKind.Void
-            let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            let g: *GlobalVarDef = sx_find_global(sm, base.ident)
             if g == null or g.ptr_array == null or g.ptr_array.param_pointee_array_size <= 0
                 return TypeKind.Void
             return g.ptr_array.param_pointee_array_elem_type
@@ -1849,13 +1836,13 @@ fn sx_index_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
     sema_index_slot(sm, e, @kind, @pointee)
     match base.kind
         ExprKind.Ident =>
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            let v: *SemaVar = sema_find_local(sm, base.ident)
             if v != null
                 return sx_local_index_slot_ty(sm, v, kind)
-            let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            let g: *GlobalVarDef = sx_find_global(sm, base.ident)
             if g != null
                 return sx_global_index_slot_ty(g, kind)
-            let ce: *ConstEntry = sx_find_const(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            let ce: *ConstEntry = sx_find_const(sm, base.ident)
             if ce != null and ce.const_type == TypeKind.Array
                 if ce.array_elem_type == TypeKind.F32 or ce.array_elem_type == TypeKind.F64
                     return ce.array_elem_type
@@ -1885,7 +1872,7 @@ fn sx_operand_float_ty(sm: *Sema, x: *Expr) -> TypeKind
     if k == TypeKind.F32 or k == TypeKind.F64
         return k
     if x.kind == ExprKind.Ident
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(sm, x.ident)
         if v != null
             # An untyped `let r = x.floor() + 0.5` is a float slot its
             # initialiser fixed; sema_expr_ty leaves it unknown.
@@ -1901,7 +1888,7 @@ fn sx_operand_float_ty(sm: *Sema, x: *Expr) -> TypeKind
     if x.kind == ExprKind.Method
         # A float primitive method (`.floor()`) keeps its receiver's width,
         # as get_expr_type's float_method_result_ty says.
-        if x.left != null and x.args == null and sx_is_float_primitive(StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) == 1
+        if x.left != null and x.args == null and sx_is_float_primitive(x.ident) == 1
             return sx_operand_float_ty(sm, x.left)
         let fd: *FnDef = sx_method_fn(sm, x)
         if fd != null and (fd.return_type == TypeKind.F32 or fd.return_type == TypeKind.F64)
@@ -1912,7 +1899,7 @@ fn sx_operand_float_ty(sm: *Sema, x: *Expr) -> TypeKind
         while b.kind == ExprKind.Binary and (b.op == OpKind.Add or b.op == OpKind.Sub)
             b = b.left
         if b.kind == ExprKind.Ident
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
+            let v: *SemaVar = sema_find_local(sm, b.ident)
             if v != null
                 if v.pointee == TypeKind.F32 or v.pointee == TypeKind.F64
                     return v.pointee
@@ -1928,13 +1915,11 @@ fn sx_operand_float_ty(sm: *Sema, x: *Expr) -> TypeKind
 
 # 1 for `ceil` / `floor` / `round` / `abs`, the float primitive methods.
 fn sx_is_float_primitive(n_sv: StrView) -> i32
-    var n: *u8 = n_sv.ptr
-    var len: i32 = n_sv.len as i32
-    if (StrView { ptr: (n), len: (len) as i64 }).eq("ceil")
+    if n_sv.eq("ceil")
         return 1
-    if (StrView { ptr: (n), len: (len) as i64 }).eq("floor") or (StrView { ptr: (n), len: (len) as i64 }).eq("round")
+    if n_sv.eq("floor") or n_sv.eq("round")
         return 1
-    if (StrView { ptr: (n), len: (len) as i64 }).eq("abs")
+    if n_sv.eq("abs")
         return 1
     0
 
@@ -1943,10 +1928,10 @@ fn sx_is_float_primitive(n_sv: StrView) -> i32
 fn sx_method_float_ty(sm: *Sema, e: *Expr) -> TypeKind
     if e.left == null
         return TypeKind.Void
-    if e.args == null and e.ident_len > 0
+    if e.args == null and e.ident.len > 0
         # A float primitive method on a float receiver keeps its width.
-        let n: *u8 = e.ident_ptr
-        let is_prim: i32 = (((StrView { ptr: (n), len: (e.ident_len) as i64 }).eq("ceil")) or ((StrView { ptr: (n), len: (e.ident_len) as i64 }).eq("floor")) or ((StrView { ptr: (n), len: (e.ident_len) as i64 }).eq("round")) or ((StrView { ptr: (n), len: (e.ident_len) as i64 }).eq("abs"))) as i32
+        let n: StrView = e.ident
+        let is_prim: i32 = (n.eq("ceil") or n.eq("floor") or n.eq("round") or n.eq("abs")) as i32
         if is_prim == 1
             let ft: TypeKind = sx_operand_float_ty(sm, e.left)
             if ft != TypeKind.Void
@@ -1964,12 +1949,12 @@ fn sx_pointee_ty(sm: *Sema, p: *Expr) -> TypeKind
     if p == null
         return TypeKind.Void
     if p.kind == ExprKind.Ident
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (p.ident_ptr), len: (p.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(sm, p.ident)
         if v != null
             if v.lent != null and v.kind == TypeKind.Unknown
                 return v.lent.param_pointee_type
             return v.pointee
-        let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (p.ident_ptr), len: (p.ident_len) as i64 })
+        let g: *GlobalVarDef = sx_find_global(sm, p.ident)
         if g != null
             return g.pointee_type
         return TypeKind.Void
@@ -2008,13 +1993,13 @@ fn sx_operand_prim_slot(sm: *Sema, x: *Expr) -> TypeKind
     if x == null
         return TypeKind.Void
     if x.kind == ExprKind.Ident
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(sm, x.ident)
         if v != null
             let k: TypeKind = sx_var_slot_ty(v)
             if primitive_name_len(k) > 0
                 return k
             return TypeKind.Void
-        let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+        let g: *GlobalVarDef = sx_find_global(sm, x.ident)
         if g != null and primitive_name_len(g.var_type) > 0
             return g.var_type
         return TypeKind.Void
@@ -2037,12 +2022,12 @@ fn sx_addr_of_array_elem_type(sm: *Sema, x: *Expr) -> TypeKind
     if x.right != null and x.right.kind == ExprKind.Range
         return TypeKind.Void
     if x.left.kind == ExprKind.Ident
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.left.ident_ptr), len: (x.left.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(sm, x.left.ident)
         if v != null
             if v.kind == TypeKind.Array
                 return v.index_elem
             return TypeKind.Void
-        let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (x.left.ident_ptr), len: (x.left.ident_len) as i64 })
+        let g: *GlobalVarDef = sx_find_global(sm, x.left.ident)
         if g != null and g.var_type == TypeKind.Array
             return g.array_elem_type
         return TypeKind.Void
@@ -2128,7 +2113,7 @@ fn sx_value_fn_sig(sm: *Sema, c: *Expr) -> *FnDef
     if c == null
         return null
     if c.kind == ExprKind.Index and c.left != null and c.left.kind == ExprKind.Ident
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (c.left.ident_ptr), len: (c.left.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(sm, c.left.ident)
         if v != null and v.kind == TypeKind.Array
             return v.elem_fn_sig
         return null
@@ -2156,17 +2141,17 @@ fn sx_value_fn_sig(sm: *Sema, c: *Expr) -> *FnDef
 # enum variant ctor's struct, else the resolved fn's return type (VOID for a
 # void fn), else i64.
 fn sx_call_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
-    if e.func_name_len == 0
+    if e.func_name.len == 0
         let fd: *FnDef = sx_value_fn_sig(sm, e.left)
         if fd != null
             return fd.return_type
         return TypeKind.I64
-    let mid: i32 = mem_builtin_id(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    let mid: i32 = mem_builtin_id(e.func_name)
     if mid != 0
         if mid == MEM_VOLATILE_STORE or mid == MEM_ATOMIC_STORE or mid == MEM_FENCE
             return TypeKind.Void
         return sx_mem_pointee(sm, e.args)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "xgetbv") == 1
+    if name_eq(e.func_name, "xgetbv") == 1
         return TypeKind.U64   # AGAST #4657
     var en: *u8 = null
     var en_len: i32 = 0
@@ -2210,13 +2195,13 @@ fn sx_nd_index_shape(sm: *Sema, e: *Expr, out_depth: *i32) -> *ArrayShape
     var sh: *ArrayShape = null
     match base.kind
         ExprKind.Ident =>
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            let v: *SemaVar = sema_find_local(sm, base.ident)
             if v != null
                 # A `[N][M]..T` local's own shape, or a plane pointer's.
                 if v.kind == TypeKind.Array or sema_is_ptr_kind(v.kind) == 1
                     sh = v.shape
             else
-                let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                let g: *GlobalVarDef = sx_find_global(sm, base.ident)
                 if g != null and g.var_type == TypeKind.Array
                     sh = g.array_shape
         ExprKind.Member =>
@@ -2245,7 +2230,7 @@ fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *
     # The record of the array behind a `*[N]T` / `& [N]T` view: its element.
     # A plane pointer (`*[N][M]..T`, whose shape is recorded) has no view.
     if b.left.kind == ExprKind.Ident
-        let pv: *SemaVar = sema_find_local(sm, StrView { ptr: (b.left.ident_ptr), len: (b.left.ident_len) as i64 })
+        let pv: *SemaVar = sema_find_local(sm, b.left.ident)
         if pv != null and (pv.kind == TypeKind.Ptr or pv.kind == TypeKind.Ref or pv.kind == TypeKind.MutRef) and pv.pointee == TypeKind.Array and pv.shape == null
             *out_elem = pv.index_elem
             *out_pointee = (pv.elem_pointee as i32)
@@ -2270,7 +2255,7 @@ fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *
                     *out_name = f.array_elem_type_name
                     *out_len = f.array_elem_type_name_len
             ExprKind.Ident =>
-                let v: *SemaVar = sema_find_local(sm, StrView { ptr: (b.left.ident_ptr), len: (b.left.ident_len) as i64 })
+                let v: *SemaVar = sema_find_local(sm, b.left.ident)
                 if v != null
                     # A `b:& [N]T` borrow param binds as an unknown local; its array
                     # is the param's.
@@ -2285,7 +2270,7 @@ fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *
                         *out_name = v.type_name
                         *out_len = v.type_name_len
                 else
-                    let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (b.left.ident_ptr), len: (b.left.ident_len) as i64 })
+                    let g: *GlobalVarDef = sx_find_global(sm, b.left.ident)
                     if g != null and g.var_type == TypeKind.Array
                         *out_elem = g.array_elem_type
                         *out_pointee = (g.array_elem_pointee as i32)
@@ -2293,7 +2278,7 @@ fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *
                         *out_len = g.array_elem_type_name_len
                     else
                         # An element of a `const T: [N]*U` table (AGAST #1866).
-                        let ce: *ConstEntry = sx_find_const(sm, StrView { ptr: (b.left.ident_ptr), len: (b.left.ident_len) as i64 })
+                        let ce: *ConstEntry = sx_find_const(sm, b.left.ident)
                         if ce != null and ce.const_type == TypeKind.Array
                             *out_elem = ce.array_elem_type
                             *out_pointee = (ce.array_elem_pointee as i32)
@@ -2427,7 +2412,7 @@ fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out_name: **u8,
     var name_len: i32 = 0
     match x.kind
         ExprKind.Ident =>
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+            let v: *SemaVar = sema_find_local(sm, x.ident)
             if v != null
                 if v.kind == TypeKind.PtrPtr
                     slot = v.inner
@@ -2440,7 +2425,7 @@ fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out_name: **u8,
                 name = v.type_name
                 name_len = v.type_name_len
             else
-                let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+                let g: *GlobalVarDef = sx_find_global(sm, x.ident)
                 if g == null or g.var_type != TypeKind.PtrPtr
                     return 0
                 slot = g.inner_pointee_type
@@ -2468,8 +2453,8 @@ fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out_name: **u8,
             if x.type_kind != TypeKind.PtrPtr
                 return 0
             slot = x.cast_ptr_kind
-            name = x.ident_ptr
-            name_len = x.ident_len
+            name = x.ident.ptr
+            name_len = x.ident.len as i32
         ExprKind.Call =>
             # `f() -> **S` (AGAST #2544).  The FnDef names S with a `ptr_` per
             # level past two (monomorph's spelling); only a struct answers.
@@ -2553,7 +2538,7 @@ fn sx_ptr_ptr_index_scalar(sm: *Sema, x: *Expr) -> TypeKind
 fn sx_local_pointee(sm: *Sema, name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, name_sv)
     if v == null
         return TypeKind.I64
     if v.kind == TypeKind.Unknown and v.lent != null
@@ -2628,10 +2613,10 @@ pub fn sema_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
                     return TypeKind.Ptr
                 TypeKind.Ptr =>
                     if p.kind == ExprKind.Ident
-                        let lpt: TypeKind = sx_local_pointee(sm, StrView { ptr: (p.ident_ptr), len: (p.ident_len) as i64 })
+                        let lpt: TypeKind = sx_local_pointee(sm, p.ident)
                         if lpt != TypeKind.I64
                             return lpt
-                        let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (p.ident_ptr), len: (p.ident_len) as i64 })
+                        let g: *GlobalVarDef = sx_find_global(sm, p.ident)
                         if g != null
                             return g.pointee_type
                         return lpt
@@ -2639,10 +2624,10 @@ pub fn sema_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
                         let base: *Expr = find_base_expr(p)
                         match base.kind
                             ExprKind.Ident =>
-                                let lpt: TypeKind = sx_local_pointee(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                                let lpt: TypeKind = sx_local_pointee(sm, base.ident)
                                 if lpt != TypeKind.I64
                                     return lpt
-                                let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                                let g: *GlobalVarDef = sx_find_global(sm, base.ident)
                                 if g != null
                                     return g.pointee_type
                                 return lpt
@@ -2661,7 +2646,7 @@ pub fn sema_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
                     return TypeKind.I64
                 _ => pass
             if (inner_type == TypeKind.Ref or inner_type == TypeKind.MutRef) and p.kind == ExprKind.Ident
-                let mr: TypeKind = sx_local_pointee(sm, StrView { ptr: (p.ident_ptr), len: (p.ident_len) as i64 })
+                let mr: TypeKind = sx_local_pointee(sm, p.ident)
                 if mr != TypeKind.Struct
                     return mr
                 return TypeKind.I64
@@ -2715,7 +2700,7 @@ pub fn sema_iter_pointee(sm: *Sema, it: *Expr) -> TypeKind
         return TypeKind.Void
     match it.kind
         ExprKind.Ident =>
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (it.ident_ptr), len: (it.ident_len) as i64 })
+            let v: *SemaVar = sema_find_local(sm, it.ident)
             if v != null
                 if v.kind == TypeKind.Array and v.elem_pointee != TypeKind.Void
                     return v.elem_pointee
@@ -2754,14 +2739,14 @@ pub fn sema_iter_pointee(sm: *Sema, it: *Expr) -> TypeKind
                 return TypeKind.Void
             var g: *GlobalVarDef = sm.module.globals
             while g != null
-                if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, StrView { ptr: (it.ident_ptr), len: (it.ident_len) as i64 }) == 1
+                if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, it.ident) == 1
                     if g.var_type == TypeKind.Array and g.array_elem_pointee != TypeKind.Void
                         return g.array_elem_pointee
                     return TypeKind.Void
                 g = g.next
             var ce: *ConstEntry = sm.module.constants
             while ce != null
-                if name_eq(StrView { ptr: (ce.name), len: (ce.name_len) as i64 }, StrView { ptr: (it.ident_ptr), len: (it.ident_len) as i64 }) == 1
+                if name_eq(StrView { ptr: (ce.name), len: (ce.name_len) as i64 }, it.ident) == 1
                     if ce.const_type == TypeKind.Array and ce.array_elem_pointee != TypeKind.Void
                         return ce.array_elem_pointee
                     return TypeKind.Void
@@ -2776,7 +2761,7 @@ pub fn sema_iter_pointee(sm: *Sema, it: *Expr) -> TypeKind
             let st: *StructDef = sema_recv_struct(sm, @r)
             if st == null
                 return TypeKind.Void
-            let idx: i32 = find_field_index(st, StrView { ptr: (it.ident_ptr), len: (it.ident_len) as i64 })
+            let idx: i32 = find_field_index(st, it.ident)
             if idx < 0
                 return TypeKind.Void
             let f: *StructField = get_field_type(st, idx)
@@ -2799,7 +2784,7 @@ pub fn sema_iter_elem_slot(sm: *Sema, it: *Expr) -> TypeKind
                 first = it.left
             return expr_sema_ty(first)
         ExprKind.Ident =>
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (it.ident_ptr), len: (it.ident_len) as i64 })
+            let v: *SemaVar = sema_find_local(sm, it.ident)
             if v != null
                 if v.kind == TypeKind.Array and v.index_elem != TypeKind.Void
                     return v.index_elem
@@ -2810,14 +2795,14 @@ pub fn sema_iter_elem_slot(sm: *Sema, it: *Expr) -> TypeKind
                 return TypeKind.Unknown
             var g: *GlobalVarDef = sm.module.globals
             while g != null
-                if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, StrView { ptr: (it.ident_ptr), len: (it.ident_len) as i64 }) == 1
+                if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, it.ident) == 1
                     if g.var_type == TypeKind.Array
                         return g.array_elem_type
                     return TypeKind.Unknown
                 g = g.next
             var ce: *ConstEntry = sm.module.constants
             while ce != null
-                if name_eq(StrView { ptr: (ce.name), len: (ce.name_len) as i64 }, StrView { ptr: (it.ident_ptr), len: (it.ident_len) as i64 }) == 1
+                if name_eq(StrView { ptr: (ce.name), len: (ce.name_len) as i64 }, it.ident) == 1
                     if ce.const_type == TypeKind.Array
                         return ce.array_elem_type
                     return TypeKind.Unknown
@@ -2829,7 +2814,7 @@ pub fn sema_iter_elem_slot(sm: *Sema, it: *Expr) -> TypeKind
         if sema_expr_ty(sm, it.left, @r) != TypeKind.Unknown
             let st: *StructDef = sema_recv_struct(sm, @r)
             if st != null
-                let idx: i32 = find_field_index(st, StrView { ptr: (it.ident_ptr), len: (it.ident_len) as i64 })
+                let idx: i32 = find_field_index(st, it.ident)
                 if idx >= 0
                     let f: *StructField = get_field_type(st, idx)
                     if f.field_type == TypeKind.Array

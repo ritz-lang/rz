@@ -172,7 +172,7 @@ def test_the_emitter_rewrites_nothing():
 def test_the_emitter_names_tuples_without_writing_the_node():
     # AGAST #4408 (#1816): the last write-back was tuple literal naming.
     # tuple_lit_infer / tuple_lit_name wrote a nameless tuple's struct name
-    # into its Expr (`e.ident_ptr`/`e.ident_len`) mid-lowering, once per error
+    # into its Expr (`e.ident`) mid-lowering, once per error
     # path and once per success path, so a later site in the same emission
     # read the name off the node.  They now decide the name and return it; the
     # node is left as the parse built it.  `sub_e` and `id` below are nodes the
@@ -180,7 +180,7 @@ def test_the_emitter_names_tuples_without_writing_the_node():
     # constructors are new nodes too).
     # The tuple naming moved to emitter_decl.ritz with the let inference (AGAST #1818).
     expr = (SRC / "emitter_expr.ritz").read_text() + "\n" + (SRC / "emitter_decl.ritz").read_text()
-    writes = re.findall(r"^\s+e\.(?:ident_ptr|ident_len)\s*=", expr, re.MULTILINE)
+    writes = re.findall(r"^\s+e\.ident(?:\.ptr|\.len)?\s*=", expr, re.MULTILINE)
     assert writes == [], (
         "emitter_expr.ritz / emitter_decl.ritz still write a field of an existing Expr node "
         f"({len(writes)} sites): tuple naming must return the name, not store it")

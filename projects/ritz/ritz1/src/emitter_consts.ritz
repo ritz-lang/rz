@@ -88,7 +88,7 @@ fn global_init_fold(s: *EmitterState, e: *Expr, out: *GlobalInit)
     # constant: both stay BAD.
     match e.kind
         ExprKind.Ident =>
-            let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            let ce: *ConstEntry = find_const_entry(s, e.ident)
             if ce != null and ce.fold_state == CONST_FOLD_DONE and is_int_const_type(ce.const_type) == 1
                 out.kind = GlobalInitKind.Int
                 out.int_val = ce.value
@@ -99,7 +99,7 @@ fn global_init_fold(s: *EmitterState, e: *Expr, out: *GlobalInit)
             return
         ExprKind.FloatLit =>
             out.kind = GlobalInitKind.Float
-            out.text = StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 }
+            out.text = e.string_val
             out.neg = false
             return
         ExprKind.NilLit =>
@@ -108,7 +108,7 @@ fn global_init_fold(s: *EmitterState, e: *Expr, out: *GlobalInit)
         # AGAST #2357: a string in a pointer slot points at its own @.str.
         ExprKind.CstringLit =>
             out.kind = GlobalInitKind.Str
-            out.text = StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 }
+            out.text = e.string_val
             return
         ExprKind.Cast =>
             global_init_fold(s, e.left, out)
@@ -229,11 +229,11 @@ fn const_fold_float(s: *EmitterState, e: *Expr) -> Option<f64>
         return None
     match e.kind
         ExprKind.FloatLit =>
-            return const_parse_f64(StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 })
+            return const_parse_f64(e.string_val)
         ExprKind.IntLit | ExprKind.CharLit =>
             return Some(e.int_val as f64)
         ExprKind.Ident =>
-            let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            let ce: *ConstEntry = find_const_entry(s, e.ident)
             if ce == null
                 return None
             if is_int_const_type(ce.const_type) == 1
@@ -721,10 +721,10 @@ fn find_field_init(fields: *FieldInit, name_sv: StrView) -> *FieldInit
 fn emit_const_array_string(s: *EmitterState, c: *ConstEntry, elem_idx: i32, fi: *FieldInit)
     let name_ir: String = ir_name(StrView { ptr: (c.name), len: (c.name_len) as i64 })
     let field_ir: String = ir_name(StrView { ptr: (fi.name), len: (fi.name_len) as i64 })
-    let strlen: i32 = fi.value.string_len
+    let strlen: i32 = fi.value.string_val.len as i32
     format_into(s, "@.const.{name_ir.as_view()}.{elem_idx}.{field_ir.as_view()} = private constant [{strlen + 1} x i8] c\"")
     for j in 0..strlen
-        emit_string_byte(s, *(fi.value.string_ptr + j))
+        emit_string_byte(s, *(fi.value.string_val.ptr + j))
     format_into(s, "\\00\"\n")
 
 # AGAST #3325: the backing `@.const.NAME.ELEM` bytes of a `"..."` element of
@@ -732,9 +732,9 @@ fn emit_const_array_string(s: *EmitterState, c: *ConstEntry, elem_idx: i32, fi: 
 # element is sized as ritz0 sizes it (#1694).
 fn emit_const_array_elem_string(s: *EmitterState, c: *ConstEntry, elem_idx: i32, lit: *Expr)
     let name_ir: String = ir_name(StrView { ptr: (c.name), len: (c.name_len) as i64 })
-    format_into(s, "@.const.{name_ir.as_view()}.{elem_idx} = private constant [{lit.string_len + 1} x i8] c\"")
-    for j in 0..lit.string_len
-        emit_string_byte(s, *(lit.string_ptr + j))
+    format_into(s, "@.const.{name_ir.as_view()}.{elem_idx} = private constant [{lit.string_val.len + 1} x i8] c\"")
+    for j in 0..(lit.string_val.len as i32)
+        emit_string_byte(s, *(lit.string_val.ptr + j))
     format_into(s, "\\00\"\n")
 
 # Emit one struct-literal element inside the top-level array constant.
@@ -878,13 +878,13 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
     # A struct or enum slot takes a const of its own type; an array slot a
     # const array of it.
     if v.kind == ExprKind.Ident and (ft == TypeKind.Struct or ft == TypeKind.Array)
-        let src: *ConstEntry = find_const_entry(s, StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 })
+        let src: *ConstEntry = find_const_entry(s, v.ident)
         if src != null and src.const_type == ft and src.value_expr != null
             if ft == TypeKind.Struct and name_eq(StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 }, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }) == 0
                 format_into(s, "zeroinitializer")
                 const_field_error_head(s, c, elem_idx, path)
                 eprints("names const `")
-                eprint_bytes(StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 })
+                eprint_bytes(v.ident)
                 eprints("`, which is not a `")
                 eprint_bytes(StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
                 eprints("`\n")
@@ -901,7 +901,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
         # Treat target struct as StrView-shaped: { ptr, i64 len }.
         format_into(s, "{ ptr ")
         emit_const_string_ref(s, c, elem_idx, v, path)
-        format_into(s, ", i64 {v.string_len} }")
+        format_into(s, ", i64 {v.string_val.len} }")
         return
     # AGAST #1569: an integer field is folded, as #1557 folds primitive
     # elements.  A raw `int_val` is 0 for `-5`, `K`, `A * 4 - 1`...
@@ -929,11 +929,11 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
                 const_field_error(s, c, elem_idx, path, "is not a struct literal")
                 return
             # LARB R60: a struct literal names the declared type.
-            if v.ident_len > 0 and name_eq(StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 }, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }) == 0
+            if v.ident.len > 0 and name_eq(v.ident, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }) == 0
                 format_into(s, "zeroinitializer")
                 const_field_error_head(s, c, elem_idx, path)
                 eprints("is a `")
-                eprint_bytes(StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 })
+                eprint_bytes(v.ident)
                 eprints("` literal for a `")
                 eprint_bytes(StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
                 eprints("`\n")
@@ -964,17 +964,17 @@ fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: 
     var len: i32 = 0
     var constructed: bool = false
     if (v.kind == ExprKind.Member or v.kind == ExprKind.Method) and v.left != null and v.left.kind == ExprKind.Ident
-        if v.left.ident_len == en_len and memcmp(v.left.ident_ptr, en, en_len) == 0
-            name = v.ident_ptr
-            len = v.ident_len
+        if (v.left.ident.len as i32) == en_len and memcmp(v.left.ident.ptr, en, en_len) == 0
+            name = v.ident.ptr
+            len = v.ident.len as i32
             constructed = v.kind == ExprKind.Method
-    else if v.kind == ExprKind.Call and v.func_name != null
-        name = v.func_name
-        len = v.func_name_len
+    else if v.kind == ExprKind.Call and v.func_name.ptr != null
+        name = v.func_name.ptr
+        len = v.func_name.len as i32
         constructed = true
     else if v.kind == ExprKind.Ident
-        name = v.ident_ptr
-        len = v.ident_len
+        name = v.ident.ptr
+        len = v.ident.len as i32
     var vi: i32 = 0 - 1
     if name != null
         vi = enum_variant_index(s.mono.pctx, en_sv, StrView { ptr: (name), len: (len) as i64 })
@@ -1141,7 +1141,7 @@ fn emit_const_string_ref(s: *EmitterState, c: *ConstEntry, elem_idx: i32, v: *Ex
         let field_ir: String = ir_name(StrView { ptr: (path.fi.name), len: (path.fi.name_len) as i64 })
         format_into(s, "@.const.{name_ir.as_view()}.{elem_idx}.{field_ir.as_view()}")
         return
-    emit_cstring_const(s, StrView { ptr: (v.string_ptr), len: (v.string_len) as i64 })
+    emit_cstring_const(s, v.string_val)
 
 # AGAST #3651: a pointer field's value -- `null`, or a string in a `*u8`.
 fn emit_const_ptr_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, v: *Expr, path: *ConstFieldPath)
@@ -1207,11 +1207,11 @@ fn emit_const_float_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ft: T
     if ft == TypeKind.F64
         if neg
             format_into(s, "-")
-        let digits: StrView = StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 }
+        let digits: StrView = e.string_val
         format_into(s, "{digits}")
         return
     var bits: i64 = 0
-    match f32_literal_bits(StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 }, neg)
+    match f32_literal_bits(e.string_val, neg)
         Some(b) => bits = b
         None =>
             format_into(s, "0.0")
@@ -1472,7 +1472,7 @@ fn const_ptr_table_error(s: *EmitterState, c: *ConstEntry, idx: i32, e: *Expr)
 fn emit_const_ptr_elem(s: *EmitterState, e: *Expr)
     format_into(s, "ptr ")
     if e.kind == ExprKind.CstringLit
-        emit_cstring_const(s, StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 })
+        emit_cstring_const(s, e.string_val)
     else
         format_into(s, "null")
 
@@ -1530,7 +1530,7 @@ fn emit_const_strview_fill(s: *EmitterState, c: *ConstEntry)
     while i < c.array_size
         if i > 0
             format_into(s, ", ")
-        format_into(s, "%StrView {{ ptr @.const.{name_ir.as_view()}.0, i64 {lit.string_len} }}")
+        format_into(s, "%StrView {{ ptr @.const.{name_ir.as_view()}.0, i64 {lit.string_val.len} }}")
         i += 1
     format_into(s, "]\n")
 
@@ -1696,7 +1696,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
             ExprKind.StringLit =>
                 # AGAST #3325: a `[N]StrView` element `"..."` is `{ ptr, len }`
                 # over its backing bytes; it was a zeroinitializer, an empty view.
-                format_into(s, "%{elem_ir.as_view()} {{ ptr @.const.{name_ir.as_view()}.{elem_idx}, i64 {elem.string_len} }}")
+                format_into(s, "%{elem_ir.as_view()} {{ ptr @.const.{name_ir.as_view()}.{elem_idx}, i64 {elem.string_val.len} }}")
             _ =>
                 # Unexpected non-struct element in a struct-array; emit zero.
                 format_into(s, "%{elem_ir.as_view()} zeroinitializer")
@@ -1768,13 +1768,13 @@ fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
         format_into(s, "\n")
         return
 
-    let strlen: i32 = c.value_expr.string_len
+    let strlen: i32 = c.value_expr.string_val.len as i32
     let name_ir: String = ir_name(StrView { ptr: (c.name), len: (c.name_len) as i64 })
 
     # Backing string global (private — only the @NAME global references it).
     format_into(s, "@.const.{name_ir.as_view()} = private constant [{strlen + 1} x i8] c\"")
     for j in 0..strlen
-        emit_string_byte(s, *(c.value_expr.string_ptr + j))
+        emit_string_byte(s, *(c.value_expr.string_val.ptr + j))
     format_into(s, "\\00\"\n")
 
     # Top-level `%StructTy { ptr @.const.NAME, i64 N }` constant.

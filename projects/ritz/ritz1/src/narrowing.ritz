@@ -212,14 +212,13 @@ pub fn narrow_known(t: TypeKind) -> TypeKind
 # that named one not yet parsed (resolve_const_values), so it resolves the
 # one it reads, as the emitter's own lookup would find it resolved.
 fn narrow_env_const(env: *NarrowEnv, name_sv: StrView) -> *ConstEntry
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if env.s != null
-        return find_const_entry(env.s, StrView { ptr: (name), len: (len) as i64 })
+        return find_const_entry(env.s, name_sv)
     let consts: *ConstEntry = env.sm.module.constants
     var c: *ConstEntry = consts
     while c != null
-        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, name_sv) == 1
             if c.fold_state == CONST_FOLD_PENDING
                 const_resolve(consts, c)
             return c
@@ -229,27 +228,25 @@ fn narrow_env_const(env: *NarrowEnv, name_sv: StrView) -> *ConstEntry
 # Ritz type of an identifier, or TypeKind.NarrowUnknown.  Same precedence as
 # emission: constants shadow locals.
 pub fn narrow_ident_type(s: *EmitterState, e: *Expr) -> TypeKind
-    narrow_name_type(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    narrow_name_type(s, e.ident)
 
 pub fn narrow_name_type(s: *EmitterState, name_sv: StrView) -> TypeKind
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     var env: NarrowEnv
     env.s = s
     env.sm = null
-    narrow_env_name_type(@env, StrView { ptr: (name), len: (len) as i64 })
+    narrow_env_name_type(@env, name_sv)
 
 fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let ce: *ConstEntry = narrow_env_const(env, StrView { ptr: (name), len: (len) as i64 })
+    let ce: *ConstEntry = narrow_env_const(env, name_sv)
     if ce != null
         if ce.fold_state != CONST_FOLD_DONE
             return TypeKind.NarrowUnknown
         return narrow_known(ce.const_type)
     if env.s == null
         # Sema: the innermost binding of the name, else a global.
-        let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (name), len: (len) as i64 })
+        let v: *SemaVar = sema_find_local(env.sm, name_sv)
         if v != null
             if v.narrow == TypeKind.Void
                 return TypeKind.NarrowUnknown
@@ -258,7 +255,7 @@ fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> TypeKind
         # #3375), so an i64 / u64 global is trusted here (AGAST #1688).
         var sg: *GlobalVarDef = env.sm.module.globals
         while sg != null
-            if name_eq(StrView { ptr: (sg.name), len: (sg.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+            if name_eq(StrView { ptr: (sg.name), len: (sg.name_len) as i64 }, name_sv) == 1
                 if ty_is_int(sg.var_type) == 1
                     return sg.var_type
                 return TypeKind.NarrowUnknown
@@ -274,7 +271,7 @@ fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> TypeKind
     var i: i32 = s.narrow_decl_count - 1
     while i >= 0
         let d: *NarrowDecl = @s.narrow_decls[i]
-        if name_eq(StrView { ptr: (d.name), len: (d.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (d.name), len: (d.name_len) as i64 }, name_sv) == 1
             if found == 0
                 found = 1
                 t = d.decl_type
@@ -285,10 +282,10 @@ fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> TypeKind
         return t
     var p: *Param = s.narrow_params
     while p != null
-        if name_eq(StrView { ptr: (p.name), len: (p.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(StrView { ptr: (p.name), len: (p.name_len) as i64 }, name_sv) == 1
             return narrow_known(p.param_type)
         p = p.next
-    let g: *GlobalVarDef = find_global(s, StrView { ptr: (name), len: (len) as i64 })
+    let g: *GlobalVarDef = find_global(s, name_sv)
     if g != null
         return narrow_global_type(g)
     TypeKind.NarrowUnknown
@@ -304,12 +301,10 @@ fn narrow_global_type(g: *GlobalVarDef) -> TypeKind
 # A name's and a `local.field`'s written type from Sema's scope, for
 # enum_as_int's targets (AGAST #3511).
 pub fn narrow_sema_name_type(sm: *Sema, name_sv: StrView) -> TypeKind
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     var env: NarrowEnv
     env.s = null
     env.sm = sm
-    narrow_env_name_type(@env, StrView { ptr: (name), len: (len) as i64 })
+    narrow_env_name_type(@env, name_sv)
 
 pub fn narrow_sema_member_type(sm: *Sema, e: *Expr) -> TypeKind
     var env: NarrowEnv
@@ -324,13 +319,13 @@ fn narrow_env_member_type(env: *NarrowEnv, e: *Expr) -> TypeKind
     var tn: *u8 = null
     var tl: i32 = 0
     if env.s != null
-        let local: *LocalVar = find_local_struct_name(env.s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+        let local: *LocalVar = find_local_struct_name(env.s, e.left.ident)
         if local == null
             return TypeKind.NarrowUnknown
         tn = lv_type_name(local)
         tl = lv_type_name_len(local)
     else
-        let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(env.sm, e.left.ident)
         if v == null
             return TypeKind.NarrowUnknown
         tn = v.type_name
@@ -344,7 +339,7 @@ fn narrow_env_member_type(env: *NarrowEnv, e: *Expr) -> TypeKind
         st = sema_find_struct(env.sm, StrView { ptr: (tn), len: (tl) as i64 })
     if st == null
         return TypeKind.NarrowUnknown
-    let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let idx: i32 = find_field_index(st, e.ident)
     if idx < 0
         return TypeKind.NarrowUnknown
     let field: *StructField = get_field_type(st, idx)
@@ -365,10 +360,10 @@ fn narrow_call_type(env: *NarrowEnv, e: *Expr) -> TypeKind
 # (`fs[i](..)`) is not resolved, and a Deref step call does not exist yet
 # (deref_field makes it during lowering).
 pub fn narrow_sema_call_fn(sm: *Sema, e: *Expr) -> *FnDef
-    if e.func_name_len == 0
+    if e.func_name.len == 0
         return null
-    if e.call_type_suffix_len <= 0
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    if e.call_type_suffix.len <= 0
+        let v: *SemaVar = sema_find_local(sm, e.func_name)
         if v != null and v.fn_sig != null and v.kind != TypeKind.Array
             return v.fn_sig
     sema_call_fn(sm, e)
@@ -393,7 +388,7 @@ fn narrow_sema_place_type(sm: *Sema, e: *Expr) -> TypeKind
             return TypeKind.NarrowUnknown
         ExprKind.Method =>
             # `.unwrap()` / `.unwrap_or(d)` is the carrier's intrinsic, no FnDef.
-            if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "unwrap") == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "unwrap_or") == 1
+            if name_eq(e.ident, "unwrap") == 1 or name_eq(e.ident, "unwrap_or") == 1
                 return narrow_sema_payload_of(sm, e.left)
             let fd: *FnDef = sbk_method_def(sm, e)
             if fd == null
@@ -613,7 +608,7 @@ fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> TypeKind
         ExprKind.CharLit =>
             return TypeKind.U8
         ExprKind.Ident =>
-            return narrow_env_name_type(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            return narrow_env_name_type(env, e.ident)
         ExprKind.Call =>
             return narrow_call_type(env, e)
         ExprKind.Cast =>
@@ -771,7 +766,7 @@ fn narrow_const_value(env: *NarrowEnv, e: *Expr, whole: i32, out: *i64) -> i32
             *out = e.int_val
             return 1
         ExprKind.Ident =>
-            let ce: *ConstEntry = narrow_env_const(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            let ce: *ConstEntry = narrow_env_const(env, e.ident)
             if ce == null or ce.fold_state != CONST_FOLD_DONE
                 return 0
             let w: i32 = ty_bits(ce.const_type)

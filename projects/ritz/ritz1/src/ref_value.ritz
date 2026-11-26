@@ -139,7 +139,7 @@ fn rv_loc(sm: *Sema, x: *Expr) -> *LocalVar
         return null
     var env: RefEnv
     var is_local: i32 = 0
-    ref_local_in(rv_env(sm, @env), StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }, @is_local)
+    ref_local_in(rv_env(sm, @env), x.ident, @is_local)
 
 fn rv_first_report(line: i32, col: i32) -> i32
     if line == RV_LAST_LINE and col == RV_LAST_COL
@@ -226,7 +226,7 @@ fn rv_check_receiver(sm: *Sema, e: *Expr, p: *Param)
     if p.param_type != TypeKind.MutRef and (p.param_type != TypeKind.Struct or p.is_self_borrow != 1)
         return
     var member: Expr
-    rl_expr_member(@member, e.left, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    rl_expr_member(@member, e.left, e.ident)
     if rv_shared(sm, @member) == 1
         rv_error(sm, e.left.span.line, e.left.span.col, "an `@T` doesn't fit an `@&T` slot: make it `@&T`\n")
 
@@ -272,7 +272,7 @@ fn rv_local_root(sm: *Sema, e0: *Expr) -> *SemaVar
     var e: *Expr = e0
     while e != null
         if e.kind == ExprKind.Ident
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            let v: *SemaVar = sema_find_local(sm, e.ident)
             if v == null
                 return null
             let n: *RsNote = rs_note(sm, v)
@@ -333,7 +333,7 @@ fn rv_referent(sm: *Sema, e: *Expr) -> StrView
         return StrView { ptr: (root.name), len: (root.name_len) as i64 }
     if e.kind != ExprKind.Ident
         return strview_empty()
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, e.ident)
     let n: *RsNote = rs_note(sm, v)
     # A loop can reach a `var`'s later write before this read.
     if n == null or n.root == null or v.is_let == 0 and RV_LOOPS > n.root_loops
@@ -343,7 +343,7 @@ fn rv_referent(sm: *Sema, e: *Expr) -> StrView
 # What `e`, which rv_referent named a root for, has: a binding keeps it.
 fn rv_referent_ty(sm: *Sema, e: *Expr, out: *RefTy) -> i32
     if e.kind == ExprKind.Ident
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(sm, e.ident)
         if v != null
             let n: *RsNote = rs_note(sm, v)
             if n == null
@@ -354,9 +354,7 @@ fn rv_referent_ty(sm: *Sema, e: *Expr, out: *RefTy) -> i32
 # `name` is written, or its address may let it be: if it's a `var`, what it holds
 # is no longer definite.
 fn rv_forget_name(sm: *Sema, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, name_sv)
     if v == null or v.is_let == 1
         return
     let n: *RsNote = rs_note(sm, v)
@@ -365,7 +363,7 @@ fn rv_forget_name(sm: *Sema, name_sv: StrView)
 
 fn rv_forget(sm: *Sema, e: *Expr)
     if e != null and e.kind == ExprKind.Ident
-        rv_forget_name(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        rv_forget_name(sm, e.ident)
 
 # The local root `a` refers to, if it has `ret`'s pointee.  A `:&` param or a
 # receiver borrows `a` itself when it's that `U`.
@@ -975,9 +973,9 @@ fn rv_into_variant(sm: *Sema, e: *Expr, slot: *RefTy)
     if e.kind != ExprKind.Call or e.args == null or slot.kind != TypeKind.Struct
         return
     var variant: i32 = 0
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "Err") == 1
+    if name_eq(e.func_name, "Err") == 1
         variant = 1
-    else if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "Some") == 0 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "Ok") == 0
+    else if name_eq(e.func_name, "Some") == 0 and name_eq(e.func_name, "Ok") == 0
         return
     var len: i32 = 0
     let name: *u8 = tagged_enum_arg_in(sm.pctx, @sm.struct_map, sm.module, StrView { ptr: (slot.name), len: (slot.name_len) as i64 }, variant, @len)
@@ -999,10 +997,10 @@ fn rv_of_mangled_ref(sm: *Sema, name_sv: StrView, out: *RefTy) -> i32
     var len: i32 = name_sv.len as i32
     var kind: TypeKind = TypeKind.Ref
     var k: i32 = 4
-    if len > 7 and (StrView { ptr: (name), len: (len) as i64 }).starts_with("refmut_")
+    if len > 7 and name_sv.starts_with("refmut_")
         kind = TypeKind.MutRef
         k = 7
-    else if len <= 4 or not (StrView { ptr: (name), len: (len) as i64 }).starts_with("ref_")
+    else if len <= 4 or not name_sv.starts_with("ref_")
         return 0
     let r: *u8 = name + k
     let n: i32 = len - k
@@ -1064,18 +1062,17 @@ fn rv_ptr_ptr_slot(out: *RefTy, inner: i32, name_sv: StrView) -> i32
 
 # The slot an `=` to the name `name` writes: what it holds, or a `**T` slot.
 fn rv_slot_of_name(sm: *Sema, name_sv: StrView, out: *RefTy) -> i32
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var env: RefEnv
-    if ref_of_ident_in(rv_env(sm, @env), StrView { ptr: (name), len: (len) as i64 }, out) == 1
+    if ref_of_ident_in(rv_env(sm, @env), name_sv, out) == 1
         return 1
     var is_local: i32 = 0
-    let loc: *LocalVar = ref_local_in(rv_env(sm, @env), StrView { ptr: (name), len: (len) as i64 }, @is_local)
+    let loc: *LocalVar = ref_local_in(rv_env(sm, @env), name_sv, @is_local)
     if is_local == 1
         if loc == null or lv_var_type(loc) != TypeKind.PtrPtr
             return 0
         return rv_ptr_ptr_slot(out, lv_inner_pointee_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
-    let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (name), len: (len) as i64 })
+    let g: *GlobalVarDef = sbk_global(sm, name_sv)
     if g == null or g.var_type != TypeKind.PtrPtr
         return 0
     rv_ptr_ptr_slot(out, g.inner_pointee_type, StrView { ptr: (g.pointee_type_name), len: (g.pointee_type_name_len) as i64 })
@@ -1148,8 +1145,8 @@ fn rv_check_fill(sm: *Sema, e: *Expr)
     var name: *u8 = null
     var len: i32 = 0
     if e.left.kind == ExprKind.StructLit
-        name = e.left.ident_ptr
-        len = e.left.ident_len
+        name = e.left.ident.ptr
+        len = e.left.ident.len as i32
     else
         var t: RefTy
         if rv_ty(sm, e.left, @t) == 0 or ref_is_pointer(t.kind) == 1
@@ -1187,12 +1184,12 @@ fn rv_cast_value_to_ref(sm: *Sema, e: *Expr)
 # it the cast copies the value out from behind the reference, and both owners
 # drop it.  A copy T is left alone, and so is a cast to a pointer type.
 fn rv_cast_move_only(sm: *Sema, e: *Expr)
-    if e.type_kind != TypeKind.Struct or e.ident_len == 0
+    if e.type_kind != TypeKind.Struct or e.ident.len == 0
         return
-    if own_type_is_move_only_in(sm.pctx, sm.module, @sm.struct_map, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
+    if own_type_is_move_only_in(sm.pctx, sm.module, @sm.struct_map, e.ident) == 0
         return
     var target: RefTy
-    ref_set(@target, TypeKind.Struct, TypeKind.Void, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    ref_set(@target, TypeKind.Struct, TypeKind.Void, e.ident)
     rv_into(sm, e.left, @target)
 
 # --- A call's temporary --------------------------------------------------------------
@@ -1251,10 +1248,10 @@ fn rv_named_holds_ptr(sm: *Sema, name_sv: StrView, depth: i32) -> i32
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0 or depth > 16
         return 0
-    let st: *StructDef = sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 })
+    let st: *StructDef = sema_find_struct(sm, name_sv)
     if st != null
         return rv_fields_hold_ptr(sm, st.fields, depth + 1)
-    let ei: i32 = user_enum_index(sm.pctx, StrView { ptr: (name), len: (len) as i64 })
+    let ei: i32 = user_enum_index(sm.pctx, name_sv)
     if ei < 0
         return 0
     var vi: i32 = 0
@@ -1373,7 +1370,7 @@ fn rv_value_args(sm: *Sema, a0: *Expr, p0: *Param)
         p = p.next
 
 fn rv_walk_struct(sm: *Sema, e: *Expr)
-    let st: *StructDef = sema_find_struct(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let st: *StructDef = sema_find_struct(sm, e.ident)
     var fi: *FieldInit = e.args as *FieldInit
     while fi != null
         if st != null
@@ -1390,14 +1387,14 @@ fn rv_walk_struct(sm: *Sema, e: *Expr)
 fn rv_qualified_variant(sm: *Sema, e: *Expr, vi: *i32) -> i32
     if rl_qualified_variant(sm, e) == 0
         return 0 - 1
-    *vi = enum_variant_index(sm.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    enum_find(sm.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+    *vi = enum_variant_index(sm.pctx, e.left.ident, e.ident)
+    enum_find(sm.pctx, e.left.ident)
 
 # The fn a named call `e` calls, as emit_call does: a local named like a fn is
 # the local (#2407, #2417), and `C_bump(c)` of a `self:& C` lends c (#3278).
 fn rv_call_def(sm: *Sema, e: *Expr) -> *FnDef
-    if e.func_name_len > 0 and e.call_type_suffix_len == 0
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    if e.func_name.len > 0 and e.call_type_suffix.len == 0
+        let v: *SemaVar = sema_find_local(sm, e.func_name)
         if v != null
             let n: *RsNote = rs_note(sm, v)
             if n != null and n.has_fn == 1
@@ -1414,7 +1411,7 @@ fn rv_walk(sm: *Sema, e: *Expr)
     let k: ExprKind = e.kind
     match k
         ExprKind.Call =>
-            if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "sizeof") == 1
+            if e.func_name.len == 6 and name_eq(e.func_name, "sizeof") == 1
                 return
             # AGAST #3015: `S_deref(@b)` made for `b.f` (R17) is a step of the
             # place `b.f`, which the borrow it's in is of; it lends nothing itself.
@@ -1431,7 +1428,7 @@ fn rv_walk(sm: *Sema, e: *Expr)
             if en != null
                 var vi: i32 = 0
                 var other: i32 = 0
-                let ei: i32 = enum_of_variant_unique(sm.pctx, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi, @other)
+                let ei: i32 = enum_of_variant_unique(sm.pctx, e.func_name, @vi, @other)
                 if ei >= 0
                     rv_payload(sm, e.args, ei, vi)
                 rv_walk_list(sm, e.args)
@@ -1745,9 +1742,9 @@ fn rv_infer_base_ptr_array(sm: *Sema, init: *Expr, loc: *LocalVar) -> i32
             if f != null
                 pa = f.ptr_array
         ExprKind.Ident =>
-            if sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) != null
+            if sema_find_local(sm, init.ident) != null
                 return 0
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 })
+            let g: *GlobalVarDef = sbk_global(sm, init.ident)
             if g != null
                 pa = g.ptr_array
         ExprKind.Call =>
@@ -1782,8 +1779,8 @@ fn rv_infer_nd_addr(sm: *Sema, init: *Expr, loc: *LocalVar) -> i32
             let arr: *LocalVar = rv_loc(sm, base)
             if arr != null and lv_var_type(arr) == TypeKind.Array
                 sh = lv_array_shape(arr)
-            else if sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 }) == null
-                let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            else if sema_find_local(sm, base.ident) == null
+                let g: *GlobalVarDef = sbk_global(sm, base.ident)
                 if g != null and g.var_type == TypeKind.Array
                     sh = g.array_shape
         ExprKind.Member =>
@@ -1883,9 +1880,9 @@ fn rv_decl_fn_sig(sm: *Sema, stmt: *Stmt) -> *FnDef
         return t.fn_sig
     if init == null or init.kind != ExprKind.Ident
         return null
-    if sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) != null or sbk_global(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) != null
+    if sema_find_local(sm, init.ident) != null or sbk_global(sm, init.ident) != null
         return null
-    let f: *FnDef = sema_find_fn(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 })
+    let f: *FnDef = sema_find_fn(sm, init.ident)
     if f == null or f.type_params != null
         return null
     f

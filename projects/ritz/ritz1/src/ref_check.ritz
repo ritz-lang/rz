@@ -94,9 +94,7 @@ pub fn ref_set(out: *RefTy, kind: TypeKind, pointee: TypeKind, name_sv: StrView)
 
 # `n` is the array's N (its d0 for a `shape`), 0 if unknown.
 pub fn ref_set_array(out: *RefTy, elem: TypeKind, elem_pointee: TypeKind, name_sv: StrView, shape: *ArrayShape, n: i32) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    ref_set(out, TypeKind.Array, elem, StrView { ptr: (name), len: (len) as i64 })
+    ref_set(out, TypeKind.Array, elem, name_sv)
     out.elem_pointee = elem_pointee
     out.shape = shape
     out.array_len = n
@@ -154,24 +152,21 @@ fn ref_of_local(loc: *LocalVar, out: *RefTy) -> i32
 
 fn ref_of_ident(s: *EmitterState, name_sv: StrView, out: *RefTy) -> i32
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     var env: RefEnv
-    ref_of_ident_in(ref_env_of(@env, s, null), StrView { ptr: (name), len: (len) as i64 }, out)
+    ref_of_ident_in(ref_env_of(@env, s, null), name_sv, out)
 
 # The local `name` names, as the emitter keeps it: its LocalVar, or on Sema
 # the image RsNote keeps of it (AGAST #4011).  Null when it names none, and
 # *is_local says whether it names a local Sema can't type.
 pub fn ref_local_in(env: *RefEnv, name_sv: StrView, is_local: *i32) -> *LocalVar
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     *is_local = 0
     if env.s != null
-        let idx: i32 = find_local_idx(env.s, StrView { ptr: (name), len: (len) as i64 })
+        let idx: i32 = find_local_idx(env.s, name_sv)
         if idx < 0
             return null
         *is_local = 1
         return local_at(env.s, idx)
-    let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (name), len: (len) as i64 })
+    let v: *SemaVar = sema_find_local(env.sm, name_sv)
     if v == null
         return null
     *is_local = 1
@@ -219,16 +214,15 @@ pub fn rs_default_loc(sm: *Sema, v: *SemaVar, loc: *LocalVar) -> i32
     1
 
 pub fn ref_of_ident_in(env: *RefEnv, name_sv: StrView, out: *RefTy) -> i32
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var is_local: i32 = 0
-    let loc: *LocalVar = ref_local_in(env, StrView { ptr: (name), len: (len) as i64 }, @is_local)
+    let loc: *LocalVar = ref_local_in(env, name_sv, @is_local)
     if loc != null
         let ok: i32 = ref_of_local(loc, out)
         # AGAST #2364: the U of an `@*U` / `@&*U` binding is Sema's fact, on
         # its note.  Nothing on the emitter's lowering path read it.
         if ok == 1 and env.sm != null and ref_is_pointer(out.kind) == 1
-            let n: *RsNote = rs_note(env.sm, sema_find_local(env.sm, StrView { ptr: (name), len: (len) as i64 }))
+            let n: *RsNote = rs_note(env.sm, sema_find_local(env.sm, name_sv))
             if n != null
                 out.ptr_pointee = n.ptr_pointee
         return ok
@@ -236,9 +230,9 @@ pub fn ref_of_ident_in(env: *RefEnv, name_sv: StrView, out: *RefTy) -> i32
         return 0
     var g: *GlobalVarDef = null
     if env.s != null
-        g = find_global(env.s, StrView { ptr: (name), len: (len) as i64 })
+        g = find_global(env.s, name_sv)
     else
-        g = sbk_global(env.sm, StrView { ptr: (name), len: (len) as i64 })
+        g = sbk_global(env.sm, name_sv)
     if g == null
         return 0
     if ref_is_pointer(g.var_type) == 1
@@ -335,14 +329,14 @@ pub fn ref_method_def(s: *EmitterState, e: *Expr) -> *FnDef
         let en: StrView = through.unwrap_or(no_name())
         if unnamed(en)
             return null
-        return method_callee_def(s, en, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return method_callee_def(s, en, e.ident)
     var t: RefTy
     if e.left != null and ref_ty_of(s, e.left, @t) == 1 and t.name_len > 0
-        return method_callee_def(s, StrView { ptr: (t.name), len: (t.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return method_callee_def(s, StrView { ptr: (t.name), len: (t.name_len) as i64 }, e.ident)
     let name: StrView = method_recv_type_name(s, e)
     if name.ptr == null or name.len == 0
         return null
-    method_callee_def(s, name, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    method_callee_def(s, name, e.ident)
 
 # Fill `out` with the type of `e`.  0 if the tables can't say.
 pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
@@ -357,7 +351,7 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
     let k: ExprKind = e.kind
     match k
         ExprKind.Ident =>
-            return ref_of_ident_in(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, out)
+            return ref_of_ident_in(env, e.ident, out)
         ExprKind.StringLit =>
             return ref_set(out, TypeKind.Struct, TypeKind.Void, "StrView")
         ExprKind.Unary =>
@@ -440,12 +434,12 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
             return 0
         _ => pass
     if k == ExprKind.Cast and e.type_kind == TypeKind.Ptr
-        return ref_set(out, TypeKind.Ptr, ptr_slot_flat(e.cast_ptr_kind), StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return ref_set(out, TypeKind.Ptr, ptr_slot_flat(e.cast_ptr_kind), e.ident)
     # AGAST #4058: and `as @S` / `as @&S`, whose pointee the parser keeps too
     # (#3443, #3757): `p as @S` is an `@S` whatever `p` was, so a write through
     # it, `(p as @S).f = v` or `.arr[i] = v`, is through an `@T`, as ritz0 says.
     if k == ExprKind.Cast and (e.type_kind == TypeKind.Ref or e.type_kind == TypeKind.MutRef) and e.cast_ptr_kind != (TypeKind.Void as i32)
-        return ref_set(out, e.type_kind, ptr_slot_flat(e.cast_ptr_kind), StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return ref_set(out, e.type_kind, ptr_slot_flat(e.cast_ptr_kind), e.ident)
     0
 
 # AGAST #2364: U for `@x` of an x of type `t`, when x is a `*U`: a local, a
@@ -461,7 +455,7 @@ fn ref_array_referent(env: *RefEnv, e: *Expr, out: *RefTy)
     if e.kind != ExprKind.Ident
         return
     var is_local: i32 = 0
-    let loc: *LocalVar = ref_local_in(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, @is_local)
+    let loc: *LocalVar = ref_local_in(env, e.ident, @is_local)
     if loc == null
         return
     if lv_var_type(loc) == TypeKind.Array
@@ -477,7 +471,7 @@ fn ref_behind(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
     if e.kind != ExprKind.Ident
         return 0
     var is_local: i32 = 0
-    let loc: *LocalVar = ref_local_in(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, @is_local)
+    let loc: *LocalVar = ref_local_in(env, e.ident, @is_local)
     if loc == null
         return 0
     var en_len: i32 = 0
@@ -490,7 +484,7 @@ fn ref_behind(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
         # AGAST #4290: on Sema, an `@[N][M]T` / `@&[N][M]T` is a plane too,
         # by SemaVar's shape (sema_elem_ty's), which the emitter's image keeps
         # only for a `*[N][M]T` (bind_nd_pointee_param): `(*p)[i]` is a row.
-        let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(env.sm, e.ident)
         if v != null and ref_is_pointer(v.kind) == 1 and v.shape != null and v.shape.rank >= 2
             shape = v.shape
     if shape != null
@@ -510,7 +504,7 @@ pub fn ref_through(s: *EmitterState, e0: *Expr) -> i32
         else
             if e.kind != ExprKind.Ident
                 return 0
-            let idx: i32 = find_local_idx(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            let idx: i32 = find_local_idx(s, e.ident)
             if idx < 0
                 return 0
             return lv_is_lent(local_at(s, idx))
@@ -647,11 +641,11 @@ fn ref_deref_ref_in(env: *RefEnv, r: *Expr) -> i32
     if r.kind != ExprKind.Ident
         return 0
     if env.s != null
-        let dl: i32 = find_local_idx(env.s, StrView { ptr: (r.ident_ptr), len: (r.ident_len) as i64 })
+        let dl: i32 = find_local_idx(env.s, r.ident)
         if dl < 0 or local_struct_levels(local_at(env.s, dl)) != 2
             return 0
         return lv_inner_ref(local_at(env.s, dl))
-    let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (r.ident_ptr), len: (r.ident_len) as i64 })
+    let v: *SemaVar = sema_find_local(env.sm, r.ident)
     if v == null or v.lent != null or rs_levels(v) != 2
         return 0
     let n: *RsNote = rs_note(env.sm, v)
@@ -701,12 +695,11 @@ pub fn rs_local(sm: *Sema, v: *SemaVar, out: *SemaTy) -> i32
     rs_set(out, kind, TypeKind.Void, StrView { ptr: (v.let_name), len: (v.let_name_len) as i64 })
 
 pub fn rs_ident(sm: *Sema, name_sv: StrView, out: *SemaTy) -> i32
-    var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, name_sv)
     if v != null
         return rs_local(sm, v, out)
-    let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (name), len: (len) as i64 })
+    let g: *GlobalVarDef = sbk_global(sm, name_sv)
     if g == null or g.var_type == TypeKind.PtrPtr
         return 0
     if ref_is_pointer(g.var_type) == 1
@@ -735,8 +728,8 @@ pub fn rs_fn(f: *FnDef, out: *SemaTy) -> i32
     rs_set(out, f.return_type, TypeKind.Void, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
 
 pub fn rs_call_fn(sm: *Sema, e: *Expr) -> *FnDef
-    if e.func_name_len > 0 and e.call_type_suffix_len == 0
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    if e.func_name.len > 0 and e.call_type_suffix.len == 0
+        let v: *SemaVar = sema_find_local(sm, e.func_name)
         if v != null
             return v.fn_sig
     sema_call_fn(sm, e)
@@ -751,7 +744,7 @@ pub fn rs_field(sm: *Sema, e: *Expr) -> *StructField
     let st: *StructDef = sema_find_struct(sm, StrView { ptr: (b.name), len: (b.name_len) as i64 })
     if st == null
         return null
-    let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let idx: i32 = find_field_index(st, e.ident)
     if idx < 0
         return null
     get_field_type(st, idx)
@@ -778,7 +771,7 @@ pub fn rs_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
     let k: ExprKind = e.kind
     match k
         ExprKind.Ident =>
-            return rs_ident(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, out)
+            return rs_ident(sm, e.ident, out)
         ExprKind.StringLit =>
             return rs_set(out, TypeKind.Struct, TypeKind.Void, "StrView")
         ExprKind.Member =>
@@ -837,12 +830,12 @@ pub fn rs_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
             return 0
         _ => pass
     if k == ExprKind.Cast and e.type_kind == TypeKind.Ptr
-        return rs_set(out, TypeKind.Ptr, ptr_slot_flat(e.cast_ptr_kind), StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return rs_set(out, TypeKind.Ptr, ptr_slot_flat(e.cast_ptr_kind), e.ident)
     # AGAST #4058: and `as @S` / `as @&S`, whose pointee the parser keeps too
     # (#3443, #3757): `p as @S` is an `@S` whatever `p` was, so a write through
     # it, `(p as @S).f = v` or `.arr[i] = v`, is through an `@T`, as ritz0 says.
     if k == ExprKind.Cast and (e.type_kind == TypeKind.Ref or e.type_kind == TypeKind.MutRef) and e.cast_ptr_kind != (TypeKind.Void as i32)
-        return rs_set(out, e.type_kind, ptr_slot_flat(e.cast_ptr_kind), StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return rs_set(out, e.type_kind, ptr_slot_flat(e.cast_ptr_kind), e.ident)
     0
 
 # The element of the instantiated `Vec$T` `v`, from its `data: *T` field: a
@@ -878,7 +871,7 @@ pub fn rs_loan_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
             else
                 let st: *StructDef = sema_find_struct(sm, StrView { ptr: (b.name), len: (b.name_len) as i64 })
                 if st != null
-                    let fi: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                    let fi: i32 = find_field_index(st, e.ident)
                     if fi >= 0
                         return rs_of_field(get_field_type(st, fi), out)
     rs_ty(sm, e, out)
@@ -893,10 +886,10 @@ pub fn rs_method_def(sm: *Sema, e: *Expr) -> *FnDef
     if rs_through_struct(sm, e.left, @en, @el) == 1
         if en == null
             return null
-        return sema_method_fn(sm, StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return sema_method_fn(sm, StrView { ptr: (en), len: (el) as i64 }, e.ident)
     var t: SemaTy
     if e.left != null and rs_loan_ty(sm, e.left, @t) == 1 and t.name_len > 0
-        return sema_method_fn(sm, StrView { ptr: (t.name), len: (t.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return sema_method_fn(sm, StrView { ptr: (t.name), len: (t.name_len) as i64 }, e.ident)
     sbk_method_def(sm, e)
 
 # The `[N]T` behind `e`, a local `*[N]T`, `@[N]T` or `@&[N]T` of type `o`, as
@@ -908,7 +901,7 @@ pub fn rs_method_def(sm: *Sema, e: *Expr) -> *FnDef
 fn rs_behind(sm: *Sema, e: *Expr, o: *SemaTy, out: *SemaTy) -> i32
     if e.kind != ExprKind.Ident
         return 0
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, e.ident)
     if v == null
         return 0
     if ref_is_pointer(v.kind) == 1 and v.index_elem != TypeKind.Void
@@ -997,7 +990,7 @@ pub fn rs_through_kind(sm: *Sema, e: *Expr) -> TypeKind
             if bk != TypeKind.Void
                 return bk
         return rs_base_array_kind(sm, root)
-    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (root.ident_ptr), len: (root.ident_len) as i64 })
+    let v: *SemaVar = sema_find_local(sm, root.ident)
     if v == null
         return TypeKind.Void
     let n: *RsNote = rs_note(sm, v)
@@ -1027,9 +1020,9 @@ fn rs_base_array_kind(sm: *Sema, root: *Expr) -> TypeKind
             if f != null
                 pa = f.ptr_array
         ExprKind.Ident =>
-            if sema_find_local(sm, StrView { ptr: (root.ident_ptr), len: (root.ident_len) as i64 }) != null
+            if sema_find_local(sm, root.ident) != null
                 return TypeKind.Void
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (root.ident_ptr), len: (root.ident_len) as i64 })
+            let g: *GlobalVarDef = sbk_global(sm, root.ident)
             if g != null
                 pa = g.ptr_array
         ExprKind.Call =>
@@ -1123,13 +1116,13 @@ pub fn ref_is_through_in(env: *RefEnv, e: *Expr) -> i32
 # A target other than the referent is left as it was: neither compiler defines
 # a struct-to-struct `as` (AGAST #3012).
 pub fn ref_cast_reads_referent(s: *EmitterState, e: *Expr) -> i32
-    if e.kind != ExprKind.Cast or e.type_kind != TypeKind.Struct or e.ident_len == 0
+    if e.kind != ExprKind.Cast or e.type_kind != TypeKind.Struct or e.ident.len == 0
         return 0
     var a: RefTy
     if ref_ty_of(s, e.left, @a) == 0 or ref_is_pointer(a.kind) == 0
         return 0
     var target: RefTy
-    ref_set(@target, TypeKind.Struct, TypeKind.Void, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    ref_set(@target, TypeKind.Struct, TypeKind.Void, e.ident)
     ref_same_pointee(@a, @target)
 
 # A fn's body is about to be emitted, its params bound.
@@ -1166,21 +1159,19 @@ fn ref_view_of_kind(kind: TypeKind) -> i32
     REF_VIEW_VALUE
 
 fn ref_view_of_ident(env: *RefEnv, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     if env.s != null
-        let idx: i32 = find_local_idx(env.s, StrView { ptr: (name), len: (len) as i64 })
+        let idx: i32 = find_local_idx(env.s, name_sv)
         if idx >= 0
             let loc: *LocalVar = local_at(env.s, idx)
             # `c:& C` is a `C`, and so is a by-value `self`.
             if lv_is_lent(loc) == 1 or lv_holds_lent_ptr(loc) == 1
                 return REF_VIEW_VALUE
             return ref_view_of_kind(lv_var_type(loc))
-        let g: *GlobalVarDef = find_global(env.s, StrView { ptr: (name), len: (len) as i64 })
+        let g: *GlobalVarDef = find_global(env.s, name_sv)
         if g == null
             return REF_VIEW_UNKNOWN
         return ref_view_of_kind(g.var_type)
-    let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (name), len: (len) as i64 })
+    let v: *SemaVar = sema_find_local(env.sm, name_sv)
     if v != null
         if v.lent != null
             return REF_VIEW_VALUE
@@ -1188,7 +1179,7 @@ fn ref_view_of_ident(env: *RefEnv, name_sv: StrView) -> i32
         if n != null and n.ref_kind != TypeKind.Void
             return ref_view_of_kind(n.ref_kind)
         return ref_view_of_kind(v.kind)
-    let sg: *GlobalVarDef = sbk_global(env.sm, StrView { ptr: (name), len: (len) as i64 })
+    let sg: *GlobalVarDef = sbk_global(env.sm, name_sv)
     if sg == null
         return REF_VIEW_UNKNOWN
     ref_view_of_kind(sg.var_type)
@@ -1210,7 +1201,7 @@ pub fn ref_view_in(env: *RefEnv, e: *Expr) -> i32
         return REF_VIEW_UNKNOWN
     let k: ExprKind = e.kind
     if k == ExprKind.Ident
-        return ref_view_of_ident(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return ref_view_of_ident(env, e.ident)
     if k == ExprKind.Unary and e.op == OpKind.Addr
         return REF_VIEW_SHARED
     if k == ExprKind.Unary and e.op == OpKind.AddrMut
@@ -1265,20 +1256,20 @@ pub fn ref_view_in(env: *RefEnv, e: *Expr) -> i32
 fn ref_inner_ref(env: *RefEnv, e: *Expr) -> i32
     if e.kind == ExprKind.Ident
         if env.s != null
-            let idx: i32 = find_local_idx(env.s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            let idx: i32 = find_local_idx(env.s, e.ident)
             if idx >= 0
                 return lv_inner_ref(local_at(env.s, idx))
-            let g: *GlobalVarDef = find_global(env.s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            let g: *GlobalVarDef = find_global(env.s, e.ident)
             if g != null
                 return g.inner_ref
             return 0
-        let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        let v: *SemaVar = sema_find_local(env.sm, e.ident)
         if v != null
             let n: *RsNote = rs_note(env.sm, v)
             if n == null
                 return 0
             return n.inner_ref
-        let sg: *GlobalVarDef = sbk_global(env.sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        let sg: *GlobalVarDef = sbk_global(env.sm, e.ident)
         if sg != null
             return sg.inner_ref
         return 0

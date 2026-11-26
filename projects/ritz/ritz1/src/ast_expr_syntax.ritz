@@ -314,10 +314,9 @@ pub fn const_resolve(consts: *ConstEntry, c: *ConstEntry) -> i32
 # merged) a PENDING one is resolved first.
 fn const_fold_ident(consts: *ConstEntry, name_sv: StrView, resolve: i32, out: *i64) -> i32
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     var c: *ConstEntry = consts
     while c != null
-        if const_name_eq(c, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if const_name_eq(c, name_sv) == 1
             if c.fold_state == CONST_FOLD_PENDING and resolve == 1
                 const_resolve(consts, c)
             if c.fold_state != CONST_FOLD_DONE
@@ -344,7 +343,7 @@ pub fn const_fold_int(consts: *ConstEntry, e: *Expr, resolve: i32, out: *i64) ->
             *out = e.int_val
             return 1
         ExprKind.Ident =>
-            return const_fold_ident(consts, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, resolve, out)
+            return const_fold_ident(consts, e.ident, resolve, out)
         ExprKind.Cast =>
             return const_fold_int(consts, e.left, resolve, out)
         ExprKind.Unary =>
@@ -517,7 +516,7 @@ fn const_expr_is_u64(consts: *ConstEntry, e: *Expr) -> i32
         ExprKind.Ident =>
             var c: *ConstEntry = consts
             while c != null
-                if const_name_eq(c, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+                if const_name_eq(c, e.ident) == 1
                     if c.const_type == TypeKind.U64
                         return 1
                     return 0
@@ -1247,7 +1246,7 @@ pub fn type_alias_find(ctx: *ParseCtx, name_sv: StrView) -> *AliasEntry
     var i: i32 = 0
     while i < ctx.alias_count
         let e: *AliasEntry = *(ctx.alias_table + i) as *AliasEntry
-        if (StrView { ptr: (e.name), len: (e.name_len) as i64 }).eq(StrView { ptr: (name), len: (len) as i64 })
+        if (StrView { ptr: (e.name), len: (e.name_len) as i64 }).eq(name_sv)
             return e
         i = i + 1
     return null
@@ -1453,14 +1452,12 @@ fn tn_note_base(p: *Parser, name_sv: StrView)
         i = i - 1
 
 pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericArg) -> *TypeRef
-    var base_name: *u8 = base_name_sv.ptr
-    var base_len: i32 = base_name_sv.len as i32
-    tn_note_base(p, StrView { ptr: (base_name), len: (base_len) as i64 })   # AGAST #4654
+    tn_note_base(p, base_name_sv)   # AGAST #4654
     var cur: *GenericArg = ga
     while cur != null
         tn_note(p, StrView { ptr: (cur.written), len: (cur.written_len) as i64 })   # AGAST #4021
         cur = cur.next
-    let mangled_sv: StrView = mangle_generic_args(p, StrView { ptr: (base_name), len: (base_len) as i64 }, ga)
+    let mangled_sv: StrView = mangle_generic_args(p, base_name_sv, ga)
     if p.skip_item == 0
         generic_use_note_mangled(p.ctx, mangled_sv, ga, diag_span(0, 0), parse_file_copy_shared(p).ptr)
     let t: *TypeRef = typeref_new(p, TypeKind.Struct)
@@ -1547,8 +1544,8 @@ pub fn expr_int(p: *Parser, val: i64, line: i32, col: i32) -> *Expr
     e.span.col = col
     e.int_val = val
     e.lit_kind = LIT_PLAIN
-    e.ident_ptr = null      # no overflowed source text (expr_int_lit)
-    e.ident_len = 0
+    e.ident.ptr = null      # no overflowed source text (expr_int_lit)
+    e.ident.len = 0
     e.next = null
     return e
 
@@ -1585,9 +1582,7 @@ fn is_pass_name(name_sv: StrView) -> i32
     return 0
 
 pub fn note_pass_binding(ctx: *ParseCtx, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if is_pass_name(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if is_pass_name(name_sv) == 1
         ctx.pass_bound = 1
 
 # Grammar action for a `for` variable: noted before the body is parsed, which
@@ -1600,7 +1595,7 @@ pub fn for_var_name(ctx: *ParseCtx, tok: Token) -> Token
 # binding of that name in the fn is the no-op.  `pass(2)`, `s.pass` and a
 # bound `pass` stay identifiers.
 fn pass_or_ident(p: *Parser, e: *Expr) -> *Expr
-    if e.kind == ExprKind.Ident and p.ctx.pass_bound == 0 and is_pass_name(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+    if e.kind == ExprKind.Ident and p.ctx.pass_bound == 0 and is_pass_name(e.ident) == 1
         return expr_pass(p, e.span.line, e.span.col)
     return e
 
@@ -1624,7 +1619,7 @@ pub fn is_unit_expr(e: *Expr) -> i32
     (e.kind == ExprKind.IntLit and e.lit_kind == LIT_UNIT) as i32
 
 # Float literal — store the raw source bytes (digits + dot) in
-# string_ptr/string_len so the emitter can re-parse to the right LLVM
+# string_val so the emitter can re-parse to the right LLVM
 # constant.  Default kind context (f32 vs f64) is decided by surrounding
 # type info at use-site; the literal itself just carries the digits.
 pub fn expr_float(p: *Parser, src_sv: StrView, line: i32, col: i32) -> *Expr
@@ -1634,8 +1629,7 @@ pub fn expr_float(p: *Parser, src_sv: StrView, line: i32, col: i32) -> *Expr
     e.kind = ExprKind.FloatLit
     e.span.line = line
     e.span.col = col
-    e.string_ptr = src as *u8
-    e.string_len = len
+    e.string_val = src_sv
     e.next = null
     # AGAST #1615: a `f32` / `f64` suffix (absorbed by the lexer) types the
     # literal: `2.5f32` is `2.5 as f32`, as in ritz0. The digits keep their
@@ -1649,7 +1643,7 @@ pub fn expr_float(p: *Parser, src_sv: StrView, line: i32, col: i32) -> *Expr
         else if s1 == 54 and s2 == 52  # "64"
             sfx = TypeKind.F64
         if sfx != TypeKind.Void
-            e.string_len = len - 3
+            e.string_val.len = (len - 3) as i64
             float_text_with_point(p, e)
             let c: *Expr = expr_cast(p, e, sfx, TypeKind.Void)
             c.cast_pointee = TypeKind.Void
@@ -1662,8 +1656,8 @@ pub fn expr_float(p: *Parser, src_sv: StrView, line: i32, col: i32) -> *Expr
 # constant.  An exponent literal with no fraction gets one, `1.0e-5`, in a
 # copy (the same value); every other literal keeps its source bytes.
 fn float_text_with_point(p: *Parser, e: *Expr)
-    let src: *u8 = e.string_ptr
-    let len: i32 = e.string_len
+    let src: *u8 = e.string_val.ptr
+    let len: i32 = e.string_val.len as i32
     var at: i32 = 0
     while at < len and *(src + at) != 'e' and *(src + at) != 'E'   # e E
         if *(src + at) == '.'                                       # .
@@ -1681,8 +1675,7 @@ fn float_text_with_point(p: *Parser, e: *Expr)
     while i < len
         *(out + i + 2) = *(src + i)
         i = i + 1
-    e.string_ptr = out
-    e.string_len = len + 2
+    e.string_val = StrView { ptr: out, len: (len + 2) as i64 }
 
 pub fn expr_string(p: *Parser, tok: Token) -> *Expr
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
@@ -1698,14 +1691,12 @@ pub fn expr_string(p: *Parser, tok: Token) -> *Expr
     e.span.line = tok.line
     e.span.col = tok.col
     # Use cooked string from lexer (escapes already processed)
-    e.string_ptr = tok.string_val as *u8
-    e.string_len = tok.string_len
+    e.string_val = StrView { ptr: tok.string_val as *u8, len: tok.string_len as i64 }
     # AGAST #1521: also keep the RAW token text, quotes included. print's
     # interpolation splits the raw text, because the cooked text cannot tell
     # `\{x}` (a literal brace) from `{x}` (a placeholder). See
     # emitter_print.ritz. Nothing else reads these slots on a string literal.
-    e.ident_ptr = tok.start
-    e.ident_len = tok.len
+    e.ident = StrView { ptr: tok.start, len: tok.len as i64 }
     e.next = null
     return e
 
@@ -1742,14 +1733,11 @@ pub fn expr_nil(p: *Parser, line: i32, col: i32) -> *Expr
     return e
 
 pub fn expr_ident(p: *Parser, name_sv: StrView, line: i32, col: i32) -> *Expr
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = ExprKind.Ident
     e.span.line = line
     e.span.col = col
-    e.ident_ptr = name as *u8
-    e.ident_len = len
+    e.ident = name_sv
     e.next = null
     return e
 
@@ -1806,8 +1794,7 @@ pub fn expr_cast(p: *Parser, left: *Expr, target_type: TypeKind, cast_pointee: T
     e.fn_sig = null
     e.int_val = 0
     e.cast_ptr_kind = (TypeKind.Void as i32)
-    e.ident_ptr = null
-    e.ident_len = 0
+    e.ident = strview_empty()
     e.bracket.line = 0   # no `as` written (AGAST #3040)
     e.bracket.col = 0
     e.next = null
@@ -1816,19 +1803,15 @@ pub fn expr_cast(p: *Parser, left: *Expr, target_type: TypeKind, cast_pointee: T
 # ExprKind.TypeOperand (AGAST #2124): `count` values of leaf kind `t` (struct
 # `name` when t == TypeKind.Struct).
 pub fn expr_type_operand(p: *Parser, count: i64, t: TypeKind, name_sv: StrView, line: i32, col: i32) -> *Expr
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = ExprKind.TypeOperand
     e.span.line = line
     e.span.col = col
     e.int_val = count
     e.type_kind = t
-    e.ident_ptr = null
-    e.ident_len = 0
+    e.ident = strview_empty()
     if t == TypeKind.Struct
-        e.ident_ptr = name
-        e.ident_len = name_len
+        e.ident = name_sv
     e.next = null
     return e
 
@@ -1875,16 +1858,13 @@ pub fn sizeof_generic_type_call(p: *Parser, name_tok: Token, base_tok: Token, ga
 
 pub fn expr_call(p: *Parser, name_sv: StrView, args: *Expr, line: i32, col: i32) -> *Expr
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = ExprKind.Call
     e.span.line = line
     e.span.col = col
-    e.func_name = name as *u8
-    e.func_name_len = len
+    e.func_name = name_sv
     e.args = args
-    e.call_type_suffix = null
-    e.call_type_suffix_len = 0
+    e.call_type_suffix = strview_empty()
     e.next = null
     return e
 
@@ -1953,11 +1933,9 @@ pub fn expr_generic_call(p: *Parser, name_sv: StrView, type_arg: *TypeRef, args:
     e.kind = ExprKind.Call
     e.span.line = line
     e.span.col = col
-    e.func_name = mangled
-    e.func_name_len = pos
+    e.func_name = StrView { ptr: mangled, len: pos as i64 }
     e.args = args
-    e.call_type_suffix = null
-    e.call_type_suffix_len = 0
+    e.call_type_suffix = strview_empty()
     e.next = null
     return e
 
@@ -1985,14 +1963,12 @@ pub fn expr_array(p: *Parser, head: *Expr, line: i32, col: i32) -> *Expr
 # count token directly (the grammar matches NUMBER, not a generic expr, to
 # keep parity with ritz0 and avoid having to constant-fold here).
 pub fn expr_array_fill(p: *Parser, value: *Expr, count_start_sv: StrView, line: i32, col: i32) -> *Expr
-    var count_start: *u8 = count_start_sv.ptr
-    var count_len: i32 = count_start_sv.len as i32
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = ExprKind.ArrayFill
     e.span.line = line
     e.span.col = col
     e.left = value
-    e.int_val = parse_int(StrView { ptr: (count_start), len: (count_len) as i64 })
+    e.int_val = parse_int(count_start_sv)
     e.next = null
     return e
 
@@ -2150,8 +2126,7 @@ pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
     while ct != null
         result = expr_cast(p, result, ct.cast_type, ct.cast_pointee)
         result.cast_ptr_kind = ct.pointee_type
-        result.ident_ptr = ct.pointee_name
-        result.ident_len = ct.pointee_name_len
+        result.ident = StrView { ptr: ct.pointee_name, len: ct.pointee_name_len as i64 }
         result.fn_sig = ct.fn_sig
         result.cast_array = ct.array
         result.cast_ptr_array = ct.ptr_array   # AGAST #4122
@@ -2169,8 +2144,7 @@ pub fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
     op.args = args
     # #4035: the parser never records a call type suffix (it was always null),
     # so nothing carries one here.
-    op.call_type_suffix = null
-    op.call_type_suffix_len = 0
+    op.call_type_suffix = strview_empty()
     op.next = null
     return op
 
@@ -2197,8 +2171,7 @@ pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *Postfi
     # Type suffix: "$" + type_name (an alias spelled as its target, #2037).
     tn_note_tok(p, type_tok)   # AGAST #4171
     let suffix_sv: StrView = generic_tok_suffix(p, StrView { ptr: (null), len: (0) as i64 }, type_tok)
-    op.call_type_suffix = suffix_sv.ptr
-    op.call_type_suffix_len = suffix_sv.len as i32
+    op.call_type_suffix = suffix_sv
     op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
     return op
@@ -2217,8 +2190,7 @@ pub fn postfix_generic_call_ptr(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     # Type suffix: "$ptr_" + type_name (an alias spelled as its target, #2037).
     tn_note_tok(p, type_tok)   # AGAST #4171
     let suffix_sv: StrView = generic_tok_suffix(p, "ptr_", type_tok)
-    op.call_type_suffix = suffix_sv.ptr
-    op.call_type_suffix_len = suffix_sv.len as i32
+    op.call_type_suffix = suffix_sv
     op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
     return op
@@ -2233,8 +2205,7 @@ pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *Po
     tn_note_args(p, ga)   # AGAST #4171
     # "" + "$" + arg → "$<arg>", from the same speller as type annotations.
     let suffix_sv: StrView = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga)
-    op.call_type_suffix = suffix_sv.ptr
-    op.call_type_suffix_len = suffix_sv.len as i32
+    op.call_type_suffix = suffix_sv
     op.call_targs = ga
     op.next = null
     return op
@@ -2280,8 +2251,7 @@ pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *P
     op.kind = POSTFIX_CALL
     op.args = args
     let suffix_sv: StrView = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga)
-    op.call_type_suffix = suffix_sv.ptr
-    op.call_type_suffix_len = suffix_sv.len as i32
+    op.call_type_suffix = suffix_sv
     op.call_targs = ga
     op.next = null
     return op
@@ -2297,11 +2267,9 @@ pub fn postfix_index(p: *Parser, index: *Expr, line: i32, col: i32) -> *PostfixO
 
 pub fn postfix_member(p: *Parser, name_sv: StrView) -> *PostfixOp
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
     op.kind = POSTFIX_MEMBER
-    op.member_name = name as *u8
-    op.member_len = len
+    op.member_name = name_sv
     tok_span_back(p, name, @op.bracket)   # AGAST #3015: the field name's place
     op.next = null
     return op
@@ -2336,21 +2304,19 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
                 ExprKind.Ident =>
                     # Modify ident to call in place (ident becomes call target)
                     result.kind = ExprKind.Call
-                    result.func_name = result.ident_ptr
-                    result.func_name_len = result.ident_len
+                    result.func_name = result.ident
                     # Copy type suffix for generic calls (e.g., "$u8" for vec_new<u8>())
                     result.call_type_suffix = op.call_type_suffix
-                    result.call_type_suffix_len = op.call_type_suffix_len
                     result.args = op.args
-                    if op.call_type_suffix != null and p.skip_item == 0
-                        generic_use_note(p.ctx, StrView { ptr: (result.func_name), len: (result.func_name_len) as i64 }, StrView { ptr: (op.call_type_suffix), len: (op.call_type_suffix_len) as i64 }, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p).ptr)
+                    if op.call_type_suffix.ptr != null and p.skip_item == 0
+                        generic_use_note(p.ctx, result.func_name, op.call_type_suffix, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p).ptr)
                 ExprKind.Member =>
                     # Method call: expr.method(args)
-                    # ExprKind.Member has: left = receiver, ident_ptr/len = method name
+                    # ExprKind.Member has: left = receiver, ident = method name
                     # Convert to ExprKind.Method by changing kind and adding args
                     result.kind = ExprKind.Method
                     result.args = op.args
-                    # left and ident_ptr/ident_len are already set from POSTFIX_MEMBER
+                    # left and ident are already set from POSTFIX_MEMBER
                 _ =>
                     # AGAST #1747: a call through any other callee (`fs[1](3)`,
                     # `f(1)(2)`) is an indirect call: ExprKind.Call with no name,
@@ -2373,8 +2339,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
             member_expr.kind = ExprKind.Member
             member_expr.span = result.span
             member_expr.left = result
-            member_expr.ident_ptr = op.member_name
-            member_expr.ident_len = op.member_len
+            member_expr.ident = op.member_name
             member_expr.bracket = op.bracket   # AGAST #3015
             member_expr.next = null
             result = member_expr
@@ -2409,16 +2374,13 @@ fn expr_nameless_call(p: *Parser, callee: *Expr, args: *Expr) -> *Expr
     let call_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     call_expr.kind = ExprKind.Call
     call_expr.span = callee.span
-    call_expr.func_name = null
-    call_expr.func_name_len = 0
-    call_expr.call_type_suffix = null
-    call_expr.call_type_suffix_len = 0
+    call_expr.func_name = strview_empty()
+    call_expr.call_type_suffix = strview_empty()
     call_expr.args = args
     call_expr.left = callee
     call_expr.right = null
     call_expr.operand = null
-    call_expr.ident_ptr = null
-    call_expr.ident_len = 0
+    call_expr.ident = strview_empty()
     call_expr.next = null
     return call_expr
 
@@ -2427,7 +2389,7 @@ fn expr_nameless_call(p: *Parser, callee: *Expr, args: *Expr) -> *Expr
 # `t.f(..)` is a method call.  Without the parens to tell them apart, the
 # call became `Tbl_f(t, ..)`, an undefined symbol.
 pub fn apply_postfix_paren_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
-    if ops != null and ops.kind == POSTFIX_CALL and base.kind == ExprKind.Member and ops.call_type_suffix_len == 0
+    if ops != null and ops.kind == POSTFIX_CALL and base.kind == ExprKind.Member and ops.call_type_suffix.len == 0
         return apply_postfix_p(p, expr_nameless_call(p, base, ops.args), ops.next)
     return apply_postfix_p(p, base, ops)
 
@@ -2472,8 +2434,7 @@ fn struct_lit_expr(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
     e.kind = ExprKind.StructLit
     e.span.line = tok.line
     e.span.col = tok.col
-    e.ident_ptr = tok.start as *u8
-    e.ident_len = tok.len
+    e.ident = StrView { ptr: tok.start as *u8, len: tok.len as i64 }
     # Store field inits in args field (reuse)
     e.args = lit as *Expr
     e.next = null
@@ -2492,8 +2453,7 @@ pub fn qualified_struct_lit(p: *Parser, qual: Token, name: Token, lit: *FieldIni
     e.kind = ExprKind.StructLit
     e.span.line = qual.line
     e.span.col = qual.col
-    e.ident_ptr = name.start as *u8
-    e.ident_len = name.len
+    e.ident = StrView { ptr: name.start as *u8, len: name.len as i64 }
     e.left = expr_ident(p, StrView { ptr: (qual.start), len: (qual.len) as i64 }, qual.line, qual.col)
     e.bracket.line = name.line   # AGAST #3015: the member name's place
     e.bracket.col = name.col
@@ -2533,8 +2493,8 @@ fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv:
         f.name = arm.pattern_name
         f.name_len = arm.pattern_name_len
     else
-        f.name = lit.ident_ptr
-        f.name_len = lit.ident_len
+        f.name = lit.ident.ptr
+        f.name_len = lit.ident.len as i32
     f.qual = qual
     f.qual_len = qual_len
     f.span.line = head.line
@@ -2564,8 +2524,7 @@ pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *Fie
     e.span.line = tok.line
     e.span.col = tok.col
     let ident_sv: StrView = mangle_generic_args(p, StrView { ptr: (tok.start), len: (tok.len) as i64 }, ga)
-    e.ident_ptr = ident_sv.ptr
-    e.ident_len = ident_sv.len as i32
+    e.ident = ident_sv
     # Store field inits in args field (reuse)
     e.args = lit as *Expr
     e.next = null
@@ -2576,20 +2535,17 @@ pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *Fie
 # =============================================================================
 
 # A NUMBER token's literal.  One of 2^64 or more doesn't fit an i64, which
-# parse_int wraps it into: it keeps its source text in ident_ptr/ident_len, so
+# parse_int wraps it into: it keeps its source text in ident, so
 # literal_slot.ritz can refuse it and name it (AGAST #3083).  Null otherwise.
 pub fn expr_int_lit(p: *Parser, start_sv: StrView, line: i32, col: i32) -> *Expr
-    var start: *u8 = start_sv.ptr
-    var len: i32 = start_sv.len as i32
-    let e: *Expr = expr_int(p, parse_int(StrView { ptr: (start), len: (len) as i64 }), line, col)
-    if parse_int_overflows(StrView { ptr: (start), len: (len) as i64 }) == 1
-        e.ident_ptr = start
-        e.ident_len = len
+    let e: *Expr = expr_int(p, parse_int(start_sv), line, col)
+    if parse_int_overflows(start_sv) == 1
+        e.ident = start_sv
     # AGAST #4245: a typed suffix (absorbed by the lexer, #107) types the
     # literal: `1u32` is `1 as u32`, as ritz0's _apply_literal_suffix has it
     # and as expr_float does for `2.5f32`.  Dropping it made `let p = 1u32`
     # an i64 local, so `take_u32(p)` was refused as a narrowing.
-    let sfx: TypeKind = int_lit_suffix_type(StrView { ptr: (start), len: (len) as i64 })
+    let sfx: TypeKind = int_lit_suffix_type(start_sv)
     if sfx != TypeKind.Void
         let c: *Expr = expr_cast(p, e, sfx, TypeKind.Void)
         c.cast_pointee = TypeKind.Void
@@ -2681,7 +2637,7 @@ pub fn parse_int_overflows(start_sv: StrView) -> i32
     var start: *u8 = start_sv.ptr
     var len: i32 = start_sv.len as i32
     var digits: *u8 = null
-    let base: i64 = int_lit_base(StrView { ptr: (start), len: (len) as i64 }, @digits)
+    let base: i64 = int_lit_base(start_sv, @digits)
     let n: i32 = len - (digits - start) as i32
     let max: u64 = 0xFFFFFFFFFFFFFFFF
     var val: u64 = 0
@@ -2865,9 +2821,7 @@ pub fn match_arm_variant(p: *Parser, name_sv: StrView, inner_kind: i32, inner_na
 # multi-field variant; `binds` lists them in order (a `_` is a wildcard
 # slot).  The arm starts with the first one selected (arm_select_bind).
 pub fn pattern_variant_binds(p: *Parser, name_sv: StrView, binds: *TupleName) -> *MatchArm
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    let a: *MatchArm = pattern_variant_inner(p, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (binds.name), len: (binds.len) as i64 }, binds.span.line, binds.span.col)
+    let a: *MatchArm = pattern_variant_inner(p, name_sv, StrView { ptr: (binds.name), len: (binds.len) as i64 }, binds.span.line, binds.span.col)
     a.pattern_binds = binds
     var n: i32 = 0
     var b: *TupleName = binds
@@ -3071,14 +3025,12 @@ pub fn match_arm_set_block_tail(p: *Parser, arm: *MatchArm, stmts: *Stmt) -> *Ma
 # Inner ident `_` becomes a wildcard payload; any other ident is a binding, and
 # binder_check.ritz refuses one named like a const, global or variant (#2407).
 pub fn pattern_variant_inner(p: *Parser, name_sv: StrView, inner_sv: StrView, line: i32, col: i32) -> *MatchArm
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     var inner: *u8 = inner_sv.ptr
     var inner_len: i32 = inner_sv.len as i32
     if inner_len == 1
         if *inner == '_'  # '_'
-            return match_arm_variant(p, StrView { ptr: (name), len: (name_len) as i64 }, PAT_WILDCARD, StrView { ptr: (null), len: (0) as i64 })
-    let a: *MatchArm = match_arm_variant(p, StrView { ptr: (name), len: (name_len) as i64 }, PAT_IDENT, StrView { ptr: (inner), len: (inner_len) as i64 })
+            return match_arm_variant(p, name_sv, PAT_WILDCARD, StrView { ptr: (null), len: (0) as i64 })
+    let a: *MatchArm = match_arm_variant(p, name_sv, PAT_IDENT, inner_sv)
     a.pattern_inner_span.line = line
     a.pattern_inner_span.col = col
     return a
@@ -3131,16 +3083,13 @@ fn postfix_index_of(p: *Parser, recv: *Expr, op: *PostfixOp) -> *Expr
 # The method call `recv.name(args)` (no generic suffix) as ExprKind.Method.
 pub fn method_call_expr(p: *Parser, recv: *Expr, name_sv: StrView, args: *Expr) -> *Expr
     var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     let m: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     m.kind = ExprKind.Method
     m.span = recv.span
     m.left = recv
-    m.ident_ptr = name
-    m.ident_len = name_len
+    m.ident = name_sv
     m.args = args
-    m.call_type_suffix = null
-    m.call_type_suffix_len = 0
+    m.call_type_suffix = strview_empty()
     m.bracket.line = 0   # no name written here: errors fall back to span (#3419)
     m.bracket.col = 0
     m.next = null

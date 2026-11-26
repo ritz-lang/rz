@@ -124,7 +124,7 @@ fn sema_vis_use(sm: *Sema, line: i32, col: i32, name_sv: StrView)
         return
     if sm.cur_fn == null or (sm.cur_fn.def_file != null and not streq(sm.cur_fn.def_file, sm.file))
         return
-    sema_vis_report(sm, line, col, StrView { ptr: (name), len: (len) as i64 })
+    sema_vis_report(sm, line, col, name_sv)
 
 # AGAST #3907: the input's type-alias uses, wherever written (the parser
 # resolved each to its target, so no walk sees the name).
@@ -165,7 +165,7 @@ fn sema_vis_report(sm: *Sema, line: i32, col: i32, name_sv: StrView)
 # `let`s.  The first arm that types wins: ritz0 types an `if` by its
 # then-branch.  match_scrutinee_type reads it for `match (if c then b else d)`.
 fn sema_note_arm_value(sm: *Sema, owner: *Expr, arm: *MatchArm)
-    if owner == null or owner.value_ty_name != null or arm.is_pass != 0
+    if owner == null or owner.value_ty_name.ptr != null or arm.is_pass != 0
         return
     # An `E.V(..)` (which sema_expr_ty types since AGAST #3810), or a unit
     # variant `E.V` (since #4251), types no arm here: ritz1 refuses a variant
@@ -176,8 +176,7 @@ fn sema_note_arm_value(sm: *Sema, owner: *Expr, arm: *MatchArm)
         return
     var t: SemaTy
     if sema_expr_ty(sm, arm.body, @t) == TypeKind.Struct and t.name != null and t.name_len > 0
-        owner.value_ty_name = t.name
-        owner.value_ty_name_len = t.name_len
+        owner.value_ty_name = StrView { ptr: t.name, len: t.name_len as i64 }
 
 # A bare-name arm's binding.  AGAST #4596: over an enum, a name that isn't one
 # of its variants binds the scrutinee's value (§8.2), typed as the enum, as
@@ -346,12 +345,12 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
         call_check_ident(sm, e)   # AGAST #4595: "Unknown identifier"
 
     let k: ExprKind = e.kind
-    if k == ExprKind.Ident and sema_is_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
-        sema_vis_use(sm, e.span.line, e.span.col, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    else if k == ExprKind.Call and sema_is_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 0
-        sema_vis_use(sm, e.span.line, e.span.col, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    if k == ExprKind.Ident and sema_is_local(sm, e.ident) == 0
+        sema_vis_use(sm, e.span.line, e.span.col, e.ident)
+    else if k == ExprKind.Call and sema_is_local(sm, e.func_name) == 0
+        sema_vis_use(sm, e.span.line, e.span.col, e.func_name)
     else if k == ExprKind.StructLit
-        sema_vis_use(sm, e.span.line, e.span.col, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        sema_vis_use(sm, e.span.line, e.span.col, e.ident)
     match k
         ExprKind.Match | ExprKind.If =>
             if discard == 0
@@ -477,15 +476,15 @@ fn sema_bind_decl(sm: *Sema, st: *Stmt)
         # AGAST #4081: `let t = take` holds fn `take`, so `t(..)` takes its
         # params (its kind stays unknown, as the bare name's).
         let init: *Expr = st.var_init
-        if t.fn_sig == null and init != null and init.kind == ExprKind.Ident and sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) == null
-            t.fn_sig = sema_find_fn(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 })
+        if t.fn_sig == null and init != null and init.kind == ExprKind.Ident and sema_find_local(sm, init.ident) == null
+            t.fn_sig = sema_find_fn(sm, init.ident)
     sema_bind_ty(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, @t, st.var_is_let)
     # AGAST #4410: `let r = @q` with `q` a scalar `*T` is a `**T` held as a
     # PTR_PTR local (the emitter's infer_ref_to_scalar_pointer_let), so `**r`
     # reads a T.  Sema's source typer has only the `@`'s PTR.
     if st.var_declared_type == TypeKind.Void and sm.scope_top > 0 and st.var_init != null
         if st.var_init.kind == ExprKind.Unary and (st.var_init.op == OpKind.Addr or st.var_init.op == OpKind.AddrMut) and st.var_init.operand != null and st.var_init.operand.kind == ExprKind.Ident
-            let src: *SemaVar = sema_find_local(sm, StrView { ptr: (st.var_init.operand.ident_ptr), len: (st.var_init.operand.ident_len) as i64 })
+            let src: *SemaVar = sema_find_local(sm, st.var_init.operand.ident)
             if src != null and (src.kind == TypeKind.Ptr or src.kind == TypeKind.PtrPtr) and src.type_name_len == 0
                 var inner: i32 = (src.pointee as i32)
                 if src.kind == TypeKind.PtrPtr
@@ -522,7 +521,7 @@ fn sema_bind_decl(sm: *Sema, st: *Stmt)
             # other bases keep Sema's source typing (and the emitter's own
             # inference mirrors it).
             if st.var_init != null and st.var_init.kind == ExprKind.Index and st.var_init.left != null and st.var_init.left.kind == ExprKind.Ident and st.var_init.right != null and st.var_init.right.kind != ExprKind.Range
-                let src: *SemaVar = sema_find_local(sm, StrView { ptr: (st.var_init.left.ident_ptr), len: (st.var_init.left.ident_len) as i64 })
+                let src: *SemaVar = sema_find_local(sm, st.var_init.left.ident)
                 if src != null and src.kind == TypeKind.Unknown and src.lent != null and src.lent.param_pointee_type == TypeKind.Array
                     lv.init_slot = src.lent.param_pointee_array_elem_type
                     if src.lent.param_pointee_array_elem_pointee != TypeKind.Void

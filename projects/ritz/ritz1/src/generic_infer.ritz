@@ -173,7 +173,7 @@ fn gi_is_int_literal(e: *Expr) -> i32
 fn gi_type_from_suffix(suffix_sv: StrView, out: *GiType) -> i32
     var suffix: *u8 = suffix_sv.ptr
     var suffix_len: i32 = suffix_sv.len as i32
-    let k: TypeKind = parse_type_from_suffix(StrView { ptr: (suffix), len: (suffix_len) as i64 })
+    let k: TypeKind = parse_type_from_suffix(suffix_sv)
     match k
         TypeKind.Array =>
             # AGAST #3277: "$arr4_i32" is the array gi_array_spell spelled.
@@ -186,7 +186,7 @@ fn gi_type_from_suffix(suffix_sv: StrView, out: *GiType) -> i32
         _ => pass
     var n: *u8 = null
     var nl: i32 = 0
-    get_type_name_from_suffix(StrView { ptr: (suffix), len: (suffix_len) as i64 }, @n, @nl)
+    get_type_name_from_suffix(suffix_sv, @n, @nl)
     match k
         TypeKind.Ptr =>
             let pk: TypeKind = primitive_type_from_name(StrView { ptr: (n), len: (nl) as i64 })
@@ -201,7 +201,7 @@ fn gi_type_from_suffix(suffix_sv: StrView, out: *GiType) -> i32
 # The return type of a call: a plain fn's, or a one-parameter generic's with
 # its suffix substituted (`vec_new<u64>()` is a Vec$u64).
 fn gi_call_type(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
-    let f: *FnDef = find_fn_in_module(m, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    let f: *FnDef = find_fn_in_module(m, e.func_name)
     if f == null or f.return_type == TypeKind.Void
         return 0
     if f.type_params == null
@@ -216,7 +216,7 @@ fn gi_call_type(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
         if gi_is_ptr_kind(f.return_type) == 1 and f.return_type_name != null and f.ret_ptr_array == null and f.ret_fn_sig == null
             return gi_ptr_type(f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }, primitive_type_from_name(StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }), out)
         return 0
-    if e.call_type_suffix_len <= 0 or f.type_params.next != null or f.return_type_name == null
+    if e.call_type_suffix.len <= 0 or f.type_params.next != null or f.return_type_name == null
         return 0
     let tp: *TypeParam = f.type_params
     let rn: *u8 = f.return_type_name
@@ -226,14 +226,14 @@ fn gi_call_type(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
         is_tp = 1
     if f.return_type == TypeKind.Struct
         if is_tp == 1
-            return gi_type_from_suffix(StrView { ptr: (e.call_type_suffix), len: (e.call_type_suffix_len) as i64 }, out)
+            return gi_type_from_suffix(e.call_type_suffix, out)
         var sn: *u8 = null
         var sl: i32 = 0
-        substitute_type_param_in_name(mono, StrView { ptr: (rn), len: (rl) as i64 }, StrView { ptr: (tp.name), len: (tp.name_len) as i64 }, StrView { ptr: (e.call_type_suffix), len: (e.call_type_suffix_len) as i64 }, @sn, @sl)
+        substitute_type_param_in_name(mono, StrView { ptr: (rn), len: (rl) as i64 }, StrView { ptr: (tp.name), len: (tp.name_len) as i64 }, e.call_type_suffix, @sn, @sl)
         return gi_set(out, TypeKind.Struct, StrView { ptr: (sn), len: (sl) as i64 }, TypeKind.Void)
     if gi_is_ptr_kind(f.return_type) == 1 and is_tp == 1
         var inner: GiType
-        if gi_type_from_suffix(StrView { ptr: (e.call_type_suffix), len: (e.call_type_suffix_len) as i64 }, @inner) == 0
+        if gi_type_from_suffix(e.call_type_suffix, @inner) == 0
             return 0
         if inner.kind == TypeKind.Struct
             return gi_set(out, f.return_type, StrView { ptr: (inner.name), len: (inner.name_len) as i64 }, TypeKind.Struct)
@@ -263,7 +263,7 @@ fn gi_member_type(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
         return gi_instance_member_type(mono, m, sn_sv.ptr, sn_sv.len as i32, e, out)
     var f: *StructField = st.fields
     while f != null
-        if f.name_len == e.ident_len and memcmp(f.name, e.ident_ptr, e.ident_len as i64) == 0
+        if f.name_len == (e.ident.len as i32) and memcmp(f.name, e.ident.ptr, e.ident.len) == 0
             if f.field_type == TypeKind.Struct and f.field_type_name != null
                 return gi_set(out, TypeKind.Struct, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, TypeKind.Void)
             if gi_is_prim(f.field_type) == 1
@@ -300,7 +300,7 @@ fn gi_instance_member_type(mono: *MonoCtx, m: *Module, sn: *u8, sl: i32, e: *Exp
     let st: *StructDef = find_generic_struct(m, StrView { ptr: (sn), len: (i) as i64 })
     if st == null
         return 0
-    let f: *StructField = gi_field_named(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let f: *StructField = gi_field_named(st, e.ident)
     if f == null
         return 0
     if f.field_type != TypeKind.Struct or f.field_type_name == null
@@ -379,14 +379,14 @@ fn gi_type_of(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
         ExprKind.CstringLit =>
             return gi_set(out, TypeKind.Ptr, StrView { ptr: (null), len: (0) as i64 }, TypeKind.U8)
         ExprKind.Ident =>
-            let idx: i32 = gi_find_local(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            let idx: i32 = gi_find_local(e.ident)
             if idx < 0
                 return 0
             return gi_set(out, *(g_gi_kinds + idx), StrView { ptr: (*(g_gi_tnames + idx)), len: (*(g_gi_tname_lens + idx)) as i64 }, *(g_gi_pointees + idx))
         ExprKind.Cast =>
             if e.type_kind == TypeKind.Ptr
-                if e.cast_pointee == TypeKind.Struct and e.ident_ptr != null
-                    return gi_set(out, TypeKind.Ptr, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, TypeKind.Struct)
+                if e.cast_pointee == TypeKind.Struct and e.ident.ptr != null
+                    return gi_set(out, TypeKind.Ptr, e.ident, TypeKind.Struct)
                 if gi_is_prim(e.cast_pointee) == 1
                     return gi_set(out, TypeKind.Ptr, StrView { ptr: (null), len: (0) as i64 }, e.cast_pointee)
                 return 0
@@ -446,16 +446,16 @@ fn gi_type_of(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
 # gi_slot or gi_struct_lit_args renamed it (#3408).  A tuple literal (no name)
 # is untyped.  Mirrors ritz0's _infer_value_type.
 fn gi_struct_lit_type(m: *Module, e: *Expr, out: *GiType) -> i32
-    if e.ident_ptr == null or e.ident_len <= 0
+    if e.ident.ptr == null or e.ident.len <= 0
         return 0
-    if find_concrete_struct(m, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == null
+    if find_concrete_struct(m, e.ident) == null
         # Not a plain struct: an instance only when spelled with its args.
         var i: i32 = 0
-        while i < e.ident_len and *(e.ident_ptr + i) != '$'   # '$'
+        while i < (e.ident.len as i32) and *(e.ident.ptr + i) != '$'   # '$'
             i = i + 1
-        if i == e.ident_len or find_generic_struct(m, StrView { ptr: (e.ident_ptr), len: (i) as i64 }) == null
+        if i == (e.ident.len as i32) or find_generic_struct(m, e.ident.take(i as i64)) == null
             return 0
-    gi_set(out, TypeKind.Struct, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, TypeKind.Void)
+    gi_set(out, TypeKind.Struct, e.ident, TypeKind.Void)
 
 # How a type binds a bare T: a primitive's name, a struct's mangled name, or
 # "ptr_" and the pointee's.  null for anything a suffix can't spell.
@@ -523,7 +523,7 @@ fn gi_match_pieces(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p_sv: StrView, a
         let idx: i32 = type_param_index(tps, StrView { ptr: (p + pi), len: (pe - pi) as i64 })
         var xe: i32 = x
         if idx >= 0 and pe == plen
-            xe = mangled_arg_end(ctx, m, StrView { ptr: (a), len: (alen) as i64 }, x)
+            xe = mangled_arg_end(ctx, m, a_sv, x)
         else
             while xe < alen and *(a + xe) != '_' and *(a + xe) != '$'   # '_' '$'
                 xe = xe + 1
@@ -561,10 +561,10 @@ fn gi_match_mangled(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p_sv: StrView, 
         let idx: i32 = type_param_index(tps, StrView { ptr: (p + pi), len: (pe - pi) as i64 })
         var ae: i32 = ai
         if idx >= 0
-            ae = mangled_arg_end(ctx, m, StrView { ptr: (a), len: (alen) as i64 }, ai)
+            ae = mangled_arg_end(ctx, m, a_sv, ai)
             gi_bind(b, idx, a + ai, ae - ai)
         else
-            ae = gi_match_pieces(ctx, m, tps, StrView { ptr: (p + pi), len: (pe - pi) as i64 }, StrView { ptr: (a), len: (alen) as i64 }, ai, b)
+            ae = gi_match_pieces(ctx, m, tps, StrView { ptr: (p + pi), len: (pe - pi) as i64 }, a_sv, ai, b)
             if ae < 0
                 return
         pi = pe + 1
@@ -573,15 +573,13 @@ fn gi_match_mangled(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p_sv: StrView, 
 # A param written `pname` (a struct-ish name: `T`, `Vec$T`) against an
 # argument of type t.
 fn gi_unify_named(ctx: *ParseCtx, m: *Module, tps: *TypeParam, pname_sv: StrView, t: *GiType, b: *GiBind)
-    var pname: *u8 = pname_sv.ptr
-    var plen: i32 = pname_sv.len as i32
-    let idx: i32 = type_param_index(tps, StrView { ptr: (pname), len: (plen) as i64 })
+    let idx: i32 = type_param_index(tps, pname_sv)
     if idx >= 0
         let s_sv: StrView = gi_spell(t)
         gi_bind(b, idx, s_sv.ptr, s_sv.len as i32)
         return
     if t.kind == TypeKind.Struct
-        gi_match_mangled(ctx, m, tps, StrView { ptr: (pname), len: (plen) as i64 }, StrView { ptr: (t.name), len: (t.name_len) as i64 }, b)
+        gi_match_mangled(ctx, m, tps, pname_sv, StrView { ptr: (t.name), len: (t.name_len) as i64 }, b)
 
 fn gi_unify_param(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p: *Param, t: *GiType, b: *GiBind)
     let pk: TypeKind = p.param_type
@@ -649,10 +647,10 @@ fn gi_array_lit_type(mono: *MonoCtx, m: *Module, arg: *Expr, out: *GiType) -> i3
     gi_array_spell(n, el.kind, StrView { ptr: (el.name), len: (el.name_len) as i64 }, el.pointee, out)
 
 fn gi_infer_call(mono: *MonoCtx, m: *Module, e: *Expr)
-    if e.call_type_suffix_len > 0
+    if e.call_type_suffix.len > 0
         return
-    let f: *FnDef = find_generic_function(m, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
-    if f == null or gi_find_local(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) >= 0
+    let f: *FnDef = find_generic_function(m, e.func_name)
+    if f == null or gi_find_local(e.func_name) >= 0
         return
     let n: i32 = count_type_params(f.type_params)
     var b: GiBind
@@ -689,7 +687,7 @@ fn gi_infer_call(mono: *MonoCtx, m: *Module, e: *Expr)
             *(b.lens + i) = 3
         if *(b.names + i) == null or *(b.conflict + i) == 1
             if failed == 0
-                gi_error(e, tp, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+                gi_error(e, tp, e.func_name)
             failed = 1
         total = total + 1 + *(b.lens + i)
         tp = tp.next
@@ -702,10 +700,9 @@ fn gi_infer_call(mono: *MonoCtx, m: *Module, e: *Expr)
             memcpy(buf + pos + 1, *(b.names + j), *(b.lens + j) as i64)
             pos = pos + 1 + *(b.lens + j)
         *(buf + pos) = 0
-        e.call_type_suffix = buf
-        e.call_type_suffix_len = pos
+        e.call_type_suffix = StrView { ptr: buf, len: pos as i64 }
         # A failed trait bound on an inferred argument is at the call (AGAST #3469).
-        generic_use_note(mono.pctx, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (buf), len: (pos) as i64 }, null, e.span, g_gi_file)
+        generic_use_note(mono.pctx, e.func_name, StrView { ptr: (buf), len: (pos) as i64 }, null, e.span, g_gi_file)
     free(b.names as *u8)
     free(b.lens as *u8)
     free(b.conflict as *u8)
@@ -812,13 +809,13 @@ fn gi_type_variant_let(mono: *MonoCtx, m: *Module, s: *Stmt)
     var name: *u8 = null
     var len: i32 = 0
     var args: *Expr = null
-    if init.kind == ExprKind.Call and init.call_type_suffix_len == 0
-        name = init.func_name
-        len = init.func_name_len
+    if init.kind == ExprKind.Call and init.call_type_suffix.len == 0
+        name = init.func_name.ptr
+        len = init.func_name.len as i32
         args = init.args
     else if init.kind == ExprKind.Ident
-        name = init.ident_ptr
-        len = init.ident_len
+        name = init.ident.ptr
+        len = init.ident.len as i32
     else
         return
     if name == null or gi_find_local(StrView { ptr: (name), len: (len) as i64 }) >= 0 or gi_fn_named(m, StrView { ptr: (name), len: (len) as i64 }) == 1
@@ -960,15 +957,15 @@ fn gi_walk_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
 
 # The generic struct an args-less literal `e` names, or null.
 fn gi_argless_struct(ctx: *ParseCtx, m: *Module, e: *Expr) -> *StructDef
-    if e == null or e.kind != ExprKind.StructLit or e.ident_ptr == null or e.ident_len <= 0
+    if e == null or e.kind != ExprKind.StructLit or e.ident.ptr == null or e.ident.len <= 0
         return null
-    if find_concrete_struct(m, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
+    if find_concrete_struct(m, e.ident) != null
         return null
     # A tuple over a generic parameter (`tuple_T_T`, #2975) is a template
     # struct the compiler names and substitutes itself, not a written literal.
-    if tuple_reg_lookup(ctx, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
+    if tuple_reg_lookup(ctx, e.ident) != null
         return null
-    find_generic_struct(m, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    find_generic_struct(m, e.ident)
 
 # Rule 1: `e`, or each branch it ends in, fills a slot of type (sn, sl), a
 # mangled struct name.  An args-less literal of that struct's generic takes
@@ -981,14 +978,13 @@ fn gi_slot(ctx: *ParseCtx, m: *Module, e: *Expr, sn: *u8, sl: i32)
         return
     if gi_argless_struct(ctx, m, e) == null
         return
-    let n: i32 = e.ident_len
-    if sl <= n + 1 or memcmp(sn, e.ident_ptr, n as i64) != 0 or *(sn + n) != '$'   # '$'
+    let n: i32 = e.ident.len as i32
+    if sl <= n + 1 or memcmp(sn, e.ident.ptr, n as i64) != 0 or *(sn + n) != '$'   # '$'
         return
     let buf: *u8 = malloc((sl + 1) as i64)
     memcpy(buf, sn, sl as i64)
     *(buf + sl) = 0
-    e.ident_ptr = buf
-    e.ident_len = sl
+    e.ident = StrView { ptr: buf, len: sl as i64 }
 
 fn gi_slot_arms(ctx: *ParseCtx, m: *Module, arms: *MatchArm, sn: *u8, sl: i32)
     var arm: *MatchArm = arms
@@ -1042,22 +1038,22 @@ fn gi_slot_args(mono: *MonoCtx, m: *Module, params: *Param, args: *Expr, tps: *T
 # generic call whose args are inferred gives only its fully-known params
 # (LARB R51a): the rest come from the args.
 fn gi_slot_call(mono: *MonoCtx, m: *Module, e: *Expr)
-    if e.func_name == null or gi_find_local(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) >= 0
+    if e.func_name.ptr == null or gi_find_local(e.func_name) >= 0
         return
-    let f: *FnDef = find_fn_in_module(m, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    let f: *FnDef = find_fn_in_module(m, e.func_name)
     if f == null
         return
     if f.type_params == null
         gi_slot_args(mono, m, f.params, e.args, null, null, null, null)
         return
-    if e.call_type_suffix_len <= 0
+    if e.call_type_suffix.len <= 0
         gi_slot_args(mono, m, f.params, e.args, f.type_params, null, null, null)
         return
-    let cap: i32 = mangled_arg_capacity(StrView { ptr: (e.call_type_suffix), len: (e.call_type_suffix_len) as i64 })
+    let cap: i32 = mangled_arg_capacity(e.call_type_suffix)
     let starts: *i32 = malloc((cap as i64) * 4) as *i32
     let lens: *i32 = malloc((cap as i64) * 4) as *i32
-    if split_mangled_args(mono.pctx, m, StrView { ptr: (e.call_type_suffix), len: (e.call_type_suffix_len) as i64 }, starts, lens) == count_type_params(f.type_params)
-        gi_slot_args(mono, m, f.params, e.args, f.type_params, e.call_type_suffix, starts, lens)
+    if split_mangled_args(mono.pctx, m, e.call_type_suffix, starts, lens) == count_type_params(f.type_params)
+        gi_slot_args(mono, m, f.params, e.args, f.type_params, e.call_type_suffix.ptr, starts, lens)
     free(starts as *u8)
     free(lens as *u8)
 
@@ -1074,7 +1070,7 @@ fn gi_slot_method(mono: *MonoCtx, m: *Module, e: *Expr)
         if ib.type_name_len == rn_sv.len as i32 and memcmp(ib.type_name, rn_sv.ptr, rn_sv.len) == 0
             var method: *FnDef = ib.methods
             while method != null
-                if method.name_len == e.ident_len and memcmp(method.name, e.ident_ptr, e.ident_len as i64) == 0
+                if method.name_len == (e.ident.len as i32) and memcmp(method.name, e.ident.ptr, e.ident.len) == 0
                     let p: *Param = method.params
                     if p != null and (StrView { ptr: (p.name), len: (p.name_len) as i64 }).eq("self")
                         gi_slot_args(mono, m, p.next, e.args, null, null, null, null)
@@ -1120,24 +1116,24 @@ fn gi_field_named(st: *StructDef, name_sv: StrView) -> *StructField
 # #3431): `W { a: 3, t: Tagged { n: 4 } }`, `t: Tagged<u8>`.  One naming a
 # param (`t: Box2<A>`) is none: its value infers, then binds A.
 fn gi_field_slots(mono: *MonoCtx, m: *Module, e: *Expr)
-    if e.ident_ptr == null or e.ident_len <= 0
+    if e.ident.ptr == null or e.ident.len <= 0
         return
-    var st: *StructDef = find_concrete_struct(m, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    var st: *StructDef = find_concrete_struct(m, e.ident)
     var tps: *TypeParam = null
     var suffix: *u8 = null
     var starts: *i32 = null
     var lens: *i32 = null
     if st == null
         var i: i32 = 0
-        while i < e.ident_len and *(e.ident_ptr + i) != '$'   # '$'
+        while i < (e.ident.len as i32) and *(e.ident.ptr + i) != '$'   # '$'
             i = i + 1
-        st = find_generic_struct(m, StrView { ptr: (e.ident_ptr), len: (i) as i64 })
+        st = find_generic_struct(m, e.ident.take(i as i64))
         if st == null or st.type_params == null
             return
         tps = st.type_params
-        if i < e.ident_len
-            suffix = e.ident_ptr + i
-            let sfl: i32 = e.ident_len - i
+        if i < (e.ident.len as i32)
+            suffix = e.ident.ptr + i
+            let sfl: i32 = (e.ident.len as i32) - i
             let cap: i32 = mangled_arg_capacity(StrView { ptr: (suffix), len: (sfl) as i64 })
             starts = malloc((cap as i64) * 4) as *i32
             lens = malloc((cap as i64) * 4) as *i32
@@ -1170,9 +1166,9 @@ fn gi_struct_lit_error(e: *Expr, st: *StructDef, tp: *TypeParam)
     eprints("can't infer `")
     gi_eprint_n(tp.name, tp.name_len)
     eprints("` for `")
-    gi_eprint_n(e.ident_ptr, e.ident_len)
+    eprints(e.ident)
     eprints("`: write its type arguments, `")
-    gi_eprint_n(e.ident_ptr, e.ident_len)
+    eprints(e.ident)
     eprint_char('<')
     var p: *TypeParam = st.type_params
     while p != null
@@ -1205,7 +1201,7 @@ fn gi_struct_lit_args(mono: *MonoCtx, m: *Module, e: *Expr, st: *StructDef)
             gi_unify_field(mono, m, tps, f, fi.value, @b)
         fi = fi.next
     # The name: the struct's, then "$" and each binding in param order.
-    var total: i32 = e.ident_len
+    var total: i32 = e.ident.len as i32
     var failed: i32 = 0
     var tp: *TypeParam = tps
     var i: i32 = 0
@@ -1221,15 +1217,14 @@ fn gi_struct_lit_args(mono: *MonoCtx, m: *Module, e: *Expr, st: *StructDef)
         i = i + 1
     if failed == 0
         let buf: *u8 = malloc((total + 1) as i64)
-        memcpy(buf, e.ident_ptr, e.ident_len as i64)
-        var pos: i32 = e.ident_len
+        memcpy(buf, e.ident.ptr, e.ident.len)
+        var pos: i32 = e.ident.len as i32
         for j in 0..n
             *(buf + pos) = 36   # '$'
             memcpy(buf + pos + 1, *(b.names + j), *(b.lens + j) as i64)
             pos = pos + 1 + *(b.lens + j)
         *(buf + pos) = 0
-        e.ident_ptr = buf
-        e.ident_len = pos
+        e.ident = StrView { ptr: buf, len: pos as i64 }
     free(b.names as *u8)
     free(b.lens as *u8)
     free(b.conflict as *u8)
@@ -1281,8 +1276,6 @@ fn gi_walk_expr(mono: *MonoCtx, m: *Module, e: *Expr)
         _ => pass
 
 fn gi_walk_fn(mono: *MonoCtx, m: *Module, f: *FnDef, impl_name_sv: StrView)
-    var impl_name: *u8 = impl_name_sv.ptr
-    var impl_len: i32 = impl_name_sv.len as i32
     g_gi_count = 0
     g_gi_ret_name = null
     g_gi_ret_len = 0
@@ -1301,7 +1294,7 @@ fn gi_walk_fn(mono: *MonoCtx, m: *Module, f: *FnDef, impl_name_sv: StrView)
             # AGAST #3277: a by-value `a: [N]E`.
             gi_array_spell(p.param_array_size, p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_array_elem_pointee, @t)
         else if p.is_self_borrow == 1 and p.param_type_name_len == 0
-            gi_set(@t, TypeKind.Struct, StrView { ptr: (impl_name), len: (impl_len) as i64 }, TypeKind.Void)
+            gi_set(@t, TypeKind.Struct, impl_name_sv, TypeKind.Void)
         else if p.is_borrow == 1 and p.param_pointee_type == TypeKind.Struct
             gi_set(@t, TypeKind.Struct, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TypeKind.Void)
         else if p.is_borrow == 1
