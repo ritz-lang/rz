@@ -978,38 +978,41 @@ fn let_check_write(sm: *Sema, stmt: *Stmt)
 # The struct `e` evaluates to, by name, as the emitter's
 # resolve_expr_struct_name names it: a `"..."` is a `Span$u8` there, a
 # struct local, a struct const, an enum variant, a call's or an impl
-# method's struct return, a struct literal.  null/0 when unknown.
-fn let_struct_name(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+# method's struct return, a struct literal.  `strview_empty()` when unknown.
+#
+# AGAST #4780: `out` is `*StrView`, not `**u8`/`*i32` — a spelling out-param
+# always holds Ritz text.  The `*u8`/`_len` field pairs this reads (AST/type
+# name fields, #4773's territory) are wrapped into a StrView right here, at
+# the boundary, rather than converting those fields themselves.
+fn let_struct_name(sm: *Sema, e: *Expr, out: *StrView)
+    *out = strview_empty()
     if e == null
         return
     if e.kind == ExprKind.StringLit
-        *out_name = c"Span$u8"
-        *out_len = 7
+        *out = "Span$u8"
         return
     if e.kind == ExprKind.Cast and e.type_kind == TypeKind.Struct
         # AGAST #3004: `r as C` through a reference reads the `C` itself.
         var t: SemaTy
         let k: TypeKind = sema_expr_ty(sm, e.left, @t)
         if (k == TypeKind.Ptr or k == TypeKind.Ref or k == TypeKind.MutRef) and t.pointee == TypeKind.Struct and name_eq(StrView { ptr: (t.name), len: (t.name_len) as i64 }, e.ident) == 1
-            *out_name = e.ident.ptr
-            *out_len = e.ident.len as i32
+            *out = e.ident
             return
-        let_struct_name(sm, e.left, out_name, out_len)
+        let_struct_name(sm, e.left, out)
         return
     match e.kind
         ExprKind.Method =>
             if name_eq(e.ident, "as_bytes") == 1
-                *out_name = c"Span$u8"
-                *out_len = 7
+                *out = "Span$u8"
                 return
             # AGAST #1466: a qualified variant ctor `Opt.Holds(x)` is the enum.
             let q: *Expr = e.left
             if q != null and q.kind == ExprKind.Ident and sema_find_local(sm, q.ident) == null and sbk_global(sm, q.ident) == null
                 let ei: i32 = enum_find(sm.pctx, q.ident)
                 if ei >= 0 and enum_variant_index(sm.pctx, q.ident, e.ident) >= 0 and enum_is_generic(sm.pctx, ei) != 1
-                    *out_name = enum_name_at(sm.pctx, ei, out_len)
+                    var en_len: i32 = 0
+                    let en: *u8 = enum_name_at(sm.pctx, ei, @en_len)
+                    *out = StrView { ptr: (en), len: (en_len) as i64 }
                     return
             # An impl method on a local receiver: its struct return.
             if q != null and q.kind == ExprKind.Ident
@@ -1022,8 +1025,7 @@ fn let_struct_name(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
                             while m != null
                                 if name_eq(StrView { ptr: (m.name), len: (m.name_len) as i64 }, e.ident) == 1
                                     if m.return_type == TypeKind.Struct and m.return_type_name_len > 0
-                                        *out_name = m.return_type_name
-                                        *out_len = m.return_type_name_len
+                                        *out = StrView { ptr: (m.return_type_name), len: (m.return_type_name_len) as i64 }
                                     return
                                 m = m.next
                             return
@@ -1032,14 +1034,12 @@ fn let_struct_name(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
         ExprKind.Ident =>
             let v: *SemaVar = sema_find_local(sm, e.ident)
             if v != null and v.let_name_len > 0 and v.let_kind == TypeKind.Struct
-                *out_name = v.let_name
-                *out_len = v.let_name_len
+                *out = StrView { ptr: (v.let_name), len: (v.let_name_len) as i64 }
                 return
             # AGAST #189: a struct const (`const FOO: StrView = "..."`).
             let ce: *ConstEntry = sbk_const(sm, e.ident)
             if ce != null and ce.const_type == TypeKind.Struct and ce.type_name_len > 0
-                *out_name = ce.type_name
-                *out_len = ce.type_name_len
+                *out = StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 }
                 return
             # AGAST #1600: a bare unit variant `B` is a value of its enum.
             if ce != null or is_builtin_const(e.ident) == 1 or v != null
@@ -1050,23 +1050,26 @@ fn let_struct_name(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
             var other: i32 = 0
             let ei: i32 = enum_of_variant_unique(sm.pctx, e.ident, @vi, @other)
             if ei >= 0 and enum_variant_kind(sm.pctx, ei, vi) == ENUM_VARIANT_UNIT
-                *out_name = enum_name_at(sm.pctx, ei, out_len)
+                var en_len: i32 = 0
+                let en: *u8 = enum_name_at(sm.pctx, ei, @en_len)
+                *out = StrView { ptr: (en), len: (en_len) as i64 }
             return
         ExprKind.Call =>
             # AGAST #1797: a user-enum payload ctor `Holds(x)` is the enum.
-            user_variant_ctor_enum(sm.pctx, e, out_name, out_len)
-            if *out_name != null
+            var ctor_name: *u8 = null
+            var ctor_len: i32 = 0
+            user_variant_ctor_enum(sm.pctx, e, @ctor_name, @ctor_len)
+            if ctor_name != null
+                *out = StrView { ptr: (ctor_name), len: (ctor_len) as i64 }
                 return
             let fdr: *FnDef = let_call_fn(sm, e)
             if fdr != null and fdr.return_type == TypeKind.Struct and fdr.return_type_name_len > 0
-                *out_name = fdr.return_type_name
-                *out_len = fdr.return_type_name_len
+                *out = StrView { ptr: (fdr.return_type_name), len: (fdr.return_type_name_len) as i64 }
             return
         _ => pass
     if e.kind == ExprKind.StructLit
         if e.ident.ptr != null and (e.ident.len as i32) > 0
-            *out_name = e.ident.ptr as *u8
-            *out_len = e.ident.len as i32
+            *out = e.ident
 
 # 1 when `init` is a known struct of another type than the known struct `want`,
 # with its name in `*out` / `*out_len` (AGAST #2293, #3293).
@@ -1077,9 +1080,10 @@ fn another_struct_source(sm: *Sema, init: *Expr, want_sv: StrView, out: **u8, ou
         return 0
     if want == null or want_len <= 0
         return 0
-    var src: *u8 = null
-    var src_len: i32 = 0
-    let_struct_name(sm, init, @src, @src_len)
+    var src_sv: StrView = strview_empty()
+    let_struct_name(sm, init, @src_sv)
+    var src: *u8 = src_sv.ptr
+    var src_len: i32 = src_sv.len as i32
     # A `c:& C` param holds its referent (#2250).
     var lent: *SemaVar = null
     if init.kind == ExprKind.Ident

@@ -1252,46 +1252,48 @@ pub fn type_alias_find(ctx: *ParseCtx, name_sv: StrView) -> *AliasEntry
     return null
 
 # Spelling of a primitive type argument, as ritz0 mangles it (its type
-# name).  Returns its length (0 for a non-primitive) and the bytes in *out.
+# name).  Returns its length (0 for a non-primitive) and the view in *out.
 # AGAST #1922: only u8/i8/i32/i64/u64 were spelled, so `Option<u32>` mangled
-# as `Option$` and tagged_enum_layout could not measure it.
-pub fn primitive_arg_spelling(ty: TypeKind, out: **u8) -> i32
+# as `Option$` and tagged_enum_layout could not measure it.  AGAST #4780:
+# `out` is `*StrView`, not `**u8` — a literal-spelling out-param always holds
+# Ritz text, never a C string.
+pub fn primitive_arg_spelling(ty: TypeKind, out: *StrView) -> i32
     match ty
         TypeKind.U8 =>
-            *out = c"u8"
+            *out = "u8"
             return 2
         TypeKind.I8 =>
-            *out = c"i8"
+            *out = "i8"
             return 2
         TypeKind.U16 =>
-            *out = c"u16"
+            *out = "u16"
             return 3
         TypeKind.I16 =>
-            *out = c"i16"
+            *out = "i16"
             return 3
         TypeKind.U32 =>
-            *out = c"u32"
+            *out = "u32"
             return 3
         TypeKind.I32 =>
-            *out = c"i32"
+            *out = "i32"
             return 3
         TypeKind.U64 =>
-            *out = c"u64"
+            *out = "u64"
             return 3
         TypeKind.I64 =>
-            *out = c"i64"
+            *out = "i64"
             return 3
         TypeKind.F32 =>
-            *out = c"f32"
+            *out = "f32"
             return 3
         TypeKind.F64 =>
-            *out = c"f64"
+            *out = "f64"
             return 3
         TypeKind.Bool =>
-            *out = c"bool"
+            *out = "bool"
             return 4
         _ => pass
-    *out = null
+    *out = strview_empty()
     return 0
 
 # spell_ptr_generic_arg over explicit parts, so an alias table entry (which
@@ -1316,7 +1318,9 @@ pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, 
         base = type_name
         base_len = type_name_len
     else
-        base_len = primitive_arg_spelling(leaf, @base)
+        var prim_spelled: StrView = strview_empty()
+        base_len = primitive_arg_spelling(leaf, @prim_spelled)
+        base = prim_spelled.ptr
     if base_len <= 0
         return strview_empty()
     let total: i32 = depth * 4 + base_len
@@ -1352,7 +1356,9 @@ pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token) -> StrView
     # type_spec argument does (capture_first_generic_arg): `vec_new<usize>`
     # is `vec_new$u64`, returning the `Vec$u64` a `Vec<usize>` local is.
     if is_word_type_name(StrView { ptr: (tok.start), len: (tok.len) as i64 }) == 1
-        spell_len = primitive_arg_spelling(word_type(tok.start), @spell)
+        var word_spelled: StrView = strview_empty()
+        spell_len = primitive_arg_spelling(word_type(tok.start), @word_spelled)
+        spell = word_spelled.ptr
     else if p.ctx.alias_count > 0
         let e: *AliasEntry = type_alias_find(p.ctx, StrView { ptr: (tok.start), len: (tok.len) as i64 })
         if e != null
@@ -1366,7 +1372,9 @@ pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token) -> StrView
                     spell = spelled_sv.ptr
                     n = spelled_sv.len as i32
                 _ =>
-                    n = primitive_arg_spelling(e.kind, @spell)
+                    var alias_spelled: StrView = strview_empty()
+                    n = primitive_arg_spelling(e.kind, @alias_spelled)
+                    spell = alias_spelled.ptr
             # A target with no spelling (array, fn type, ...) keeps the alias
             # name: no worse than before, and the mismatch stays visible.
             if n > 0
@@ -1396,7 +1404,13 @@ pub fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
     if (ty_int_bits(ga.ty) == 64) and ga.name != null and ga.name_len > 0
         *out = ga.name
         return ga.name_len
-    return primitive_arg_spelling(ga.ty, out)
+    # AGAST #4780: primitive_arg_spelling's out-param is `*StrView`; this
+    # fn's own `out` stays `**u8` (its other branches hand back `ga.name`,
+    # a `*u8` AST field — #4773's territory), so unwrap at the boundary.
+    var prim_spelled: StrView = strview_empty()
+    let n: i32 = primitive_arg_spelling(ga.ty, @prim_spelled)
+    *out = prim_spelled.ptr
+    return n
 
 # Mangle `base<a1, a2, ...>` as "base$a1$a2..." (AGAST #1574), from the
 # captured argument list.  Returns an arena-allocated, NUL-terminated name
