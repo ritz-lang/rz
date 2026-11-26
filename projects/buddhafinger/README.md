@@ -2,14 +2,17 @@
 
 A modal (Vim-style) terminal code editor written in Ritz, for Linux first and
 then Harland. [`docs/BUDDHAFINGER_PROPOSAL.md`](../../docs/BUDDHAFINGER_PROPOSAL.md)
-is the design and AGAST epic #4782 tracks the work. This is the skeleton:
-the modules exist, the editor does not yet.
+is the design and AGAST epic #4782 tracks the work. The core (buffer,
+screen, modes and the first-release commands) is in; the terminal event
+loop and the platform save are still to come.
 
 ## Layout
 
 - `src/core/`: the editor core (`buffer` with its undo `history` and
-  `utf8` cursor stepping, `screen`, `modes`, `commands`). It does no
-  terminal or OS I/O, so it is tested without a terminal.
+  `utf8` cursor stepping, `screen`, `modes`, `commands`, and `editor`,
+  which applies typed keys to the editor state). It does no terminal or OS
+  I/O, so it is tested without a terminal: files go through the
+  `FileStore` seam in `files`, which the platform implements.
 - `src/syntax/`: lexical colors. `lexer` splits one line into tokens (no
   state crosses a line in Ritz); `highlight` caches each line's colored runs
   for the screen, and an edit re-lexes only the lines it touched.
