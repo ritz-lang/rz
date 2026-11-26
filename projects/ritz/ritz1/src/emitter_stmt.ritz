@@ -436,19 +436,19 @@ fn decl_emit_init(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type: TypeKind
 fn emit_nd_sub_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
     let sh: *ArrayShape = dst.shape
     let v: *Expr = stmt.assign_value
-    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0 and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+    if sh.leaf_type == TypeKind.Struct and sh.leaf_name.len > 0 and own_type_is_move_only(s, sh.leaf_name)
         emit_nd_error_sv(s, stmt.span.line, stmt.span.col, "assigning a row of a multi-dimensional array of a move-only type is not supported in ritz1 (assign each element)")
         return
     if sh.rank - dst.depth >= 2
         emit_nd_plane_store(s, dst.reg, nd_shape_from(sh, dst.depth), v)
         return
     let m: i32 = sh.dims[sh.rank - 1]
-    let leaf_sv: StrView = StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }
+    let leaf_sv: StrView = sh.leaf_name
     # A row of another N-D array, `n[0]`: copied from the address its GEP gives.
     var vd: i32 = 0
     let vsh: *ArrayShape = nd_index_shape(s, v, @vd)
     if vsh != null and vd == vsh.rank - 1
-        if vsh.dims[vsh.rank - 1] != m or vsh.leaf_pointee != sh.leaf_pointee or array_elem_types_match(vsh.leaf_type, StrView { ptr: (vsh.leaf_name), len: (vsh.leaf_name_len) as i64 }, sh.leaf_type, leaf_sv) == 0
+        if vsh.dims[vsh.rank - 1] != m or vsh.leaf_pointee != sh.leaf_pointee or array_elem_types_match(vsh.leaf_type, vsh.leaf_name, sh.leaf_type, leaf_sv) == 0
             emit_ir_error_sv(s, v.span, "this row's type is not the multi-dimensional array's row type")
             return
         var src: NdIndexPtr
@@ -479,8 +479,8 @@ fn emit_nd_stmt_row_store(s: *EmitterState, stmt: *Stmt, place: *Expr)
 fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
     let sh: *ArrayShape = dst.shape
     var leaf_st: *StructDef = null
-    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0
-        leaf_st = find_struct(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+    if sh.leaf_type == TypeKind.Struct and sh.leaf_name.len > 0
+        leaf_st = find_struct(s, sh.leaf_name)
     if sh.leaf_type == TypeKind.Struct and leaf_st == null
         emit_nd_error_sv(s, stmt.span.line, stmt.span.col, "assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
         return
@@ -488,14 +488,14 @@ fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
         emit_nd_sub_store(s, stmt, dst)   # AGAST #4666
         return
     if sh.leaf_type == TypeKind.Struct
-        let sval: i32 = emit_store_into_slot(s, stmt.assign_value, TypeKind.Struct, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })   # AGAST #2454, #2390
+        let sval: i32 = emit_store_into_slot(s, stmt.assign_value, TypeKind.Struct, sh.leaf_name)   # AGAST #2454, #2390
         # AGAST #3377 (LARB R39): the old element drops after v, before the
         # store, when a binding owns the array (`g`, `h.m`).
         var arr: *Expr = stmt.if_cond as *Expr
         while arr != null and arr.kind == ExprKind.Index
             arr = arr.left
-        own_drop_old_elem(s, arr, dst.reg, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
-        emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, sval, dst.reg)
+        own_drop_old_elem(s, arr, dst.reg, sh.leaf_name)
+        emit_struct_store_or_copy(s, TypeKind.Struct, sh.leaf_name, sval, dst.reg)
         return
     let ty: StrView = elem_mem_llvm(sh.leaf_type)
     set_match_float_hint(s, stmt.assign_value, sh.leaf_type, StrView { ptr: (null), len: (0) as i64 })   # AGAST #4028
@@ -1664,8 +1664,8 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
         else if left > 2
             src.plane = nd_shape_from(nd_shape, nd_depth + 1)
         src.elem_type = nd_shape.leaf_type
-        src.elem_name = nd_shape.leaf_name
-        src.elem_name_len = nd_shape.leaf_name_len
+        src.elem_name = nd_shape.leaf_name.ptr
+        src.elem_name_len = nd_shape.leaf_name.len as i32
         src.bind_pointee = elem_recorded_pointee(s, src.elem_type, nd_shape.leaf_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
 
     if src.iter_kind == ForIterKind.Unsupported and iter != null
@@ -2006,7 +2006,7 @@ fn narrow_int_llvm(bits: i32) -> StrView
 # nothing, when `v` is no N-D value; a move-only leaf isn't copied either
 # (the old elements would never drop, and `v`'s would drop twice).
 fn emit_nd_whole_assign(s: *EmitterState, stmt: *Stmt, sh: *ArrayShape) -> bool
-    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0 and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+    if sh.leaf_type == TypeKind.Struct and sh.leaf_name.len > 0 and own_type_is_move_only(s, sh.leaf_name)
         return false
     let v: *Expr = stmt.assign_value
     let cra: *Param = call_ret_array(s, v)

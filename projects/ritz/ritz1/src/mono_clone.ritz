@@ -122,8 +122,8 @@ fn template_member_field(mono: *MonoCtx, m: *Module, sname_sv: StrView, e: *Expr
 # array_elem_type_name / var_type_name are unset), so a walk of those never
 # instantiated P$i64 and `gb[1][2].v` fell to "unhandled EXPR_MEMBER".
 fn add_struct_from_array_shape(mono: *MonoCtx, m: *Module, sh: *ArrayShape)
-    if sh != null and sh.leaf_name != null
-        add_struct_from_mangled_name(mono, m, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+    if sh != null and sh.leaf_name.ptr != null
+        add_struct_from_mangled_name(mono, m, sh.leaf_name)
 
 # AGAST #3021: `Option$Slot$i32` / `Result$Two$u8$i64$Slot$i32` are laid out
 # by the emitter, but the instances their arguments name are this module's to
@@ -1871,30 +1871,25 @@ fn ptr_array_arg_param(name_sv: StrView) -> *Param
 # `sh` with a leaf `T` substituted (AGAST #2290).  Shapes are shared, so a change
 # is a copy.
 fn array_shape_subst(sh: *ArrayShape, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView) -> *ArrayShape
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
-    var subst_name: *u8 = subst_name_sv.ptr
-    var subst_len: i32 = subst_name_sv.len as i32
-    if sh == null or sh.leaf_name_len != type_param_len or memcmp(sh.leaf_name, type_param, type_param_len as i64) != 0
+    if sh == null or not sh.leaf_name.eq(type_param_sv)
         return sh
     let out: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
     *out = *sh
     out.leaf_type = subst_type
-    out.leaf_name = subst_name
-    out.leaf_name_len = subst_len
+    out.leaf_name = subst_name_sv
     return out
 
 # AGAST #3119: `sh` with a generic leaf's `$T` rewritten, `[2][3]P<T>` (leaf
 # `P$T`) at T = i64 is leaf `P$i64`.  Shared as it stood, `W$i64.a` named the
 # `%P$T` no struct is, and `w.a[1][2].v` fell to "unhandled EXPR_MEMBER".
 fn array_shape_mangled_subst(mono: *MonoCtx, sh: *ArrayShape, type_param_sv: StrView, suffix_sv: StrView) -> *ArrayShape
-    if sh == null or sh.leaf_name == null or find_dollar_sign(StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }) <= 0
+    if sh == null or sh.leaf_name.ptr == null or find_dollar_sign(sh.leaf_name) <= 0
         return sh
     let out: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
     *out = *sh
     var n: i32 = 0
-    substitute_type_param_in_name(mono, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, type_param_sv, suffix_sv, @out.leaf_name, @n)
-    out.leaf_name_len = n
+    substitute_type_param_in_name(mono, sh.leaf_name, type_param_sv, suffix_sv, @out.leaf_name.ptr, @n)
+    out.leaf_name.len = n as i64
     return out
 
 # A reference param that holds a pointer records what that pointer points at,
@@ -2602,8 +2597,8 @@ fn sizeof_subst_operand(at: *Expr, subst_type: TypeKind, subst_name_sv: StrView)
             # AGAST #3634: `[N][M]E` is N*M values of its leaf E.
             count = shape_leaf_count(a.shape)
             op.type_kind = a.shape.leaf_type
-            leaf_name = a.shape.leaf_name
-            leaf_len = a.shape.leaf_name_len
+            leaf_name = a.shape.leaf_name.ptr
+            leaf_len = a.shape.leaf_name.len as i32
         op.int_val = op.int_val * count as i64
     if op.type_kind == TypeKind.Struct
         op.ident = StrView { ptr: leaf_name, len: leaf_len as i64 }
@@ -3081,23 +3076,22 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
     *cloned = *fields   # AGAST #4680, as clone_struct_fields
     # AGAST #3141: a bare `[2][3]T` leaf, T one of the parameters.
     let sh: *ArrayShape = fields.array_shape
-    if sh != null and sh.leaf_name != null
-        let si: i32 = type_param_index(tp, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+    if sh != null and sh.leaf_name.ptr != null
+        let si: i32 = type_param_index(tp, sh.leaf_name)
         if si >= 0
             var sh_name: *u8 = null
             var sh_len: i32 = 0
             let arg_s: *u8 = suffix + *(starts + si)
             get_type_name_from_suffix(StrView { ptr: (arg_s), len: (*(lens + si)) as i64 }, @sh_name, @sh_len)
-            cloned.array_shape = array_shape_subst(sh, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, parse_type_from_suffix(StrView { ptr: (arg_s), len: (*(lens + si)) as i64 }), StrView { ptr: (sh_name), len: (sh_len) as i64 })
-        else if find_dollar_sign(StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }) > 0
+            cloned.array_shape = array_shape_subst(sh, sh.leaf_name, parse_type_from_suffix(StrView { ptr: (arg_s), len: (*(lens + si)) as i64 }), StrView { ptr: (sh_name), len: (sh_len) as i64 })
+        else if find_dollar_sign(sh.leaf_name) > 0
             # AGAST #3140: a generic leaf, `[2][3]P<T>` (leaf `P$T`) of a
             # `W<T, U>`, its parameters rewritten as array_elem_type_name's are.
             # Shared as it stood, `W$i64$i32.a` named a `%P$T` no struct is.
             let msh: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
             *msh = *sh
-            let msh_sv: StrView = substitute_params_in_mangled(mono, tp, suffix, starts, lens, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
-            msh.leaf_name = msh_sv.ptr
-            msh.leaf_name_len = msh_sv.len as i32
+            let msh_sv: StrView = substitute_params_in_mangled(mono, tp, suffix, starts, lens, sh.leaf_name)
+            msh.leaf_name = msh_sv
             cloned.array_shape = msh
     cloned.ptr_array = ptr_array_unless_generic(fields.ptr_array)  # AGAST #2329
     # AGAST #3151: a struct U may be the parameter; a scalar U is itself.
