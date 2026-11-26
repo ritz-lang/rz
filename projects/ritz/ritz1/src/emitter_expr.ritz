@@ -169,7 +169,7 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
             if mst == null
                 return 0
             let addr: i32 = emit_expr(s, x)
-            let mp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, addr)
+            let mp: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, addr)
             *out_st = mst
             *out_levels = 1
             return mp
@@ -232,7 +232,7 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
         let pp_levels: i32 = ptr_ptr_struct_operand(s, x, @pp_st)
         if pp_levels >= 2
             let pp_val: i32 = emit_expr(s, x)
-            let pp_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, pp_val)
+            let pp_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, pp_val)
             *out_st = pp_st
             *out_levels = pp_levels
             return pp_ptr
@@ -256,7 +256,7 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
             *out_st = b_st
             *out_levels = 1
             return b_val
-        let b_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, b_val)
+        let b_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, b_val)
         *out_st = b_st
         *out_levels = 1
         return b_ptr
@@ -757,7 +757,7 @@ fn member_ptr_of_binary(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     let field: *StructField = get_field_type(st, field_idx)
     # Evaluate the full binary expression to get the pointer
     let ptr_val: i32 = emit_expr(s, e.left)
-    let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, ptr_val)
+    let base_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, ptr_val)
     emit_member_gep_from_ptr(s, result, base_ptr, st, field_idx, field)
 
 # Array element case: struct_array[idx].field
@@ -1030,7 +1030,7 @@ fn emit_ptr_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult
 pub fn emit_ptr_elem_addr(s: *EmitterState, ie: *Expr, st: *StructDef) -> i32
     let ptr_val: i32 = emit_expr(s, ie.left)
     let idx_reg: i32 = emit_expr(s, ie.right)
-    let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, ptr_val)
+    let base_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, ptr_val)
     let elem_ptr: i32 = next_reg(s)
     gep_struct_open(s, elem_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
     format_into(s, ", ptr %.{base_ptr}, i64 %.{idx_reg}\n")
@@ -1144,7 +1144,7 @@ fn emit_enum_tag_test(s: *EmitterState, type_name: StrView, ptr_reg: i32, want_c
     let cmp: i32 = next_reg(s)
     let pred: StrView = if want_carrier then "eq" else "ne"
     format_into(s, "  %.{cmp} = icmp {pred} i8 %.{tag}, 0  ; is_ok/is_err tag check\n")
-    ir_zext_i1_i64(s.out, @s.reg_counter, cmp)
+    ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, cmp)
 
 # =============================================================================
 # Try operator (AGAST #134)
@@ -1164,7 +1164,7 @@ fn result_err_arg(s: *EmitterState, name: StrView) -> StrView
 # tag byte is copied; for a Result the Err payload's bytes are copied field 2
 # to field 2 — E's size when it can be measured, else the smaller payload.
 fn emit_try_err_relayout(s: *EmitterState, inner_slot: i32, inner: StrView) -> i32
-    let out_name: StrView = StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
+    let out_name: StrView = StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }
     let out_ir: String = ir_name(out_name)
     let out: i32 = next_reg(s)
     entry_alloca_reg_begin_named(s, out)
@@ -1206,18 +1206,18 @@ fn emit_try_err_relayout(s: *EmitterState, inner_slot: i32, inner: StrView) -> i
 # registered enum (a user enum or a Result$/Option$ instantiation) names
 # itself; a struct, pointer, ref or absent return is `None`.
 fn try_ret_enum_name(s: *EmitterState) -> StrView
-    if s.fn_ret_type == TypeKind.Struct and s.ret_type_name != null and s.ret_type_name_len > 0
-        let ret_sv: StrView = StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
-        if is_enum_type(s.mono.pctx, ret_sv) == 1 or is_tagged_enum_type(ret_sv) == 1
+    if s.fcx.fn_ret_type == TypeKind.Struct and s.fcx.ret_type_name != null and s.fcx.ret_type_name_len > 0
+        let ret_sv: StrView = StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }
+        if is_enum_type(s.sym.mono.pctx, ret_sv) == 1 or is_tagged_enum_type(ret_sv) == 1
             return ret_sv
     "None"
 
 # ritz0's `fn_ret_type_name` for the Result message: a struct or enum's name,
 # a primitive's keyword (`got i32` for a scalar fn), else `None`.
 fn try_ret_type_name(s: *EmitterState) -> StrView
-    if s.fn_ret_type == TypeKind.Struct and s.ret_type_name != null and s.ret_type_name_len > 0
-        return StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
-    let prim: StrView = primitive_spelling(s.fn_ret_type)
+    if s.fcx.fn_ret_type == TypeKind.Struct and s.fcx.ret_type_name != null and s.fcx.ret_type_name_len > 0
+        return StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }
+    let prim: StrView = primitive_spelling(s.fcx.fn_ret_type)
     if not unnamed(prim)
         return prim
     "None"
@@ -1238,7 +1238,7 @@ fn try_ret_type_name(s: *EmitterState) -> StrView
 fn try_carrier_refused(s: *EmitterState, e: *Expr, carrier: StrView) -> bool
     if unnamed(carrier) or carrier.len <= 0
         return false
-    let ret_sv: StrView = StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
+    let ret_sv: StrView = StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }
 
     if carrier.eq("Option") or carrier.starts_with("Option$")
         # ritz0: the fn must itself return an Option.
@@ -1253,7 +1253,7 @@ fn try_carrier_refused(s: *EmitterState, e: *Expr, carrier: StrView) -> bool
         # §14.2: the fn must return a Result, not just any enum.  #4455's
         # weaker check let a Result operand into an Option- or user-enum-
         # returning fn.
-        if s.fn_ret_type == TypeKind.Struct and s.ret_type_name != null and s.ret_type_name_len > 0
+        if s.fcx.fn_ret_type == TypeKind.Struct and s.fcx.ret_type_name != null and s.fcx.ret_type_name_len > 0
             if ret_sv.starts_with("Result$")
                 # ... and with the same E (tagged_enum_arg splits `Result$T$E`).
                 let op_e: StrView = result_err_arg(s, carrier)
@@ -1270,7 +1270,7 @@ fn try_carrier_refused(s: *EmitterState, e: *Expr, carrier: StrView) -> bool
 
 # The enclosing fn's return type name (no_name() when it has none).
 fn try_fn_ret_sv(s: *EmitterState) -> StrView
-    StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
+    StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }
 
 # The carrier `expr?` unwraps: the inner expression's declared type, else the
 # enclosing fn's return type when the inner is opaque (same type by
@@ -1372,7 +1372,7 @@ fn emit_try_early_return(s: *EmitterState, slot: i32, enum_sv: StrView)
     var ret_slot: i32 = slot
     if is_tagged_enum_type(enum_sv) == 1 and is_tagged_enum_type(ret_sv) == 1 and name_eq(enum_sv, ret_sv) == 0
         ret_slot = emit_try_err_relayout(s, slot, enum_sv)
-    if s.ret_sret == 1
+    if s.fcx.ret_sret == 1
         # AGAST #1730 — never taken today (tagged enums keep their ABI; see
         # struct_ret_uses_sret), but a `ret %T` in an sret fn is invalid IR.
         emit_sret_ret_from_ptr(s, ret_slot)
@@ -1389,7 +1389,7 @@ fn emit_try_early_return(s: *EmitterState, slot: i32, enum_sv: StrView)
 # operand that resolves to an enum is `e as E`, not judged here.  True when refused.
 fn int_as_enum_refused(s: *EmitterState, e: *Expr) -> bool
     let enum_sv: StrView = e.ident
-    if e.type_kind != TypeKind.Struct or e.ident.len <= 0 or enum_find(s.mono.pctx, enum_sv) < 0
+    if e.type_kind != TypeKind.Struct or e.ident.len <= 0 or enum_find(s.sym.mono.pctx, enum_sv) < 0
         return false
     if ty_int_bits(expr_slot_ty(e.left)) == 0
         return false
@@ -1460,7 +1460,7 @@ pub fn call_array_spill(s: *EmitterState, root: *Expr) -> *Expr
     let ra: *Param = call_ret_array(s, call)
     let slot: i32 = emit_call_array_temp(s, call, ra)
     add_local_full(s, name, slot, TypeKind.Array, StrView { ptr: (ra.param_type_name), len: (ra.param_type_name_len) as i64 }, TypeKind.I64, ra.param_array_size, ra.param_array_elem_type)
-    let loc: *LocalVar = local_at(s, s.local_count - 1)
+    let loc: *LocalVar = local_at(s, s.fcx.local_count - 1)
     lv_set_array_elem_pointee(loc, ra.param_array_elem_pointee)
     let id: *Expr = malloc(sizeof(Expr)) as *Expr
     memset(id as *u8, 0, sizeof(Expr))
@@ -1499,7 +1499,7 @@ pub fn emit_array_lit_value(s: *EmitterState, e: *Expr) -> i32
     entry_alloca_reg_end(s)
     emit_array_lit_into(s, sarr, sel_n, TypeKind.Struct, sel_sv, e)
     own_note_array_temp(s, e, sarr)
-    ir_ptrtoint_i64(s.out, @s.reg_counter, sarr)
+    ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, sarr)
 
 # `x as T`: the result register (0 after a refusal).
 pub fn emit_cast_expr(s: *EmitterState, e: *Expr) -> i32
@@ -1570,9 +1570,9 @@ pub fn emit_cast_expr(s: *EmitterState, e: *Expr) -> i32
     if src_is_float and dst_is_float
         # f32 ↔ f64
         if src_ty == TypeKind.F64 and target_ty == TypeKind.F32
-            return ir_fptrunc_f64_f32(s.out, @s.reg_counter, cast_src)
+            return ir_fptrunc_f64_f32(s.ir.out, @s.fcx.reg_counter, cast_src)
         if src_ty == TypeKind.F32 and target_ty == TypeKind.F64
-            return ir_fpext_f32_f64(s.out, @s.reg_counter, cast_src)
+            return ir_fpext_f32_f64(s.ir.out, @s.fcx.reg_counter, cast_src)
         return cast_src
     emit_cast_int_wrap(s, cast_src, src_ty, target_ty)
 

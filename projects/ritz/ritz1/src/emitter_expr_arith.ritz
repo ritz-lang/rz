@@ -93,7 +93,7 @@ fn eq_aggregate_operand(s: *EmitterState, e: *Expr) -> StrView
         name = resolve_expr_struct_name(s, e)
     if unnamed(name) or name.len == 0 or is_tagged_enum_type(name) == 1
         return none
-    let ei: i32 = enum_find(s.mono.pctx, name)
+    let ei: i32 = enum_find(s.sym.mono.pctx, name)
     if ei >= 0
         # A fieldless enum compares its tags (#1660); one with a payload can't.
         if not enum_has_payload(s, ei)
@@ -104,14 +104,14 @@ fn eq_aggregate_operand(s: *EmitterState, e: *Expr) -> StrView
 
 # Does any variant of enum `ei` carry a payload?
 fn enum_has_payload(s: *EmitterState, ei: i32) -> bool
-    for vi in 0..enum_variant_count(s.mono.pctx, ei)
-        if enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
+    for vi in 0..enum_variant_count(s.sym.mono.pctx, ei)
+        if enum_variant_kind(s.sym.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
             return true
     false
 
 # What to do instead of `==` on the aggregate `name`.
 fn aggregate_eq_hint(s: *EmitterState, name: StrView) -> StrView
-    if enum_find(s.mono.pctx, name) >= 0
+    if enum_find(s.sym.mono.pctx, name) >= 0
         return " — a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
     if name_eq(name, "StrView") == 1
         return " — use a.eq(b) from ritzlib.strview"
@@ -309,7 +309,7 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         format_into(s, "  %.{gep_reg} = getelementptr i8, ptr %.{left_as_ptr}, i64 %.{offset_reg}\n")
 
         # ptrtoint back to i64 (unified value model)
-        let ptr_result: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, gep_reg)
+        let ptr_result: i32 = ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, gep_reg)
         return ptr_result
 
     # Float arithmetic / comparison dispatch.  When either operand is a
@@ -367,10 +367,10 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # AGAST #1869: a failing `assert a OP b` prints the two operands, as the
     # i64s this compare reads (not a re-evaluation; see emit_assert_stmt).
     # The float path above records nothing, so its asserts print no values.
-    if e == s.assert_cap_expr
-        s.assert_cap_l = left_reg
-        s.assert_cap_r = scaled_right
-        s.assert_cap_ok = 1
+    if e == s.fcx.assert_cap_expr
+        s.fcx.assert_cap_l = left_reg
+        s.fcx.assert_cap_r = scaled_right
+        s.fcx.assert_cap_ok = 1
 
     # LARB R63 (AGAST #3489): `+ - *` checked; `/ %` and a shift count guarded.
     let checked: i32 = arith_trap_guard(s, e, left_reg, scaled_right)
@@ -385,7 +385,7 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     format_into(s, "  %.{result} = {opcode}%.{left_reg}, %.{scaled_right}\n")
 
     if is_compare(e.op)
-        return ir_zext_i1_i64(s.out, @s.reg_counter, result)
+        return ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, result)
 
     # LARB R63 (AGAST #3486): `+%` / `-%` / `*%` wrap at their operand type.
     # The sum is an i64 like every integer, so a wider slot would otherwise see
@@ -432,7 +432,7 @@ fn int_binop_opcode(op: OpKind, unsigned: bool, shr_unsigned: bool) -> StrView
 # `a and b`, short-circuit: a phi over the two exits.
 fn emit_logical_and(s: *EmitterState, e: *Expr) -> i32
     # Synthetic anchor block — gives us a known predecessor label for
-    # the phi.  s.current_label may be stale at the function entry
+    # the phi.  s.fcx.current_label may be stale at the function entry
     # block (which is named `entry`, not a number), so we can't rely
     # on it being a valid number.  LLVM optimizes the trivial branch
     # away.
@@ -442,7 +442,7 @@ fn emit_logical_and(s: *EmitterState, e: *Expr) -> i32
     let sa_left_val: i32 = emit_expr(s, e.left)
     let sa_left_bool: i32 = next_reg(s)
     format_into(s, "  %.{sa_left_bool} = icmp ne i64 %.{sa_left_val}, 0\n")
-    let sa_entry_label: i32 = s.current_label
+    let sa_entry_label: i32 = s.fcx.current_label
     let sa_right_label: i32 = next_label(s)
     let sa_end_label: i32 = next_label(s)
     format_into(s, "  br i1 %.{sa_left_bool}, label %L{sa_right_label}, label %L{sa_end_label}\n")
@@ -451,8 +451,8 @@ fn emit_logical_and(s: *EmitterState, e: *Expr) -> i32
     let sa_right_val: i32 = emit_expr(s, e.right)
     let sa_right_bool: i32 = next_reg(s)
     format_into(s, "  %.{sa_right_bool} = icmp ne i64 %.{sa_right_val}, 0\n")
-    let sa_right_ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, sa_right_bool)
-    let sa_right_exit: i32 = s.current_label
+    let sa_right_ext: i32 = ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, sa_right_bool)
+    let sa_right_exit: i32 = s.fcx.current_label
     format_into(s, "  br label %L{sa_end_label}\n")
     # End — phi merges short-circuit (false) and full-eval branches.
     begin_block(s, sa_end_label)
@@ -468,7 +468,7 @@ fn emit_logical_or(s: *EmitterState, e: *Expr) -> i32
     let so_left_val: i32 = emit_expr(s, e.left)
     let so_left_bool: i32 = next_reg(s)
     format_into(s, "  %.{so_left_bool} = icmp ne i64 %.{so_left_val}, 0\n")
-    let so_entry_label: i32 = s.current_label
+    let so_entry_label: i32 = s.fcx.current_label
     let so_right_label: i32 = next_label(s)
     let so_end_label: i32 = next_label(s)
     # Inverted: if left truthy, skip right (result already true).
@@ -477,8 +477,8 @@ fn emit_logical_or(s: *EmitterState, e: *Expr) -> i32
     let so_right_val: i32 = emit_expr(s, e.right)
     let so_right_bool: i32 = next_reg(s)
     format_into(s, "  %.{so_right_bool} = icmp ne i64 %.{so_right_val}, 0\n")
-    let so_right_ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, so_right_bool)
-    let so_right_exit: i32 = s.current_label
+    let so_right_ext: i32 = ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, so_right_bool)
+    let so_right_exit: i32 = s.fcx.current_label
     format_into(s, "  br label %L{so_end_label}\n")
     begin_block(s, so_end_label)
     let so_phi: i32 = next_reg(s)
@@ -512,9 +512,9 @@ fn emit_float_binop(s: *EmitterState, e: *Expr, fty_t: TypeKind, left_in: i32, r
         var callee: StrView = "@__ritz_fmod(double "
         if fty_t == TypeKind.F32
             callee = "@__ritz_fmodf(float "
-            s.fmod_helpers_used = s.fmod_helpers_used | 2
+            s.ir.fmod_helpers_used = s.ir.fmod_helpers_used | 2
         else
-            s.fmod_helpers_used = s.fmod_helpers_used | 1
+            s.ir.fmod_helpers_used = s.ir.fmod_helpers_used | 1
         let fmod_r: i32 = next_reg(s)
         format_into(s, "  %.{fmod_r} = call {fty} {callee}%.{left_reg}, {fty} %.{scaled_right})\n")
         return fmod_r
@@ -526,7 +526,7 @@ fn emit_float_binop(s: *EmitterState, e: *Expr, fty_t: TypeKind, left_in: i32, r
     format_into(s, "  %.{result_f} = {opcode}{fty} %.{left_reg}, %.{scaled_right}\n")
     # Comparison ops produce i1 — zext to i64 for unified value model.
     if is_compare(e.op)
-        return ir_zext_i1_i64(s.out, @s.reg_counter, result_f)
+        return ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, result_f)
     result_f
 
 # The float op or ordered compare, as the opcode and its trailing space.
@@ -602,9 +602,9 @@ fn unit_enum_tag_to_i64(s: *EmitterState, operand: *Expr, reg: i32) -> i32
     format_into(s, "  %.{tag} = extractvalue %{en_ir.as_view()} %.{reg}, 0\n")
     # AGAST #4574: a repr enum's tag is its repr type; equality only needs
     # both sides widened alike.
-    let tag_ty: StrView = enum_tag_ty_named(s.mono.pctx, en)
-    let uei: i32 = user_enum_index(s.mono.pctx, en)
-    if uei >= 0 and enum_tag_size(s.mono.pctx, uei) == 8
+    let tag_ty: StrView = enum_tag_ty_named(s.sym.mono.pctx, en)
+    let uei: i32 = user_enum_index(s.sym.mono.pctx, en)
+    if uei >= 0 and enum_tag_size(s.sym.mono.pctx, uei) == 8
         return tag
     let wide: i32 = next_reg(s)
     format_into(s, "  %.{wide} = zext {tag_ty} %.{tag} to i64\n")
@@ -641,7 +641,7 @@ fn ptr_operand_stride(s: *EmitterState, x: *Expr) -> i64
     # Only a StructDef or a user enum (user_enum_size, AGAST #4574: an
     # `enum E: i32` steps 4 bytes) has a size here; get_struct_size_by_name
     # says 8 for a tagged enum, so those keep ptr_arith_elem_size's answer.
-    if pointee.len > 0 and (find_struct(s, pointee) != null or user_enum_index(s.mono.pctx, pointee) >= 0)
+    if pointee.len > 0 and (find_struct(s, pointee) != null or user_enum_index(s.sym.mono.pctx, pointee) >= 0)
         return get_struct_size_by_name(s, pointee)
     ptr_arith_elem_size(s, x)
 
@@ -968,7 +968,7 @@ fn const_scalar_addr_refused(s: *EmitterState, e: *Expr) -> bool
     diag_error_at(emitter_source_file(), e.span)
     let name: StrView = op.ident
     eprint("cannot take the address of const `{name}`; a const scalar has no storage\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     true
 
 # The address of the place `op` names by its own kind, when it is one this
@@ -1003,7 +1003,7 @@ pub fn emit_lvalue_ptr_impl(s: *EmitterState, op: *Expr) -> i32
         var ei_deref: Expr
         elem_index_as_deref(s, op, @ei_sum, @ei_deref)
         let ei_val: i32 = emit_expr(s, @ei_sum)
-        let ei_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, ei_val)
+        let ei_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, ei_val)
         return ei_ptr
     # AGAST #3145: `@x[lo..hi]` is no element, so it has no address.
     if op.kind == ExprKind.Index and op.right != null and op.right.kind == ExprKind.Range
@@ -1068,7 +1068,7 @@ pub fn emit_lvalue_ptr_impl(s: *EmitterState, op: *Expr) -> i32
         let deref_addr: i32 = emit_expr(s, op.operand)
         if deref_operand_is_ptr(s, op.operand) != 0
             return deref_addr
-        let deref_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, deref_addr)
+        let deref_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, deref_addr)
         return deref_ptr
     return -1
 
@@ -1115,7 +1115,7 @@ fn lvalue_ptr_of_index(s: *EmitterState, op: *Expr) -> Option<i32>
         var th: ThroughIndex
         index_through_fill(s, op, through_spill(s, through), @th)
         let th_val: i32 = emit_expr(s, @th.sum)
-        let th_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, th_val)
+        let th_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, th_val)
         return Some(th_ptr)
     # AGAST #2321: ritz0 lowers this at stride `[N]T`, past the end of the
     # array, against its own read; ritz1 stepped by a byte.  Neither (#2330).
@@ -1132,7 +1132,7 @@ fn lvalue_ptr_of_index(s: *EmitterState, op: *Expr) -> Option<i32>
         var pf_deref: Expr
         elem_index_as_deref(s, op, @pf_sum, @pf_deref)
         let pf_val: i32 = emit_expr(s, @pf_sum)
-        let pf_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, pf_val)
+        let pf_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, pf_val)
         return Some(pf_ptr)
     # Handle @arr[i] - address of array element
     match op.left.kind
@@ -1385,7 +1385,7 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             let operand: i32 = emit_expr(s, e.operand)
             let result: i32 = next_reg(s)
             format_into(s, "  %.{result} = icmp eq i64 %.{operand}, 0\n")
-            let ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
+            let ext: i32 = ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, result)
             return ext
         OpKind.Deref => emit_unary_deref(s, e)
         OpKind.Addr => emit_unary_addr(s, e)
@@ -1441,7 +1441,7 @@ fn emit_unary_deref(s: *EmitterState, e: *Expr) -> i32
             # bools are carried in.  (The i64 default read 7 bytes past it.)
             let bval: i32 = next_reg(s)
             emit_load_into(s, "i1", bval, ptr)
-            let bresult: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, bval)
+            let bresult: i32 = ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, bval)
             return bresult
         _ =>
             if ty_int_bits(deref_type) == 8
@@ -1507,7 +1507,7 @@ fn emit_unary_addr(s: *EmitterState, e: *Expr) -> i32
     own_lend_temps(s, e.operand, lend_from)   # AGAST #3050
     if addr_ptr >= 0
         # `@expr` is an i64 in ritz1's value model.
-        let result: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, addr_ptr)
+        let result: i32 = ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, addr_ptr)
         return result
     emit_ir_error_sv(s, e.span, "cannot take address")
     return 0
@@ -1643,7 +1643,7 @@ struct TrapMessage
 fn trap_message(s: *EmitterState, e: *Expr, what: Trap) -> TrapMessage
     let file: StrView = source_base_name()
     let op: StrView = binary_op_spelling(e.op)
-    let newline: StrView = if (s.platform_stop & PSTOP_FREESTANDING) == 0 then "\n" else ""
+    let newline: StrView = if (s.ir.platform_stop & PSTOP_FREESTANDING) == 0 then "\n" else ""
     var text: String = string_new()
     format_into(@&text, "{file}:{e.span.line}:{e.span.col}: {trap_text(what)} `{op}`{newline}")
     TrapMessage { index: intern_string(s, text.as_view()), len: text.len() }
@@ -1838,10 +1838,10 @@ pub fn emit_overflow_helpers(s: *EmitterState)
         format_into(s, "define internal void @__ritz_overflow_trap(ptr %msg, i64 %len) cold noinline noreturn nounwind")
         emit_no_red_zone_attr(s)
         format_into(s, " {{\nentry:\n")
-        if (s.platform_stop & PSTOP_FREESTANDING) != 0
+        if (s.ir.platform_stop & PSTOP_FREESTANDING) != 0
             # A kernel stops through its own hook, as ritz0's _emit_trap
             # does: no exit syscall in its IR (AGAST #4607).
-            s.platform_stop = s.platform_stop | PSTOP_USED
+            s.ir.platform_stop = s.ir.platform_stop | PSTOP_USED
             format_into(s, "  call void @ritz_platform_fatal(ptr %msg, i64 %len, i32 1)\n  unreachable\n}}\n")
         else
             format_into(s, "  %w = call i64 asm sideeffect \"syscall\", \"=&{{rax}},{{rax}},{{rdi}},{{rsi}},{{rdx}},~{{rcx}},~{{r11}},~{{memory}}\"(i64 1, i64 2, ptr %msg, i64 %len)\n  %x = call i64 asm sideeffect \"syscall\", \"=&{{rax}},{{rax}},{{rdi}},~{{rcx}},~{{r11}},~{{memory}}\"(i64 60, i64 1)\n  unreachable\n}}\n")

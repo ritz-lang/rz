@@ -68,7 +68,16 @@ SEMA_TYPE = SRC / "sema_type.ritz"
 # module's stops (is the target a kernel; did a stop call
 # ritz_platform_fatal; did emit_platform_hooks define it).  Lowering state,
 # moved off three module globals so #4454's budget holds.
+#
+# #4697 split it, counting unchanged: the 102 are EmitterState's own fields
+# plus those of its four parts (PARTS), so moving a field between parts is
+# not a new field, and a new one counts wherever it lands.
 MEASURED_FIELDS = 102
+
+# AGAST #4697: EmitterState is these four parts (field -> struct), the
+# dispatch seam and the hooks.  Each part is a struct in emitter_core.ritz.
+PARTS = {"ir": "IrBuf", "fcx": "FnCtx", "sym": "SymTab", "diag": "Diag"}
+TOP_FIELDS = ("own", "emit", "own_before_ret_fn", "ref_cast_reads_referent_fn")
 
 # The three names the superseded acceptance grep counted (101 hits on main).
 # They are lowering state: every file that touches them is emitter-side.
@@ -101,7 +110,20 @@ def _strip_comments(text: str) -> str:
 
 
 def _field_lines() -> dict[str, str]:
-    return _struct_fields(EMITTER_CORE.read_text(), "EmitterState")
+    """Every lowering-state field: EmitterState's own, a part's expanded.
+
+    A part field (`ir: IrBuf`) is not counted itself; its struct's fields are,
+    keyed `ir.out`, so the count is the state, not the grouping (#4697).
+    """
+    text = EMITTER_CORE.read_text()
+    fields: dict[str, str] = {}
+    for name, line in _struct_fields(text, "EmitterState").items():
+        if name in PARTS:
+            for sub, sub_line in _struct_fields(text, PARTS[name]).items():
+                fields[f"{name}.{sub}"] = sub_line
+        else:
+            fields[name] = line
+    return fields
 
 
 def _references(value: str, files: list[Path]) -> list[str]:
@@ -127,6 +149,23 @@ def test_emitterstate_fields_are_frozen_at_the_measured_count():
         f"value_ty_name, sema_levels), not on EmitterState."
     )
     assert len(fields) == len(set(fields)), "duplicate field name in EmitterState"
+
+
+@pytest.mark.unit
+def test_emitterstate_is_its_four_parts_the_seam_and_the_hooks():
+    # AGAST #4697: the 102 fields were one struct.  They are four parts by
+    # lifetime (the module's IR, the fn being emitted, the module's symbols,
+    # what was reported); only the seam and the two hooks stay on top.  A new
+    # field joins a part, not EmitterState itself.
+    own = _struct_fields(EMITTER_CORE.read_text(), "EmitterState")
+    want = [f"{n}: {t}" for n, t in PARTS.items()] + list(TOP_FIELDS)
+    got = [f"{n}: {line.split(':', 1)[1].split('#')[0].strip()}" if n in PARTS else n
+           for n, line in own.items()]
+    assert got == want, (
+        f"emitter_core.ritz: EmitterState's own fields are {got}, expected "
+        f"{want}: a new field belongs in IrBuf / FnCtx / SymTab / Diag (#4697)")
+    for part in PARTS.values():
+        assert _struct_fields(EMITTER_CORE.read_text(), part), f"struct {part} is empty"
 
 
 @pytest.mark.unit
@@ -182,8 +221,9 @@ def test_sema_writes_the_annotation_and_the_emitter_reads_it():
 @pytest.mark.unit
 def test_the_superseded_grep_names_are_lowering_state():
     fields = _field_lines()
+    bare = {k.rsplit(".", 1)[-1] for k in fields}
     for name in GREP_NAMES:
-        assert name in fields, (
+        assert name in bare, (
             f"EmitterState.{name} is gone; the #1816 grep measured lowering "
             f"state, so its deletion needs a new AST annotation, not a delete")
         hits = _references(name, sorted(SRC.glob("*.ritz")))

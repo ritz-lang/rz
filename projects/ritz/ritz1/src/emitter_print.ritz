@@ -74,7 +74,7 @@ fn named(name: StrView) -> bool
     not unnamed(name) and name.len > 0
 
 # A compiler-emitted error at `span`: an IR comment, a stderr line located
-# there (diag, AGAST #3445), and one more on s.error_count (AGAST #1369), so
+# there (diag, AGAST #3445), and one more on s.diag.error_count (AGAST #1369), so
 # ritz1 exits non-zero instead of writing the output.
 fn fmt_error_at(s: *EmitterState, span: SrcSpan, msg: StrView)
     format_into(s, "  ; ERROR: {msg}\n")
@@ -82,7 +82,7 @@ fn fmt_error_at(s: *EmitterState, span: SrcSpan, msg: StrView)
     eprints("ritz1 cannot emit: ")
     eprints(msg)
     eprints("\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # fmt_error_at, at a print literal.
 fn emit_print_error(s: *EmitterState, lit: *Expr, msg: StrView)
@@ -112,7 +112,7 @@ fn emit_spec_error(s: *EmitterState, lit: *Expr, expr: StrView, spec: StrView)
         eprints("` for now")
     eprints("\n")
     format_into(s, "  ; ERROR: format spec\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 fn emit_print_zero(s: *EmitterState) -> i32
     let z: i32 = next_reg(s)
@@ -220,7 +220,7 @@ fn ptrptr_type_name(s: *EmitterState, b: *Expr) -> StrView
 
 # The struct `e` is by value: resolve_expr_struct_name's, else a method call
 # returning one (`{s.as_view()}`, #4533: resolve_expr_struct_name's method
-# arm only sees `s.module.impls`, and String's impl lives in an imported
+# arm only sees `s.sym.module.impls`, and String's impl lives in an imported
 # module), else an element `a[i]` / `p[i]` / `args[i]` (AGAST #4576).
 fn value_struct_name(s: *EmitterState, e: *Expr) -> StrView
     let resolved: StrView = resolve_expr_struct_name(s, e)
@@ -368,7 +368,7 @@ fn fmt_note_slots(s: *EmitterState, e: *Expr)
 
 # interp_parse_expr, with the parsed nodes' slot types noted.
 fn fmt_parse(s: *EmitterState, text: StrView, line: i32, col: i32) -> *Expr
-    let e: *Expr = interp_parse_expr(s.mono.pctx, text, line, col)
+    let e: *Expr = interp_parse_expr(s.sym.mono.pctx, text, line, col)
     if e != null
         fmt_note_slots(s, e)
     e
@@ -537,7 +537,7 @@ fn impl_trait_method(ib: *ImplBlock, tname: StrView, method: StrView) -> *FnDef
 # The first `tname` impl of `type_name` in the module with a `method`; a
 # `concrete` one only (no type parameters) when asked.
 fn module_trait_method(s: *EmitterState, type_name: StrView, tname: StrView, method: StrView, concrete: bool) -> *FnDef
-    var ib: *ImplBlock = s.module.impls
+    var ib: *ImplBlock = s.sym.module.impls
     while ib != null
         if (not concrete or ib.type_params == null) and name_eq(StrView { ptr: ib.type_name, len: ib.type_name_len as i64 }, type_name) == 1
             let m: *FnDef = impl_trait_method(ib, tname, method)
@@ -712,7 +712,7 @@ fn fmt_explicit_writer(s: *EmitterState, writer_expr: *Expr, sink: *PrintSink, s
     alloca_at(s, slot, "ptr", "write/writeln Writer")
     var wp: i32 = v
     if t != TypeKind.MutRef
-        wp = ir_inttoptr_ptr(s.out, @s.reg_counter, v)
+        wp = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, v)
     format_into(s, "  store ptr %.{wp}, ptr %.{slot}\n")
     let name: StrView = fmt_name("wptr")
     add_local_struct(s, name, slot, TypeKind.MutRef, writer_type())
@@ -739,7 +739,7 @@ fn fmt_sink_write_ptr(s: *EmitterState, sink: *PrintSink, ptr: i32, len: i32) ->
         SinkKind.Writer => writer_write(s, sink, ptr, len)
 
 fn fd_write(s: *EmitterState, fd: i64, ptr: i32, len: i32) -> i32
-    let pi: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, ptr)
+    let pi: i32 = ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, ptr)
     let r: i32 = next_reg(s)
     let write: StrView = syscall_write_asm()
     format_into(s, "  %.{r} = {write}(i64 1, i64 {fd}, i64 %.{pi}, i64 %.{len})\n")
@@ -758,7 +758,7 @@ fn writer_write(s: *EmitterState, sink: *PrintSink, ptr: i32, len: i32) -> i32
     format_into(s, "  %.{sp} = getelementptr %Writer, ptr %.{w}, i32 0, i32 {isink}\n")
     let sf: i32 = next_reg(s)
     format_into(s, "  %.{sf} = load ptr, ptr %.{sp}\n")
-    let di: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, ptr)
+    let di: i32 = ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, ptr)
     let got: i32 = next_reg(s)
     format_into(s, "  %.{got} = call i64 %.{sf}(ptr %.{w}, i64 %.{di}, i64 %.{len})\n")
     let lp: i32 = next_reg(s)
@@ -811,7 +811,7 @@ fn fmt_strview_parts(s: *EmitterState, e: *Expr, view: ViewOf) -> ByteRegs
     let ty: String = ir_name(view.name)
     var v: i32 = 0
     if view.form == ViewForm.Pointer
-        let p: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, emit_expr(s, e))
+        let p: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, emit_expr(s, e))
         v = next_reg(s)
         format_into(s, "  %.{v} = load %{ty.as_view()}, ptr %.{p}\n")
     else
@@ -829,10 +829,10 @@ fn view_fields(s: *EmitterState, ty: StrView, v: i32) -> ByteRegs
 # A NUL-terminated pointer (an i64 value): strlen, then one write. The
 # strlen helper is emit_format_helpers' (`i64 @__ritz_fmt_strlen(ptr)`).
 fn fmt_write_cstr(s: *EmitterState, sink: *PrintSink, v: i32) -> i32
-    let p: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, v)
+    let p: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, v)
     let n: i32 = next_reg(s)
     format_into(s, "  %.{n} = call i64 @__ritz_fmt_strlen(ptr %.{p})\n")
-    s.fmt_helpers_used = 1
+    s.ir.fmt_helpers_used = 1
     fmt_sink_write_ptr(s, sink, p, n)
 
 # A bool or an integer in its intrinsic form, the scalars Display and Debug
@@ -1137,7 +1137,7 @@ fn emit_format_literal(s: *EmitterState, k: *FmtSink, lit: *Expr) -> i32
 # The helpers the print paths call. Emitted once, after the functions, by a
 # module that used any of them.
 pub fn emit_print_helpers(s: *EmitterState)
-    if s.print_helpers_used == 0 and not g_fmt_writer_used
+    if s.ir.print_helpers_used == 0 and not g_fmt_writer_used
         return
     let write: StrView = syscall_write_asm()
     format_into(s, "\n; print interpolation helpers (AGAST #1521, #4381), as ritz0's _emit_print_value\n")
@@ -1270,27 +1270,27 @@ fn assert_file_base() -> StrView
     StrView { ptr: path.ptr + start, len: path.len - start }
 
 fn assert_file_str(s: *EmitterState) -> i32
-    if s.assert_file_str < 0
-        s.assert_file_str = add_string(s, assert_file_base())
-    s.assert_file_str
+    if s.ir.assert_file_str < 0
+        s.ir.assert_file_str = add_string(s, assert_file_base())
+    s.ir.assert_file_str
 
 # write(2, data, len) for bytes known at compile time.
 fn assert_write(s: *EmitterState, data: StrView)
     if data.len <= 0
         return
     let idx: i32 = add_string(s, data)
-    s.print_helpers_used = 1
+    s.ir.print_helpers_used = 1
     format_into(s, "  call void @__ritz_print_bytes(i64 2, i64 ptrtoint (ptr @.str.{idx} to i64), i64 {data.len})\n")
 
 # The value in i64 register `reg`, printed as `kind` says.
 fn assert_write_reg(s: *EmitterState, reg: i32, kind: AssertVal)
-    s.assert_helpers_used = 1
+    s.ir.assert_helpers_used = 1
     let code: i64 = assert_val_code(kind)
     format_into(s, "  call void @__ritz_assert_val(i64 %.{reg}, i64 {code})\n")
 
 # A line number known at compile time, printed signed.
 fn assert_write_line(s: *EmitterState, line: i32)
-    s.assert_helpers_used = 1
+    s.ir.assert_helpers_used = 1
     let code: i64 = assert_val_code(AssertVal.Signed)
     format_into(s, "  call void @__ritz_assert_val(i64 {line as i64}, i64 {code})\n")
 
@@ -1372,11 +1372,11 @@ fn assert_message(stmt: *Stmt) -> StrView
 # [[test_helper]] reached through it reports that location; helpers do not
 # record, so through any depth of helpers the line stays the test's.
 pub fn record_assert_site(s: *EmitterState, e: *Expr)
-    if s.fn_assert_kind != ASSERT_FN_TEST
+    if s.fcx.fn_assert_kind != ASSERT_FN_TEST
         return
     let idx: i32 = assert_file_str(s)
     let base_len: i64 = assert_file_base().len
-    s.assert_site_used = 1
+    s.ir.assert_site_used = 1
     format_into(s, "  store ptr @.str.{idx}, ptr @__ritz_assert_site_file\n")
     format_into(s, "  store i64 {base_len}, ptr @__ritz_assert_site_file_len\n")
     format_into(s, "  store i64 {e.span.line as i64}, ptr @__ritz_assert_site_line\n")
@@ -1390,10 +1390,10 @@ fn assert_placement_error(s: *EmitterState, stmt: *Stmt)
         # `main` for an adapted main (#4018), else up to a generic's `$`.
         eprint_bytes(fn_display_name(f).slice(0, assert_fn_source_name(f).len))
     eprints("'\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 pub fn emit_assert_stmt(s: *EmitterState, stmt: *Stmt)
-    if s.fn_assert_kind == ASSERT_FN_PLAIN
+    if s.fcx.fn_assert_kind == ASSERT_FN_PLAIN
         assert_placement_error(s, stmt)
         return
     let c: *Expr = stmt.if_cond
@@ -1402,16 +1402,16 @@ pub fn emit_assert_stmt(s: *EmitterState, stmt: *Stmt)
     # evaluating anything twice.
     var shown: AssertShown = assert_shown_of(s, c)
     if not unnamed(shown.op)
-        s.assert_cap_expr = c
-        s.assert_cap_ok = 0
+        s.fcx.assert_cap_expr = c
+        s.fcx.assert_cap_ok = 0
     let cond: i32 = emit_expr(s, c)
-    s.assert_cap_expr = null
-    if s.assert_cap_ok == 0
+    s.fcx.assert_cap_expr = null
+    if s.fcx.assert_cap_ok == 0
         shown.op = no_name()
-    shown.left_reg = s.assert_cap_l
-    shown.right_reg = s.assert_cap_r
+    shown.left_reg = s.fcx.assert_cap_l
+    shown.right_reg = s.fcx.assert_cap_r
     let ok: i32 = assert_branch(s, cond)
-    if (s.platform_stop & PSTOP_FREESTANDING) != 0
+    if (s.ir.platform_stop & PSTOP_FREESTANDING) != 0
         assert_fatal_stop(s, stmt, shown)
     else
         assert_report(s, stmt, shown)
@@ -1430,7 +1430,7 @@ fn assert_branch(s: *EmitterState, cond: i32) -> i32
 
 # A hosted failing assert: the report on fd 2, then exit(1).
 fn assert_report(s: *EmitterState, stmt: *Stmt, shown: AssertShown)
-    let helper: bool = s.fn_assert_kind == ASSERT_FN_HELPER
+    let helper: bool = s.fcx.fn_assert_kind == ASSERT_FN_HELPER
     if helper
         assert_write_site_loc(s, stmt.span.line)
     else
@@ -1469,7 +1469,7 @@ fn assert_report(s: *EmitterState, stmt: *Stmt, shown: AssertShown)
 # A [[test_helper]]'s location: the call site the running [[test]] recorded,
 # else (no test recorded one) the assert's own.
 fn assert_write_site_loc(s: *EmitterState, line: i32)
-    s.assert_site_used = 1
+    s.ir.assert_site_used = 1
     let l_site: i32 = next_label(s)
     let l_own: i32 = next_label(s)
     let l_head: i32 = next_label(s)
@@ -1483,7 +1483,7 @@ fn assert_write_site_loc(s: *EmitterState, line: i32)
     format_into(s, "  %.{fp_r} = load i64, ptr @__ritz_assert_site_file\n")
     let fl_r: i32 = next_reg(s)
     format_into(s, "  %.{fl_r} = load i64, ptr @__ritz_assert_site_file_len\n")
-    s.print_helpers_used = 1
+    s.ir.print_helpers_used = 1
     format_into(s, "  call void @__ritz_print_bytes(i64 2, i64 %.{fp_r}, i64 %.{fl_r})\n")
     assert_write(s, ":")
     assert_write_reg(s, line_r, AssertVal.Signed)
@@ -1497,7 +1497,7 @@ fn assert_write_site_loc(s: *EmitterState, line: i32)
 # `ritz_platform_fatal(@.str.<idx>, <len>, 1)`, then `unreachable`: a
 # freestanding stop with a constant message.
 fn emit_platform_fatal_str(s: *EmitterState, idx: i32, len: i64)
-    s.platform_stop = s.platform_stop | PSTOP_USED
+    s.ir.platform_stop = s.ir.platform_stop | PSTOP_USED
     format_into(s, "  call void @ritz_platform_fatal(ptr @.str.{idx}, i64 {len}, i32 1)\n")
     format_into(s, "  unreachable\n")
 
@@ -1527,12 +1527,12 @@ fn assert_fatal_stop(s: *EmitterState, stmt: *Stmt, shown: AssertShown)
 # binary; ritz0 defines the same symbols) and @__ritz_assert_val, the value
 # printer: ritz0's _get_assert_val_fn instruction for instruction.
 pub fn emit_assert_helpers(s: *EmitterState)
-    if s.assert_site_used == 1
+    if s.ir.assert_site_used == 1
         format_into(s, "\n; assert call-site globals (AGAST #1869)\n")
         format_into(s, "@__ritz_assert_site_file = weak global ptr null\n")
         format_into(s, "@__ritz_assert_site_file_len = weak global i64 0\n")
         format_into(s, "@__ritz_assert_site_line = weak global i64 0\n")
-    if s.assert_helpers_used == 0
+    if s.ir.assert_helpers_used == 0
         return
     let write: StrView = syscall_write_asm()
     format_into(s, "\n; assert value printer (AGAST #1869): kind 0 signed, 1 unsigned, 2 0x-hex, 3 bool\n")
@@ -1618,21 +1618,21 @@ pub fn emit_match_no_variant_trap(s: *EmitterState, enum_name_sv: StrView, slot:
     let text: StrView = head.as_view()
     let idx: i32 = intern_string(s, text)
 
-    let ei: i32 = user_enum_index(s.mono.pctx, enum_name_sv)
-    let tag_ty: StrView = llvm_text(enum_tag_llvm(s.mono.pctx, ei))
-    let signed: bool = enum_tag_signed(s.mono.pctx, ei) == 1
+    let ei: i32 = user_enum_index(s.sym.mono.pctx, enum_name_sv)
+    let tag_ty: StrView = llvm_text(enum_tag_llvm(s.sym.mono.pctx, ei))
+    let signed: bool = enum_tag_signed(s.sym.mono.pctx, ei) == 1
     let tag_ptr: i32 = next_reg(s)
     gep_struct_open(s, tag_ptr, enum_name_sv)
     format_into(s, ", ptr %.{slot}, i32 0, i32 0\n")
     let tag: i32 = next_reg(s)
     format_into(s, "  %.{tag} = load {tag_ty}, ptr %.{tag_ptr}\n")
     var wide: i32 = tag
-    if ty_int_bits(enum_repr(s.mono.pctx, ei)) < 64
+    if ty_int_bits(enum_repr(s.sym.mono.pctx, ei)) < 64
         wide = next_reg(s)
         let extend: StrView = if signed then "sext" else "zext"
         format_into(s, "  %.{wide} = {extend} {tag_ty} %.{tag} to i64\n")
     g_match_trap_used = true
-    s.sret_helpers_used = 1   # the helper copies with @__ritz_sret_copy
+    s.ir.sret_helpers_used = 1   # the helper copies with @__ritz_sret_copy
     let sign_arg: i64 = if signed then 1 else 0
     format_into(s, "  call void @__ritz_match_trap(ptr @.str.{idx}, i64 {text.len}, i64 %.{wide}, i64 {sign_arg})\n")
 
@@ -1645,7 +1645,7 @@ pub fn emit_match_trap_helper(s: *EmitterState)
     if not g_match_trap_used
         return
     g_match_trap_used = false
-    let free: bool = (s.platform_stop & PSTOP_FREESTANDING) != 0
+    let free: bool = (s.ir.platform_stop & PSTOP_FREESTANDING) != 0
     format_into(s, "\n; match with no arm for a repr enum's value (AGAST #4586)\n")
     if free
         format_into(s, "@.ritz_match_tail = private unnamed_addr constant [17 x i8] c\" names no variant\"\n")
@@ -1692,7 +1692,7 @@ pub fn emit_match_trap_helper(s: *EmitterState)
     format_into(s, "  call void @__ritz_sret_copy(ptr %td, ptr @.ritz_match_tail, i64 {tail_len})\n")
     format_into(s, "  %len = add i64 %at, {tail_len}\n")
     if free
-        s.platform_stop = s.platform_stop | PSTOP_USED
+        s.ir.platform_stop = s.ir.platform_stop | PSTOP_USED
         format_into(s, "  call void @ritz_platform_fatal(ptr %buf, i64 %len, i32 1)\n")
         format_into(s, "  unreachable\n}}\n")
         return
@@ -1756,7 +1756,7 @@ fn fmt_error(s: *EmitterState, at: *Expr, name: StrView, msg: StrView)
         eprints("' ")
     eprints(msg)
     eprints("\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 fn fmt_is_ptr_type(t: TypeKind) -> bool
     t == TypeKind.Ptr or t == TypeKind.Ref or t == TypeKind.MutRef
@@ -1913,7 +1913,7 @@ fn emit_fmt_int(s: *EmitterState, e: *Expr, ty: TypeKind) -> ByteRegs
     format_into(s, "  %.{p} = getelementptr i8, ptr %.{buf}, i64 %.{start}\n")
     let n: i32 = next_reg(s)
     format_into(s, "  %.{n} = sub i64 20, %.{start}\n")
-    s.fmt_helpers_used = 1
+    s.ir.fmt_helpers_used = 1
     ByteRegs { ptr: p, len: n }
 
 # Append a view's `len` bytes from its `ptr`: loaded first through a pointer
@@ -1938,7 +1938,7 @@ fn fmt_push_bool(s: *EmitterState, k: *FmtSink, e: *Expr)
     format_into(s, "  %.{p} = select i1 %.{b}, ptr @.ritz_fmt_true, ptr @.ritz_fmt_false\n")
     let n: i32 = next_reg(s)
     format_into(s, "  %.{n} = select i1 %.{b}, i64 4, i64 5\n")
-    s.fmt_helpers_used = 1
+    s.ir.fmt_helpers_used = 1
     fmt_push(s, k, p, len_in(n))
 
 # Append the NUL-terminated bytes a pointer value points at.
@@ -1947,7 +1947,7 @@ fn fmt_push_cstr(s: *EmitterState, k: *FmtSink, e: *Expr)
     let sp: i32 = i64_value_to_ptr(s, e, v)
     let sn: i32 = next_reg(s)
     format_into(s, "  %.{sn} = call i64 @__ritz_fmt_strlen(ptr %.{sp})\n")
-    s.fmt_helpers_used = 1
+    s.ir.fmt_helpers_used = 1
     fmt_push(s, k, sp, len_in(sn))
 
 # Append the formatted value of placeholder `e`: as print's table, except
@@ -2033,7 +2033,7 @@ pub fn emit_format_into(s: *EmitterState, e: *Expr) -> i32
 # _format_strlen_helper define the same functions. "no-builtins" keeps
 # clang from turning the strlen loop into a libc call.
 pub fn emit_format_helpers(s: *EmitterState)
-    if s.fmt_helpers_used == 0
+    if s.ir.fmt_helpers_used == 0
         return
     format_into(s, "\n; format_into helpers (AGAST #1824), as ritz0's _format_int_helper\n")
     # Decimal digits back to front, ending at buf[20]; returns the first

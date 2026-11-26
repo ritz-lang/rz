@@ -130,9 +130,9 @@ pub fn local_field_nd_shape(s: *EmitterState, stmt: *Stmt) -> *ArrayShape
 # type so its phi, every arm and the slot / `ret` agree.  emit_match and
 # emit_if_expr consume the hint on entry.
 pub fn set_match_float_hint(s: *EmitterState, e: *Expr, ty: TypeKind, ty_name: StrView)
-    s.match_float_hint = TypeKind.Void
+    s.fcx.match_float_hint = TypeKind.Void
     if e != null and (e.kind == ExprKind.Match or e.kind == ExprKind.If)
-        s.match_float_hint = slot_float_type(ty, ty_name)
+        s.fcx.match_float_hint = slot_float_type(ty, ty_name)
 
 # TypeKind.F32 / TypeKind.F64 when a slot of type (ty, ty_name) is a float, else Void.
 pub fn slot_float_type(ty: TypeKind, ty_name: StrView) -> TypeKind
@@ -145,14 +145,14 @@ pub fn slot_float_type(ty: TypeKind, ty_name: StrView) -> TypeKind
     TypeKind.Void
 
 # AGAST #3205: the fn's tail statement is a match and the fn returns a struct
-# or enum (`ret_type`, named s.ret_type_name): if no arm yields a value (every
+# or enum (`ret_type`, named s.fcx.ret_type_name): if no arm yields a value (every
 # arm `return`s), the match's phi is typed as that, which the implicit `ret`
 # names, not i64.  emit_match_arms consumes the hint.
 pub fn set_match_agg_hint(s: *EmitterState, ret_type: TypeKind)
     if ret_type != TypeKind.Struct
         return
-    s.match_agg_hint = s.ret_type_name
-    s.match_agg_hint_len = s.ret_type_name_len
+    s.fcx.match_agg_hint = s.fcx.ret_type_name
+    s.fcx.match_agg_hint_len = s.fcx.ret_type_name_len
 
 # AGAST #2388: a struct the iterable form walks through its header: a Vec<T>,
 # a Span<T> or a StrView.  ritz0 takes any struct opening with a pointer and
@@ -194,7 +194,7 @@ pub fn for_header_elem(s: *EmitterState, st: *StructDef, out: *ForElem) -> bool
             # its layout (#1797), bound as a struct element is.  AGAST #3647:
             # and an Option / Result instance (`%Option$i64`), at the layout
             # tagged_enum_layout gives it, as ptr_pointee_size strides it (#1578).
-            if find_struct(s, data_name) == null and user_enum_index(s.mono.pctx, data_name) < 0 and is_tagged_enum_type(data_name) == 0
+            if find_struct(s, data_name) == null and user_enum_index(s.sym.mono.pctx, data_name) < 0 and is_tagged_enum_type(data_name) == 0
                 return false
             out.elem = TypeKind.Struct
             out.name = data.field_type_name
@@ -433,7 +433,7 @@ fn sret_copy_open(s: *EmitterState, dst_ptr: i32, src_ptr: i32)
 
 fn sret_copy_close(s: *EmitterState)
     format_into(s, ", ptr null, i32 1) to i64))\n")
-    s.sret_helpers_used = 1
+    s.ir.sret_helpers_used = 1
 
 # Copy `[N x T]` (spelled for `field`) from `src_ptr` over `dst_ptr` as one
 # aggregate load + store: every element is read before any is written.
@@ -611,9 +611,9 @@ pub fn if_stmt_arm_agg(s: *EmitterState, list: *Stmt) -> StrView
     let last: *Stmt = last_stmt(list)
     match last.kind
         StmtKind.If =>
-            return StrView { ptr: s.last_if_stmt_agg_name, len: s.last_if_stmt_agg_name_len as i64 }
+            return StrView { ptr: s.fcx.last_if_stmt_agg_name, len: s.fcx.last_if_stmt_agg_name_len as i64 }
         StmtKind.Match =>
-            return StrView { ptr: s.last_match_agg_name, len: s.last_match_agg_name_len as i64 }
+            return StrView { ptr: s.fcx.last_match_agg_name, len: s.fcx.last_match_agg_name_len as i64 }
         StmtKind.Expr =>
             if last.expr != null
                 return expr_arm_agg(s, last.expr)
@@ -673,14 +673,14 @@ pub fn if_stmt_arm_float_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: St
     if last.kind == StmtKind.Expr and last.expr != null
         return match_arm_float_settle(s, last.expr, reg, fr)
     if last.kind == StmtKind.If or last.kind == StmtKind.Match
-        return float_arm_settle(s, s.last_match_float_ty, null, last.span, reg, fr)
+        return float_arm_settle(s, s.fcx.last_match_float_ty, null, last.span, reg, fr)
     reg
 
 # True if the statement `if` `stmt` has no value to give: a statement follows
-# it, or its list's value is unread (s.if_stmt_discarded).  Consumes the mark.
+# it, or its list's value is unread (s.fcx.if_stmt_discarded).  Consumes the mark.
 pub fn if_stmt_is_discarded(s: *EmitterState, stmt: *Stmt) -> bool
-    let marked: *Stmt = s.if_stmt_discarded
-    s.if_stmt_discarded = null
+    let marked: *Stmt = s.fcx.if_stmt_discarded
+    s.fcx.if_stmt_discarded = null
     stmt.next != null or stmt == marked
 
 # AGAST #3323: an arm's phi incoming.  An arm that never reaches the merge (a
@@ -718,9 +718,9 @@ fn phi_zero(agg: StrView, float_ty: TypeKind) -> StrView
 # `ret`: a `"..."` arm is a %Span$u8 (#98) but a `-> StrView` fn returns
 # %StrView.  Any other type is `agg` itself.
 pub fn if_stmt_phi_type(s: *EmitterState, agg: StrView, ret_type: TypeKind) -> StrView
-    if agg.len <= 0 or ret_type != TypeKind.Struct or s.ret_type_name_len <= 0
+    if agg.len <= 0 or ret_type != TypeKind.Struct or s.fcx.ret_type_name_len <= 0
         return agg
-    let ret_name: StrView = StrView { ptr: s.ret_type_name, len: s.ret_type_name_len as i64 }
+    let ret_name: StrView = StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 }
     if is_layout_equiv_pair(agg, ret_name) == 1
         return ret_name
     agg
@@ -785,11 +785,11 @@ fn emit_loop_jump(s: *EmitterState, target: i32)
 
 # `break`, running the defers of the scopes it leaves.
 pub fn emit_break_stmt(s: *EmitterState, stmt: *Stmt)
-    emit_loop_jump(s, s.break_label)
+    emit_loop_jump(s, s.fcx.break_label)
 
 # `continue`, running the defers of the scopes it leaves.
 pub fn emit_continue_stmt(s: *EmitterState, stmt: *Stmt)
-    emit_loop_jump(s, s.continue_label)
+    emit_loop_jump(s, s.fcx.continue_label)
 
 
 
@@ -856,7 +856,7 @@ struct ArrayInto
 # completes, which is immediately before this is asked.
 pub fn match_arm_float_ty(s: *EmitterState, e: *Expr) -> TypeKind
     if e.kind == ExprKind.Match or e.kind == ExprKind.If
-        return s.last_match_float_ty
+        return s.fcx.last_match_float_ty
     binop_operand_float_ty(s, e)
 
 # AGAST #1946: settle a scalar arm's value against the phi's float type.  A

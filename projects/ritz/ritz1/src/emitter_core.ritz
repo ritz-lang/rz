@@ -69,7 +69,7 @@ struct NarrowDecl
 # splice_deferred_struct_loads); a record used for neither is a dead load and
 # is dropped as a dead load (#3952).
 #
-# `off` is an offset into s.out, i.e. into the function body being emitted.
+# `off` is an offset into s.ir.out, i.e. into the function body being emitted.
 # It is shifted when splice_entry_allocas inserts the entry-block buffer.
 const DLOAD_PENDING: i32 = 0
 const DLOAD_KEEP: i32 = 1
@@ -77,7 +77,7 @@ const DLOAD_DROPPED: i32 = 2
 
 struct DeferredLoad
     reg: i32          # the load's result register (already burned)
-    off: i64          # s.out offset the line belongs at
+    off: i64          # s.ir.out offset the line belongs at
     src_reg: i32      # `ptr %.N` source, or -1 when it is a named global
     src_name: *u8     # `ptr @<name>` source when src_reg < 0
     src_name_len: i32
@@ -86,7 +86,10 @@ struct DeferredLoad
     state: i32
     used: i32         # 1 once the IR referenced the register as an operand
 
-struct EmitterState
+# AGAST #4697 — the module's IR as it is written: the output String and its
+# entry-block redirect, the deferred loads, and the per-module sets of what
+# has been emitted or must be defined at the module tail (EmitterState.ir).
+struct IrBuf
     # The IR text.  A String drawn from the module's Arena (main.ritz), written
     # through format_into(s, "...") (EmitterState.push_bytes).  Points at
     # entry_allocas while a redirect is in effect (#4460).
@@ -95,8 +98,8 @@ struct EmitterState
     # (buffer offset, source span) of each (frame_limit still locates the
     # largest one).  Written by entry_alloca_begin / entry_alloca and spliced
     # after `entry:` by splice_entry_allocas when the body is complete; a
-    # DYNAMIC alloca (`alloca i8, i64 %.N`) is still written to s.out.
-    # entry_out_saved is s.out while a redirect is in effect.
+    # DYNAMIC alloca (`alloca i8, i64 %.N`) is still written to s.ir.out.
+    # entry_out_saved is s.ir.out while a redirect is in effect.
     entry_allocas: *String   # in the module's arena, like `out`
     ea_marks: *FrameMark
     ea_count: i32
@@ -108,19 +111,6 @@ struct EmitterState
     dloads: *DeferredLoad
     dload_count: i32
     dload_cap: i32
-    reg_counter: i32
-    label_counter: i32
-    # Heap array of `locals_cap` LocalVars (AGAST #1905); index it with
-    # local_at.  Grown by add_local_full; never shrinks across fns.
-    locals: *LocalVar
-    locals_cap: i32
-    local_count: i32
-    break_label: i32
-    continue_label: i32
-    module: *Module
-    # Monomorphisation's tables: a generic enum first named at emission is
-    # recorded there (add_enum_instance; AGAST #4454, they were globals).
-    mono: *MonoCtx
     # String literals; entry i is emitted as @.str.i (AGAST #1905).
     strings: NameList
     externs: NameList
@@ -136,6 +126,48 @@ struct EmitterState
     late_tuples: NameList
     emitted_fns: NameList
     emitted_globals: NameList
+    # 1 once any sret copy/zero is emitted: emit_sret_helpers then defines
+    # @__ritz_sret_copy / @__ritz_sret_zero for this module.
+    sret_helpers_used: i32
+    # Bit 1 / bit 2 once float `%` calls @__ritz_fmod / @__ritz_fmodf: see
+    # emit_fmod_helpers (AGAST #3817).
+    fmod_helpers_used: i32
+    # AGAST #1521 — 1 once a print interpolation has called one of the
+    # @__ritz_print_* helpers; emit_module then defines them.
+    print_helpers_used: i32
+    # AGAST #1824 — 1 once a format_into has called @__ritz_fmt_int /
+    # @__ritz_fmt_strlen; emit_module then defines them.
+    fmt_helpers_used: i32
+    # AGAST #1869 — assert lowering (FnCtx has the per-fn half).
+    # assert_helpers_used / assert_site_used: emit_module then defines
+    # @__ritz_assert_val / the @__ritz_assert_site_* globals.
+    # assert_file_str: @.str index of the source file's basename, or -1.
+    assert_helpers_used: i32
+    assert_site_used: i32
+    assert_file_str: i32
+    # AGAST #4607 — freestanding stops: PSTOP_* bits.  emit_module sets
+    # PSTOP_FREESTANDING from `--target` (a kernel's traps and failing
+    # asserts stop through ritz_platform_fatal, never an exit syscall); each
+    # such call sets PSTOP_USED, and emit_platform_hooks sets PSTOP_DEFINED
+    # when it defines the weak hook, so the module tail declares it only
+    # when needed (emit_platform_fatal_decl).
+    platform_stop: i32
+
+# AGAST #4697 — the fn being emitted: registers and labels, locals, the
+# context hints a nested expression reads, and the per-fn tables (narrowing,
+# frame marks, packed marks).  Reset at each fn's start; its grown buffers
+# (locals, packed marks, frame marks) are kept for the next fn
+# (EmitterState.fcx).
+struct FnCtx
+    reg_counter: i32
+    label_counter: i32
+    # Heap array of `locals_cap` LocalVars (AGAST #1905); index it with
+    # local_at.  Grown by add_local_full; never shrinks across fns.
+    locals: *LocalVar
+    locals_cap: i32
+    local_count: i32
+    break_label: i32
+    continue_label: i32
     # Track last expression value for if/else phi nodes
     last_expr_reg: i32
     # ritz-task-1309 — the block that DEFINED `last_expr_reg`.
@@ -143,7 +175,7 @@ struct EmitterState
     # `last_expr_reg` on its own is just "some register"; it carries no record
     # of where it was produced.  Phi emission needs both halves — the incoming
     # value AND the predecessor block it flows from — and it used to pair
-    # `last_expr_reg` with `s.current_label`, silently assuming the two agree.
+    # `last_expr_reg` with `s.fcx.current_label`, silently assuming the two agree.
     # They disagree whenever the value was produced in a *nested* block that
     # the insertion point has since moved past (an inner `if`'s then-block, a
     # loop body).  The result was `phi i64 [ %x, %L20 ]` where %x is neither
@@ -174,12 +206,6 @@ struct EmitterState
     # was loaded from, so `return f()` copies the slot instead of the value.
     sret_last_val: i32
     sret_last_slot: i32
-    # 1 once any sret copy/zero is emitted: emit_sret_helpers then defines
-    # @__ritz_sret_copy / @__ritz_sret_zero for this module.
-    sret_helpers_used: i32
-    # Bit 1 / bit 2 once float `%` calls @__ritz_fmod / @__ritz_fmodf: see
-    # emit_fmod_helpers (AGAST #3817).
-    fmod_helpers_used: i32
     # Tagged-enum context for variant constructors (ritz-task-133).
     # When non-null, `Some(x)` / `Ok(x)` / `None` / `Err(x)` allocas use this
     # struct name instead of falling back to `ret_type_name`.  Set by
@@ -259,40 +285,14 @@ struct EmitterState
     # match / if is, so an enclosing match reports the void call itself.
     void_arm_line: i32
     void_arm_col: i32
-    # ritz-task-193 — O(1) symbol lookups.
+    # ritz-task-193 — O(1) local lookup (SymTab has the other four maps).
     # `local_map`  : fnv1a(name)  -> i32 index into `locals[]`.  Cleared at
     #                each fn/method start (because `local_count` resets to 0)
     #                and rebuilt by emit_match_arm_body after scope unwind.
     #                Shadowing: insert overwrites; outer bindings re-found via
     #                the array-scan fallback when the map points to a stale
     #                (idx >= local_count) or name-mismatched entry.
-    # `global_map` : fnv1a(name)  -> *GlobalVarDef  (cast to i64).  Built once
-    #                per emit_module from `m.globals` after monomorphization.
-    # `fn_map`     : fnv1a(name)  -> *FnDef         (first-occurrence wins to
-    #                preserve linked-list head-first semantics).
-    # `struct_map` : fnv1a(name)  -> *StructDef     (first-occurrence wins).
-    # `const_map`  : fnv1a(name)  -> *ConstEntry    (first-occurrence wins).
-    # All five replace linear-scan symbol lookups that made ritz1 5.7×
-    # slower than ritz0 cold-builds on valet (67 .ritz files, 11.5k LoC).
     local_map: HashMapI64
-    global_map: HashMapI64
-    fn_map: HashMapI64
-    struct_map: HashMapI64
-    const_map: HashMapI64
-    # AGAST #1369 — count of expressions the emitter could not lower.
-    # The emitter used to have NO way to report failure: when it met something
-    # it could not emit it wrote `; ERROR: ...` into the IR as a comment,
-    # substituted a zero (or, for an assignment, dropped the store), and
-    # returned success.  ritz1 then exited 0, build.py printed its tick, and
-    # the program segfaulted or silently computed the wrong answer.
-    # emit_module returns this count and main refuses to write the output when
-    # it is non-zero.  See emit_ir_error_sv().
-    error_count: i32
-    # AGAST #3362 — the last undeclared struct name already reported (by the
-    # member access rule, or #3347's literal rule for `String`), so one
-    # mistake is one error; see unknown_struct_member_refused.
-    unknown_struct_name: *u8
-    unknown_struct_name_len: i32
     match_scrut_kind: i32   # BK_* of the scrutinee of the match being emitted
     match_scrut_int: TypeKind    # AGAST #3358: its integer type kind, or 0
     match_scrut_str: i32    # AGAST #1876: 1 when it is a StrView, which string arms compare
@@ -301,12 +301,6 @@ struct EmitterState
     wanted: **Expr
     wanted_count: i32
     wanted_cap: i32
-    # AGAST #1521 — 1 once a print interpolation has called one of the
-    # @__ritz_print_* helpers; emit_module then defines them.
-    print_helpers_used: i32
-    # AGAST #1824 — 1 once a format_into has called @__ritz_fmt_int /
-    # @__ritz_fmt_strlen; emit_module then defines them.
-    fmt_helpers_used: i32
     # AGAST #4462 — per-register packed provenance (index = register), 1 when
     # the register is a pointer derived from a `[[packed]]` struct: a
     # getelementptr whose source type is packed, or whose base is itself
@@ -322,39 +316,17 @@ struct EmitterState
     narrow_decls: [256]NarrowDecl
     narrow_decl_count: i32
     narrow_decl_overflow: i32
-    # AGAST #1869 — assert lowering (emit_assert_stmt, emitter_print.ritz).
+    # AGAST #1869 — assert lowering (emit_assert_stmt, emitter_print.ritz;
+    # IrBuf has the module-tail half).
     # fn_assert_kind: ASSERT_FN_* of the fn being emitted, set by emit_fn /
-    # emit_impl_method.  assert_helpers_used / assert_site_used: emit_module
-    # then defines @__ritz_assert_val / the @__ritz_assert_site_* globals.
+    # emit_impl_method.
     # assert_cap_*: emit_expr_binary records the i64 operand registers of
     # the comparison assert_cap_expr (assert_cap_ok = 1 once it has).
-    # assert_file_str: @.str index of the source file's basename, or -1.
     fn_assert_kind: i32
-    assert_helpers_used: i32
-    assert_site_used: i32
     assert_cap_expr: *Expr
     assert_cap_ok: i32
     assert_cap_l: i32
     assert_cap_r: i32
-    assert_file_str: i32
-    # AGAST #4607 — freestanding stops: PSTOP_* bits.  emit_module sets
-    # PSTOP_FREESTANDING from `--target` (a kernel's traps and failing
-    # asserts stop through ritz_platform_fatal, never an exit syscall); each
-    # such call sets PSTOP_USED, and emit_platform_hooks sets PSTOP_DEFINED
-    # when it defines the weak hook, so the module tail declares it only
-    # when needed (emit_platform_fatal_decl).
-    platform_stop: i32
-    # AGAST #2158 — move checking and drop insertion (ownership.ritz).
-    # Allocated by own_init in emit_module.
-    own: *OwnState
-    # AGAST #4697: how the emitter recurses (emitter_seam.ritz).  Also how
-    # ownership.ritz emits a deferred statement at a block's exit
-    # (own_run_defer, AGAST #3508) without importing emitter_stmt.
-    emit: EmitTable
-    # AGAST #3513: ownership's own_before_ret and ref_check's
-    # ref_cast_reads_referent, so emitter_core imports neither module.
-    own_before_ret_fn: fn(*EmitterState)
-    ref_cast_reads_referent_fn: fn(*EmitterState, *Expr) -> i32
     # AGAST #3739 — what frame_limit.ritz needs to locate a fn's allocas.
     # fm: (offset in out, span) marks, appended as emit_stmt / emit_expr
     # enter and leave; an alloca line belongs to the last mark at or before
@@ -368,6 +340,64 @@ struct EmitterState
     fs: *FrameSlot
     fs_count: i32
     fs_cap: i32
+
+# AGAST #4697 — the module's symbols (EmitterState.sym).  The maps are built
+# once by build_symbol_maps; `mono` still grows as emission names a new
+# generic enum.
+struct SymTab
+    module: *Module
+    # Monomorphisation's tables: a generic enum first named at emission is
+    # recorded there (add_enum_instance; AGAST #4454, they were globals).
+    mono: *MonoCtx
+    # ritz-task-193 — O(1) symbol lookups (FnCtx has local_map).
+    # `global_map` : fnv1a(name)  -> *GlobalVarDef  (cast to i64).  Built once
+    #                per emit_module from `m.globals` after monomorphization.
+    # `fn_map`     : fnv1a(name)  -> *FnDef         (first-occurrence wins to
+    #                preserve linked-list head-first semantics).
+    # `struct_map` : fnv1a(name)  -> *StructDef     (first-occurrence wins).
+    # `const_map`  : fnv1a(name)  -> *ConstEntry    (first-occurrence wins).
+    # All five maps replace linear-scan symbol lookups that made ritz1 5.7×
+    # slower than ritz0 cold-builds on valet (67 .ritz files, 11.5k LoC).
+    global_map: HashMapI64
+    fn_map: HashMapI64
+    struct_map: HashMapI64
+    const_map: HashMapI64
+
+# AGAST #4697 — what the emitter has reported (EmitterState.diag).
+struct Diag
+    # AGAST #1369 — count of expressions the emitter could not lower.
+    # The emitter used to have NO way to report failure: when it met something
+    # it could not emit it wrote `; ERROR: ...` into the IR as a comment,
+    # substituted a zero (or, for an assignment, dropped the store), and
+    # returned success.  ritz1 then exited 0, build.py printed its tick, and
+    # the program segfaulted or silently computed the wrong answer.
+    # emit_module returns this count and main refuses to write the output when
+    # it is non-zero.  See emit_ir_error_sv().
+    error_count: i32
+    # AGAST #3362 — the last undeclared struct name already reported (by the
+    # member access rule, or #3347's literal rule for `String`), so one
+    # mistake is one error; see unknown_struct_member_refused.
+    unknown_struct_name: *u8
+    unknown_struct_name_len: i32
+
+# AGAST #4697 — the emitter: four parts, the dispatch seam and the two
+# hooks into modules emitter_core does not import.
+struct EmitterState
+    ir: IrBuf
+    fcx: FnCtx
+    sym: SymTab
+    diag: Diag
+    # AGAST #2158 — move checking and drop insertion (ownership.ritz).
+    # Allocated by own_init in emit_module.
+    own: *OwnState
+    # AGAST #4697: how the emitter recurses (emitter_seam.ritz).  Also how
+    # ownership.ritz emits a deferred statement at a block's exit
+    # (own_run_defer, AGAST #3508) without importing emitter_stmt.
+    emit: EmitTable
+    # AGAST #3513: ownership's own_before_ret and ref_check's
+    # ref_cast_reads_referent, so emitter_core imports neither module.
+    own_before_ret_fn: fn(*EmitterState)
+    ref_cast_reads_referent_fn: fn(*EmitterState, *Expr) -> i32
 
 # AGAST #4697 — the emit table: the emitter's eight re-entry points, one per
 # way a nested expression or statement is emitted.  Statements and
@@ -398,7 +428,7 @@ pub const PSTOP_FREESTANDING: i32 = 1
 pub const PSTOP_USED: i32 = 2
 pub const PSTOP_DEFINED: i32 = 4
 
-# AGAST #3739 — from `off` in s.out on, the emitter was at `line`:`col`.
+# AGAST #3739 — from `off` in s.ir.out on, the emitter was at `line`:`col`.
 struct FrameMark
     off: i64
     line: i32
@@ -415,7 +445,7 @@ struct FrameSlot
 struct OwnBinding
     name: *u8
     name_len: i32
-    local_idx: i32        # its index in s.locals when it was declared
+    local_idx: i32        # its index in s.fcx.locals when it was declared
     slot: i32             # register of its storage (alloca / byval pointer)
     flag: i32             # register of its `alloca i1` drop flag
     type_name: *u8
@@ -566,10 +596,10 @@ pub fn emit_no_red_zone_attr(s: *EmitterState)
 # A pointer LOADED from memory is a new register and starts afresh, exactly as
 # the old pass treated it.  The marks are per fn (register numbers are too).
 
-# Start offset of the line currently being built in s.out.
+# Start offset of the line currently being built in s.ir.out.
 fn packed_line_start(s: *EmitterState) -> i64
-    var i: i64 = s.out.data.len - 1
-    while i >= 0 and *(s.out.data.data + i) != 10   # '\n'
+    var i: i64 = s.ir.out.data.len - 1
+    while i >= 0 and *(s.ir.out.data.data + i) != 10   # '\n'
         i -= 1
     i + 1
 
@@ -593,17 +623,17 @@ pub fn arena_string(a: *Allocator, cap: i64) -> *String
 # The two splices (the entry-block allocas, the deferred struct loads) are the
 # only places the emitter writes anywhere but the end of the IR.
 pub fn out_insert(s: *EmitterState, at: i64, text: StrView)
-    let old_len: i64 = s.out.data.len
-    if not s.out.data.ensure_cap(old_len + text.len)
+    let old_len: i64 = s.ir.out.data.len
+    if not s.ir.out.data.ensure_cap(old_len + text.len)
         emit_out_exhausted()
-    memmove(s.out.data.data + at + text.len, s.out.data.data + at, old_len - at)
-    memcpy(s.out.data.data + at, text.ptr, text.len)
-    s.out.data.len = old_len + text.len
+    memmove(s.ir.out.data.data + at + text.len, s.ir.out.data.data + at, old_len - at)
+    memcpy(s.ir.out.data.data + at, text.ptr, text.len)
+    s.ir.out.data.len = old_len + text.len
 
 # The partial line currently being built (no trailing newline yet).
 fn packed_line(s: *EmitterState) -> StrView
     let start: i64 = packed_line_start(s)
-    StrView { ptr: (s.out.data.data + start), len: (s.out.data.len - start) }
+    StrView { ptr: (s.ir.out.data.data + start), len: (s.ir.out.data.len - start) }
 
 # Does the partial line end with `, ptr ` -- i.e. is a pointer operand next?
 fn packed_line_at_ptr_sep(s: *EmitterState) -> i32
@@ -639,29 +669,29 @@ fn packed_gep_dst(s: *EmitterState) -> i32
 pub fn packed_mark(s: *EmitterState, reg: i32)
     if reg < 0
         return
-    if reg >= s.packed_marks_cap
-        var cap: i32 = s.packed_marks_cap
+    if reg >= s.fcx.packed_marks_cap
+        var cap: i32 = s.fcx.packed_marks_cap
         if cap < 64
             cap = 64
         while cap <= reg
             cap = cap * 2
-        let old: i32 = s.packed_marks_cap
-        let grown: *u8 = realloc(s.packed_marks, cap as i64)
-        s.packed_marks = grown
+        let old: i32 = s.fcx.packed_marks_cap
+        let grown: *u8 = realloc(s.fcx.packed_marks, cap as i64)
+        s.fcx.packed_marks = grown
         memzero(grown + old, (cap - old) as i64)
-        s.packed_marks_cap = cap
-    *(s.packed_marks + reg) = 1
+        s.fcx.packed_marks_cap = cap
+    *(s.fcx.packed_marks + reg) = 1
 
 # 1 when `reg` is a pointer derived from a packed struct.
 pub fn packed_marked(s: *EmitterState, reg: i32) -> i32
-    if reg < 0 or s.packed_marks == null or reg >= s.packed_marks_cap
+    if reg < 0 or s.fcx.packed_marks == null or reg >= s.fcx.packed_marks_cap
         return 0
-    *(s.packed_marks + reg) as i32
+    *(s.fcx.packed_marks + reg) as i32
 
 # Start a new fn: no register carries provenance from the previous one.
 pub fn packed_marks_reset(s: *EmitterState)
-    if s.packed_marks != null and s.packed_marks_cap > 0
-        memzero(s.packed_marks, s.packed_marks_cap as i64)
+    if s.fcx.packed_marks != null and s.fcx.packed_marks_cap > 0
+        memzero(s.fcx.packed_marks, s.fcx.packed_marks_cap as i64)
 
 # `text` appended to the IR as is: a whole piece with no value in it, such as a
 # type spelling a lookup returned.  Instructions are written with
@@ -683,7 +713,7 @@ pub fn emit_sv(s: *EmitterState, text: StrView)
 # fixed size: a module whose text outgrows it stops here, rather than writing a
 # truncated .ll that clang would reject (or worse, accept).
 fn out_append(s: *EmitterState, text: StrView)
-    if not s.out.push_span(Span<u8> { ptr: text.ptr, len: text.len })
+    if not s.ir.out.push_span(Span<u8> { ptr: text.ptr, len: text.len })
         emit_out_exhausted()
 
 fn emit_out_exhausted()
@@ -726,7 +756,7 @@ pub fn emit_name(s: *EmitterState, name_sv: StrView)
     # whether N is a pointer into packed memory.
     let line: StrView = packed_line(s)
     if line.ends_with(" = getelementptr %")
-        if struct_is_packed(s.mono.pctx, find_struct(s, name_sv)) == 1
+        if struct_is_packed(s.sym.mono.pctx, find_struct(s, name_sv)) == 1
             packed_mark(s, packed_gep_dst(s))
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
@@ -734,16 +764,16 @@ pub fn emit_name(s: *EmitterState, name_sv: StrView)
     while i < len and *(name + i) != '$'   # '$'
         i += 1
     if i >= len
-        s.out.push_span(Span<u8> { ptr: (name), len: (len as i64) as i64 })
+        s.ir.out.push_span(Span<u8> { ptr: (name), len: (len as i64) as i64 })
         return
     # Up to and including the first `$` as is; every later `$` is `_`.
-    s.out.push_span(Span<u8> { ptr: (name), len: (i as i64 + 1) as i64 })
+    s.ir.out.push_span(Span<u8> { ptr: (name), len: (i as i64 + 1) as i64 })
     for j in (i + 1)..len
         let c: u8 = *(name + j)
         if c == '$'
-            s.out.push(95)   # '_'
+            s.ir.out.push(95)   # '_'
         else
-            s.out.push(c)
+            s.ir.out.push(c)
 
 # `  %.{dst} = getelementptr %<struct>`: the start of a GEP over a named struct
 # type, left open for the caller's `, ptr %.{base}, i32 0, ...`.  The name goes
@@ -771,7 +801,7 @@ pub fn ir_name(name: StrView) -> String
     out
 
 # AGAST #3257: how many counted errors were printed WITHOUT a file:line:col,
-# out of s.error_count.  Since #3445 the emit_ir_error family is located, so
+# out of s.diag.error_count.  Since #3445 the emit_ir_error family is located, so
 # only the errors that have no source construct to point at count here (in
 # emitter.ritz: the multi-dimensional global leak tally, and a source
 # `struct StrView` / `Span$u8` of the wrong layout, since a StructDef
@@ -783,9 +813,9 @@ var g_emit_unlocated: i32 = 0
 pub fn emit_unlocated_errors() -> i32
     g_emit_unlocated
 
-# Count `n` unlocated errors, both in s.error_count and in g_emit_unlocated.
+# Count `n` unlocated errors, both in s.diag.error_count and in g_emit_unlocated.
 pub fn count_unlocated_error(s: *EmitterState, n: i32)
-    s.error_count = s.error_count + n
+    s.diag.error_count = s.diag.error_count + n
     g_emit_unlocated = g_emit_unlocated + n
 
 # AGAST #1369 — record that the emitter could not lower something.
@@ -812,7 +842,7 @@ pub fn emit_ir_error_sv(s: *EmitterState, span: SrcSpan, msg: StrView)
     emit_ir_error_begin(s, span, msg)
     format_into(s, "\n")
     eprints("\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # Same, for the sites that append a name to the message before the newline.
 # The caller follows this with emit_ir_error_end, which counts the error.
@@ -827,7 +857,7 @@ pub fn emit_ir_error_end(s: *EmitterState, name: StrView)
     format_into(s, "'\n")
     eprint_bytes(name)
     eprints("'\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 # AGAST #2296: EmitterState.ctx_slot_*, saved around a slot.
 struct SlotCtx
     name: *u8
@@ -840,30 +870,30 @@ struct SlotCtx
 pub fn enter_slot_ctx(s: *EmitterState, saved: *SlotCtx, ty: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
-    saved.name = s.ctx_slot_name
-    saved.name_len = s.ctx_slot_name_len
-    saved.set = s.ctx_slot_set
-    s.ctx_slot_set = 1
-    s.ctx_slot_name = null
-    s.ctx_slot_name_len = 0
+    saved.name = s.fcx.ctx_slot_name
+    saved.name_len = s.fcx.ctx_slot_name_len
+    saved.set = s.fcx.ctx_slot_set
+    s.fcx.ctx_slot_set = 1
+    s.fcx.ctx_slot_name = null
+    s.fcx.ctx_slot_name_len = 0
     if ty == TypeKind.Struct and name != null and name_len > 0
-        s.ctx_slot_name = name
-        s.ctx_slot_name_len = name_len
+        s.fcx.ctx_slot_name = name
+        s.fcx.ctx_slot_name_len = name_len
 
 pub fn leave_slot_ctx(s: *EmitterState, saved: *SlotCtx)
-    s.ctx_slot_name = saved.name
-    s.ctx_slot_name_len = saved.name_len
-    s.ctx_slot_set = saved.set
+    s.fcx.ctx_slot_name = saved.name
+    s.fcx.ctx_slot_name_len = saved.name_len
+    s.fcx.ctx_slot_set = saved.set
 
 # The struct type the value being emitted lands in: the innermost slot's, or
 # outside any slot (a `return`, a tail) the fn's return type.  null when
 # neither is a struct.
 pub fn slot_struct_name(s: *EmitterState, out_len: *i32) -> *u8
-    if s.ctx_slot_set == 1
-        *out_len = s.ctx_slot_name_len
-        return s.ctx_slot_name
-    *out_len = s.ret_type_name_len
-    return s.ret_type_name
+    if s.fcx.ctx_slot_set == 1
+        *out_len = s.fcx.ctx_slot_name_len
+        return s.fcx.ctx_slot_name
+    *out_len = s.fcx.ret_type_name_len
+    return s.fcx.ret_type_name
 
 # AGAST #1509: a multi-dimensional array use ritz1 does not lower, as
 # `<file>:<line>:<col>: error: <msg>`.  Counts like emit_ir_error_sv, so the
@@ -878,7 +908,7 @@ pub fn emit_nd_error_sv(s: *EmitterState, line: i32, col: i32, msg: StrView)
 pub fn emit_nd_error_begin(s: *EmitterState, line: i32, col: i32)
     format_into(s, "  ; ERROR\n")
     diag_error_at(diag_source_file(), diag_span(line, col))
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # AGAST #1813 — where the emitter is, for its located errors: the input
 # file and the function being emitted (set by emit_fn).  The file itself
@@ -930,14 +960,14 @@ fn reg_operand_of(s: *EmitterState, text: StrView) -> i32
     let reg: i32 = register_digits(text)
     if reg < 0
         return reg
-    let have: i64 = s.out.data.len
-    if have < 2 or *(s.out.data.data + (have - 2)) != '%' or *(s.out.data.data + (have - 1)) != '.'
+    let have: i64 = s.ir.out.data.len
+    if have < 2 or *(s.ir.out.data.data + (have - 2)) != '%' or *(s.ir.out.data.data + (have - 1)) != '.'
         return 0 - 1
     reg
 
 pub fn next_reg(s: *EmitterState) -> i32
-    let r: i32 = s.reg_counter
-    s.reg_counter = s.reg_counter + 1
+    let r: i32 = s.fcx.reg_counter
+    s.fcx.reg_counter = s.fcx.reg_counter + 1
     r
 
 # =============================================================================
@@ -961,8 +991,8 @@ pub fn next_reg(s: *EmitterState) -> i32
 
 fn dload_note_use(s: *EmitterState, reg: i32)
     var i: i32 = 0
-    while i < s.dload_count
-        let r: *DeferredLoad = s.dloads + (i as i64)
+    while i < s.ir.dload_count
+        let r: *DeferredLoad = s.ir.dloads + (i as i64)
         if r.state != DLOAD_DROPPED and r.reg == reg
             r.used = 1
             return
@@ -1024,10 +1054,10 @@ fn dload_cannot_write(p_sv: StrView) -> i32
 
 # 1 when every line emitted since offset `from` cannot write memory.
 pub fn dload_region_cannot_write(s: *EmitterState, from: i64) -> i32
-    if from >= s.out.data.len
+    if from >= s.ir.out.data.len
         return 1
-    var p: *u8 = s.out.data.data + from
-    let end: *u8 = s.out.data.data + s.out.data.len
+    var p: *u8 = s.ir.out.data.data + from
+    let end: *u8 = s.ir.out.data.data + s.ir.out.data.len
     while p < end
         let ll: i64 = scan_line_len(p, end)
         if dload_cannot_write(StrView { ptr: (p), len: (ll) }) == 0
@@ -1043,17 +1073,17 @@ fn dload_dup(p: *u8, n: i32) -> *u8
     d
 
 pub fn dload_add(s: *EmitterState, reg: i32, ty_sv: StrView, src_reg: i32, src_name: *u8, src_name_len: i32)
-    if s.dload_count >= s.dload_cap
+    if s.ir.dload_count >= s.ir.dload_cap
         var cap: i32 = 8
-        if s.dload_cap > 0
-            cap = s.dload_cap * 2
-        s.dloads = realloc(s.dloads as *u8, (cap as i64) * sizeof(DeferredLoad)) as *DeferredLoad
-        s.dload_cap = cap
+        if s.ir.dload_cap > 0
+            cap = s.ir.dload_cap * 2
+        s.ir.dloads = realloc(s.ir.dloads as *u8, (cap as i64) * sizeof(DeferredLoad)) as *DeferredLoad
+        s.ir.dload_cap = cap
     var ty: *u8 = ty_sv.ptr
     var ty_len: i32 = ty_sv.len as i32
-    let r: *DeferredLoad = s.dloads + (s.dload_count as i64)
+    let r: *DeferredLoad = s.ir.dloads + (s.ir.dload_count as i64)
     r.reg = reg
-    r.off = s.out.data.len
+    r.off = s.ir.out.data.len
     r.src_reg = src_reg
     r.src_name = dload_dup(src_name, src_name_len)
     r.src_name_len = src_name_len
@@ -1061,27 +1091,27 @@ pub fn dload_add(s: *EmitterState, reg: i32, ty_sv: StrView, src_reg: i32, src_n
     r.ty_len = ty_len
     r.state = DLOAD_PENDING
     r.used = 0
-    s.dload_count = s.dload_count + 1
+    s.ir.dload_count = s.ir.dload_count + 1
 
 # splice_entry_allocas inserted `n` bytes at body_start: every deferred line
 # moved with the body.
 pub fn defer_loads_shift(s: *EmitterState, n: i64)
     var i: i32 = 0
-    while i < s.dload_count
-        let r: *DeferredLoad = s.dloads + (i as i64)
+    while i < s.ir.dload_count
+        let r: *DeferredLoad = s.ir.dloads + (i as i64)
         r.off = r.off + n
         i += 1
 
 # The function body is complete: write each kept load back at its offset,
 # drop the rest, and forget the fn.
 pub fn splice_deferred_struct_loads(s: *EmitterState)
-    if s.dload_count <= 0
+    if s.ir.dload_count <= 0
         return
     # Whatever is still pending was never paired with a store: dead if no
     # reader, kept (written back) if one.
     var j: i32 = 0
-    while j < s.dload_count
-        let r: *DeferredLoad = s.dloads + (j as i64)
+    while j < s.ir.dload_count
+        let r: *DeferredLoad = s.ir.dloads + (j as i64)
         if r.state == DLOAD_PENDING
             if r.used == 0
                 r.state = DLOAD_DROPPED
@@ -1090,14 +1120,14 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
         j += 1
     var i: i32 = 0
     var shift: i64 = 0
-    while i < s.dload_count
-        let r: *DeferredLoad = s.dloads + (i as i64)
+    while i < s.ir.dload_count
+        let r: *DeferredLoad = s.ir.dloads + (i as i64)
         if r.state == DLOAD_KEEP
             # Render through the ordinary emitters into a scratch buffer, so
             # the line is spelled exactly as the load site spells it.
             var line: String = string_new()
-            let saved: *String = s.out
-            s.out = @line
+            let saved: *String = s.ir.out
+            s.ir.out = @line
             let dst: i32 = r.reg
             format_into(s, "  %.{dst} = load %")
             emit_name(s, StrView { ptr: (r.ty), len: (r.ty_len) as i64 })
@@ -1108,7 +1138,7 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
                 format_into(s, ", ptr @")
                 emit_name(s, StrView { ptr: (r.src_name), len: (r.src_name_len) as i64 })
                 format_into(s, "\n")
-            s.out = saved
+            s.ir.out = saved
             let at: i64 = r.off + shift
             out_insert(s, at, line.as_view())
             shift = shift + line.len()
@@ -1116,14 +1146,14 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
             # buffer is freed once, by the compiler.
         i += 1
     var k: i32 = 0
-    while k < s.dload_count
-        let r2: *DeferredLoad = s.dloads + (k as i64)
+    while k < s.ir.dload_count
+        let r2: *DeferredLoad = s.ir.dloads + (k as i64)
         if r2.ty != null
             free(r2.ty)
         if r2.src_name != null
             free(r2.src_name)
         k += 1
-    s.dload_count = 0
+    s.ir.dload_count = 0
 
 # =============================================================================
 # Entry-block alloca buffer (AGAST #4460)
@@ -1144,17 +1174,17 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
 # Record where the next alloca line starts in the entry buffer and the source
 # span in force, so frame_limit can still name/bound the largest alloca.
 pub fn entry_alloca_mark(s: *EmitterState)
-    if s.ea_count >= s.ea_cap
+    if s.ir.ea_count >= s.ir.ea_cap
         var cap: i32 = 64
-        if s.ea_cap > 0
-            cap = s.ea_cap * 2
-        s.ea_marks = realloc(s.ea_marks as *u8, (cap as i64) * sizeof(FrameMark)) as *FrameMark
-        s.ea_cap = cap
-    let m: *FrameMark = s.ea_marks + (s.ea_count as i64)
-    m.off = s.entry_allocas.data.len
-    m.line = s.fm_line
-    m.col = s.fm_col
-    s.ea_count = s.ea_count + 1
+        if s.ir.ea_cap > 0
+            cap = s.ir.ea_cap * 2
+        s.ir.ea_marks = realloc(s.ir.ea_marks as *u8, (cap as i64) * sizeof(FrameMark)) as *FrameMark
+        s.ir.ea_cap = cap
+    let m: *FrameMark = s.ir.ea_marks + (s.ir.ea_count as i64)
+    m.off = s.ir.entry_allocas.data.len
+    m.line = s.fcx.fm_line
+    m.col = s.fcx.fm_col
+    s.ir.ea_count = s.ir.ea_count + 1
 
 # Begin a static alloca whose type the caller emits itself (a compound array
 # or struct type through emit_llvm_type_struct and friends): redirect the
@@ -1163,45 +1193,45 @@ pub fn entry_alloca_mark(s: *EmitterState)
 # then calls entry_alloca_end.
 pub fn entry_alloca_begin(s: *EmitterState) -> i32
     entry_alloca_mark(s)
-    s.entry_out_saved = s.out
-    s.out = s.entry_allocas
+    s.ir.entry_out_saved = s.ir.out
+    s.ir.out = s.ir.entry_allocas
     let r: i32 = next_reg(s)
     format_into(s, "  %.{r} = alloca ")
     r
 
 pub fn entry_alloca_end(s: *EmitterState)
-    s.out = s.entry_out_saved
+    s.ir.out = s.ir.entry_out_saved
 
 # A whole static alloca line of LLVM type `ty`.
 pub fn entry_alloca(s: *EmitterState, ty: StrView) -> i32
     entry_alloca_mark(s)
-    ir_alloca(s.entry_allocas, @s.reg_counter, ty)
+    ir_alloca(s.ir.entry_allocas, @s.fcx.reg_counter, ty)
 
 # The same line for a register the caller already took with next_reg.  The
 # sites that allocate early (one slot for every branch of a type switch, say)
 # keep their next_reg exactly where it was; only the line's destination moves.
 pub fn entry_alloca_reg(s: *EmitterState, r: i32, ty: StrView)
     entry_alloca_mark(s)
-    ir_alloca_at(s.entry_allocas, r, ty)
+    ir_alloca_at(s.ir.entry_allocas, r, ty)
 
 # entry_alloca_begin for a register already taken: redirect, write the
 # `  %.{r} = alloca ` prefix with no new register, then entry_alloca_reg_end.
 pub fn entry_alloca_reg_begin(s: *EmitterState, r: i32)
     entry_alloca_mark(s)
-    s.entry_out_saved = s.out
-    s.out = s.entry_allocas
+    s.ir.entry_out_saved = s.ir.out
+    s.ir.out = s.ir.entry_allocas
     format_into(s, "  %.{r} = alloca ")
 
 # entry_alloca_reg_begin when the type starts with a bare struct name
 # (`emit_name` emits no `%`): the prefix is `  %.{r} = alloca %`.
 pub fn entry_alloca_reg_begin_named(s: *EmitterState, r: i32)
     entry_alloca_mark(s)
-    s.entry_out_saved = s.out
-    s.out = s.entry_allocas
+    s.ir.entry_out_saved = s.ir.out
+    s.ir.out = s.ir.entry_allocas
     format_into(s, "  %.{r} = alloca %")
 
 pub fn entry_alloca_reg_end(s: *EmitterState)
-    s.out = s.entry_out_saved
+    s.ir.out = s.ir.entry_out_saved
 
 # AGAST #1335 — the value of `current_label` inside a function's entry block.
 #
@@ -1224,17 +1254,17 @@ pub fn entry_alloca_reg_end(s: *EmitterState)
 const ENTRY_BLOCK_LABEL: i32 = -1
 
 pub fn next_label(s: *EmitterState) -> i32
-    let l: i32 = s.label_counter
-    s.label_counter = s.label_counter + 1
+    let l: i32 = s.fcx.label_counter
+    s.fcx.label_counter = s.fcx.label_counter + 1
     l
 
 # ritz-task-1267 — Open a new basic block.
 #
 # This is the ONLY sanctioned way to start a basic block.  Emitting
-# `L<n>:` by hand is a bug: `s.current_label` is the
+# `L<n>:` by hand is a bug: `s.fcx.current_label` is the
 # emitter's insertion point, and every PHI predecessor label we write is
 # derived from it.  If a construct opens a block without refreshing
-# `s.current_label`, an enclosing IF/short-circuit emitter later names a
+# `s.fcx.current_label`, an enclosing IF/short-circuit emitter later names a
 # *stale* block as a PHI predecessor — producing IR where the phi entries
 # don't match the CFG, and where the incoming value doesn't dominate its
 # use.
@@ -1248,7 +1278,7 @@ pub fn next_label(s: *EmitterState) -> i32
 # makes that whole class of bug unrepresentable.
 pub fn begin_block(s: *EmitterState, label: i32)
     format_into(s, "L{label}:\n")
-    s.current_label = label
+    s.fcx.current_label = label
 
 # ritz-task-1309 — the three sanctioned accessors for `last_expr_reg`.
 #
@@ -1263,24 +1293,24 @@ const LAST_EXPR_I64: i32 = 1
 const LAST_EXPR_PTR: i32 = 2
 
 pub fn set_last_expr(s: *EmitterState, reg: i32)
-    s.last_expr_reg = reg
-    s.last_expr_label = s.current_label
-    s.last_expr_model = LAST_EXPR_UNKNOWN
+    s.fcx.last_expr_reg = reg
+    s.fcx.last_expr_label = s.fcx.current_label
+    s.fcx.last_expr_model = LAST_EXPR_UNKNOWN
 
 # AGAST #2950: an `if` / `match` statement's phi, `ptr` when `ptr_ty` is 1.
 pub fn set_last_expr_phi(s: *EmitterState, reg: i32, ptr_ty: i32)
     set_last_expr(s, reg)
-    s.last_expr_model = LAST_EXPR_I64
+    s.fcx.last_expr_model = LAST_EXPR_I64
     if ptr_ty == 1
-        s.last_expr_model = LAST_EXPR_PTR
+        s.fcx.last_expr_model = LAST_EXPR_PTR
 
 # Drop the tracked value.  Used where control flow makes any previous value
 # unavailable at the new insertion point (break/continue dead blocks, and the
 # start of each `if` branch).
 pub fn clear_last_expr(s: *EmitterState)
-    s.last_expr_reg = 0
-    s.last_expr_label = s.current_label
-    s.last_expr_model = LAST_EXPR_UNKNOWN
+    s.fcx.last_expr_reg = 0
+    s.fcx.last_expr_label = s.fcx.current_label
+    s.fcx.last_expr_model = LAST_EXPR_UNKNOWN
 
 # Read the last expression value, but ONLY if it was defined in the block we
 # are currently emitting into; 0 otherwise.
@@ -1292,58 +1322,58 @@ pub fn clear_last_expr(s: *EmitterState)
 # has already left is reported as "no value", which correctly suppresses the
 # phi rather than emitting a dominance-violating one.
 pub fn last_expr_here(s: *EmitterState) -> i32
-    if s.last_expr_label != s.current_label
+    if s.fcx.last_expr_label != s.fcx.current_label
         return 0
-    return s.last_expr_reg
+    return s.fcx.last_expr_reg
 
 # The idx-th entry of the locals table.  Indexes through a local copy of the
-# pointer field: ritz1 cannot lower `@s.locals[idx]` on a pointer field.
+# pointer field: ritz1 cannot lower `@s.fcx.locals[idx]` on a pointer field.
 pub fn local_at(s: *EmitterState, idx: i32) -> *LocalVar
-    let base: *LocalVar = s.locals
+    let base: *LocalVar = s.fcx.locals
     return @base[idx]
 
 # Allocate the locals table (emit_module).
 pub fn locals_init(s: *EmitterState, cap: i32)
-    s.locals = malloc((cap as i64) * sizeof(LocalVar)) as *LocalVar
-    s.locals_cap = cap
-    s.local_count = 0
-    s.fm_cap = 256   # AGAST #3739: frame_limit's marks and slots
-    s.fm = malloc((s.fm_cap as i64) * sizeof(FrameMark)) as *FrameMark
-    s.fs_cap = cap
-    s.fs = malloc((s.fs_cap as i64) * sizeof(FrameSlot)) as *FrameSlot
+    s.fcx.locals = malloc((cap as i64) * sizeof(LocalVar)) as *LocalVar
+    s.fcx.locals_cap = cap
+    s.fcx.local_count = 0
+    s.fcx.fm_cap = 256   # AGAST #3739: frame_limit's marks and slots
+    s.fcx.fm = malloc((s.fcx.fm_cap as i64) * sizeof(FrameMark)) as *FrameMark
+    s.fcx.fs_cap = cap
+    s.fcx.fs = malloc((s.fcx.fs_cap as i64) * sizeof(FrameSlot)) as *FrameSlot
     frame_begin_fn(s, 0, 0)
 
 # AGAST #3739: forget the last fn's marks and slots; until a statement or
 # expression says otherwise, the fn's allocas are at line:col (its `fn`).
 pub fn frame_begin_fn(s: *EmitterState, line: i32, col: i32)
-    s.fm_count = 0
-    s.fs_count = 0
-    s.fm_line = 0
-    s.fm_col = 0
+    s.fcx.fm_count = 0
+    s.fcx.fs_count = 0
+    s.fcx.fm_line = 0
+    s.fcx.fm_col = 0
     frame_mark(s, line, col)
 
-# AGAST #3739: the emitter is at line:col from here on in s.out.  A mark at
+# AGAST #3739: the emitter is at line:col from here on in s.ir.out.  A mark at
 # the offset of the previous one replaces it: nothing was emitted under it.
 pub fn frame_mark(s: *EmitterState, line: i32, col: i32)
-    s.fm_line = line
-    s.fm_col = col
-    let off: i64 = s.out.data.len
-    if s.fm_count > 0
-        let last: *FrameMark = s.fm + ((s.fm_count - 1) as i64)
+    s.fcx.fm_line = line
+    s.fcx.fm_col = col
+    let off: i64 = s.ir.out.data.len
+    if s.fcx.fm_count > 0
+        let last: *FrameMark = s.fcx.fm + ((s.fcx.fm_count - 1) as i64)
         if last.off == off
             last.line = line
             last.col = col
             return
-    if s.fm_count >= s.fm_cap
-        s.fm_cap = s.fm_cap * 2
-        s.fm = realloc(s.fm as *u8, (s.fm_cap as i64) * sizeof(FrameMark)) as *FrameMark
-    let m: *FrameMark = s.fm + (s.fm_count as i64)
+    if s.fcx.fm_count >= s.fcx.fm_cap
+        s.fcx.fm_cap = s.fcx.fm_cap * 2
+        s.fcx.fm = realloc(s.fcx.fm as *u8, (s.fcx.fm_cap as i64) * sizeof(FrameMark)) as *FrameMark
+    let m: *FrameMark = s.fcx.fm + (s.fcx.fm_count as i64)
     m.off = off
     m.line = line
     m.col = col
-    s.fm_count = s.fm_count + 1
+    s.fcx.fm_count = s.fcx.fm_count + 1
 
-# ritz-task-193 — Resolve `name` to an index into `s.locals[]` using the
+# ritz-task-193 — Resolve `name` to an index into `s.fcx.locals[]` using the
 # per-fn HashMap (fnv1a hash of name bytes).  Falls back to a from-end
 # linear scan to handle two cases the map can't:
 #   1. Stale map entry: emit_match_arm_body's scope rollback drops bindings
@@ -1363,15 +1393,15 @@ pub fn find_local_idx(s: *EmitterState, name_sv: StrView) -> i32
     var len: i32 = name_sv.len as i32
     # Fast path: single-probe HashMap lookup with collision check.
     let key: i64 = fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64
-    let stored: i64 = s.local_map.get(key).unwrap_or(0)
+    let stored: i64 = s.fcx.local_map.get(key).unwrap_or(0)
     if stored > 0
         let idx: i32 = (stored - 1) as i32
-        if idx >= 0 and idx < s.local_count
+        if idx >= 0 and idx < s.fcx.local_count
             let loc: *LocalVar = local_at(s, idx)
             if name_eq(StrView { ptr: (loc.name), len: (loc.name_len) as i64 }, name_sv) == 1
                 return idx
     # Fallback: linear scan from end (innermost scope wins).
-    var i: i32 = s.local_count - 1
+    var i: i32 = s.fcx.local_count - 1
     while i >= 0
         let loc: *LocalVar = local_at(s, i)
         if name_eq(StrView { ptr: (loc.name), len: (loc.name_len) as i64 }, name_sv) == 1
@@ -1569,15 +1599,15 @@ pub fn deref_operand_is_ptr(s: *EmitterState, e: *Expr) -> i32
 # inner binding's index (now past the count) for the entire fn body, costing
 # us the fast-path on every subsequent lookup of that name.
 pub fn rebuild_local_map(s: *EmitterState)
-    s.local_map.clear()
+    s.fcx.local_map.clear()
     var i: i32 = 0
-    while i < s.local_count
+    while i < s.fcx.local_count
         let loc: *LocalVar = local_at(s, i)
         let key: i64 = fnv1a_str(Span<u8> { ptr: (loc.name), len: (loc.name_len) as i64 }) as i64
         # Store `i + 1` so 0 unambiguously means miss in find_local_idx.
         # Insert in order so later (innermost) bindings overwrite earlier
         # (outer) ones — matches the linear-scan-from-end semantics.
-        s.local_map.insert(key, (i + 1) as i64)
+        s.fcx.local_map.insert(key, (i + 1) as i64)
         i = i + 1
 
 pub fn add_local(s: *EmitterState, name_sv: StrView, reg: i32, var_type: TypeKind)
@@ -1704,7 +1734,7 @@ pub fn add_array_view(s: *EmitterState, name_sv: StrView, reg: i32, kind: TypeKi
     memcpy(view_name, name, len as i64)
     *(view_name + len) = 35   # '#': no identifier has one, so `p#` names only this
     add_local_full(s, StrView { ptr: (view_name), len: (len + 1) as i64 }, reg, TypeKind.Ptr, StrView { ptr: (type_name), len: (type_name_len) as i64 }, elem, 0, TypeKind.Void)
-    let view: *LocalVar = local_at(s, s.local_count - 1)
+    let view: *LocalVar = local_at(s, s.fcx.local_count - 1)
     lv_mark_array_view(view)
 
 # 1 when an array of `elem` gets a view: a scalar, or a struct ritz1 knows.
@@ -1772,32 +1802,32 @@ pub fn add_local_full(s: *EmitterState, name_sv: StrView, reg: i32, var_type: Ty
     var len: i32 = name_sv.len as i32
     var type_name: *u8 = type_name_sv.ptr
     var type_name_len: i32 = type_name_sv.len as i32
-    if s.local_count >= s.locals_cap
-        let cap: i64 = (s.locals_cap as i64) * 2
-        s.locals = realloc(s.locals as *u8, cap * sizeof(LocalVar)) as *LocalVar
-        s.locals_cap = cap as i32
-    if s.fs_count >= s.fs_cap   # AGAST #3739: frame_limit names reg's slot
-        s.fs_cap = s.fs_cap * 2
-        s.fs = realloc(s.fs as *u8, (s.fs_cap as i64) * sizeof(FrameSlot)) as *FrameSlot
-    let fslot: *FrameSlot = s.fs + (s.fs_count as i64)
+    if s.fcx.local_count >= s.fcx.locals_cap
+        let cap: i64 = (s.fcx.locals_cap as i64) * 2
+        s.fcx.locals = realloc(s.fcx.locals as *u8, cap * sizeof(LocalVar)) as *LocalVar
+        s.fcx.locals_cap = cap as i32
+    if s.fcx.fs_count >= s.fcx.fs_cap   # AGAST #3739: frame_limit names reg's slot
+        s.fcx.fs_cap = s.fcx.fs_cap * 2
+        s.fcx.fs = realloc(s.fcx.fs as *u8, (s.fcx.fs_cap as i64) * sizeof(FrameSlot)) as *FrameSlot
+    let fslot: *FrameSlot = s.fcx.fs + (s.fcx.fs_count as i64)
     fslot.reg = reg
     fslot.name = name
     fslot.name_len = len
-    s.fs_count = s.fs_count + 1
-    let idx: i32 = s.local_count
+    s.fcx.fs_count = s.fcx.fs_count + 1
+    let idx: i32 = s.fcx.local_count
     let loc: *LocalVar = local_at(s, idx)
     # AGAST #4528: name + slot + the one `*TypeRef`; lv_loc_init clears the
     # binding flags and builds the chain the flat arguments describe.
     lv_loc_init(loc, StrView { ptr: (name), len: (len) as i64 }, var_type, StrView { ptr: (type_name), len: (type_name_len) as i64 }, pointee, arr_size, arr_elem)
     loc.reg = reg
-    s.local_count = idx + 1
+    s.fcx.local_count = idx + 1
     # ritz-task-193 — mirror into HashMap so find_local* hits O(1).
     # Store `idx + 1` so the value is non-zero (0 = miss in
     # hashmap_i64_get).  Same name overwrites (inner shadows outer);
     # the find fallback + rebuild_local_map together preserve correct
     # shadow semantics.
     let key: i64 = fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64
-    s.local_map.insert(key, (idx + 1) as i64)
+    s.fcx.local_map.insert(key, (idx + 1) as i64)
 
 # ritz-task-193 — module-scope find_* now use HashMaps populated once per
 # module by build_symbol_maps in emit_module (after monomorphization fixes
@@ -1814,7 +1844,7 @@ pub fn find_global(s: *EmitterState, name_sv: StrView) -> *GlobalVarDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let key: i64 = fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64
-    let g: *GlobalVarDef = s.global_map.get(key).unwrap_or(0) as *GlobalVarDef
+    let g: *GlobalVarDef = s.sym.global_map.get(key).unwrap_or(0) as *GlobalVarDef
     if g == null
         return null
     if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
@@ -1822,7 +1852,7 @@ pub fn find_global(s: *EmitterState, name_sv: StrView) -> *GlobalVarDef
     # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
     # another name is a collision, not a miss.  Scan the list (first
     # occurrence wins, as in build_symbol_maps).
-    var cur: *GlobalVarDef = s.module.globals
+    var cur: *GlobalVarDef = s.sym.module.globals
     while cur != null
         if name_eq(StrView { ptr: (cur.name), len: (cur.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             return cur
@@ -1835,7 +1865,7 @@ pub fn find_fn(s: *EmitterState, name_sv: StrView) -> *FnDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let key: i64 = fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64
-    let fn_def: *FnDef = s.fn_map.get(key).unwrap_or(0) as *FnDef
+    let fn_def: *FnDef = s.sym.fn_map.get(key).unwrap_or(0) as *FnDef
     if fn_def == null
         return null
     if name_eq(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
@@ -1843,7 +1873,7 @@ pub fn find_fn(s: *EmitterState, name_sv: StrView) -> *FnDef
     # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
     # another name is a collision, not a miss.  Scan the list (first
     # occurrence wins, as in build_symbol_maps).
-    var cur: *FnDef = s.module.functions
+    var cur: *FnDef = s.sym.module.functions
     while cur != null
         if name_eq(StrView { ptr: (cur.name), len: (cur.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             return cur
@@ -1964,18 +1994,18 @@ pub fn fn_symbol(f: *FnDef, out_len: *i32) -> *u8
 # AGAST #2260: is `e`'s value used by a statement being emitted?
 fn value_wanted(s: *EmitterState, e: *Expr) -> i32
     var i: i32 = 0
-    while i < s.wanted_count
-        if s.wanted[i] == e
+    while i < s.fcx.wanted_count
+        if s.fcx.wanted[i] == e
             return 1
         i += 1
     0
 
 fn want_push(s: *EmitterState, e: *Expr)
-    if s.wanted_count == s.wanted_cap
-        s.wanted_cap = s.wanted_cap * 2 + 16
-        s.wanted = realloc(s.wanted as *u8, s.wanted_cap as i64 * 8) as **Expr
-    s.wanted[s.wanted_count] = e
-    s.wanted_count += 1
+    if s.fcx.wanted_count == s.fcx.wanted_cap
+        s.fcx.wanted_cap = s.fcx.wanted_cap * 2 + 16
+        s.fcx.wanted = realloc(s.fcx.wanted as *u8, s.fcx.wanted_cap as i64 * 8) as **Expr
+    s.fcx.wanted[s.fcx.wanted_count] = e
+    s.fcx.wanted_count += 1
 
 fn want_list(s: *EmitterState, list: *Expr)
     var cur: *Expr = list
@@ -2078,7 +2108,7 @@ pub fn reject_procedure_value(s: *EmitterState, e: *Expr, name_sv: StrView)
         eprint_char('`')
     eprints(" returns nothing, so its call has no value to use here\n")
     format_into(s, "  ; ERROR: a procedure call has no value\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # Call `e`, to `name`, resolved to `fd`: a procedure's call has no value to
 # use (AGAST #2255).  A procedure call in a `-> T` fn's tail is tail_value's,
@@ -2098,7 +2128,7 @@ pub fn note_method_callee(s: *EmitterState, e: *Expr, fd: *FnDef)
 pub fn find_struct(s: *EmitterState, name_sv: StrView) -> *StructDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    struct_map_find(@s.struct_map, s.module, StrView { ptr: (name), len: (len) as i64 })
+    struct_map_find(@s.sym.struct_map, s.sym.module, StrView { ptr: (name), len: (len) as i64 })
 
 # Result struct for emit_member_ptr - returns pointer register and field info
 struct MemberPtrResult
@@ -2166,14 +2196,14 @@ pub fn namelist_len(l: *NameList, i: i32) -> i32
 pub fn add_extern(s: *EmitterState, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if namelist_find(@s.externs, StrView { ptr: (name), len: (len) as i64 }) >= 0
+    if namelist_find(@s.ir.externs, StrView { ptr: (name), len: (len) as i64 }) >= 0
         return  # Already registered
     # Add new external - copy the name since caller might use a stack buffer
     let name_copy: *u8 = malloc(len as i64 + 1) as *u8
     for k in 0..len
         *(name_copy + k) = *(name + k)
     *(name_copy + len) = 0  # Null terminate
-    namelist_push(@s.externs, StrView { ptr: (name_copy), len: (len) as i64 })
+    namelist_push(@s.ir.externs, StrView { ptr: (name_copy), len: (len) as i64 })
 
 # Add extern for method call: TypeName_methodName
 # Allocates memory for the mangled name
@@ -2215,7 +2245,7 @@ pub fn add_method_extern(s: *EmitterState, type_name_sv: StrView, method_name_sv
 pub fn was_struct_emitted(s: *EmitterState, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if namelist_find(@s.emitted_structs, StrView { ptr: (name), len: (len) as i64 }) >= 0
+    if namelist_find(@s.ir.emitted_structs, StrView { ptr: (name), len: (len) as i64 }) >= 0
         return 1
     0
 
@@ -2223,13 +2253,13 @@ pub fn was_struct_emitted(s: *EmitterState, name_sv: StrView) -> i32
 pub fn mark_struct_emitted(s: *EmitterState, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    namelist_push(@s.emitted_structs, StrView { ptr: (name), len: (len) as i64 })
+    namelist_push(@s.ir.emitted_structs, StrView { ptr: (name), len: (len) as i64 })
 
 # Check if a function has already been emitted
 pub fn was_fn_emitted(s: *EmitterState, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if namelist_find(@s.emitted_fns, StrView { ptr: (name), len: (len) as i64 }) >= 0
+    if namelist_find(@s.ir.emitted_fns, StrView { ptr: (name), len: (len) as i64 }) >= 0
         return 1
     0
 
@@ -2237,13 +2267,13 @@ pub fn was_fn_emitted(s: *EmitterState, name_sv: StrView) -> i32
 pub fn mark_fn_emitted(s: *EmitterState, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    namelist_push(@s.emitted_fns, StrView { ptr: (name), len: (len) as i64 })
+    namelist_push(@s.ir.emitted_fns, StrView { ptr: (name), len: (len) as i64 })
 
 # Check if a global has already been emitted
 pub fn was_global_emitted(s: *EmitterState, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if namelist_find(@s.emitted_globals, StrView { ptr: (name), len: (len) as i64 }) >= 0
+    if namelist_find(@s.ir.emitted_globals, StrView { ptr: (name), len: (len) as i64 }) >= 0
         return 1
     0
 
@@ -2251,7 +2281,7 @@ pub fn was_global_emitted(s: *EmitterState, name_sv: StrView) -> i32
 pub fn mark_global_emitted(s: *EmitterState, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    namelist_push(@s.emitted_globals, StrView { ptr: (name), len: (len) as i64 })
+    namelist_push(@s.ir.emitted_globals, StrView { ptr: (name), len: (len) as i64 })
 
 # find_builtin_const / is_builtin_const moved to ast_query (AGAST #4319);
 # re-exported through `pub import ast_query` above.
@@ -2278,7 +2308,7 @@ pub fn find_const_entry(s: *EmitterState, name_sv: StrView) -> *ConstEntry
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let key: i64 = fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64
-    let ce: *ConstEntry = s.const_map.get(key).unwrap_or(0) as *ConstEntry
+    let ce: *ConstEntry = s.sym.const_map.get(key).unwrap_or(0) as *ConstEntry
     if ce == null
         return null
     if name_eq(StrView { ptr: (ce.name), len: (ce.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
@@ -2286,7 +2316,7 @@ pub fn find_const_entry(s: *EmitterState, name_sv: StrView) -> *ConstEntry
     # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
     # another name is a collision, not a miss.  Scan the list (first
     # occurrence wins, as in build_symbol_maps).
-    var cur: *ConstEntry = s.module.constants
+    var cur: *ConstEntry = s.sym.module.constants
     while cur != null
         if name_eq(StrView { ptr: (cur.name), len: (cur.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             return cur
@@ -2303,7 +2333,7 @@ pub fn find_const_entry(s: *EmitterState, name_sv: StrView) -> *ConstEntry
 pub fn const_int_init_float_ty(s: *EmitterState, ce: *ConstEntry, out: *i64) -> TypeKind
     if ce == null or (ce.const_type != TypeKind.F32 and ce.const_type != TypeKind.F64)
         return TypeKind.Void
-    if const_fold_int(s.module.constants, ce.value_expr, 1, out) == 0
+    if const_fold_int(s.sym.module.constants, ce.value_expr, 1, out) == 0
         return TypeKind.Void
     ce.const_type
 
@@ -2339,46 +2369,46 @@ pub fn init_emitter_maps(s: *EmitterState)
     # of fns/structs after monomorphization) — undersizing pays an O(N)
     # rehash cost on every doubling.  `hashmap_i64_with_cap` rounds up to
     # power-of-2, so the constants above need not be exact.
-    s.local_map = hashmap_i64_with_cap(512)
-    s.global_map = hashmap_i64_with_cap(256)
-    s.fn_map = hashmap_i64_with_cap(8192)
-    s.struct_map = hashmap_i64_with_cap(2048)
-    s.const_map = hashmap_i64_with_cap(256)
+    s.fcx.local_map = hashmap_i64_with_cap(512)
+    s.sym.global_map = hashmap_i64_with_cap(256)
+    s.sym.fn_map = hashmap_i64_with_cap(8192)
+    s.sym.struct_map = hashmap_i64_with_cap(2048)
+    s.sym.const_map = hashmap_i64_with_cap(256)
 
 # ritz-task-193 — populate per-module symbol tables from the AST after
 # monomorphization.  emit_module calls this once; the maps stay valid for
 # the lifetime of the EmitterState because nothing in the emit pipeline
-# mutates `s.module.{globals,functions,structs,constants}` after init.
+# mutates `s.sym.module.{globals,functions,structs,constants}` after init.
 # First-occurrence wins (skip-if-contains) — preserves the head-first
 # semantics of the legacy linked-list scans in the face of duplicate
 # entries from import-merged modules.
 pub fn build_symbol_maps(s: *EmitterState)
-    var g: *GlobalVarDef = s.module.globals
+    var g: *GlobalVarDef = s.sym.module.globals
     while g != null
         let kg: i64 = fnv1a_str(Span<u8> { ptr: (g.name), len: (g.name_len) as i64 }) as i64
-        if not s.global_map.contains(kg)
-            s.global_map.insert(kg, g as i64)
+        if not s.sym.global_map.contains(kg)
+            s.sym.global_map.insert(kg, g as i64)
         g = g.next
 
-    var fd: *FnDef = s.module.functions
+    var fd: *FnDef = s.sym.module.functions
     while fd != null
         let kf: i64 = fnv1a_str(Span<u8> { ptr: (fd.name), len: (fd.name_len) as i64 }) as i64
-        if not s.fn_map.contains(kf)
-            s.fn_map.insert(kf, fd as i64)
+        if not s.sym.fn_map.contains(kf)
+            s.sym.fn_map.insert(kf, fd as i64)
         fd = fd.next
 
-    var st: *StructDef = s.module.structs
+    var st: *StructDef = s.sym.module.structs
     while st != null
         let ks: i64 = fnv1a_str(Span<u8> { ptr: (st.name), len: (st.name_len) as i64 }) as i64
-        if not s.struct_map.contains(ks)
-            s.struct_map.insert(ks, st as i64)
+        if not s.sym.struct_map.contains(ks)
+            s.sym.struct_map.insert(ks, st as i64)
         st = st.next
 
-    var ce: *ConstEntry = s.module.constants
+    var ce: *ConstEntry = s.sym.module.constants
     while ce != null
         let kc: i64 = fnv1a_str(Span<u8> { ptr: (ce.name), len: (ce.name_len) as i64 }) as i64
-        if not s.const_map.contains(kc)
-            s.const_map.insert(kc, ce as i64)
+        if not s.sym.const_map.contains(kc)
+            s.sym.const_map.insert(kc, ce as i64)
         ce = ce.next
 
 # AGAST #1509: times a multi-dimensional array's TypeKind.Array element reached
@@ -2522,7 +2552,7 @@ pub fn is_concrete_payload_type(s: *EmitterState, name_sv: StrView, allow_enum: 
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
     if st != null
         return (st.type_params == null) as i32
-    if allow_enum == 1 and user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) >= 0
+    if allow_enum == 1 and user_enum_index(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) >= 0
         return 1
     0
 
@@ -2645,7 +2675,7 @@ const TAGGED_ENUM_FALLBACK_BYTES: i64 = 144
 pub fn tagged_enum_arg(s: *EmitterState, name_sv: StrView, variant: i32, out_len: *i32) -> *u8
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    tagged_enum_arg_in(s.mono.pctx, @s.struct_map, s.module, StrView { ptr: (name), len: (len) as i64 }, variant, out_len)
+    tagged_enum_arg_in(s.sym.mono.pctx, @s.sym.struct_map, s.sym.module, StrView { ptr: (name), len: (len) as i64 }, variant, out_len)
 
 # AGAST #2272: is a mangled argument `unit`, the `()` type?  It is zero bytes,
 # 1-aligned: `Result<(), i32>` is { i8, [3 x i8], [4 x i8] }, as in ritz0.
@@ -2677,11 +2707,11 @@ pub fn mangled_type_size_align(s: *EmitterState, name_sv: StrView, align: *i64) 
         return 1 + pad + n   # all-i8 struct: 1-aligned
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
     if st == null
-        let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
+        let uei: i32 = user_enum_index(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
         if uei >= 0
-            *align = user_enum_align(s.mono.pctx, uei)   # 1 unless a repr enum (#1797, #4574)
+            *align = user_enum_align(s.sym.mono.pctx, uei)   # 1 unless a repr enum (#1797, #4574)
             return user_enum_size(s, uei)
-        if is_enum_type(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if is_enum_type(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) == 1
             return 1   # generic user enum: unmeasured, tag only
         return 0
     if st.type_params != null
@@ -2816,10 +2846,10 @@ pub fn user_enum_layout(s: *EmitterState, ei: i32, pad: *i64) -> i64
     *pad = 0
     var max_size: i64 = 0
     var max_align: i64 = 1
-    let count: i32 = enum_variant_count(s.mono.pctx, ei)
+    let count: i32 = enum_variant_count(s.sym.mono.pctx, ei)
     for vi in 0..count
         var a: i64 = 1
-        let sz: i64 = variant_payload_size_align(s, enum_variant_fields(s.mono.pctx, ei, vi), @a)
+        let sz: i64 = variant_payload_size_align(s, enum_variant_fields(s.sym.mono.pctx, ei, vi), @a)
         if sz > max_size
             max_size = sz
         if a > max_align
@@ -2834,7 +2864,7 @@ pub fn user_enum_size(s: *EmitterState, ei: i32) -> i64
     var pad: i64 = 0
     let n: i64 = user_enum_layout(s, ei, @pad)
     if n == 0
-        return enum_tag_size(s.mono.pctx, ei)
+        return enum_tag_size(s.sym.mono.pctx, ei)
     1 + pad + n
 
 # Field 0 of the enum named `name_sv` (AGAST #4574): its LLVM type, and
@@ -2875,13 +2905,13 @@ pub fn variant_sel_offset(s: *EmitterState, name_sv: StrView, sel: i32) -> i64
     var len: i32 = name_sv.len as i32
     if sel < VARIANT_FIELD_STRIDE
         return 0
-    let ei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
+    let ei: i32 = user_enum_index(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
     if ei < 0
         return 0
     let vi: i32 = sel % VARIANT_FIELD_STRIDE
-    if vi >= enum_variant_count(s.mono.pctx, ei)
+    if vi >= enum_variant_count(s.sym.mono.pctx, ei)
         return 0
-    variant_field_offset(s, enum_variant_fields(s.mono.pctx, ei, vi), sel / VARIANT_FIELD_STRIDE)
+    variant_field_offset(s, enum_variant_fields(s.sym.mono.pctx, ei, vi), sel / VARIANT_FIELD_STRIDE)
 
 # AGAST #1295: a pointer to the payload field `sel` names in the enum at
 # `slot_reg`: field 2 (the `[N x i8]` buffer, AGAST #1898), then the field's
@@ -2910,7 +2940,7 @@ pub fn tagged_enum_scalar_bits(s: *EmitterState, name_sv: StrView, variant: i32,
     var len: i32 = name_sv.len as i32
     *signed = 1
     if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, variant)
+        let uf: *StructField = user_enum_tuple_field(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, variant)
         if uf == null
             return 64
         return type_code_scalar_bits(uf.field_type, signed)
@@ -2952,7 +2982,7 @@ pub fn tagged_enum_narrow_int_type(s: *EmitterState, name_sv: StrView, variant: 
 pub fn tagged_enum_int_type(s: *EmitterState, name_sv: StrView, variant: i32) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    tagged_enum_int_type_in(s.mono.pctx, @s.struct_map, s.module, StrView { ptr: (name), len: (len) as i64 }, variant)
+    tagged_enum_int_type_in(s.sym.mono.pctx, @s.sym.struct_map, s.sym.module, StrView { ptr: (name), len: (len) as i64 }, variant)
 
 # tagged_enum_int_type over a struct map of `m`: Sema's narrowing check reads
 # a match binding's payload type with it (AGAST #3505).
@@ -2999,7 +3029,7 @@ pub fn tagged_enum_float_type(s: *EmitterState, name_sv: StrView, variant: i32) 
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, variant)
+        let uf: *StructField = user_enum_tuple_field(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, variant)
         if uf == null
             return TypeKind.Void
         if uf.field_type == TypeKind.F32 or uf.field_type == TypeKind.F64
@@ -3317,10 +3347,10 @@ pub fn qualified_variant(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
         return 0 - 1
     if find_global(s, q.ident) != null
         return 0 - 1
-    let ei: i32 = enum_find(s.mono.pctx, q.ident)
+    let ei: i32 = enum_find(s.sym.mono.pctx, q.ident)
     if ei < 0
         return 0 - 1
-    let vi: i32 = enum_variant_index(s.mono.pctx, q.ident, e.ident)
+    let vi: i32 = enum_variant_index(s.sym.mono.pctx, q.ident, e.ident)
     if vi < 0
         return 0 - 1
     *out_vi = vi
@@ -3334,9 +3364,9 @@ pub fn qualified_variant_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_le
     *out_len = 0
     var vi: i32 = 0
     let ei: i32 = qualified_variant(s, e, @vi)
-    if ei < 0 or enum_is_generic(s.mono.pctx, ei) == 1
+    if ei < 0 or enum_is_generic(s.sym.mono.pctx, ei) == 1
         return
-    *out_name = enum_name_at(s.mono.pctx, ei, out_len)
+    *out_name = enum_name_at(s.sym.mono.pctx, ei, out_len)
 
 # AGAST #4759: a qualified variant ritz1 cannot build, as
 # `<file>:<line>:<col>: error: 'E.V' <msg>`.  Counted like emit_ir_error, so
@@ -3352,7 +3382,7 @@ pub fn emit_qualified_variant_error_sv(s: *EmitterState, e: *Expr, msg: StrView)
     eprints("' ")
     eprints(msg)
     eprints("\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     let z: i32 = next_reg(s)
     format_into(s, "  %.{z} = add i64 0, 0\n")
     z
@@ -3366,13 +3396,13 @@ pub fn is_module_item(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32) -> i32
         return 0
     if is_const(s, StrView { ptr: (q), len: (ql) as i64 }) == 1 or find_fn(s, StrView { ptr: (q), len: (ql) as i64 }) != null
         return 0
-    if is_enum_type(s.mono.pctx, StrView { ptr: (q), len: (ql) as i64 }) == 1 or find_struct(s, StrView { ptr: (q), len: (ql) as i64 }) != null
+    if is_enum_type(s.sym.mono.pctx, StrView { ptr: (q), len: (ql) as i64 }) == 1 or find_struct(s, StrView { ptr: (q), len: (ql) as i64 }) != null
         return 0
     if name_eq(StrView { ptr: (q), len: (ql) as i64 }, "Span") == 1 or name_eq(StrView { ptr: (q), len: (ql) as i64 }, "StrView") == 1
         return 0
     if name_eq(StrView { ptr: (q), len: (ql) as i64 }, "Option") == 1 or name_eq(StrView { ptr: (q), len: (ql) as i64 }, "Result") == 1
         return 0
-    var ib: *ImplBlock = s.module.impls
+    var ib: *ImplBlock = s.sym.module.impls
     while ib != null
         if name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (q), len: (ql) as i64 }) == 1
             return 0
@@ -3395,7 +3425,7 @@ pub fn emit_module_item_error(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32
     eprints("Imported names share one namespace, so write `")
     eprint_bytes(StrView { ptr: (n), len: (nl) as i64 })
     eprints("`\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     let z: i32 = next_reg(s)
     format_into(s, "  %.{z} = add i64 0, 0\n")
     z
@@ -3409,9 +3439,9 @@ pub fn emit_ambiguous_variant_error(s: *EmitterState, name_sv: StrView, span: Sr
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var a_len: i32 = 0
-    let a: *u8 = enum_name_at(s.mono.pctx, ea, @a_len)
+    let a: *u8 = enum_name_at(s.sym.mono.pctx, ea, @a_len)
     var b_len: i32 = 0
-    let b: *u8 = enum_name_at(s.mono.pctx, eb, @b_len)
+    let b: *u8 = enum_name_at(s.sym.mono.pctx, eb, @b_len)
     format_into(s, "  ; ERROR: ambiguous enum variant '")
     emit_name(s, name_sv)
     format_into(s, "'\n")
@@ -3427,7 +3457,7 @@ pub fn emit_ambiguous_variant_error(s: *EmitterState, name_sv: StrView, span: Sr
     eprints(".")
     eprint_bytes(StrView { ptr: (name), len: (len) as i64 })
     eprints("'\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     let zero: i32 = next_reg(s)
     format_into(s, "  %.{zero} = add i64 0, 0\n")
     return zero
@@ -3519,7 +3549,7 @@ pub fn is_elem_aggregate_name(s: *EmitterState, name_sv: StrView) -> i32
         return 0
     if find_struct(s, name_sv) != null
         return 1
-    is_user_enum_name(s.mono.pctx, name_sv)
+    is_user_enum_name(s.sym.mono.pctx, name_sv)
 
 # Emit `  %.dst = load <ty>, ptr %.ptr` for a destination the site has
 # already allocated with next_reg.  The instruction shape lives here rather
@@ -3571,8 +3601,8 @@ pub fn intern_string(s: *EmitterState, text: StrView) -> i32
 pub fn add_string(s: *EmitterState, data_sv: StrView) -> i32
     var data: *u8 = data_sv.ptr
     var len: i32 = data_sv.len as i32
-    let idx: i32 = namelist_count(@s.strings)
-    namelist_push(@s.strings, StrView { ptr: (data), len: (len) as i64 })
+    let idx: i32 = namelist_count(@s.ir.strings)
+    namelist_push(@s.ir.strings, StrView { ptr: (data), len: (len) as i64 })
     idx
 
 # =============================================================================
@@ -3593,13 +3623,13 @@ pub fn get_struct_size_by_name(s: *EmitterState, name_sv: StrView) -> i64
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
     if st == null
         # AGAST #1797: a user enum, `{ i8 }` or `{ i8, [P x i8], [N x i8] }`.
-        let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
+        let uei: i32 = user_enum_index(s.sym.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
         if uei >= 0
             return user_enum_size(s, uei)
         return 8
     # `[[packed]]` (AGAST #1847): fields back to back, no tail padding —
     # the layout of the `<{ ... }>` type emit_one_struct_type writes.
-    let packed: i32 = struct_is_packed(s.mono.pctx, st)
+    let packed: i32 = struct_is_packed(s.sym.mono.pctx, st)
     var offset: i64 = 0
     var max_align: i64 = 1
     var f: *StructField = st.fields
@@ -3642,11 +3672,11 @@ pub fn get_struct_align_by_name(s: *EmitterState, name_sv: StrView) -> i64
         return 1   # AGAST #1898: { i8, [P x i8], [N x i8] } is 1-aligned
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
     if st == null
-        let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
+        let uei: i32 = user_enum_index(s.sym.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
         if uei >= 0
-            return user_enum_align(s.mono.pctx, uei)   # AGAST #1797, #4574
+            return user_enum_align(s.sym.mono.pctx, uei)   # AGAST #1797, #4574
         return 8
-    if struct_is_packed(s.mono.pctx, st) == 1
+    if struct_is_packed(s.sym.mono.pctx, st) == 1
         return 1   # `[[packed]]`: an LLVM packed struct is 1-aligned (#1847)
     var max_align: i64 = 1
     var f: *StructField = st.fields
@@ -3730,7 +3760,7 @@ pub fn ptr_pointee_size(s: *EmitterState, pointee: TypeKind, name_sv: StrView) -
             return ps
         # AGAST #2411: and `Vec$C.data + i` over a non-generic user enum
         # strides at the enum's own layout (#1797).
-        let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
+        let uei: i32 = user_enum_index(s.sym.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
         if uei >= 0
             return user_enum_size(s, uei)
         return 0
@@ -3877,7 +3907,7 @@ pub fn global_is_receiver(g: *GlobalVarDef) -> i32
 pub fn impl_type_named(s: *EmitterState, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var ib: *ImplBlock = s.module.impls
+    var ib: *ImplBlock = s.sym.module.impls
     while ib != null
         if name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             return 1
@@ -3936,7 +3966,7 @@ pub fn mem_builtin_error(s: *EmitterState, e: *Expr, msg: StrView)
     eprints(" ")
     eprints(msg)
     eprints("\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 pub fn mem_int_type_bits(t: TypeKind) -> i32
     if ty_int_bits(t) == 8

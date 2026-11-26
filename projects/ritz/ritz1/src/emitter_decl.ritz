@@ -103,7 +103,7 @@ fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
         return 0
     if lv_var_type(src) == TypeKind.Ptr and lv_pointee_type(src) == TypeKind.Array
         return infer_ref_to_array_pointer_let(dt, src)
-    if lv_type_name_len(src) > 0 and is_enum_type(s.mono.pctx, StrView { ptr: (lv_type_name(src)), len: (lv_type_name_len(src)) as i64 }) == 1
+    if lv_type_name_len(src) > 0 and is_enum_type(s.sym.mono.pctx, StrView { ptr: (lv_type_name(src)), len: (lv_type_name_len(src)) as i64 }) == 1
         return infer_ref_to_enum_pointer_let(dt, src)
     if find_struct(s, StrView { ptr: (lv_type_name(src)), len: (lv_type_name_len(src)) as i64 }) == null
         return infer_ref_to_scalar_pointer_let(dt, src)
@@ -752,10 +752,10 @@ pub fn infer_ctor_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     if init.kind == ExprKind.Call
         var uc_name: *u8 = null
         var uc_len: i32 = 0
-        user_variant_ctor_enum(s.mono.pctx, init, @uc_name, @uc_len)
+        user_variant_ctor_enum(s.sym.mono.pctx, init, @uc_name, @uc_len)
         if uc_name != null
             return 0   # a user enum's own variant (#1797)
-    let ret_name: StrView = StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
+    let ret_name: StrView = StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }
     var name: StrView = ret_name
     if ctor_family_is(init, ret_name) == 0
         name = ctor_scrutinee_enum(s, init)
@@ -774,7 +774,7 @@ pub fn builtin_tagged_ctor(s: *EmitterState, e: *Expr) -> i32
     if e.kind == ExprKind.Call
         var uc_name: *u8 = null
         var uc_len: i32 = 0
-        user_variant_ctor_enum(s.mono.pctx, e, @uc_name, @uc_len)
+        user_variant_ctor_enum(s.sym.mono.pctx, e, @uc_name, @uc_len)
         if uc_name != null
             return 0
     1
@@ -854,8 +854,8 @@ pub fn infer_ctor_arms(s: *EmitterState, stmt: *Stmt) -> CtorArms
     if mixed != null
         emit_ctor_type_error(s, mixed)
         return ctor_arms(ArmsCtor.Refused)
-    if ctor_family_is(any, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }) == 1
-        return CtorArms { kind: ArmsCtor.Named, name: StrView { ptr: s.ret_type_name, len: s.ret_type_name_len as i64 } }
+    if ctor_family_is(any, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }) == 1
+        return CtorArms { kind: ArmsCtor.Named, name: StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 } }
     let t: StrView = arm_payload_spelling(s, val)
     if t.len <= 0
         emit_ctor_type_error(s, val)
@@ -869,8 +869,8 @@ pub fn infer_ctor_arms(s: *EmitterState, stmt: *Stmt) -> CtorArms
             emit_ctor_type_error(s, err)
             return ctor_arms(ArmsCtor.Refused)
         name = ctor_join(ctor_join("Result$", t, "$"), e, "")
-    if namelist_find(@s.late_enums, name) < 0
-        namelist_push(@s.late_enums, name)
+    if namelist_find(@s.ir.late_enums, name) < 0
+        namelist_push(@s.ir.late_enums, name)
     CtorArms { kind: ArmsCtor.Named, name: name }
 
 # AGAST #2784: the struct returned by the method call `init` on a call's
@@ -958,7 +958,7 @@ fn tuple_bind_array_field(s: *EmitterState, fld: *StructField, val: i32, name: S
     emit_field_llvm_type(s, fld)
     format_into(s, " %.{val}, ptr %.{slot}\n")
     add_local_full(s, name, slot, TypeKind.Array, StrView { ptr: (fld.array_elem_type_name), len: (fld.array_elem_type_name_len) as i64 }, TypeKind.I64, fld.array_size, fld.array_elem_type)
-    let loc: *LocalVar = local_at(s, s.local_count - 1)
+    let loc: *LocalVar = local_at(s, s.fcx.local_count - 1)
     lv_set_array_elem_pointee(loc, fld.array_elem_pointee)
     lv_set_array_shape(loc, fld.array_shape)
 
@@ -1000,14 +1000,14 @@ pub fn tuple_bind_field(s: *EmitterState, fld: *StructField, sname_sv: StrView, 
     match ft
         TypeKind.Ptr | TypeKind.PtrPtr =>
             add_local_full(s, name_sv, slot, ft, ft_name, fld.ptr_pointee, 0, TypeKind.Void)
-            let ploc: *LocalVar = local_at(s, s.local_count - 1)
+            let ploc: *LocalVar = local_at(s, s.fcx.local_count - 1)
             lv_set_inner_pointee_type(ploc, fld.inner_pointee_type)
         TypeKind.Struct =>
             add_local_struct(s, name_sv, slot, ft, ft_name)
         _ =>
             add_local(s, name_sv, slot, slot_type)
             if ft == TypeKind.Bool
-                let bloc: *LocalVar = local_at(s, s.local_count - 1)
+                let bloc: *LocalVar = local_at(s, s.fcx.local_count - 1)
                 bloc.is_bool = 1
 
 # The LLVM type a bound tuple field's slot holds: the struct `name` for a
@@ -1259,7 +1259,7 @@ fn decl_infer_call(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Type
     # AGAST #1797: `let b = Holds(20)` is the user enum it builds.
     var uc_name: *u8 = null
     var uc_len: i32 = 0
-    user_variant_ctor_enum(s.mono.pctx, stmt.var_init, @uc_name, @uc_len)
+    user_variant_ctor_enum(s.sym.mono.pctx, stmt.var_init, @uc_name, @uc_len)
     var fn_def: *FnDef = null
     if uc_name != null
         var_type = TypeKind.Struct
@@ -1432,7 +1432,7 @@ fn decl_infer_method(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Ty
             # and, S a `Vec$E`, `t.len()` / `t[0]` had no receiver.
             # AGAST #3620: or a user enum's `%E` (`match t` over it).
             let up: StrView = unwrap_payload_struct_name(s, stmt.var_init)
-            if up.len > 0 and (find_struct(s, up) != null or user_enum_index(s.mono.pctx, up) >= 0)
+            if up.len > 0 and (find_struct(s, up) != null or user_enum_index(s.sym.mono.pctx, up) >= 0)
                 var_type = TypeKind.Struct
                 dt.var_type = TypeKind.Struct
                 set_decl_name(dt, up)
@@ -1999,11 +1999,11 @@ pub fn decl_register_local(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type:
                     add_local_full(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, alloca_reg, TypeKind.Array, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 }, TypeKind.I64, dt.var_array_size, dt.var_array_elem_type)
                 else
                     add_local_array(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, alloca_reg, dt.var_array_size, dt.var_array_elem_type)
-                let arr_loc: *LocalVar = local_at(s, s.local_count - 1)
+                let arr_loc: *LocalVar = local_at(s, s.fcx.local_count - 1)
                 lv_set_array_elem_pointee(arr_loc, dt.var_array_elem_pointee)   # AGAST #2341
                 lv_set_array_rec(arr_loc, dt.var_array)   # AGAST #2995
-                if dt.var_array_shape != null and s.local_count > 0
-                    let nd_loc: *LocalVar = local_at(s, s.local_count - 1)
+                if dt.var_array_shape != null and s.fcx.local_count > 0
+                    let nd_loc: *LocalVar = local_at(s, s.fcx.local_count - 1)
                     lv_set_array_shape(nd_loc, dt.var_array_shape)   # AGAST #1509
             _ =>
                 add_local(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, alloca_reg, var_type)
@@ -2025,15 +2025,15 @@ pub fn decl_register_local(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type:
 # Store the emitted initialiser `init_reg` into the slot at its type.
 pub fn decl_store_init(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type: TypeKind, init_reg: i32, alloca_reg: i32)
     if ty_int_bits(var_type) == 32
-        let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, init_reg)
+        let trunc: i32 = ir_trunc_i64_i32(s.ir.out, @s.fcx.reg_counter, init_reg)
         emit_store_typed(s, "i32", trunc, alloca_reg)
     else if ty_int_bits(var_type) == 16
         # Truncate i64 (unified value model) to i16 for the slot.
-        let trunc: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, init_reg)
+        let trunc: i32 = ir_trunc_i64_i16(s.ir.out, @s.fcx.reg_counter, init_reg)
         emit_store_typed(s, "i16", trunc, alloca_reg)
     else if ty_int_bits(var_type) == 8
         # Truncate i64 to i8 for byte types
-        let trunc: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, init_reg)
+        let trunc: i32 = ir_trunc_i64_i8(s.ir.out, @s.fcx.reg_counter, init_reg)
         emit_store_typed(s, "i8", trunc, alloca_reg)
     else
         match var_type
@@ -2267,7 +2267,7 @@ fn init_is_str_view(s: *EmitterState, e: *Expr) -> bool
 
 # After emit_var_decl: mark the binding it registered as a `let`, and (#3579)
 # an unannotated one bound to a StrView value (init_is_str_view).  `before` is
-# s.local_count before the decl, so a decl that registered nothing never marks
+# s.fcx.local_count before the decl, so a decl that registered nothing never marks
 # an outer binding of the same name.  The `let` rule is Sema's (let_check.ritz,
 # AGAST #3504); LocalVar.is_let is for the emitter's readers: asm operands,
 # ref_check's `@x` of a `let` (let_addr_of_own), and str_view's.
@@ -2393,7 +2393,7 @@ fn expr_is_definitely_int(s: *EmitterState, e: *Expr) -> i32
 # that type.  `val_reg` is emit_expr(value).  AGAST #1935.
 pub fn emit_field_elem_narrow(s: *EmitterState, val_reg: i32, elem_ty: TypeKind, value: *Expr) -> i32
     if elem_ty == TypeKind.Bool
-        let t1: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val_reg)
+        let t1: i32 = ir_trunc_i64_i1(s.ir.out, @s.fcx.reg_counter, val_reg)
         return t1
     # AGAST #2065: an integer value into a float slot (`R { a: 3 }`,
     # `r.a = 3`, `p[i] = 3`, `x = 3`) is sitofp'd; it stored the i64.
@@ -2401,7 +2401,7 @@ pub fn emit_field_elem_narrow(s: *EmitterState, val_reg: i32, elem_ty: TypeKind,
         if expr_is_definitely_int(s, value) == 1
             return emit_int_into_float_slot(s, val_reg, float_slot_unsigned(value), elem_ty)
     if elem_ty == TypeKind.F32 and expr_slot_ty(value) == TypeKind.F64
-        let tf: i32 = ir_fptrunc_f64_f32(s.out, @s.reg_counter, val_reg)
+        let tf: i32 = ir_fptrunc_f64_f32(s.ir.out, @s.fcx.reg_counter, val_reg)
         return tf
     # AGAST #4028: an f32 value into an f64 slot widens (§7.5); it stored the
     # `float` register as `double`.  An if / match is never F32 here (its phi
@@ -2617,12 +2617,12 @@ fn tuple_struct_new(s: *EmitterState, name: StrView, fields: *StructField) -> *S
     st.name = name.ptr
     st.name_len = name.len as i32
     st.fields = fields
-    st.next = s.module.structs
-    s.module.structs = st
+    st.next = s.sym.module.structs
+    s.sym.module.structs = st
     let key: i64 = fnv1a_str(Span<u8> { ptr: name.ptr, len: name.len }) as i64
-    if not s.struct_map.contains(key)
-        s.struct_map.insert(key, st as i64)
-    namelist_push(@s.late_tuples, name)
+    if not s.sym.struct_map.contains(key)
+        s.sym.struct_map.insert(key, st as i64)
+    namelist_push(@s.ir.late_tuples, name)
     st
 
 # AGAST #4408 (#1816): the name tuple_lit_name decided for a literal is kept
@@ -3042,8 +3042,8 @@ pub fn ctor_scrutinee_enum(s: *EmitterState, scr: *Expr) -> StrView
     let name: StrView = tagged_ctor_enum_name(s, scr)
     if unnamed(name)
         return no_name()
-    if namelist_find(@s.late_enums, name) < 0
-        namelist_push(@s.late_enums, name)
+    if namelist_find(@s.ir.late_enums, name) < 0
+        namelist_push(@s.ir.late_enums, name)
     name
 
 # --- A generic user enum's bare constructor as the scrutinee (AGAST #2437) ----

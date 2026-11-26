@@ -36,7 +36,7 @@ fn abi_param_type_name(p: *Param) -> StrView
 
 # The struct type the fn being emitted returns.
 fn abi_ret_type_name(s: *EmitterState) -> StrView
-    StrView { ptr: s.ret_type_name, len: s.ret_type_name_len as i64 }
+    StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 }
 
 # A `ptr` operand: the register `reg`, or the global `@<name>` when reg < 0.
 fn emit_ptr_operand(s: *EmitterState, reg: i32, name: StrView)
@@ -77,8 +77,8 @@ pub fn defer_try_struct_copy_store_named(s: *EmitterState, t: TypeKind, ty_sv: S
 # The held load of %.val as type `ty`, when the region since it cannot have
 # written its source; null when there is none.
 fn pending_load_of(s: *EmitterState, ty: StrView, val: i32) -> *DeferredLoad
-    for i in 0..s.dload_count
-        let r: *DeferredLoad = s.dloads + (i as i64)
+    for i in 0..s.ir.dload_count
+        let r: *DeferredLoad = s.ir.dloads + (i as i64)
         if r.state == DLOAD_PENDING and r.reg == val and dload_region_cannot_write(s, r.off) == 1
             let held: StrView = StrView { ptr: r.ty, len: r.ty_len as i64 }
             if held.eq(ty)
@@ -88,7 +88,7 @@ fn pending_load_of(s: *EmitterState, ty: StrView, val: i32) -> *DeferredLoad
 # The store of %.val to <dst> (the register `dst`, or `@dst_name` when dst < 0)
 # as the `@__ritz_sret_copy` call, when %.val is a held load; false otherwise.
 fn defer_copy_store(s: *EmitterState, t: TypeKind, ty: StrView, val: i32, dst: i32, dst_name: StrView) -> bool
-    if s.dload_count <= 0 or struct_ret_uses_sret(s, t, ty) == 0
+    if s.ir.dload_count <= 0 or struct_ret_uses_sret(s, t, ty) == 0
         return false
     let r: *DeferredLoad = pending_load_of(s, ty, val)
     if r == null
@@ -100,7 +100,7 @@ fn defer_copy_store(s: *EmitterState, t: TypeKind, ty: StrView, val: i32, dst: i
     format_into(s, ", ")
     emit_sret_size(s, ty)
     format_into(s, ")\n")
-    s.sret_helpers_used = 1
+    s.ir.sret_helpers_used = 1
     if r.used == 0
         r.state = DLOAD_DROPPED
     else
@@ -368,8 +368,8 @@ pub fn emit_call_sret_result(s: *EmitterState, f: *FnDef, result: i32, slot: i32
     if fn_sret_array(s, f) != null
         return slot
     emit_struct_load_or_defer(s, TypeKind.Struct, result, name_sv, slot, no_name())
-    s.sret_last_val = result
-    s.sret_last_slot = slot
+    s.fcx.sret_last_val = result
+    s.fcx.sret_last_slot = slot
     result
 
 # The LLVM type of param `p` in a signature or call argument list.  AGAST #2287:
@@ -416,7 +416,7 @@ pub fn emit_sret_ret_from_ptr(s: *EmitterState, src_ptr: i32)
     emit_sret_size(s, abi_ret_type_name(s))
     format_into(s, ")\n")
     format_into(s, "  ret void\n")
-    s.sret_helpers_used = 1
+    s.ir.sret_helpers_used = 1
 
 # Module-internal byte copy / zero used by every sret return.  Defined once
 # per module, only when used.  "no-builtins" keeps clang from rewriting the
@@ -425,7 +425,7 @@ pub fn emit_sret_ret_from_ptr(s: *EmitterState, src_ptr: i32)
 # its own piece, so the sink runs its before-`ret` drops, but no owned binding
 # is live here and they emit nothing.
 pub fn emit_sret_helpers(s: *EmitterState)
-    if s.sret_helpers_used == 0
+    if s.ir.sret_helpers_used == 0
         return
     format_into(s, "define internal void @__ritz_sret_copy(ptr %d, ptr %s, i64 %n) \"no-builtins\"")
     emit_no_red_zone_attr(s)
@@ -530,7 +530,7 @@ fn emit_fmod_fn(s: *EmitterState, w: FmodWidth)
 
 # The fmod helper at width `w`, when float `%` called it in this module.
 fn emit_fmod_if_used(s: *EmitterState, w: FmodWidth)
-    if (s.fmod_helpers_used & fmod_used_bit(w)) != 0
+    if (s.ir.fmod_helpers_used & fmod_used_bit(w)) != 0
         emit_fmod_fn(s, w)
 
 # The fmod helpers float `%` called in this module, defined once each.
@@ -542,8 +542,8 @@ pub fn emit_fmod_helpers(s: *EmitterState)
 # is the load of an sret call's slot (`return f()`), copy the slot itself;
 # otherwise spill the value and copy that.
 pub fn emit_sret_ret_value(s: *EmitterState, val: i32)
-    if val == s.sret_last_val and s.sret_last_slot > 0
-        emit_sret_ret_from_ptr(s, s.sret_last_slot)
+    if val == s.fcx.sret_last_val and s.fcx.sret_last_slot > 0
+        emit_sret_ret_from_ptr(s, s.fcx.sret_last_slot)
         return
     let ty: StrView = abi_ret_type_name(s)
     let tmp: i32 = emit_sret_call_slot(s, ty)
@@ -575,10 +575,10 @@ pub fn bare_unit_variant_enum(s: *EmitterState, e: *Expr, out_vi: *i32, out_othe
     let name: StrView = e.ident
     if is_const(s, name) == 1 or find_local(s, name) >= 0 or find_global(s, name) != null or find_fn(s, name) != null
         return 0 - 1
-    let ei: i32 = enum_of_variant_unique(s.mono.pctx, name, out_vi, out_other)
+    let ei: i32 = enum_of_variant_unique(s.sym.mono.pctx, name, out_vi, out_other)
     if ei < 0
         return ei
-    if enum_variant_kind(s.mono.pctx, ei, *out_vi) != ENUM_VARIANT_UNIT
+    if enum_variant_kind(s.sym.mono.pctx, ei, *out_vi) != ENUM_VARIANT_UNIT
         *out_vi = 0 - 1
         return 0 - 1
     ei

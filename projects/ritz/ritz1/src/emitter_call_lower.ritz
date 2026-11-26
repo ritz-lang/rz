@@ -237,7 +237,7 @@ fn has_method_fn(s: *EmitterState, type_name: StrView, method: StrView, lower: b
 pub fn refuse_no_method(s: *EmitterState, e: *Expr, type_name: StrView) -> bool
     let builtin_carrier: bool = type_name.starts_with("Option$") or type_name.starts_with("Result$")
     let is_strview: bool = name_eq(type_name, "StrView") == 1
-    if not builtin_carrier and not is_strview and find_struct(s, type_name) == null and is_enum_type(s.mono.pctx, type_name) == 0
+    if not builtin_carrier and not is_strview and find_struct(s, type_name) == null and is_enum_type(s.sym.mono.pctx, type_name) == 0
         return false
     if has_method_fn(s, type_name, ident_sv(e), false)
         return false
@@ -256,7 +256,7 @@ pub fn refuse_no_method(s: *EmitterState, e: *Expr, type_name: StrView) -> bool
         eprints("StrView")
     else
         eprint_bytes(type_name)
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     if is_strview or type_name.find_byte('$') < type_name.len
         eprints("`\n")
         return true
@@ -335,15 +335,15 @@ pub fn emit_self_value(s: *EmitterState, p: *Param, recv: i32) -> i32
 # common case).  `no_name()` when no enum context is available; callers should
 # emit a defensive zero value rather than invalid IR in that case.
 pub fn resolve_enum_ctx(s: *EmitterState) -> StrView
-    let ctx: StrView = StrView { ptr: s.ctx_enum_name, len: s.ctx_enum_name_len as i64 }
+    let ctx: StrView = StrView { ptr: s.fcx.ctx_enum_name, len: s.fcx.ctx_enum_name_len as i64 }
     if ctx.ptr != null and ctx.len > 0 and is_tagged_enum_type(ctx) == 1
         return ctx
     # AGAST #1498: inside a call argument the enclosing fn's return type
     # says nothing about the argument's type — borrowing it built an
     # %Option$i64 for an Option<i32> param.
-    if s.ctx_enum_arg == 1
+    if s.fcx.ctx_enum_arg == 1
         return no_name()
-    let ret: StrView = StrView { ptr: s.ret_type_name, len: s.ret_type_name_len as i64 }
+    let ret: StrView = StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 }
     if ret.ptr != null and ret.len > 0 and is_tagged_enum_type(ret) == 1
         return ret
     no_name()
@@ -351,7 +351,7 @@ pub fn resolve_enum_ctx(s: *EmitterState) -> StrView
 # The EmitterState form of ast_query's lent_self_call_view_in (AGAST #4391:
 # the pure part moved to ast_query, this wrapper stays here).
 pub fn lent_self_call_view(s: *EmitterState, f: *FnDef) -> *FnDef
-    lent_self_call_view_in(s.module, f)
+    lent_self_call_view_in(s.sym.module, f)
 
 # AGAST #2502: the `[N]T` local `@e` names when `e` is `@a` and the slot
 # `name` is a `Span<T>` / `[T]` (one type since #1614); else null.
@@ -566,7 +566,7 @@ pub fn emit_array_return_from(s: *EmitterState, ra: *Param, slot: i32) -> i32
         emit_array_sret_size(s, ra)
         format_into(s, ")\n")
         format_into(s, "  ret void\n")   # a `ret` starts its piece (the sink's ret hook)
-        s.sret_helpers_used = 1
+        s.ir.sret_helpers_used = 1
         return 1
     let val: i32 = next_reg(s)
     format_into(s, "  %.{val} = load ")
@@ -1094,7 +1094,7 @@ pub fn spill_byval_arg(s: *EmitterState, arg: *Expr, reg: i32, p: *Param) -> i32
     # load).
     if arg != null and arg.kind == ExprKind.Unary
         if arg.op == OpKind.Addr or arg.op == OpKind.AddrMut
-            let pp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, reg)
+            let pp: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, reg)
             val = next_reg(s)
             let pty: String = ir_name(param_type_sv(p))
             format_into(s, "  %.{val} = load %{pty.as_view()}, ptr %.{pp}\n")
@@ -1125,7 +1125,7 @@ pub fn emit_ctor_type_error(s: *EmitterState, ctor: *Expr)
 # an enum it is #1498 / #2142's refusal, now located too.  Returns an i64 zero
 # so the rest of the fn still emits; the error stops the output.
 pub fn emit_no_enum_ctx_error(s: *EmitterState, ctor: *Expr) -> i32
-    if s.ctx_enum_arg == 1
+    if s.fcx.ctx_enum_arg == 1
         emit_nd_error_sv(s, ctor.span.line, ctor.span.col, "variant constructor has no enum context: the parameter or slot it goes into is not an Option/Result")
     else
         emit_ctor_type_error(s, ctor)
@@ -1144,13 +1144,13 @@ pub fn users_variant_wins(s: *EmitterState, e: *Expr) -> bool
         return false
     var a: i32 = 0
     var b: i32 = 0
-    if user_variant_ctor_ambiguous(s.mono.pctx, e, @a, @b) == 0
-        let en: StrView = user_ctor_enum(s.mono.pctx, e)
+    if user_variant_ctor_ambiguous(s.sym.mono.pctx, e, @a, @b) == 0
+        let en: StrView = user_ctor_enum(s.sym.mono.pctx, e)
         if unnamed(en)
             return false
         # The let's slot is this user enum (`let x: E = Ok(5)`, or an untyped
         # let #1797 typed %E): the user's variant, whatever the fn returns.
-        if s.ctx_enum_name != null and name_eq(StrView { ptr: s.ctx_enum_name, len: s.ctx_enum_name_len as i64 }, en) == 1
+        if s.fcx.ctx_enum_name != null and name_eq(StrView { ptr: s.fcx.ctx_enum_name, len: s.fcx.ctx_enum_name_len as i64 }, en) == 1
             return true
     if unnamed(resolve_enum_ctx(s))
         return true
@@ -1180,7 +1180,7 @@ pub fn variant_payload_aggregate(s: *EmitterState, payload_expr: *Expr) -> StrVi
             var bother: i32 = 0
             let bei: i32 = bare_unit_variant_enum(s, payload_expr, @bvi, @bother)
             if bei >= 0
-                return enum_name_view(s.mono.pctx, bei)
+                return enum_name_view(s.sym.mono.pctx, bei)
         ExprKind.StringLit =>
             # Bare "..." lowers to a %Span$u8 aggregate (AGAST #98) —
             # layout-equal to StrView; storing it as i64 was invalid IR
@@ -1207,7 +1207,7 @@ pub fn variant_payload_aggregate(s: *EmitterState, payload_expr: *Expr) -> StrVi
         ExprKind.Call =>
             # AGAST #1466: a user-enum ctor `Err(Missing(5))` is the enum
             # aggregate (it was stored as an i64: invalid IR).
-            let en: StrView = user_ctor_enum(s.mono.pctx, payload_expr)
+            let en: StrView = user_ctor_enum(s.sym.mono.pctx, payload_expr)
             if not unnamed(en)
                 return en
             let fn_def: *FnDef = find_call_fn(s, payload_expr)
@@ -1231,7 +1231,7 @@ pub fn variant_payload_aggregate(s: *EmitterState, payload_expr: *Expr) -> StrVi
 # a tagged enum's type argument, or a user enum's (or instance's) tuple field.
 # `no_name()` when the payload is a scalar or unknown.
 pub fn variant_payload_type_name(s: *EmitterState, enum_name: StrView, tag: i32) -> StrView
-    let uf: *StructField = user_enum_tuple_field(s.mono.pctx, enum_name, tag)
+    let uf: *StructField = user_enum_tuple_field(s.sym.mono.pctx, enum_name, tag)
     if uf != null and uf.field_type == TypeKind.Struct
         return StrView { ptr: uf.field_type_name, len: uf.field_type_name_len as i64 }
     tagged_payload(s, enum_name, tag)
@@ -1251,7 +1251,7 @@ pub fn variant_array_payload(s: *EmitterState, enum_name: StrView, tag: i32, e: 
 pub fn variant_array_type(s: *EmitterState, enum_name: StrView, tag: i32, out: *ArrayArg) -> i32
     if enum_name.ptr == null or enum_name.len <= 0
         return 0
-    let uf: *StructField = user_enum_tuple_field(s.mono.pctx, enum_name, tag)
+    let uf: *StructField = user_enum_tuple_field(s.sym.mono.pctx, enum_name, tag)
     if uf != null
         if uf.field_type != TypeKind.Array or uf.array_size <= 0
             return 0
@@ -1282,7 +1282,7 @@ pub fn emit_variant_slot(s: *EmitterState, enum_name: StrView, tag: i32) -> i32
     let tag_ptr: i32 = next_reg(s)
     gep_struct_open(s, tag_ptr, enum_name)
     format_into(s, ", ptr %.{slot}, i32 0, i32 0\n")
-    emit_store_imm(s, enum_tag_ty_named(s.mono.pctx, enum_name), enum_tag_value_named(s.mono.pctx, enum_name, tag), tag_ptr)
+    emit_store_imm(s, enum_tag_ty_named(s.sym.mono.pctx, enum_name), enum_tag_value_named(s.sym.mono.pctx, enum_name, tag), tag_ptr)
     slot
 
 # Load the enum assembled at `slot` as a value.
@@ -1303,8 +1303,8 @@ pub fn emit_payload_count_error(s: *EmitterState, ei: i32, vi: i32, args: *Expr,
     var at: SrcSpan = call
     if args != null
         at = args.span
-    let variant: StrView = enum_variant_label(s.mono.pctx, ei, vi)
-    let takes: i32 = enum_variant_field_count(s.mono.pctx, ei, vi)
+    let variant: StrView = enum_variant_label(s.sym.mono.pctx, ei, vi)
+    let takes: i32 = enum_variant_field_count(s.sym.mono.pctx, ei, vi)
     var msg: String = string_new()
     format_into(@&msg, "variant `{variant}` takes {takes} payload value(s), got {got}")
     emit_nd_error_sv(s, at.line, at.col, msg.as_view())
@@ -1379,9 +1379,9 @@ fn simd_arg_own_type(s: *EmitterState, arg: *Expr) -> StrView
 # shapes (squeeze/crc32_simd has `fn load_vec(...) -> v2i64 \n
 # simd_loadu(data as *i64)`).
 fn simd_ctx_type(s: *EmitterState) -> StrView
-    if s.ctx_simd_name != null and s.ctx_simd_name_len > 0
-        return StrView { ptr: s.ctx_simd_name, len: s.ctx_simd_name_len as i64 }
-    let ret: StrView = StrView { ptr: s.ret_type_name, len: s.ret_type_name_len as i64 }
+    if s.fcx.ctx_simd_name != null and s.fcx.ctx_simd_name_len > 0
+        return StrView { ptr: s.fcx.ctx_simd_name, len: s.fcx.ctx_simd_name_len as i64 }
+    let ret: StrView = StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 }
     if ret.ptr != null and ret.len > 0 and is_simd_vector_type_name(ret) == 1
         return ret
     no_name()
@@ -1425,7 +1425,7 @@ fn sizeof_kind_size(s: *EmitterState, t: TypeKind, name: StrView) -> i64
             let prim: i64 = ty_store_size(ty_from_name(name))
             if prim > 0
                 return prim
-            if find_struct(s, name) != null or is_tagged_enum_type(name) == 1 or user_enum_index(s.mono.pctx, name) >= 0
+            if find_struct(s, name) != null or is_tagged_enum_type(name) == 1 or user_enum_index(s.sym.mono.pctx, name) >= 0
                 return get_struct_size_by_name(s, name)
             return -1
         TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
@@ -1458,7 +1458,7 @@ fn sizeof_alias_size(s: *EmitterState, name_sv: StrView) -> i64
     var leaf: TypeKind = TypeKind.Void
     var leaf_name: *u8 = null
     var leaf_len: i32 = 0
-    if type_alias_sizeof_shape(s.mono.pctx, name_sv, @count, @leaf, @leaf_name, @leaf_len) == 0
+    if type_alias_sizeof_shape(s.sym.mono.pctx, name_sv, @count, @leaf, @leaf_name, @leaf_len) == 0
         return -1
     return sizeof_times(count, sizeof_kind_size(s, leaf, StrView { ptr: leaf_name, len: leaf_len as i64 }))
 
@@ -1492,11 +1492,11 @@ fn sizeof_names_type(s: *EmitterState, e: *Expr) -> bool
 # The newest declaration of `name` in this function (null if none, or if
 # the table overflowed and can no longer be trusted).
 fn sizeof_find_decl(s: *EmitterState, name_sv: StrView) -> *NarrowDecl
-    if s.narrow_decl_overflow != 0
+    if s.fcx.narrow_decl_overflow != 0
         return null
-    var i: i32 = s.narrow_decl_count - 1
+    var i: i32 = s.fcx.narrow_decl_count - 1
     while i >= 0
-        let d: *NarrowDecl = @s.narrow_decls[i]
+        let d: *NarrowDecl = @s.fcx.narrow_decls[i]
         if name_eq(StrView { ptr: d.name, len: d.name_len as i64 }, name_sv) == 1
             return d
         i = i - 1
@@ -1750,7 +1750,7 @@ fn sizeof_error(s: *EmitterState, e: *Expr, name: StrView)
         eprints("sizeof: unknown type or value `")
         eprint_bytes(name)
         eprints("`\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # The constant `sizeof(...)` folds to; reports and returns 0 when unknown.
 pub fn sizeof_call_value(s: *EmitterState, e: *Expr) -> i64
@@ -1863,15 +1863,15 @@ pub fn widen_call_result(s: *EmitterState, ret_type: TypeKind, ret_sv: StrView, 
         if ty_int_bits(t) == 0 or ty_int_bits(t) == 64
             return call_result
     match t
-        TypeKind.Bool => return ir_zext_i1_i64(s.out, @s.reg_counter, call_result)
-        TypeKind.I32 => return ir_sext_i32_i64(s.out, @s.reg_counter, call_result)
-        TypeKind.U32 => return ir_zext_i32_i64(s.out, @s.reg_counter, call_result)
-        TypeKind.I16 => return ir_sext_i16_i64(s.out, @s.reg_counter, call_result)
-        TypeKind.U16 => return ir_zext_i16_i64(s.out, @s.reg_counter, call_result)
-        TypeKind.I8 => return ir_sext_i8_i64(s.out, @s.reg_counter, call_result)
-        TypeKind.U8 => return ir_zext_i8_i64(s.out, @s.reg_counter, call_result)
+        TypeKind.Bool => return ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, call_result)
+        TypeKind.I32 => return ir_sext_i32_i64(s.ir.out, @s.fcx.reg_counter, call_result)
+        TypeKind.U32 => return ir_zext_i32_i64(s.ir.out, @s.fcx.reg_counter, call_result)
+        TypeKind.I16 => return ir_sext_i16_i64(s.ir.out, @s.fcx.reg_counter, call_result)
+        TypeKind.U16 => return ir_zext_i16_i64(s.ir.out, @s.fcx.reg_counter, call_result)
+        TypeKind.I8 => return ir_sext_i8_i64(s.ir.out, @s.fcx.reg_counter, call_result)
+        TypeKind.U8 => return ir_zext_i8_i64(s.ir.out, @s.fcx.reg_counter, call_result)
         # A `-> @&T` call returns a ptr: an i64 for the value model.
-        TypeKind.MutRef => return ir_ptrtoint_i64(s.out, @s.reg_counter, call_result)
+        TypeKind.MutRef => return ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, call_result)
         # `-> *T` / `-> @T` calls return an i64 already, as does the rest.
         _ => pass
     call_result
@@ -2060,7 +2060,7 @@ pub fn emit_float_select(s: *EmitterState, ft: TypeKind, cond: i32, a: i32, b: i
 # its clones of generic bodies), so this is the enum without one -- the
 # located error ritz0 gives (enum_from.py).  -1 when `e` is no such call.
 pub fn try_emit_enum_from(s: *EmitterState, e: *Expr) -> i32
-    if is_enum_from_call(s.mono.pctx, e) == 0
+    if is_enum_from_call(s.sym.mono.pctx, e) == 0
         return -1
     let en: StrView = ident_sv(e.left)
     if find_local(s, en) >= 0 or find_global(s, en) != null
@@ -2072,7 +2072,7 @@ pub fn try_emit_enum_from(s: *EmitterState, e: *Expr) -> i32
     eprints("' has no 'from': that needs a representation type ('enum ")
     eprint_bytes(en)
     eprints(": <integer type>') and its module must import ritzlib.option\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     let z: i32 = next_reg(s)
     format_into(s, "  %.{z} = add i64 0, 0\n")
     z
@@ -2104,7 +2104,7 @@ pub fn static_call_of_self_error(s: *EmitterState, e: *Expr, m: *FnDef)
         eprints("@&")
     eprint_lower(ty)
     eprints(")`\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # `text` to stderr, ASCII upper case lowered.
 fn eprint_lower(text: StrView)
@@ -2131,7 +2131,7 @@ pub fn refuse_receiver_short_of_self(s: *EmitterState, recv: *Expr, mfn: *FnDef,
     format_into(s, "  ; ERROR: receiver short of `self` (AGAST #2403)\n")
     diag_error_at(emitter_source_file(), recv.span)
     eprints("a receiver of a pointer `self` must be a place one level short of it, or have its levels\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     true
 
 # AGAST #3071: true for `a[i]` of a local array, which emit_lvalue_ptr places.
@@ -2446,7 +2446,7 @@ pub fn emit_local_array_copy(s: *EmitterState, size: i32, et: TypeKind, name_sv:
         format_into(s, "  call void @__ritz_sret_copy(ptr %.{dst_ptr}, ptr %.{src_ptr}, i64 ptrtoint (ptr getelementptr (")
         emit_local_array_llvm_type(s, size, et, name_sv)
         format_into(s, ", ptr null, i32 1) to i64))\n")
-        s.sret_helpers_used = 1
+        s.ir.sret_helpers_used = 1
         return
     let agg: i32 = next_reg(s)
     format_into(s, "  %.{agg} = load ")

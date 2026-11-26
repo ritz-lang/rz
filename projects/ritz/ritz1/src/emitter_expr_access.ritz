@@ -46,7 +46,7 @@ fn field_type_text(f: *StructField) -> StrView
 # The name of enum `ei`.
 fn enum_text(s: *EmitterState, ei: i32) -> StrView
     var len: i32 = 0
-    let name: *u8 = enum_name_at(s.mono.pctx, ei, @len)
+    let name: *u8 = enum_name_at(s.sym.mono.pctx, ei, @len)
     StrView { ptr: name, len: len as i64 }
 
 # =============================================================================
@@ -59,14 +59,14 @@ fn enum_text(s: *EmitterState, ei: i32) -> StrView
 # value already, as is anything else (a struct, a reference).
 fn widen_loaded(s: *EmitterState, t: TypeKind, v: i32) -> i32
     match t
-        TypeKind.I8 => ir_sext_i8_i64(s.out, @s.reg_counter, v)
-        TypeKind.U8 => ir_zext_i8_i64(s.out, @s.reg_counter, v)
-        TypeKind.I16 => ir_sext_i16_i64(s.out, @s.reg_counter, v)
-        TypeKind.U16 => ir_zext_i16_i64(s.out, @s.reg_counter, v)
-        TypeKind.I32 => ir_sext_i32_i64(s.out, @s.reg_counter, v)
-        TypeKind.U32 => ir_zext_i32_i64(s.out, @s.reg_counter, v)
-        TypeKind.Bool => ir_zext_i1_i64(s.out, @s.reg_counter, v)
-        TypeKind.Ptr | TypeKind.PtrPtr => ir_ptrtoint_i64(s.out, @s.reg_counter, v)
+        TypeKind.I8 => ir_sext_i8_i64(s.ir.out, @s.fcx.reg_counter, v)
+        TypeKind.U8 => ir_zext_i8_i64(s.ir.out, @s.fcx.reg_counter, v)
+        TypeKind.I16 => ir_sext_i16_i64(s.ir.out, @s.fcx.reg_counter, v)
+        TypeKind.U16 => ir_zext_i16_i64(s.ir.out, @s.fcx.reg_counter, v)
+        TypeKind.I32 => ir_sext_i32_i64(s.ir.out, @s.fcx.reg_counter, v)
+        TypeKind.U32 => ir_zext_i32_i64(s.ir.out, @s.fcx.reg_counter, v)
+        TypeKind.Bool => ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, v)
+        TypeKind.Ptr | TypeKind.PtrPtr => ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, v)
         _ => v
 
 # A `t` (spelled `ty` in memory) loaded from `ptr` and widened.
@@ -124,8 +124,8 @@ pub fn users_none_wins(s: *EmitterState, e: *Expr) -> bool
     let ei: i32 = bare_unit_variant_enum(s, e, @vi, @other)
     if ei == 0 - 1
         return false
-    if ei >= 0 and s.ctx_enum_name != null
-        let ctx: StrView = StrView { ptr: s.ctx_enum_name, len: s.ctx_enum_name_len as i64 }
+    if ei >= 0 and s.fcx.ctx_enum_name != null
+        let ctx: StrView = StrView { ptr: s.fcx.ctx_enum_name, len: s.fcx.ctx_enum_name_len as i64 }
         if ctx.eq(enum_text(s, ei))
             return true
     unnamed(resolve_enum_ctx(s))
@@ -195,7 +195,7 @@ fn emit_const_value(s: *EmitterState, e: *Expr, name: StrView) -> i32
         let dv: i32 = emit_expr(s, ce.value_expr)
         if lft == TypeKind.F64
             return dv
-        return ir_fptrunc_f64_f32(s.out, @s.reg_counter, dv)
+        return ir_fptrunc_f64_f32(s.ir.out, @s.fcx.reg_counter, dv)
     let val: i64 = find_const(s, name)
     let result: i32 = next_reg(s)
     format_into(s, "  %.{result} = add i64 0, {val}\n")
@@ -285,7 +285,7 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     # AGAST #2422: `Empty` where the slot is a `Slot<i32>`.
     var ivi: i32 = 0
     let iei: i32 = slot_instance_variant(s, name, @ivi)
-    if iei >= 0 and enum_variant_kind(s.mono.pctx, iei, ivi) == ENUM_VARIANT_UNIT
+    if iei >= 0 and enum_variant_kind(s.sym.mono.pctx, iei, ivi) == ENUM_VARIANT_UNIT
         return emit_unit_variant_value(s, enum_text(s, iei), ivi)
 
     # AGAST #1600 / #1610: a bare unit variant `B` of a user enum, as the
@@ -453,7 +453,7 @@ fn emit_deref_index(s: *EmitterState, e: *Expr, elem: TypeKind) -> i32
     emit_ptr_elem_read(s, elem, base_ptr, idx)
 
 # AGAST #2330, #2996: `e`, a whole struct element, where a number goes.  A copy
-# (`let s: S = a[i]`, `g(a[i])`) is s.struct_copy_expr; anything else put a `%S`
+# (`let s: S = a[i]`, `g(a[i])`) is s.fcx.struct_copy_expr; anything else put a `%S`
 # where clang wanted an i64 (`a[i] as i32`, `return a[i]`, `a[i] + 1`).  Refuses
 # it, located, and returns true; false for a copy.
 #
@@ -473,7 +473,7 @@ fn struct_elem_refused(s: *EmitterState, e: *Expr, name: StrView) -> bool
 # The shared refusal: a struct value `e` where a number goes, located at `e`
 # with `msg`.  True when refused; false when `e` is the copy being emitted.
 fn struct_value_refused(s: *EmitterState, e: *Expr, msg: StrView) -> bool
-    if s.struct_copy_expr == e
+    if s.fcx.struct_copy_expr == e
         return false
     emit_nd_error_sv(s, e.span.line, e.span.col, msg)
     true
@@ -595,7 +595,7 @@ pub fn emit_index_base_ptr(s: *EmitterState, e: *Expr) -> i32
     let base: i32 = emit_expr(s, e)
     if expr_is_ptr_valued(s, e) == 1
         return base
-    ir_inttoptr_ptr(s.out, @s.reg_counter, base)
+    ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, base)
 
 # AGAST #3565: the pointee of an index store's base `x` when it names a `*T`
 # or `**T`: a root index_store_root_pointee types, or pointer arithmetic
@@ -1026,7 +1026,7 @@ fn emit_index_through_ptr(s: *EmitterState, e: *Expr, base: IndexBase) -> i32
     let elem: TypeKind = through_ptr_elem(base.kind, base.pointee)
     let base_reg: i32 = emit_expr(s, e.left)
     let idx: i32 = emit_expr(s, e.right)
-    let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, base_reg)
+    let base_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, base_reg)
     emit_ptr_elem_read(s, elem, base_ptr, idx)
 
 pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
@@ -1063,16 +1063,16 @@ pub fn is_enum_instance(ctx: *ParseCtx, name: StrView) -> i32
 # enclosing fn's return type outside a call argument.  When that is an instance
 # declaring variant `name`, its tracker index (*out_vi the tag); else -1.
 pub fn slot_instance_variant(s: *EmitterState, name: StrView, out_vi: *i32) -> i32
-    var en: StrView = StrView { ptr: s.ctx_enum_name, len: s.ctx_enum_name_len as i64 }
-    if en.ptr == null and s.ctx_enum_arg == 0
-        en = StrView { ptr: s.ret_type_name, len: s.ret_type_name_len as i64 }
-    if is_enum_instance(s.mono.pctx, en) == 0
+    var en: StrView = StrView { ptr: s.fcx.ctx_enum_name, len: s.fcx.ctx_enum_name_len as i64 }
+    if en.ptr == null and s.fcx.ctx_enum_arg == 0
+        en = StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 }
+    if is_enum_instance(s.sym.mono.pctx, en) == 0
         return 0 - 1
-    let vi: i32 = enum_variant_index(s.mono.pctx, en, name)
+    let vi: i32 = enum_variant_index(s.sym.mono.pctx, en, name)
     if vi < 0
         return 0 - 1
     *out_vi = vi
-    enum_find(s.mono.pctx, en)
+    enum_find(s.sym.mono.pctx, en)
 
 # AGAST #3021: a generic enum's bare constructor (`Full(6)`, `Empty`) whose
 # slot names no instance of it, refused at the constructor:
@@ -1084,14 +1084,14 @@ pub fn slot_instance_variant(s: *EmitterState, name: StrView, out_vi: *i32) -> i
 # generic enum's variant.
 pub fn emit_no_instance_error(s: *EmitterState, name: StrView, span: SrcSpan) -> i32
     var vi: i32 = 0
-    let ei: i32 = generic_enum_of_variant(s.mono.pctx, name, @vi)
+    let ei: i32 = generic_enum_of_variant(s.sym.mono.pctx, name, @vi)
     if ei < 0
         return 0
     let en: StrView = enum_text(s, ei)
     format_into(s, "  ; ERROR: generic enum constructor with no instance\n")
     diag_error_at(emitter_source_file(), span)
     eprint("can't infer the `{en}` instance `{name}` builds: give its slot a `{en}<...>` type\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     let z: i32 = next_reg(s)
     format_into(s, "  %.{z} = add i64 0, 0  ; constructor with no instance (error)\n")
     z
@@ -1101,8 +1101,8 @@ pub fn emit_no_instance_error(s: *EmitterState, name: StrView, span: SrcSpan) ->
 # `Light` (emit_expr_ident).  The result register is a struct-typed SSA value
 # usable as a call arg or var-decl initializer.
 fn emit_unit_variant_value(s: *EmitterState, en: StrView, tag: i32) -> i32
-    let tag_ty: StrView = enum_tag_ty_named(s.mono.pctx, en)
-    emit_tagged_unit(s, en, "enum variant ctor", tag_ty, enum_tag_value_named(s.mono.pctx, en, tag))
+    let tag_ty: StrView = enum_tag_ty_named(s.sym.mono.pctx, en)
+    emit_tagged_unit(s, en, "enum variant ctor", tag_ty, enum_tag_value_named(s.sym.mono.pctx, en, tag))
 
 # =============================================================================
 # Members
@@ -1129,7 +1129,7 @@ fn unknown_field_refused(s: *EmitterState, e: *Expr) -> bool
         f = f.next
     # R17 rule 5(a)'s words, at the field name (AGAST #3015): "`S` has no field
     # `f`".  Sema (deref_field.ritz) has usually said it already; it says it once.
-    let words: *u8 = df_no_field_once(s.mono.pctx, s.module, e, st)
+    let words: *u8 = df_no_field_once(s.sym.mono.pctx, s.sym.module, e, st)
     if words != null
         emit_nd_error_sv(s, df_line(e), df_col(e), strview_from_cstr(words))
     true
@@ -1149,14 +1149,14 @@ fn unknown_struct_member_refused(s: *EmitterState, e: *Expr) -> bool
     let tn: StrView = local_type_text(loc)
     if find_struct(s, tn) != null
         return false
-    let reported: StrView = StrView { ptr: s.unknown_struct_name, len: s.unknown_struct_name_len as i64 }
-    if s.error_count > 0 and reported.eq(tn)
+    let reported: StrView = StrView { ptr: s.diag.unknown_struct_name, len: s.diag.unknown_struct_name_len as i64 }
+    if s.diag.error_count > 0 and reported.eq(tn)
         return true
     diag_error_at(emitter_source_file(), e.left.span)
     eprint("`{ident_text(e.left)}` is a `{tn}`, which names no declared struct: it has no field `{ident_text(e)}` (is an import missing?)\n")
-    s.error_count = s.error_count + 1
-    s.unknown_struct_name = lv_type_name(loc)
-    s.unknown_struct_name_len = lv_type_name_len(loc)
+    s.diag.error_count = s.diag.error_count + 1
+    s.diag.unknown_struct_name = lv_type_name(loc)
+    s.diag.unknown_struct_name_len = lv_type_name_len(loc)
     true
 
 # AGAST #4263: `o.expect("x").v` / `o.frob().v`, a field of a method call the
@@ -1167,9 +1167,9 @@ fn unknown_struct_member_refused(s: *EmitterState, e: *Expr) -> bool
 pub fn method_base_refused(s: *EmitterState, e: *Expr) -> bool
     if e.left == null or e.left.kind != ExprKind.Method
         return false
-    let before: i32 = s.error_count
+    let before: i32 = s.diag.error_count
     emit_expr(s, e.left)
-    s.error_count > before
+    s.diag.error_count > before
 
 # AGAST #4155: `p.len` with `p` a `*i32` local or param, or `x.len` with `x` an
 # `i64`: a scalar has no fields.  It fell to "unhandled EXPR_MEMBER" (and ritz0
@@ -1196,7 +1196,7 @@ pub fn primitive_member_refused(s: *EmitterState, e: *Expr) -> bool
     format_into(s, "  ; ERROR\n")
     diag_error_at(emitter_source_file(), e.left.span)   # located at the base
     eprint("`{ident_text(e.left)}` has type `{sigil}{name}`, which is not a struct: it has no field `{ident_text(e)}`\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     true
 
 # `"lit".ptr` / `"lit".len` (AGAST #4301).  A bare literal is a StrView (#98):
@@ -1224,7 +1224,7 @@ fn emit_strlit_field(s: *EmitterState, e: *Expr) -> i32
     format_into(s, "  ; ERROR\n")
     diag_error_at(emitter_source_file(), e.span)
     eprint("`StrView` has no field `{field}`\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     0
 
 # Qualified enum variant: `Shade.Light` / `Result.Ok`.  When the LHS ident is a
@@ -1234,14 +1234,14 @@ fn emit_strlit_field(s: *EmitterState, e: *Expr) -> i32
 # when `e` is no such variant.
 fn try_emit_qualified_variant(s: *EmitterState, e: *Expr) -> Option<i32>
     let en: StrView = ident_text(e.left)
-    if is_enum_type(s.mono.pctx, en) == 0
+    if is_enum_type(s.sym.mono.pctx, en) == 0
         return None
-    let variant_idx: i32 = enum_variant_index(s.mono.pctx, en, ident_text(e))
+    let variant_idx: i32 = enum_variant_index(s.sym.mono.pctx, en, ident_text(e))
     if variant_idx < 0
         return None
     # AGAST #1466: `Option.None` built `alloca %Option`, which clang rejects
     # (ritz1 has no generic-enum specialisation; ritz0 rejects the form).
-    if enum_is_generic(s.mono.pctx, enum_find(s.mono.pctx, en)) == 1
+    if enum_is_generic(s.sym.mono.pctx, enum_find(s.sym.mono.pctx, en)) == 1
         return Some(emit_qualified_variant_error_sv(s, e, "is a variant of a generic enum: a qualified generic enum value is not supported (ritz0 rejects it too); write the unqualified form, e.g. None"))
     Some(emit_unit_variant_value(s, en, variant_idx))
 
@@ -1314,7 +1314,7 @@ pub fn through_spill(s: *EmitterState, view: *LocalVar) -> *LocalVar
     *name = '#'   # no identifier has one
     let len: i32 = 1 + fmt_i64_into(Span<u8> { ptr: name + 1, len: BASE_SPILL_NAME_BUF - 1 }, g_base_spills as i64).len as i32
     add_local_full(s, StrView { ptr: (name), len: (len) as i64 }, slot, TypeKind.Ptr, StrView { ptr: (lv_type_name(view)), len: (lv_type_name_len(view)) as i64 }, lv_pointee_type(view), 0, TypeKind.Void)
-    let bound: *LocalVar = local_at(s, s.local_count - 1)
+    let bound: *LocalVar = local_at(s, s.fcx.local_count - 1)
     lv_mark_array_view(bound)
     bound
 
@@ -1371,11 +1371,11 @@ pub fn emit_lent_referent(s: *EmitterState, e: *Expr, name: StrView) -> i32
 
 # emit_expr, with `e` marked as a copy into a struct slot when `ty` is one (#2330).
 pub fn emit_struct_copy(s: *EmitterState, e: *Expr, ty: TypeKind) -> i32
-    let saved: *Expr = s.struct_copy_expr
+    let saved: *Expr = s.fcx.struct_copy_expr
     if ty == TypeKind.Struct
-        s.struct_copy_expr = e
+        s.fcx.struct_copy_expr = e
     let reg: i32 = emit_expr(s, e)
-    s.struct_copy_expr = saved
+    s.fcx.struct_copy_expr = saved
     return reg
 
 struct NdIndexPtr

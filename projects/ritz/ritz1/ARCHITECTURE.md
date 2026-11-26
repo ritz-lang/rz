@@ -386,7 +386,7 @@ empty. A note that belongs to a move goes on that check's own entry.
 |---|---|
 | `emitter` | `emit_module`, `emit_fn`, impl methods; post-passes over the emitted IR text. |
 | `emitter_consts` | Module-level data: global initializers, integer const resolution, const arrays of struct literals, scalar struct consts. Split from `emitter` (AGAST #1818), which `pub import`s it. |
-| `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. Imports no emitter module above it (AGAST #1818), so it sits below the emission modules: a fn that needs one belongs in `emitter_types`. |
+| `emitter_core` | `EmitterState` and its four parts (AGAST #4697: `IrBuf` the module's IR and what it must define at its tail, `FnCtx` the fn being emitted, `SymTab` the module's symbols, `Diag` what was reported), struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. Imports no emitter module above it (AGAST #1818), so it sits below the emission modules: a fn that needs one belongs in `emitter_types`. |
 | `emitter_types` | What an expression's type, struct, pointee or element is, asked before it is emitted: the expression typing the old `emitter_core` did, the through-index views (the old `index_through`), and the method-callee and deref-pointee lookups (AGAST #1818). It reaches no emission module, so it and the Sema-side checks that read it sit below the emission modules. |
 | `emitter_abi` | How a struct or array crosses a call: sret returns and byval params (AGAST #1730, #1739, #2306, #3181), their attributes, and the deferred large-struct loads and copies. Above `emitter_core`, below the emitter modules (AGAST #1818). |
 | `emitter_call_lower` | The call path's parts that never recurse into `emit_expr`: argument and receiver place facts, arg conversions, `sizeof`, enum payload shapes, builtin method pieces, the `CALL_INTRINSICS` table. Below the emission modules (AGAST #1818). |
@@ -420,7 +420,7 @@ is left of it (`c""` literals, `*u8` parameters) is pinned down-only per file
 (`tools/ritz1_text_ratchet.py`, run by `make tools-ratchets`).
 
 **Where the IR goes.** One `Arena` per emitted module (`main.ritz` opens it and
-frees it with the module).  `EmitterState.out` is a `String` drawn from it, as is
+frees it with the module).  `EmitterState.ir.out` is a `String` drawn from it, as is
 the entry-block alloca buffer, each sized once to the room it has (`arena_string`):
 they never grow, so no block is ever realloc'd or freed on its own, which keeps
 the compile valgrind-clean.  An IR that outgrows its buffer stops the compile with

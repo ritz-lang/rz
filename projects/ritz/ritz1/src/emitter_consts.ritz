@@ -51,11 +51,11 @@ pub fn emit_string_byte(s: *EmitterState, b: u8)
     else if b == 34
         format_into(s, "\\22")
     else if b >= 32 and b < 127
-        s.out.push(b)
+        s.ir.out.push(b)
     else
-        s.out.push('\\')
-        s.out.push(hex_digit_upper((b >> 4) as i64))
-        s.out.push(hex_digit_upper(b as i64))
+        s.ir.out.push('\\')
+        s.ir.out.push(hex_digit_upper((b >> 4) as i64))
+        s.ir.out.push(hex_digit_upper(b as i64))
 
 # What a global's or const's initializer folds to (LARB R60).
 enum GlobalInitKind
@@ -297,7 +297,7 @@ fn global_init_error(s: *EmitterState, g: *GlobalVarDef, line: i32, col: i32, wh
     eprints("\n")
     let name_ir: String = ir_name(StrView { ptr: (g.name), len: (g.name_len) as i64 })
     format_into(s, "; ERROR: global initializer for @{name_ir.as_view()}: {why}\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # AGAST #2357: `@.str.N`, a string constant as a constant `ptr` operand.
 # The pool is written after every global and fn (emit_string_constants), so a
@@ -444,7 +444,7 @@ fn global_init_check(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
         gi.int_val = 0
         return
     var v: i64 = 0
-    if const_fold_int(s.module.constants, g.init_expr, 1, @v) == 0
+    if const_fold_int(s.sym.module.constants, g.init_expr, 1, @v) == 0
         match const_fold_float(s, g.init_expr)
             Some(_) => global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, "is not a float type but has a float initializer")
             None => global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
@@ -472,14 +472,14 @@ fn const_fold_error(s: *EmitterState, c: *ConstEntry)
         eprints("' must have array type, got ")
         eprint_bytes(StrView { ptr: (ty_name(c.const_type)), len: (ty_name_len(c.const_type)) as i64 })
         eprint_char('\n')
-        s.error_count = s.error_count + 1
+        s.diag.error_count = s.diag.error_count + 1
         return
     # LARB R63 (AGAST #3489): `MAXV + 1` overflows, which is its own error.
-    let site: *Expr = const_overflow_site(s.module.constants, c.value_expr, 1)
+    let site: *Expr = const_overflow_site(s.sym.module.constants, c.value_expr, 1)
     if site != null
         const_overflow_report(c.src_file, site)
         format_into(s, "; ERROR: const overflow\n")
-        s.error_count = s.error_count + 1
+        s.diag.error_count = s.diag.error_count + 1
         return
     if c.src_file != null
         eprints_cstr(c.src_file)
@@ -494,15 +494,15 @@ fn const_fold_error(s: *EmitterState, c: *ConstEntry)
     eprints("' has an initializer that is not a constant integer expression (ritz1 folds literals, other integer consts, unary - ~ !, casts and binary operators)\n")
     let name_ir: String = ir_name(StrView { ptr: (c.name), len: (c.name_len) as i64 })
     format_into(s, "; ERROR: const {name_ir.as_view()} is not a constant integer expression\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # The loop visits each const once, so each BAD one is reported once — whether
 # it failed on its own turn or earlier, while resolving a const that names it.
 pub fn resolve_const_values(s: *EmitterState)
-    var c: *ConstEntry = s.module.constants
+    var c: *ConstEntry = s.sym.module.constants
     while c != null
         if c.fold_state == CONST_FOLD_PENDING
-            const_resolve(s.module.constants, c)
+            const_resolve(s.sym.module.constants, c)
         if c.fold_state == CONST_FOLD_BAD
             const_fold_error(s, c)
         c = c.next
@@ -600,7 +600,7 @@ fn module_drop_error(s: *EmitterState, is_global: bool, name_sv: StrView, arr_si
         eprint_char(']')
     eprints(ty_sv)
     eprints("`, which has Drop: a module-level value is never dropped\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # True when `g`'s declared type has Drop (nothing drops it): reported, true.
 fn global_drop_refused(s: *EmitterState, g: *GlobalVarDef) -> bool
@@ -647,7 +647,7 @@ fn const_drop_refused(s: *EmitterState, c: *ConstEntry) -> bool
     true
 
 pub fn emit_global_vars(s: *EmitterState)
-    var g: *GlobalVarDef = s.module.globals
+    var g: *GlobalVarDef = s.sym.module.globals
     while g != null
         # Skip already-emitted globals (deduplication for imports)
         if was_global_emitted(s, StrView { ptr: (g.name), len: (g.name_len) as i64 }) == 1
@@ -797,7 +797,7 @@ fn emit_const_struct_body(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *
     # the `<{ ... }>` type emit_one_struct_type declares; an unpacked one is
     # `{ ... }`.  A mismatch is `packed'ness of initializer and type don't
     # match` from clang, so the value side tracks the type side.
-    let packed: bool = struct_is_packed(s.mono.pctx, st) == 1
+    let packed: bool = struct_is_packed(s.sym.mono.pctx, st) == 1
     if packed
         format_into(s, "<{ ")
     else
@@ -907,7 +907,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
     # elements.  A raw `int_val` is 0 for `-5`, `K`, `A * 4 - 1`...
     if is_int_const_type(ft) == 1
         var folded: i64 = 0
-        if const_fold_int(s.module.constants, v, 1, @folded) == 0
+        if const_fold_int(s.sym.module.constants, v, 1, @folded) == 0
             format_into(s, "0")
             const_field_error(s, c, elem_idx, path, "is not a constant integer expression")
             return
@@ -940,7 +940,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
                 return
             emit_const_struct_body(s, c, elem_idx, st, v.args as *FieldInit, path)
             return
-        let ei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
+        let ei: i32 = user_enum_index(s.sym.mono.pctx, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
         if ei >= 0
             emit_const_unit_variant(s, c, elem_idx, ei, v, path)
             return
@@ -958,7 +958,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
 # constructed (`E.V(x)`, `V(x)`) or named bare.
 fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: i32, v: *Expr, path: *ConstFieldPath)
     var en_len: i32 = 0
-    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
+    let en: *u8 = enum_name_at(s.sym.mono.pctx, ei, @en_len)
     let en_sv: StrView = StrView { ptr: (en), len: (en_len) as i64 }
     var name: *u8 = null
     var len: i32 = 0
@@ -977,7 +977,7 @@ fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: 
         len = v.ident.len as i32
     var vi: i32 = 0 - 1
     if name != null
-        vi = enum_variant_index(s.mono.pctx, en_sv, StrView { ptr: (name), len: (len) as i64 })
+        vi = enum_variant_index(s.sym.mono.pctx, en_sv, StrView { ptr: (name), len: (len) as i64 })
     if vi < 0
         format_into(s, "zeroinitializer")
         const_field_error_head(s, c, elem_idx, path)
@@ -985,13 +985,13 @@ fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: 
         eprints(en_sv)
         eprints("`\n")
         return
-    if constructed or enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
+    if constructed or enum_variant_kind(s.sym.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
         format_into(s, "zeroinitializer")
         const_field_error(s, c, elem_idx, path, "is a variant with a payload, which isn't a constant initialiser")
         return
     # AGAST #4574: a repr enum's field 0 is its discriminant in the repr type.
-    let tag_ty: StrView = llvm_text(enum_tag_llvm(s.mono.pctx, ei))
-    format_into(s, "{{ {tag_ty} {enum_tag_value(s.mono.pctx, ei, vi)}")
+    let tag_ty: StrView = llvm_text(enum_tag_llvm(s.sym.mono.pctx, ei))
+    format_into(s, "{{ {tag_ty} {enum_tag_value(s.sym.mono.pctx, ei, vi)}")
     var pad: i64 = 0
     let n: i64 = user_enum_layout(s, ei, @pad)
     if n > 0
@@ -1233,7 +1233,7 @@ fn emit_double_bits(s: *EmitterState, bits: i64)
     format_into(s, "0x")
     var sh: i32 = 60
     while sh >= 0
-        s.out.push(hex_digit_upper(bits >> sh))
+        s.ir.out.push(hex_digit_upper(bits >> sh))
         sh -= 4
 
 # The bits of the `double` holding float literal `text` (digits '.' digits,
@@ -1348,7 +1348,7 @@ fn const_field_error_head(s: *EmitterState, c: *ConstEntry, elem_idx: i32, path:
             eprint_field_path(path)
             eprint_char('\'')
     eprints(" ")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # `inn.leaf.v`: the field names from the element down to `path`.  A root
 # sentinel (a struct const's or global's whole value) prints nothing.
@@ -1386,7 +1386,7 @@ fn const_array_elem_error(s: *EmitterState, c: *ConstEntry, idx: i32)
     eprints(" is not a constant integer expression (ritz1 folds literals, other integer consts, unary - ~ !, casts and binary operators)\n")
     let name_ir: String = ir_name(StrView { ptr: (c.name), len: (c.name_len) as i64 })
     format_into(s, "; ERROR: const {name_ir.as_view()} array element {idx} is not a constant integer expression\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # AGAST #1606: emit `const NAME: [N]T = [v; N]` (primitive T) as
 #   @NAME = internal constant [N x T] [T v, T v, ...]
@@ -1397,7 +1397,7 @@ fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
         return
     mark_global_emitted(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
     var v: i64 = 0
-    if c.value_expr.left == null or const_fold_int(s.module.constants, c.value_expr.left, 1, @v) == 0
+    if c.value_expr.left == null or const_fold_int(s.sym.module.constants, c.value_expr.left, 1, @v) == 0
         const_array_elem_error(s, c, 0)
         return
     let name_ir: String = ir_name(StrView { ptr: (c.name), len: (c.name_len) as i64 })
@@ -1437,7 +1437,7 @@ fn const_struct_fill_error(s: *EmitterState, c: *ConstEntry)
     eprints("const '")
     eprint_bytes(StrView { ptr: (c.name), len: (c.name_len) as i64 })
     eprints("': a struct table can't be a fill `[v; N]`: write its elements out\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
     # A placeholder `[N x %S]` so `T[i].a` lowers (const_struct_fill_global
     # lets the readers through) instead of cascading into an unlocated
     # "unhandled EXPR_MEMBER".  The output is refused, so it is never written.
@@ -1467,7 +1467,7 @@ fn const_ptr_table_error(s: *EmitterState, c: *ConstEntry, idx: i32, e: *Expr)
     eprints("' element ")
     eprint_i64(idx as i64)
     eprints(" is not a string literal or null\n")
-    s.error_count = s.error_count + 1
+    s.diag.error_count = s.diag.error_count + 1
 
 # `ptr @.str.K` for a string element, `ptr null` for null.
 fn emit_const_ptr_elem(s: *EmitterState, e: *Expr)
@@ -1594,7 +1594,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
         is_fill = 1
     if c.value_expr.kind != ExprKind.ArrayLit and is_fill == 0
         return
-    if const_array_shared(s.mono.pctx, c)
+    if const_array_shared(s.sym.mono.pctx, c)
         emit_const_array_shared_entry(s, c)
         return
     # AGAST #1606: the fill form `const Z: [N]T = [v; N]` of a primitive
@@ -1629,7 +1629,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
         var fi: i32 = 0
         while fe != null
             var ignored: i64 = 0
-            if const_fold_int(s.module.constants, fe, 1, @ignored) == 0
+            if const_fold_int(s.sym.module.constants, fe, 1, @ignored) == 0
                 const_array_elem_error(s, c, fi)
                 bad = true
             fi = fi + 1
@@ -1645,7 +1645,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
             if pi > 0
                 format_into(s, ", ")
             var v: i64 = 0
-            const_fold_int(s.module.constants, pe, 1, @v)
+            const_fold_int(s.sym.module.constants, pe, 1, @v)
             format_into(s, "{elem_ty} {v}")
             pi = pi + 1
             pe = pe.next
@@ -1785,7 +1785,7 @@ fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
 
 # Walk module constants and emit LLVM globals for const arrays of structs.
 pub fn emit_const_arrays(s: *EmitterState)
-    var c: *ConstEntry = s.module.constants
+    var c: *ConstEntry = s.sym.module.constants
     while c != null
         # LARB R60: a const of a type with Drop is never dropped; refuse it
         # rather than lower data nothing will release.

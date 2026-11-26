@@ -69,13 +69,13 @@ fn try_emit_span_builtin(s: *EmitterState, e: *Expr, type_name: StrView, receive
         SpanMethod.Ptr =>
             let p: i32 = next_reg(s)
             emit_load_into(s, "ptr", p, fptr)
-            ir_ptrtoint_i64(s.out, @s.reg_counter, p)
+            ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, p)
         SpanMethod.IsEmpty =>
             let n: i32 = next_reg(s)
             emit_load_into(s, "i64", n, fptr)
             let z: i32 = next_reg(s)
             format_into(s, "  %.{z} = icmp eq i64 %.{n}, 0\n")
-            ir_zext_i1_i64(s.out, @s.reg_counter, z)
+            ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, z)
         SpanMethod.Slice => emit_span_slice(s, e, type_name, struct_ptr)
 
 # The Span methods try_emit_span_builtin lowers.
@@ -172,36 +172,36 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
             let span_src: *LocalVar = find_local_struct_name(s, arg.ident)
             if span_src != null and lv_var_type(span_src) == TypeKind.Array
                 return 0
-    let saved_name: *u8 = s.ctx_enum_name
-    let saved_len: i32 = s.ctx_enum_name_len
-    let saved_arg: i32 = s.ctx_enum_arg
+    let saved_name: *u8 = s.fcx.ctx_enum_name
+    let saved_len: i32 = s.fcx.ctx_enum_name_len
+    let saved_arg: i32 = s.fcx.ctx_enum_arg
     var saved_slot: SlotCtx
     if p != null
         enter_slot_ctx(s, @saved_slot, p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
     else
         enter_slot_ctx(s, @saved_slot, TypeKind.Void, StrView { ptr: (null), len: (0) as i64 })
-    s.ctx_enum_name = null
-    s.ctx_enum_name_len = 0
-    s.ctx_enum_arg = 1
+    s.fcx.ctx_enum_name = null
+    s.fcx.ctx_enum_name_len = 0
+    s.fcx.ctx_enum_arg = 1
     if p != null
         if p.param_type == TypeKind.Struct and p.param_type_name_len > 0
-            if is_tagged_enum_type(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == 1 or is_enum_instance(s.mono.pctx, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == 1
-                s.ctx_enum_name = p.param_type_name
-                s.ctx_enum_name_len = p.param_type_name_len
+            if is_tagged_enum_type(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == 1 or is_enum_instance(s.sym.mono.pctx, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == 1
+                s.fcx.ctx_enum_name = p.param_type_name
+                s.fcx.ctx_enum_name_len = p.param_type_name_len
     # AGAST #2279: a `c:& C` argument copies into a by-value `C` param.  A lent
     # `self` param is a `ptr` (emit_impl_method).
     var reg: i32 = 0
     # LARB R43 (#3385): an f32 / f64 param is a float slot for an if / match
     # argument; emit_match_arms / emit_if_expr take the hint on entry.
     if p != null and (arg.kind == ExprKind.If or arg.kind == ExprKind.Match)
-        s.match_float_hint = param_float_type(p)
+        s.fcx.match_float_hint = param_float_type(p)
     if p != null and param_self_is_ptr(p) == 0
         reg = emit_expr_by_value(s, arg, p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
     else
         reg = emit_expr(s, arg)
-    s.ctx_enum_name = saved_name
-    s.ctx_enum_name_len = saved_len
-    s.ctx_enum_arg = saved_arg
+    s.fcx.ctx_enum_name = saved_name
+    s.fcx.ctx_enum_name_len = saved_len
+    s.fcx.ctx_enum_arg = saved_arg
     leave_slot_ctx(s, @saved_slot)
     if param_uses_byval(s, p) == 1
         return spill_byval_arg(s, arg, reg, p)
@@ -220,26 +220,26 @@ pub fn emit_expr_into_slot_impl(s: *EmitterState, e: *Expr, ty: TypeKind, name: 
         let referent: i32 = emit_lent_referent(s, e, name)
         if referent != 0
             return referent
-    let saved_name: *u8 = s.ctx_enum_name
-    let saved_len: i32 = s.ctx_enum_name_len
-    let saved_arg: i32 = s.ctx_enum_arg
-    s.ctx_enum_name = null
-    s.ctx_enum_name_len = 0
-    s.ctx_enum_arg = 1
+    let saved_name: *u8 = s.fcx.ctx_enum_name
+    let saved_len: i32 = s.fcx.ctx_enum_name_len
+    let saved_arg: i32 = s.fcx.ctx_enum_arg
+    s.fcx.ctx_enum_name = null
+    s.fcx.ctx_enum_name_len = 0
+    s.fcx.ctx_enum_arg = 1
     var saved_slot: SlotCtx
     enter_slot_ctx(s, @saved_slot, ty, name)
     if ty == TypeKind.Struct and not unnamed(name) and name.len > 0
-        if is_tagged_enum_type(name) == 1 or is_enum_instance(s.mono.pctx, name) == 1
-            s.ctx_enum_name = name.ptr
-            s.ctx_enum_name_len = name.len as i32
+        if is_tagged_enum_type(name) == 1 or is_enum_instance(s.sym.mono.pctx, name) == 1
+            s.fcx.ctx_enum_name = name.ptr
+            s.fcx.ctx_enum_name_len = name.len as i32
     # AGAST #4028 / #4029: an if / match into a float slot (`v = if c then y
     # else y`, `S { d: match .. }`) merges at the slot's type, as a let does;
     # its phi was the arms' width, stored at the slot's.
     set_match_float_hint(s, e, ty, name)
     var reg: i32 = emit_struct_copy(s, e, ty)
-    s.ctx_enum_name = saved_name
-    s.ctx_enum_name_len = saved_len
-    s.ctx_enum_arg = saved_arg
+    s.fcx.ctx_enum_name = saved_name
+    s.fcx.ctx_enum_name_len = saved_len
+    s.fcx.ctx_enum_arg = saved_arg
     leave_slot_ctx(s, @saved_slot)
     if ty == TypeKind.Struct
         reg = coerce_array_to_span(s, e, reg, name)   # AGAST #2502
@@ -393,7 +393,7 @@ fn emit_array_arg_addr(s: *EmitterState, arg: *Expr, p: *Param) -> i32
 
 # AGAST #2279: `return c` or a tail `c` with `c:& C` in a fn returning `C`: the
 # value is the referent.  Emits the `ret` and returns 1; 0 when `e` is anything
-# else.  Only s.ret_type_name's slot reads it.
+# else.  Only s.fcx.ret_type_name's slot reads it.
 # AGAST #2302: `return e` / a tail `e` in a `-> [N]T` fn, whose return `ra` is
 # that type as a param.  As ritz0, the return is a first-class `[N x T]`: `e` is
 # copied into a fresh one by emit_array_local_whole_assign, whose checks it
@@ -432,14 +432,14 @@ pub fn emit_array_return_if_stmt(s: *EmitterState, st: *Stmt, ra: *Param) -> i32
 pub fn emit_lent_return(s: *EmitterState, e: *Expr, ret_type: TypeKind) -> i32
     if ret_type != TypeKind.Struct
         return 0
-    let val: i32 = emit_lent_referent(s, e, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
+    let val: i32 = emit_lent_referent(s, e, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 })
     if val == 0
         return 0
-    if s.ret_sret == 1
+    if s.fcx.ret_sret == 1
         emit_sret_ret_value(s, val)   # AGAST #1730
         return 1
     format_into(s, "  ret ")
-    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
+    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 })
     format_into(s, " %.{val}\n")
     return 1
 
@@ -498,20 +498,20 @@ fn try_emit_user_variant_ctor(s: *EmitterState, e: *Expr) -> i32
     var ivi: i32 = 0
     let iei: i32 = slot_instance_variant(s, e.func_name, @ivi)
     if iei >= 0
-        let ikind: i32 = enum_variant_kind(s.mono.pctx, iei, ivi)
+        let ikind: i32 = enum_variant_kind(s.sym.mono.pctx, iei, ivi)
         # AGAST #1295: a payload variant takes its fields' values (counted
         # by emit_variant_build).
         if (ikind == ENUM_VARIANT_UNIT and e.args == null) or ((ikind == ENUM_VARIANT_TUPLE or ikind == ENUM_VARIANT_STRUCT) and e.args != null)
             var in_len: i32 = 0
-            let in_name: *u8 = enum_name_at(s.mono.pctx, iei, @in_len)
+            let in_name: *u8 = enum_name_at(s.sym.mono.pctx, iei, @in_len)
             return emit_variant_build(s, StrView { ptr: (in_name), len: (in_len) as i64 }, ivi, e.args)
     var amb_a: i32 = 0
     var amb_b: i32 = 0
-    if user_variant_ctor_ambiguous(s.mono.pctx, e, @amb_a, @amb_b) == 1
+    if user_variant_ctor_ambiguous(s.sym.mono.pctx, e, @amb_a, @amb_b) == 1
         return emit_ambiguous_variant_error(s, e.func_name, e.span, amb_a, amb_b)
     var en: *u8 = null
     var en_len: i32 = 0
-    user_variant_ctor_enum(s.mono.pctx, e, @en, @en_len)
+    user_variant_ctor_enum(s.sym.mono.pctx, e, @en, @en_len)
     if en == null
         # AGAST #3021: a generic enum's `Full(6)` no slot names an instance
         # of is refused here; it called an undeclared `@Full`.  A fn of that
@@ -520,13 +520,13 @@ fn try_emit_user_variant_ctor(s: *EmitterState, e: *Expr) -> i32
             # AGAST #4153: `Z(1)` / `One()`, a variant given the wrong count.
             var mei: i32 = 0
             var mvi: i32 = 0
-            if user_variant_ctor_miscounted(s.mono.pctx, e, @mei, @mvi) == 1
+            if user_variant_ctor_miscounted(s.sym.mono.pctx, e, @mei, @mvi) == 1
                 return emit_payload_count_refusal(s, mei, mvi, e)
             return emit_no_instance_error(s, e.func_name, e.span)
         return 0
     var vi: i32 = 0
     var other: i32 = 0
-    enum_of_variant_unique(s.mono.pctx, e.func_name, @vi, @other)
+    enum_of_variant_unique(s.sym.mono.pctx, e.func_name, @vi, @other)
     return emit_variant_build(s, StrView { ptr: (en), len: (en_len) as i64 }, vi, e.args)
 
 # AGAST #1466: `E.V(args)`, variant `vi` of enum `ei` (see qualified_variant),
@@ -534,11 +534,11 @@ fn try_emit_user_variant_ctor(s: *EmitterState, e: *Expr) -> i32
 # tuple or struct variant with one value per field (AGAST #1295), or a unit variant called with none.
 # Anything else ritz1 cannot build is a located error, never IR.
 fn emit_qualified_variant_ctor(s: *EmitterState, e: *Expr, ei: i32, vi: i32) -> i32
-    if enum_is_generic(s.mono.pctx, ei) == 1
+    if enum_is_generic(s.sym.mono.pctx, ei) == 1
         return emit_qualified_variant_error_sv(s, e, "is a variant of a generic enum: a qualified generic enum value is not supported (ritz0 rejects it too); write the unqualified form, e.g. Some(x) / Ok(x) / None")
     var en_len: i32 = 0
-    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
-    let kind: i32 = enum_variant_kind(s.mono.pctx, ei, vi)
+    let en: *u8 = enum_name_at(s.sym.mono.pctx, ei, @en_len)
+    let kind: i32 = enum_variant_kind(s.sym.mono.pctx, ei, vi)
     # AGAST #1295: a tuple variant, or a struct one built positionally, takes
     # one value per field (emit_variant_build counts them, located); a unit
     # variant none.  The rest is the count's error, as unqualified (#4153).
@@ -572,15 +572,15 @@ fn emit_payload_into_slot(s: *EmitterState, enum_name: StrView, tag: i32, e: *Ex
         return emit_expr(s, e)
     let pay: *u8 = pay_ty.ptr
     let pay_len: i32 = pay_ty.len as i32
-    let saved_name: *u8 = s.ctx_enum_name
-    let saved_len: i32 = s.ctx_enum_name_len
-    let saved_arg: i32 = s.ctx_enum_arg
-    s.ctx_enum_name = null
-    s.ctx_enum_name_len = 0
-    s.ctx_enum_arg = 1
-    if is_tagged_enum_type(StrView { ptr: (pay), len: (pay_len) as i64 }) == 1 or is_enum_instance(s.mono.pctx, StrView { ptr: (pay), len: (pay_len) as i64 }) == 1
-        s.ctx_enum_name = pay
-        s.ctx_enum_name_len = pay_len
+    let saved_name: *u8 = s.fcx.ctx_enum_name
+    let saved_len: i32 = s.fcx.ctx_enum_name_len
+    let saved_arg: i32 = s.fcx.ctx_enum_arg
+    s.fcx.ctx_enum_name = null
+    s.fcx.ctx_enum_name_len = 0
+    s.fcx.ctx_enum_arg = 1
+    if is_tagged_enum_type(StrView { ptr: (pay), len: (pay_len) as i64 }) == 1 or is_enum_instance(s.sym.mono.pctx, StrView { ptr: (pay), len: (pay_len) as i64 }) == 1
+        s.fcx.ctx_enum_name = pay
+        s.fcx.ctx_enum_name_len = pay_len
     # AGAST #4678: a struct payload is a copy into the variant's slot, as a
     # struct argument is, so a whole struct element (`Some(m.params[i])`,
     # `Ok(p[i])`) is its value rather than refused (whole_struct_elem_refused).
@@ -589,9 +589,9 @@ fn emit_payload_into_slot(s: *EmitterState, enum_name: StrView, tag: i32, e: *Ex
         reg = emit_struct_copy(s, e, TypeKind.Struct)
     else
         reg = emit_expr(s, e)
-    s.ctx_enum_name = saved_name
-    s.ctx_enum_name_len = saved_len
-    s.ctx_enum_arg = saved_arg
+    s.fcx.ctx_enum_name = saved_name
+    s.fcx.ctx_enum_name_len = saved_len
+    s.fcx.ctx_enum_arg = saved_arg
     reg
 
 # AGAST #3029: write the array literal or fill `e` into the payload buffer at
@@ -677,7 +677,7 @@ fn payload_aggregate_name(s: *EmitterState, enum_name: StrView, sel: i32, e: *Ex
         return built
     # AGAST #1797: a user enum's tuple variant declares its payload type; a
     # struct one is the aggregate whatever the expression form.
-    let uf: *StructField = user_enum_tuple_field(s.mono.pctx, enum_name, sel)
+    let uf: *StructField = user_enum_tuple_field(s.sym.mono.pctx, enum_name, sel)
     if uf != null and uf.field_type == TypeKind.Struct and uf.field_type_name_len > 0
         return StrView { ptr: uf.field_type_name, len: uf.field_type_name_len as i64 }
     # AGAST #2987: a tagged enum's payload declared as an enum (a tagged one,
@@ -690,7 +690,7 @@ fn payload_aggregate_name(s: *EmitterState, enum_name: StrView, sel: i32, e: *Ex
     if decl == null or decl_len <= 0
         return no_name()
     let decl_sv: StrView = StrView { ptr: decl, len: decl_len as i64 }
-    if is_tagged_enum_type(decl_sv) == 1 or enum_find(s.mono.pctx, decl_sv) >= 0
+    if is_tagged_enum_type(decl_sv) == 1 or enum_find(s.sym.mono.pctx, decl_sv) >= 0
         return decl_sv
     no_name()
 
@@ -702,9 +702,9 @@ fn payload_aggregate_name(s: *EmitterState, enum_name: StrView, sel: i32, e: *Ex
 # AGAST #1295: `payload_expr` is the head of the argument list: a user
 # enum's variant takes one value per field, each stored at its offset.
 fn emit_variant_build(s: *EmitterState, enum_name: StrView, tag: i32, payload_expr: *Expr) -> i32
-    let ei: i32 = user_enum_index(s.mono.pctx, enum_name)
-    if ei >= 0 and tag >= 0 and tag < enum_variant_count(s.mono.pctx, ei) and payload_expr != null
-        let nf: i32 = enum_variant_field_count(s.mono.pctx, ei, tag)
+    let ei: i32 = user_enum_index(s.sym.mono.pctx, enum_name)
+    if ei >= 0 and tag >= 0 and tag < enum_variant_count(s.sym.mono.pctx, ei) and payload_expr != null
+        let nf: i32 = enum_variant_field_count(s.sym.mono.pctx, ei, tag)
         var na: i32 = 0
         var a: *Expr = payload_expr
         while a != null
@@ -742,13 +742,13 @@ fn emit_variant_build(s: *EmitterState, enum_name: StrView, tag: i32, payload_ex
 # generic call path always emits `call i64 @name`, which mismatches when the
 # binding is a `<N x iM>` vector type.  These helpers port ritz0's inline
 # lowering for the simd_* builtins (simd_loadu, simd_xor, simd_add, etc.).
-# Vector-type selection: prefer the binding context (`s.ctx_simd_name`, set
+# Vector-type selection: prefer the binding context (`s.fcx.ctx_simd_name`, set
 # by emit_var_decl / emit_assign) for simd_load/loadu where the type is not
 # encoded in the args; for binary ops fall back to walking the arg locals.
 # =============================================================================
 
 # `simd_loadu(ptr) -> vec<N,T>` / `simd_load(...)`: emit an inline LLVM load
-# with the vector type pulled from `s.ctx_simd_name` (set by the enclosing
+# with the vector type pulled from `s.fcx.ctx_simd_name` (set by the enclosing
 # `let v: v4i32 = ...` / `v = ...`).  `unaligned == 1` → align 1; else use
 # 16-byte (SSE2) or 32-byte (AVX2) alignment based on the chosen vec type.
 fn emit_simd_loadu(s: *EmitterState, e: *Expr, unaligned: bool) -> i32
@@ -818,7 +818,7 @@ fn emit_simd_extract(s: *EmitterState, e: *Expr) -> i32
     let vec_name: StrView = simd_type_of(s, e.args)
     # `idx_reg` is i64 in the unified value model; truncate to i32 for
     # the extractelement opcode.
-    let i32idx: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, idx_reg)
+    let i32idx: i32 = ir_trunc_i64_i32(s.ir.out, @s.fcx.reg_counter, idx_reg)
     let elem: i32 = next_reg(s)
     format_into(s, "  %.{elem} = extractelement {simd_vec_llvm(vec_name)} %.{vec_reg}, i32 %.{i32idx}\n")
     # Element is the vector's scalar type — extend to i64 for the unified
@@ -839,7 +839,7 @@ fn emit_simd_insert(s: *EmitterState, e: *Expr) -> i32
     let vec_name: StrView = simd_type_of(s, e.args)
     let vt: StrView = simd_vec_llvm(vec_name)
     let et: StrView = simd_elem_llvm(vec_name)
-    let i32idx: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, idx_reg)
+    let i32idx: i32 = ir_trunc_i64_i32(s.ir.out, @s.fcx.reg_counter, idx_reg)
     # Truncate val from i64 down to the element width.
     var val_narrow: i32 = val_reg
     if simd_vector_elem_bits(vec_name) != 64
@@ -1349,10 +1349,10 @@ fn emit_builtin_alloca(s: *EmitterState, e: *Expr) -> i32
         let size_reg: i32 = emit_expr(s, arg)
         let alloca_reg: i32 = next_reg(s)
         format_into(s, "  %.{alloca_reg} = alloca i8, i64 %.{size_reg}\n")
-        return ir_ptrtoint_i64(s.out, @s.reg_counter, alloca_reg)
+        return ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, alloca_reg)
     let alloca_reg: i32 = next_reg(s)
     entry_alloca_reg(s, alloca_reg, "i8")
-    ir_ptrtoint_i64(s.out, @s.reg_counter, alloca_reg)
+    ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, alloca_reg)
 
 # What emit_expr_call learned about a call through a value: the local slot
 # holding the fn pointer (-1: none), its signature, and a nameless callee's
@@ -1414,7 +1414,7 @@ fn try_emit_indirect_call(s: *EmitterState, e: *Expr, c: *CallCallee) -> Option<
         if lv != null and lv_fn_sig(lv) == null and lv.not_fn == 1
             binder_call_refuse(fn_source_file(emitter_current_fn()), e.span.line, e.span.col, name)
             format_into(s, "  ; ERROR: a call of a local that holds no fn\n")
-            s.error_count = s.error_count + 1
+            s.diag.error_count = s.diag.error_count + 1
             return Some(0)
         if lv != null
             c.icall_sig = lv_fn_sig(lv)
@@ -1435,7 +1435,7 @@ fn try_emit_indirect_call(s: *EmitterState, e: *Expr, c: *CallCallee) -> Option<
         if c.icall_sig == null
             let ut_args: *i32 = call_reg_slots(e.args, 0)
             let ut_argc: i32 = emit_untyped_call_args(s, e, ut_args)
-            let ut_fp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, c.callee_val)
+            let ut_fp: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, c.callee_val)
             let ut_result: i32 = next_reg(s)
             emit_untyped_icall(s, ut_result, ut_fp, ut_args, ut_argc)
             return Some(ut_result)
@@ -1570,7 +1570,7 @@ fn call_ref_struct_arg(s: *EmitterState, ref_arg: *Expr, param_ptr: *Param, reg:
         format_into(s, "{ty_ir.as_view()}  ; rvalue auto-borrow\n")
         entry_alloca_reg_end(s)
         emit_struct_store_or_copy(s, TypeKind.Struct, type_name, reg, spill)
-        return ir_ptrtoint_i64(s.out, @s.reg_counter, spill)
+        return ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, spill)
     -1
 
 # Arg j into the typed param `param_ptr`'s representation, in converted_regs[j].
@@ -1696,7 +1696,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         # fn_map, so without this the call took the untyped i64 fallback and
         # clang refused it, unlocated (AGAST #2447).
         if fn_def == null
-            fn_def = find_impl_method_by_symbol(s.module, full_name)
+            fn_def = find_impl_method_by_symbol(s.sym.module, full_name)
             fn_from_impl = true
         # AGAST #3255, #3667: Sema's call_check refused a call no fn answers
         # (AGAST #3503), so one reaching here is a Sema / emitter split.
@@ -1763,7 +1763,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     var call_sret: i32 = 0
     # [[callconv = "win64"]] on the callee, or on the fn type of a typed
     # indirect call (fn_def is then its signature) -- AGAST #1879.
-    let call_cc: *u8 = fn_callconv_kw(s.mono.pctx, fn_def)
+    let call_cc: *u8 = fn_callconv_kw(s.sym.mono.pctx, fn_def)
     if struct_ret_uses_sret(s, ret_type, ret_struct) == 1
         call_sret = emit_sret_call_slot(s, ret_struct)
     call_sret = emit_call_sret_array_slot(s, fn_def, call_sret)   # AGAST #3181
@@ -2275,7 +2275,7 @@ struct StaticMethod
 
 # The impl method `Type.method` names; None when no impl of `Type` has it.
 fn static_method_def(s: *EmitterState, type_sv: StrView, method_sv: StrView) -> Option<StaticMethod>
-    var sib: *ImplBlock = s.module.impls
+    var sib: *ImplBlock = s.sym.module.impls
     while sib != null
         if name_eq(StrView { ptr: (sib.type_name), len: (sib.type_name_len) as i64 }, type_sv) == 1
             var sm_it: *FnDef = sib.methods
@@ -2494,8 +2494,8 @@ fn struct_result_slot(s: *EmitterState, r: *MethodRecv, why: StrView) -> i32
     let held: i32 = own_temp_slot_of(s, r.recv_value_reg)
     if held > 0
         return held
-    if s.sret_last_slot > 0 and s.sret_last_val == r.recv_value_reg
-        return s.sret_last_slot
+    if s.fcx.sret_last_slot > 0 and s.fcx.sret_last_val == r.recv_value_reg
+        return s.fcx.sret_last_slot
     if is_primitive_type_name(r.type_name) == 1
         return 0
     let slot: i32 = next_reg(s)
@@ -3054,7 +3054,7 @@ fn emit_impl_method_call(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv
         let sp: TypeKind = mfn.params.param_type
         if sp == TypeKind.Ptr or sp == TypeKind.Ref
             let recv_int: i32 = next_reg(s)
-            format_into(s.out, "  %.{recv_int} = ptrtoint ptr %.{r.receiver_reg} to i64\n")
+            format_into(s.ir.out, "  %.{recv_int} = ptrtoint ptr %.{r.receiver_reg} to i64\n")
             r.receiver_reg = recv_int
             recv_ty = "i64 "
 
