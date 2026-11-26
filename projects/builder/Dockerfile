@@ -62,6 +62,12 @@ ENV PATH=/opt/venv/bin:$PATH \
     RITZ_CACHE_DIR=/tmp/ritz-cas
 COPY . /src
 WORKDIR /src
+# Empty by default. projects/ritz/scripts/ritz1-jobs.sh then caps the
+# bootstrap at min(nproc, 8). Pass --build-arg RITZ1_JOBS=12 on a machine
+# that can take it. An empty value is the cap, not -j0. Declared here so a
+# different width does not redo the toolchain install above.
+ARG RITZ1_JOBS=
+ENV RITZ1_JOBS=${RITZ1_JOBS}
 RUN make -C projects/ritz ritz1-bootstrap
 RUN bash projects/builder/check_fixed_point.sh projects/ritz/ritz1
 RUN python3 projects/builder/stage_tree.py /src /stage \
@@ -84,6 +90,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /var/log/apt /var/log/dpkg.log
 COPY --from=bootstrap /toolchain/ /
 COPY --from=bootstrap /stage/ /rz/
+# The single-package entrypoint (AGAST #4823). It is not part of /rz: a
+# package build runs ./rz from a private workspace copied out of /rz.
+COPY projects/builder/entrypoint.sh /usr/local/bin/rz-builder
+COPY projects/builder/summary.py /usr/local/lib/rz-builder/summary.py
+RUN chmod 755 /usr/local/bin/rz-builder
+ENTRYPOINT ["/usr/local/bin/rz-builder"]
 # The labels must name what ships: refuse a missing commit, and a ritz1 sha256
 # that is not this binary's.
 RUN set -eu; \

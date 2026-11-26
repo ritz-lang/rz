@@ -14,12 +14,17 @@
 #   - the labels name the commit and the shipped binary's sha256;
 #   - every native tool the survey found runs, and clang is CI's major;
 #   - ritz1_selfhosted runs (usage) and compiles a file to IR;
-#   - a hello package (outside the image's tree) builds, its [[test]] passes
-#     under `rz test`, and its binary prints the expected line;
+#   - the entrypoint builds and tests a hello package mounted read-only,
+#     writes /out, and the binary prints the expected line;
+#   - a package that does not compile exits non-zero, with summary.json ok false;
+#   - no package argument exits 2;
 #   - `rz build --all --compiler ritz1_selfhosted` builds every package the
 #     image ships, so the shipped sources are complete;
 #   - the tree has no .git, no checkout, no test corpus the build ignores;
 #   - the unpacked image size is within the budget in README.md.
+#
+# RITZ1_JOBS, when set, is the bootstrap's make -j (see ritz1-jobs.sh).
+# Unset keeps that script's cap. It is not the image default.
 #
 #   --reproducible  rebuild the bootstrap stage with --no-cache and require
 #                   the same ritz1_selfhosted sha256
@@ -52,17 +57,39 @@ work="$(mktemp -d)"
 boot_tag="rz-builder-bootstrap:${commit:0:12}"
 images=()
 cleanup() {
-    rm -rf "$work"
+    # A root container can leave root-owned files on a bind mount. Remove
+    # what we can, then ask a root container to remove the rest. The trap
+    # must not turn a green run into exit 1.
+    if [[ -n ${work:-} && -d $work ]]; then
+        rm -rf "$work" 2>/dev/null || true
+        if [[ -d $work ]]; then
+            local cleaner=${tag:-${boot_tag:-}}
+            if [[ -n $cleaner ]]; then
+                docker run --rm --network=none --user 0 --entrypoint rm \
+                    -v "$work:/cleanup" "$cleaner" -rf /cleanup >/dev/null 2>&1 || true
+            fi
+            rm -rf "$work" 2>/dev/null || true
+        fi
+    fi
     if [[ $keep -eq 0 && ${#images[@]} -gt 0 ]]; then
         docker image rm "${images[@]}" >/dev/null 2>&1 || true
     fi
+    return 0
 }
 trap cleanup EXIT
 
 echo "=== context: git archive ${commit:0:12} ==="
 git -C "$ROOT" archive --format=tar "$commit" > "$work/context.tar"
 
-build() { docker build -f projects/builder/Dockerfile "$@" - < "$work/context.tar"; }
+build() {
+    local -a jobs=()
+    # Only when the caller set it. An empty build-arg would still be the cap,
+    # but leaving it off keeps the Dockerfile's own default in the cache key.
+    if [[ -n ${RITZ1_JOBS:-} ]]; then
+        jobs+=(--build-arg "RITZ1_JOBS=${RITZ1_JOBS}")
+    fi
+    docker build -f projects/builder/Dockerfile "${jobs[@]}" "$@" - < "$work/context.tar"
+}
 
 echo "=== pass 1: bootstrap stage ==="
 build --target bootstrap -t "$boot_tag"
@@ -84,7 +111,9 @@ echo "=== pass 2: runtime image $tag ==="
 build --build-arg "RZ_COMMIT=$commit" --build-arg "RITZ1_SHA256=$sha" -t "$tag"
 images+=("$tag")
 
-run() { docker run --rm -i "$tag" "$@"; }
+# The image ENTRYPOINT is rz-builder. These probes name the program.
+# A relative path is resolved from WORKDIR /rz; a bare name is PATH.
+run() { docker run --rm --network=none --entrypoint "$1" "$tag" "${@:2}"; }
 
 echo "=== checks ==="
 label() { docker image inspect "$tag" --format "{{ index .Config.Labels \"$1\" }}"; }
@@ -107,8 +136,9 @@ grep -q '^Usage: ritz1 ' <<<"$usage" && ok "ritz1_selfhosted runs (usage)" || ba
 ir="$(run sh -c 'printf "fn main() -> i32\n    42\n" > /tmp/m.ritz && projects/ritz/ritz1/build/ritz1_selfhosted /tmp/m.ritz -o /tmp/m.ll && grep -c "^define" /tmp/m.ll' 2>&1)" \
     && ok "ritz1_selfhosted compiles a file to IR ($ir definitions)" || bad "ritz1_selfhosted compile: $ir"
 
-# hello: a package outside the image's tree, piped in, built, tested, run.
-mkdir -p "$work/hello/src" "$work/hello/test"
+# hello: a package outside the image's tree, mounted read-only. The
+# entrypoint builds and tests it and writes /out. The mount must not change.
+mkdir -p "$work/hello/src" "$work/hello/test" "$work/hello-out"
 cat > "$work/hello/ritz.toml" <<'EOF'
 [package]
 name = "hello"
@@ -132,16 +162,74 @@ fn test_arithmetic() -> i32
     assert 2 + 3 == 5
     0
 EOF
-hello="$(tar -C "$work" -cf - hello | run sh -c '
-    set -e; mkdir -p /work; tar -C /work -xf -
-    ./rz build /work/hello --compiler ritz1_selfhosted >&2
-    ./rz test /work/hello --compiler ritz1_selfhosted >&2
-    /work/hello/build/debug/hello' 2>"$work/hello.log")" || true
-if [[ "$hello" == "Hello from the Ritz builder" ]]; then
-    ok "hello builds, passes rz test and runs in the container"
+hello_before=$(find "$work/hello" -type f -print0 | sort -z | xargs -0 sha256sum)
+set +e
+# seccomp=unconfined: the default profile rejects io_uring_* with EPERM.
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    -v "$work/hello:/src/projects/hello:ro" \
+    -v "$work/hello-out:/out" \
+    "$tag" /src/projects/hello >"$work/hello-entry.log" 2>&1
+hello_rc=$?
+set -e
+hello_after=$(find "$work/hello" -type f -print0 | sort -z | xargs -0 sha256sum)
+hello_ok=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ok"))' \
+    "$work/hello-out/summary.json" 2>/dev/null || echo missing)
+hello_passed=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["test"].get("passed"))' \
+    "$work/hello-out/summary.json" 2>/dev/null || echo missing)
+if [[ $hello_rc -eq 0 && $hello_ok == True && $hello_passed == 1 && $hello_before == "$hello_after" ]]; then
+    ok "hello: entrypoint builds and tests a read-only mount, summary ok, 1 test"
 else
-    bad "hello in the container printed '$hello'"; sed 's/^/     | /' "$work/hello.log"
+    bad "hello entrypoint rc=$hello_rc ok=$hello_ok tests=$hello_passed mount-unchanged=$([[ $hello_before == "$hello_after" ]] && echo yes || echo no)"
+    sed 's/^/     | /' "$work/hello-entry.log" | tail -30
 fi
+hello_bin=$(docker run --rm --network=none --security-opt seccomp=unconfined \
+    --entrypoint /out/bin/hello \
+    -v "$work/hello-out:/out:ro" "$tag" 2>"$work/hello-bin.log" || true)
+if [[ $hello_bin == "Hello from the Ritz builder" ]]; then
+    ok "hello binary from /out prints the expected line"
+else
+    bad "hello binary printed '$hello_bin'"; sed 's/^/     | /' "$work/hello-bin.log"
+fi
+
+# A package that does not compile: non-zero exit, summary.json ok false.
+mkdir -p "$work/bad/src" "$work/bad-out"
+cat > "$work/bad/ritz.toml" <<'EOF'
+[package]
+name = "bad"
+version = "0.1.0"
+sources = ["src"]
+
+[[bin]]
+name = "bad"
+entry = "main::main"
+EOF
+cat > "$work/bad/src/main.ritz" <<'EOF'
+fn main() -> i32
+    this is not ritz
+EOF
+set +e
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    -v "$work/bad:/src/projects/bad:ro" \
+    -v "$work/bad-out:/out" \
+    "$tag" /src/projects/bad >"$work/bad-entry.log" 2>&1
+bad_rc=$?
+set -e
+bad_ok=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ok"))' \
+    "$work/bad-out/summary.json" 2>/dev/null || echo missing)
+if [[ $bad_rc -ne 0 && $bad_ok == False ]]; then
+    ok "a package that does not compile exits $bad_rc and summary ok is false"
+else
+    bad "bad package rc=$bad_rc summary ok=$bad_ok, want non-zero and false"
+    sed 's/^/     | /' "$work/bad-entry.log" | tail -20
+fi
+
+set +e
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    "$tag" >"$work/usage.log" 2>&1
+usage_rc=$?
+set -e
+[[ $usage_rc -eq 2 ]] && ok "no package argument exits 2" \
+    || bad "no package argument exited $usage_rc, want 2"
 
 if run ./rz build --all --compiler ritz1_selfhosted > "$work/all.log" 2>&1; then
     ok "rz build --all under ritz1_selfhosted: $(grep -c '^PKG PASS' "$work/all.log") packages, every one the image ships"

@@ -20,15 +20,51 @@ tagged `rz-builder:<commit12>-<ritz1-sha12>` and labelled
 `/rz/BUILDER_INFO` in the image records those values and the clang and
 binutils versions.
 
-Inside the image the workspace is `/rz`:
+Inside the image the workspace is `/rz`. The entrypoint builds and tests
+one package with that image's `ritz1_selfhosted` (passed as `RITZ1` and as
+`--compiler ritz1_selfhosted`, never the default compiler) and writes
+`/out`:
 
 ```bash
-docker run --rm -v "$PWD/mypkg:/work/mypkg" rz-builder:<tag> \
-    ./rz build /work/mypkg --compiler ritz1_selfhosted
+# A mounted package. Path dependencies and ritzlib come from the image.
+# seccomp=unconfined: Docker's default profile returns EPERM for
+# io_uring_setup / io_uring_enter / io_uring_register, and ritzlib's tests
+# call them.
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    -v "$PWD/projects/sage:/src/projects/sage:ro" \
+    -v "$PWD/out:/out" \
+    rz-builder:<tag> /src/projects/sage
+
+# A package that already ships in the image.
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    -v "$PWD/out:/out" \
+    rz-builder:<tag> projects/sage
+
+# Harland's kernel ELF, build only. The image has no QEMU.
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    -v "$PWD/out:/out" \
+    rz-builder:<tag> --build-only projects/harland
 ```
 
-The single-package entrypoint (`docker run … <pkg>`, artifacts in `/out`)
-is #4823. Publishing from CI and enforcing the size budget is #4824.
+The exit status is 0 only when the build succeeded and every test passed.
+`--build-only` skips tests and is 0 when the build succeeded. The source
+mount is not written. The run needs no network.
+
+`/out` holds `bin/` (ELF and PE binaries), `obj/` (this run's `.o` files),
+`build/` (the package build tree), `build.log`, `test.log`, and
+`summary.json` (`ok`, the build exit, and the test counts). When the
+container is root, those files are given to the user who owns the mount.
+
+```bash
+bash projects/builder/accept.sh rz-builder:<tag>
+```
+
+That compares the host's `./rz build` and `./rz test` under
+`ritz1_selfhosted` with the container, on ritzlib's tests, sage, rzsh's
+Linux bin, tome, one indium PIC bin, and harland's kernel ELF (build
+only). The two sides must agree on pass/fail and on the test counts.
+
+Publishing from CI and enforcing the size budget is #4824.
 
 This directory is not a Ritz package and has no `ritz.toml`. `rz`'s
 `projects/**` glob only matches directories that have a `ritz.toml`
@@ -46,6 +82,9 @@ instead of `pkg:builder`.
 | `stage_tree.py` | Copies the runtime tree (below) out of a checkout |
 | `collect_toolchain.sh` | Copies the native tools and their `ldd` closure |
 | `test.sh` | Builds the image from `git archive` and tests it by running it |
+| `entrypoint.sh` | Image entrypoint: one package, `ritz1_selfhosted`, artifacts in `/out` |
+| `summary.py` | Writes `summary.json` and copies bins and `.o` files into `/out` |
+| `accept.sh` | Host `./rz` versus the container, on the packages #4823 names |
 
 ## Survey: what a build executes
 
@@ -107,7 +146,10 @@ Debian 13 has no clang-21, so the image uses apt.llvm.org's
   hosted binary links `_start` from them.
 - **Library packages**: every package that some `ritz.toml` names as a path
   dependency, found by reading the manifests (`stage_tree.library_packages`),
-  plus ritzunit, which `rz test` links into every test binary. On
+  plus ritzunit, which `rz test` links into every test binary, and the
+  harland kernel package. Nothing path-depends on `projects/harland` itself
+  (the dependencies name its ABI subdirectories), and the entrypoint builds
+  that kernel ELF with `--build-only`. The image has no QEMU. On
   6892b71c6 that is angelo, cryptosec, goliath, harland's boot_abi,
   driver_abi, libnet, net_abi and virtio_abi, http, iris, lexis, mausoleum,
   prism, ritzunit (with inventory), sage, spire, squeeze, tome and zeus.

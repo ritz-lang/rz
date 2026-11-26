@@ -13,8 +13,10 @@ projects/builder/README.md; in short:
   traced with an audit hook (README, "Python");
 - ritzlib and the runtime shims, without their tests;
 - every package another package names as a path dependency, plus ritzunit
-  (which `rz test` links into every test binary): its ritz.toml and its
-  sources (.ritz, linker scripts, .s, .ll), no tests, docs or examples;
+  (which `rz test` links into every test binary) and the harland kernel
+  (nothing path-depends on the package itself; the entrypoint builds its
+  ELF): its ritz.toml and its sources (.ritz, linker scripts, .s, .ll),
+  no tests, docs or examples;
 - ritz1_selfhosted, at the path build_pipeline.RITZ1_SELFHOSTED_BIN names.
 
 Nothing else: no .git, no build caches, no ritz0 compiler back end (ritz0
@@ -86,9 +88,11 @@ SOURCE_SUFFIXES = {".ritz", ".ld", ".s", ".S", ".ll"}
 SKIP_DIRS = {"test", "tests", "docs", "doc", "bench", "benchmarks", "build",
              "archive", "fixtures", "testdata"}
 
-# Packages that ship even though no ritz.toml names them: `rz test` links
-# ritzunit's runner into every test binary.
-ALWAYS = ["projects/ritzunit"]
+# Packages that ship even though no ritz.toml names them as a path
+# dependency. `rz test` links ritzunit's runner into every test binary.
+# The harland kernel is the in-tree `--build-only` package (AGAST #4823);
+# other manifests name harland's ABI subdirectories, not this package.
+ALWAYS = ["projects/ritzunit", "projects/harland"]
 
 
 def library_packages(root: Path) -> list[Path]:
