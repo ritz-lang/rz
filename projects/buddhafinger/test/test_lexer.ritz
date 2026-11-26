@@ -1,0 +1,247 @@
+# test/test_lexer.ritz - the editor lexer's ritzunit suite (AGAST #4827).
+#
+# Each case lexes one line and compares its "shape": the line with every
+# byte replaced by the class of the token it is in (`.` outside any token).
+#   K keyword   T type   L literal   N number   S string   E escape
+#   C char      # comment   A attribute
+# Then the drift test: the editor's compiler-keyword table against the one
+# ritz1's lexer is built from.
+
+import ritzlib.fs { read_file }
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new }
+
+import syntax.lexer { Kind, Token, lex_line, compiler_keywords, word_kind }
+
+fn letter(k: Kind) -> u8
+    match k
+        Kind.Keyword => 'K'
+        Kind.Type => 'T'
+        Kind.Literal => 'L'
+        Kind.Number => 'N'
+        Kind.String => 'S'
+        Kind.Escape => 'E'
+        Kind.Char => 'C'
+        Kind.Comment => '#'
+        Kind.Attribute => 'A'
+
+# `line`'s shape; also checks the tokens are ascending, non-empty and inside
+# the line, which the screen relies on.
+[[test_helper]]
+fn shape(line: StrView) -> String
+    var toks: Vec<Token> = vec_new<Token>()
+    lex_line(span_from_strview(line), @&toks)
+    var out = string_new()
+    for i in 0..line.len
+        out.push('.')
+    var end: i64 = 0
+    for i in 0..toks.len()
+        let t = toks.get(i)
+        assert t.len > 0
+        assert t.start >= end
+        assert t.start + t.len <= line.len
+        end = t.start + t.len
+        for k in t.start..end
+            out.set_char(k, letter(t.kind))
+    out
+
+[[test_helper]]
+fn shape_is(line: StrView, want: StrView) -> bool
+    let got = shape(line)
+    if not got.eq(want)
+        print("lex  {line}\nwant {want}\ngot  {got.as_view()}\n")
+        return false
+    true
+
+# ============================================================================
+# Words
+# ============================================================================
+
+[[test]]
+fn test_keywords_types_and_literals() -> i32
+    assert shape_is("pub fn f(x: i64) -> bool", "KKK.KK......TTT.....TTTT")
+    assert shape_is("if a and not b then true else nil", "KK...KKK.KKK...KKKK.LLLL.KKKK.LLL")
+    assert shape_is("let v: Vec<u8> = None", "KKK....TTT.TT....LLLL")
+    0
+
+[[test]]
+fn test_words_match_whole_identifiers_only() -> i32
+    # A keyword inside a longer name, or a type's prefix, is no word.
+    assert shape_is("lets fn_x i640 _if self", "...................KKKK")
+    assert shape_is("format(x)", ".........")
+    0
+
+[[test]]
+fn test_word_kinds() -> i32
+    assert word_kind("continue").is_some()
+    assert word_kind("u64").is_some()
+    assert word_kind("Self").is_some()
+    assert word_kind("ident").is_none()
+    0
+
+# ============================================================================
+# Numbers
+# ============================================================================
+
+[[test]]
+fn test_numbers_with_bases_separators_and_suffixes() -> i32
+    assert shape_is("x = 1_000 + 0xFFu8", "....NNNNN...NNNNNN")
+    assert shape_is("0b1010i32 7usize 2.5f32 1e9", "NNNNNNNNN.NNNNNN.NNNNNN.NNN")
+    assert shape_is("3.25e-2 0x10i64", "NNNNNNN.NNNNNNN")
+    0
+
+[[test]]
+fn test_a_suffix_running_into_a_name_is_not_taken() -> i32
+    # ritz1 lexes `5usize_max` as `5` + an identifier (AGAST #107).
+    assert shape_is("5usize_max 5u8x", "N..........N...")
+    0
+
+[[test]]
+fn test_ranges_and_tuple_fields_are_integers() -> i32
+    # `0..n`: no fraction. `p.0.1`: after a `.` only the digits (AGAST #3232).
+    assert shape_is("for i in 0..n", "KKK...KK.N...")
+    assert shape_is("p.0.1 + 1.5", "..N.N...NNN")
+    0
+
+[[test]]
+fn test_digits_inside_a_name_are_the_name() -> i32
+    assert shape_is("x1 = a2b", "........")
+    0
+
+# ============================================================================
+# Strings, escapes, chars
+# ============================================================================
+
+[[test]]
+fn test_strings_and_their_escapes() -> i32
+    assert shape_is("s = \"a\\nb\"", "....SSEESS")
+    assert shape_is("\"\\x41\\\"\\{\" x", "SEEEEEEEES..")
+    0
+
+[[test]]
+fn test_c_strings_take_their_prefix() -> i32
+    assert shape_is("f(c\"x\\0\", c)", "..SSSEES....")
+    # `c` before a non-quote is a name; `abc"x"` is a name then a string.
+    assert shape_is("abc\"x\"", "...SSS")
+    0
+
+[[test]]
+fn test_a_newline_ends_an_unterminated_string() -> i32
+    # Lexing is per line: the string runs to the end of this one only.
+    assert shape_is("x = \"open # not a comment", "....SSSSSSSSSSSSSSSSSSSSS")
+    assert shape_is("\"tail\\", "SSSSSE")
+    0
+
+[[test]]
+fn test_a_hash_in_a_string_is_not_a_comment() -> i32
+    assert shape_is("\"#\" # c", "SSS.###")
+    0
+
+[[test]]
+fn test_chars_and_char_escapes() -> i32
+    assert shape_is("'a' '\\n' '\\x7f'", "CCC.CEEC.CEEEEC")
+    # A lone quote is no char.
+    assert shape_is("'' x'", ".....")
+    0
+
+# ============================================================================
+# Comments and attributes
+# ============================================================================
+
+[[test]]
+fn test_comments_run_to_the_end_of_the_line() -> i32
+    assert shape_is("x # fn \"s\" 1", "..##########")
+    assert shape_is("# all", "#####")
+    0
+
+[[test]]
+fn test_attributes_on_their_own_line() -> i32
+    assert shape_is("[[test]]", "AAAAAAAA")
+    assert shape_is("    [[target_os = \"linux\"]] # c", "....AAAAAAAAAAAAAAAAAAAAAAA.###")
+    # `[[` inside an expression is indexing, not an attribute.
+    assert shape_is("a[[1][0]]", "...N..N..")
+    0
+
+[[test]]
+fn test_plain_and_empty_lines() -> i32
+    assert shape_is("", "")
+    assert shape_is("    x.y(z) + w", "..............")
+    # Bytes that aren't ASCII are plain, never part of a token.
+    assert shape_is("é fn", "...KK")
+    0
+
+# ============================================================================
+# Drift: the compiler's keywords are the editor's
+# ============================================================================
+
+# ritz1's keyword table: the words lexer_keyword in the generated
+# lexer_scan_gen.ritz returns a keyword token for. `rz test` runs in the
+# package directory.
+const KEYWORD_TABLE: StrView = "../ritz/ritz1/src/lexer_scan_gen.ritz"
+
+# Every `c"<word>"` between `fn lexer_keyword(` and the next top-level fn.
+[[test_helper]]
+fn compiler_table_words(src: StrView) -> Vec<StrView>
+    var words: Vec<StrView> = vec_new<StrView>()
+    let at = src.find("fn lexer_keyword(")
+    assert at >= 0
+    var body = src.skip(at + 1)
+    let next = body.find("\nfn ")
+    let next_pub = body.find("\npub fn ")
+    var end: i64 = body.len
+    if next >= 0 and next < end
+        end = next
+    if next_pub >= 0 and next_pub < end
+        end = next_pub
+    body = body.take(end)
+    var i: i64 = 0
+    while i + 1 < body.len
+        if body.get(i) == 'c' and body.get(i + 1) == '"'
+            var j: i64 = i + 2
+            while j < body.len and body.get(j) != '"'
+                j += 1
+            words.push(body.slice(i + 2, j))
+            i = j
+        i += 1
+    words
+
+fn contains(words: @Vec<StrView>, w: StrView) -> bool
+    for i in 0..words.len()
+        if words.get(i).eq(w)
+            return true
+    false
+
+[[test]]
+fn test_editor_keywords_match_the_compilers() -> i32
+    var text = string_new()
+    match read_file(KEYWORD_TABLE)
+        Ok(t) => text = t
+        Err(_) =>
+            print("cannot read {KEYWORD_TABLE}\n")
+            assert false
+    let compiler = compiler_table_words(text.as_view())
+    let editor = compiler_keywords()
+    # A sanity floor: an extraction that finds nothing proves nothing.
+    assert compiler.len() > 40
+    var ok = true
+    for i in 0..compiler.len()
+        let w = compiler.get(i)
+        if not contains(@editor, w)
+            print("ritz1 keyword `{w}` is missing from syntax/lexer.ritz's COMPILER_WORDS\n")
+            ok = false
+    for i in 0..editor.len()
+        let w = editor.get(i)
+        if not contains(@compiler, w)
+            print("syntax/lexer.ritz's COMPILER_WORDS has `{w}`, which ritz1 no longer reserves\n")
+            ok = false
+    assert ok
+    0
+
+[[test]]
+fn test_every_compiler_keyword_is_colored() -> i32
+    let editor = compiler_keywords()
+    for i in 0..editor.len()
+        assert word_kind(editor.get(i)).is_some()
+    0

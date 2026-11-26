@@ -1,0 +1,261 @@
+# test/test_highlight.ritz - lexical colors on screen (AGAST #4827).
+#
+# The token -> style table, colored cells through render_styled, and the
+# per-line cache: a frame lexes each shown line once, an unchanged frame
+# lexes nothing, and an edit re-lexes only the lines it touched.
+
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string
+import ritzlib.termsession { Style, style_plain }
+
+import core.modes { Mode }
+import core.screen { LineSource, Screen, Size, View, Status, render, render_styled, screen_new, view_new, style_eq, style_escape, style_gutter }
+import syntax.lexer { Kind }
+import syntax.highlight { Highlighter, highlighter_new, kind_style }
+
+# ============================================================================
+# A line source: `\n`-separated lines
+# ============================================================================
+
+struct Lines
+    data: Vec<u8>
+    starts: Vec<i64>    # each line's first byte, then data.len() + 1
+
+impl LineSource for Lines
+    fn line_count(self: @Lines) -> i64
+        self.starts.len() - 1
+
+    fn line(self: @Lines, l: i64) -> [u8]
+        let all = span_from_vec<u8>(@self.data)
+        all.slice(self.starts.get(l), self.starts.get(l + 1) - 1)
+
+fn lines(s: StrView) -> Lines
+    var data: Vec<u8> = vec_new<u8>()
+    var starts: Vec<i64> = vec_new<i64>()
+    starts.push(0)
+    for i in 0..s.len
+        let c = s.get(i)
+        if c == '\n'
+            starts.push(data.len() + 1)
+        data.push(c)
+    starts.push(data.len() + 1)
+    Lines { data: data, starts: starts }
+
+# n lines "let x1 = 1" .. "let xn = n".
+fn numbered(n: i64) -> Lines
+    var s = string_new()
+    for i in 0..n
+        if i > 0
+            s.push('\n')
+        s.push_str("let x")
+        s.push_i64(i + 1)
+        s.push_str(" = ")
+        s.push_i64(i + 1)
+    lines(s.as_view())
+
+fn status() -> Status
+    Status { name: "a.ritz", dirty: false, mode: Mode.Normal }
+
+fn show(scr: @&Screen, src: @Lines, view: @&View, hl: @&Highlighter)
+    render_styled(scr, src, view, hl, status(), "")
+
+# The style of the cell at text row r, text column c (past the gutter of 4).
+fn at(scr: @Screen, r: i64, c: i64) -> Style
+    scr.cell(r, 4 + c).style
+
+fn is(got: Style, k: Kind) -> bool
+    style_eq(got, kind_style(k))
+
+# ============================================================================
+# Styles
+# ============================================================================
+
+[[test]]
+fn test_every_kind_is_colored_and_keywords_stand_apart() -> i32
+    let kinds: [9]Kind = [Kind.Keyword, Kind.Type, Kind.Literal, Kind.Number, Kind.String, Kind.Escape, Kind.Char, Kind.Comment, Kind.Attribute]
+    for i in 0..9
+        assert not style_eq(kind_style(kinds[i]), style_plain())
+    assert not style_eq(kind_style(Kind.Keyword), kind_style(Kind.Type))
+    assert not style_eq(kind_style(Kind.String), kind_style(Kind.Comment))
+    assert not style_eq(kind_style(Kind.Keyword), kind_style(Kind.Comment))
+    # An escape in a literal looks like the screen's escape glyphs.
+    assert style_eq(kind_style(Kind.Escape), style_escape())
+    0
+
+[[test]]
+fn test_render_styled_colors_each_token() -> i32
+    var scr = screen_new(Size { rows: 4, cols: 30 })
+    var view = view_new()
+    var hl = highlighter_new()
+    let src = lines("fn f() -> i32 # c\nx = \"a\\n\" 7u8")
+    show(@&scr, @src, @&view, @&hl)
+    assert is(at(@scr, 0, 0), Kind.Keyword)
+    assert is(at(@scr, 0, 1), Kind.Keyword)
+    assert style_eq(at(@scr, 0, 3), style_plain())         # `f`
+    assert is(at(@scr, 0, 10), Kind.Type)                 # `i32`
+    assert style_eq(at(@scr, 0, 13), style_plain())        # the blank before `#`
+    assert is(at(@scr, 0, 14), Kind.Comment)
+    assert is(at(@scr, 0, 16), Kind.Comment)
+    assert is(at(@scr, 1, 4), Kind.String)
+    assert is(at(@scr, 1, 6), Kind.Escape)
+    assert is(at(@scr, 1, 8), Kind.String)
+    assert is(at(@scr, 1, 10), Kind.Number)
+    assert is(at(@scr, 1, 12), Kind.Number)
+    # The gutter keeps its own style.
+    assert style_eq(scr.cell(0, 2).style, style_gutter())
+    0
+
+[[test]]
+fn test_plain_render_has_no_colors() -> i32
+    var scr = screen_new(Size { rows: 3, cols: 20 })
+    var view = view_new()
+    let src = lines("fn f() # c")
+    render(@&scr, @src, @&view, status(), "")
+    for c in 0..10
+        assert style_eq(at(@scr, 0, c), style_plain())
+    0
+
+[[test]]
+fn test_control_bytes_in_a_string_keep_the_escape_style() -> i32
+    var scr = screen_new(Size { rows: 3, cols: 20 })
+    var view = view_new()
+    var hl = highlighter_new()
+    let src = lines("\"a\x01b\"")
+    show(@&scr, @src, @&view, @&hl)
+    assert is(at(@scr, 0, 1), Kind.String)
+    assert style_eq(at(@scr, 0, 2), style_escape())        # `^A`
+    assert style_eq(at(@scr, 0, 3), style_escape())
+    assert is(at(@scr, 0, 4), Kind.String)
+    0
+
+[[test]]
+fn test_colors_hold_when_scrolled_far_right_in_a_long_line() -> i32
+    # Past CHECKPOINT_STRIDE the scan resumes mid-line from a checkpoint:
+    # the style lookup must start there too, not at the line's first token.
+    var s = string_from("fn f() ")
+    for i in 0..3000
+        s.push('1')
+    s.push_str(" # end")
+    let src = lines(s.as_view())
+    var scr = screen_new(Size { rows: 3, cols: 20 })
+    var view = view_new()
+    var hl = highlighter_new()
+    view.cursor_byte = s.len() - 1
+    show(@&scr, @src, @&view, @&hl)
+    assert view.left > 0
+    # The last cell is the cursor's: `d` of the comment; before it, digits.
+    assert is(at(@scr, 0, 15), Kind.Comment)
+    assert is(at(@scr, 0, 9), Kind.Number)
+    assert style_eq(at(@scr, 0, 10), style_plain())
+    0
+
+# ============================================================================
+# The cache: an edit re-lexes only the lines it touched
+# ============================================================================
+
+[[test]]
+fn test_a_frame_lexes_each_shown_line_once() -> i32
+    var scr = screen_new(Size { rows: 7, cols: 20 })     # 5 text rows
+    var view = view_new()
+    var hl = highlighter_new()
+    let src = numbered(50)
+    show(@&scr, @src, @&view, @&hl)
+    assert hl.lexed() == 5
+    show(@&scr, @src, @&view, @&hl)
+    assert hl.lexed() == 5
+    0
+
+[[test]]
+fn test_an_edit_inside_a_line_relexes_that_line_only() -> i32
+    var scr = screen_new(Size { rows: 7, cols: 20 })
+    var view = view_new()
+    var hl = highlighter_new()
+    show(@&scr, @src_of("let a = 1\nlet b = 2\nlet c = 3"), @&view, @&hl)
+    assert hl.lexed() == 3
+    # Line 1 becomes a comment.
+    let after = src_of("let a = 1\n# b = 2\nlet c = 3")
+    hl.lines_changed(1, 1, 1)
+    show(@&scr, @after, @&view, @&hl)
+    assert hl.lexed() == 4
+    assert is(at(@scr, 1, 0), Kind.Comment)
+    assert is(at(@scr, 2, 0), Kind.Keyword)
+    0
+
+fn src_of(s: StrView) -> Lines
+    lines(s)
+
+[[test]]
+fn test_split_and_join_shift_later_lines_without_relexing_them() -> i32
+    var scr = screen_new(Size { rows: 8, cols: 24 })
+    var view = view_new()
+    var hl = highlighter_new()
+    show(@&scr, @src_of("let a = 1\nlet b = 2\nx = \"s\"\n# end"), @&view, @&hl)
+    assert hl.lexed() == 4
+    # Split line 1 after `let`: lines 1..2 replace line 1; 2 and 3 move down.
+    let split = src_of("let a = 1\nlet\n b = 2\nx = \"s\"\n# end")
+    hl.lines_changed(1, 1, 2)
+    show(@&scr, @split, @&view, @&hl)
+    assert hl.lexed() == 6
+    assert is(at(@scr, 1, 0), Kind.Keyword)
+    assert style_eq(at(@scr, 2, 1), style_plain())
+    assert is(at(@scr, 3, 4), Kind.String)     # moved, not re-lexed
+    assert is(at(@scr, 4, 0), Kind.Comment)
+    # Join them back: lines 1..2 become one line.
+    hl.lines_changed(1, 2, 1)
+    show(@&scr, @src_of("let a = 1\nlet b = 2\nx = \"s\"\n# end"), @&view, @&hl)
+    assert hl.lexed() == 7
+    assert is(at(@scr, 2, 4), Kind.String)
+    assert is(at(@scr, 3, 0), Kind.Comment)
+    0
+
+[[test]]
+fn test_an_unreported_change_shows_the_cached_colors() -> i32
+    # The cache trusts lines_changed: proof that untouched lines aren't lexed.
+    var scr = screen_new(Size { rows: 4, cols: 20 })
+    var view = view_new()
+    var hl = highlighter_new()
+    show(@&scr, @src_of("let a"), @&view, @&hl)
+    show(@&scr, @src_of("xyz a"), @&view, @&hl)
+    assert hl.lexed() == 1
+    assert is(at(@scr, 0, 0), Kind.Keyword)
+    0
+
+[[test]]
+fn test_scrolling_lexes_only_newly_shown_lines() -> i32
+    var scr = screen_new(Size { rows: 7, cols: 20 })     # 5 text rows
+    var view = view_new()
+    var hl = highlighter_new()
+    let src = numbered(50)
+    show(@&scr, @src, @&view, @&hl)
+    view.cursor_line = 6                                 # top becomes 2
+    show(@&scr, @src, @&view, @&hl)
+    assert hl.lexed() == 7
+    0
+
+[[test]]
+fn test_relexing_one_line_over_and_over_keeps_storage_bounded() -> i32
+    var scr = screen_new(Size { rows: 7, cols: 40 })
+    var view = view_new()
+    var hl = highlighter_new()
+    let src = numbered(5)
+    show(@&scr, @src, @&view, @&hl)
+    for i in 0..5000
+        hl.lines_changed(0, 1, 1)
+        show(@&scr, @src, @&view, @&hl)
+    assert hl.lexed() == 5 + 5000
+    assert hl.stored_runs() < 5000
+    assert is(at(@scr, 4, 0), Kind.Keyword)
+    assert is(at(@scr, 0, 9), Kind.Number)
+    0
+
+[[test]]
+fn test_an_edit_past_the_cached_lines_is_harmless() -> i32
+    var hl = highlighter_new()
+    hl.lines_changed(100, 3, 1)
+    var scr = screen_new(Size { rows: 4, cols: 20 })
+    var view = view_new()
+    show(@&scr, @src_of("let a\nlet b"), @&view, @&hl)
+    assert hl.lexed() == 2
+    0

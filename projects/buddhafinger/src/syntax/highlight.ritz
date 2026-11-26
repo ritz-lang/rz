@@ -1,0 +1,142 @@
+# syntax/highlight.ritz - lexical colors for the screen, cached per line.
+#
+# A Highlighter is the screen's LineStyler (core/screen.ritz): it gives each
+# shown line's StyleRuns, lexing the line (syntax/lexer.ritz) the first time
+# it is asked and caching the runs. No lexical state crosses a line, so the
+# editor reports each edit as the lines it replaced and only those are lexed
+# again; the lines after it keep their runs and move with it.
+#
+#   var hl = highlighter_new()
+#   render_styled(@&scr, @buf, @&view, @&hl, status, "")
+#   buf.split_line(pos(4, 2))
+#   hl.lines_changed(4, 1, 2)       # line 4 became lines 4 and 5
+#
+# The seam for semantic tokens: when the language server advertises them,
+# they are an overlay merged into a line's runs here, over the lexical ones.
+
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.termsession { Style, Color, style_plain }
+
+import core.screen { LineStyler, StyleRun, style_escape }
+import syntax.lexer { Kind, Token, lex_line }
+
+# ============================================================================
+# Token styles
+# ============================================================================
+
+# The style a token of kind `k` is drawn in. An escape in a literal looks
+# like the screen's escape glyphs (`^[`, `<ff>`).
+pub fn kind_style(k: Kind) -> Style
+    var s = style_plain()
+    match k
+        Kind.Keyword =>
+            s.fg = Color.Index(5)
+            s.bold = true
+        Kind.Type => s.fg = Color.Index(2)
+        Kind.Literal => s.fg = Color.Index(1)
+        Kind.Number => s.fg = Color.Index(1)
+        Kind.String => s.fg = Color.Index(3)
+        Kind.Escape => s = style_escape()
+        Kind.Char => s.fg = Color.Index(3)
+        Kind.Comment => s.fg = Color.Index(4)
+        Kind.Attribute =>
+            s.fg = Color.Index(6)
+            s.bold = true
+    s
+
+# ============================================================================
+# The per-line cache
+# ============================================================================
+
+# Line l's runs are runs[first .. first + count], when `lexed`.
+struct Entry
+    lexed: bool
+    first: i64
+    count: i64
+
+fn entry_stale() -> Entry
+    Entry { lexed: false, first: 0, count: 0 }
+
+# Runs a re-lex leaves behind before the store is compacted, beyond the live
+# ones: compaction copies the live runs, so it runs at most once per this
+# many dropped.
+const SLACK_RUNS: i64 = 1024
+
+pub struct Highlighter
+    lines: Vec<Entry>       # per buffer line, from 0; past the end: stale
+    runs: Vec<StyleRun>     # every line's runs, back to back
+    live: i64               # how many of `runs` an entry still points at
+    lexed: i64              # lines lexed so far
+    toks: Vec<Token>        # lex_line's scratch
+
+pub fn highlighter_new() -> Highlighter
+    Highlighter { lines: vec_new<Entry>(), runs: vec_new<StyleRun>(), live: 0, lexed: 0, toks: vec_new<Token>() }
+
+impl Highlighter
+    # Lines first .. first + old_count were replaced by new_count lines: an
+    # edit within line l is (l, 1, 1), a split (l, 1, 2), joining l and l + 1
+    # (l, 2, 1). The new lines are lexed when next shown; later lines move.
+    pub fn lines_changed(self: @&Highlighter, first: i64, old_count: i64, new_count: i64)
+        let n = self.lines.len()
+        if first >= n
+            return                      # never shown: nothing cached
+        let old_end = if first + old_count < n then first + old_count else n
+        var next: Vec<Entry> = vec_with_cap<Entry>(n - (old_end - first) + new_count)
+        for l in 0..first
+            next.push(self.lines.get(l))
+        for l in first..old_end
+            self.live -= self.lines.get(l).count
+        for k in 0..new_count
+            next.push(entry_stale())
+        for l in old_end..n
+            next.push(self.lines.get(l))
+        self.lines = next
+
+    # Lines lexed since the Highlighter was made.
+    pub fn lexed(self: @Highlighter) -> i64
+        self.lexed
+
+    # Runs held, live or awaiting compaction.
+    pub fn stored_runs(self: @Highlighter) -> i64
+        self.runs.len()
+
+    # Lex line l (`bytes`) into fresh runs at the end of the store.
+    fn lex(self: @&Highlighter, l: i64, bytes: [u8])
+        while self.lines.len() <= l
+            self.lines.push(entry_stale())
+        self.live -= self.lines.get(l).count
+        self.lines.set(l, entry_stale())
+        if self.runs.len() - self.live > self.live + SLACK_RUNS
+            self.compact()
+        self.toks.clear()
+        lex_line(bytes, @&self.toks)
+        let first = self.runs.len()
+        for i in 0..self.toks.len()
+            let t = self.toks.get(i)
+            self.runs.push(StyleRun { start: t.start, len: t.len, style: kind_style(t.kind) })
+        let count = self.toks.len()
+        self.lines.set(l, Entry { lexed: true, first: first, count: count })
+        self.live += count
+        self.lexed += 1
+
+    # Drop the runs no entry points at.
+    fn compact(self: @&Highlighter)
+        var kept: Vec<StyleRun> = vec_with_cap<StyleRun>(self.live + SLACK_RUNS)
+        for l in 0..self.lines.len()
+            var e = self.lines.get(l)
+            if e.lexed
+                let from = e.first
+                e.first = kept.len()
+                for i in 0..e.count
+                    kept.push(self.runs.get(from + i))
+                self.lines.set(l, e)
+        self.runs = kept
+
+impl LineStyler for Highlighter
+    fn runs(self: @&Highlighter, l: i64, bytes: [u8]) -> [StyleRun]
+        if l >= self.lines.len() or not self.lines.get(l).lexed
+            self.lex(l, bytes)
+        let e = self.lines.get(l)
+        let all = span_from_vec<StyleRun>(@self.runs)
+        all.slice(e.first, e.first + e.count)

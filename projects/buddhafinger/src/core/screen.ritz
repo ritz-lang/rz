@@ -13,6 +13,10 @@
 #   scr.emit(@&out)                               # the changed cells
 #   out.flush(STDOUT)
 #
+# render_styled(@&scr, @lines, @&view, @&styler, status, "") colors the text
+# by a LineStyler's runs (syntax/highlight.ritz's Highlighter gives the
+# lexical colors); render draws it plain.
+#
 # Layout, top to bottom: the text area (a line-number gutter, then the
 # lines from view.top, horizontally scrolled by view.left cells; rows past
 # the last line show `~`), the status line, and the command/message line.
@@ -66,6 +70,27 @@ pub const GUTTER_MIN_DIGITS: i64 = 3
 pub trait LineSource
     fn line_count(self: @Self) -> i64
     fn line(self: @Self, l: i64) -> [u8]
+
+# Colors for a line's text: bytes [start, start + len) are drawn in `style`.
+pub struct StyleRun
+    start: i64
+    len: i64
+    style: Style
+
+# What colors lines (syntax.highlight's Highlighter: lexical colors now, a
+# semantic-token overlay later). runs() gives line l's runs, ascending and
+# not overlapping, valid until the next call; bytes in no run are plain
+# text, and escape glyphs keep the escape style whatever run they are in.
+pub trait LineStyler
+    fn runs(self: @&Self, l: i64, bytes: [u8]) -> [StyleRun]
+
+# No colors: what render() draws with.
+pub struct NoStyles
+    none: Vec<StyleRun>
+
+impl LineStyler for NoStyles
+    fn runs(self: @&NoStyles, l: i64, bytes: [u8]) -> [StyleRun]
+        span_from_vec<StyleRun>(@self.none)
 
 # ============================================================================
 # Styles
@@ -614,7 +639,14 @@ impl Screen
 
 # Compose the frame for `src` through `view` into `scr`, scrolling the view
 # so its cursor is on screen, with `status` and `message` below the text.
+# The text is uncolored; render_styled colors it.
 pub fn render<L: LineSource>(scr: @&Screen, src: @L, view: @&View, status: Status, message: StrView)
+    var plain = NoStyles { none: vec_new<StyleRun>() }
+    render_styled(scr, src, view, @&plain, status, message)
+
+# render, with each shown line's text colored by `styler`. Only the lines on
+# screen are asked for.
+pub fn render_styled<L: LineSource, S: LineStyler>(scr: @&Screen, src: @L, view: @&View, styler: @&S, status: Status, message: StrView)
     scr.back.clear()
     let rows: i64 = text_rows(scr.size) as i64
     let cols: i64 = scr.back.cols
@@ -649,7 +681,8 @@ pub fn render<L: LineSource>(scr: @&Screen, src: @L, view: @&View, status: Statu
         let l = view.top + r
         if l < count
             draw_number(@&scr.back, r, gutter, l + 1)
-            draw_line(scr, r, gutter, l, src.line(l), view.left)
+            let bytes = src.line(l)
+            draw_line(scr, r, gutter, l, bytes, view.left, styler.runs(l, bytes))
         else
             scr.back.set(r, 0, Cell { ch: '~' as u32, style: style_filler() })
 
@@ -670,16 +703,24 @@ fn draw_number(g: @&Grid, r: i64, gutter: i64, n: i64)
     let digits = fmt_i64_into(@buf, n)
     g.put(r, gutter - 1 - digits.len, gutter - 1, span_from_strview(digits), style_gutter())
 
-# Line l's cells from cell column `left`, at columns gutter.. of row r.
-fn draw_line(scr: @&Screen, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64)
+# Line l's cells from cell column `left`, at columns gutter.. of row r, in
+# the colors `runs` give its bytes.
+fn draw_line(scr: @&Screen, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64, runs: [StyleRun])
     let end = left + scr.back.cols - gutter
     var sc = scan_from(@&scr.marks, l, bytes, true, left)
+    var ri: i64 = 0                 # the first run not wholly before sc.byte
     while not sc.done() and sc.cell < end
         let u = sc.unit()
+        # The scan may start mid-line, from a checkpoint: skip the runs before it.
+        while ri < runs.len and runs[ri].start + runs[ri].len <= sc.byte
+            ri += 1
+        var style = style_text()
+        if ri < runs.len and runs[ri].start <= sc.byte
+            style = runs[ri].style
         for k in 0..u.width
             let at = sc.cell + k
             if at >= left and at < end
-                scr.back.set(r, gutter + at - left, Cell { ch: glyph_char(u, k), style: unit_style(u, style_text()) })
+                scr.back.set(r, gutter + at - left, Cell { ch: glyph_char(u, k), style: unit_style(u, style) })
         sc.advance(@&scr.marks, u)
 
 # ` MODE  name [+]` from the left, `line:col ` from the right, reversed.

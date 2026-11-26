@@ -10,6 +10,10 @@ the modules exist, the editor does not yet.
 - `src/core/`: the editor core (`buffer` with its undo `history` and
   `utf8` cursor stepping, `screen`, `modes`, `commands`). It does no
   terminal or OS I/O, so it is tested without a terminal.
+- `src/syntax/`: lexical colors. `lexer` splits one line into tokens (no
+  state crosses a line in Ritz); `highlight` caches each line's colored runs
+  for the screen, and an edit re-lexes only the lines it touched.
+  `test_lexer.ritz` fails when ritz1's keyword table and the lexer's drift.
 - `src/platform/`: the platform adapters that do that I/O (`linux` so far).
 - `src/main.ritz`: the `buddhafinger` binary.
 - `test/`: the ritzunit suites. `test_buffer_fuzz.ritz` runs seeded random
