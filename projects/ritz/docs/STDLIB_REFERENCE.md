@@ -104,6 +104,7 @@ modules links without sys. A freestanding program defines all three itself.
 9. [Process Management](#process-management)
    - [process](#process) - Subprocess spawning
    - [term](#term) - Terminal attributes and size
+   - [termsession](#termsession) - Raw mode, keys and escape output
    - [argspec](#argspec) - Argument parsing
    - [os.env](#osenv) - Environment variables
 10. [Utilities](#utilities)
@@ -2732,6 +2733,50 @@ fn enter_raw() -> Result<Termios, Errno>
                 Ok(_) => Ok(orig)
                 Err(e) => Err(e)
         Err(e) => Err(e)
+```
+
+---
+
+### termsession
+
+**Module**: `ritzlib.termsession` (Linux and Harland)
+
+What a line editor or full-screen program needs from a terminal (AGAST #4814,
+lifted from rzsh). Raw mode clears `ECHO ICANON ISIG IEXTEN ICRNL IXON` on
+Linux and `TTY_ECHO | TTY_ICANON | TTY_ISIG` on Harland, so Ctrl-C reaches the
+program as `Key.Ctrl('c')`. `Errno` comes with the import.
+
+| Item | Signature | Description |
+|------|-----------|-------------|
+| `term_enter_raw` | `fn(fd: i32) -> Result<TermSession, Errno>` | Raw mode; the session restores the saved attributes when dropped. `.restore()`, `.resume()`, `.is_raw()`, `.fd()` |
+| `term_state_raw` | `fn(fd: i32) -> Result<TermState, Errno>` | The same with no drop, for a module-level owner (a global is never dropped): restore it by hand |
+| `key_reader` | `fn(fd: i32) -> KeyReader` | `.read_key() -> Result<Key, InputEnd>`, one byte per read. After an incomplete sequence it polls `escape_timeout_ms` (default `ESCAPE_TIMEOUT_MS`, 25) for the rest, so a lone ESC is `Key.Escape` without the next keystroke. Harland has no poll yet (AGAST #4829): there the next byte resolves it |
+| `key_decoder` | `fn() -> KeyDecoder` | The byte-at-a-time decoder: `.feed(b) -> Option<Key>`, `.take_held()` (ESC then `x` is two keys), `.pending()`, `.flush()` (what a timeout does), `.reset()` |
+| `Key` | enum | `Char(u32)` (UTF-8 decoded), `Ctrl(u8)` (the lower-case letter), `Enter`, `Tab`, `Backspace`, `Escape`, arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `F(u8)`, `Unknown`; `.eq(other)` |
+| `term_out` | `fn() -> TermOut` | A buffer of text and sequences: `.text`, `.cursor_up/down/left/right(n)`, `.cursor_column(c)`, `.cursor_to(row, col)`, `.clear_screen`, `.clear_to_eol`, `.save_cursor`, `.restore_cursor`, `.hide_cursor`, `.show_cursor`, `.enter_alt_screen`, `.leave_alt_screen`, `.style(Style)`, `.reset_style`, `.as_view`, `.flush(fd) -> Result<(), Errno>` |
+| `style_plain` | `fn() -> Style` | `Style { fg, bg: Color, bold, underline, reverse }`; `Color.Default` or `Color.Index(n)` (256 colors) |
+
+```ritz
+import ritzlib.termsession
+import ritzlib.sys { STDIN, STDOUT }
+import ritzlib.result
+
+# Echo keys as text until Ctrl-Q; the terminal is restored on every return.
+fn run() -> Result<(), Errno>
+    let session: TermSession = term_enter_raw(STDIN)?
+    var reader: KeyReader = key_reader(STDIN)
+    var out: TermOut = term_out()
+    while true
+        match reader.read_key()
+            Ok(key) =>
+                if key.eq(Key.Ctrl('q'))
+                    return Ok(())
+                if key.eq(Key.Escape)
+                    out.text("<esc>")
+                else
+                    out.text(".")
+                out.flush(STDOUT)?
+            Err(_) => return Ok(())
 ```
 
 ---

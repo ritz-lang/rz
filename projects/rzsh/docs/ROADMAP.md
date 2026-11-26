@@ -83,6 +83,10 @@ pub fn sys_tty_setattr(fd: i32, attr: *TtyAttrs) -> i32
 
 ### 1.2 Escape Sequence Parsing
 
+Done, and since AGAST #4814 shared: raw mode, key decoding (with the Escape
+timeout) and cursor output live in `ritzlib.termsession`, which rzsh calls.
+The plan as first written follows.
+
 Once in raw mode, we need to parse escape sequences:
 
 ```

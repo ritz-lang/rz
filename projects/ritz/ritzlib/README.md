@@ -106,6 +106,7 @@ pub fn main() -> i32
 | `strview.ritz` | `ritzlib.strview` | Zero-copy string view |
 | `sys.ritz` | `ritzlib.sys` | System call wrappers |
 | `term.ritz` | `ritzlib.term` | Terminal attributes and size (Linux termios) -> Result |
+| `termsession.ritz` | `ritzlib.termsession` | Raw mode (Linux and Harland), keys with the Escape timeout, escape output |
 | `testlib.ritz` | `ritzlib.testlib` | Helpers for `[[test]]` integration tests |
 | `time.ritz` | `ritzlib.time` | Duration, sleep(Duration) and the wall clock |
 | `timer.ritz` | `ritzlib.timer` | High-performance timing utilities |

@@ -10,16 +10,14 @@ import ritzlib.sys {
     # Linux-specific (only used when target_os=linux)
     sys_open, sys_open3, sys_close, sys_getdents64, sys_fork, sys_execve, sys_wait4, sys_exit,
     sys_pipe, sys_dup, sys_dup2, sys_chdir, sys_getcwd,
-    O_RDONLY, O_DIRECTORY,
-    ECHO, ICANON, ISIG, IEXTEN, ICRNL, IXON,
-    VMIN, VTIME, STDIN, STDOUT,
+    O_RDONLY, O_DIRECTORY, STDIN, STDOUT,
     # Harland-specific (only used when target_os=harland)
-    sys_readdir, sys_spawn_args, sys_wait, sys_yield,
-    sys_tty_getattr, sys_tty_setattr, TtyAttrs, TTY_ECHO, TTY_ICANON, TTY_ISIG,
+    sys_readdir, sys_spawn_args, sys_wait,
     sys_tty_setfg, TTY_FG_CHILDREN
 }
 
-import ritzlib.term { tcgetattr, tcsetattr, TcsetWhen, Termios, Errno }
+import ritzlib.term { tcgetattr, Errno }
+import ritzlib.termsession { TermState, term_state_raw }
 import rawio { out_str, err_str, in_read }
 import ritzlib.result
 import ritzlib.gvec
@@ -385,34 +383,6 @@ pub fn os_environ() -> Vec<StrView>
     return vec_new<StrView>()
 
 # ============================================================================
-# Input waiting
-# ============================================================================
-
-# True when a stdin read result means "no more input, ever". On Linux a
-# blocking read returns 0 only at EOF (a closed pipe, ^D in cooked mode):
-# without this the shell spun on EOF forever. EINTR (-4) is not the end.
-[[target_os = "linux"]]
-pub fn os_input_ended(n: i64) -> bool
-    return n == 0 or (n < 0 and n != -4)
-
-# Harland's console read blocks too (AGAST #4254): 0 is ^D on an empty
-# line in cooked mode, a negative errno an unreadable stdin.
-[[target_os = "harland"]]
-pub fn os_input_ended(n: i64) -> bool
-    return n <= 0
-
-# Linux: blocking read handles waiting, no need to do anything
-[[target_os = "linux"]]
-pub fn os_yield()
-    # No-op on Linux - blocking I/O handles this
-    return
-
-# Harland: call sys_yield to let other processes run
-[[target_os = "harland"]]
-pub fn os_yield()
-    sys_yield()
-
-# ============================================================================
 # Directory listing layout
 # ============================================================================
 
@@ -440,98 +410,34 @@ pub fn os_default_path() -> StrView
 # ============================================================================
 # Terminal raw mode
 # ============================================================================
-# Raw mode disables canonical input (line buffering) and echo, allowing
-# character-by-character input with escape sequence detection.
+# Raw mode (ritzlib.termsession, both targets) turns off canonical input and
+# echo, so keys arrive one at a time with their escape sequences, and Ctrl-C
+# is a key for the editor instead of a signal.
 
-# Shared state for raw mode tracking (used by both targets)
-# Note: g_orig_termios storage is platform-specific but we need one buffer
-# that holds Termios (60 bytes) or TtyAttrs (4 bytes) depending on target.
-# We allocate enough for Termios (the larger one).
-var g_termios_storage: [64]u8
-# 0 = not in raw mode, 1 = in raw mode
-var g_raw_mode_active: i32 = 0
+# The raw mode rzsh entered; g_tty_open once there is one. A TermState, not a
+# TermSession: this lives for the process, `exit` leaves through sys_exit,
+# and every path out restores it by hand (os_disable_raw_mode).
+var g_tty: TermState
+var g_tty_open: bool = false
 
-# Linux: Save original termios and apply raw mode settings
-[[target_os = "linux"]]
-pub fn os_enable_raw_mode() -> i32
-    if g_raw_mode_active != 0
-        return 0  # Already in raw mode
+# Raw mode on stdin; Err (ENOTTY for a pipe) leaves it as it is. Raw mode
+# entered before is resumed, with the attributes it first saved.
+pub fn os_enable_raw_mode() -> Result<(), Errno>
+    if g_tty_open
+        return g_tty.resume()
+    g_tty = term_state_raw(STDIN)?
+    g_tty_open = true
+    Ok(())
 
-    # Cast storage to Termios pointer
-    let orig_termios: *Termios = @g_termios_storage[0] as *Termios
+# Back to the attributes raw mode found.
+pub fn os_disable_raw_mode()
+    if g_tty_open
+        match g_tty.restore()
+            Ok(_) => pass
+            Err(_) => pass     # nothing better to do than carry on
 
-    # Get current terminal settings
-    match tcgetattr(STDIN)
-        Ok(t) => *orig_termios = t
-        Err(e) => return -e.code()  # Failed (probably not a tty)
-
-    # Create raw mode settings
-    var raw: Termios = *orig_termios
-
-    # Disable canonical mode, echo, signals, extended processing
-    raw.c_lflag = raw.c_lflag & (0xFFFFFFFF ^ (ECHO | ICANON | ISIG | IEXTEN))
-
-    # Disable CR->NL translation and XON/XOFF
-    raw.c_iflag = raw.c_iflag & (0xFFFFFFFF ^ (ICRNL | IXON))
-
-    # Set minimum characters for read to 1, timeout to 0
-    raw.c_cc[VMIN] = 1
-    raw.c_cc[VTIME] = 0
-
-    # Apply raw mode
-    match tcsetattr(STDIN, @raw, TcsetWhen.Now)
-        Ok(_) =>
-            g_raw_mode_active = 1
-            0
-        Err(e) => -e.code()
-
-[[target_os = "linux"]]
-pub fn os_disable_raw_mode() -> i32
-    if g_raw_mode_active == 0
-        return 0  # Not in raw mode
-
-    # Restore original terminal settings
-    let orig_termios: *Termios = @g_termios_storage[0] as *Termios
-    let saved: Termios = *orig_termios
-    g_raw_mode_active = 0
-    match tcsetattr(STDIN, @saved, TcsetWhen.Now)
-        Ok(_) => 0
-        Err(e) => -e.code()
-
-[[target_os = "linux"]]
 pub fn os_is_raw_mode() -> bool
-    return g_raw_mode_active != 0
-
-# Harland: the console has three flags (ritzlib TtyAttrs, AGAST #4254). Raw
-# mode clears them all: no kernel echo or line editing, and Ctrl-C reaches
-# the editor as a byte instead of killing the shell.
-[[target_os = "harland"]]
-pub fn os_enable_raw_mode() -> i32
-    if g_raw_mode_active != 0
-        return 0
-    let orig: *TtyAttrs = @g_termios_storage[0] as *TtyAttrs
-    let r1: i32 = sys_tty_getattr(STDIN, orig)
-    if r1 != 0
-        return r1
-    var raw: TtyAttrs = *orig
-    raw.flags = raw.flags & (0xFFFFFFFF ^ (TTY_ECHO | TTY_ICANON | TTY_ISIG))
-    let r2: i32 = sys_tty_setattr(STDIN, @raw)
-    if r2 != 0
-        return r2
-    g_raw_mode_active = 1
-    return 0
-
-[[target_os = "harland"]]
-pub fn os_disable_raw_mode() -> i32
-    if g_raw_mode_active == 0
-        return 0
-    let r: i32 = sys_tty_setattr(STDIN, @g_termios_storage[0] as *TtyAttrs)
-    g_raw_mode_active = 0
-    return r
-
-[[target_os = "harland"]]
-pub fn os_is_raw_mode() -> bool
-    return g_raw_mode_active != 0
+    g_tty_open and g_tty.is_raw()
 
 # The console's Ctrl-C goes to rzsh's children, never to rzsh (#4276, the
 # kernel's tty/fg.ritz). Spawn is blocking, so rzsh can't name the command's
@@ -554,14 +460,16 @@ fn os_tty_fg_children()
 # foreground moves to rzsh's children first, before ISIG is back on.
 pub fn os_tty_suspend() -> bool
     os_tty_fg_children()
-    if g_raw_mode_active == 0
+    if not os_is_raw_mode()
         return false
     os_disable_raw_mode()
     return true
 
 pub fn os_tty_resume(was_raw: bool)
     if was_raw
-        os_enable_raw_mode()
+        match os_enable_raw_mode()
+            Ok(_) => pass
+            Err(_) => pass     # the prompt still works, echoed by the kernel
 
 # RZSH_DEBUG_TTY_WINDOW (exec_external): hold rzsh between os_tty_suspend
 # (ISIG back on) and spawn, in a read(0) of one line, so a test can type

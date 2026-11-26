@@ -1,0 +1,448 @@
+# ritzlib.termsession: key decoding, the Escape timeout, raw mode and the
+# escape-sequence writer (AGAST #4814).
+#
+# Decoding runs on byte strings, including the same bytes fed one per call
+# (split reads). The reader runs on a pipe: an ESC whose `[` arrives within
+# the timeout is an arrow key, and one with nothing after it is a bare
+# Escape. A pty master (/dev/ptmx) is the terminal raw mode is entered on.
+
+import ritzlib.sys
+import ritzlib.termsession
+import ritzlib.term
+import ritzlib.fd
+import ritzlib.process
+import ritzlib.time
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span
+import ritzlib.strview
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Every key `bytes` decodes to, fed in one pass, then flushed (as a timeout
+# would) so a sequence left open shows as its key.
+fn keys_of(text: StrView) -> Vec<Key>
+    keys_of_bytes(text.as_bytes())
+
+fn keys_of_bytes(bytes: Span<u8>) -> Vec<Key>
+    var dec: KeyDecoder = key_decoder()
+    var keys: Vec<Key> = vec_new<Key>()
+    for i in 0..bytes.len
+        collect(@&dec, bytes.get(i), @&keys)
+    match dec.flush()
+        Some(k) => keys.push(k)
+        None => pass
+    keys
+
+fn collect(dec: @&KeyDecoder, b: u8, keys: @&Vec<Key>)
+    match dec.feed(b)
+        Some(k) => keys.push(k)
+        None => pass
+    match dec.take_held()
+        Some(k) => keys.push(k)
+        None => pass
+
+# Bytes no literal can hold (invalid UTF-8): the first `n` of a, b, c.
+fn raw_keys(n: i64, a: u8, b: u8, c: u8) -> Vec<Key>
+    var bytes: [3]u8
+    bytes[0] = a
+    bytes[1] = b
+    bytes[2] = c
+    keys_of_bytes(span_from_ptr<u8>(@bytes[0], n))
+
+# `bytes` decodes to exactly `want`.
+fn decodes_to(bytes: StrView, want: Key) -> bool
+    let keys: Vec<Key> = keys_of(bytes)
+    keys.len() == 1 and keys.get(0).eq(want)
+
+fn opt_is(o: Option<Key>, want: Key) -> bool
+    match o
+        Some(k) => k.eq(want)
+        None => false
+
+fn is_key(r: Result<Key, InputEnd>, want: Key) -> bool
+    match r
+        Ok(k) => k.eq(want)
+        Err(_) => false
+
+fn is_eof(r: Result<Key, InputEnd>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => match e
+            Eof => true
+            Failed(_) => false
+
+# ============================================================================
+# Decoding
+# ============================================================================
+
+[[test]]
+fn test_text_and_control_bytes() -> i32
+    assert decodes_to("a", Key.Char('a'))
+    assert decodes_to(" ", Key.Char(' '))
+    assert decodes_to("~", Key.Char('~'))
+    assert decodes_to("\r", Key.Enter)
+    assert decodes_to("\n", Key.Enter)
+    assert decodes_to("\t", Key.Tab)
+    assert decodes_to("\x7f", Key.Backspace)
+    assert decodes_to("\x08", Key.Backspace)
+    assert decodes_to("\x03", Key.Ctrl('c'))
+    assert decodes_to("\x01", Key.Ctrl('a'))
+    assert decodes_to("\x1a", Key.Ctrl('z'))
+    assert decodes_to("\x1c", Key.Unknown)
+    0
+
+[[test]]
+fn test_csi_and_ss3_keys() -> i32
+    assert decodes_to("\e[A", Key.Up)
+    assert decodes_to("\e[B", Key.Down)
+    assert decodes_to("\e[C", Key.Right)
+    assert decodes_to("\e[D", Key.Left)
+    assert decodes_to("\e[H", Key.Home)
+    assert decodes_to("\e[F", Key.End)
+    assert decodes_to("\eOA", Key.Up)
+    assert decodes_to("\eOP", Key.F(1))
+    assert decodes_to("\eOS", Key.F(4))
+    # Modifiers are read past: Ctrl-Up is still Up.
+    assert decodes_to("\e[1;5A", Key.Up)
+    0
+
+[[test]]
+fn test_tilde_keys() -> i32
+    assert decodes_to("\e[1~", Key.Home)
+    assert decodes_to("\e[2~", Key.Insert)
+    assert decodes_to("\e[3~", Key.Delete)
+    assert decodes_to("\e[4~", Key.End)
+    assert decodes_to("\e[5~", Key.PageUp)
+    assert decodes_to("\e[6~", Key.PageDown)
+    assert decodes_to("\e[15~", Key.F(5))
+    assert decodes_to("\e[24~", Key.F(12))
+    assert decodes_to("\e[3;5~", Key.Delete)
+    assert decodes_to("\e[99~", Key.Unknown)
+    # A private sequence (bracketed paste's end marker is one) is no key.
+    assert decodes_to("\e[?1u", Key.Unknown)
+    0
+
+[[test]]
+fn test_utf8_text() -> i32
+    assert decodes_to("é", Key.Char(0xE9))
+    assert decodes_to("€", Key.Char(0x20AC))
+    assert decodes_to("😀", Key.Char(0x1F600))
+    # Overlong NUL, a surrogate, a bare continuation byte: not text.
+    let overlong: Vec<Key> = raw_keys(2, 0xC0, 0x80, 0)    # 0xC0 never leads
+    assert overlong.len() == 2
+    assert overlong.get(0).eq(Key.Unknown) and overlong.get(1).eq(Key.Unknown)
+    let nul3: Vec<Key> = raw_keys(3, 0xE0, 0x80, 0x80)    # overlong 3-byte NUL
+    assert nul3.len() == 1 and nul3.get(0).eq(Key.Unknown)
+    let surrogate: Vec<Key> = raw_keys(3, 0xED, 0xA0, 0x80)
+    assert surrogate.len() == 1 and surrogate.get(0).eq(Key.Unknown)
+    let stray: Vec<Key> = raw_keys(1, 0x80, 0, 0)
+    assert stray.len() == 1 and stray.get(0).eq(Key.Unknown)
+    # A sequence cut off by ASCII: Unknown, then the ASCII key.
+    let cut: Vec<Key> = raw_keys(3, 0xE2, 0x82, 'a')
+    assert cut.len() == 2
+    assert cut.get(0).eq(Key.Unknown)
+    assert cut.get(1).eq(Key.Char('a'))
+    0
+
+[[test]]
+fn test_escape_then_another_key_is_two_keys() -> i32
+    let keys: Vec<Key> = keys_of("\ex")
+    assert keys.len() == 2
+    assert keys.get(0).eq(Key.Escape)
+    assert keys.get(1).eq(Key.Char('x'))
+    # ESC ESC [ A: an Escape, then Up.
+    let twice: Vec<Key> = keys_of("\e\e[A")
+    assert twice.len() == 2
+    assert twice.get(0).eq(Key.Escape)
+    assert twice.get(1).eq(Key.Up)
+    0
+
+# The bytes of one key arrive in separate reads: the decoder carries the
+# sequence across feeds and completes it on the last byte, not before.
+[[test]]
+fn test_split_reads_complete_on_the_last_byte() -> i32
+    var dec: KeyDecoder = key_decoder()
+    assert dec.feed('\e').is_none()
+    assert dec.pending()
+    assert dec.feed('[').is_none()
+    assert dec.feed('3').is_none()
+    assert opt_is(dec.feed('~'), Key.Delete)
+    assert not dec.pending()
+    # UTF-8 split the same way.
+    assert dec.feed(0xE2).is_none()
+    assert dec.feed(0x82).is_none()
+    assert opt_is(dec.feed(0xAC), Key.Char(0x20AC))
+    0
+
+# A lone ESC decodes to nothing until it is flushed (the timeout's job);
+# then it is Escape, and the next `[` is text, not a sequence.
+[[test]]
+fn test_flush_ends_a_lone_escape() -> i32
+    var dec: KeyDecoder = key_decoder()
+    assert dec.feed('\e').is_none()
+    assert opt_is(dec.flush(), Key.Escape)
+    assert not dec.pending()
+    assert opt_is(dec.feed('['), Key.Char('['))
+    # A cut-off CSI flushes as Unknown; nothing open flushes as None.
+    assert dec.feed('\e').is_none()
+    assert dec.feed('[').is_none()
+    assert opt_is(dec.flush(), Key.Unknown)
+    assert dec.flush().is_none()
+    0
+
+# ============================================================================
+# KeyReader: the Escape timeout
+# ============================================================================
+
+# ESC, then nothing: after the timeout the reader returns Escape, without
+# waiting for another byte. The `[A` written afterwards is two text keys.
+[[test]]
+fn test_reader_escape_after_the_timeout() -> i32
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 1
+    var reader: KeyReader = key_reader(p.read.raw())
+    assert reader.escape_timeout_ms == 25
+    assert p.write.write_str("\e").is_ok()
+    assert is_key(reader.read_key(), Key.Escape)
+    assert p.write.write_str("[A").is_ok()
+    assert is_key(reader.read_key(), Key.Char('['))
+    assert is_key(reader.read_key(), Key.Char('A'))
+    p.write.close()
+    assert is_eof(reader.read_key())
+    p.read.close()
+    0
+
+# ESC, then `[A` from another process 20 ms later, inside a 2 s timeout:
+# separate reads, one key (Up).
+[[test]]
+fn test_reader_sequence_within_the_timeout() -> i32
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 1
+    let child: i32 = match fork()
+        Ok(fr) => match fr
+            Child =>
+                p.read.close()
+                p.write.write_str("\e")
+                sleep_ms(20)
+                p.write.write_str("[A")
+                sys_exit(0)
+                0
+            Parent(pid) => pid
+        Err(_) => return 2
+    p.write.close()
+    var reader: KeyReader = key_reader(p.read.raw())
+    reader.escape_timeout_ms = 2000
+    assert is_key(reader.read_key(), Key.Up)
+    wait_pid(child)
+    p.read.close()
+    0
+
+# The input closing in the middle of a sequence gives that key, then Eof.
+[[test]]
+fn test_reader_eof_flushes_an_open_escape() -> i32
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 1
+    assert p.write.write_str("a\e").is_ok()
+    p.write.close()
+    var reader: KeyReader = key_reader(p.read.raw())
+    assert is_key(reader.read_key(), Key.Char('a'))
+    assert is_key(reader.read_key(), Key.Escape)
+    assert reader.read_key().is_err()
+    p.read.close()
+    0
+
+# ============================================================================
+# TermSession on a pty
+# ============================================================================
+
+fn open_pty() -> Fd
+    match fd_open("/dev/ptmx", O_RDWR | O_CLOEXEC, 0)
+        Ok(f) => f
+        Err(_) => fd_adopt(-1)
+
+fn lflag_of(fd: i32) -> u32
+    match tcgetattr(fd)
+        Ok(t) => t.c_lflag
+        Err(_) => 0
+
+fn iflag_of(fd: i32) -> u32
+    match tcgetattr(fd)
+        Ok(t) => t.c_iflag
+        Err(_) => 0
+
+fn is_raw(fd: i32) -> bool
+    let l: u32 = lflag_of(fd)
+    (l & (ECHO | ICANON | ISIG | IEXTEN)) == 0 and (iflag_of(fd) & (ICRNL | IXON)) == 0
+
+# Enter raw mode; the session's drop puts the attributes back.
+fn enter_and_drop(fd: i32) -> bool
+    match term_enter_raw(fd)
+        Ok(s) =>
+            let session: TermSession = s
+            session.is_raw() and is_raw(fd)
+        Err(_) => false
+
+[[test]]
+fn test_session_enters_raw_and_drop_restores() -> i32
+    var pty: Fd = open_pty()
+    if not pty.valid()
+        return 0     # no /dev/ptmx on this system
+    let fd: i32 = pty.raw()
+    # Start from cooked attributes, whatever the pty began with.
+    var cooked: Termios = match tcgetattr(fd)
+        Ok(t) => t
+        Err(_) => return 1
+    cooked.c_lflag = cooked.c_lflag | ECHO | ICANON | ISIG | IEXTEN
+    cooked.c_iflag = cooked.c_iflag | ICRNL | IXON
+    assert tcsetattr(fd, @cooked, TcsetWhen.Now).is_ok()
+    let before_l: u32 = lflag_of(fd)
+    let before_i: u32 = iflag_of(fd)
+    assert enter_and_drop(fd)
+    assert lflag_of(fd) == before_l
+    assert iflag_of(fd) == before_i
+    pty.close()
+    0
+
+[[test]]
+fn test_session_restore_and_resume() -> i32
+    var pty: Fd = open_pty()
+    if not pty.valid()
+        return 0
+    let fd: i32 = pty.raw()
+    let before_l: u32 = lflag_of(fd)
+    var session: TermSession = match term_enter_raw(fd)
+        Ok(s) => s
+        Err(_) => return 1
+    assert is_raw(fd)
+    assert session.restore().is_ok()
+    assert not session.is_raw()
+    assert lflag_of(fd) == before_l
+    assert session.restore().is_ok()      # twice is fine
+    assert session.resume().is_ok()
+    assert session.is_raw()
+    assert is_raw(fd)
+    assert session.restore().is_ok()
+    pty.close()
+    0
+
+# A TermState has no drop: it stays raw until restore(), and copies of it
+# share nothing but the terminal.
+[[test]]
+fn test_state_stays_raw_until_restored() -> i32
+    var pty: Fd = open_pty()
+    if not pty.valid()
+        return 0
+    let fd: i32 = pty.raw()
+    let before_l: u32 = lflag_of(fd)
+    var state: TermState = match term_state_raw(fd)
+        Ok(t) => t
+        Err(_) => return 1
+    assert state.fd() == fd
+    assert state.is_raw() and is_raw(fd)
+    assert state.restore().is_ok()
+    assert not state.is_raw()
+    assert lflag_of(fd) == before_l
+    assert state.resume().is_ok()
+    assert is_raw(fd)
+    assert state.restore().is_ok()
+    pty.close()
+    0
+
+[[test]]
+fn test_session_not_a_tty_is_enotty() -> i32
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 1
+    let code: i32 = match term_enter_raw(p.read.raw())
+        Ok(_) => 0
+        Err(e) => e.code()
+    assert code == 25
+    p.read.close()
+    p.write.close()
+    0
+
+# ============================================================================
+# TermOut
+# ============================================================================
+
+[[test]]
+fn test_cursor_sequences() -> i32
+    var out: TermOut = term_out()
+    out.cursor_left(1)
+    assert out.as_view().eq("\e[1D")
+    out.cursor_right(42)
+    out.cursor_up(3)
+    out.cursor_down(4)
+    out.cursor_left(0)          # nothing
+    assert out.as_view().eq("\e[1D\e[42C\e[3A\e[4B")
+    var col: TermOut = term_out()
+    col.cursor_column(2147483647)
+    col.cursor_column(0)
+    col.cursor_to(5, 12)
+    col.cursor_to(0, -3)
+    assert col.as_view().eq("\e[2147483647G\e[1G\e[5;12H\e[1;1H")
+    0
+
+[[test]]
+fn test_screen_and_cursor_modes() -> i32
+    var out: TermOut = term_out()
+    out.enter_alt_screen()
+    out.hide_cursor()
+    out.clear_screen()
+    out.clear_to_eol()
+    out.save_cursor()
+    out.restore_cursor()
+    out.show_cursor()
+    out.leave_alt_screen()
+    assert out.as_view().eq("\e[?1049h\e[?25l\e[2J\e[K\e[s\e[u\e[?25h\e[?1049l")
+    0
+
+[[test]]
+fn test_styles() -> i32
+    var out: TermOut = term_out()
+    out.style(style_plain())
+    assert out.as_view().eq("\e[0m")
+    var s: Style = style_plain()
+    s.bold = true
+    s.reverse = true
+    s.fg = Color.Index(1)
+    s.bg = Color.Index(236)
+    var styled: TermOut = term_out()
+    styled.style(s)
+    styled.text("hi")
+    styled.reset_style()
+    assert styled.as_view().eq("\e[0;1;7;38;5;1;48;5;236mhi\e[0m")
+    var u: Style = style_plain()
+    u.underline = true
+    var under: TermOut = term_out()
+    under.style(u)
+    assert under.as_view().eq("\e[0;4m")
+    0
+
+[[test]]
+fn test_flush_writes_and_empties() -> i32
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 1
+    var out: TermOut = term_out()
+    out.text("ab")
+    out.cursor_left(2)
+    assert out.flush(p.write.raw()).is_ok()
+    assert out.as_view().is_empty()
+    var buf: [16]u8
+    let n: i64 = match p.read.read(@buf)
+        Ok(k) => k
+        Err(_) => return 2
+    assert n == 6
+    let got: StrView = StrView { ptr: @buf[0], len: n }
+    assert got.eq("ab\e[2D")
+    p.read.close()
+    p.write.close()
+    0

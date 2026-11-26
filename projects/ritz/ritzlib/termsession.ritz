@@ -1,0 +1,667 @@
+# ritzlib/termsession.ritz - Raw mode (Linux and Harland), keys with the Escape timeout, escape output
+#
+# What a full-screen or line-editing program needs from a terminal, on Linux
+# and Harland (AGAST #4814; lifted from rzsh's os.ritz and input.ritz):
+#
+#   term_enter_raw(fd) -> Result<TermSession, Errno>
+#       raw mode on `fd`; the session restores the saved attributes when it
+#       is dropped, and on restore(). resume() turns raw mode back on (rzsh
+#       hands the terminal to a command between the two).
+#   term_state_raw(fd) -> Result<TermState, Errno>
+#       the same without the drop, for an owner no scope holds: a
+#       module-level value is never dropped, so it restores by hand.
+#   key_reader(fd) -> KeyReader         reader.read_key() -> Result<Key, InputEnd>
+#       one Key per call, from a KeyDecoder. After an incomplete sequence
+#       (a lone ESC above all) it waits `escape_timeout_ms` (25 by default)
+#       for the rest, so a bare Escape arrives without the next keystroke.
+#   key_decoder() -> KeyDecoder         decoder.feed(b) -> Option<Key>
+#       the byte-at-a-time state machine, for callers with their own reads.
+#   term_out() -> TermOut               out.cursor_to(r, c), out.style(s), ...
+#       escape sequences and text into one buffer; out.flush(fd) writes it.
+#
+#   match term_enter_raw(STDIN)
+#       Ok(session) =>
+#           var reader: KeyReader = key_reader(STDIN)
+#           while true
+#               match reader.read_key()
+#                   Ok(key) => if key.eq(Key.Ctrl('q')) then break else ...
+#                   Err(_) => break
+#           # session dropped here: the terminal is back as it was found
+#       Err(e) => ...    # not a terminal
+#
+# Raw mode clears ECHO, ICANON, ISIG, IEXTEN, ICRNL and IXON on Linux (VMIN
+# 1, VTIME 0) and TTY_ECHO | TTY_ICANON | TTY_ISIG on Harland. With ISIG off,
+# Ctrl-C reaches the program as Key.Ctrl('c') instead of killing it.
+#
+# Harland's console read blocks until a byte arrives and has no poll, so the
+# Escape timeout is not available there yet: an ESC waits for the next byte,
+# as it did in rzsh. `input_waits` is the seam the timed console read
+# (AGAST #4829) fills in.
+
+import ritzlib.sys
+import ritzlib.result
+import ritzlib.option
+import ritzlib.span { Span }
+import ritzlib.strview { StrView }
+import ritzlib.string
+import ritzlib.fmt.digits { fmt_i64_into }
+import ritzlib.term { tcgetattr, tcsetattr, TcsetWhen }
+# Errno is every Err here, so importers of termsession get it too.
+pub import ritzlib.errno
+
+# ============================================================================
+# Keys
+# ============================================================================
+
+# One key press, decoded from the bytes a terminal sends for it.
+pub enum Key
+    Char(u32)       # text: a Unicode scalar value (UTF-8 decoded), >= ' '
+    Ctrl(u8)        # Ctrl plus a letter, as the lower-case letter: Ctrl('c')
+    Enter           # CR or LF
+    Tab
+    Backspace       # DEL (127) or BS (8)
+    Escape          # a lone ESC: nothing followed it within the timeout
+    Up
+    Down
+    Left
+    Right
+    Home
+    End
+    PageUp
+    PageDown
+    Insert
+    Delete
+    F(u8)           # function key F1..F12
+    Unknown         # a sequence or byte with no key above
+
+impl Key
+    # Whether two keys are the same key (variant and payload).
+    pub fn eq(self: @Key, other: Key) -> bool
+        self.tag() == other.tag() and self.payload() == other.payload()
+
+    # A number per variant, for eq.
+    fn tag(self: @Key) -> i32
+        match *self
+            Char(_) => 1
+            Ctrl(_) => 2
+            Enter => 3
+            Tab => 4
+            Backspace => 5
+            Escape => 6
+            Up => 7
+            Down => 8
+            Left => 9
+            Right => 10
+            Home => 11
+            End => 12
+            PageUp => 13
+            PageDown => 14
+            Insert => 15
+            Delete => 16
+            F(_) => 17
+            Unknown => 18
+
+    # The data a variant carries, 0 for one that carries none.
+    fn payload(self: @Key) -> u32
+        match *self
+            Char(c) => c
+            Ctrl(c) => c as u32
+            F(n) => n as u32
+            _ => 0
+
+# ============================================================================
+# KeyDecoder: bytes to keys
+# ============================================================================
+
+# Where the decoder is in a multi-byte sequence.
+enum DecodeState
+    Ground      # between keys
+    Esc         # saw ESC
+    Csi         # saw ESC [ (parameters so far in param / param_count)
+    Ss3         # saw ESC O
+    Utf8        # inside a UTF-8 sequence, `need` continuation bytes to go
+
+# A parameter is capped here so a long run of digits can't overflow.
+const PARAM_MAX: i32 = 9999
+
+pub struct KeyDecoder
+    state: DecodeState
+    param: i32          # the first CSI parameter (ESC [ 3 ~ is 3)
+    param_count: i32    # CSI parameters seen (`;` separates them)
+    codepoint: u32      # UTF-8 value so far
+    need: i32           # UTF-8 continuation bytes still to come
+    min: u32            # the least value this UTF-8 length may encode
+    held: Option<Key>   # a key decoded alongside the one feed returned
+
+pub fn key_decoder() -> KeyDecoder
+    KeyDecoder { state: DecodeState.Ground, param: 0, param_count: 0, codepoint: 0, need: 0, min: 0, held: None }
+
+impl KeyDecoder
+    # Feed one byte: the key it completes, or None while a sequence is still
+    # open. One byte can complete two keys (ESC then `x` is Escape and
+    # Char('x')): feed returns the first, take_held the second.
+    pub fn feed(self: @&KeyDecoder, b: u8) -> Option<Key>
+        match self.state
+            DecodeState.Ground => self.ground(b)
+            DecodeState.Esc => self.after_esc(b)
+            DecodeState.Csi => self.csi(b)
+            DecodeState.Ss3 => self.ss3(b)
+            DecodeState.Utf8 => self.utf8(b)
+
+    # The second key of the last feed, once: None when it completed one.
+    pub fn take_held(self: @&KeyDecoder) -> Option<Key>
+        let k: Option<Key> = self.held
+        self.held = None
+        k
+
+    # Whether a sequence is open: more bytes would extend it.
+    pub fn pending(self: @KeyDecoder) -> bool
+        match self.state
+            DecodeState.Ground => false
+            _ => true
+
+    # End the open sequence, as when nothing followed it in time: a lone ESC
+    # is Key.Escape, a cut-off sequence Key.Unknown. None if none is open.
+    pub fn flush(self: @&KeyDecoder) -> Option<Key>
+        let key: Option<Key> = match self.state
+            DecodeState.Ground => None
+            DecodeState.Esc => Some(Key.Escape)
+            _ => Some(Key.Unknown)
+        self.reset()
+        key
+
+    # Back to Ground, dropping any open sequence and held key.
+    pub fn reset(self: @&KeyDecoder)
+        self.state = DecodeState.Ground
+        self.param = 0
+        self.param_count = 0
+        self.codepoint = 0
+        self.need = 0
+        self.held = None
+
+    fn ground(self: @&KeyDecoder, b: u8) -> Option<Key>
+        if b == 27
+            self.state = DecodeState.Esc
+            return None
+        if b == 127 or b == 8
+            return Some(Key.Backspace)
+        if b == 13 or b == 10
+            return Some(Key.Enter)
+        if b == 9
+            return Some(Key.Tab)
+        if b >= 1 and b <= 26
+            return Some(Key.Ctrl(b + 96))
+        if b >= 32 and b < 127
+            return Some(Key.Char(b as u32))
+        if b >= 0xC2 and b <= 0xDF
+            return self.utf8_start((b & 0x1F) as u32, 1, 0x80)
+        if b >= 0xE0 and b <= 0xEF
+            return self.utf8_start((b & 0x0F) as u32, 2, 0x800)
+        if b >= 0xF0 and b <= 0xF4
+            return self.utf8_start((b & 0x07) as u32, 3, 0x10000)
+        # NUL, Ctrl-\ .. Ctrl-_, a stray continuation or an invalid lead byte
+        Some(Key.Unknown)
+
+    fn after_esc(self: @&KeyDecoder, b: u8) -> Option<Key>
+        if b == '['
+            self.state = DecodeState.Csi
+            self.param = 0
+            self.param_count = 0
+            return None
+        if b == 'O'
+            self.state = DecodeState.Ss3
+            return None
+        # Not a sequence: the ESC was a key of its own, and `b` starts the next.
+        self.state = DecodeState.Ground
+        self.held = self.ground(b)
+        Some(Key.Escape)
+
+    fn csi(self: @&KeyDecoder, b: u8) -> Option<Key>
+        if b >= '0' and b <= '9'
+            if self.param_count == 0
+                self.param_count = 1
+            if self.param_count == 1 and self.param < PARAM_MAX
+                self.param = self.param * 10 + ((b - '0') as i32)
+            return None
+        if b == ';'
+            if self.param_count == 0
+                self.param_count = 1
+            self.param_count += 1
+            return None
+        if b >= 0x20 and b <= 0x3F
+            # private markers (`?`, `<`) and intermediates: part of a sequence
+            # no key here uses
+            self.param_count = -1
+            return None
+        self.state = DecodeState.Ground
+        if b >= 0x40 and b <= 0x7E
+            if self.param_count < 0
+                return Some(Key.Unknown)
+            return Some(csi_final(b, self.param))
+        # A control byte or non-ASCII cut the sequence off: it starts the next key.
+        self.held = self.ground(b)
+        Some(Key.Unknown)
+
+    fn ss3(self: @&KeyDecoder, b: u8) -> Option<Key>
+        self.state = DecodeState.Ground
+        if b >= 0x40 and b <= 0x7E
+            return Some(csi_final(b, 0))
+        self.held = self.ground(b)
+        Some(Key.Unknown)
+
+    fn utf8_start(self: @&KeyDecoder, bits: u32, need: i32, min: u32) -> Option<Key>
+        self.state = DecodeState.Utf8
+        self.codepoint = bits
+        self.need = need
+        self.min = min
+        None
+
+    fn utf8(self: @&KeyDecoder, b: u8) -> Option<Key>
+        if (b & 0xC0) != 0x80
+            # The sequence ended early: it is Unknown, and `b` starts the next key.
+            self.state = DecodeState.Ground
+            self.held = self.ground(b)
+            return Some(Key.Unknown)
+        self.codepoint = (self.codepoint << 6) | ((b & 0x3F) as u32)
+        self.need -= 1
+        if self.need > 0
+            return None
+        self.state = DecodeState.Ground
+        let c: u32 = self.codepoint
+        # Overlong forms, UTF-16 surrogates and values past U+10FFFF are not text.
+        if c < self.min or (c >= 0xD800 and c <= 0xDFFF) or c > 0x10FFFF
+            return Some(Key.Unknown)
+        Some(Key.Char(c))
+
+# The key a CSI (or SS3) sequence ending in `final` names; `param` is its
+# first parameter (0 when it had none). Modifier parameters (ESC [ 1 ; 5 A,
+# Ctrl-Up) are read past and dropped: the key is still Up.
+fn csi_final(final: u8, param: i32) -> Key
+    match final
+        'A' => Key.Up
+        'B' => Key.Down
+        'C' => Key.Right
+        'D' => Key.Left
+        'H' => Key.Home
+        'F' => Key.End
+        'P' => Key.F(1)
+        'Q' => Key.F(2)
+        'R' => Key.F(3)
+        'S' => Key.F(4)
+        '~' => tilde_key(param)
+        _ => Key.Unknown
+
+# ESC [ <n> ~, the vt220 keys.
+fn tilde_key(n: i32) -> Key
+    match n
+        1 => Key.Home
+        2 => Key.Insert
+        3 => Key.Delete
+        4 => Key.End
+        5 => Key.PageUp
+        6 => Key.PageDown
+        7 => Key.Home
+        8 => Key.End
+        11 => Key.F(1)
+        12 => Key.F(2)
+        13 => Key.F(3)
+        14 => Key.F(4)
+        15 => Key.F(5)
+        17 => Key.F(6)
+        18 => Key.F(7)
+        19 => Key.F(8)
+        20 => Key.F(9)
+        21 => Key.F(10)
+        23 => Key.F(11)
+        24 => Key.F(12)
+        _ => Key.Unknown
+
+# ============================================================================
+# KeyReader: keys from a file descriptor, with the Escape timeout
+# ============================================================================
+
+# How long a reader waits for the rest of a sequence after its first bytes,
+# by default. Terminals send a whole sequence in one write, so 25 ms is far
+# longer than the gap inside one and far shorter than a person's next key.
+pub const ESCAPE_TIMEOUT_MS: i32 = 25
+
+# Why read_key returned no key: the input closed, or a read failed.
+pub enum InputEnd
+    Eof
+    Failed(Errno)
+
+pub struct KeyReader
+    fd: i32
+    escape_timeout_ms: i32     # set it to change the wait for a sequence's rest
+    decoder: KeyDecoder
+
+pub fn key_reader(fd: i32) -> KeyReader
+    KeyReader { fd: fd, escape_timeout_ms: ESCAPE_TIMEOUT_MS, decoder: key_decoder() }
+
+impl KeyReader
+    # The next key. Blocks until one is complete; after a sequence's first
+    # bytes it waits at most escape_timeout_ms for the rest, then returns
+    # what it has (a lone ESC is Key.Escape). Reads one byte at a time, so
+    # bytes after the key stay in the terminal for whoever reads next (rzsh
+    # hands typeahead to the command it runs).
+    pub fn read_key(self: @&KeyReader) -> Result<Key, InputEnd>
+        while true
+            match self.decoder.take_held()
+                Some(k) => return Ok(k)
+                None => pass
+            if self.decoder.pending() and not input_waits(self.fd, self.escape_timeout_ms)
+                match self.decoder.flush()
+                    Some(k) => return Ok(k)
+                    None => pass
+            var byte: [1]u8
+            let n: i64 = sys_read(self.fd, @byte[0], 1)
+            if n == 1
+                match self.decoder.feed(byte[0])
+                    Some(k) => return Ok(k)
+                    None => pass
+            else if n == 0
+                # The input closed in the middle of a sequence: that key first.
+                match self.decoder.flush()
+                    Some(k) => return Ok(k)
+                    None => return Err(InputEnd.Eof)
+            else if n != -4    # EINTR: read again
+                return Err(InputEnd.Failed(errno_from_raw(n as i32)))
+
+    # Drop any sequence in progress (rzsh starts each line afresh).
+    pub fn reset(self: @&KeyReader)
+        self.decoder.reset()
+
+# Whether input on `fd` is ready within `timeout_ms` (poll(2)). An error other
+# than EINTR says yes, so the read that follows reports it.
+[[target_os = "linux"]]
+fn input_waits(fd: i32, timeout_ms: i32) -> bool
+    var fds: [1]PollFd
+    fds[0] = PollFd { fd: fd, events: POLLIN, revents: 0 }
+    var rc: i32 = sys_poll(@fds[0], 1, timeout_ms)
+    while rc == -4
+        rc = sys_poll(@fds[0], 1, timeout_ms)
+    rc != 0
+
+# Harland: no poll and no timed console read yet (AGAST #4829), so the next
+# byte is always awaited, as a blocking read.
+[[target_os = "harland"]]
+fn input_waits(fd: i32, timeout_ms: i32) -> bool
+    true
+
+# ============================================================================
+# TermSession: raw mode, restored on drop
+# ============================================================================
+
+# The attributes a session saves and puts back, per target.
+[[target_os = "linux"]]
+struct SavedAttrs
+    termios: Termios
+
+[[target_os = "harland"]]
+struct SavedAttrs
+    tty: TtyAttrs
+
+# A terminal's raw mode, by value: the attributes it was found with and
+# whether raw mode is on. Nothing restores it but restore(): own it through
+# a TermSession unless it must outlive every scope (rzsh keeps one per
+# process, at module level, and restores it before each exit).
+pub struct TermState
+    fd: i32
+    saved: SavedAttrs
+    raw: bool
+
+# Put `fd` (a terminal) in raw mode. Err (ENOTTY for a pipe or file) leaves
+# it untouched.
+pub fn term_state_raw(fd: i32) -> Result<TermState, Errno>
+    let saved: SavedAttrs = attrs_get(fd)?
+    var state: TermState = TermState { fd: fd, saved: saved, raw: false }
+    state.resume()?
+    Ok(state)
+
+impl TermState
+    # Back to the attributes raw mode found. resume() can turn raw mode on
+    # again afterwards. Ok when already restored.
+    pub fn restore(self: @&TermState) -> Result<(), Errno>
+        if not self.raw
+            return Ok(())
+        self.raw = false
+        attrs_set(self.fd, @self.saved)
+
+    # Raw mode again after restore(). Ok when already raw.
+    pub fn resume(self: @&TermState) -> Result<(), Errno>
+        if self.raw
+            return Ok(())
+        attrs_set_raw(self.fd, @self.saved)?
+        self.raw = true
+        Ok(())
+
+    # Whether raw mode is on.
+    pub fn is_raw(self: @TermState) -> bool
+        self.raw
+
+    # The terminal's file descriptor.
+    pub fn fd(self: @TermState) -> i32
+        self.fd
+
+# A terminal in raw mode, restored when the session is dropped, so every
+# exit path through its owner's scope leaves the terminal as it was found.
+pub struct TermSession
+    state: TermState
+
+# Put `fd` (a terminal) in raw mode for the session's lifetime. Err (ENOTTY
+# for a pipe or file) leaves it untouched.
+pub fn term_enter_raw(fd: i32) -> Result<TermSession, Errno>
+    Ok(TermSession { state: term_state_raw(fd)? })
+
+impl TermSession
+    # Back to the attributes the session found, before the drop does it (rzsh
+    # hands the terminal to a command this way). Ok when already restored.
+    pub fn restore(self: @&TermSession) -> Result<(), Errno>
+        self.state.restore()
+
+    # Raw mode again after restore(). Ok when already raw.
+    pub fn resume(self: @&TermSession) -> Result<(), Errno>
+        self.state.resume()
+
+    # Whether raw mode is on.
+    pub fn is_raw(self: @TermSession) -> bool
+        self.state.is_raw()
+
+    # The terminal's file descriptor.
+    pub fn fd(self: @TermSession) -> i32
+        self.state.fd()
+
+impl Drop for TermSession
+    fn drop(self: @&TermSession)
+        match self.state.restore()
+            Ok(_) => pass
+            Err(_) => pass     # nothing left to report it to
+
+[[target_os = "linux"]]
+fn attrs_get(fd: i32) -> Result<SavedAttrs, Errno>
+    Ok(SavedAttrs { termios: tcgetattr(fd)? })
+
+[[target_os = "linux"]]
+fn attrs_set(fd: i32, a: @SavedAttrs) -> Result<(), Errno>
+    tcsetattr(fd, @a.termios, TcsetWhen.Now)
+
+# No echo, line editing, signal keys, Ctrl-V, CR -> NL or XON/XOFF; each
+# read returns as soon as one byte is there.
+[[target_os = "linux"]]
+fn attrs_set_raw(fd: i32, a: @SavedAttrs) -> Result<(), Errno>
+    var raw: Termios = a.termios
+    raw.c_lflag = raw.c_lflag & (0xFFFFFFFF ^ (ECHO | ICANON | ISIG | IEXTEN))
+    raw.c_iflag = raw.c_iflag & (0xFFFFFFFF ^ (ICRNL | IXON))
+    raw.c_cc[VMIN] = 1
+    raw.c_cc[VTIME] = 0
+    tcsetattr(fd, @raw, TcsetWhen.Now)
+
+[[target_os = "harland"]]
+fn attrs_get(fd: i32) -> Result<SavedAttrs, Errno>
+    var a: SavedAttrs = SavedAttrs { tty: TtyAttrs { flags: 0 } }
+    let rc: i32 = sys_tty_getattr(fd, @a.tty)
+    if rc != 0
+        return Err(errno_from_raw(rc))
+    Ok(a)
+
+[[target_os = "harland"]]
+fn attrs_set(fd: i32, a: @SavedAttrs) -> Result<(), Errno>
+    var copy: TtyAttrs = a.tty
+    let rc: i32 = sys_tty_setattr(fd, @copy)
+    if rc != 0
+        return Err(errno_from_raw(rc))
+    Ok(())
+
+# The console's three flags all off: no echo, no line editing, and Ctrl-C a
+# byte for the program instead of a kill.
+[[target_os = "harland"]]
+fn attrs_set_raw(fd: i32, a: @SavedAttrs) -> Result<(), Errno>
+    var raw: TtyAttrs = a.tty
+    raw.flags = raw.flags & (0xFFFFFFFF ^ (TTY_ECHO | TTY_ICANON | TTY_ISIG))
+    let rc: i32 = sys_tty_setattr(fd, @raw)
+    if rc != 0
+        return Err(errno_from_raw(rc))
+    Ok(())
+
+# ============================================================================
+# TermOut: escape sequences and text, buffered
+# ============================================================================
+
+# A color: the terminal's default, or an entry of the 256-color palette
+# (0-7 are the basic colors, 8-15 their bright forms).
+pub enum Color
+    Default
+    Index(u8)
+
+# How text is drawn. style_plain() is the terminal's default.
+pub struct Style
+    fg: Color
+    bg: Color
+    bold: bool
+    underline: bool
+    reverse: bool
+
+pub fn style_plain() -> Style
+    Style { fg: Color.Default, bg: Color.Default, bold: false, underline: false, reverse: false }
+
+pub struct TermOut
+    buf: String
+
+pub fn term_out() -> TermOut
+    TermOut { buf: string_new() }
+
+impl TermOut
+    # Text, as is.
+    pub fn text(self: @&TermOut, s: StrView)
+        self.buf.push_str(s)
+
+    # Move the cursor `n` cells; n <= 0 writes nothing.
+    pub fn cursor_up(self: @&TermOut, n: i32)
+        if n > 0
+            self.csi_n(n, 'A')
+
+    pub fn cursor_down(self: @&TermOut, n: i32)
+        if n > 0
+            self.csi_n(n, 'B')
+
+    pub fn cursor_right(self: @&TermOut, n: i32)
+        if n > 0
+            self.csi_n(n, 'C')
+
+    pub fn cursor_left(self: @&TermOut, n: i32)
+        if n > 0
+            self.csi_n(n, 'D')
+
+    # To column `col` of this row, 1-based (below 1 is 1).
+    pub fn cursor_column(self: @&TermOut, col: i32)
+        if col < 1
+            self.csi_n(1, 'G')
+        else
+            self.csi_n(col, 'G')
+
+    # To row `row`, column `col`, both 1-based (below 1 is 1).
+    pub fn cursor_to(self: @&TermOut, row: i32, col: i32)
+        self.buf.push_str("\e[")
+        self.number(if row < 1 then 1 else row)
+        self.buf.push(';')
+        self.number(if col < 1 then 1 else col)
+        self.buf.push('H')
+
+    pub fn save_cursor(self: @&TermOut)
+        self.buf.push_str("\e[s")
+
+    pub fn restore_cursor(self: @&TermOut)
+        self.buf.push_str("\e[u")
+
+    pub fn hide_cursor(self: @&TermOut)
+        self.buf.push_str("\e[?25l")
+
+    pub fn show_cursor(self: @&TermOut)
+        self.buf.push_str("\e[?25h")
+
+    # Clear the whole screen (the cursor stays put).
+    pub fn clear_screen(self: @&TermOut)
+        self.buf.push_str("\e[2J")
+
+    # Clear from the cursor to the end of its line.
+    pub fn clear_to_eol(self: @&TermOut)
+        self.buf.push_str("\e[K")
+
+    # The alternate screen (xterm 1049): the shell's screen comes back on leave.
+    pub fn enter_alt_screen(self: @&TermOut)
+        self.buf.push_str("\e[?1049h")
+
+    pub fn leave_alt_screen(self: @&TermOut)
+        self.buf.push_str("\e[?1049l")
+
+    # Draw what follows in `s` (SGR). Starts from a reset, so `s` is the whole
+    # style, not a change to the last one.
+    pub fn style(self: @&TermOut, s: Style)
+        self.buf.push_str("\e[0")
+        if s.bold
+            self.buf.push_str(";1")
+        if s.underline
+            self.buf.push_str(";4")
+        if s.reverse
+            self.buf.push_str(";7")
+        self.color(";38;5;", s.fg)
+        self.color(";48;5;", s.bg)
+        self.buf.push('m')
+
+    # Back to the terminal's default style.
+    pub fn reset_style(self: @&TermOut)
+        self.buf.push_str("\e[0m")
+
+    # What is buffered and not yet flushed.
+    pub fn as_view(self: @TermOut) -> StrView
+        self.buf.as_view()
+
+    # Write the buffer to `fd`, all of it, and empty it. On Err the buffer is
+    # emptied too: what was written of it is unknown.
+    pub fn flush(self: @&TermOut, fd: i32) -> Result<(), Errno>
+        var rest: StrView = self.buf.as_view()
+        while not rest.is_empty()
+            let n: i64 = sys_write(fd, rest.ptr, rest.len)
+            if n < 0 and n != -4
+                self.buf.clear()
+                return Err(errno_from_raw(n as i32))
+            if n > 0
+                rest = rest.skip(n)
+        self.buf.clear()
+        Ok(())
+
+    fn csi_n(self: @&TermOut, n: i32, cmd: u8)
+        self.buf.push_str("\e[")
+        self.number(n)
+        self.buf.push(cmd)
+
+    fn number(self: @&TermOut, n: i32)
+        var digits: [20]u8
+        self.buf.push_str(fmt_i64_into(@digits, n as i64))
+
+    fn color(self: @&TermOut, prefix: StrView, c: Color)
+        match c
+            Color.Default => pass
+            Color.Index(i) =>
+                self.buf.push_str(prefix)
+                self.number(i as i32)

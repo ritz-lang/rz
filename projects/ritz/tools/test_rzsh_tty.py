@@ -1,7 +1,8 @@
 """rzsh hands the harland console to the commands it runs (AGAST #4254).
 
-On harland, rzsh's raw mode is a real sys_tty_setattr that turns off echo,
-canonical mode and ISIG while it edits a line; exec_external restores the
+On harland, rzsh's raw mode (ritzlib.termsession, AGAST #4814) is a real
+sys_tty_setattr that turns off echo, canonical mode and ISIG while it edits a
+line; exec_external restores the
 saved attributes while the command runs and takes raw mode back afterwards.
 So Ctrl-C at the prompt is a byte for the editor, and Ctrl-C during a
 command reaches the command (the kernel kills it with status 130).
@@ -15,6 +16,7 @@ from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parents[3]
 RZSH_SRC = WORKSPACE / "projects" / "rzsh" / "src"
+TERMSESSION = WORKSPACE / "projects" / "ritz" / "ritzlib" / "termsession.ritz"
 
 
 def _code(path):
@@ -32,10 +34,13 @@ def _body(code, name):
 
 
 def test_raw_mode_is_a_real_tty_setattr_on_harland():
-    os_code = _code(RZSH_SRC / "os.ritz")
-    raw = os_code.split('[[target_os = "harland"]]\npub fn os_enable_raw_mode')[1]
+    ts_code = _code(TERMSESSION)
+    raw = ts_code.split('[[target_os = "harland"]]\nfn attrs_set_raw')[1]
     raw = raw.split("[[target_os")[0]
     assert "sys_tty_setattr" in raw and "TTY_ISIG" in raw
+    # rzsh enters it through ritzlib, not a copy of its own (#4814).
+    enable = _body(_code(RZSH_SRC / "os.ritz"), "os_enable_raw_mode")
+    assert "term_state_raw(STDIN)" in enable
 
 
 def test_exec_external_hands_the_terminal_to_the_command():

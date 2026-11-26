@@ -7,17 +7,16 @@
 # Runtime _start calls main() and then sys_exit(return_value).
 
 import common { println, print_prompt, line_clear, print_raw_warning }
-import rawio { in_read }
-
 import os {
-    os_yield, os_environ, os_input_ended,
-    os_enable_raw_mode, os_disable_raw_mode
+    os_environ, os_enable_raw_mode, os_disable_raw_mode
 }
 
 import parse { g_environ }
 import state { ShellState, shell_state_new }
 import shell { run_line }
-import input { input_reset, input_parse_byte, KEY_NONE }
+import ritzlib.termsession { Key, KeyReader, key_reader }
+import ritzlib.sys { STDIN }
+import ritzlib.result
 import history { history_reset_nav }
 import editor {
     editor_handle_key, cli_mode,
@@ -89,9 +88,9 @@ fn run_cli(mode: i32, args: Span<StrView>) -> i32
     return run_line(args[2])
 
 fn print_banner()
-    let raw_result: i32 = os_enable_raw_mode()
-    if raw_result != 0
-        print_raw_warning(raw_result)
+    match os_enable_raw_mode()
+        Ok(_) => pass
+        Err(e) => print_raw_warning(-e.code())    # -errno, as the syscall said
     println("")
     println("===========================================")
     println(version_string())
@@ -104,20 +103,13 @@ fn read_line() -> i32
     print_prompt()
     line_clear()
     history_reset_nav()
-    input_reset()
-    var read_buf: [1]u8
+    # A fresh reader per line: no half-read sequence carries over.
+    var reader: KeyReader = key_reader(STDIN)
     var action: i32 = EDIT_CONTINUE
     while action == EDIT_CONTINUE
-        let n: i64 = in_read(Span<u8> { ptr: @read_buf[0], len: 1 })
-        if n > 0
-            let key: i32 = input_parse_byte(read_buf[0])
-            # KEY_NONE: in the middle of an escape sequence, keep reading
-            if key != KEY_NONE
-                action = editor_handle_key(key)
-        else if os_input_ended(n)
-            action = EDIT_EXIT
-        else
-            os_yield()
+        action = match reader.read_key()
+            Ok(key) => editor_handle_key(key)
+            Err(_) => EDIT_EXIT     # end of input, or stdin unreadable
     return action
 
 pub fn main(args: Span<StrView>) -> i32

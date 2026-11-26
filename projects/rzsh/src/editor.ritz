@@ -1,6 +1,7 @@
 # Line editor: one handler per key (AGAST #3940, LARB v4 packages.md M9)
 #
-# main's read loop decodes bytes into keys (input.ritz) and hands each key to
+# main's read loop decodes bytes into keys (ritzlib.termsession's KeyReader)
+# and hands each key to
 # editor_handle_key, which edits the line buffer (common.ritz), echoes the
 # change to the terminal, and returns what the loop does next.
 
@@ -15,13 +16,8 @@ import common {
 
 import shell { run_line }
 
-import input {
-    input_get_char, cursor_left, cursor_right, clear_to_eol,
-    KEY_CHAR, KEY_UP, KEY_DOWN, KEY_RIGHT, KEY_LEFT,
-    KEY_HOME, KEY_END, KEY_DELETE, KEY_BACKSPACE, KEY_ENTER,
-    KEY_CTRL_C, KEY_CTRL_D, KEY_CTRL_A, KEY_CTRL_E,
-    KEY_CTRL_K, KEY_CTRL_U, KEY_CTRL_L
-}
+import ritzlib.termsession { Key, TermOut, term_out }
+import ritzlib.sys { STDOUT }
 
 import history { history_add, history_up, history_down }
 
@@ -47,6 +43,28 @@ pub fn cli_mode(arg: StrView) -> i32
 # ============================================================================
 # Terminal helpers
 # ============================================================================
+
+# Each escape sequence is written as soon as it is built, so it stays in order
+# with the text puts writes around it.
+fn emit(out: @&TermOut)
+    match out.flush(STDOUT)
+        Ok(_) => pass
+        Err(_) => pass     # a terminal that can't be written can't be told
+
+fn cursor_left(n: i32)
+    var out: TermOut = term_out()
+    out.cursor_left(n)
+    emit(@&out)
+
+fn cursor_right(n: i32)
+    var out: TermOut = term_out()
+    out.cursor_right(n)
+    emit(@&out)
+
+fn clear_to_eol()
+    var out: TermOut = term_out()
+    out.clear_to_eol()
+    emit(@&out)
 
 # After modifying text mid-line, redraw the remainder and reposition cursor.
 fn redraw_line_from_cursor()
@@ -133,7 +151,10 @@ fn on_kill_to_start()
 
 # Clear the screen and redraw the prompt and line.
 fn on_clear_screen()
-    puts("\e[2J\e[H")
+    var out: TermOut = term_out()
+    out.clear_screen()
+    out.cursor_to(1, 1)
+    emit(@&out)
     print_prompt()
     let len: i64 = line_length()
     if len > 0
@@ -183,49 +204,56 @@ fn on_history_down()
 # ============================================================================
 
 # Keys that change the line's text. False if `key` is not one of them.
-fn edit_key(key: i32) -> bool
-    if key == KEY_BACKSPACE
-        on_backspace()
-    else if key == KEY_DELETE
-        on_delete()
-    else if key == KEY_CTRL_K
-        on_kill_to_end()
-    else if key == KEY_CTRL_U
-        on_kill_to_start()
-    else if key == KEY_CTRL_L
-        on_clear_screen()
-    else
-        return false
+fn edit_key(key: Key) -> bool
+    match key
+        Key.Backspace => on_backspace()
+        Key.Delete => on_delete()
+        Key.Ctrl(c) => return ctrl_edit_key(c)
+        _ => return false
+    return true
+
+# Ctrl-K kills to the end, Ctrl-U to the start, Ctrl-L clears the screen.
+fn ctrl_edit_key(c: u8) -> bool
+    match c
+        'k' => on_kill_to_end()
+        'u' => on_kill_to_start()
+        'l' => on_clear_screen()
+        _ => return false
     return true
 
 # Keys that move the cursor or swap in a history entry.
-fn motion_key(key: i32) -> bool
-    if key == KEY_LEFT
-        on_left()
-    else if key == KEY_RIGHT
-        on_right()
-    else if key == KEY_HOME or key == KEY_CTRL_A
-        on_home()
-    else if key == KEY_END or key == KEY_CTRL_E
-        on_end()
-    else if key == KEY_UP
-        on_history_up()
-    else if key == KEY_DOWN
-        on_history_down()
-    else
-        return false
+fn motion_key(key: Key) -> bool
+    match key
+        Key.Left => on_left()
+        Key.Right => on_right()
+        Key.Home => on_home()
+        Key.End => on_end()
+        Key.Ctrl(c) =>
+            if c == 'a'
+                on_home()
+            else if c == 'e'
+                on_end()
+            else
+                return false
+        Key.Up => on_history_up()
+        Key.Down => on_history_down()
+        _ => return false
     return true
 
-# Handle one decoded key. Unhandled keys (TAB, CTRL_W, ...) are ignored.
-pub fn editor_handle_key(key: i32) -> i32
-    if (key & 0xFFFF) == KEY_CHAR
-        on_char(input_get_char(key))
-    else if key == KEY_ENTER
-        return on_enter()
-    else if key == KEY_CTRL_C
-        return on_ctrl_c()
-    else if key == KEY_CTRL_D
-        return on_ctrl_d()
-    else if not edit_key(key)
+# Handle one decoded key. Unhandled keys (Tab, Ctrl-W, Escape, ...) are
+# ignored. The line holds bytes, so text past ASCII is ignored too.
+pub fn editor_handle_key(key: Key) -> i32
+    match key
+        Key.Char(c) =>
+            if c < 128
+                on_char(c as u8)
+        Key.Enter => return on_enter()
+        Key.Ctrl(c) =>
+            if c == 'c'
+                return on_ctrl_c()
+            if c == 'd'
+                return on_ctrl_d()
+        _ => pass
+    if not edit_key(key)
         motion_key(key)
     return EDIT_CONTINUE
