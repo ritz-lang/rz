@@ -23,8 +23,7 @@
 # ioapic_set_irq (arch/x86_64/apic.ritz) program their sources in the
 # remappable format with handles from ir_handle_msi / ir_handle_ioapic.
 #
-# DMA remapping (AGAST #4722) has its mechanics here and is not turned on:
-# TE is never set, so no DMA is translated yet. For a requester on a
+# DMA remapping (AGAST #4722) has its mechanics here. For a requester on a
 # segment where vtd_translation_capable holds:
 #   - vtd_domain_new makes a domain: a domain ID and an empty second-level
 #     page table; vtd_domain_map / vtd_domain_unmap map and unmap one 4 KiB
@@ -40,6 +39,18 @@
 # may still be cached, so the caller must not hand the page out again.
 # The firmware's RMRRs (dmar_rmrr_*) are what an identity context for a
 # device that DMAs behind the OS's back must map.
+#
+# The translating boot (AGAST #4723): ir_init calls vtd_dma_init once
+# interrupt remapping is on. If every unit can translate it gives each
+# segment an identity domain (RAM up to the PMM's top and the segment's
+# RMRRs, mapped to themselves read-write, in 2 MiB leaves where every unit
+# of the segment walks them), points every requester's context at it (all
+# 256 buses x 256 dev.fn, so no device or DMA alias is left without one),
+# drops the context caches and IOTLBs, and only then sets TE: devices that
+# are already bus-mastering (virtio-blk, NVMe) keep working. No private
+# domain yet; the ring-1 cutover (RING1_DRIVER.md PR 7) moves the NIC's
+# requester off the identity domain. vtd_dma_translation_on says whether
+# TE is on.
 #
 # vtd_ir_set and the DMA functions take no lock: today only the BSP calls
 # them, during boot. A caller on another CPU needs one around the table
@@ -59,18 +70,19 @@ import drivers.iommu.dmar {
     ACPI_SIG_DMAR, DMAR_INTR_REMAP, DMAR_X2APIC_OPT_OUT,
     dmar_parse, dmar_flags, dmar_num_units, dmar_unit_base, dmar_num_ioapics,
     dmar_ioapic_source_id, dmar_num_segs, dmar_seg_id, dmar_unit_seg_index,
-    dmar_sid_seg_index, DMAR_SEG_ALL,
+    dmar_sid_seg_index, dmar_seg_index, DMAR_SEG_ALL,
+    dmar_num_rmrrs, dmar_rmrr_base, dmar_rmrr_limit, dmar_rmrr_segment,
     irte_lo, irte_hi, IRTE_SVT_VERIFY_SID, IRT_ENTRIES,
     VTD_REG_CAP, VTD_REG_ECAP, VTD_REG_GCMD, VTD_REG_GSTS, VTD_REG_RTADDR, VTD_REG_FSTS,
     VTD_REG_IQH, VTD_REG_IQT, VTD_REG_IQA, VTD_REG_IRTA,
-    ECAP_C, GCMD_QIE, GCMD_IRE, GCMD_SIRTP, GCMD_CFI, GCMD_SRTP, GCMD_WBF,
+    ECAP_C, GCMD_QIE, GCMD_IRE, GCMD_SIRTP, GCMD_CFI, GCMD_SRTP, GCMD_WBF, GCMD_TE,
     vtd_gcmd_from_gsts, vtd_irta, vtd_ecap_can_remap,
     QI_DESC_SIZE, qi_iec_global_lo, qi_iec_index_lo, qi_wait_lo, qi_wait_hi, qi_next_tail,
     CAP_RWBF, CAP_CM, CAP_SAGAW_39, CAP_SAGAW_48, DMAR_SID_NONE, vtd_cap_domains, vtd_cap_sl_levels, vtd_iova_bits,
     vtd_cap_fault_offset, vtd_cap_fault_count, vtd_can_translate,
     FSTS_PFO, FSTS_PPF, FSTS_IQE, FSTS_ITE, fsts_fri,
     vtd_rtaddr, vtd_sid_bus, vtd_sid_devfn, vtd_root_lo, vtd_ctx_lo, vtd_ctx_hi, vtd_ctx_did,
-    vtd_entry_present, vtd_entry_addr, sl_index, sl_table, sl_leaf, sl_present,
+    vtd_entry_present, vtd_entry_addr, sl_index, sl_table, sl_leaf, sl_present, sl_leaf_2m, sl_is_large, vtd_cap_sl_2m,
     frcd_pending, frcd_sid, frcd_reason, frcd_is_read, frcd_addr,
     QI_G_GLOBAL, QI_G_DOMAIN, qi_cc_global_lo, qi_cc_device_lo, qi_iotlb_lo,
     qi_iotlb_unmap_lo, qi_iotlb_unmap_hi
@@ -100,6 +112,7 @@ var vtd_num_doms: i32 = 0
 var vtd_dom_sl_phys: [8]u64     # each domain's second-level table
 var vtd_dom_seg: [8]i32         # the segment index it serves
 var vtd_dom_levels: [8]u32      # its depth: 3 or 4
+var vtd_dma_on: bool = false    # TE is set on every unit (AGAST #4723)
 
 # Why a DMA remapping call failed (or Ok).
 pub enum VtdDma
@@ -344,6 +357,7 @@ fn vtd_units_disable(n: i32)
 # parsed. Returns 0 with remapping on, -1 with it off (logged why).
 pub fn vtd_ir_init(x2apic: bool) -> i32
     vtd_on = false
+    vtd_dma_on = false
     vtd_units = 0
     vtd_num_doms = 0
     var k: i32 = 0
@@ -458,13 +472,16 @@ fn vtd_seg_publish(si: i32, addr: u64)
                 vtd_gcmd(u, GCMD_WBF, 0, GCMD_WBF, false)
         u = u + 1
 
-# ... a whole new (zeroed) table page.
-fn vtd_seg_publish_page(si: i32, phys: u64)
-    let v: u64 = phys_to_virt(phys)
+# ... a whole table page, at kernel address `v`.
+fn vtd_seg_publish_table(si: i32, v: u64)
     var off: u64 = 0
     while off < 4096
         vtd_seg_publish(si, v + off)
         off = off + 64
+
+# ... a whole new (zeroed) table page.
+fn vtd_seg_publish_page(si: i32, phys: u64)
+    vtd_seg_publish_table(si, phys_to_virt(phys))
 
 # The segment index whose root table and units serve requester `sid`, or
 # -1: remapping is off, `sid` has no source ID or no unit is on its segment.
@@ -513,6 +530,10 @@ pub fn vtd_domain_new(sid: u32) -> Option<u32>
     let si: i32 = vtd_sid_seg(sid)
     if si < 0
         return None
+    return vtd_seg_domain_new(si)
+
+# ... for segment index `si`.
+fn vtd_seg_domain_new(si: i32) -> Option<u32>
     let levels: u32 = vtd_seg_levels(si)
     if levels == 0 or vtd_num_doms >= VTD_MAX_DOMAINS
         return None
@@ -545,16 +566,20 @@ fn vtd_dom_iova_ok(d: i32, iova: u64) -> bool
         u = u + 1
     return true
 
-# The kernel address of the leaf entry for `iova` in domain index `d`. A
-# missing table is made with `alloc`; else (or with no page for it) 0.
-# Internal; 0 is never a table entry's address (as pmm_alloc_page's 0).
-fn vtd_sl_leaf_entry(d: i32, iova: u64, alloc: bool) -> u64
+# The kernel address of the level-`leaf` entry for `iova` in domain index
+# `d` (1: the 4 KiB leaf's, 2: a 2 MiB leaf's). A missing table is made
+# with `alloc`; else (with no page for it, or a 2 MiB leaf above `leaf` in
+# the way) 0. Internal; 0 is never a table entry's address (as
+# pmm_alloc_page's 0).
+fn vtd_sl_entry(d: i32, iova: u64, leaf: u32, alloc: bool) -> u64
     let si: i32 = vtd_dom_seg[d]
     var table: u64 = vtd_dom_sl_phys[d]
     var level: u32 = vtd_dom_levels[d]
-    while level > 1
+    while level > leaf
         let e: u64 = phys_to_virt(table) + sl_index(iova, level) * 8
         var v: u64 = volatile_load(e as *u64)
+        if sl_present(v) and sl_is_large(v)
+            return 0
         if not sl_present(v)
             if not alloc
                 return 0
@@ -567,7 +592,11 @@ fn vtd_sl_leaf_entry(d: i32, iova: u64, alloc: bool) -> u64
             vtd_seg_publish(si, e)
         table = vtd_entry_addr(v)
         level = level - 1
-    return phys_to_virt(table) + sl_index(iova, 1) * 8
+    return phys_to_virt(table) + sl_index(iova, leaf) * 8
+
+# ... the 4 KiB leaf's.
+fn vtd_sl_leaf_entry(d: i32, iova: u64, alloc: bool) -> u64
+    return vtd_sl_entry(d, iova, 1, alloc)
 
 # Drop domain `did`'s mapping of `iova` from every IOTLB on segment `si`
 # (with `cm_only`, only units in caching mode, which may have cached the
@@ -789,3 +818,154 @@ pub fn vtd_fault_next() -> Option<VtdFault>
                 i = i + 1
         u = u + 1
     return None
+
+# ============================================================================
+# The translating boot (AGAST #4723): identity contexts, then TE
+# ============================================================================
+
+# Is DMA translated: TE set on every unit, every requester in a context?
+pub fn vtd_dma_translation_on() -> bool
+    return vtd_dma_on
+
+fn vtd_dma_fail(what: StrView) -> bool
+    klog("      [vtd] translation off (")
+    klog(what)
+    klog(")\n")
+    return false
+
+# Does every unit on segment `si` walk 2 MiB second-level leaves?
+fn vtd_seg_sl_2m(si: i32) -> bool
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si and not vtd_cap_sl_2m(vtd_cap[u])
+            return false
+        u = u + 1
+    return true
+
+# Map bytes `base` to `last` of domain index `d` to themselves, read-write,
+# in level-`leaf` leaves (1: 4 KiB, 2: 2 MiB), the range rounded out to
+# them. A leaf that is there already stays. TE is clear: nothing to
+# invalidate.
+fn vtd_identity_map(d: i32, base: u64, last: u64, leaf: u32) -> VtdDma
+    let size: u64 = (1 as u64) << (12 + 9 * (leaf - 1))
+    let mask: u64 = 0xFFFFFFFFFFFFFFFF ^ (size - 1)
+    if not vtd_dom_iova_ok(d, last & mask)
+        return VtdDma.BadAddress
+    var a: u64 = base & mask
+    while a <= (last & mask)
+        let e: u64 = vtd_sl_entry(d, a, leaf, true)
+        if e == 0
+            return VtdDma.NoPage
+        if not sl_present(volatile_load(e as *u64))
+            if leaf == 2
+                volatile_store(e as *u64, sl_leaf_2m(a, true))
+            else
+                volatile_store(e as *u64, sl_leaf(a, true))
+            vtd_seg_publish(vtd_dom_seg[d], e)
+        a = a + size
+    return VtdDma.Ok
+
+# Point every context entry on segment `si` that has none at domain index
+# `d`: all 256 buses, all 256 dev.fn, so a requester whose DMA arrives
+# under an alias (a bridge, a phantom function) has one too.
+fn vtd_seg_identity_contexts(si: i32, d: i32) -> VtdDma
+    let lo: u64 = vtd_ctx_lo(vtd_dom_sl_phys[d])
+    let hi: u64 = vtd_ctx_hi((d + 1) as u32, vtd_dom_levels[d])
+    var bus: u32 = 0
+    while bus < 256
+        let table: u64 = vtd_ctx_entry(si, bus << 8, true)
+        if table == 0
+            return VtdDma.NoPage
+        var f: u64 = 0
+        while f < 256
+            let ce: u64 = table + f * 16
+            if not vtd_entry_present(volatile_load(ce as *u64))
+                # the domain first, then present: no half an entry
+                volatile_store((ce + 8) as *u64, hi)
+                memory_barrier()
+                volatile_store(ce as *u64, lo)
+            f = f + 1
+        vtd_seg_publish_table(si, table)
+        bus = bus + 1
+    return VtdDma.Ok
+
+# Segment index `si`'s identity domain: RAM below `ram_top` and the
+# segment's RMRRs, then a context naming it for every requester.
+# NoSegment if the segment's units can't all translate.
+fn vtd_seg_identity(si: i32, ram_top: u64) -> VtdDma
+    if vtd_seg_levels(si) == 0
+        return VtdDma.NoSegment
+    let dom: u32 = vtd_seg_domain_new(si).unwrap_or(0)
+    if dom == 0
+        return VtdDma.NoDomain
+    let d: i32 = vtd_dom_index(dom)
+    var leaf: u32 = 1
+    if vtd_seg_sl_2m(si)
+        leaf = 2
+    if ram_top > 0
+        let r: VtdDma = vtd_identity_map(d, 0, ram_top - 1, leaf)
+        if r != VtdDma.Ok
+            return r
+    var k: i32 = 0
+    while k < dmar_num_rmrrs
+        if dmar_seg_index(dmar_rmrr_segment[k] as u32) == si
+            let r: VtdDma = vtd_identity_map(d, dmar_rmrr_base[k], dmar_rmrr_limit[k], leaf)
+            if r != VtdDma.Ok
+                return r
+        k = k + 1
+    let root: VtdDma = vtd_seg_root(si)
+    if root != VtdDma.Ok
+        return root
+    return vtd_seg_identity_contexts(si, d)
+
+# Turn DMA translation on, once interrupt remapping is (vtd_ir_init):
+# give every requester on every segment an identity context (physical
+# memory below `ram_top`, the PMM's top, and the RMRRs), drop every unit's
+# context cache and IOTLB, then set TE on each unit. False, with
+# translation left off (logged why), if remapping is off, a unit can't
+# translate, the RAM or an RMRR is past what a unit translates, there's no
+# page for a table, or a unit didn't confirm.
+pub fn vtd_dma_init(ram_top: u64) -> bool
+    if not vtd_on
+        return false
+    if vtd_dma_on
+        return true
+    var si: i32 = 0
+    while si < dmar_num_segs
+        let r: VtdDma = vtd_seg_identity(si, ram_top)
+        if r == VtdDma.NoSegment
+            return vtd_dma_fail("a unit can't translate")
+        if r == VtdDma.BadAddress
+            return vtd_dma_fail("RAM or an RMRR past the unit's IOVA width")
+        if r == VtdDma.NoPage or r == VtdDma.NoDomain
+            return vtd_dma_fail("no page or domain for the identity tables")
+        if r != VtdDma.Ok
+            return vtd_dma_fail("a unit didn't take the root table")
+        si = si + 1
+    # whatever a unit cached before the contexts were there (caching mode
+    # caches not-present entries; firmware may have translated)
+    var u: i32 = 0
+    while u < vtd_units
+        vtd_qi_submit(u, qi_cc_global_lo(), 0)
+        vtd_qi_submit(u, qi_iotlb_lo(QI_G_GLOBAL, 0, vtd_cap[u]), 0)
+        if not vtd_qi_sync(u)
+            return vtd_dma_fail("context cache / IOTLB flush failed")
+        u = u + 1
+    u = 0
+    while u < vtd_units
+        if not vtd_gcmd(u, GCMD_TE, 0, GCMD_TE, true)
+            var k: i32 = 0
+            while k <= u
+                vtd_gcmd(k, 0, GCMD_TE, GCMD_TE, false)
+                k = k + 1
+            return vtd_dma_fail("TE won't set")
+        u = u + 1
+    vtd_dma_on = true
+    klog("      [vtd] translation on: identity domain for every requester on ")
+    klog_dec(dmar_num_segs as i64)
+    klog(" PCI segment(s), RAM below ")
+    klog_hex(ram_top)
+    klog(", ")
+    klog_dec(dmar_num_rmrrs as i64)
+    klog(" RMRR(s)\n")
+    return true

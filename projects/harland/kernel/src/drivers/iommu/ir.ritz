@@ -24,7 +24,8 @@ import drivers.iommu.dmar {
     ACPI_SIG_DMAR, msi_addr_remap, msi_addr_is_remap, msi_addr_handle,
     ioapic_rte_remap_hi, ioapic_rte_remap_lo, ioapic_rte_is_remap, ioapic_rte_handle, irte_dest
 }
-import drivers.iommu.vtd { vtd_ir_init, vtd_ir_enabled, vtd_ir_x2apic, vtd_ir_set, vtd_ir_get_lo, vtd_ioapic_sid }
+import mm.pmm { pmm_top_phys }
+import drivers.iommu.vtd { vtd_ir_init, vtd_ir_enabled, vtd_ir_x2apic, vtd_ir_set, vtd_ir_get_lo, vtd_ioapic_sid, vtd_dma_init, vtd_dma_translation_on }
 import drivers.iommu.ivrs { AMDVI_MSI_ADDR, amdvi_msi_data, amdvi_msi_handle, amdvi_rte_lo, amdvi_rte_handle }
 import drivers.iommu.amdvi { amdvi_ir_init, amdvi_ir_enabled, amdvi_ir_x2apic, amdvi_ir_set, amdvi_ir_get_dest, amdvi_ioapic_sid }
 
@@ -34,14 +35,26 @@ pub const IR_NO_HANDLE: u32 = 0xFFFFFFFF
 # Bring interrupt remapping up, VT-d or AMD-Vi. `x2apic`: the LAPIC is in
 # x2APIC mode, so table entries carry 32-bit destinations where the
 # hardware can. Returns 0 with remapping on, -1 with it off (logged why).
+# With VT-d remapping on, DMA translation comes on too where every unit
+# can translate: an identity context for every requester, then TE
+# (AGAST #4723). AMD-Vi stays DMA pass-through (decision D6).
 pub fn ir_init(x2apic: bool) -> i32
     if acpi_find_table(ACPI_SIG_DMAR) != 0
-        return vtd_ir_init(x2apic)
+        if vtd_ir_init(x2apic) == 0
+            vtd_dma_init(pmm_top_phys())
+            return 0
+        return -1
     let rc: i32 = amdvi_ir_init(x2apic)
     if rc == -2
         klog("      Interrupt remapping: off (no DMAR or IVRS table)\n")
         return -1
     return rc
+
+# Is device DMA translated by an IOMMU on this boot (VT-d TE on, every
+# requester in a context)? Then a virtio device is asked for
+# VIRTIO_F_ACCESS_PLATFORM so its DMA goes through the domain.
+pub fn dma_translation_on() -> bool
+    return vtd_dma_translation_on()
 
 # Is interrupt remapping on? Then every MSI and redirection entry must name
 # a table entry (ir_msi_*, ir_ioapic_rte_*).

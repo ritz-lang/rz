@@ -11,7 +11,9 @@ interrupts on that returns the pattern the script wrote, an interrupt counter
 > 0, commands that waited for their interrupt and none that completed without
 it. The NIC is modern-only with a 1024-entry RX queue (AGAST #3576), so it
 must also come up over the MMIO transport, cap that queue at 256 and get a
-DHCP lease.
+DHCP lease. It boots twice (AGAST #4723): pc, then q35 with intel-iommu and
+the NIC behind it, where every check holds again with DMA translated
+("[vtd] translation on") and the NIC on VIRTIO_F_ACCESS_PLATFORM.
 
 It is a build-all step after the Tier-1 boot, so every room's gate runs it.
 Like that boot (test_ci_harland_boot.py), these tests pin:
@@ -53,12 +55,15 @@ TIER1_SCRIPT = "projects/harland/tools/test_tier1_boot.sh"
 # The same stubs as test_ci_harland_boot.py (kept local: tools/ test modules
 # don't import each other). The QEMU stub writes $FAKE_SERIAL to the
 # `-serial file:PATH` it was given and idles until killed; every argv goes
-# to $STUB_LOG.
+# to $STUB_LOG. The translating boot (an intel-iommu on the command line,
+# AGAST #4723) gets $FAKE_SERIAL_VTD after it: the lines only that boot logs.
 QEMU_STUB = r"""#!/usr/bin/env bash
 echo "$@" >> "$STUB_LOG"
+extra=""
+case " $* " in *" intel-iommu,"*) extra="$FAKE_SERIAL_VTD" ;; esac
 prev=""
 for a in "$@"; do
-    if [ "$prev" = "-serial" ]; then printf '%b' "$FAKE_SERIAL" > "${a#file:}"; fi
+    if [ "$prev" = "-serial" ]; then printf '%b' "$FAKE_SERIAL$extra" > "${a#file:}"; fi
     prev="$a"
 done
 sleep 30
@@ -146,6 +151,13 @@ def net_rx_waits(waits: int = 880, halts: int = 880) -> str:
 WAITS_OK = BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + net_rx_waits()
 
 PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_OK + WAITS_OK + SUITE_PASSED
+
+# The translating boot's own lines (AGAST #4723): interrupt remapping, TE
+# with identity contexts, and the NIC's bit 33.
+IR_ON = r"      Interrupt remapping: VT-d on, 1 unit(s), table at 0x7E000, 8-bit xAPIC destinations\n"
+TE_ON = r"      [vtd] translation on: identity domain for every requester on 1 PCI segment(s), RAM below 0x80000000, 0 RMRR(s)\n"
+NET_PLATFORM = r"[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated: DMA through the IOMMU\n"
+VTD_OK = IR_ON + TE_ON + NET_PLATFORM
 
 
 # --------------------------------------------------------------------------
@@ -241,6 +253,7 @@ def _run(tree, serial: str = "", *, qemu=True, qemu_img=True, full_path=True,
         "OVMF_CODE": str(tree["ovmf"]),
         "STUB_LOG": str(tree["tmp"] / "stub.log"),
         "FAKE_SERIAL": serial,
+        "FAKE_SERIAL_VTD": VTD_OK,
         **(env_extra or {}),
     }
     return subprocess.run(["/bin/bash", str(tree["script"])], env=env,
@@ -290,6 +303,8 @@ def test_all_checks_pass_and_the_serial_log_is_kept(tree):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PASS: virtio-net delivered 8 MSI-X interrupts" in r.stdout
     assert "interrupts: 8" in (keep / "msix.log").read_text()
+    assert "[vtd] translation on" in (keep / "msix-vtd.log").read_text()
+    assert "PASS: VT-d DMA translation is on" in r.stdout
 
 
 @pytest.mark.integration
@@ -378,6 +393,62 @@ def test_no_nvme_msix_table_fails(tree):
 def test_exception_fails_even_if_everything_else_passed(tree):
     r = _run(tree, r"EXCEPTION: #GP\nRIP=0x1\nCR2=0\n" + PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
+
+
+@pytest.mark.integration
+def test_boots_pc_then_q35_with_the_nic_behind_intel_iommu(tree):
+    """AGAST #4723: the second boot is the translating one: q35 with the
+    split irqchip, intel-iommu with interrupt remapping, the NIC created
+    with iommu_platform=on. The first stays pc with no IOMMU."""
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    pc, vtd = (tree["tmp"] / "stub.log").read_text().splitlines()
+    assert "-machine pc " in pc and "iommu" not in pc
+    assert "-machine q35,kernel-irqchip=split " in vtd
+    assert "-device intel-iommu,intremap=on,eim=on " in vtd
+    # before the PCI devices it translates
+    assert vtd.index("intel-iommu") < vtd.index("virtio-blk-pci")
+    assert ("virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024,iommu_platform=on"
+            in vtd)
+    # the same devices on both
+    for dev in ("virtio-blk-pci,drive=initramfs,disable-legacy=on", "-device virtio-keyboard-pci",
+                "-device nvme,serial=harland-msix", "-netdev user,id=net0"):
+        assert dev in pc and dev in vtd, dev
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "drop, want",
+    [
+        (IR_ON, "VT-d interrupt remapping did not come on"),
+        (TE_ON, 'no "[vtd] translation on"'),
+        (NET_PLATFORM, "did not negotiate VIRTIO_F_ACCESS_PLATFORM"),
+    ],
+    ids=["no-interrupt-remapping", "no-translation", "nic-without-bit-33"],
+)
+def test_translating_boot_check_missing_fails(tree, drop, want):
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": VTD_OK.replace(drop, "")})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout
+
+
+@pytest.mark.integration
+def test_translating_boot_keeps_every_device_check(tree):
+    """A check that fails only on the translating boot fails the script: the
+    storage, NVMe and NIC assertions run on both boots (halted > 0 too)."""
+    r = _run(tree, PASSED.replace(net_rx_waits(), ""),
+             env_extra={"FAKE_SERIAL_VTD": ""})
+    assert r.returncode == 1
+    # both boots report it, each under its own header
+    assert r.stdout.count("no virtio-net RX wait count logged") == 2
+    assert "===== msix boot (pc) =====" in r.stdout and "===== msix boot (vtd) =====" in r.stdout
+
+
+@pytest.mark.integration
+def test_translation_claimed_on_pc_fails(tree):
+    r = _run(tree, PASSED + TE_ON)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "on the pc machine, which has no IOMMU" in r.stdout
 
 
 @pytest.mark.integration

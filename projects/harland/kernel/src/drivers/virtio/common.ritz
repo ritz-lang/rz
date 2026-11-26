@@ -18,7 +18,7 @@ import drivers.pci { PciDevice, pci_enable_bus_master, pci_enable_memory, pci_en
 # The transport-independent virtqueue and feature negotiation (AGAST #4732):
 # this file is the transport, the allocation and the register access.
 import virtio_abi.virtq { Virtqueue, VIRTQ_MAX_SIZE, virtq_ring_bytes, virtq_init, virtq_desc_phys, virtq_avail_phys, virtq_used_phys }
-import virtio_abi.features { VIRTIO_F_VERSION_1, virtio_driver_features, virtio_features_lo, virtio_features_hi, virtio_features_join }
+import virtio_abi.features { VIRTIO_F_VERSION_1, VIRTIO_F_ACCESS_PLATFORM, virtio_driver_features, virtio_features_lo, virtio_features_hi, virtio_features_join }
 
 # ============================================================================
 # VirtIO Device Status Bits
@@ -114,6 +114,7 @@ pub struct VirtioDevice
     transport: u8           # VIO_TRANSPORT_LEGACY or VIO_TRANSPORT_MMIO
     msix_on: u8             # 1 once the driver enabled MSI-X (moves legacy config to 24)
     version_1: u8           # 1 if VIRTIO_F_VERSION_1 was negotiated
+    access_platform: bool   # VIRTIO_F_ACCESS_PLATFORM was negotiated: DMA goes through the IOMMU
     # Modern MMIO transport addresses (from PCI capabilities)
     mmio_common: u64        # Common config MMIO base
     mmio_notify: u64        # Notification MMIO base
@@ -122,7 +123,6 @@ pub struct VirtioDevice
     notify_multiplier: u32  # Notify offset multiplier
 
 # kalloc sizes
-const VIRTIO_DEVICE_SIZE: u64 = 200       # sizeof(VirtioDevice)
 
 # ============================================================================
 # Device I/O Helpers (Legacy port I/O)
@@ -225,6 +225,7 @@ pub fn vio_set_features(dev: *VirtioDevice, wanted: u64)
             (*dev).version_1 = 1
         else
             (*dev).version_1 = 0
+        (*dev).access_platform = (accepted & VIRTIO_F_ACCESS_PLATFORM) != 0
     else
         let offered: u64 = vio_read32(dev, VIRTIO_PCI_HOST_FEATURES) as u64
         vio_write32(dev, VIRTIO_PCI_GUEST_FEATURES, virtio_features_lo(virtio_driver_features(offered, wanted)))
@@ -398,7 +399,7 @@ pub fn vq_notify(vq: *Virtqueue)
 
 pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
     # Allocate device structure
-    let dev: *VirtioDevice = kalloc(VIRTIO_DEVICE_SIZE) as *VirtioDevice
+    let dev: *VirtioDevice = kalloc(sizeof(VirtioDevice) as u64) as *VirtioDevice
     if dev == 0 as *VirtioDevice
         klog("[virtio] Failed to allocate device\n")
         return 0 as *VirtioDevice
@@ -413,6 +414,7 @@ pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
     (*dev).notify_multiplier = 0
     (*dev).msix_on = 0
     (*dev).version_1 = 0
+    (*dev).access_platform = false
 
     # Try legacy I/O transport first (BAR0 as I/O space)
     if (*pci_dev).bar_is_io[0] != 0

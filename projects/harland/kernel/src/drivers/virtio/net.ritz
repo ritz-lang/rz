@@ -16,6 +16,8 @@ import drivers.pci { PciDevice, pci_find_virtio, VIRTIO_DEVICE_NET }
 import mm.vmm { vmm_virt_to_phys, phys_to_virt }
 import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count }
 import drivers.virtio.common { VirtioDevice, VIO_TRANSPORT_MMIO, VIRTIO_MSI_NO_VECTOR, VIRTIO_STATUS_FAILED, vio_init_device, vio_add_status, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_get_queue_size, vio_setup_queue_vec, vio_read_isr, vio_note_msix_on, vio_set_config_msix_vector, vio_read_config8, vio_read_config16, vq_notify }
+import virtio_abi.features { VIRTIO_F_ACCESS_PLATFORM }
+import drivers.iommu.ir { dma_translation_on }
 import virtio_abi.virtq { Virtqueue, VringDesc, TxSlots, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE, tx_slots_init, tx_slots_take, tx_slots_post, vq_reclaim_tx }
 
 # MSI-X table entries this driver uses: config changes, RX queue, TX queue
@@ -294,11 +296,21 @@ pub fn virtio_net_init() -> i32
     if (device_features & VIRTIO_NET_F_STATUS) != 0
         accepted_features = accepted_features | VIRTIO_NET_F_STATUS
 
-    vio_set_features(vdev, accepted_features as u64)
+    # On a boot that translates DMA (an identity context for every
+    # requester, AGAST #4723), VIRTIO_F_ACCESS_PLATFORM (bit 33) too: a
+    # device created with iommu_platform=on then DMAs through the IOMMU,
+    # not to guest-physical addresses behind it. The identity domain maps
+    # the physical addresses this driver programs, so nothing else changes.
+    var wanted: u64 = accepted_features as u64
+    if dma_translation_on()
+        wanted = wanted | VIRTIO_F_ACCESS_PLATFORM
+    vio_set_features(vdev, wanted)
     virtio_net.features = accepted_features
     if vio_features_ok(vdev) != 0
         vio_add_status(vdev, VIRTIO_STATUS_FAILED)
         return -1
+    if (*vdev).access_platform
+        klog("[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated: DMA through the IOMMU\n")
 
     virtio_net.hdr_size = VIRTIO_NET_HDR_SIZE
     if (*vdev).version_1 != 0

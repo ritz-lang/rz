@@ -43,6 +43,8 @@ VTD = KERNEL_SRC / "drivers" / "iommu" / "vtd.ritz"
 APIC = KERNEL_SRC / "arch" / "x86_64" / "apic.ritz"
 MSIX = KERNEL_SRC / "drivers" / "msix.ritz"
 IR = KERNEL_SRC / "drivers" / "iommu" / "ir.ritz"
+VIRTIO_COMMON = KERNEL_SRC / "drivers" / "virtio" / "common.ritz"
+VIRTIO_NET = KERNEL_SRC / "drivers" / "virtio" / "net.ritz"
 
 PROGRAM = """\
 import drivers.iommu.dmar
@@ -319,6 +321,14 @@ fn main() -> i32
         return 64
     if qi_iotlb_unmap_lo(3, 0) != 0x30022 or qi_iotlb_unmap_hi(0x10ABC, 0) != 0
         return 65
+    # 2 MiB second-level leaves (AGAST #4723): PS (bit 7) on a level-2 entry,
+    # the address 2 MiB aligned; CAP.SLLPS bit 34 says the unit walks them
+    if sl_leaf_2m(0x40000000, true) != 0x40000083 or sl_leaf_2m(0x40012345, false) != 0x40000081
+        return 66
+    if not sl_is_large(sl_leaf_2m(0x200000, false)) or sl_is_large(sl_leaf(0x200000, true)) or sl_is_large(sl_table(0x8000))
+        return 66
+    if not vtd_cap_sl_2m(0x400000000) or vtd_cap_sl_2m(0x800000000) or vtd_cap_sl_2m(0)
+        return 67
     0
 """
 
@@ -339,7 +349,8 @@ CLAIMS = {1: "two DRHD units", 2: "DMAR flags", 3: "unit register bases", 4: "IN
           53: "FSTS.FRI", 54: "RTADDR / root entry / SID split", 55: "context entry", 56: "entry present/addr",
           57: "second-level index", 58: "second-level entries", 59: "second-level present",
           60: "fault record decode", 61: "fault record not pending / write", 62: "context-cache descriptors",
-          63: "IOTLB descriptors + drain", 64: "IOTLB page-selective unmap", 65: "IOTLB unmap without PSI"}
+          63: "IOTLB descriptors + drain", 64: "IOTLB page-selective unmap", 65: "IOTLB unmap without PSI",
+          66: "2 MiB second-level leaf", 67: "CAP.SLLPS 2 MiB"}
 
 
 @pytest.mark.integration
@@ -511,14 +522,14 @@ pub fn deadline_passed(deadline: u64) -> bool
 """
 
 DMA_PMM_STUB = """\
-var g_mem: [196608]u8
+var g_mem: [8388608]u8
 var g_next: u64 = 0
 
 pub fn pmm_alloc_page() -> u64
     let base: u64 = @g_mem[0] as u64
     if g_next == 0
         g_next = (base + 4095) & (0xFFFFFFFFFFFFFFFF ^ 4095)
-    if g_next + 4096 > base + 196608
+    if g_next + 4096 > base + 8388608
         return 0
     let p: u64 = g_next
     g_next = g_next + 4096
@@ -549,8 +560,9 @@ FAKEVTD = """\
 import drivers.iommu.dmar { VTD_REG_GCMD, VTD_REG_GSTS, VTD_REG_IQH, VTD_REG_IQT, VTD_REG_IQA, GCMD_WBF, QI_TYPE_WAIT, QI_WAIT_SW }
 
 var g_regs: [4096]u8
-var g_dmar: [64]u8
+var g_dmar: [96]u8
 var g_dead: bool = false
+var g_rmrr: bool = false
 pub var fake_log_lo: [64]u64
 pub var fake_log_hi: [64]u64
 pub var fake_log_n: i32 = 0
@@ -608,6 +620,14 @@ fn put32(off: i32, v: u32)
     put16(off, v)
     put16(off + 2, v >> 16)
 
+fn put64(off: i32, v: u64)
+    put32(off, (v & 0xFFFFFFFF) as u32)
+    put32(off + 4, (v >> 32) as u32)
+
+# With an RMRR, the DMAR also reserves 0x7F000000-0x7F00FFFF on segment 0.
+pub fn fake_set_rmrr(on: bool)
+    g_rmrr = on
+
 # DMAR: one unit, every device on segment 0, interrupt remapping supported.
 pub fn fake_dmar() -> u64
     put32(0, 0x52414D44)
@@ -617,6 +637,13 @@ pub fn fake_dmar() -> u64
     put16(50, 16)
     put8(52, 1)
     put32(56, 0xFED90000)
+    if g_rmrr
+        put32(4, 88)
+        put16(64, 1)
+        put16(66, 24)
+        put16(70, 0)
+        put64(72, 0x7F000000)
+        put64(80, 0x7F00FFFF)
     return @g_dmar[0] as u64
 """
 
@@ -781,8 +808,7 @@ DMA_CLAIMS = {1: "nothing before remapping is on", 2: "IR init on the fake unit"
               33: "second-level table walked by hand", 34: "a unit that can't translate is refused"}
 
 
-@pytest.mark.integration
-def test_vtd_dma_remapping_on_an_emulated_unit(tmp_path):
+def _run_on_emulated_unit(tmp_path, program, claims):
     tree = tmp_path / "tree"
     sources = dict(DMA_STUBS)
     for rel in ("drivers/iommu/dmar.ritz", "drivers/iommu/vtd.ritz"):
@@ -790,7 +816,7 @@ def test_vtd_dma_remapping_on_an_emulated_unit(tmp_path):
     for rel, text in sources.items():
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
         (tree / rel).write_text(text)
-    (tmp_path / "t.ritz").write_text(DMA_PROGRAM)
+    (tmp_path / "t.ritz").write_text(program)
     env = dict(os.environ, RITZ_PATH=f"{tree}:{RITZ_ROOT}:{tmp_path}")
     objs = []
     for src, extra in [(tmp_path / "t.ritz", ()), *[(tree / rel, ("--no-runtime",)) for rel in sources]]:
@@ -803,15 +829,188 @@ def test_vtd_dma_remapping_on_an_emulated_unit(tmp_path):
                           capture_output=True, text=True)
     assert link.returncode == 0, link.stderr[-3000:]
     rc = subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
-    assert rc == 0, f"exit {rc}: {DMA_CLAIMS.get(rc, 'crash')}"
+    assert rc == 0, f"exit {rc}: {claims.get(rc, 'crash')}"
+
+
+@pytest.mark.integration
+def test_vtd_dma_remapping_on_an_emulated_unit(tmp_path):
+    _run_on_emulated_unit(tmp_path, DMA_PROGRAM, DMA_CLAIMS)
+
+
+# --- The translating boot (AGAST #4723) ------------------------------------------
+#
+# vtd_dma_init, on the same emulated unit: an identity domain per segment
+# (RAM up to the top the caller gives, and the segment's RMRRs, in 2 MiB
+# leaves where CAP.SLLPS has them), a context naming it for every requester
+# (each bus:dev.fn), the context cache and IOTLB dropped, then TE. The test
+# walks the tables the unit would walk.
+
+TE_PROGRAM = """\
+import drivers.iommu.dmar
+import drivers.iommu.vtd
+import fakevtd
+
+# SAGAW 4-level, 256 domain IDs, MGAW 48, fault records at 0x220, PSI, DRD,
+# SLLPS 2 MiB (bit 34); no caching mode.
+const CAP: u64 = 0x800384222F0402
+const ECAP: u64 = 0x0A
+const TOP: u64 = 0x40000000                  # 1 GiB of RAM
+
+fn te_on() -> bool
+    return (fake_reg32(VTD_REG_GSTS) & GCMD_TE) != 0
+
+# The entry the unit's walk for requester `sid` ends on at `iova`: the
+# leaf (or 0 if the walk stops at a missing entry), with `*level` the level
+# it is at (2: a 2 MiB leaf). 0 with `*level` 9: no context.
+fn walk(sid: u32, iova: u64, level: *u32) -> u64
+    *level = 9
+    let re: u64 = volatile_load((fake_reg64(VTD_REG_RTADDR) + vtd_sid_bus(sid) * 16) as *u64)
+    if not vtd_entry_present(re)
+        return 0
+    let ce: u64 = vtd_entry_addr(re) + vtd_sid_devfn(sid) * 16
+    let lo: u64 = volatile_load(ce as *u64)
+    if not vtd_entry_present(lo)
+        return 0
+    var lvl: u32 = (volatile_load((ce + 8) as *u64) & 7) as u32 + 2
+    var t: u64 = vtd_entry_addr(lo)
+    while true
+        *level = lvl
+        let e: u64 = volatile_load((t + sl_index(iova, lvl) * 8) as *u64)
+        if not sl_present(e) or lvl == 1 or sl_is_large(e)
+            return e
+        t = vtd_entry_addr(e)
+        lvl = lvl - 1
+
+# How many descriptors with low half `lo` were queued from entry `from` on.
+fn queued(lo: u64, from: i32) -> i32
+    var n: i32 = 0
+    var k: i32 = from
+    while k < fake_log_n
+        if fake_log_lo[k] == lo
+            n = n + 1
+        k = k + 1
+    return n
+
+fn main() -> i32
+    fake_set_reg64(VTD_REG_CAP, CAP)
+    fake_set_reg64(VTD_REG_ECAP, ECAP)
+    fake_set_rmrr(true)
+    # nothing before interrupt remapping is on
+    if vtd_dma_translation_on() or vtd_dma_init(TOP)
+        return 1
+    if vtd_ir_init(false) != 0 or te_on()
+        return 2
+    let n0: i32 = fake_log_n
+    if not vtd_dma_init(TOP)
+        return 3
+    if not vtd_dma_translation_on() or not te_on() or (fake_reg32(VTD_REG_GCMD) & GCMD_TE) == 0
+        return 4
+    # interrupt remapping stays on, compatibility format still blocked
+    if (fake_reg32(VTD_REG_GSTS) & GCMD_IRE) == 0 or (fake_reg32(VTD_REG_GCMD) & GCMD_CFI) != 0
+        return 5
+    # one identity domain, and every requester names it: the first, the
+    # last, one on another bus, and the NIC-like 00:03.0
+    let dom: u32 = vtd_context_domain(0x0000).unwrap_or(0)
+    if dom == 0 or vtd_context_domain(0xFFFF).unwrap_or(0) != dom or vtd_context_domain(0x0318).unwrap_or(0) != dom or vtd_context_domain(0x18).unwrap_or(0) != dom
+        return 6
+    # RAM is identity-mapped read-write in 2 MiB leaves, up to TOP and no further
+    var lvl: u32 = 0
+    if walk(0x18, 0, @lvl) != sl_leaf_2m(0, true) or lvl != 2
+        return 7
+    if walk(0xFFFF, 0x3FFFF000, @lvl) != sl_leaf_2m(0x3FE00000, true) or lvl != 2
+        return 8
+    if sl_present(walk(0x18, TOP, @lvl)) or sl_present(walk(0x18, 0x7EE00000, @lvl))
+        return 9
+    # the RMRR (above TOP) is mapped for every requester on its segment
+    if walk(0x0318, 0x7F00F000, @lvl) != sl_leaf_2m(0x7F000000, true) or lvl != 2
+        return 10
+    # the root table's install drops the caches once; once the contexts are
+    # in, every unit's are dropped again, last, before TE
+    if queued(qi_cc_global_lo(), n0) != 2 or queued(qi_iotlb_lo(QI_G_GLOBAL, 0, CAP), n0) != 2
+        return 11
+    if fake_log_lo[fake_log_n - 2] != qi_cc_global_lo() or fake_log_lo[fake_log_n - 1] != qi_iotlb_lo(QI_G_GLOBAL, 0, CAP)
+        return 11
+    # a second call leaves it as it is
+    let root: u64 = fake_reg64(VTD_REG_RTADDR)
+    if not vtd_dma_init(TOP) or fake_reg64(VTD_REG_RTADDR) != root or vtd_context_domain(0x18).unwrap_or(0) != dom
+        return 12
+
+    # a unit without 2 MiB leaves: 4 KiB leaves
+    fake_set_reg32(VTD_REG_GCMD, 0)
+    fake_set_reg32(VTD_REG_GSTS, 0)
+    fake_set_rmrr(false)
+    fake_set_reg64(VTD_REG_CAP, CAP & (0xFFFFFFFFFFFFFFFF ^ 0x400000000))
+    if vtd_ir_init(false) != 0 or vtd_dma_translation_on() or te_on()
+        return 13
+    if not vtd_dma_init(0x400000) or not te_on()
+        return 14
+    if walk(0x18, 0x3FF000, @lvl) != sl_leaf(0x3FF000, true) or lvl != 1 or sl_present(walk(0x18, 0x400000, @lvl))
+        return 15
+
+    # a unit that can't translate: interrupt remapping only, TE stays clear
+    fake_set_reg32(VTD_REG_GCMD, 0)
+    fake_set_reg32(VTD_REG_GSTS, 0)
+    fake_set_reg64(VTD_REG_CAP, CAP & (0xFFFFFFFFFFFFFFFF ^ (CAP_SAGAW_48 | CAP_SAGAW_39)))
+    if vtd_ir_init(false) != 0 or vtd_dma_init(TOP) or vtd_dma_translation_on() or te_on()
+        return 16
+    # RAM past what the unit translates (MGAW 39): refused
+    fake_set_reg64(VTD_REG_CAP, (CAP & (0xFFFFFFFFFFFFFFFF ^ 0x3F0000)) | 0x260000)
+    if vtd_ir_init(false) != 0 or vtd_dma_init(0x10000000000) or vtd_dma_translation_on() or te_on()
+        return 17
+    # a unit that stops answering its queue: refused, TE stays clear
+    fake_set_reg64(VTD_REG_CAP, CAP)
+    if vtd_ir_init(false) != 0
+        return 18
+    fake_set_dead(true)
+    if vtd_dma_init(TOP) or vtd_dma_translation_on() or te_on()
+        return 19
+    0
+"""
+
+TE_CLAIMS = {1: "nothing before interrupt remapping", 2: "IR init, TE clear", 3: "translation init",
+             4: "TE set and reported", 5: "IR kept, CFI still blocked", 6: "identity context for every requester",
+             7: "RAM identity 2 MiB leaf at 0", 8: "RAM identity up to the top", 9: "nothing past the top",
+             10: "RMRR identity-mapped", 11: "context cache + IOTLB flushed before TE", 12: "second init is a no-op",
+             13: "IR re-init on a 4 KiB unit", 14: "translation on with 4 KiB leaves", 15: "4 KiB identity leaves",
+             16: "a unit that can't translate is refused", 17: "RAM past the IOVA width is refused",
+             18: "IR on the live unit", 19: "a dead queue refuses TE"}
+
+
+@pytest.mark.integration
+def test_vtd_translating_boot_on_an_emulated_unit(tmp_path):
+    _run_on_emulated_unit(tmp_path, TE_PROGRAM, TE_CLAIMS)
 
 
 @pytest.mark.unit
-def test_vtd_dma_never_sets_translation_enable():
-    # AGAST #4722: the mechanics exist, translation stays off until the cutover
+def test_vtd_sets_translation_enable_only_in_the_translating_boot():
+    # AGAST #4723: TE is set in one place, after the identity contexts and
+    # the global flush, and only from ir_init once VT-d remapping is on
     code = _code(VTD)
-    assert "GCMD_TE" not in code, "vtd.ritz must not set TE yet"
-    # and the boot path doesn't touch the DMA tables: the vtd boot is unchanged
-    init = _body(code, "vtd_ir_init")
-    for fn in ("vtd_seg_root(", "vtd_domain_new(", "vtd_context_attach(", "VTD_REG_RTADDR"):
-        assert fn not in init, fn
+    code = re.sub(r"^import [^{\n]*\{.*?\}", "", code, flags=re.M | re.S)
+    te = [m.start() for m in re.finditer(r"GCMD_TE", code)]
+    init = _body(code, "vtd_dma_init").rstrip()
+    assert te and all(code.find(init) <= i < code.find(init) + len(init) for i in te), \
+        "GCMD_TE outside vtd_dma_init"
+    assert init.index("vtd_seg_identity(") < init.index("qi_cc_global_lo()") < init.index("GCMD_TE"), init
+    assert "vtd_seg_levels(si) == 0" in _body(code, "vtd_seg_identity"), "a segment that can't translate must be refused"
+    assert "if not vtd_on" in init, init
+    ir_init = _body(_code(IR), "ir_init")
+    assert re.search(r"vtd_ir_init\(x2apic\) == 0", ir_init) and "vtd_dma_init(pmm_top_phys())" in ir_init, ir_init
+    # the boot's answer: VT-d's; AMD-Vi stays pass-through (decision D6)
+    on = _body(_code(IR), "dma_translation_on")
+    assert "vtd_dma_translation_on()" in on and "amdvi" not in on, on
+
+
+@pytest.mark.unit
+def test_virtio_net_asks_for_access_platform_on_a_translating_boot():
+    # AGAST #4723: VIRTIO_F_ACCESS_PLATFORM (bit 33) puts the NIC's DMA
+    # through the domain; asked for only when the boot translates
+    common = _code(VIRTIO_COMMON)
+    assert "(*dev).access_platform" in _body(common, "vio_set_features")
+    # common.ritz is shared with blk and input and host-compiled with stubs:
+    # the IOMMU question is virtio-net's
+    assert "drivers.iommu" not in common
+    init = _body(_code(VIRTIO_NET), "virtio_net_init")
+    assert re.search(r"if dma_translation_on\(\)\s+wanted = wanted \| VIRTIO_F_ACCESS_PLATFORM\s+vio_set_features\(vdev, wanted\)", init), \
+        "virtio-net must ask for bit 33 on a translating boot"
+    assert "VIRTIO_F_ACCESS_PLATFORM negotiated" in VIRTIO_NET.read_text()

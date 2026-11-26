@@ -62,6 +62,20 @@
 #   - the kernel took no exception, and init's Tier-1 suite still reports
 #     ALL TESTS PASSED with the NIC and NVMe attached.
 #
+# It boots twice, with the same devices and the same checks (AGAST #4723,
+# docs/RING1_DRIVER.md "DMA domain", PR 5b):
+#   - "pc": the pc machine, no IOMMU. PCI stays on port I/O ("[pci] no
+#     MCFG: segment 0 only, port I/O"), and DMA is not translated;
+#   - "vtd", the translating boot: q35 with kernel-irqchip=split and
+#     -device intel-iommu,intremap=on,eim=on, the NIC with iommu_platform=on so
+#     QEMU puts its DMA behind the IOMMU. The kernel turns interrupt
+#     remapping on ("Interrupt remapping: VT-d on"), gives every requester
+#     an identity context and sets TE ("[vtd] translation on"), and
+#     virtio-net negotiates VIRTIO_F_ACCESS_PLATFORM, bit 33 ("[virtio-net]
+#     VIRTIO_F_ACCESS_PLATFORM negotiated"). Every storage, NVMe and NIC
+#     check above must still pass with translation on: the disks and the
+#     NIC were bus-mastering through identity contexts, halted > 0 included.
+#
 # The NIC uses QEMU's user-mode network (slirp): its built-in DHCP server
 # answers inside QEMU, so this needs no root and no host network.
 #
@@ -74,7 +88,7 @@
 # Usage: tools/test_msix_boot.sh
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for the boot (default 120)
-#        KEEP_WORK=DIR  copy the serial log (msix.log) into DIR
+#        KEEP_WORK=DIR  copy the serial logs (msix.log, msix-vtd.log) into DIR
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
 #
 # Exit: 0 = pass; 1 = the boot or a check failed; 3 = a required tool is
@@ -157,225 +171,278 @@ print(h)
 EOF
 ) || { echo "FAIL: could not write the NVMe disk"; exit 1; }
 
-vars=()
-if [ -n "$OVMF_VARS" ]; then
-    cp "$OVMF_VARS" "$WORK/vars.fd"
-    vars=(-drive "if=pflash,format=raw,file=$WORK/vars.fd")
-fi
-SERIAL="$WORK/msix.log"
-: > "$SERIAL"
-# romfile= drops the NIC's iPXE option ROM, so OVMF never tries a network
-# boot before the ESP. The legacy virtio-net path is covered by
-# tools/test_tier1_boot.sh's grub boot, whose NIC is QEMU's transitional
-# default.
-timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m 2G \
-    -display none -no-reboot -monitor none \
-    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
-    -drive "format=raw,file=fat:rw:$WORK/esp" \
-    -device virtio-blk-pci,drive=initramfs,disable-legacy=on \
-    -device virtio-keyboard-pci \
-    -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
-    -device virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024 \
-    -netdev user,id=net0 \
-    -device nvme,serial=harland-msix,drive=nvme0 \
-    -drive "file=$WORK/nvme.img,format=raw,if=none,id=nvme0" \
-    -serial "file:$SERIAL" >/dev/null 2>&1 &
-pid=$!
-timed_out=1
-for _ in $(seq 1 "$TIMEOUT"); do
-    sleep 1
-    grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$SERIAL" && { sleep 1; timed_out=0; break; }
-    kill -0 "$pid" 2>/dev/null || { timed_out=0; break; }
-done
-kill "$pid" 2>/dev/null
-wait "$pid" 2>/dev/null
+# boot NAME SERIAL: boot the machine; NAME "vtd" is q35 with intel-iommu
+# and the NIC behind it, "pc" has no IOMMU.
+boot() {
+    local name="$1" serial="$2" machine=(-machine pc) iommu=() platform="" vars=()
+    if [ "$name" = vtd ]; then
+        # intremap=on wants the split irqchip; eim=on because the kernel
+        # runs the LAPIC in x2APIC mode (32-bit IRTE destinations). The
+        # IOMMU goes before the PCI devices it translates.
+        machine=(-machine q35,kernel-irqchip=split)
+        iommu=(-device intel-iommu,intremap=on,eim=on)
+        platform=",iommu_platform=on"
+    fi
+    if [ -n "$OVMF_VARS" ]; then
+        cp "$OVMF_VARS" "$WORK/vars-$name.fd"
+        vars=(-drive "if=pflash,format=raw,file=$WORK/vars-$name.fd")
+    fi
+    : > "$serial"
+    # romfile= drops the NIC's iPXE option ROM, so OVMF never tries a network
+    # boot before the ESP. The legacy virtio-net path is covered by
+    # tools/test_tier1_boot.sh's grub boot, whose NIC is QEMU's transitional
+    # default.
+    timeout "$TIMEOUT" qemu-system-x86_64 "${machine[@]}" -cpu Haswell-v1 -smp 4 -m 2G \
+        "${iommu[@]}" \
+        -display none -no-reboot -monitor none \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
+        -drive "format=raw,file=fat:rw:$WORK/esp" \
+        -device virtio-blk-pci,drive=initramfs,disable-legacy=on \
+        -device virtio-keyboard-pci \
+        -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
+        -device "virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024$platform" \
+        -netdev user,id=net0 \
+        -device nvme,serial=harland-msix,drive=nvme0 \
+        -drive "file=$WORK/nvme.img,format=raw,if=none,id=nvme0" \
+        -serial "file:$serial" >/dev/null 2>&1 &
+    local pid=$!
+    timed_out=1
+    for _ in $(seq 1 "$TIMEOUT"); do
+        sleep 1
+        grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$serial" && { sleep 1; timed_out=0; break; }
+        kill -0 "$pid" 2>/dev/null || { timed_out=0; break; }
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+}
 
-echo "----- msix boot: MSI-X lines -----"
-grep -a "\[msix\]" "$SERIAL" | head -30
-echo "----------------------------------"
+# check NAME SERIAL: the verdicts for one boot; sets rc=1 on any failure.
+check() {
+    local name="$1" SERIAL="$2"
+    echo "===== msix boot ($name) ====="
+    echo "----- msix boot ($name): MSI-X and IOMMU lines -----"
+    grep -aE "\[msix\]|Interrupt remapping|\[vtd\]|ACCESS_PLATFORM" "$SERIAL" | head -34
+    echo "----------------------------------"
+
+    if grep -aqE "EXCEPTION|KERNEL PANIC" "$SERIAL"; then
+        sed -n '/EXCEPTION/,/CR2/p' "$SERIAL" | head -20
+        echo "FAIL: kernel exception during boot"
+        rc=1
+    fi
+    # QEMU's NVMe controller is PCI 1b36:0010.
+    if grep -aiqE "\[msix\] [0-9a-f:.]+ 1b36:0010: [1-9][0-9]* vectors" "$SERIAL"; then
+        echo "PASS: NVMe controller's MSI-X table found"
+    else
+        echo "FAIL: no MSI-X table found on the NVMe controller (1b36:0010)"
+        rc=1
+    fi
+    if grep -aq "\[virtio-net\] Transport: modern (MMIO)" "$SERIAL"; then
+        echo "PASS: virtio-net is driven over the modern (MMIO) transport"
+    else
+        grep -a "\[virtio-net\]" "$SERIAL" | head -5
+        echo "FAIL: virtio-net was not driven over the modern (MMIO) transport"
+        rc=1
+    fi
+    if grep -aqF "[virtio-net] Queue 0: size=256 (device max 1024)" "$SERIAL"; then
+        echo "PASS: virtio-net's 1024-entry RX queue was capped to 256"
+    else
+        echo "FAIL: virtio-net's RX queue was not capped from 1024 to 256"
+        rc=1
+    fi
+    if grep -aqF "[dhcp] Configured!" "$SERIAL"; then
+        echo "PASS: DHCP got a lease over the modern virtio-net"
+    else
+        grep -a "\[dhcp\]\|DHCP" "$SERIAL" | head -5
+        echo "FAIL: DHCP got no lease over the modern virtio-net"
+        rc=1
+    fi
+    burst=$(grep -aoE "\[net\] TX burst: sent=[0-9]+/[0-9]+ replies=[0-9]+" "$SERIAL" | tail -1)
+    b_sent=$(echo "$burst" | sed -nE 's/.*sent=([0-9]+)\/.*/\1/p')
+    b_total=$(echo "$burst" | sed -nE 's/.*sent=[0-9]+\/([0-9]+) .*/\1/p')
+    b_replies=$(echo "$burst" | sed -nE 's/.*replies=([0-9]+)$/\1/p')
+    if [ -z "$burst" ]; then
+        grep -a "\[net\] TX burst" "$SERIAL" | head -3
+        echo "FAIL: no TX burst result ([net] TX burst: sent=S/N replies=R)"
+        rc=1
+    elif [ "$b_total" -le 256 ] || [ "$b_sent" -ne "$b_total" ]; then
+        echo "FAIL: TX burst sent $b_sent of $b_total frames, want all of more than 256"
+        rc=1
+    elif [ "$b_replies" -le 256 ]; then
+        echo "FAIL: TX burst got $b_replies distinct replies to $b_sent pings, want > 256"
+        rc=1
+    else
+        echo "PASS: TX burst sent $b_sent/$b_total frames, $b_replies distinct replies"
+    fi
+    if grep -aq "\[msix\] virtio-net: MSI-X on" "$SERIAL"; then
+        echo "PASS: virtio-net is in MSI-X mode"
+    else
+        echo "FAIL: virtio-net did not come up in MSI-X mode"
+        rc=1
+    fi
+    count=$(grep -aoE "\[msix\] virtio-net interrupts: [0-9]+" "$SERIAL" | tail -1 | grep -oE "[0-9]+$")
+    if [ -n "$count" ] && [ "$count" -gt 0 ]; then
+        echo "PASS: virtio-net delivered $count MSI-X interrupts"
+    else
+        echo "FAIL: virtio-net MSI-X interrupt counter is ${count:-missing}, want > 0"
+        rc=1
+    fi
+    if grep -aqE "\[msix\] nvme [^ ]+: MSI-X on" "$SERIAL"; then
+        echo "PASS: NVMe is in MSI-X mode"
+    else
+        grep -a "\[msix\] nvme\|\[nvme\]" "$SERIAL" | head -5
+        echo "FAIL: NVMe did not come up in MSI-X mode"
+        rc=1
+    fi
+    nread=$(grep -aoE "\[msix\] nvme [^ ]+ nsid 1: LBA 32568-32767 fnv1a=[0-9]+" "$SERIAL" | head -1 | sed -nE 's/.*fnv1a=([0-9]+)$/\1/p')
+    if [ -z "$nread" ]; then
+        grep -a "\[msix\] nvme .* nsid" "$SERIAL" | head -3
+        echo "FAIL: no NVMe read under MSI-X ([msix] nvme <serial> nsid 1: LBA 32568-32767 fnv1a=H)"
+        rc=1
+    elif [ "$nread" != "$want_fnv" ]; then
+        echo "FAIL: NVMe read under MSI-X returned fnv1a=$nread, want fnv1a=$want_fnv"
+        rc=1
+    else
+        echo "PASS: NVMe read LBAs 32568-32767 under MSI-X (fnv1a=$want_fnv)"
+    fi
+    nirq=$(grep -aoE "\[msix\] nvme interrupts: [0-9]+, commands waited: [0-9]+, completions without one: [0-9]+" "$SERIAL" | tail -1)
+    n_count=$(echo "$nirq" | sed -nE 's/.*interrupts: ([0-9]+),.*/\1/p')
+    n_waited=$(echo "$nirq" | sed -nE 's/.*commands waited: ([0-9]+),.*/\1/p')
+    n_missed=$(echo "$nirq" | sed -nE 's/.*without one: ([0-9]+)$/\1/p')
+    if [ -z "$n_count" ] || [ "$n_count" -eq 0 ]; then
+        echo "FAIL: NVMe MSI-X interrupt counter is ${n_count:-missing}, want > 0"
+        rc=1
+    elif [ "$n_waited" -eq 0 ]; then
+        echo "FAIL: no NVMe command waited for its MSI-X interrupt (polled with $n_count delivered)"
+        rc=1
+    elif [ "$n_missed" -ne 0 ]; then
+        echo "FAIL: $n_missed NVMe completions arrived without an interrupt ($n_count delivered)"
+        rc=1
+    else
+        echo "PASS: NVMe delivered $n_count MSI-X interrupts, $n_waited commands waited for theirs, none missed"
+    fi
+    # An idle sleeping wait wakes only for the watchdog and the odd other
+    # interrupt; a spinning one that counts its rounds runs thousands of them.
+    IDLE_HALTS_MAX=64
+    n_idle=$(grep -aoE "\[msix\] nvme idle wait halted: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
+    if [ -z "$n_idle" ]; then
+        echo "FAIL: no NVMe idle interrupt wait logged ([msix] nvme idle wait halted: P)"
+        rc=1
+    elif [ "$n_idle" -eq 0 ]; then
+        echo "FAIL: NVMe idle interrupt wait never halted: it spins instead of sleeping"
+        rc=1
+    elif [ "$n_idle" -gt "$IDLE_HALTS_MAX" ]; then
+        echo "FAIL: NVMe idle interrupt wait halted $n_idle times (> $IDLE_HALTS_MAX): it spins instead of sleeping"
+        rc=1
+    else
+        echo "PASS: NVMe idle interrupt wait slept: halted $n_idle times in one watchdog round"
+    fi
+    if grep -aqE "\[virtio-blk\] Device 0 initialized \([0-9]+ MB, modern" "$SERIAL"; then
+        echo "PASS: virtio-blk is driven over the modern (MMIO) transport"
+    else
+        grep -a "\[virtio-blk\]" "$SERIAL" | head -5
+        echo "FAIL: virtio-blk was not driven over the modern (MMIO) transport"
+        rc=1
+    fi
+    if grep -aq "\[msix\] virtio-blk: MSI-X on" "$SERIAL"; then
+        echo "PASS: virtio-blk is in MSI-X mode"
+    else
+        grep -a "\[msix\] virtio-blk" "$SERIAL" | head -3
+        echo "FAIL: virtio-blk did not come up in MSI-X mode"
+        rc=1
+    fi
+    birq=$(grep -aoE "\[msix\] virtio-blk interrupts: [0-9]+, requests waited: [0-9]+, halted: [0-9]+, data: [A-Za-z]+" "$SERIAL" | tail -1)
+    bk_count=$(echo "$birq" | sed -nE 's/.*interrupts: ([0-9]+),.*/\1/p')
+    bk_waited=$(echo "$birq" | sed -nE 's/.*requests waited: ([0-9]+),.*/\1/p')
+    bk_data=$(echo "$birq" | sed -nE 's/.*data: ([A-Za-z]+)$/\1/p')
+    if [ -z "$birq" ]; then
+        echo "FAIL: no virtio-blk MSI-X read check logged ([msix] virtio-blk interrupts: N, requests waited: W, ...)"
+        rc=1
+    elif [ "$bk_count" -eq 0 ]; then
+        echo "FAIL: virtio-blk MSI-X interrupt counter is 0, want > 0"
+        rc=1
+    elif [ "$bk_waited" -eq 0 ]; then
+        echo "FAIL: no virtio-blk request waited for its MSI-X interrupt (polled with $bk_count delivered)"
+        rc=1
+    elif [ "$bk_data" != "same" ]; then
+        echo "FAIL: virtio-blk reads under MSI-X returned data: $bk_data, want the polled reads' (same)"
+        rc=1
+    else
+        echo "PASS: virtio-blk delivered $bk_count MSI-X interrupts, $bk_waited requests waited for theirs, same data as polled"
+    fi
+    if grep -aq "\[msix\] virtio-input: MSI-X on" "$SERIAL"; then
+        echo "PASS: virtio-input is in MSI-X mode"
+    else
+        grep -a "\[msix\] virtio-input\|\[virtio-input\]" "$SERIAL" | head -3
+        echo "FAIL: virtio-input did not come up in MSI-X mode"
+        rc=1
+    fi
+    nrx=$(grep -aoE "\[msix\] virtio-net rx waits: [0-9]+, halted: [0-9]+" "$SERIAL" | tail -1)
+    nrx_waits=$(echo "$nrx" | sed -nE 's/.*rx waits: ([0-9]+),.*/\1/p')
+    nrx_halts=$(echo "$nrx" | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
+    if [ -z "$nrx" ]; then
+        echo "FAIL: no virtio-net RX wait count logged ([msix] virtio-net rx waits: W, halted: H)"
+        rc=1
+    elif [ "$nrx_waits" -eq 0 ]; then
+        echo "FAIL: the DHCP window never waited on the RX vector: it busy-polls"
+        rc=1
+    elif [ "$nrx_halts" -eq 0 ]; then
+        echo "FAIL: virtio-net RX waits ($nrx_waits) never halted: they spin instead of sleeping"
+        rc=1
+    else
+        echo "PASS: virtio-net RX waited on its vector $nrx_waits times, halted $nrx_halts"
+    fi
+    if [ "$name" = pc ]; then
+        # QEMU's pc machine has no MCFG: PCI stays on port I/O, segment 0 only
+        # (AGAST #4582; tools/test_irq_dest_boot.sh boots q35 through ECAM).
+        if grep -aqF "[pci] no MCFG: segment 0 only, port I/O" "$SERIAL"; then
+            echo "PASS: no MCFG on pc: PCI config access stays on port I/O"
+        else
+            grep -a "\[pci\]" "$SERIAL" | head -5
+            echo "FAIL: no \"[pci] no MCFG: segment 0 only, port I/O\" on the pc machine"
+            rc=1
+        fi
+        # No IOMMU on pc: nothing may claim DMA is translated
+        if grep -aqF "[vtd] translation on" "$SERIAL"; then
+            echo "FAIL: \"[vtd] translation on\" on the pc machine, which has no IOMMU"
+            rc=1
+        fi
+    else
+        # The translating boot (AGAST #4723): interrupt remapping, then TE
+        # with an identity context for every requester, and the NIC's DMA
+        # through it
+        if grep -aq "Interrupt remapping: VT-d on" "$SERIAL"; then
+            echo "PASS: VT-d interrupt remapping is on"
+        else
+            grep -a "Interrupt remapping\|DMAR" "$SERIAL" | head -3
+            echo "FAIL: VT-d interrupt remapping did not come on"
+            rc=1
+        fi
+        if grep -aqF "[vtd] translation on" "$SERIAL"; then
+            echo "PASS: VT-d DMA translation is on: identity contexts, TE set"
+        else
+            grep -a "\[vtd\]" "$SERIAL" | head -3
+            echo "FAIL: no \"[vtd] translation on\": DMA was not translated"
+            rc=1
+        fi
+        if grep -aqF "[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated" "$SERIAL"; then
+            echo "PASS: virtio-net negotiated VIRTIO_F_ACCESS_PLATFORM: its DMA goes through the IOMMU"
+        else
+            echo "FAIL: virtio-net did not negotiate VIRTIO_F_ACCESS_PLATFORM (bit 33) on the translating boot"
+            rc=1
+        fi
+    fi
+    if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
+        echo "PASS: init Tier-1 suite: ALL TESTS PASSED"
+    else
+        [ "$timed_out" = 1 ] && echo "FAIL: no verdict within ${TIMEOUT}s (BOOT_TIMEOUT)"
+        echo "FAIL: init's Tier-1 suite did not report ALL TESTS PASSED"
+        rc=1
+    fi
+}
 
 rc=0
-if grep -aqE "EXCEPTION|KERNEL PANIC" "$SERIAL"; then
-    sed -n '/EXCEPTION/,/CR2/p' "$SERIAL" | head -20
-    echo "FAIL: kernel exception during boot"
-    rc=1
-fi
-# QEMU's NVMe controller is PCI 1b36:0010.
-if grep -aiqE "\[msix\] [0-9a-f:.]+ 1b36:0010: [1-9][0-9]* vectors" "$SERIAL"; then
-    echo "PASS: NVMe controller's MSI-X table found"
-else
-    echo "FAIL: no MSI-X table found on the NVMe controller (1b36:0010)"
-    rc=1
-fi
-if grep -aq "\[virtio-net\] Transport: modern (MMIO)" "$SERIAL"; then
-    echo "PASS: virtio-net is driven over the modern (MMIO) transport"
-else
-    grep -a "\[virtio-net\]" "$SERIAL" | head -5
-    echo "FAIL: virtio-net was not driven over the modern (MMIO) transport"
-    rc=1
-fi
-if grep -aqF "[virtio-net] Queue 0: size=256 (device max 1024)" "$SERIAL"; then
-    echo "PASS: virtio-net's 1024-entry RX queue was capped to 256"
-else
-    echo "FAIL: virtio-net's RX queue was not capped from 1024 to 256"
-    rc=1
-fi
-if grep -aqF "[dhcp] Configured!" "$SERIAL"; then
-    echo "PASS: DHCP got a lease over the modern virtio-net"
-else
-    grep -a "\[dhcp\]\|DHCP" "$SERIAL" | head -5
-    echo "FAIL: DHCP got no lease over the modern virtio-net"
-    rc=1
-fi
-burst=$(grep -aoE "\[net\] TX burst: sent=[0-9]+/[0-9]+ replies=[0-9]+" "$SERIAL" | tail -1)
-b_sent=$(echo "$burst" | sed -nE 's/.*sent=([0-9]+)\/.*/\1/p')
-b_total=$(echo "$burst" | sed -nE 's/.*sent=[0-9]+\/([0-9]+) .*/\1/p')
-b_replies=$(echo "$burst" | sed -nE 's/.*replies=([0-9]+)$/\1/p')
-if [ -z "$burst" ]; then
-    grep -a "\[net\] TX burst" "$SERIAL" | head -3
-    echo "FAIL: no TX burst result ([net] TX burst: sent=S/N replies=R)"
-    rc=1
-elif [ "$b_total" -le 256 ] || [ "$b_sent" -ne "$b_total" ]; then
-    echo "FAIL: TX burst sent $b_sent of $b_total frames, want all of more than 256"
-    rc=1
-elif [ "$b_replies" -le 256 ]; then
-    echo "FAIL: TX burst got $b_replies distinct replies to $b_sent pings, want > 256"
-    rc=1
-else
-    echo "PASS: TX burst sent $b_sent/$b_total frames, $b_replies distinct replies"
-fi
-if grep -aq "\[msix\] virtio-net: MSI-X on" "$SERIAL"; then
-    echo "PASS: virtio-net is in MSI-X mode"
-else
-    echo "FAIL: virtio-net did not come up in MSI-X mode"
-    rc=1
-fi
-count=$(grep -aoE "\[msix\] virtio-net interrupts: [0-9]+" "$SERIAL" | tail -1 | grep -oE "[0-9]+$")
-if [ -n "$count" ] && [ "$count" -gt 0 ]; then
-    echo "PASS: virtio-net delivered $count MSI-X interrupts"
-else
-    echo "FAIL: virtio-net MSI-X interrupt counter is ${count:-missing}, want > 0"
-    rc=1
-fi
-if grep -aqE "\[msix\] nvme [^ ]+: MSI-X on" "$SERIAL"; then
-    echo "PASS: NVMe is in MSI-X mode"
-else
-    grep -a "\[msix\] nvme\|\[nvme\]" "$SERIAL" | head -5
-    echo "FAIL: NVMe did not come up in MSI-X mode"
-    rc=1
-fi
-nread=$(grep -aoE "\[msix\] nvme [^ ]+ nsid 1: LBA 32568-32767 fnv1a=[0-9]+" "$SERIAL" | head -1 | sed -nE 's/.*fnv1a=([0-9]+)$/\1/p')
-if [ -z "$nread" ]; then
-    grep -a "\[msix\] nvme .* nsid" "$SERIAL" | head -3
-    echo "FAIL: no NVMe read under MSI-X ([msix] nvme <serial> nsid 1: LBA 32568-32767 fnv1a=H)"
-    rc=1
-elif [ "$nread" != "$want_fnv" ]; then
-    echo "FAIL: NVMe read under MSI-X returned fnv1a=$nread, want fnv1a=$want_fnv"
-    rc=1
-else
-    echo "PASS: NVMe read LBAs 32568-32767 under MSI-X (fnv1a=$want_fnv)"
-fi
-nirq=$(grep -aoE "\[msix\] nvme interrupts: [0-9]+, commands waited: [0-9]+, completions without one: [0-9]+" "$SERIAL" | tail -1)
-n_count=$(echo "$nirq" | sed -nE 's/.*interrupts: ([0-9]+),.*/\1/p')
-n_waited=$(echo "$nirq" | sed -nE 's/.*commands waited: ([0-9]+),.*/\1/p')
-n_missed=$(echo "$nirq" | sed -nE 's/.*without one: ([0-9]+)$/\1/p')
-if [ -z "$n_count" ] || [ "$n_count" -eq 0 ]; then
-    echo "FAIL: NVMe MSI-X interrupt counter is ${n_count:-missing}, want > 0"
-    rc=1
-elif [ "$n_waited" -eq 0 ]; then
-    echo "FAIL: no NVMe command waited for its MSI-X interrupt (polled with $n_count delivered)"
-    rc=1
-elif [ "$n_missed" -ne 0 ]; then
-    echo "FAIL: $n_missed NVMe completions arrived without an interrupt ($n_count delivered)"
-    rc=1
-else
-    echo "PASS: NVMe delivered $n_count MSI-X interrupts, $n_waited commands waited for theirs, none missed"
-fi
-# An idle sleeping wait wakes only for the watchdog and the odd other
-# interrupt; a spinning one that counts its rounds runs thousands of them.
-IDLE_HALTS_MAX=64
-n_idle=$(grep -aoE "\[msix\] nvme idle wait halted: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
-if [ -z "$n_idle" ]; then
-    echo "FAIL: no NVMe idle interrupt wait logged ([msix] nvme idle wait halted: P)"
-    rc=1
-elif [ "$n_idle" -eq 0 ]; then
-    echo "FAIL: NVMe idle interrupt wait never halted: it spins instead of sleeping"
-    rc=1
-elif [ "$n_idle" -gt "$IDLE_HALTS_MAX" ]; then
-    echo "FAIL: NVMe idle interrupt wait halted $n_idle times (> $IDLE_HALTS_MAX): it spins instead of sleeping"
-    rc=1
-else
-    echo "PASS: NVMe idle interrupt wait slept: halted $n_idle times in one watchdog round"
-fi
-if grep -aqE "\[virtio-blk\] Device 0 initialized \([0-9]+ MB, modern" "$SERIAL"; then
-    echo "PASS: virtio-blk is driven over the modern (MMIO) transport"
-else
-    grep -a "\[virtio-blk\]" "$SERIAL" | head -5
-    echo "FAIL: virtio-blk was not driven over the modern (MMIO) transport"
-    rc=1
-fi
-if grep -aq "\[msix\] virtio-blk: MSI-X on" "$SERIAL"; then
-    echo "PASS: virtio-blk is in MSI-X mode"
-else
-    grep -a "\[msix\] virtio-blk" "$SERIAL" | head -3
-    echo "FAIL: virtio-blk did not come up in MSI-X mode"
-    rc=1
-fi
-birq=$(grep -aoE "\[msix\] virtio-blk interrupts: [0-9]+, requests waited: [0-9]+, halted: [0-9]+, data: [A-Za-z]+" "$SERIAL" | tail -1)
-bk_count=$(echo "$birq" | sed -nE 's/.*interrupts: ([0-9]+),.*/\1/p')
-bk_waited=$(echo "$birq" | sed -nE 's/.*requests waited: ([0-9]+),.*/\1/p')
-bk_data=$(echo "$birq" | sed -nE 's/.*data: ([A-Za-z]+)$/\1/p')
-if [ -z "$birq" ]; then
-    echo "FAIL: no virtio-blk MSI-X read check logged ([msix] virtio-blk interrupts: N, requests waited: W, ...)"
-    rc=1
-elif [ "$bk_count" -eq 0 ]; then
-    echo "FAIL: virtio-blk MSI-X interrupt counter is 0, want > 0"
-    rc=1
-elif [ "$bk_waited" -eq 0 ]; then
-    echo "FAIL: no virtio-blk request waited for its MSI-X interrupt (polled with $bk_count delivered)"
-    rc=1
-elif [ "$bk_data" != "same" ]; then
-    echo "FAIL: virtio-blk reads under MSI-X returned data: $bk_data, want the polled reads' (same)"
-    rc=1
-else
-    echo "PASS: virtio-blk delivered $bk_count MSI-X interrupts, $bk_waited requests waited for theirs, same data as polled"
-fi
-if grep -aq "\[msix\] virtio-input: MSI-X on" "$SERIAL"; then
-    echo "PASS: virtio-input is in MSI-X mode"
-else
-    grep -a "\[msix\] virtio-input\|\[virtio-input\]" "$SERIAL" | head -3
-    echo "FAIL: virtio-input did not come up in MSI-X mode"
-    rc=1
-fi
-nrx=$(grep -aoE "\[msix\] virtio-net rx waits: [0-9]+, halted: [0-9]+" "$SERIAL" | tail -1)
-nrx_waits=$(echo "$nrx" | sed -nE 's/.*rx waits: ([0-9]+),.*/\1/p')
-nrx_halts=$(echo "$nrx" | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
-if [ -z "$nrx" ]; then
-    echo "FAIL: no virtio-net RX wait count logged ([msix] virtio-net rx waits: W, halted: H)"
-    rc=1
-elif [ "$nrx_waits" -eq 0 ]; then
-    echo "FAIL: the DHCP window never waited on the RX vector: it busy-polls"
-    rc=1
-elif [ "$nrx_halts" -eq 0 ]; then
-    echo "FAIL: virtio-net RX waits ($nrx_waits) never halted: they spin instead of sleeping"
-    rc=1
-else
-    echo "PASS: virtio-net RX waited on its vector $nrx_waits times, halted $nrx_halts"
-fi
-# QEMU's pc machine has no MCFG: PCI stays on port I/O, segment 0 only
-# (AGAST #4582; tools/test_irq_dest_boot.sh boots q35 through ECAM).
-if grep -aqF "[pci] no MCFG: segment 0 only, port I/O" "$SERIAL"; then
-    echo "PASS: no MCFG on pc: PCI config access stays on port I/O"
-else
-    grep -a "\[pci\]" "$SERIAL" | head -5
-    echo "FAIL: no \"[pci] no MCFG: segment 0 only, port I/O\" on the pc machine"
-    rc=1
-fi
-if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
-    echo "PASS: init Tier-1 suite: ALL TESTS PASSED"
-else
-    [ "$timed_out" = 1 ] && echo "FAIL: no verdict within ${TIMEOUT}s (BOOT_TIMEOUT)"
-    echo "FAIL: init's Tier-1 suite did not report ALL TESTS PASSED"
-    rc=1
-fi
+boot pc "$WORK/msix.log"
+check pc "$WORK/msix.log"
+boot vtd "$WORK/msix-vtd.log"
+check vtd "$WORK/msix-vtd.log"
 exit $rc
