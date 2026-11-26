@@ -12,6 +12,14 @@
 # at boot) wakes the reader. Interrupts stay off from the check to the
 # block, so input landing in between still wakes it.
 #
+# poll(2) on fd 0 (syscall/runtime/poll.ritz, #4829) asks tty_console_readable
+# whether read(0) would return now, and to wait for that with a timeout
+# parks in tty_console_wait on its own wait set (proc/waitset.ritz), with a
+# TSC deadline and a console watch: COM1's interrupt wakes it as it wakes a
+# reader, and sched_tick's waitset_tick at the deadline. The wait is
+# monotonic (the TSC), so no wall clock is involved, and it is as fine as
+# the 100 Hz tick: a 25 ms timeout ends 25 to 35 ms after the call.
+#
 # Ctrl-C (TTY_ISIG) kills the running Proc if it is in the console's
 # foreground (tty/fg.ritz, #4276: set by the shell, as tcsetpgrp does). With
 # preemption (#3629) the running Proc is whichever process holds the CPU when
@@ -28,7 +36,11 @@
 import io { disable_interrupts, enable_interrupts }
 import serial { serial_data_available, serial_read_byte_nonblock, serial_write_byte }
 import tty.fg { tty_fg_is_current, tty_fg_set }
-import proc.table { BLOCK_TTY, proc_block, proc_wake }
+import ritzlib.option
+import proc.table { BLOCK_TTY, BLOCK_WAIT, proc_block, proc_wake, proc_current, proc_current_slot, proc_reap_pending }
+import proc.waitset { waitset_arm, waitset_disarm, waitset_watch_console, waitset_console_ready }
+import proc.waitq { waitq_can_park }
+import arch.x86_64.tsc { deadline_passed }
 import proc.sched { sched_block }
 import syscall.runtime.process { process_kill_current }
 import tty.ldisc { ldisc_input, ldisc_readable, ldisc_read, ldisc_take_intr, ldisc_intr_pending, ldisc_take_echo, ldisc_get_flags, ldisc_set_flags }
@@ -79,8 +91,10 @@ fn tty_console_kill_foreground()
 # and call tty_console_irq_kill: a process to kill for a Ctrl-C.
 pub fn tty_console_irq(from_user: bool) -> bool
     tty_console_pull()
-    # A reader blocked in read(0) looks again (a line, a byte, ^D or ^C).
+    # A reader blocked in read(0) looks again (a line, a byte, ^D or ^C),
+    # and so does a timed poll watching the console.
     proc_wake(BLOCK_TTY)
+    waitset_console_ready()
     from_user and tty_console_intr_due()
 
 pub fn tty_console_irq_kill()
@@ -115,6 +129,53 @@ pub fn tty_console_read(buf: *u8, count: i64) -> i64
             proc_block(BLOCK_TTY, 0)
             sched_block()
     n
+
+# Whether read(0) would return now (a line, a raw byte or an end of input),
+# after pulling what COM1 holds. A Ctrl-C for the foreground kills it, as in
+# read(0).
+pub fn tty_console_readable() -> bool
+    disable_interrupts()
+    tty_console_pull()
+    if tty_console_intr_due()
+        enable_interrupts()
+        tty_console_kill_foreground()
+    let ready: bool = ldisc_readable()
+    enable_interrupts()
+    ready
+
+# A timed poll's wait (#4829): sleep on the caller's wait set until TSC
+# `deadline` passes (None: no deadline), or, with `for_input`, until read(0)
+# would return. Console input wakes it either way, so a Ctrl-C for the
+# foreground still kills it. Returns tty_console_readable's answer as the
+# wait ended. A process marked to exit stops waiting (its return to user
+# exits), and a CPU that cannot park (not the BSP, no process) does not wait.
+pub fn tty_console_wait(for_input: bool, deadline: Option<u64>) -> bool
+    disable_interrupts()
+    let slot: i32 = proc_current_slot()
+    var ready: bool = false
+    while true
+        tty_console_pull()
+        if tty_console_intr_due()
+            waitset_disarm(slot)
+            enable_interrupts()
+            tty_console_kill_foreground()
+        ready = ldisc_readable()
+        if (for_input and ready) or not waitq_can_park() or proc_reap_pending(proc_current())
+            break
+        match deadline
+            Some(t) =>
+                if deadline_passed(t)
+                    break
+                waitset_arm(slot, t)
+            None => pass
+        waitset_watch_console(slot)
+        # Until COM1's interrupt or the deadline wakes it; returns with IF=0.
+        proc_block(BLOCK_WAIT, 0)
+        sched_block()
+    if slot >= 0
+        waitset_disarm(slot)
+    enable_interrupts()
+    ready
 
 pub fn tty_console_get_flags() -> u32
     disable_interrupts()

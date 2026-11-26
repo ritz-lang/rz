@@ -21,7 +21,9 @@ import drivers.pci { pci_print_all_devices }
 import drivers.msix { msix_print_all, msix_vector_alloc, msix_vector_count }
 import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
-import io { enable_interrupts, disable_interrupts, halt_loop }
+import io { enable_interrupts, disable_interrupts, halt_loop, rdtsc }
+import tty.console { tty_console_irq, tty_console_get_flags, tty_console_set_flags }
+import tty.ldisc { ldisc_input, ldisc_read }
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed, tsc_hz }
 import arch.x86_64.apcall { ap_run_nvme_probe }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test, virtio_blk_read, virtio_blk_msix_vector, virtio_blk_irq_count, virtio_blk_irq_wait_count, virtio_blk_irq_halt_count }
@@ -399,6 +401,8 @@ const DRIVER_STUB_ENTER: u64 = 0
 const DRIVER_STUB_FAULT: u64 = 1
 const DRIVER_STUB_SPIN: u64 = 2
 const DRIVER_STUB_IRQ_WAIT: u64 = 3
+const DRIVER_STUB_CONSOLE_POLL: u64 = 4
+const DRIVER_STUB_POLL_NVAL: u64 = 5
 const DRIVER_STUB_COOKIE: u64 = 0x4713
 # SCHED_HZ is 100: a 50 ms spin spans five ticks.
 const DRIVER_SPIN_MS: u64 = 50
@@ -644,6 +648,108 @@ fn drv_irq_wait_self_test() -> bool
     klog("\n")
     return ok and status == 0 and reparked and waited
 
+# console-poll (#4829): poll(2) on fd 0 is the console's timed read. The stub
+# (modes 4 and 5, driver_stub.s) polls { 0, POLLIN } with the console raw
+# (one byte readable) and nothing typed:
+#   * timeout 0 returns 0 at once;
+#   * timeout CONSOLE_POLL_SHORT_MS returns 0, no sooner than that and well
+#     before CONSOLE_POLL_LATE_MS: only the wait set's deadline ends it;
+#   * timeout CONSOLE_POLL_LONG_MS, parked on its wait set, gets a byte
+#     through the console's receive path (ldisc_input, then tty_console_irq
+#     as COM1's interrupt runs it): it returns 1 with POLLIN within
+#     CONSOLE_POLL_PROMPT_MS, long before its deadline;
+#   * an entry with fd -1 is skipped and a number that names no file is
+#     POLLNVAL, which returns at once even with no timeout.
+# The byte is read back out and the console's flags restored, so init finds
+# the console as boot left it.
+const CONSOLE_POLL_SHORT_MS: u64 = 30
+const CONSOLE_POLL_LATE_MS: u64 = 500
+const CONSOLE_POLL_LONG_MS: u64 = 5000
+const CONSOLE_POLL_PROMPT_MS: u64 = 200
+const CONSOLE_POLL_BYTE: u8 = 0x6B          # 'k'
+# The stub's status for a return of 1 with revents POLLIN.
+const CONSOLE_POLL_GOT_BYTE: i64 = 0x101
+const MS_PER_S: u64 = 1000
+
+# Milliseconds since TSC `start`.
+fn ms_since(start: u64) -> u64
+    (rdtsc() - start) * MS_PER_S / tsc_hz()
+
+# Run the stub in `mode` with `arg1` to its exit: its status, or -1 if it
+# could not be spawned.
+fn console_poll_stub(mode: u64, arg1: u64) -> i64
+    let pid: i64 = process_spawn_image(driver_stub(), mode, arg1)
+    if pid <= 0
+        return -1
+    drv_stub_status(pid as u64)
+
+fn console_poll_self_test() -> bool
+    klog("\nTesting poll on the console (the timed console read)...\n")
+    let flags: u32 = tty_console_get_flags()
+    tty_console_set_flags(0)
+    sched_start(proc_current_slot())
+
+    var t: u64 = rdtsc()
+    let at_once: i64 = console_poll_stub(DRIVER_STUB_CONSOLE_POLL, 0)
+    let at_once_ms: u64 = ms_since(t)
+
+    t = rdtsc()
+    let timed: i64 = console_poll_stub(DRIVER_STUB_CONSOLE_POLL, CONSOLE_POLL_SHORT_MS)
+    let timed_ms: u64 = ms_since(t)
+
+    var woke: i64 = -1
+    var woke_ms: u64 = 0
+    let pid: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_CONSOLE_POLL, CONSOLE_POLL_LONG_MS)
+    if pid > 0
+        if await_wait_set(pid as u64, DRV_TEST_PARK_US)
+            t = rdtsc()
+            disable_interrupts()
+            ldisc_input(CONSOLE_POLL_BYTE)
+            tty_console_irq(false)
+            enable_interrupts()
+        else
+            klog("  the stub never parked in poll\n")
+        woke = drv_stub_status(pid as u64)
+        woke_ms = ms_since(t)
+    var byte: [1]u8
+    disable_interrupts()
+    let drained: i64 = ldisc_read(@byte[0], 1)
+    enable_interrupts()
+
+    let nval: i64 = console_poll_stub(DRIVER_STUB_POLL_NVAL, 0)
+    sched_stop()
+    tty_console_set_flags(flags)
+
+    klog("  timeout 0: status ")
+    klog_dec(at_once)
+    klog(" after ")
+    klog_dec(at_once_ms as i64)
+    klog(" ms; timeout ")
+    klog_dec(CONSOLE_POLL_SHORT_MS as i64)
+    klog(" ms: status ")
+    klog_dec(timed)
+    klog(" after ")
+    klog_dec(timed_ms as i64)
+    klog(" ms; a byte: status ")
+    klog_hex(woke as u64)
+    klog(" ")
+    klog_dec(woke_ms as i64)
+    klog(" ms after it; POLLNVAL: status ")
+    klog_dec(nval)
+    klog("\n")
+    let ok_at_once: bool = at_once == 0 and at_once_ms < CONSOLE_POLL_SHORT_MS
+    let ok_timed: bool = timed == 0 and timed_ms >= CONSOLE_POLL_SHORT_MS and timed_ms < CONSOLE_POLL_LATE_MS
+    let ok_woke: bool = woke == CONSOLE_POLL_GOT_BYTE and woke_ms < CONSOLE_POLL_PROMPT_MS
+    let ok_drained: bool = drained == 1 and byte[0] == CONSOLE_POLL_BYTE
+    ok_at_once and ok_timed and ok_woke and ok_drained and nval == 0
+
+# Yield until `pid` is parked on its wait set, or `us` has passed.
+fn await_wait_set(pid: u64, us: u64) -> bool
+    let deadline: u64 = deadline_after_us(us)
+    while not parked_on_wait_set(pid) and not deadline_passed(deadline)
+        sched_yield()
+    parked_on_wait_set(pid)
+
 # The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
 # stack: boot_process_tests).
 fn driver_process_tests()
@@ -652,6 +758,7 @@ fn driver_process_tests()
     boot_test_result("driver-preempt", driver_preempt_self_test())
     boot_test_result("driver-reap", driver_reap_self_test())
     boot_test_result("drv-irq-wait", drv_irq_wait_self_test())
+    boot_test_result("console-poll", console_poll_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before

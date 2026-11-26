@@ -148,10 +148,11 @@ documents `KEY_ESCAPE` as "bare escape after timeout" but sets `VTIME` to 0
 and blocks in `read`, so today the next keystroke is what resolves it. For a
 modal editor that would make Escape-to-leave-Insert hang until the next key.
 
-On Linux, wait on stdin with `poll` and a configurable timeout (default
-25 ms) after an `ESC`. On Harland, `read(0)` blocks until a byte arrives, so
-the first Harland port is blocked on a timed console read. A monotonic
-timeout is enough; a wall clock is not required.
+After an `ESC`, wait on stdin with `poll` and a configurable timeout (default
+25 ms): `ritzlib.termsession`'s `KeyReader` does, through
+`ritzlib.timedread`'s `read_timeout`. On Harland that is `poll` on fd 0, the
+kernel's timed console read (AGAST #4829): monotonic, as fine as the 100 Hz
+scheduler tick, with no wall clock.
 
 ### Harland console
 
@@ -342,7 +343,7 @@ on both targets.
 
 | Need | Today | Required for | Milestone |
 |---|---|---|---|
-| Timed console read (`VTIME`-like timeout, or `poll` on fd 0) | `read(0)` blocks until a byte arrives | Bare Escape, key timeouts | First port |
+| Timed console read (`VTIME`-like timeout, or `poll` on fd 0) | Done (#4829): `poll` on fd 0, `ritzlib.timedread` | Bare Escape, key timeouts | First port |
 | Portable create-and-write in `ritzlib/fs.ritz` | `write_file` uses Linux-only `sys_open3` | Saving through ritzlib on Harland | First port |
 | Empty write commits on close | A zero-byte buffer commits nothing | Saving an empty buffer | First port |
 | Larger raw input queue, or an overrun the reader can see | Bytes past 1024 dropped silently | Paste, fast input bursts | Paste support |

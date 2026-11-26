@@ -18,6 +18,11 @@
 #     to waitset_tick, which wakes the parked set whose deadline has passed
 #     and no other. The shared LAPIC watchdog is not used, so two device
 #     waits cannot clear each other's timeouts.
+#   * The console, per process slot (#4829): a timed poll on fd 0
+#     (syscall/runtime/poll.ritz) parks here with a deadline and a console
+#     watch, and COM1's receive interrupt (tty/console.ritz tty_console_irq)
+#     calls waitset_console_ready, which wakes each watcher parked on its
+#     wait set. A plain read(0) still blocks on BLOCK_TTY.
 #
 # A wake only makes the process runnable: DrvIrqWait re-checks its own
 # object and deadline under cli, and parks again when neither is due. The
@@ -58,6 +63,7 @@ struct IrqObject
 
 var irq_objects: [16]IrqObject      # IRQ_OBJECT_MAX
 var waitset_deadline: [8]u64        # MAX_PROCS, by process slot; NO_DEADLINE = unarmed
+var waitset_console: [8]bool        # MAX_PROCS, by process slot: watching the console
 
 # The slot holding `object_id`, or -1.
 fn irq_object_slot(object_id: u64) -> i32
@@ -140,9 +146,26 @@ pub fn irq_object_take(object_id: u64) -> bool
 pub fn waitset_arm(slot: i32, deadline: u64)
     waitset_deadline[slot] = deadline
 
-# The process in `slot` is no longer waiting: the tick leaves it alone.
+# Console input wakes the process in `slot` while it is parked on its wait
+# set, until waitset_disarm. IF=0.
+pub fn waitset_watch_console(slot: i32)
+    waitset_console[slot] = true
+
+# The process in `slot` is no longer waiting: the tick and console input
+# leave it alone.
 pub fn waitset_disarm(slot: i32)
     waitset_deadline[slot] = NO_DEADLINE
+    waitset_console[slot] = false
+
+# Console input arrived (tty_console_irq, IF=0): wake each process watching
+# the console that is parked on its wait set. One blocked for anything
+# else, or not watching, is not touched.
+pub fn waitset_console_ready()
+    var slot: i32 = 0
+    while slot < MAX_PROCS
+        if waitset_console[slot]
+            proc_wake_pid(proc_at(slot).pid, BLOCK_WAIT)
+        slot = slot + 1
 
 # The scheduler tick, with the TSC reading `now` (sched_tick, IF=0): wake
 # each process parked on its wait set whose deadline has passed. A process

@@ -45,7 +45,7 @@ FAKE_QEMU = textwrap.dedent("""\
     # the kernel's banner and boot-test self-tests (\\harland\\boot-test,
     # #1887), then its ring dump repeating both (\\harland\\klog-dump, #1885)
     names = ("vmm higher-half heap ipc channel-close channel-debug-print munmap "
-             "mmap-failure pmm-above-4g mmap-overlap mmap-cursor mmap-driver-window elf-loader sysret nmi-gs ist-nest nmi-nest cap-device shm-map virtio-blk-read proc-create-init driver-enter driver-fault driver-preempt driver-reap drv-irq-wait").split()
+             "mmap-failure pmm-above-4g mmap-overlap mmap-cursor mmap-driver-window elf-loader sysret nmi-gs ist-nest nmi-nest cap-device shm-map virtio-blk-read proc-create-init driver-enter driver-fault driver-preempt driver-reap drv-irq-wait console-poll").split()
     log = ("\\n========================================\\n    Hello from Harland!\\n========================================\\n"
            + "".join(f"[boot-test] PASS {n}\\n" for n in names)
            + f"[boot-test] {len(names)} passed, 0 failed\\n")

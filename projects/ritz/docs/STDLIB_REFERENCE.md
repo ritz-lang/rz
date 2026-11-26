@@ -105,6 +105,7 @@ modules links without sys. A freestanding program defines all three itself.
    - [process](#process) - Subprocess spawning
    - [term](#term) - Terminal attributes and size
    - [termsession](#termsession) - Raw mode, keys and escape output
+   - [timedread](#timedread) - A read that gives up after a timeout
    - [argspec](#argspec) - Argument parsing
    - [os.env](#osenv) - Environment variables
 10. [Utilities](#utilities)
@@ -2750,7 +2751,7 @@ program as `Key.Ctrl('c')`. `Errno` comes with the import.
 |------|-----------|-------------|
 | `term_enter_raw` | `fn(fd: i32) -> Result<TermSession, Errno>` | Raw mode; the session restores the saved attributes when dropped. `.restore()`, `.resume()`, `.is_raw()`, `.fd()` |
 | `term_state_raw` | `fn(fd: i32) -> Result<TermState, Errno>` | The same with no drop, for a module-level owner (a global is never dropped): restore it by hand |
-| `key_reader` | `fn(fd: i32) -> KeyReader` | `.read_key() -> Result<Key, InputEnd>`, one byte per read. After an incomplete sequence it polls `escape_timeout_ms` (default `ESCAPE_TIMEOUT_MS`, 25) for the rest, so a lone ESC is `Key.Escape` without the next keystroke. Harland has no poll yet (AGAST #4829): there the next byte resolves it |
+| `key_reader` | `fn(fd: i32) -> KeyReader` | `.read_key() -> Result<Key, InputEnd>`, one byte per read. After an incomplete sequence it waits `escape_timeout_ms` (default `ESCAPE_TIMEOUT_MS`, 25) for the rest through `timedread.read_timeout`, so a lone ESC is `Key.Escape` without the next keystroke, on Linux and Harland |
 | `key_decoder` | `fn() -> KeyDecoder` | The byte-at-a-time decoder: `.feed(b) -> Option<Key>`, `.take_held()` (ESC then `x` is two keys), `.pending()`, `.flush()` (what a timeout does), `.reset()` |
 | `Key` | enum | `Char(u32)` (UTF-8 decoded), `Ctrl(u8)` (the lower-case letter), `Enter`, `Tab`, `Backspace`, `Escape`, arrows, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `Delete`, `F(u8)`, `Unknown`; `.eq(other)` |
 | `term_out` | `fn() -> TermOut` | A buffer of text and sequences: `.text`, `.cursor_up/down/left/right(n)`, `.cursor_column(c)`, `.cursor_to(row, col)`, `.clear_screen`, `.clear_to_eol`, `.save_cursor`, `.restore_cursor`, `.hide_cursor`, `.show_cursor`, `.enter_alt_screen`, `.leave_alt_screen`, `.style(Style)`, `.reset_style`, `.as_view`, `.flush(fd) -> Result<(), Errno>` |
@@ -2777,6 +2778,36 @@ fn run() -> Result<(), Errno>
                     out.text(".")
                 out.flush(STDOUT)?
             Err(_) => return Ok(())
+```
+
+---
+
+### timedread
+
+**Module**: `ritzlib.timedread` (Linux and Harland)
+
+"Wait at most N ms for input" as one `poll(2)` on both targets (AGAST #4829).
+On Harland, fd 0 is the serial console and its `POLLIN` is the kernel's timed
+console read; files are always ready. The timeout is monotonic. EINTR is
+retried. `Errno` comes with the import.
+
+| Item | Signature | Description |
+|------|-----------|-------------|
+| `wait_readable` | `fn(fd: i32, timeout_ms: i32) -> Result<bool, Errno>` | `Ok(true)` once a read would not block, `Ok(false)` when the timeout passed first; `timeout_ms < 0` waits as long as it takes, `0` does not wait. An fd that names no open file is `Err(BadF)` |
+| `read_timeout` | `fn(fd: i32, buf: Span<u8>, timeout_ms: i32) -> Result<TimedRead, Errno>` | `wait_readable`, then one read: `TimedRead.Read(n)` (0: the input ended) or `TimedRead.TimedOut` with `buf` untouched |
+
+```ritz
+import ritzlib.timedread
+import ritzlib.span { span_from_ptr }
+import ritzlib.sys { STDIN }
+import ritzlib.result
+
+# The next byte on stdin, or None if nothing came within 25 ms.
+fn byte_within_25ms() -> Result<Option<u8>, Errno>
+    var buf: [1]u8
+    match read_timeout(STDIN, span_from_ptr<u8>(@buf[0], 1), 25)?
+        TimedRead.Read(n) => if n == 1 then Ok(Some(buf[0])) else Ok(None)
+        TimedRead.TimedOut => Ok(None)
 ```
 
 ---

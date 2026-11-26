@@ -81,6 +81,8 @@ AREAS = {
     # NetInfo (224), NetAddr (225), NetAttach (228): NoDev until a driver
     # and service exist (#4751).
     "net": ["sys_net_info_handler", "sys_net_addr_handler", "sys_net_attach_handler"],
+    # Poll (7): the console's timed read (#4829).
+    "poll": ["sys_poll_handler"],
 }
 
 VARS = {
@@ -226,8 +228,8 @@ def test_table_registers_handlers_imported_from_their_area():
     code = _code(_area("entry"))
     regs = re.findall(r"^\s+syscall_register\(Syscall\.(\w+),\s*(\w+)\)", _body(code, "syscall_table_init"), re.M)
     # 38 since ShmMap (227, #4717); 39 with DrvIrqWait (220, #4719);
-    # 42 with NetInfo, NetAddr, NetAttach (#4751).
-    assert len(regs) == 42, regs
+    # 42 with NetInfo, NetAddr, NetAttach (#4751); 43 with Poll (7, #4829).
+    assert len(regs) == 43, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

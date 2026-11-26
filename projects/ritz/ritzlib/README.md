@@ -109,6 +109,7 @@ pub fn main() -> i32
 | `termsession.ritz` | `ritzlib.termsession` | Raw mode (Linux and Harland), keys with the Escape timeout, escape output |
 | `testlib.ritz` | `ritzlib.testlib` | Helpers for `[[test]]` integration tests |
 | `time.ritz` | `ritzlib.time` | Duration, sleep(Duration) and the wall clock |
+| `timedread.ritz` | `ritzlib.timedread` | a read that gives up after a timeout, on Linux and Harland |
 | `timer.ritz` | `ritzlib.timer` | High-performance timing utilities |
 | `uring.ritz` | `ritzlib.uring` | io_uring bindings for Linux |
 <!-- END module table -->

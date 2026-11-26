@@ -1,0 +1,151 @@
+# ritzlib.timedread: a read that gives up after a timeout (AGAST #4829).
+#
+# On Linux, on a pipe: with nothing written, wait_readable and read_timeout
+# return after the timeout (no sooner), and a byte already there, or one
+# written before the deadline, returns at once. A closed write end is input
+# ending (Read(0)), and a number that names no open file is Err(BadF). The
+# same API on Harland is exercised by indium's timed_read_test Tier-1
+# program and the kernel's console-poll boot test.
+
+import ritzlib.sys
+import ritzlib.timedread
+import ritzlib.fd
+import ritzlib.process
+import ritzlib.time
+import ritzlib.timer
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span
+import ritzlib.strview
+
+fn new_pipe() -> Option<Pipe>
+    match pipe()
+        Ok(p) => Some(p)
+        Err(_) => None
+
+fn is_timed_out(r: Result<TimedRead, Errno>) -> bool
+    match r
+        Ok(t) => match t
+            TimedRead.TimedOut => true
+            TimedRead.Read(_) => false
+        Err(_) => false
+
+# Ok(Read(n)) as n, TimedOut as -1000, Err as minus its errno.
+fn read_n(r: Result<TimedRead, Errno>) -> i64
+    match r
+        Ok(t) => match t
+            TimedRead.Read(n) => n
+            TimedRead.TimedOut => -1000
+        Err(e) => -(e.code() as i64)
+
+# Ok(true) as 1, Ok(false) as 0, Err as minus its errno.
+fn wait_result(r: Result<bool, Errno>) -> i32
+    match r
+        Ok(ready) => if ready then 1 else 0
+        Err(e) => -e.code()
+
+# Nothing written: Ok(false) after the timeout, not before it.
+[[test]]
+fn test_wait_readable_times_out() -> i32
+    var p: Pipe = match new_pipe()
+        Some(pp) => pp
+        None => return 1
+    let start: i64 = now_millis()
+    assert wait_result(wait_readable(p.read.raw(), 30)) == 0
+    let waited: i64 = now_millis() - start
+    assert waited >= 30
+    assert waited < 2000
+    p.write.close()
+    p.read.close()
+    0
+
+# A byte already there: Ok(true) with no wait, even with a long timeout.
+[[test]]
+fn test_wait_readable_ready_at_once() -> i32
+    var p: Pipe = match new_pipe()
+        Some(pp) => pp
+        None => return 1
+    assert p.write.write_str("x").is_ok()
+    let start: i64 = now_millis()
+    assert wait_result(wait_readable(p.read.raw(), 5000)) == 1
+    assert now_millis() - start < 1000
+    # A zero timeout asks without waiting.
+    assert wait_result(wait_readable(p.read.raw(), 0)) == 1
+    p.write.close()
+    p.read.close()
+    0
+
+# read_timeout with nothing written: TimedOut after the timeout, the buffer
+# untouched; a zero timeout is TimedOut at once.
+[[test]]
+fn test_read_timeout_times_out() -> i32
+    var p: Pipe = match new_pipe()
+        Some(pp) => pp
+        None => return 1
+    var buf: [4]u8
+    buf[0] = 0x5A
+    let start: i64 = now_millis()
+    assert is_timed_out(read_timeout(p.read.raw(), span_from_ptr<u8>(@buf[0], 4), 30))
+    assert now_millis() - start >= 30
+    assert buf[0] == 0x5A
+    assert is_timed_out(read_timeout(p.read.raw(), span_from_ptr<u8>(@buf[0], 4), 0))
+    p.write.close()
+    p.read.close()
+    0
+
+# A byte written by another process 20 ms in, inside a 5 s timeout, is read
+# as soon as it arrives.
+[[test]]
+fn test_read_timeout_byte_before_the_deadline() -> i32
+    var p: Pipe = match new_pipe()
+        Some(pp) => pp
+        None => return 1
+    let child: i32 = match fork()
+        Ok(fr) => match fr
+            Child =>
+                p.read.close()
+                sleep_ms(20)
+                p.write.write_str("k")
+                sys_exit(0)
+                0
+            Parent(pid) => pid
+        Err(_) => return 2
+    p.write.close()
+    var buf: [4]u8
+    let start: i64 = now_millis()
+    assert read_n(read_timeout(p.read.raw(), span_from_ptr<u8>(@buf[0], 4), 5000)) == 1
+    assert now_millis() - start < 2000
+    assert buf[0] == 'k'
+    wait_pid(child)
+    p.read.close()
+    0
+
+# The write end closed: input ended, Read(0), with no wait. A negative
+# timeout waits as long as it takes and reads the same way.
+[[test]]
+fn test_read_timeout_end_of_input() -> i32
+    var p: Pipe = match new_pipe()
+        Some(pp) => pp
+        None => return 1
+    assert p.write.write_str("ab").is_ok()
+    p.write.close()
+    var buf: [4]u8
+    assert read_n(read_timeout(p.read.raw(), span_from_ptr<u8>(@buf[0], 4), -1)) == 2
+    assert buf[0] == 'a' and buf[1] == 'b'
+    assert read_n(read_timeout(p.read.raw(), span_from_ptr<u8>(@buf[0], 4), 5000)) == 0
+    p.read.close()
+    0
+
+# A number that names no open file: Err(BadF), from either call.
+[[test]]
+fn test_closed_fd_is_badf() -> i32
+    var p: Pipe = match new_pipe()
+        Some(pp) => pp
+        None => return 1
+    let gone: i32 = p.read.raw()
+    p.read.close()
+    p.write.close()
+    assert wait_result(wait_readable(gone, 1000)) == -9         # EBADF
+    var buf: [1]u8
+    assert read_n(read_timeout(gone, span_from_ptr<u8>(@buf[0], 1), 1000)) == -9
+    0

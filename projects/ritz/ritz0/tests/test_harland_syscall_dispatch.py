@@ -67,7 +67,11 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 # were declared but never dispatched, so every call got an error (AGAST #2122):
 # they are gone, and their numbers are free.
 ABI = {
-    "Read": 0, "Write": 1, "Open": 2, "Close": 3, "Lseek": 8,
+    "Read": 0, "Write": 1, "Open": 2, "Close": 3,
+    # Poll (7): Linux's poll(2); fd 0's POLLIN is the console's timed read
+    # (#4829, ritzlib.timedread).
+    "Poll": 7,
+    "Lseek": 8,
     "Mmap": 9, "Munmap": 11, "TtySetfg": 16, "Readdir": 17, "TtyGetattr": 18, "TtySetattr": 19,
     "Exit": 20, "Spawn": 21, "Wait": 22, "Getpid": 23, "Yield": 24,
     "SpawnArgs": 25, "Getcwd": 26, "Chdir": 27, "SpawnBg": 28,
@@ -104,7 +108,7 @@ DISPATCHED = {
     "IpcRecv", "IpcClose", "CapGrant", "CapRevoke", "CapDerive", "CapInfo",
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
-    "Sync", "Smp", "ShmMap", "DrvIrqWait", "NetInfo", "NetAddr", "NetAttach",
+    "Sync", "Smp", "ShmMap", "DrvIrqWait", "NetInfo", "NetAddr", "NetAttach", "Poll",
 }
 
 

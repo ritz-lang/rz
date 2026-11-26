@@ -23,6 +23,12 @@
 #                      { handle, EVENT_DATA }, out[1] kept
 #                   5  the same again        -> 1 at the deadline:
 #                      out_count 0, out[0] kept
+#   mode 4 (CONSOLE_POLL, #4829): one poll(2) on { fd 0, POLLIN } with
+#                   timeout RSI ms; the exit status is
+#                   revents << 8 | (the return & 0xFF).
+#   mode 5 (POLL_NVAL, #4829): poll(2) on { -1, POLLIN } and { 63, POLLIN }
+#                   with no timeout; exit 0 if it returned 1 at once with
+#                   revents 0 and POLLNVAL, else 1.
 # Report: Getpid, the CPL from CS, and arg1, packed into the exit status
 #   (arg1 & 0x7FFF) << 16 | cpl << 8 | (pid & 0xFF)
 # which the kernel decodes and logs as "[driver] pid N cpl C arg1 K".
@@ -33,11 +39,23 @@
 .equ SYS_EXIT,   20
 .equ SYS_GETPID, 23
 .equ SYS_DRV_IRQ_WAIT, 220
+.equ SYS_POLL,   7
 
 # Modes (postinit.ritz DRIVER_STUB_*)
 .equ DRIVER_STUB_FAULT, 1
 .equ DRIVER_STUB_SPIN,  2
 .equ DRIVER_STUB_IRQ_WAIT, 3
+.equ DRIVER_STUB_CONSOLE_POLL, 4
+.equ DRIVER_STUB_POLL_NVAL, 5
+
+# ritzlib.sys PollFd (8 bytes): fd i32, events i16, revents i16
+.equ PFD_FD,      0
+.equ PFD_EVENTS,  4
+.equ PFD_REVENTS, 6
+.equ PFD_SIZE,    8
+.equ POLLIN,      1
+.equ POLLNVAL,    32
+.equ POLL_NOT_OPEN, 63
 
 # driver_abi/src/wait.ritz: WaitRequest (40 bytes) and WaitEvent (16)
 .equ WR_SOURCES,      0
@@ -71,6 +89,10 @@ driver_stub_start:
 .Ldriver_stub_not_fault:
     cmpq $DRIVER_STUB_IRQ_WAIT, %r12
     je .Ldriver_stub_irq_wait
+    cmpq $DRIVER_STUB_CONSOLE_POLL, %r12
+    je .Ldriver_stub_console_poll
+    cmpq $DRIVER_STUB_POLL_NVAL, %r12
+    je .Ldriver_stub_poll_nval
     cmpq $DRIVER_STUB_SPIN, %r12
     jne .Ldriver_stub_report
     rdtsc
@@ -191,6 +213,52 @@ driver_stub_start:
     movq %rbx, WR_EVENTS+WE_SIZE+WE_HANDLE(%r14)
     movq %rbx, WR_EVENTS+WE_SIZE+WE_BITS(%r14)
     ret
+
+# Mode 4: poll { 0, POLLIN } for r13 ms.
+.Ldriver_stub_console_poll:
+    subq $16, %rsp
+    movl $0, PFD_FD(%rsp)
+    movw $POLLIN, PFD_EVENTS(%rsp)
+    movw $0x7777, PFD_REVENTS(%rsp)     # the kernel must write it
+    movq $SYS_POLL, %rax
+    movq %rsp, %rdi
+    movl $1, %esi
+    movq %r13, %rdx
+    syscall
+    movzbl %al, %edi
+    movzwl PFD_REVENTS(%rsp), %eax
+    shll $8, %eax
+    orl %eax, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# Mode 5: a skipped entry and a number that names no file, no timeout.
+.Ldriver_stub_poll_nval:
+    subq $16, %rsp
+    movl $-1, PFD_FD(%rsp)
+    movw $POLLIN, PFD_EVENTS(%rsp)
+    movw $0x7777, PFD_REVENTS(%rsp)
+    movl $POLL_NOT_OPEN, PFD_SIZE+PFD_FD(%rsp)
+    movw $POLLIN, PFD_SIZE+PFD_EVENTS(%rsp)
+    movw $0x7777, PFD_SIZE+PFD_REVENTS(%rsp)
+    movq $SYS_POLL, %rax
+    movq %rsp, %rdi
+    movl $2, %esi
+    movq $-1, %rdx
+    syscall
+    movl $1, %edi
+    cmpq $1, %rax
+    jne .Lpoll_nval_exit
+    cmpw $0, PFD_REVENTS(%rsp)
+    jne .Lpoll_nval_exit
+    cmpw $POLLNVAL, PFD_SIZE+PFD_REVENTS(%rsp)
+    jne .Lpoll_nval_exit
+    xorl %edi, %edi
+.Lpoll_nval_exit:
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
 
 .size driver_stub_start, . - driver_stub_start
 

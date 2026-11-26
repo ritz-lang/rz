@@ -1,0 +1,65 @@
+# timed_read_test: ritzlib.timedread on Harland (AGAST #4829).
+#
+# The portable "read with timeout" API is a poll(2) on both targets; on
+# Harland fd 0 is the serial console and its POLLIN is the kernel's timed
+# console read. The Tier-1 boot types nothing at the console, so each wait
+# on fd 0 must end at its timeout instead of blocking for a byte, and the
+# buffer stays untouched. A number that names no open file is Err(BadF) at
+# once. The same API's Linux run is ritzlib/tests/test_timedread.ritz; the
+# kernel's console-poll boot test measures the wait and a byte arriving
+# before the deadline.
+#
+# Exit 0 only if every claim held; each failure has its own code.
+
+import ritzlib.strview { StrView }
+import ritzlib.timedread
+import ritzlib.span { span_from_ptr }
+import ritzlib.result
+
+const STDIN: i32 = 0
+# Never opened by this program: harland's poll reports it POLLNVAL.
+const NOT_OPEN: i32 = 63
+const UNTOUCHED: u8 = 0x5A
+
+fn timed_out(name: StrView, r: Result<TimedRead, Errno>) -> bool
+    match r
+        Ok(t) => match t
+            TimedRead.TimedOut => true
+            TimedRead.Read(n) =>
+                print("[timed_read_test] FAIL: {name} read {n} bytes\n")
+                false
+        Err(e) =>
+            print("[timed_read_test] FAIL: {name} failed: {e.code()}\n")
+            false
+
+pub fn main() -> i32
+    # Asked without waiting: nothing typed.
+    match wait_readable(STDIN, 0)
+        Ok(ready) =>
+            if ready
+                print("[timed_read_test] FAIL: the console had input\n")
+                return 1
+        Err(_) => return 2
+    # A 50 ms wait ends at its timeout.
+    match wait_readable(STDIN, 50)
+        Ok(ready) =>
+            if ready
+                return 3
+        Err(_) => return 4
+    # read_timeout: TimedOut, the buffer untouched.
+    var buf: [4]u8
+    buf[0] = UNTOUCHED
+    if not timed_out("read_timeout(0, 30 ms)", read_timeout(STDIN, span_from_ptr<u8>(@buf[0], 4), 30))
+        return 5
+    if buf[0] != UNTOUCHED
+        return 6
+    # The number names no file: Err(BadF), with no wait.
+    match wait_readable(NOT_OPEN, -1)
+        Ok(_) =>
+            print("[timed_read_test] FAIL: fd 63 was ready\n")
+            return 7
+        Err(e) =>
+            if e.code() != 9
+                return 8
+    print("[timed_read_test] PASS: console reads time out and a closed fd is EBADF\n")
+    return 0

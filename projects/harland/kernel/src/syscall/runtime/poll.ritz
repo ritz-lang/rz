@@ -1,0 +1,107 @@
+# Harland Syscall Runtime - poll (AGAST #4829)
+#
+# Poll (7, Linux's number and ABI): poll(fds, nfds, timeout_ms) -> how many
+# entries have a non-zero revents, 0 when the timeout passed first, or an
+# errno. `fds` is nfds 8-byte entries { fd: i32, events: i16, revents: i16 }
+# (ritzlib's PollFd); revents is written for every entry. timeout_ms < 0
+# waits as long as it takes, 0 does not wait.
+#
+#   fd < 0          skipped: revents 0
+#   a file          POLLIN | POLLOUT, as asked: a file never blocks
+#   fd 0, the       POLLIN once read(0) would return (a line, or a raw byte,
+#   console         or an end of input: tty_console_readable); POLLOUT
+#   fds 1, 2        POLLOUT (the console's output; read on them is BadF)
+#   anything else   POLLNVAL, which counts, so the call returns at once
+#
+#   Errno.Inval     nfds above POLL_FDS_MAX
+#   Errno.Fault     the array is not the caller's writable memory
+#
+# Why poll and not a VTIME timeout in the console flags (tty_setattr): this is
+# the call ritzlib already makes on Linux for a key reader's Escape timeout
+# (ritzlib.timedread, ritzlib.termsession), so one portable function covers
+# both targets; it needs no change to the TtyAttrs ABI or to read(0); and
+# VTIME counts tenths of a second, too coarse for a 25 ms Escape timeout.
+#
+# The wait is tty_console_wait's: parked on the caller's wait set with a TSC
+# deadline (monotonic, no wall clock) and a console watch, so COM1 input or
+# the deadline (sched_tick, 100 Hz) ends it.
+
+import ritzlib.option
+import mm.uptr { uptr_check_write }
+import syscall.errno { Errno }
+import fs.syscall { is_fs_fd }
+import tty.console { tty_console_readable, tty_console_wait }
+import arch.x86_64.tsc { deadline_after_us }
+
+# ritzlib.sys's PollFd.
+struct PollFd
+    fd: i32
+    events: i16
+    revents: i16
+
+const POLLIN: i16 = 1
+const POLLOUT: i16 = 4
+const POLLNVAL: i16 = 32
+
+# The most entries one call takes.
+const POLL_FDS_MAX: u64 = 64
+const US_PER_MS: u64 = 1000
+
+# What one entry reports, `console_readable` being tty_console_readable's
+# answer.
+fn poll_revents(fd: i32, events: i16, console_readable: bool) -> i16
+    if fd < 0
+        return 0
+    if is_fs_fd(fd)
+        return events & (POLLIN | POLLOUT)
+    if fd == 0
+        var r: i16 = events & POLLOUT
+        if console_readable
+            r = r | (events & POLLIN)
+        return r
+    if fd <= 2
+        return events & POLLOUT
+    POLLNVAL
+
+# Write every entry's revents; how many are non-zero.
+fn poll_fill(fds: *PollFd, nfds: u64, console_readable: bool) -> i64
+    var count: i64 = 0
+    var i: u64 = 0
+    while i < nfds
+        let e: *PollFd = fds + i
+        let r: i16 = poll_revents(e.fd, e.events, console_readable)
+        (*e).revents = r
+        if r != 0
+            count = count + 1
+        i = i + 1
+    count
+
+# Whether an entry waits for console input: fd 0 asking POLLIN (and not a file).
+fn poll_wants_console(fds: *PollFd, nfds: u64) -> bool
+    var i: u64 = 0
+    while i < nfds
+        let e: *PollFd = fds + i
+        if e.fd == 0 and (e.events & POLLIN) != 0 and not is_fs_fd(0)
+            return true
+        i = i + 1
+    false
+
+# poll(fds, nfds, timeout_ms): the caller's page table is loaded.
+pub fn sys_poll_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    let fds: *PollFd = rdi as *PollFd
+    let nfds: u64 = rsi
+    # An int in Linux's ABI: the low 32 bits, signed.
+    let timeout_ms: i32 = rdx as i32
+    if nfds > POLL_FDS_MAX
+        return Errno.Inval as i64
+    if nfds > 0 and uptr_check_write(fds as *u8, nfds * sizeof(PollFd) as u64) != 0
+        return Errno.Fault as i64
+    let count: i64 = poll_fill(fds, nfds, tty_console_readable())
+    if count > 0 or timeout_ms == 0
+        return count
+    # Nothing ready: only console input or the deadline can change that.
+    var deadline: Option<u64> = None
+    if timeout_ms > 0
+        deadline = Some(deadline_after_us(timeout_ms as u64 * US_PER_MS))
+    let readable: bool = tty_console_wait(poll_wants_console(fds, nfds), deadline)
+    poll_fill(fds, nfds, readable)

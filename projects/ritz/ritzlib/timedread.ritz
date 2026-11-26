@@ -1,0 +1,70 @@
+# ritzlib/timedread.ritz - a read that gives up after a timeout, on Linux and Harland
+#
+# The portable form of "wait at most N ms for input" (AGAST #4829): one
+# poll(2) on both targets. Linux's poll takes any fd; Harland's takes fd 0
+# (the console: the kernel's timed console read), files (always ready) and
+# fds 1-2 (harland kernel/src/syscall/runtime/poll.ritz). The timeout is
+# monotonic on both: no wall clock is read.
+#
+#   wait_readable(fd, timeout_ms) -> Result<bool, Errno>
+#       Ok(true) once a read on `fd` would not block (input, its end, or an
+#       error the read will report), Ok(false) when `timeout_ms` passed
+#       first. timeout_ms < 0 waits as long as it takes; 0 does not wait.
+#   read_timeout(fd, buf, timeout_ms) -> Result<TimedRead, Errno>
+#       wait_readable, then one read(2) into `buf`: Read(n) (0: the input
+#       ended), or TimedOut with `buf` untouched.
+#
+#   var buf: [1]u8
+#   match read_timeout(STDIN, span_from_ptr<u8>(@buf[0], 1), 25)
+#       Ok(TimedRead.Read(n)) => ...      # n bytes, or 0 at end of input
+#       Ok(TimedRead.TimedOut) => ...     # nothing within 25 ms
+#       Err(e) => ...                     # BadF, ...
+#
+# ritzlib.termsession's KeyReader reads every byte through read_timeout:
+# after an ESC it waits escape_timeout_ms for the rest of a sequence, so a
+# bare Escape arrives on its own on both targets.
+#
+# An EINTR from poll or read is retried, so Err(Intr) never escapes; a
+# retried wait starts its timeout again (a signal can lengthen it).
+
+import ritzlib.sys
+import ritzlib.span { Span }
+import ritzlib.result
+# Errno is every Err here, so importers of timedread get it too.
+pub import ritzlib.errno
+
+const EINTR: i32 = 4
+
+# What read_timeout found.
+pub enum TimedRead
+    Read(i64)       # bytes read into the buffer; 0 when the input ended
+    TimedOut        # nothing arrived within the timeout
+
+# Whether a read on `fd` would return within `timeout_ms` (above). A number
+# that names no open file is Err(BadF).
+pub fn wait_readable(fd: i32, timeout_ms: i32) -> Result<bool, Errno>
+    var fds: [1]PollFd
+    fds[0] = PollFd { fd: fd, events: POLLIN, revents: 0 }
+    var rc: i32 = sys_poll(@fds[0], 1, timeout_ms)
+    while rc == -EINTR
+        fds[0].revents = 0
+        rc = sys_poll(@fds[0], 1, timeout_ms)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    if rc == 0
+        return Ok(false)
+    if (fds[0].revents & POLLNVAL) != 0
+        return Err(Errno.BadF)
+    Ok(true)
+
+# Wait up to `timeout_ms` for input on `fd`, then read what is there into
+# `buf` (above). timeout_ms < 0 is a plain blocking read.
+pub fn read_timeout(fd: i32, buf: Span<u8>, timeout_ms: i32) -> Result<TimedRead, Errno>
+    if timeout_ms >= 0 and not wait_readable(fd, timeout_ms)?
+        return Ok(TimedRead.TimedOut)
+    var n: i64 = sys_read(fd, buf.ptr, buf.len)
+    while n == -(EINTR as i64)
+        n = sys_read(fd, buf.ptr, buf.len)
+    if n < 0
+        return Err(errno_from_raw(n as i32))
+    Ok(TimedRead.Read(n))

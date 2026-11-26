@@ -33,15 +33,15 @@
 # 1, VTIME 0) and TTY_ECHO | TTY_ICANON | TTY_ISIG on Harland. With ISIG off,
 # Ctrl-C reaches the program as Key.Ctrl('c') instead of killing it.
 #
-# Harland's console read blocks until a byte arrives and has no poll, so the
-# Escape timeout is not available there yet: an ESC waits for the next byte,
-# as it did in rzsh. `input_waits` is the seam the timed console read
-# (AGAST #4829) fills in.
+# The Escape timeout is ritzlib.timedread's read_timeout, a poll(2) on both
+# targets: on Harland the kernel's timed console read (AGAST #4829), so a
+# bare Escape arrives there without the next keystroke too.
 
 import ritzlib.sys
 import ritzlib.result
 import ritzlib.option
-import ritzlib.span { Span }
+import ritzlib.span { Span, span_from_ptr }
+import ritzlib.timedread { TimedRead, read_timeout }
 import ritzlib.strview { StrView }
 import ritzlib.string
 import ritzlib.fmt.digits { fmt_i64_into }
@@ -345,48 +345,36 @@ impl KeyReader
     # bytes after the key stay in the terminal for whoever reads next (rzsh
     # hands typeahead to the command it runs).
     pub fn read_key(self: @&KeyReader) -> Result<Key, InputEnd>
+        var byte: [1]u8
         while true
             match self.decoder.take_held()
                 Some(k) => return Ok(k)
                 None => pass
-            if self.decoder.pending() and not input_waits(self.fd, self.escape_timeout_ms)
-                match self.decoder.flush()
-                    Some(k) => return Ok(k)
-                    None => pass
-            var byte: [1]u8
-            let n: i64 = sys_read(self.fd, @byte[0], 1)
-            if n == 1
-                match self.decoder.feed(byte[0])
-                    Some(k) => return Ok(k)
-                    None => pass
-            else if n == 0
-                # The input closed in the middle of a sequence: that key first.
-                match self.decoder.flush()
-                    Some(k) => return Ok(k)
-                    None => return Err(InputEnd.Eof)
-            else if n != -4    # EINTR: read again
-                return Err(InputEnd.Failed(errno_from_raw(n as i32)))
+            # Between keys, wait as long as it takes; inside a sequence, at
+            # most escape_timeout_ms for its next byte.
+            var wait: i32 = -1
+            if self.decoder.pending()
+                wait = self.escape_timeout_ms
+            match read_timeout(self.fd, span_from_ptr<u8>(@byte[0], 1), wait)
+                Ok(r) => match r
+                    TimedRead.Read(n) =>
+                        if n == 0
+                            # The input closed in the middle of a sequence: that key first.
+                            match self.decoder.flush()
+                                Some(k) => return Ok(k)
+                                None => return Err(InputEnd.Eof)
+                        match self.decoder.feed(byte[0])
+                            Some(k) => return Ok(k)
+                            None => pass
+                    TimedRead.TimedOut =>
+                        match self.decoder.flush()
+                            Some(k) => return Ok(k)
+                            None => pass
+                Err(e) => return Err(InputEnd.Failed(e))
 
     # Drop any sequence in progress (rzsh starts each line afresh).
     pub fn reset(self: @&KeyReader)
         self.decoder.reset()
-
-# Whether input on `fd` is ready within `timeout_ms` (poll(2)). An error other
-# than EINTR says yes, so the read that follows reports it.
-[[target_os = "linux"]]
-fn input_waits(fd: i32, timeout_ms: i32) -> bool
-    var fds: [1]PollFd
-    fds[0] = PollFd { fd: fd, events: POLLIN, revents: 0 }
-    var rc: i32 = sys_poll(@fds[0], 1, timeout_ms)
-    while rc == -4
-        rc = sys_poll(@fds[0], 1, timeout_ms)
-    rc != 0
-
-# Harland: no poll and no timed console read yet (AGAST #4829), so the next
-# byte is always awaited, as a blocking read.
-[[target_os = "harland"]]
-fn input_waits(fd: i32, timeout_ms: i32) -> bool
-    true
 
 # ============================================================================
 # TermSession: raw mode, restored on drop

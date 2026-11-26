@@ -38,6 +38,7 @@ DRIVER = KERNEL_SRC / "syscall" / "runtime" / "driver.ritz"
 MSIX = KERNEL_SRC / "drivers" / "msix.ritz"
 SCHED = KERNEL_SRC / "proc" / "sched.ritz"
 ENTRY = KERNEL_SRC / "syscall" / "runtime" / "entry.ritz"
+CONSOLE = KERNEL_SRC / "tty" / "console.ritz"
 
 MODULES = ["syscall/errno.ritz", "proc/table.ritz", "proc/waitset.ritz"]
 
@@ -201,6 +202,39 @@ fn main() -> i32
     # Its id can be registered again, cold.
     if not irq_object_register(OBJ_A, VEC_A) or irq_object_take(OBJ_A)
         return 21
+
+    # The console on the wait set (#4829, a timed poll on fd 0): console
+    # input wakes each slot watching it while parked on its wait set, and
+    # no other.
+    park(d, BLOCK_WAIT)
+    waitset_watch_console(d)
+    park(o, BLOCK_WAIT)
+    waitset_console_ready()
+    if not running(d)
+        return 23
+    if not parked(o, BLOCK_WAIT)
+        return 24
+    # A watcher blocked for anything else is not woken (the console's own
+    # BLOCK_TTY readers are proc_wake's).
+    park(d, BLOCK_TTY)
+    waitset_console_ready()
+    if not parked(d, BLOCK_TTY)
+        return 25
+    proc_wake(BLOCK_TTY)
+    # Disarming ends the watch as well as the deadline.
+    waitset_disarm(d)
+    park(d, BLOCK_WAIT)
+    waitset_console_ready()
+    if not parked(d, BLOCK_WAIT)
+        return 26
+    # A watch with a deadline: the deadline wakes it with no input.
+    waitset_watch_console(d)
+    waitset_arm(d, 50)
+    waitset_tick(50)
+    if not running(d)
+        return 27
+    waitset_disarm(d)
+    proc_wake_pid(OTHER, BLOCK_WAIT)
     0
 """
 
@@ -241,3 +275,15 @@ def test_sched_tick_expires_wait_set_deadlines():
 def test_entry_registers_drv_irq_wait():
     src = ENTRY.read_text()
     assert "syscall_register(Syscall.DrvIrqWait, sys_drv_irq_wait_handler)" in src
+
+
+def test_console_input_wakes_console_watchers():
+    """#4829: COM1's receive interrupt wakes the BLOCK_TTY readers and the
+    wait sets watching the console (a timed poll on fd 0)."""
+    body = _fn_body(CONSOLE.read_text(), "tty_console_irq")
+    assert "proc_wake(BLOCK_TTY)" in body and "waitset_console_ready()" in body, body
+
+
+def test_entry_registers_poll():
+    src = ENTRY.read_text()
+    assert "syscall_register(Syscall.Poll, sys_poll_handler)" in src
