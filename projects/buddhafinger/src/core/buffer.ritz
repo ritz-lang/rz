@@ -125,6 +125,7 @@ pub struct Buffer
     # line doesn't rescan the lines above it.
     starts: Vec<i64>
     history: History
+    revision: i64           # how many times the text has changed (revision())
 
 impl Drop for Buffer
     fn drop(self: @&Buffer)
@@ -134,13 +135,13 @@ impl Drop for Buffer
 pub fn buffer_new() -> Buffer
     var lines: Vec<Line> = vec_new<Line>()
     lines.push(line_empty())
-    Buffer { lines: lines, total: 0, starts: vec_new<i64>(), history: history_new() }
+    Buffer { lines: lines, total: 0, starts: vec_new<i64>(), history: history_new(), revision: 0 }
 
 # A buffer holding `data` byte for byte: any terminators, NULs and
 # malformed UTF-8 come back out of serialize() unchanged.
 pub fn buffer_from_bytes(data: [u8]) -> Buffer
     let lines = parse_lines(data)
-    Buffer { lines: lines, total: data.len, starts: vec_new<i64>(), history: history_new() }
+    Buffer { lines: lines, total: data.len, starts: vec_new<i64>(), history: history_new(), revision: 0 }
 
 impl Buffer
     # ------------------------------------------------------------------
@@ -311,6 +312,7 @@ impl Buffer
             return s
         let removed = self.text(s, e)
         self.history.record(off, removed[0..removed.len()], text)
+        self.revision += 1
         if s.line == e.line and not has_break(text) and not self.joins_cr_lf(s.line, removed.len(), text.len)
             # Line-local: splice the one line's bytes in place.
             splice_bytes(@&self.lines[s.line].bytes, s.col, removed.len(), text)
@@ -443,6 +445,7 @@ impl Buffer
             k -= 1
         let at = g.edits[0].off
         self.history.redo.push(g)
+        self.revision += 1
         Some(self.pos_at(at))
 
     # Redo the last undone step. Returns where its first edit was, or None
@@ -458,7 +461,14 @@ impl Buffer
             self.replace_bytes(off, off + n, span_from_vec<u8>(@g.edits[k].inserted))
         let at = g.edits[0].off
         self.history.undo.push(g)
+        self.revision += 1
         Some(self.pos_at(at))
+
+    # A count that goes up with every change to the text (an edit, an undo,
+    # a redo) and never otherwise: a renderer compares it with the one it
+    # last drew to know whether cached line data is stale.
+    pub fn revision(self: @Buffer) -> i64
+        self.revision
 
     # True while the buffer differs from the state last saved (or loaded),
     # as undo history sees it: `:q` refuses.

@@ -3,10 +3,27 @@
 #   tcgetattr(fd) -> Result<Termios, Errno>
 #   tcsetattr(fd, @t, when: TcsetWhen) -> Result<(), Errno>
 #   get_winsize(fd) -> Result<Winsize, Errno>
+#   set_winsize(fd, @ws) -> Result<(), Errno>
+#   make_controlling_tty(fd) -> Result<(), Errno>
+#   pty_open() -> Result<Pty, Errno>    pty.master, pty.slave_path(), pty.open_slave()
 #
-# Each is one ioctl(2) on `fd` (TCGETS / TCSETS* / TIOCGWINSZ).  A fd that
-# is not a terminal is Err(Other(25)) (ENOTTY), which is the usual answer
-# under a test harness or a pipe.
+# Each is one ioctl(2) on `fd` (TCGETS / TCSETS* / TIOCGWINSZ / TIOCSWINSZ /
+# TIOCSCTTY).  A fd that is not a terminal is Err(Other(25)) (ENOTTY), which
+# is the usual answer under a test harness or a pipe.
+#
+# A pty is a terminal a program makes for another to run on (a test driving
+# a full-screen program, AGAST #4819): the child takes the slave end as its
+# controlling terminal, the parent writes keys to the master and reads the
+# screen back from it, and set_winsize on the master resizes it.
+#
+#   match pty_open()
+#       Ok(pty) =>
+#           ... fork; in the child:
+#               new_session()                  # ritzlib.process
+#               let tty: Fd = pty.open_slave()?
+#               make_controlling_tty(tty.raw())
+#           ... in the parent: pty.master.write_str("ihello\e")
+#       Err(e) => ...    # no /dev/ptmx
 #
 #   match tcgetattr(STDIN)
 #       Ok(orig) =>
@@ -22,6 +39,8 @@
 
 import ritzlib.sys
 import ritzlib.result
+import ritzlib.string
+import ritzlib.fd { Fd, fd_open }
 # Termios / Winsize are this API's values, so importers of term get them too.
 pub import ritzlib.sys { Termios, Winsize }
 # Errno is part of this API (every Err), so importers of term get it too.
@@ -63,3 +82,67 @@ pub fn get_winsize(fd: i32) -> Result<Winsize, Errno>
     if rc < 0
         return Err(errno_from_raw(rc))
     Ok(ws)
+
+# Set the window size of the terminal on `fd`. On a pty master the kernel
+# sends SIGWINCH to the slave's foreground process group when it changes.
+[[target_os = "linux"]]
+pub fn set_winsize(fd: i32, ws: @Winsize) -> Result<(), Errno>
+    var copy: Winsize = *ws
+    let rc: i32 = sys_ioctl(fd, TIOCSWINSZ, @copy as *u8)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(())
+
+# Make the terminal on `fd` this process's controlling terminal (TIOCSCTTY):
+# the one that sends its foreground group SIGWINCH, and SIGHUP when it goes
+# away. The caller leads a session with no terminal yet (ritzlib.process's
+# new_session); else Err(Perm).
+[[target_os = "linux"]]
+pub fn make_controlling_tty(fd: i32) -> Result<(), Errno>
+    let rc: i32 = sys_ioctl(fd, TIOCSCTTY, null)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(())
+
+# How a pty's ends are opened: read-write, close-on-exec, and never as the
+# controlling terminal (make_controlling_tty does that). Harland has no ptys
+# (pty_open is Linux-only); its value only lets Pty's methods compile there.
+[[target_os = "linux"]]
+const PTY_OPEN_FLAGS: i32 = O_RDWR | O_NOCTTY | O_CLOEXEC
+[[target_os = "harland"]]
+const PTY_OPEN_FLAGS: i32 = O_RDWR
+
+# A pseudo-terminal: the master end, owned by whoever opened it (close it
+# once), and the number of its slave end, /dev/pts/<number>.
+pub struct Pty
+    master: Fd
+    number: u32
+
+# A new pseudo-terminal from /dev/ptmx, its slave end unlocked and ready to
+# open. Neither end becomes this process's controlling terminal.
+[[target_os = "linux"]]
+pub fn pty_open() -> Result<Pty, Errno>
+    var master: Fd = fd_open("/dev/ptmx", PTY_OPEN_FLAGS, 0)?
+    var unlock: i32 = 0
+    var rc: i32 = sys_ioctl(master.raw(), TIOCSPTLCK, @unlock as *u8)
+    if rc >= 0
+        var number: u32 = 0
+        rc = sys_ioctl(master.raw(), TIOCGPTN, @number as *u8)
+        if rc >= 0
+            return Ok(Pty { master: master, number: number })
+    let closed = master.close()
+    Err(errno_from_raw(rc))
+
+impl Pty
+    # "/dev/pts/<number>": the slave end's path.
+    pub fn slave_path(self: @Pty) -> String
+        var path: String = string_from("/dev/pts/")
+        path.push_i64(self.number as i64)
+        path
+
+    # Open the slave end for reading and writing (close-on-exec, and not as
+    # a controlling terminal: make_controlling_tty does that), owned by the
+    # caller.
+    pub fn open_slave(self: @Pty) -> Result<Fd, Errno>
+        let path: String = self.slave_path()
+        fd_open(path.as_view(), PTY_OPEN_FLAGS, 0)

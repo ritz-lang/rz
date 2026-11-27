@@ -3,8 +3,8 @@
 A modal (Vim-style) terminal code editor written in Ritz, for Linux first and
 then Harland. [`docs/BUDDHAFINGER_PROPOSAL.md`](../../docs/BUDDHAFINGER_PROPOSAL.md)
 is the design and AGAST epic #4782 tracks the work. The core (buffer,
-screen, modes and the first-release commands) is in; the terminal event
-loop and the platform save are still to come.
+screen, modes and the first-release commands), the Linux save and the Linux
+event loop are in: `buddhafinger [FILE]` edits FILE on the terminal on stdin.
 
 ## Layout
 
@@ -18,13 +18,20 @@ loop and the platform save are still to come.
   for the screen, and an edit re-lexes only the lines it touched.
   `test_lexer.ritz` fails when ritz1's keyword table and the lexer's drift.
 - `src/platform/`: the platform adapters that do that I/O: `linux` (the
-  terminal) and `save` (`LinuxFiles`, the Linux `core/files` `FileStore`: temp
-  file, fsync, rename, directory fsync, permissions kept, external-change
-  check).
-- `src/main.ritz`: the `buddhafinger` binary.
+  terminal session and event loop: raw mode on the alternate screen, one
+  `poll` on the terminal and a signalfd with the Escape timeout as its
+  deadline, Ctrl-Z/SIGTSTP suspend, SIGCONT resume, SIGWINCH resize,
+  SIGTERM/SIGINT/SIGHUP exit, the terminal restored on every way out) and
+  `save` (`LinuxFiles`, the Linux `core/files` `FileStore`: temp file, fsync,
+  rename, directory fsync, permissions kept, external-change check).
+- `src/main.ritz`: the `buddhafinger` binary, `platform/linux`'s `run_editor`
+  on stdin.
 - `test/`: the ritzunit suites. `test_buffer_fuzz.ritz` runs seeded random
   edits against a reference buffer; a failure prints its seed, and
   `BF_FUZZ_SEED=<seed> make -C projects/buddhafinger test` replays it alone.
+  `test_terminal.ritz` runs the editor on a pty: open, edit, save and exit,
+  a bare Escape, Ctrl-Z and SIGTSTP then SIGCONT, SIGTERM/SIGINT/SIGHUP and
+  a resize, comparing the terminal's attributes before and after each.
 
 ## Build and test
 

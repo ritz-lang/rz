@@ -1,12 +1,394 @@
-# platform/linux.ritz - the Linux terminal adapter.
+# platform/linux.ritz - the Linux terminal session and event loop (AGAST #4819).
 #
-# Terminal and OS I/O live here, never in src/core/. The terminal session
-# (raw mode, key decoding, Escape timeout) comes from the ritzlib module lifted
-# from rzsh (docs/BUDDHAFINGER_PROPOSAL.md, "Shared terminal session"); until
-# then this adapter only writes text to the terminal.
+# run_editor(tty, path) is the `buddhafinger FILE` program: it opens the
+# file, puts the terminal in raw mode on the alternate screen, and runs one
+# loop until `:q` or a signal ends it (docs/BUDDHAFINGER_PROPOSAL.md, "Event
+# loop" and "Linux signals"):
+#
+#   - No sigaction handlers. At startup SIGTERM, SIGINT, SIGHUP, SIGTSTP,
+#     SIGCONT and SIGWINCH are blocked and read from a signalfd instead.
+#   - poll waits on the terminal and the signalfd. Its timeout is the next
+#     timer deadline: the Escape timeout while a key sequence is open, so a
+#     bare Escape leaves Insert without the next keystroke. The M2
+#     language-server client adds its pipes to the same poll (POLL_SLOTS).
+#   - SIGTERM, SIGINT, SIGHUP: restore the terminal, exit 128 + the signal.
+#     With ISIG off, Ctrl-C is a key and SIGINT comes only from another
+#     process.
+#   - SIGTSTP, and Ctrl-Z (a key, ISIG being off): restore the terminal,
+#     then SIGSTOP this process, since a blocked SIGTSTP stops nothing.
+#   - SIGCONT: raw mode and the alternate screen again, and a full repaint.
+#   - SIGWINCH: get_winsize, then lay the screen out again.
+#
+# Every way out restores the terminal: `:q`, a signal, the terminal closing,
+# a failed poll, read or write.
 
-import ritzlib.io { prints }
+import ritzlib.errno { Errno }
+import ritzlib.fd { Fd, PollFd, POLLIN, POLLHUP, POLLERR, POLLNVAL, fd_borrow, poll }
+import ritzlib.gvec
+import ritzlib.io { eprints }
+import ritzlib.option
+import ritzlib.process { SigSet, sigset_of, signalfd_read, kill, process_id, SIGNALFD_NONBLOCK, SIGNALFD_CLOEXEC }
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_from_ptr, span_from_strview, span_from_vec }
 import ritzlib.strview { StrView }
+import ritzlib.string
+import ritzlib.sys { SIGTERM, SIGINT, SIGHUP, SIGTSTP, SIGCONT, SIGWINCH, SIGSTOP }
+import ritzlib.term { get_winsize }
+import ritzlib.termsession { Key, KeyDecoder, TermOut, TermSession, ESCAPE_TIMEOUT_MS, key_decoder, term_enter_raw, term_out }
+import ritzlib.timer { now_millis }
 
-pub fn term_write(s: StrView)
-    prints(s)
+import core.editor { Editor, editor_new, editor_open, handle_key }
+import core.files { FileStore, LoadError }
+import core.modes { Mode }
+import core.screen { Screen, Size, View, render, render_styled, screen_new, text_rows, view_new }
+import platform.save { LinuxFiles, linux_files }
+import syntax.highlight { Highlighter, highlighter_new }
+
+# Exit statuses besides 128 + a terminating signal.
+pub const EXIT_OK: i32 = 0
+pub const EXIT_FAILED: i32 = 1
+
+# The size used when the terminal reports none (0 x 0).
+const DEFAULT_ROWS: i32 = 24
+const DEFAULT_COLS: i32 = 80
+
+# Terminal bytes one turn of the loop reads: a longer paste takes several
+# turns, so signals are still read in between.
+const READ_CHUNK: i64 = 256
+
+# The poll set: the terminal, then the signalfd. The language server's
+# stdout and stderr (POLLIN) and its stdin (POLLOUT while bytes are queued)
+# go after these when the M2 client lands (AGAST #4828).
+const SLOT_TTY: i64 = 0
+const SLOT_SIGNALS: i64 = 1
+const POLL_SLOTS: i64 = 2
+
+# The signals the loop reads from its signalfd.
+fn loop_signals() -> SigSet
+    var set = sigset_of(SIGTERM)
+    set.add(SIGINT)
+    set.add(SIGHUP)
+    set.add(SIGTSTP)
+    set.add(SIGCONT)
+    set.add(SIGWINCH)
+    set
+
+# Why the loop ended.
+enum Exit
+    Quit                # `:q`, `:wq`, `:q!`
+    Signal(i32)         # SIGTERM, SIGINT or SIGHUP
+    Closed              # the terminal hung up or reached end of input
+    Failed(Errno)       # a poll, read, write or termios call failed
+
+fn exit_status(e: Exit) -> i32
+    match e
+        Exit.Quit => EXIT_OK
+        Exit.Signal(sig) => 128 + sig
+        Exit.Closed => EXIT_FAILED
+        Exit.Failed(err) =>
+            report(err.message())
+            EXIT_FAILED
+
+# "buddhafinger: <what>" on stderr: only once the terminal is restored.
+fn report(what: StrView)
+    eprints("buddhafinger: ")
+    eprints(what)
+    eprints("\n")
+
+# ============================================================================
+# Start and finish
+# ============================================================================
+
+# Edit `path` ("" for a new, unnamed buffer) on the terminal `tty` until the
+# editor quits or a signal ends it. Returns the exit status: EXIT_OK after
+# `:q`, 128 + the signal after SIGTERM, SIGINT or SIGHUP, EXIT_FAILED when
+# the file can't be read, `tty` isn't a terminal or the terminal fails.
+pub fn run_editor(tty: i32, path: StrView) -> i32
+    var files = linux_files()
+    var ed: Editor = match open_file(@&files, path)
+        Some(e) => e
+        None => return EXIT_FAILED
+    # Block the signals first: from here they queue for the loop.
+    let set = loop_signals()
+    let old_mask: SigSet = match set.block()
+        Ok(m) => m
+        Err(e) =>
+            report(e.message())
+            return EXIT_FAILED
+    var signals: Fd = match set.signalfd(SIGNALFD_NONBLOCK | SIGNALFD_CLOEXEC)
+        Ok(f) => f
+        Err(e) =>
+            let back = old_mask.set_mask()
+            report(e.message())
+            return EXIT_FAILED
+    let term: TermSession = match term_enter_raw(tty)
+        Ok(t) => t
+        Err(_) =>
+            let closed = signals.close()
+            let back = old_mask.set_mask()
+            report("not a terminal")
+            return EXIT_FAILED
+    var s = Session { tty: tty, term: term, signals: signals, decoder: key_decoder(), escape_ms: ESCAPE_TIMEOUT_MS as i64, deadline: None, screen: screen_new(query_size(tty)), view: view_new(), styler: highlighter_new(), out: term_out(), drawn: None, dirty: true, suspended: false }
+    s.size_changed(@&ed)
+    s.enter_screen()
+    let exit = s.run(@&ed, @&files)
+    s.finish()
+    let back = old_mask.set_mask()
+    exit_status(exit)
+
+# The editor on `path`: its bytes, or an empty buffer under that name when
+# there is no such file. None (reported) when it can't be read.
+fn open_file(files: @&LinuxFiles, path: StrView) -> Option<Editor>
+    if path.is_empty()
+        return Some(editor_new())
+    match files.load(path)
+        Ok(bytes) =>
+            var ed = editor_open(path, span_from_vec<u8>(@bytes))
+            let info = ed.file_info(path)
+            ed.say(info.as_view())
+            Some(ed)
+        Err(e) =>
+            match e
+                LoadError.NotFound =>
+                    var ed = editor_open(path, span_from_strview(""))
+                    ed.say_about(path, " [New]")
+                    Some(ed)
+                LoadError.Failed(err) =>
+                    var what = string_from(path)
+                    what.push_str(": ")
+                    what.push_str(err.message())
+                    report(what.as_view())
+                    None
+
+# The terminal's size, or 24 x 80 when it reports none.
+fn query_size(tty: i32) -> Size
+    match get_winsize(tty)
+        Ok(ws) =>
+            if ws.ws_row > 0 and ws.ws_col > 0
+                return Size { rows: ws.ws_row as i32, cols: ws.ws_col as i32 }
+            Size { rows: DEFAULT_ROWS, cols: DEFAULT_COLS }
+        Err(_) => Size { rows: DEFAULT_ROWS, cols: DEFAULT_COLS }
+
+# ============================================================================
+# The loop
+# ============================================================================
+
+struct Session
+    tty: i32
+    term: TermSession       # raw mode; restored by finish() and on drop
+    signals: Fd             # the signalfd (owned)
+    decoder: KeyDecoder
+    escape_ms: i64          # how long an open key sequence waits for the rest
+    deadline: Option<i64>   # when it stops waiting (now_millis()); None: none open
+    screen: Screen
+    view: View
+    styler: Highlighter
+    out: TermOut
+    drawn: Option<i64>      # the text_revision the caches were built for; None before the first paint
+    dirty: bool             # a repaint is due
+    suspended: bool         # stopped by Ctrl-Z or SIGTSTP; SIGCONT ends it
+
+impl Session
+    fn run(self: @&Session, ed: @&Editor, files: @&LinuxFiles) -> Exit
+        var fds: [2]PollFd
+        loop
+            if ed.quit
+                return Exit.Quit
+            if self.dirty and not self.suspended
+                match self.paint(ed)
+                    Ok(_) => pass
+                    Err(e) => return Exit.Failed(e)
+            fds[SLOT_TTY] = PollFd { fd: self.tty, events: POLLIN, revents: 0 }
+            fds[SLOT_SIGNALS] = PollFd { fd: self.signals.raw(), events: POLLIN, revents: 0 }
+            match poll(span_from_ptr<PollFd>(@fds[0], POLL_SLOTS), self.timeout())
+                Ok(_) => pass
+                Err(e) =>
+                    match e
+                        Errno.Intr => continue
+                        _ => return Exit.Failed(e)
+            if (fds[SLOT_SIGNALS].revents & POLLIN) != 0
+                match self.take_signals(ed)
+                    Some(exit) => return exit
+                    None => pass
+            let tty_events = fds[SLOT_TTY].revents
+            if (tty_events & POLLIN) != 0
+                match self.read_keys(ed, files)
+                    Some(exit) => return exit
+                    None => pass
+            else if (tty_events & (POLLHUP | POLLERR | POLLNVAL)) != 0
+                return Exit.Closed
+            match self.check_deadline(ed, files)
+                Some(exit) => return exit
+                None => pass
+
+    # poll's timeout: until the open key sequence's deadline, or forever.
+    fn timeout(self: @Session) -> i32
+        match self.deadline
+            Some(at) =>
+                let left = at - now_millis()
+                if left < 0 then 0 else left as i32
+            None => -1     # poll(2): no timeout
+
+    # ------------------------------------------------------------------
+    # Keys
+    # ------------------------------------------------------------------
+
+    # Read what the terminal has and apply each key it completes. A
+    # sequence still open at the end (a lone ESC) waits for the deadline.
+    fn read_keys(self: @&Session, ed: @&Editor, files: @&LinuxFiles) -> Option<Exit>
+        var buf: [256]u8
+        let tty = fd_borrow(self.tty)
+        let n: i64 = match tty.read(Span<u8> { ptr: @buf[0], len: READ_CHUNK })
+            Ok(k) => k
+            Err(e) =>
+                match e
+                    Errno.Intr => return None
+                    Errno.Again => return None
+                    _ => return Some(Exit.Closed)    # EIO: the terminal went away
+        if n == 0
+            return Some(Exit.Closed)
+        for i in 0..n
+            match self.decoder.feed(buf[i])
+                Some(k) =>
+                    match self.key(ed, files, k)
+                        Some(exit) => return Some(exit)
+                        None => pass
+                None => pass
+            match self.decoder.take_held()
+                Some(k) =>
+                    match self.key(ed, files, k)
+                        Some(exit) => return Some(exit)
+                        None => pass
+                None => pass
+        if self.decoder.pending()
+            self.deadline = Some(now_millis() + self.escape_ms)
+        else
+            self.deadline = None
+        None
+
+    # Past the deadline with a sequence open: nothing more came, so it ends
+    # here (a lone ESC is Key.Escape).
+    fn check_deadline(self: @&Session, ed: @&Editor, files: @&LinuxFiles) -> Option<Exit>
+        match self.deadline
+            Some(at) =>
+                if now_millis() < at
+                    return None
+            None => return None
+        self.deadline = None
+        match self.decoder.flush()
+            Some(k) => self.key(ed, files, k)
+            None => None
+
+    fn key(self: @&Session, ed: @&Editor, files: @&LinuxFiles, k: Key) -> Option<Exit>
+        if k.eq(Key.Ctrl('z'))
+            self.suspend()
+            return None
+        handle_key<LinuxFiles>(ed, files, k)
+        self.dirty = true
+        if ed.quit
+            return Some(Exit.Quit)
+        None
+
+    # ------------------------------------------------------------------
+    # Signals
+    # ------------------------------------------------------------------
+
+    # Every signal waiting on the signalfd, in turn.
+    fn take_signals(self: @&Session, ed: @&Editor) -> Option<Exit>
+        loop
+            match signalfd_read(@self.signals)
+                Ok(pending) =>
+                    match pending
+                        Some(sig) =>
+                            match self.signal(ed, sig)
+                                Some(exit) => return Some(exit)
+                                None => pass
+                        None => return None
+                Err(e) => return Some(Exit.Failed(e))
+
+    fn signal(self: @&Session, ed: @&Editor, sig: i32) -> Option<Exit>
+        if sig == SIGTERM or sig == SIGINT or sig == SIGHUP
+            return Some(Exit.Signal(sig))
+        if sig == SIGTSTP
+            self.suspend()
+        else if sig == SIGCONT
+            return self.resume(ed)
+        else if sig == SIGWINCH
+            self.size_changed(ed)
+        None
+
+    # Give the terminal back as it was found and stop. Returns once
+    # continued; SIGCONT, already queued by then, does the rest (resume).
+    fn suspend(self: @&Session)
+        self.leave_screen()
+        let restored = self.term.restore()
+        self.suspended = true
+        let stopped = kill(process_id(), SIGSTOP)
+
+    # Continued (after a suspend, or a SIGSTOP from elsewhere): raw mode and
+    # the alternate screen again, and a full repaint at the size the
+    # terminal has now.
+    fn resume(self: @&Session, ed: @&Editor) -> Option<Exit>
+        self.suspended = false
+        match self.term.resume()
+            Ok(_) => pass
+            Err(e) => return Some(Exit.Failed(e))
+        self.enter_screen()
+        self.size_changed(ed)
+        None
+
+    # A new size, or the old one with the screen's contents unknown: lay
+    # out again and repaint everything.
+    fn size_changed(self: @&Session, ed: @&Editor)
+        let size = query_size(self.tty)
+        self.screen.resize(size)
+        ed.page = text_rows(size) as i64
+        self.dirty = true
+
+    # ------------------------------------------------------------------
+    # The screen
+    # ------------------------------------------------------------------
+
+    # Compose the editor's frame and write what changed.
+    fn paint(self: @&Session, ed: @&Editor) -> Result<(), Errno>
+        let rev = ed.text_revision()
+        if self.drawn.unwrap_or(-1) != rev
+            # The text changed: every line's checkpoints and colors may be stale.
+            self.screen.text_changed(0, 0)
+            self.styler = highlighter_new()
+            self.drawn = Some(rev)
+        self.view.top = ed.top
+        self.view.cursor_line = ed.cursor.line
+        self.view.cursor_byte = ed.cursor.col
+        let message: StrView = match ed.mode
+            Mode.CommandLine => ed.command_line()
+            _ => ed.message.as_view()
+        if ed.path.as_view().ends_with(".ritz")
+            render_styled(@&self.screen, ed, @&self.view, @&self.styler, ed.status(), message)
+        else
+            render(@&self.screen, ed, @&self.view, ed.status(), message)
+        ed.top = self.view.top
+        self.out.hide_cursor()
+        self.screen.emit(@&self.out)
+        self.out.show_cursor()
+        self.dirty = false
+        self.out.flush(self.tty)
+
+    # Onto the alternate screen; the next paint draws everything.
+    fn enter_screen(self: @&Session)
+        self.out.enter_alt_screen()
+        self.screen.invalidate_terminal()
+        let flushed = self.out.flush(self.tty)
+
+    # Back to the shell's screen, in the default style, cursor shown.
+    fn leave_screen(self: @&Session)
+        self.out.reset_style()
+        self.out.show_cursor()
+        self.out.leave_alt_screen()
+        let flushed = self.out.flush(self.tty)
+
+    # The terminal as it was found, the signalfd closed.
+    fn finish(self: @&Session)
+        self.leave_screen()
+        let restored = self.term.restore()
+        let closed = self.signals.close()

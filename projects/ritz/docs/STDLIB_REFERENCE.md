@@ -1594,7 +1594,10 @@ struct Stat
 
 #### Signal Constants
 
-`SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGILL`, `SIGABRT`, `SIGKILL`, `SIGSEGV`, `SIGPIPE`, `SIGTERM`, `SIGCHLD`, `SIGSTOP`
+Exported (Linux), for `SigSet`, `kill` and signalfd callers: `SIGHUP`,
+`SIGINT`, `SIGPIPE`, `SIGTERM`, `SIGCONT`, `SIGSTOP`, `SIGTSTP` and `SIGWINCH`
+(28; AGAST #4819). The rest (`SIGQUIT`, `SIGKILL`, `SIGCHLD`, ...) are
+module-private.
 
 #### Standard File Descriptors
 
@@ -2701,6 +2704,7 @@ cover). To run a program and read its output, use `spawn`.
 | `process_id` | `fn() -> i32` | getpid(2) |
 | `parent_process_id` | `fn() -> i32` | getppid(2). Linux |
 | `user_id` | `fn() -> u32` | getuid(2), the real uid. Linux |
+| `new_session` | `fn() -> Result<i32, Errno>` | setsid(2): a new session and process group led by this process, with no controlling terminal; `Ok(the session id)`, `Err(Perm)` for a group leader. A child about to take a pty as its terminal calls it first. Linux |
 
 **SigSet** (AGAST #4691): signals 1..64 as the kernel's mask. `sigset_empty()`,
 `sigset_of(sig)`; `s.add(sig)` (outside 1..64 is ignored), `s.contains(sig)`.
@@ -2750,6 +2754,9 @@ three-flag form (`sys_tty_getattr` / `sys_tty_setattr` in `ritzlib.sys`).
 | `tcgetattr` | `fn(fd: i32) -> Result<Termios, Errno>` | The terminal attributes of `fd` (TCGETS) |
 | `tcsetattr` | `fn(fd: i32, t: @Termios, when: TcsetWhen) -> Result<(), Errno>` | Set them: `TcsetWhen.Now` (TCSETS), `.Drain` after pending output (TCSETSW), `.Flush` after a drain, discarding unread input (TCSETSF) |
 | `get_winsize` | `fn(fd: i32) -> Result<Winsize, Errno>` | Rows and columns of the terminal on `fd` (TIOCGWINSZ) |
+| `set_winsize` | `fn(fd: i32, ws: @Winsize) -> Result<(), Errno>` | Set them (TIOCSWINSZ); on a pty master the slave's foreground group gets SIGWINCH |
+| `make_controlling_tty` | `fn(fd: i32) -> Result<(), Errno>` | Make the terminal on `fd` this process's controlling terminal (TIOCSCTTY); a session leader with none only (`ritzlib.process`'s `new_session`), else `Err(Perm)` |
+| `pty_open` | `fn() -> Result<Pty, Errno>` | A new pseudo-terminal from /dev/ptmx, its slave unlocked: `Pty { master: Fd, number: u32 }`, the master owned by the caller. `pty.slave_path()` is `/dev/pts/<number>`, `pty.open_slave()` opens it (`Result<Fd, Errno>`, not as the controlling terminal). AGAST #4819 |
 
 ```ritz
 import ritzlib.term

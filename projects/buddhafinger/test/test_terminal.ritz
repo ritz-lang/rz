@@ -1,0 +1,350 @@
+# test/test_terminal.ritz - the Linux event loop, driven through a pty (AGAST #4819).
+#
+# Each test opens a pty, forks, and runs platform.linux's run_editor in the
+# child on the slave end, which it takes as its controlling terminal; the
+# test types keys into the master and reads the frames back from it. The
+# cases are the proposal's "Screen and I/O tests": open, edit, save and
+# exit; a bare Escape leaving Insert with no key after it; Ctrl-Z (and
+# SIGTSTP) then SIGCONT; SIGTERM, SIGINT and SIGHUP; a resize. Every exit
+# path must leave the terminal's attributes as they were before the editor
+# started, compared field by field (a pty master reads its slave's).
+#
+# Waits are generous (seconds) so a loaded host only slows a test down;
+# nothing waits for something not to happen.
+
+import ritzlib.errno
+import ritzlib.fd
+import ritzlib.fs
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.process { ForkResult, ProcessResult, fork, kill, new_session, process_id, try_wait_pid }
+import ritzlib.result
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.sys
+import ritzlib.term { Pty, Termios, Winsize, get_winsize, make_controlling_tty, pty_open, set_winsize, tcgetattr }
+import ritzlib.time { sleep_ms }
+import ritzlib.timer { now_millis }
+
+import platform.linux { run_editor }
+
+# How long a test waits for the editor to show something or exit.
+const WAIT_MS: i64 = 5000
+
+# ============================================================================
+# The editor on a pty
+# ============================================================================
+
+struct Child
+    pid: i32
+    pty: Pty
+    before: Termios     # the slave's attributes before the editor started
+    seen: String        # everything the editor has written so far
+    mark: i64           # expect() searches `seen` from here
+
+# Start the editor on `path` ("" for none) in a `rows` x `cols` pty. None
+# where the system has no ptys or can't fork: the caller skips.
+fn spawn_editor(path: StrView, rows: u16, cols: u16) -> Option<Child>
+    var pty: Pty = match pty_open()
+        Ok(p) => p
+        Err(_) => return None
+    let ws = Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 }
+    let sized = set_winsize(pty.master.raw(), @ws)
+    let before: Termios = match tcgetattr(pty.master.raw())
+        Ok(t) => t
+        Err(_) => return None
+    match fork()
+        Ok(f) => match f
+            ForkResult.Child =>
+                sys_exit(editor_child(@&pty, path))
+                None
+            ForkResult.Parent(pid) =>
+                Some(Child { pid: pid, pty: pty, before: before, seen: string_new(), mark: 0 })
+        Err(_) => None
+
+# The child: a session of its own with the slave as its terminal, then the
+# editor. 120 and up: the terminal could not be set up.
+fn editor_child(pty: @&Pty, path: StrView) -> i32
+    let closed = pty.master.close()
+    match new_session()
+        Ok(_) => pass
+        Err(_) => return 120
+    var tty: Fd = match pty.open_slave()
+        Ok(s) => s
+        Err(_) => return 121
+    match make_controlling_tty(tty.raw())
+        Ok(_) => pass
+        Err(_) => return 122
+    run_editor(tty.raw(), path)
+
+impl Child
+    # Read what the editor wrote, waiting up to `ms`. False once the
+    # editor has exited and closed the terminal.
+    fn pump(self: @&Child, ms: i64) -> bool
+        var fds: [1]PollFd
+        fds[0] = PollFd { fd: self.pty.master.raw(), events: POLLIN, revents: 0 }
+        match poll(span_from_ptr<PollFd>(@fds[0], 1), ms as i32)
+            Ok(n) =>
+                if n == 0
+                    return true
+            Err(_) => return true
+        var buf: [4096]u8
+        match self.pty.master.read(Span<u8> { ptr: @buf[0], len: 4096 })
+            Ok(n) =>
+                if n <= 0
+                    return false
+                self.seen.push_span(Span<u8> { ptr: @buf[0], len: n })
+                true
+            Err(_) => false
+
+    # Wait until `needle` shows up in the output after the last match.
+    fn expect(self: @&Child, needle: StrView) -> bool
+        let deadline = now_millis() + WAIT_MS
+        loop
+            let rest = self.seen.as_view().slice(self.mark, self.seen.len())
+            let at = rest.find(needle)      # rest.len() when it isn't there
+            if at < rest.len()
+                self.mark += at + needle.len()
+                return true
+            let left = deadline - now_millis()
+            if left <= 0
+                return false
+            if not self.pump(left)
+                return false
+
+    fn send(self: @&Child, keys: StrView) -> bool
+        match self.pty.master.write_str(keys)
+            Ok(_) => true
+            Err(_) => false
+
+    fn signal(self: @Child, sig: i32) -> bool
+        match kill(self.pid, sig)
+            Ok(_) => true
+            Err(_) => false
+
+    # Wait for the editor to exit, reading its output meanwhile: Some(its
+    # exit code), or None if it is still running after WAIT_MS (it is
+    # killed) or died by a signal.
+    fn wait_exit(self: @&Child) -> Option<i32>
+        let deadline = now_millis() + WAIT_MS
+        while now_millis() < deadline
+            match try_wait_pid(self.pid)
+                Ok(r) => match r
+                    Some(res) =>
+                        if res.signaled != 0
+                            return None
+                        return Some(res.exit_code)
+                    None => pass
+                Err(_) => return None
+            if not self.pump(10)
+                sleep_ms(10)
+        let killed = self.signal(SIGKILL_FOR_TESTS)
+        let reaped = try_wait_pid(self.pid)
+        None
+
+    # Whether the editor exited with `code` within WAIT_MS.
+    fn exits_with(self: @&Child, code: i32) -> bool
+        match self.wait_exit()
+            Some(got) => got == code
+            None => false
+
+    # Whether the editor is stopped (state T in /proc/<pid>/stat), waiting
+    # up to WAIT_MS for it to get there.
+    fn wait_stopped(self: @&Child) -> bool
+        let deadline = now_millis() + WAIT_MS
+        while now_millis() < deadline
+            if proc_state(self.pid) == 'T'
+                return true
+            if not self.pump(10)
+                sleep_ms(10)
+        false
+
+    # Whether the terminal is in raw mode, waiting up to WAIT_MS for it.
+    fn wait_raw(self: @&Child) -> bool
+        let deadline = now_millis() + WAIT_MS
+        while now_millis() < deadline
+            match tcgetattr(self.pty.master.raw())
+                Ok(t) =>
+                    if (t.c_lflag & ICANON) == 0 and (t.c_lflag & ECHO) == 0
+                        return true
+                Err(_) => return false
+            if not self.pump(10)
+                sleep_ms(10)
+        false
+
+    # Whether the terminal's attributes are those it had before the editor.
+    fn restored(self: @Child) -> bool
+        match tcgetattr(self.pty.master.raw())
+            Ok(now) => same_termios(@self.before, @now)
+            Err(_) => false
+
+    fn close(self: @&Child)
+        let closed = self.pty.master.close()
+
+# SIGKILL: the one signal a test sends that the editor must not see.
+const SIGKILL_FOR_TESTS: i32 = 9
+
+# The state letter in /proc/<pid>/stat ('R', 'S', 'T', ...), 0 if unreadable.
+fn proc_state(pid: i32) -> u8
+    var path = string_from("/proc/")
+    path.push_i64(pid as i64)
+    path.push_str("/stat")
+    match read_file(path.as_view())
+        Ok(text) =>
+            # "<pid> (<comm>) <state> ...": the comm may hold spaces, so from the last ')'.
+            let v = text.as_view()
+            var i: i64 = v.len() - 1
+            while i >= 0 and v.get(i) != ')'
+                i -= 1
+            if i >= 0 and i + 2 < v.len()
+                return v.get(i + 2)
+            0
+        Err(_) => 0
+
+# The control characters TCGETS fills: the kernel's struct termios has 19
+# (NCCS); the rest of ritzlib's 32-byte c_cc is whatever the stack held.
+const KERNEL_NCCS: i64 = 19
+
+fn same_termios(a: @Termios, b: @Termios) -> bool
+    if a.c_iflag != b.c_iflag or a.c_oflag != b.c_oflag or a.c_cflag != b.c_cflag or a.c_lflag != b.c_lflag
+        return false
+    for i in 0..KERNEL_NCCS
+        if a.c_cc[i] != b.c_cc[i]
+            return false
+    true
+
+# ============================================================================
+# Files
+# ============================================================================
+
+# A fresh empty directory "/tmp/bf_tty_<pid>_<name>".
+fn fixture_dir(name: StrView) -> String
+    var d: String = string_from("/tmp/bf_tty_")
+    d.push_i64(process_id() as i64)
+    d.push('_')
+    d.push_str(name)
+    let gone = remove_dir_all(d.as_view())
+    let made = mkdir(d.as_view(), 493)
+    d
+
+fn holds(path: StrView, want: StrView) -> bool
+    match read_file(path)
+        Ok(s) => s.as_view().eq(want)
+        Err(_) => false
+
+# ============================================================================
+# Tests
+# ============================================================================
+
+# Open a file, insert a character, leave Insert, :wq: the file holds the
+# edit, the editor exits 0 and the terminal is as it was.
+[[test]]
+fn test_open_edit_save_exit() -> i32
+    let dir = fixture_dir("save")
+    let path = path_join(dir.as_view(), "f.txt")
+    let w = write_file(path.as_view(), "hello\n")
+    var c: Child = match spawn_editor(path.as_view(), 24, 80)
+        Some(k) => k
+        None => return 0     # no ptys here
+    assert c.expect("hello")
+    assert c.expect("NORMAL")
+    assert c.wait_raw()
+    assert c.send("ix\e:wq\r")
+    assert c.exits_with(0)
+    assert holds(path.as_view(), "xhello\n")
+    assert c.restored()
+    c.close()
+    let gone = remove_dir_all(dir.as_view())
+    0
+
+# A lone Escape leaves Insert after the escape timeout, with no key after it.
+[[test]]
+fn test_bare_escape_leaves_insert() -> i32
+    var c: Child = match spawn_editor("", 24, 80)
+        Some(k) => k
+        None => return 0
+    assert c.expect("NORMAL")
+    assert c.send("i")
+    assert c.expect("INSERT")
+    assert c.send("\e")
+    assert c.expect("NORMAL")
+    assert c.send(":q\r")
+    assert c.exits_with(0)
+    assert c.restored()
+    c.close()
+    0
+
+# Ctrl-Z (a key: ISIG is off) and SIGTSTP from another process both stop
+# the editor with the terminal restored; SIGCONT brings back raw mode, the
+# alternate screen and a full repaint.
+[[test]]
+fn test_suspend_and_resume() -> i32
+    var c: Child = match spawn_editor("", 24, 80)
+        Some(k) => k
+        None => return 0
+    assert c.expect("NORMAL")
+    assert c.wait_raw()
+    for round in 0..2
+        if round == 0
+            assert c.send("\x1a")
+        else
+            assert c.signal(SIGTSTP)
+        assert c.wait_stopped()
+        assert c.expect("\e[?1049l")
+        assert c.restored()
+        assert c.signal(SIGCONT)
+        assert c.expect("\e[?1049h")
+        assert c.expect("NORMAL")
+        assert c.wait_raw()
+    assert c.send(":q\r")
+    assert c.exits_with(0)
+    assert c.restored()
+    c.close()
+    0
+
+# SIGTERM, SIGINT and SIGHUP end the editor, unsaved edits or not, with
+# the terminal restored and exit status 128 + the signal.
+[[test]]
+fn test_termination_signals_restore_the_terminal() -> i32
+    var sigs: [3]i32
+    sigs[0] = SIGTERM
+    sigs[1] = SIGINT
+    sigs[2] = SIGHUP
+    for k in 0..3
+        var c: Child = match spawn_editor("", 24, 80)
+            Some(ch) => ch
+            None => return 0
+        assert c.expect("NORMAL")
+        assert c.wait_raw()
+        assert c.send("ix")
+        assert c.expect("INSERT")
+        assert c.signal(sigs[k])
+        assert c.exits_with(128 + sigs[k])
+        assert c.expect("\e[?1049l")
+        assert c.restored()
+        c.close()
+    0
+
+# A resize is a SIGWINCH to the terminal's foreground group: the editor
+# lays out again at the new size, the status line on the new second-last row.
+[[test]]
+fn test_resize_relayouts() -> i32
+    var c: Child = match spawn_editor("", 24, 80)
+        Some(k) => k
+        None => return 0
+    assert c.expect("NORMAL")
+    let ws = Winsize { ws_row: 10, ws_col: 40, ws_xpixel: 0, ws_ypixel: 0 }
+    let resized: bool = match set_winsize(c.pty.master.raw(), @ws)
+        Ok(_) => true
+        Err(_) => false
+    assert resized
+    # Row 9 (1-based) is the status line now, drawn reversed: on 24 rows it
+    # was a `~` filler row.
+    assert c.expect("\e[2J")
+    assert c.expect("\e[9;1H\e[0;7m NORMAL")
+    assert c.send(":q\r")
+    assert c.exits_with(0)
+    assert c.restored()
+    c.close()
+    0

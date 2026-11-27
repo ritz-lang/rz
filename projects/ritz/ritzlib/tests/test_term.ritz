@@ -3,6 +3,10 @@
 #   tcgetattr(fd) -> Result<Termios, Errno>
 #   tcsetattr(fd, @t, when: TcsetWhen) -> Result<(), Errno>
 #   get_winsize(fd) -> Result<Winsize, Errno>
+#   set_winsize(fd, @ws) -> Result<(), Errno>
+#   make_controlling_tty(fd) -> Result<(), Errno>
+#   pty_open() -> Result<Pty, Errno>
+# and ritzlib.process's new_session, which a pty's child calls first (AGAST #4819).
 #
 # A pty master (/dev/ptmx) is a terminal without needing one on stdin, so
 # the Ok paths run under any harness; a pipe is the not-a-tty case (ENOTTY).
@@ -11,6 +15,9 @@ import ritzlib.sys
 import ritzlib.term
 import ritzlib.fd
 import ritzlib.result
+import ritzlib.process { ForkResult, fork, wait_pid, new_session, process_id }
+import ritzlib.span
+import ritzlib.string
 
 const E_NOTTY: i32 = 25
 
@@ -110,4 +117,138 @@ fn test_get_winsize_on_a_pty() -> i32
         Err(_) => false
     assert ok
     m.close()
+    0
+
+# ============================================================================
+# Pty, set_winsize, make_controlling_tty, new_session (AGAST #4819)
+# ============================================================================
+
+# Whether the terminal on `fd` is `rows` x `cols`.
+fn sized(fd: i32, rows: u16, cols: u16) -> bool
+    match get_winsize(fd)
+        Ok(ws) => ws.ws_row == rows and ws.ws_col == cols
+        Err(_) => false
+
+[[test]]
+fn test_set_winsize_reaches_both_ends() -> i32
+    var pty: Pty = match pty_open()
+        Ok(p) => p
+        Err(_) => return 0     # no /dev/ptmx on this system
+    let ws = Winsize { ws_row: 30, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 }
+    assert unit_err(set_winsize(pty.master.raw(), @ws)) == 0
+    assert sized(pty.master.raw(), 30, 100)
+    var slave: Fd = match pty.open_slave()
+        Ok(s) => s
+        Err(_) => fd_adopt(-1)
+    assert slave.valid()
+    assert sized(slave.raw(), 30, 100)
+    slave.close()
+    pty.master.close()
+    0
+
+[[test]]
+fn test_set_winsize_not_a_tty_is_enotty() -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            let ws = Winsize { ws_row: 1, ws_col: 1, ws_xpixel: 0, ws_ypixel: 0 }
+            assert unit_err(set_winsize(p.write.raw(), @ws)) == E_NOTTY
+            p.read.close()
+            p.write.close()
+        Err(_) =>
+            assert false
+    0
+
+# Bytes written to the slave end come out of the master: the two ends are
+# one terminal.
+[[test]]
+fn test_pty_slave_writes_reach_the_master() -> i32
+    var pty: Pty = match pty_open()
+        Ok(p) => p
+        Err(_) => return 0
+    let path = pty.slave_path()
+    assert path.as_view().starts_with("/dev/pts/")
+    var slave: Fd = match pty.open_slave()
+        Ok(s) => s
+        Err(_) => fd_adopt(-1)
+    assert slave.valid()
+    assert unit_err(slave.write_str("ok")) == 0
+    var buf: [8]u8
+    let n: i64 = match pty.master.read(Span<u8> { ptr: @buf[0], len: 8 })
+        Ok(k) => k
+        Err(_) => -1
+    assert n == 2
+    assert buf[0] == 'o' and buf[1] == 'k'
+    slave.close()
+    pty.master.close()
+    0
+
+# Whether child `pid` exited 0: every step went as expected (else its exit
+# code names the step that didn't).
+fn child_passed(pid: i32) -> bool
+    match wait_pid(pid)
+        Ok(r) => r.signaled == 0 and r.exit_code == 0
+        Err(_) => false
+
+# Run session_child (with_session) or no_session_child in a forked child:
+# whether it passed.
+fn in_child(pty: @Pty, with_session: bool) -> bool
+    match fork()
+        Ok(f) => match f
+            ForkResult.Child =>
+                if with_session
+                    sys_exit(session_child(pty))
+                sys_exit(no_session_child(pty))
+                false
+            ForkResult.Parent(pid) => child_passed(pid)
+        Err(_) => false
+
+# In a child: new_session leads a session (its id is the pid) and a second
+# call is Err(Perm); the session's leader then takes the slave end as its
+# controlling terminal.
+fn session_child(pty: @Pty) -> i32
+    match new_session()
+        Ok(sid) =>
+            if sid != process_id()
+                return 1
+        Err(_) =>
+            return 2
+    match new_session()
+        Ok(_) =>
+            return 3
+        Err(e) =>
+            if e.code() != 1
+                return 4
+    var slave: Fd = match pty.open_slave()
+        Ok(s) => s
+        Err(_) => return 5
+    if unit_err(make_controlling_tty(slave.raw())) != 0
+        return 6
+    0
+
+# A process that leads no session can't take a controlling terminal: EPERM (1).
+fn no_session_child(pty: @Pty) -> i32
+    var slave: Fd = match pty.open_slave()
+        Ok(s) => s
+        Err(_) => return 1
+    if unit_err(make_controlling_tty(slave.raw())) != 1
+        return 2
+    0
+
+[[test]]
+fn test_new_session_then_controlling_tty() -> i32
+    var pty: Pty = match pty_open()
+        Ok(p) => p
+        Err(_) => return 0
+    assert in_child(@pty, true)
+    pty.master.close()
+    0
+
+[[test]]
+fn test_controlling_tty_needs_a_session() -> i32
+    var pty: Pty = match pty_open()
+        Ok(p) => p
+        Err(_) => return 0
+    assert in_child(@pty, false)
+    pty.master.close()
     0

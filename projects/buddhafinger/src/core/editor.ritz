@@ -59,6 +59,7 @@ pub struct Editor
     pending: u8             # the first key of gg, dd or yy; 0: none
     message: String         # the message line
     quit: bool
+    revisions: i64          # text revisions of the buffers before this one (text_revision)
 
 pub fn editor_new() -> Editor
     editor_with(string_new(), buffer_new())
@@ -68,7 +69,7 @@ pub fn editor_open(path: StrView, data: [u8]) -> Editor
     editor_with(string_from(path), buffer_from_bytes(data))
 
 fn editor_with(path: String, buf: Buffer) -> Editor
-    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), pending: 0, message: string_new(), quit: false }
+    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), pending: 0, message: string_new(), quit: false, revisions: 0 }
 
 # ============================================================================
 # Characters and columns
@@ -193,6 +194,17 @@ impl Editor
 
     pub fn status(self: @Editor) -> Status
         Status { name: self.path.as_view(), dirty: self.buf.is_dirty(), mode: self.mode }
+
+    # A count that goes up with every change to the text, a new buffer from
+    # `:e` included, and never otherwise (Buffer.revision across buffers).
+    pub fn text_revision(self: @Editor) -> i64
+        self.revisions + self.buf.revision()
+
+    # A new buffer: text_revision keeps counting up from the old one's. pub
+    # for handle_key<F>'s `:e`, as say() below is.
+    pub fn replace_buffer(self: @&Editor, buf: Buffer)
+        self.revisions += self.buf.revision() + 1
+        self.buf = buf
 
     # The command line as typed, prompt first; empty outside CommandLine mode.
     pub fn command_line(self: @Editor) -> StrView
@@ -723,13 +735,13 @@ fn edit<F: FileStore>(ed: @&Editor, files: @&F, path: StrView)
         return
     match files.load(path)
         Ok(bytes) =>
-            ed.buf = buffer_from_bytes(span_from_vec<u8>(@bytes))
+            ed.replace_buffer(buffer_from_bytes(span_from_vec<u8>(@bytes)))
             let info = ed.file_info(path)
             ed.say(info.as_view())
         Err(e) =>
             match e
                 LoadError.NotFound =>
-                    ed.buf = buffer_new()
+                    ed.replace_buffer(buffer_new())
                     ed.say_about(path, " [New]")
                 LoadError.Failed(errno) =>
                     var what = string_from(": ")
