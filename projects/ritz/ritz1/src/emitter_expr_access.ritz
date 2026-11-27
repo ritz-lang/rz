@@ -35,10 +35,6 @@ import text_bridge   # no_name / unnamed (AGAST #4696)
 fn ident_text(e: *Expr) -> StrView
     e.ident
 
-# The struct type a local is declared with.
-fn local_type_text(lv: *LocalVar) -> StrView
-    StrView { ptr: lv_type_name(lv), len: lv_type_name_len(lv) as i64 }
-
 # The struct type a field is declared with.
 fn field_type_text(f: *StructField) -> StrView
     f.field_type_name
@@ -218,7 +214,7 @@ fn emit_local_value(s: *EmitterState, e: *Expr, index: i32, lv: *LocalVar) -> i3
         emit_whole_array_error(s, e)
         return 0
     let result: i32 = next_reg(s)
-    emit_struct_load_or_defer(s, var_type, result, local_type_text(lv), index, no_name())
+    emit_struct_load_or_defer(s, var_type, result, lv_name(lv), index, no_name())
     widen_slot_value(s, var_type, result)
 
 # A global's value.  AGAST #2427: a struct is loaded whole at its own type, as
@@ -793,7 +789,7 @@ fn named_slice_refusal(e: *Expr, base: IndexBase) -> StrView
         # address, so `t[1]` read bytes and `t.len` had no struct.  What
         # monomorph didn't rewrite is refused rather than read as an address.
         if base.kind == TypeKind.Struct
-            if is_sliceable_name(local_type_text(base.local))
+            if is_sliceable_name(lv_name(base.local))
                 return "this slice of a Vec, Span or String isn't lowered by ritz1 (`let t = v[lo..hi]` is)"
             return "a struct can't be sliced (only String, Vec and Span can)"
     # AGAST #2521: nothing else slices (LANGUAGE_SPEC §3.4, R9 rules 5 and
@@ -839,8 +835,8 @@ fn emit_local_array_index(s: *EmitterState, e: *Expr, local: *LocalVar) -> i32
         if whole_struct_elem_refused(s, e)
             return 0
         let sidx: i32 = emit_expr(s, e.right)
-        let sptr: i32 = emit_struct_elem_addr(s, lv_array_size(local), local_type_text(local), local.reg, sidx)
-        return emit_struct_load(s, local_type_text(local), sptr)
+        let sptr: i32 = emit_struct_elem_addr(s, lv_array_size(local), lv_name(local), local.reg, sidx)
+        return emit_struct_load(s, lv_name(local), sptr)
     # GEP [0, index] at the alloca's own element type (AGAST #1564: u32 / u16
     # / i16 used to fall to `[N x i64]` over a narrower alloca), then load.  A
     # float / double element is the value itself (#1966): no widen.
@@ -899,7 +895,7 @@ fn try_emit_const_array_index(s: *EmitterState, e: *Expr, carr: *ConstEntry) -> 
 fn try_emit_view_local_index(s: *EmitterState, e: *Expr, local: *LocalVar) -> Option<i32>
     if lv_var_type(local) != TypeKind.Struct
         return None
-    let name: StrView = local_type_text(local)
+    let name: StrView = lv_name(local)
     if is_vec_name(name)
         return Some(emit_view_index(s, local.reg, name, 4, e.right))
     if name.starts_with("Span$")
@@ -1108,7 +1104,7 @@ fn unknown_field_refused(s: *EmitterState, e: *Expr) -> bool
     let loc: *LocalVar = find_local_struct_name(s, ident_text(e.left))
     if loc == null or lv_var_type(loc) != TypeKind.Struct or lv_type_name(loc) == null
         return false
-    let st: *StructDef = find_struct(s, local_type_text(loc))
+    let st: *StructDef = find_struct(s, lv_name(loc))
     if st == null
         return false
     let field: StrView = ident_text(e)
@@ -1137,7 +1133,7 @@ fn unknown_struct_member_refused(s: *EmitterState, e: *Expr) -> bool
     let loc: *LocalVar = find_local_struct_name(s, ident_text(e.left))
     if loc == null or lv_var_type(loc) != TypeKind.Struct or lv_type_name(loc) == null or lv_type_name_len(loc) <= 0
         return false
-    let tn: StrView = local_type_text(loc)
+    let tn: StrView = lv_name(loc)
     if find_struct(s, tn) != null
         return false
     let reported: StrView = StrView { ptr: s.diag.unknown_struct_name, len: s.diag.unknown_struct_name_len as i64 }
@@ -1304,7 +1300,7 @@ pub fn through_spill(s: *EmitterState, view: *LocalVar) -> *LocalVar
     let name: *u8 = malloc(BASE_SPILL_NAME_BUF)
     *name = '#'   # no identifier has one
     let len: i32 = 1 + fmt_i64_into(Span<u8> { ptr: name + 1, len: BASE_SPILL_NAME_BUF - 1 }, g_base_spills as i64).len as i32
-    add_local_full(s, StrView { ptr: (name), len: (len) as i64 }, slot, TypeKind.Ptr, StrView { ptr: (lv_type_name(view)), len: (lv_type_name_len(view)) as i64 }, lv_pointee_type(view), 0, TypeKind.Void)
+    add_local_full(s, StrView { ptr: (name), len: (len) as i64 }, slot, TypeKind.Ptr, lv_name(view), lv_pointee_type(view), 0, TypeKind.Void)
     let bound: *LocalVar = local_at(s, s.fcx.local_count - 1)
     lv_mark_array_view(bound)
     bound
@@ -1348,7 +1344,7 @@ pub fn emit_lent_referent(s: *EmitterState, e: *Expr, name: StrView) -> i32
         loc = lent_self_local(s, e)
     if loc == null or lv_var_type(loc) == TypeKind.Array
         return 0
-    if name_eq(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, name) == 0
+    if name_eq(lv_name(loc), name) == 0
         return 0
     var src: i32 = emit_expr(s, e)
     if lv_var_type(loc) == TypeKind.Ptr

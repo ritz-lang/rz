@@ -76,7 +76,7 @@ fn addr_mut_struct(s: *EmitterState, o: *Expr) -> StrView
 
 # A local's type name; no_name() when it has none.
 fn local_type_name(loc: *LocalVar) -> StrView
-    named_or_none(StrView { ptr: lv_type_name(loc), len: lv_type_name_len(loc) as i64 })
+    named_or_none(lv_name(loc))
 
 # `name`, or no_name() when it is empty.
 fn named_or_none(name: StrView) -> StrView
@@ -251,7 +251,7 @@ pub fn for_call_struct_name(s: *EmitterState, e: *Expr) -> StrView
     if name_eq(e.ident, "as_bytes") == 0
         return named
     let loc: *LocalVar = find_local_struct_name(s, e.left.ident)
-    if loc != null and name_eq(StrView { ptr: lv_type_name(loc), len: lv_type_name_len(loc) as i64 }, "StrView") == 1
+    if loc != null and name_eq(lv_name(loc), "StrView") == 1
         return "Span$u8"
     named
 
@@ -318,10 +318,8 @@ struct ForIterSrc
     elem_type: TypeKind
     arr_size: i32
     data_reg: i32
-    type_name: *u8
-    type_name_len: i32
-    const_name: *u8
-    const_name_len: i32
+    type_name: StrView
+    const_name: StrView
     bind_pointee: TypeKind
     bind_name: StrView
     elem_name: StrView
@@ -343,7 +341,7 @@ pub fn for_iter_ident(s: *EmitterState, src: *ForIterSrc, iter: *Expr, arr_ident
                 return lv_array_shape(loc)
             src.elem_type = lv_array_elem_type(loc)
             src.arr_size = lv_array_size(loc)
-            src.elem_name = StrView { ptr: lv_type_name(loc), len: (lv_type_name_len(loc)) as i64 }
+            src.elem_name = lv_name(loc)
             src.bind_pointee = elem_recorded_pointee(s, src.elem_type, lv_array_elem_pointee(loc), elem_name_of(src), @src.bind_name)
         else if not via_addr and array_ptr_named(s, name) != null
             # AGAST #2410: `a: *[N]T` / `@[N]T` / `@&[N]T` walks the array
@@ -360,8 +358,7 @@ pub fn for_iter_ident(s: *EmitterState, src: *ForIterSrc, iter: *Expr, arr_ident
         src.iter_kind = ForIterKind.ArraySym
         src.elem_type = centry.array_elem_type
         src.arr_size = centry.array_size
-        src.const_name = centry.name.ptr as *u8
-        src.const_name_len = centry.name.len as i32
+        src.const_name = centry.name
         src.elem_name = centry.array_elem_type_name
         # AGAST #1866: `for p in T` over a `[N]*u8` table binds a `*u8`.
         src.bind_pointee = elem_recorded_pointee(s, src.elem_type, centry.array_elem_pointee, elem_name_of(src), @src.bind_name)
@@ -370,8 +367,7 @@ pub fn for_iter_ident(s: *EmitterState, src: *ForIterSrc, iter: *Expr, arr_ident
     if glob == null or glob.var_type != TypeKind.Array
         return nd_in
     src.iter_kind = ForIterKind.ArraySym
-    src.const_name = glob.name.ptr
-    src.const_name_len = glob.name.len as i32
+    src.const_name = glob.name
     if glob.array_shape != null
         return glob.array_shape
     src.elem_type = glob.array_elem_type
@@ -390,7 +386,7 @@ pub fn emit_for_elem_ptr(s: *EmitterState, src: *ForIterSrc, elem_ptr: i32, idx:
     if src.iter_kind == ForIterKind.HeaderReg
         # `data` is field 0 and `len` field 1, as for_header_struct checked.
         let data_ptr_ptr: i32 = next_reg(s)
-        gep_struct_open(s, data_ptr_ptr, StrView { ptr: src.type_name, len: src.type_name_len as i64 })
+        gep_struct_open(s, data_ptr_ptr, src.type_name)
         format_into(s, ", ptr %.{src.data_reg}, i32 0, i32 0\n")
         let data_ptr: i32 = next_reg(s)
         format_into(s, "  %.{data_ptr} = load ptr, ptr %.{data_ptr_ptr}\n")
@@ -404,7 +400,7 @@ pub fn emit_for_elem_ptr(s: *EmitterState, src: *ForIterSrc, elem_ptr: i32, idx:
     # A local array or a field is an SSA reg; a const or global
     # array is its symbol.
     if src.iter_kind == ForIterKind.ArraySym
-        let sym: String = ir_name(StrView { ptr: src.const_name, len: src.const_name_len as i64 })
+        let sym: String = ir_name(src.const_name)
         format_into(s, "@{sym.as_view()}")
     else
         format_into(s, "%.{src.data_reg}")
@@ -618,7 +614,7 @@ pub fn if_stmt_arm_agg(s: *EmitterState, list: *Stmt) -> StrView
 fn expr_arm_agg(s: *EmitterState, e: *Expr) -> StrView
     let lent: *LocalVar = lent_referent_local(s, e)
     if lent != null   # AGAST #2288: emit_if_stmt_arm read the referent
-        return StrView { ptr: lv_type_name(lent), len: lv_type_name_len(lent) as i64 }
+        return lv_name(lent)
     var name: StrView = resolve_expr_struct_name(s, e)
     if unnamed(name)
         name = call_result_struct_name(s, e)
@@ -802,8 +798,7 @@ struct MatchResult
     # AGAST #1645: LLVM struct type the arms yield (`%StrView`, `%Point`),
     # or null when they yield the usual i64 scalar.  The merge phi is emitted
     # at this type.
-    agg_name: *u8
-    agg_name_len: i32
+    agg_name: StrView
     # AGAST #1946: TypeKind.F32 / TypeKind.F64 when the arms yield a float, else 0.
     # Fixed by the enclosing let / return's hint (match_float_hint) or by
     # the first float-valued arm; later arms are coerced to it.

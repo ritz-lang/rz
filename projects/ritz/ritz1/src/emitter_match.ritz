@@ -468,8 +468,7 @@ pub fn match_result_init(r: *MatchResult, n_arms: i32)
     r.values = malloc(n * 4) as *i32
     r.labels = malloc(n * 4) as *i32
     r.count = 0
-    r.agg_name = null
-    r.agg_name_len = 0
+    r.agg_name = strview_empty()
     r.float_ty = TypeKind.Void
     r.hint_ty = TypeKind.Void
     r.int_arms = 0
@@ -547,7 +546,7 @@ fn match_arm_into_slot(s: *EmitterState, arm: *MatchArm, result: *MatchResult, b
         return
     if body_reg == MATCH_ZERO_VALUE and if_arm_diverges(arm)
         return
-    if result.agg_name == null or struct_ret_uses_sret(s, TypeKind.Struct, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }) == 0
+    if unnamed(result.agg_name) or struct_ret_uses_sret(s, TypeKind.Struct, result.agg_name) == 0
         result.slot_misses = result.slot_misses + 1
         return
     if body_reg == MATCH_ZERO_VALUE and result.slot == 0
@@ -559,8 +558,8 @@ fn match_arm_into_slot(s: *EmitterState, arm: *MatchArm, result: *MatchResult, b
         emit_match_phi_type(s, result)
         format_into(s, "\n")
         entry_alloca_reg_end(s)
-    if result.agg_name != null and result.agg_name_len > 0 and body_reg != MATCH_ZERO_VALUE
-        emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, body_reg, result.slot)
+    if result.agg_name.len > 0 and body_reg != MATCH_ZERO_VALUE
+        emit_struct_store_or_copy(s, TypeKind.Struct, result.agg_name, body_reg, result.slot)
     else
         format_into(s, "  store ")
         emit_match_phi_type(s, result)
@@ -574,8 +573,8 @@ fn match_merge_slot(s: *EmitterState, result: *MatchResult) -> i32
     if result.slot == 0 or result.slot_misses > 0
         return 0
     let reg: i32 = next_reg(s)
-    if result.agg_name != null and result.agg_name_len > 0
-        emit_struct_load_or_defer(s, TypeKind.Struct, reg, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, result.slot, no_name())
+    if result.agg_name.len > 0
+        emit_struct_load_or_defer(s, TypeKind.Struct, reg, result.agg_name, result.slot, no_name())
     else
         format_into(s, "  %.{reg} = load ")
         emit_match_phi_type(s, result)
@@ -584,8 +583,8 @@ fn match_merge_slot(s: *EmitterState, result: *MatchResult) -> i32
 
 # AGAST #1946: the merge phi's type: the arms' struct, their float, or i64.
 fn emit_match_phi_type(s: *EmitterState, result: *MatchResult)
-    if result.agg_name != null and result.agg_name_len > 0
-        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 })
+    if result.agg_name.len > 0
+        emit_llvm_type_struct(s, TypeKind.Struct, result.agg_name)
     else if result.ptr_ty == 1
         format_into(s, "ptr")
     else if result.float_ty != TypeKind.Void
@@ -598,7 +597,7 @@ fn emit_match_phi_type(s: *EmitterState, result: *MatchResult)
 fn emit_match_phi_value(s: *EmitterState, result: *MatchResult, reg: i32)
     if reg != MATCH_ZERO_VALUE
         format_into(s, "%.{reg}")
-    else if result.agg_name != null and result.agg_name_len > 0
+    else if result.agg_name.len > 0
         format_into(s, "zeroinitializer")
     else if result.ptr_ty == 1
         format_into(s, "null")
@@ -610,8 +609,8 @@ fn emit_match_phi_value(s: *EmitterState, result: *MatchResult, reg: i32)
 # AGAST #1946: publish the phi's type for an untyped `let v = match` / `if`
 # (#1666).  Called after every arm, so the outermost construct's type wins.
 fn publish_match_type(s: *EmitterState, result: *MatchResult)
-    if result.agg_name != null and result.agg_name_len > 0
-        s.fcx.last_match_agg_name = StrView { ptr: result.agg_name, len: result.agg_name_len as i64 }
+    if result.agg_name.len > 0
+        s.fcx.last_match_agg_name = result.agg_name
         s.fcx.last_match_float_ty = TypeKind.Void
     else
         s.fcx.last_match_agg_name = strview_empty()
@@ -835,14 +834,14 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         lent_arm = lent_referent_local(s, arm.body)
         # AGAST #3005: a nameless tuple arm takes the type an earlier arm
         # fixed, or its own elements', with this arm's bindings in scope.
-        let agg_sv: StrView = StrView { ptr: result.agg_name, len: result.agg_name_len as i64 }
+        let agg_sv: StrView = result.agg_name
         let arm_lit_name_sv: StrView = tuple_lit_name(s, arm.body, agg_sv).unwrap_or(no_name())
         arm_lit_name = arm_lit_name_sv.ptr
         arm_lit_name_len = arm_lit_name_sv.len as i32
         if lent_arm != null and discarded
             body_reg = MATCH_ZERO_VALUE   # AGAST #3028: nothing reads it
         else if lent_arm != null
-            body_reg = emit_lent_referent(s, arm.body, StrView { ptr: (lv_type_name(lent_arm)), len: (lv_type_name_len(lent_arm)) as i64 })
+            body_reg = emit_lent_referent(s, arm.body, lv_name(lent_arm))
         else
             # AGAST #2092: a nested match / if (an `else if`, a match in an
             # arm, a block's tail) merges at the enclosing annotation too.
@@ -874,7 +873,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # binding (`Some(v) => v`) is still in scope; it is popped below.
         var arm_ty: StrView = no_name()
         if lent_arm != null
-            arm_ty = StrView { ptr: (lv_type_name(lent_arm)), len: (lv_type_name_len(lent_arm)) as i64 }
+            arm_ty = lv_name(lent_arm)
         # AGAST #4168: a nested match / if arm is of the type its own phi
         # published; the outer phi stayed i64 over its %S value.
         if unnamed(arm_ty) and not unnamed(nested_ty)
@@ -915,14 +914,12 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # StrView in the language; its `%Span$u8` lowering (#98) is an
         # artefact, so a leading literal arm types the phi as StrView, the
         # same type a later `Some(s) => s` over Option<StrView> yields.
-        if result.agg_name == null and not unnamed(arm_ty)
+        if unnamed(result.agg_name) and not unnamed(arm_ty)
             if arm.body.kind == ExprKind.StringLit
-                result.agg_name = "StrView".as_ptr()
-                result.agg_name_len = 7
+                result.agg_name = "StrView"
             else
-                result.agg_name = arm_ty.ptr
-                result.agg_name_len = arm_ty.len as i32
-        let agg_name: StrView = StrView { ptr: result.agg_name, len: result.agg_name_len as i64 }
+                result.agg_name = arm_ty
+        let agg_name: StrView = result.agg_name
         # AGAST #1662: rebuild a layout-equivalent arm value (Span$u8 <->
         # StrView, #168) as the phi's type here, in the arm's own block before
         # its `br`, so every phi incoming value has the phi's type.
@@ -932,11 +929,11 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # an i64 phi (another arm is a `*C`, or the pre-scan couldn't see the
         # arm's own `let`) it is converted.  The reverse can't happen: no arm
         # name shadows the one the pre-scan read.
-        if result.agg_name == null and unnamed(arm_ty) and result.ptr_ty == 0
+        if unnamed(result.agg_name) and unnamed(arm_ty) and result.ptr_ty == 0
             if arm_value_is_ptr(s, arm.body) == 1
                 body_reg = ptr_value_to_i64(s, arm.body, body_reg)
         # AGAST #1946: a float-valued scalar arm types the phi as float.
-        if result.agg_name == null and result.ptr_ty == 0
+        if unnamed(result.agg_name) and result.ptr_ty == 0
             body_reg = match_arm_float_settle(s, arm.body, body_reg, result)
     match_arm_into_slot(s, arm, result, body_reg)   # AGAST #3696
 
@@ -1205,7 +1202,7 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out: *StrView) -> i3
             # last-seen type name (an enum field's type, say), so trusting it
             # lowered `d as *H` as enum -> int.  `*p` of a `*E` is the deref arm.
             if loc != null and not resolve_local_is_ptr(loc) and lv_type_name_len(loc) > 0
-                let lt: StrView = StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }
+                let lt: StrView = lv_name(loc)
                 # Also recognize user-declared enums (Shade, etc.) via the
                 # parser's per-enum tracker.  The tag is field 0 and the
                 # payload field 2, as for Result/Option (AGAST #1797).
@@ -1238,7 +1235,7 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out: *StrView) -> i3
                     let ploc: *LocalVar = find_local_struct_name(s, ident_sv(opnd))
                     if ploc != null and lv_var_type(ploc) == TypeKind.Ptr and lv_pointee_type(ploc) == TypeKind.Struct
                         if lv_type_name_len(ploc) > 0
-                            let lt: StrView = StrView { ptr: (lv_type_name(ploc)), len: (lv_type_name_len(ploc)) as i64 }
+                            let lt: StrView = lv_name(ploc)
                             if is_tagged_enum_type(lt) == 1 or is_enum_type(s.sym.mono.pctx, lt) == 1
                                 *out = lt
                                 return 1
@@ -2126,8 +2123,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     # can't see it.
     let float_hint: TypeKind = take_match_float_hint(s)
     # AGAST #3205: taken before the scrutinee, so a match there can't see it.
-    let agg_hint: *u8 = s.fcx.match_agg_hint.ptr
-    let agg_hint_len: i32 = s.fcx.match_agg_hint.len as i32
+    let agg_hint: StrView = s.fcx.match_agg_hint
     s.fcx.match_agg_hint = strview_empty()
     # Detect whether the scrutinee is a tagged-enum struct; if so, spill
     # it into an alloca once so every arm can GEP the same pointer.
@@ -2256,9 +2252,8 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     # AGAST #3205: no arm yielded a value (each `return`s), so nothing typed
     # the phi; as a `-> S` fn's tail it is an S of zeros, which no path
     # reaches, not the i64 the implicit `ret %S` would name.
-    if result.agg_name == null and result.ptr_ty == 0 and result.float_ty == TypeKind.Void and result.int_arms == 0 and agg_hint_len > 0
+    if unnamed(result.agg_name) and result.ptr_ty == 0 and result.float_ty == TypeKind.Void and result.int_arms == 0 and agg_hint.len > 0
         result.agg_name = agg_hint
-        result.agg_name_len = agg_hint_len
     publish_match_type(s, @result)
     if result.void_arms > 0
         # AGAST #1654: an arm yields no value (a void call), so the match is

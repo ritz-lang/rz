@@ -71,10 +71,6 @@ fn ident_sv(e: *Expr) -> StrView
 fn param_type_sv(p: *Param) -> StrView
     p.param_type_name
 
-# The type name local `loc` records.
-fn lv_type_sv(loc: *LocalVar) -> StrView
-    StrView { ptr: lv_type_name(loc), len: lv_type_name_len(loc) as i64 }
-
 # StrView.as_bytes() -> Span<u8> — bypasses the missing StrView_as_bytes impl
 # Returns -1 if not applicable, else the LLVM register holding the Span<u8>.
 # recv_is_ptr_of_ptr = 1 when the stack slot holds a pointer value (receiver is *StrView);
@@ -454,7 +450,7 @@ pub fn span_array_elem_fits(s: *EmitterState, e: *Expr, loc: *LocalVar, name: St
     var prefix: StrView = ""
     match lv_array_elem_type(loc)
         TypeKind.Struct =>
-            elem = lv_type_sv(loc)
+            elem = lv_name(loc)
         TypeKind.Ptr =>
             elem = primitive_arg_name(lv_array_elem_pointee(loc))
             prefix = "ptr_"
@@ -511,7 +507,7 @@ pub fn emit_array_ptr_arg_copy(s: *EmitterState, value: *Expr, loc: *LocalVar, s
     if lv_pointee_array_size(loc) != p.param_array_size
         emit_ir_error_sv(s, value.span, "array length does not match the local array's length")
         return
-    if not array_store_fits(s, value, lv_pointee_array_elem_type(loc), lv_type_sv(loc), p.param_array_elem_type, param_type_sv(p))
+    if not array_store_fits(s, value, lv_pointee_array_elem_type(loc), lv_name(loc), p.param_array_elem_type, param_type_sv(p))
         return
     emit_local_array_copy(s, p.param_array_size, p.param_array_elem_type, param_type_sv(p), emit_load_ptr(s, loc.reg), slot)
 
@@ -623,7 +619,7 @@ fn arg_pointee_name(s: *EmitterState, arg: *Expr) -> StrView
                 let loc: *LocalVar = find_local_struct_name(s, ident_sv(x))
                 if loc == null or (lv_var_type(loc) != TypeKind.Struct and lent_struct_local(s, x) == null)
                     return no_name()
-                return lv_type_sv(loc)
+                return lv_name(loc)
             ExprKind.Member =>
                 let f: *StructField = member_field_def(s, x)
                 if f == null or f.field_type != TypeKind.Struct
@@ -639,7 +635,7 @@ fn arg_pointee_name(s: *EmitterState, arg: *Expr) -> StrView
     let t: TypeKind = lv_var_type(loc)
     if t != TypeKind.Ptr and t != TypeKind.Ref and t != TypeKind.MutRef
         return no_name()
-    lv_type_sv(loc)
+    lv_name(loc)
 
 # What the place `value` holds: its array's dimensions in `out`, or that it's no
 # array, or ARG_DIMS_UNKNOWN when ritz1 can't tell from here.  Emits nothing.
@@ -790,7 +786,7 @@ fn place_type_of(s: *EmitterState, e: *Expr, out: *PlaceType) -> bool
         ExprKind.Ident =>
             let loc: *LocalVar = find_local_struct_name(s, ident_sv(e))
             if loc != null
-                return place_type_set(out, lv_var_type(loc), lv_pointee_type(loc), lv_type_sv(loc))
+                return place_type_set(out, lv_var_type(loc), lv_pointee_type(loc), lv_name(loc))
             let g: *GlobalVarDef = find_global(s, ident_sv(e))
             if g == null
                 return false
@@ -1171,7 +1167,7 @@ pub fn variant_payload_aggregate(s: *EmitterState, payload_expr: *Expr) -> StrVi
         ExprKind.Ident =>
             let loc: *LocalVar = find_local_struct_name(s, ident_sv(payload_expr))
             if loc != null and lv_var_type(loc) == TypeKind.Struct and lv_type_name_len(loc) > 0
-                return lv_type_sv(loc)
+                return lv_name(loc)
             # AGAST #2144: `Ok(Vacant)` / `Some(Vacant)`, a bare unit variant
             # of a user enum, is the enum aggregate as `Ok(Opt.Vacant)` is
             # (it was stored as an i64: invalid IR).  A same-named const /
@@ -1363,8 +1359,8 @@ fn simd_arg_own_type(s: *EmitterState, arg: *Expr) -> StrView
     match arg.kind
         ExprKind.Ident =>
             let lv: *LocalVar = find_local_struct_name(s, ident_sv(arg))
-            if lv != null and is_simd_vector_type_name(lv_type_sv(lv)) == 1
-                return lv_type_sv(lv)
+            if lv != null and is_simd_vector_type_name(lv_name(lv)) == 1
+                return lv_name(lv)
         ExprKind.Unary =>
             # `*p` — check the operand (deref of *v4i32 → v4i32 value).
             return simd_arg_own_type(s, arg.operand)
@@ -1506,14 +1502,14 @@ fn sizeof_local_size(s: *EmitterState, lv: *LocalVar, depth: i32) -> i64
         TypeKind.Array =>
             if lv_array_shape(lv) != null
                 return sizeof_shape_size(s, lv_array_shape(lv), 0)
-            return sizeof_times(lv_array_size(lv) as i64, sizeof_kind_size(s, lv_array_elem_type(lv), lv_type_sv(lv)))
+            return sizeof_times(lv_array_size(lv) as i64, sizeof_kind_size(s, lv_array_elem_type(lv), lv_name(lv)))
         TypeKind.Struct =>
-            return sizeof_kind_size(s, TypeKind.Struct, lv_type_sv(lv))
+            return sizeof_kind_size(s, TypeKind.Struct, lv_name(lv))
         _ => pass
     if lv.is_bool == 1
         return 1
     if ty_bits(t) == 0
-        return sizeof_kind_size(s, t, lv_type_sv(lv))
+        return sizeof_kind_size(s, t, lv_name(lv))
     # An integer slot: ritz1 keeps every integer in i64, and the parser
     # defaults a missing annotation to TypeKind.I64, so the slot can't say.
     # An unannotated `let x = init` has init's type, as in ritz0.
@@ -1559,7 +1555,7 @@ fn sizeof_array_elem_struct(s: *EmitterState, b: *Expr) -> StrView
     if lidx >= 0
         let lv: *LocalVar = local_at(s, lidx)
         if lv_var_type(lv) == TypeKind.Array and lv_array_shape(lv) == null and lv_array_elem_type(lv) == TypeKind.Struct
-            return lv_type_sv(lv)
+            return lv_name(lv)
         return no_name()
     let g: *GlobalVarDef = find_global(s, ident_sv(b))
     if g != null and g.var_type == TypeKind.Array and g.array_shape == null and g.array_elem_type == TypeKind.Struct
@@ -1623,11 +1619,11 @@ fn sizeof_index_size(s: *EmitterState, e: *Expr) -> i64
             TypeKind.Array =>
                 if lv_array_shape(lv) != null
                     return sizeof_shape_size(s, lv_array_shape(lv), 1)
-                return sizeof_kind_size(s, lv_array_elem_type(lv), lv_type_sv(lv))
+                return sizeof_kind_size(s, lv_array_elem_type(lv), lv_name(lv))
             TypeKind.PtrPtr =>
                 return 8
             TypeKind.Ptr =>
-                return sizeof_kind_size(s, lv_pointee_type(lv), lv_type_sv(lv))
+                return sizeof_kind_size(s, lv_pointee_type(lv), lv_name(lv))
             _ => pass
         return -1
     let g: *GlobalVarDef = find_global(s, ident_sv(b))
@@ -1668,7 +1664,7 @@ fn sizeof_deref_size(s: *EmitterState, e: *Expr) -> i64
             TypeKind.PtrPtr =>
                 return 8
             TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
-                return sizeof_kind_size(s, lv_pointee_type(lv), lv_type_sv(lv))
+                return sizeof_kind_size(s, lv_pointee_type(lv), lv_name(lv))
             _ => pass
         return -1
     let g: *GlobalVarDef = find_global(s, ident_sv(o))
@@ -2405,7 +2401,7 @@ pub fn array_place_shape(s: *EmitterState, value: *Expr, out: *ArraySrc) -> i32
         let loc: *LocalVar = find_local_struct_name(s, ident_sv(value))
         if loc != null
             if lv_var_type(loc) == TypeKind.Array and lv_array_shape(loc) == null
-                return array_src_set(out, lv_array_size(loc), lv_array_elem_type(loc), lv_type_sv(loc))
+                return array_src_set(out, lv_array_size(loc), lv_array_elem_type(loc), lv_name(loc))
             return 0
         let g: *GlobalVarDef = find_global(s, ident_sv(value))
         if g != null and g.var_type == TypeKind.Array and g.array_shape == null
