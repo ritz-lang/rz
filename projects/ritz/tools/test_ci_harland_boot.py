@@ -217,7 +217,12 @@ SMP_OK = "[smp] syscall stacks OK: 4 CPUs in ring-3 SYSCALL at once, distinct pe
 # The BSP pinged each of the three APs over its mailbox and every pong came
 # back in order (AGAST #4879, SMP_USER.md §6).
 MBOX_OK = "".join(f"[mbox] round trip OK: cpu {k} answered 64 pings\n" for k in (1, 2, 3))
-SMP_OK = SMP_OK + MBOX_OK
+# Each AP served the BSP's owner-side UNMAP and a KERNEL_INVLPG (AGAST #4880,
+# SMP_USER.md §3, §6).
+TLB_OK = "".join(f"[tlb] owner unmap OK: cpu {k} saw the unmap\n[tlb] kernel invlpg OK: cpu {k} saw the unmap\n"
+                 for k in (1, 2, 3))
+TLB_NONE = "[tlb] no APs for the owner unmap\n"
+SMP_OK = SMP_OK + MBOX_OK + TLB_OK
 PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
 # The native ESP carries \\harland\\klog-dump, so the kernel dumps its crash
 # ring before init: the dump must be exactly the kernel's serial output up to
@@ -611,7 +616,31 @@ def test_every_ap_must_answer_the_mailbox_round_trip(tree, mbox, verdict):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("line, rc", [("[mbox] no APs to ping\n", 0), ("", 1)], ids=["said", "silent"])
+@pytest.mark.parametrize(
+    "tlb, verdict",
+    [
+        (TLB_OK.replace("[tlb] owner unmap OK: cpu 3 saw the unmap\n", ""),
+         "2 (owner) and 3 (kernel) of 3 APs saw the unmap"),
+        (TLB_OK.replace("[tlb] owner unmap OK: cpu 2 saw the unmap\n",
+                        "[tlb] owner unmap FAIL: cpu 2 read the stale frame\n"),
+         "an AP missed an unmap"),
+        (TLB_OK + "[vmm] vmm_free_pml4: PML4 0x7FE4F000 is still loaded on cpu 1: not freed\n",
+         "a PML4 was freed while a CPU still had it loaded"),
+    ],
+    ids=["missing-ap", "stale-read", "freed-while-loaded"],
+)
+def test_every_ap_must_see_the_unmap(tree, tlb, verdict):
+    """Every AP -smp starts must serve the owner-side unmap and the
+    kernel-half one (AGAST #4880): one OK line each per distinct AP, no FAIL,
+    and vmm_free_pml4's lazy-CR3 assert never fires."""
+    r = _run(tree, PASSED.replace(TLB_OK, tlb))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert verdict in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("line, rc", [("[mbox] no APs to ping\n" + TLB_NONE, 0), ("[mbox] no APs to ping\n", 1), ("", 1)],
+                         ids=["said", "tlb-silent", "silent"])
 def test_one_cpu_must_say_it_has_no_ap_to_ping(tree, line, rc):
     """At -smp 1 there is no AP: the kernel says so, and silence fails. Nor
     does it run the SMP syscall-stack self-test (init_smp needs an AP)."""
@@ -620,6 +649,7 @@ def test_one_cpu_must_say_it_has_no_ap_to_ping(tree, line, rc):
     assert "PASS (native): one CPU, no SMP syscall-stack self-test to run" in r.stdout
     if rc == 0:
         assert "PASS (native): one CPU, no AP to ping over the mailbox" in r.stdout
+        assert "PASS (native): one CPU, no AP for the owner unmap" in r.stdout
 
 
 @pytest.mark.integration

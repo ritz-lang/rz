@@ -39,11 +39,12 @@
 import ritzlib.option
 import io { disable_interrupts, enable_interrupts, interrupts_enabled }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
-import proc.table { BLOCK_WAIT, proc_wake_pid }
+import proc.table { BLOCK_WAIT, proc_wake_pid, proc_on_cpu }
 import proc.waitset { shm_latch_post_peers }
 import driver_abi.wait { SHM_DETACH_TIMEOUT_MS }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
-import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_SHM, DRV_RING_BASE, DRV_DMA_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, phys_to_virt }
+import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_SHM, DRV_RING_BASE, DRV_DMA_BASE, vmm_map_page_in, vmm_nx_flag, phys_to_virt }
+import mm.tlb { TLB_CLEAR, tlb_unmap_on }
 import syscall.errno { Errno }
 
 # Pages one object holds: the frame region (driver_abi FRAME_REGION_SIZE,
@@ -252,13 +253,13 @@ fn shm_cursor_slot(pid: u32) -> i32
         shm_cursors[free].in_use = true
     return free
 
-# Clear `pages` non-owning leaves from vaddr in pml4; the frames stay the
-# object's.
-fn shm_clear_leaves(pml4: u64, vaddr: u64, pages: u64)
-    var p: u64 = 0
-    while p < pages
-        vmm_unmap_page_in(pml4, vaddr + p * PAGE_SIZE)
-        p = p + 1
+# Clear `pages` non-owning leaves from vaddr in process `pid`'s pml4; the
+# frames stay the object's. The holder may be on another CPU (netd on its
+# AP), so the unmap is done there, by the CPU it is on (mm/tlb.ritz), and
+# this returns once that CPU has flushed them: the object's frames are
+# reclaimed only after.
+fn shm_clear_leaves(pid: u32, pml4: u64, vaddr: u64, pages: u64)
+    tlb_unmap_on(proc_on_cpu(pid as u64), pid as u64, pml4, vaddr, pages, TLB_CLEAR)
 
 # ShmMap: map object `id` into process `pid`, whose page table is `pml4`,
 # as user, NX, write-back leaves (writable if `writable`), from the
@@ -298,7 +299,7 @@ pub fn shm_map(pid: u32, pml4: u64, id: u64, writable: bool) -> i64
     var p: u64 = 0
     while p < pages
         if vmm_map_page_in(pml4, vaddr + p * PAGE_SIZE, shm_objects[slot].pages[p as i32], flags) != 0
-            shm_clear_leaves(pml4, vaddr, p)
+            shm_clear_leaves(pid, pml4, vaddr, p)
             return Errno.NoMem as i64
         p = p + 1
 
@@ -333,7 +334,7 @@ pub fn shm_unmap(pid: u32, id: u64) -> bool
         return false
     let slot: i32 = shm_object_slot(id)
     if slot >= 0
-        shm_clear_leaves(shm_maps[m].pml4, shm_maps[m].vaddr, shm_objects[slot].page_count)
+        shm_clear_leaves(pid, shm_maps[m].pml4, shm_maps[m].vaddr, shm_objects[slot].page_count)
     shm_drop_mapping(m)
     return true
 
@@ -366,8 +367,8 @@ fn shm_detach_due(slot: i32) -> bool
     o.in_use and o.retired and o.map_count > 0 and deadline_passed(o.detach_deadline)
 
 # Unmap by force every mapping of a retired object whose holder has not
-# detached within SHM_DETACH_TIMEOUT_MS: its leaves go (with the TLB entry,
-# when it is the running process), so its next load or store there is a
+# detached within SHM_DETACH_TIMEOUT_MS: its leaves go (with the TLB entries,
+# flushed by the CPU the holder is on), so its next load or store there is a
 # user #PF that kills it, and the last one reclaims the object. The fault
 # is not pointed at a replacement. Runs where no kernel path on this CPU is
 # part-way through the PMM or a page-table edit: the tick over CPL-3 code
@@ -383,7 +384,7 @@ pub fn shm_detach_expired() -> u32
             var m: i32 = 0
             while m < MAX_SHM_MAPS
                 if shm_maps[m].in_use and shm_maps[m].object_id == id
-                    shm_clear_leaves(shm_maps[m].pml4, shm_maps[m].vaddr, pages)
+                    shm_clear_leaves(shm_maps[m].pid, shm_maps[m].pml4, shm_maps[m].vaddr, pages)
                     shm_drop_mapping(m)
                     unmapped = unmapped + 1
                 m = m + 1

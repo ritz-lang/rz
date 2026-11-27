@@ -1,0 +1,203 @@
+# Harland address-space changes across CPUs (AGAST #4880, docs/SMP_USER.md
+# §3 "Address-space changes across CPUs")
+#
+# A user space is loaded only on the CPU its process is on (proc/table.ritz
+# proc_on_cpu): a CPU that a process leaves loads the kernel's PML4 before it
+# publishes the move (mm/vmm.ritz vmm_load_kernel_pml4). Without PCID a CR3
+# load flushes, and harland never sets PTE_GLOBAL, so only that one CPU can
+# hold a space's translations. An unmap needs no broadcast shootdown: it
+# needs the owner to do it.
+#
+# - Owner-side unmap (tlb_unmap_on): the requester posts UNMAP{pid, pml4,
+#   va, pages} to the CPU the process is on. That CPU serves it at its next
+#   safe point (sync/mbox.ritz mbox_drain): it clears the leaves, then, if
+#   the space is loaded there, runs one invlpg per page up to
+#   TLB_INVLPG_MAX or reloads CR3 beyond that, then replies UNMAP_DONE. The
+#   requester waits for the reply and only then may give the frames back. A
+#   process on the requester's own CPU is unmapped locally.
+# - A move during the request is harmless: a process that forwards to the
+#   BSP after UNMAP was posted left its old CPU's CR3 before it posted the
+#   move, and cannot run anywhere until the waiting BSP has its UNMAP_DONE.
+# - Kernel-half unmaps (tlb_unmap_kernel_page): PML4[256..511] is live on
+#   every CPU, so the requester posts KERNEL_INVLPG to every started CPU and
+#   waits for every acknowledgement before the frame is reused.
+# - Mapping needs no message: x86 caches no not-present translation.
+#
+# No deadlock (§2): only the BSP sends requests and busy-waits, taking only
+# replies to its own request; an AP serves its mailbox at every safe point
+# and never waits on another CPU. The wait has no deadline: giving up would
+# free a frame another CPU may still reach. It logs once if the owner is
+# slow, and keeps waiting.
+
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview { StrView }
+import klog { klog }
+import io { cpu_pause }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_map_started }
+import sync.mbox { MboxMsg, MBOX_UNMAP, MBOX_UNMAP_DONE, MBOX_KERNEL_INVLPG, MBOX_KERNEL_INVLPG_DONE, mbox_msg, mbox_post, mbox_take, mbox_drop_stray }
+import mm.pmm { PAGE_SIZE }
+import mm.vmm { vmm_clear_leaf_in, vmm_quarantine_leaf_in, vmm_get_current_pml4, vmm_unmap_kernel_page, vmm_flush_tlb, vmm_flush_tlb_all }
+
+# The kernel's is arch/x86_64/percpu.ritz cpu_index.
+extern fn cpu_index() -> i32
+
+# UNMAP's mode (its arg[4]).
+pub const TLB_CLEAR: u64 = 0        # clear the leaves (vmm_clear_leaf_in)
+pub const TLB_QUARANTINE: u64 = 1   # quarantine them (vmm_quarantine_leaf_in)
+
+# Pages flushed one invlpg each; beyond this a CR3 reload is cheaper.
+pub const TLB_INVLPG_MAX: u64 = 32
+
+# The wait logs once after this long without a reply (and keeps waiting).
+const TLB_SLOW_US: u64 = 10000000   # 10 s
+
+# The id of the last request this CPU sent: a reply carrying another is a
+# late one and is dropped. Only the BSP sends requests (§2).
+var tlb_request_id: u64 = 0
+
+# Flush `pages` pages from `vaddr` on this CPU: one invlpg each up to
+# TLB_INVLPG_MAX, else (or with `pages` 0) a CR3 reload.
+fn tlb_flush_here(vaddr: u64, pages: u64)
+    if pages == 0 or pages > TLB_INVLPG_MAX
+        vmm_flush_tlb_all()
+        return
+    var p: u64 = 0
+    while p < pages
+        vmm_flush_tlb(vaddr + p * PAGE_SIZE)
+        p = p + 1
+
+# The owner's side of UNMAP: clear (or quarantine) the `pages` leaves from
+# `vaddr` in `pml4`, then flush them if that space is loaded on this CPU (a
+# space that is not loaded here has no TLB entries here). How many leaves
+# changed.
+fn tlb_unmap_here(pml4: u64, vaddr: u64, pages: u64, mode: u64) -> u64
+    var changed: u64 = 0
+    var p: u64 = 0
+    while p < pages
+        let va: u64 = vaddr + p * PAGE_SIZE
+        if mode == TLB_QUARANTINE
+            match vmm_quarantine_leaf_in(pml4, va)
+                Some(_) => changed = changed + 1
+                None => pass
+        else if vmm_clear_leaf_in(pml4, va) != 0
+            changed = changed + 1
+        p = p + 1
+    if changed != 0 and pml4 == vmm_get_current_pml4()
+        tlb_flush_here(vaddr, pages)
+    changed
+
+# sync/mbox.ritz's handler for UNMAP and KERNEL_INVLPG, on the owner (its
+# `extern` hook): the value the reply carries in arg[1].
+pub fn tlb_serve(kind: u32, pml4: u64, vaddr: u64, pages: u64, mode: u64) -> u64
+    if kind == MBOX_UNMAP
+        return tlb_unmap_here(pml4, vaddr, pages, mode)
+    tlb_flush_here(vaddr, pages)
+    0
+
+# A CPU other than this one that can serve a request: a valid, started index.
+fn is_remote(cpu: i32) -> bool
+    cpu >= 0 and cpu < MAX_CPUS and cpu != cpu_index() and cpu_map_started(cpu) != 0
+
+# The next `kind` message in this CPU's mailbox, waiting for it as long as
+# it takes (anything else is a late reply, dropped). `what` names the wait
+# in the one log line a slow one gets.
+fn tlb_next_reply(kind: u32, what: StrView) -> MboxMsg
+    let me: i32 = cpu_index()
+    let slow: u64 = deadline_after_us(TLB_SLOW_US)
+    var logged: bool = false
+    while true
+        match mbox_take(me)
+            Some(m) =>
+                if m.kind == kind
+                    return m
+                mbox_drop_stray(m)
+            None =>
+                if not logged and deadline_passed(slow)
+                    klog("[tlb] still waiting for ")
+                    klog(what)
+                    klog("\n")
+                    logged = true
+                cpu_pause()
+
+# Wait for the UNMAP_DONE from `from` to request `id`; another one is a
+# late reply, dropped.
+fn tlb_wait_unmap_done(from: i32, id: u64) -> MboxMsg
+    while true
+        let m: MboxMsg = tlb_next_reply(MBOX_UNMAP_DONE, "an UNMAP_DONE")
+        if m.from as i32 == from and m.arg[0] == id
+            return m
+        mbox_drop_stray(m)
+
+# Post request `msg` (its arg[0] set to a new id) to `cpu`; the id.
+fn tlb_post(cpu: i32, msg: MboxMsg) -> u64
+    tlb_request_id = tlb_request_id + 1
+    var m: MboxMsg = msg
+    m.arg[0] = tlb_request_id
+    mbox_post(cpu, m)
+    tlb_request_id
+
+# Clear (TLB_CLEAR) or quarantine (TLB_QUARANTINE) `pages` 4 KiB leaves from
+# `vaddr` in process `pid`'s page table `pml4`, on `cpu`, the CPU the
+# process is on (proc_on_cpu). On this CPU (or one that is not started) it
+# is local; otherwise an UNMAP request, and the call returns once the owner
+# has cleared and flushed them. Only then may the caller free the frames.
+# How many leaves changed.
+pub fn tlb_unmap_on(cpu: i32, pid: u64, pml4: u64, vaddr: u64, pages: u64, mode: u64) -> u64
+    if pages == 0
+        return 0
+    if not is_remote(cpu)
+        return tlb_unmap_here(pml4, vaddr, pages, mode)
+    var req: MboxMsg = mbox_msg(MBOX_UNMAP)
+    req.pid = pid
+    req.arg[1] = pml4
+    req.arg[2] = vaddr
+    req.arg[3] = pages
+    req.arg[4] = mode
+    let id: u64 = tlb_post(cpu, req)
+    tlb_wait_unmap_done(cpu, id).arg[1]
+
+# Flush `pages` kernel-half pages from `vaddr` (0: the whole TLB) on every
+# started CPU but this one, and wait for each to acknowledge. How many did.
+pub fn tlb_kernel_shootdown(vaddr: u64, pages: u64) -> i32
+    var req: MboxMsg = mbox_msg(MBOX_KERNEL_INVLPG)
+    req.arg[2] = vaddr
+    req.arg[3] = pages
+    # Every CPU's ids, posted first, so the CPUs flush in parallel.
+    var ids: [64]u64     # MAX_CPUS; 0: nothing outstanding
+    var posted: i32 = 0
+    var i: i32 = 0
+    while i < MAX_CPUS
+        ids[i] = 0
+        if i < num_cpus as i32 and is_remote(i)
+            ids[i] = tlb_post(i, req)
+            posted = posted + 1
+        i = i + 1
+    # The acks come back in any order: each one settles its CPU's id.
+    var acked: i32 = 0
+    while acked < posted
+        let m: MboxMsg = tlb_next_reply(MBOX_KERNEL_INVLPG_DONE, "KERNEL_INVLPG acks")
+        let from: i32 = m.from as i32
+        if from >= 0 and from < MAX_CPUS and ids[from] != 0 and ids[from] == m.arg[0]
+            ids[from] = 0
+            acked = acked + 1
+        else
+            mbox_drop_stray(m)
+    acked
+
+pub enum TlbError
+    # vmm_unmap_kernel_page refused: the VA is not mapped through a PD (or
+    # inside a 1 GiB page), or no page could be had to split a 2 MiB one
+    NotUnmappable
+
+# Unmap the kernel-half page at `vaddr` (vmm_unmap_kernel_page, which
+# flushes this CPU) and flush it on every other started CPU: on Ok no CPU
+# can reach the frame through `vaddr`, and it may be reused. The split of a
+# 2 MiB page changes all of it, so the others reload CR3. On Err nothing
+# changed and nothing was sent.
+pub fn tlb_unmap_kernel_page(vaddr: u64) -> Result<(), TlbError>
+    if vmm_unmap_kernel_page(vaddr) != 0
+        return Err(TlbError.NotUnmappable)
+    tlb_kernel_shootdown(vaddr, 0)
+    Ok(())

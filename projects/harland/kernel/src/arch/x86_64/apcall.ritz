@@ -19,14 +19,23 @@
 import ritzlib.option
 import ritzlib.result
 import klog { klog, klog_dec }
+import ritzlib.strview { StrView }
 import io { cpu_pause, interrupts_enabled, enable_interrupts, disable_interrupts }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_started }
 import arch.x86_64.percpu { cpu_index }
 import sync.mbox { MboxMsg, MBOX_CALL, MBOX_CALL_DONE, MBOX_PING, MBOX_PONG, mbox_msg, mbox_post, mbox_take, mbox_drop_stray }
 import drivers.nvme.nvme { nvme_ap_probe }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
+import mm.vmm { PTE_WRITABLE, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PHYSMAP_BASE, phys_to_virt, vmm_create_user_pml4, vmm_free_pml4, vmm_map_page, vmm_map_page_in, vmm_map_mmio, vmm_switch_pml4, vmm_load_kernel_pml4, vmm_pml4_loaded_on }
+import mm.tlb { TLB_CLEAR, tlb_unmap_on, tlb_unmap_kernel_page }
 
 const AP_CALL_NVME: u32 = 1
+# The owner-unmap boot test's steps on the AP (tlb_selftest_all, below).
+const AP_CALL_TLB_LOAD_A: u32 = 2   # load the test PML4, map VA -> A, read A
+const AP_CALL_TLB_MAP_B: u32 = 3    # map VA -> B, read
+const AP_CALL_TLB_KREAD: u32 = 4    # read the kernel-half test VA
+const AP_CALL_TLB_DROP: u32 = 5     # load the kernel's PML4 again
 
 # How long the BSP waits for an AP to finish one call, and for one AP's pings.
 const AP_CALL_TIMEOUT_US: u64 = 10000000   # 10 s
@@ -54,6 +63,8 @@ pub fn ap_call_run(kind: u32) -> i32
     var status: i32 = -1
     if kind == AP_CALL_NVME
         status = nvme_ap_probe()
+    else if kind >= AP_CALL_TLB_LOAD_A and kind <= AP_CALL_TLB_DROP
+        status = tlb_test_step(kind)
     if not was_on
         disable_interrupts()
     status
@@ -73,23 +84,30 @@ fn ap_wait_reply(from: i32, kind: u32, tag: u64, deadline: u64) -> Option<MboxMs
             None => cpu_pause()
     None
 
-# Send call `kind` to CPU `cpu` and wait for its CALL_DONE.
-fn ap_call_one(cpu: i32, kind: u32) -> Result<(), ApCallError>
+# Send call `kind` to CPU `cpu` and wait for its CALL_DONE: the callee's
+# status, or None when it did not answer.
+fn ap_call_status(cpu: i32, kind: u32) -> Option<i64>
     ap_call_id = ap_call_id + 1
     var call: MboxMsg = mbox_msg(MBOX_CALL)
     call.arg[0] = ap_call_id
     call.arg[1] = kind as u64
     mbox_post(cpu, call)
     match ap_wait_reply(cpu, MBOX_CALL_DONE, ap_call_id, deadline_after_us(AP_CALL_TIMEOUT_US))
-        Some(done) =>
-            if done.arg[1] != 0
-                return Err(ApCallError.Failed)
-            Ok(())
+        Some(done) => Some(done.arg[1] as i64)
         None =>
             klog("[apcall] AP ")
             klog_dec(cpu_apic_ids[cpu] as i64)
             klog(" did not answer\n")
-            Err(ApCallError.NoAnswer)
+            None
+
+# Send call `kind` to CPU `cpu` and wait for its CALL_DONE.
+fn ap_call_one(cpu: i32, kind: u32) -> Result<(), ApCallError>
+    match ap_call_status(cpu, kind)
+        Some(status) =>
+            if status != 0
+                return Err(ApCallError.Failed)
+            Ok(())
+        None => Err(ApCallError.NoAnswer)
 
 # The started CPUs other than this one, by cpu_map index.
 fn is_other_ap(i: i32) -> bool
@@ -157,4 +175,205 @@ pub fn ap_ping_all() -> i32
         i = i + 1
     if aps == 0
         klog("[mbox] no APs to ping\n")
+    n
+
+# ============================================================================
+# The owner-unmap boot test (AGAST #4880, SMP_USER.md §3 and §6)
+# ============================================================================
+#
+# For each started AP: AP call 1 loads a test PML4 on the AP, maps TLB_TEST_VA
+# to frame A and reads A's marker, so the AP's TLB holds VA -> A. The BSP
+# posts UNMAP{VA} to that AP (mm/tlb.ritz tlb_unmap_on) and waits for
+# UNMAP_DONE. AP call 2 maps VA -> B, which needs no flush (the old leaf is
+# not present), and reads: B's marker only if the owner's invlpg dropped the
+# stale entry. Then the same for the kernel half: the AP reads a kernel VA
+# mapped to A, the BSP unmaps it with tlb_unmap_kernel_page (KERNEL_INVLPG
+# to every AP), maps it to B, and the AP must read B. Last, AP call DROP
+# loads the kernel's PML4 on the AP, and the test PML4 must be loaded
+# nowhere before vmm_free_pml4 frees it. Lines, per AP:
+#   [tlb] owner unmap OK: cpu N saw the unmap
+#   [tlb] kernel invlpg OK: cpu N saw the unmap
+# or "[tlb] owner unmap FAIL: cpu N <why>" ("[tlb] kernel invlpg FAIL: ...").
+# With no AP: "[tlb] no APs for the owner unmap".
+#
+# The AP's steps use BSP-owned state (the test's globals below), lent for
+# the call as nvme_ap_probe's are: the BSP writes them before it posts the
+# CALL and reads them after the CALL_DONE.
+
+# A lower-half VA no process uses: the test PML4 maps it, supervisor-only.
+const TLB_TEST_VA: u64 = 0x10000000000          # PML4[2]
+const TLB_MARK_A: u64 = 0x4141414141414141
+const TLB_MARK_B: u64 = 0x4242424242424242
+
+# A step's status (CALL_DONE's arg[1]).
+const TLB_STEP_OK: i32 = 0
+const TLB_STEP_STALE: i32 = 1        # read the marker of the frame unmapped
+const TLB_STEP_WRONG: i32 = 2        # read neither marker
+const TLB_STEP_NO_MAP: i32 = 3       # a page table could not be had
+const TLB_STEP_LOW_STACK: i32 = 4    # running on a stack a user PML4 lacks
+
+var tlb_pml4: u64 = 0       # the test address space
+var tlb_frame_a: u64 = 0
+var tlb_frame_b: u64 = 0
+var tlb_kva: u64 = 0        # the kernel-half test VA
+var tlb_want: u64 = 0       # the marker the next read must see
+var tlb_stale: u64 = 0      # the marker a stale translation would show
+
+# Read the quadword at `va`, and grade it against tlb_want / tlb_stale.
+fn tlb_test_read(va: u64) -> i32
+    let got: u64 = volatile_load(va as *u64)
+    if got == tlb_want
+        return TLB_STEP_OK
+    if got == tlb_stale
+        return TLB_STEP_STALE
+    TLB_STEP_WRONG
+
+# This CPU's stack is in the kernel half, so it stays mapped under the test
+# PML4 (an AP that idles on its identity-mapped bootstrap stack would fault).
+fn tlb_on_kernel_stack() -> bool
+    var marker: u64 = 0
+    (@marker as u64) >= PHYSMAP_BASE
+
+# One step of the test on the AP (ap_call_run, AP_CALL_TLB_*).
+fn tlb_test_step(kind: u32) -> i32
+    if kind == AP_CALL_TLB_LOAD_A
+        if not tlb_on_kernel_stack()
+            return TLB_STEP_LOW_STACK
+        vmm_switch_pml4(tlb_pml4)
+        if vmm_map_page_in(tlb_pml4, TLB_TEST_VA, tlb_frame_a, PTE_WRITABLE) != 0
+            return TLB_STEP_NO_MAP
+        return tlb_test_read(TLB_TEST_VA)
+    if kind == AP_CALL_TLB_MAP_B
+        if vmm_map_page_in(tlb_pml4, TLB_TEST_VA, tlb_frame_b, PTE_WRITABLE) != 0
+            return TLB_STEP_NO_MAP
+        return tlb_test_read(TLB_TEST_VA)
+    if kind == AP_CALL_TLB_KREAD
+        return tlb_test_read(tlb_kva)
+    vmm_load_kernel_pml4()
+    TLB_STEP_OK
+
+fn tlb_step_why(status: Option<i64>) -> StrView
+    match status
+        Some(s) =>
+            if s == TLB_STEP_STALE as i64
+                return "read the stale frame"
+            if s == TLB_STEP_WRONG as i64
+                return "read neither marker"
+            if s == TLB_STEP_NO_MAP as i64
+                return "could not map the test page"
+            if s == TLB_STEP_LOW_STACK as i64
+                return "idles on a stack the test PML4 lacks"
+            "failed"
+        None => "did not answer"
+
+fn tlb_step_ok(status: Option<i64>) -> bool
+    match status
+        Some(s) => s == TLB_STEP_OK as i64
+        None => false
+
+fn tlb_verdict(what: StrView, cpu: i32, why: Option<StrView>)
+    klog("[tlb] ")
+    klog(what)
+    match why
+        Some(w) =>
+            klog(" FAIL: cpu ")
+            klog_dec(cpu as i64)
+            klog(" ")
+            klog(w)
+            klog("\n")
+        None =>
+            klog(" OK: cpu ")
+            klog_dec(cpu as i64)
+            klog(" saw the unmap\n")
+
+# Run AP call `kind` on `cpu` wanting `want` (a stale read shows `stale`):
+# None when it passed, else why not.
+fn tlb_ap_step(cpu: i32, kind: u32, want: u64, stale: u64) -> Option<StrView>
+    tlb_want = want
+    tlb_stale = stale
+    let status: Option<i64> = ap_call_status(cpu, kind)
+    if tlb_step_ok(status)
+        return None
+    Some(tlb_step_why(status))
+
+# The owner unmap on `cpu`: None when it passed, else why not. Leaves the
+# test PML4 loaded on `cpu` (tlb_selftest_one drops it).
+fn tlb_owner_unmap(cpu: i32) -> Option<StrView>
+    match tlb_ap_step(cpu, AP_CALL_TLB_LOAD_A, TLB_MARK_A, TLB_MARK_B)
+        Some(w) => return Some(w)
+        None => pass
+    if vmm_pml4_loaded_on(tlb_pml4, cpu_index()) != cpu
+        return Some("does not show the test PML4 loaded")
+    if tlb_unmap_on(cpu, 0, tlb_pml4, TLB_TEST_VA, 1, TLB_CLEAR) != 1
+        return Some("cleared no leaf")
+    tlb_ap_step(cpu, AP_CALL_TLB_MAP_B, TLB_MARK_B, TLB_MARK_A)
+
+# The kernel-half unmap seen from `cpu`: None when it passed, else why not.
+fn tlb_kernel_invlpg(cpu: i32) -> Option<StrView>
+    tlb_kva = vmm_map_mmio(tlb_frame_a, PAGE_SIZE)
+    if tlb_kva == 0
+        return Some("no kernel VA for the test")
+    match tlb_ap_step(cpu, AP_CALL_TLB_KREAD, TLB_MARK_A, TLB_MARK_B)
+        Some(w) => return Some(w)
+        None => pass
+    match tlb_unmap_kernel_page(tlb_kva)
+        Ok(_) => pass
+        Err(_) => return Some("could not unmap the kernel VA")
+    # A new leaf: vmm_map_page flushes nothing, here or anywhere.
+    if vmm_map_page(tlb_kva, tlb_frame_b, PTE_WRITABLE | PTE_WRITE_THROUGH | PTE_CACHE_DISABLE) != 0
+        return Some("could not remap the kernel VA")
+    let verdict: Option<StrView> = tlb_ap_step(cpu, AP_CALL_TLB_KREAD, TLB_MARK_B, TLB_MARK_A)
+    # The window's VA is not reused (the MMIO window only grows); the frame
+    # goes back below, so no CPU may reach it through the VA.
+    match tlb_unmap_kernel_page(tlb_kva)
+        Ok(_) => verdict
+        Err(_) => Some("could not unmap the kernel VA again")
+
+# Both tests on `cpu`, with fresh frames and a fresh test PML4. True when
+# both passed.
+fn tlb_selftest_one(cpu: i32) -> bool
+    tlb_pml4 = vmm_create_user_pml4()
+    tlb_frame_a = pmm_alloc_page()
+    tlb_frame_b = pmm_alloc_page()
+    if tlb_pml4 == 0 or tlb_frame_a == 0 or tlb_frame_b == 0
+        klog("[tlb] owner unmap FAIL: no memory for the test\n")
+        return false
+    volatile_store(phys_to_virt(tlb_frame_a) as *u64, TLB_MARK_A)
+    volatile_store(phys_to_virt(tlb_frame_b) as *u64, TLB_MARK_B)
+
+    let owner: Option<StrView> = tlb_owner_unmap(cpu)
+    tlb_verdict("owner unmap", cpu, owner)
+    let kernel: Option<StrView> = tlb_kernel_invlpg(cpu)
+    tlb_verdict("kernel invlpg", cpu, kernel)
+
+    # The lazy-CR3 drop: the AP loads the kernel's PML4, and only then is
+    # the test space loaded nowhere and safe to free (vmm_free_pml4 refuses
+    # one still loaded). VA -> B is the test PML4's one leaf: freed with it.
+    var dropped: bool = tlb_step_ok(ap_call_status(cpu, AP_CALL_TLB_DROP))
+    if dropped and vmm_pml4_loaded_on(tlb_pml4, -1) >= 0
+        dropped = false
+    if not dropped
+        klog("[tlb] owner unmap FAIL: cpu ")
+        klog_dec(cpu as i64)
+        klog(" kept the test PML4 loaded\n")
+    else
+        vmm_free_pml4(tlb_pml4)
+        pmm_free_page(tlb_frame_a)
+    tlb_pml4 = 0
+    owner.is_none() and kernel.is_none() and dropped
+
+# The boot's owner-unmap test on every started AP (SMP_USER.md §6), after the
+# mailbox round trip. How many APs passed.
+pub fn tlb_selftest_all() -> i32
+    var n: i32 = 0
+    var aps: i32 = 0
+    var i: i32 = 0
+    while i < num_cpus as i32 and i < MAX_CPUS
+        if is_other_ap(i)
+            aps = aps + 1
+            if tlb_selftest_one(i)
+                n = n + 1
+        i = i + 1
+    if aps == 0
+        klog("[tlb] no APs for the owner unmap\n")
     n
