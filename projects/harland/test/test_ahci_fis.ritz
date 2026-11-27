@@ -1,0 +1,119 @@
+# H2D FIS and PRDT encoding for READ/WRITE DMA EXT and FLUSH (AGAST #4884).
+# The kernel writes these bytes into the command table.
+
+import ritzlib.span
+import drivers.ahci.regs { ahci_rf_read }
+import drivers.ahci.fis {
+    ahci_chunk_sectors, ahci_xfer_pages, ahci_fill_h2d, ahci_fill_header,
+    ahci_fill_prdt, AhciDir, AHCI_CMD_READ_DMA_EXT, AHCI_CMD_WRITE_DMA_EXT,
+    AHCI_CMD_FLUSH_EXT, AHCI_CMD_IDENTIFY, AHCI_MAX_SECTORS
+}
+
+[[test]]
+fn test_read_dma_ext_lays_out_lba48() -> i32
+    var fis: [20]u8
+    # LBA 0x112233445566, 200 sectors. Count is little-endian at bytes 12-13.
+    ahci_fill_h2d(@fis, AHCI_CMD_READ_DMA_EXT, 0x112233445566, 200)
+    if fis[0] != 0x27 or fis[1] != 0x80 or fis[2] != 0x25
+        return 1
+    if fis[4] != 0x66 or fis[5] != 0x55 or fis[6] != 0x44
+        return 2
+    if fis[7] != 0x40 or fis[8] != 0x33 or fis[9] != 0x22 or fis[10] != 0x11
+        return 3
+    if fis[12] != 200 or fis[13] != 0
+        return 4
+    return 0
+
+[[test]]
+fn test_write_and_flush_commands() -> i32
+    var fis: [20]u8
+    var hdr: [16]u8
+    ahci_fill_h2d(@fis, AHCI_CMD_WRITE_DMA_EXT, 1, 8)
+    ahci_fill_header(@hdr, AhciDir.Write, 1, 0x1000)
+    if fis[2] != 0x35
+        return 1
+    # W bit and PRDTL 1, CFL 5, CTBA 0x1000.
+    if ahci_rf_read(@hdr, 0) != (5 | 0x40 | (1 << 16))
+        return 2
+    if ahci_rf_read(@hdr, 8) != 0x1000 or ahci_rf_read(@hdr, 12) != 0
+        return 3
+    ahci_fill_h2d(@fis, AHCI_CMD_FLUSH_EXT, 0, 0)
+    ahci_fill_header(@hdr, AhciDir.Read, 0, 0x2000)
+    if fis[2] != 0xEA or fis[12] != 0 or fis[4] != 0
+        return 4
+    if ahci_rf_read(@hdr, 0) != 5
+        return 5
+    return 0
+
+[[test]]
+fn test_identify_fis_is_one_pio_command() -> i32
+    var fis: [20]u8
+    ahci_fill_h2d(@fis, AHCI_CMD_IDENTIFY, 0, 0)
+    if fis[2] != 0xEC or fis[1] != 0x80 or fis[7] != 0x40
+        return 1
+    return 0
+
+[[test]]
+fn test_short_buffers_are_left_alone() -> i32
+    # A FIS or header that does not fit writes nothing past (or into) dst.
+    var small: [19]u8
+    let s: [u8] = @small
+    s.fill(0xAA)
+    ahci_fill_h2d(s, AHCI_CMD_READ_DMA_EXT, 1, 1)
+    if small[0] != 0xAA or small[18] != 0xAA
+        return 1
+    ahci_fill_header(s.to(15), AhciDir.Write, 1, 0x1000)
+    if small[0] != 0xAA
+        return 2
+    return 0
+
+[[test]]
+fn test_prdt_splits_200_sectors_across_two_commands() -> i32
+    # 200 sectors is 100 KiB: 128 then 72. 72 sectors is 9 full pages.
+    if ahci_chunk_sectors(200) != AHCI_MAX_SECTORS
+        return 1
+    if ahci_chunk_sectors(72) != 72
+        return 2
+    let first_bytes: u32 = AHCI_MAX_SECTORS * 512
+    let second_bytes: u32 = 72 * 512
+    if ahci_xfer_pages(first_bytes) != 16
+        return 3
+    if ahci_xfer_pages(second_bytes) != 9
+        return 4
+    var phys: [16]u64
+    var i: i32 = 0
+    while i < 16
+        phys[i] = 0x1000 + (i as u64) * 0x1000
+        i = i + 1
+    var prdt: [256]u8
+    let n: i32 = ahci_fill_prdt(@prdt, @phys, first_bytes)
+    if n != 16
+        return 5
+    # First entry: 4096 bytes, I clear. Last entry: 4096 bytes, I set.
+    if ahci_rf_read(@prdt, 0) != 0x1000 or ahci_rf_read(@prdt, 12) != 4095
+        return 6
+    if (ahci_rf_read(@prdt, 15 * 16 + 12) & 0x80000000) == 0
+        return 7
+    if (ahci_rf_read(@prdt, 15 * 16 + 12) & 0x3FFFFF) != 4095
+        return 8
+    # A short tail: 512 bytes is one entry, DBC 511, I set.
+    let one: i32 = ahci_fill_prdt(@prdt, @phys, 512)
+    if one != 1 or ahci_rf_read(@prdt, 12) != (511 | 0x80000000)
+        return 9
+    return 0
+
+[[test]]
+fn test_prdt_refuses_what_does_not_fit() -> i32
+    var phys: [16]u64
+    var prdt: [256]u8
+    let p: [u64] = @phys
+    let d: [u8] = @prdt
+    # 9 pages of data but only 8 page addresses.
+    if ahci_fill_prdt(d, p.to(8), 72 * 512) != 0
+        return 1
+    # 16 entries need 256 bytes of table.
+    if ahci_fill_prdt(d.to(255), p, 128 * 512) != 0
+        return 2
+    if ahci_fill_prdt(d, p, 0) != 0
+        return 3
+    return 0

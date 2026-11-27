@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""CI must boot harland on q35 and check the polled AHCI probe (AGAST #4882).
+"""CI must boot harland on q35 and check AHCI (AGAST #4882, #4884).
 
 projects/harland/tools/test_ahci_boot.sh boots under OVMF with no virtio-blk
-and no NVMe. Two ide-hd disks on ich9-ahci must log IDENTIFY with the sector
-counts the script created. A second step attaches no ide-hd; the empty
-controller must log one summary and no per-port line. A missing tool is a
-SETUP ERROR (exit 3). Every failed check is exit 1.
+and no NVMe. Two ide-hd disks: the root qcow2 (qemu-img virtual-size, the
+stub reports 2048 sectors) and a 4 MiB patterned data disk. The first qemu
+must log IDENTIFY, the FNV-1a of LBAs 1-200, an initramfs load, Tier-1, and
+/var/boots = 1. The second qemu of the same disks must log boot 2 and Tier-1.
+The stub overlays a one-sector goliath image so the pattern check can pass.
+A second step attaches no ide-hd; the empty controller must log one summary
+and no per-port line. A missing tool is a SETUP ERROR (exit 3). Every failed
+check is exit 1.
 
 Run with:
     python3 -m pytest projects/ritz/tools/test_ci_ahci_boot.py -q
@@ -15,6 +19,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -34,11 +39,45 @@ NVME_SCRIPT = "projects/harland/tools/test_nvme_boot.sh"
 QEMU_STUB = r"""#!/usr/bin/env bash
 echo "$@" >> "$STUB_LOG"
 prev=""
+serial_file=""
+data_img=""
 for a in "$@"; do
-    if [ "$prev" = "-serial" ]; then printf '%b' "$FAKE_SERIAL" > "${a#file:}"; fi
+    if [ "$prev" = "-serial" ]; then serial_file="${a#file:}"; fi
+    case "$a" in
+        file=*data.img,format=raw*)
+            data_img="${a#file=}"
+            data_img="${data_img%%,format=*}"
+            ;;
+    esac
     prev="$a"
 done
+payload="${FAKE_SERIAL:-}"
+if [ "${AHCI_WHICH:-1}" = "2" ]; then payload="${FAKE_SERIAL2:-$payload}"; fi
+if [ -n "$serial_file" ]; then printf '%b' "$payload" > "$serial_file"; fi
+if [ "${FAKE_PERSIST:-0}" = "1" ] && [ -n "$data_img" ]; then
+    python3 - "$data_img" <<'PY'
+import struct, sys
+path = sys.argv[1]
+with open(path, "r+b") as f:
+    hdr = bytearray(512)
+    hdr[0:8] = b"GOLIATHB"
+    struct.pack_into("<II", hdr, 8, 2, 512)
+    struct.pack_into("<QQ", hdr, 24, 2, 512)
+    f.seek(0)
+    f.write(hdr)
+    f.seek(2 * 512)
+    f.write(b"GOLIATHS")
+PY
+fi
 sleep 30
+"""
+
+QEMU_IMG_STUB = """#!/usr/bin/env bash
+if [ "$1" = "info" ]; then
+    echo '{"virtual-size":1048576}'
+    exit 0
+fi
+exit 0
 """
 MKINITRAMFS_STUB = """import sys
 out = sys.argv[sys.argv.index("--output") + 1]
@@ -54,8 +93,27 @@ DATA_LINE = (
     "512-byte sectors, write cache\n"
 )
 SUMMARY = "[ahci] 00:1f.2: 2 disks\n"
-IDENTIFY = ROOT_LINE + DATA_LINE + SUMMARY
 EMPTY = "[ahci] 00:1f.2: 0 disks\n"
+
+
+def _pattern_fnv() -> int:
+    h = 0x811C9DC5
+    for n in range(1, 201):
+        for b in (b"LBA" + struct.pack("<I", n) + b"!") * 64:
+            h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def _persist_serial(boot: int) -> str:
+    fnv = _pattern_fnv()
+    lines = ""
+    if boot == 1:
+        lines += ROOT_LINE + DATA_LINE + SUMMARY
+        lines += f"[ahci] 00:1f.2 port 1: LBA 1-200 fnv1a={fnv}\n"
+        lines += "[initramfs] Loaded 4 files\n"
+    lines += f"  [OK] Persistent storage (goliath image: boot {boot}, 1 blobs)\n"
+    lines += "ALL TESTS PASSED\n"
+    return lines
 
 
 def _build_all() -> list[dict]:
@@ -113,6 +171,7 @@ def tree(tmp_path):
     for rel in (
         "projects/harland/build/debug/harland.elf",
         "projects/harland/build/debug/BOOTX64.EFI",
+        "projects/indium/build/debug/init.elf",
     ):
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -140,6 +199,7 @@ def _run(tree, serial: str = "", *, qemu=True, env_extra=None) -> subprocess.Com
     stubs = tree["stubs"]
     if qemu:
         _stub(stubs, "qemu-system-x86_64", QEMU_STUB)
+        _stub(stubs, "qemu-img", QEMU_IMG_STUB)
         path = f"{stubs}{os.pathsep}{os.environ['PATH']}"
     else:
         for tool in ("dirname", "python3"):
@@ -160,7 +220,7 @@ def _run(tree, serial: str = "", *, qemu=True, env_extra=None) -> subprocess.Com
         env=env,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=60,
     )
 
 
@@ -173,7 +233,10 @@ def test_missing_qemu_is_a_setup_error(tree):
 
 @pytest.mark.integration
 def test_identify_lines_pass(tree):
-    r = _run(tree, IDENTIFY)
+    r = _run(tree, _persist_serial(1), env_extra={
+        "FAKE_SERIAL2": _persist_serial(2),
+        "FAKE_PERSIST": "1",
+    })
     assert r.returncode == 0, r.stdout + r.stderr
     argv = (tree["tmp"] / "stub.log").read_text()
     assert "q35" in argv
@@ -194,7 +257,7 @@ def test_wrong_sector_count_fails(tree):
 
 @pytest.mark.integration
 def test_exception_fails(tree):
-    r = _run(tree, "EXCEPTION: #GP\n" + IDENTIFY)
+    r = _run(tree, "EXCEPTION: #GP\n" + ROOT_LINE + DATA_LINE + SUMMARY)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL: kernel exception" in r.stdout
 
