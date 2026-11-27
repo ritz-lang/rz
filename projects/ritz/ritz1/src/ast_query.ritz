@@ -375,43 +375,38 @@ pub fn user_enum_tuple_field(ctx: *ParseCtx, name_sv: StrView, sel: i32) -> *Str
 # with no payload; it used to fall through to a fn call returning i64).
 # AGAST #2039: a name two enums declare is no ctor here (null): the caller,
 # try_emit_user_variant_ctor, reports it via user_variant_ctor_ambiguous.
-pub fn user_variant_ctor_enum(ctx: *ParseCtx, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+pub fn user_variant_ctor_enum(ctx: *ParseCtx, e: *Expr) -> StrView
     if e == null or e.kind != ExprKind.Call
-        return
+        return strview_empty()
     var vi: i32 = 0
     var other: i32 = 0
     let ei: i32 = enum_of_variant_unique(ctx, e.func_name, @vi, @other)
     if ei < 0
-        return
+        return strview_empty()
     let kind: i32 = enum_variant_kind(ctx, ei, vi)
     if kind == ENUM_VARIANT_UNIT
         if e.args != null
-            return
+            return strview_empty()
     else if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
         # AGAST #1295: one value per field, `Rect(w, h)`, a struct variant's
         # positionally; emit_variant_build checks the count, located.
         if e.args == null
-            return
+            return strview_empty()
     else
-        return
-    *out_name = enum_name_at(ctx, ei, out_len)
+        return strview_empty()
+    enum_name_at(ctx, ei)
 
 # AGAST #3995: the user enum a call constructs whatever its slot, for the two
 # typers (get_expr_type, Sema's sema_call_ty): user_variant_ctor_enum, less
 # a variant named Some / Ok / Err / None, whose call is the builtin Option /
 # Result one unless the slot is the user's enum (users_variant_wins).
-pub fn user_enum_ctor_call(ctx: *ParseCtx, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+pub fn user_enum_ctor_call(ctx: *ParseCtx, e: *Expr) -> StrView
     if e == null or e.kind != ExprKind.Call
-        return
-    let n: *u8 = e.func_name.ptr
-    let l: i32 = e.func_name.len as i32
-    if name_eq(StrView { ptr: (n), len: (l) as i64 }, "Some") == 1 or name_eq(StrView { ptr: (n), len: (l) as i64 }, "Ok") == 1 or name_eq(StrView { ptr: (n), len: (l) as i64 }, "Err") == 1 or name_eq(StrView { ptr: (n), len: (l) as i64 }, "None") == 1
-        return
-    user_variant_ctor_enum(ctx, e, out_name, out_len)
+        return strview_empty()
+    let n: StrView = e.func_name
+    if name_eq(n, "Some") == 1 or name_eq(n, "Ok") == 1 or name_eq(n, "Err") == 1 or name_eq(n, "None") == 1
+        return strview_empty()
+    user_variant_ctor_enum(ctx, e)
 
 # The dims of `sh` from dimension `from` inward, and its leaf, as a shape of
 # their own: `[3][4]T` from 1 of `[2][3][4]T`.  AGAST #3379: a plane a `for`
@@ -613,35 +608,32 @@ fn te_arg_end(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, buf_sv: StrView,
 # arguments.  `Result$Vec$u8$i32`, variant 0 -> `Vec$u8`, 1 -> `i32`.
 #
 # The EmitterState wrapper (tagged_enum_arg) stays in emitter_core.
-pub fn tagged_enum_arg_in(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, name_sv: StrView, variant: i32, out_len: *i32) -> *u8
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    *out_len = 0
-    if name == null or is_tagged_enum_type(name_sv) == 0
-        return null
+pub fn tagged_enum_arg_in(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, name_sv: StrView, variant: i32) -> StrView
+    let len: i32 = name_sv.len as i32
+    if name_sv.ptr == null or is_tagged_enum_type(name_sv) == 0
+        return strview_empty()
     let start: i32 = 7
     if start >= len
-        return null
-    let is_result: i32 = name_eq(StrView { ptr: (name), len: (6) as i64 }, "Result")
+        return strview_empty()
+    let is_result: i32 = name_eq(name_sv.take(6), "Result")
     let end0: i32 = te_arg_end(ctx, structs, m, name_sv, start)
+    # skip + take, not slice: an empty argument keeps its pointer, as the
+    # `name + start` this returned did.
     if is_result == 0
         if variant != 0 or end0 != len
-            return null
-        *out_len = end0 - start
-        return name + start
+            return strview_empty()
+        return name_sv.skip(start as i64).take((end0 - start) as i64)
     if end0 + 1 >= len
-        return null
+        return strview_empty()
     let e_start: i32 = end0 + 1
     let e_end: i32 = te_arg_end(ctx, structs, m, name_sv, e_start)
     if e_end != len
-        return null
+        return strview_empty()
     if variant == 0
-        *out_len = end0 - start
-        return name + start
+        return name_sv.skip(start as i64).take((end0 - start) as i64)
     if variant != 1
-        return null
-    *out_len = e_end - e_start
-    return name + e_start
+        return strview_empty()
+    name_sv.skip(e_start as i64).take((e_end - e_start) as i64)
 
 # =============================================================================
 # The local and ownership-path images the Sema-side checks read (AGAST #4391)
@@ -775,18 +767,18 @@ fn lv_is_ptr_kind(k: TypeKind) -> i32
 # The name the just-built array element `e` carries, from a flat type name.
 # A `[N]S` names S on the element; a `[N]*S` / `[N]@S` names it on the
 # pointee, which is what tr_elem_name reads.
-fn lv_name_into_elem(e: *TypeRef, name: *u8, name_len: i32)
-    if e == null or name == null or name_len <= 0
+fn lv_name_into_elem(e: *TypeRef, name: StrView)
+    if e == null or name.ptr == null or name.len <= 0
         return
     if e.kind == TypeKind.Struct
-        e.name = StrView { ptr: name, len: name_len as i64 }
+        e.name = name
         return
     if lv_is_ptr_kind(e.kind) == 1
         if e.pointee == null
             e.pointee = lv_tyref(TypeKind.Struct)
-        e.pointee.name = StrView { ptr: name, len: name_len as i64 }
+        e.pointee.name = name
         return
-    e.name = StrView { ptr: name, len: name_len as i64 }
+    e.name = name
 
 # Build the chain an add_local_full's flat arguments describe.  Depth is kept
 # at the two levels the flat model had (`**T` is PTR_PTR -> PTR), so
@@ -1015,10 +1007,10 @@ pub fn lv_set_var_type(v: *LocalVar, k: TypeKind)
         v.ty.kind = k
 
 # Set the name tr_name answers: the first struct node, else the deepest node's.
-pub fn lv_set_type_name(v: *LocalVar, name: *u8, name_len: i32)
+pub fn lv_set_type_name(v: *LocalVar, name: StrView)
     if v.ty == null
         return
-    v.ty.name = StrView { ptr: name, len: name_len as i64 }
+    v.ty.name = name
 
 pub fn lv_set_pointee_type(v: *LocalVar, k: TypeKind)
     if v.ty == null
@@ -1164,11 +1156,11 @@ pub fn lv_set_pointee_array_elem_pointee(v: *LocalVar, k: TypeKind)
             e.ref_inner = k
         _ => pass
 
-pub fn lv_set_pointee_array_elem_name(v: *LocalVar, name: *u8, name_len: i32)
+pub fn lv_set_pointee_array_elem_name(v: *LocalVar, name: StrView)
     let a: *TypeRef = lv_pa_ensure(v)
     if a == null or a.elem == null
         return
-    lv_name_into_elem(a.elem, name, name_len)
+    lv_name_into_elem(a.elem, name)
 
 pub fn lv_set_pointee_array_shape(v: *LocalVar, sh: *ArrayShape)
     let a: *TypeRef = lv_pa_ensure(v)
@@ -1259,14 +1251,11 @@ pub fn is_borrow_scalar_kind(t: TypeKind) -> i32
 # AGAST #2543: the S of `loc`, a `*[N]S` or `**[N]S` local or param, or null.
 # #2548: every reader of a `*[N]S`'s element name asks here, not type_name, which
 # a `*[N]S` or `**[N]S` local or param leaves empty (#2553).
-pub fn array_ptr_elem_name(loc: *LocalVar, out_len: *i32) -> *u8
+pub fn array_ptr_elem_name(loc: *LocalVar) -> StrView
     let pn: StrView = lv_pointee_array_elem_name(loc)
     if pn.len > 0
-        *out_len = pn.len as i32
-        return pn.ptr
-    let nm: StrView = lv_name(loc)
-    *out_len = nm.len as i32
-    nm.ptr
+        return pn
+    lv_name(loc)
 
 # =========================================================================
 # The variant-constructor queries (AGAST #4391; moved from emitter_core).
@@ -1500,9 +1489,8 @@ pub fn name_array_ptr_param_loc(loc: *LocalVar, param: *Param)
             return
     if loc == null or lv_name_len(loc) <= 0
         return
-    let tn: StrView = lv_name(loc)
-    lv_set_pointee_array_elem_name(loc, tn.ptr, tn.len as i32)
-    lv_set_type_name(loc, null, 0)
+    lv_set_pointee_array_elem_name(loc, lv_name(loc))
+    lv_set_type_name(loc, strview_empty())
 
 # AGAST #3074: 1 when the array behind `stmt`'s local holds S or `*S`.
 pub fn names_array_elem_struct(stmt: *Stmt) -> i32
@@ -1522,15 +1510,12 @@ pub fn names_array_elem_struct(stmt: *Stmt) -> i32
 #
 # AGAST #3104: and a `**[N]*S` local, which capture_var_type names as `@*[N]*S`.
 pub fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let deep_ptr: bool = ref_to_ptr(loc) == 1 or lv_var_type(loc) == TypeKind.PtrPtr
     if lv_name_len(loc) > 0 and deep_ptr and names_array_elem_struct(stmt) == 1
-        let dname: StrView = lv_name(loc)
-        lv_set_pointee_array_elem_name(loc, dname.ptr, dname.len as i32)
-        lv_set_type_name(loc, null, 0)
+        lv_set_pointee_array_elem_name(loc, lv_name(loc))
+        lv_set_type_name(loc, strview_empty())
         return
-    if lv_name_len(loc) > 0 or name == null or len <= 0
+    if lv_name_len(loc) > 0 or name_sv.ptr == null or name_sv.len <= 0
         return
     if stmt.var_pointee_array_size <= 0 or stmt.var_pointee_array_elem_type != TypeKind.Struct
         return
@@ -1540,7 +1525,7 @@ pub fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name_sv: StrView)
     let deep: bool = t == TypeKind.PtrPtr or ((t == TypeKind.Ref or t == TypeKind.MutRef) and stmt.var_pointee_type == TypeKind.Ptr)
     let two: bool = deep and stmt.var_inner_pointee_type == (TypeKind.Array as i32)
     if one or two
-        lv_set_pointee_array_elem_name(loc, name, len)
+        lv_set_pointee_array_elem_name(loc, name_sv)
 
 # AGAST #2331: 1 for an `@*T` or `@&*T` local.  It records N and U when T is
 # `[N]U`: `*r` reads that `*[N]U`, as it does through a `**[N]U`.
@@ -1599,9 +1584,8 @@ pub fn arm_binds_enum_value(ctx: *ParseCtx, arm: *MatchArm, enum_name_sv: StrVie
     let ei: i32 = enum_find(ctx, StrView { ptr: (enum_name_sv.ptr), len: (base) })
     if ei >= 0
         for vi in 0..enum_variant_count(ctx, ei)
-            var vlen: i32 = 0
-            let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
-            if name.eq(StrView { ptr: (vname), len: (vlen) as i64 })
+            let vname: StrView = enum_variant_name(ctx, ei, vi)
+            if name.eq(vname)
                 return 0
         return 1
     if name.eq("Some") or name.eq("None") or name.eq("Ok") or name.eq("Err")
