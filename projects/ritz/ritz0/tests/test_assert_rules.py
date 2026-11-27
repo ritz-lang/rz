@@ -100,7 +100,7 @@ def test_assert_in_test_helper_compiles(request, tmp_path, compiler):
 # --- the message is a "..." literal (AGAST #3794) ---------------------------
 #
 # LANGUAGE_SPEC: `assert cond, "message"`.  The message is a StrView literal;
-# a `c"..."` message is C in Ritz clothing (AGENT.md, No Concessions), so all
+# a `c"..."` message is C in Ritz clothing (AGENTS.md, No Concessions), so all
 # three compilers refuse it at the literal in one wording.  ritz1 must give
 # the located error, not a parse error that refuses the whole file.
 # tools/test_assert_message_literal.py keeps the tree free of the form.

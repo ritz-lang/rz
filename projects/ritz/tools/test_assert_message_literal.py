@@ -1,7 +1,7 @@
 """AGAST #3794: an assert message is a `"..."` literal, never `c"..."`.
 
 LANGUAGE_SPEC gives the form as `assert cond, "message"`: the message is a
-StrView literal.  A `c"..."` message is "C in Ritz clothing" (AGENT.md, the
+StrView literal.  A `c"..."` message is "C in Ritz clothing" (AGENTS.md, the
 No Concessions Doctrine) and every compiler refuses it with a located error
 (ritz0/test_assert_rules.py).  This guard keeps the tree clean of the form,
 so a file nobody compiles in CI can't keep it alive either.

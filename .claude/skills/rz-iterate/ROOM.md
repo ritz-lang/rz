@@ -24,10 +24,11 @@ vouches that the subsystems you changed pass **in full** on that commit.
    outside an interop boundary (a syscall path or argv, an `extern fn`), and
    new text-taking APIs take `StrView`: if the only API takes
    NUL-terminated `*u8`, add the `StrView` one to ritzlib. Read
-   `projects/ritz/docs/RITZ_NOT_C.md` before writing code and run
-   `/ritz-review` on your diff. Its verdict is a step, not the end of your
-   turn: fix what it finds and keep going to the push and the REAP in the
-   same turn. Your REAP says how many `c""` you added and removed.
+   `projects/ritz/docs/LANGUAGE_SPEC.md` before writing any code, then
+   `projects/ritz/docs/RITZ_NOT_C.md`, and run `/ritz-review` on your diff.
+   Its verdict is a step, not the end of your turn: fix what it finds and
+   keep going to the push and the REAP in the same turn. Your REAP says how
+   many `c""` you added and removed.
 3. **Subagents (Agent tool) for parallel work.** No rooms of your own.
 4. **Finish the job; don't file follow-ons.** Do your ticket's whole
    objective in your commit, with the adjacent fixes it needs (a caller to

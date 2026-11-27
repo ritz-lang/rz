@@ -157,4 +157,4 @@ sage/
 
 ---
 
-*Part of the Ritz ecosystem. See `larb/AGENT.md` for full guidelines.*
+*Part of the Ritz ecosystem. See `AGENTS.md` (repo root) for full guidelines.*
