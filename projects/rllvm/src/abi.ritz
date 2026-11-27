@@ -1,0 +1,220 @@
+# abi: where each element of a call's arguments and return value goes, as
+# LLVM's x86-64 backend lowers the same IR types (DESIGN.md "ABI"). That is
+# the contract, not the C ABI's eightbyte classing: an aggregate is flattened
+# into its scalar and vector elements, and each element takes the next
+# register of its class or the next stack slot on its own.
+#
+# The plans here are pure data; lower.ritz moves the bytes. The few helpers
+# at the end emit the xmm and x87 moves the call path needs.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.result { Result }
+import ritzlib.strview { StrView }
+import razm.insn { OpSize, Operand, Reg, RegClass }
+import rllvm.ir
+import rllvm.layout
+import rllvm.gen
+import rllvm.parse { Fail }
+
+pub enum Class
+    Int         # i1..i64 and pointers: the general-purpose registers
+    Float       # float and double
+    Vector      # a 128-bit vector, or one half of a 256-bit one
+
+pub enum Where
+    Gpr         # num: the hardware register number
+    Xmm         # num: the xmm register
+    X87         # num: 0 for st0, 1 for st1
+    Stack       # num: the offset from %rsp at the call
+    Hidden      # a demoted return: no register; the value goes through memory
+
+# One element of a flattened value, or a whole byval argument.
+pub struct Part
+    arg: i64        # the argument it belongs to; -1 in a return plan
+    cls: Class
+    offset: i64     # its first byte in the value
+    size: i64       # bytes: 1, 2, 4, 8 or 16; a byval's whole size
+    ty: i64         # the leaf's type (the whole vector for a half)
+    at: Where
+    num: i64
+    byval: bool     # a copy of the pointee placed at `num` on the stack
+
+# One argument as the call or the signature writes it.
+pub struct ArgSpec
+    ty: i64
+    byval_ty: i64   # the byval pointee; -1 when not byval
+    align: i64      # the byval's align, 0 when none is written
+
+pub struct ArgPlan
+    parts: Vec<Part>
+    stack: i64      # bytes of stack arguments
+    align: i64      # the outgoing area's alignment: 16, or a larger byval's
+    xmm: i64        # vector registers used: %al for a variadic callee
+
+pub struct RetPlan
+    parts: Vec<Part>
+    demoted: bool   # returned through a hidden pointer in %rdi
+
+# Register limits.
+const ARG_GPRS: i64 = 6
+const ARG_XMMS: i64 = 8
+const RET_GPRS: i64 = 3
+const RET_XMMS: i64 = 4     # vectors: xmm0-3
+const RET_FLOAT_XMMS: i64 = 2   # floats: xmm0-1, then x87
+const RET_X87: i64 = 2
+
+fn vector_bits(m: @Module, ty: i64) -> i64
+    let t: Type = m.types.get(m.resolve(ty))
+    t.width * size_align(m, t.elem).size * 8
+
+# Does `ty` hold a 256-bit vector, through structs, arrays and names?
+pub fn has_wide_vector(m: @Module, ty: i64) -> bool
+    let ls: Vec<Leaf> = leaves(m, ty)
+    for i in 0..ls.len
+        let t: Type = m.types.get(m.resolve(ls.get(i).ty))
+        if t.kind == TypeKind.Vector and vector_bits(m, ls.get(i).ty) == 256
+            return true
+    false
+
+fn part(arg: i64, cls: Class, offset: i64, size: i64, ty: i64) -> Part
+    Part { arg: arg, cls: cls, offset: offset, size: size, ty: ty, at: Where.Hidden, num: 0, byval: false }
+
+# The elements of `ty` in order, a 256-bit vector as two 128-bit halves.
+fn elements(m: @Module, ty: i64, arg: i64) -> Vec<Part>
+    var out = vec_new<Part>()
+    let ls: Vec<Leaf> = leaves(m, ty)
+    for i in 0..ls.len
+        let l: Leaf = ls.get(i)
+        let k: TypeKind = m.types.get(m.resolve(l.ty)).kind
+        if k == TypeKind.Vector
+            let halves: i64 = vector_bits(m, l.ty) / 128
+            for h in 0..halves
+                out.push(part(arg, Class.Vector, l.offset + h * 16, 16, l.ty))
+        else if k == TypeKind.Float or k == TypeKind.Double
+            out.push(part(arg, Class.Float, l.offset, type_size(m, l.ty), l.ty))
+        else
+            out.push(part(arg, Class.Int, l.offset, type_size(m, l.ty), l.ty))
+    out
+
+fn max(a: i64, b: i64) -> i64
+    if a > b then a else b
+
+# Where each argument element goes. `first_gpr` is 1 when a hidden return
+# pointer takes %rdi.
+pub fn plan_args(m: @Module, specs: @Vec<ArgSpec>, first_gpr: i64) -> ArgPlan
+    var plan = ArgPlan { parts: vec_new<Part>(), stack: 0, align: 16, xmm: 0 }
+    var gprs: i64 = first_gpr
+    for a in 0..specs.len
+        let s: ArgSpec = specs.get(a)
+        if s.byval_ty >= 0
+            # No register: the pointee is copied into the argument area.
+            let sa: SizeAlign = size_align(m, s.byval_ty)
+            let align: i64 = max(8, max(s.align, sa.align))
+            var p = part(a, Class.Int, 0, sa.size, s.byval_ty)
+            plan.stack = round_up(plan.stack, align)
+            p.at = Where.Stack
+            p.num = plan.stack
+            p.byval = true
+            plan.stack += round_up(sa.size, 8)
+            plan.align = max(plan.align, align)
+            plan.parts.push(p)
+            continue
+        let es: Vec<Part> = elements(m, s.ty, a)
+        for i in 0..es.len
+            var p: Part = es.get(i)
+            if p.cls == Class.Int and gprs < ARG_GPRS
+                p.at = Where.Gpr
+                p.num = ARG_REGS[gprs]
+                gprs += 1
+            else if p.cls != Class.Int and plan.xmm < ARG_XMMS
+                p.at = Where.Xmm
+                p.num = plan.xmm
+                plan.xmm += 1
+            else
+                # The next slot aligned to the larger of 8 and the element's
+                # own alignment; it occupies a multiple of 8 bytes.
+                plan.stack = round_up(plan.stack, max(8, p.size))
+                p.at = Where.Stack
+                p.num = plan.stack
+                plan.stack += round_up(p.size, 8)
+            plan.parts.push(p)
+    plan
+
+# Where each element of a return value of type `ty` goes. Integers take
+# rax, rdx, rcx; vectors xmm0-3; floats share that xmm sequence up to xmm1
+# and then take st0, st1. When any element finds no register the whole value
+# is demoted.
+pub fn plan_ret(m: @Module, ty: i64) -> RetPlan
+    var plan = RetPlan { parts: elements(m, ty, -1), demoted: false }
+    var gprs: i64 = 0
+    var xmms: i64 = 0
+    var x87: i64 = 0
+    for i in 0..plan.parts.len
+        var p: Part = plan.parts.get(i)
+        if p.cls == Class.Int and gprs < RET_GPRS
+            p.at = Where.Gpr
+            p.num = RET_REGS[gprs]
+            gprs += 1
+        else if p.cls == Class.Vector and xmms < RET_XMMS
+            p.at = Where.Xmm
+            p.num = xmms
+            xmms += 1
+        else if p.cls == Class.Float and xmms < RET_FLOAT_XMMS
+            p.at = Where.Xmm
+            p.num = xmms
+            xmms += 1
+        else if p.cls == Class.Float and x87 < RET_X87
+            p.at = Where.X87
+            p.num = x87
+            x87 += 1
+        else
+            plan.demoted = true
+        plan.parts.set(i, p)
+    if plan.demoted
+        for i in 0..plan.parts.len
+            var p: Part = plan.parts.get(i)
+            p.at = Where.Hidden
+            plan.parts.set(i, p)
+    plan
+
+# Does `ty` have a float or vector element: one that moves through memory
+# rather than straight from a slot into a GPR?
+pub fn has_float_or_vector(m: @Module, ty: i64) -> bool
+    let ls: Vec<Leaf> = leaves(m, ty)
+    for i in 0..ls.len
+        if not is_int_or_ptr(m, ls.get(i).ty)
+            return true
+    false
+
+# ------------------------------------------------------------- emission
+
+pub fn xmm(n: i64) -> Operand
+    Operand.Register(Reg { class: RegClass.Xmm, num: n as u8 })
+
+fn xmm_move_name(p: @Part) -> StrView
+    if p.size == 4
+        return "movss"
+    if p.size == 8
+        return "movsd"
+    "movdqu"
+
+# Element `p` from disp(%base) into its xmm register.
+pub fn load_xmm(g: @&Gen, p: @Part, base: i64, disp: i64) -> Result<(), Fail>
+    let src: Operand = g.mem(base, disp)
+    g.op2(xmm_move_name(p), OpSize.Unsized, src, xmm(p.num))
+
+# Element `p` from its xmm register to disp(%base).
+pub fn store_xmm(g: @&Gen, p: @Part, base: i64, disp: i64) -> Result<(), Fail>
+    let dst: Operand = g.mem(base, disp)
+    g.op2(xmm_move_name(p), OpSize.Unsized, xmm(p.num), dst)
+
+# Push element `p` at disp(%base) onto the x87 stack.
+pub fn load_x87(g: @&Gen, p: @Part, base: i64, disp: i64) -> Result<(), Fail>
+    let src: Operand = g.mem(base, disp)
+    let name: StrView = if p.size == 4 then "flds" else "fldl"
+    g.op1(name, OpSize.Unsized, src)
+
+# Pop st0 to disp(%base) at element `p`'s width.
+pub fn pop_x87(g: @&Gen, p: @Part, base: i64, disp: i64) -> Result<(), Fail>
+    let dst: Operand = g.mem(base, disp)
+    let name: StrView = if p.size == 4 then "fstps" else "fstpl"
+    g.op1(name, OpSize.Unsized, dst)

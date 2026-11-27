@@ -5,9 +5,11 @@
 # no value is ever addressed below %rsp: a `noredzone` function and any other
 # get the same frame.
 #
-# Calls take integer and pointer arguments and returns, flattened in order
-# (DESIGN.md "ABI": rdi..r9 then the stack; rax, rdx, rcx, else demoted to a
-# hidden pointer). Floats, vectors and byval are #4804/#4805.
+# Calls, parameters and returns follow DESIGN.md "ABI": abi.ritz plans where
+# each flattened element goes (GPR, xmm, x87, stack, or a demoted return's
+# hidden pointer); the call path here moves it between that place and the
+# value's slot. A float or vector constant operand is first written to the
+# frame's scratch area, so every non-integer element moves through memory.
 import ritzlib.gvec { Vec, vec_new }
 import ritzlib.hashmap { HashMap, hashmap_new }
 import ritzlib.option { Option }
@@ -18,6 +20,7 @@ import razm.insn { OpSize, Operand }
 import rllvm.ir
 import rllvm.layout
 import rllvm.gen
+import rllvm.abi
 import rllvm.inline_asm
 import rllvm.parse { Fail, FailKind }
 
@@ -146,14 +149,8 @@ struct ValueSlot
     offset: i64         # the value's first byte is -offset(%rbp)
     ty: i64
     is_alloca: bool     # the value is the address -offset(%rbp) itself
+    realign: i64        # an alloca aligned past 16: that alignment; else 0
     phi_in: i64         # a phi's incoming copy at -phi_in(%rbp); else 0
-
-# One integer leaf of a call's arguments: which value, its type, and where
-# the leaf sits in it.
-struct ArgLeaf
-    vid: i64
-    ty: i64
-    leaf: Leaf
 
 pub struct FnLower
     m: @Module
@@ -163,6 +160,7 @@ pub struct FnLower
     frame: i64          # bytes below %rbp
     guard: i64          # the stack protector's copy; 0: none
     sret: i64           # the hidden return pointer's slot; 0: none
+    scratch: i64        # float/vector constants and unnamed results; 0: none
     saved: Vec<i64>     # callee-saved registers an asm block uses
     saved_at: Vec<i64>  # and their slots
     first_label: i64    # block i's label is first_label + i
@@ -178,6 +176,7 @@ pub fn fn_lower(m: @Module, f: Function) -> FnLower
         frame: 0,
         guard: 0,
         sret: 0,
+        scratch: 0,
         saved: vec_new<i64>(),
         saved_at: vec_new<i64>(),
         first_label: 0,
@@ -272,17 +271,21 @@ impl FnLower
     fn lay_out(self: @&FnLower) -> Result<(), Fail>
         if self.has(FA_SSPSTRONG)
             self.guard = self.reserve(8, 8)
-        if self.demoted(self.f.ret_ty)
+        if plan_ret(self.m, self.f.ret_ty).demoted
             self.sret = self.reserve(8, 8)
         for i in 0..self.f.nparams
             let p: Param = self.m.params.get(self.f.first_param + i)
             let sa: SizeAlign = size_align(self.m, p.ty)
             let off: i64 = self.reserve(sa.size, sa.align)
-            self.add_slot(p.name, ValueSlot { offset: off, ty: p.ty, is_alloca: false, phi_in: 0 })
+            self.add_slot(p.name, ValueSlot { offset: off, ty: p.ty, is_alloca: false, realign: 0, phi_in: 0 })
+        var scratch: i64 = 0
         for b in 0..self.f.nblocks
             let blk: Block = self.m.blocks.get(self.f.first_block + b)
             for k in 0..blk.count
                 let inst: Inst = self.m.insts.get(blk.first + k)
+                let need: i64 = self.scratch_need(@inst)
+                if need > scratch
+                    scratch = need
                 if inst.op == Opcode.Call
                     let callee: IrValue = self.value(self.operand(@inst, 0))
                     if callee.kind == ValueKind.Asm
@@ -292,10 +295,13 @@ impl FnLower
                 if inst.op == Opcode.Alloca
                     let sa: SizeAlign = size_align(self.m, inst.ty)
                     let align: i64 = if inst.align > sa.align then inst.align else sa.align
-                    if align > 16
-                        return Err(fail_unsupported(inst.line, "alloca aligned past 16"))
-                    let off: i64 = self.reserve(sa.size, align)
-                    self.add_slot(inst.name, ValueSlot { offset: off, ty: inst.ty, is_alloca: true, phi_in: 0 })
+                    # %rbp is only 16-aligned: a larger alignment reserves
+                    # align - 16 spare bytes and rounds the address up into
+                    # them where it is taken (load_scalar).
+                    let slack: i64 = if align > 16 then align - 16 else 0
+                    let off: i64 = self.reserve(sa.size + slack, if align > 16 then 16 else align)
+                    let realign: i64 = if align > 16 then align else 0
+                    self.add_slot(inst.name, ValueSlot { offset: off, ty: inst.ty, is_alloca: true, realign: realign, phi_in: 0 })
                     continue
                 let ty: i64 = self.result_type(@inst)?
                 let sa: SizeAlign = size_align(self.m, ty)
@@ -303,13 +309,57 @@ impl FnLower
                 var phi_in: i64 = 0
                 if inst.op == Opcode.Phi
                     phi_in = self.reserve(sa.size, sa.align)
-                self.add_slot(inst.name, ValueSlot { offset: off, ty: ty, is_alloca: false, phi_in: phi_in })
+                self.add_slot(inst.name, ValueSlot { offset: off, ty: ty, is_alloca: false, realign: 0, phi_in: phi_in })
+        if scratch > 0
+            self.scratch = self.reserve(scratch, 16)
         self.frame = round_up(self.frame, 16)
         Ok(())
 
-    # Does a value of type `ty` come back through a hidden pointer?
-    fn demoted(self: @FnLower, ty: i64) -> bool
-        leaves(self.m, ty).len > 3
+    # Does operand `vid` need a copy in scratch to move its float or vector
+    # elements? A named value already has a slot; a constant does not.
+    fn needs_home(self: @FnLower, vid: i64) -> bool
+        let v: IrValue = self.value(vid)
+        v.kind != ValueKind.Local and v.attr != ParamAttr.Byval and has_float_or_vector(self.m, v.ty)
+
+    fn home_size(self: @FnLower, ty: i64) -> i64
+        round_up(type_size(self.m, ty), 16)
+
+    # The scratch bytes an instruction needs: its constant float and vector
+    # operands, and an unnamed call's result, which still has to land (an
+    # x87 value is popped, a demoted one written).
+    fn scratch_need(self: @FnLower, inst: @Inst) -> i64
+        var n: i64 = 0
+        if inst.op == Opcode.Ret and inst.count == 1
+            let vid: i64 = self.operand(inst, 0)
+            if self.needs_home(vid)
+                n += self.home_size(self.value(vid).ty)
+        if inst.op != Opcode.Call
+            return n
+        let callee: IrValue = self.value(self.operand(inst, 0))
+        if callee.kind == ValueKind.Asm or callee.text.starts_with("@llvm.")
+            return n
+        for k in 1..inst.count
+            let vid: i64 = self.operand(inst, k)
+            if self.needs_home(vid)
+                n += self.home_size(self.value(vid).ty)
+        if inst.name.len == 0
+            n += self.home_size(self.call_return_type(inst))
+        n
+
+    # The %rbp displacement of value `vid`'s bytes: its slot, or a copy
+    # written to scratch at `at`.
+    fn home(self: @FnLower, g: @&Gen, vid: i64, at: i64) -> Result<i64, Fail>
+        let v: IrValue = self.value(vid)
+        if v.kind == ValueKind.Local
+            match self.slot_of(v.text)
+                Some(s) => return Ok(0 - s.offset)
+                None => return Err(fail_malformed(g.line, "use of an undefined value"))
+        let disp: i64 = at - self.scratch
+        if v.kind == ValueKind.Zero or v.kind == ValueKind.Undef
+            g.fill_zero(RBP, disp, type_size(self.m, v.ty))?
+        else
+            self.store_value(g, RBP, disp, vid, v.ty)?
+        Ok(disp)
 
     # Every leaf of `ty` is an integer or pointer.
     fn check_int_leaves(self: @FnLower, ty: i64, line: i64, what: StrView) -> Result<Vec<Leaf>, Fail>
@@ -331,6 +381,11 @@ impl FnLower
                     Some(s) => s
                     None => return Err(fail_malformed(g.line, "use of an undefined value"))
                 let d: Operand = g.mem(RBP, 0 - s.offset)
+                if s.is_alloca and s.realign > 0
+                    let up: Operand = g.mem(RBP, s.realign - 16 - s.offset)
+                    g.op2("lea", OpSize.Quad, up, r64(r))?
+                    let mask: Operand = g.imm(0 - s.realign)
+                    return g.op2("and", OpSize.Quad, mask, r64(r))
                 if s.is_alloca
                     return g.op2("lea", OpSize.Quad, d, r64(r))
                 g.load(r, RBP, 0 - s.offset, type_size(self.m, s.ty))
@@ -510,33 +565,44 @@ impl FnLower
             g.address(R11, "__stack_chk_guard", 0)?
             g.load(R11, R11, 0, 8)?
             g.store(R11, RBP, 0 - self.guard, 8)?
-        var next: i64 = 0
+        var first: i64 = 0
         if self.sret != 0
             g.store(RDI, RBP, 0 - self.sret, 8)?
-            next = 1
-        var stack: i64 = 16
+            first = 1
+        var specs = vec_new<ArgSpec>()
         for i in 0..self.f.nparams
             let p: Param = self.m.params.get(self.f.first_param + i)
-            if p.attr == ParamAttr.Byval
-                return Err(fail_unsupported(self.f.line, "a byval parameter"))
+            let bt: i64 = if p.attr == ParamAttr.Byval then p.attr_ty else -1
+            specs.push(ArgSpec { ty: p.ty, byval_ty: bt, align: p.attr_align })
+        let plan: ArgPlan = plan_args(self.m, @specs, first)
+        for i in 0..plan.parts.len
+            let pt: Part = plan.parts.get(i)
+            let p: Param = self.m.params.get(self.f.first_param + pt.arg)
             let s: ValueSlot = match self.slot_of(p.name)
                 Some(s) => s
                 None => continue
-            let ls: Vec<Leaf> = self.check_int_leaves(p.ty, self.f.line, "a float or vector parameter")?
-            for k in 0..ls.len
-                let l: Leaf = ls.get(k)
-                let bytes: i64 = type_size(self.m, l.ty)
-                var r: i64 = R11
-                if next < 6
-                    r = ARG_REGS[next]
-                    next += 1
-                else
-                    g.load(R11, RBP, stack, 8)?
-                    stack += 8
-                if self.is_i1(l.ty)
+            let disp: i64 = pt.offset - s.offset
+            # Stack arguments start above the return address and saved %rbp.
+            let from: i64 = 16 + pt.num
+            if pt.at == Where.Gpr
+                if self.is_i1(pt.ty)
                     let one: Operand = g.imm(1)
-                    g.op2("and", OpSize.Long, one, r32(r))?
-                g.store(r, RBP, l.offset - s.offset, bytes)?
+                    g.op2("and", OpSize.Long, one, r32(pt.num))?
+                g.store(pt.num, RBP, disp, pt.size)?
+            else if pt.at == Where.Xmm
+                store_xmm(g, @pt, RBP, disp)?
+            else if pt.byval
+                # The IR pointer is the address of the caller's copy.
+                let a: Operand = g.mem(RBP, from)
+                g.op2("lea", OpSize.Quad, a, r64(R11))?
+                g.store(R11, RBP, 0 - s.offset, 8)?
+            else if self.is_i1(pt.ty)
+                g.load(R11, RBP, from, 1)?
+                let one: Operand = g.imm(1)
+                g.op2("and", OpSize.Long, one, r32(R11))?
+                g.store(R11, RBP, disp, 1)?
+            else
+                g.copy(RBP, disp, RBP, from, pt.size)?
         Ok(())
 
     fn epilogue(self: @FnLower, g: @&Gen) -> Result<(), Fail>
@@ -585,10 +651,36 @@ impl FnLower
                 self.store_value(g, R10, 0, vid, ty)?
                 g.op2("mov", OpSize.Quad, r64(R10), r64(RAX))?
             else
-                let ls: Vec<Leaf> = self.check_int_leaves(ty, inst.line, "a float or vector return")?
-                for k in 0..ls.len
-                    self.load_leaf(g, RET_REGS[k], vid, ty, ls.get(k))?
+                self.load_return(g, vid, ty)?
+        # An sret function returns its pointer in %rax.
+        for i in 0..self.f.nparams
+            let p: Param = self.m.params.get(self.f.first_param + i)
+            if p.attr == ParamAttr.Sret
+                match self.slot_of(p.name)
+                    Some(s) => g.load(RAX, RBP, 0 - s.offset, 8)?
+                    None => pass
         self.epilogue(g)
+
+    # Return value `vid` of type `ty` into its registers. x87 values are
+    # pushed last element first, so st0 holds the first.
+    fn load_return(self: @FnLower, g: @&Gen, vid: i64, ty: i64) -> Result<(), Fail>
+        let rp: RetPlan = plan_ret(self.m, ty)
+        var home: i64 = 0
+        if has_float_or_vector(self.m, ty)
+            home = self.home(g, vid, 0)?
+        var k: i64 = rp.parts.len
+        while k > 0
+            k -= 1
+            let pt: Part = rp.parts.get(k)
+            if pt.at == Where.X87
+                load_x87(g, @pt, RBP, home + pt.offset)?
+        for i in 0..rp.parts.len
+            let pt: Part = rp.parts.get(i)
+            if pt.at == Where.Gpr
+                self.load_leaf(g, pt.num, vid, ty, Leaf { ty: pt.ty, offset: pt.offset })?
+            else if pt.at == Where.Xmm
+                load_xmm(g, @pt, RBP, home + pt.offset)?
+        Ok(())
 
     fn lower_br(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         if inst.count == 1
@@ -801,6 +893,24 @@ impl FnLower
                     return f.variadic
         false
 
+    # A 256-bit vector crosses only to an internal or private definition in
+    # this module: clang's side of any other call may pass it in a ymm
+    # register (DESIGN.md "ABI", 256-bit vectors at a boundary).
+    fn check_wide_call(self: @FnLower, inst: @Inst, callee: IrValue, ret_ty: i64) -> Result<(), Fail>
+        var wide: bool = has_wide_vector(self.m, ret_ty)
+        for k in 1..inst.count
+            if has_wide_vector(self.m, self.value(self.operand(inst, k)).ty)
+                wide = true
+        if not wide
+            return Ok(())
+        if callee.kind == ValueKind.Global
+            for i in 0..self.m.funcs.len
+                let f: Function = self.m.funcs.get(i)
+                let local: bool = f.linkage == Linkage.Internal or f.linkage == Linkage.Private
+                if f.name.eq(callee.text) and local and not f.is_decl
+                    return Ok(())
+        Err(Fail { kind: FailKind.Unsupported, line: inst.line, what: string_from("256-bit vector in a call to a function that is not internal") })
+
     fn lower_call(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         let cvid: i64 = self.operand(inst, 0)
         let callee: IrValue = self.value(cvid)
@@ -809,63 +919,98 @@ impl FnLower
         if callee.kind == ValueKind.Global and callee.text.starts_with("@llvm.")
             return self.lower_intrinsic(g, inst, symbol_of(callee.text))
         let ret_ty: i64 = self.call_return_type(inst)
-        let rls: Vec<Leaf> = self.check_int_leaves(ret_ty, inst.line, "a call returning floats or vectors")?
-        let demote: bool = rls.len > 3
-        # Every argument leaf, in order.
-        var args = vec_new<ArgLeaf>()
+        self.check_wide_call(inst, callee, ret_ty)?
+        let rp: RetPlan = plan_ret(self.m, ret_ty)
+        var specs = vec_new<ArgSpec>()
+        for k in 1..inst.count
+            let a: IrValue = self.value(self.operand(inst, k))
+            let bt: i64 = if a.attr == ParamAttr.Byval then a.attr_ty else -1
+            specs.push(ArgSpec { ty: a.ty, byval_ty: bt, align: a.attr_align })
+        let first: i64 = if rp.demoted then 1 else 0
+        let plan: ArgPlan = plan_args(self.m, @specs, first)
+        # Each argument's bytes, for the elements that move through memory.
+        var homes = vec_new<i64>()
+        var used: i64 = 0
         for k in 1..inst.count
             let vid: i64 = self.operand(inst, k)
-            let a: IrValue = self.value(vid)
-            if a.attr == ParamAttr.Byval
-                return Err(fail_unsupported(inst.line, "a byval argument"))
-            let ls: Vec<Leaf> = self.check_int_leaves(a.ty, inst.line, "a float or vector argument")?
-            for i in 0..ls.len
-                args.push(ArgLeaf { vid: vid, ty: a.ty, leaf: ls.get(i) })
-        let first_reg: i64 = if demote then 1 else 0
-        let in_regs: i64 = 6 - first_reg
-        let n_stack: i64 = if args.len > in_regs then args.len - in_regs else 0
-        let area: i64 = round_up(n_stack * 8, 16)
+            var at: i64 = 0
+            if specs.get(k - 1).byval_ty < 0 and has_float_or_vector(self.m, specs.get(k - 1).ty)
+                at = self.home(g, vid, used)?
+                if self.needs_home(vid)
+                    used += self.home_size(specs.get(k - 1).ty)
+            homes.push(at)
+        # Where the result lands: its slot, or scratch for an unnamed call.
+        var dest: i64 = used - self.scratch
+        let named: bool = inst.name.len > 0
+        match self.result_slot(inst)
+            Some(slot) => dest = 0 - slot.offset
+            None => pass
+        # The outgoing area, aligned to 16 or to a larger byval.
+        let area: i64 = round_up(plan.stack, 16)
         if area > 0
             let n: Operand = g.imm(area)
             g.op2("sub", OpSize.Quad, n, r64(RSP))?
-        for j in 0..n_stack
-            let a: ArgLeaf = args.get(in_regs + j)
-            self.load_leaf(g, R11, a.vid, a.ty, a.leaf)?
-            g.store(R11, RSP, j * 8, 8)?
-        let s: Option<ValueSlot> = self.result_slot(inst)
-        if demote
-            match s
-                Some(slot) =>
-                    let d: Operand = g.mem(RBP, 0 - slot.offset)
-                    g.op2("lea", OpSize.Quad, d, r64(RDI))?
-                None => return Err(fail_unsupported(inst.line, "an unnamed call returning through memory"))
-        let n_regs: i64 = if args.len < in_regs then args.len else in_regs
-        for j in 0..n_regs
-            let a: ArgLeaf = args.get(j)
-            self.load_leaf(g, ARG_REGS[first_reg + j], a.vid, a.ty, a.leaf)?
+        if plan.align > 16
+            let mask: Operand = g.imm(0 - plan.align)
+            g.op2("and", OpSize.Quad, mask, r64(RSP))?
+        for i in 0..plan.parts.len
+            let pt: Part = plan.parts.get(i)
+            if pt.at != Where.Stack
+                continue
+            let vid: i64 = self.operand(inst, pt.arg + 1)
+            if pt.byval
+                self.load_scalar(g, RAX, vid)?
+                g.copy(RSP, pt.num, RAX, 0, pt.size)?
+            else if pt.cls == Class.Int
+                self.load_leaf(g, R11, vid, specs.get(pt.arg).ty, Leaf { ty: pt.ty, offset: pt.offset })?
+                g.store(R11, RSP, pt.num, 8)?
+            else
+                g.copy(RSP, pt.num, RBP, homes.get(pt.arg) + pt.offset, pt.size)?
+        if rp.demoted
+            let d: Operand = g.mem(RBP, dest)
+            g.op2("lea", OpSize.Quad, d, r64(RDI))?
+        for i in 0..plan.parts.len
+            let pt: Part = plan.parts.get(i)
+            let vid: i64 = self.operand(inst, pt.arg + 1)
+            if pt.at == Where.Gpr
+                self.load_leaf(g, pt.num, vid, specs.get(pt.arg).ty, Leaf { ty: pt.ty, offset: pt.offset })?
+            else if pt.at == Where.Xmm
+                load_xmm(g, @pt, RBP, homes.get(pt.arg) + pt.offset)?
         if self.is_variadic_callee(inst, callee)
-            g.op2("xor", OpSize.Long, r32(RAX), r32(RAX))?
+            if plan.xmm == 0
+                g.op2("xor", OpSize.Long, r32(RAX), r32(RAX))?
+            else
+                g.constant(RAX, plan.xmm, 32)?
         if callee.kind == ValueKind.Global
             g.call(symbol_of(callee.text))?
         else
             self.load_scalar(g, R11, cvid)?
             g.op1("call", OpSize.Unsized, Operand.Indirect(gpr(R11, OpSize.Quad)))?
-        if area > 0
-            let n: Operand = g.imm(area)
-            g.op2("add", OpSize.Quad, n, r64(RSP))?
-        if demote
+        # %rsp below the frame is always %rbp - frame, whatever the call
+        # did to align it.
+        if area > 0 or plan.align > 16
+            let f: Operand = g.mem(RBP, 0 - self.frame)
+            g.op2("lea", OpSize.Quad, f, r64(RSP))?
+        if rp.demoted
             return Ok(())
-        match s
-            Some(slot) =>
-                for k in 0..rls.len
-                    let l: Leaf = rls.get(k)
-                    let r: i64 = RET_REGS[k]
-                    if self.is_i1(l.ty)
-                        let one: Operand = g.imm(1)
-                        g.op2("and", OpSize.Long, one, r32(r))?
-                    g.store(r, RBP, l.offset - slot.offset, type_size(self.m, l.ty))?
-                Ok(())
-            None => Ok(())
+        # Pop st0 then st1 even for an unused result: the x87 stack is empty
+        # at every call boundary.
+        for i in 0..rp.parts.len
+            let pt: Part = rp.parts.get(i)
+            if pt.at == Where.X87
+                pop_x87(g, @pt, RBP, dest + pt.offset)?
+        if not named
+            return Ok(())
+        for i in 0..rp.parts.len
+            let pt: Part = rp.parts.get(i)
+            if pt.at == Where.Gpr
+                if self.is_i1(pt.ty)
+                    let one: Operand = g.imm(1)
+                    g.op2("and", OpSize.Long, one, r32(pt.num))?
+                g.store(pt.num, RBP, dest + pt.offset, pt.size)?
+            else if pt.at == Where.Xmm
+                store_xmm(g, @pt, RBP, dest + pt.offset)?
+        Ok(())
 
     # The intrinsics this slice needs: llvm.trap and the overflow checks
     # ritz1 puts on every `+`, `-` and `*`. The rest are #4806's.

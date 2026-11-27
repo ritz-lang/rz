@@ -46,6 +46,13 @@ FREESTANDING = {
     "freestanding/kernel.ll": ("freestanding/kernel.ld", False),
     "freestanding/large.ll": ("freestanding/linker.ld", True),
 }
+# Entries whose remaining gap is another ticket's lowering, named in the
+# xfail. abi_a/abi_b: the call ABI is done; their bodies use float and vector
+# arithmetic (fadd, fmul, fptrunc, extractelement).
+WAITS_ON = {
+    "hosted/abi_a.ll": "#4805 float and vector lowering",
+    "hosted/abi_b.ll": "#4805 float and vector lowering",
+}
 LINUX_SHIM = "hosted/shim.ll"
 HARLAND_SHIM = "freestanding/harland_start.ll"
 
@@ -113,7 +120,8 @@ def rllvm_compile(rllvm: list[str], rel: str, root: Path) -> Path:
     out = root / f"{e.stem}.rllvm.o"
     r = c.compile_entry(rllvm, e, out)
     if r.returncode == EXIT_UNSUPPORTED:
-        pytest.xfail(f"rllvm does not compile {rel} yet: {r.stderr.strip()}")
+        waits = f" (waits on {WAITS_ON[rel]})" if rel in WAITS_ON else ""
+        pytest.xfail(f"rllvm does not compile {rel} yet{waits}: {r.stderr.strip()}")
     assert r.returncode == 0, f"rllvm {rel}: exit {r.returncode}: {r.stderr}"
     assert c.check_relocations(out, e.profile, c.asm_symbols(e.path)) == []
     return out
