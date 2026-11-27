@@ -36,6 +36,31 @@ fi
 [[ $# -eq 1 ]] || usage
 pkg=$1
 
+# A pipeline that started too late was GitHub's (AGAST #4846). main.yml's
+# builder-watch gives Woodpecker FALLBACK_SECONDS from the pipeline's creation
+# to start it and then runs the matrix on GitHub; without a token it can't
+# cancel the pipeline, which stays pending until an agent appears. Such a
+# pipeline skips every package here, in seconds, instead of queueing ~15 min
+# of duplicate work per dead push in front of the live ones. SLACK_SECONDS
+# covers the watch's poll interval and clock skew: a pipeline starting near
+# the deadline runs on both, never on neither. FALLBACK_SECONDS is
+# woodpecker_fleet.py's (test_woodpecker_builder.py pins the two equal).
+# CI_PIPELINE_CREATED / _STARTED are the server's Unix times; missing or
+# not numbers, the package runs.
+FALLBACK_SECONDS=600
+SLACK_SECONDS=300
+created=${CI_PIPELINE_CREATED:-}
+started=${CI_PIPELINE_STARTED:-}
+if [[ $created =~ ^[0-9]+$ && $started =~ ^[0-9]+$ && $started -gt 0 ]]; then
+    late=$((started - created))
+    if [[ $late -gt $((FALLBACK_SECONDS + SLACK_SECONDS)) ]]; then
+        echo "woodpecker_builder_step: $pkg skipped: this pipeline started $((late / 60)) min" \
+            "after it was created, past main.yml's ${FALLBACK_SECONDS}s fallback, so GitHub's" \
+            "hosted builder-matrix ran this commit (see builder-watch on GitHub)"
+        exit 0
+    fi
+fi
+
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 rc=0

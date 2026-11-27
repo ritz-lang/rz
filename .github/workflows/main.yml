@@ -649,8 +649,10 @@ jobs:
   # (https://ci.fucken.ninja, .woodpecker/builder.yml, one step per package,
   # each step's pod running the builder image of the commit). These hosted
   # jobs are the fallback: builder-fleet asks Woodpecker whether it can run
-  # it, and builder-packages and builder-matrix run here only when it can't,
-  # so hosted minutes go to the matrix only while the fleet is down.
+  # it, builder-watch then gives Woodpecker FALLBACK_SECONDS (10 min,
+  # woodpecker_fleet.py) to start this commit's pipeline, and
+  # builder-packages and builder-matrix run here only when it didn't, so
+  # hosted minutes go to the matrix only while the fleet is down.
   # builder-image runs either way: it publishes the image Woodpecker pulls.
   # projects/builder/README.md, "CI on huburght's Woodpecker".
   #
@@ -711,6 +713,44 @@ jobs:
           fi
           python3 .github/scripts/woodpecker_fleet.py https://ci.fucken.ninja ritz-lang/rz >> "$GITHUB_OUTPUT"
 
+  # The probe only knows a pipeline stuck BEFORE this push. The first live
+  # push (97eacd11d, run 45917434037) found none, went to Woodpecker, whose
+  # server was up with no agent for the rz label, and got no matrix
+  # anywhere. builder-watch is the routing decision every builder job below
+  # reads: when builder-fleet said Woodpecker, it polls this commit's
+  # pipeline (anonymously, the repo is public there) and says hosted unless
+  # it started within FALLBACK_SECONDS of being created. A pipeline it gave
+  # up on stays queued (cancelling needs a token); its steps skip themselves
+  # once an agent takes it (woodpecker_builder_step.sh). `why` reaches the
+  # hosted jobs' logs.
+  builder-watch:
+    needs: [builder-fleet]
+    # Also after a failed probe: that is a hosted run.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      hosted: ${{ steps.watch.outputs.hosted }}
+      why: ${{ steps.watch.outputs.why }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Did huburght's Woodpecker start this commit's builder matrix?
+        id: watch
+        env:
+          FLEET_HOSTED: ${{ needs.builder-fleet.outputs.hosted }}
+        run: |
+          if [[ "$FLEET_HOSTED" != false ]]; then
+            echo "hosted=true" >> "$GITHUB_OUTPUT"
+            echo "why=builder-fleet routed it to GitHub (no Gitea push, Woodpecker down, or a pipeline stuck pending; its log says which)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 .github/scripts/woodpecker_fleet.py --watch "${{ github.sha }}" https://ci.fucken.ninja ritz-lang/rz >> "$GITHUB_OUTPUT"
+
   # tools/builder_matrix.py computes the matrix: every workspace package
   # that builds with ritz1_selfhosted (an open known-failures `build` or
   # `parity` excuse under it skips a package here rather than turning every
@@ -722,13 +762,18 @@ jobs:
   # like builder.yml's own job (which builds inside Docker), this needs no
   # setup action.
   builder-packages:
-    needs: builder-fleet
-    if: needs.builder-fleet.outputs.hosted == 'true'
+    needs: builder-watch
+    if: needs.builder-watch.outputs.hosted == 'true'
     runs-on: ubuntu-latest
     outputs:
       packages: ${{ steps.list.outputs.packages }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Why the builder matrix runs on GitHub
+        env:
+          WHY: ${{ needs.builder-watch.outputs.why }}
+        run: echo "::notice title=Hosted builder matrix::$WHY"
 
       - name: List the builder-matrix packages
         id: list
@@ -751,9 +796,12 @@ jobs:
   # (write access to packages here only), read by `docker login --password-stdin`
   # into a DOCKER_CONFIG under runner.temp that the always() logout removes,
   # as in builder.yml. The image is saved and uploaded only for the hosted
-  # matrix.
+  # matrix. It waits for builder-watch, the final routing: Woodpecker's
+  # first step waits for the image, and the watch needs only the pipeline
+  # started, so neither waits on the other.
   builder-image:
-    needs: [builder-fleet]
+    needs: [builder-watch]
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -795,13 +843,13 @@ jobs:
           rm -rf "$DOCKER_CONFIG"
 
       - name: Save the builder image for the hosted matrix
-        if: needs.builder-fleet.outputs.hosted == 'true'
+        if: needs.builder-watch.outputs.hosted == 'true'
         run: |
           docker tag "${{ steps.build.outputs.tag }}" rz-builder:ci
           docker save rz-builder:ci | gzip -1 > "$RUNNER_TEMP/rz-builder.tar.gz"
 
       - name: Upload the builder image
-        if: needs.builder-fleet.outputs.hosted == 'true'
+        if: needs.builder-watch.outputs.hosted == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: rz-builder-image
@@ -823,8 +871,8 @@ jobs:
   # projects/buddhafinger test` in the bootstrap job above).
   builder-matrix:
     name: builder-matrix (${{ matrix.package }})
-    needs: [builder-fleet, builder-packages, builder-image]
-    if: needs.builder-fleet.outputs.hosted == 'true'
+    needs: [builder-watch, builder-packages, builder-image]
+    if: needs.builder-watch.outputs.hosted == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:

@@ -133,7 +133,10 @@ _WOODPECKER_HEADER = """\
 # whose image IS the builder image of the commit, published by main.yml's
 # builder-image job; the first step waits for it, since a pod that can't
 # pull fails at once. GitHub's builder-matrix runs only when
-# woodpecker_fleet.py finds the fleet down. Steps have no depends_on, so
+# woodpecker_fleet.py finds the fleet down or this pipeline doesn't start
+# within 10 min of its creation; a pipeline that starts later than that
+# (plus slack) skips its steps, since GitHub ran the commit
+# (woodpecker_builder_step.sh). Steps have no depends_on, so
 # they run one at a time, in order; each package runs whatever the one
 # before it did (fail-fast: false, as on GitHub).
 #

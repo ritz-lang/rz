@@ -411,7 +411,7 @@ def test_fleet_up_means_no_hosted_run():
     ({"/api/healthz": (502, b"bad gateway")}, "server"),
     ({"/api/repos/lookup/ritz-lang/rz": (404, b"")}, "repo"),
     ({"/api/repos/7/pipelines": (200, json.dumps([
-        {"status": "pending", "created": NOW - 31 * 60}]).encode())}, "pending"),
+        {"status": "pending", "created": NOW - 11 * 60}]).encode())}, "pending"),
     ({"/api/repos/7/pipelines": (200, b"not json")}, "pipelines"),
 ])
 def test_fleet_down_or_stuck_falls_back_to_hosted(change, reason):
@@ -436,7 +436,7 @@ def test_fleet_cli_prints_a_github_output_line_and_never_fails():
 # --- main.yml: hosted only when the fleet is down ---------------------------
 
 MAIN_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "main.yml"
-HOSTED = "needs.builder-fleet.outputs.hosted == 'true'"
+HOSTED = "needs.builder-watch.outputs.hosted == 'true'"
 
 
 def _main_jobs() -> dict:
@@ -460,25 +460,311 @@ def test_builder_fleet_probes_woodpecker_only_after_a_gitea_push():
 
 
 @pytest.mark.unit
-def test_the_hosted_matrix_runs_only_when_the_fleet_is_down():
+def test_builder_watch_waits_for_this_commits_pipeline_only_when_routed_to_woodpecker():
+    """builder-fleet said Woodpecker: builder-watch gives this commit's
+    pipeline FALLBACK_SECONDS to start. builder-fleet said hosted (or
+    failed): it passes that on at once and says why."""
+    job = _main_jobs()["builder-watch"]
+    assert job["needs"] == ["builder-fleet"]
+    assert job["if"] == "${{ !cancelled() }}"
+    assert job["outputs"] == {"hosted": "${{ steps.watch.outputs.hosted }}",
+                              "why": "${{ steps.watch.outputs.why }}"}
+    assert (woodpecker_fleet.FALLBACK_SECONDS // 60 + 2
+            <= job["timeout-minutes"] <= woodpecker_fleet.FALLBACK_SECONDS // 60 + 10)
+    assert "permissions" in job and job["permissions"] == {"contents": "read"}
+    [step] = [s for s in job["steps"] if s.get("id") == "watch"]
+    assert step["env"]["FLEET_HOSTED"] == "${{ needs.builder-fleet.outputs.hosted }}"
+    run = step["run"]
+    assert re.search(r'if \[\[ "\$FLEET_HOSTED" != false \]\]; then', run), run
+    assert ('python3 .github/scripts/woodpecker_fleet.py --watch "${{ github.sha }}" '
+            'https://ci.fucken.ninja ritz-lang/rz >> "$GITHUB_OUTPUT"') in run, run
+    assert "secrets." not in str(job)
+
+
+@pytest.mark.unit
+def test_the_hosted_matrix_runs_only_when_woodpecker_did_not_take_it():
     jobs = _main_jobs()
     for name in ("builder-packages", "builder-matrix"):
-        assert "builder-fleet" in jobs[name]["needs"], name
+        assert "builder-watch" in jobs[name]["needs"], name
         assert jobs[name]["if"] == HOSTED, name
-    assert jobs["builder-matrix"]["needs"] == ["builder-fleet", "builder-packages",
+    assert jobs["builder-matrix"]["needs"] == ["builder-watch", "builder-packages",
                                                "builder-image"]
+
+
+@pytest.mark.unit
+def test_the_hosted_fallback_log_says_why():
+    [step] = [s for s in _main_jobs()["builder-packages"]["steps"]
+              if "WHY" in s.get("env", {})]
+    assert step["env"]["WHY"] == "${{ needs.builder-watch.outputs.why }}"
+    assert 'echo "::notice' in step["run"] and "$WHY" in step["run"], step["run"]
 
 
 @pytest.mark.unit
 def test_builder_image_always_builds_and_hands_over_the_image_only_when_hosted():
     """The image is built on every run: Woodpecker pulls it from ghcr.io
-    when the fleet is up, and the hosted matrix takes it as an artifact when
-    it isn't. Saving and uploading ~400 MiB is skipped when nobody reads it."""
+    when it took the commit, and the hosted matrix takes it as an artifact
+    when it didn't. It waits for builder-watch so the hand-over follows the
+    final decision; Woodpecker's first step waits for the image, and the
+    watch needs only the pipeline started, not the image."""
     job = _main_jobs()["builder-image"]
-    assert "if" not in job
-    assert job["needs"] == ["builder-fleet"]
+    assert "if" not in job or job["if"] == "${{ !cancelled() }}"
+    assert job["needs"] == ["builder-watch"]
     handover = [s for s in job["steps"]
                 if "rz-builder:ci" in str(s.get("run", "")) or "upload-artifact" in str(s.get("uses", ""))]
     assert len(handover) == 2, handover
     for s in handover:
         assert s["if"] == HOSTED, s
+
+
+# --- the watch: Woodpecker gets FALLBACK_SECONDS to start the commit -------
+#
+# Faked API answers and a fake clock: a dry run of the decision, so nobody
+# waits ten minutes on a real dead pipeline (rz, 2026-11-27).
+
+SHA = "97eacd11d8ee" + "0" * 28
+
+
+class _Clock:
+    """time() and sleep() for watch(): sleep advances time, never blocks."""
+
+    def __init__(self, t: float = NOW):
+        self.t = t
+        self.slept = 0.0
+
+    def time(self) -> float:
+        return self.t
+
+    def sleep(self, s: float) -> None:
+        self.t += s
+        self.slept += s
+
+
+_LOOKUP = (200, json.dumps({"id": 3}).encode())
+
+
+def _watch_fetch(clock: _Clock, pipelines, *, lookup=_LOOKUP):
+    """pipelines(t) -> list of pipeline dicts (or an Exception) at time t."""
+    def fetch(url):
+        if url.endswith("/api/repos/lookup/ritz-lang/rz"):
+            return lookup
+        if url.endswith("/api/repos/3/pipelines"):
+            answer = pipelines(clock.t)
+            if isinstance(answer, Exception):
+                raise answer
+            return 200, json.dumps(answer).encode()
+        raise OSError(f"no route to {url}")
+    return fetch
+
+
+def _run_watch(pipelines, clock=None, **kw):
+    clock = clock or _Clock()
+    hosted, why = woodpecker_fleet.watch(
+        "https://ci.example", "ritz-lang/rz", SHA,
+        _watch_fetch(clock, pipelines, **kw), clock=clock.time, sleep=clock.sleep)
+    return hosted, why, clock
+
+
+def _pl(status, created=NOW, started=0, commit=SHA, **extra):
+    return {"number": 1, "commit": commit, "status": status,
+            "created": created, "started": started, **extra}
+
+
+@pytest.mark.unit
+def test_watch_one_constant_of_about_ten_minutes():
+    assert woodpecker_fleet.FALLBACK_SECONDS == 10 * 60
+    assert woodpecker_fleet.STUCK_SECONDS == woodpecker_fleet.FALLBACK_SECONDS
+
+
+@pytest.mark.unit
+def test_watch_started_pipeline_means_woodpecker_runs_it():
+    hosted, why, clock = _run_watch(lambda t: [_pl("running", started=NOW + 5)])
+    assert hosted is False, why
+    assert clock.slept == 0
+
+
+@pytest.mark.unit
+def test_watch_waits_while_pending_and_takes_a_late_start():
+    """Pending, then started at minute 4 (an agent finishing other work)."""
+    def pls(t):
+        if t < NOW + 240:
+            return [_pl("pending")]
+        return [_pl("running", started=NOW + 240)]
+    hosted, why, clock = _run_watch(pls)
+    assert hosted is False, why
+    assert 240 <= clock.slept < woodpecker_fleet.FALLBACK_SECONDS
+
+
+@pytest.mark.unit
+def test_watch_pending_forever_falls_back_at_the_deadline_and_says_why():
+    hosted, why, clock = _run_watch(lambda t: [_pl("pending"),
+                                               _pl("pending", commit="f" * 40)])
+    assert hosted is True
+    assert "pending" in why and "10 min" in why and "no agent" in why, why
+    assert SHA[:12] in why, why
+    # The deadline, not a poll more than one interval past it.
+    assert (woodpecker_fleet.FALLBACK_SECONDS <= clock.slept
+            < woodpecker_fleet.FALLBACK_SECONDS + woodpecker_fleet.POLL_SECONDS + 1)
+
+
+@pytest.mark.unit
+def test_watch_deadline_counts_from_the_pipeline_created_not_the_watch_start():
+    """Created 9.5 min before the watch began: half a minute left."""
+    created = NOW - 570
+    hosted, why, clock = _run_watch(lambda t: [_pl("pending", created=created)])
+    assert hosted is True, why
+    assert clock.slept < 30 + woodpecker_fleet.POLL_SECONDS + 1
+
+
+@pytest.mark.unit
+def test_watch_no_pipeline_for_the_commit_falls_back():
+    """The webhook never fired (or fired for another commit)."""
+    hosted, why, clock = _run_watch(lambda t: [_pl("success", commit="e" * 40,
+                                                   started=NOW - 900)])
+    assert hosted is True
+    assert "no pipeline" in why, why
+    assert clock.slept >= woodpecker_fleet.FALLBACK_SECONDS
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", ["killed", "error", "declined", "skipped", "failure"])
+def test_watch_finished_without_starting_falls_back_at_once(status):
+    """Cancelled while pending, a config error: it will never run."""
+    hosted, why, clock = _run_watch(lambda t: [_pl(status)])
+    assert hosted is True
+    assert status in why, why
+    assert clock.slept == 0
+
+
+@pytest.mark.unit
+def test_watch_rides_out_api_errors_until_the_deadline():
+    def pls(t):
+        if t < NOW + 60:
+            return OSError("connection reset")
+        return [_pl("running", started=NOW + 30)]
+    hosted, why, _ = _run_watch(pls)
+    assert hosted is False, why
+
+
+@pytest.mark.unit
+def test_watch_api_down_throughout_falls_back_with_the_last_error():
+    hosted, why, clock = _run_watch(lambda t: OSError("connection refused"))
+    assert hosted is True
+    assert "connection refused" in why, why
+    assert clock.slept >= woodpecker_fleet.FALLBACK_SECONDS
+
+
+class _FakeWoodpecker:
+    """A real HTTP server answering the two calls watch() makes."""
+
+    def __init__(self, pipelines):
+        import http.server
+        import threading
+        body = json.dumps(pipelines).encode()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/api/repos/lookup/ritz-lang/rz":
+                    out = json.dumps({"id": 3}).encode()
+                elif self.path.startswith("/api/repos/3/pipelines"):
+                    out = body
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("status,hosted", [("running", "false"), ("killed", "true")])
+def test_watch_cli_writes_hosted_and_why_for_github_output(status, hosted):
+    srv = _FakeWoodpecker([_pl(status, created=time.time(),
+                               started=time.time() if status == "running" else 0)])
+    try:
+        r = subprocess.run([sys.executable, str(FLEET_SCRIPT), "--watch", SHA,
+                            srv.url, "ritz-lang/rz"],
+                           capture_output=True, text=True, timeout=60, check=False)
+    finally:
+        srv.close()
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    assert lines[0] == f"hosted={hosted}", r.stdout
+    assert lines[1].startswith("why=") and len(lines) == 2, r.stdout
+    if hosted == "true":
+        assert status in lines[1]
+        assert "::notice" in r.stderr or "::warning" in r.stderr, r.stderr
+
+
+@pytest.mark.integration
+def test_watch_cli_usage():
+    r = subprocess.run([sys.executable, str(FLEET_SCRIPT), "--watch", "abc",
+                        "http://x", "ritz-lang/rz"],
+                       capture_output=True, text=True, timeout=30, check=False)
+    assert r.returncode == 2
+
+
+# --- the guard: a pipeline that started too late leaves it to GitHub --------
+
+
+def _guard_env(created: int | None, started: int | None) -> dict:
+    env = {}
+    if created is not None:
+        env["CI_PIPELINE_CREATED"] = str(created)
+    if started is not None:
+        env["CI_PIPELINE_STARTED"] = str(started)
+    return env
+
+
+def _step_env(tmp_path, extra, *args):
+    old = dict(os.environ)
+    os.environ.update(extra)
+    try:
+        return _step(tmp_path, *args, summary={"ok": True, "test": {"passed": 1}})
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+
+
+@pytest.mark.unit
+def test_guard_limit_is_the_watch_constant_plus_slack():
+    """The watch falls back at FALLBACK_SECONDS after creation; the step
+    skips only past that plus slack, so an edge case runs twice, never
+    zero times."""
+    m = re.search(r"^FALLBACK_SECONDS=(\d+)$", STEP_SCRIPT.read_text(), re.MULTILINE)
+    assert m and int(m[1]) == woodpecker_fleet.FALLBACK_SECONDS
+    s = re.search(r"^SLACK_SECONDS=(\d+)$", STEP_SCRIPT.read_text(), re.MULTILINE)
+    assert s and int(s[1]) >= 4 * woodpecker_fleet.POLL_SECONDS
+
+
+@pytest.mark.integration
+def test_guard_skips_a_stale_pipeline_without_running_the_entrypoint(tmp_path):
+    r, calls, _ = _step_env(tmp_path, _guard_env(NOW, NOW + 3600), "projects/sage")
+    assert r.returncode == 0, r.stderr
+    assert calls == []
+    assert "GitHub" in r.stdout and "60 min" in r.stdout, r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("env", [
+    _guard_env(NOW, NOW + 60),            # prompt start
+    _guard_env(NOW, NOW + 600 + 200),     # past the watch, inside the slack
+    _guard_env(None, None),               # a manual run on an older server
+    _guard_env(NOW, 0),
+    _guard_env("x", "y"),
+])
+def test_guard_runs_a_fresh_or_unknown_pipeline(tmp_path, env):
+    r, calls, _ = _step_env(tmp_path, env, "projects/sage")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert len(calls) == 1

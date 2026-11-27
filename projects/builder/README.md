@@ -118,15 +118,26 @@ On a push to main:
 2. `builder-fleet` runs `.github/scripts/woodpecker_fleet.py` only after a
    push that happened (`pushed=true`). It says `hosted=false` when
    `/api/healthz` answers, `ritz-lang/rz` is activated there, and no
-   pipeline of it has been `pending` for 30 minutes (that means no agent is
-   taking work). Anything else, including no push or a `workflow_dispatch`
-   run, says `hosted=true`.
-3. `builder-image` builds and tests the image (`test.sh`) and pushes
+   pipeline of it has been `pending` for `FALLBACK_SECONDS` (10 minutes;
+   that means no agent is taking work). Anything else, including no push or
+   a `workflow_dispatch` run, says `hosted=true`.
+3. `builder-watch` makes the final call. When `builder-fleet` said
+   Woodpecker, it runs `woodpecker_fleet.py --watch <commit>`, which polls
+   the repo's pipelines anonymously every 20 s. It says `hosted=false` once
+   this commit's pipeline has started, and `hosted=true` when the pipeline
+   is still pending `FALLBACK_SECONDS` after it was created, never shows up,
+   or ends without starting (killed, a config error). The probe alone can't
+   see an agent that is missing before any pipeline is stuck: the first live
+   push, `97eacd11d`, went to Woodpecker, sat `pending` with no agent for the
+   `pool: rz-builder` label, and got no matrix anywhere. The watch also says
+   `why`, which `builder-packages` prints as a notice.
+4. `builder-image` builds and tests the image (`test.sh`) and pushes
    `ghcr.io/ritz-lang/rz-builder:<commit>`. It hands the image to the hosted
-   matrix only when `hosted=true`.
-4. `builder-packages` and `builder-matrix` run only when `hosted=true`, so
-   GitHub spends no matrix minutes while the fleet is up.
-5. The push's webhook (Gitea to Woodpecker) starts
+   matrix only when `builder-watch` says `hosted=true`.
+5. `builder-packages` and `builder-matrix` run only when `builder-watch`
+   says `hosted=true`, so GitHub spends no matrix minutes while the fleet is
+   up.
+6. The push's webhook (Gitea to Woodpecker) starts
    `.woodpecker/builder.yml`:
    - `wait-for-image` polls ghcr anonymously until `:<commit>` exists, for
      up to 40 minutes. A step whose pod can't pull its image fails at once.
@@ -139,6 +150,14 @@ On a push to main:
      (`check_builder_summary.py`).
    - Steps have no `depends_on`, so they run one at a time. Every package
      runs whatever the one before it did.
+   - A pipeline that started more than `FALLBACK_SECONDS` + 5 minutes after
+     it was created (`CI_PIPELINE_STARTED - CI_PIPELINE_CREATED`) is one
+     `builder-watch` gave up on, and GitHub ran that commit. Every step
+     skips in seconds and says so. Without a token GitHub can't cancel the
+     pipelines it gave up on, so when an agent appears after an outage it
+     clears that queue fast instead of spending ~15 minutes on each. The 5
+     minutes of slack mean a pipeline starting near the deadline runs on
+     both, never on neither.
 
 The pipeline is generated, so don't edit it. When the matrix moves (a
 package, or a known-failures `build`/`parity` entry under
