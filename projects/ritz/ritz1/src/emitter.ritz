@@ -657,8 +657,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     # via stale-but-still-OCCUPIED slots).
     s.fcx.local_map.clear()
     # Store return type name for struct returns
-    s.fcx.ret_type_name = f.return_type_name.ptr
-    s.fcx.ret_type_name_len = f.return_type_name.len as i32
+    s.fcx.ret_type_name = f.return_type_name
     # AGAST #1730 — large struct returns go through `ptr sret(%T) %ret.sret`.
     s.fcx.ret_sret = struct_ret_uses_sret(s, f.return_type, f.return_type_name)
     s.fcx.fn_ret_type = f.return_type   # AGAST #1454
@@ -860,10 +859,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                         var ret_name: *u8 = lv_type_name(local)
                         var ret_name_len: i32 = lv_type_name_len(local)
                         var ret_val: i32 = val
-                        if is_layout_equiv_pair(StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }) == 1
-                            ret_val = rebuild_layout_equiv(s, val, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 })
-                            ret_name = s.fcx.ret_type_name
-                            ret_name_len = s.fcx.ret_type_name_len
+                        if is_layout_equiv_pair(StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, s.fcx.ret_type_name) == 1
+                            ret_val = rebuild_layout_equiv(s, val, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, s.fcx.ret_type_name)
+                            ret_name = s.fcx.ret_type_name.ptr
+                            ret_name_len = s.fcx.ret_type_name.len as i32
                         format_into(s, "  ret ")
                         emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (ret_name), len: (ret_name_len) as i64 })
                         format_into(s, " %.{ret_val}\n")
@@ -872,7 +871,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     else
                         let val: i32 = emit_struct_copy(s, stmt.expr, TypeKind.Struct)
                         format_into(s, "  ret ")
-                        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 })
+                        emit_llvm_type_struct(s, TypeKind.Struct, s.fcx.ret_type_name)
                         format_into(s, " %.{val}\n")
                 else if s.fcx.ret_sret == 1
                     emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TypeKind.Struct))   # AGAST #1730
@@ -881,9 +880,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     # AGAST #1643: a tail `"..."` is a %Span$u8; coerce it to a
                     # %StrView return the way `return "..."` does (#168).
                     let val: i32 = emit_struct_copy(s, stmt.expr, TypeKind.Struct)
-                    let ret_reg: i32 = coerce_struct_ret_value(s, stmt.expr, val, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 })
+                    let ret_reg: i32 = coerce_struct_ret_value(s, stmt.expr, val, s.fcx.ret_type_name)
                     format_into(s, "  ret ")
-                    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 })
+                    emit_llvm_type_struct(s, TypeKind.Struct, s.fcx.ret_type_name)
                     format_into(s, " %.{ret_reg}\n")
             else
                 # AGAST #1652: a tail `s` (`s: @&S`) from a `-> *S` fn is a `ptr`.
@@ -1009,8 +1008,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # Without this, `fn slice(self: @StrView, ...) -> StrView` ended up
     # emitting `ret %Token` because the Token-returning emit_fn ran
     # earlier and last set s.fcx.ret_type_name.
-    s.fcx.ret_type_name = method.return_type_name.ptr
-    s.fcx.ret_type_name_len = method.return_type_name.len as i32
+    s.fcx.ret_type_name = method.return_type_name
     # AGAST #1730 — large struct returns go through `ptr sret(%T) %ret.sret`.
     s.fcx.ret_sret = struct_ret_uses_sret(s, method.return_type, method.return_type_name)
     s.fcx.fn_ret_type = method.return_type   # AGAST #1454
@@ -2403,29 +2401,22 @@ pub fn emit_module(m: *Module, out: *String, alloc: *Allocator, mono: *MonoCtx, 
             last_expr_label: 0,
             last_expr_model: LAST_EXPR_UNKNOWN,   # AGAST #2950
             current_label: ENTRY_BLOCK_LABEL,   # AGAST #1335
-            ret_type_name: null,
-            ret_type_name_len: 0,
+            ret_type_name: strview_empty(),
             ret_sret: 0,   # AGAST #1730 — set per fn by emit_fn / emit_impl_method
             fn_ret_type: TypeKind.Void,   # AGAST #1454 — set per fn like ret_sret
             sret_last_val: 0,
             sret_last_slot: 0,
-            ctx_enum_name: null,
-            ctx_enum_name_len: 0,
+            ctx_enum_name: strview_empty(),
             ctx_enum_arg: 0,
-            ctx_slot_name: null,   # AGAST #2296
-            ctx_slot_name_len: 0,
+            ctx_slot_name: strview_empty(),   # AGAST #2296
             ctx_slot_set: 0,
             struct_copy_expr: null,
-            ctx_simd_name: null,
-            ctx_simd_name_len: 0,
-            last_match_agg_name: null,   # AGAST #1666
-            last_match_agg_name_len: 0,
+            ctx_simd_name: strview_empty(),
+            last_match_agg_name: strview_empty(),   # AGAST #1666
             last_match_float_ty: TypeKind.Void,   # AGAST #1946
-            last_if_stmt_agg_name: null,   # AGAST #2559
-            last_if_stmt_agg_name_len: 0,
+            last_if_stmt_agg_name: strview_empty(),   # AGAST #2559
             match_float_hint: TypeKind.Void,
-            match_agg_hint: null,   # AGAST #3205
-            match_agg_hint_len: 0,
+            match_agg_hint: strview_empty(),   # AGAST #3205
             match_no_value: 0,   # AGAST #2046
             if_arm_value: null,   # AGAST #2288
             if_stmt_discarded: null,   # AGAST #3749

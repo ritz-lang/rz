@@ -172,22 +172,19 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
             let span_src: *LocalVar = find_local_struct_name(s, arg.ident)
             if span_src != null and lv_var_type(span_src) == TypeKind.Array
                 return 0
-    let saved_name: *u8 = s.fcx.ctx_enum_name
-    let saved_len: i32 = s.fcx.ctx_enum_name_len
+    let saved_name: StrView = s.fcx.ctx_enum_name
     let saved_arg: i32 = s.fcx.ctx_enum_arg
     var saved_slot: SlotCtx
     if p != null
         enter_slot_ctx(s, @saved_slot, p.param_type, p.param_type_name)
     else
         enter_slot_ctx(s, @saved_slot, TypeKind.Void, strview_empty())
-    s.fcx.ctx_enum_name = null
-    s.fcx.ctx_enum_name_len = 0
+    s.fcx.ctx_enum_name = strview_empty()
     s.fcx.ctx_enum_arg = 1
     if p != null
         if p.param_type == TypeKind.Struct and p.param_type_name.len > 0
             if is_tagged_enum_type(p.param_type_name) == 1 or is_enum_instance(s.sym.mono.pctx, p.param_type_name) == 1
-                s.fcx.ctx_enum_name = p.param_type_name.ptr
-                s.fcx.ctx_enum_name_len = p.param_type_name.len as i32
+                s.fcx.ctx_enum_name = p.param_type_name
     # AGAST #2279: a `c:& C` argument copies into a by-value `C` param.  A lent
     # `self` param is a `ptr` (emit_impl_method).
     var reg: i32 = 0
@@ -200,7 +197,6 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     else
         reg = emit_expr(s, arg)
     s.fcx.ctx_enum_name = saved_name
-    s.fcx.ctx_enum_name_len = saved_len
     s.fcx.ctx_enum_arg = saved_arg
     leave_slot_ctx(s, @saved_slot)
     if param_uses_byval(s, p) == 1
@@ -220,25 +216,21 @@ pub fn emit_expr_into_slot_impl(s: *EmitterState, e: *Expr, ty: TypeKind, name: 
         let referent: i32 = emit_lent_referent(s, e, name)
         if referent != 0
             return referent
-    let saved_name: *u8 = s.fcx.ctx_enum_name
-    let saved_len: i32 = s.fcx.ctx_enum_name_len
+    let saved_name: StrView = s.fcx.ctx_enum_name
     let saved_arg: i32 = s.fcx.ctx_enum_arg
-    s.fcx.ctx_enum_name = null
-    s.fcx.ctx_enum_name_len = 0
+    s.fcx.ctx_enum_name = strview_empty()
     s.fcx.ctx_enum_arg = 1
     var saved_slot: SlotCtx
     enter_slot_ctx(s, @saved_slot, ty, name)
     if ty == TypeKind.Struct and not unnamed(name) and name.len > 0
         if is_tagged_enum_type(name) == 1 or is_enum_instance(s.sym.mono.pctx, name) == 1
-            s.fcx.ctx_enum_name = name.ptr
-            s.fcx.ctx_enum_name_len = name.len as i32
+            s.fcx.ctx_enum_name = name
     # AGAST #4028 / #4029: an if / match into a float slot (`v = if c then y
     # else y`, `S { d: match .. }`) merges at the slot's type, as a let does;
     # its phi was the arms' width, stored at the slot's.
     set_match_float_hint(s, e, ty, name)
     var reg: i32 = emit_struct_copy(s, e, ty)
     s.fcx.ctx_enum_name = saved_name
-    s.fcx.ctx_enum_name_len = saved_len
     s.fcx.ctx_enum_arg = saved_arg
     leave_slot_ctx(s, @saved_slot)
     if ty == TypeKind.Struct
@@ -432,14 +424,14 @@ pub fn emit_array_return_if_stmt(s: *EmitterState, st: *Stmt, ra: *Param) -> i32
 pub fn emit_lent_return(s: *EmitterState, e: *Expr, ret_type: TypeKind) -> i32
     if ret_type != TypeKind.Struct
         return 0
-    let val: i32 = emit_lent_referent(s, e, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 })
+    let val: i32 = emit_lent_referent(s, e, s.fcx.ret_type_name)
     if val == 0
         return 0
     if s.fcx.ret_sret == 1
         emit_sret_ret_value(s, val)   # AGAST #1730
         return 1
     format_into(s, "  ret ")
-    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 })
+    emit_llvm_type_struct(s, TypeKind.Struct, s.fcx.ret_type_name)
     format_into(s, " %.{val}\n")
     return 1
 
@@ -566,27 +558,21 @@ fn emit_payload_into_slot(s: *EmitterState, enum_name: StrView, tag: i32, e: *Ex
     let pay_ty: StrView = variant_payload_type_name(s, enum_name, tag)
     if pay_ty.len <= 0
         return emit_expr(s, e)
-    let pay: *u8 = pay_ty.ptr
-    let pay_len: i32 = pay_ty.len as i32
-    let saved_name: *u8 = s.fcx.ctx_enum_name
-    let saved_len: i32 = s.fcx.ctx_enum_name_len
+    let saved_name: StrView = s.fcx.ctx_enum_name
     let saved_arg: i32 = s.fcx.ctx_enum_arg
-    s.fcx.ctx_enum_name = null
-    s.fcx.ctx_enum_name_len = 0
+    s.fcx.ctx_enum_name = strview_empty()
     s.fcx.ctx_enum_arg = 1
-    if is_tagged_enum_type(StrView { ptr: (pay), len: (pay_len) as i64 }) == 1 or is_enum_instance(s.sym.mono.pctx, StrView { ptr: (pay), len: (pay_len) as i64 }) == 1
-        s.fcx.ctx_enum_name = pay
-        s.fcx.ctx_enum_name_len = pay_len
+    if is_tagged_enum_type(pay_ty) == 1 or is_enum_instance(s.sym.mono.pctx, pay_ty) == 1
+        s.fcx.ctx_enum_name = pay_ty
     # AGAST #4678: a struct payload is a copy into the variant's slot, as a
     # struct argument is, so a whole struct element (`Some(m.params[i])`,
     # `Ok(p[i])`) is its value rather than refused (whole_struct_elem_refused).
     var reg: i32 = 0
-    if find_struct(s, StrView { ptr: (pay), len: (pay_len) as i64 }) != null
+    if find_struct(s, pay_ty) != null
         reg = emit_struct_copy(s, e, TypeKind.Struct)
     else
         reg = emit_expr(s, e)
     s.fcx.ctx_enum_name = saved_name
-    s.fcx.ctx_enum_name_len = saved_len
     s.fcx.ctx_enum_arg = saved_arg
     reg
 

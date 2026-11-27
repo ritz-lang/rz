@@ -76,7 +76,12 @@ SEMA_TYPE = SRC / "sema_type.ritz"
 # #4852 added one: fcx.x86_features, the X86F_* bits add_extern sets as a fn
 # body names an x86 ISA-extension intrinsic (it replaced a 3x memcmp scan of
 # each fn's IR text).  Per-fn lowering state, reset at each fn's start.
-MEASURED_FIELDS = 103
+#
+# #4773 removed seven: each FnCtx name that was a `*u8` + `_len: i32` pair
+# (ret_type_name, ctx_enum_name, ctx_slot_name, ctx_simd_name,
+# last_match_agg_name, last_if_stmt_agg_name, match_agg_hint) is one
+# StrView, so the same state is seven fields fewer.
+MEASURED_FIELDS = 96
 
 # AGAST #4697: EmitterState is these four parts (field -> struct), the
 # dispatch seam and the hooks.  Each part is a struct in emitter_core.ritz.

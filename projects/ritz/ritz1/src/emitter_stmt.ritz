@@ -88,12 +88,11 @@ fn emit_tuple_decl(s: *EmitterState, stmt: *Stmt)
         # AGAST #2594: a match / if block init.  Its arms' phi type is known
         # only once they are emitted, as for an untyped `let v = match`
         # (#1666): emit_match / the if publish it in last_match_agg_name.
-        s.fcx.last_match_agg_name = null
-        s.fcx.last_match_agg_name_len = 0
+        s.fcx.last_match_agg_name = strview_empty()
         s.fcx.last_match_float_ty = TypeKind.Void
         init_reg = emit_expr(s, init)
-        if s.fcx.last_match_agg_name != null
-            sname = StrView { ptr: s.fcx.last_match_agg_name, len: s.fcx.last_match_agg_name_len as i64 }
+        if s.fcx.last_match_agg_name.ptr != null
+            sname = s.fcx.last_match_agg_name
     else
         sname = tuple_decl_struct_name(s, init)
         # A copy of the struct it destructures: `let (a, b) = ps[1]` (#2996).
@@ -270,8 +269,7 @@ fn decl_pre_emit_arms(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: T
         # ExprKind.If (#1613) publishes its phi type the same way.
         if stmt.var_init.kind == ExprKind.Match or stmt.var_init.kind == ExprKind.If
             # Clear first so a stale type from an earlier match can't leak in.
-            s.fcx.last_match_agg_name = null
-            s.fcx.last_match_agg_name_len = 0
+            s.fcx.last_match_agg_name = strview_empty()
             s.fcx.last_match_float_ty = TypeKind.Void
             # AGAST #2454: arms ending in Some / None / Ok / Err build the
             # enum they name, not the no-enum zero.
@@ -289,10 +287,10 @@ fn decl_pre_emit_arms(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: T
                 *pre_init_reg = emit_zero_i64(s)   # refused: its arms are not emitted
             leave_slot_ctx(s, @pre_slot)
             *pre_emitted = 1
-            if s.fcx.last_match_agg_name != null and s.fcx.last_match_agg_name_len > 0
+            if s.fcx.last_match_agg_name.ptr != null and s.fcx.last_match_agg_name.len > 0
                 var_type = TypeKind.Struct
                 dt.var_type = TypeKind.Struct
-                dt.var_type_name = StrView { ptr: s.fcx.last_match_agg_name, len: s.fcx.last_match_agg_name_len as i64 }
+                dt.var_type_name = s.fcx.last_match_agg_name
             else if s.fcx.last_match_float_ty != TypeKind.Void
                 # AGAST #1946: float-valued arms, `let v = match o` with
                 # `Some(x) => x` over Option<f64>: a `double` slot.
@@ -388,22 +386,18 @@ fn decl_emit_init(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type: TypeKind
     # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
     # a non-Result-returning fn still builds the right struct.  Save /
     # restore around the init expression so nested decls don't leak.
-    let _saved_ctx: *u8 = s.fcx.ctx_enum_name
-    let _saved_ctx_len: i32 = s.fcx.ctx_enum_name_len
+    let _saved_ctx: StrView = s.fcx.ctx_enum_name
     # AGAST #167: same shape, different ctx — when the binding's
     # declared type is a SIMD vector (`v4i32`, ...) the inline SIMD
     # intrinsic dispatch in emit_expr_call uses this to size the
     # `<N x iM>` load result.
-    let _saved_simd: *u8 = s.fcx.ctx_simd_name
-    let _saved_simd_len: i32 = s.fcx.ctx_simd_name_len
+    let _saved_simd: StrView = s.fcx.ctx_simd_name
     if var_type == TypeKind.Struct
         if dt.var_type_name.len > 0
             if is_ctor_slot_enum(s.sym.mono.pctx, dt.var_type_name) == 1
-                s.fcx.ctx_enum_name = dt.var_type_name.ptr
-                s.fcx.ctx_enum_name_len = dt.var_type_name.len as i32
+                s.fcx.ctx_enum_name = dt.var_type_name
             if is_simd_vector_type_name(dt.var_type_name) == 1
-                s.fcx.ctx_simd_name = dt.var_type_name.ptr
-                s.fcx.ctx_simd_name_len = dt.var_type_name.len as i32
+                s.fcx.ctx_simd_name = dt.var_type_name
     var init_reg: i32 = pre_init_reg
     if pre_emitted == 0
         # AGAST #2296: the annotation, if any, is the slot `Span.empty()`
@@ -419,9 +413,7 @@ fn decl_emit_init(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type: TypeKind
             init_reg = coerce_array_to_span(s, stmt.var_init, init_reg, dt.var_type_name)   # AGAST #2502
         leave_slot_ctx(s, @saved_slot)
     s.fcx.ctx_enum_name = _saved_ctx
-    s.fcx.ctx_enum_name_len = _saved_ctx_len
     s.fcx.ctx_simd_name = _saved_simd
-    s.fcx.ctx_simd_name_len = _saved_simd_len
     decl_store_init(s, stmt, dt, var_type, init_reg, alloca_reg)
 
 # AGAST #4666: `m[i] = r`, a whole row (or plane) of an N-D array: `dst` is
@@ -598,12 +590,10 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 return
             # AGAST #167: thread SIMD ctx so the rhs intrinsic dispatch
             # (e.g. `wk = simd_loadu(@k[0])`) knows which `<N x iM>` to load.
-            let _saved_simd_a: *u8 = s.fcx.ctx_simd_name
-            let _saved_simd_a_len: i32 = s.fcx.ctx_simd_name_len
+            let _saved_simd_a: StrView = s.fcx.ctx_simd_name
             let local: *LocalVar = find_local_struct_name(s, stmt.assign_target)
             if local != null and is_simd_vector_type_name(StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }) == 1
-                s.fcx.ctx_simd_name = lv_type_name(local)
-                s.fcx.ctx_simd_name_len = lv_type_name_len(local)
+                s.fcx.ctx_simd_name = StrView { ptr: lv_type_name(local), len: (lv_type_name_len(local)) as i64 }
             # For function call or other expression returning struct.
             # AGAST #2142: `held = Some(..)` builds the local's enum.
             var val: i32 = 0
@@ -612,7 +602,6 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             else
                 val = emit_expr(s, stmt.assign_value)
             s.fcx.ctx_simd_name = _saved_simd_a
-            s.fcx.ctx_simd_name_len = _saved_simd_a_len
             if local != null
                 # AGAST #168: Span$u8 ↔ StrView layout coercion at assign sites
                 # (e.g. `path = "..."` where path: StrView).  See emit_var_decl
@@ -1168,7 +1157,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
         return
     if struct_return_as_int_refused(s, stmt.return_value, ret_type)   # AGAST #3008
         return
-    set_match_float_hint(s, stmt.return_value, ret_type, StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 })
+    set_match_float_hint(s, stmt.return_value, ret_type, s.fcx.ret_type_name)
     let val: i32 = emit_expr(s, stmt.return_value)
     match ty_int_bits(ret_type)
         32 =>
@@ -1227,7 +1216,7 @@ fn emit_void_fn_value_return(s: *EmitterState, stmt: *Stmt)
 # `return v` from an `-> S` fn: the whole struct, loaded from where it is, or
 # written through the sret pointer (AGAST #1730).
 fn emit_struct_return(s: *EmitterState, stmt: *Stmt)
-    let ret_name: StrView = StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 }
+    let ret_name: StrView = s.fcx.ret_type_name
     # A struct literal (`return NFAFragment { start: s0, end: s0 }`), built in
     # a slot of its own.
     if stmt.return_value.kind == ExprKind.StructLit
@@ -2287,16 +2276,13 @@ fn emit_return_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     # AGAST #2207: a `return` leaves the let initialiser it sits in, so the
     # let's enum context does not apply to it. With none set,
     # resolve_enum_ctx falls back to the fn's return type.
-    let ret_ctx_name: *u8 = s.fcx.ctx_enum_name
-    let ret_ctx_len: i32 = s.fcx.ctx_enum_name_len
-    s.fcx.ctx_enum_name = null
-    s.fcx.ctx_enum_name_len = 0
+    let ret_ctx_name: StrView = s.fcx.ctx_enum_name
+    s.fcx.ctx_enum_name = strview_empty()
     # So does the slot's: a `return` lands in the fn's return type.
     let ret_slot_set: i32 = s.fcx.ctx_slot_set
     s.fcx.ctx_slot_set = 0
     emit_return(s, stmt, ret_type)
     s.fcx.ctx_enum_name = ret_ctx_name
-    s.fcx.ctx_enum_name_len = ret_ctx_len
     s.fcx.ctx_slot_set = ret_slot_set
 
 # A scalar phi's type: the arms' float (AGAST #3421), else the i64 every
@@ -2404,7 +2390,7 @@ fn emit_if_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
             else_result = 0
     let has_phi: bool = has_else and then_result != 0 and else_result != 0
     if has_phi
-        let ret_name: StrView = StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }
+        let ret_name: StrView = s.fcx.ret_type_name
         if ret_type == TypeKind.Struct and ret_name.len > 0 and is_tagged_enum_type(ret_name) == 1
             phi_agg = ret_name
         else if then_phi.len > 0
@@ -2412,8 +2398,7 @@ fn emit_if_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
         else if else_agg.len > 0
             phi_agg = else_agg
     # AGAST #2559: publish it for an enclosing `if` ending in this one.
-    s.fcx.last_if_stmt_agg_name = phi_agg.ptr
-    s.fcx.last_if_stmt_agg_name_len = phi_agg.len as i32
+    s.fcx.last_if_stmt_agg_name = phi_agg
     if has_phi
         let phi_reg: i32 = next_reg(s)
         format_into(s, "  %.{phi_reg} = phi ")
@@ -2626,7 +2611,7 @@ fn emit_match_stmt(s: *EmitterState, stmt: *Stmt)
     let match_reg: i32 = emit_match(s, stmt.if_cond, arms, stmt.span)
     set_last_expr(s, match_reg)
     # AGAST #2950: its phi is a `ptr` or an i64 (emit_match_phi_type).
-    if match_reg > 0 and s.fcx.last_match_agg_name == null and s.fcx.last_match_float_ty == TypeKind.Void
+    if match_reg > 0 and s.fcx.last_match_agg_name.ptr == null and s.fcx.last_match_float_ty == TypeKind.Void
         set_last_expr_phi(s, match_reg, arms_ptr_valued(s, arms))
 
 # The struct local `stmt.var_name`, its struct, and the index of its field

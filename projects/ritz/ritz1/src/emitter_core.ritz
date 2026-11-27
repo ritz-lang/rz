@@ -193,8 +193,7 @@ struct FnCtx
     # Track current label for phi node predecessors (needed for nested control flow)
     current_label: i32
     # Current function's return type name (for struct returns)
-    ret_type_name: *u8
-    ret_type_name_len: i32
+    ret_type_name: StrView
     # AGAST #1730 — 1 when the current fn returns its (large) struct through
     # a `ptr sret(%T) %ret.sret` first parameter; see struct_ret_uses_sret.
     ret_sret: i32
@@ -207,25 +206,23 @@ struct FnCtx
     sret_last_val: i32
     sret_last_slot: i32
     # Tagged-enum context for variant constructors (ritz-task-133).
-    # When non-null, `Some(x)` / `Ok(x)` / `None` / `Err(x)` allocas use this
+    # When non-empty, `Some(x)` / `Ok(x)` / `None` / `Err(x)` allocas use this
     # struct name instead of falling back to `ret_type_name`.  Set by
     # emit_var_decl / emit_return for explicit `let r: Result<_,_> = Ok(x)`
-    # bindings.  Null means "use ret_type_name" (covers tail-expression
+    # bindings.  Empty means "use ret_type_name" (covers tail-expression
     # returns inside a Result-returning fn).
-    ctx_enum_name: *u8
-    ctx_enum_name_len: i32
+    ctx_enum_name: StrView
     # AGAST #1498: 1 while emitting a call argument (emit_call_arg).  There
     # the only valid enum context is the callee's parameter type, already in
     # ctx_enum_name; resolve_enum_ctx must NOT fall back to ret_type_name.
     ctx_enum_arg: i32
     # AGAST #2296: the struct type of the slot the value being emitted lands
     # in, whatever kind of struct: a typed let's, a parameter's or a store
-    # target's (null when it isn't a struct), so `Span.empty()` can take its
+    # target's (empty when it isn't a struct), so `Span.empty()` can take its
     # T from it.  ctx_slot_set is 1 inside such a slot; 0 (a `return`, or no
     # slot yet) falls back to the fn's return type, as ritz0's
     # expected_ritz_type does.
-    ctx_slot_name: *u8
-    ctx_slot_name_len: i32
+    ctx_slot_name: StrView
     ctx_slot_set: i32
     # AGAST #2330: the expression being emitted into a struct slot, a copy, or null.
     # emit_expr_index lets a struct element of a pointer to an array be that, and
@@ -234,26 +231,23 @@ struct FnCtx
     struct_copy_expr: *Expr
     # AGAST #167: SIMD-typed binding context.  When emitting `let v: v4i32 =
     # simd_loadu(...)`, the var-decl pre-sets these so emit_expr_call's
-    # SIMD intrinsic dispatch knows which `<N x iM>` type to produce.  Null
+    # SIMD intrinsic dispatch knows which `<N x iM>` type to produce.  Empty
     # means "no SIMD-typed enclosing binding" — intrinsic dispatch then
     # tries to derive the type from arg idents (vector-typed locals).
-    ctx_simd_name: *u8
-    ctx_simd_name_len: i32
+    ctx_simd_name: StrView
     # AGAST #1666: the merge-phi aggregate type (MatchResult.agg_name) of
-    # the most recently completed emit_match, or null when its phi was i64.
+    # the most recently completed emit_match, or empty when its phi was i64.
     # emit_var_decl reads it right after emitting an untyped `let v = match`
     # initializer to size the slot as `alloca %StrView` rather than i64.
-    last_match_agg_name: *u8
-    last_match_agg_name_len: i32
+    last_match_agg_name: StrView
     # AGAST #1946: the float phi type (TypeKind.F32 / TypeKind.F64) of the most
     # recently completed emit_match / emit_if_expr, or 0 when it was not a
     # float.  Read like last_match_agg_name by an untyped `let v = match`.
     last_match_float_ty: TypeKind
     # AGAST #2559: the struct type of the most recently completed statement
-    # `if`'s merge phi, or null when it had none or it was i64.  An enclosing
+    # `if`'s merge phi, or empty when it had none or it was i64.  An enclosing
     # `if` whose arm ends in it (an `else if` chain) types its own phi by it.
-    last_if_stmt_agg_name: *u8
-    last_if_stmt_agg_name_len: i32
+    last_if_stmt_agg_name: StrView
     # AGAST #1946: the float type an enclosing `let x: f64 = match ...` /
     # `return match ...` (in a `-> f64` fn) expects of the match, or 0.  The
     # match it is set for consumes and clears it on entry; it re-sets it just
@@ -262,11 +256,10 @@ struct FnCtx
     # statements).
     match_float_hint: TypeKind
     # AGAST #3205: the struct or enum a `-> S` fn returns, set while its tail
-    # match (a StmtKind.Match) is emitted, or null.  Taken on entry like
+    # match (a StmtKind.Match) is emitted, or empty.  Taken on entry like
     # match_float_hint; the match's phi falls back to it when no arm yields a
     # value (every arm `return`s), so the implicit `ret %S` names no i64 phi.
-    match_agg_hint: *u8
-    match_agg_hint_len: i32
+    match_agg_hint: StrView
     # AGAST #2046: set by a caller that discards the value of the match / if
     # it is about to emit (StmtKind.Match, an expression statement, a match or
     # if nested as an arm).  emit_match / emit_if_expr consume and clear it
@@ -864,29 +857,22 @@ pub fn emit_ir_error_end(s: *EmitterState, name: StrView)
     s.diag.error_count = s.diag.error_count + 1
 # AGAST #2296: EmitterState.ctx_slot_*, saved around a slot.
 struct SlotCtx
-    name: *u8
-    name_len: i32
+    name: StrView
     set: i32
 
 # Enter the slot of declared type (ty, name) after saving the enclosing one in
 # `saved`.  A non-struct slot is still a slot: it hides the enclosing one and
 # the fn's return type, so neither leaks into an argument.
 pub fn enter_slot_ctx(s: *EmitterState, saved: *SlotCtx, ty: TypeKind, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     saved.name = s.fcx.ctx_slot_name
-    saved.name_len = s.fcx.ctx_slot_name_len
     saved.set = s.fcx.ctx_slot_set
     s.fcx.ctx_slot_set = 1
-    s.fcx.ctx_slot_name = null
-    s.fcx.ctx_slot_name_len = 0
-    if ty == TypeKind.Struct and name != null and name_len > 0
-        s.fcx.ctx_slot_name = name
-        s.fcx.ctx_slot_name_len = name_len
+    s.fcx.ctx_slot_name = strview_empty()
+    if ty == TypeKind.Struct and name_sv.ptr != null and name_sv.len > 0
+        s.fcx.ctx_slot_name = name_sv
 
 pub fn leave_slot_ctx(s: *EmitterState, saved: *SlotCtx)
     s.fcx.ctx_slot_name = saved.name
-    s.fcx.ctx_slot_name_len = saved.name_len
     s.fcx.ctx_slot_set = saved.set
 
 # The struct type the value being emitted lands in: the innermost slot's, or
@@ -894,8 +880,8 @@ pub fn leave_slot_ctx(s: *EmitterState, saved: *SlotCtx)
 # neither is a struct.
 pub fn slot_struct_name(s: *EmitterState) -> StrView
     if s.fcx.ctx_slot_set == 1
-        return StrView { ptr: s.fcx.ctx_slot_name, len: s.fcx.ctx_slot_name_len as i64 }
-    StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 }
+        return s.fcx.ctx_slot_name
+    s.fcx.ret_type_name
 
 # AGAST #1509: a multi-dimensional array use ritz1 does not lower, as
 # `<file>:<line>:<col>: error: <msg>`.  Counts like emit_ir_error_sv, so the
