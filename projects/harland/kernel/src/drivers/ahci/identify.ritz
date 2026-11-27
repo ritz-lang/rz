@@ -1,0 +1,90 @@
+# IDENTIFY DEVICE (ATA 0xEC) field parse. The buffer is the raw PIO payload:
+# ASCII fields are byte-swapped inside each 16-bit word. AGAST #4882.
+
+import ritzlib.span
+
+pub const AHCI_ID_BYTES: i64 = 512
+
+# Why a payload is not a 512-byte LBA48 disk. Sector4Kn carries the logical
+# sector size the caller logs. Io is a command failure, not a short buffer.
+pub enum IdentifyError
+    Short
+    NoLba48
+    Sector4Kn(u32)
+    Io
+
+pub struct IdentifyInfo
+    model_len: i64
+    serial_len: i64
+    sectors: u64
+    sector_size: u32
+    write_cache: bool
+    ncq: bool
+    model: [40]u8
+    serial: [20]u8
+
+impl IdentifyInfo
+    # Borrowed: a by-value self would copy the arrays and the view would
+    # point at that copy (LANGUAGE_SPEC §5.4, S-PTR-6).
+    pub fn model(self: @IdentifyInfo) -> StrView
+        StrView { ptr: @self.model[0], len: self.model_len }
+
+    pub fn serial(self: @IdentifyInfo) -> StrView
+        StrView { ptr: @self.serial[0], len: self.serial_len }
+
+fn id_word(buf: [u8], word: i32) -> u32
+    let off: i64 = word as i64 * 2
+    let lo: u32 = buf[off] as u32
+    let hi: u32 = buf[off + 1] as u32
+    lo | (hi << 8)
+
+# ATA string at `word`: each word's bytes swapped, trailing space and NUL
+# trimmed. Returns the length kept. `dst` is the caller's model or serial.
+fn copy_ata_string(dst: [u8], buf: [u8], word: i32, nwords: i32) -> i64
+    var n: i64 = 0
+    var w: i32 = 0
+    while w < nwords and n + 1 < dst.len
+        let raw: u32 = id_word(buf, word + w)
+        dst[n] = ((raw >> 8) & 0xFF) as u8
+        n = n + 1
+        if n < dst.len
+            dst[n] = (raw & 0xFF) as u8
+            n = n + 1
+        w = w + 1
+    while n > 0
+        let c: u8 = dst[n - 1]
+        if c != 0x20 and c != 0
+            break
+        n = n - 1
+    n
+
+# Parse one IDENTIFY payload. Ok is a 512-byte-sector LBA48 disk. 4Kn and
+# non-LBA48 are errors; the caller logs them and skips the port.
+pub fn ahci_parse_identify(buf: [u8]) -> Result<IdentifyInfo, IdentifyError>
+    if buf.len < AHCI_ID_BYTES
+        return Err(IdentifyError.Short)
+    var info: IdentifyInfo
+    let model: [u8] = @info.model
+    model.zero()
+    let serial: [u8] = @info.serial
+    serial.zero()
+    info.serial_len = copy_ata_string(serial, buf, 10, 10)
+    info.model_len = copy_ata_string(model, buf, 27, 20)
+    let w100: u64 = id_word(buf, 100) as u64
+    let w101: u64 = id_word(buf, 101) as u64
+    let w102: u64 = id_word(buf, 102) as u64
+    let w103: u64 = id_word(buf, 103) as u64
+    info.sectors = w100 | (w101 << 16) | (w102 << 32) | (w103 << 48)
+    let w106: u32 = id_word(buf, 106)
+    if (w106 & 0x1000) != 0
+        let words: u32 = id_word(buf, 117) | (id_word(buf, 118) << 16)
+        info.sector_size = words * 2
+    else
+        info.sector_size = 512
+    info.write_cache = (id_word(buf, 85) & 0x20) != 0
+    info.ncq = (id_word(buf, 76) & 0x100) != 0
+    if (id_word(buf, 83) & 0x400) == 0
+        return Err(IdentifyError.NoLba48)
+    if info.sector_size != 512
+        return Err(IdentifyError.Sector4Kn(info.sector_size))
+    Ok(info)
