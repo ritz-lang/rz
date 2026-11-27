@@ -64,6 +64,20 @@ def _main(body):
     return f"{TYPES}pub fn main() -> i32\n{body}"
 
 
+# Two C's behind a `*C` global (AGAST #4900).
+GLOBAL_CS = """\
+var g_cs: *C = null
+var g_cs_store: [2]C
+
+"""
+
+
+def _main_g(body):
+    return (f"{TYPES}{GLOBAL_CS}pub fn main() -> i32\n"
+            "    g_cs_store[0] = C { a: 0, b: 1 }\n    g_cs_store[1] = C { a: 3, b: 2 }\n"
+            f"    g_cs = @g_cs_store[0]\n{body}")
+
+
 # name: (program, exit code).
 ROWS = {
     # A bool method on a static call's result, as an `if` condition.
@@ -89,6 +103,14 @@ ROWS = {
     # ... of a free call's.
     "method_on_unwrap_of_call": (_main(
         "    some_c().unwrap().get_b()\n"), 3),
+    # A bool method on `*(g + i)` of a `*C` global, as an `if` condition.
+    "global_ptr_arith_deref_in_if": (_main_g(
+        "    var i: i32 = 0\n    while i < 2\n"
+        "        if not (*(g_cs + i)).is_zero()\n            return 7 + i\n"
+        "        i += 1\n    1\n"), 8),
+    # ... on a plain `*g`.
+    "global_ptr_deref_in_if": (_main_g(
+        "    if (*g_cs).is_zero()\n        return 7\n    1\n"), 7),
 }
 
 
