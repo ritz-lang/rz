@@ -102,21 +102,19 @@ fn gi_is_ptr_kind(k: TypeKind) -> i32
 # TypeKind.Array and returns 1, or 0 for an element a suffix can't spell.
 # AGAST #4178: an array element (elem TypeKind.Array, elem_name its own
 # spelling) nests as spell_last_array nests `[N][M]E`: "arr2_arr3_u8".
-fn gi_array_spell(size: i32, elem: TypeKind, elem_name_sv: StrView, elem_pointee: TypeKind, out: *GiType) -> i32
-    var elem_name: *u8 = elem_name_sv.ptr
-    var elem_name_len: i32 = elem_name_sv.len as i32
+fn gi_array_spell(size: i32, elem: TypeKind, elem_name: StrView, elem_pointee: TypeKind, out: *GiType) -> i32
     var e: *u8 = null
     var el: i32 = 0
     var ptr: i32 = 0
     match elem
         TypeKind.Struct | TypeKind.Array =>
-            e = elem_name
-            el = elem_name_len
+            e = elem_name.ptr
+            el = (elem_name.len as i32)
         TypeKind.Ptr =>
             ptr = 1
             if elem_pointee == TypeKind.Struct
-                e = elem_name
-                el = elem_name_len
+                e = elem_name.ptr
+                el = (elem_name.len as i32)
             else
                 var ptr_spelled: StrView = strview_empty()
                 el = primitive_arg_spelling(elem_pointee, @ptr_spelled)
@@ -164,21 +162,19 @@ fn gi_is_int_literal(e: *Expr) -> i32
     1
 
 # The type a one-argument suffix ("$u8", "$Vec$u8", "$ptr_u8") names.
-fn gi_type_from_suffix(suffix_sv: StrView, out: *GiType) -> i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
-    let k: TypeKind = parse_type_from_suffix(suffix_sv)
+fn gi_type_from_suffix(suffix: StrView, out: *GiType) -> i32
+    let k: TypeKind = parse_type_from_suffix(suffix)
     match k
         TypeKind.Array =>
             # AGAST #3277: "$arr4_i32" is the array gi_array_spell spelled.
             var arr: ArrayArg
-            if suffix_len < 2 or array_arg_decode(StrView { ptr: (suffix + 1), len: (suffix_len - 1) as i64 }, @arr) == 0
+            if suffix.len < 2 or array_arg_decode(suffix.skip(1), @arr) == 0
                 return 0
-            return gi_set(out, TypeKind.Array, StrView { ptr: (suffix + 1), len: (suffix_len - 1) as i64 }, TypeKind.Void)
+            return gi_set(out, TypeKind.Array, suffix.skip(1), TypeKind.Void)
         TypeKind.Void =>
             return 0
         _ => pass
-    let n: StrView = get_type_name_from_suffix(suffix_sv)
+    let n: StrView = get_type_name_from_suffix(suffix)
     match k
         TypeKind.Ptr =>
             let pk: TypeKind = primitive_type_from_name(n)
@@ -512,35 +508,31 @@ fn gi_bind(b: *GiBind, idx: i32, s: StrView)
 # it is the component's last (`ptr_Vec$u8` binds A = `Vec$u8`).  Other pieces
 # match exactly, so a component naming no param is a plain comparison.  Like
 # gi_match_mangled, it binds as it goes.  The argument end, or -1 for no match.
-fn gi_match_pieces(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p_sv: StrView, a_sv: StrView, ai: i32, b: *GiBind) -> i32
-    var p: *u8 = p_sv.ptr
-    var plen: i32 = p_sv.len as i32
-    var a: *u8 = a_sv.ptr
-    var alen: i32 = a_sv.len as i32
+fn gi_match_pieces(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p: StrView, a: StrView, ai: i32, b: *GiBind) -> i32
     var pi: i32 = 0
     var x: i32 = ai
-    while pi < plen
+    while pi < p.len
         var pe: i32 = pi
-        while pe < plen and *(p + pe) != '_'   # '_'
+        while pe < p.len and p.get(pe) != '_'   # '_'
             pe = pe + 1
-        let idx: i32 = type_param_index(tps, StrView { ptr: (p + pi), len: (pe - pi) as i64 })
+        let idx: i32 = type_param_index(tps, p.skip(pi).take(pe - pi))
         var xe: i32 = x
-        if idx >= 0 and pe == plen
-            xe = mangled_arg_end(ctx, m, a_sv, x)
+        if idx >= 0 and pe == p.len
+            xe = mangled_arg_end(ctx, m, a, x)
         else
-            while xe < alen and *(a + xe) != '_' and *(a + xe) != '$'   # '_' '$'
+            while xe < a.len and a.get(xe) != '_' and a.get(xe) != '$'   # '_' '$'
                 xe = xe + 1
         if idx >= 0
-            gi_bind(b, idx, a_sv.slice(x as i64, xe as i64))   # an empty piece binds nothing
-        else if xe - x != pe - pi or memcmp(p + pi, a + x, (pe - pi) as i64) != 0
+            gi_bind(b, idx, a.slice(x as i64, xe as i64))   # an empty piece binds nothing
+        else if xe - x != pe - pi or memcmp(p.ptr + pi, a.ptr + x, (pe - pi) as i64) != 0
             return -1
         x = xe
-        if pe < plen
-            if x >= alen or *(a + x) != '_'
+        if pe < p.len
+            if x >= a.len or a.get(x) != '_'
                 return -1
             x = x + 1
         pi = pe + 1
-    if x < alen and *(a + x) != '$'
+    if x < a.len and a.get(x) != '$'
         return -1
     x
 
@@ -548,26 +540,22 @@ fn gi_match_pieces(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p_sv: StrView, a
 # argument's (`Vec$u64`), component by component: a type param's component
 # takes one whole mangled argument (`Vec$u8` in `Vec$Vec$u8`), and any other
 # binds what its `_`-pieces name (`Box2$ptr_A` against `Box2$ptr_u8`).
-fn gi_match_mangled(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p_sv: StrView, a_sv: StrView, b: *GiBind)
-    var p: *u8 = p_sv.ptr
-    var plen: i32 = p_sv.len as i32
-    var a: *u8 = a_sv.ptr
-    var alen: i32 = a_sv.len as i32
+fn gi_match_mangled(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p: StrView, a: StrView, b: *GiBind)
     var pi: i32 = 0
     var ai: i32 = 0
-    while pi < plen
-        if ai >= alen
+    while pi < p.len
+        if ai >= a.len
             return
         var pe: i32 = pi
-        while pe < plen and *(p + pe) != '$'   # '$'
+        while pe < p.len and p.get(pe) != '$'   # '$'
             pe = pe + 1
-        let idx: i32 = type_param_index(tps, StrView { ptr: (p + pi), len: (pe - pi) as i64 })
+        let idx: i32 = type_param_index(tps, p.skip(pi).take(pe - pi))
         var ae: i32 = ai
         if idx >= 0
-            ae = mangled_arg_end(ctx, m, a_sv, ai)
-            gi_bind(b, idx, a_sv.slice(ai as i64, ae as i64))
+            ae = mangled_arg_end(ctx, m, a, ai)
+            gi_bind(b, idx, a.slice(ai as i64, ae as i64))
         else
-            ae = gi_match_pieces(ctx, m, tps, StrView { ptr: (p + pi), len: (pe - pi) as i64 }, a_sv, ai, b)
+            ae = gi_match_pieces(ctx, m, tps, p.skip(pi).take(pe - pi), a, ai, b)
             if ae < 0
                 return
         pi = pe + 1
@@ -610,20 +598,14 @@ fn gi_bare_param_index(tps: *TypeParam, p: *Param) -> i32
         return type_param_index(tps, p.param_type_name)
     -1
 
-fn gi_eprint_n(s: *u8, n: i32)
-    for i in 0..n
-        eprint_char(*(s + i))
-
-fn gi_error(e: *Expr, tp: *TypeParam, fname_sv: StrView)
-    var fname: *u8 = fname_sv.ptr
-    var flen: i32 = fname_sv.len as i32
+fn gi_error(e: *Expr, tp: *TypeParam, fname: StrView)
     diag_error_at(g_gi_file, e.span)
     eprints("can't infer `")
     eprints(tp.name)
     eprints("` for `")
-    gi_eprint_n(fname, flen)
+    eprints(fname)
     eprints("`: write `")
-    gi_eprint_n(fname, flen)
+    eprints(fname)
     eprint_char('<')
     eprints(tp.name)
     eprints(">(...)`\n")
@@ -757,14 +739,12 @@ fn gi_fn_named(m: *Module, name_sv: StrView) -> i32
         f = f.next
     0
 
-fn gi_variant_error(e: *Expr, tp: *TypeParam, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn gi_variant_error(e: *Expr, tp: *TypeParam, name: StrView)
     diag_error_at(g_gi_file, e.span)
     eprints("can't infer `")
     eprints(tp.name)
     eprints("` for `")
-    gi_eprint_n(name, len)
+    eprints(name)
     eprints("`: give the binding a type\n")
     g_gi_errors = g_gi_errors + 1
 
@@ -1060,17 +1040,15 @@ fn gi_slot_method(mono: *MonoCtx, m: *Module, e: *Expr)
 # Partly known counts as naming one.  A struct whose own name has a param as
 # a `_`-piece (`My_A`) counts too: the safe way, no slot, as before R51a.
 # Mirrors ritz0's _names_type_param (#3430).
-fn gi_names_type_param(tps: *TypeParam, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if tps == null or name == null
+fn gi_names_type_param(tps: *TypeParam, name: StrView) -> i32
+    if tps == null or name.ptr == null
         return 0
     var pos: i32 = 0
-    while pos < len
+    while pos < name.len
         var end: i32 = pos
-        while end < len and *(name + end) != '$' and *(name + end) != '_'   # '$' '_'
+        while end < name.len and name.get(end) != '$' and name.get(end) != '_'   # '$' '_'
             end = end + 1
-        if type_param_index(tps, StrView { ptr: (name + pos), len: (end - pos) as i64 }) >= 0
+        if type_param_index(tps, name.skip(pos).take(end - pos)) >= 0
             return 1
         pos = end + 1
     0

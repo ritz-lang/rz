@@ -126,57 +126,51 @@ fn is_comparison(e: *Expr) -> i32
     0
 
 # What `name` is in a mangled `Option$<name>` or `Result$<ok>$<err>`.
-fn bk_mangled(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name_eq(name_sv, "bool") == 1
+fn bk_mangled(name: StrView) -> i32
+    if name_eq(name, "bool") == 1
         return BK_BOOL
-    if len == 2 or len == 3 or len == 5
-        if *name == 'i' or *name == 'u'
-            if len == 5 and name_eq(StrView { ptr: (name + 1), len: (4) as i64 }, "size") == 0
+    if name.len == 2 or name.len == 3 or name.len == 5
+        if name.get(0) == 'i' or name.get(0) == 'u'
+            if name.len == 5 and name_eq(name.skip(1).take(4), "size") == 0
                 return BK_UNSURE
-            if len < 5 and (*(name + 1) < '0' or *(name + 1) > '9')
+            if name.len < 5 and (name.get(1) < '0' or name.get(1) > '9')
                 return BK_UNSURE
             return BK_INT
     BK_UNSURE
 
 # What `Some(v)`, `Ok(v)` or `Err(v)` binds over the mangled tagged enum `name`.
-pub fn bk_tagged_payload(name_sv: StrView, is_err: i32) -> i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
+pub fn bk_tagged_payload(name: StrView, is_err: i32) -> i32
     var i: i32 = 0
-    while i < name_len and *(name + i) != '$'
+    while i < name.len and name.get(i) != '$'
         i += 1
     i += 1
     var end: i32 = i
-    while end < name_len and *(name + end) != '$'
+    while end < name.len and name.get(end) != '$'
         end += 1
     if is_err == 1
         i = end + 1
-        end = name_len
-    if i >= name_len
+        end = (name.len as i32)
+    if i >= name.len
         return BK_UNSURE
-    bk_mangled(StrView { ptr: (name + i), len: (end - i) as i64 })
+    bk_mangled(name.skip(i).take(end - i))
 
 # What `Some(v)` / `Ok(v)` / `Err(v)` binds over the mangled tagged enum
 # `name`: bk_tagged_payload's kinds, and a pointer for a payload ritz0 mangles
 # `ptr_T` (`Option$ptr_u8`), which bk_mangled leaves unsure (AGAST #4200).
 # Sema's bool_note_arm and the emitter's payload_bool_kind both read a
 # binding with it, so the two agree (#4280).
-pub fn bk_tagged_binding(name_sv: StrView, is_err: i32) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn bk_tagged_binding(name: StrView, is_err: i32) -> i32
     var i: i32 = 0
-    while i < len and *(name + i) != '$'
+    while i < name.len and name.get(i) != '$'
         i += 1
     i += 1
     if is_err == 1
-        while i < len and *(name + i) != '$'
+        while i < name.len and name.get(i) != '$'
             i += 1
         i += 1
-    if i + 4 < len and name_eq(StrView { ptr: (name + i), len: (4) as i64 }, "ptr_") == 1
+    if i + 4 < name.len and name_eq(name.skip(i).take(4), "ptr_") == 1
         return BK_PTR
-    bk_tagged_payload(name_sv, is_err)
+    bk_tagged_payload(name, is_err)
 
 # --- What an expression is, on Sema --------------------------------------------
 #
@@ -624,11 +618,9 @@ pub fn sbk_member_field(sm: *Sema, e: *Expr) -> *StructField
 
 # Field `field` of the struct `name`, or of what its `deref` hands back
 # (`b.x` on a Box<Point>, AGAST #3015), or null.
-pub fn sbk_struct_field(sm: *Sema, name_sv: StrView, field_sv: StrView) -> *StructField
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var tn: *u8 = name
-    var tn_len: i32 = len
+pub fn sbk_struct_field(sm: *Sema, name: StrView, field_sv: StrView) -> *StructField
+    var tn: *u8 = name.ptr
+    var tn_len: i32 = (name.len as i32)
     var hops: i32 = 0
     while hops < 4 and tn != null and tn_len > 0
         let st: *StructDef = sema_find_struct(sm, StrView { ptr: (tn), len: (tn_len) as i64 })
@@ -1176,12 +1168,10 @@ fn sbk_tuple_elem(sm: *Sema, m: *Expr) -> i32
     tn.elem[ti]
 
 # Element `name` ("0", "1", ..) of `tn`, or -1.
-fn sbk_tuple_index(tn: *SemaTupleNote, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if tn == null or len != 1
+fn sbk_tuple_index(tn: *SemaTupleNote, name: StrView) -> i32
+    if tn == null or name.len != 1
         return 0 - 1
-    let i: i32 = *name as i32 - 48
+    let i: i32 = name.get(0) as i32 - 48
     if i < 0 or i >= tn.n
         return 0 - 1
     i
@@ -1314,17 +1304,15 @@ pub fn bool_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
 # The struct an `Option$S` / `Result$S$E` carries in Some / Ok, or an empty
 # view (tagged_enum_payload_struct): an Option's whole suffix, a Result's
 # shortest `$`-prefix naming a concrete struct (`Result$Vec$E$i32` -> `Vec$E`).
-fn sbk_ok_struct(sm: *Sema, name_sv: StrView) -> StrView
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn sbk_ok_struct(sm: *Sema, name: StrView) -> StrView
     var dollar: i32 = 0
-    while dollar < len and *(name + dollar) != '$'
+    while dollar < name.len and name.get(dollar) != '$'
         dollar += 1
-    let sfx: *u8 = name + dollar + 1
-    let sfx_len: i32 = len - dollar - 1
+    let sfx: *u8 = name.ptr + dollar + 1
+    let sfx_len: i32 = (name.len as i32) - dollar - 1
     if sfx_len <= 0
         return strview_empty()
-    if name_eq(StrView { ptr: (name), len: (dollar) as i64 }, "Option") == 1
+    if name_eq(name.take(dollar), "Option") == 1
         let st: *StructDef = sema_find_struct(sm, StrView { ptr: (sfx), len: (sfx_len) as i64 })
         if st == null
             return strview_empty()
@@ -1340,31 +1328,29 @@ fn sbk_ok_struct(sm: *Sema, name_sv: StrView) -> StrView
     strview_empty()
 
 # The struct a mangled `Option$S` / `Result$S$E` carries, by name, onto `v`.
-fn sbk_payload_struct(sm: *Sema, v: *SemaVar, name_sv: StrView, is_err: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn sbk_payload_struct(sm: *Sema, v: *SemaVar, name: StrView, is_err: i32)
     var i: i32 = 0
-    while i < len and *(name + i) != '$'
+    while i < name.len and name.get(i) != '$'
         i += 1
     i += 1
     var end: i32 = i
-    while end < len and *(name + end) != '$'
+    while end < name.len and name.get(end) != '$'
         end += 1
     if is_err == 1
         i = end + 1
-        end = len
-    if i >= len or v.kind != TypeKind.Unknown
+        end = (name.len as i32)
+    if i >= name.len or v.kind != TypeKind.Unknown
         return
-    if name_eq(StrView { ptr: (name + i), len: (end - i) as i64 }, "f32") == 1 or name_eq(StrView { ptr: (name + i), len: (end - i) as i64 }, "f64") == 1
+    if name_eq(name.skip(i).take(end - i), "f32") == 1 or name_eq(name.skip(i).take(end - i), "f64") == 1
         v.bk = BK_FLOAT
         return
     if is_err == 0
-        let ok: StrView = sbk_ok_struct(sm, name_sv)
+        let ok: StrView = sbk_ok_struct(sm, name)
         if ok.ptr != null
             v.bk = BK_OTHER
             v.type_name = ok
         return
-    let st: *StructDef = sema_find_struct(sm, StrView { ptr: (name + i), len: (end - i) as i64 })
+    let st: *StructDef = sema_find_struct(sm, name.skip(i).take(end - i))
     if st != null
         v.bk = BK_OTHER
         v.type_name = st.name

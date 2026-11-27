@@ -67,6 +67,7 @@ import ritzlib.cstr
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.hash
+import ritzlib.span       # span_from_strview: fnv1a_str keys
 import ritzlib.hashmap
 import ritzlib.str
 
@@ -262,19 +263,17 @@ pub fn sema_file(sm: *Sema) -> StrView
 
 # The fn named `name`: the first of that name in the module, as the
 # emitter's find_fn resolves it.
-pub fn sema_find_fn(sm: *Sema, name_sv: StrView) -> *FnDef
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let fd: *FnDef = sm.fn_map.get(fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64).unwrap_or(0) as *FnDef
+pub fn sema_find_fn(sm: *Sema, name: StrView) -> *FnDef
+    let fd: *FnDef = sm.fn_map.get(fnv1a_str(span_from_strview(name)) as i64).unwrap_or(0) as *FnDef
     if fd == null
         return null
-    if name_eq(fd.name, name_sv) == 1
+    if name_eq(fd.name, name) == 1
         return fd
     # The map is keyed by the hash alone: a hit with another name is a
     # collision, so scan (first occurrence wins).
     var cur: *FnDef = sm.module.functions
     while cur != null
-        if name_eq(cur.name, name_sv) == 1
+        if name_eq(cur.name, name) == 1
             return cur
         cur = cur.next
     null
@@ -363,15 +362,13 @@ pub fn sema_tuple_new(fields: *StructField) -> *StructDef
     st
 
 # The tuple struct `name` names, or null.
-pub fn sema_tuple_struct(name_sv: StrView) -> *StructDef
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len != SEMA_TUPLE_NAME_LEN or name_eq(StrView { ptr: (name), len: (7) as i64 }, "(tuple)") == 0
+pub fn sema_tuple_struct(name: StrView) -> *StructDef
+    if name.ptr == null or name.len != SEMA_TUPLE_NAME_LEN or name_eq(name.take(7), "(tuple)") == 0
         return null
     var n: i32 = 0
     var at: i32 = 7
     while at < SEMA_TUPLE_NAME_LEN
-        n = n * 10 + (*(name + at) as i32 - '0' as i32)
+        n = n * 10 + (name.get(at) as i32 - '0' as i32)
         at += 1
     if n < 0 or n >= g_sema_tuple_count
         return null
@@ -382,19 +379,17 @@ pub fn sema_tuple_struct(name_sv: StrView) -> *StructDef
 # find_struct resolves it.  Not a tuple struct Sema made: a nameless tuple
 # takes the type of the slot it is written into (the emitter's tuple_lit_name),
 # so the checks comparing one struct with another leave it be.
-pub fn sema_find_struct(sm: *Sema, name_sv: StrView) -> *StructDef
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len <= 0
+pub fn sema_find_struct(sm: *Sema, name: StrView) -> *StructDef
+    if name.ptr == null or name.len <= 0
         return null
-    let st: *StructDef = sm.struct_map.get(fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64).unwrap_or(0) as *StructDef
+    let st: *StructDef = sm.struct_map.get(fnv1a_str(span_from_strview(name)) as i64).unwrap_or(0) as *StructDef
     if st == null
-        return sema_view_struct(name_sv)
-    if name_eq(st.name, name_sv) == 1
+        return sema_view_struct(name)
+    if name_eq(st.name, name) == 1
         return st
     var cur: *StructDef = sm.module.structs
     while cur != null
-        if name_eq(cur.name, name_sv) == 1
+        if name_eq(cur.name, name) == 1
             return cur
         cur = cur.next
     null
@@ -413,16 +408,14 @@ pub fn sema_ty_unknown(t: *SemaTy)
     t.fn_sig = null
     t.shape = null
 
-pub fn sema_bind_ty(sm: *Sema, name_sv: StrView, t: *SemaTy, is_let: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len <= 0
+pub fn sema_bind_ty(sm: *Sema, name: StrView, t: *SemaTy, is_let: i32)
+    if name.ptr == null or name.len <= 0
         return
     if sm.scope_top >= sm.scope_cap
         sm.scope_cap = sm.scope_cap * 2
         sm.scope = realloc(sm.scope as *u8, sm.scope_cap as i64 * sizeof(SemaVar)) as *SemaVar
     let v: *SemaVar = @sm.scope[sm.scope_top]
-    v.name = name_sv
+    v.name = name
     v.kind = t.kind
     v.type_name = t.name
     v.pointee = t.pointee
@@ -500,24 +493,20 @@ pub fn sema_impl_of(sm: *Sema, f: *FnDef) -> *ImplBlock
     null
 
 # `a` + `sep` + `b`, heap-allocated.
-fn sema_join(a_sv: StrView, sep: u8, b_sv: StrView) -> StrView
-    var a: *u8 = a_sv.ptr
-    var a_len: i32 = a_sv.len as i32
-    var b: *u8 = b_sv.ptr
-    var b_len: i32 = b_sv.len as i32
-    var n: i32 = a_len + b_len
+fn sema_join(a: StrView, sep: u8, b: StrView) -> StrView
+    var n: i32 = (a.len as i32) + (b.len as i32)
     if sep != 0
         n = n + 1
     let buf: *u8 = malloc(n as i64 + 1)
     var k: i32 = 0
-    for i in 0..a_len
-        *(buf + k) = *(a + i)
+    for i in 0..(a.len as i32)
+        *(buf + k) = a.get(i)
         k += 1
     if sep != 0
         *(buf + k) = sep
         k += 1
-    for i in 0..b_len
-        *(buf + k) = *(b + i)
+    for i in 0..(b.len as i32)
+        *(buf + k) = b.get(i)
         k += 1
     *(buf + n) = 0
     StrView { ptr: (buf), len: (n) as i64 }

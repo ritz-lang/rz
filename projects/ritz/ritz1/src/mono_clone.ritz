@@ -83,13 +83,11 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
 # collected first): the one-parameter template's field, with a `Vec$T` type
 # rewritten to `Vec$i32`, so `b.v.push(3)` instantiates `vec_push$i32`.  null
 # for anything else.
-fn template_member_field(mono: *MonoCtx, m: *Module, sname_sv: StrView, e: *Expr) -> *StructField
-    var sname: *u8 = sname_sv.ptr
-    var sname_len: i32 = sname_sv.len as i32
-    let dollar: i32 = find_dollar_sign(sname_sv)
+fn template_member_field(mono: *MonoCtx, m: *Module, sname: StrView, e: *Expr) -> *StructField
+    let dollar: i32 = find_dollar_sign(sname)
     if dollar <= 0
         return null
-    let tmpl: *StructDef = find_generic_struct(m, StrView { ptr: (sname), len: (dollar) as i64 })
+    let tmpl: *StructDef = find_generic_struct(m, sname.take(dollar))
     if tmpl == null or count_type_params(tmpl.type_params) != 1
         return null
     var f: *StructField = tmpl.fields
@@ -103,7 +101,7 @@ fn template_member_field(mono: *MonoCtx, m: *Module, sname_sv: StrView, e: *Expr
         return null
     let out: *StructField = malloc(sizeof(StructField)) as *StructField
     memcpy(out as *u8, f as *u8, sizeof(StructField))
-    out.field_type_name = substitute_type_param_in_name(mono, f.field_type_name, tmpl.type_params.name, StrView { ptr: (sname + dollar), len: (sname_len - dollar) as i64 })
+    out.field_type_name = substitute_type_param_in_name(mono, f.field_type_name, tmpl.type_params.name, sname.skip(dollar))
     out.next = null
     out
 
@@ -121,16 +119,14 @@ fn add_struct_from_array_shape(mono: *MonoCtx, m: *Module, sh: *ArrayShape)
 # bound `s` as an i64, so `match s` was "a variant pattern needs an enum
 # scrutinee".  The name itself is still add_enum_instance's: ritzlib.option
 # and ritzlib.result declare `enum Option<T>` / `enum Result<T, E>`.
-fn add_builtin_enum_args(mono: *MonoCtx, m: *Module, name_sv: StrView, dollar_pos: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if dollar_pos != 6 or len <= 7
+fn add_builtin_enum_args(mono: *MonoCtx, m: *Module, name: StrView, dollar_pos: i32)
+    if dollar_pos != 6 or name.len <= 7
         return
-    let is_option: i32 = (name_sv.starts_with("Option")) as i32
-    if is_option == 0 and not name_sv.starts_with("Result")
+    let is_option: i32 = (name.starts_with("Option")) as i32
+    if is_option == 0 and not name.starts_with("Result")
         return
-    let suffix: *u8 = name + dollar_pos
-    let suffix_len: i32 = len - dollar_pos
+    let suffix: *u8 = name.ptr + dollar_pos
+    let suffix_len: i32 = (name.len as i32) - dollar_pos
     if is_option == 1
         # One parameter: the whole suffix is its argument.
         add_struct_from_mangled_name(mono, m, StrView { ptr: (suffix + 1), len: (suffix_len - 1) as i64 })
@@ -146,27 +142,25 @@ fn add_builtin_enum_args(mono: *MonoCtx, m: *Module, name_sv: StrView, dollar_po
 
 # Add struct instantiation from a mangled name like "Pair$i32"
 # Splits on '$' to get base name and suffix
-fn add_struct_from_mangled_name(mono: *MonoCtx, m: *Module, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let dollar_pos: i32 = find_dollar_sign(name_sv)
+fn add_struct_from_mangled_name(mono: *MonoCtx, m: *Module, name: StrView)
+    let dollar_pos: i32 = find_dollar_sign(name)
     if dollar_pos <= 0
         return  # Not a mangled name
 
-    let base_name: *u8 = name
+    let base_name: *u8 = name.ptr
     let base_len: i32 = dollar_pos
 
     # Only add if this is actually a generic struct template
     let template: *StructDef = find_generic_struct(m, StrView { ptr: (base_name), len: (base_len) as i64 })
     if template == null
-        add_builtin_enum_args(mono, m, name_sv, dollar_pos)   # AGAST #3021
-        add_enum_instance(mono, m, name_sv, dollar_pos)   # AGAST #2422
-        add_enum_impl_instance(mono, m, name_sv, dollar_pos)   # AGAST #3309
+        add_builtin_enum_args(mono, m, name, dollar_pos)   # AGAST #3021
+        add_enum_instance(mono, m, name, dollar_pos)   # AGAST #2422
+        add_enum_impl_instance(mono, m, name, dollar_pos)   # AGAST #3309
         return  # Not a generic struct we know about
 
     # Create suffix including the '$'
-    let suffix: *u8 = name + dollar_pos
-    let suffix_len: i32 = len - dollar_pos
+    let suffix: *u8 = name.ptr + dollar_pos
+    let suffix_len: i32 = (name.len as i32) - dollar_pos
 
     # AGAST #1574: a multi-parameter template needs exactly one argument per
     # parameter.  (Unlike `Vec$T` below, no placeholder check: nothing
@@ -211,15 +205,13 @@ fn add_struct_from_mangled_name(mono: *MonoCtx, m: *Module, name_sv: StrView)
 # Record `name` (`Slot$i32`, its `$` at dollar_pos) as an instance of the
 # generic enum its base names, once, and instantiate what its payloads name
 # (`Full(Box<T>)` at i32 needs `Box$i32`).  Anything else is left alone.
-pub fn add_enum_instance(mono: *MonoCtx, m: *Module, name_sv: StrView, dollar_pos: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let base: i32 = enum_find(mono.pctx, StrView { ptr: (name), len: (dollar_pos) as i64 })
-    if base < 0 or enum_is_generic(mono.pctx, base) != 1 or enum_find(mono.pctx, name_sv) >= 0
+pub fn add_enum_instance(mono: *MonoCtx, m: *Module, name: StrView, dollar_pos: i32)
+    let base: i32 = enum_find(mono.pctx, name.take(dollar_pos))
+    if base < 0 or enum_is_generic(mono.pctx, base) != 1 or enum_find(mono.pctx, name) >= 0
         return
     let tp: *TypeParam = generic_enum_params(mono.pctx, base)
-    let suffix: *u8 = name + dollar_pos
-    let suffix_len: i32 = len - dollar_pos
+    let suffix: *u8 = name.ptr + dollar_pos
+    let suffix_len: i32 = (name.len as i32) - dollar_pos
     let n: i32 = count_type_params(tp)
     if n == 0
         return
@@ -236,7 +228,7 @@ pub fn add_enum_instance(mono: *MonoCtx, m: *Module, name_sv: StrView, dollar_po
     let fields: **StructField = malloc((count as i64 + 1) * 8) as **StructField
     for vi in 0..count
         *(fields + vi) = clone_struct_fields_multi(mono, enum_variant_fields(mono.pctx, base, vi), tp, suffix, starts, lens)
-    enum_record_instance(mono.pctx, base, name_sv, fields)
+    enum_record_instance(mono.pctx, base, name, fields)
     for vj in 0..count
         var f: *StructField = *(fields + vj)
         while f != null
@@ -247,13 +239,11 @@ pub fn add_enum_instance(mono: *MonoCtx, m: *Module, name_sv: StrView, dollar_po
 # Rewrite a mangled name, replacing every `$`-component that is a type
 # parameter with its argument: `Box$B` at <A=i64, B=i32> is `Box$i32`.
 # Returns `name` itself when no component is a parameter.
-pub fn substitute_params_in_mangled(mono: *MonoCtx, tp: *TypeParam, suffix: *u8, starts: *i32, lens: *i32, name0_sv: StrView) -> StrView
-    var name0: *u8 = name0_sv.ptr
-    var len0: i32 = name0_sv.len as i32
+pub fn substitute_params_in_mangled(mono: *MonoCtx, tp: *TypeParam, suffix: *u8, starts: *i32, lens: *i32, name0: StrView) -> StrView
     # AGAST #2975: a tuple component over any of the parameters
     # (`Vec$tuple_K_V`) is its instantiation, one parameter at a time.
-    var name: *u8 = name0
-    var len: i32 = len0
+    var name: *u8 = name0.ptr
+    var len: i32 = (name0.len as i32)
     var ti: i32 = 0
     var tcur: *TypeParam = tp
     while tcur != null
@@ -1080,12 +1070,10 @@ fn slice_into_span_annotation(mono: *MonoCtx, m: *Module, s: *Stmt) -> i32
     return slice_into_span_slot(mono, m, s.var_init, s.var_type_name)
 
 # The same view of `e` into any slot of type `tn` (AGAST #2877).
-fn slice_into_span_slot(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView) -> i32
-    var tn: *u8 = tn_sv.ptr
-    var tn_len: i32 = tn_sv.len as i32
-    if e == null or tn == null or tn_len < 5
+fn slice_into_span_slot(mono: *MonoCtx, m: *Module, e: *Expr, tn: StrView) -> i32
+    if e == null or tn.ptr == null or tn.len < 5
         return 0
-    if not tn_sv.starts_with("Span$")
+    if not tn.starts_with("Span$")
         return 0
     if e.kind != ExprKind.Index or e.right == null or e.right.kind != ExprKind.Range
         return 0
@@ -1142,18 +1130,16 @@ fn slice_into_span_slot(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView) ->
 # `-> Option<[u8]>` is a view of `b.data`, `Ok(v[1..3])` into `Result<Span<T>,
 # E>` too.  A slice it can't rewrite is kept (mono.slice_kept) for the emitter to
 # refuse, located: as vec_slice's copy it was a Vec in a Span slot.
-fn slice_into_expected(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView)
-    var tn: *u8 = tn_sv.ptr
-    var tn_len: i32 = tn_sv.len as i32
-    if e == null or tn == null or tn_len <= 0
+fn slice_into_expected(mono: *MonoCtx, m: *Module, e: *Expr, tn: StrView)
+    if e == null or tn.ptr == null or tn.len <= 0
         return
     if e.kind == ExprKind.Index
-        if slice_into_span_slot(mono, m, e, tn_sv) == 1 and e.kind == ExprKind.Index
+        if slice_into_span_slot(mono, m, e, tn) == 1 and e.kind == ExprKind.Index
             mono.slice_kept = e
         return
     if e.kind != ExprKind.Call or e.call_type_suffix.len != 0 or e.args == null or e.args.next != null
         return
-    let pay_sv: StrView = variant_payload_type(mono.pctx, m, tn_sv, e.func_name)
+    let pay_sv: StrView = variant_payload_type(mono.pctx, m, tn, e.func_name)
     if pay_sv.ptr != null and pay_sv.len > 0
         slice_into_expected(mono, m, e.args, pay_sv)
 
@@ -1436,58 +1422,52 @@ fn replace_param_component(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrV
     return subst_components(mono, name_sv, type_param_sv, new_suffix_sv, 1)
 
 # replace_param_component, or with plain == 0 only its tuple components.
-fn subst_components(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, new_suffix_sv: StrView, plain: i32) -> StrView
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
-    var new_suffix: *u8 = new_suffix_sv.ptr
-    var new_suffix_len: i32 = new_suffix_sv.len as i32
-    if name == null or type_param == null or new_suffix_len < 1
-        return strview_from_ptr(name, name_len as i64)
-    let arg: *u8 = new_suffix + 1
-    let arg_len: i32 = new_suffix_len - 1
+fn subst_components(mono: *MonoCtx, name: StrView, type_param: StrView, new_suffix: StrView, plain: i32) -> StrView
+    if name.ptr == null or type_param.ptr == null or new_suffix.len < 1
+        return strview_from_ptr(name.ptr, name.len)
+    let arg: *u8 = new_suffix.ptr + 1
+    let arg_len: i32 = (new_suffix.len as i32) - 1
     # Pass 1: each component's replacement, to size the output.  A tuple's
     # is registered once (tuple_subst is idempotent), so pass 2 asks again.
     var hits: i32 = 0
     var total: i32 = 0
     var pos: i32 = 0
-    while pos <= name_len
+    while pos <= name.len
         var end: i32 = pos
-        while end < name_len and *(name + end) != '$'   # '$'
+        while end < name.len and name.get(end) != '$'   # '$'
             end = end + 1
-        if plain == 1 and end - pos == type_param_len and memcmp(name + pos, type_param, type_param_len as i64) == 0
+        if plain == 1 and end - pos == type_param.len and memcmp(name.ptr + pos, type_param.ptr, type_param.len) == 0
             hits = hits + 1
             total = total + arg_len
-        else if tuple_subst(mono, StrView { ptr: (name + pos), len: (end - pos) as i64 }, type_param_sv, new_suffix_sv).ptr != null
+        else if tuple_subst(mono, name.skip(pos).take(end - pos), type_param, new_suffix).ptr != null
             hits = hits + 1
-            total = total + tuple_subst(mono, StrView { ptr: (name + pos), len: (end - pos) as i64 }, type_param_sv, new_suffix_sv).len as i32
-        else if plain == 1 and piece_param_head(StrView { ptr: (name + pos), len: (end - pos) as i64 }, type_param_sv) > 0
+            total = total + tuple_subst(mono, name.skip(pos).take(end - pos), type_param, new_suffix).len as i32
+        else if plain == 1 and piece_param_head(name.skip(pos).take(end - pos), type_param) > 0
             hits = hits + 1
-            total = total + piece_param_head(StrView { ptr: (name + pos), len: (end - pos) as i64 }, type_param_sv) + arg_len
+            total = total + piece_param_head(name.skip(pos).take(end - pos), type_param) + arg_len
         else
             total = total + end - pos
-        if end < name_len
+        if end < name.len
             total = total + 1
         pos = end + 1
     if hits == 0
-        return strview_from_ptr(name, name_len as i64)
+        return strview_from_ptr(name.ptr, name.len)
     # Pass 2: build it.
     let out: *u8 = malloc(total as i64 + 1) as *u8
     var o: i32 = 0
     pos = 0
-    while pos <= name_len
+    while pos <= name.len
         var end: i32 = pos
-        while end < name_len and *(name + end) != '$'
+        while end < name.len and name.get(end) != '$'
             end = end + 1
         var tn_sv: StrView = strview_empty()
-        if plain == 1 and end - pos == type_param_len and memcmp(name + pos, type_param, type_param_len as i64) == 0
+        if plain == 1 and end - pos == type_param.len and memcmp(name.ptr + pos, type_param.ptr, type_param.len) == 0
             for j in 0..arg_len
                 *(out + o) = *(arg + j)
                 o = o + 1
         else
-            tn_sv = tuple_subst(mono, StrView { ptr: (name + pos), len: (end - pos) as i64 }, type_param_sv, new_suffix_sv)
-            let head: i32 = piece_param_head(StrView { ptr: (name + pos), len: (end - pos) as i64 }, type_param_sv)
+            tn_sv = tuple_subst(mono, name.skip(pos).take(end - pos), type_param, new_suffix)
+            let head: i32 = piece_param_head(name.skip(pos).take(end - pos), type_param)
             if tn_sv.ptr != null
                 for j in 0..(tn_sv.len as i32)
                     *(out + o) = *((tn_sv.ptr) + j)
@@ -1495,16 +1475,16 @@ fn subst_components(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, ne
             else if plain == 1 and head > 0
                 # AGAST #3748: `ptr_A` at A = `Box2_u8` is `ptr_Box2_u8`.
                 for j in pos..(pos + head)
-                    *(out + o) = *(name + j)
+                    *(out + o) = name.get(j)
                     o = o + 1
                 for j in 0..arg_len
                     *(out + o) = *(arg + j)
                     o = o + 1
             else
                 for j in pos..end
-                    *(out + o) = *(name + j)
+                    *(out + o) = name.get(j)
                     o = o + 1
-        if end < name_len
+        if end < name.len
             *(out + o) = 36
             o = o + 1
         pos = end + 1
@@ -1522,10 +1502,9 @@ fn subst_components(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, ne
 # `{i32, i32}`, registered the first time and put in the module being
 # specialised once no parameter is left in it.  null when `name` is no
 # tuple over type_param.
-fn tuple_subst(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, suffix_sv: StrView) -> StrView
+fn tuple_subst(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, suffix: StrView) -> StrView
     var type_param_len: i32 = type_param_sv.len as i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
+    let suffix_len: i32 = suffix.len as i32
     let r: *TupleReg = tuple_reg_lookup(mono.pctx, name_sv)
     if r == null or type_param_index(r.def.type_params, type_param_sv) < 0
         return strview_empty()
@@ -1544,11 +1523,11 @@ fn tuple_subst(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, suffix_
         nf.next = null
         if f.field_type == TypeKind.Struct and f.field_type_name.ptr != null
             if name_is_type_param(f.field_type_name, type_param_sv) == 1
-                subst_value_field(nf, parse_type_from_suffix(suffix_sv), get_type_name_from_suffix(suffix_sv))
-                sp = suffix + 1
+                subst_value_field(nf, parse_type_from_suffix(suffix), get_type_name_from_suffix(suffix))
+                sp = suffix.ptr + 1
                 sl = suffix_len - 1
             else
-                let nn_sv: StrView = replace_param_component(mono, f.field_type_name, type_param_sv, suffix_sv)
+                let nn_sv: StrView = replace_param_component(mono, f.field_type_name, type_param_sv, suffix)
                 nf.field_type_name = nn_sv
                 sp = nn_sv.ptr
                 sl = nn_sv.len as i32
@@ -1557,8 +1536,8 @@ fn tuple_subst(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, suffix_
             # ritz0 mangles it: the template's `ptr_T` / `ref_T` / `refmut_T`
             # with its trailing T replaced, so `(*T, i32)` at T = i32 is
             # `tuple_ptr_i32_i32` (and at T = *u8, `tuple_ptr_ptr_u8_i32`).
-            let sn: StrView = get_type_name_from_suffix(suffix_sv)
-            let st: TypeKind = parse_type_from_suffix(suffix_sv)
+            let sn: StrView = get_type_name_from_suffix(suffix)
+            let st: TypeKind = parse_type_from_suffix(suffix)
             if f.field_type == TypeKind.PtrPtr
                 # AGAST #3184: `**T` (`tuple_ptr_ptr_i32_i32`).
                 subst_ptr_ptr_field(nf, st, sn)
@@ -1577,7 +1556,7 @@ fn tuple_subst(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, suffix_
             let keep: i32 = sl - type_param_len
             let ps: *u8 = malloc((keep + suffix_len) as i64) as *u8
             memcpy(ps, sp, keep as i64)
-            memcpy(ps + keep, suffix + 1, (suffix_len - 1) as i64)
+            memcpy(ps + keep, suffix.ptr + 1, (suffix_len - 1) as i64)
             sp = ps
             sl = keep + suffix_len - 1
         let ga: *GenericArg = calloc(1, sizeof(GenericArg)) as *GenericArg
@@ -1638,12 +1617,10 @@ fn tuple_elem_points_at(f: *StructField, type_param_sv: StrView) -> i32
 
 # Specialise `template` at ONE type parameter (type_param_name) bound to the
 # one-argument suffix "$arg".  The result's name is template.name + suffix.
-fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_param_name_sv: StrView, suffix_sv: StrView) -> *FnDef
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
+fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_param_name_sv: StrView, suffix: StrView) -> *FnDef
     mono.mono_module = m  # AGAST #1926: see names_generic_struct
     # Create a new FnDef with mangled name
-    let mangled_name_len: i32 = (template.name.len as i32) + suffix_len
+    let mangled_name_len: i32 = (template.name.len as i32) + (suffix.len as i32)
     let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
 
     # Copy base name
@@ -1651,13 +1628,13 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
         *(mangled_name + i) = *(template.name.ptr + i)
 
     # Copy suffix (including the $)
-    for j in 0..suffix_len
-        *(mangled_name + (template.name.len as i32) + j) = *(suffix + j)
+    for j in 0..(suffix.len as i32)
+        *(mangled_name + (template.name.len as i32) + j) = suffix.get(j)
     *(mangled_name + mangled_name_len) = 0
 
     # Get the substitution type from suffix
-    let subst_type_name: StrView = get_type_name_from_suffix(suffix_sv)
-    let subst_type: TypeKind = parse_type_from_suffix(suffix_sv)
+    let subst_type_name: StrView = get_type_name_from_suffix(suffix)
+    let subst_type: TypeKind = parse_type_from_suffix(suffix)
 
     # Clone the function with specialized name
     # Sized with sizeof(FnDef) (AGAST #1663) — type_params lives at the
@@ -1669,9 +1646,9 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
     # selfhost asm-fails fixed by widening this allocation.
     let specialized: *FnDef = malloc(sizeof(FnDef)) as *FnDef
     specialized.name = StrView { ptr: mangled_name, len: mangled_name_len as i64 }
-    specialized.params = clone_params_with_suffix(mono, template.params, type_param_name_sv, subst_type, subst_type_name, suffix_sv)
+    specialized.params = clone_params_with_suffix(mono, template.params, type_param_name_sv, subst_type, subst_type_name, suffix)
     specialized.return_type = substitute_type(template.return_type, type_param_name_sv, subst_type, subst_type_name)
-    specialized.body = clone_body(mono, template.body, type_param_name_sv, subst_type, subst_type_name, suffix_sv)
+    specialized.body = clone_body(mono, template.body, type_param_name_sv, subst_type, subst_type_name, suffix)
     specialized.type_params = null  # Not generic anymore
     specialized.next = null
     specialized.line = template.line
@@ -1683,9 +1660,9 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
     # `declare`).
     specialized.is_local = 1
     specialized.ret_fn_sig = template.ret_fn_sig   # AGAST #2120
-    specialized.ret_ref = clone_params_with_suffix(mono, template.ret_ref, type_param_name_sv, subst_type, subst_type_name, suffix_sv)   # AGAST #2308
+    specialized.ret_ref = clone_params_with_suffix(mono, template.ret_ref, type_param_name_sv, subst_type, subst_type_name, suffix)   # AGAST #2308
     specialized.ret_array = null   # AGAST #2343: `[N]T` keeps T's own name; left unjudged
-    specialized.ret_array_param = clone_params_with_suffix(mono, template.ret_array_param, type_param_name_sv, subst_type, subst_type_name, suffix_sv)   # AGAST #2302
+    specialized.ret_array_param = clone_params_with_suffix(mono, template.ret_array_param, type_param_name_sv, subst_type, subst_type_name, suffix)   # AGAST #2302
     specialized.ret_ptr_array = ptr_array_unless_generic(template.ret_ptr_array)   # AGAST #2329
     specialized.def_file = template.def_file   # AGAST #2236: names the diagnostic's file
     specialized.is_pub = 1   # AGAST #3419: an instance has no declaration to mark `pub`
@@ -1711,7 +1688,7 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
                             specialized.return_type_name = rap.param_type_name
                 # Otherwise it might be a generic struct like "Vec$T" -> "Vec$u8"
                 else
-                    specialized.return_type_name = substitute_type_param_in_name(mono, specialized.return_type_name, type_param_name_sv, suffix_sv)
+                    specialized.return_type_name = substitute_type_param_in_name(mono, specialized.return_type_name, type_param_name_sv, suffix)
         # AGAST #1980: `-> *T` names its pointee "T" too.  Left unsubstituted,
         # `let p = vec_as_ptr<i32>(@v)` registered p as a pointer to struct %T
         # (`load %T`, byte stride).  Name the concrete pointee instead: a
@@ -1731,7 +1708,7 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
             # instance is "W$i32".  Left unsubstituted, find_struct missed it and
             # `g(@w).v` / `w.g().v` were "unhandled EXPR_MEMBER".
             else if specialized.return_type_name.ptr != null
-                specialized.return_type_name = substitute_type_param_in_name(mono, specialized.return_type_name, type_param_name_sv, suffix_sv)
+                specialized.return_type_name = substitute_type_param_in_name(mono, specialized.return_type_name, type_param_name_sv, suffix)
         # AGAST #3015: and `-> @T` / `-> @&T` (Deref's `deref`, R17): the referent
         # is T's concrete name, so `(*b.deref()).f` finds T's field.
         TypeKind.Ref | TypeKind.MutRef =>
@@ -1852,13 +1829,11 @@ fn ptr_arg_pointee(name_sv: StrView) -> TypeKind
 # `r:& *<ptr_S>`, which binds as nothing: `r` read as the borrow slot and
 # `r = v` wrote that, not the caller's `**S`.  `name` is T less its first
 # `ptr_` (get_type_name_from_suffix).
-fn borrow_take_ptr_ptr_arg(param: *Param, subst_type: TypeKind, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn borrow_take_ptr_ptr_arg(param: *Param, subst_type: TypeKind, name: StrView)
     if param.is_borrow != 1 or param.param_type != TypeKind.MutRef or subst_type != TypeKind.Ptr
         return
-    var rest: *u8 = name
-    var rest_len: i32 = len
+    var rest: *u8 = name.ptr
+    var rest_len: i32 = (name.len as i32)
     var extra: i32 = 0
     while rest_len > 4 and (StrView { ptr: (rest), len: (rest_len) as i64 }).starts_with("ptr_")
         rest = rest + 4
@@ -2034,18 +2009,15 @@ fn substitute_type(ty: TypeKind, type_param_sv: StrView, subst_type: TypeKind, s
     # The caller should handle struct name substitution
     return ty
 
-fn mangle_struct_name(name_sv: StrView, suffix_sv: StrView) -> StrView
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
+fn mangle_struct_name(name: StrView, suffix: StrView) -> StrView
+    let name_len: i32 = name.len as i32
     # Create mangled name like Vec$u8
-    let mangled_len: i32 = name_len + suffix_len
+    let mangled_len: i32 = name_len + (suffix.len as i32)
     let mangled: *u8 = malloc(mangled_len as i64 + 1) as *u8
     for i in 0..name_len
-        *(mangled + i) = *(name + i)
-    for j in 0..suffix_len
-        *(mangled + name_len + j) = *(suffix + j)
+        *(mangled + i) = name.get(i)
+    for j in 0..(suffix.len as i32)
+        *(mangled + name_len + j) = suffix.get(j)
     *(mangled + mangled_len) = 0
     return strview_from_ptr(mangled, mangled_len as i64)
 
@@ -2064,36 +2036,32 @@ fn names_generic_struct(mono: *MonoCtx, name_sv: StrView) -> i32
 # Substitute type parameter in a mangled name like "Vec$T" -> "Vec$u8"
 # Input: name = "Vec$T", type_param = "T", new_suffix = "$u8"
 # Output: "Vec$u8"
-pub fn substitute_type_param_in_name(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, new_suffix_sv: StrView) -> StrView
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
-    var new_suffix: *u8 = new_suffix_sv.ptr
-    var new_suffix_len: i32 = new_suffix_sv.len as i32
+pub fn substitute_type_param_in_name(mono: *MonoCtx, name: StrView, type_param: StrView, new_suffix: StrView) -> StrView
+    let name_len: i32 = name.len as i32
+    let new_suffix_len: i32 = new_suffix.len as i32
     # AGAST #2975: `tuple_T_T` at T = i32 is `tuple_i32_i32`.
-    let tn_sv: StrView = tuple_subst(mono, name_sv, type_param_sv, new_suffix_sv)
+    let tn_sv: StrView = tuple_subst(mono, name, type_param, new_suffix)
     if tn_sv.ptr != null
         return tn_sv
     # AGAST #1612: multi-parameter passes rewrite whole components, anywhere
     # in the name, and never append (see mono.mono_component_mode).
     if mono.mono_component_mode != 0
-        return replace_param_component(mono, name_sv, type_param_sv, new_suffix_sv)
+        return replace_param_component(mono, name, type_param, new_suffix)
     # Check if name ends with "$T" where T is the type param
     # Expected pattern: "Base$T" where Base is some prefix
     # AGAST #1582: only a one-argument name ("Vec$T") takes this shortcut.
     # `Pair$T$T` has T in more than one component; rewriting the tail alone
     # gave `Pair$T$i64`, so a multi-argument name goes to the #2418 rewrite
     # below, which substitutes every component.
-    let expected_suffix_len: i32 = type_param_len + 1  # "$" + type_param
-    if name_len > expected_suffix_len and find_dollar_sign(StrView { ptr: (name), len: (name_len - expected_suffix_len) as i64 }) < 0
+    let expected_suffix_len: i32 = (type_param.len as i32) + 1  # "$" + type_param
+    if name_len > expected_suffix_len and find_dollar_sign(name.take(name_len - expected_suffix_len)) < 0
         let suffix_start: i32 = name_len - expected_suffix_len
         # Check for '$' separator
-        if *(name + suffix_start) == '$'  # '$'
+        if name.get(suffix_start) == '$'  # '$'
             # Check if rest matches type param
             var matches: i32 = 1
-            for i in 0..type_param_len
-                if *(name + suffix_start + 1 + i) != *(type_param + i)
+            for i in 0..(type_param.len as i32)
+                if name.get(suffix_start + 1 + i) != type_param.get(i)
                     matches = 0
                     break
             if matches != 0
@@ -2103,18 +2071,18 @@ pub fn substitute_type_param_in_name(mono: *MonoCtx, name_sv: StrView, type_para
                 let result: *u8 = malloc(new_len as i64 + 1) as *u8
                 # Copy base part
                 for j in 0..base_len
-                    *(result + j) = *(name + j)
+                    *(result + j) = name.get(j)
                 # Copy new suffix
                 for k in 0..new_suffix_len
-                    *(result + base_len + k) = *(new_suffix + k)
+                    *(result + base_len + k) = new_suffix.get(k)
                 *(result + new_len) = 0
                 return StrView { ptr: result, len: new_len as i64 }
 
     # AGAST #2418: T as an inner component, `Result$T$i32` at T = i32 is
     # `Result$i32$i32` (one-parameter fn over `Result<T, i32>`).
-    if new_suffix_len > 0 and find_dollar_sign(name_sv) >= 0
-        let hit_sv: StrView = replace_param_component(mono, name_sv, type_param_sv, new_suffix_sv)
-        if hit_sv.ptr != name
+    if new_suffix_len > 0 and find_dollar_sign(name) >= 0
+        let hit_sv: StrView = replace_param_component(mono, name, type_param, new_suffix)
+        if hit_sv.ptr != name.ptr
             return hit_sv
 
     # If the name doesn't have $T pattern, it might be a bare struct name like "Vec"
@@ -2122,23 +2090,23 @@ pub fn substitute_type_param_in_name(mono: *MonoCtx, name_sv: StrView, type_para
     # struct TEMPLATE gets it: a plain struct (`p: *Cell`, `var c: Cell`,
     # `Cell { .. }`) keeps its name, else `Cell` -> `Cell$i64`, which does not
     # exist (AGAST #1926).
-    if new_suffix_len > 0 and names_generic_struct(mono, name_sv) != 0
+    if new_suffix_len > 0 and names_generic_struct(mono, name) != 0
         # Append the new suffix (e.g., "Vec" + "$u8" = "Vec$u8")
         let new_len: i32 = name_len + new_suffix_len
         let result: *u8 = malloc(new_len as i64 + 1) as *u8
         for i in 0..name_len
-            *(result + i) = *(name + i)
+            *(result + i) = name.get(i)
         for k in 0..new_suffix_len
-            *(result + name_len + k) = *(new_suffix + k)
+            *(result + name_len + k) = new_suffix.get(k)
         *(result + new_len) = 0
         return StrView { ptr: result, len: new_len as i64 }
     else
         # No substitution needed - just copy the name
-        let copy: *u8 = malloc(name_len as i64 + 1) as *u8
+        let copy: *u8 = malloc(name.len + 1) as *u8
         for i in 0..name_len
-            *(copy + i) = *(name + i)
+            *(copy + i) = name.get(i)
         *(copy + name_len) = 0
-        return StrView { ptr: copy, len: name_len as i64 }
+        return StrView { ptr: copy, len: name.len }
 
 fn clone_body(mono: *MonoCtx, body: *Stmt, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView, suffix_sv: StrView) -> *Stmt
     if body == null
@@ -2175,13 +2143,11 @@ fn clone_unknown_kind(what: StrView, kind: i32)
 # `name` is T less its first `ptr_`, as borrow_take_ptr_ptr_arg reads it.
 # 1 when it retyped the local.  `@T` / `@&T` locals bind through var_ref
 # (#2308) and stay as they are.
-fn ptr_local_take_ptr_arg(s: *Stmt, cloned: *Stmt, subst_type: TypeKind, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn ptr_local_take_ptr_arg(s: *Stmt, cloned: *Stmt, subst_type: TypeKind, name: StrView) -> i32
     if s.var_type != TypeKind.Ptr or subst_type != TypeKind.Ptr
         return 0
-    var rest: *u8 = name
-    var rest_len: i32 = len
+    var rest: *u8 = name.ptr
+    var rest_len: i32 = (name.len as i32)
     var extra: i32 = 0
     while rest_len > 4 and (StrView { ptr: (rest), len: (rest_len) as i64 }).starts_with("ptr_")
         rest = rest + 4
@@ -2411,9 +2377,7 @@ fn clone_stmt(mono: *MonoCtx, s: *Stmt, type_param_sv: StrView, subst_type: Type
 
 # `sizeof(T)` with T := subst (AGAST #2124): one value of the concrete kind,
 # keeping `at`'s span and element count (1 for a bare `T`).
-fn sizeof_subst_operand(at: *Expr, subst_type: TypeKind, subst_name_sv: StrView) -> *Expr
-    var subst_name: *u8 = subst_name_sv.ptr
-    var subst_len: i32 = subst_name_sv.len as i32
+fn sizeof_subst_operand(at: *Expr, subst_type: TypeKind, subst_name: StrView) -> *Expr
     let op: *Expr = malloc(sizeof(Expr)) as *Expr
     memcpy(op as *u8, at as *u8, sizeof(Expr))
     if at.kind != ExprKind.TypeOperand
@@ -2427,10 +2391,10 @@ fn sizeof_subst_operand(at: *Expr, subst_type: TypeKind, subst_name_sv: StrView)
         op.type_kind = TypeKind.Struct
     # AGAST #2832: T = `[N]E` is N values of E, as sizeof_array_type_call
     # records a written `sizeof([N]E)`.
-    var leaf_name: *u8 = subst_name
-    var leaf_len: i32 = subst_len
+    var leaf_name: *u8 = subst_name.ptr
+    var leaf_len: i32 = (subst_name.len as i32)
     var a: ArrayArg
-    if subst_type == TypeKind.Array and array_arg_decode(subst_name_sv, @a) == 1
+    if subst_type == TypeKind.Array and array_arg_decode(subst_name, @a) == 1
         op.type_kind = a.elem
         leaf_name = a.name.ptr
         leaf_len = a.name.len as i32
@@ -2692,52 +2656,44 @@ fn clone_field_inits(mono: *MonoCtx, fi: *FieldInit, type_param_sv: StrView, sub
     cloned.next = clone_field_inits(mono, fi.next, type_param_sv, subst_type, subst_name_sv, suffix_sv)
     return cloned
 
-fn check_and_substitute_suffix(mono: *MonoCtx, old_suffix_sv: StrView, type_param_sv: StrView, new_suffix_sv: StrView) -> StrView
-    var old_suffix: *u8 = old_suffix_sv.ptr
-    var old_suffix_len: i32 = old_suffix_sv.len as i32
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
-    var new_suffix: *u8 = new_suffix_sv.ptr
-    var new_suffix_len: i32 = new_suffix_sv.len as i32
+fn check_and_substitute_suffix(mono: *MonoCtx, old_suffix: StrView, type_param: StrView, new_suffix: StrView) -> StrView
     # AGAST #1612: in a multi-parameter pass a call suffix may name several
     # parameters (`helper<T, U>` is "$T$U"); rewrite the matching component.
     if mono.mono_component_mode != 0
-        let rewritten_sv: StrView = replace_param_component(mono, old_suffix_sv, type_param_sv, new_suffix_sv)
-        if rewritten_sv.ptr == old_suffix
+        let rewritten_sv: StrView = replace_param_component(mono, old_suffix, type_param, new_suffix)
+        if rewritten_sv.ptr == old_suffix.ptr
             return strview_empty()
         return rewritten_sv
     # AGAST #2975: `vec_push<(T, i32)>` is "$tuple_T_i32".
-    let tup_sv: StrView = subst_components(mono, old_suffix_sv, type_param_sv, new_suffix_sv, 0)
-    if tup_sv.ptr != old_suffix
+    let tup_sv: StrView = subst_components(mono, old_suffix, type_param, new_suffix, 0)
+    if tup_sv.ptr != old_suffix.ptr
         return tup_sv
     # Check if old_suffix is "$T" where T matches type_param
-    if old_suffix_len != type_param_len + 1
+    if old_suffix.len != (type_param.len as i32) + 1
         # AGAST #3343: T inside a nested argument, `deep<Cell<T>>` ("$Cell$T")
         # at T = i32 is "$Cell$i32".  Left alone, every instance called the
         # unspecialised `deep$Cell$T` (invalid IR), so polymorphic recursion
         # never got deeper than one level and #3330's cap never fired.
-        let inner_sv: StrView = replace_param_component(mono, old_suffix_sv, type_param_sv, new_suffix_sv)
-        if inner_sv.ptr == old_suffix
+        let inner_sv: StrView = replace_param_component(mono, old_suffix, type_param, new_suffix)
+        if inner_sv.ptr == old_suffix.ptr
             return strview_empty()
         return inner_sv
-    if *old_suffix != '$'  # $
+    if old_suffix.get(0) != '$'  # $
         return strview_empty()
-    if memcmp(old_suffix + 1, type_param, type_param_len as i64) != 0
+    if memcmp(old_suffix.ptr + 1, type_param.ptr, type_param.len) != 0
         return strview_empty()
 
     # Substitute with new suffix
-    return strview_from_ptr(new_suffix, new_suffix_len as i64)
+    return strview_from_ptr(new_suffix.ptr, new_suffix.len)
 
 # ============================================================================
 # Struct Cloning and Specialization
 # ============================================================================
 # Clone a generic struct and substitute the type parameter
 
-fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef, suffix_sv: StrView) -> *StructDef
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
+fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef, suffix: StrView) -> *StructDef
     # Create a new StructDef with mangled name
-    let mangled_name_len: i32 = (template.name.len as i32) + suffix_len
+    let mangled_name_len: i32 = (template.name.len as i32) + (suffix.len as i32)
     let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
 
     # Copy base name
@@ -2745,20 +2701,20 @@ fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef,
         *(mangled_name + i) = *(template.name.ptr + i)
 
     # Copy suffix (including the $)
-    for j in 0..suffix_len
-        *(mangled_name + (template.name.len as i32) + j) = *(suffix + j)
+    for j in 0..(suffix.len as i32)
+        *(mangled_name + (template.name.len as i32) + j) = suffix.get(j)
     *(mangled_name + mangled_name_len) = 0
 
     # AGAST #1574: substitute EVERY parameter of a multi-parameter template.
     if count_type_params(template.type_params) >= 2
-        let cap: i64 = 4 * mangled_arg_capacity(suffix_sv) as i64
+        let cap: i64 = 4 * mangled_arg_capacity(suffix) as i64
         let starts: *i32 = malloc(cap) as *i32
         let lens: *i32 = malloc(cap) as *i32
-        if split_mangled_args(mono.pctx, m, suffix_sv, starts, lens) != count_type_params(template.type_params)
+        if split_mangled_args(mono.pctx, m, suffix, starts, lens) != count_type_params(template.type_params)
             return null
         let multi: *StructDef = malloc(sizeof(StructDef)) as *StructDef
         multi.name = StrView { ptr: mangled_name, len: mangled_name_len as i64 }
-        multi.fields = clone_struct_fields_multi(mono, template.fields, template.type_params, suffix, starts, lens)
+        multi.fields = clone_struct_fields_multi(mono, template.fields, template.type_params, suffix.ptr, starts, lens)
         multi.type_params = null
         multi.next = null
         if struct_is_packed(mono.pctx, template) == 1
@@ -2773,13 +2729,13 @@ fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef,
         type_param_len = template.type_params.name.len as i32
 
     # Get the substitution type from suffix
-    let subst_type_name: StrView = get_type_name_from_suffix(suffix_sv)
-    let subst_type: TypeKind = parse_type_from_suffix(suffix_sv)
+    let subst_type_name: StrView = get_type_name_from_suffix(suffix)
+    let subst_type: TypeKind = parse_type_from_suffix(suffix)
 
     # Clone the struct with specialized name
     let specialized: *StructDef = malloc(sizeof(StructDef)) as *StructDef
     specialized.name = StrView { ptr: mangled_name, len: mangled_name_len as i64 }
-    specialized.fields = clone_struct_fields(mono, template.fields, StrView { ptr: (type_param_name), len: (type_param_len) as i64 }, subst_type, subst_type_name, suffix_sv)
+    specialized.fields = clone_struct_fields(mono, template.fields, StrView { ptr: (type_param_name), len: (type_param_len) as i64 }, subst_type, subst_type_name, suffix)
     specialized.type_params = null  # Not generic anymore
     specialized.next = null
     if struct_is_packed(mono.pctx, template) == 1
@@ -3192,20 +3148,18 @@ fn specialize_wanted_methods(mono: *MonoCtx, m: *Module) -> i32
 # (clone_and_specialize_function: a `T` return becomes the argument, `*W<T>`
 # becomes `*W$i32`, and multi-parameter impls are handled), then renamed to
 # the method mangling `Type$suffix_method` (e.g. `Box$i64_set`).
-fn specialize_impl_method(mono: *MonoCtx, m: *Module, ib: *ImplBlock, method: *FnDef, type_name_sv: StrView, suffix_sv: StrView) -> *FnDef
-    var type_name: *u8 = type_name_sv.ptr
-    var type_name_len: i32 = type_name_sv.len as i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
+fn specialize_impl_method(mono: *MonoCtx, m: *Module, ib: *ImplBlock, method: *FnDef, type_name: StrView, suffix: StrView) -> *FnDef
+    let type_name_len: i32 = type_name.len as i32
+    let suffix_len: i32 = suffix.len as i32
     let template: *FnDef = malloc(sizeof(FnDef)) as *FnDef
     memcpy(template as *u8, method as *u8, sizeof(FnDef))
     template.type_params = ib.type_params
     let self_name: *u8 = malloc((type_name_len + suffix_len) as i64 + 1)
-    memcpy(self_name, type_name, type_name_len as i64)
-    memcpy(self_name + type_name_len, suffix, suffix_len as i64)
+    memcpy(self_name, type_name.ptr, type_name.len)
+    memcpy(self_name + type_name_len, suffix.ptr, suffix.len)
     *(self_name + type_name_len + suffix_len) = 0
     mono.impl_self_name = StrView { ptr: self_name, len: (type_name_len + suffix_len) as i64 }
-    let specialized: *FnDef = clone_and_specialize_function(mono, m, template, suffix_sv)
+    let specialized: *FnDef = clone_and_specialize_function(mono, m, template, suffix)
     mono.impl_self_name = strview_empty()
     free(template as *u8)
     if specialized == null
@@ -3215,10 +3169,10 @@ fn specialize_impl_method(mono: *MonoCtx, m: *Module, ib: *ImplBlock, method: *F
     let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
     var pos: i32 = 0
     for i in 0..type_name_len
-        *(mangled_name + pos) = *(type_name + i)
+        *(mangled_name + pos) = type_name.get(i)
         pos = pos + 1
     for j in 0..suffix_len
-        *(mangled_name + pos) = *(suffix + j)
+        *(mangled_name + pos) = suffix.get(j)
         pos = pos + 1
     *(mangled_name + pos) = 95  # '_'
     pos = pos + 1

@@ -33,30 +33,22 @@ import diag
 import monomorph
 import sema
 
-fn tb_eq(a_sv: StrView, b_sv: StrView) -> i32
-    var a: *u8 = a_sv.ptr
-    var alen: i32 = a_sv.len as i32
-    var b: *u8 = b_sv.ptr
-    var blen: i32 = b_sv.len as i32
-    if alen != blen
+fn tb_eq(a: StrView, b: StrView) -> i32
+    if a.len != b.len
         return 0
-    (memcmp(a, b, alen as i64) == 0) as i32
+    (memcmp(a.ptr, b.ptr, a.len) == 0) as i32
 
-fn tb_write(s_sv: StrView)
-    var s: *u8 = s_sv.ptr
-    var len: i32 = s_sv.len as i32
-    sys_write(2, s, len as i64)
+fn tb_write(s: StrView)
+    sys_write(2, s.ptr, s.len)
 
 fn tb_file(sm: *Sema, file: StrView) -> StrView
     if file.len == 0
         return sm.file
     file
 
-fn tb_dollar(s_sv: StrView) -> i32
-    var s: *u8 = s_sv.ptr
-    var len: i32 = s_sv.len as i32
+fn tb_dollar(s: StrView) -> i32
     var k: i32 = 0
-    while k < len and *(s + k) != '$'   # '$'
+    while k < s.len and s.get(k) != '$'   # '$'
         k = k + 1
     k
 
@@ -163,18 +155,16 @@ fn tb_unmet(ctx: *ParseCtx, m: *Module, tps: *TypeParam, suffix_sv: StrView, out
 # Exactly, by a non-generic impl for its name, or through a generic impl of
 # its generic type whose own bounds its args meet (§12.2: an impl covers
 # every instantiation).  A pointer, reference, array or primitive has none.
-fn tb_implements(ctx: *ParseCtx, m: *Module, arg_sv: StrView, tname_sv: StrView) -> i32
-    var arg: *u8 = arg_sv.ptr
-    var arg_len: i32 = arg_sv.len as i32
-    let k: i32 = tb_dollar(arg_sv)
+fn tb_implements(ctx: *ParseCtx, m: *Module, arg: StrView, tname_sv: StrView) -> i32
+    let k: i32 = tb_dollar(arg)
     var ib: *ImplBlock = m.impls
     while ib != null
-        if ib.trait_name.ptr != null and tb_eq(ib.trait_name, tname_sv) == 1 and tb_eq(ib.type_name, StrView { ptr: (arg), len: (k) as i64 }) == 1
-            if k == arg_len and ib.type_params == null
+        if ib.trait_name.ptr != null and tb_eq(ib.trait_name, tname_sv) == 1 and tb_eq(ib.type_name, arg.take(k)) == 1
+            if k == arg.len and ib.type_params == null
                 return 1
-            if k < arg_len and ib.type_params != null
+            if k < arg.len and ib.type_params != null
                 var unused: *TraitBound = null
-                if tb_unmet(ctx, m, ib.type_params, StrView { ptr: (arg + k), len: (arg_len - k) as i64 }, @unused) < 0
+                if tb_unmet(ctx, m, ib.type_params, arg.skip(k), @unused) < 0
                     return 1
                 return 0
         ib = ib.next
@@ -184,40 +174,38 @@ fn tb_implements(ctx: *ParseCtx, m: *Module, arg_sv: StrView, tname_sv: StrView)
 # Spelling a mangled type as written: `Bag$Nope` is `Bag<Nope>`
 # ----------------------------------------------------------------------------
 
-fn tb_eprint_type(ctx: *ParseCtx, m: *Module, s_sv: StrView)
-    var s: *u8 = s_sv.ptr
-    var len: i32 = s_sv.len as i32
-    if len > 7 and s_sv.starts_with("refmut_")
+fn tb_eprint_type(ctx: *ParseCtx, m: *Module, s: StrView)
+    if s.len > 7 and s.starts_with("refmut_")
         eprints("@&")
-        tb_eprint_type(ctx, m, StrView { ptr: (s + 7), len: (len - 7) as i64 })
+        tb_eprint_type(ctx, m, s.skip(7))
         return
-    if len > 4 and s_sv.starts_with("ref_")
+    if s.len > 4 and s.starts_with("ref_")
         eprint_char('@')
-        tb_eprint_type(ctx, m, StrView { ptr: (s + 4), len: (len - 4) as i64 })
+        tb_eprint_type(ctx, m, s.skip(4))
         return
-    if len > 4 and s_sv.starts_with("ptr_")
+    if s.len > 4 and s.starts_with("ptr_")
         eprint_char('*')
-        tb_eprint_type(ctx, m, StrView { ptr: (s + 4), len: (len - 4) as i64 })
+        tb_eprint_type(ctx, m, s.skip(4))
         return
-    let k: i32 = tb_dollar(s_sv)
-    tb_write(StrView { ptr: (s), len: (k) as i64 })
-    if k >= len
+    let k: i32 = tb_dollar(s)
+    tb_write(s.take(k))
+    if k >= s.len
         return
-    let arity: i32 = mangled_component_arity(ctx, m, StrView { ptr: (s), len: (k) as i64 })
+    let arity: i32 = mangled_component_arity(ctx, m, s.take(k))
     if arity <= 0
-        tb_write(StrView { ptr: (s + k), len: (len - k) as i64 })   # no template to say how it nests
+        tb_write(s.skip(k))   # no template to say how it nests
         return
-    let cap: i64 = 4 * (mangled_arg_capacity(StrView { ptr: (s + k), len: (len - k) as i64 }) + 1) as i64
+    let cap: i64 = 4 * (mangled_arg_capacity(s.skip(k)) + 1) as i64
     let starts: *i32 = malloc(cap) as *i32
     let lens: *i32 = malloc(cap) as *i32
-    if tb_split(ctx, m, arity, StrView { ptr: (s + k), len: (len - k) as i64 }, starts, lens) != arity
-        tb_write(StrView { ptr: (s + k), len: (len - k) as i64 })
+    if tb_split(ctx, m, arity, s.skip(k), starts, lens) != arity
+        tb_write(s.skip(k))
     else
         eprint_char('<')
         for i in 0..arity
             if i > 0
                 eprints(", ")
-            tb_eprint_type(ctx, m, StrView { ptr: (s + k + *(starts + i) + 1), len: (*(lens + i) - 1) as i64 })
+            tb_eprint_type(ctx, m, s.skip(k + *(starts + i) + 1).take(*(lens + i) - 1))
         eprint_char('>')
     free(starts as *u8)
     free(lens as *u8)
@@ -229,15 +217,13 @@ fn tb_eprint_type(ctx: *ParseCtx, m: *Module, s_sv: StrView)
 # Is the instance's argument still a parameter (`W$T`, a template's own
 # spelling of its type, or `total$U` inside another generic)?  Such a
 # spelling is no instance: the one its parameters become is judged.
-fn tb_has_free_param(ctx: *ParseCtx, m: *Module, suffix_sv: StrView) -> i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
+fn tb_has_free_param(ctx: *ParseCtx, m: *Module, suffix: StrView) -> i32
     var pos: i32 = 0
-    while pos < suffix_len
+    while pos < suffix.len
         var end: i32 = pos + 1
-        while end < suffix_len and *(suffix + end) != '$'
+        while end < suffix.len and suffix.get(end) != '$'
             end = end + 1
-        var c: *u8 = suffix + pos + 1
+        var c: *u8 = suffix.ptr + pos + 1
         var clen: i32 = end - pos - 1
         # The name under `ptr_` / `ref_` / `refmut_` / `arrN_` pieces.
         var j: i32 = clen - 1

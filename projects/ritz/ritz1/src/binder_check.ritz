@@ -28,6 +28,7 @@ import ritzlib.cstr
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.hash
+import ritzlib.span       # span_from_strview: fnv1a_str keys
 import ritzlib.hashmap
 import ritzlib.memory
 
@@ -83,10 +84,8 @@ fn binder_kind_exact(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> i32
         return BINDER_VARIANT
     BINDER_NONE
 
-fn binder_map_note(name_sv: StrView, kind: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    (*g_binder_map).insert(fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64, kind as i64)
+fn binder_map_note(name: StrView, kind: i32)
+    (*g_binder_map).insert(fnv1a_str(span_from_strview(name)) as i64, kind as i64)
 
 # The table every lookup reads: built once, from the merged module.
 fn binder_build_map(ctx: *ParseCtx, m: *Module)
@@ -115,14 +114,12 @@ fn binder_build_map(ctx: *ParseCtx, m: *Module)
         c = c.next
 
 # The BINDER_* kind of module value `name` names, BINDER_NONE for none.
-pub fn binder_module_value_kind(ctx: *ParseCtx, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if g_binder_module == null or name == null or len <= 0
+pub fn binder_module_value_kind(ctx: *ParseCtx, name: StrView) -> i32
+    if g_binder_module == null or name.ptr == null or name.len <= 0
         return BINDER_NONE
-    if (*g_binder_map).get(fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64).unwrap_or(0) == 0
+    if (*g_binder_map).get(fnv1a_str(span_from_strview(name)) as i64).unwrap_or(0) == 0
         return BINDER_NONE
-    binder_kind_exact(ctx, g_binder_module, name_sv)
+    binder_kind_exact(ctx, g_binder_module, name)
 
 fn binder_kind_word(kind: i32) -> StrView
     if kind == BINDER_CONST
@@ -169,10 +166,8 @@ fn binder_scope_find(name_sv: StrView) -> i32
         i = i - 1
     0 - 1
 
-fn binder_is_wildcard(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    (len == 1 and *name == '_') as i32
+fn binder_is_wildcard(name: StrView) -> i32
+    (name.len == 1 and name.get(0) == '_') as i32
 
 # `file:line:col: error: a local can't reuse a name bound earlier in its fn:
 # '<name>' (at L:C) — rename the local`.  Returns 1 (one error).
@@ -194,29 +189,25 @@ fn binder_reuse_report(file: StrView, span: SrcSpan, name_sv: StrView, at_line: 
 
 # 1 when `name` takes a module value's name or one still in scope, after
 # saying so.  `_` is never bound (binder_bind), so it passes.
-fn binder_judge(ctx: *ParseCtx, file: StrView, span: SrcSpan, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len <= 0
+fn binder_judge(ctx: *ParseCtx, file: StrView, span: SrcSpan, name: StrView) -> i32
+    if name.ptr == null or name.len <= 0
         return 0
-    let kind: i32 = binder_module_value_kind(ctx, name_sv)
+    let kind: i32 = binder_module_value_kind(ctx, name)
     if kind != BINDER_NONE
-        return binder_report(file, span.line, span.col, name_sv, kind)
-    let at: i32 = binder_scope_find(name_sv)
+        return binder_report(file, span.line, span.col, name, kind)
+    let at: i32 = binder_scope_find(name)
     if at < 0
         return 0
-    binder_reuse_report(file, span, name_sv, g_scope_line[at], g_scope_col[at])
+    binder_reuse_report(file, span, name, g_scope_line[at], g_scope_col[at])
 
 # Put `name` in scope.  A module value's name is never a local's.
-fn binder_bind(ctx: *ParseCtx, span: SrcSpan, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len <= 0 or binder_is_wildcard(name_sv) == 1
+fn binder_bind(ctx: *ParseCtx, span: SrcSpan, name: StrView)
+    if name.ptr == null or name.len <= 0 or binder_is_wildcard(name) == 1
         return
-    if binder_module_value_kind(ctx, name_sv) != BINDER_NONE or g_scope_top >= BINDER_SCOPE_CAP
+    if binder_module_value_kind(ctx, name) != BINDER_NONE or g_scope_top >= BINDER_SCOPE_CAP
         return
-    g_scope_name[g_scope_top] = name
-    g_scope_len[g_scope_top] = len
+    g_scope_name[g_scope_top] = name.ptr
+    g_scope_len[g_scope_top] = (name.len as i32)
     g_scope_line[g_scope_top] = span.line
     g_scope_col[g_scope_top] = span.col
     g_scope_top = g_scope_top + 1

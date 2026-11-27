@@ -22,6 +22,7 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.memory
 import ritzlib.hash       # fnv1a_str (struct_map_find)
+import ritzlib.span       # span_from_strview: fnv1a_str keys
 import ritzlib.hashmap    # HashMapI64
 import ritzlib.str        # memcmp (array_elem_types_match, param_is_span)
 import ritzlib.strview    # strview_eq (name_eq)
@@ -108,11 +109,9 @@ pub fn name_eq(name_sv: StrView, target_sv: StrView) -> i32
         return 1
     0
 
-pub fn eprint_bytes(p_sv: StrView)
-    var p: *u8 = p_sv.ptr
-    var len: i32 = p_sv.len as i32
-    for i in 0..len
-        eprint_char(*(p + i))
+pub fn eprint_bytes(p: StrView)
+    for i in 0..(p.len as i32)
+        eprint_char(p.get(i))
 
 # Find field index in a struct (returns -1 if not found)
 pub fn find_field_index(st: *StructDef, field_sv: StrView) -> i32
@@ -137,19 +136,17 @@ pub fn get_field_type(st: *StructDef, field_idx: i32) -> *StructField
     null
 
 # 1 if `name` is the mangled symbol `<ib.type_name>_<method.name>`.
-pub fn impl_method_symbol_eq(ib: *ImplBlock, method: *FnDef, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn impl_method_symbol_eq(ib: *ImplBlock, method: *FnDef, name: StrView) -> i32
     let type_len: i32 = ib.type_name.len as i32
-    if type_len + 1 + (method.name.len as i32) != len
+    if type_len + 1 + (method.name.len as i32) != name.len
         return 0
     for mj in 0..type_len
-        if *(ib.type_name.ptr + mj) != *(name + mj)
+        if *(ib.type_name.ptr + mj) != name.get(mj)
             return 0
-    if *(name + type_len) != '_'  # '_'
+    if name.get(type_len) != '_'  # '_'
         return 0
     for mk in 0..(method.name.len as i32)
-        if *(method.name.ptr + mk) != *(name + type_len + 1 + mk)
+        if *(method.name.ptr + mk) != name.get(type_len + 1 + mk)
             return 0
     1
 
@@ -242,27 +239,25 @@ pub fn is_simd_vector_type_name(name_sv: StrView) -> i32
 # than the old packed-i64 representation.  Callers that emit payload load /
 # store paths still key off this predicate to decide between "scalar slot"
 # and "tagged-enum aggregate slot" code shapes.
-pub fn is_tagged_enum_type(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    if name_len >= 7
+pub fn is_tagged_enum_type(name: StrView) -> i32
+    if name.len >= 7
         # "Result$" = 82 101 115 117 108 116 36
-        if *(name + 0) == 'R'
-            if *(name + 1) == 'e'
-                if *(name + 2) == 's'
-                    if *(name + 3) == 'u'
-                        if *(name + 4) == 'l'
-                            if *(name + 5) == 't'
-                                if *(name + 6) == '$'
+        if name.get(0) == 'R'
+            if name.get(1) == 'e'
+                if name.get(2) == 's'
+                    if name.get(3) == 'u'
+                        if name.get(4) == 'l'
+                            if name.get(5) == 't'
+                                if name.get(6) == '$'
                                     return 1
         # "Option$" = 79 112 116 105 111 110 36
-        if *(name + 0) == 'O'
-            if *(name + 1) == 'p'
-                if *(name + 2) == 't'
-                    if *(name + 3) == 'i'
-                        if *(name + 4) == 'o'
-                            if *(name + 5) == 'n'
-                                if *(name + 6) == '$'
+        if name.get(0) == 'O'
+            if name.get(1) == 'p'
+                if name.get(2) == 't'
+                    if name.get(3) == 'i'
+                        if name.get(4) == 'o'
+                            if name.get(5) == 'n'
+                                if name.get(6) == '$'
                                     return 1
     return 0
 
@@ -316,12 +311,10 @@ pub fn type_code_scalar_bits(t: TypeKind, signed: *i32) -> i32
     64
 
 # Tracker index of the non-generic user enum `name`, or -1.
-pub fn user_enum_index(ctx: *ParseCtx, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len <= 0
+pub fn user_enum_index(ctx: *ParseCtx, name: StrView) -> i32
+    if name.ptr == null or name.len <= 0
         return 0 - 1
-    let ei: i32 = enum_find(ctx, name_sv)
+    let ei: i32 = enum_find(ctx, name)
     if ei < 0
         return 0 - 1
     if enum_is_generic(ctx, ei) == 1
@@ -530,21 +523,19 @@ pub fn is_builtin_const(name_sv: StrView) -> i32
 
 # find a struct definition by name over any fnv1a(name) -> first-StructDef map
 # of `m`'s structs: the emitter's, or Sema's (AGAST #3505).
-pub fn struct_map_find(map: *HashMapI64, m: *Module, name_sv: StrView) -> *StructDef
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let key: i64 = fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64
+pub fn struct_map_find(map: *HashMapI64, m: *Module, name: StrView) -> *StructDef
+    let key: i64 = fnv1a_str(span_from_strview(name)) as i64
     let st: *StructDef = map.get(key).unwrap_or(0) as *StructDef
     if st == null
         return null
-    if name_eq(st.name, name_sv) == 1
+    if name_eq(st.name, name) == 1
         return st
     # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
     # another name is a collision, not a miss.  Scan the list (first
     # occurrence wins, as in build_symbol_maps).
     var cur: *StructDef = m.structs
     while cur != null
-        if name_eq(cur.name, name_sv) == 1
+        if name_eq(cur.name, name) == 1
             return cur
         cur = cur.next
     return null
@@ -557,11 +548,9 @@ pub fn struct_map_find(map: *HashMapI64, m: *Module, name_sv: StrView) -> *Struc
 # Option 1, a generic struct or enum template its parameter count; 0 for a leaf
 # (primitive, concrete struct, pointer to a leaf).  `ptr_` prefixes are
 # skipped: `ptr_Vec$u8` is one argument.
-fn te_component_arity(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var p: *u8 = name
-    var n: i32 = len
+fn te_component_arity(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, name: StrView) -> i32
+    var p: *u8 = name.ptr
+    var n: i32 = (name.len as i32)
     var k0: i32 = mangled_ref_prefix(StrView { ptr: (p), len: (n) as i64 })
     while k0 > 0
         p = p + k0
@@ -587,18 +576,16 @@ fn te_component_arity(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, name_sv:
 
 # End (exclusive) of the mangled type argument starting at buf[pos]: its
 # first component plus one nested argument per generic parameter.
-fn te_arg_end(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, buf_sv: StrView, pos: i32) -> i32
-    var buf: *u8 = buf_sv.ptr
-    var len: i32 = buf_sv.len as i32
+fn te_arg_end(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, buf: StrView, pos: i32) -> i32
     var end: i32 = pos
-    while end < len and *(buf + end) != '$'   # '$'
+    while end < buf.len and buf.get(end) != '$'   # '$'
         end = end + 1
-    let arity: i32 = te_component_arity(ctx, structs, m, StrView { ptr: (buf + pos), len: (end - pos) as i64 })
+    let arity: i32 = te_component_arity(ctx, structs, m, buf.skip(pos).take(end - pos))
     var k: i32 = 0
     while k < arity
-        if end >= len
+        if end >= buf.len
             return end
-        end = te_arg_end(ctx, structs, m, buf_sv, end + 1)
+        end = te_arg_end(ctx, structs, m, buf, end + 1)
         k = k + 1
     end
 
@@ -1200,31 +1187,11 @@ struct OwnPath
 
 # AGAST #4391: a user enum variant-constructor query, moved from
 # emitter_expr_call; the checks and the emitter both ask it.
-pub fn is_variant_carrier(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    if name_len == 4
-        # "Some"
-        if *name == 'S' and *(name + 1) == 'o' and *(name + 2) == 'm' and *(name + 3) == 'e'
-            return 1
-    if name_len == 2
-        # "Ok"
-        if *name == 'O' and *(name + 1) == 'k'
-            return 1
-    return 0
+pub fn is_variant_carrier(name: StrView) -> i32
+    (name.eq("Some") or name.eq("Ok")) as i32
 
-pub fn is_variant_null(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    if name_len == 4
-        # "None"
-        if *name == 'N' and *(name + 1) == 'o' and *(name + 2) == 'n' and *(name + 3) == 'e'
-            return 1
-    if name_len == 3
-        # "Err"
-        if *name == 'E' and *(name + 1) == 'r' and *(name + 2) == 'r'
-            return 1
-    return 0
+pub fn is_variant_null(name: StrView) -> i32
+    (name.eq("None") or name.eq("Err")) as i32
 
 # =============================================================================
 # Pure helpers the Sema check modules share with the emitter (AGAST #4391)
@@ -1457,15 +1424,11 @@ pub fn param_pointee_dims(out: *ArrayDims, p: *Param)
 # 1 when two array element types name the same type (struct elements by name).
 # Exactly the same type, through an address too: `[N]u32` doesn't fit a
 # reference to `[N]i32`, though LLVM spells both `i32` (#2367).
-pub fn array_elem_types_match(a: TypeKind, a_name_sv: StrView, b: TypeKind, b_name_sv: StrView) -> i32
-    var a_name: *u8 = a_name_sv.ptr
-    var a_len: i32 = a_name_sv.len as i32
-    var b_name: *u8 = b_name_sv.ptr
-    var b_len: i32 = b_name_sv.len as i32
+pub fn array_elem_types_match(a: TypeKind, a_name: StrView, b: TypeKind, b_name: StrView) -> i32
     if a == TypeKind.Struct or b == TypeKind.Struct
-        if a != b or a_len != b_len or a_len <= 0
+        if a != b or a_name.len != b_name.len or a_name.len <= 0
             return 0
-        return (memcmp(a_name, b_name, a_len as i64) == 0) as i32
+        return (memcmp(a_name.ptr, b_name.ptr, a_name.len) == 0) as i32
     return (a == b) as i32
 
 # =============================================================================

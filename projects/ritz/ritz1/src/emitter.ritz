@@ -1341,9 +1341,7 @@ fn inline_import_defined(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> i32
         f = f.next
     0
 
-fn is_local_function(m: *Module, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn is_local_function(m: *Module, name: StrView) -> i32
     var f: *FnDef = m.functions
     while f != null
         # AGAST #194: a fn is "local" only when this .ll actually
@@ -1353,7 +1351,7 @@ fn is_local_function(m: *Module, name_sv: StrView) -> i32
         # files carry is_local == 0 and must NOT short-circuit the
         # extern-declare path here — otherwise call sites in the
         # current .ll would reference unresolved symbols.
-        if f.body != null and f.is_local == 1 and name_eq(f.name, name_sv) == 1
+        if f.body != null and f.is_local == 1 and name_eq(f.name, name) == 1
             return 1
         f = f.next
     # Also check impl block methods (mangled as Type_method). Without this,
@@ -1364,7 +1362,7 @@ fn is_local_function(m: *Module, name_sv: StrView) -> i32
     # AGAST #194: same rationale as the m.functions branch above — only
     # methods this .ll actually defines (is_local==1) count as local for the
     # extern-declare suppression check.
-    let method: *FnDef = find_impl_method_by_symbol(m, StrView { ptr: (name), len: (len) as i64 })
+    let method: *FnDef = find_impl_method_by_symbol(m, name)
     if method != null and method.is_local == 1
         return 1
     0
@@ -1372,29 +1370,27 @@ fn is_local_function(m: *Module, name_sv: StrView) -> i32
 # AGAST #167: Recognize LLVM x86 intrinsic names registered as externs by
 # emit_x86_simd_intrinsic.  These need typed `declare <vec> @llvm.x86.foo(<vec>...)`
 # instead of the generic `declare i64 @name(...)`.
-fn is_llvm_x86_intrinsic_name(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn is_llvm_x86_intrinsic_name(name: StrView) -> i32
     # Cheap prefix match on "llvm.x86.".
-    if len < 9
+    if name.len < 9
         return 0
-    if *(name + 0) != 'l'
+    if name.get(0) != 'l'
         return 0
-    if *(name + 1) != 'l'
+    if name.get(1) != 'l'
         return 0
-    if *(name + 2) != 'v'
+    if name.get(2) != 'v'
         return 0
-    if *(name + 3) != 'm'
+    if name.get(3) != 'm'
         return 0
-    if *(name + 4) != '.'
+    if name.get(4) != '.'
         return 0
-    if *(name + 5) != 'x'
+    if name.get(5) != 'x'
         return 0
-    if *(name + 6) != '8'
+    if name.get(6) != '8'
         return 0
-    if *(name + 7) != '6'
+    if name.get(7) != '6'
         return 0
-    if *(name + 8) != '.'
+    if name.get(8) != '.'
         return 0
     1
 
@@ -1482,9 +1478,7 @@ fn emit_declare_attrs_nl(s: *EmitterState)
 # signature, written exactly as emit_fn writes the definition (sret first).
 # `is_method` = 1 for an impl method: emit_impl_method spells its `self`
 # param as plain `ptr` whatever its declared type, so the declare must too.
-fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name_sv: StrView, is_method: i32)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
+fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name: StrView, is_method: i32)
     let sret: i32 = struct_ret_uses_sret(s, f.return_type, f.return_type_name)
     format_into(s, "declare ")
     emit_sv(s, llvm_text(fn_callconv_kw(s.sym.mono.pctx, f)))
@@ -1492,7 +1486,7 @@ fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name_sv: StrView, i
         format_into(s, "void")
     else
         emit_fn_ret_llvm_type(s, f)   # AGAST #2302
-    let name_ir: String = ir_name(StrView { ptr: (name), len: (name_len) as i64 })
+    let name_ir: String = ir_name(name)
     format_into(s, " @{name_ir.as_view()}(")
     var first: bool = true
     if sret == 1
@@ -1723,12 +1717,10 @@ fn emit_struct_types(s: *EmitterState)
 # emitted_structs) for the tagged-enum name at (name, len).  No-op when
 # name doesn't look like Result$/Option$, which lets callers funnel every
 # type name they see through here unconditionally.  ritz-task-133.
-fn emit_tagged_enum_decl_once(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len == 0
+fn emit_tagged_enum_decl_once(s: *EmitterState, name: StrView)
+    if name.ptr == null or name.len == 0
         return
-    if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
+    if is_tagged_enum_type(name) == 0
         return
     # Skip template-shaped names like `Option$T` / `Result$E` — these are
     # the raw generic placeholders that leak in from function signatures
@@ -1744,33 +1736,31 @@ fn emit_tagged_enum_decl_once(s: *EmitterState, name_sv: StrView)
     # and `Option$P` skipped with the placeholders left clang an unsized
     # `%Option$P`.  Ask the module, not the name's length.
     let suffix_start: i32 = 7
-    if len - suffix_start == 1
-        let ch: i32 = *(name + suffix_start) as i32
+    if (name.len as i32) - suffix_start == 1
+        let ch: i32 = name.get(suffix_start) as i32
         if ch >= 'A' and ch <= 'Z'
-            if is_concrete_payload_type(s, StrView { ptr: (name + suffix_start), len: (1) as i64 }, 1) == 0
+            if is_concrete_payload_type(s, name.skip(suffix_start).take(1), 1) == 0
                 return
-    if was_struct_emitted(s, StrView { ptr: (name), len: (len) as i64 }) == 1
+    if was_struct_emitted(s, name) == 1
         return
-    mark_struct_emitted(s, StrView { ptr: (name), len: (len) as i64 })
-    let name_ir: String = ir_name(StrView { ptr: (name), len: (len) as i64 })
+    mark_struct_emitted(s, name)
+    let name_ir: String = ir_name(name)
     # AGAST #1898: ritz0's layout, the pad field always present (field 2 is
     # the payload); see tagged_enum_layout in emitter_core.
     var pad: i64 = 0
-    let n: i64 = tagged_enum_layout(s, StrView { ptr: (name), len: (len) as i64 }, @pad)
+    let n: i64 = tagged_enum_layout(s, name, @pad)
     format_into(s, "%{name_ir.as_view()} = type {{ i8, [{pad} x i8], [{n} x i8] }}\n")
-    emit_tagged_enum_arg_decls(s, StrView { ptr: (name), len: (len) as i64 })
+    emit_tagged_enum_arg_decls(s, name)
 
 # AGAST #2435: an Option / Result its arguments name is declared with it.
 # `Some(Some(5))` in an `Option<Option<i64>>` builds the inner `%Option$i64`,
 # which nothing else in the module may name: undeclared, its alloca was an
 # unsized type clang refused.  A named type may be declared after its first use.
-fn emit_tagged_enum_arg_decls(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let t: StrView = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, 0)   # Some's / Ok's
+fn emit_tagged_enum_arg_decls(s: *EmitterState, name: StrView)
+    let t: StrView = tagged_enum_arg(s, name, 0)   # Some's / Ok's
     if t.ptr != null
         emit_tagged_enum_decl_once(s, t)
-    let e: StrView = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, 1)   # Err's; null for an Option
+    let e: StrView = tagged_enum_arg(s, name, 1)   # Err's; null for an Option
     if e.ptr != null
         emit_tagged_enum_decl_once(s, e)
 
@@ -1922,25 +1912,23 @@ fn emit_tagged_enum_scan_stmts(s: *EmitterState, body: *Stmt)
 # nothing else has claimed — matching the single-tag layout ritz0 uses
 # for C-style enums.  User structs and Result$/Option$ tagged enums are
 # already marked in `emitted_structs` by prior passes, so we skip those.
-fn emit_enum_fallback_decl(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len == 0
+fn emit_enum_fallback_decl(s: *EmitterState, name: StrView)
+    if name.ptr == null or name.len == 0
         return
-    if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if is_tagged_enum_type(name) == 1
         return
-    if is_primitive_type_name(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if is_primitive_type_name(name) == 1
         return
     # AGAST #167: SIMD vector type names lower to `<N x iM>` directly — they
     # never need (and must not get) a `%v4i32 = type { i8 }` named-struct
     # decl which would pin the LLVM type to a bogus `{ i8 }` layout.
-    if is_simd_vector_type_name(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if is_simd_vector_type_name(name) == 1
         return
-    if was_struct_emitted(s, StrView { ptr: (name), len: (len) as i64 }) == 1
+    if was_struct_emitted(s, name) == 1
         return
     # AGAST #2975: a tuple over a generic parameter (`tuple_T_T`, a template
     # fn's `-> (T, T)`) is a template, never a type.
-    let tr: *TupleReg = tuple_reg_lookup(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
+    let tr: *TupleReg = tuple_reg_lookup(s.sym.mono.pctx, name)
     if tr != null and tr.def.type_params != null
         return
     # Skip generic instantiations (`Vec$String`, `Span$u8`, `Pair$i32`, ...).
@@ -1949,17 +1937,17 @@ fn emit_enum_fallback_decl(s: *EmitterState, name_sv: StrView)
     # Without this filter we'd emit `%Vec$String = type { i8 }` and clobber
     # the real Vec$T layout that emit_struct_types instantiates lazily.
     # A generic enum's instance (`Slot$i32`, AGAST #2422) is a recorded enum.
-    if user_enum_index(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) < 0
+    if user_enum_index(s.sym.mono.pctx, name) < 0
         var i: i32 = 0
-        while i < len
-            if *(name + i) == '$'
+        while i < name.len
+            if name.get(i) == '$'
                 return
             i = i + 1
-    mark_struct_emitted(s, StrView { ptr: (name), len: (len) as i64 })
-    let name_ir: String = ir_name(StrView { ptr: (name), len: (len) as i64 })
+    mark_struct_emitted(s, name)
+    let name_ir: String = ir_name(name)
     # AGAST #1797: a user enum with payload variants gets ritz0's layout
     # (emitter_core user_enum_layout); tag-only enums stay `{ i8 }`.
-    let uei: i32 = user_enum_index(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
+    let uei: i32 = user_enum_index(s.sym.mono.pctx, name)
     if uei >= 0
         var pad: i64 = 0
         let n: i64 = user_enum_layout(s, uei, @pad)
@@ -2176,24 +2164,20 @@ fn emit_test_bits_type(s: *EmitterState, bits: i32)
         format_into(s, "i{bits as i64}")
 
 # 1 if this module (imports included) has a global `var` named `name`.
-fn module_has_global(s: *EmitterState, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn module_has_global(s: *EmitterState, name: StrView) -> i32
     var g: *GlobalVarDef = s.sym.module.globals
     while g != null
-        if name_eq(g.name, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name_eq(g.name, name) == 1
             return 1
         g = g.next
     0
 
 # 1 when this file itself has a fn `name` (defined or `extern`): ritz1 writes
 # a define or declare for it, so a weak definition beside it would clash.
-fn module_has_local_fn(s: *EmitterState, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn module_has_local_fn(s: *EmitterState, name: StrView) -> i32
     var f: *FnDef = s.sym.module.functions
     while f != null
-        if f.is_local == 1 and name_eq(f.name, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if f.is_local == 1 and name_eq(f.name, name) == 1
             return 1
         f = f.next
     0
