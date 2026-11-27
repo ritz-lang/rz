@@ -27,11 +27,28 @@
 # replace the image's. The compiler stays the image's: a checkout's own
 # ritz1/build is never used, and the image's ritz1_selfhosted is linked where
 # the pipeline looks for it.
+#
+# The CAS (compiled modules: the package's, ritzlib's, ritzunit's) is private
+# to the run unless $RZ_BUILDER_CACHE names a writable directory, mounted
+# for the purpose (AGAST #4857). The store is then
+# $RZ_BUILDER_CACHE/<cache key>, so a run on the same compiler reuses the
+# objects of the last; any other `ritz1-*` store there (an older compiler)
+# is deleted, and after the run the store is trimmed to
+# $RZ_BUILDER_CACHE_MAX_BYTES (default 1536MiB). A CAS key already covers
+# the compiler, clang, the flags and every source in a module's import
+# closure, so a stale object is never reused. Concurrent runs on one store
+# are safe (cas.py: atomic renames, a per-key lock).
+#
+#   rz-builder --cache-key
+#
+# prints the key and exits: ritz1-<first 16 of ritz1_selfhosted's sha256,
+# the image's dev.ritz.ritz1-selfhosted.sha256 label>-clang-<version>.
 set -euo pipefail
 
 RZ_ROOT=${RZ_ROOT:-/rz}
 OUT=${RZ_OUT:-/out}
 BUILD_ONLY=0
+CACHE_KEY_ONLY=0
 
 usage() {
     sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d'
@@ -41,14 +58,15 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --build-only) BUILD_ONLY=1; shift ;;
+        --cache-key) CACHE_KEY_ONLY=1; shift ;;
         -h|--help) usage ;;
         --) shift; break ;;
         -*) echo "rz-builder: unknown option $1" >&2; usage ;;
         *) break ;;
     esac
 done
-[[ $# -eq 1 ]] || usage
-PKG_ARG=$1
+[[ $# -eq $((1 - CACHE_KEY_ONLY)) ]] || usage
+PKG_ARG=${1:-}
 
 # summary.py sits beside this script in the repo and under /usr/local/lib
 # in the image.
@@ -72,6 +90,22 @@ if [[ -z ${RITZ1:-} ]]; then
     fi
 fi
 [[ -x $RITZ1 ]] || { echo "rz-builder: ritz1_selfhosted is not executable at $RITZ1" >&2; exit 2; }
+
+cache_key() {
+    local sha clang_version
+    sha=$(sha256sum "$RITZ1" | cut -c1-16)
+    clang_version=$(clang --version 2>/dev/null \
+        | sed -n '1s/.*clang version \([0-9][0-9.]*\).*/\1/p')
+    if [[ -z $clang_version ]]; then
+        echo "rz-builder: no clang version from \`clang --version\`" >&2
+        return 2
+    fi
+    printf 'ritz1-%s-clang-%s\n' "$sha" "$clang_version"
+}
+if [[ $CACHE_KEY_ONLY -eq 1 ]]; then
+    cache_key
+    exit
+fi
 [[ -d $RZ_ROOT/projects/ritz ]] || { echo "rz-builder: $RZ_ROOT is not a builder workspace" >&2; exit 2; }
 
 if [[ $PKG_ARG == /* ]]; then
@@ -121,9 +155,15 @@ if ! mkdir -p "$OUT" || ! touch "$OUT/.write-test"; then
 fi
 rm -f "$OUT/.write-test"
 rm -rf "$OUT/bin" "$OUT/obj" "$OUT/build" "$OUT/summary.json" \
-    "$OUT/build.log" "$OUT/test.log"
+    "$OUT/build.log" "$OUT/test.log" "$OUT/cas-stats.jsonl"
 
-WS=$(mktemp -d)
+# One fixed path, not mktemp's (AGAST #4857): the workspace has no checkout
+# or package marker, so a CAS key names the package's own modules by their
+# absolute path, and a random one missed them on every run of a persistent
+# store. A container has /tmp to itself; a path already taken (two runs on
+# one host) falls back to a private one, which is only uncached.
+WS=${TMPDIR:-/tmp}/rz-builder-ws
+mkdir "$WS" 2>/dev/null || WS=$(mktemp -d)
 cleanup() {
     if [[ -n ${WS:-} && -d $WS ]]; then
         rm -rf "$WS"
@@ -247,7 +287,29 @@ if [[ $(readlink -f "$RITZ1") != $(readlink -f "$chosen") ]]; then
     exit 2
 fi
 export RITZ1
-export RITZ_CACHE_DIR=$WS/cas
+CACHE_ROOT=${RZ_BUILDER_CACHE:-}
+if [[ -n $CACHE_ROOT ]]; then
+    if [[ $CACHE_ROOT != /* || ! -d $CACHE_ROOT || ! -w $CACHE_ROOT ]]; then
+        echo "rz-builder: RZ_BUILDER_CACHE=$CACHE_ROOT is not a writable absolute directory" >&2
+        exit 2
+    fi
+    key=$(cache_key)
+    for old in "$CACHE_ROOT"/ritz1-*; do
+        if [[ -d $old && $old != "$CACHE_ROOT/$key" ]]; then
+            echo "rz-builder: removing $old, the store of another compiler"
+            rm -rf "$old"
+        fi
+    done
+    export RITZ_CACHE_DIR=$CACHE_ROOT/$key
+    echo "rz-builder: CAS $RITZ_CACHE_DIR ($(find "$RITZ_CACHE_DIR" -name '*.o' 2>/dev/null | wc -l) objects)"
+else
+    export RITZ_CACHE_DIR=$WS/cas
+fi
+mkdir -p "$RITZ_CACHE_DIR"
+# What the store saved, for summary.json's `cas`; the marker's mtime is the
+# run's start, which tells this run's objects from the store's others.
+export RITZ_CAS_STATS_LOG=$WS/cas-stats.jsonl
+touch "$WS/run-start"
 export RITZ_BUILD_CACHE_DIR=$WS/bcache
 export PYTHONUNBUFFERED=1
 
@@ -274,10 +336,17 @@ python3 "$SUMMARY" finish \
     --build-only "$BUILD_ONLY" \
     --package-build "$WS/$REL/build" \
     --cas "$RITZ_CACHE_DIR" \
+    --since "$WS/run-start" \
+    --cas-stats "$RITZ_CAS_STATS_LOG" \
     --source "$PKG_ARG" \
     --manifest "$WS/$REL/ritz.toml" \
     --ritz1 "$RITZ1"
 verdict=$?
+cp "$RITZ_CAS_STATS_LOG" "$OUT/cas-stats.jsonl" 2>/dev/null || true
+if [[ -n $CACHE_ROOT ]]; then
+    python3 "$WS/projects/ritz/cas.py" gc --max-bytes "${RZ_BUILDER_CACHE_MAX_BYTES:-1536MiB}" \
+        | tail -1 || echo "rz-builder: trimming $RITZ_CACHE_DIR failed; the verdict stands" >&2
+fi
 set -e
 
 # /out is a host mount. Files created as root stay root-owned, and the host
@@ -288,6 +357,10 @@ if [[ $(id -u) -eq 0 ]]; then
     out_gid=$(stat -c %g "$OUT")
     if [[ $out_uid -ne 0 ]]; then
         chown -R "$out_uid:$out_gid" "$OUT" || true
+    fi
+    # The same for a mounted cache, which the host saves and restores.
+    if [[ -n $CACHE_ROOT && $(stat -c %u "$CACHE_ROOT") -ne 0 ]]; then
+        chown -R "$(stat -c %u:%g "$CACHE_ROOT")" "$CACHE_ROOT" || true
     fi
 fi
 exit "$verdict"

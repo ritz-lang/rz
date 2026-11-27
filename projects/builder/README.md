@@ -68,8 +68,43 @@ mount is not written. The run needs no network.
 
 `/out` holds `bin/` (ELF and PE binaries), `obj/` (this run's `.o` files),
 `build/` (the package build tree), `build.log`, `test.log`, and
-`summary.json` (`ok`, the build exit, and the test counts). When the
+`summary.json` (`ok`, the build exit, the test counts, and `cas`: the
+store's hits, misses and the modules it `compiled`), and `cas-stats.jsonl`
+(the store's per-process record, `cas.py summary` reads it). When the
 container is root, those files are given to the user who owns the mount.
+
+### A persistent CAS (`RZ_BUILDER_CACHE`)
+
+By default the CAS (the compiled modules: the package's own, ritzlib's,
+ritzunit's) lives in the run's private workspace and is gone after it.
+Mount a writable directory and name it in `RZ_BUILDER_CACHE` to keep it
+(AGAST #4857):
+
+```bash
+docker run ... -v "$PWD/cas:/cache" -e RZ_BUILDER_CACHE=/cache rz-builder:<tag> projects/buddhafinger
+```
+
+The store is `/cache/<key>`, where `rz-builder --cache-key` prints the key:
+`ritz1-<first 16 of the dev.ritz.ritz1-selfhosted.sha256 label>-clang-<version>`.
+A new compiler starts an empty store and deletes the other `ritz1-*` ones.
+After the run the store is trimmed to `RZ_BUILDER_CACHE_MAX_BYTES` (`cas.py
+gc`; default 1536MiB). Reuse is safe by construction: a CAS key covers the
+compiler, clang, the flags and every source in a module's import closure.
+Concurrent runs on one store are safe too (atomic renames, a per-key lock).
+Anyone who can write the directory can plant objects a later run links in,
+so mount it writable only for trusted builds. The entrypoint works in a
+fixed `/tmp/rz-builder-ws`: the package's own modules are keyed by their
+absolute path, and a random workspace missed them on every run.
+
+buddhafinger on the hosted path, 2026-11-27: cold 16 s and 55 modules
+compiled; warm 3 s and 0 compiled; the same 156 tests passed, and the same
+bins and objects, byte for byte. `test.sh` checks the same on its hello
+package, and that a changed compiler misses.
+
+main.yml's hosted `builder-matrix` keeps the directory in `actions/cache`
+(`run_builder_package.sh --cache`), keyed by `--cache-key` and saved after
+every run. Woodpecker doesn't keep it yet: a volume on huburght needs the
+repo trusted for volumes, which is Aaron's call (adele, 2026-11-27).
 
 ```bash
 bash projects/builder/accept.sh rz-builder:<tag>
@@ -112,7 +147,7 @@ Gitea. `list_packages()` still checks each listed package against the
 eligibility rules (swept or opted in, no known `build`/`parity` failure)
 and fails rather than emit an empty matrix. Widening the matrix again means
 editing `MATRIX_PACKAGES` and regenerating the pipeline (below). Keeping
-the CAS between runs is AGAST #4857.
+the CAS between runs is AGAST #4857 ("A persistent CAS", above).
 
 On a push to main:
 

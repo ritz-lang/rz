@@ -4,10 +4,13 @@
 # main.yml's builder-matrix job calls this once per matrix entry, from the
 # root of the checkout under test.
 #
-#   run_builder_package.sh [--build-only] <image> <package-rel-path> <out-dir>
+#   run_builder_package.sh [--build-only] [--cache <dir>] <image> <package-rel-path> <out-dir>
 #
 #   --build-only         build, don't test: the package has no tests
 #                        (tools/builder_matrix.py's `build_only`)
+#   --cache <dir>        host directory mounted writable as the image's
+#                        RZ_BUILDER_CACHE, its persistent CAS (AGAST #4857);
+#                        created if missing
 #   <image>              the builder image ref to run, e.g. rz-builder:ci,
 #                        main.yml's builder-image job's build of this commit
 #   <package-rel-path>   workspace-relative package path, e.g.
@@ -48,14 +51,22 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: run_builder_package.sh [--build-only] <image> <package-rel-path> <out-dir>" >&2
+    echo "usage: run_builder_package.sh [--build-only] [--cache <dir>] <image> <package-rel-path> <out-dir>" >&2
     exit 2
 }
 build_only=0
-if [[ ${1:-} == --build-only ]]; then
-    build_only=1
-    shift
-fi
+cache=()
+while [[ ${1:-} == --* ]]; do
+    case $1 in
+        --build-only) build_only=1; shift ;;
+        --cache)
+            [[ $# -ge 2 ]] || usage
+            mkdir -p "$2"
+            cache=(-v "$2:/cache" -e RZ_BUILDER_CACHE=/cache)
+            shift 2 ;;
+        *) usage ;;
+    esac
+done
 [[ $# -eq 3 ]] || usage
 image=$1 pkg=$2 out=$3
 
@@ -77,6 +88,7 @@ docker run --rm --network=none --security-opt seccomp=unconfined \
     -e RZ_ROOT=/ws \
     -v "$PWD:/ws:ro" \
     -v "$out:/out" \
+    "${cache[@]}" \
     "$image" "${mode[@]}" "$pkg"
 
 summary="$out/summary.json"

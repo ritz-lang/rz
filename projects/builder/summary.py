@@ -99,12 +99,16 @@ def copy_bins(package_build: Path, out: Path) -> list[str]:
     return names
 
 
-def copy_objects(cas_root: Path, out: Path) -> int:
+def copy_objects(cas_root: Path, out: Path, since: float | None = None) -> int:
     """Object files from this run's content-addressed store.
 
     Named from the store's module identity when it has one, so a freestanding
     build (whose scratch directory rz deletes) still leaves `.o` files in
     /out. Two modules with the same file name get a short key prefix.
+
+    `since`: the store is shared and persistent (RZ_BUILDER_CACHE, AGAST
+    #4857), so only objects stored or hit at or after this time are this
+    run's: ArtifactStore touches an object on every hit.
     """
     dest_dir = out / "obj"
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -113,6 +117,8 @@ def copy_objects(cas_root: Path, out: Path) -> int:
         return 0
     n = 0
     for obj in sorted(objects.rglob("*.o")):
+        if since is not None and obj.stat().st_mtime < since:
+            continue
         key = obj.name[:-2]
         name = key[:12] + ".o"
         meta_path = cas_root / "meta" / key[:2] / f"{key}.json"
@@ -132,6 +138,25 @@ def copy_objects(cas_root: Path, out: Path) -> int:
         shutil.copy2(obj, dest)
         n += 1
     return n
+
+
+def cas_stats(log: Path) -> dict:
+    """What the store saved this run, from its RITZ_CAS_STATS_LOG (cas.py:
+    one JSON line per process). `compiled` counts distinct keys built: a
+    warm run of an unchanged compiler and sources leaves it at 0 (AGAST
+    #4857)."""
+    hits = misses = 0
+    compiled: set[tuple] = set()
+    for line in log.read_text(errors="replace").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        hits += rec.get("hits", 0)
+        misses += rec.get("misses", 0)
+        for key, ext, *_rest in rec.get("missed", []):
+            compiled.add((key, ext))
+    return {"hits": hits, "misses": misses, "compiled": len(compiled)}
 
 
 def _sha256(path: Path) -> str:
@@ -162,7 +187,8 @@ def finish(args: argparse.Namespace) -> int:
     if package_build.is_dir():
         shutil.copytree(package_build, build_copy, symlinks=True)
     bins = copy_bins(package_build, out)
-    objects = copy_objects(Path(args.cas), out)
+    since = Path(args.since).stat().st_mtime if args.since else None
+    objects = copy_objects(Path(args.cas), out, since)
 
     name = ""
     manifest = Path(args.manifest)
@@ -184,6 +210,8 @@ def finish(args: argparse.Namespace) -> int:
         "objects": objects,
         "ok": ok,
     }
+    if args.cas_stats and Path(args.cas_stats).is_file():
+        summary["cas"] = cas_stats(Path(args.cas_stats))
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if ok else 1
 
@@ -208,6 +236,10 @@ def main(argv: list[str]) -> int:
     fin.add_argument("--source", required=True)
     fin.add_argument("--manifest", required=True)
     fin.add_argument("--ritz1", required=True)
+    # AGAST #4857: a shared store. --since: a file whose mtime is the run's
+    # start; --cas-stats: the run's RITZ_CAS_STATS_LOG.
+    fin.add_argument("--since")
+    fin.add_argument("--cas-stats")
 
     args = parser.parse_args(argv)
     if args.cmd == "parse-test":

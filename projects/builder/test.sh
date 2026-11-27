@@ -17,6 +17,9 @@
 #   - ritz1_selfhosted runs (usage) and compiles a file to IR;
 #   - the entrypoint builds and tests a hello package mounted read-only,
 #     writes /out, and the binary prints the expected line;
+#   - with a cache mounted (RZ_BUILDER_CACHE), a second run of hello
+#     compiles nothing and gives the same binary, and a changed compiler
+#     misses into a store of its own;
 #   - a package that does not compile exits non-zero, with summary.json ok false;
 #   - with the commit's tree mounted as RZ_ROOT, an in-tree package outside
 #     projects/ builds with the image's compiler and the mount is unchanged;
@@ -194,6 +197,51 @@ if [[ $hello_bin == "Hello from the Ritz builder" ]]; then
     ok "hello binary from /out prints the expected line"
 else
     bad "hello binary printed '$hello_bin'"; sed 's/^/     | /' "$work/hello-bin.log"
+fi
+
+# AGAST #4857: a persistent CAS (RZ_BUILDER_CACHE). Two runs of hello on one
+# mounted cache: the first compiles ritzlib, the second compiles nothing and
+# gives the same binary and test count. A different compiler (the image's
+# plus one byte) gets a store of its own and compiles again; the first
+# store is deleted. Mount unchanged throughout.
+mkdir -p "$work/cas"
+cached_hello() {  # <name> [command run in the container instead of the entrypoint]
+    mkdir -p "$work/$1-out"
+    local -a cmd=(/src/projects/hello) ep=()
+    [[ -n ${2:-} ]] && { ep=(--entrypoint bash); cmd=(-c "$2"); }
+    local t0=$SECONDS
+    docker run --rm --network=none --security-opt seccomp=unconfined \
+        -v "$work/hello:/src/projects/hello:ro" -v "$work/$1-out:/out" \
+        -v "$work/cas:/cache" -e RZ_BUILDER_CACHE=/cache "${ep[@]}" \
+        "$tag" "${cmd[@]}" >"$work/$1.log" 2>&1
+    echo "$? $((SECONDS - t0))"
+}
+cas_field() {  # <name> <python expression over the summary `s`>
+    python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' \
+        "$work/$1-out/summary.json" "$2" 2>/dev/null || echo missing
+}
+read -r cold_rc cold_s < <(cached_hello cold)
+read -r warm_rc warm_s < <(cached_hello warm)
+cold=$(cas_field cold '(s["cas"]["compiled"], s["test"]["passed"])')
+warm=$(cas_field warm '(s["cas"]["compiled"], s["test"]["passed"], s["cas"]["hits"])')
+same_bin=$(cmp -s "$work/cold-out/bin/hello" "$work/warm-out/bin/hello" && echo yes || echo no)
+if [[ $cold_rc -eq 0 && $warm_rc -eq 0 && $cold =~ ^\([1-9][0-9]*,\ 1\)$ \
+      && $warm =~ ^\(0,\ 1,\ [1-9][0-9]*\)$ && $same_bin == yes ]]; then
+    ok "cache: cold run compiled $cold (modules, tests) in ${cold_s}s; warm run compiled nothing in ${warm_s}s, same binary"
+else
+    bad "cache: cold rc=$cold_rc $cold, warm rc=$warm_rc $warm (compiled, tests, hits), same binary: $same_bin"
+    sed 's/^/     | /' "$work/warm.log" | tail -20
+fi
+read -r other_rc _ < <(cached_hello other \
+    'cp /rz/projects/ritz/ritz1/build/ritz1_selfhosted /tmp/r1 && printf x >> /tmp/r1 && RITZ1=/tmp/r1 exec rz-builder /src/projects/hello')
+other=$(cas_field other '(s["cas"]["compiled"] > 0, s["test"]["passed"])')
+stores=$(find "$work/cas" -mindepth 1 -maxdepth 1 -name 'ritz1-*' | wc -l)
+hello_now=$(find "$work/hello" -type f -print0 | sort -z | xargs -0 sha256sum)
+if [[ $other_rc -eq 0 && $other == "(True, 1)" && $stores -eq 1 && $hello_now == "$hello_before" ]]; then
+    ok "cache: a changed compiler misses, in a store of its own; the old store is gone"
+else
+    bad "cache: changed compiler rc=$other_rc $other (compiled any, tests), $stores store(s)"
+    sed 's/^/     | /' "$work/other.log" | tail -20
 fi
 
 # A package that does not compile: non-zero exit, summary.json ok false.
