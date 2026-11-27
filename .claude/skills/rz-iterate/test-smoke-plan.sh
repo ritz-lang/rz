@@ -139,6 +139,27 @@ change projects/builder/Dockerfile >/dev/null
 eq "$(targets)" "smoke tools-ratchets builder" "an excluded projects/builder is still builder, never entry:builder"
 git reset -q --hard "$mark"
 
+# AGAST #4752: a CI boot script's pin.  Train e0f78f1e went red on
+# test_ci_msix_boot.py after a car changed test_msix_boot.sh, which only
+# pkg:harland covered.  A path a projects/ritz/tools/test_ci_*.py names
+# runs that file (ci:), read from the planned commit's tree.
+mark="$(git rev-parse HEAD)"
+mkdir -p projects/ritz/tools
+printf 'SCRIPT = "projects/harland/tools/test_msix_boot.sh"\nS = "projects/harland/tools/shell_session.py"\n' > projects/ritz/tools/test_ci_msix_boot.py
+printf 'S = REPO / "projects/harland/tools/shell_session.py"\n' > projects/ritz/tools/test_ci_shell_boot.py
+git add -A; git commit -qm pins
+change projects/harland/tools/test_msix_boot.sh >/dev/null
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap ci:test_ci_msix_boot.py pkg:harland" "a CI boot script runs the test_ci_*.py that names it"
+has "$(bash "$SP" plan)" "^ci:test_ci_msix_boot.py	cd projects/ritz && python3 -m pytest -q -n 8 --dist loadgroup tools/test_ci_msix_boot.py$" \
+    "ci: runs that one file under xdist, as tools-unit does"
+change projects/harland/tools/shell_session.py >/dev/null
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap ci:test_ci_msix_boot.py ci:test_ci_shell_boot.py pkg:harland" "a file two pins name runs both"
+change projects/harland/tools/other.sh >/dev/null
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:harland" "a path no pin names runs none"
+change projects/ritz/tools/test_ci_msix_boot.py >/dev/null
+eq "$(targets)" "smoke tools-unit tools-ratchets" "a pin itself is tools-unit's (which runs it)"
+git reset -q --hard "$mark"
+
 # 2. A mixed diff: each target once, in the fixed order, packages last.
 s="$(change projects/ritz/ritz0/y.py projects/ritz/tools/u.py projects/ritz/ritz0/z.py \
     projects/spire/lib/a.ritz projects/angelo/src/b.ritz docs/c.md)"

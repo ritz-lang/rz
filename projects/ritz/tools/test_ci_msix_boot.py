@@ -51,6 +51,7 @@ import ci_local  # noqa: E402
 REPO = ci_local.REPO_ROOT
 MSIX_SCRIPT = "projects/harland/tools/test_msix_boot.sh"
 TIER1_SCRIPT = "projects/harland/tools/test_tier1_boot.sh"
+SESSION_SCRIPT = "projects/harland/tools/shell_session.py"
 
 # The same stubs as test_ci_harland_boot.py (kept local: tools/ test modules
 # don't import each other). The QEMU stub writes $FAKE_SERIAL to the
@@ -60,6 +61,9 @@ TIER1_SCRIPT = "projects/harland/tools/test_tier1_boot.sh"
 # #4735) its NIC has another owner, so its log is its own.
 QEMU_STUB = r"""#!/usr/bin/env bash
 echo "$@" >> "$STUB_LOG"
+# The vtd-shell boot (AGAST #4752): shell_session.py puts the serial port
+# on its unix socket, and NET_GUEST plays rzsh there.
+case " $* " in *" socket,id=con,"*) exec python3 "$(dirname "$0")/net_guest.py" "$@" ;; esac
 log="$FAKE_SERIAL"
 case " $* " in *" intel-iommu,"*) log="$FAKE_SERIAL_VTD" ;; esac
 prev=""
@@ -68,6 +72,85 @@ for a in "$@"; do
     prev="$a"
 done
 sleep 30
+"""
+# The vtd-shell boot's guest (AGAST #4752), for the real shell_session.py
+# --net: connects to the -chardev socket, sends $FAKE_SHELL_BANNER (the seat
+# handoff and netd's lease), then answers rzsh's net session with real UDP
+# on the hostfwd's host port, as QEMU's slirp would. Each typed line is
+# `CMD ; echo [TAG=]$?` or `CMD &`: udp-send sends to the host listener;
+# udp-recv binds the hostfwd port and prints the first datagram it gets; a
+# background `udp-recv` holds the port until `wait`, and a second bind
+# meanwhile prints Errno.Exist and exits 17. Knobs, each one guest bug:
+# $FAKE_PING replaces ping's reply line, $FAKE_EXIST the second bind's
+# error line.
+NET_GUEST = r"""import os, re, socket, sys
+args = sys.argv[1:]
+path = [a for a in args if a.startswith("socket,id=con,")][0].split("path=")[1].split(",")[0]
+port = int(re.search(r"hostfwd=udp:127\.0\.0\.1:([0-9]+)-:", " ".join(args)).group(1))
+con = socket.socket(socket.AF_UNIX)
+con.connect(path)
+PROMPT = b"rzsh> "
+EXIST = "udp-recv: net_bind: Errno.Exist (port in use) (-17)"
+job = None  # the background udp-recv's socket
+
+
+def bind():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", port))
+    return s
+
+
+def recv(s):
+    data, (_, sport) = s.recvfrom(4096)
+    s.close()
+    return "from 10.0.2.2:%d: %d bytes: %s" % (sport, len(data), data.decode())
+
+
+def run(cmd):
+    # (output lines, status)
+    global job
+    argv = cmd.split()
+    if argv == ["ping", "10.0.2.2"]:
+        return [os.environ.get("FAKE_PING", "reply from 10.0.2.2: 9 bytes: ritz ping")], 0
+    if argv[:2] == ["udp-send", "10.0.2.2"]:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.sendto(argv[3].encode(), ("127.0.0.1", int(argv[2])))
+        u.close()
+        return [], 0
+    if argv == ["udp-recv", str(port)]:
+        if job is not None:
+            return [os.environ.get("FAKE_EXIST", EXIST)], 17
+        return [recv(bind())], 0
+    if argv == ["wait"]:
+        out, job = ([recv(job)] if job else []), None
+        return out, 0
+    return ["rzsh: %s: command not found" % argv[0]], 127
+
+
+con.sendall(os.environ.get("FAKE_SHELL_BANNER", "").encode() + PROMPT)
+line = b""
+while True:
+    b = con.recv(1)
+    if not b:
+        sys.exit(1)
+    if b != b"\r":
+        con.sendall(b)
+        line += b
+        continue
+    cmd, line = line.decode(), b""
+    con.sendall(b"\r\n")
+    if cmd == "exit":
+        con.sendall(b"Goodbye!\r\n[init] Shell exited\r\n[exit] init exited with code 0, powering off\r\n")
+        con.close()
+        sys.exit(0)
+    if cmd.endswith(" &"):
+        job = bind()
+        con.sendall(b"[1] 7\r\n" + PROMPT)
+        continue
+    cmd, _, echo = cmd.partition(" ; echo ")
+    out, status = run(cmd)
+    out.append(echo.replace("$?", str(status)))
+    con.sendall("".join(o + "\r\n" for o in out).encode() + PROMPT)
 """
 QEMU_IMG_STUB = """#!/usr/bin/env bash
 for a in "$@"; do last="$a"; done
@@ -228,6 +311,11 @@ KERNEL_NIC_UP = r"[virtio-net] Initialization complete!\n"
 # NIC brought up by the ring-1 driver (modern transport from the kernel
 # probe, bit 33 and the capped RX queue from the driver), and its parks in
 # place of the in-kernel RX waits.
+# The vtd-shell boot's console before rzsh's prompt (AGAST #4752): the seat
+# handoff and netd's lease, which seat_checks and the net session wait for.
+# (The fixtures' r"\n" is for the serial stub's printf %b; this one is sent
+# as is.)
+SHELL_OK = SEAT_OK.replace(r"\n", "\r\n")
 VTD_OK = (NVME_TABLE.replace(PCI_PORT_IO, "") + IR_ON + TE_ON + NET_MODERN + NIC_DMA_OK + NIC_ON
           + RING1_PARKED + NET_PLATFORM + RX_CAPPED + DRIVER_UP + DHCP_OK + TX_BURST_OK + interrupts(8)
           + driver_parks(41) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SEAT_OK + RESTART_OK + SUITE_PASSED)
@@ -283,6 +371,7 @@ def tree(tmp_path):
     tools = root / "projects" / "harland" / "tools"
     tools.mkdir(parents=True)
     shutil.copy(REPO / MSIX_SCRIPT, tools / "test_msix_boot.sh")
+    shutil.copy(REPO / SESSION_SCRIPT, tools / "shell_session.py")
     (tools / "mkinitramfs.py").write_text(MKINITRAMFS_STUB)
     for rel in (
         "projects/harland/build/debug/harland.elf",
@@ -312,6 +401,7 @@ def _run(tree, serial: str = "", *, qemu=True, qemu_img=True, full_path=True,
     stubs = tree["stubs"]
     if qemu:
         _stub(stubs, "qemu-system-x86_64", QEMU_STUB)
+        _stub(stubs, "net_guest.py", NET_GUEST)
     if qemu_img:
         _stub(stubs, "qemu-img", QEMU_IMG_STUB)
     if full_path:
@@ -328,6 +418,10 @@ def _run(tree, serial: str = "", *, qemu=True, qemu_img=True, full_path=True,
         "STUB_LOG": str(tree["tmp"] / "stub.log"),
         "FAKE_SERIAL": serial,
         "FAKE_SERIAL_VTD": VTD_OK,
+        "FAKE_SHELL_BANNER": SHELL_OK,
+        # shell_session.py's pacing is for a real guest's UART and netd
+        "SHELL_TYPE_DELAY": "0",
+        "SHELL_NET_SETTLE": "0",
         **(env_extra or {}),
     }
     return subprocess.run(["/bin/bash", str(tree["script"])], env=env,
@@ -378,6 +472,7 @@ def test_all_checks_pass_and_the_serial_log_is_kept(tree):
     assert "PASS: virtio-net delivered 8 MSI-X interrupts" in r.stdout
     assert "interrupts: 8" in (keep / "msix.log").read_text()
     assert "[vtd] translation on" in (keep / "msix-vtd.log").read_text()
+    assert "reply from 10.0.2.2" in (keep / "msix-vtd-shell.log").read_text()
     assert "PASS: VT-d DMA translation is on" in r.stdout
 
 
@@ -476,7 +571,7 @@ def test_boots_pc_then_q35_with_the_nic_behind_intel_iommu(tree):
     with iommu_platform=on. The first stays pc with no IOMMU."""
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
-    pc, vtd = (tree["tmp"] / "stub.log").read_text().splitlines()
+    pc, vtd, _shell = (tree["tmp"] / "stub.log").read_text().splitlines()
     assert "-machine pc " in pc and "iommu" not in pc
     assert "-machine q35,kernel-irqchip=split " in vtd
     assert "-device intel-iommu,intremap=on,eim=on " in vtd
@@ -882,3 +977,55 @@ def test_the_boot_images_carry_the_driver():
     script = (REPO / MSIX_SCRIPT).read_text()
     assert "initramfs.pkgs" in script
     assert 'USER_PKGS="indium rzsh prism"' not in script
+
+
+# --------------------------------------------------------------------------
+# The vtd-shell boot: ring-3 networking from rzsh (AGAST #4752). The stub's
+# NET_GUEST plays rzsh for the real shell_session.py --net.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_vtd_shell_boots_init_interactive_with_a_udp_hostfwd(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    _pc, vtd, shell = (tree["tmp"] / "stub.log").read_text().splitlines()
+    assert "-device intel-iommu,intremap=on,eim=on " in shell
+    assert "initramfs-shell.qcow2" in shell and "initramfs-shell" not in vtd
+    assert "esp-shell" in shell
+    port = shell.split("hostfwd=udp:127.0.0.1:")[1].split("-:")[0]
+    assert f"hostfwd=udp:127.0.0.1:{port}-:{port}" in shell
+    assert "-chardev socket,id=con," in shell and "-serial chardev:con" in shell
+
+
+@pytest.mark.integration
+def test_vtd_shell_net_session_passes(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    shell = r.stdout.split("===== msix boot (vtd-shell): ring-3 networking =====")[1]
+    assert "PASS: `ping 10.0.2.2`: one echo through netd" in shell
+    assert "PASS: the host listener on" in shell and "got one datagram `hello`" in shell
+    assert "a second bind of live port" in shell and "FAIL" not in shell
+    assert shell.count("from a new process rebinds the port") == 6
+    assert "PASS: the kernel handed the frame seat to /bin/netd (pid 3)" in shell
+    assert "PASS: `exit`: rzsh returns to init_interactive" in shell
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "env, want",
+    [
+        ({"FAKE_PING": "ping: timeout"}, "FAIL: `ping 10.0.2.2`"),
+        ({"FAKE_EXIST": "udp-recv: net_bind: Errno.Io (-5)"},
+         "answered Errno.Exist"),
+        ({"FAKE_SHELL_BANNER": SHELL_OK.replace("[net] seat -> netd pid 3\r\n", "")},
+         "FAIL: the kernel did not hand the frame seat to /bin/netd"),
+        ({"FAKE_SHELL_BANNER": ""}, "FAIL: netd logged no lease"),
+    ],
+    ids=["no-ping-reply", "second-bind-not-exist", "no-seat-handoff", "no-netd-lease"],
+)
+def test_vtd_shell_check_fails(tree, env, want):
+    r = _run(tree, PASSED, env_extra=env)
+    assert r.returncode == 1, r.stdout + r.stderr
+    shell = r.stdout.split("===== msix boot (vtd-shell): ring-3 networking =====")[1]
+    assert want in shell, shell

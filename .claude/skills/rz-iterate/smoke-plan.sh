@@ -71,6 +71,12 @@
 #                                        test-*-systemd.sh through
 #                                        .claude/room-unit.sh)
 #   .claude/host-env.sh                  skill:rz-iterate (train.sh sources it)
+#   any path a projects/ritz/tools/      ci:<file>, as well as the above
+#     test_ci_*.py names (outside        (that one pin under xdist; AGAST
+#     projects/ritz/tools/)              #4752: train e0f78f1e went red on
+#                                        test_ci_msix_boot.py after a car
+#                                        changed test_msix_boot.sh, which
+#                                        planned pkg:harland alone)
 #   rz, rz.toml                          build-all
 #   anything else (.github, known-failures)  nothing of its own; the
 #                                        train's full gate covers it
@@ -129,6 +135,8 @@ cmd_of() {
         build-all)        echo "./rz build --all" ;;
         build-all-ritz1)  echo "make -C projects/ritz build-all-ritz1" ;;
         builder)          echo "bash projects/builder/test.sh" ;;
+        # One CI pin: tools-unit's invocation, on that file alone.
+        ci:*)             echo "cd projects/ritz && python3 -m pytest -q -n 8 --dist loadgroup tools/${1#ci:}" ;;
         # The package under every compiler the gate builds it with (#4777:
         # #4739's package built under ritz0 and only ritz1 refused it), all
         # three in full, then its tests.  A compiler whose known-failures/
@@ -169,9 +177,20 @@ pkg_of() {
     done
 }
 
+# pins_of <path>: `ci:<file>` for each projects/ritz/tools/test_ci_*.py in
+# the planned tree that names <path> (a tools/ path is tools-unit's, which
+# runs every pin).
+pins_of() {
+    local f
+    [[ "$1" != projects/ritz/tools/* ]] || return 0
+    git -C "$ROOT" grep -lF -- "$1" "$TIP" -- 'projects/ritz/tools/test_ci_*.py' 2>/dev/null \
+        | while IFS= read -r f; do echo "ci:${f##*/}"; done
+}
+
 # targets_of <path>: the targets one changed path needs (see the header).
 targets_of() {
     local p="$1" rest
+    pins_of "$p"
     # Anything under .claude/ (markdown too) runs tools-unit: tools/ tests
     # read SKILL.md, the hooks and settings (AGAST #4580's first train
     # failed on two that assert the briefing's text).  Checked before the
@@ -213,7 +232,7 @@ targets_of() {
 ORDER=(smoke doc-examples tools-unit tools-ratchets harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1 builder)
 
 # plan_targets <range...>: every target for the diff, smoke first, in ORDER,
-# then entry:/pkg:/skill: targets sorted.
+# then ci:/entry:/pkg:/skill: targets sorted.
 plan_targets() {
     local files t o extra=() tip last
     local -A want=()
@@ -226,8 +245,9 @@ plan_targets() {
         *..*) tip="${last##*..}"; tip="${tip:-HEAD}" ;;
         *)   if [[ $# -ge 2 ]]; then tip="$last"; else tip=HEAD; fi ;;
     esac
-    # Read by pkg_of (bash's dynamic scope reaches targets_of's subshells).
-    local MANIFESTS EXCLUDED
+    # Read by pkg_of and pins_of (bash's dynamic scope reaches targets_of's
+    # subshells).
+    local MANIFESTS EXCLUDED TIP="$tip"
     MANIFESTS="$(git -C "$ROOT" ls-tree -r --name-only "$tip" -- projects 2>/dev/null | sed -n 's#/ritz\.toml$##p')"
     EXCLUDED="$(git -C "$ROOT" show "$tip:rz.toml" 2>/dev/null \
         | sed -n '/^\[workspace\.exclude\]/,/^\[[a-z]/s/^"\([^"]*\)" *=.*/\1/p')"
@@ -241,7 +261,7 @@ plan_targets() {
     # -m inproc half included (#4622): both, and the ratchets are covered.
     [[ -z "${want[tools-unit]:-}" || -z "${want[unit]:-}" ]] || unset 'want[tools-ratchets]'
     for o in "${ORDER[@]}"; do [[ -n "${want[$o]:-}" ]] && echo "$o"; done
-    for t in "${!want[@]}"; do case "$t" in entry:*|pkg:*|skill:*) extra+=("$t") ;; esac; done
+    for t in "${!want[@]}"; do case "$t" in entry:*|pkg:*|skill:*|ci:*) extra+=("$t") ;; esac; done
     [[ ${#extra[@]} -eq 0 ]] || printf '%s\n' "${extra[@]}" | sort
 }
 

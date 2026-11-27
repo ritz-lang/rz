@@ -64,6 +64,9 @@ import time
 PROMPT = b"rzsh> "
 # Seconds between typed bytes, so COM1's 16-byte FIFO never overruns.
 TYPE_DELAY = float(os.environ.get("SHELL_TYPE_DELAY", "0.02"))
+# Seconds _feed_until waits after udp-recv's prompt for the datagrams still
+# in flight to be dropped (a guest's netd needs them; a stub guest doesn't).
+NET_SETTLE = float(os.environ.get("SHELL_NET_SETTLE", "1.0"))
 FATAL = re.compile(rb"KERNEL PANIC|!!! EXCEPTION !!!|EXCEPTION:")
 # netd's lease line (system/src/netd.ritz log_address). It goes to the
 # console like every kernel and service line, so the net session waits for
@@ -390,7 +393,7 @@ def _feed_until(con: "Console", host: HostUdp, payload: bytes, timeout: float) -
         if out is not None:
             # The copies still in flight land while no endpoint holds the
             # port (netd drops them), not on the next step's fresh bind.
-            time.sleep(1.0)
+            time.sleep(NET_SETTLE)
             return out
         if FATAL.search(con.buf):
             return None
