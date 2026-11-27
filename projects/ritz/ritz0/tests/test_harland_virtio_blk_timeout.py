@@ -47,11 +47,10 @@ KERNEL_SRC = RITZ_ROOT.parent / "harland" / "kernel" / "src"
 # --- stand-ins ----------------------------------------------------------------
 
 # The real serial.ritz drives the UART through port I/O; only its StrView
-# is needed here.
+# is needed here, re-exported from ritzlib as the real one is (blk.ritz's
+# ritzlib.span import brings ritzlib.strview in too).
 SERIAL_STUB = """\
-pub struct StrView
-    ptr: *u8
-    len: i64
+pub import ritzlib.strview { StrView }
 """
 
 # The kernel logs through klog (AGAST #1885); these have its signatures and
@@ -173,9 +172,13 @@ pub fn nvme_ns_write(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i
     -1
 """
 
-# blk.ritz probes AHCI and ignores the count (AGAST #4882). The real probe
-# lives in the kernel; this stand-in keeps the virtio timeout tree linking.
+# blk.ritz probes AHCI and ignores the count (AGAST #4882), then looks up and
+# drives AHCI disks past the virtio ones (#4884). The real driver lives in the
+# kernel; this stand-in finds no disks, so the timeout test still drives
+# virtio. drivers/ahci/fis.ritz (AhciDir, AHCI_SECTOR_BYTES) is the real one.
 AHCI_STUB = """\
+import drivers.ahci.fis { AhciDir }
+
 pub enum AhciError
     Timeout
     BarNotMemory
@@ -183,9 +186,21 @@ pub enum AhciError
     HandoffKept
     NoDma
     CtlFull
+    Device
+    Dead
+    Range
+
+pub struct AhciDisk
+    sectors: u64
 
 pub fn ahci_probe() -> Result<u32, AhciError>
     Ok(0)
+
+pub fn ahci_get_disk(n: i32) -> Option<@AhciDisk>
+    None
+
+pub fn ahci_disk_rw(disk: *AhciDisk, lba: u64, buf: [u8], dir: AhciDir) -> Result<(), AhciError>
+    Err(AhciError.Range)
 """
 
 # Physical == virtual, as in the kernel's identity map: pages come from a
@@ -569,7 +584,18 @@ pub fn deadline_passed(deadline: u64) -> bool
     rdtsc() >= deadline
 """
 
+# ritzlib.str's memset, which Span.zero (drivers/ahci/fis.ritz) calls. The
+# tree links -nostdlib and no ritzlib objects, so the symbol comes from here.
+MEM_STUB = """\
+# standard-exempt: raw-ptr-param: LLVM/libc ABI symbol: memset(3)
+pub fn memset(dest: *u8, c: u8, n: i64) -> *u8
+    for i in 0..n
+        *(dest + i) = c
+    return dest
+"""
+
 STUBS = {
+    "libc_mem.ritz": MEM_STUB,
     "serial.ritz": SERIAL_STUB,
     "klog.ritz": KLOG_STUB,
     "io.ritz": IO_STUB,
@@ -584,7 +610,8 @@ STUBS = {
 }
 REAL = ["drivers/virtio/blk.ritz", "drivers/virtio/common.ritz",
         "drivers/virtio/vmsix.ritz", "drivers/irq_wait.ritz",
-        "drivers/virtio/window.ritz"]
+        "drivers/virtio/window.ritz", "drivers/ahci/fis.ritz",
+        "drivers/ahci/regs.ritz", "syscall/errno.ritz"]
 # The virtqueue and feature negotiation the drivers call (AGAST #4732): the
 # real virtio_abi package, at virtio_abi/<module>.ritz in the tree.
 VIRTIO_ABI_SRC = KERNEL_SRC.parents[1] / "virtio_abi" / "src"
