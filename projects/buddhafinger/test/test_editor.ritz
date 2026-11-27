@@ -14,8 +14,8 @@ import ritzlib.strview
 import ritzlib.string
 import ritzlib.termsession { Key }
 
-import core.buffer { Buffer }
-import core.editor { Editor, editor_new, editor_open, handle_key }
+import core.buffer { Buffer, pos }
+import core.editor { Editor, LangAsk, editor_new, editor_open, handle_key, jump_to, MSG_NO_JUMP, MSG_NOT_SAVED, MAX_JUMPS }
 import core.files { FileStore, LoadError, SaveError }
 import core.modes { Mode, mode_label }
 import core.screen { LineSource, Size, render, screen_new, view_new }
@@ -679,4 +679,93 @@ fn test_text_revision_follows_text_changes() -> i32
     feed(@&ed, @&d, ":e g.txt<cr>")
     assert ed.command_line().is_empty()
     assert ed.text_revision() > r3
+    0
+
+# ============================================================================
+# Language keys and jumps (AGAST #4828)
+# ============================================================================
+
+[[test]]
+fn test_k_and_gd_raise_requests_for_the_loop() -> i32
+    var d = disk_new()
+    var ed = open("fn f()\nf()\n")
+    assert ed.take_ask() == LangAsk.Nothing
+    feed(@&ed, @&d, "K")
+    assert ed.take_ask() == LangAsk.Hover
+    assert ed.take_ask() == LangAsk.Nothing         # taken once
+    feed(@&ed, @&d, "jgd")
+    assert ed.take_ask() == LangAsk.Definition
+    assert ed.cursor.line == 1                      # gd moves nothing itself
+    feed(@&ed, @&d, "gg")
+    assert ed.take_ask() == LangAsk.Nothing
+    assert ed.cursor.line == 0
+    0
+
+[[test]]
+fn test_jump_in_this_file_and_back() -> i32
+    var d = disk_new()
+    var ed = open("one\ntwo\nthree\n")
+    feed(@&ed, @&d, "jl")
+    assert jump_to<Disk>(@&ed, @&d, "f.txt", pos(2, 3))
+    assert ed.cursor.line == 2 and ed.cursor.col == 3
+    assert ed.jump_depth() == 1
+    feed(@&ed, @&d, "<C-o>")
+    assert ed.cursor.line == 1 and ed.cursor.col == 1
+    assert ed.jump_depth() == 0
+    feed(@&ed, @&d, "<C-t>")
+    assert ed.message.as_view().eq(MSG_NO_JUMP)
+    0
+
+[[test]]
+fn test_jump_to_another_file_and_back_reopens_the_first() -> i32
+    var d = disk_with("g.ritz", "fn g()\n\nfn h()\n")
+    var ed = open("abc\nx\n")
+    feed(@&ed, @&d, "j")
+    assert jump_to<Disk>(@&ed, @&d, "g.ritz", pos(2, 3))
+    assert ed.path.as_view().eq("g.ritz")
+    assert ed.cursor.line == 2 and ed.cursor.col == 3
+    # f.txt isn't on the in-memory disk: it reopens [New], at the old cursor clamped.
+    d.disk_path.clear()
+    d.disk_path.push_str("f.txt")
+    d.disk.clear()
+    d.disk.push_view("abc\nx\n")
+    feed(@&ed, @&d, "<C-t>")
+    assert ed.path.as_view().eq("f.txt")
+    assert ed.cursor.line == 1 and ed.cursor.col == 0
+    0
+
+[[test]]
+fn test_jump_away_is_refused_with_pending_edits() -> i32
+    var d = disk_with("g.ritz", "fn g()\n")
+    var ed = open("abc\n")
+    feed(@&ed, @&d, "x")
+    assert not jump_to<Disk>(@&ed, @&d, "g.ritz", pos(0, 0))
+    assert ed.message.as_view().eq(MSG_NOT_SAVED)
+    assert ed.path.as_view().eq("f.txt")
+    assert ed.jump_depth() == 0
+    0
+
+[[test]]
+fn test_jump_back_kept_when_the_file_cannot_reopen() -> i32
+    var d = disk_with("g.ritz", "fn g()\n")
+    var ed = open("abc\n")
+    assert jump_to<Disk>(@&ed, @&d, "g.ritz", pos(0, 3))
+    feed(@&ed, @&d, "x")                            # pending edits in g.ritz
+    feed(@&ed, @&d, "<C-o>")
+    assert ed.message.as_view().eq(MSG_NOT_SAVED)
+    assert ed.path.as_view().eq("g.ritz")
+    assert ed.jump_depth() == 1
+    0
+
+[[test]]
+fn test_jump_stack_keeps_the_newest() -> i32
+    var d = disk_new()
+    var ed = open("a\nb\nc\n")
+    for i in 0..MAX_JUMPS + 5
+        assert jump_to<Disk>(@&ed, @&d, "f.txt", pos(i % 3, 0))
+    assert ed.jump_depth() == MAX_JUMPS
+    # The newest jump left from line (MAX_JUMPS + 3) % 3.
+    feed(@&ed, @&d, "<C-o>")
+    assert ed.cursor.line == (MAX_JUMPS + 3) % 3
+    assert ed.path.as_view().eq("f.txt")
     0

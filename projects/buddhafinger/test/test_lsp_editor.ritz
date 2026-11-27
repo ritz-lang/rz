@@ -1,0 +1,421 @@
+# test/test_lsp_editor.ritz - the editor and its language server, on a pty (AGAST #4828).
+#
+# platform.linux's run_editor_with runs in a forked child on a pty slave,
+# with a language server: a scripted one from test/fake_lsp/, and the real
+# ritz-lsp (with RITZ1=ritz1_selfhosted) when this checkout has built it.
+# The test types into the master and reads the frames back:
+#
+#   - a change that breaks the file gets the diagnostic overlay (underlined
+#     in red, its message on the cursor's line) with no request sent after
+#     the change; K shows hover, gd jumps to the definition, Ctrl-O back;
+#   - a server that stops reading in the middle of a big didOpen, flooding
+#     its stderr, doesn't stop typing or repaint, and `:q!` still exits at
+#     once with the terminal restored;
+#   - a server that closed its stdin ends the session (EPIPE, SIGPIPE being
+#     blocked), shown in the status line, and the editor goes on.
+
+import ritzlib.errno
+import ritzlib.fd
+import ritzlib.fs { chmod, cwd, mkdir, path_exists, read_file, remove_dir_all, write_file }
+import ritzlib.gvec
+import ritzlib.io { prints }
+import ritzlib.option
+import ritzlib.process { ForkResult, fork, kill, new_session, try_wait_pid }
+import ritzlib.result
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.sys
+import ritzlib.term { Pty, Termios, Winsize, make_controlling_tty, pty_open, set_winsize, tcgetattr }
+import ritzlib.testlib { sandbox_path }
+import ritzlib.time { sleep_ms }
+import ritzlib.timer { now_millis }
+
+import platform.linux { run_editor_with }
+import platform.lsp { LangConfig, lang_config }
+
+const WAIT_MS: i64 = 4000         # under ritzunit's 10 s per test, with the screen dump
+
+# The SGR of an error's bytes: underlined, red (syntax/marks.ritz).
+const ERROR_SGR: StrView = "\e[0;4;38;5;1m"
+
+# ============================================================================
+# The editor on a pty (test_terminal.ritz's harness, with a server)
+# ============================================================================
+
+struct Child
+    pid: i32
+    pty: Pty
+    before: Termios
+    seen: String
+    mark: i64
+
+fn spawn_editor(path: StrView, lang: @LangConfig) -> Option<Child>
+    var pty: Pty = match pty_open()
+        Ok(p) => p
+        Err(_) => return None
+    let ws = Winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 }
+    let sized = set_winsize(pty.master.raw(), @ws)
+    let before: Termios = match tcgetattr(pty.master.raw())
+        Ok(t) => t
+        Err(_) => return None
+    match fork()
+        Ok(f) => match f
+            ForkResult.Child =>
+                sys_exit(editor_child(@&pty, path, lang))
+                None
+            ForkResult.Parent(pid) =>
+                Some(Child { pid: pid, pty: pty, before: before, seen: string_new(), mark: 0 })
+        Err(_) => None
+
+fn editor_child(pty: @&Pty, path: StrView, lang: @LangConfig) -> i32
+    let closed = pty.master.close()
+    match new_session()
+        Ok(_) => pass
+        Err(_) => return 120
+    var tty: Fd = match pty.open_slave()
+        Ok(s) => s
+        Err(_) => return 121
+    match make_controlling_tty(tty.raw())
+        Ok(_) => pass
+        Err(_) => return 122
+    let cfg = lang_config(lang.server.as_view(), lang.ritz1.as_view())
+    run_editor_with(tty.raw(), path, cfg)
+
+impl Child
+    fn pump(self: @&Child, ms: i64) -> bool
+        var fds: [1]PollFd
+        fds[0] = PollFd { fd: self.pty.master.raw(), events: POLLIN, revents: 0 }
+        match poll(span_from_ptr<PollFd>(@fds[0], 1), ms as i32)
+            Ok(n) =>
+                if n == 0
+                    return true
+            Err(_) => return true
+        var buf: [4096]u8
+        match self.pty.master.read(Span<u8> { ptr: @buf[0], len: 4096 })
+            Ok(n) =>
+                if n <= 0
+                    return false
+                self.seen.push_span(Span<u8> { ptr: @buf[0], len: n })
+                true
+            Err(_) => false
+
+    # Wait until `needle` shows up in the output after the last match.
+    fn expect(self: @&Child, needle: StrView) -> bool
+        let deadline = now_millis() + WAIT_MS
+        loop
+            let rest = self.seen.as_view().slice(self.mark, self.seen.len())
+            let at = rest.find(needle)
+            if at < rest.len()
+                self.mark += at + needle.len()
+                return true
+            let left = deadline - now_millis()
+            if left <= 0
+                return false
+            if not self.pump(left)
+                return false
+
+    # The screen the output so far draws (screen_of), row r.
+    fn row(self: @Child, r: i64) -> String
+        let grid = screen_of(self.seen.as_view())
+        let all: [u8] = grid[0..grid.len()]
+        string_from(all.slice(r * COLS, r * COLS + COLS).as_strview())
+
+    # Wait until row r of the screen holds `needle` (any row for r < 0).
+    fn shows(self: @&Child, r: i64, needle: StrView) -> bool
+        let deadline = now_millis() + WAIT_MS
+        loop
+            let first = if r < 0 then 0 else r
+            let last = if r < 0 then ROWS - 1 else r
+            for k in first..last + 1
+                let text = self.row(k)
+                if text.as_view().find(needle) < text.len()
+                    return true
+            let left = deadline - now_millis()
+            if left <= 0
+                # What the screen showed instead, for the failure's log.
+                prints("not shown: ")
+                prints(needle)
+                prints("\n")
+                for k in 0..ROWS
+                    let t = self.row(k)
+                    prints(t.as_view())
+                    prints("|\n")
+                return false
+            if not self.pump(if left < 50 then left else 50)
+                prints("the editor closed the terminal\n")
+                return false
+
+    fn send(self: @&Child, keys: StrView) -> bool
+        match self.pty.master.write_str(keys)
+            Ok(_) => true
+            Err(_) => false
+
+    # Some(exit code) once it exits within `ms`; None (killed) otherwise.
+    fn wait_exit(self: @&Child, ms: i64) -> Option<i32>
+        let deadline = now_millis() + ms
+        while now_millis() < deadline
+            match try_wait_pid(self.pid)
+                Ok(r) => match r
+                    Some(res) =>
+                        if res.signaled != 0
+                            return None
+                        return Some(res.exit_code)
+                    None => pass
+                Err(_) => return None
+            if not self.pump(10)
+                sleep_ms(10)
+        let killed = kill(self.pid, 9)
+        let reaped = try_wait_pid(self.pid)
+        None
+
+    fn restored(self: @Child) -> bool
+        match tcgetattr(self.pty.master.raw())
+            Ok(t) => t.c_iflag == self.before.c_iflag and t.c_oflag == self.before.c_oflag and t.c_cflag == self.before.c_cflag and t.c_lflag == self.before.c_lflag
+            Err(_) => false
+
+    fn close(self: @&Child)
+        let closed = self.pty.master.close()
+
+# ============================================================================
+# The screen the output draws
+# ============================================================================
+
+const ROWS: i64 = 24
+const COLS: i64 = 80
+const STATUS_ROW: i64 = 22
+const MESSAGE_ROW: i64 = 23
+
+# The ROWS x COLS characters `out` leaves on a terminal: cursor moves
+# (CSI row;col H) and clears (CSI 2J) followed, styles and modes skipped,
+# each non-ASCII code point drawn as `?`. Enough for the editor's output.
+fn screen_of(out: StrView) -> Vec<u8>
+    var grid: Vec<u8> = vec_new<u8>()
+    for i in 0..ROWS * COLS
+        grid.push(' ')
+    var row: i64 = 0
+    var col: i64 = 0
+    var i: i64 = 0
+    while i < out.len()
+        let c = out.get(i)
+        if c == 27 and i + 1 < out.len() and out.get(i + 1) == '['
+            var j = i + 2
+            var p1: i64 = 0
+            var p2: i64 = 0
+            var second = false
+            while j < out.len() and (out.get(j) < 0x40 or out.get(j) > 0x7e)
+                let d = out.get(j)
+                if d == ';'
+                    second = true
+                else if d >= '0' and d <= '9'
+                    if second
+                        p2 = p2 * 10 + (d - '0') as i64
+                    else
+                        p1 = p1 * 10 + (d - '0') as i64
+                j += 1
+            if j < out.len()
+                let f = out.get(j)
+                if f == 'H'
+                    row = if p1 > 0 then p1 - 1 else 0
+                    col = if p2 > 0 then p2 - 1 else 0
+                else if f == 'J' and p1 == 2
+                    for k in 0..ROWS * COLS
+                        grid.set(k, ' ')
+            i = j + 1
+            continue
+        if c >= 0x20 and c < 0x7f
+            if row < ROWS and col < COLS
+                grid.set(row * COLS + col, c)
+            col += 1
+        else if c >= 0xc0
+            if row < ROWS and col < COLS
+                grid.set(row * COLS + col, '?')
+            col += 1
+        i += 1
+    grid
+
+# ============================================================================
+# Files
+# ============================================================================
+
+fn file_in(dir: @String, name: StrView) -> String
+    var p = string_from(dir.as_view())
+    p.push('/')
+    p.push_str(name)
+    p
+
+fn fixture(name: StrView) -> String
+    var p = string_from("test/fake_lsp/")
+    p.push_str(name)
+    match read_file(p.as_view())
+        Ok(s) => s
+        Err(_) => string_new()
+
+# A fresh directory with server.sh (prelude.sh then `script`) and a.ritz
+# holding `text`.
+fn setup(name: StrView, script: StrView, text: StrView) -> String
+    let dir = sandbox_path("bf_lspty", name)
+    let gone = remove_dir_all(dir.as_view())
+    let made = mkdir(dir.as_view(), 448)
+    if not script.is_empty()
+        var s = fixture("prelude.sh")
+        let own = fixture(script)
+        s.push_str(own.as_view())
+        let server = file_in(@dir, "server.sh")
+        let w = write_file(server.as_view(), s.as_view())
+        let x = chmod(server.as_view(), 493)
+    let src = file_in(@dir, "a.ritz")
+    let w2 = write_file(src.as_view(), text)
+    dir
+
+# How many of the server's saved messages are requests (carry an id).
+fn requests_in(dir: @String) -> i64
+    var count: i64 = 0
+    var n: i64 = 1
+    loop
+        var name = string_from("msg.")
+        name.push_i64(n)
+        let p = file_in(dir, name.as_view())
+        match read_file(p.as_view())
+            Ok(s) =>
+                if s.as_view().find("\"id\":") < s.len()
+                    count += 1
+            Err(_) => return count
+        n += 1
+
+const SOURCE: StrView = "fn helper() -> i32\n    1\n\nfn main() -> i32\n    helper()\n"
+
+# ============================================================================
+# Cases
+# ============================================================================
+
+[[test]]
+fn test_overlay_hover_and_definition_with_a_scripted_server() -> i32
+    let dir = setup("overlay", "editor.sh", SOURCE)
+    let server = file_in(@dir, "server.sh")
+    let cfg = lang_config(server.as_view(), "")
+    let src = file_in(@dir, "a.ritz")
+    var c: Child = match spawn_editor(src.as_view(), @cfg)
+        Some(k) => k
+        None => return 0     # no ptys here
+    assert c.shows(4, "helper()")
+    # Break it: a new first line. The overlay comes unasked.
+    assert c.send("ggOBROKEN\e")
+    assert c.expect(ERROR_SGR)
+    assert c.shows(MESSAGE_ROW, "undefined: BROKEN")
+    # Fixed again (undo): the next list is empty, and no request went out.
+    assert c.send("u")
+    assert c.shows(0, "fn helper")
+    # The call on line 5: K shows the hover, gd goes to helper's name.
+    assert c.send("ggjjjj0w")
+    assert c.shows(STATUS_ROW, " 5:5 ")
+    assert c.send("K")
+    assert c.shows(MESSAGE_ROW, "HOVER: helper returns i32")
+    assert c.send("gd")
+    assert c.shows(STATUS_ROW, " 1:4 ")
+    assert c.send("\x0f")                          # Ctrl-O: back
+    assert c.shows(STATUS_ROW, " 5:5 ")
+    assert c.send(":q!\r")
+    let code = c.wait_exit(WAIT_MS)
+    assert code.unwrap_or(-1) == 0
+    assert c.restored()
+    c.close()
+    # initialize, hover, definition: no probe for diagnostics.
+    assert requests_in(@dir) == 3
+    let gone = remove_dir_all(dir.as_view())
+    0
+
+[[test]]
+fn test_typing_goes_on_while_the_server_stalls_and_floods_stderr() -> i32
+    var text = string_new()
+    for i in 0..12288                   # 768 KiB: many pipes full, under the sync limit
+        text.push_str("let value = 1234567890 # sixty-four bytes of ritz source text.\n")
+    let dir = setup("stall", "stall_editor.sh", text.as_view())
+    let server = file_in(@dir, "server.sh")
+    let cfg = lang_config(server.as_view(), "")
+    let src = file_in(@dir, "a.ritz")
+    var c: Child = match spawn_editor(src.as_view(), @cfg)
+        Some(k) => k
+        None => return 0
+    assert c.shows(0, "let value")
+    # The didOpen is stuck in the pipe: keys and repaint go on.
+    for i in 0..5
+        assert c.send("0iSTILL")
+        assert c.send("TYPING\e")
+        assert c.shows(i, "STILLTYPINGlet value")
+        assert c.send("j")
+    let asked = now_millis()
+    assert c.send(":q!\r")
+    let code = c.wait_exit(WAIT_MS)
+    assert code.unwrap_or(-1) == 0
+    assert now_millis() - asked < 3000
+    assert c.restored()
+    c.close()
+    let gone = remove_dir_all(dir.as_view())
+    0
+
+# A server that closed its stdin: the didOpen write is EPIPE, not a
+# SIGPIPE kill (the editor blocks it). The session ends, the status line
+# says why, and editing goes on.
+[[test]]
+fn test_a_server_that_stops_reading_ends_the_session_not_the_editor() -> i32
+    let dir = setup("epipe", "epipe.sh", SOURCE)
+    let server = file_in(@dir, "server.sh")
+    let cfg = lang_config(server.as_view(), "")
+    let src = file_in(@dir, "a.ritz")
+    var c: Child = match spawn_editor(src.as_view(), @cfg)
+        Some(k) => k
+        None => return 0
+    assert c.shows(MESSAGE_ROW, "lsp: closed its input")
+    assert c.shows(STATUS_ROW, "  lsp: c")             # the tag, cut at the edge by the long path
+    assert c.send("ggiStill here \e")
+    assert c.shows(0, "Still here fn helper")
+    assert c.send(":q!\r")
+    let code = c.wait_exit(WAIT_MS)
+    assert code.unwrap_or(-1) == 0
+    assert c.restored()
+    c.close()
+    let gone = remove_dir_all(dir.as_view())
+    0
+
+# The real server: built by `make -C projects/buddhafinger test`. Skipped
+# (and says so) where it isn't: the builder image's CI run mounts the
+# checkout read-only and builds only this package.
+[[test]]
+fn test_real_ritz_lsp_overlay_hover_and_definition() -> i32
+    let here: String = match cwd()
+        Ok(d) => d
+        Err(_) => return 0
+    let server = file_in(@here, "../ritz-lsp/build/debug/ritz-lsp")
+    let ritz1 = file_in(@here, "../ritz/ritz1/build/ritz1_selfhosted")
+    if not path_exists(server.as_view()) or not path_exists(ritz1.as_view())
+        prints("test_real_ritz_lsp_overlay_hover_and_definition: skipped, no ritz-lsp or ritz1_selfhosted built\n")
+        return 0
+    let dir = setup("real", "", SOURCE)
+    let cfg = lang_config(server.as_view(), ritz1.as_view())
+    let src = file_in(@dir, "a.ritz")
+    var c: Child = match spawn_editor(src.as_view(), @cfg)
+        Some(k) => k
+        None => return 0
+    assert c.shows(4, "helper()")
+    # A call to a function nobody declared: ritz1's error, overlaid, unasked.
+    assert c.send("Go    undeclared_fn()\e")
+    assert c.expect(ERROR_SGR)
+    assert c.send("u")
+    assert c.shows(STATUS_ROW, " 5:")
+    # Hover and definition on the call to helper (line 5).
+    assert c.send("ggjjjj0w")
+    assert c.shows(STATUS_ROW, " 5:5 ")
+    assert c.send("K")
+    assert c.shows(MESSAGE_ROW, "fn helper() -> i32")
+    assert c.send("gd")
+    assert c.shows(STATUS_ROW, " 1:4 ")
+    assert c.send("\x14")                          # Ctrl-T: back
+    assert c.shows(STATUS_ROW, " 5:5 ")
+    assert c.send(":q!\r")
+    let code = c.wait_exit(WAIT_MS)
+    assert code.unwrap_or(-1) == 0
+    assert c.restored()
+    c.close()
+    let gone = remove_dir_all(dir.as_view())
+    0

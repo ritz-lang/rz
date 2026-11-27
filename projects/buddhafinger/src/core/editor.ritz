@@ -12,6 +12,12 @@
 #   Undo          u Ctrl-R; an Insert session is one undo step
 #   Search        / (a literal pattern), n N
 #   Command line  :w  :w <path>  :q  :q!  :wq  :e <path>  :<line>
+#   Language      K (hover), gd (go to definition), Ctrl-O / Ctrl-T (jump back)
+#
+# K and gd only raise a request (take_ask): the event loop asks the language
+# server and, for gd, calls jump_to with the answer. Each jump_to pushes
+# where the cursor was, and Ctrl-O or Ctrl-T goes back there, reopening the
+# file it was in.
 #
 # Files go through the FileStore seam (core/files.ritz), so the core does no
 # I/O. The event loop renders through core.screen, using Editor as the
@@ -43,6 +49,23 @@ import core.utf8 { utf8_encode, utf8_next, utf8_prev }
 pub const MSG_NOT_SAVED: StrView = "E37: No write since last change (add ! to override)"
 pub const MSG_NO_NAME: StrView = "E32: No file name"
 pub const MSG_NO_PATTERN: StrView = "No previous search pattern"
+pub const MSG_NO_JUMP: StrView = "E73: Tag stack empty"
+
+# The most jumps kept for Ctrl-O / Ctrl-T; the oldest go first.
+pub const MAX_JUMPS: i64 = 100
+
+# What the user asked the language server for (K, gd); the loop takes it.
+pub enum LangAsk
+    Nothing
+    Hover
+    Definition
+
+# Where a jump left from: a file (jump_paths[path_at .. path_at + path_len])
+# and the cursor in it.
+struct Jump
+    path_at: i64
+    path_len: i64
+    at: Pos
 
 pub struct Editor
     buf: Buffer
@@ -60,6 +83,9 @@ pub struct Editor
     message: String         # the message line
     quit: bool
     revisions: i64          # text revisions of the buffers before this one (text_revision)
+    ask: LangAsk            # K or gd, until the loop takes it
+    jumps: Vec<Jump>        # where each jump_to left from, oldest first
+    jump_paths: Vec<u8>     # their file names, back to back
 
 pub fn editor_new() -> Editor
     editor_with(string_new(), buffer_new())
@@ -69,7 +95,7 @@ pub fn editor_open(path: StrView, data: [u8]) -> Editor
     editor_with(string_from(path), buffer_from_bytes(data))
 
 fn editor_with(path: String, buf: Buffer) -> Editor
-    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), pending: 0, message: string_new(), quit: false, revisions: 0 }
+    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), pending: 0, message: string_new(), quit: false, revisions: 0, ask: LangAsk.Nothing, jumps: vec_new<Jump>(), jump_paths: vec_new<u8>() }
 
 # ============================================================================
 # Characters and columns
@@ -193,7 +219,7 @@ impl Editor
         self.shown() - 1
 
     pub fn status(self: @Editor) -> Status
-        Status { name: self.path.as_view(), dirty: self.buf.is_dirty(), mode: self.mode }
+        Status { name: self.path.as_view(), dirty: self.buf.is_dirty(), mode: self.mode, lang: "" }
 
     # A count that goes up with every change to the text, a new buffer from
     # `:e` included, and never otherwise (Buffer.revision across buffers).
@@ -557,7 +583,12 @@ impl Editor
 pub fn handle_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
     ed.message.clear()
     match ed.mode
-        Mode.Normal => normal_key(ed, key)
+        Mode.Normal =>
+            if key.eq(Key.Ctrl('o')) or key.eq(Key.Ctrl('t'))
+                ed.pending = 0
+                jump_back<F>(ed, files)
+            else
+                normal_key(ed, key)
         Mode.Insert => ed.insert_key(key)
         Mode.CommandLine => command_line_key<F>(ed, files, key)
 
@@ -566,6 +597,9 @@ fn normal_key(ed: @&Editor, key: Key)
     # The second key of gg, dd or yy; any other drops the first and acts alone.
     let first = ed.pending
     ed.pending = 0
+    if first == 'g' and c == 'd'
+        ed.ask = LangAsk.Definition
+        return
     if first != 0 and c == first
         if c == 'g'
             ed.place_line(0)
@@ -636,6 +670,8 @@ fn normal_char(ed: @&Editor, c: u8)
         ed.search(false)
     else if c == ':' or c == '/'
         ed.open_command_line(c)
+    else if c == 'K'
+        ed.ask = LangAsk.Hover
 
 fn command_line_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
     match key
@@ -690,7 +726,8 @@ fn run_command<F: FileStore>(ed: @&Editor, files: @&F, text: StrView)
                 else
                     ed.quit = true
             Command.ForceQuit => ed.quit = true
-            Command.Edit(p) => edit<F>(ed, files, p)
+            Command.Edit(p) =>
+                let opened = edit<F>(ed, files, p)
         None =>
             var msg = string_from("E492: Not an editor command: ")
             msg.push_str(text)
@@ -726,13 +763,14 @@ fn write<F: FileStore>(ed: @&Editor, files: @&F, path: StrView, own: bool) -> bo
 
 # `:e path`: replace the buffer with the file, refused with pending edits.
 # A missing file opens empty under its name.
-fn edit<F: FileStore>(ed: @&Editor, files: @&F, path: StrView)
+# True when the file is now the buffer.
+fn edit<F: FileStore>(ed: @&Editor, files: @&F, path: StrView) -> bool
     if path.is_empty()
         ed.say(MSG_NO_NAME)
-        return
+        return false
     if ed.buf.is_dirty()
         ed.say(MSG_NOT_SAVED)
-        return
+        return false
     match files.load(path)
         Ok(bytes) =>
             ed.replace_buffer(buffer_from_bytes(span_from_vec<u8>(@bytes)))
@@ -747,8 +785,94 @@ fn edit<F: FileStore>(ed: @&Editor, files: @&F, path: StrView)
                     var what = string_from(": ")
                     what.push_str(errno.message())
                     ed.say_about(path, what.as_view())
-                    return
+                    return false
     ed.path.clear()
     ed.path.push_str(path)
     ed.top = 0
     ed.place(pos(0, 0))
+    true
+
+# ============================================================================
+# Jumps (go to definition and back)
+# ============================================================================
+
+impl Editor
+    # K or gd since the last call, cleared.
+    pub fn take_ask(self: @&Editor) -> LangAsk
+        let a = self.ask
+        self.ask = LangAsk.Nothing
+        a
+
+    # How many jumps Ctrl-O / Ctrl-T can go back.
+    pub fn jump_depth(self: @Editor) -> i64
+        self.jumps.len()
+
+    # Remember the cursor and file, to come back to. pub only for the
+    # generic jump_to<F> (see say()).
+    pub fn push_jump(self: @&Editor)
+        if self.jumps.len() >= MAX_JUMPS
+            # Drop the oldest: its name leaves the front of the pool.
+            let old = self.jumps.get(0)
+            var kept: Vec<Jump> = vec_with_cap<Jump>(MAX_JUMPS)
+            for i in 1..self.jumps.len()
+                var j = self.jumps.get(i)
+                j.path_at -= old.path_len
+                kept.push(j)
+            self.jumps = kept
+            let all: [u8] = self.jump_paths[0..self.jump_paths.len()]
+            let rest = all.len - old.path_len
+            all[0..rest].copy_from(all[old.path_len..all.len])
+            while self.jump_paths.len() > rest
+                self.jump_paths.pop()
+        let at = self.jump_paths.len()
+        self.jump_paths.push_view(self.path.as_view())
+        self.jumps.push(Jump { path_at: at, path_len: self.path.len(), at: self.cursor })
+
+    # The newest jump, taken off: its file name and cursor. pub only for
+    # the generic jump_back<F>.
+    pub fn pop_jump(self: @&Editor) -> Option<JumpBack>
+        if self.jumps.is_empty()
+            return None
+        let j = self.jumps.pop()
+        let all: [u8] = self.jump_paths[j.path_at..j.path_at + j.path_len]
+        let back = JumpBack { path: string_from(all.as_strview()), at: j.at }
+        while self.jump_paths.len() > j.path_at
+            self.jump_paths.pop()
+        Some(back)
+
+    # Put back a jump pop_jump gave, as it was. pub for jump_back<F>.
+    pub fn restore_jump(self: @&Editor, j: @JumpBack)
+        let at = self.jump_paths.len()
+        self.jump_paths.push_view(j.path.as_view())
+        self.jumps.push(Jump { path_at: at, path_len: j.path.len(), at: j.at })
+
+# A jump taken off the stack (Editor.pop_jump).
+pub struct JumpBack
+    path: String
+    at: Pos
+
+# Go to `at` in the file `path` (this buffer's when it names it),
+# remembering where the cursor was for Ctrl-O / Ctrl-T. Another file is
+# opened as `:e` would, so pending edits refuse it (E37). True when there.
+pub fn jump_to<F: FileStore>(ed: @&Editor, files: @&F, path: StrView, at: Pos) -> bool
+    ed.push_jump()
+    if not ed.path.as_view().eq(path)
+        if not edit<F>(ed, files, path)
+            let dropped = ed.pop_jump()
+            return false
+    ed.place(at)
+    true
+
+# Ctrl-O / Ctrl-T: back to where the last jump_to left from. A file that
+# can't be reopened (pending edits) keeps the jump for another try.
+fn jump_back<F: FileStore>(ed: @&Editor, files: @&F)
+    let j: JumpBack = match ed.pop_jump()
+        Some(b) => b
+        None =>
+            ed.say(MSG_NO_JUMP)
+            return
+    if not ed.path.as_view().eq(j.path.as_view())
+        if not edit<F>(ed, files, j.path.as_view())
+            ed.restore_jump(@j)
+            return
+    ed.place(j.at)

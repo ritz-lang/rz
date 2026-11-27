@@ -1,0 +1,645 @@
+# lsp/client.ritz - the language client: what Buddhafinger says to ritz-lsp
+# and what it makes of the answers (AGAST #4828).
+#
+# docs/BUDDHAFINGER_PROPOSAL.md, "ritz-lsp". No I/O: the bytes to send wait
+# in `out` (lsp/wire.ritz's Outbox) and the bytes read go into `reader`;
+# platform/lsp.ritz moves them. Time comes in as `now` (milliseconds).
+#
+# What the server does (projects/ritz-lsp): stdio JSON-RPC, full-text sync,
+# UTF-16 positions, hover and definition. Its diagnostics carry the version
+# they were compiled for, and it publishes them whenever its stdin goes
+# idle, so the client never asks for them: a probe request would force a
+# compile.
+#
+#   - Start: `initialize`, then on its answer `initialized` and the
+#     capabilities (Reply.Ready). Nothing else goes before the answer.
+#   - Sync: the document's version is the editor's text revision. Each turn
+#     the loop asks wants_text(uri, revision, size); when it says yes it
+#     builds the text and calls send_text. A didChange that hasn't started
+#     is replaced by the next (Outbox coalescing); didOpen and didClose keep
+#     their place. Above SYNC_LIMIT_BYTES the document is closed on the
+#     server instead (sync suspended) until it shrinks again.
+#   - Requests: hover and definition, each tied to the revision it was asked
+#     at. An answer for an older revision, or for a request since replaced,
+#     is dropped; one that doesn't come in REQUEST_TIMEOUT_MS is
+#     Reply.TimedOut.
+#   - Diagnostics: kept with their version, and shown (diagnostics()) only
+#     while that version is the current revision.
+
+import ritzlib.gvec
+import ritzlib.json { Json, json_parse, json_emit_string, json_emit_bytes }
+import ritzlib.option
+import ritzlib.result { Result }
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string
+
+import lsp.wire { Framed, FrameReader, Outbox, frame_reader, outbox_new }
+
+# Documents above this many bytes are not synced (see platform/lsp.ritz's
+# header for the measurement it comes from).
+pub const SYNC_LIMIT_BYTES: i64 = 1048576             # 1 MiB
+
+# The outbox's cap: one snapshot in flight and one waiting, plus requests.
+pub const QUEUE_CAP_BYTES: i64 = 2 * SYNC_LIMIT_BYTES + 65536
+
+# How long the server has to answer `initialize`, and then each request.
+pub const INIT_TIMEOUT_MS: i64 = 10000
+pub const REQUEST_TIMEOUT_MS: i64 = 5000
+
+# The most diagnostics kept for one version; the rest are dropped.
+pub const MAX_DIAGNOSTICS: i64 = 1000
+
+pub enum Phase
+    Starting            # initialize sent, not answered
+    Ready
+    Ended               # initialize timed out, or the server failed it
+
+pub enum AskKind
+    Hover
+    Definition
+
+# Why ask() sent nothing.
+pub enum Refused
+    NotReady            # the server hasn't answered initialize (or is gone)
+    NotOpen             # no document on the server: not a Ritz file, or sync suspended
+    Unsupported         # the server didn't advertise it
+    Busy                # the outbox is full
+
+# What a message from the server, or a timeout, means to the editor.
+pub enum Reply
+    Nothing             # nothing to show: a notification it doesn't use, a stale answer
+    Ready               # initialize answered: capabilities known
+    Diagnostics         # a new list for the current revision
+    Hover               # hover_text() is the answer
+    NoHover
+    Definition          # target_uri(), target_line, target_char
+    NoDefinition
+    Failed(AskKind)     # the server answered with an error: error_text()
+    TimedOut(AskKind)
+    InitFailed          # initialize timed out or failed: the session is over
+
+impl Reply
+    # Reply.Nothing: nothing came of it.
+    pub fn is_nothing(self: @Reply) -> bool
+        match *self
+            Reply.Nothing => true
+            _ => false
+
+# An outstanding request; id 0 is none.
+struct Ask
+    id: i64
+    revision: i64
+    deadline: i64
+
+fn no_ask() -> Ask
+    Ask { id: 0, revision: 0, deadline: 0 }
+
+# One diagnostic: a range in UTF-16 positions, its severity (1 error ..
+# 4 hint) and its message, text[msg_at .. msg_at + msg_len] of the pool.
+pub struct Diag
+    line: i64
+    start: i64
+    end_line: i64
+    end: i64
+    severity: i64
+    msg_at: i64
+    msg_len: i64
+
+pub struct Client
+    out: Outbox
+    reader: FrameReader
+    phase: Phase
+    next_id: i64
+    init_id: i64
+    init_deadline: i64
+    hover_ok: bool              # the server's capabilities
+    definition_ok: bool
+    sync_ok: bool
+    doc: String                 # the editor's document's uri; empty: not a Ritz file
+    open: bool                  # `doc` is open on the server
+    synced: i64                 # the revision last queued for it
+    suspended: bool             # `doc` is over SYNC_LIMIT_BYTES
+    hover: Ask
+    definition: Ask
+    diags: Vec<Diag>
+    diag_text: Vec<u8>
+    diag_version: i64           # the revision `diags` are for; -1: none
+    hover_text: String
+    target: String
+    target_line: i64
+    target_char: i64
+    error: String
+    stale: i64                  # answers and diagnostics dropped as outdated
+    json: Vec<u8>               # the message being built
+
+pub fn client_new() -> Client
+    Client { out: outbox_new(QUEUE_CAP_BYTES), reader: frame_reader(), phase: Phase.Starting, next_id: 1, init_id: 0, init_deadline: 0, hover_ok: false, definition_ok: false, sync_ok: false, doc: string_new(), open: false, synced: -1, suspended: false, hover: no_ask(), definition: no_ask(), diags: vec_new<Diag>(), diag_text: vec_new<u8>(), diag_version: -1, hover_text: string_new(), target: string_new(), target_line: 0, target_char: 0, error: string_new(), stale: 0, json: vec_new<u8>() }
+
+# ============================================================================
+# JSON reading helpers
+# ============================================================================
+
+fn field(v: @Json, key: StrView) -> Option<@Json>
+    v.get_field(key)
+
+fn number_of(v: Option<@Json>, otherwise: i64) -> i64
+    match v
+        Some(j) =>
+            let r: @Json = j
+            match r.get_number()
+                Some(n) => n
+                None => otherwise
+        None => otherwise
+
+fn string_of(v: Option<@Json>) -> StrView
+    match v
+        Some(j) =>
+            let r: @Json = j
+            match r.get_string()
+                Some(s) => s
+                None => ""
+        None => ""
+
+# A server capability: `true`, or an options object.
+fn provided(v: Option<@Json>) -> bool
+    match v
+        Some(j) =>
+            let r: @Json = j
+            match r.get_bool()
+                Some(b) => b
+                None => not r.is_null()
+        None => false
+
+# textDocumentSync: a kind (0 none, 1 full, 2 incremental) or an object
+# with `change`. Any kind but none takes full-text changes.
+fn syncs(v: Option<@Json>) -> bool
+    match v
+        Some(j) =>
+            let r: @Json = j
+            match r.get_number()
+                Some(k) => k != 0
+                None => number_of(r.get_field("change"), 0) != 0 or provided(r.get_field("openClose"))
+        None => false
+
+# The first line of hover contents worth a message line: not a code fence,
+# not blank, trimmed.
+fn first_line(text: StrView) -> StrView
+    var at: i64 = 0
+    while at < text.len()
+        var stop = at + text.slice(at, text.len()).find("\n")
+        if stop > text.len()
+            stop = text.len()
+        let line = text.slice(at, stop).trim()
+        if not line.is_empty() and not line.starts_with("```")
+            return line
+        at = stop + 1
+    ""
+
+# Hover contents: MarkupContent, a MarkedString (a string or
+# {language, value}) or an array of them, the first taken.
+fn hover_value(c: @Json) -> StrView
+    match c.get_string()
+        Some(s) => return s
+        None => pass
+    match c.get_field("value")
+        Some(v) => return string_of(Some(v))
+        None => pass
+    match c.get_index(0)
+        Some(first) =>
+            let f: @Json = first
+            match f.get_string()
+                Some(s) => s
+                None => string_of(f.get_field("value"))
+        None => ""
+
+# ============================================================================
+# Building messages
+# ============================================================================
+
+impl Client
+    fn begin(self: @&Client, method: StrView)
+        self.json.clear()
+        self.json.push_view("{\"jsonrpc\":\"2.0\",\"method\":\"")
+        self.json.push_view(method)
+        self.json.push_view("\"")
+
+    fn begin_request(self: @&Client, method: StrView) -> i64
+        let id = self.next_id
+        self.next_id += 1
+        self.begin(method)
+        self.json.push_view(",\"id\":")
+        self.json.push_view(string_from_i64(id).as_view())
+        id
+
+    # `,"params":{"textDocument":{"uri":...` without closing either object.
+    fn doc_params(self: @&Client)
+        self.json.push_view(",\"params\":{\"textDocument\":{\"uri\":")
+        json_emit_string(self.doc.as_view(), @&self.json)
+
+    fn body(self: @Client) -> [u8]
+        self.json[0..self.json.len()]
+
+    fn drop_diagnostics(self: @&Client)
+        self.diags.clear()
+        self.diag_text.clear()
+        self.diag_version = -1
+
+    # ------------------------------------------------------------------
+    # Start
+    # ------------------------------------------------------------------
+
+    # Queue `initialize` for a client in process `pid`.
+    pub fn start(self: @&Client, pid: i64, now: i64)
+        self.init_id = self.begin_request("initialize")
+        self.json.push_view(",\"params\":{\"processId\":")
+        self.json.push_view(string_from_i64(pid).as_view())
+        self.json.push_view(",\"clientInfo\":{\"name\":\"buddhafinger\"},\"rootUri\":null,\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\"]},\"textDocument\":{\"synchronization\":{\"dynamicRegistration\":false},\"hover\":{\"contentFormat\":[\"plaintext\",\"markdown\"]},\"definition\":{\"linkSupport\":false},\"publishDiagnostics\":{\"versionSupport\":true}}}}}")
+        let queued = self.out.push_ordered(self.body())      # an empty queue: fits
+        self.phase = Phase.Starting
+        self.init_deadline = now + INIT_TIMEOUT_MS
+
+    pub fn ready(self: @Client) -> bool
+        self.phase == Phase.Ready
+
+    # ------------------------------------------------------------------
+    # Sync
+    # ------------------------------------------------------------------
+
+    # The editor shows document `uri` ("" when it isn't a Ritz file) at
+    # `revision`, `size` bytes long. Queues didClose when the document
+    # changed or grew past SYNC_LIMIT_BYTES. True when the server needs the
+    # text now: build it and call send_text.
+    pub fn wants_text(self: @&Client, uri: StrView, revision: i64, size: i64) -> bool
+        if self.phase != Phase.Ready or not self.sync_ok
+            return false
+        if not self.doc.as_view().eq(uri)
+            self.close_doc()
+            self.doc.clear()
+            self.doc.push_str(uri)
+            self.synced = -1
+            self.suspended = false
+        if uri.is_empty()
+            return false
+        if size > SYNC_LIMIT_BYTES
+            if not self.suspended
+                self.close_doc()
+                self.suspended = true
+            return false
+        self.suspended = false
+        if self.open and self.synced == revision
+            return false
+        # Don't build a text the queue can't take yet: the server is behind.
+        self.out.snapshot_fits(size + size / 8 + 512)
+
+    # The document's text at `revision`, as wants_text asked for. False if
+    # the queue couldn't take it (wants_text asks again next turn).
+    pub fn send_text(self: @&Client, revision: i64, text: [u8]) -> bool
+        let opening = not self.open
+        if opening
+            self.begin("textDocument/didOpen")
+            self.doc_params()
+            self.json.push_view(",\"languageId\":\"ritz\",\"version\":")
+            self.json.push_view(string_from_i64(revision).as_view())
+            self.json.push_view(",\"text\":")
+            json_emit_bytes(text, @&self.json)
+            self.json.push_view("}}}")
+        else
+            self.begin("textDocument/didChange")
+            self.doc_params()
+            self.json.push_view(",\"version\":")
+            self.json.push_view(string_from_i64(revision).as_view())
+            self.json.push_view("},\"contentChanges\":[{\"text\":")
+            json_emit_bytes(text, @&self.json)
+            self.json.push_view("}]}}")
+        let queued = if opening then self.out.push_ordered(self.body()) else self.out.push_snapshot(self.body())
+        if queued.is_err()
+            return false
+        self.open = true
+        self.synced = revision
+        true
+
+    # didClose for the open document; its diagnostics go with it.
+    fn close_doc(self: @&Client)
+        self.drop_diagnostics()
+        if not self.open
+            return
+        self.begin("textDocument/didClose")
+        self.doc_params()
+        self.json.push_view("}}}")
+        let queued = self.out.push_ordered(self.body())
+        self.open = false
+
+    pub fn sync_suspended(self: @Client) -> bool
+        self.suspended
+
+    # ------------------------------------------------------------------
+    # Requests
+    # ------------------------------------------------------------------
+
+    # Ask for hover or definition at (line, UTF-16 char) of the document at
+    # `revision`. A request of the same kind still out is forgotten.
+    pub fn ask(self: @&Client, kind: AskKind, revision: i64, line: i64, ch: i64, now: i64) -> Result<(), Refused>
+        if self.phase != Phase.Ready
+            return Err(Refused.NotReady)
+        let supported = match kind
+            AskKind.Hover => self.hover_ok
+            AskKind.Definition => self.definition_ok
+        if not supported
+            return Err(Refused.Unsupported)
+        if not self.open or self.suspended
+            return Err(Refused.NotOpen)
+        let method: StrView = match kind
+            AskKind.Hover => "textDocument/hover"
+            AskKind.Definition => "textDocument/definition"
+        let saved_id = self.next_id
+        let id = self.begin_request(method)
+        self.doc_params()
+        self.json.push_view("},\"position\":{\"line\":")
+        self.json.push_view(string_from_i64(line).as_view())
+        self.json.push_view(",\"character\":")
+        self.json.push_view(string_from_i64(ch).as_view())
+        self.json.push_view("}}}")
+        if self.out.push(self.body()).is_err()
+            self.next_id = saved_id
+            return Err(Refused.Busy)
+        let a = Ask { id: id, revision: revision, deadline: now + REQUEST_TIMEOUT_MS }
+        match kind
+            AskKind.Hover => self.hover = a
+            AskKind.Definition => self.definition = a
+        Ok(())
+
+    # The earliest deadline to wake up for, if anything is waiting.
+    pub fn deadline(self: @Client) -> Option<i64>
+        var at: i64 = -1
+        if self.phase == Phase.Starting
+            at = self.init_deadline
+        if self.hover.id != 0 and (at < 0 or self.hover.deadline < at)
+            at = self.hover.deadline
+        if self.definition.id != 0 and (at < 0 or self.definition.deadline < at)
+            at = self.definition.deadline
+        if at < 0 then None else Some(at)
+
+    # What ran out of time by `now`, one at a time: Reply.Nothing when
+    # nothing did.
+    pub fn expire(self: @&Client, now: i64) -> Reply
+        if self.phase == Phase.Starting and now >= self.init_deadline
+            self.phase = Phase.Ended
+            self.error.clear()
+            self.error.push_str("no answer to initialize")
+            return Reply.InitFailed
+        if self.hover.id != 0 and now >= self.hover.deadline
+            self.hover = no_ask()
+            return Reply.TimedOut(AskKind.Hover)
+        if self.definition.id != 0 and now >= self.definition.deadline
+            self.definition = no_ask()
+            return Reply.TimedOut(AskKind.Definition)
+        Reply.Nothing
+
+    # ------------------------------------------------------------------
+    # Answers
+    # ------------------------------------------------------------------
+
+    # The next whole message read, applied: Some(what it means), or None
+    # when no whole message is buffered. Err(()) when the stream is not
+    # LSP framing: the session can't go on.
+    pub fn next_reply(self: @&Client, revision: i64) -> Result<Option<Reply>, ()>
+        match self.reader.next()
+            Framed.Message(m) => Ok(Some(self.receive(m, revision)))
+            Framed.Partial => Ok(None)
+            Framed.Bad => Err(())
+
+    # One message from the server, the editor's text at `revision`.
+    pub fn receive(self: @&Client, text: StrView, revision: i64) -> Reply
+        let msg: Json = match json_parse(text)
+            Ok(j) => j
+            Err(_) => return Reply.Nothing
+        let id = number_of(msg.get_field("id"), -1)
+        let method = string_of(msg.get_field("method"))
+        if not method.is_empty()
+            if method.eq("textDocument/publishDiagnostics")
+                match msg.get_field("params")
+                    Some(p) => return self.take_diagnostics(p, revision)
+                    None => return Reply.Nothing
+            if id >= 0
+                # A request from the server (registerCapability and the
+                # like): answered, with nothing.
+                self.json.clear()
+                self.json.push_view("{\"jsonrpc\":\"2.0\",\"id\":")
+                self.json.push_view(string_from_i64(id).as_view())
+                self.json.push_view(",\"result\":null}")
+                let queued = self.out.push_ordered(self.body())
+            return Reply.Nothing
+        if id < 0
+            return Reply.Nothing
+        let failed = msg.get_field("error").is_some()
+        if id == self.init_id and self.phase == Phase.Starting
+            if failed
+                self.phase = Phase.Ended
+                self.error.clear()
+                self.error.push_str(string_of(error_message(@msg)))
+                return Reply.InitFailed
+            match msg.get_field("result")
+                Some(r) =>
+                    let res: @Json = r
+                    match res.get_field("capabilities")
+                        Some(caps) => self.take_capabilities(caps)
+                        None => pass
+                None => pass
+            self.begin("initialized")
+            self.json.push_view(",\"params\":{}}")
+            let queued = self.out.push_ordered(self.body())
+            self.phase = Phase.Ready
+            return Reply.Ready
+        if id == self.hover.id
+            let asked = self.hover.revision
+            self.hover = no_ask()
+            if asked != revision
+                self.stale += 1
+                return Reply.Nothing
+            if failed
+                return self.fail(AskKind.Hover, @msg)
+            return self.take_hover(@msg)
+        if id == self.definition.id
+            let asked = self.definition.revision
+            self.definition = no_ask()
+            if asked != revision
+                self.stale += 1
+                return Reply.Nothing
+            if failed
+                return self.fail(AskKind.Definition, @msg)
+            return self.take_definition(@msg)
+        self.stale += 1                 # a request since replaced, or never made
+        Reply.Nothing
+
+    fn fail(self: @&Client, kind: AskKind, msg: @Json) -> Reply
+        self.error.clear()
+        self.error.push_str(string_of(error_message(msg)))
+        Reply.Failed(kind)
+
+    fn take_capabilities(self: @&Client, caps: @Json)
+        self.hover_ok = provided(caps.get_field("hoverProvider"))
+        self.definition_ok = provided(caps.get_field("definitionProvider"))
+        self.sync_ok = syncs(caps.get_field("textDocumentSync"))
+
+    fn take_hover(self: @&Client, msg: @Json) -> Reply
+        self.hover_text.clear()
+        let r: @Json = match msg.get_field("result")
+            Some(v) => v
+            None => return Reply.NoHover
+        let contents: @Json = match r.get_field("contents")
+            Some(c) => c
+            None => return Reply.NoHover
+        let line = first_line(hover_value(contents))
+        if line.is_empty()
+            return Reply.NoHover
+        self.hover_text.push_str(line)
+        Reply.Hover
+
+    fn take_definition(self: @&Client, msg: @Json) -> Reply
+        let r: @Json = match msg.get_field("result")
+            Some(v) => v
+            None => return Reply.NoDefinition
+        # A Location, or an array of Locations or LocationLinks: the first.
+        var loc: @Json = r
+        match r.get_index(0)
+            Some(first) => loc = first
+            None =>
+                if r.array_len() == 0 and r.get_field("uri").is_none()
+                    return Reply.NoDefinition
+        var uri = string_of(loc.get_field("uri"))
+        var range = loc.get_field("range")
+        if uri.is_empty()
+            uri = string_of(loc.get_field("targetUri"))
+            range = loc.get_field("targetSelectionRange")
+        if uri.is_empty()
+            return Reply.NoDefinition
+        let rg: @Json = match range
+            Some(v) => v
+            None => return Reply.NoDefinition
+        let start: @Json = match rg.get_field("start")
+            Some(v) => v
+            None => return Reply.NoDefinition
+        self.target.clear()
+        self.target.push_str(uri)
+        self.target_line = number_of(start.get_field("line"), 0)
+        self.target_char = number_of(start.get_field("character"), 0)
+        Reply.Definition
+
+    fn take_diagnostics(self: @&Client, p: @Json, revision: i64) -> Reply
+        if not self.open or not string_of(p.get_field("uri")).eq(self.doc.as_view())
+            return Reply.Nothing
+        let version = number_of(p.get_field("version"), -1)
+        if version != revision
+            # Compiled for text the editor no longer has (or unversioned).
+            self.stale += 1
+            if version < 0
+                self.drop_diagnostics()
+                return Reply.Diagnostics
+            return Reply.Nothing
+        self.drop_diagnostics()
+        self.diag_version = version
+        let list: @Json = match p.get_field("diagnostics")
+            Some(l) => l
+            None => return Reply.Diagnostics
+        var i: i64 = 0
+        while i < list.array_len() and i < MAX_DIAGNOSTICS
+            match list.get_index(i)
+                Some(d) => self.take_diagnostic(d)
+                None => pass
+            i += 1
+        Reply.Diagnostics
+
+    fn take_diagnostic(self: @&Client, d: @Json)
+        let range: @Json = match d.get_field("range")
+            Some(r) => r
+            None => return
+        let s: @Json = match range.get_field("start")
+            Some(v) => v
+            None => return
+        let e: @Json = match range.get_field("end")
+            Some(v) => v
+            None => s
+        let message = string_of(d.get_field("message"))
+        let at = self.diag_text.len()
+        self.diag_text.push_view(message)
+        self.diags.push(Diag { line: number_of(s.get_field("line"), 0), start: number_of(s.get_field("character"), 0), end_line: number_of(e.get_field("line"), 0), end: number_of(e.get_field("character"), 0), severity: number_of(d.get_field("severity"), 1), msg_at: at, msg_len: message.len() })
+
+    # ------------------------------------------------------------------
+    # What the editor reads
+    # ------------------------------------------------------------------
+
+    # The diagnostics for the text at `revision`: none unless the server's
+    # latest list was compiled for exactly that revision.
+    pub fn diagnostics(self: @Client, revision: i64) -> [Diag]
+        if self.diag_version != revision or not self.open
+            return span_from_vec<Diag>(@self.diags).slice(0, 0)
+        span_from_vec<Diag>(@self.diags)
+
+    pub fn message_of(self: @Client, d: Diag) -> StrView
+        let all: [u8] = self.diag_text[0..self.diag_text.len()]
+        all.slice(d.msg_at, d.msg_at + d.msg_len).as_strview()
+
+    pub fn hover_text(self: @Client) -> StrView
+        self.hover_text.as_view()
+
+    pub fn target_uri(self: @Client) -> StrView
+        self.target.as_view()
+
+    pub fn error_text(self: @Client) -> StrView
+        self.error.as_view()
+
+# An error response's message.
+fn error_message(msg: @Json) -> Option<@Json>
+    match msg.get_field("error")
+        Some(e) =>
+            let err: @Json = e
+            err.get_field("message")
+        None => None
+
+# ============================================================================
+# file:// uris
+# ============================================================================
+
+fn hex_digit(d: u8) -> u8
+    if d < 10 then '0' + d else 'A' + d - 10
+
+fn hex_value(c: u8) -> i64
+    if c >= '0' and c <= '9'
+        return (c - '0') as i64
+    if c >= 'a' and c <= 'f'
+        return (c - 'a' + 10) as i64
+    if c >= 'A' and c <= 'F'
+        return (c - 'A' + 10) as i64
+    -1
+
+# The file:// uri of absolute path `path`: RFC 3986's unreserved bytes and
+# `/` as they are, every other byte %XX (as ritz-lsp's paths.ritz decodes).
+pub fn uri_of_path(path: StrView) -> String
+    var out = string_from("file://")
+    for i in 0..path.len()
+        let c = path.get(i)
+        let plain = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '.' or c == '_' or c == '~' or c == '/'
+        if plain
+            out.push(c)
+        else
+            out.push('%')
+            out.push(hex_digit(c >> 4))
+            out.push(hex_digit(c & 15))
+    out
+
+# The path of a file:// uri, %XX decoded; None for any other uri.
+pub fn path_of_uri(uri: StrView) -> Option<String>
+    if not uri.starts_with("file://")
+        return None
+    var out = string_new()
+    var i: i64 = 7
+    while i < uri.len()
+        let c = uri.get(i)
+        if c == '%' and i + 2 < uri.len() and hex_value(uri.get(i + 1)) >= 0 and hex_value(uri.get(i + 2)) >= 0
+            out.push((hex_value(uri.get(i + 1)) * 16 + hex_value(uri.get(i + 2))) as u8)
+            i += 3
+        else
+            out.push(c)
+            i += 1
+    Some(out)
