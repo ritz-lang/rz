@@ -1,0 +1,84 @@
+# udp-echo: send every UDP datagram on a port back to its sender (AGAST
+# #4768)
+#
+# harland docs/RING2_NET.md "Ring-3 tools" and "Rollout": the app end of
+# the UDP round trip tools/net_latency.sh times. NetAttach, ShmMap and
+# NetAddr (net_attach), libnet's net_bind on the port (UDP_ECHO_PORT, 7,
+# when no argument is given: the kernel spawns it with none), then forever:
+# net_recv_from, and net_send_to of the same bytes to the peer's address
+# and port. It parks in ShmWait between datagrams (wait_data) rather than
+# yielding, and prints nothing per datagram, so a round trip costs only the
+# path's switches and syscalls. It runs until it is killed (the kernel
+# reaps it when its window closes) or a call fails.
+
+import ritzlib.span { Span }
+import ritzlib.strview { StrView }
+import libnet.client { NetExchange, BindResult, RecvResult, SendResult, ERRNO_BADF }
+import libnet.ring { AppBytes, app_req_ring, app_ev_ring }
+import net_attach { wake_service, wait_data, net_attach, link_mtu, parse_port, wait_round, usage_error }
+import net_tool { fail }
+
+# The echo protocol's port (RFC 862), and the one the kernel's latency
+# window expects.
+pub const UDP_ECHO_PORT: u16 = 7
+
+# How long one park lasts before udp-echo looks again on its own. A wake
+# comes with every datagram; this only bounds a lost one.
+const ECHO_WAIT_MS: u64 = 1000
+
+# The attachment: a global, since NetExchange is over 1 MiB (libnet's
+# NetExchange.init comment).
+var g_exchange: NetExchange
+
+pub fn main(args: Span<StrView>) -> i32
+    let usage: StrView = "Usage: udp-echo [port]\n"
+    var port: u16 = UDP_ECHO_PORT
+    if args.len == 2
+        let arg: StrView = args.get(1)
+        if arg.eq("--help") or arg.eq("-h")
+            print("{usage}")
+            return 0
+        port = match parse_port(arg)
+            Some(p) => p
+            None => return usage_error(usage)
+    else if args.len > 2
+        return usage_error(usage)
+
+    var exchange: u64 = 0
+    match net_attach()
+        Ok(a) =>
+            g_exchange.init(app_req_ring(a.region), app_ev_ring(a.region))
+            exchange = a.handle
+        Err(e) => return fail("udp-echo", e.call, e.errno)
+
+    var handle: u32 = 0
+    loop
+        let r = g_exchange.net_bind(port)
+        wake_service(exchange, g_exchange.take_published())
+        match r
+            BindResult.Bound(h) =>
+                handle = h
+                break
+            BindResult.Err(e) => return fail("udp-echo", "net_bind", e)
+            BindResult.Pending => wait_data(exchange, ECHO_WAIT_MS)
+
+    # NetInfo's MTU once, not a syscall per datagram: the link does not
+    # change inside a measured window.
+    let mtu: Option<u32> = link_mtu()
+    var payload: AppBytes = [0; 2048]     # APP_SLOT, written out as libnet does
+    loop
+        match g_exchange.net_recv_from(handle, @&payload)
+            RecvResult.Datagram(d) =>
+                let all: [u8] = @payload
+                let bytes: [u8] = all[0..d.length as i64]
+                loop
+                    let r = g_exchange.net_send_to(handle, bytes, d.addr, d.port, mtu)
+                    wake_service(exchange, g_exchange.take_published())
+                    match r
+                        SendResult.Sent => break
+                        SendResult.Err(e) => return fail("udp-echo", "net_send_to", e)
+                        SendResult.BadF => return fail("udp-echo", "net_send_to", ERRNO_BADF)
+                        SendResult.Pending => wait_round()
+            RecvResult.Err(e) => return fail("udp-echo", "net_recv_from", e)
+            RecvResult.BadF => return fail("udp-echo", "net_recv_from", ERRNO_BADF)
+            RecvResult.Empty => wait_data(exchange, ECHO_WAIT_MS)

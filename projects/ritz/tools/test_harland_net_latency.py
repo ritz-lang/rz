@@ -1,4 +1,4 @@
-"""The ICMP latency gate's host side (AGAST #4768).
+"""The network latency gate's host side (AGAST #4768).
 
 projects/harland/tools/net_latency.sh boots Harland twice (the in-kernel
 stack, then the CPL-3 driver and netd) and runs net_latency_wire.py, which
@@ -10,6 +10,9 @@ pieces a wrong number would come from, without QEMU:
   * the frames: a valid IPv4 + ICMP checksum on every echo request, an ARP
     reply only for the host's own address, and only a reply with the sent
     identifier and sequence counts as one;
+  * the UDP round trip: a valid IPv4 + UDP checksum (pseudo-header) on
+    every datagram, and only the guest echo's datagram, between the right
+    ports and carrying the sent payload, counts as its reply;
   * the statistics: min / median / p99 by nearest rank, warm-up excluded;
   * the serial log: the kernel's [net-latency] ready / done / echoes lines;
   * the tail: how many timed echoes took longer than a threshold.
@@ -150,3 +153,52 @@ def test_serial_lines_parse(wire):
         },
         "netd": {"switches": 900, "cr3": 880, "syscalls": 2000},
     }
+
+
+# The UDP round trip (#4768 part 2): the host sends a datagram to the guest's
+# /bin/udp-echo through netd, and times the datagram it sends back.
+
+
+def _udp_sum(src, dst, udp):
+    pseudo = src + dst + struct.pack("!BBH", 0, 17, len(udp))
+    return _sum16(pseudo + udp)
+
+
+def test_udp_request_has_valid_checksums(wire):
+    payload = wire.udp_payload(7, 56)
+    assert len(payload) == 56
+    frame = wire.udp_request(HOST_MAC, GUEST_MAC, HOST_IP, GUEST_IP, 40000, 7, payload)
+    assert frame[0:6] == GUEST_MAC and frame[6:12] == HOST_MAC
+    assert frame[12:14] == b"\x08\x00"
+    ip = frame[14:34]
+    assert ip[9] == 17 and ip[12:16] == HOST_IP and ip[16:20] == GUEST_IP
+    assert struct.unpack("!H", ip[2:4])[0] == 20 + 8 + 56
+    assert _sum16(ip) == 0xFFFF
+    udp = frame[34:]
+    sport, dport, length, csum = struct.unpack("!HHHH", udp[0:8])
+    assert (sport, dport, length) == (40000, 7, 8 + 56)
+    # A zero checksum means "none" to netd; ours is real and verifies.
+    assert csum != 0 and _udp_sum(HOST_IP, GUEST_IP, udp) == 0xFFFF
+    assert udp[8:] == payload
+
+
+def _udp_reply(payload, sport=7, dport=40000, src=GUEST_IP, dst=HOST_IP):
+    udp = struct.pack("!HHHH", sport, dport, 8 + len(payload), 0) + payload
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0, src, dst)
+    return HOST_MAC + GUEST_MAC + b"\x08\x00" + ip + udp
+
+
+def test_udp_reply_matches_only_its_datagram(wire):
+    p = wire.udp_payload(7, 56)
+    assert wire.udp_reply_of(_udp_reply(p), HOST_IP, 7, 40000) == p
+    # The wrong ports, or a datagram to another address, are not ours.
+    assert wire.udp_reply_of(_udp_reply(p, sport=9), HOST_IP, 7, 40000) is None
+    assert wire.udp_reply_of(_udp_reply(p, dport=40001), HOST_IP, 7, 40000) is None
+    assert (
+        wire.udp_reply_of(_udp_reply(p, dst=bytes([10, 0, 2, 2])), HOST_IP, 7, 40000)
+        is None
+    )
+    # An ICMP echo reply to the host is not a UDP reply.
+    assert wire.udp_reply_of(_reply(0x4C54, 7), HOST_IP, 7, 40000) is None
+    # Each round trip's payload names its sequence.
+    assert wire.udp_payload(7, 56) != wire.udp_payload(8, 56)

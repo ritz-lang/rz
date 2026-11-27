@@ -16,21 +16,24 @@
 # Errors are the negative errno numbers RING2_NET.md and libnet use
 # (libnet.client's ERRNO_*); ritzlib's Errno does not carry NoDev or NFile.
 #
-# Waiting: libnet never blocks, and these tools do not park in ShmWait (229)
-# yet, so a tool told Pending yields once and calls again (wait_round).
-# ping counts its deadline in those rounds; see PING_ROUNDS_PER_MS.
+# Waiting: libnet never blocks. ping, udp-send and udp-recv do not park in
+# ShmWait (229), so a tool told Pending yields once and calls again
+# (wait_round); ping counts its deadline in those rounds, see
+# PING_ROUNDS_PER_MS. udp-echo (AGAST #4768) parks instead (wait_data):
+# its round trips are measured, and a yield loop would add switches that
+# are the tool's, not the path's.
 #
 # The wake is the tool's (AGAST #4752): libnet makes no syscalls, so after
 # a call that published a request (NetExchange.take_published) the tool
 # posts DATA on its exchange (wake_service). netd parks on that bit; a
 # request without it sat on the ring until netd's 60 s idle deadline.
 
-import ritzlib.sys { syscall0, syscall1, syscall2, sys_yield, SYS_NET_ATTACH, SYS_SHM_MAP, SYS_SHM_NOTIFY, SYS_NET_ADDR, SYS_NET_INFO }
+import ritzlib.sys { syscall0, syscall1, syscall2, sys_yield, SYS_NET_ATTACH, SYS_SHM_MAP, SYS_SHM_NOTIFY, SYS_SHM_WAIT, SYS_NET_ADDR, SYS_NET_INFO }
 import ritzlib.option
 import ritzlib.result
 import ritzlib.strview { StrView }
 import driver_abi.link { NetInfo, NetAddr }
-import driver_abi.wait { EVENT_DATA }
+import driver_abi.wait { EVENT_DATA, WaitSource, WaitEvent, WaitRequest }
 
 # A usage error's exit status. A failed call exits with its errno's
 # magnitude instead (net_tool.fail).
@@ -105,6 +108,21 @@ pub fn wake_service(handle: u64, published: u32)
 # One wait for a Pending call: yield the CPU, then the caller calls again.
 pub fn wait_round()
     sys_yield()
+
+# Park until the service posts DATA on exchange `handle` (an event or a
+# reply is on the event ring) or `deadline_ms` passes: one ShmWait (229)
+# listing that exchange alone. A post that came before the wait is latched,
+# so a datagram that arrived between the caller's empty net_recv_from and
+# this wait still wakes it. The caller calls libnet again either way; an
+# errno (the exchange is gone) shows up there as the peer's close.
+pub fn wait_data(handle: u64, deadline_ms: u64)
+    var source: WaitSource = WaitSource { handle: handle, mask: EVENT_DATA, _pad: 0 }
+    var event: WaitEvent = WaitEvent { handle: 0, bits: 0, _pad: 0 }
+    var req: WaitRequest = WaitRequest {
+        sources: @source, source_count: 1, out_cap: 1, out: @event,
+        deadline: deadline_ms, out_count: 0, _pad: 0
+    }
+    syscall1(SYS_SHM_WAIT, @&req as i64)
 
 # An IPv4 address in wire order. A struct, not a bare [4]u8, so it can
 # ride in an Option and a match arm on ritz1 (a whole array can't).

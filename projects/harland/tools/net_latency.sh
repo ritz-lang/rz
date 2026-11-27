@@ -7,7 +7,7 @@
 #   SKIP_BUILD=1 bash projects/harland/tools/net_latency.sh
 #
 # Measures ICMP echo RTT, host -> guest -> host, on each owner of the guest's
-# network stack:
+# network stack, and a UDP round trip on the ring path:
 #   in-kernel    q35, no IOMMU: an untranslated boot, so virtio_net_init and
 #                the kernel stack own the NIC;
 #   kernel-ring  q35 + intel-iommu: the CPL-3 /bin/virtio-net owns the NIC,
@@ -15,6 +15,10 @@
 #                self-test window, before the handoff);
 #   netd         the same boot after the seat handoff: the CPL-3 driver and
 #                /bin/netd.
+#   netd-udp     the same boot after netd's window: the kernel spawns
+#                /bin/udp-echo (port 7), and the wire sends UDP datagrams
+#                to it and times each until its bytes come back: driver,
+#                netd and an app, the whole ring path.
 # Both boots are q35 with the split irqchip, the same CPU, memory and NIC
 # (modern virtio-net, rx_queue_size=1024); the translating one adds the
 # IOMMU and VIRTIO_F_ACCESS_PLATFORM, which a ring-1 driver needs.
@@ -27,10 +31,10 @@
 # netdev whose other end is tools/net_latency_wire.py: it sends WARMUP+COUNT
 # echo requests to A (one at a time) and prints min / median / p99 RTT of
 # the COUNT timed ones. S and C are the window's process switches and
-# page-table loads; on the netd window they are the echoes' alone (pid 1
-# sleeps through it), so S / COUNT+WARMUP is the switches per echo, and the
-# same for the window's syscalls (N on the done line). An idle
-# run (COUNT=0 WARMUP=0) gives the baseline to subtract.
+# page-table loads; on the netd and netd-udp windows they are the round
+# trips' alone (pid 1 sleeps through it), so S / COUNT+WARMUP is the
+# switches per round trip, and the same for the window's syscalls (N on the
+# done line). An idle run (COUNT=0 WARMUP=0) gives the baseline to subtract.
 #
 # The RTT is the host's (send to reply), so it carries QEMU's hub and dgram
 # hops and the host's scheduling. "wire-floor" pings slirp's gateway over
@@ -143,6 +147,7 @@ measure() {
         # wire-floor: slirp's gateway, through the same hub, no guest.
         target=()
         [ "$owner" = wire-floor ] && target=(--target 10.0.2.2 --guest-mac "$SLIRP_MAC")
+        [ "$owner" = netd-udp ] && target=(--udp 7)
         out=$(python3 -I "$WIRE" --serial "$serial" --owner "$owner" \
             --listen "$WIRE_PORT" --qemu "$QEMU_PORT" --guest-mac "$GUEST_MAC" \
             --count "$COUNT" --warmup "$WARMUP" --interval-ms "$INTERVAL_MS" \
@@ -175,8 +180,8 @@ echo "=== net latency: accel=$ACCEL count=$COUNT warmup=$WARMUP interval=${INTER
 [ "$ACCEL" = kvm ] || echo "NOTE: TCG, not KVM: the numbers are the emulator's as much as the guest's"
 echo "--- pc: the wire floor, then in-kernel"
 measure pc wire-floor in-kernel
-echo "--- vtd: kernel-ring, then netd"
-measure vtd kernel-ring netd
+echo "--- vtd: kernel-ring, then netd, then netd-udp"
+measure vtd kernel-ring netd netd-udp
 
 # The table: RTTs from the wire, switch counts from the serial logs.
 python3 -I - "$RESULTS" "$WORK/pc.log" "$WORK/vtd.log" "$WIRE" <<'EOF'
@@ -188,7 +193,7 @@ for log in sys.argv[2:4]:
     with open(log, "rb") as f:
         counts.update(wire.done_counts(f.read()))
 print()
-print("| owner | received/sent | min us | median us | p99 us | >10 ms | switches/echo | cr3/echo | syscalls/echo |")
+print("| owner | received/sent | min us | median us | p99 us | >10 ms | switches/rt | cr3/rt | syscalls/rt |")
 print("|---|---|---|---|---|---|---|---|---|")
 for line in open(sys.argv[1]):
     r = json.loads(line)

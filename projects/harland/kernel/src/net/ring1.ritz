@@ -505,7 +505,8 @@ fn pid1_sleep_until(deadline: u64)
 
 # As pid 1 after the handoff, before init (kernel_tail), when `enabled`: wait
 # for netd's lease as the restart test does, then open the latency window
-# (net/latency.ritz, owner "netd") on that address and sleep through it.
+# (net/latency.ritz, owner "netd") on that address and sleep through it,
+# then the UDP window (owner "netd-udp", net_latency_udp_window).
 # Nothing on a boot with no netd.
 pub fn net_latency_netd_window(enabled: bool)
     if not enabled or not net_restart_armed()
@@ -529,3 +530,33 @@ pub fn net_latency_netd_window(enabled: bool)
     let mark: LatencyMark = latency_open("netd", addr.address)
     pid1_sleep_until(deadline_after_us(NET_LATENCY_WINDOW_US))
     latency_close("netd", mark)
+    net_latency_udp_window(addr.address)
+
+# How long /bin/udp-echo gets to attach and bind before the UDP window opens:
+# a bind is a few ring rounds, so this is slack, and the script's warm-up
+# datagrams cover a late one.
+const UDP_ECHO_SETTLE_US: u64 = 500000
+
+# The UDP round trip (AGAST #4768 part 2), right after netd's ICMP window:
+# spawn /bin/udp-echo (indium, port 7), let it bind, open the "netd-udp"
+# window on netd's address and sleep through it, then reap udp-echo. The
+# window's switches and syscalls are the driver's, netd's and udp-echo's,
+# so the script's per-round-trip counts carry the app hop the ICMP window
+# lacks.
+fn net_latency_udp_window(address: [4]u8)
+    let pid: u64 = match process_spawn_program("/bin/udp-echo")
+        Result.Ok(p) => p
+        Result.Err(e) =>
+            klog("[net-latency] /bin/udp-echo was not spawned (errno ")
+            klog_dec(e as i64)
+            klog("): no udp window\n")
+            return
+    # Nobody waits for it: its exit leaves no zombie (#4745).
+    proc_detach(pid)
+    pid1_sleep_until(deadline_after_us(UDP_ECHO_SETTLE_US))
+    let mark: LatencyMark = latency_open("netd-udp", address)
+    pid1_sleep_until(deadline_after_us(NET_LATENCY_WINDOW_US))
+    latency_close("netd-udp", mark)
+    match process_mark_exit(pid)
+        Result.Ok(_) => sched_yield()
+        Result.Err(_) => klog("[net-latency] udp-echo exited inside its window\n")

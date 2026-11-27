@@ -94,13 +94,13 @@ Indium is a distribution, not the kernel. Code that the kernel spawns, or that d
 | `projects/harland/system/` | New package for the programs the kernel spawns. `src/netd.ritz` is `[[bin]] netd`, this service. `src/virtio_net.ritz` is `[[bin]] virtio-net`, the ring-1 driver as built, which D9 removes. Both use the same freestanding user target and linker script as Indium's bins. The Indium image build installs them as `/bin/netd` and `/bin/virtio-net`. |
 | `projects/harland/nic/` | New under D9: the NIC interface (`trait Nic`) and its virtio-net implementation, moved from `system/src/virtio_net.ritz` and `system/src/vnet.ritz`. A leaf package on the `virtio_abi` pattern, with no kernel imports. netd does the syscalls and passes in the mapped windows and DMA runs. ENA and e1000e implement the same trait later. |
 | `projects/harland/libnet/` | The ring-3 `net_*` library on `net_abi`: `net_bind`, `net_send_to`, `net_recv_from`, `net_ping`, `net_close`. |
-| `projects/indium/user/` | `ping`, `udp-send`, and `udp-recv`, which link `libnet`. |
+| `projects/indium/user/` | `ping`, `udp-send`, `udp-recv`, and `udp-echo`, which link `libnet`. |
 
 The `SYS_*` numbers for these calls (`NetInfo` 224, `NetAddr` 225, `ShmMap` 227, `NetAttach` 228, and the rest) go in `ritzlib/sys.ritz`, in its `target_os = "harland"` table, beside the other Harland numbers. Only the numbers go there. The `net_*` API is not in ritzlib. It is `libnet`.
 
 ### Boot switch
 
-Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. Under D9 it spawns `/bin/netd` alone, in `/bin/virtio-net`'s place. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` keeps the EC2 peer-ping window on ENA. On any other NIC it opens the latency window on each owner ("Rollout"). Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling. The gate ran on 2026-11-27 ("Rollout"), and D9 takes the first lever.
+Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. Under D9 it spawns `/bin/netd` alone, in `/bin/virtio-net`'s place. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` keeps the EC2 peer-ping window on ENA. On any other NIC it opens the latency window on each owner, and after netd's a UDP window with `/bin/udp-echo` ("Rollout"). Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling. The gate ran on 2026-11-27 ("Rollout"), and D9 takes the first lever.
 
 ### Drivers inside netd (D9)
 
@@ -622,6 +622,8 @@ The first cutover runs three ring-3 programs. They are distribution apps in `pro
 
 `ping` publishes one `APP_PING` and prints the payload of the matching `EV_PING_REPLY`. One echo. No count and no interval. A quiet peer ends as `Errno.Io` after `PING_DEADLINE_MS`.
 
+`udp-echo` binds the port it was given, or 7 with no argument, and sends every datagram it receives back to its sender's address and port. It runs until it is killed. It is the app end of the UDP round trip in Rollout: the kernel spawns it with no argument. While it waits for a datagram or a bind reply it parks in one `ShmWait` (229) on its exchange (`net_attach.ritz` `wait_data`), not a yield loop, and it prints nothing per datagram, so a round trip costs only the path's switches and syscalls.
+
 A second bind of a port that is already live fails inside the service with `Errno.Exist` (-17). The program exits non-zero and holds no new handle.
 
 ## Rollout
@@ -662,7 +664,32 @@ Two more runs agree. At a 20 ms interval the medians are 694, 953, and 1021 µs.
 
 **Decision.** Whether a gap of about 300 µs (1.6–1.9× the guest's share) under nested KVM matters is Aaron's call, flagged on #4768. Decided 2026-11-27 (M2.9b, #4872). Lever 1 is D9, network drivers inside netd ("Drivers inside netd (D9)", #4875). Batching is #4876. Polling on a dedicated core is #4877, after APs run user processes (#4874). PCID is parked (#4878). Each landed lever adds its own dated entry here.
 
-**UDP round-trip** stays open in #4768 until #4752's udp tools land. The same window and wire carry it: the wire would send a datagram to a guest echo app instead of an ICMP echo.
+**UDP round-trip**: the next entry.
+
+### 2026-11-27: UDP round trip (AGAST #4768)
+
+**Setup.** As in the ICMP entry, on the same host, with one more owner on the ring boot. Right after netd's window, pid 1 spawns `/bin/udp-echo` (indium, port 7). It waits 500 ms for the bind, then opens a fourth window, **netd-udp**, on netd's address (`kernel/src/net/ring1.ritz` `net_latency_udp_window`), and reaps `udp-echo` when the window closes. The wire (`--udp 7`) sends a 56-byte datagram from 10.0.2.200:40000 with a real UDP checksum, which netd verifies. It times each datagram from send until the same bytes come back from port 7: 20 warm-up, then 200 timed, one at a time, 10 ms apart. The path is the CPL-3 driver, netd and an app, which is the whole ring path. `udp-echo` parks in `ShmWait` between datagrams and prints nothing, so the counts are the path's own. An idle run (`COUNT=0 WARMUP=0`) gives each window's baseline without traffic: 2 switches and 97 syscalls on netd, and 22 switches and 107 syscalls on netd-udp, from `udp-echo`'s 1 s park deadline. The per-round-trip counts below subtract it.
+
+**Results.** Four rounds on the final kernel, in µs, with ICMP on the same boots for comparison. The host's load average was 8–21 from other rooms' builds throughout, about half to all of the ICMP entry's 18. "Slow" counts round trips over 10 ms out of 200. Every datagram and every echo came back in every round.
+
+| owner | min | median | p99 | slow | switches/rt | CR3 loads/rt | syscalls/rt |
+|---|---|---|---|---|---|---|---|
+| wire-floor | 118 / 135 / 141 / 124 | 252 / 305 / 306 / 522 | 4678 / 4987 / 9818 / 10275 | 0 / 1 / 2 / 5 | – | – | – |
+| in-kernel (ICMP) | 533 / 474 / 547 / 483 | 787 / 753 / 917 / 955 | 21530 / 19990 / 25512 / 15981 | 3 / 4 / 4 / 3 | 0 | 0 | 0 |
+| netd (ICMP) | 929 / 669 / 784 / 994 | 1473 / 1478 / 1436 / 1477 | 7773 / 16442 / 5786 / 4780 | 0 / 4 / 0 / 1 | 4.02 | 4.02 | 6.9 |
+| netd-udp | 1002 / 1107 / 1137 / 1091 | 1653 / 1626 / 1790 / 1874 | 4984 / 8095 / 9019 / 14633 | 0 / 2 / 1 / 6 | 7.00 | 7.00 | 11.9 |
+
+The counts barely move between rounds: netd-udp logged 1557–1561 switches and 2717–2722 syscalls per window.
+
+**Load, not a regression.** netd's ICMP median is about 1.45 ms here, against about 1.0 ms in the ICMP entry. In the same hour, an A/B build of that entry's commit (`d083d7962`) gave 1588 µs, so the rise is the host's load. Compare rows inside one boot, not across entries.
+
+**Reading.**
+
+- **The app hop.** On the same boot, a UDP round trip through `udp-echo` costs 150–400 µs more at the median than an ICMP echo that netd answers itself: +180, +148, +354 and +397 in the four rounds. It also costs 3 more switches and 5 more syscalls. Each of those switches is an address-space switch too: switches equal CR3 loads in every window. The app makes at least two of those 5 syscalls, its `ShmWait` and its `ShmNotify` after `net_send_to`. The rest were not traced to a process. The 7 switches are one more than a single pass through each process (idle, driver, netd, app, netd, driver, idle). Which extra wake that is was not traced.
+- **The whole ring path.** After the wire floor is subtracted, the guest's share of a UDP round trip is about 1.3–1.5 ms on this loaded host, against 0.43–0.61 ms for an in-kernel ICMP echo on the same host in the same hour. The in-kernel stack has no UDP echo, so there is no in-kernel UDP row. ICMP is the like-for-like comparison of stacks (the ICMP entry). This row is what an app pays end to end on the ring path.
+- **The levers** are the ICMP entry's. Merging the driver and netd still removes 2 switches per round trip. The app's switches stay as long as the app is a separate process, which is the point of the design.
+
+**Decision.** Recorded in M2.9b (#4872). This entry only adds the UDP numbers it needed.
 
 ## Open questions
 
