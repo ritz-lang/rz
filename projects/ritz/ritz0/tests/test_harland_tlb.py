@@ -123,7 +123,7 @@ def _kernel_ritz():
     return sorted(KERNEL_SRC.rglob("*.ritz"))
 
 
-def test_no_kernel_code_sets_pte_global():
+def _pin_no_pte_global():
     """A global entry survives a CR3 load, and the lazy-CR3 drop (and every
     KERNEL_INVLPG full flush) rely on a CR3 load flushing everything."""
     users = []
@@ -135,7 +135,7 @@ def test_no_kernel_code_sets_pte_global():
     assert not users, "PTE_GLOBAL used:\n" + "\n".join(users)
 
 
-def test_every_cr3_load_goes_through_vmm_switch_pml4():
+def _pin_every_cr3_load_goes_through_vmm_switch_pml4():
     """PC_ACTIVE_PML4 is only right if it sees every CR3 load. Ritz code
     writes CR3 in vmm_switch_pml4 and in vmm_flush_tlb_all (which reloads the
     value already there), and nowhere else."""
@@ -150,7 +150,7 @@ def test_every_cr3_load_goes_through_vmm_switch_pml4():
     assert body.find("pc_active_pml4[c]") < body.find("%cr3"), "the slot must be written before the load"
 
 
-def test_vmm_free_pml4_refuses_a_loaded_pml4_before_freeing_anything():
+def _pin_vmm_free_pml4_refuses_a_loaded_pml4():
     body = _fn_body(VMM_SRC.read_text(), "vmm_free_pml4")
     check = body.find("vmm_pml4_loaded_on(pml4, -1)")
     assert check != -1, "vmm_free_pml4 does not ask whether the PML4 is loaded"
@@ -158,7 +158,7 @@ def test_vmm_free_pml4_refuses_a_loaded_pml4_before_freeing_anything():
     assert "return" in body[check:body.find("vmm_free_user_pages")]
 
 
-def test_owner_flushes_before_the_reply_and_only_where_loaded():
+def _pin_owner_flushes_before_the_reply_and_only_where_loaded():
     """The UNMAP_DONE is posted after tlb_serve returns (sync/mbox.ritz), and
     the owner flushes only a space loaded on it."""
     here = _fn_body(TLB_SRC.read_text(), "tlb_unmap_here")
@@ -166,3 +166,24 @@ def test_owner_flushes_before_the_reply_and_only_where_loaded():
     handle = _fn_body((KERNEL_SRC / "sync" / "mbox.ritz").read_text(), "mbox_handle")
     serve = handle.find("tlb_serve(")
     assert serve != -1 and serve < handle.find("mbox_post(msg.from as i32, done)", serve)
+
+
+# One case for the source pins (docs/TESTING.md, "What a ritz0 pytest case
+# costs"): each row still runs and fails on its own, by name.
+SOURCE_PINS = [
+    _pin_no_pte_global,
+    _pin_every_cr3_load_goes_through_vmm_switch_pml4,
+    _pin_vmm_free_pml4_refuses_a_loaded_pml4,
+    _pin_owner_flushes_before_the_reply_and_only_where_loaded,
+]
+
+
+@pytest.mark.unit
+def test_source_pins():
+    failed = []
+    for pin in SOURCE_PINS:
+        try:
+            pin()
+        except AssertionError as e:
+            failed.append(f"{pin.__name__}: {e}")
+    assert not failed, "\n".join(failed)

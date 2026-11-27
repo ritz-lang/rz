@@ -185,8 +185,7 @@ def _body(src, name):
     return m.group(0)
 
 
-@pytest.mark.unit
-def test_free_waits_for_the_iotlb_before_the_pmm():
+def _pin_free_waits_for_the_iotlb_before_the_pmm():
     """§5: the IOVA leaves the domain and the unit confirms it before the CPU
     leaves go and the frames reach the PMM; then both ranges go back on the
     free list. Unconfirmed: the leaves are quarantined (PTE_DEVICE), the
@@ -202,8 +201,7 @@ def test_free_waits_for_the_iotlb_before_the_pmm():
     assert re.search(r"dma_quarantine_iova\(run\.phys, run\.pages, run\.iova\)", body)
 
 
-@pytest.mark.unit
-def test_alloc_reuses_a_hole_and_keeps_the_bump_above_holes():
+def _pin_alloc_reuses_a_hole_and_keeps_the_bump_above_holes():
     """DrvDmaAlloc takes a hole of this process and device first; a fresh run
     starts past every hole (dma_hole_floor); a failure after the domain
     confirmed gives the range back, an unconfirmed one quarantines it with
@@ -218,8 +216,7 @@ def test_alloc_reuses_a_hole_and_keeps_the_bump_above_holes():
     assert "dma_run_add(" in body
 
 
-@pytest.mark.unit
-def test_quarantined_leaf_is_kept_and_counted():
+def _pin_quarantined_leaf_is_kept_and_counted():
     """A quarantined leaf is not present (a stale pointer faults) but keeps
     PTE_DEVICE and the frame: vmm_free_user_pt never frees it, and
     vmm_slot_end counts the page so the VA is not handed out again."""
@@ -229,10 +226,30 @@ def test_quarantined_leaf_is_kept_and_counted():
     assert "PTE_DEVICE" in _body(src, "vmm_slot_end")
 
 
-@pytest.mark.unit
-def test_exit_settles_every_live_run_before_the_pml4_goes():
+def _pin_exit_settles_every_live_run_before_the_pml4_goes():
     """A driver's exit takes each live run out of its domain (quarantining
     one the unit doesn't confirm) and forgets its holes, before
     vmm_free_pml4 frees the confirmed frames once."""
     body = _body(PROCESS.read_text(), "sys_exit_impl")
     assert body.index("drv_dma_process_end(") < body.index("vmm_free_pml4(my_pml4)")
+
+
+# One case for the source pins (docs/TESTING.md, "What a ritz0 pytest case
+# costs"): each row still runs and fails on its own, by name.
+SOURCE_PINS = [
+    _pin_free_waits_for_the_iotlb_before_the_pmm,
+    _pin_alloc_reuses_a_hole_and_keeps_the_bump_above_holes,
+    _pin_quarantined_leaf_is_kept_and_counted,
+    _pin_exit_settles_every_live_run_before_the_pml4_goes,
+]
+
+
+@pytest.mark.unit
+def test_source_pins():
+    failed = []
+    for pin in SOURCE_PINS:
+        try:
+            pin()
+        except AssertionError as e:
+            failed.append(f"{pin.__name__}: {e}")
+    assert not failed, "\n".join(failed)
