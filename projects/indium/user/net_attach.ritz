@@ -17,15 +17,20 @@
 # (libnet.client's ERRNO_*); ritzlib's Errno does not carry NoDev or NFile.
 #
 # Waiting: libnet never blocks, and these tools do not park in ShmWait (229)
-# yet (no net service exists to notify an exchange), so a tool told Pending
-# yields once and calls again (wait_round).
+# yet, so a tool told Pending yields once and calls again (wait_round).
 # ping counts its deadline in those rounds; see PING_ROUNDS_PER_MS.
+#
+# The wake is the tool's (AGAST #4752): libnet makes no syscalls, so after
+# a call that published a request (NetExchange.take_published) the tool
+# posts DATA on its exchange (wake_service). netd parks on that bit; a
+# request without it sat on the ring until netd's 60 s idle deadline.
 
-import ritzlib.sys { syscall0, syscall1, sys_yield, SYS_NET_ATTACH, SYS_SHM_MAP, SYS_NET_ADDR, SYS_NET_INFO }
+import ritzlib.sys { syscall0, syscall1, syscall2, sys_yield, SYS_NET_ATTACH, SYS_SHM_MAP, SYS_SHM_NOTIFY, SYS_NET_ADDR, SYS_NET_INFO }
 import ritzlib.option
 import ritzlib.result
 import ritzlib.strview { StrView }
 import driver_abi.link { NetInfo, NetAddr }
+import driver_abi.wait { EVENT_DATA }
 
 # A usage error's exit status. A failed call exits with its errno's
 # magnitude instead (net_tool.fail).
@@ -40,9 +45,12 @@ pub struct AttachError
     call: StrView
     errno: i32
 
-# What a tool attached to: the mapped exchange region (APP_REGION_SIZE
-# bytes at this address) and the lease NetAddr copied out.
+# What a tool attached to: the exchange handle NetAttach returned (the
+# one wake_service posts to), the mapped exchange region
+# (APP_REGION_SIZE bytes at this address) and the lease NetAddr copied
+# out.
 pub struct Attached
+    handle: u64
     region: u64
     lease: NetAddr
 
@@ -64,7 +72,7 @@ pub fn net_attach() -> Result<Attached, AttachError>
     let rc: i64 = syscall1(SYS_NET_ADDR, @&lease as i64)
     if rc < 0
         return Err(AttachError { call: "NetAddr", errno: rc as i32 })
-    Ok(Attached { region: region as u64, lease: lease })
+    Ok(Attached { handle: handle as u64, region: region as u64, lease: lease })
 
 # A ring-2 network service is up on this boot: NetAddr (225) holds its
 # published record. False while none runs (Errno.NoDev): every boot
@@ -84,6 +92,15 @@ pub fn link_mtu() -> Option<u32>
     if syscall1(SYS_NET_INFO, @&info as i64) < 0
         return None
     Some(info.mtu)
+
+# Wake the service for `published` new requests on exchange `handle`
+# (RING2_NET.md "Datagram send": store the request write_idx, then
+# ShmNotify DATA). Nothing to post when none were published. A refused
+# notify (the service is gone) needs no handling here: the next libnet
+# call sees the peer close.
+pub fn wake_service(handle: u64, published: u32)
+    if published > 0
+        syscall2(SYS_SHM_NOTIFY, handle as i64, EVENT_DATA as i64)
 
 # One wait for a Pending call: yield the CPU, then the caller calls again.
 pub fn wait_round()

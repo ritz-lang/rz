@@ -2,7 +2,8 @@
 #
 # run_line() takes one input line through parse.tokenize() and runs it:
 #
-#   list       pipeline ; pipeline ; ...
+#   list       pipeline ; pipeline ; ...     (an item ended by `&` instead
+#                                            of `;` runs in the background)
 #   pipeline   command | command | ...         (Linux only)
 #   command    [NAME=VALUE...] | word... [< file] [> file] [>> file]
 #
@@ -17,14 +18,15 @@ import common {
 
 import parse {
     TokKind, Tokens, tokenize, tokens_len, tokens_kind, tokens_word,
-    tokens_is_word, tokens_drop, g_last_status, PARSE_UNTERMINATED,
+    tokens_is_word, tokens_drop, g_last_status, PARSE_UNTERMINATED, PARSE_AND_LIST,
     var_set, var_lookup, var_unset, var_export, assignment_pos, is_valid_name,
     vars_count, var_exported_name, var_value,
     Envp, vars_build_envp, envp_ptr, envp_drop
 }
 
 import os {
-    os_directory_names, os_stdout_is_terminal, os_default_path, os_spawn_search,
+    os_directory_names, os_stdout_is_terminal, os_default_path, os_spawn_search, os_spawn_start,
+    SpawnError, spawn_error_status,
     os_has_fd_control, os_fork, os_pipe, os_dup, os_dup2, os_close,
     os_open_write, os_open_read, os_wait, os_chdir, os_getcwd,
     os_disable_raw_mode, os_tty_suspend, os_tty_resume, os_tty_window_probe
@@ -208,6 +210,100 @@ fn ls_uses_builtin(args: Span<StrView>) -> bool
 fn ls_uses_builtin(args: Span<StrView>) -> bool
     return true
 
+# ============================================================================
+# Background jobs (AGAST #4752)
+# ============================================================================
+# `cmd &` starts one external command and goes on without waiting; `wait`
+# reaps every job it started, oldest first. No job control beyond that:
+# no `jobs`, `fg` or `%n`, and the console's Ctrl-C reaches a job like any
+# other child of rzsh (os_tty_suspend). The pids are a Vec in ShellState
+# (state.ritz: a Vec can't be module-level, §13.6); g_jobs points at it
+# while it is installed.
+
+var g_jobs: *Vec<i32> = null
+
+pub fn jobs_install(v: @&Vec<i32>)
+    g_jobs = v
+
+pub fn jobs_release()
+    g_jobs = null
+
+# `wait`: reap every background job, oldest first. The last one's status,
+# 0 with none.
+fn cmd_wait(args: Span<StrView>) -> i32
+    if args.len > 1
+        err_str("rzsh: wait: takes no arguments\n")
+        return 2
+    if g_jobs == null
+        return 0
+    # A typed local: ritz1 can't resolve a generic method's T through the
+    # `*Vec` global itself.
+    let jobs: *Vec<i32> = g_jobs
+    var status: i32 = 0
+    var k: i64 = 0
+    while k < jobs.len
+        let pid: i32 = jobs.get(k)
+        status = os_wait(pid)
+        k += 1
+    jobs.clear()
+    return status
+
+# The commands dispatch() runs inside the shell, so none can be a job.
+fn is_builtin(args: Span<StrView>) -> bool
+    let cmd: StrView = args[0]
+    if cmd.eq("ls")
+        return ls_uses_builtin(args)
+    if cmd.eq("cd") or cmd.eq("pwd") or cmd.eq("export") or cmd.eq("unset")
+        return true
+    if cmd.eq("help") or cmd.eq("exit") or cmd.eq("pid") or cmd.eq("echo")
+        return true
+    return cmd.eq("clear") or cmd.eq("wait")
+
+# The item [start, end) ended with `&`: start its one external command and
+# return without waiting. 0 once it started ("[n] pid" on stderr, as a
+# shell's job notice is); 2, starting nothing, for anything but a simple
+# external command; a failed start's status (127: not found).
+fn run_background(tk: @Tokens, start: i64, end: i64) -> i32
+    if start == end
+        err_str("rzsh: syntax error near '&'\n")
+        return 2
+    var words: Vec<StrView> = vec_new<StrView>()
+    var t: i64 = start
+    while t < end
+        if not tokens_is_word(tk, t)
+            err_str("rzsh: only a simple command can run in the background\n")
+            return 2
+        if not words.push(tokens_word(tk, t))
+            err_str("rzsh: out of memory\n")
+            return 1
+        t += 1
+    let args: Span<StrView> = span_from_vec(@words)
+    if assignment_pos(args[0]) >= 0 or is_builtin(args)
+        eputs3("rzsh: ", args[0], ": a builtin cannot run in the background\n")
+        return 2
+    if g_jobs == null
+        err_str("rzsh: out of memory\n")
+        return 1
+    # A typed local, as in cmd_wait.
+    let jobs: *Vec<i32> = g_jobs
+    var envp: Envp = vars_build_envp()
+    let search: StrView = var_lookup("PATH").unwrap_or(os_default_path())
+    let pid: i32 = match os_spawn_start(args, search, envp_ptr(@envp), true)
+        Ok(started) => started
+        Err(e) => return spawn_error_status(e)
+    let pushed: bool = jobs.push(pid)
+    if not pushed
+        # Running but untracked: `wait` won't reap it.
+        err_str("rzsh: out of memory\n")
+        return 1
+    var notice: String = string_from("[")
+    notice.push_i64(jobs.len)
+    notice.push_str("] ")
+    notice.push_i64(pid as i64)
+    notice.push_str("\n")
+    err_str(notice.as_view())
+    return 0
+
 # Runs the command `args` (args[0] names it) as a builtin or external command.
 fn dispatch(args: Span<StrView>) -> i32
     let cmd: StrView = args[0]
@@ -232,6 +328,8 @@ fn dispatch(args: Span<StrView>) -> i32
         return cmd_ls(args)
     if cmd.eq("clear")
         return cmd_clear()
+    if cmd.eq("wait")
+        return cmd_wait(args)
     return exec_external(args)
 
 # ============================================================================
@@ -430,8 +528,15 @@ pub fn run_line(line: StrView) -> i32
             tokens_drop(@&tk)
             g_last_status = 2
             return 2
+        if tk.err == PARSE_AND_LIST
+            err_str("rzsh: syntax error: `&&` is not supported\n")
+            tokens_drop(@&tk)
+            g_last_status = 2
+            return 2
         let n: i64 = tokens_len(@tk)
-        if n > 0
+        if tk.background
+            g_last_status = run_background(@tk, 0, n)
+        else if n > 0
             g_last_status = run_pipeline(@tk, 0, n)
         pos = tk.next
         tokens_drop(@&tk)

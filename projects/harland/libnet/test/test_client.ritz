@@ -323,3 +323,65 @@ fn test_ping_times_out_after_deadline() -> i32
     if ping_err(g_exchange.net_ping(peer, @payload, PING_DEADLINE_MS, @&g_buf)) != -5
         return 3
     0
+
+# ---------------------------------------------------------------------------
+# 6. Every request the library publishes is counted once for the app's
+#    wake (AGAST #4752, RING2_NET.md "Datagram send": store the request
+#    write_idx, then ShmNotify DATA). netd parks on the exchange's DATA
+#    bit, so a request with no wake behind it waits for netd's idle
+#    deadline. A Pending re-call publishes nothing and counts nothing.
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_take_published_counts_each_request_once() -> i32
+    let region = reset()
+    var svc = fake_service(region)
+    let empty: [0]u8 = []
+    let peer: [4]u8 = [10, 0, 2, 2]
+
+    if g_exchange.take_published() != 0
+        return 1
+    # net_bind publishes APP_BIND once; polling it again publishes nothing.
+    if not is_bind_pending(g_exchange.net_bind(7777))
+        return 2
+    if not is_bind_pending(g_exchange.net_bind(7777))
+        return 3
+    if g_exchange.take_published() != 1
+        return 4
+    if g_exchange.take_published() != 0
+        return 5
+    if not svc_publish(@&svc, EV_BOUND, 1, 4, 7777, 0, no_addr(), @empty)
+        return 6
+    if not is_bound(g_exchange.net_bind(7777), 4)
+        return 7
+    if g_exchange.take_published() != 0
+        return 8
+
+    # net_send_to: one publish per Sent; a rejected send publishes none.
+    let small: [5]u8 = [1; 5]
+    if not is_send_sent(g_exchange.net_send_to(4, @small, peer, 9, Some(1500)))
+        return 9
+    let too_big: [2049]u8 = [1; 2049]
+    if send_err(g_exchange.net_send_to(4, @too_big, peer, 9, Some(1500))) != -22
+        return 10
+    if g_exchange.take_published() != 1
+        return 11
+
+    # net_ping publishes APP_PING once.
+    if not is_ping_pending(g_exchange.net_ping(peer, @small, 0, @&g_buf))
+        return 12
+    if not is_ping_pending(g_exchange.net_ping(peer, @small, 1, @&g_buf))
+        return 13
+    if g_exchange.take_published() != 1
+        return 14
+    if ping_err(g_exchange.net_ping(peer, @small, PING_DEADLINE_MS, @&g_buf)) != -5
+        return 15
+
+    # net_close publishes APP_CLOSE once.
+    if not is_close_pending(g_exchange.net_close(4))
+        return 16
+    if not is_close_pending(g_exchange.net_close(4))
+        return 17
+    if g_exchange.take_published() != 1
+        return 18
+    0

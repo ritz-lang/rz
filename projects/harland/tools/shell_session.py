@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Drive a scripted rzsh session over a guest's serial console (AGAST #4252, #4254).
 
-    shell_session.py LOG TIMEOUT -- QEMU_ARGV...
+    shell_session.py [--net PORT] LOG TIMEOUT -- QEMU_ARGV...
 
 Listens on a unix socket, starts QEMU with its first serial port connected to
 it (`-chardev socket,id=con,path=SOCK -serial chardev:con`, appended to
@@ -27,12 +27,34 @@ prints "[init] Shell exited" and returns, and the kernel reports init's exit
 The last check asserts those three in that order, then that QEMU exits by
 itself with status 0. Before #1882 the kernel took rzsh's exit as init's and
 "[init] Shell exited" never appeared; that now fails.
+
+--net PORT plays net_session() instead of SESSION and the tty checks: the
+ring-3 networking acceptance of a translating boot (AGAST #4752, M2.10;
+harland docs/RING2_NET.md "Ring-3 tools"), whose QEMU_ARGV forwards host
+UDP 127.0.0.1:PORT to the guest's PORT (hostfwd=udp:127.0.0.1:PORT-:PORT)
+and runs /bin/netd. Slirp's gateway 10.0.2.2 is the host:
+
+  ping 10.0.2.2               prints one reply and exits 0;
+  udp-send 10.0.2.2 L hello   exits 0 and a host listener on L gets `hello`;
+  udp-recv PORT               prints a datagram the host sends through
+                              the hostfwd, with its peer port, and exits 0;
+  udp-recv PORT & udp-recv PORT
+                              one bind of a live port: whichever process
+                              binds second exits 17 with Errno.Exist, the
+                              other gets the host's datagram, and `wait`
+                              reaps the job;
+  udp-recv PORT, 6 times      each from a new process (more than netd's 5
+                              attachments and the free process slots), each
+                              gets its datagram and none sees Errno.Exist.
+
+Then `exit` as above.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -43,6 +65,18 @@ PROMPT = b"rzsh> "
 # Seconds between typed bytes, so COM1's 16-byte FIFO never overruns.
 TYPE_DELAY = float(os.environ.get("SHELL_TYPE_DELAY", "0.02"))
 FATAL = re.compile(rb"KERNEL PANIC|!!! EXCEPTION !!!|EXCEPTION:")
+# netd's lease line (system/src/netd.ritz log_address). It goes to the
+# console like every kernel and service line, so the net session waits for
+# it before typing: the tools need the lease, and the line must not land in
+# a command's output.
+NETD_CONFIGURED = b"[netd] configured "
+# What the ring-3 net tools print (indium user/ping.ritz, udp_recv.ritz,
+# net_tool.ritz fail()).
+PING_REPLY = "reply from 10.0.2.2: 9 bytes: ritz ping"
+EXIST_LINE = b"udp-recv: net_bind: Errno.Exist (port in use) (-17)"
+# Udp-recv's report, from the host sender's port with `payload`.
+def _from_line(port: int, payload: bytes) -> bytes:
+    return b"from 10.0.2.2:%d: %d bytes: %s" % (port, len(payload), payload)
 
 
 def _lines(out: bytes) -> list[str]:
@@ -153,6 +187,7 @@ class Console:
         self.conn = conn
         self.log = log
         self.buf = b""
+        self.seen = b""                   # every byte received, for markers
         self.conn.settimeout(0.5)
 
     def _recv(self) -> bool:
@@ -166,6 +201,7 @@ class Console:
         self.log.write(data)
         self.log.flush()
         self.buf += data
+        self.seen += data
         return True
 
     def expect(self, marker: bytes, timeout: float) -> bytes | None:
@@ -309,11 +345,138 @@ def tty_session(con: "Console", timeout: float) -> int:
     return fails
 
 
+class HostUdp:
+    """The host's end of the guest's UDP: a listener udp-send sends to
+    (10.0.2.2:listen_port in the guest), and a sender into the hostfwd'd
+    guest port, from one fixed source port udp-recv must print."""
+
+    def __init__(self, fwd_port: int):
+        self.fwd_port = fwd_port
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listen_port = self.listener.getsockname()[1]
+        self.sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sender.bind(("127.0.0.1", 0))
+        self.send_port = self.sender.getsockname()[1]
+
+    def send(self, payload: bytes) -> None:
+        self.sender.sendto(payload, ("127.0.0.1", self.fwd_port))
+
+    def received(self, timeout: float) -> list[bytes]:
+        """Every datagram the listener got within timeout of the first."""
+        got = []
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([self.listener], [], [], left)[0]:
+                return got
+            got.append(self.listener.recv(4096))
+            deadline = time.monotonic() + 0.5
+
+    def close(self) -> None:
+        self.listener.close()
+        self.sender.close()
+
+
+def _feed_until(con: "Console", host: HostUdp, payload: bytes, timeout: float) -> bytes | None:
+    """Wait for the next prompt, sending `payload` into the hostfwd every
+    half second meanwhile: a datagram before the guest's bind is dropped
+    (no endpoint holds the port), so the first one that lands after it is
+    the one udp-recv reports. None on a timeout, hang-up or panic."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        host.send(payload)
+        out = con.expect(PROMPT, 0.5)
+        if out is not None:
+            # The copies still in flight land while no endpoint holds the
+            # port (netd drops them), not on the next step's fresh bind.
+            time.sleep(1.0)
+            return out
+        if FATAL.search(con.buf):
+            return None
+    return None
+
+
+def net_session(con: "Console", host: HostUdp, timeout: float) -> int:
+    """The M2.10 checks (AGAST #4752); the number that failed. Each step
+    ends at a prompt, so a failed step does not derail the next."""
+    fails = 0
+    if NETD_CONFIGURED not in con.seen and con.expect(NETD_CONFIGURED, timeout) is None:
+        print(f"FAIL: netd logged no lease ({NETD_CONFIGURED.decode().strip()} A) "
+              f"within {timeout:.0f}s of the prompt")
+        return 1
+    # The rest of netd's line, and any prompt redraw, before the first command.
+    con.drain(1.0)
+
+    con.type_line("ping 10.0.2.2 ; echo $?")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and _listing(_lines(out[: -len(PROMPT)])) == [PING_REPLY, "0"],
+                 f"`ping 10.0.2.2`: one echo through netd prints `{PING_REPLY}` and exits 0", out)
+
+    con.type_line(f"udp-send 10.0.2.2 {host.listen_port} hello ; echo $?")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and _listing(_lines(out[: -len(PROMPT)])) == ["0"],
+                 f"`udp-send 10.0.2.2 {host.listen_port} hello` exits 0", out)
+    got = host.received(10.0)
+    fails += _ok(got == [b"hello"],
+                 f"the host listener on {host.listen_port} got one datagram `hello` (got {got!r})")
+
+    port = host.fwd_port
+    want = _from_line(host.send_port, b"datagram-1")
+    con.type_line(f"udp-recv {port} ; echo $?")
+    out = _feed_until(con, host, b"datagram-1", timeout)
+    fails += _ok(out is not None and _listing(_lines(out[: -len(PROMPT)])) == [want.decode(), "0"],
+                 f"`udp-recv {port}` prints the host's datagram through hostfwd=udp "
+                 f"(`{want.decode()}`) and exits 0", out)
+
+    # Two live binds of one port. The job and the next command race to bind
+    # it, so neither is assumed first: the second one exits 17 with
+    # Errno.Exist and the other gets the datagram, whichever it is. Nothing
+    # is sent until that Errno.Exist is on the console: a datagram before
+    # it would let the first holder take it, close the port and leave the
+    # second bind nothing to collide with.
+    start = len(con.seen)
+    con.type_line(f"udp-recv {port} &")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and re.search(rb"\[1\] [0-9]+", out) is not None,
+                 f"`udp-recv {port} &` starts a background job", out)
+    want = _from_line(host.send_port, b"datagram-2")
+    con.type_line(f"udp-recv {port} ; echo fg=$?")
+    if EXIST_LINE not in con.seen[start:] and con.expect(EXIST_LINE, timeout) is None:
+        print(f"FAIL: neither bind of live port {port} answered Errno.Exist within {timeout:.0f}s")
+        return fails + 1
+    fg = _feed_until(con, host, b"datagram-2", timeout)
+    con.type_line("wait ; echo job=$?")
+    job = _feed_until(con, host, b"datagram-2", timeout)
+    phase = con.seen[start:]
+    statuses = sorted(re.findall(rb"(?:fg|job)=([0-9]+)", phase))
+    fails += _ok(fg is not None and job is not None and phase.count(EXIST_LINE) == 1
+                 and phase.count(want) == 1 and statuses == [b"0", b"17"],
+                 f"a second bind of live port {port} exits 17 with Errno.Exist while the "
+                 f"first holds it and gets the datagram", phase)
+
+    # A new process each time: its attachment and process slot are the ones
+    # the last run freed, and the port its net_close freed binds again.
+    for i in range(3, 9):
+        payload = b"datagram-%d" % i
+        want = _from_line(host.send_port, payload)
+        con.type_line(f"udp-recv {port} ; echo $?")
+        out = _feed_until(con, host, payload, timeout)
+        fails += _ok(out is not None and _listing(_lines(out[: -len(PROMPT)])) == [want.decode(), "0"],
+                     f"`udp-recv {port}` run {i - 2} of 6 from a new process rebinds the port "
+                     f"and prints `{want.decode()}` (no Errno.Exist)", out)
+    return fails
+
+
 def main(argv: list[str]) -> int:
+    fwd_port = None
+    if argv[:1] == ["--net"] and len(argv) > 1 and argv[1].isdigit():
+        fwd_port, argv = int(argv[1]), argv[2:]
     if len(argv) < 4 or argv[2] != "--":
-        print("usage: shell_session.py LOG TIMEOUT -- QEMU_ARGV...", file=sys.stderr)
+        print("usage: shell_session.py [--net PORT] LOG TIMEOUT -- QEMU_ARGV...", file=sys.stderr)
         return 2
     log_path, timeout, qemu = argv[0], float(argv[1]), argv[3:]
+    host = HostUdp(fwd_port) if fwd_port is not None else None
 
     # Under /tmp, not $TMPDIR: a gate's TMPDIR is deep enough to overrun
     # sun_path's 107 bytes (AGAST #4177).
@@ -345,20 +508,24 @@ def main(argv: list[str]) -> int:
                       f"{timeout:.0f}s; the guest stopped, panicked or hung up)")
                 return 1
             print("PASS: rzsh prompt on the serial console")
-            for cmd, what, check in SESSION:
-                con.type_line(cmd)
-                out = con.expect(PROMPT, timeout)
-                if out is None:
-                    print(f"FAIL: `{cmd}`: no prompt afterwards within {timeout:.0f}s")
-                    return 1
-                lines = _lines(out[: -len(PROMPT)])
-                if check(lines):
-                    print(f"PASS: `{cmd}`: {what}")
-                else:
-                    print(f"FAIL: `{cmd}`: {what}; got {lines!r}")
+            if host is not None:
+                if net_session(con, host, timeout):
                     rc = 1
-            if tty_session(con, timeout):
-                rc = 1
+            else:
+                for cmd, what, check in SESSION:
+                    con.type_line(cmd)
+                    out = con.expect(PROMPT, timeout)
+                    if out is None:
+                        print(f"FAIL: `{cmd}`: no prompt afterwards within {timeout:.0f}s")
+                        return 1
+                    lines = _lines(out[: -len(PROMPT)])
+                    if check(lines):
+                        print(f"PASS: `{cmd}`: {what}")
+                    else:
+                        print(f"FAIL: `{cmd}`: {what}; got {lines!r}")
+                        rc = 1
+                if tty_session(con, timeout):
+                    rc = 1
             con.type_line("exit")
             tail = con.drain(timeout)
             ok_exit = _in_order(tail, EXIT_MARKERS)
@@ -380,6 +547,8 @@ def main(argv: list[str]) -> int:
             proc.kill()
             proc.wait()
         srv.close()
+        if host is not None:
+            host.close()
         try:
             os.unlink(sock_path)
             os.rmdir(sock_dir)

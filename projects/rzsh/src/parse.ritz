@@ -49,11 +49,14 @@ pub struct Token
 pub struct Tokens
     toks: Vec<Token>
     words: Vec<String>   # owns the bytes every Word token's StrView borrows
-    next: i64            # index just past the ';' that ended the item, or -1
-    err: i32             # 0, or PARSE_UNTERMINATED
+    next: i64            # index just past the ';' or '&' that ended the item, or -1
+    err: i32             # 0, PARSE_UNTERMINATED or PARSE_AND_LIST
+    background: bool     # an '&' ended the item: run it without waiting
 
 # tokenize() errors
 pub const PARSE_UNTERMINATED: i32 = -1
+# `&&`: rzsh has no AND list, and must not read it as two background items.
+pub const PARSE_AND_LIST: i32 = -2
 
 # Exit status of the last command, for `$?`.
 pub var g_last_status: i32 = 0
@@ -89,7 +92,7 @@ fn is_blank(c: u8) -> bool
     return c == ' ' or c == '\t' or c == '\n' or c == '\r'
 
 fn is_operator(c: u8) -> bool
-    return c == '|' or c == ';' or c == '>' or c == '<'
+    return c == '|' or c == ';' or c == '&' or c == '>' or c == '<'
 
 pub fn is_name_start(c: u8) -> bool
     return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_'
@@ -276,7 +279,7 @@ fn lex_operator(lx: @&Lexer) -> bool
 # Tokenizer
 # ============================================================================
 
-# Splits one list item of `line`, from `pos` up to the next unquoted ';' or
+# Splits one list item of `line`, from `pos` up to the next unquoted ';', '&' or
 # the end. Items are tokenized one at a time, right before they run, so
 # `export X=5 ; echo $X` and `false ; echo $?` see the earlier item's effect.
 # The caller owns the result and frees it with tokens_drop.
@@ -286,7 +289,7 @@ pub fn tokenize(line: StrView, pos: i64) -> Tokens
     lx.i = pos
     lx.word = string_new()
     lx.quoted = false
-    lx.out = Tokens { toks: vec_new<Token>(), words: vec_new<String>(), next: -1, err: 0 }
+    lx.out = Tokens { toks: vec_new<Token>(), words: vec_new<String>(), next: -1, err: 0, background: false }
 
     while true
         while is_blank(at(@lx, 0))
@@ -295,6 +298,14 @@ pub fn tokenize(line: StrView, pos: i64) -> Tokens
         if c == '\0' or c == '#'   # end, or a '#' comment
             break
         if c == ';'
+            lx.out.next = lx.i + 1
+            break
+        # `cmd &` (AGAST #4752): the item ends here and runs in the background.
+        if c == '&'
+            if at(@lx, 1) == '&'
+                lx.out.err = PARSE_AND_LIST
+                break
+            lx.out.background = true
             lx.out.next = lx.i + 1
             break
         if not lex_operator(@&lx) and not lex_word(@&lx)

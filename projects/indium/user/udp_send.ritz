@@ -10,7 +10,7 @@ import ritzlib.span { Span, span_from_strview }
 import ritzlib.strview { StrView }
 import libnet.client { NetExchange, BindResult, SendResult, CloseResult, ERRNO_BADF }
 import libnet.ring { app_req_ring, app_ev_ring }
-import net_attach { Ipv4, net_attach, link_mtu, parse_addr, parse_port, wait_round, usage_error }
+import net_attach { wake_service, Ipv4, net_attach, link_mtu, parse_addr, parse_port, wait_round, usage_error }
 import net_tool { fail }
 
 # The attachment: a global, since NetExchange is over 1 MiB (libnet's
@@ -32,13 +32,18 @@ pub fn main(args: Span<StrView>) -> i32
         None => return usage_error(usage)
     let message: StrView = args.get(3)
 
+    var exchange: u64 = 0
     match net_attach()
-        Ok(a) => g_exchange.init(app_req_ring(a.region), app_ev_ring(a.region))
+        Ok(a) =>
+            g_exchange.init(app_req_ring(a.region), app_ev_ring(a.region))
+            exchange = a.handle
         Err(e) => return fail("udp-send", e.call, e.errno)
 
     var handle: u32 = 0
     loop
-        match g_exchange.net_bind(0)
+        let r = g_exchange.net_bind(0)
+        wake_service(exchange, g_exchange.take_published())
+        match r
             BindResult.Bound(h) =>
                 handle = h
                 break
@@ -47,14 +52,18 @@ pub fn main(args: Span<StrView>) -> i32
 
     # Returns once the request is on the ring; a full ring waits for SPACE.
     loop
-        match g_exchange.net_send_to(handle, span_from_strview(message), addr.octets, port, link_mtu())
+        let r = g_exchange.net_send_to(handle, span_from_strview(message), addr.octets, port, link_mtu())
+        wake_service(exchange, g_exchange.take_published())
+        match r
             SendResult.Sent => break
             SendResult.Err(e) => return fail("udp-send", "net_send_to", e)
             SendResult.BadF => return fail("udp-send", "net_send_to", ERRNO_BADF)
             SendResult.Pending => wait_round()
 
     loop
-        match g_exchange.net_close(handle)
+        let r = g_exchange.net_close(handle)
+        wake_service(exchange, g_exchange.take_published())
+        match r
             CloseResult.Closed => return 0
             CloseResult.Err(e) => return fail("udp-send", "net_close", e)
             CloseResult.BadF => return fail("udp-send", "net_close", ERRNO_BADF)

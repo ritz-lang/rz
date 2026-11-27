@@ -12,7 +12,7 @@ import ritzlib.sys {
     sys_pipe, sys_dup, sys_dup2, sys_chdir, sys_getcwd,
     O_RDONLY, O_DIRECTORY, STDIN, STDOUT,
     # Harland-specific (only used when target_os=harland)
-    sys_readdir, sys_spawn_args, sys_wait,
+    sys_readdir, sys_spawn_args, sys_spawn_bg, sys_wait,
     sys_tty_setfg, TTY_FG_CHILDREN
 }
 
@@ -172,15 +172,37 @@ fn not_found(cmd: StrView)
     err_str(cmd)
     err_str("\n")
 
-# Linux: fork, then the child tries each candidate with execve.
-[[target_os = "linux"]]
+# Why os_spawn_start started nothing; the message is reported already.
+pub enum SpawnError
+    NotFound    # no candidate on the search path starts
+    NotStarted  # the process couldn't be created
+
+# The shell exit status for a failed start: 127 not found, 126 not started.
+pub fn spawn_error_status(e: SpawnError) -> i32
+    return match e
+        SpawnError.NotFound => 127
+        SpawnError.NotStarted => 126
+
+# Runs `args` (args[0] names it, found on `search`) and waits for it: its
+# exit status, or spawn_error_status when it doesn't start.
 pub fn os_spawn_search(args: Span<StrView>, search: StrView, envp: **u8) -> i32
+    return match os_spawn_start(args, search, envp, false)
+        Ok(pid) => os_wait(pid)
+        Err(e) => spawn_error_status(e)
+
+# Starts `args` for os_spawn_search, or as a background job (`cmd &`,
+# AGAST #4752): its pid for os_wait.
+# Linux: fork, then the child tries each candidate with execve; a command
+# that isn't found is the child's exit 127. A fork never blocks, so
+# `background` changes nothing here.
+[[target_os = "linux"]]
+pub fn os_spawn_start(args: Span<StrView>, search: StrView, envp: **u8, background: bool) -> Result<i32, SpawnError>
     let cmd: StrView = args[0]
     let argv: CArgv = cargv_build(args)
     var path: String = string_new()
     let pid: i32 = sys_fork()
     if pid < 0
-        return 126
+        return Err(SpawnError.NotStarted)
 
     if pid == 0
         if has_slash(cmd)
@@ -195,24 +217,29 @@ pub fn os_spawn_search(args: Span<StrView>, search: StrView, envp: **u8) -> i32
         not_found(cmd)
         sys_exit(127)
 
-    return os_wait(pid)
+    return Ok(pid)
 
 # Harland: spawn `path` (`./prog`, `bin/cat` or a PATH candidate) once it
 # is resolved against the cwd; the kernel takes absolute paths only.
+# spawn_args runs the child to its exit before it returns (the console
+# handoff, os_tty_fg_children, counts on that); a background job is
+# spawn_bg's, which returns at once with both running (#3629).
 [[target_os = "harland"]]
-fn spawn_resolved(path: StrView, argv: @CArgv, argc: i32) -> i64
+fn spawn_resolved(path: StrView, argv: @CArgv, argc: i32, background: bool) -> i64
     var absolute: String = match path_absolute(path)
         Ok(resolved) => resolved
         Err(_) => return -1
     let raw: *u8 = absolute.as_ptr()
     if raw == null
         return -1
+    if background
+        return sys_spawn_bg(raw, argv.ptrs.data, argc)
     return sys_spawn_args(raw, argv.ptrs.data, argc)
 
 # Harland: try sys_spawn_args on each candidate until one starts. No
 # environment is passed (harland has none).
 [[target_os = "harland"]]
-pub fn os_spawn_search(args: Span<StrView>, search: StrView, envp: **u8) -> i32
+pub fn os_spawn_start(args: Span<StrView>, search: StrView, envp: **u8, background: bool) -> Result<i32, SpawnError>
     let cmd: StrView = args[0]
     let argv: CArgv = cargv_build(args)
     let argc: i32 = args.len as i32
@@ -221,18 +248,18 @@ pub fn os_spawn_search(args: Span<StrView>, search: StrView, envp: **u8) -> i32
     var pid: i64 = -1
     if has_slash(cmd)
         path.push_str(cmd)
-        pid = spawn_resolved(path.as_view(), @argv, argc)
+        pid = spawn_resolved(path.as_view(), @argv, argc, background)
     else
         var pos: i64 = 0
         while pos >= 0 and pid < 0
             pos = next_candidate(search, pos, cmd, @&path)
             if pos >= 0
-                pid = spawn_resolved(path.as_view(), @argv, argc)
+                pid = spawn_resolved(path.as_view(), @argv, argc, background)
 
     if pid < 0
         not_found(cmd)
-        return 127
-    return sys_wait(pid as i32) as i32
+        return Err(SpawnError.NotFound)
+    return Ok(pid as i32)
 
 # ============================================================================
 # Process and file-descriptor control (pipes, redirection)

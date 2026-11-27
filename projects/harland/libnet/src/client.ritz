@@ -131,6 +131,7 @@ pub struct NetExchange
     outstanding_id: u32
     ping_deadline: u64
     peer_closed: bool
+    published: u32                   # requests published since take_published
     pending_reply: Option<ReplyEvent>
     handles: [MAX_ENDPOINTS]HandleQueue
     meta: [QUEUE_ROWS]QueueMeta
@@ -155,6 +156,7 @@ impl NetExchange
         self.outstanding_id = 0
         self.ping_deadline = 0
         self.peer_closed = false
+        self.published = 0
         self.pending_reply = None
         for i in 0..MAX_ENDPOINTS as u64
             self.handles[i].handle = 0
@@ -178,6 +180,17 @@ impl NetExchange
         match self.find_handle(handle)
             Some(idx) => self.handles[idx as u64].drops
             None => 0
+
+    # Requests published onto the request ring since the last call,
+    # cleared as it is read. The library makes no syscalls, so the wake
+    # is the caller's: when this is non-zero, ShmNotify DATA on the
+    # exchange handle (RING2_NET.md "Datagram send": store the request
+    # write_idx, then ShmNotify). netd parks on that bit, and a request
+    # with no wake behind it waits for netd's idle deadline.
+    pub fn take_published(self: @&NetExchange) -> u32
+        let n = self.published
+        self.published = 0
+        n
 
     # A fresh, non-zero request id. 0 stays "not a request id" (net_abi).
     fn alloc_id(self: @&NetExchange) -> u32
@@ -258,7 +271,8 @@ impl NetExchange
             let addr: [4]u8 = [0, 0, 0, 0]
             let empty: [0]u8 = []
             match self.req.publish(APP_BIND, id, 0, port, 0, addr, @empty)
-                AppPublish.Done => pass
+                AppPublish.Done =>
+                    self.published += 1
                 AppPublish.Full => return BindResult.Pending
                 AppPublish.BadLength => return BindResult.Err(ERRNO_INVAL)
                 AppPublish.Close(_) =>
@@ -306,7 +320,9 @@ impl NetExchange
             return SendResult.Err(ERRNO_INVAL)
         let id = self.alloc_id()
         match self.req.publish(APP_SEND_TO, id, handle, port, 0, addr, bytes)
-            AppPublish.Done => SendResult.Sent
+            AppPublish.Done =>
+                self.published += 1
+                SendResult.Sent
             AppPublish.Full => SendResult.Pending
             AppPublish.BadLength => SendResult.Err(ERRNO_INVAL)
             AppPublish.Close(_) =>
@@ -347,7 +363,8 @@ impl NetExchange
         if self.outstanding_id == 0
             let id = self.alloc_id()
             match self.req.publish(APP_PING, id, 0, 0, 0, addr, payload)
-                AppPublish.Done => pass
+                AppPublish.Done =>
+                    self.published += 1
                 AppPublish.Full => return PingResult.Pending
                 AppPublish.BadLength => return PingResult.Err(ERRNO_INVAL)
                 AppPublish.Close(_) =>
@@ -391,7 +408,8 @@ impl NetExchange
             let addr: [4]u8 = [0, 0, 0, 0]
             let empty: [0]u8 = []
             match self.req.publish(APP_CLOSE, id, handle, 0, 0, addr, @empty)
-                AppPublish.Done => pass
+                AppPublish.Done =>
+                    self.published += 1
                 AppPublish.Full => return CloseResult.Pending
                 AppPublish.BadLength => return CloseResult.Err(ERRNO_INVAL)
                 AppPublish.Close(_) =>

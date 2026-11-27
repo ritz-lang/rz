@@ -122,6 +122,20 @@
 # lines). init's net-tool checks then see no service.
 # The pc run keeps the in-kernel driver and every check it had.
 #
+# Then the ring-3 networking acceptance (AGAST #4752, M2.10; docs/
+# RING2_NET.md "Ring-3 tools"): a third boot, "vtd-shell", is the same
+# translating machine with init_interactive as /bin/init and no boot
+# options (no self-tests, no netd-restart: that test spends netd's restart
+# budget, and these tools need a live netd). Its NIC also forwards host UDP
+# 127.0.0.1:P to the guest's P (hostfwd=udp). tools/shell_session.py --net P
+# drives rzsh over its serial port: `ping 10.0.2.2` prints one reply;
+# `udp-send 10.0.2.2 <port> hello` reaches a host listener; `udp-recv P`
+# prints a datagram the host sends through the hostfwd; with `udp-recv P &`
+# holding the port, a second bind exits 17 with Errno.Exist; and six more
+# `udp-recv P` runs from new processes each rebind it and get their
+# datagram. The log also shows the seat handoff and netd's own lease
+# (seat_checks).
+#
 # The NIC uses QEMU's user-mode network (slirp): its built-in DHCP server
 # answers inside QEMU, so this needs no root and no host network.
 #
@@ -134,7 +148,8 @@
 # Usage: tools/test_msix_boot.sh
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for the boot (default 120)
-#        KEEP_WORK=DIR  copy the serial logs (msix.log, msix-vtd.log) into DIR
+#        KEEP_WORK=DIR  copy the serial logs (msix.log, msix-vtd.log,
+#                       msix-vtd-shell.log) into DIR
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
 #
 # Exit: 0 = pass; 1 = the boot or a check failed; 3 = a required tool is
@@ -170,7 +185,8 @@ done
 
 # Same packages as test_tier1_boot.sh, from the one list: init's suite
 # spawns them, and harland/system builds /bin/virtio-net, the vtd boot's
-# NIC owner (AGAST #4735).
+# NIC owner (AGAST #4735). The vtd-shell boot's init_interactive and rzsh
+# come from the same list.
 USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
 [ -n "$USER_PKGS" ] || { echo "FAIL: no packages in $PROJECTS_DIR/indium/initramfs.pkgs"; exit 1; }
 
@@ -197,8 +213,13 @@ for pkg in $USER_PKGS; do
 done
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
+# The vtd-shell boot (AGAST #4752): the same programs, init_interactive as
+# /bin/init, and an ESP with no boot option markers.
+python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" --init init_interactive \
+    --output "$WORK/initramfs-shell.qcow2" >/dev/null || { echo "FAIL: mkinitramfs (init_interactive) failed"; exit 1; }
 cp "$LOADER_EFI" "$WORK/esp/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$WORK/esp/harland/kernel.elf"
+cp -r "$WORK/esp" "$WORK/esp-shell"
 # This ESP asks for the kernel's pre-init network self-tests (AGAST #4335):
 # the boot option is the presence of this marker on the boot volume. Every
 # other boot script leaves it out, so a misbehaving NIC can't keep rzsh from
@@ -224,11 +245,14 @@ print(h)
 EOF
 ) || { echo "FAIL: could not write the NVMe disk"; exit 1; }
 
-# boot NAME SERIAL: boot the machine; NAME "vtd" is q35 with intel-iommu
-# and the NIC behind it, "pc" has no IOMMU.
-boot() {
-    local name="$1" serial="$2" machine=(-machine pc) iommu=() platform="" vars=()
-    if [ "$name" = vtd ]; then
+# qemu_cmd NAME ESP INITRAMFS NETDEV: set qemu=(...) to the machine with
+# that ESP directory and initramfs, the NIC's netdev options NETDEV after
+# "user,id=net0"; the serial port is the caller's. NAME "vtd" (and
+# "vtd-shell") is q35 with intel-iommu and the NIC behind it, "pc" has no
+# IOMMU.
+qemu_cmd() {
+    local name="$1" esp="$2" initramfs="$3" netdev="$4" machine=(-machine pc) iommu=() platform="" vars=()
+    if [ "$name" != pc ]; then
         # intremap=on wants the split irqchip; eim=on because the kernel
         # runs the LAPIC in x2APIC mode (32-bit IRTE destinations). The
         # IOMMU goes before the PCI devices it translates.
@@ -240,24 +264,31 @@ boot() {
         cp "$OVMF_VARS" "$WORK/vars-$name.fd"
         vars=(-drive "if=pflash,format=raw,file=$WORK/vars-$name.fd")
     fi
-    : > "$serial"
     # romfile= drops the NIC's iPXE option ROM, so OVMF never tries a network
     # boot before the ESP. The legacy virtio-net path is covered by
     # tools/test_tier1_boot.sh's grub boot, whose NIC is QEMU's transitional
     # default.
-    timeout "$TIMEOUT" qemu-system-x86_64 "${machine[@]}" -cpu Haswell-v1 -smp 4 -m 2G \
-        "${iommu[@]}" \
-        -display none -no-reboot -monitor none \
-        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
-        -drive "format=raw,file=fat:rw:$WORK/esp" \
-        -device virtio-blk-pci,drive=initramfs,disable-legacy=on \
-        -device virtio-keyboard-pci \
-        -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
-        -device "virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024$platform" \
-        -netdev user,id=net0 \
-        -device nvme,serial=harland-msix,drive=nvme0 \
-        -drive "file=$WORK/nvme.img,format=raw,if=none,id=nvme0" \
-        -serial "file:$serial" >/dev/null 2>&1 &
+    qemu=(qemu-system-x86_64 "${machine[@]}" -cpu Haswell-v1 -smp 4 -m 2G
+        "${iommu[@]}"
+        -display none -no-reboot -monitor none
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}"
+        -drive "format=raw,file=fat:rw:$esp"
+        -device virtio-blk-pci,drive=initramfs,disable-legacy=on
+        -device virtio-keyboard-pci
+        -drive "file=$initramfs,format=qcow2,if=none,id=initramfs"
+        -device "virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024$platform"
+        -netdev "user,id=net0$netdev"
+        -device nvme,serial=harland-msix,drive=nvme0
+        -drive "file=$WORK/nvme.img,format=raw,if=none,id=nvme0")
+}
+
+# boot NAME SERIAL: boot the Tier-1 suite on the machine NAME (qemu_cmd),
+# its serial port written to SERIAL.
+boot() {
+    local name="$1" serial="$2"
+    qemu_cmd "$name" "$WORK/esp" "$WORK/initramfs.qcow2" ""
+    : > "$serial"
+    timeout "$TIMEOUT" "${qemu[@]}" -serial "file:$serial" >/dev/null 2>&1 &
     local pid=$!
     timed_out=1
     for _ in $(seq 1 "$TIMEOUT"); do
@@ -725,9 +756,37 @@ check() {
     fi
 }
 
+# net_shell_boot: the vtd-shell boot (AGAST #4752): rzsh drives ping,
+# udp-send and udp-recv against /bin/netd (shell_session.py --net, which
+# prints each check). Sets rc=1 on any failure.
+net_shell_boot() {
+    local log="$WORK/msix-vtd-shell.log" port src
+    echo "===== msix boot (vtd-shell): ring-3 networking ====="
+    # A free host UDP port for the hostfwd. The guest binds the same number.
+    port=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    qemu_cmd vtd-shell "$WORK/esp-shell" "$WORK/initramfs-shell.qcow2" ",hostfwd=udp:127.0.0.1:$port-:$port"
+    python3 "$SCRIPT_DIR/shell_session.py" --net "$port" "$log" "$TIMEOUT" -- "${qemu[@]}"
+    src=$?
+    [ "$src" -eq "$EXIT_SETUP" ] && setup_error "QEMU could not be started (vtd-shell)"
+    if [ "$src" -ne 0 ]; then
+        echo "----- vtd-shell serial tail -----"
+        tail -c 1500 "$log" 2>/dev/null | tr -d '\r'
+        echo
+        echo "---------------------------------"
+        rc=1
+    fi
+    if grep -aqE "KERNEL PANIC|!!! EXCEPTION !!!" "$log" 2>/dev/null; then
+        sed -n '/EXCEPTION/,/CR2/p' "$log" | head -20
+        echo "FAIL: kernel exception or panic on the vtd-shell boot"
+        rc=1
+    fi
+    seat_checks "$log"
+}
+
 rc=0
 boot pc "$WORK/msix.log"
 check pc "$WORK/msix.log"
 boot vtd "$WORK/msix-vtd.log"
 check vtd "$WORK/msix-vtd.log"
+net_shell_boot
 exit $rc
