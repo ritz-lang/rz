@@ -27,6 +27,7 @@ These tests pin: the memo is written and then used; a corrupt memo is a miss
 yields "unknown" (no reuse) even with a memo present.
 """
 
+import errno
 import os
 import shutil
 import subprocess
@@ -105,12 +106,32 @@ def _plant(cache: Path, binary: Path, text: str) -> Path:
     return memo
 
 
+def _open_for_rewrite(binary: Path, timeout: float = 10.0):
+    """Open `binary` "r+b", waiting out ETXTBSY from a just-reaped exec (#4901).
+
+    `subprocess.run` has reaped the ritz1 child, but the kernel lifts the
+    exec's deny-write only when the child's last `mm` reference drops: a
+    `/proc/<pid>` reader (a CI resource sampler) can hold it past `wait()`,
+    so the open briefly fails "Text file busy".  Retry on that errno only,
+    bounded; anything else, or a holder that never lets go, still fails.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return binary.open("r+b")
+        except OSError as e:
+            if e.errno != errno.ETXTBSY or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 def _compile(binary: Path, work: Path, cache: Path, name: str = "unit") -> subprocess.CompletedProcess:
     src = work / f"{name}.ritz"
     src.write_text(SOURCE)
     env = dict(os.environ, RITZ_CACHE_DIR=str(cache))
     return subprocess.run(
         [str(binary), str(src), "-o", str(work / f"{name}.ll")],
+        check=False,
         capture_output=True,
         text=True,
         cwd=str(work),
@@ -243,7 +264,7 @@ class TestChangedBinaryMisses:
         assert _compiler_hash(binary, work, cache) != padded   # memo in use
         before = os.stat(binary)
         # Rewrite the trailing padding in place, then restore mtime.
-        with binary.open("r+b") as fh:
+        with _open_for_rewrite(binary) as fh:
             fh.seek(-64, os.SEEK_END)
             fh.write(b"\1" * 64)
         os.utime(binary, ns=(before.st_atime_ns, before.st_mtime_ns))
