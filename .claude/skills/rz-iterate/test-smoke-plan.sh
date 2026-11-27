@@ -109,13 +109,13 @@ has "$(cat "$T/stub/out.log")" "build under ritz1_selfhosted excused" "and says 
 printf '[workspace.exclude]\n"projects/harland/boot" = "harland builds it"\n' > rz.toml
 change projects/harland/ritz.toml projects/harland/netstack/ritz.toml projects/harland/boot/ritz.toml >/dev/null
 change projects/harland/netstack/src/arp.ritz >/dev/null
-eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:harland pkg:harland/netstack" "a nested package's change builds it and its enclosing package"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland pkg:harland/netstack" "a nested package's change builds it and its enclosing package"
 change projects/harland/boot/src/b.ritz >/dev/null
-eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:harland" "an excluded nested dir is its enclosing package's"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland" "an excluded nested dir is its enclosing package's"
 change projects/harland/kernel/src/k.ritz >/dev/null
-eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:harland" "the enclosing package's own files build it alone"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland" "the enclosing package's own files build it alone"
 nest="$(git rev-parse HEAD~2)"; git mv -k projects/harland/netstack/ritz.toml projects/harland/netstack/x.toml; git commit -qm unnest
-eq "$(targets "$nest^!")" "smoke tools-ratchets ritz1-bootstrap pkg:harland pkg:harland/netstack" "the planned commit's tree decides, not the work tree"
+eq "$(targets "$nest^!")" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland pkg:harland/netstack" "the planned commit's tree decides, not the work tree"
 git reset -q --hard HEAD~1
 # AGAST #4813: a top-level package rz.toml excludes (buddhafinger: built with
 # ritz1_selfhosted only) runs its dedicated entry, never pkg:'s
@@ -149,15 +149,33 @@ printf 'SCRIPT = "projects/harland/tools/test_msix_boot.sh"\nS = "projects/harla
 printf 'S = REPO / "projects/harland/tools/shell_session.py"\n' > projects/ritz/tools/test_ci_shell_boot.py
 git add -A; git commit -qm pins
 change projects/harland/tools/test_msix_boot.sh >/dev/null
-eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap ci:test_ci_msix_boot.py pkg:harland" "a CI boot script runs the test_ci_*.py that names it"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap ci:test_ci_msix_boot.py pkg:harland" "a CI boot script runs the test_ci_*.py that names it"
 has "$(bash "$SP" plan)" "^ci:test_ci_msix_boot.py	cd projects/ritz && python3 -m pytest -q -n 8 --dist loadgroup tools/test_ci_msix_boot.py$" \
     "ci: runs that one file under xdist, as tools-unit does"
 change projects/harland/tools/shell_session.py >/dev/null
-eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap ci:test_ci_msix_boot.py ci:test_ci_shell_boot.py pkg:harland" "a file two pins name runs both"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap ci:test_ci_msix_boot.py ci:test_ci_shell_boot.py pkg:harland" "a file two pins name runs both"
 change projects/harland/tools/other.sh >/dev/null
-eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:harland" "a path no pin names runs none"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland" "a path no pin names runs none"
 change projects/ritz/tools/test_ci_msix_boot.py >/dev/null
 eq "$(targets)" "smoke tools-unit tools-ratchets" "a pin itself is tools-unit's (which runs it)"
+git reset -q --hard "$mark"
+
+# AGAST #4898: train 0000283f79b4 went red in [ritz0 unit tests] after #4882
+# changed harland's virtio/blk.ritz: ritz0/tests/test_harland_*.py compile
+# and read harland sources (kernel/src, boot, the *_abi trees, tools,
+# build.py, ritz.toml) by paths relative to the tree, which no ci: pin
+# names.  So any non-doc harland path runs unit; a harland doc does not.
+mark="$(git rev-parse HEAD)"
+blk="$(change projects/harland/kernel/src/drivers/virtio/blk.ritz)"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland" "a harland kernel source runs ritz0's unit suite (it compiles them)"
+eq "$(bash "$SP" check "$blk" "smoke ${blk:0:12} [smoke tools-ratchets ritz1-bootstrap pkg:harland] EXIT=0" >/dev/null 2>&1; echo $?)" 1 \
+    "check refuses a harland quote without unit (#4882's)"
+change projects/harland/virtio_abi/src/v.ritz >/dev/null
+has "$(targets)" " unit " "a harland ABI tree runs unit"
+change projects/harland/docs/SMP.md >/dev/null
+eq "$(targets)" "smoke tools-ratchets" "a harland doc-only change does not"
+change projects/nexus/src/m.ritz >/dev/null
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:nexus" "nor does another package"
 git reset -q --hard "$mark"
 
 # 2. A mixed diff: each target once, in the fixed order, packages last.
