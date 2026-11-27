@@ -598,7 +598,7 @@ The frozen corpus stays the routine test. Before the switch, a survey runs rllvm
 - small PIC: an indium `pic` bin
 - large: `minimal_syscall`
 
-`./rz test rllvm --survey DIR` runs rllvm on every `.ll` under `DIR`, which is the IR a `--debug` build keeps under `build/`. It builds nothing itself. For each file it reports accepted, or the construct outside the subset. The cutover change records the counts per profile. Every rejected construct is either added to the subset, with a corpus entry, or listed in the change with the files it keeps on clang.
+`./rz test rllvm --survey DIR` runs rllvm on every `.ll` under `DIR`, which is the IR a `--debug` build keeps under `build/`. It builds nothing itself. For each file it reports accepted, or the construct outside the subset. The cutover change records the counts per profile. Every rejected construct is either added to the subset, with a corpus entry, or listed in the change with the files it keeps on clang. The counts and outcomes are in `projects/rllvm/tests/corpus/SURVEY.md`.
 
 ### Routing unsupported input
 

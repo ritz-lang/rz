@@ -115,6 +115,9 @@ REJECT = {
     "float vector": (fn("  %r = fadd <4 x float> zeroinitializer, zeroinitializer ; <-"), "type '<4 x float>'"),
     "odd vector": (fn("  %r = add <2 x i32> zeroinitializer, zeroinitializer ; <-"), "type '<2 x i32>'"),
     "typed pointer": (fn("  %r = load i32, i32* null ; <-"), "typed pointer 'i32*'"),
+    # ritz0 spells a function pointer as a typed function type (#4807).
+    "function type field": (HEAD + "%T = type {i8* (i64)*, i64} ; <-\n", "function type 'i8* (...)'"),
+    "function type param": (HEAD + "declare void @f(i32 (i8*, i64)*) ; <-\n", "function type 'i32 (...)'"),
     "opaque": (HEAD + "%T = type opaque ; <-\n", "type 'opaque'"),
     "win64cc define": (HEAD + "define win64cc void @f() { ; <-\nentry:\n  ret void\n}\n", "calling convention 'win64cc'"),
     "win64cc call": (fn("  call win64cc void @g() ; <-"), "calling convention 'win64cc'"),

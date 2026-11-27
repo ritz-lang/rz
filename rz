@@ -17,6 +17,7 @@ Compiler Selection:
 Examples:
     rz build tome                Build the tome project
     rz test --all                Run all tests
+    rz test rllvm --survey DIR   rllvm on every .ll under DIR (--profile P)
     rz run nexus                 Build and run nexus
     rz build --compiler ritz1    Build with self-hosted compiler
 """
@@ -742,10 +743,37 @@ def cmd_build(args):
     return run_build(project, extra_args)
 
 
+SURVEY_PROJECT = "rllvm"
+
+
+def run_survey(project, survey_dir, profile, compiler):
+    """`rz test rllvm --survey DIR` (AGAST #4807; projects/razm/DESIGN.md
+    "Coverage before the switch"): build rllvm, then run its survey.py over
+    the .ll files under DIR. It builds no IR: DIR is what a --debug build
+    kept. The survey's exit status is the command's."""
+    if project != SURVEY_PROJECT:
+        print(f"Error: --survey runs rllvm's survey: rz test {SURVEY_PROJECT} "
+              f"--survey DIR", file=sys.stderr)
+        return 1
+    rc = run_build(project, ["--compiler", compiler])
+    if rc != 0:
+        return rc
+    pkg = PROJECTS_DIR / project
+    env = {**os.environ, "RLLVM": str(pkg / "build" / "debug" / "rllvm")}
+    cmd = [sys.executable, str(pkg / "tests" / "survey.py"),
+           str(Path(survey_dir).resolve()), "--profile", profile]
+    return bounded_run.child(cmd, env=env, cwd=WORKSPACE_ROOT).returncode
+
+
 def cmd_test(args):
     """Handle 'rz test' command."""
     compiler = getattr(args, "compiler", "ritz0")
     extra_args = ["--compiler", compiler]
+
+    if getattr(args, "survey", None) is not None:
+        project = (None if args.all or not args.project
+                   else _resolve_or_report(args.project))
+        return run_survey(project, args.survey, args.profile, compiler)
 
     if args.all:
         projects = discover_projects()
@@ -966,6 +994,12 @@ def build_parser():
                              help="Compiler to use (default: ritz0)")
     test_parser.add_argument("-j", "--jobs", type=_positive_int, metavar="N",
                              help=JOBS_HELP)
+    test_parser.add_argument("--survey", metavar="DIR",
+                             help="rllvm only: run rllvm on every .ll under DIR "
+                                  "(a --debug build's IR) and report each file")
+    test_parser.add_argument("--profile", default="hosted",
+                             choices=["hosted", "shim", "small-pic", "kernel", "large"],
+                             help="--survey: rllvm's flags (default: hosted)")
 
     # run
     run_parser = subparsers.add_parser("run", help="Build and run a project")

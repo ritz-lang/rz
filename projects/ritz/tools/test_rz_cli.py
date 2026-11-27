@@ -273,3 +273,50 @@ class TestBuildPyRitzPathForTests:
     def test_caller_order_is_preserved_after_root(self, buildpy):
         result = buildpy.ritz_path_for_tests("/a:/b")
         assert result.split(":")[1:] == ["/a", "/b"]
+
+
+@pytest.mark.unit
+class TestSurvey:
+    """`rz test rllvm --survey DIR [--profile P]` (AGAST #4807): builds rllvm,
+    then runs its survey.py over DIR with that binary. It builds no IR."""
+
+    def run(self, rz, monkeypatch, argv, build_rc=0):
+        calls = []
+        monkeypatch.setattr(rz, "run_build",
+                            lambda p, extra=None: calls.append(("build", p, extra)) or build_rc)
+
+        class Done:
+            returncode = 7
+
+        def child(cmd, env=None, cwd=None):
+            calls.append(("child", cmd, env))
+            return Done()
+        monkeypatch.setattr(rz.bounded_run, "child", child)
+        args = rz.build_parser().parse_args(argv)
+        return args.func(args), calls
+
+    def test_builds_rllvm_then_runs_the_survey_on_dir(self, rz, monkeypatch, tmp_path):
+        rc, calls = self.run(rz, monkeypatch, ["test", "rllvm", "--survey", str(tmp_path),
+                                               "--profile", "kernel", "--compiler", "ritz1"])
+        assert rc == 7
+        assert calls[0] == ("build", "rllvm", ["--compiler", "ritz1"])
+        _, cmd, env = calls[1]
+        assert cmd[1:] == [str(rz.PROJECTS_DIR / "rllvm" / "tests" / "survey.py"),
+                           str(tmp_path.resolve()), "--profile", "kernel"]
+        assert env["RLLVM"] == str(rz.PROJECTS_DIR / "rllvm" / "build" / "debug" / "rllvm")
+
+    def test_profile_defaults_to_hosted(self, rz, monkeypatch, tmp_path):
+        _, calls = self.run(rz, monkeypatch, ["test", "rllvm", "--survey", str(tmp_path)])
+        assert calls[1][1][-2:] == ["--profile", "hosted"]
+
+    def test_a_failed_build_runs_no_survey(self, rz, monkeypatch, tmp_path):
+        rc, calls = self.run(rz, monkeypatch, ["test", "rllvm", "--survey", str(tmp_path)],
+                             build_rc=1)
+        assert rc == 1 and [c[0] for c in calls] == ["build"]
+
+    @pytest.mark.parametrize("argv", [["test", "razm", "--survey", "x"],
+                                      ["test", "--all", "--survey", "x"]])
+    def test_survey_is_rllvms_alone(self, rz, monkeypatch, capsys, argv):
+        rc, calls = self.run(rz, monkeypatch, argv)
+        assert rc == 1 and calls == []
+        assert "--survey runs rllvm's survey" in capsys.readouterr().err
