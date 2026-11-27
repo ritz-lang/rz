@@ -1,0 +1,279 @@
+# lsp/wire.ritz - the language server's wire: UTF-16 columns, JSON-RPC
+# frames, and the queue of frames waiting for the server's stdin (AGAST #4828).
+#
+# docs/BUDDHAFINGER_PROPOSAL.md, "Event loop" and "ritz-lsp". No I/O here:
+# platform/lsp.ritz moves the bytes, lsp/client.ritz decides what to send.
+#
+#   - Columns. The editor stores byte offsets; LSP positions count UTF-16
+#     code units. utf16_col and byte_col convert one line's columns, and
+#     only the language client calls them (the proposal's "keep UTF-16
+#     conversion at the ritz-lsp boundary").
+#   - Frames. `Content-Length: N\r\n\r\n` then N bytes of JSON (push_frame).
+#     FrameReader takes stdout's bytes as they come, in any pieces, and
+#     hands back each whole message.
+#   - Outbox. Frames for the server's stdin, written as the pipe takes them.
+#     A frame the pipe took part of keeps its bytes and offset until the
+#     rest goes. A full-text snapshot (didOpen / didChange) whose frame has
+#     not started is replaced by a newer one instead of queueing behind it,
+#     and the queued bytes are capped. The last ORDERED_RESERVE bytes under
+#     the cap are for ordered frames only (didOpen, didClose, initialized),
+#     so snapshots and requests filling the queue can't crowd them out.
+
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.fmt.digits { fmt_i64_into }
+
+import core.utf8 { utf8_unit_len }
+
+# ============================================================================
+# UTF-16 columns
+# ============================================================================
+
+# UTF-16 code units in line[0..byte): two for a code point above U+FFFF
+# (a 4-byte UTF-8 sequence), one for any other, a malformed byte included.
+pub fn utf16_col(line: [u8], byte: i64) -> i64
+    let end = if byte < line.len then byte else line.len
+    var units: i64 = 0
+    var i: i64 = 0
+    while i < end
+        let n = utf8_unit_len(line, i)
+        units += if n == 4 then 2 else 1
+        i += n
+    units
+
+# The byte column `units` UTF-16 code units into `line`: the line's end
+# past it, and the code point's start for a column inside a surrogate pair.
+pub fn byte_col(line: [u8], units: i64) -> i64
+    var left = units
+    var i: i64 = 0
+    while i < line.len
+        let n = utf8_unit_len(line, i)
+        let w: i64 = if n == 4 then 2 else 1
+        if left < w
+            return i
+        left -= w
+        i += n
+    line.len
+
+# ============================================================================
+# Frames
+# ============================================================================
+
+# The longest header block (every header line, CRLFs included) a frame
+# may have, and the largest body: past either, the stream is not LSP.
+pub const MAX_HEADER_BYTES: i64 = 4096
+pub const MAX_BODY_BYTES: i64 = 33554432        # 32 MiB
+
+# `body` as a frame onto `out`.
+pub fn push_frame(out: @&Vec<u8>, body: [u8])
+    var digits: [20]u8
+    out.push_view("Content-Length: ")
+    out.push_view(fmt_i64_into(@digits, body.len))
+    out.push_view("\r\n\r\n")
+    out.push_span(body)
+
+# What FrameReader.next found.
+pub enum Framed
+    Message(StrView)    # a whole message's JSON, valid until the next feed()
+    Partial             # not a whole frame yet: feed more
+    Bad                 # not a frame: the stream can't be read past it
+
+pub struct FrameReader
+    buf: Vec<u8>
+    start: i64          # where the first unread frame starts in buf
+
+pub fn frame_reader() -> FrameReader
+    FrameReader { buf: vec_new<u8>(), start: 0 }
+
+# The number a Content-Length value names, or -1: digits only, around blanks.
+fn length_value(v: StrView) -> i64
+    let t = v.trim()
+    if t.is_empty()
+        return -1
+    for i in 0..t.len()
+        let c = t.get(i)
+        if c < '0' or c > '9'
+            return -1
+    match t.parse_i64()
+        Some(n) => n
+        None => -1
+
+# True when `line` is header `name` (in any case) and its colon.
+fn header_named(line: StrView, name: StrView) -> bool
+    if line.len() <= name.len() or line.get(name.len()) != ':'
+        return false
+    for i in 0..name.len()
+        var a = line.get(i)
+        var b = name.get(i)
+        if a >= 'A' and a <= 'Z'
+            a += 32
+        if b >= 'A' and b <= 'Z'
+            b += 32
+        if a != b
+            return false
+    true
+
+impl FrameReader
+    # Bytes read from the server's stdout, in whatever pieces they came.
+    # Drops what earlier messages used: views next() gave are invalid after.
+    pub fn feed(self: @&FrameReader, bytes: [u8])
+        if self.start > 0
+            let n = self.buf.len() - self.start
+            let all: [u8] = self.buf[0..self.buf.len()]
+            all[0..n].copy_from(all[self.start..self.start + n])
+            while self.buf.len() > n
+                self.buf.pop()
+            self.start = 0
+        self.buf.push_span(bytes)
+
+    # Bytes held: unread frames and the start of the next.
+    pub fn buffered(self: @FrameReader) -> i64
+        self.buf.len() - self.start
+
+    # The next whole message, if there is one.
+    pub fn next(self: @&FrameReader) -> Framed
+        let all: [u8] = self.buf[0..self.buf.len()]
+        let rest = all.slice(self.start, all.len).as_strview()
+        let end = rest.find("\r\n\r\n")         # rest.len() when it isn't there
+        if end >= rest.len()
+            if rest.len() > MAX_HEADER_BYTES
+                return Framed.Bad
+            return Framed.Partial
+        if end + 4 > MAX_HEADER_BYTES
+            return Framed.Bad
+        var length: i64 = -1
+        var at: i64 = 0
+        while at < end
+            var stop = at + rest.slice(at, end).find("\r\n")
+            if stop > end
+                stop = end
+            let line = rest.slice(at, stop)
+            if header_named(line, "Content-Length")
+                length = length_value(line.slice(15, line.len()))
+                if length < 0
+                    return Framed.Bad
+            at = stop + 2
+        if length < 0 or length > MAX_BODY_BYTES
+            return Framed.Bad
+        let body = end + 4
+        if rest.len() - body < length
+            return Framed.Partial
+        self.start += body + length
+        Framed.Message(rest.slice(body, body + length))
+
+# ============================================================================
+# The outbox
+# ============================================================================
+
+# Headroom under the cap that only push_ordered may use.
+pub const ORDERED_RESERVE: i64 = 4096
+
+# Why push refused a frame.
+pub enum OutboxError
+    Full                # it would take the queue past its cap
+
+# Frames for the server's stdin, oldest first:
+#
+#   wire      frames ahead of the snapshot, the one being written first;
+#             wire[sent..] is still to go
+#   snapshot  the full-text frame no byte of which is written yet: a newer
+#             snapshot replaces it (coalescing)
+#   after     frames queued behind that snapshot
+#
+# Once the snapshot's first byte is written it joins the wire, and `after`
+# with it, so a frame in flight is never replaced or cut.
+pub struct Outbox
+    wire: Vec<u8>
+    sent: i64
+    snapshot: Vec<u8>
+    after: Vec<u8>
+    cap: i64            # the most bytes queued (written ones not counted)
+    replaced: i64       # snapshots dropped for newer ones, for tests
+
+pub fn outbox_new(cap: i64) -> Outbox
+    Outbox { wire: vec_new<u8>(), sent: 0, snapshot: vec_new<u8>(), after: vec_new<u8>(), cap: cap, replaced: 0 }
+
+impl Outbox
+    # Bytes waiting to be written.
+    pub fn queued(self: @Outbox) -> i64
+        self.wire.len() - self.sent + self.snapshot.len() + self.after.len()
+
+    pub fn is_empty(self: @Outbox) -> bool
+        self.queued() == 0
+
+    # True while a frame is written in part: the pipe took some of it.
+    pub fn mid_frame(self: @Outbox) -> bool
+        self.sent > 0 and self.sent < self.wire.len()
+
+    # Queue `body` as a frame. Err(Full) leaves the queue as it was.
+    pub fn push(self: @&Outbox, body: [u8]) -> Result<(), OutboxError>
+        if self.queued() + frame_len(body.len) > self.cap - ORDERED_RESERVE
+            return Err(OutboxError.Full)
+        if self.snapshot.is_empty()
+            push_frame(@&self.wire, body)
+        else
+            push_frame(@&self.after, body)
+        Ok(())
+
+    # Queue the full-text snapshot `body`, replacing the one not yet started.
+    pub fn push_snapshot(self: @&Outbox, body: [u8]) -> Result<(), OutboxError>
+        if not self.snapshot_fits(body.len)
+            return Err(OutboxError.Full)
+        if not self.snapshot.is_empty()
+            self.replaced += 1
+        self.snapshot.clear()
+        push_frame(@&self.snapshot, body)
+        Ok(())
+
+    # Queue `body` as a frame no later snapshot may move ahead of: a
+    # document's didOpen or didClose, initialize and initialized. The
+    # snapshot waiting now goes before it, as queued, and stops being
+    # replaceable. It may use the ORDERED_RESERVE.
+    pub fn push_ordered(self: @&Outbox, body: [u8]) -> Result<(), OutboxError>
+        if self.queued() + frame_len(body.len) > self.cap
+            return Err(OutboxError.Full)
+        self.wire.push_span(self.snapshot[0..self.snapshot.len()])
+        self.wire.push_span(self.after[0..self.after.len()])
+        self.snapshot.clear()
+        self.after.clear()
+        push_frame(@&self.wire, body)
+        Ok(())
+
+    # True when queueing a body of `n` bytes as a snapshot would fit the cap.
+    pub fn snapshot_fits(self: @Outbox, n: i64) -> bool
+        self.queued() - self.snapshot.len() + frame_len(n) <= self.cap - ORDERED_RESERVE
+
+    # The bytes to write next: the rest of the wire, else the snapshot whole.
+    pub fn pending(self: @Outbox) -> [u8]
+        if self.sent < self.wire.len()
+            let w: [u8] = self.wire[0..self.wire.len()]
+            return w.slice(self.sent, w.len)
+        self.snapshot[0..self.snapshot.len()]
+
+    # `n` bytes of pending() were written.
+    pub fn wrote(self: @&Outbox, n: i64)
+        if n <= 0
+            return
+        if self.sent >= self.wire.len()
+            # The snapshot's first bytes went: it and what follows it are
+            # the wire now, and can no longer be replaced.
+            self.wire.clear()
+            self.wire.push_span(self.snapshot[0..self.snapshot.len()])
+            self.wire.push_span(self.after[0..self.after.len()])
+            self.snapshot.clear()
+            self.after.clear()
+            self.sent = 0
+        self.sent += n
+        if self.sent >= self.wire.len()
+            self.wire.clear()
+            self.sent = 0
+
+# The size of the frame around a body of `n` bytes.
+fn frame_len(n: i64) -> i64
+    var digits: i64 = 1
+    var k = n
+    while k >= 10
+        k = k / 10
+        digits += 1
+    16 + digits + 4 + n

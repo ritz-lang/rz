@@ -14,6 +14,7 @@ import core.modes { Mode }
 import core.screen { LineSource, Screen, Size, View, Status, render, render_styled, screen_new, view_new, style_eq, style_escape, style_gutter }
 import syntax.lexer { Kind }
 import syntax.highlight { Highlighter, highlighter_new, kind_style }
+import syntax.marks { DiagMark, Marked, marked_new, marked_style }
 
 # ============================================================================
 # A line source: `\n`-separated lines
@@ -56,7 +57,7 @@ fn numbered(n: i64) -> Lines
     lines(s.as_view())
 
 fn status() -> Status
-    Status { name: "a.ritz", dirty: false, mode: Mode.Normal }
+    Status { name: "a.ritz", dirty: false, mode: Mode.Normal, lang: "" }
 
 fn show(scr: @&Screen, src: @Lines, view: @&View, hl: @&Highlighter)
     render_styled(scr, src, view, hl, status(), "")
@@ -258,4 +259,61 @@ fn test_an_edit_past_the_cached_lines_is_harmless() -> i32
     var view = view_new()
     show(@&scr, @src_of("let a\nlet b"), @&view, @&hl)
     assert hl.lexed() == 2
+    0
+
+# ============================================================================
+# Diagnostics over the colors (AGAST #4828)
+# ============================================================================
+
+[[test]]
+fn test_marked_bytes_are_underlined_over_their_colors() -> i32
+    var scr = screen_new(Size { rows: 4, cols: 30 })
+    var view = view_new()
+    var m = marked_new(true)
+    let src = lines("fn f() -> i32\nlet y = zz")
+    m.add(DiagMark { line: 1, start: 8, end: 10, error: true })     # `zz`: an error
+    m.add(DiagMark { line: 0, start: 0, end: 4, error: false })     # `fn f`: a warning (added out of order)
+    m.sort_marks()
+    render_styled(@&scr, @src, @&view, @&m, status(), "")
+    assert style_eq(at(@scr, 0, 0), marked_style(kind_style(Kind.Keyword), false))
+    assert style_eq(at(@scr, 0, 2), marked_style(style_plain(), false))    # the blank
+    assert style_eq(at(@scr, 0, 3), marked_style(style_plain(), false))    # `f`
+    assert style_eq(at(@scr, 0, 4), style_plain())                         # `(`: past the mark
+    assert is(at(@scr, 0, 10), Kind.Type)                                  # unmarked colors stay
+    assert style_eq(at(@scr, 1, 0), kind_style(Kind.Keyword))              # `let`
+    assert style_eq(at(@scr, 1, 8), marked_style(style_plain(), true))
+    assert style_eq(at(@scr, 1, 9), marked_style(style_plain(), true))
+    assert not style_eq(marked_style(style_plain(), true), marked_style(style_plain(), false))
+    0
+
+[[test]]
+fn test_overlapping_and_empty_marks() -> i32
+    var scr = screen_new(Size { rows: 4, cols: 30 })
+    var view = view_new()
+    var m = marked_new(false)                                   # no lexical colors
+    let src = lines("abcdef\nxy")
+    m.add(DiagMark { line: 0, start: 1, end: 4, error: false })
+    m.add(DiagMark { line: 0, start: 3, end: 5, error: true })
+    m.add(DiagMark { line: 1, start: 9, end: 9, error: true })      # past the end: the last byte
+    m.sort_marks()
+    render_styled(@&scr, @src, @&view, @&m, status(), "")
+    assert style_eq(at(@scr, 0, 0), style_plain())
+    assert style_eq(at(@scr, 0, 1), marked_style(style_plain(), false))
+    assert style_eq(at(@scr, 0, 3), marked_style(style_plain(), true))    # both: error wins
+    assert style_eq(at(@scr, 0, 4), marked_style(style_plain(), true))
+    assert style_eq(at(@scr, 0, 5), style_plain())
+    assert style_eq(at(@scr, 1, 0), style_plain())
+    assert style_eq(at(@scr, 1, 1), marked_style(style_plain(), true))
+    0
+
+[[test]]
+fn test_status_line_shows_the_language_state() -> i32
+    var scr = screen_new(Size { rows: 3, cols: 40 })
+    var view = view_new()
+    let src = lines("x")
+    var st = status()
+    st.lang = "lsp: exited"
+    render(@&scr, @src, @&view, st, "")
+    let row = scr.row_text(1)
+    assert row.as_view().find("a.ritz  lsp: exited") < row.len()
     0

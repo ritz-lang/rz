@@ -1,0 +1,415 @@
+# test/test_lsp_client.ritz - the language client against a scripted server (AGAST #4828).
+#
+# The client is fed the messages a server would send, in the order and with
+# the delays a test chooses, and what it queues for the server is read back
+# frame by frame: capability negotiation, the sync rules (didOpen at the
+# current revision, rapid edits coalesced, suspension above the limit),
+# requests tied to revisions, delayed and stale answers, timeouts, and
+# diagnostics shown only for the revision they were compiled for.
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string
+
+import lsp.client { AskKind, Client, Diag, Phase, Refused, Reply, client_new, path_of_uri, uri_of_path, INIT_TIMEOUT_MS, REQUEST_TIMEOUT_MS, SYNC_LIMIT_BYTES }
+import lsp.wire { Framed, frame_reader }
+
+const URI: StrView = "file:///src/a.ritz"
+
+fn bytes(s: StrView) -> [u8]
+    span_from_strview(s)
+
+# ============================================================================
+# The scripted side
+# ============================================================================
+
+# Everything the client has queued, as the server would read it: the
+# messages, each on its own line.
+fn sent(c: @&Client) -> String
+    var r = frame_reader()
+    loop
+        let p = c.out.pending()
+        if p.len == 0
+            break
+        r.feed(p)
+        c.out.wrote(p.len)
+    var out = string_new()
+    loop
+        match r.next()
+            Framed.Message(m) =>
+                out.push_str(m)
+                out.push('\n')
+            _ => break
+    out
+
+fn has(s: @String, needle: StrView) -> bool
+    s.as_view().find(needle) < s.len()
+
+fn count_of(s: @String, needle: StrView) -> i64
+    var n: i64 = 0
+    var at: i64 = 0
+    let v = s.as_view()
+    loop
+        let rest = v.slice(at, v.len())
+        let k = rest.find(needle)
+        if k >= rest.len()
+            return n
+        n += 1
+        at += k + needle.len()
+
+fn refused(r: Result<(), Refused>) -> StrView
+    match r
+        Ok(_) => "sent"
+        Err(e) => match e
+            Refused.NotReady => "not-ready"
+            Refused.NotOpen => "not-open"
+            Refused.Unsupported => "unsupported"
+            Refused.Busy => "busy"
+
+# What next_reply gave: "none", "bad", or the reply's name.
+fn next_name(c: @&Client) -> StrView
+    match c.next_reply(1)
+        Ok(r) => match r
+            Some(x) => reply_name(x)
+            None => "none"
+        Err(_) => "bad"
+
+fn is_reply(r: Reply, want: Reply) -> bool
+    reply_name(r).eq(reply_name(want))
+
+fn reply_name(r: Reply) -> StrView
+    match r
+        Reply.Nothing => "nothing"
+        Reply.Ready => "ready"
+        Reply.Diagnostics => "diagnostics"
+        Reply.Hover => "hover"
+        Reply.NoHover => "no-hover"
+        Reply.Definition => "definition"
+        Reply.NoDefinition => "no-definition"
+        Reply.Failed(k) => if k == AskKind.Hover then "failed-hover" else "failed-definition"
+        Reply.TimedOut(k) => if k == AskKind.Hover then "timeout-hover" else "timeout-definition"
+        Reply.InitFailed => "init-failed"
+
+const CAPS_ALL: StrView = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true}}}"
+
+# A client past initialize with CAPS_ALL, `text` open at revision `rev`,
+# and its outbox drained.
+[[test_helper]]
+fn ready_client(text: StrView, rev: i64) -> Client
+    var c = client_new()
+    c.start(42, 0)
+    let r = c.receive(CAPS_ALL, rev)
+    assert c.wants_text(URI, rev, text.len())
+    assert c.send_text(rev, bytes(text))
+    let drained = sent(@&c)
+    c
+
+fn diag_msg(version: i64, message: StrView) -> String
+    var s = string_from("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///src/a.ritz\",\"version\":")
+    s.push_i64(version)
+    s.push_str(",\"diagnostics\":[{\"range\":{\"start\":{\"line\":1,\"character\":2},\"end\":{\"line\":1,\"character\":5}},\"severity\":1,\"source\":\"ritz1\",\"message\":\"")
+    s.push_str(message)
+    s.push_str("\"}]}}")
+    s
+
+fn answer(id: i64, result: StrView) -> String
+    var s = string_from("{\"jsonrpc\":\"2.0\",\"id\":")
+    s.push_i64(id)
+    s.push_str(",\"result\":")
+    s.push_str(result)
+    s.push('}')
+    s
+
+# ============================================================================
+# Start and capabilities
+# ============================================================================
+
+[[test]]
+fn test_initialize_goes_first_and_nothing_else_until_answered() -> i32
+    var c = client_new()
+    c.start(42, 0)
+    assert not c.wants_text(URI, 1, 10)         # not before the answer
+    let first = sent(@&c)
+    assert count_of(@first, "\n") == 1
+    assert has(@first, "\"method\":\"initialize\"")
+    assert has(@first, "\"processId\":42")
+    assert has(@first, "\"positionEncodings\":[\"utf-16\"]")
+    assert refused(c.ask(AskKind.Hover, 1, 0, 0, 0)).eq("not-ready")
+    assert is_reply(c.receive(CAPS_ALL, 1), Reply.Ready)
+    assert c.ready()
+    let next = sent(@&c)
+    assert has(@next, "\"method\":\"initialized\"")
+    0
+
+[[test]]
+fn test_capabilities_decide_what_may_be_asked() -> i32
+    var c = client_new()
+    c.start(1, 0)
+    # Hover only, sync as an options object.
+    let r = c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"hoverProvider\":{},\"definitionProvider\":false}}}", 1)
+    assert c.hover_ok
+    assert not c.definition_ok
+    assert c.sync_ok
+    assert c.wants_text(URI, 1, 3)
+    assert c.send_text(1, bytes("abc"))
+    assert c.ask(AskKind.Hover, 1, 0, 0, 0).is_ok()
+    assert refused(c.ask(AskKind.Definition, 1, 0, 0, 0)).eq("unsupported")
+    0
+
+[[test]]
+fn test_a_server_without_sync_gets_no_documents() -> i32
+    var c = client_new()
+    c.start(1, 0)
+    let r = c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}", 1)
+    assert c.ready()
+    assert not c.wants_text(URI, 1, 3)
+    0
+
+[[test]]
+fn test_initialize_error_or_silence_ends_the_session() -> i32
+    var c = client_new()
+    c.start(1, 0)
+    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"boom\"}}", 1), Reply.InitFailed)
+    assert c.error_text().eq("boom")
+    var d = client_new()
+    d.start(1, 100)
+    assert d.deadline().unwrap_or(0) == 100 + INIT_TIMEOUT_MS
+    assert is_reply(d.expire(100 + INIT_TIMEOUT_MS - 1), Reply.Nothing)
+    assert is_reply(d.expire(100 + INIT_TIMEOUT_MS), Reply.InitFailed)
+    assert d.phase == Phase.Ended
+    0
+
+# ============================================================================
+# Sync
+# ============================================================================
+
+[[test]]
+fn test_did_open_carries_the_revision_and_the_text() -> i32
+    var c = client_new()
+    c.start(1, 0)
+    let r = c.receive(CAPS_ALL, 7)
+    let skip = sent(@&c)
+    assert c.wants_text(URI, 7, 12)
+    assert c.send_text(7, bytes("fn main()\n\t\"x\""))
+    let out = sent(@&c)
+    assert has(@out, "\"method\":\"textDocument/didOpen\"")
+    assert has(@out, "\"uri\":\"file:///src/a.ritz\"")
+    assert has(@out, "\"version\":7")
+    assert has(@out, "\"text\":\"fn main()\\n\\t\\\"x\\\"\"")
+    assert not c.wants_text(URI, 7, 12)         # synced
+    assert c.wants_text(URI, 8, 13)
+    0
+
+# Rapid edits while the server isn't reading: each change replaces the one
+# that hasn't started, so the server gets the last text once.
+[[test]]
+fn test_rapid_edits_coalesce_to_the_last() -> i32
+    var c = ready_client("v1", 1)
+    for rev in 2..50
+        var text = string_from("text at ")
+        text.push_i64(rev)
+        assert c.wants_text(URI, rev, text.len())
+        assert c.send_text(rev, bytes(text.as_view()))
+    let out = sent(@&c)
+    assert count_of(@out, "didChange") == 1
+    assert has(@out, "\"version\":49")
+    assert has(@out, "text at 49")
+    0
+
+[[test]]
+fn test_another_document_closes_the_first() -> i32
+    var c = ready_client("one", 1)
+    assert c.wants_text("file:///src/b.ritz", 2, 3)
+    assert c.send_text(2, bytes("two"))
+    let out = sent(@&c)
+    assert has(@out, "didClose\",\"params\":{\"textDocument\":{\"uri\":\"file:///src/a.ritz\"}")
+    assert has(@out, "didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///src/b.ritz\"")
+    # Not a Ritz file: closed, nothing opened.
+    assert not c.wants_text("", 3, 3)
+    let out2 = sent(@&c)
+    assert has(@out2, "didClose")
+    assert not has(@out2, "didOpen")
+    0
+
+[[test]]
+fn test_sync_suspends_above_the_limit_and_resumes_below() -> i32
+    var c = ready_client("small", 1)
+    let r = c.receive(diag_msg(1, "x").as_view(), 1)
+    assert c.diagnostics(1).len == 1
+    assert not c.wants_text(URI, 2, SYNC_LIMIT_BYTES + 1)
+    assert c.sync_suspended()
+    let out = sent(@&c)
+    assert has(@out, "didClose")
+    assert c.diagnostics(2).len == 0
+    assert refused(c.ask(AskKind.Hover, 2, 0, 0, 0)).eq("not-open")
+    assert not c.wants_text(URI, 3, SYNC_LIMIT_BYTES + 5)
+    assert sent(@&c).is_empty()                  # closed once
+    assert c.wants_text(URI, 4, 10)
+    assert c.send_text(4, bytes("small again"))
+    assert not c.sync_suspended()
+    let back = sent(@&c)
+    assert has(@back, "didOpen")
+    0
+
+# ============================================================================
+# Requests and answers
+# ============================================================================
+
+[[test]]
+fn test_hover_answer_for_the_current_revision() -> i32
+    var c = ready_client("fn f()\nf()\n", 3)
+    assert c.ask(AskKind.Hover, 3, 1, 1, 0).is_ok()
+    let out = sent(@&c)
+    assert has(@out, "\"method\":\"textDocument/hover\",\"id\":2")
+    assert has(@out, "\"position\":{\"line\":1,\"character\":1}")
+    let a = answer(2, "{\"contents\":{\"kind\":\"markdown\",\"value\":\"```ritz\\nfn f()\\n```\"}}")
+    assert is_reply(c.receive(a.as_view(), 3), Reply.Hover)
+    assert c.hover_text().eq("fn f()")
+    let none = c.ask(AskKind.Hover, 3, 0, 0, 0)
+    assert is_reply(c.receive(answer(3, "null").as_view(), 3), Reply.NoHover)
+    0
+
+[[test]]
+fn test_definition_answer_location_or_links() -> i32
+    var c = ready_client("x", 1)
+    let a = c.ask(AskKind.Definition, 1, 0, 0, 0)
+    let loc = answer(2, "{\"uri\":\"file:///lib/b.ritz\",\"range\":{\"start\":{\"line\":4,\"character\":3},\"end\":{\"line\":4,\"character\":6}}}")
+    assert is_reply(c.receive(loc.as_view(), 1), Reply.Definition)
+    assert c.target_uri().eq("file:///lib/b.ritz")
+    assert c.target_line == 4
+    assert c.target_char == 3
+    let b = c.ask(AskKind.Definition, 1, 0, 0, 0)
+    let links = answer(3, "[{\"targetUri\":\"file:///c.ritz\",\"targetRange\":{},\"targetSelectionRange\":{\"start\":{\"line\":9,\"character\":0},\"end\":{\"line\":9,\"character\":1}}}]")
+    assert is_reply(c.receive(links.as_view(), 1), Reply.Definition)
+    assert c.target_uri().eq("file:///c.ritz")
+    assert c.target_line == 9
+    let d = c.ask(AskKind.Definition, 1, 0, 0, 0)
+    assert is_reply(c.receive(answer(4, "[]").as_view(), 1), Reply.NoDefinition)
+    0
+
+# The text changed while the answer was on its way: it is dropped.
+[[test]]
+fn test_answer_for_an_older_revision_is_dropped() -> i32
+    var c = ready_client("abc", 5)
+    assert c.ask(AskKind.Hover, 5, 0, 0, 0).is_ok()
+    let a = answer(2, "{\"contents\":\"stale\"}")
+    assert is_reply(c.receive(a.as_view(), 6), Reply.Nothing)
+    assert c.stale == 1
+    assert c.hover_text().is_empty()
+    0
+
+# A second hover replaces the first: the first one's answer, arriving
+# late, is dropped and the second's is shown.
+[[test]]
+fn test_delayed_answer_to_a_replaced_request_is_dropped() -> i32
+    var c = ready_client("abc", 5)
+    assert c.ask(AskKind.Hover, 5, 0, 0, 0).is_ok()
+    assert c.ask(AskKind.Hover, 5, 0, 1, 0).is_ok()
+    assert is_reply(c.receive(answer(3, "{\"contents\":\"second\"}").as_view(), 5), Reply.Hover)
+    assert is_reply(c.receive(answer(2, "{\"contents\":\"first\"}").as_view(), 5), Reply.Nothing)
+    assert c.hover_text().eq("second")
+    0
+
+[[test]]
+fn test_request_times_out_and_its_late_answer_is_dropped() -> i32
+    var c = ready_client("abc", 1)
+    assert c.ask(AskKind.Definition, 1, 0, 0, 1000).is_ok()
+    assert c.deadline().unwrap_or(0) == 1000 + REQUEST_TIMEOUT_MS
+    assert is_reply(c.expire(1000 + REQUEST_TIMEOUT_MS - 1), Reply.Nothing)
+    assert is_reply(c.expire(1000 + REQUEST_TIMEOUT_MS), Reply.TimedOut(AskKind.Definition))
+    assert c.deadline().is_none()
+    assert is_reply(c.receive(answer(2, "null").as_view(), 1), Reply.Nothing)
+    0
+
+[[test]]
+fn test_error_answer_is_reported() -> i32
+    var c = ready_client("abc", 1)
+    let a = c.ask(AskKind.Hover, 1, 0, 0, 0)
+    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}", 1), Reply.Failed(AskKind.Hover))
+    assert c.error_text().eq("Method not found")
+    0
+
+[[test]]
+fn test_server_requests_are_answered_with_null() -> i32
+    var c = ready_client("abc", 1)
+    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"client/registerCapability\",\"params\":{}}", 1), Reply.Nothing)
+    let out = sent(@&c)
+    assert has(@out, "{\"jsonrpc\":\"2.0\",\"id\":77,\"result\":null}")
+    0
+
+# ============================================================================
+# Diagnostics
+# ============================================================================
+
+[[test]]
+fn test_diagnostics_show_only_for_their_revision() -> i32
+    var c = ready_client("abc", 4)
+    assert is_reply(c.receive(diag_msg(4, "undefined name").as_view(), 4), Reply.Diagnostics)
+    let ds = c.diagnostics(4)
+    assert ds.len == 1
+    let d: Diag = ds[0]
+    assert d.line == 1 and d.start == 2 and d.end_line == 1 and d.end == 5
+    assert d.severity == 1
+    assert c.message_of(d).eq("undefined name")
+    # The text moved on: the list is hidden, not shown against other text.
+    assert c.diagnostics(5).len == 0
+    0
+
+[[test]]
+fn test_diagnostics_for_an_older_version_are_dropped() -> i32
+    var c = ready_client("abc", 4)
+    let r = c.receive(diag_msg(4, "old").as_view(), 4)
+    assert is_reply(c.receive(diag_msg(3, "older").as_view(), 4), Reply.Nothing)
+    assert c.stale == 1
+    assert c.message_of(c.diagnostics(4)[0]).eq("old")
+    # Another document's list is not this one's.
+    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///other.ritz\",\"version\":4,\"diagnostics\":[]}}", 4), Reply.Nothing)
+    assert c.diagnostics(4).len == 1
+    0
+
+# No request goes out for diagnostics: they come on their own.
+[[test]]
+fn test_no_probe_request_after_a_change() -> i32
+    var c = ready_client("abc", 1)
+    assert c.wants_text(URI, 2, 4)
+    assert c.send_text(2, bytes("abcd"))
+    let out = sent(@&c)
+    assert count_of(@out, "\"id\":") == 0
+    0
+
+# ============================================================================
+# Framing through the client
+# ============================================================================
+
+[[test]]
+fn test_next_reply_reads_split_frames() -> i32
+    var c = client_new()
+    c.start(1, 0)
+    let caps = answer(1, "{\"capabilities\":{\"hoverProvider\":true}}")
+    var frame = string_from("Content-Length: ")
+    frame.push_i64(caps.len())
+    frame.push_str("\r\n\r\n")
+    frame.push_str(caps.as_view())
+    let all = bytes(frame.as_view())
+    c.reader.feed(all.slice(0, 10))
+    assert next_name(@&c).eq("none")
+    c.reader.feed(all.slice(10, all.len))
+    assert next_name(@&c).eq("ready")
+    c.reader.feed(bytes("garbage\r\n\r\n"))
+    assert next_name(@&c).eq("bad")
+    0
+
+[[test]]
+fn test_uris_round_trip_paths() -> i32
+    let u = uri_of_path("/home/a b/ü%.ritz")
+    assert u.as_view().eq("file:///home/a%20b/%C3%BC%25.ritz")
+    var back = string_new()
+    match path_of_uri(u.as_view())
+        Some(p) => back = p
+        None => pass
+    assert back.as_view().eq("/home/a b/ü%.ritz")
+    assert path_of_uri("untitled:1").is_none()
+    0

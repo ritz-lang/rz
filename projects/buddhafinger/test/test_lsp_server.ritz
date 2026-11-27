@@ -1,0 +1,327 @@
+# test/test_lsp_server.ritz - the language server session on real pipes (AGAST #4828).
+#
+# platform/lsp.ritz's LangServer runs a scripted fake server: a /bin/sh
+# script from test/fake_lsp/ (prelude.sh, then the case's own), which reads the client's frames (saving each
+# body as msg.N in its directory, for the test to check byte for byte) and
+# answers on cue. The cases the proposal's "Language tests" name at the
+# process level: an answer split into partial frames, a delayed reply, the
+# server's environment (RITZ1), a server that exits or closes its stdin,
+# and a server that stalls its stdin reads in the middle of a full-text
+# update while flooding stderr: each loop turn stays short, the queue stays
+# under its cap, the stderr log under its size, and once the server reads
+# again the frame it was stalled in arrives intact and the rapid edits made
+# meanwhile arrive as one change, the last.
+#
+# Waits are generous (seconds) so a loaded host only slows a test down.
+
+import ritzlib.fd { PollFd, poll }
+import ritzlib.fs { chmod, mkdir, path_exists, read_file, remove_dir_all, write_file }
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.process { sigset_of }
+import ritzlib.result
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string
+import ritzlib.sys { SIGPIPE }
+import ritzlib.testlib { sandbox_path }
+import ritzlib.time { sleep_ms }
+import ritzlib.timer { now_millis }
+
+import lsp.client { AskKind, Reply, QUEUE_CAP_BYTES }
+import platform.lsp { LangConfig, LangServer, lang_config, lang_config_choose, lang_idle, LOG_BYTES }
+
+const WAIT_MS: i64 = 10000
+const URI: StrView = "file:///src/a.ritz"
+
+# ============================================================================
+# The scripted server
+# ============================================================================
+
+struct Fake
+    dir: String
+
+# The fixtures, relative to the package (the tests run there).
+const FIXTURES: StrView = "test/fake_lsp/"
+
+fn fixture(name: StrView) -> String
+    var p = string_from(FIXTURES)
+    p.push_str(name)
+    match read_file(p.as_view())
+        Ok(s) => s
+        Err(_) => string_new()
+
+# A fresh directory holding server.sh: prelude.sh, then fake_lsp/<name>.sh.
+fn fake(name: StrView) -> Fake
+    let dir = sandbox_path("bf_lsp", name)
+    let gone = remove_dir_all(dir.as_view())
+    let made = mkdir(dir.as_view(), 448)
+    var script = fixture("prelude.sh")
+    var own = string_from(name)
+    own.push_str(".sh")
+    let body = fixture(own.as_view())
+    script.push_str(body.as_view())
+    let path = file_in(@dir, "server.sh")
+    let wrote = write_file(path.as_view(), script.as_view())
+    let x = chmod(path.as_view(), 493)          # 0755
+    Fake { dir: dir }
+
+fn file_in(dir: @String, name: StrView) -> String
+    var p = string_from(dir.as_view())
+    p.push('/')
+    p.push_str(name)
+    p
+
+impl Fake
+    fn config(self: @Fake) -> LangConfig
+        let server = file_in(@self.dir, "server.sh")
+        lang_config(server.as_view(), "/opt/ritz1_selfhosted")
+
+    # The body of the server's n-th message ("" if it hasn't one).
+    fn msg(self: @Fake, n: i64) -> String
+        var name = string_from("msg.")
+        name.push_i64(n)
+        let p = file_in(@self.dir, name.as_view())
+        match read_file(p.as_view())
+            Ok(s) => s
+            Err(_) => string_new()
+
+    # The file `name` in the server's directory ("" if there's none).
+    fn text_of(self: @Fake, name: StrView) -> String
+        let p = file_in(@self.dir, name)
+        match read_file(p.as_view())
+            Ok(s) => s
+            Err(_) => string_new()
+
+    fn has(self: @Fake, name: StrView) -> bool
+        let p = file_in(@self.dir, name)
+        path_exists(p.as_view())
+
+    fn touch(self: @Fake, name: StrView)
+        let p = file_in(@self.dir, name)
+        let wrote = write_file(p.as_view(), "")
+
+    fn clean(self: @Fake)
+        let gone = remove_dir_all(self.dir.as_view())
+
+# ============================================================================
+# A loop like the editor's: poll the three pipes, move bytes, take replies
+# ============================================================================
+
+fn name_of(r: Reply) -> StrView
+    match r
+        Reply.Nothing => "nothing"
+        Reply.Ready => "ready"
+        Reply.Diagnostics => "diagnostics"
+        Reply.Hover => "hover"
+        Reply.NoHover => "no-hover"
+        Reply.Definition => "definition"
+        Reply.NoDefinition => "no-definition"
+        Reply.Failed(_) => "failed"
+        Reply.TimedOut(_) => "timed-out"
+        Reply.InitFailed => "init-failed"
+
+# One turn, waiting up to `ms` for the pipes: the replies' names, space-separated.
+fn turn(ls: @&LangServer, rev: i64, ms: i32) -> String
+    var fds: [3]PollFd
+    let set = span_from_ptr<PollFd>(@fds[0], 3)
+    ls.poll_fds(set)
+    let polled = poll(set, ms)
+    ls.service(set)
+    var got = string_new()
+    loop
+        match ls.next_reply(rev)
+            Some(r) =>
+                got.push_str(name_of(r))
+                got.push(' ')
+            None => break
+    got
+
+# Turn until a reply named `want` comes: false if the session ends or
+# WAIT_MS passes first.
+fn until(ls: @&LangServer, rev: i64, want: StrView) -> bool
+    let deadline = now_millis() + WAIT_MS
+    while now_millis() < deadline and ls.running()
+        let got = turn(ls, rev, 20)
+        if got.as_view().find(want) < got.len()
+            return true
+    false
+
+# Turn until the session ends: false if it is still running after WAIT_MS.
+fn until_ended(ls: @&LangServer) -> bool
+    let deadline = now_millis() + WAIT_MS
+    while now_millis() < deadline and ls.running()
+        let got = turn(ls, 1, 20)
+    not ls.running()
+
+fn contains(s: @String, needle: StrView) -> bool
+    s.as_view().find(needle) < s.len()
+
+fn block_sigpipe()
+    let set = sigset_of(SIGPIPE)
+    let old = set.block()
+
+# ============================================================================
+# Cases
+# ============================================================================
+
+# The answer to initialize comes in three pieces, cut inside the header and
+# the body; hover is answered late. RITZ1 reaches the server.
+[[test]]
+fn test_split_answer_delayed_reply_and_environment() -> i32
+    block_sigpipe()
+    let f = fake("split")
+    var ls = lang_idle()
+    let cfg = f.config()
+    assert ls.start(@cfg, now_millis())
+    assert until(@&ls, 1, "ready")
+    assert contains(@f.msg(1), "\"method\":\"initialize\"")
+    assert ls.client.wants_text(URI, 3, 5)
+    assert ls.client.send_text(3, span_from_strview("fn x"))
+    assert until(@&ls, 3, "diagnostics")
+    assert ls.client.diagnostics(3).len == 1
+    assert contains(@f.msg(3), "\"method\":\"textDocument/didOpen\"")
+    assert ls.client.ask(AskKind.Hover, 3, 0, 1, now_millis()).is_ok()
+    let asked = now_millis()
+    assert until(@&ls, 3, "hover")
+    assert now_millis() - asked >= 250
+    assert ls.client.hover_text().eq("late but here")
+    let env = f.text_of("ritz1")
+    assert env.as_view().eq("/opt/ritz1_selfhosted")
+    ls.finish()
+    f.clean()
+    0
+
+[[test]]
+fn test_server_exit_ends_the_session_with_its_status_and_last_words() -> i32
+    block_sigpipe()
+    let f = fake("exit")
+    var ls = lang_idle()
+    let cfg = f.config()
+    assert ls.start(@cfg, now_millis())
+    assert until_ended(@&ls)
+    assert ls.tag().eq("lsp: exited (status 3)")
+    assert ls.last_log_line().eq("fatal: no ritz1 here")
+    f.clean()
+    0
+
+# The server closed its stdin but is still running: the client's next
+# write, `initialized` once initialize is answered, is EPIPE (SIGPIPE
+# blocked), and that ends the session.
+[[test]]
+fn test_closed_stdin_is_epipe_and_ends_the_session() -> i32
+    block_sigpipe()
+    let f = fake("epipe")
+    var ls = lang_idle()
+    let cfg = f.config()
+    assert ls.start(@cfg, now_millis())
+    assert until(@&ls, 1, "ready")
+    assert until_ended(@&ls)
+    assert ls.tag().starts_with("lsp: closed its input")
+    f.clean()
+    0
+
+[[test]]
+fn test_a_command_that_is_not_there_does_not_start() -> i32
+    var ls = lang_idle()
+    let cfg = lang_config("/nonexistent/ritz-lsp", "")
+    assert not ls.start(@cfg, now_millis())
+    assert not ls.running()
+    assert ls.tag().starts_with("lsp: can't start")
+    # With RITZ1 to pass on too (through env(1)): still refused up front.
+    var ls2 = lang_idle()
+    let cfg2 = lang_config("/nonexistent/ritz-lsp", "/opt/ritz1")
+    assert not ls2.start(@cfg2, now_millis())
+    assert ls2.tag().starts_with("lsp: can't start")
+    0
+
+# The server stops reading in the middle of a big didOpen and floods its
+# stderr; the editor goes on editing (a new snapshot every turn).
+[[test]]
+fn test_stalled_reads_and_stderr_flood_keep_the_loop_moving() -> i32
+    block_sigpipe()
+    let f = fake("stall")
+    var ls = lang_idle()
+    let cfg = f.config()
+    assert ls.start(@cfg, now_millis())
+    assert until(@&ls, 1, "ready")
+    # 512 KiB of text: far more than a pipe holds, so the write stops mid-frame.
+    var text = string_new()
+    for i in 0..8192
+        text.push_str("let value = 1234567890 # sixty-four bytes of ritz source text.\n")
+    assert ls.client.wants_text(URI, 1, text.len())
+    assert ls.client.send_text(1, span_from_strview(text.as_view()))
+    var opened: Vec<u8> = vec_new<u8>()
+    opened.push_span(span_from_vec<u8>(@ls.client.json))
+    var slowest: i64 = 0
+    var was_mid = false
+    var rev: i64 = 1
+    for t in 0..120
+        rev += 1
+        var edit = string_from(text.as_view())
+        edit.push_str("# edit ")
+        edit.push_i64(rev)
+        if t == 119
+            edit.push_str(" LAST-EDIT")
+        let started = now_millis()
+        if ls.client.wants_text(URI, rev, edit.len())
+            let sent = ls.client.send_text(rev, span_from_strview(edit.as_view()))
+        let got = turn(@&ls, rev, 5)
+        let took = now_millis() - started
+        if took > slowest
+            slowest = took
+        assert ls.client.out.queued() <= QUEUE_CAP_BYTES
+        assert ls.log_bytes() <= LOG_BYTES
+        if ls.client.out.mid_frame()
+            was_mid = true
+        assert ls.running()
+    # A turn is a poll of at most 5 ms plus bounded pipe work.
+    assert slowest < 200
+    assert was_mid
+    assert ls.client.out.replaced > 100
+    assert ls.last_log_line().eq("flood done")
+    f.touch("go")
+    let deadline = now_millis() + WAIT_MS
+    while not f.has("done") and now_millis() < deadline
+        let got = turn(@&ls, rev, 10)
+    assert f.has("done")
+    # The frame the server stalled in arrived intact, byte for byte.
+    let got_open = f.msg(3)
+    assert got_open.len() == opened.len()
+    assert got_open.as_view().eq(span_from_vec<u8>(@opened).as_strview())
+    # The edits made meanwhile came as one didChange: the last.
+    let change = f.msg(4)
+    assert contains(@change, "\"method\":\"textDocument/didChange\"")
+    assert contains(@change, "LAST-EDIT")
+    var v = string_from("\"version\":")
+    v.push_i64(rev)
+    assert contains(@change, v.as_view())
+    assert f.msg(5).is_empty()
+    ls.finish()
+    f.clean()
+    0
+
+# Which server and RITZ1: the variables when set (an empty server turns it
+# off), else what sits beside the editor binary in its monorepo.
+[[test]]
+fn test_config_prefers_the_variables_then_the_monorepo() -> i32
+    let root = sandbox_path("bf_lsp", "tree")
+    let gone = remove_dir_all(root.as_view())
+    var dirs: [6]StrView = ["", "/projects", "/projects/ritz-lsp", "/projects/ritz-lsp/build", "/projects/ritz-lsp/build/debug", "/projects/buddhafinger"]
+    for i in 0..6
+        var d = string_from(root.as_view())
+        d.push_str(dirs[i])
+        let made = mkdir(d.as_view(), 448)
+    let lsp = file_in(@root, "projects/ritz-lsp/build/debug/ritz-lsp")
+    let w = write_file(lsp.as_view(), "#!/bin/sh\n")
+    let x = chmod(lsp.as_view(), 493)
+    let exe = file_in(@root, "projects/buddhafinger/build/debug/buddhafinger")
+    let c1 = lang_config_choose(None, Some("/r1"), exe.as_view())
+    assert c1.server.as_view().eq(lsp.as_view())
+    assert c1.ritz1.as_view().eq("/r1")
+    let c2 = lang_config_choose(Some("/my/lsp"), None, exe.as_view())
+    assert c2.server.as_view().eq("/my/lsp")
+    let c3 = lang_config_choose(Some(""), None, exe.as_view())
+    assert c3.server.is_empty()                  # turned off
+    let gone2 = remove_dir_all(root.as_view())
+    0

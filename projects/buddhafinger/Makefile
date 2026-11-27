@@ -17,9 +17,11 @@ RZ := ../../rz
 .PHONY: all build test
 all: build
 
-# ritz1-bootstrap builds ritz1 + ritz1_selfhosted; a no-op when both are current.
+# ritz1-bootstrap builds ritz1 + ritz1_selfhosted; a no-op when both are
+# current. ritz-lsp is built for test_lsp_editor.ritz's real-server smoke.
 build:
 	$(MAKE) -C ../ritz ritz1-bootstrap
+	$(RZ) build ritz-lsp --compiler $(COMPILER)
 	$(RZ) build buddhafinger --compiler $(COMPILER)
 
 test: build

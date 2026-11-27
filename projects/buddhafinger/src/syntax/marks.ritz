@@ -1,0 +1,154 @@
+# syntax/marks.ritz - diagnostics drawn over the lexical colors (AGAST #4828).
+#
+# Marked is the LineStyler the event loop renders with: the Highlighter's
+# lexical colors (syntax/highlight.ritz), with each diagnostic's bytes
+# underlined on top, and errors in red. The marks are byte ranges, one per
+# line a diagnostic covers; platform/lsp.ritz converts the server's UTF-16
+# ranges into them for the revision on screen and nothing else.
+#
+#   var m = marked_new(true)
+#   m.add(DiagMark { line: 3, start: 4, end: 9, error: true })
+#   m.sort_marks()
+#   render_styled(@&scr, ed, @&view, @&m, status, "")
+#
+# A line with no marks gets the Highlighter's runs as they are.
+
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.termsession { Style, Color, style_plain }
+
+import core.screen { LineStyler, StyleRun }
+import syntax.highlight { Highlighter, highlighter_new }
+
+# One line's diagnostic bytes [start, end). An empty range marks the byte
+# at `start` (or the line's last, past its end).
+pub struct DiagMark
+    line: i64
+    start: i64
+    end: i64
+    error: bool         # severity 1: drawn red as well as underlined
+
+pub struct Marked
+    lex: Highlighter
+    lexical: bool       # the lexical colors under the marks (a Ritz file)
+    marks: Vec<DiagMark>    # ascending by line
+    out: Vec<StyleRun>  # runs() of a marked line
+    cuts: Vec<i64>      # its run and mark boundaries, scratch
+    none: Vec<StyleRun>
+
+pub fn marked_new(lexical: bool) -> Marked
+    Marked { lex: highlighter_new(), lexical: lexical, marks: vec_new<DiagMark>(), out: vec_new<StyleRun>(), cuts: vec_new<i64>(), none: vec_new<StyleRun>() }
+
+# The style marked text is drawn in, over `base`.
+pub fn marked_style(base: Style, error: bool) -> Style
+    var s = base
+    s.underline = true
+    if error
+        s.fg = Color.Index(1)
+    s
+
+impl Marked
+    # The text changed: every line is lexed again when next shown.
+    pub fn text_changed(self: @&Marked)
+        self.lex = highlighter_new()
+
+    pub fn clear_marks(self: @&Marked)
+        self.marks.clear()
+
+    # Add a mark; sort_marks once they are all in.
+    pub fn add(self: @&Marked, m: DiagMark)
+        self.marks.push(m)
+
+    # Order the marks by line (stable), as runs() looks them up.
+    pub fn sort_marks(self: @&Marked)
+        for i in 1..self.marks.len()
+            let m = self.marks.get(i)
+            var k = i
+            while k > 0 and self.marks.get(k - 1).line > m.line
+                self.marks.set(k, self.marks.get(k - 1))
+                k -= 1
+            self.marks.set(k, m)
+
+    # The first mark on line l, by index, if any.
+    fn first_on(self: @Marked, l: i64) -> i64
+        var lo: i64 = 0
+        var hi: i64 = self.marks.len()
+        while lo < hi
+            let mid = (lo + hi) / 2
+            if self.marks.get(mid).line < l
+                lo = mid + 1
+            else
+                hi = mid
+        lo
+
+    fn cut(self: @&Marked, at: i64, len: i64)
+        let c = if at < 0 then 0 else if at > len then len else at
+        # Insertion into the sorted, distinct cuts.
+        var i: i64 = self.cuts.len()
+        while i > 0 and self.cuts.get(i - 1) > c
+            i -= 1
+        if i > 0 and self.cuts.get(i - 1) == c
+            return
+        self.cuts.push(c)
+        var k = self.cuts.len() - 1
+        while k > i
+            self.cuts.set(k, self.cuts.get(k - 1))
+            k -= 1
+        self.cuts.set(i, c)
+
+# A mark's bytes on a line `len` bytes long: never empty unless the line is.
+fn mark_span(m: DiagMark, len: i64) -> StyleRun
+    var a = if m.start < 0 then 0 else m.start
+    var b = if m.end > len then len else m.end
+    if a >= len
+        a = if len > 0 then len - 1 else 0
+    if b <= a
+        b = if a < len then a + 1 else a
+    StyleRun { start: a, len: b - a, style: style_plain() }
+
+impl LineStyler for Marked
+    fn runs(self: @&Marked, l: i64, bytes: [u8]) -> [StyleRun]
+        let base: [StyleRun] = if self.lexical then self.lex.runs(l, bytes) else span_from_vec<StyleRun>(@self.none)
+        let first = self.first_on(l)
+        if first >= self.marks.len() or self.marks.get(first).line != l
+            return base
+        let len = bytes.len
+        self.cuts.clear()
+        self.cut(0, len)
+        self.cut(len, len)
+        for i in 0..base.len
+            self.cut(base[i].start, len)
+            self.cut(base[i].start + base[i].len, len)
+        var k = first
+        while k < self.marks.len() and self.marks.get(k).line == l
+            let sp = mark_span(self.marks.get(k), len)
+            self.cut(sp.start, len)
+            self.cut(sp.start + sp.len, len)
+            k += 1
+        self.out.clear()
+        var ri: i64 = 0
+        for c in 0..self.cuts.len() - 1
+            let a = self.cuts.get(c)
+            let b = self.cuts.get(c + 1)
+            while ri < base.len and base[ri].start + base[ri].len <= a
+                ri += 1
+            var styled = false
+            var style = style_plain()
+            if ri < base.len and base[ri].start <= a
+                style = base[ri].style
+                styled = true
+            var marked = false
+            var error = false
+            var j = first
+            while j < self.marks.len() and self.marks.get(j).line == l
+                let sp = mark_span(self.marks.get(j), len)
+                if sp.start <= a and a < sp.start + sp.len
+                    marked = true
+                    if self.marks.get(j).error
+                        error = true
+                j += 1
+            if marked
+                style = marked_style(style, error)
+            if styled or marked
+                self.out.push(StyleRun { start: a, len: b - a, style: style })
+        span_from_vec<StyleRun>(@self.out)

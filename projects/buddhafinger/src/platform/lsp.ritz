@@ -1,0 +1,381 @@
+# platform/lsp.ritz - ritz-lsp as a child process on polled pipes (AGAST #4828).
+#
+# docs/BUDDHAFINGER_PROPOSAL.md, "Event loop" and "ritz-lsp". A LangServer is
+# the server's process and the lsp/client.ritz Client talking to it; the
+# event loop (platform/linux.ritz) puts its three pipes in the same poll as
+# the terminal and the signalfd:
+#
+#   - The server runs through ritzlib.process's spawn, with RITZ1 in its
+#     environment pointing at ritz1_selfhosted (set by env(1), spawn
+#     passing the editor's environment on), and the parent's ends of the
+#     pipes nonblocking (Process.set_nonblocking).
+#   - stdout and stderr are polled for POLLIN, stdin for POLLOUT only while
+#     the client's outbox holds bytes (poll_fds). A frame the pipe took part
+#     of keeps its bytes and offset in the outbox (lsp/wire.ritz).
+#   - Each loop turn moves at most PIPE_BUDGET_BYTES through each pipe, so a
+#     server flooding stderr, or a big snapshot, can't hold up keys and
+#     repaint. stdout's bytes go to the client's FrameReader; stderr's keep
+#     only their last LOG_BYTES (the log).
+#   - The editor blocks SIGPIPE, so a server that closed its stdin is EPIPE
+#     here, not a kill. EOF on stdout, EPIPE, a stream that isn't LSP
+#     framing or no answer to `initialize` end the session: the server is
+#     reaped (killed if it hangs on) and tag() says why in the status line.
+#
+# The sync limit (lsp/client.ritz SYNC_LIMIT_BYTES, 1 MiB): building one
+# snapshot (Buffer.serialize, JSON escaping, framing) measured 13 ms per
+# MiB of source (1, 2 and 4 MiB: 13, 26 and 52 ms; huburght, a debug build
+# by ritz1_selfhosted, 2026-11-27), so a 1 MiB file's synced edit fits one
+# 60 Hz frame (the proposal's ~17 ms target) and 2 MiB would not. Above it
+# the document is closed on the server: lexical colors, motions and editing
+# are unaffected.
+
+import ritzlib.errno { Errno }
+import ritzlib.fd { Fd, PollFd, POLLIN, POLLOUT, POLLHUP, POLLERR, POLLNVAL, TryRead, TryWrite }
+import ritzlib.fs { access, read_link }
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.os.env { env_get }
+import ritzlib.process { Process, ProcessResult, find_command, process_id, spawn }
+import ritzlib.result { Result }
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string
+import ritzlib.sys { X_OK }
+import ritzlib.time { sleep_ms }
+import ritzlib.timer { now_millis }
+
+import lsp.client { Client, Reply, client_new }
+
+# Bytes one loop turn moves through each pipe, at most.
+pub const PIPE_BUDGET_BYTES: i64 = 65536
+
+# The stderr bytes kept: the last ones.
+pub const LOG_BYTES: i64 = 16384
+
+# How long a server that is told to go (stdin closed) gets before it is killed.
+const EXIT_GRACE_MS: i64 = 200
+
+const PIPE_CHUNK: i64 = 4096
+
+# ============================================================================
+# Which server
+# ============================================================================
+
+# The server to run: `server` (empty: none) with RITZ1=`ritz1` in its
+# environment (empty: whatever RITZ1 the editor has).
+pub struct LangConfig
+    server: String
+    ritz1: String
+
+pub fn lang_config(server: StrView, ritz1: StrView) -> LangConfig
+    LangConfig { server: string_from(server), ritz1: string_from(ritz1) }
+
+# `rel` under the monorepo's projects/ directory of the editor binary
+# `exe` (projects/buddhafinger/build/<profile>/buddhafinger), if that is an
+# executable there.
+fn beside_editor(exe_path: StrView, rel: StrView) -> Option<String>
+    var exe = string_from(exe_path)
+    # Four components up: build/<profile>/buddhafinger, then buddhafinger/.
+    for i in 0..4
+        let v = exe.as_view()
+        var k = v.len() - 1
+        while k > 0 and v.get(k) != '/'
+            k -= 1
+        if k <= 0 or exe.is_empty()
+            return None
+        while exe.len() > k
+            exe.pop()
+    exe.push('/')
+    exe.push_str(rel)
+    match access(exe.as_view(), X_OK)
+        Ok(_) => Some(exe)
+        Err(_) => None
+
+# The editor's own choice: $BUDDHAFINGER_LSP if set (empty turns the
+# server off), else the monorepo's ritz-lsp beside this editor, else
+# ritz-lsp on $PATH. RITZ1 is $RITZ1 if set, else the monorepo's
+# ritz1_selfhosted, else ritz1_selfhosted on $PATH.
+pub fn lang_config_from_env() -> LangConfig
+    let exe: String = match read_link("/proc/self/exe")
+        Ok(p) => p
+        Err(_) => string_new()
+    lang_config_choose(env_get("BUDDHAFINGER_LSP"), env_get("RITZ1"), exe.as_view())
+
+# lang_config_from_env's choice, given the two variables' values and the
+# editor binary's path.
+pub fn lang_config_choose(lsp_var: Option<StrView>, ritz1_var: Option<StrView>, exe: StrView) -> LangConfig
+    var server = string_new()
+    match lsp_var
+        Some(v) => server.push_str(v)
+        None =>
+            match beside_editor(exe, "ritz-lsp/build/debug/ritz-lsp")
+                Some(p) => server = p
+                None =>
+                    match find_command("ritz-lsp")
+                        Some(p) => server = p
+                        None => pass
+    var ritz1 = string_new()
+    match ritz1_var
+        Some(v) => ritz1.push_str(v)
+        None =>
+            match beside_editor(exe, "ritz/ritz1/build/ritz1_selfhosted")
+                Some(p) => ritz1 = p
+                None =>
+                    match find_command("ritz1_selfhosted")
+                        Some(p) => ritz1 = p
+                        None => pass
+    LangConfig { server: server, ritz1: ritz1 }
+
+# The server process: cfg.server with the editor's environment, RITZ1 set
+# to cfg.ritz1 when that names one (`env RITZ1=<ritz1> <server>`, the
+# server resolved and checked first, so a missing one is Err(NoEnt) here
+# rather than env's exit 127).
+fn spawn_server(cfg: @LangConfig) -> Result<Process, Errno>
+    let no_args: Vec<StrView> = vec_new<StrView>()
+    if cfg.ritz1.is_empty()
+        return spawn(cfg.server.as_view(), span_from_vec<StrView>(@no_args))
+    var server = string_from(cfg.server.as_view())
+    if cfg.server.as_view().find("/") >= cfg.server.len()
+        match find_command(cfg.server.as_view())
+            Some(p) => server = p
+            None => return Err(Errno.NoEnt)
+    match access(server.as_view(), X_OK)
+        Ok(_) => pass
+        Err(e) => return Err(e)
+    var setting = string_from("RITZ1=")
+    setting.push_str(cfg.ritz1.as_view())
+    var args: Vec<StrView> = vec_new<StrView>()
+    args.push(setting.as_view())
+    args.push(server.as_view())
+    spawn("env", span_from_vec<StrView>(@args))
+
+# ============================================================================
+# The session
+# ============================================================================
+
+pub enum LangState
+    Off                 # not started: no server configured, or no Ritz file yet
+    Running
+    Ended               # tag() and detail() say why
+
+pub struct LangServer
+    proc: Process
+    client: Client
+    state: LangState
+    log: Vec<u8>        # stderr's last LOG_BYTES bytes
+    out_open: bool
+    err_open: bool
+    why: String         # the status-line tag once ended
+    reported: bool      # the end was told on the message line
+
+pub fn lang_idle() -> LangServer
+    var p: Process
+    p.pid = -1
+    p.stdin_fd = -1
+    p.stdout_fd = -1
+    p.stderr_fd = -1
+    p.waited = 1
+    LangServer { proc: p, client: client_new(), state: LangState.Off, log: vec_new<u8>(), out_open: false, err_open: false, why: string_new(), reported: false }
+
+impl LangServer
+    pub fn running(self: @LangServer) -> bool
+        self.state == LangState.Running
+
+    # Start `cfg`'s server and send it `initialize`. False (tag() says why)
+    # when it can't be started.
+    pub fn start(self: @&LangServer, cfg: @LangConfig, now: i64) -> bool
+        if cfg.server.is_empty()
+            return false
+        match spawn_server(cfg)
+            Ok(p) => self.proc = p
+            Err(e) =>
+                self.state = LangState.Ended
+                self.why.clear()
+                self.why.push_str("lsp: can't start (")
+                self.why.push_str(e.message())
+                self.why.push(')')
+                return false
+        match self.proc.set_nonblocking()
+            Ok(_) => pass
+            Err(e) =>
+                self.end("lsp: pipes failed")
+                return false
+        self.client = client_new()
+        self.client.start(process_id() as i64, now)
+        self.log.clear()
+        self.out_open = true
+        self.err_open = true
+        self.reported = false
+        self.state = LangState.Running
+        true
+
+    # The three poll entries, written to fds[0..3]: stdout and stderr for
+    # POLLIN, stdin for POLLOUT while bytes wait to go. An entry with
+    # nothing to watch has fd -1, which poll(2) skips.
+    pub fn poll_fds(self: @LangServer, fds: Span<PollFd>)
+        let off = PollFd { fd: -1, events: 0, revents: 0 }
+        fds[0] = off
+        fds[1] = off
+        fds[2] = off
+        if not self.running()
+            return
+        if self.out_open
+            fds[0] = PollFd { fd: self.proc.stdout().raw(), events: POLLIN, revents: 0 }
+        if self.err_open
+            fds[1] = PollFd { fd: self.proc.stderr().raw(), events: POLLIN, revents: 0 }
+        if not self.client.out.is_empty()
+            fds[2] = PollFd { fd: self.proc.stdin().raw(), events: POLLOUT, revents: 0 }
+
+    # Move bytes for what poll reported in fds[0..3] (poll_fds' order), at
+    # most PIPE_BUDGET_BYTES through each pipe. Ends the session on EOF,
+    # EPIPE or a pipe error.
+    pub fn service(self: @&LangServer, fds: Span<PollFd>)
+        if not self.running()
+            return
+        let wake = POLLIN | POLLHUP | POLLERR | POLLNVAL
+        if (fds[2].revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) != 0
+            self.write_some()
+        if self.running() and (fds[1].revents & wake) != 0
+            self.read_stderr()
+        if self.running() and (fds[0].revents & wake) != 0
+            self.read_stdout()
+
+    fn write_some(self: @&LangServer)
+        var left = PIPE_BUDGET_BYTES
+        let pipe = self.proc.stdin()
+        while left > 0
+            let p: [u8] = self.client.out.pending()
+            if p.len == 0
+                return
+            let chunk: [u8] = if p.len < left then p else p.slice(0, left)
+            match pipe.try_write(chunk)
+                Ok(w) => match w
+                    TryWrite.Wrote(n) =>
+                        self.client.out.wrote(n)
+                        left -= n
+                    TryWrite.WouldBlock => return
+                Err(e) =>
+                    match e
+                        Errno.Pipe => self.end("lsp: closed its input")
+                        _ => self.end("lsp: write failed")
+                    return
+
+    fn read_stdout(self: @&LangServer)
+        var buf: [4096]u8
+        var left = PIPE_BUDGET_BYTES
+        let pipe = self.proc.stdout()
+        while left > 0
+            match pipe.try_read(Span<u8> { ptr: @buf[0], len: PIPE_CHUNK })
+                Ok(r) => match r
+                    TryRead.Data(n) =>
+                        self.client.reader.feed(Span<u8> { ptr: @buf[0], len: n })
+                        left -= n
+                    TryRead.WouldBlock => return
+                    TryRead.Eof =>
+                        self.out_open = false
+                        self.end("lsp: exited")
+                        return
+                Err(_) =>
+                    self.end("lsp: read failed")
+                    return
+
+    fn read_stderr(self: @&LangServer)
+        var buf: [4096]u8
+        var left = PIPE_BUDGET_BYTES
+        let pipe = self.proc.stderr()
+        while left > 0
+            match pipe.try_read(Span<u8> { ptr: @buf[0], len: PIPE_CHUNK })
+                Ok(r) => match r
+                    TryRead.Data(n) =>
+                        self.keep_log(Span<u8> { ptr: @buf[0], len: n })
+                        left -= n
+                    TryRead.WouldBlock => return
+                    TryRead.Eof =>
+                        self.err_open = false
+                        return
+                Err(_) =>
+                    self.err_open = false
+                    return
+
+    # Append to the log, keeping its last LOG_BYTES bytes.
+    fn keep_log(self: @&LangServer, bytes: [u8])
+        let from = if bytes.len > LOG_BYTES then bytes.len - LOG_BYTES else 0
+        self.log.push_span(bytes.slice(from, bytes.len))
+        let n = self.log.len()
+        if n > LOG_BYTES
+            let all: [u8] = self.log[0..n]
+            all[0..LOG_BYTES].copy_from(all[n - LOG_BYTES..n])
+            while self.log.len() > LOG_BYTES
+                self.log.pop()
+
+    # The next message read from the server, applied, for the editor's text
+    # at `revision`; None when no whole message waits. A stream that isn't
+    # LSP framing ends the session.
+    pub fn next_reply(self: @&LangServer, revision: i64) -> Option<Reply>
+        if self.state == LangState.Off
+            return None
+        match self.client.next_reply(revision)
+            Ok(r) => r
+            Err(_) =>
+                self.end("lsp: bad message")
+                None
+
+    # End the session: the server is told to go (stdin closed), given
+    # EXIT_GRACE_MS, then killed; `why`, with how it exited, is the tag.
+    pub fn end(self: @&LangServer, why: StrView)
+        if self.state != LangState.Running
+            return
+        self.state = LangState.Ended
+        self.why.clear()
+        self.why.push_str(why)
+        self.proc.close_stdin()
+        let deadline = now_millis() + EXIT_GRACE_MS
+        loop
+            match self.proc.try_wait()
+                Some(r) =>
+                    if r.signaled != 0
+                        self.why.push_str(" (signal ")
+                        self.why.push_i64(r.signal as i64)
+                        self.why.push(')')
+                    else if r.exit_code != 0
+                        self.why.push_str(" (status ")
+                        self.why.push_i64(r.exit_code as i64)
+                        self.why.push(')')
+                    break
+                None => pass
+            if now_millis() >= deadline
+                break
+            sleep_ms(5)
+        self.proc.cleanup()
+        self.out_open = false
+        self.err_open = false
+
+    # The editor is quitting.
+    pub fn finish(self: @&LangServer)
+        self.end("lsp: done")
+
+    # What the status line shows: nothing while all is well.
+    pub fn tag(self: @LangServer) -> StrView
+        match self.state
+            LangState.Off => ""
+            LangState.Running =>
+                if not self.client.ready()
+                    return "lsp: starting"
+                if self.client.sync_suspended()
+                    return "lsp: off (large file)"
+                ""
+            LangState.Ended => self.why.as_view()
+
+    # The last line the server wrote to stderr: why it failed, often.
+    pub fn last_log_line(self: @LangServer) -> StrView
+        let all: [u8] = self.log[0..self.log.len()]
+        var end = all.len
+        while end > 0 and (all[end - 1] == '\n' or all[end - 1] == '\r')
+            end -= 1
+        var start = end
+        while start > 0 and all[start - 1] != '\n'
+            start -= 1
+        all.slice(start, end).as_strview()
+
+    pub fn log_bytes(self: @LangServer) -> i64
+        self.log.len()

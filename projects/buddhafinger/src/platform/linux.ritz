@@ -7,10 +7,13 @@
 #
 #   - No sigaction handlers. At startup SIGTERM, SIGINT, SIGHUP, SIGTSTP,
 #     SIGCONT and SIGWINCH are blocked and read from a signalfd instead.
-#   - poll waits on the terminal and the signalfd. Its timeout is the next
-#     timer deadline: the Escape timeout while a key sequence is open, so a
-#     bare Escape leaves Insert without the next keystroke. The M2
-#     language-server client adds its pipes to the same poll (POLL_SLOTS).
+#   - poll waits on the terminal, the signalfd and the language server's
+#     pipes (platform/lsp.ritz, AGAST #4828). Its timeout is the next timer
+#     deadline: the Escape timeout while a key sequence is open, so a bare
+#     Escape leaves Insert without the next keystroke, and the language
+#     server's initialize or request timeout.
+#   - SIGPIPE is blocked too (and ignored when read), so a language server
+#     that closed its stdin is EPIPE on the write, not a kill.
 #   - SIGTERM, SIGINT, SIGHUP: restore the terminal, exit 128 + the signal.
 #     With ISIG off, Ctrl-C is a key and SIGINT comes only from another
 #     process.
@@ -21,6 +24,13 @@
 #
 # Every way out restores the terminal: `:q`, a signal, the terminal closing,
 # a failed poll, read or write.
+#
+# The language server (a Ritz file only): each turn sends the text when it
+# changed (lsp/client.ritz coalesces and bounds it), K and gd's requests,
+# and applies what came back: diagnostics underlined for the revision on
+# screen with the cursor line's message shown, hover on the message line, a
+# definition jumped to (Ctrl-O / Ctrl-T back). Its failures show in the
+# status line.
 
 import ritzlib.errno { Errno }
 import ritzlib.fd { Fd, PollFd, POLLIN, POLLHUP, POLLERR, POLLNVAL, fd_borrow, poll }
@@ -32,17 +42,22 @@ import ritzlib.result { Result }
 import ritzlib.span { Span, span_from_ptr, span_from_strview, span_from_vec }
 import ritzlib.strview { StrView }
 import ritzlib.string
-import ritzlib.sys { SIGTERM, SIGINT, SIGHUP, SIGTSTP, SIGCONT, SIGWINCH, SIGSTOP }
+import ritzlib.sys { SIGTERM, SIGINT, SIGHUP, SIGTSTP, SIGCONT, SIGWINCH, SIGSTOP, SIGPIPE }
+import ritzlib.fs { cwd }
 import ritzlib.term { get_winsize }
 import ritzlib.termsession { Key, KeyDecoder, TermOut, TermSession, ESCAPE_TIMEOUT_MS, key_decoder, term_enter_raw, term_out }
 import ritzlib.timer { now_millis }
 
-import core.editor { Editor, editor_new, editor_open, handle_key }
+import core.buffer { pos }
+import core.editor { Editor, LangAsk, editor_new, editor_open, handle_key, jump_to }
 import core.files { FileStore, LoadError }
 import core.modes { Mode }
-import core.screen { Screen, Size, View, render, render_styled, screen_new, text_rows, view_new }
+import core.screen { Screen, Size, View, render_styled, screen_new, text_rows, view_new }
+import lsp.client { AskKind, Diag, Refused, Reply, path_of_uri, uri_of_path }
+import lsp.wire { byte_col, utf16_col }
+import platform.lsp { LangConfig, LangServer, LangState, lang_config_from_env, lang_idle }
 import platform.save { LinuxFiles, linux_files }
-import syntax.highlight { Highlighter, highlighter_new }
+import syntax.marks { DiagMark, Marked, marked_new }
 
 # Exit statuses besides 128 + a terminating signal.
 pub const EXIT_OK: i32 = 0
@@ -56,12 +71,16 @@ const DEFAULT_COLS: i32 = 80
 # turns, so signals are still read in between.
 const READ_CHUNK: i64 = 256
 
-# The poll set: the terminal, then the signalfd. The language server's
-# stdout and stderr (POLLIN) and its stdin (POLLOUT while bytes are queued)
-# go after these when the M2 client lands (AGAST #4828).
+# The poll set: the terminal, the signalfd, then the language server's
+# stdout and stderr (POLLIN) and its stdin (POLLOUT while bytes are queued),
+# in LangServer.poll_fds' order.
 const SLOT_TTY: i64 = 0
 const SLOT_SIGNALS: i64 = 1
-const POLL_SLOTS: i64 = 2
+const SLOT_LANG: i64 = 2
+const POLL_SLOTS: i64 = 5
+
+# The most lines one diagnostic is underlined on.
+const MAX_MARK_LINES: i64 = 200
 
 # The signals the loop reads from its signalfd.
 fn loop_signals() -> SigSet
@@ -71,6 +90,7 @@ fn loop_signals() -> SigSet
     set.add(SIGTSTP)
     set.add(SIGCONT)
     set.add(SIGWINCH)
+    set.add(SIGPIPE)
     set
 
 # Why the loop ended.
@@ -104,6 +124,10 @@ fn report(what: StrView)
 # `:q`, 128 + the signal after SIGTERM, SIGINT or SIGHUP, EXIT_FAILED when
 # the file can't be read, `tty` isn't a terminal or the terminal fails.
 pub fn run_editor(tty: i32, path: StrView) -> i32
+    run_editor_with(tty, path, lang_config_from_env())
+
+# run_editor with the language server `lang` (lang.server empty: none).
+pub fn run_editor_with(tty: i32, path: StrView, lang: LangConfig) -> i32
     var files = linux_files()
     var ed: Editor = match open_file(@&files, path)
         Some(e) => e
@@ -128,7 +152,7 @@ pub fn run_editor(tty: i32, path: StrView) -> i32
             let back = old_mask.set_mask()
             report("not a terminal")
             return EXIT_FAILED
-    var s = Session { tty: tty, term: term, signals: signals, decoder: key_decoder(), escape_ms: ESCAPE_TIMEOUT_MS as i64, deadline: None, screen: screen_new(query_size(tty)), view: view_new(), styler: highlighter_new(), out: term_out(), drawn: None, dirty: true, suspended: false }
+    var s = Session { tty: tty, term: term, signals: signals, decoder: key_decoder(), escape_ms: ESCAPE_TIMEOUT_MS as i64, deadline: None, screen: screen_new(query_size(tty)), view: view_new(), styler: marked_new(true), out: term_out(), drawn: None, dirty: true, suspended: false, lang: lang_idle(), config: lang, uri_for: string_new(), uri: string_new(), marks_for: -1 }
     s.size_changed(@&ed)
     s.enter_screen()
     let exit = s.run(@&ed, @&files)
@@ -182,24 +206,31 @@ struct Session
     deadline: Option<i64>   # when it stops waiting (now_millis()); None: none open
     screen: Screen
     view: View
-    styler: Highlighter
+    styler: Marked          # lexical colors with the diagnostics over them
     out: TermOut
     drawn: Option<i64>      # the text_revision the caches were built for; None before the first paint
     dirty: bool             # a repaint is due
     suspended: bool         # stopped by Ctrl-Z or SIGTSTP; SIGCONT ends it
+    lang: LangServer        # the language server session (platform/lsp.ritz)
+    config: LangConfig      # which server
+    uri_for: String         # the editor path `uri` was made for
+    uri: String             # its file:// uri; empty when it isn't a Ritz file
+    marks_for: i64          # the revision styler's marks are for; -1: rebuild
 
 impl Session
     fn run(self: @&Session, ed: @&Editor, files: @&LinuxFiles) -> Exit
-        var fds: [2]PollFd
+        var fds: [5]PollFd
         loop
             if ed.quit
                 return Exit.Quit
+            self.lang_turn(ed, files)
             if self.dirty and not self.suspended
                 match self.paint(ed)
                     Ok(_) => pass
                     Err(e) => return Exit.Failed(e)
             fds[SLOT_TTY] = PollFd { fd: self.tty, events: POLLIN, revents: 0 }
             fds[SLOT_SIGNALS] = PollFd { fd: self.signals.raw(), events: POLLIN, revents: 0 }
+            self.lang.poll_fds(span_from_ptr<PollFd>(@fds[SLOT_LANG], 3))
             match poll(span_from_ptr<PollFd>(@fds[0], POLL_SLOTS), self.timeout())
                 Ok(_) => pass
                 Err(e) =>
@@ -217,17 +248,25 @@ impl Session
                     None => pass
             else if (tty_events & (POLLHUP | POLLERR | POLLNVAL)) != 0
                 return Exit.Closed
+            self.lang_io(ed, files, span_from_ptr<PollFd>(@fds[SLOT_LANG], 3))
             match self.check_deadline(ed, files)
                 Some(exit) => return exit
                 None => pass
 
-    # poll's timeout: until the open key sequence's deadline, or forever.
+    # poll's timeout: until the open key sequence's deadline or the
+    # language server's, whichever is first, or forever.
     fn timeout(self: @Session) -> i32
-        match self.deadline
-            Some(at) =>
-                let left = at - now_millis()
-                if left < 0 then 0 else left as i32
-            None => -1     # poll(2): no timeout
+        var at: i64 = self.deadline.unwrap_or(-1)
+        if self.lang.running()
+            match self.lang.client.deadline()
+                Some(d) =>
+                    if at < 0 or d < at
+                        at = d
+                None => pass
+        if at < 0
+            return -1      # poll(2): no timeout
+        let left = at - now_millis()
+        if left < 0 then 0 else left as i32
 
     # ------------------------------------------------------------------
     # Keys
@@ -307,6 +346,8 @@ impl Session
                 Err(e) => return Some(Exit.Failed(e))
 
     fn signal(self: @&Session, ed: @&Editor, sig: i32) -> Option<Exit>
+        if sig == SIGPIPE
+            return None         # the write that raised it got EPIPE
         if sig == SIGTERM or sig == SIGINT or sig == SIGHUP
             return Some(Exit.Signal(sig))
         if sig == SIGTSTP
@@ -355,18 +396,22 @@ impl Session
         if self.drawn.unwrap_or(-1) != rev
             # The text changed: every line's checkpoints and colors may be stale.
             self.screen.text_changed(0, 0)
-            self.styler = highlighter_new()
+            self.styler.text_changed()
             self.drawn = Some(rev)
+        if self.marks_for != rev
+            self.build_marks(ed, rev)
         self.view.top = ed.top
         self.view.cursor_line = ed.cursor.line
         self.view.cursor_byte = ed.cursor.col
-        let message: StrView = match ed.mode
+        var message: StrView = match ed.mode
             Mode.CommandLine => ed.command_line()
             _ => ed.message.as_view()
-        if ed.path.as_view().ends_with(".ritz")
-            render_styled(@&self.screen, ed, @&self.view, @&self.styler, ed.status(), message)
-        else
-            render(@&self.screen, ed, @&self.view, ed.status(), message)
+        if message.is_empty() and ed.mode != Mode.CommandLine
+            message = self.diagnostic_at(ed.cursor.line, rev)
+        var status = ed.status()
+        status.lang = self.lang.tag()
+        self.styler.lexical = ed.path.as_view().ends_with(".ritz")
+        render_styled(@&self.screen, ed, @&self.view, @&self.styler, status, message)
         ed.top = self.view.top
         self.out.hide_cursor()
         self.screen.emit(@&self.out)
@@ -387,8 +432,177 @@ impl Session
         self.out.leave_alt_screen()
         let flushed = self.out.flush(self.tty)
 
-    # The terminal as it was found, the signalfd closed.
+    # The terminal as it was found, the signalfd closed, the language
+    # server gone.
     fn finish(self: @&Session)
         self.leave_screen()
         let restored = self.term.restore()
         let closed = self.signals.close()
+        self.lang.finish()
+
+    # ------------------------------------------------------------------
+    # The language server
+    # ------------------------------------------------------------------
+
+    # The editor's file as a file:// uri, "" unless it is a Ritz file.
+    fn doc_uri(self: @&Session, ed: @Editor) -> StrView
+        if self.uri_for.as_view().eq(ed.path.as_view()) and not self.uri_for.is_empty()
+            return self.uri.as_view()
+        self.uri_for.clear()
+        self.uri_for.push_str(ed.path.as_view())
+        self.uri.clear()
+        let p = ed.path.as_view()
+        if not p.ends_with(".ritz")
+            return ""
+        if p.starts_with("/")
+            self.uri = uri_of_path(p)
+        else
+            match cwd()
+                Ok(dir) =>
+                    var abs = dir
+                    abs.push('/')
+                    abs.push_str(p)
+                    self.uri = uri_of_path(abs.as_view())
+                Err(_) => pass
+        self.uri.as_view()
+
+    # Before the poll: start the server for a Ritz file, send the text if
+    # it changed, send K / gd's request, and act on any timeouts.
+    fn lang_turn(self: @&Session, ed: @&Editor, files: @&LinuxFiles)
+        let uri = string_from(self.doc_uri(ed))
+        let ask = ed.take_ask()
+        if self.lang.state == LangState.Off and not uri.is_empty() and not self.config.server.is_empty()
+            if not self.lang.start(@self.config, now_millis())
+                self.report_end(ed)
+        if not self.lang.running()
+            if ask != LangAsk.Nothing
+                if self.lang.state == LangState.Ended
+                    ed.say(self.lang.tag())
+                else
+                    ed.say("lsp: no language server")
+                self.dirty = true
+            return
+        let rev = ed.text_revision()
+        if self.lang.client.wants_text(uri.as_view(), rev, ed.buf.byte_len())
+            let text = ed.buf.serialize()
+            let sent = self.lang.client.send_text(rev, span_from_vec<u8>(@text))
+            self.dirty = true
+        if ask != LangAsk.Nothing
+            let kind = if ask == LangAsk.Hover then AskKind.Hover else AskKind.Definition
+            let line = ed.cursor.line
+            let ch = utf16_col(ed.buf.line(line), ed.cursor.col)
+            match self.lang.client.ask(kind, rev, line, ch, now_millis())
+                Ok(_) => pass
+                Err(e) =>
+                    ed.say(refusal(e))
+                    self.dirty = true
+        loop
+            let r = self.lang.client.expire(now_millis())
+            if r.is_nothing()
+                break
+            self.apply(ed, files, r)
+
+    # After the poll: move the pipes' bytes and apply what came back.
+    fn lang_io(self: @&Session, ed: @&Editor, files: @&LinuxFiles, fds: Span<PollFd>)
+        if not self.lang.running()
+            return
+        self.lang.service(fds)
+        loop
+            match self.lang.next_reply(ed.text_revision())
+                Some(r) => self.apply(ed, files, r)
+                None => break
+        if not self.lang.running()
+            self.report_end(ed)
+
+    # The session ended: say so once on the message line (the status line
+    # keeps the tag), with the server's last stderr line.
+    fn report_end(self: @&Session, ed: @&Editor)
+        if self.lang.reported
+            return
+        self.lang.reported = true
+        var what = string_from(self.lang.tag())
+        let last = self.lang.last_log_line()
+        if not last.is_empty()
+            what.push_str(": ")
+            what.push_str(last)
+        ed.say(what.as_view())
+        self.marks_for = -1
+        self.dirty = true
+
+    fn apply(self: @&Session, ed: @&Editor, files: @&LinuxFiles, r: Reply)
+        self.dirty = true
+        match r
+            Reply.Nothing => pass
+            Reply.Ready => pass
+            Reply.Diagnostics => self.marks_for = -1
+            Reply.Hover => ed.say(self.lang.client.hover_text())
+            Reply.NoHover => ed.say("lsp: nothing to show here")
+            Reply.Definition => self.go_to_definition(ed, files)
+            Reply.NoDefinition => ed.say("lsp: no definition found")
+            Reply.Failed(_) =>
+                var what = string_from("lsp: ")
+                what.push_str(self.lang.client.error_text())
+                ed.say(what.as_view())
+            Reply.TimedOut(k) => ed.say(if k == AskKind.Hover then "lsp: hover timed out" else "lsp: definition timed out")
+            Reply.InitFailed =>
+                self.lang.end("lsp: no answer")
+                self.report_end(ed)
+
+    # Jump to the definition the server named (its UTF-16 column made a
+    # byte column on the line it lands on).
+    fn go_to_definition(self: @&Session, ed: @&Editor, files: @&LinuxFiles)
+        let target = self.lang.client.target_uri()
+        var path = string_new()
+        if target.eq(self.uri.as_view())
+            path.push_str(ed.path.as_view())     # this file, under the name it has here
+        else
+            match path_of_uri(target)
+                Some(p) => path = p
+                None =>
+                    ed.say("lsp: definition is not in a file")
+                    return
+        let line = self.lang.client.target_line
+        let ch = self.lang.client.target_char
+        if jump_to<LinuxFiles>(ed, files, path.as_view(), pos(line, 0))
+            let l = ed.cursor.line
+            ed.place(pos(l, byte_col(ed.buf.line(l), ch)))
+
+    # The diagnostics for revision `rev` as byte ranges on screen: none
+    # unless the server's latest list is for exactly this text.
+    fn build_marks(self: @&Session, ed: @Editor, rev: i64)
+        self.marks_for = rev
+        self.styler.clear_marks()
+        if not self.lang.running()
+            return
+        let ds = self.lang.client.diagnostics(rev)
+        let last = ed.shown() - 1
+        for i in 0..ds.len
+            let d: Diag = ds[i]
+            var l = d.line
+            let stop = if d.end_line < d.line + MAX_MARK_LINES then d.end_line else d.line + MAX_MARK_LINES - 1
+            while l <= stop and l <= last
+                let text = ed.buf.line(l)
+                let a = if l == d.line then byte_col(text, d.start) else 0
+                let b = if l == d.end_line then byte_col(text, d.end) else text.len
+                self.styler.add(DiagMark { line: l, start: a, end: b, error: d.severity == 1 })
+                l += 1
+        self.styler.sort_marks()
+
+    # The message of the first diagnostic on line `l`, for the message line.
+    fn diagnostic_at(self: @Session, l: i64, rev: i64) -> StrView
+        if not self.lang.running()
+            return ""
+        let ds = self.lang.client.diagnostics(rev)
+        for i in 0..ds.len
+            let d: Diag = ds[i]
+            if d.line <= l and l <= d.end_line
+                return self.lang.client.message_of(d)
+        ""
+
+# What the message line says when a request can't be sent.
+fn refusal(e: Refused) -> StrView
+    match e
+        Refused.NotReady => "lsp: still starting"
+        Refused.NotOpen => "lsp: this file isn't synced"
+        Refused.Unsupported => "lsp: the server doesn't do that"
+        Refused.Busy => "lsp: busy"
