@@ -1661,23 +1661,21 @@ struct ArrayArg
     size: i32
     elem: TypeKind          # TYPE_* of the element
     pointee: TypeKind       # for a TypeKind.Ptr element, its pointee's TYPE_*
-    name: *u8          # the struct named by the element or its pointee
-    name_len: i32
+    name: StrView          # the struct named by the element or its pointee
     # AGAST #3634: every dimension of an `arrN_arrM_..E` (elem is then
     # TypeKind.Array and name null, as on an N-D local); null for a 1-D one.
     shape: *ArrayShape
 
 # 1 and *out filled when name[0..len] spells an array, else 0.
 pub fn array_arg_decode(name_sv: StrView, out: *ArrayArg) -> i32
-    var len: i32 = name_sv.len as i32
     out.shape = null
     if array_arg_decode_1d(name_sv, out) == 0
         return 0
     # AGAST #3634: an element that itself spells an array nests it.
-    if out.elem != TypeKind.Struct or out.name_len < 6
+    if out.elem != TypeKind.Struct or out.name.len < 6
         return 1
     var inner: ArrayArg
-    if array_arg_decode(StrView { ptr: (out.name), len: (out.name_len) as i64 }, @inner) == 0
+    if array_arg_decode(out.name, @inner) == 0
         return 1
     var inner_rank: i32 = 1
     if inner.shape != null
@@ -1691,7 +1689,7 @@ pub fn array_arg_decode(name_sv: StrView, out: *ArrayArg) -> i32
         sh.dims[1] = inner.size
         sh.leaf_type = inner.elem
         sh.leaf_pointee = inner.pointee
-        sh.leaf_name = StrView { ptr: inner.name, len: inner.name_len as i64 }
+        sh.leaf_name = inner.name
     else
         for d in 0..inner_rank
             sh.dims[d + 1] = inner.shape.dims[d]
@@ -1700,8 +1698,7 @@ pub fn array_arg_decode(name_sv: StrView, out: *ArrayArg) -> i32
         sh.leaf_name = inner.shape.leaf_name
     out.elem = TypeKind.Array
     out.pointee = TypeKind.Void
-    out.name = null
-    out.name_len = 0
+    out.name = strview_empty()
     out.shape = sh
     1
 
@@ -1730,15 +1727,13 @@ fn array_arg_decode_1d(name_sv: StrView, out: *ArrayArg) -> i32
         elem_len = elem_len - 4
     let prim: TypeKind = primitive_type_from_name(StrView { ptr: (elem), len: (elem_len) as i64 })
     if prim != TypeKind.Void
-        out.name = null
-        out.name_len = 0
+        out.name = strview_empty()
         if out.elem == TypeKind.Ptr
             out.pointee = prim
         else
             out.elem = prim
         return 1
-    out.name = elem
-    out.name_len = elem_len
+    out.name = StrView { ptr: elem, len: elem_len as i64 }
     if out.elem == TypeKind.Ptr
         out.pointee = TypeKind.Struct
     1
@@ -1857,7 +1852,7 @@ pub fn subst_value_field(cloned: *StructField, subst_type: TypeKind, subst_name_
         cloned.array_size = a.size
         cloned.array_elem_type = a.elem
         cloned.array_elem_pointee = a.pointee
-        cloned.array_elem_type_name = StrView { ptr: a.name, len: a.name_len as i64 }
+        cloned.array_elem_type_name = a.name
         cloned.array_shape = a.shape   # AGAST #3634: `[N][M]E`
 
 # A `*T` / `@T` / `@&T` field at T = the argument.  The parser records a
@@ -1924,12 +1919,9 @@ pub fn find_generic_impl(start: *ImplBlock, type_name_sv: StrView) -> *ImplBlock
     return null
 
 struct WantedMethod
-    base: *u8
-    base_len: i32
-    suffix: *u8          # "$i32"; null: every instance
-    suffix_len: i32
-    method: *u8
-    method_len: i32
+    base: StrView
+    suffix: StrView          # "$i32"; null: every instance
+    method: StrView
     site: *InstSite      # AGAST #4844: where it was first wanted
     next: *WantedMethod
 
@@ -1955,28 +1947,19 @@ pub fn inherent_generic_method(m: *Module, base_sv: StrView, meth_sv: StrView) -
 pub fn wanted_in(list: *WantedMethod, base_sv: StrView, suffix_sv: StrView, meth_sv: StrView) -> i32
     var w: *WantedMethod = list
     while w != null
-        if name_eq(StrView { ptr: (w.method), len: (w.method_len) as i64 }, meth_sv) == 1
-            if w.suffix == null
+        if name_eq(w.method, meth_sv) == 1
+            if w.suffix.ptr == null
                 return 1
-            if name_eq(StrView { ptr: (w.base), len: (w.base_len) as i64 }, base_sv) == 1 and name_eq(StrView { ptr: (w.suffix), len: (w.suffix_len) as i64 }, suffix_sv) == 1
+            if name_eq(w.base, base_sv) == 1 and name_eq(w.suffix, suffix_sv) == 1
                 return 1
         w = w.next
     0
 
 pub fn push_wanted(list: *WantedMethod, base_sv: StrView, suffix_sv: StrView, meth_sv: StrView) -> *WantedMethod
-    var base: *u8 = base_sv.ptr
-    var base_len: i32 = base_sv.len as i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
-    var meth: *u8 = meth_sv.ptr
-    var meth_len: i32 = meth_sv.len as i32
     let w: *WantedMethod = malloc(sizeof(WantedMethod)) as *WantedMethod
-    w.base = base
-    w.base_len = base_len
-    w.suffix = suffix
-    w.suffix_len = suffix_len
-    w.method = meth
-    w.method_len = meth_len
+    w.base = base_sv
+    w.suffix = suffix_sv
+    w.method = meth_sv
     w.site = null
     w.next = list
     w
@@ -1987,11 +1970,11 @@ pub fn wanted_site(list: *WantedMethod, base_sv: StrView, suffix_sv: StrView, me
     var wild: *InstSite = null
     var w: *WantedMethod = list
     while w != null
-        if name_eq(StrView { ptr: (w.method), len: (w.method_len) as i64 }, meth_sv) == 1
-            if w.suffix == null
+        if name_eq(w.method, meth_sv) == 1
+            if w.suffix.ptr == null
                 if wild == null
                     wild = w.site
-            else if name_eq(StrView { ptr: (w.base), len: (w.base_len) as i64 }, base_sv) == 1 and name_eq(StrView { ptr: (w.suffix), len: (w.suffix_len) as i64 }, suffix_sv) == 1
+            else if name_eq(w.base, base_sv) == 1 and name_eq(w.suffix, suffix_sv) == 1
                 return w.site
         w = w.next
     wild

@@ -54,14 +54,11 @@ struct LetEnv
 
 # The type of the place reached so far along a `let`'s own storage.
 struct LetPlace
-    name: *u8            # the `let` binding's name
-    name_len: i32
+    name: StrView            # the `let` binding's name
     kind: TypeKind            # TYPE_* of the place; TypeKind.Unknown when Sema can't say
-    type_name: *u8       # struct name when kind == TypeKind.Struct (or a pointer's pointee)
-    type_name_len: i32
+    type_name: StrView       # struct name when kind == TypeKind.Struct (or a pointer's pointee)
     elem: TypeKind            # element TYPE_* when kind == TypeKind.Array
-    elem_name: *u8       # element struct name when elem == TypeKind.Struct
-    elem_name_len: i32
+    elem_name: StrView       # element struct name when elem == TypeKind.Struct
     is_const: i32        # AGAST #3325: the root is a module `const` array
     pointee: TypeKind         # the pointee's TYPE_* when kind is a pointer
     inner: i32           # a `**T` place's inner-pointee slot
@@ -92,24 +89,19 @@ fn let_place_const(env: *LetEnv, name_sv: StrView, out: *LetPlace) -> i32
         ce = sbk_const(env.sm, name_sv)
     if ce == null or (ce.const_type != TypeKind.Array and ce.const_type != TypeKind.Struct)
         return 0
-    out.name = ce.name.ptr
-    out.name_len = ce.name.len as i32
+    out.name = ce.name
     out.kind = ce.const_type
-    out.type_name = null
-    out.type_name_len = 0
+    out.type_name = strview_empty()
     out.elem = TypeKind.Void
-    out.elem_name = null
-    out.elem_name_len = 0
+    out.elem_name = strview_empty()
     if ce.const_type == TypeKind.Array
         out.elem = ce.array_elem_type
-        out.elem_name = ce.array_elem_type_name.ptr
-        out.elem_name_len = ce.array_elem_type_name.len as i32
+        out.elem_name = ce.array_elem_type_name
     else
         # LARB R60 / R48: a struct or enum const is read-only data too, so a
         # write into it (`C.k = 2`) or a mutable borrow is refused as a const
         # array's is.
-        out.type_name = ce.type_name.ptr
-        out.type_name_len = ce.type_name.len as i32
+        out.type_name = ce.type_name
     out.is_const = 1
     return 1
 
@@ -130,27 +122,23 @@ fn let_place_root(env: *LetEnv, name_sv: StrView, out: *LetPlace) -> i32
     # LocalVar does not record an array's element struct name; SemaVar's
     # let_name does.  Without it a `.f` past `a[i]` stays permissive
     # (let_place_member answers 0).
-    out.elem_name = null
-    out.elem_name_len = 0
+    out.elem_name = strview_empty()
     if env.s == null
         let v: *SemaVar = sema_find_local(env.sm, name_sv)
         if v == null
             return let_place_const(env, name_sv, out)
         if v.is_let != 1
             return 0
-        out.name = v.name.ptr
-        out.name_len = v.name.len as i32
+        out.name = v.name
         out.kind = v.let_kind
-        out.type_name = v.let_name.ptr
-        out.type_name_len = v.let_name.len as i32
+        out.type_name = v.let_name
         out.elem = v.let_elem
         out.pointee = v.let_pointee
         out.inner = v.inner
         out.tuple = v.tuple
         # AGAST #3399: a 1-D array's let_name is its element struct.
         if v.let_kind == TypeKind.Array and v.let_elem == TypeKind.Struct
-            out.elem_name = v.let_name.ptr
-            out.elem_name_len = v.let_name.len as i32
+            out.elem_name = v.let_name
         # AGAST #4071: an N-D array's element struct is its shape's leaf.
         if v.let_kind == TypeKind.Array
             out.shape = let_nd_shape(v.shape)
@@ -162,10 +150,8 @@ fn let_place_root(env: *LetEnv, name_sv: StrView, out: *LetPlace) -> i32
     if loc.is_let != 1
         return 0
     out.name = loc.name
-    out.name_len = loc.name_len
     out.kind = lv_var_type(loc)
-    out.type_name = lv_type_name(loc)
-    out.type_name_len = lv_type_name_len(loc)
+    out.type_name = StrView { ptr: lv_type_name(loc), len: (lv_type_name_len(loc)) as i64 }
     out.elem = lv_array_elem_type(loc)
     out.pointee = lv_pointee_type(loc)
     out.inner = lv_inner_pointee_type(loc)
@@ -180,12 +166,11 @@ fn let_place_member(env: *LetEnv, out: *LetPlace, field_sv: StrView) -> i32
         # none let_find_struct finds.  The field is the `let`'s own storage.
         out.kind = TypeKind.Unknown
         out.tuple = 0
-        out.type_name = null
-        out.type_name_len = 0
+        out.type_name = strview_empty()
         return 1
-    if out.kind != TypeKind.Struct or out.type_name_len <= 0
+    if out.kind != TypeKind.Struct or out.type_name.len <= 0
         return 0
-    let st: *StructDef = let_find_struct(env, StrView { ptr: (out.type_name), len: (out.type_name_len) as i64 })
+    let st: *StructDef = let_find_struct(env, out.type_name)
     if st == null
         return 0
     let fidx: i32 = find_field_index(st, field_sv)
@@ -195,11 +180,9 @@ fn let_place_member(env: *LetEnv, out: *LetPlace, field_sv: StrView) -> i32
     if fld == null
         return 0
     out.kind = fld.field_type
-    out.type_name = fld.field_type_name.ptr
-    out.type_name_len = fld.field_type_name.len as i32
+    out.type_name = fld.field_type_name
     out.elem = fld.array_elem_type
-    out.elem_name = fld.array_elem_type_name.ptr
-    out.elem_name_len = fld.array_elem_type_name.len as i32
+    out.elem_name = fld.array_elem_type_name
     out.pointee = fld.ptr_pointee
     out.inner = fld.inner_pointee_type
     out.shape = null
@@ -220,22 +203,18 @@ fn let_place_index(out: *LetPlace) -> i32
         if out.depth < out.shape.rank
             return 1
         out.kind = out.shape.leaf_type
-        out.type_name = out.shape.leaf_name.ptr
-        out.type_name_len = out.shape.leaf_name.len as i32
+        out.type_name = out.shape.leaf_name
         out.pointee = out.shape.leaf_pointee
         out.shape = null
         out.depth = 0
         out.elem = TypeKind.Void
-        out.elem_name = null
-        out.elem_name_len = 0
+        out.elem_name = strview_empty()
         out.inner = (TypeKind.Void as i32)
         return 1
     out.kind = out.elem
     out.type_name = out.elem_name
-    out.type_name_len = out.elem_name_len
     out.elem = TypeKind.Void
-    out.elem_name = null
-    out.elem_name_len = 0
+    out.elem_name = strview_empty()
     out.pointee = TypeKind.Void
     out.inner = (TypeKind.Void as i32)
     return 1
@@ -280,21 +259,21 @@ fn let_error(env: *LetEnv, line: i32, col: i32, head: StrView, name: StrView, ta
 
 fn let_error_assign_through(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(env, line, col, "cannot assign through const `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, "`; it is read-only data\n")
+        let_error(env, line, col, "cannot assign through const `", pl.name, "`; it is read-only data\n")
         return
-    let_error(env, line, col, "cannot assign through `let` binding `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, "`; declare it `var`\n")
+    let_error(env, line, col, "cannot assign through `let` binding `", pl.name, "`; declare it `var`\n")
 
 fn let_error_assign_whole(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(env, line, col, "cannot assign to const `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, "`; it is read-only data\n")
+        let_error(env, line, col, "cannot assign to const `", pl.name, "`; it is read-only data\n")
         return
-    let_error(env, line, col, "cannot assign to `let` binding `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, "`; declare it `var`\n")
+    let_error(env, line, col, "cannot assign to `let` binding `", pl.name, "`; declare it `var`\n")
 
 fn let_error_borrow(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(env, line, col, "cannot borrow const `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, "` as mutable; it is read-only data\n")
+        let_error(env, line, col, "cannot borrow const `", pl.name, "` as mutable; it is read-only data\n")
         return
-    let_error(env, line, col, "cannot borrow `let` binding `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, "` as mutable; declare it `var`\n")
+    let_error(env, line, col, "cannot borrow `let` binding `", pl.name, "` as mutable; declare it `var`\n")
 
 fn let_sema_env(sm: *Sema, env: *LetEnv)
     env.s = null
@@ -795,7 +774,7 @@ fn let_ptr_place_lent(pl: *LetPlace, p: *Param) -> i32
     if want == TypeKind.Array and p.param_pointee_array_size > 0
         return (pl.pointee == TypeKind.Array) as i32
     if want == TypeKind.Struct or pl.pointee == TypeKind.Struct
-        return (want == pl.pointee and name_eq(p.param_type_name, StrView { ptr: (pl.type_name), len: (pl.type_name_len) as i64 }) == 1) as i32
+        return (want == pl.pointee and name_eq(p.param_type_name, pl.type_name) == 1) as i32
     (want == pl.pointee) as i32
 
 # 1 when an `[a..b]` slice is on `e`'s path: no place (arg_is_place).

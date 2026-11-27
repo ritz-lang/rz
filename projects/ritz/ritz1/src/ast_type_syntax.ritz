@@ -162,22 +162,22 @@ pub fn field_new(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32, col: i32
     # field.  It comes from the chain, never from a sibling field.
     match ty
         TypeKind.Struct =>
-            f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
+            f.field_type_name = facts.type_name
         TypeKind.Ptr =>
             if facts.pointee_type == TypeKind.Struct
-                f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
+                f.field_type_name = facts.type_name
             else
                 f.field_type_name = strview_empty()
         TypeKind.PtrPtr =>
             if facts.inner_pointee_type == (TypeKind.Struct as i32)
-                f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
+                f.field_type_name = facts.type_name
             else
                 f.field_type_name = strview_empty()
         TypeKind.Ref | TypeKind.MutRef =>
             if facts.ref_inner_type == TypeKind.Struct
-                f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
+                f.field_type_name = facts.type_name
             else if ref_field_ptr_ptr_slot(p, tr) != (TypeKind.Void as i32)
-                f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
+                f.field_type_name = facts.type_name
                 f.inner_pointee_type = ref_field_ptr_ptr_slot(p, tr)
             else
                 f.field_type_name = strview_empty()
@@ -188,7 +188,7 @@ pub fn field_new(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32, col: i32
         f.array_size = facts.array_size
         f.array_elem_type = facts.array_elem_type
         f.array_elem_pointee = facts.array_elem_pointee
-        f.array_elem_type_name = StrView { ptr: facts.array_elem_type_name, len: facts.array_elem_type_name_len as i64 }
+        f.array_elem_type_name = facts.array_elem_type_name
     else
         f.array_size = 0
         f.array_elem_type = TypeKind.Void
@@ -542,7 +542,7 @@ pub fn array_lit_length_decl(p: *Parser, tr: *TypeRef, init: *Expr)
     one.rank = 1
     one.dims[0] = facts.array_size
     one.leaf_type = facts.array_elem_type
-    one.leaf_name = StrView { ptr: facts.array_elem_type_name, len: facts.array_elem_type_name_len as i64 }
+    one.leaf_name = facts.array_elem_type_name
     one.leaf_pointee = facts.array_elem_pointee
     array_lit_length_walk(p.ctx, init, @one, 0)
 
@@ -806,11 +806,10 @@ pub fn type_alias_declared(ctx: *ParseCtx, name_sv: StrView) -> i32
 # The alias's own tokens (#3625), since the table keeps a pointer, array or
 # generic instance (`Box$u8`) only in replay form.
 pub fn type_alias_target_spelling(ctx: *ParseCtx, name_sv: StrView) -> StrView
-    var len: i32 = name_sv.len as i32
     let e: *AliasEntry = type_alias_find(ctx, name_sv)
     if e == null
         return strview_empty()
-    StrView { ptr: (e.spelling), len: (e.spelling_len) as i64 }
+    e.spelling
 
 # 1 if `c` is a letter, digit or `_`.
 fn alias_word_char(c: u8) -> i32
@@ -884,8 +883,6 @@ fn type_alias_kind_has_state(kind: TypeKind) -> i32
 # target type.  attrs ran first, so p.skip_item is already set for a
 # [[target_os = "<not linux>"]] alias: don't record it.
 pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     if p.skip_item != 0
         gated_decl_log(p.ctx, name_sv)   # AGAST #3467
         return tr
@@ -919,11 +916,9 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     if existed and e.replayed and alias_snapshot_changed(e, f)
         p.ctx.alias_stale = true
     e.replayed = false
-    e.name = name
-    e.name_len = len
+    e.name = name_sv
     e.kind = f.kind
     e.type_name = f.type_name
-    e.type_name_len = f.type_name_len
     e.pointee_type = f.pointee_type
     e.inner_pointee_type = f.inner_pointee_type
     e.ptr_depth = f.ptr_depth
@@ -931,7 +926,6 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     e.array_elem_type = f.array_elem_type
     e.array_elem_pointee = f.array_elem_pointee
     e.array_elem_type_name = f.array_elem_type_name
-    e.array_elem_type_name_len = f.array_elem_type_name_len
     e.array_shape = f.array_shape
     e.ref_inner_type = f.ref_inner_type
     e.inner_ref = f.inner_ref   # AGAST #2399
@@ -940,8 +934,7 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     if e.fn_sig != null and (p.ctx.attr_bits & ATTR_WIN64) != 0
         item_attr_record(p.ctx, e.fn_sig as *u8, ATTR_WIN64)
     let spell_sv: StrView = type_alias_spell(p, name_sv)
-    e.spelling = spell_sv.ptr
-    e.spelling_len = spell_sv.len as i32
+    e.spelling = spell_sv
     return tr
 
 # AGAST #4769: true if the snapshot `f` names a different type than `e` holds,
@@ -952,8 +945,8 @@ fn alias_snapshot_changed(e: *AliasEntry, f: *TypeFacts) -> bool
         return true
     if e.pointee_type != f.pointee_type or e.array_elem_type != f.array_elem_type
         return true
-    let old_name = StrView { ptr: e.type_name, len: e.type_name_len as i64 }
-    if not old_name.eq(StrView { ptr: f.type_name, len: f.type_name_len as i64 })
+    let old_name = e.type_name
+    if not old_name.eq(f.type_name)
         return true
     let a: *ArrayShape = e.array_shape
     let b: *ArrayShape = f.array_shape
@@ -1019,8 +1012,8 @@ fn alias_packed_ptr_typeref(p: *Parser, slot: i32, name: *u8, name_len: i32) -> 
 # `array_elem_type` / `array_elem_pointee` pair describes.
 fn alias_array_elem_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
     let k: TypeKind = e.array_elem_type
-    var name: *u8 = e.array_elem_type_name
-    var name_len: i32 = e.array_elem_type_name_len
+    var name: *u8 = e.array_elem_type_name.ptr
+    var name_len: i32 = e.array_elem_type_name.len as i32
     match k
         TypeKind.Ptr =>
             let t: *TypeRef = typeref_new(p, TypeKind.Ptr)
@@ -1074,7 +1067,7 @@ fn alias_referent_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
                 ptr.pointee = arr
                 return ptr
             let ptr: *TypeRef = typeref_new(p, TypeKind.Ptr)
-            ptr.pointee = alias_leaf_typeref(p, e.pointee_type, e.type_name, e.type_name_len)
+            ptr.pointee = alias_leaf_typeref(p, e.pointee_type, e.type_name.ptr, (e.type_name.len as i32))
             return ptr
         TypeKind.PtrPtr =>
             # The referent is a `**..T`: its depth comes from the snapshot's
@@ -1082,7 +1075,7 @@ fn alias_referent_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
             var leaf_kind: i32 = e.inner_pointee_type
             if ptr_slot_extra(leaf_kind) > 0
                 leaf_kind = (ptr_ptr_slot_inner(leaf_kind) as i32)
-            let leaf: *TypeRef = alias_leaf_typeref(p, ptr_slot_flat(leaf_kind), e.type_name, e.type_name_len)
+            let leaf: *TypeRef = alias_leaf_typeref(p, ptr_slot_flat(leaf_kind), e.type_name.ptr, (e.type_name.len as i32))
             var depth: i32 = e.ptr_depth
             if depth < 2
                 depth = 2
@@ -1090,7 +1083,7 @@ fn alias_referent_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
         TypeKind.Array =>
             return alias_array_typeref(p, e)
         _ => pass
-    alias_leaf_typeref(p, e.ref_inner_type, e.type_name, e.type_name_len)
+    alias_leaf_typeref(p, e.ref_inner_type, e.type_name.ptr, (e.type_name.len as i32))
 
 # A `*..T` from an alias snapshot: `ptr_depth` levels ending in the recorded
 # leaf kind (`PTR_DEPTH_UNIT`-packed past two, as the flat slot was).
@@ -1100,19 +1093,19 @@ fn alias_pointer_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
         # Every level past two is packed into the inner-pointee slot; unpack
         # it back into the chain the parser would have built.
         if ptr_slot_extra(e.inner_pointee_type) > 0
-            return alias_packed_ptr_typeref(p, e.inner_pointee_type, e.type_name, e.type_name_len)
+            return alias_packed_ptr_typeref(p, e.inner_pointee_type, e.type_name.ptr, (e.type_name.len as i32))
         let leaf_kind: TypeKind = ptr_ptr_slot_inner(e.inner_pointee_type)
         var leaf: *TypeRef = null
         if leaf_kind == TypeKind.Array
             leaf = alias_array_typeref(p, e)
         else
-            leaf = alias_leaf_typeref(p, leaf_kind, e.type_name, e.type_name_len)
+            leaf = alias_leaf_typeref(p, leaf_kind, e.type_name.ptr, (e.type_name.len as i32))
         return alias_ptr_chain(p, depth, leaf, e.inner_ref)
     var leaf: *TypeRef = null
     if e.pointee_type == TypeKind.Array
         leaf = alias_array_typeref(p, e)
     else
-        leaf = alias_leaf_typeref(p, e.pointee_type, e.type_name, e.type_name_len)
+        leaf = alias_leaf_typeref(p, e.pointee_type, e.type_name.ptr, (e.type_name.len as i32))
     alias_ptr_chain(p, 1, leaf, e.inner_ref)
 
 # Called from type_named.  Returns the alias's target as a `*TypeRef`, or null
@@ -1127,7 +1120,7 @@ pub fn type_alias_resolve(p: *Parser, name_sv: StrView) -> *TypeRef
     var t: *TypeRef = null
     match e.kind
         TypeKind.Struct =>
-            t = alias_leaf_typeref(p, TypeKind.Struct, e.type_name, e.type_name_len)
+            t = alias_leaf_typeref(p, TypeKind.Struct, e.type_name.ptr, (e.type_name.len as i32))
         TypeKind.Ptr | TypeKind.PtrPtr =>
             t = alias_pointer_typeref(p, e)
         TypeKind.Array =>
@@ -1153,8 +1146,8 @@ pub fn type_alias_sizeof_shape(ctx: *ParseCtx, name_sv: StrView, count: *i64, le
         return 0
     *count = 1
     *leaf = e.kind
-    *leaf_name = e.type_name
-    *leaf_len = e.type_name_len
+    *leaf_name = e.type_name.ptr
+    *leaf_len = e.type_name.len as i32
     if e.kind == TypeKind.Array
         let sh: *ArrayShape = e.array_shape
         if sh != null
@@ -1170,8 +1163,8 @@ pub fn type_alias_sizeof_shape(ctx: *ParseCtx, name_sv: StrView, count: *i64, le
         else
             *count = e.array_size as i64
             *leaf = e.array_elem_type
-            *leaf_name = e.array_elem_type_name
-            *leaf_len = e.array_elem_type_name_len
+            *leaf_name = e.array_elem_type_name.ptr
+            *leaf_len = e.array_elem_type_name.len as i32
     return 1
 
 # item dispatcher for type_alias_def: like item_dispatch_enum, the alias
@@ -1261,7 +1254,7 @@ pub fn capture_first_generic_arg(p: *Parser, tr: *TypeRef) -> *GenericArg
     ga.ty = ty
     match ty
         TypeKind.Struct =>
-            ga.name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
+            ga.name = facts.type_name
         TypeKind.Ptr | TypeKind.PtrPtr =>
             # AGAST #1519: a pointer's pointee is only in parser state now, so
             # spell it here ("ptr_u8", "ptr_ptr_Foo"); generic_arg_spelling
@@ -1325,8 +1318,8 @@ fn spell_ptr_generic_arg(p: *Parser, tr: *TypeRef) -> StrView
     # AGAST #3686: past two levels the pointee is itself a `**`; pass the
     # depth-packed slot, as a `***u8` local records it.
     if ty == TypeKind.PtrPtr and facts.pointee_type == TypeKind.PtrPtr
-        return spell_ptr_parts(p, ty, TypeKind.Ptr, tr_ptr_ptr_inner_pointee(tr), StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 })
-    return spell_ptr_parts(p, ty, facts.pointee_type, facts.inner_pointee_type, StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 })
+        return spell_ptr_parts(p, ty, TypeKind.Ptr, tr_ptr_ptr_inner_pointee(tr), facts.type_name)
+    return spell_ptr_parts(p, ty, facts.pointee_type, facts.inner_pointee_type, facts.type_name)
 
 # AGAST #2384: the reference type that just parsed, spelled as ritz0's
 # mangle_type_name spells a RefType: "ref_" (`@T`) or "refmut_" (`@&T`), then
@@ -1343,8 +1336,8 @@ fn spell_ref_generic_arg(p: *Parser, tr: *TypeRef) -> StrView
     var base_len: i32 = 0
     match inner
         TypeKind.Struct =>
-            base = facts.type_name
-            base_len = facts.type_name_len
+            base = facts.type_name.ptr
+            base_len = facts.type_name.len as i32
         TypeKind.Ptr | TypeKind.PtrPtr =>
             let bsv: StrView = spell_ptr_generic_arg(p, tr.pointee)
             base = bsv.ptr
@@ -1401,8 +1394,8 @@ fn spell_last_array(p: *Parser, tr: *TypeRef) -> StrView
     let sh: *ArrayShape = facts.array_shape
     var et: TypeKind = facts.array_elem_type
     var ep: TypeKind = facts.array_elem_pointee
-    var en: *u8 = facts.array_elem_type_name
-    var en_len: i32 = facts.array_elem_type_name_len
+    var en: *u8 = facts.array_elem_type_name.ptr
+    var en_len: i32 = facts.array_elem_type_name.len as i32
     var dims: i32 = 1
     if sh != null
         et = sh.leaf_type
@@ -2119,7 +2112,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
         if p.var_type_name != null
             s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
         else
-            s.var_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
+            s.var_type_name = facts.type_name
     else if ty == TypeKind.Ptr and p.var_pointee == TypeKind.Struct and p.var_type_name != null
         # AGAST #2822: `*S`, latched by capture_var_type (every typed decl
         # goes through it) before a `<*B>` in the initializer re-set it.

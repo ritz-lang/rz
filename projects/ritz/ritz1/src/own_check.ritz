@@ -125,12 +125,10 @@ const OC_BLOCK_UNSAFE: i32 = 3
 
 # A binding that owns a value of a move-only type.
 struct OcBind
-    name: *u8
-    name_len: i32
+    name: StrView
     vi: i32           # its SemaVar's index in Sema's scope; -1 for a match's scrutinee
     id: i32           # its identity, for the loop events and the field-move log
-    type_name: *u8    # the struct (or an array's element struct)
-    type_name_len: i32
+    type_name: StrView    # the struct (or an array's element struct)
     count: i32        # element count of a `[N]T` binding; 0 for a single value
     moved: i32
     move_line: i32
@@ -726,19 +724,14 @@ fn oc_register(sm: *Sema, name_sv: StrView) -> i32
 # them for an array).
 fn oc_register_as(sm: *Sema, name_sv: StrView, tname_sv: StrView, count: i32) -> i32
     var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var tname: *u8 = tname_sv.ptr
-    var tlen: i32 = tname_sv.len as i32
     let vi: i32 = oc_var_index(sm, name_sv)
     if vi < 0
         return 0
     let o: *OcState = oc()
     let b: *OcBind = oc_new_bind(o)
-    b.name = name
-    b.name_len = len
+    b.name = name_sv
     b.vi = vi
-    b.type_name = tname
-    b.type_name_len = tlen
+    b.type_name = tname_sv
     b.count = count
     # AGAST #2168: a struct with no drop of its own can be partly moved.
     if count == 0 and oc_partly_movable(sm, tname_sv) == 1
@@ -748,7 +741,6 @@ fn oc_register_as(sm: *Sema, name_sv: StrView, tname_sv: StrView, count: i32) ->
 
 # The registered binding `name` currently resolves to, or null.
 fn oc_lookup(sm: *Sema, name_sv: StrView) -> *OcBind
-    var len: i32 = name_sv.len as i32
     let o: *OcState = oc()
     if o.live_count == 0
         return null
@@ -758,7 +750,7 @@ fn oc_lookup(sm: *Sema, name_sv: StrView) -> *OcBind
     var i: i32 = o.live_count - 1
     while i >= 0
         let b: *OcBind = oc_live_at(o, i)
-        if b.vi == vi and name_eq(StrView { ptr: (b.name), len: (b.name_len) as i64 }, name_sv) == 1
+        if b.vi == vi and name_eq(b.name, name_sv) == 1
             return b
         i -= 1
     null
@@ -778,7 +770,7 @@ fn oc_error_in_defer(sm: *Sema, b: *OcBind) -> i32
 fn oc_error_defer_at(sm: *Sema, line: i32, col: i32, b: *OcBind)
     oc_error_at(sm, line, col)
     oc_put_char('`')
-    oc_put_bytes(b.name, b.name_len)
+    oc_puts(b.name)
     oc_puts("` may be moved before the deferred statement runs\n")
 
 fn oc_error_use_at(sm: *Sema, line: i32, col: i32, b: *OcBind, move_line: i32, move_col: i32)
@@ -789,7 +781,7 @@ fn oc_error_use_at(sm: *Sema, line: i32, col: i32, b: *OcBind, move_line: i32, m
         return
     oc_error_at(sm, line, col)
     oc_puts("use of moved value: `")
-    oc_put_bytes(b.name, b.name_len)
+    oc_puts(b.name)
     oc_puts("` (moved at ")
     oc_put_loc(sm, move_line, move_col)
     oc_puts(")\n")
@@ -802,13 +794,13 @@ fn oc_error_borrow_at(sm: *Sema, line: i32, col: i32, b: *OcBind)
         return
     oc_error_at(sm, line, col)
     oc_puts("cannot borrow `")
-    oc_put_bytes(b.name, b.name_len)
+    oc_puts(b.name)
     oc_puts("` - value has been moved\n")
 
 # `b.f.g` for path `path` of the binding (`b` for -1).
 fn oc_put_binding_path(b: *OcBind, path: i32)
     if path < 0
-        oc_put_bytes(b.name, b.name_len)
+        oc_puts(b.name)
         return
     let p: *OwnPath = oc_path_at(b, path)
     oc_put_binding_path(b, p.parent)
@@ -846,7 +838,7 @@ fn oc_error_borrow_field_at(sm: *Sema, line: i32, col: i32, b: *OcBind, bits: i3
         return
     oc_error_at(sm, line, col)
     oc_puts("cannot borrow `")
-    oc_put_bytes(b.name, b.name_len)
+    oc_puts(b.name)
     oc_puts("` - `")
     oc_put_binding_path(b, oc_first_moved(oc(), b.id, bits))
     oc_puts("` has been moved\n")
@@ -999,8 +991,8 @@ fn oc_member_path(sm: *Sema, e: *Expr, out_b: **OcBind, out_drop: **u8, out_drop
         let b: *OcBind = oc_lookup(sm, l.ident)
         if b == null or b.count > 0
             return null
-        tname = b.type_name
-        tlen = b.type_name_len
+        tname = b.type_name.ptr
+        tlen = b.type_name.len as i32
         *out_b = b
     else
         let pf: *StructField = oc_member_path(sm, l, out_b, out_drop, out_drop_len)
@@ -1122,9 +1114,9 @@ fn oc_value_struct(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
     if ref_ty_in(ref_env_of(@env, null, sm), e, @t) == 1
         if t.kind != TypeKind.Struct
             return 0
-        if t.name_len > 0
-            *out_name = t.name
-            *out_len = t.name_len
+        if t.name.len > 0
+            *out_name = t.name.ptr
+            *out_len = t.name.len as i32
             return 1
     # A name or field ref_ty_in can't type: Sema's (a nameless tuple and its
     # fields, `p[i].f` through a Vec or Span, AGAST #2444).
@@ -1394,9 +1386,9 @@ fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
     else
         var env: RefEnv
         var t: RefTy
-        if ref_ty_in(ref_env_of(@env, null, sm), e.left, @t) == 1 and t.name_len > 0
-            name = t.name
-            len = t.name_len
+        if ref_ty_in(ref_env_of(@env, null, sm), e.left, @t) == 1 and t.name.len > 0
+            name = t.name.ptr
+            len = t.name.len as i32
             is_ptr = ref_is_pointer(t.kind)
             m = rs_method_def(sm, e)
         else if e.left != null and e.left.kind == ExprKind.Member and oc_value_struct(sm, e.left, @name, @len) == 1
@@ -2358,7 +2350,7 @@ fn oc_start_unwritten(sm: *Sema, stmt: *Stmt)
     let b: *OcBind = oc_lookup(sm, stmt.var_name)
     if b == null or b.count > 0
         return
-    if b.path_count == 0 and oc_has_drop_impl(sm, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 }) == 0 and oc_find_struct(sm, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 }) != null
+    if b.path_count == 0 and oc_has_drop_impl(sm, b.type_name) == 0 and oc_find_struct(sm, b.type_name) != null
         # Move-only only through a type argument (`Vec<Res>`: a `*Res`
         # field): no part has drop glue, so nothing starts unwritten.
         return
@@ -2417,7 +2409,7 @@ fn oc_error_unwritten_at(sm: *Sema, line: i32, col: i32, b: *OcBind, path: i32)
     oc_put_char('`')
     oc_put_binding_path(b, path)
     oc_puts("` may be unwritten: `")
-    oc_put_bytes(b.name, b.name_len)
+    oc_puts(b.name)
     oc_puts("` has no initialiser (§13.6)\n")
     b.uninit_told = 1
 
@@ -2443,9 +2435,9 @@ fn oc_check_unwritten_drop(sm: *Sema, from: i32, line: i32, col: i32)
                 oc_put_char('`')
                 oc_put_binding_path(b, oc_first_moved(o, b.id, bits))
                 oc_puts("` may be unwritten when `")
-                oc_put_bytes(b.name, b.name_len)
+                oc_puts(b.name)
                 oc_puts("` is dropped: `")
-                oc_put_bytes(b.name, b.name_len)
+                oc_puts(b.name)
                 oc_puts("` has no initialiser (§13.6)\n")
                 b.uninit_told = 1
         i += 1
@@ -2761,9 +2753,9 @@ fn oc_scrut_enum(sm: *Sema, typed: *Expr) -> StrView
     # Else what the image of its LocalVar says (ref_check's typing).
     var env: RefEnv
     var r: RefTy
-    if ref_ty_in(ref_env_of(@env, null, sm), typed, @r) == 0 or r.kind != TypeKind.Struct or r.name_len <= 0
+    if ref_ty_in(ref_env_of(@env, null, sm), typed, @r) == 0 or r.kind != TypeKind.Struct or r.name.len <= 0
         return strview_empty()
-    StrView { ptr: (r.name), len: (r.name_len) as i64 }
+    r.name
 
 # Before a match's arms: the match owns a scrutinee it moved.  The old
 # match_scrut goes on the hook stack for oc_match_end.
@@ -2792,8 +2784,7 @@ fn oc_match_begin(sm: *Sema, scrut: *Expr)
         return
     oc_push_scope()
     let b: *OcBind = oc_new_bind(o)
-    b.type_name = name_sv.ptr
-    b.type_name_len = name_sv.len as i32
+    b.type_name = name_sv
     o.match_scrut = o.live_count - 1
 
 # The struct an arm's payload binding holds, as sema_walk bound it
@@ -2814,7 +2805,6 @@ fn oc_payload_struct_ty(pt: *SemaTy) -> StrView
 # scrutinee and the payload is move-only, the binding owns it now; when the
 # match owns nothing, it is lent (AGAST #2178, Rust's E0507).
 fn oc_match_payload(sm: *Sema, arm: *MatchArm, name_sv: StrView)
-    var len: i32 = name_sv.len as i32
     let o: *OcState = oc()
     if o.match_scrut < 0 and o.match_scrut != OC_MATCH_LENT
         return
@@ -2829,7 +2819,7 @@ fn oc_match_payload(sm: *Sema, arm: *MatchArm, name_sv: StrView)
         # scrutinee drops what the arm moved out (a use after free).
         let sb: *OcBind = oc_live_at(o, o.match_scrut)
         var pt: SemaTy
-        sema_named_payload_ty(sm, arm, StrView { ptr: (sb.type_name), len: (sb.type_name_len) as i64 }, @pt)
+        sema_named_payload_ty(sm, arm, sb.type_name, @pt)
         pname_sv = oc_payload_struct_ty(@pt)
     if pname_sv.ptr == null
         return
@@ -2870,7 +2860,7 @@ fn oc_scrut_binding(sm: *Sema, arm: *MatchArm, scrut: *Expr)
     var name_sv: StrView = strview_empty()
     if o.match_scrut >= 0
         let sb: *OcBind = oc_live_at(o, o.match_scrut)
-        name_sv = StrView { ptr: (sb.type_name), len: (sb.type_name_len) as i64 }
+        name_sv = sb.type_name
     else
         var typed: *Expr = scrut
         if scrut.kind == ExprKind.Unary and (scrut.op == OpKind.Addr or scrut.op == OpKind.AddrMut) and scrut.operand != null

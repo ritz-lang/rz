@@ -144,8 +144,7 @@ struct AlLocal
     name: *u8
     len: i32
     ty: TypeKind
-    type_name: *u8
-    type_name_len: i32
+    type_name: StrView
     pointee: TypeKind
     inner_pointee: i32
     inner_ref: i32
@@ -162,8 +161,7 @@ struct AlLocal
 # value is stored in.
 struct AlPoint
     await_expr: *Expr
-    result: *u8
-    result_len: i32
+    result: StrView
     next: *AlPoint
 
 struct AlBlock
@@ -286,19 +284,15 @@ fn al_local(a: *AlFn, name_sv: StrView, span: SrcSpan) -> *AlLocal
 
 fn al_set_scalar(l: *AlLocal, ty: TypeKind)
     l.ty = ty
-    l.type_name = null
-    l.type_name_len = 0
+    l.type_name = strview_empty()
     l.pointee = TypeKind.I64
     l.inner_pointee = (TypeKind.Void as i32)
     l.inner_ref = INNER_REF_NONE
     l.unsupported = 0
 
 fn al_set_struct(l: *AlLocal, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     al_set_scalar(l, TypeKind.Struct)
-    l.type_name = name
-    l.type_name_len = len
+    l.type_name = name_sv
 
 # A primitive type's kind from its name (`i64`), as a `-> *i64` return names
 # its pointee; 0 for any other name (a struct's).
@@ -336,8 +330,7 @@ fn al_set_ret(l: *AlLocal, f: *FnDef) -> i32
                 l.pointee = pt
             else
                 l.pointee = TypeKind.Struct
-                l.type_name = f.return_type_name.ptr
-                l.type_name_len = f.return_type_name.len as i32
+                l.type_name = f.return_type_name
             return 1
         _ => pass
     if t == TypeKind.PtrPtr or al_type_unsupported(t, TypeKind.Void) == 1
@@ -356,8 +349,7 @@ fn al_local_of_param(a: *AlFn, p: *Param)
     let l: *AlLocal = al_local(a, p.name, p.name_span)
     l.is_param = 1
     l.ty = p.param_type
-    l.type_name = p.param_type_name.ptr
-    l.type_name_len = p.param_type_name.len as i32
+    l.type_name = p.param_type_name
     l.pointee = p.param_pointee_type
     l.inner_pointee = p.param_inner_pointee_type
     l.inner_ref = p.param_inner_ref
@@ -373,18 +365,18 @@ fn al_held_async(a: *AlFn, e: *Expr) -> *AlAsync
     if e == null or e.kind != ExprKind.Ident
         return null
     let l: *AlLocal = al_local_find(a, e.ident)
-    if l == null or l.ty != TypeKind.Struct or l.type_name == null
+    if l == null or l.ty != TypeKind.Struct or l.type_name.ptr == null
         return null
-    if al_ends_with(StrView { ptr: (l.type_name), len: (l.type_name_len) as i64 }, "$Future") == 0
+    if al_ends_with(l.type_name, "$Future") == 0
         return null
-    al_find_async(StrView { ptr: (l.type_name), len: (l.type_name_len - 7) as i64 })
+    al_find_async(l.type_name.take(l.type_name.len - 7))   # drop the `$Future`
 
 # The struct a method receiver local `l` (`S`, `*S`) names; empty otherwise.
 fn al_recv_type(l: *AlLocal) -> StrView
-    if l == null or l.type_name == null
+    if l == null or l.type_name.ptr == null
         return strview_empty()
     if l.ty == TypeKind.Struct or (l.ty == TypeKind.Ptr and l.pointee == TypeKind.Struct)
-        return StrView { ptr: (l.type_name), len: (l.type_name_len) as i64 }
+        return l.type_name
     strview_empty()
 
 # The method `name` of an inherent or trait impl on struct `ty`; null if none.
@@ -448,8 +440,7 @@ fn al_set_source_value(l: *AlLocal, f: *FnDef) -> i32
             l.pointee = pt
         else
             l.pointee = TypeKind.Struct
-            l.type_name = inner.ptr
-            l.type_name_len = inner.len as i32
+            l.type_name = inner
         return 1
     if al_type_name_unheld(t) == 1
         return 0
@@ -528,7 +519,6 @@ fn al_infer(a: *AlFn, e: *Expr, l: *AlLocal) -> i32
                 return 0
             l.ty = src.ty
             l.type_name = src.type_name
-            l.type_name_len = src.type_name_len
             l.pointee = src.pointee
             l.inner_pointee = src.inner_pointee
             l.inner_ref = src.inner_ref
@@ -598,8 +588,7 @@ fn al_an_decl(a: *AlFn, s: *Stmt, top: i32)
     if s.var_declared_type != TypeKind.Void
         typed = 1
         t.ty = s.var_type
-        t.type_name = s.var_type_name.ptr
-        t.type_name_len = s.var_type_name.len as i32
+        t.type_name = s.var_type_name
         t.pointee = s.var_pointee_type
         t.inner_pointee = s.var_inner_pointee_type
         t.inner_ref = s.var_inner_ref
@@ -615,7 +604,6 @@ fn al_an_decl(a: *AlFn, s: *Stmt, top: i32)
     if typed == 1
         l.ty = t.ty
         l.type_name = t.type_name
-        l.type_name_len = t.type_name_len
         l.pointee = t.pointee
         l.inner_pointee = t.inner_pointee
         l.inner_ref = t.inner_ref
@@ -890,7 +878,7 @@ fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
         if p != null
             # A state already drove it (an await, a short-circuit whose right
             # operand awaits, or an awaiting `if` operand): its value is stored.
-            let m: *Expr = al_self_field(StrView { ptr: (p.result), len: (p.result_len) as i64 }, e.span)
+            let m: *Expr = al_self_field(p.result, e.span)
             m.next = e.next
             return m
     if k == ExprKind.Await
@@ -1248,12 +1236,9 @@ fn al_extra(a: *AlFn, name_sv: StrView) -> *AlLocal
 
 # The await `e`'s result is stored in self.<name>.
 fn al_add_point(a: *AlFn, e: *Expr, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let p: *AlPoint = al_zalloc(sizeof(AlPoint)) as *AlPoint
     p.await_expr = e
-    p.result = name
-    p.result_len = len
+    p.result = name_sv
     p.next = a.points
     a.points = p
 
@@ -2495,7 +2480,6 @@ fn al_lower_match(a: *AlFn, scrut: *Expr, arms: *MatchArm, d: *AlDest, lp: *AlLo
         let x: *AlLocal = al_extra(a, field)
         x.ty = t.ty
         x.type_name = t.type_name
-        x.type_name_len = t.type_name_len
         x.pointee = t.pointee
         x.inner_pointee = t.inner_pointee
         x.inner_ref = t.inner_ref
@@ -2699,16 +2683,16 @@ fn al_field_of(l: *AlLocal) -> *StructField
     # pointee is recorded in array_elem_type (#1304), which `p + i` strides by.
     match l.ty
         TypeKind.Struct =>
-            f.field_type_name = StrView { ptr: l.type_name, len: l.type_name_len as i64 }
+            f.field_type_name = l.type_name
         TypeKind.Ptr =>
             f.ptr_pointee = l.pointee
             if l.pointee == TypeKind.Struct
-                f.field_type_name = StrView { ptr: l.type_name, len: l.type_name_len as i64 }
+                f.field_type_name = l.type_name
             else
                 f.array_elem_type = l.pointee
         _ =>
-            if l.ty == TypeKind.PtrPtr and l.type_name_len > 0
-                f.field_type_name = StrView { ptr: l.type_name, len: l.type_name_len as i64 }
+            if l.ty == TypeKind.PtrPtr and l.type_name.len > 0
+                f.field_type_name = l.type_name
     f
 
 # The signature every generated future's header poll fn has: `fn(*u8) -> bool`.

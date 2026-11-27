@@ -46,8 +46,7 @@ import ritzlib.strview
 pub struct RefTy
     kind: TypeKind       # TYPE_*
     pointee: TypeKind    # TYPE_* behind a pointer kind, or an array's element
-    name: *u8       # the struct: kind's own, or the pointee's
-    name_len: i32
+    name: StrView       # the struct: kind's own, or the pointee's
     elem_pointee: TypeKind     # U for an array's `*U` element; TypeKind.Void if unknown
     shape: *ArrayShape    # a multi-dimensional array's, else null
     returned: i32         # 1 for a slot that leaves the fn as a pointer or reference
@@ -64,8 +63,7 @@ pub struct RefTy
     ptr_pointee: TypeKind
     # AGAST #3048: a `**T` slot's T, as ptr_pointee keeps its kind; only
     # ref_ptr_ptr_slot sets it, and only a struct T has one.
-    held_name: *u8
-    held_name_len: i32
+    held_name: StrView
     # AGAST #3383 (LARB R42): N for an array kind, d0 for `[d0][d1]..T`, which
     # a literal landing here must be as long as; 0 if unknown.
     array_len: i32
@@ -74,12 +72,9 @@ var REF_LAST_LINE: i32 = 0
 var REF_LAST_COL: i32 = 0
 
 pub fn ref_set(out: *RefTy, kind: TypeKind, pointee: TypeKind, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     out.kind = kind
     out.pointee = pointee
-    out.name = name
-    out.name_len = len
+    out.name = name_sv
     out.elem_pointee = TypeKind.Void
     out.shape = null
     out.returned = 0
@@ -88,8 +83,7 @@ pub fn ref_set(out: *RefTy, kind: TypeKind, pointee: TypeKind, name_sv: StrView)
     out.ref_shape = null
     out.name_only = 0
     out.ptr_pointee = TypeKind.Void
-    out.held_name = null
-    out.held_name_len = 0
+    out.held_name = strview_empty()
     out.array_len = 0
     1
 
@@ -330,8 +324,8 @@ pub fn ref_method_def(s: *EmitterState, e: *Expr) -> *FnDef
             return null
         return method_callee_def(s, en, e.ident)
     var t: RefTy
-    if e.left != null and ref_ty_of(s, e.left, @t) == 1 and t.name_len > 0
-        return method_callee_def(s, StrView { ptr: (t.name), len: (t.name_len) as i64 }, e.ident)
+    if e.left != null and ref_ty_of(s, e.left, @t) == 1 and t.name.len > 0
+        return method_callee_def(s, t.name, e.ident)
     let name: StrView = method_recv_type_name(s, e)
     if name.ptr == null or name.len == 0
         return null
@@ -360,10 +354,10 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
                     if ref_ty_in(env, e.operand, @t) == 0
                         return 0
                     if ref_is_pointer(t.kind) == 1
-                        ref_set(out, TypeKind.Ptr, TypeKind.Ptr, StrView { ptr: (t.name), len: (t.name_len) as i64 })
+                        ref_set(out, TypeKind.Ptr, TypeKind.Ptr, t.name)
                         out.ptr_pointee = ref_addr_ptr_pointee(@t)
                         return 1
-                    ref_set(out, TypeKind.Ptr, t.kind, StrView { ptr: (t.name), len: (t.name_len) as i64 })
+                    ref_set(out, TypeKind.Ptr, t.kind, t.name)
                     if t.kind == TypeKind.Array
                         ref_array_referent(env, e.operand, out)
                         out.ref_shape = t.shape   # AGAST #2098
@@ -378,7 +372,7 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
                         return ref_behind(env, e.operand, out)
                     if t.pointee == TypeKind.Void or ref_is_pointer(t.pointee) == 1
                         return 0
-                    return ref_set(out, t.pointee, TypeKind.Void, StrView { ptr: (t.name), len: (t.name_len) as i64 })
+                    return ref_set(out, t.pointee, TypeKind.Void, t.name)
                 _ => pass
             return 0
         ExprKind.Member =>
@@ -401,7 +395,7 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
                 # A plane pointer's `q[i]` is a row of its `[M][N]..T` (#2570,
                 # AGAST #4259), as the plane's own is.
                 var plane: RefTy
-                ref_set_array(@plane, TypeKind.Array, TypeKind.Void, StrView { ptr: (b.name), len: (b.name_len) as i64 }, b.ref_shape, 0)
+                ref_set_array(@plane, TypeKind.Array, TypeKind.Void, b.name, b.ref_shape, 0)
                 return ref_row(@plane, out)
             if ref_is_pointer(b.kind) == 1 and b.pointee == TypeKind.Array
                 # A `*[N]T` / `@[N]T` / `@&[N]T`'s `q[i]` is an element of the
@@ -410,7 +404,7 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
                 if ref_behind(env, e.left, @arr) == 0
                     if b.ref_elem == TypeKind.Void
                         return 0
-                    ref_set_array(@arr, b.ref_elem, TypeKind.Void, StrView { ptr: (b.name), len: (b.name_len) as i64 }, null, b.ref_size)
+                    ref_set_array(@arr, b.ref_elem, TypeKind.Void, b.name, null, b.ref_size)
                 if arr.kind == TypeKind.Array and arr.pointee == TypeKind.Array
                     return ref_row(@arr, out)   # an `@[N][M]T` plane, by Sema's shape
                 b = arr
@@ -420,16 +414,16 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
                 let ep: TypeKind = b.elem_pointee
                 if ep == TypeKind.Void or ep == TypeKind.Array or ep == TypeKind.PtrPtr or ref_is_pointer(ep) == 1
                     return 0
-                return ref_set(out, b.pointee, ep, StrView { ptr: (b.name), len: (b.name_len) as i64 })
+                return ref_set(out, b.pointee, ep, b.name)
             if b.pointee == TypeKind.Void or ref_is_pointer(b.pointee) == 1 or b.pointee == TypeKind.Array
                 return 0
-            return ref_set(out, b.pointee, TypeKind.Void, StrView { ptr: (b.name), len: (b.name_len) as i64 })
+            return ref_set(out, b.pointee, TypeKind.Void, b.name)
         ExprKind.Call | ExprKind.Method =>
             return ref_of_fn(ref_call_def_in(env, e), out)
         ExprKind.Binary =>
             var l: RefTy
             if ref_ty_in(env, e.left, @l) == 1 and ref_is_pointer(l.kind) == 1
-                return ref_set(out, l.kind, l.pointee, StrView { ptr: (l.name), len: (l.name_len) as i64 })
+                return ref_set(out, l.kind, l.pointee, l.name)
             return 0
         _ => pass
     if k == ExprKind.Cast and e.type_kind == TypeKind.Ptr
@@ -538,8 +532,7 @@ pub struct RsNote
     # it points at stays: an `@*C` of `let p = @q` keeps its `*C`.
     ref_kind: TypeKind
     ref_pointee: TypeKind
-    ref_name: *u8
-    ref_name_len: i32
+    ref_name: StrView
     inner_ref: i32        # Param.param_inner_ref / Stmt.var_inner_ref (AGAST #2399)
     # The `q#` view's T when emit_var_decl's inference makes an un-annotated
     # `let q = h(p)` a `*[N]T` (infer_array_ptr_let), which index_elem, from
@@ -552,12 +545,10 @@ pub struct RsNote
     ptr_pointee: TypeKind
     # LocalVar.ref_root* (AGAST #2340): the local root this binding definitely
     # refers to, how many loops it was declared in, and what it points at.
-    root: *u8
-    root_len: i32
+    root: StrView
     root_loops: i32
     root_pointee: TypeKind
-    root_name: *u8
-    root_name_len: i32
+    root_name: StrView
     # AGAST #4011: the LocalVar the emitter will make for this binding, as far
     # as ref_check's typing reads it (ref_local_in); has_loc 0 when none is.
     has_loc: i32
@@ -670,7 +661,7 @@ pub fn rs_set(out: *SemaTy, kind: TypeKind, pointee: TypeKind, name_sv: StrView)
 pub fn rs_local(sm: *Sema, v: *SemaVar, out: *SemaTy) -> i32
     let n: *RsNote = rs_note(sm, v)
     if n != null and n.ref_kind != TypeKind.Void
-        return rs_set(out, n.ref_kind, n.ref_pointee, StrView { ptr: (n.ref_name), len: (n.ref_name_len) as i64 })
+        return rs_set(out, n.ref_kind, n.ref_pointee, n.ref_name)
     let p: *Param = v.lent
     if p != null and p.param_type == TypeKind.MutRef
         # `c:& C` (and a free fn's `self:& C`) reads as a `C` (§13.4).
@@ -1061,9 +1052,9 @@ pub fn ref_same_pointee(a: *RefTy, slot: *RefTy) -> i32
         return 0
     if slot.kind != TypeKind.Struct
         return 1
-    if a.name_len == 0 or slot.name_len == 0
+    if a.name.len == 0 or slot.name.len == 0
         return 0
-    name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
+    name_eq(a.name, slot.name)
 
 # A call's by-value result is a temporary, not a place (Aaron's ruling on
 # AGAST #2518, LARB review 4): ref_value.ritz's checks, and ownership.ritz's
@@ -1328,16 +1319,16 @@ pub fn ref_same_referent(a: *RefTy, ret: *RefTy) -> i32
         return 0
     if a.pointee != TypeKind.Struct and a.pointee != TypeKind.Ptr
         return 1
-    if a.name_len == 0 or ret.name_len == 0
+    if a.name.len == 0 or ret.name.len == 0
         return 0
-    name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (ret.name), len: (ret.name_len) as i64 })
+    name_eq(a.name, ret.name)
 
 # The element of the instantiated `Vec$T` `v`, from its `data: *T` field (as
 # emit_vec_elem_member_ptr finds it): a struct or an integer.  0 otherwise.
 pub fn ref_vec_elem(s: *EmitterState, v: *RefTy, out: *RefTy) -> i32
-    if v.name_len <= 4 or *v.name != 'V' or *(v.name + 1) != 'e' or *(v.name + 2) != 'c' or *(v.name + 3) != '$'
+    if v.name.len <= 4 or *v.name.ptr != 'V' or *(v.name.ptr + 1) != 'e' or *(v.name.ptr + 2) != 'c' or *(v.name.ptr + 3) != '$'
         return 0
-    let vec_st: *StructDef = find_struct(s, StrView { ptr: (v.name), len: (v.name_len) as i64 })
+    let vec_st: *StructDef = find_struct(s, v.name)
     if vec_st == null
         return 0
     let di: i32 = find_field_index(vec_st, "data")
@@ -1348,7 +1339,7 @@ pub fn ref_vec_elem(s: *EmitterState, v: *RefTy, out: *RefTy) -> i32
         return 0
     if find_struct(s, data.field_type_name) != null
         return ref_set(out, TypeKind.Struct, TypeKind.Void, data.field_type_name)
-    let k: TypeKind = vec_name_elem_type(StrView { ptr: (v.name), len: (v.name_len) as i64 })
+    let k: TypeKind = vec_name_elem_type(v.name)
     if k == TypeKind.Unknown
         return 0
     ref_set(out, k, TypeKind.Void, strview_empty())

@@ -853,15 +853,13 @@ fn tr_chain_fn_sig(tr: *TypeRef) -> *FnDef
 # that snapshot from the chain instead of latching it on the Parser.
 pub struct TypeFacts
     kind: TypeKind
-    type_name: *u8
-    type_name_len: i32
+    type_name: StrView
     pointee_type: TypeKind
     inner_pointee_type: i32
     ptr_depth: i32
     array_size: i32
     array_elem_type: TypeKind
-    array_elem_type_name: *u8
-    array_elem_type_name_len: i32
+    array_elem_type_name: StrView
     array_elem_pointee: TypeKind
     array_shape: *ArrayShape
     ref_inner_type: TypeKind
@@ -873,8 +871,7 @@ pub fn type_facts(p: *Parser, tr: *TypeRef) -> *TypeFacts
     let kind: TypeKind = tr_kind(tr)
     f.kind = kind
     let type_name_sv: StrView = tr_name(tr)
-    f.type_name = type_name_sv.ptr
-    f.type_name_len = type_name_sv.len as i32
+    f.type_name = type_name_sv
     # `last_pointee_type`: the pointer's pointee, or, for a reference, the
     # pointer it wraps one level in (`@*T` recorded T) -- and for a reference
     # to a value, that value's own kind (`@S` recorded S, which is what a
@@ -914,16 +911,14 @@ pub fn type_facts(p: *Parser, tr: *TypeRef) -> *TypeFacts
     f.array_size = 0
     f.array_elem_type = TypeKind.Void
     f.array_elem_pointee = TypeKind.Void
-    f.array_elem_type_name = null
-    f.array_elem_type_name_len = 0
+    f.array_elem_type_name = strview_empty()
     f.array_shape = null
     if a != null
         f.array_size = tr_count(a) as i32
         f.array_elem_type = tr_elem_kind(a)
         f.array_elem_pointee = tr_elem_pointee(a)
         let array_elem_name_sv: StrView = tr_elem_name(a)
-        f.array_elem_type_name = array_elem_name_sv.ptr
-        f.array_elem_type_name_len = array_elem_name_sv.len as i32
+        f.array_elem_type_name = array_elem_name_sv
         f.array_shape = tr_shape(a)
     f.ref_inner_type = tr_ref_inner(tr)
     f.inner_ref = tr_inner_ref(tr)
@@ -1201,33 +1196,28 @@ pub fn ptr_array_pointee_elem(p: *Parser, tr: *TypeRef) -> TypeKind
     tr_elem_kind(a)
 
 pub struct AliasEntry
-    name: *u8
-    name_len: i32
+    name: StrView
     kind: TypeKind
-    type_name: *u8
-    type_name_len: i32
+    type_name: StrView
     pointee_type: TypeKind
     inner_pointee_type: i32
     array_size: i32
     array_elem_type: TypeKind
     array_elem_pointee: TypeKind
-    array_elem_type_name: *u8
-    array_elem_type_name_len: i32
+    array_elem_type_name: StrView
     ref_inner_type: TypeKind
     inner_ref: i32  # AGAST #2399
     ptr_depth: i32         # AGAST #1924
     array_shape: *ArrayShape  # AGAST #1509
     fn_sig: *FnDef         # AGAST #1879: a fn type's signature (type_fn)
-    spelling: *u8          # AGAST #3625: the target as written (type_alias_spell)
-    spelling_len: i32
+    spelling: StrView          # AGAST #3625: the target as written (type_alias_spell)
     replayed: bool         # AGAST #4769: a use replayed it since it was recorded
 
 pub fn type_alias_find(ctx: *ParseCtx, name_sv: StrView) -> *AliasEntry
-    var len: i32 = name_sv.len as i32
     var i: i32 = 0
     while i < ctx.alias_count
         let e: *AliasEntry = *(ctx.alias_table + i) as *AliasEntry
-        if (StrView { ptr: (e.name), len: (e.name_len) as i64 }).eq(name_sv)
+        if (e.name).eq(name_sv)
             return e
         i = i + 1
     return null
@@ -1346,10 +1336,10 @@ pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token) -> StrView
             var n: i32 = 0
             match e.kind
                 TypeKind.Struct =>
-                    spell = e.type_name
-                    n = e.type_name_len
+                    spell = e.type_name.ptr
+                    n = e.type_name.len as i32
                 TypeKind.Ptr | TypeKind.PtrPtr =>
-                    let spelled_sv: StrView = spell_ptr_parts(p, e.kind, e.pointee_type, e.inner_pointee_type, StrView { ptr: (e.type_name), len: (e.type_name_len) as i64 })
+                    let spelled_sv: StrView = spell_ptr_parts(p, e.kind, e.pointee_type, e.inner_pointee_type, e.type_name)
                     spell = spelled_sv.ptr
                     n = spelled_sv.len as i32
                 _ =>
@@ -1820,8 +1810,8 @@ pub fn sizeof_array_type_call(p: *Parser, name_tok: Token, lbracket: Token, len_
     let facts: *TypeFacts = type_facts(p, t)
     var count: i64 = facts.array_size as i64
     var leaf: TypeKind = facts.array_elem_type
-    var leaf_name: *u8 = facts.array_elem_type_name
-    var leaf_len: i32 = facts.array_elem_type_name_len
+    var leaf_name: *u8 = facts.array_elem_type_name.ptr
+    var leaf_len: i32 = facts.array_elem_type_name.len as i32
     let sh: *ArrayShape = facts.array_shape
     if sh != null
         count = 1
@@ -1845,7 +1835,7 @@ pub fn sizeof_generic_type_call(p: *Parser, name_tok: Token, base_tok: Token, ga
         return null
     let t: *TypeRef = type_generic_with_saved(p, StrView { ptr: (base_tok.start), len: (base_tok.len) as i64 }, ga)
     let facts: *TypeFacts = type_facts(p, t)
-    let arg: *Expr = expr_type_operand(p, 1, facts.kind, StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 }, base_tok.line, base_tok.col)
+    let arg: *Expr = expr_type_operand(p, 1, facts.kind, facts.type_name, base_tok.line, base_tok.col)
     return expr_call(p, StrView { ptr: (name_tok.start), len: (name_tok.len) as i64 }, arg, name_tok.line, name_tok.col)
 
 pub fn expr_call(p: *Parser, name_sv: StrView, args: *Expr, line: i32, col: i32) -> *Expr
@@ -2020,11 +2010,11 @@ pub fn cast_tail_new(p: *Parser, tr: *TypeRef, next: *CastTail, as_line: i32, as
     if next == null and ty == TypeKind.Ptr
         ct.pointee_type = (f.pointee_type as i32)
         if f.pointee_type == TypeKind.Struct
-            ct.pointee_name = StrView { ptr: f.type_name, len: f.type_name_len as i64 }
+            ct.pointee_name = f.type_name
     # AGAST #3443: and the struct of `as @S` / `as @&S`.
     if next == null and (ty == TypeKind.Ref or ty == TypeKind.MutRef) and f.ref_inner_type == TypeKind.Struct
         ct.pointee_type = (TypeKind.Struct as i32)
-        ct.pointee_name = StrView { ptr: f.type_name, len: f.type_name_len as i64 }
+        ct.pointee_name = f.type_name
     # AGAST #3757: and the scalar of `as @T` / `as @&T` (`(p as @&i32)[i] = v`
     # strides by it).
     if next == null and (ty == TypeKind.Ref or ty == TypeKind.MutRef) and primitive_name_len(f.ref_inner_type) > 0
@@ -2032,13 +2022,13 @@ pub fn cast_tail_new(p: *Parser, tr: *TypeRef, next: *CastTail, as_line: i32, as
     # AGAST #2288: and the struct of `as C`, so `c as C` with `c:& C` can
     # read the referent.  pointee_type stays TypeKind.Void: there's no pointee.
     if next == null and ty == TypeKind.Struct
-        ct.pointee_name = StrView { ptr: f.type_name, len: f.type_name_len as i64 }
+        ct.pointee_name = f.type_name
     # AGAST #2544: and of `as **S` (`***S`, ...): pointee_type is the packed
     # inner-pointee slot a `**S` local records (ptr_ptr_inner_pointee).
     if next == null and ty == TypeKind.PtrPtr
         ct.pointee_type = ptr_ptr_inner_pointee(p, tr)
         if ptr_ptr_slot_inner(ct.pointee_type) == TypeKind.Struct
-            ct.pointee_name = StrView { ptr: f.type_name, len: f.type_name_len as i64 }
+            ct.pointee_name = f.type_name
     return ct
 
 # AGAST #3435: the grammar's block_ended.  Matches nothing, and fails unless
