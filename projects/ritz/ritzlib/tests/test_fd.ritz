@@ -16,6 +16,7 @@
 #   Fd.seek(offset, whence) -> Result<i64, Errno>
 #   Fd.stat() -> Result<Stat, Errno>, Fd.truncate(len) -> Result<(), Errno>
 #   Fd.chmod(mode) / lock(op) -> Result<(), Errno>
+#   Fd.fsync() -> Result<(), Errno>          file or directory to stable storage
 #   Fd.raw() -> i32, Fd.valid() -> bool
 #   Fd.sendfile(out: @Fd, offset: i64, count: i64) -> Result<i64, Errno>
 #   poll(fds: Span<PollFd>, timeout_ms: i32) -> Result<i32, Errno>
@@ -40,6 +41,7 @@ const E_IO: i32 = 5
 const E_BADF: i32 = 9
 const E_EXIST: i32 = 17
 const E_ISDIR: i32 = 21
+const E_INVAL: i32 = 22
 const E_PIPE: i32 = 32
 const E_NAMETOOLONG: i32 = 36
 
@@ -269,6 +271,7 @@ fn test_ops_on_closed_fd_are_badf() -> i32
     assert count_of(f.seek(0, SEEK_SET)) == -1000 - E_BADF as i64
     assert size_of_stat(f.stat()) == -1000 - E_BADF as i64
     assert unit_err(f.truncate(0)) == E_BADF
+    assert unit_err(f.fsync()) == E_BADF
     assert open_err(f.dup()) == E_BADF
     0
 
@@ -296,6 +299,38 @@ fn test_chmod_sets_mode() -> i32
     assert mode_of_stat(f.stat()) == 384
     f.close()
     unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_fsync_file_keeps_its_bytes() -> i32
+    let p: String = tmp_path("fsync")
+    var f: Fd = fresh(@p)
+    f.write_str("durable")
+    assert unit_err(f.fsync()) == 0
+    assert size_of_stat(f.stat()) == 7
+    f.close()
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_fsync_directory() -> i32
+    # A save fsyncs the directory after the rename that replaced the file.
+    var d: Fd = fd_of(fd_open("/tmp", O_RDONLY + O_DIRECTORY, 0))
+    assert d.valid()
+    assert unit_err(d.fsync()) == 0
+    d.close()
+    0
+
+[[test]]
+fn test_fsync_pipe_is_inval() -> i32
+    # A pipe has no storage to flush: fsync(2) says EINVAL.
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            assert unit_err(p.write.fsync()) == E_INVAL
+            p.close()
+        Err(_) =>
+            assert false
     0
 
 [[test]]
