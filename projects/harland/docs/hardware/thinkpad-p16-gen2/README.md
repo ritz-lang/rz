@@ -84,8 +84,8 @@ Mapped on main as of 2026-11-27.
 | Class | Device | Harland |
 |---|---|---|
 | Boot, initramfs | UEFI loader on a USB stick | `boot/` |
-| Display | GOP on the iGPU [8086:a788], 3840x2400 at 0x4000000000 | `drivers/display` maps and fills it; it draws **no text** |
-| Kernel log, panic screen, tty output | framebuffer (no serial connector, though `DBGP` names a 16550 at I/O 0x3f8) | gap: on-screen log + panic #4868 |
+| Display | GOP on the iGPU [8086:a788], 3840x2400 at 0x4000000000 | `drivers/display` maps it write-combining; `fbcon.ritz` draws text on it (#4868) |
+| Kernel log, panic screen, tty output | framebuffer (no serial connector, though `DBGP` names a 16550 at I/O 0x3f8) | `drivers/display/fbcon.ritz` (#4868; glyphs x2 at 3840x2400); COM1 is used only if `serial_start`'s probe finds it |
 | Keyboard, TrackPoint | i8042 PS/2, IRQ 1 under Linux (`PNP0F13` mouse in the DSDT) | gap: PS/2 #4869 |
 | USB | Intel xHCI [8086:7a60] 00:14.0; Thunderbolt xHCI [8086:1138] 48:00.0 | gap: USB epic #4860 (Thunderbolt is out of its scope) |
 | NVMe | Samsung PM9A1 [144d:a80a] 07:00.0, no VMD | `drivers/nvme` |

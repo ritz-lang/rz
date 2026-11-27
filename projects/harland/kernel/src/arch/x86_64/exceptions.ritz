@@ -3,7 +3,8 @@
 # Handles CPU exceptions (divide error, page fault, etc.) and hardware IRQs.
 # These handlers are called from isr_stubs.s assembly code.
 
-import klog { klog, klog_dec, klog_hex }
+import klog { klog, klog_dec, klog_hex, klog_mark, klog_console_tail }
+import drivers.display.fbcon { fbcon_panic_begin, fbcon_write, fbcon_rows_left }
 import io { halt_loop }
 import serial { StrView, serial_drain_output }
 import tty.console { tty_console_irq, tty_console_irq_kill }
@@ -238,7 +239,11 @@ fn log_user_fault(frame: *InterruptFrame, user_rip: u64, bad_iret: bool)
 # A fault taken at any non-zero CPL (a ring-3 program or a ring-1 driver)
 # kills only the running process (#2755, #4711): it exits with status
 # 128 + vector and its parent resumes (init's exit powers off).
-# A kernel-mode exception prints diagnostic information and halts.
+# A kernel-mode exception prints diagnostic information and halts. On a
+# framebuffer the report is also the panic screen (AGAST #4868): white on
+# red under a KERNEL PANIC banner, then the registers and stack trace (klog
+# draws them), then as much of the recent kernel log as fits. No step
+# allocates or needs interrupts.
 
 pub fn exception_handler(frame: *InterruptFrame)
     # The "nmi-gs" self-test's NMI (arch/x86_64/nmi_probe.ritz, AGAST
@@ -272,6 +277,8 @@ pub fn exception_handler(frame: *InterruptFrame)
     # the stack it interrupted (idt.ritz, AGAST #4628), so an overflow can't
     # push its frame and becomes a #DF on its own IST stack; CR2 still holds
     # the guard page address, as Linux's #DF handler reads it.
+    fbcon_panic_begin()
+    let report_mark: u64 = klog_mark()
     let vec: u64 = (*frame).vector
     if (vec == 14 or vec == 8) and syscall_stack_guard_hit(read_cr2())
         klog("\n*** KERNEL PANIC: syscall stack overflow (guard page hit at 0x")
@@ -362,10 +369,33 @@ pub fn exception_handler(frame: *InterruptFrame)
 
     # Dump ring buffer (shows recent kernel activity before crash)
     ring_dump()
+    panic_screen_log_tail(report_mark)
 
     klog("\n*** KERNEL PANIC ***\n")
     klog("System halted.\n")
     halt_loop()
+
+# The panic screen's last part: the newest kernel log lines from before the
+# report (`mark`) that fit above the closing two lines (ring_dump wrote the
+# whole ring to COM1 only).
+const PANIC_TAIL_RESERVED_ROWS: u32 = 5
+
+fn panic_screen_log_tail(mark: u64)
+    let rows: u32 = fbcon_rows_left()
+    if rows <= PANIC_TAIL_RESERVED_ROWS
+        return
+    fbcon_write("\n--- recent kernel log ---\n")
+    klog_console_tail(rows - PANIC_TAIL_RESERVED_ROWS, mark)
+
+# The \harland\panic-test boot option (tools/test_fbcon_boot.sh, AGAST
+# #4868): a kernel #UD once the console is up, so the boot test can read
+# the panic screen. With `armed` it never returns; without, a no-op.
+pub fn exception_panic_test(armed: bool)
+    if not armed
+        return
+    klog("[panic-test] raising #UD in the kernel\n")
+    asm x86_64:
+        ud2
 
 # ============================================================================
 # IRQ Handler

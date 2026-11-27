@@ -615,8 +615,9 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     boot (#1852; test_ci_msix_boot.py), the NVMe boot (#1850;
     test_ci_nvme_boot.py), the AP-issued NVMe boot (#4220;
     test_ci_nvme_ap_boot.py), the ESP-initramfs boot (#4253;
-    test_ci_esp_initramfs_boot.py) and the rzsh serial session (#4252;
-    test_ci_shell_boot.py). A new step here must make the same promise."""
+    test_ci_esp_initramfs_boot.py), the rzsh serial session (#4252;
+    test_ci_shell_boot.py) and the no-serial framebuffer boot (#4868;
+    test_ci_fbcon_boot.py). A new step here must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
     assert [s.run.strip().splitlines()[-1] for s in steps] == [
         "./rz build --all",
@@ -647,6 +648,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/harland/tools/test_esp_initramfs_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_shell_boot.sh",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
+        "bash projects/harland/tools/test_fbcon_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_irq_dest_boot.sh",
     ]

@@ -16,10 +16,10 @@
 # Import makes their symbols available (creates external declarations).
 
 import io { halt_loop }
-import serial { StrView, serial_init, serial_enable_rx }
+import serial { StrView, serial_start, serial_enable_rx }
 import drivers.pci { pci_init, pci_init_segments }
 import drivers.acpi.tables { acpi_find_table, ACPI_SIG_MCFG }
-import boot_abi.handoff { HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION_INITRAMFS, HARLAND_BOOT_VERSION_FLAGS, HARLAND_BOOT_FLAG_NET_SELFTEST, HARLAND_BOOT_FLAG_NET_RESPONDER, HARLAND_BOOT_FLAG_KLOG_DUMP, HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_BOOT_FLAG_NETD_RESTART, HarlandMemEntry, HarlandBootInfo }
+import boot_abi.handoff { HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION_INITRAMFS, HARLAND_BOOT_VERSION_FLAGS, HARLAND_BOOT_FLAG_NET_SELFTEST, HARLAND_BOOT_FLAG_NET_RESPONDER, HARLAND_BOOT_FLAG_KLOG_DUMP, HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_BOOT_FLAG_NETD_RESTART, HARLAND_BOOT_FLAG_PANIC_TEST, HarlandMemEntry, HarlandBootInfo }
 import mm.pmm { PAGE_SIZE, Mb2BootInfo, Mb2ModuleTag, mb2_find_module, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_mark_region_used, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel, pmm_log_stats }
 import mm.vmm { vmm_init, vmm_flush_tlb_all, vmm_reserve_page_tables, vmm_init_physmap, phys_to_virt }
 import mm.heap { KERNEL_VIRT_BASE, kheap_init, heap_get_used, heap_check }
@@ -37,7 +37,7 @@ import fs.syscall { fs_syscall_init }
 import fs.initramfs { initramfs_load, initramfs_set_boot_image }
 
 # Display driver imports
-import drivers.display.mod { display_init, display_draw_boot_frame, PIXEL_FORMAT_UNSUPPORTED, Mb2FramebufferTag, mb2_fb_format, mb2_find_fb_tag, MB2_FB_TAG_RGB_MIN_SIZE }
+import drivers.display.mod { display_init, display_console_start, PIXEL_FORMAT_UNSUPPORTED, Mb2FramebufferTag, mb2_fb_format, mb2_find_fb_tag, MB2_FB_TAG_RGB_MIN_SIZE }
 
 # Input driver imports
 import drivers.virtio.input { virtio_input_init }
@@ -52,9 +52,9 @@ import arch.x86_64.apic { pic_remap, apic_init_with_mb, apic_init_from_bootinfo,
 import arch.x86_64.percpu { cpu_bringup }
 import arch.x86_64.cpu_smp { smp_syscall_selftest }
 
-# Exception and IRQ handlers: only isr_stubs.s calls them, so this bare
-# import is what keeps the module linked (#3458).
-import arch.x86_64.exceptions
+# Exception and IRQ handlers: only isr_stubs.s calls them; this import
+# keeps the module linked (#3458), and brings the panic-test trigger.
+import arch.x86_64.exceptions { exception_panic_test }
 
 # ELF loader
 import loader.image { ElfStatus, elf_status_code }
@@ -407,7 +407,7 @@ fn init_display()
     klog("x")
     klog_dec(boot_fb_height as i64)
     klog("\n")
-    display_draw_boot_frame(boot_fb_width, boot_fb_height)
+    display_console_start()
 
 # A corrupt heap is not survivable: everything after it allocates. Halt with
 # the stage it was found after (heap_check logs the bad block's address).
@@ -549,9 +549,11 @@ fn init_ipc_and_capabilities()
 pub fn kernel_main(boot_info_addr: u64) -> i32
     # BSS first: every global below lives there
     clear_bss()
-    serial_init()
+    let have_com1: bool = serial_start()
     ring_clear()
     print_banner()
+    if not have_com1
+        klog("No COM1 (serial probe): the console is the framebuffer alone\n")
     detect_boot_protocol(boot_info_addr)
     # Boot-test mode (AGAST #1887); kernel_tail reads the rest.
     let boot_test: bool = boot_option(HARLAND_BOOT_FLAG_BOOT_TEST)
@@ -561,6 +563,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     init_physical_memory(boot_info_addr)
     init_virtual_memory(boot_info_addr)
     init_display()
+    exception_panic_test(boot_option(HARLAND_BOOT_FLAG_PANIC_TEST))
     init_devices()
     init_namespace(boot_info_addr)
     init_smp(boot_info_addr)

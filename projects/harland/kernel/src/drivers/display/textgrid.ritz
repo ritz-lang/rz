@@ -1,0 +1,268 @@
+# Harland console text grid (AGAST #4868)
+#
+# The character side of the framebuffer console (fbcon.ritz): a cols x rows
+# grid of bytes with a cursor, newline, wrap and scroll, and the range of
+# rows that changed since the renderer last looked. fbcon.ritz turns the
+# grid into pixels; this module draws nothing and imports nothing, so
+# test/test_fbcon.ritz runs it on the host.
+#
+# Bytes, as the kernel log and the tty write them:
+#   '\n'  starts the next line (column 0: the console is its own ONLCR)
+#   '\r'  column 0;  '\b' one column left;  '\t' the next multiple of 8
+#   ESC [ ... <final>  a CSI sequence: `J` clears the screen (any argument),
+#         `H` homes the cursor (`H` with row;col moves it), `K` erases to
+#         the end of the line; others (`m` colours, ...) are swallowed
+#   other bytes below 32, and 127: ignored
+#   anything else is drawn (fbcon draws a byte with no glyph as '?')
+# Wrap is deferred, as a VT100's: a byte in the last column leaves the
+# cursor past it, and only the next drawn byte starts a new line, so a line
+# exactly `cols` wide followed by '\n' takes one row, not two.
+
+pub const GRID_BLANK: u8 = 32
+
+# Glyph scale: x2 for modes wider than this (the X99 at 3840x2160, the
+# ThinkPad at 3840x2400), x1 otherwise (chungus at 1920x1080).
+pub const GRID_SCALE2_MIN_WIDTH: u32 = 2000
+
+const CH_BS: u8 = 8
+const CH_TAB: u8 = 9
+const CH_NL: u8 = 10
+const CH_CR: u8 = 13
+const CH_ESC: u8 = 27
+const CH_DEL: u8 = 127
+const CH_LBRACKET: u8 = 91
+const CH_SEMI: u8 = 59
+const CH_0: u8 = 48
+const CH_9: u8 = 57
+const CH_J: u8 = 74
+const CH_H: u8 = 72
+const CH_K: u8 = 75
+
+const TAB_STOP: u32 = 8
+
+# Escape-parser states
+const ESC_NONE: u8 = 0
+const ESC_SEEN: u8 = 1        # ESC, waiting for '['
+const ESC_CSI: u8 = 2         # in ESC [ params
+
+# Up to two numeric CSI parameters (row;col) are kept.
+const CSI_MAX_PARAMS: i32 = 2
+
+pub struct TextGrid
+    cells: *u8          # cols * rows bytes, row-major; the caller owns them
+    cols: u32
+    rows: u32
+    col: u32            # cursor; col == cols is the deferred-wrap position
+    row: u32
+    dirty_lo: u32       # rows [dirty_lo, dirty_hi) changed; empty if lo >= hi
+    dirty_hi: u32
+    esc: u8             # ESC_*
+    nparams: i32
+    params: [2]u32
+
+# A cell size and the grid that fits a mode, capped at `max_cells`.
+pub struct GridGeometry
+    scale: u32          # 1 or 2
+    cell_w: u32         # pixels
+    cell_h: u32
+    cols: u32
+    rows: u32
+
+# The glyph scale for a mode `width` pixels wide.
+pub fn grid_scale_for(width: u32) -> u32
+    if width > GRID_SCALE2_MIN_WIDTH
+        return 2
+    1
+
+# The grid for a width x height mode with font_w x font_h glyphs, at most
+# max_cells cells (rows are dropped to fit). A mode smaller than one cell
+# has a 0 x 0 grid.
+pub fn grid_geometry(width: u32, height: u32, font_w: u32, font_h: u32, max_cells: u32) -> GridGeometry
+    let scale: u32 = grid_scale_for(width)
+    let cw: u32 = font_w * scale
+    let ch: u32 = font_h * scale
+    var cols: u32 = width / cw
+    var rows: u32 = height / ch
+    if cols == 0 or rows == 0
+        cols = 0
+        rows = 0
+    else if cols > max_cells
+        cols = max_cells
+        rows = 1
+    else if cols * rows > max_cells
+        rows = max_cells / cols
+    GridGeometry { scale: scale, cell_w: cw, cell_h: ch, cols: cols, rows: rows }
+
+fn mark_dirty(g: *TextGrid, lo: u32, hi: u32)
+    if (*g).dirty_lo >= (*g).dirty_hi
+        (*g).dirty_lo = lo
+        (*g).dirty_hi = hi
+        return
+    if lo < (*g).dirty_lo
+        (*g).dirty_lo = lo
+    if hi > (*g).dirty_hi
+        (*g).dirty_hi = hi
+
+fn cell_index(g: *TextGrid, row: u32, col: u32) -> i64
+    (row as i64) * ((*g).cols as i64) + col as i64
+
+fn blank_rows(g: *TextGrid, lo: u32, hi: u32)
+    var i: i64 = cell_index(g, lo, 0)
+    let end: i64 = cell_index(g, hi, 0)
+    while i < end
+        *((*g).cells + i) = GRID_BLANK
+        i = i + 1
+    mark_dirty(g, lo, hi)
+
+# Blank the whole grid and home the cursor.
+pub fn grid_clear(g: *TextGrid)
+    blank_rows(g, 0, (*g).rows)
+    (*g).col = 0
+    (*g).row = 0
+
+# Start a grid on `cells` (cols * rows bytes): blank, cursor home, all dirty.
+pub fn grid_init(g: *TextGrid, cells: *u8, cols: u32, rows: u32)
+    (*g).cells = cells
+    (*g).cols = cols
+    (*g).rows = rows
+    (*g).dirty_lo = 0
+    (*g).dirty_hi = 0
+    (*g).esc = ESC_NONE
+    (*g).nparams = 0
+    grid_clear(g)
+
+# The byte at (row, col); a blank outside the grid.
+pub fn grid_at(g: *TextGrid, row: u32, col: u32) -> u8
+    if row >= (*g).rows or col >= (*g).cols
+        return GRID_BLANK
+    *((*g).cells + cell_index(g, row, col))
+
+# Rows the renderer must redraw, then forget them.
+pub struct DirtyRows
+    lo: u32
+    hi: u32
+
+pub fn grid_take_dirty(g: *TextGrid) -> DirtyRows
+    var d: DirtyRows = DirtyRows { lo: (*g).dirty_lo, hi: (*g).dirty_hi }
+    if d.lo >= d.hi
+        d = DirtyRows { lo: 0, hi: 0 }
+    (*g).dirty_lo = 0
+    (*g).dirty_hi = 0
+    d
+
+# Move every row up one; the bottom row is blank.
+fn scroll_up(g: *TextGrid)
+    let cols: i64 = (*g).cols as i64
+    let n: i64 = cols * (((*g).rows - 1) as i64)
+    var i: i64 = 0
+    while i < n
+        *((*g).cells + i) = *((*g).cells + i + cols)
+        i = i + 1
+    blank_rows(g, (*g).rows - 1, (*g).rows)
+    mark_dirty(g, 0, (*g).rows)
+
+fn newline(g: *TextGrid)
+    (*g).col = 0
+    if (*g).row + 1 >= (*g).rows
+        scroll_up(g)
+        (*g).row = (*g).rows - 1
+    else
+        (*g).row = (*g).row + 1
+
+fn draw(g: *TextGrid, c: u8)
+    if (*g).col >= (*g).cols
+        newline(g)
+    *((*g).cells + cell_index(g, (*g).row, (*g).col)) = c
+    mark_dirty(g, (*g).row, (*g).row + 1)
+    (*g).col = (*g).col + 1
+
+fn erase_to_eol(g: *TextGrid)
+    var c: u32 = (*g).col
+    while c < (*g).cols
+        *((*g).cells + cell_index(g, (*g).row, c)) = GRID_BLANK
+        c = c + 1
+    mark_dirty(g, (*g).row, (*g).row + 1)
+
+# CSI parameter i, or `dflt` if it was not given (or was 0).
+fn csi_param(g: *TextGrid, i: i32, dflt: u32) -> u32
+    if i >= (*g).nparams or (*g).params[i] == 0
+        return dflt
+    (*g).params[i]
+
+fn csi_final(g: *TextGrid, c: u8)
+    if c == CH_J
+        grid_clear(g)
+    else if c == CH_H
+        var r: u32 = csi_param(g, 0, 1) - 1
+        var k: u32 = csi_param(g, 1, 1) - 1
+        if r >= (*g).rows
+            r = (*g).rows - 1
+        if k >= (*g).cols
+            k = (*g).cols - 1
+        (*g).row = r
+        (*g).col = k
+    else if c == CH_K
+        erase_to_eol(g)
+
+# Inside ESC [ ...: digits and ';' build the parameters, a byte in
+# 0x40..0x7E ends the sequence, anything else is skipped.
+fn csi_byte(g: *TextGrid, c: u8)
+    if c >= CH_0 and c <= CH_9
+        if (*g).nparams == 0
+            (*g).nparams = 1
+            (*g).params[0] = 0
+        let i: i32 = (*g).nparams - 1
+        if i < CSI_MAX_PARAMS and (*g).params[i] < 10000
+            (*g).params[i] = (*g).params[i] * 10 + (c - CH_0) as u32
+        return
+    if c == CH_SEMI
+        if (*g).nparams == 0
+            (*g).nparams = 1
+            (*g).params[0] = 0
+        if (*g).nparams < CSI_MAX_PARAMS
+            (*g).params[(*g).nparams] = 0
+        (*g).nparams = (*g).nparams + 1
+        return
+    if c >= 64 and c <= 126
+        (*g).esc = ESC_NONE
+        csi_final(g, c)
+
+# Write one byte at the cursor.
+pub fn grid_put(g: *TextGrid, c: u8)
+    if (*g).cols == 0 or (*g).rows == 0
+        return
+    if (*g).esc == ESC_SEEN
+        if c == CH_LBRACKET
+            (*g).esc = ESC_CSI
+            (*g).nparams = 0
+        else
+            (*g).esc = ESC_NONE
+        return
+    if (*g).esc == ESC_CSI
+        csi_byte(g, c)
+        return
+    if c == CH_NL
+        newline(g)
+    else if c == CH_CR
+        (*g).col = 0
+    else if c == CH_BS
+        if (*g).col >= (*g).cols
+            (*g).col = (*g).cols - 1
+        else if (*g).col > 0
+            (*g).col = (*g).col - 1
+    else if c == CH_TAB
+        var stop: u32 = ((*g).col / TAB_STOP + 1) * TAB_STOP
+        if stop > (*g).cols
+            stop = (*g).cols
+        while (*g).col < stop
+            draw(g, GRID_BLANK)
+    else if c == CH_ESC
+        (*g).esc = ESC_SEEN
+    else if c >= 32 and c != CH_DEL
+        draw(g, c)
+
+# Rows below the cursor's: how many lines can be written without scrolling.
+pub fn grid_rows_left(g: *TextGrid) -> u32
+    if (*g).rows == 0
+        return 0
+    (*g).rows - 1 - (*g).row

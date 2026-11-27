@@ -1,0 +1,404 @@
+# Harland framebuffer console (AGAST #4868)
+#
+# The Acer has no serial port, so the kernel log, rzsh and the panic screen
+# must reach the GOP framebuffer. These run the console's three layers on
+# the host:
+#   * the text grid (drivers/display/textgrid.ritz): wrap, scroll, the
+#     control bytes and CSI sequences the kernel and rzsh write, and the
+#     glyph scale for the three laptops' modes;
+#   * the renderer (drivers/display/fbcon.ritz) on a framebuffer in
+#     ordinary memory: glyph pixels, both pixel formats, scroll, cursor,
+#     the panic screen;
+#   * klog as its sink, the boot log replayed at console start, and the
+#     panic screen's log tail (klog.ritz).
+# fbcon_irqsave(false): fbcon_write's cli would fault in a hosted process.
+#
+# And the COM1 probe's verdict (serial.ritz): the Acer's absent UART reads
+# 0xFF everywhere, which hung the first console read.
+
+import drivers.display.textgrid { TextGrid, GridGeometry, DirtyRows, GRID_BLANK, grid_scale_for, grid_geometry, grid_init, grid_put, grid_at, grid_take_dirty, grid_rows_left }
+import drivers.display.fbcon { FBCON_MAX_CELLS, fbcon_irqsave, fbcon_init, fbcon_draw, fbcon_cell, fbcon_active, fbcon_stop, fbcon_geometry, fbcon_rows_left, fbcon_panic_begin }
+import drivers.display.font8x16 { FONT_W, FONT_H, font_row }
+import boot_abi.handoff { FB_FORMAT_RGBX, FB_FORMAT_BGRX, FB_FORMAT_OTHER }
+import arch.x86_64.pat { pat_with_wc }
+import serial { COM1_PROBE_A, COM1_PROBE_B, com1_probe_verdict }
+import klog { klog, klog_serial, ring_clear, klog_mark, klog_console_start, klog_console_tail }
+import ritzlib.strview { StrView }
+
+# ============================================================================
+# Text grid
+# ============================================================================
+
+var g_cells: [64]u8
+var g_grid: TextGrid
+
+# An 8 x 4 grid.
+fn grid8x4() -> *TextGrid
+    grid_init(@g_grid, @g_cells[0], 8, 4)
+    @g_grid
+
+fn put_all(g: *TextGrid, s: StrView)
+    var i: i64 = 0
+    while i < s.len
+        grid_put(g, *(s.ptr + i))
+        i = i + 1
+
+# Row `row` of the grid is exactly `want`, then blanks.
+fn row_is(g: *TextGrid, row: u32, want: StrView) -> bool
+    var c: u32 = 0
+    while c < (*g).cols
+        var expect: u8 = GRID_BLANK
+        if (c as i64) < want.len
+            expect = *(want.ptr + c as i64)
+        if grid_at(g, row, c) != expect
+            return false
+        c = c + 1
+    true
+
+[[test]]
+fn test_grid_writes_and_newline() -> i32
+    let g: *TextGrid = grid8x4()
+    put_all(g, "ab\ncd")
+    assert row_is(g, 0, "ab")
+    assert row_is(g, 1, "cd")
+    assert (*g).row == 1 and (*g).col == 2
+    0
+
+[[test]]
+fn test_grid_wraps_long_lines() -> i32
+    let g: *TextGrid = grid8x4()
+    put_all(g, "0123456789")
+    assert row_is(g, 0, "01234567")
+    assert row_is(g, 1, "89")
+    assert (*g).row == 1 and (*g).col == 2
+    0
+
+# A wrap on the last row scrolls, as a newline there does.
+[[test]]
+fn test_grid_wrap_on_the_last_row_scrolls() -> i32
+    let g: *TextGrid = grid8x4()
+    put_all(g, "a\nb\nc\n0123456789")
+    assert row_is(g, 0, "b")
+    assert row_is(g, 2, "01234567")
+    assert row_is(g, 3, "89")
+    0
+
+# A line exactly as wide as the grid, then '\n', takes one row: the wrap
+# waits for the next drawn byte (a VT100's deferred wrap).
+[[test]]
+fn test_grid_full_line_then_newline_is_one_row() -> i32
+    let g: *TextGrid = grid8x4()
+    put_all(g, "01234567\nx")
+    assert row_is(g, 0, "01234567")
+    assert row_is(g, 1, "x")
+    0
+
+[[test]]
+fn test_grid_scrolls_at_the_bottom() -> i32
+    let g: *TextGrid = grid8x4()
+    put_all(g, "a\nb\nc\nd")
+    let d0: DirtyRows = grid_take_dirty(g)
+    assert grid_rows_left(g) == 0
+    put_all(g, "\ne")
+    assert row_is(g, 0, "b")
+    assert row_is(g, 1, "c")
+    assert row_is(g, 2, "d")
+    assert row_is(g, 3, "e")
+    assert (*g).row == 3
+    # A scroll moved every row.
+    let d: DirtyRows = grid_take_dirty(g)
+    assert d.lo == 0 and d.hi == 4
+    0
+
+[[test]]
+fn test_grid_dirty_rows_are_the_changed_ones() -> i32
+    let g: *TextGrid = grid8x4()
+    let d0: DirtyRows = grid_take_dirty(g)
+    assert d0.lo == 0 and d0.hi == 4    # grid_init dirties all
+    put_all(g, "\n\nx")
+    let d: DirtyRows = grid_take_dirty(g)
+    assert d.lo == 2 and d.hi == 3
+    let none: DirtyRows = grid_take_dirty(g)
+    assert none.lo == none.hi
+    0
+
+# The ldisc's rubout echo is BS, space, BS; '\r' returns to column 0.
+[[test]]
+fn test_grid_backspace_and_carriage_return() -> i32
+    let g: *TextGrid = grid8x4()
+    put_all(g, "abc\x08 \x08")
+    assert row_is(g, 0, "ab")
+    assert (*g).col == 2
+    put_all(g, "\rZ")
+    assert row_is(g, 0, "Zb")
+    # Rubout of a byte in the last column (the cursor past it).
+    put_all(g, "\n01234567\x08 \x08")
+    assert row_is(g, 1, "0123456")
+    0
+
+[[test]]
+fn test_grid_tab_stops_at_eight() -> i32
+    var cells: [64]u8
+    var g: TextGrid
+    grid_init(@g, @cells[0], 16, 4)
+    put_all(@g, "ab\tc")
+    assert grid_at(@g, 0, 8) == 99      # 'c'
+    assert grid_at(@g, 0, 5) == GRID_BLANK
+    0
+
+# rzsh's `clear` writes "\e[2J\e[H"; colours and other CSIs draw nothing.
+[[test]]
+fn test_grid_csi_clear_home_and_erase() -> i32
+    let g: *TextGrid = grid8x4()
+    put_all(g, "abc\ndef")
+    put_all(g, "\x1b[2J\x1b[H")
+    assert row_is(g, 0, "")
+    assert row_is(g, 1, "")
+    assert (*g).row == 0 and (*g).col == 0
+    put_all(g, "\x1b[1;31mhi\x1b[0m")
+    assert row_is(g, 0, "hi")
+    put_all(g, "\x1b[2;3Hq")
+    assert grid_at(g, 1, 2) == 113      # 'q'
+    put_all(g, "\x1b[1;2H\x1b[K")
+    assert row_is(g, 0, "h")
+    0
+
+[[test]]
+fn test_grid_ignores_other_control_bytes() -> i32
+    let g: *TextGrid = grid8x4()
+    put_all(g, "a\x07\x00\x7fb")
+    assert row_is(g, 0, "ab")
+    0
+
+# x1 up to 2000 px wide, x2 above (the X99 and the ThinkPad at 4K).
+[[test]]
+fn test_grid_scale_for_the_laptops() -> i32
+    assert grid_scale_for(1920) == 1
+    assert grid_scale_for(2000) == 1
+    assert grid_scale_for(2001) == 2
+    assert grid_scale_for(3840) == 2
+    0
+
+[[test]]
+fn test_grid_geometry_for_the_three_machines() -> i32
+    let acer: GridGeometry = grid_geometry(1920, 1080, 8, 16, FBCON_MAX_CELLS)
+    assert acer.scale == 1 and acer.cell_w == 8 and acer.cell_h == 16
+    assert acer.cols == 240 and acer.rows == 67
+    let x99: GridGeometry = grid_geometry(3840, 2160, 8, 16, FBCON_MAX_CELLS)
+    assert x99.scale == 2 and x99.cell_w == 16 and x99.cell_h == 32
+    assert x99.cols == 240 and x99.rows == 67
+    let tp: GridGeometry = grid_geometry(3840, 2400, 8, 16, FBCON_MAX_CELLS)
+    assert tp.cols == 240 and tp.rows == 75
+    0
+
+# A mode with more cells than the static grid loses rows, not columns.
+[[test]]
+fn test_grid_geometry_caps_the_cell_count() -> i32
+    let g: GridGeometry = grid_geometry(2000, 3200, 8, 16, 1000)
+    assert g.cols == 250 and g.rows == 4
+    let tiny: GridGeometry = grid_geometry(7, 100, 8, 16, 1000)
+    assert tiny.cols == 0 and tiny.rows == 0
+    0
+
+# ============================================================================
+# Renderer, on a 384 x 48 framebuffer in memory (48 x 3 cells)
+# ============================================================================
+
+const FB_W: u32 = 384
+const FB_H: u32 = 48
+const FB_PITCH: u32 = 1600          # 400 pixels a line: padding past FB_W
+const FB_WORDS: i64 = 19200         # FB_PITCH / 4 * FB_H
+var g_fb: [19200]u32
+
+const BGRX_FG: u32 = 0x00C8C8C8
+const BGRX_BG: u32 = 0x00102040     # dark blue: B in the low byte
+const RGBX_BG: u32 = 0x00402010
+const PANIC_BG: u32 = 0x00A00000    # BGRX red: R in bits 16-23
+const PANIC_FG: u32 = 0x00FFFFFF
+
+fn fb_base() -> u64
+    @g_fb[0] as u64
+
+fn px(x: u32, y: u32) -> u32
+    g_fb[(y * (FB_PITCH / 4) + x) as i64]
+
+fn console(format: u8) -> bool
+    var i: i64 = 0
+    while i < FB_WORDS
+        g_fb[i] = 0xDEADBEEF
+        i = i + 1
+    fbcon_irqsave(false)
+    fbcon_init(fb_base(), FB_W, FB_H, FB_PITCH, 32, format)
+
+# The cell at (row, col) shows glyph c in fg on bg (the cursor's underline
+# rows excepted when `skip_cursor_rows`).
+fn cell_shows(row: u32, col: u32, c: u8, fg: u32, bg: u32, skip_cursor_rows: bool) -> bool
+    var gy: u32 = 0
+    while gy < FONT_H
+        if skip_cursor_rows and gy >= FONT_H - 2
+            return true
+        let bits: u8 = font_row(c, gy)
+        var gx: u32 = 0
+        while gx < FONT_W
+            var want: u32 = bg
+            if (bits & (0x80 >> gx as u8)) != 0
+                want = fg
+            if px(col * 8 + gx, row * 16 + gy) != want
+                return false
+            gx = gx + 1
+        gy = gy + 1
+    true
+
+[[test]]
+fn test_fbcon_draws_glyphs() -> i32
+    assert console(FB_FORMAT_BGRX)
+    let geom: GridGeometry = fbcon_geometry()
+    assert geom.cols == 48 and geom.rows == 3
+    fbcon_draw("A@")
+    assert cell_shows(0, 0, 65, BGRX_FG, BGRX_BG, false)
+    assert cell_shows(0, 1, 64, BGRX_FG, BGRX_BG, false)
+    # The whole mode is cleared, the pitch's padding is not touched.
+    assert px(383, 47) == BGRX_BG
+    assert px(384, 0) == 0xDEADBEEF
+    0
+
+[[test]]
+fn test_fbcon_rgbx_swaps_red_and_blue() -> i32
+    assert console(FB_FORMAT_RGBX)
+    assert px(40, 40) == RGBX_BG
+    0
+
+[[test]]
+fn test_fbcon_refuses_modes_it_cannot_draw() -> i32
+    assert not fbcon_init(fb_base(), FB_W, FB_H, FB_PITCH, 24, FB_FORMAT_BGRX)
+    assert not fbcon_active()
+    assert not fbcon_init(fb_base(), FB_W, FB_H, FB_PITCH, 32, FB_FORMAT_OTHER)
+    assert not fbcon_init(0, FB_W, FB_H, FB_PITCH, 32, FB_FORMAT_BGRX)
+    assert not fbcon_init(fb_base(), 4, 4, FB_PITCH, 32, FB_FORMAT_BGRX)
+    # Not active: drawing is a no-op.
+    fbcon_draw("x")
+    0
+
+# The cursor is an underline on the glyph's bottom two rows, and it moves.
+[[test]]
+fn test_fbcon_cursor_follows_output() -> i32
+    assert console(FB_FORMAT_BGRX)
+    assert px(0, 15) == BGRX_FG and px(7, 14) == BGRX_FG
+    fbcon_draw("a")
+    assert px(8, 15) == BGRX_FG      # under cell (0, 1)
+    assert cell_shows(0, 0, 97, BGRX_FG, BGRX_BG, false)    # 'a', no underline
+    0
+
+[[test]]
+fn test_fbcon_scrolls_the_pixels() -> i32
+    assert console(FB_FORMAT_BGRX)
+    fbcon_draw("one\ntwo\nthree\nfour")
+    assert fbcon_cell(0, 0) == 116      # 't' of "two"
+    assert cell_shows(0, 1, 119, BGRX_FG, BGRX_BG, false)   # 'w'
+    assert cell_shows(1, 4, 101, BGRX_FG, BGRX_BG, false)   # "three"'s last 'e'
+    assert cell_shows(2, 0, 102, BGRX_FG, BGRX_BG, false)   # 'f'
+    # A cell that went from a glyph to a blank is redrawn blank.
+    assert cell_shows(2, 4, 32, BGRX_FG, BGRX_BG, true)
+    assert fbcon_rows_left() == 0
+    0
+
+[[test]]
+fn test_fbcon_panic_screen() -> i32
+    assert console(FB_FORMAT_BGRX)
+    fbcon_draw("boot log")
+    fbcon_panic_begin()
+    assert fbcon_active()
+    # White on red, the banner first.
+    assert px(383, 47) == PANIC_BG
+    assert fbcon_cell(0, 0) == 42       # '*'
+    assert cell_shows(0, 0, 42, PANIC_FG, PANIC_BG, false)
+    assert fbcon_cell(0, 4) == 75       # 'K' of KERNEL PANIC
+    # The boot log is gone; the cursor waits two rows down.
+    assert fbcon_cell(1, 0) == 32
+    assert fbcon_rows_left() == 0
+    # A second panic (a fault while drawing the first) stops drawing.
+    fbcon_panic_begin()
+    assert not fbcon_active()
+    0
+
+# ============================================================================
+# klog as the console's sink
+# ============================================================================
+
+fn grid_row_starts(row: u32, want: StrView) -> bool
+    var i: i64 = 0
+    while i < want.len
+        if fbcon_cell(row, i as u32) != *(want.ptr + i)
+            return false
+        i = i + 1
+    true
+
+# What klog logged before the console existed is replayed when it starts,
+# and klog writes to it from then on.
+[[test]]
+fn test_klog_replays_and_feeds_the_console() -> i32
+    klog_serial(false)
+    ring_clear()
+    fbcon_stop()
+    klog("boot\n")
+    assert console(FB_FORMAT_BGRX)
+    klog_console_start()
+    assert grid_row_starts(0, "boot")
+    klog("next")
+    assert grid_row_starts(1, "next")
+    0
+
+# The panic screen's log tail: the last `lines` lines logged before the
+# mark taken as the crash report began, not the report itself.
+[[test]]
+fn test_klog_console_tail_shows_the_last_lines_before_the_mark() -> i32
+    klog_serial(false)
+    fbcon_stop()
+    ring_clear()
+    klog("l1\nl2\nl3\nl4\n")
+    let mark: u64 = klog_mark()
+    klog("report\n")
+    assert console(FB_FORMAT_BGRX)
+    klog_console_tail(2, mark)
+    assert grid_row_starts(0, "l3")
+    assert grid_row_starts(1, "l4")
+    assert grid_row_starts(2, "")
+    assert fbcon_cell(2, 0) == 32
+    fbcon_stop()
+    0
+
+# ============================================================================
+# COM1 probe
+# ============================================================================
+
+[[test]]
+fn test_com1_probe_finds_a_16550() -> i32
+    # Scratch register kept both patterns; LSR idle (THRE | TEMT).
+    assert com1_probe_verdict(COM1_PROBE_A, COM1_PROBE_B, 0x60)
+    0
+
+# No UART: every port reads 0xFF, the scratch register keeps nothing.
+[[test]]
+fn test_com1_probe_rejects_a_floating_bus() -> i32
+    assert not com1_probe_verdict(0xFF, 0xFF, 0xFF)
+    0
+
+[[test]]
+fn test_com1_probe_needs_both_scratch_patterns_and_a_real_lsr() -> i32
+    assert not com1_probe_verdict(COM1_PROBE_A, 0x00, 0x60)
+    assert not com1_probe_verdict(0x00, COM1_PROBE_B, 0x60)
+    # An 8250 with no scratch register, or one that ate the write.
+    assert not com1_probe_verdict(COM1_PROBE_B, COM1_PROBE_A, 0x60)
+    assert not com1_probe_verdict(COM1_PROBE_A, COM1_PROBE_B, 0xFF)
+    0
+
+# ============================================================================
+# PAT: entry 4 becomes write-combining, the others stay (arch/x86_64/pat.ritz)
+# ============================================================================
+
+[[test]]
+fn test_pat_entry4_becomes_wc() -> i32
+    # The reset value: WB WT UC- UC, twice.
+    assert pat_with_wc(0x0007040600070406) == 0x0007040100070406
+    assert pat_with_wc(0xFFFFFFFFFFFFFFFF) == 0xFFFFFF01FFFFFFFF
+    0
