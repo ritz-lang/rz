@@ -372,20 +372,18 @@ fn sbk_arms(sm: *Sema, arms: *MatchArm) -> i32
 
 # What `e?` or `e.unwrap()` gives, for `e` an Option or Result.
 fn sbk_payload_of(sm: *Sema, e: *Expr) -> i32
-    var name: *u8 = null
-    var len: i32 = 0
-    sbk_receiver(sm, e, @name, @len)
-    if name == null or len <= 0 or is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
+    var name: StrView = strview_empty()
+    sbk_receiver(sm, e, @name)
+    if name.ptr == null or name.len <= 0 or is_tagged_enum_type(name) == 0
         return BK_UNSURE
-    bk_tagged_payload(StrView { ptr: (name), len: (len) as i64 }, 0)
+    bk_tagged_payload(name, 0)
 
 # The type name method call `e` dispatches on, or an empty view.
 pub fn sbk_method_recv(sm: *Sema, e: *Expr) -> StrView
     let rcv: *Expr = e.left
     if rcv == null
         return strview_empty()
-    var name: *u8 = null
-    var len: i32 = 0
+    var name: StrView = strview_empty()
     if rcv.kind == ExprKind.Ident
         if sema_find_local(sm, rcv.ident) == null and sbk_global(sm, rcv.ident) == null
             # Neither local nor global: a static call names its impl type.
@@ -396,10 +394,10 @@ pub fn sbk_method_recv(sm: *Sema, e: *Expr) -> StrView
         ExprKind.StringLit =>
             return "StrView"
         _ => pass
-    sbk_receiver(sm, rcv, @name, @len)
-    if name == null or len <= 0
+    sbk_receiver(sm, rcv, @name)
+    if name.ptr == null or name.len <= 0
         return strview_empty()
-    StrView { ptr: (name), len: (len) as i64 }
+    name
 
 # The fn a method call dispatches to, or null.
 pub fn sbk_method_def(sm: *Sema, e: *Expr) -> *FnDef
@@ -524,79 +522,67 @@ fn sbk_member_kind_is_array(sm: *Sema, e: *Expr) -> i32
     (f != null and f.field_type == TypeKind.Array) as i32
 
 # The struct `e` is, or points at: `x`, `(*p).f`, `a[i].f`, `(x as *S).f`, ..
-pub fn sbk_receiver(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+pub fn sbk_receiver(sm: *Sema, e: *Expr, out: *StrView)
+    *out = strview_empty()
     if e.kind == ExprKind.Unary and (e.op == OpKind.Deref or e.op == OpKind.Addr or e.op == OpKind.AddrMut)
-        sbk_receiver(sm, e.operand, out_name, out_len)
+        sbk_receiver(sm, e.operand, out)
     else if e.kind == ExprKind.Call and e.func_name.len == 0
         let sig: *FnDef = sbk_value_fn_sig(sm, e.left)
         if sig != null and (sig.return_type == TypeKind.Struct or sig.return_type == TypeKind.Ptr)
-            *out_name = sig.return_type_name.ptr
-            *out_len = sig.return_type_name.len as i32
+            *out = sig.return_type_name
     else if e.kind == ExprKind.Binary and (e.op == OpKind.Add or e.op == OpKind.Sub)
-        sbk_receiver(sm, e.left, out_name, out_len)
+        sbk_receiver(sm, e.left, out)
     else if e.kind == ExprKind.Index
-        sbk_receiver(sm, e.left, out_name, out_len)
+        sbk_receiver(sm, e.left, out)
         # `v[i]` of a Vec<S> / Span<S> is an S: its buffer's element.  An
         # array's element is the name itself.
-        if *out_name != null and name_is_indexable(StrView { ptr: (*out_name), len: (*out_len) as i64 }) == 1 and sbk_is_array(sm, e.left) == 0
-            let st: *StructDef = sema_find_struct(sm, StrView { ptr: (*out_name), len: (*out_len) as i64 })
-            *out_name = null
-            *out_len = 0
+        if out.ptr != null and name_is_indexable(*out) == 1 and sbk_is_array(sm, e.left) == 0
+            let st: *StructDef = sema_find_struct(sm, *out)
+            *out = strview_empty()
             if st != null
                 var di: i32 = find_field_index(st, "data")
                 if di < 0
                     di = find_field_index(st, "ptr")
                 if di >= 0
                     let df: *StructField = get_field_type(st, di)
-                    *out_name = df.field_type_name.ptr
-                    *out_len = df.field_type_name.len as i32
+                    *out = df.field_type_name
     else if e.kind == ExprKind.Cast and (e.ident.len as i32) > 0
-        *out_name = e.ident.ptr
-        *out_len = e.ident.len as i32
+        *out = e.ident
     else
         match e.kind
             ExprKind.Ident =>
                 let v: *SemaVar = sema_find_local(sm, e.ident)
                 if v != null
-                    *out_name = v.type_name.ptr
-                    *out_len = v.type_name.len as i32
+                    *out = v.type_name
                 else
                     let g: *GlobalVarDef = sbk_global(sm, e.ident)
                     # AGAST #3984: a `[N]T` global keeps T as its element's name.
                     if g != null and g.var_type == TypeKind.Array
-                        *out_name = g.array_elem_type_name.ptr
-                        *out_len = g.array_elem_type_name.len as i32
+                        *out = g.array_elem_type_name
                     else if g != null
-                        *out_name = g.type_name.ptr
-                        *out_len = g.type_name.len as i32
+                        *out = g.type_name
                     else
                         let ce: *ConstEntry = sbk_const(sm, e.ident)
                         if ce != null and ce.const_type == TypeKind.Array
-                            *out_name = ce.array_elem_type_name.ptr
-                            *out_len = ce.array_elem_type_name.len as i32
+                            *out = ce.array_elem_type_name
                         else if ce != null
-                            *out_name = ce.type_name.ptr
-                            *out_len = ce.type_name.len as i32
+                            *out = ce.type_name
             ExprKind.If | ExprKind.Match =>
                 # The first arm that names one.
                 var arm: *MatchArm = e.args as *MatchArm
-                while arm != null and *out_name == null
+                while arm != null and out.ptr == null
                     if arm.is_pass == 0 and arm.body != null
-                        sbk_receiver(sm, arm.body, out_name, out_len)
+                        sbk_receiver(sm, arm.body, out)
                     arm = arm.next
             _ =>
                 if e.kind == ExprKind.Method and sbk_is_unwrap(e) == 1
                     # `r.unwrap()` of an Option$S / Result$S$E is an S.
-                    var cname: *u8 = null
-                    var clen: i32 = 0
-                    sbk_receiver(sm, e.left, @cname, @clen)
-                    if cname != null and clen > 0 and is_tagged_enum_type(StrView { ptr: (cname), len: (clen) as i64 }) == 1
-                        let ok: StrView = sbk_ok_struct(sm, StrView { ptr: (cname), len: (clen) as i64 })
+                    var cname: StrView = strview_empty()
+                    sbk_receiver(sm, e.left, @cname)
+                    if cname.ptr != null and cname.len > 0 and is_tagged_enum_type(cname) == 1
+                        let ok: StrView = sbk_ok_struct(sm, cname)
                         if ok.ptr != null
-                            *out_name = ok.ptr
-                            *out_len = ok.len as i32
+                            *out = ok
                 else
                     match e.kind
                         ExprKind.Method =>
@@ -604,30 +590,25 @@ pub fn sbk_receiver(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
                             # receiver.
                             let fd: *FnDef = sbk_method_def(sm, e)
                             if fd != null and (fd.return_type == TypeKind.Struct or fd.return_type == TypeKind.Ptr)
-                                *out_name = fd.return_type_name.ptr
-                                *out_len = fd.return_type_name.len as i32
+                                *out = fd.return_type_name
                             else if fd != null and (fd.return_type == TypeKind.Ref or fd.return_type == TypeKind.MutRef)
                                 # AGAST #4457: `comp.damage_tracker().has_damage()` — the tail's
                                 # rule, so a method's `-> @S` / `-> @&S` types like a free fn's.
                                 var t: SemaTy
                                 if sema_expr_ty(sm, e, @t) == fd.return_type and t.pointee == TypeKind.Struct
-                                    *out_name = t.name.ptr
-                                    *out_len = t.name.len as i32
+                                    *out = t.name
                         ExprKind.Member =>
                             let f: *StructField = sbk_member_field(sm, e)
                             if f != null
                                 if f.field_type == TypeKind.Array
-                                    *out_name = f.array_elem_type_name.ptr
-                                    *out_len = f.array_elem_type_name.len as i32
+                                    *out = f.array_elem_type_name
                                 else
-                                    *out_name = f.field_type_name.ptr
-                                    *out_len = f.field_type_name.len as i32
+                                    *out = f.field_type_name
                         _ =>
                             var t: SemaTy
                             let k: TypeKind = sema_expr_ty(sm, e, @t)
                             if k == TypeKind.Struct or ((k == TypeKind.Ptr or k == TypeKind.Ref or k == TypeKind.MutRef) and t.pointee == TypeKind.Struct)
-                                *out_name = t.name.ptr
-                                *out_len = t.name.len as i32
+                                *out = t.name
 
 # The field `e` reads, through what sbk_receiver names when Sema can't type
 # the receiver: `(*p).f`, `a[i].f`, `(*(*b).ops).n`.
@@ -635,12 +616,11 @@ pub fn sbk_member_field(sm: *Sema, e: *Expr) -> *StructField
     let f: *StructField = sbk_field(sm, e)
     if f != null or e.left == null
         return f
-    var name: *u8 = null
-    var len: i32 = 0
-    sbk_receiver(sm, e.left, @name, @len)
-    if name == null or len <= 0
+    var name: StrView = strview_empty()
+    sbk_receiver(sm, e.left, @name)
+    if name.ptr == null or name.len <= 0
         return null
-    sbk_struct_field(sm, StrView { ptr: (name), len: (len) as i64 }, e.ident)
+    sbk_struct_field(sm, name, e.ident)
 
 # Field `field` of the struct `name`, or of what its `deref` hands back
 # (`b.x` on a Box<Point>, AGAST #3015), or null.
@@ -678,12 +658,11 @@ fn sbk_member(sm: *Sema, e: *Expr) -> i32
         if ce != null
             return bk_of_type(ce.const_type, ce.type_name)
     if f == null
-        var name: *u8 = null
-        var len: i32 = 0
-        sbk_receiver(sm, e.left, @name, @len)
-        if name == null or len <= 0
+        var name: StrView = strview_empty()
+        sbk_receiver(sm, e.left, @name)
+        if name.ptr == null or name.len <= 0
             return BK_UNSURE
-        f = sbk_struct_field(sm, StrView { ptr: (name), len: (len) as i64 }, e.ident)
+        f = sbk_struct_field(sm, name, e.ident)
         if f == null
             return BK_UNSURE
     bk_of_type(f.field_type, f.field_type_name)
@@ -962,10 +941,9 @@ pub fn bool_note_decl(sm: *Sema, st: *Stmt)
             sm.scope_top = sm.scope_top - 1
             let k: i32 = sema_bool_kind(sm, st.var_init)
             # `var p = match o ..` of a struct: name it for `p.f`.
-            var rname: *u8 = null
-            var rlen: i32 = 0
+            var rname: StrView = strview_empty()
             if v.type_name.ptr == null or v.type_name.len <= 0
-                sbk_receiver(sm, st.var_init, @rname, @rlen)
+                sbk_receiver(sm, st.var_init, @rname)
             # `let r = @&a[i]`: `*r` and `r[0]` are what it points at.
             let init: *Expr = st.var_init
             if init.kind == ExprKind.Unary and (init.op == OpKind.Addr or init.op == OpKind.AddrMut)
@@ -986,8 +964,8 @@ pub fn bool_note_decl(sm: *Sema, st: *Stmt)
             # AGAST #3768: `let t = (a, b)`: its elements, for `t.1` / `let (x, y) = t`.
             v.bk_tuple = sbk_tuple_of(sm, init)
             sm.scope_top = sm.scope_top + 1
-            if rname != null and rlen > 0
-                v.type_name = StrView { ptr: rname, len: rlen as i64 }
+            if rname.ptr != null and rname.len > 0
+                v.type_name = rname
             if k == BK_BAD
                 v.bk = BK_INT
             else
@@ -1071,10 +1049,9 @@ pub fn bool_note_tuple(sm: *Sema, st: *Stmt)
             if arm != null
                 lit = arm.body
         if lit != null and (lit.kind != ExprKind.StructLit or lit.ident.len != 0)
-            var name: *u8 = null
-            var len: i32 = 0
-            sbk_receiver(sm, lit, @name, @len)
-            let ts: *StructDef = sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 })
+            var name: StrView = strview_empty()
+            sbk_receiver(sm, lit, @name)
+            let ts: *StructDef = sema_find_struct(sm, name)
             if ts != null and ts.fields != null and ts.fields.next != null
                 k0 = bk_of_type(ts.fields.field_type, ts.fields.field_type_name)
                 k1 = bk_of_type(ts.fields.next.field_type, ts.fields.next.field_type_name)
@@ -1117,11 +1094,10 @@ fn sbk_tuple_lit(sm: *Sema, e: *Expr) -> *SemaTupleNote
     fi = e.args as *FieldInit
     while i < n
         note.bk[i] = sema_bool_kind(sm, fi.value)
-        var name: *u8 = null
-        var len: i32 = 0
-        sbk_receiver(sm, fi.value, @name, @len)
-        note.name[i] = name
-        note.name_len[i] = len
+        var name: StrView = strview_empty()
+        sbk_receiver(sm, fi.value, @name)
+        note.name[i] = name.ptr
+        note.name_len[i] = (name.len as i32)
         note.sub[i] = sbk_tuple_of(sm, fi.value)
         note.elem[i] = sbk_value_elem(sm, fi.value)
         i += 1
@@ -1303,29 +1279,28 @@ pub fn bool_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
     let v: *SemaVar = sbk_last(sm)
     if v == null or scrut == null
         return
-    var name: *u8 = null
-    var len: i32 = 0
-    sbk_receiver(sm, scrut, @name, @len)
+    var name: StrView = strview_empty()
+    sbk_receiver(sm, scrut, @name)
     if arm.pattern_kind == PAT_IDENT
-        if name == null or len <= 0
+        if name.ptr == null or name.len <= 0
             v.bk = sbk_binding(sema_bool_kind(sm, scrut))
         else if v.kind != TypeKind.Unknown
             # AGAST #4596: sema_bind_arm_name typed an enum's binding arm.
             v.bk = sbk_of_ty(v.kind, v.type_name)
         return
-    if name == null or len <= 0
+    if name.ptr == null or name.len <= 0
         v.bk = BK_UNSURE
-    else if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
+    else if is_tagged_enum_type(name) == 1
         let is_err: i32 = 1 - sbk_tag_one(arm.pattern_name)
-        v.bk = sbk_tagged_binding(StrView { ptr: (name), len: (len) as i64 }, is_err)
+        v.bk = sbk_tagged_binding(name, is_err)
         # A float payload binds a float local, a struct payload a struct one.
-        sbk_payload_struct(sm, v, StrView { ptr: (name), len: (len) as i64 }, is_err)
+        sbk_payload_struct(sm, v, name, is_err)
         # AGAST #4265: one sema_arm_payload_ty typed (a struct, a user enum
         # such as fs's Errno) is what its type says, as the emitter has it.
         if v.bk == BK_UNSURE and v.kind != TypeKind.Unknown
             v.bk = sbk_of_ty(v.kind, v.type_name)
-    else if user_enum_index(sm.pctx, StrView { ptr: (name), len: (len) as i64 }) >= 0
-        let uf: *StructField = user_enum_tuple_field(sm.pctx, StrView { ptr: (name), len: (len) as i64 }, arm_variant_sel(sm.pctx, StrView { ptr: (name), len: (len) as i64 }, arm))
+    else if user_enum_index(sm.pctx, name) >= 0
+        let uf: *StructField = user_enum_tuple_field(sm.pctx, name, arm_variant_sel(sm.pctx, name, arm))
         if uf == null
             v.bk = BK_UNSURE
         else

@@ -423,10 +423,10 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> StrVi
     if src == null and init.kind == ExprKind.Binary and (init.op == OpKind.Add or init.op == OpKind.Sub)
         src = array_ptr_index_base(s, init.left)
     if src != null
-        return array_ptr_elem_view(src)
+        return array_ptr_elem_name(src)
     let pp: *LocalVar = array_ptr_ptr_deref_base(s, init)   # #2543: `let p = *r`
     if pp != null
-        return array_ptr_elem_view(pp)
+        return array_ptr_elem_name(pp)
     let pa: *Param = base_ptr_array(s, init)   # #2329
     if pa != null
         return pa.param_type_name
@@ -450,19 +450,13 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> StrVi
                     return StrView { ptr: lv_type_name(arr), len: lv_type_name_len(arr) as i64 }
                 # #2543: `let r = @q` with `q: *[N]S`, for name_array_ptr_local.
                 if array_ptr_index_base(s, oper) != null
-                    return array_ptr_elem_view(arr)
+                    return array_ptr_elem_name(arr)
             else
                 let garr: *GlobalVarDef = global_array_named(s, oper)
                 if garr != null
                     return garr.array_elem_type_name
         _ => pass
     no_name()
-
-# The S of the `*[N]S` / `**[N]S` local `loc`, as array_ptr_elem_name names it.
-fn array_ptr_elem_view(loc: *LocalVar) -> StrView
-    var len: i32 = 0
-    let name: *u8 = array_ptr_elem_name(loc, @len)
-    StrView { ptr: name, len: len as i64 }
 
 # AGAST #2564: `let e = v[i]` and `let e = x.vf[i]`, on a Vec, Span or String whose
 # element is a struct S held by value, is a copy of that S, as `let e: S = v[i]`.
@@ -750,10 +744,8 @@ pub fn infer_ctor_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     if is_tagged_ctor(s, init) == 0
         return 0
     if init.kind == ExprKind.Call
-        var uc_name: *u8 = null
-        var uc_len: i32 = 0
-        user_variant_ctor_enum(s.sym.mono.pctx, init, @uc_name, @uc_len)
-        if uc_name != null
+        let uc_name: StrView = user_variant_ctor_enum(s.sym.mono.pctx, init)
+        if uc_name.ptr != null
             return 0   # a user enum's own variant (#1797)
     let ret_name: StrView = StrView { ptr: (s.fcx.ret_type_name), len: (s.fcx.ret_type_name_len) as i64 }
     var name: StrView = ret_name
@@ -772,10 +764,8 @@ pub fn builtin_tagged_ctor(s: *EmitterState, e: *Expr) -> i32
     if is_tagged_ctor(s, e) == 0
         return 0
     if e.kind == ExprKind.Call
-        var uc_name: *u8 = null
-        var uc_len: i32 = 0
-        user_variant_ctor_enum(s.sym.mono.pctx, e, @uc_name, @uc_len)
-        if uc_name != null
+        let uc_name: StrView = user_variant_ctor_enum(s.sym.mono.pctx, e)
+        if uc_name.ptr != null
             return 0
     1
 
@@ -1063,8 +1053,8 @@ fn decl_pointee_array_elem_struct(dt: *DeclTy) -> i32
 fn decl_name_array_ptr_local(loc: *LocalVar, dt: *DeclTy, name_sv: StrView)
     let deep_ptr: bool = ref_to_ptr(loc) == 1 or lv_var_type(loc) == TypeKind.PtrPtr
     if lv_type_name_len(loc) > 0 and deep_ptr and decl_pointee_array_elem_struct(dt) == 1
-        lv_set_pointee_array_elem_name(loc, lv_type_name(loc), lv_type_name_len(loc))
-        lv_set_type_name(loc, null, 0)
+        lv_set_pointee_array_elem_name(loc, lv_name(loc))
+        lv_set_type_name(loc, strview_empty())
         return
     if lv_type_name_len(loc) > 0 or name_sv.ptr == null or name_sv.len <= 0
         return
@@ -1076,7 +1066,7 @@ fn decl_name_array_ptr_local(loc: *LocalVar, dt: *DeclTy, name_sv: StrView)
     let deep: bool = t == TypeKind.PtrPtr or ((t == TypeKind.Ref or t == TypeKind.MutRef) and dt.var_pointee_type == TypeKind.Ptr)
     let two: bool = deep and dt.var_inner_pointee_type == (TypeKind.Array as i32)
     if one or two
-        lv_set_pointee_array_elem_name(loc, name_sv.ptr, name_sv.len as i32)
+        lv_set_pointee_array_elem_name(loc, name_sv)
 
 # AGAST #2417: the signature of an un-annotated `let f = mb`, a bare fn
 # name: mb's own.  Without it a call `f(..)` was the untyped `call i64` and
@@ -1257,15 +1247,13 @@ pub fn decl_infer_array_lit(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type
 fn decl_infer_call(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: TypeKind) -> TypeKind
     var var_type: TypeKind = var_type_in
     # AGAST #1797: `let b = Holds(20)` is the user enum it builds.
-    var uc_name: *u8 = null
-    var uc_len: i32 = 0
-    user_variant_ctor_enum(s.sym.mono.pctx, stmt.var_init, @uc_name, @uc_len)
+    let uc_name: StrView = user_variant_ctor_enum(s.sym.mono.pctx, stmt.var_init)
     var fn_def: *FnDef = null
-    if uc_name != null
+    if uc_name.ptr != null
         var_type = TypeKind.Struct
         dt.var_type = TypeKind.Struct
-        dt.var_type_name = uc_name
-        dt.var_type_name_len = uc_len
+        dt.var_type_name = uc_name.ptr
+        dt.var_type_name_len = (uc_name.len as i32)
     else
         fn_def = find_call_fn(s, stmt.var_init)
     if fn_def != null and fn_def.return_type == TypeKind.PtrPtr

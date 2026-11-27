@@ -362,7 +362,6 @@ class RitzGenerator:
         self._emit('    p.heap_offset = 0')
         self._emit('    p.module = null')
         self._emit('    # Initialize all remaining Parser fields to prevent garbage values')
-        self._emit('    p.fn_return_type_name = strview_empty()')
         self._emit('    p.var_type_name = strview_empty()')
         self._emit('    p.var_pointee = TypeKind.Void')
         self._emit('    p.var_inner_pointee = 0')

@@ -130,12 +130,11 @@ fn bk_arms(s: *EmitterState, arms: *MatchArm) -> i32
 
 # What `e?` or `e.unwrap()` gives, for `e` an Option or Result.
 fn bk_payload_of(s: *EmitterState, e: *Expr) -> i32
-    var name: *u8 = null
-    var len: i32 = 0
-    bk_receiver(s, e, @name, @len)
-    if name == null or len <= 0 or is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
+    var name: StrView = strview_empty()
+    bk_receiver(s, e, @name)
+    if name.ptr == null or name.len <= 0 or is_tagged_enum_type(name) == 0
         return BK_UNSURE
-    bk_tagged_payload(StrView { ptr: (name), len: (len) as i64 }, 0)
+    bk_tagged_payload(name, 0)
 
 # The fn a method call dispatches to, or null.
 pub fn bk_method_def(s: *EmitterState, e: *Expr) -> *FnDef
@@ -146,14 +145,12 @@ pub fn bk_method_def(s: *EmitterState, e: *Expr) -> *FnDef
 
 # The type name method call `e` dispatches on, or `strview_empty()`.
 fn bk_method_recv(s: *EmitterState, e: *Expr) -> StrView
-    let recv: StrView = method_recv_type_name(s, e)
-    var tn: *u8 = recv.ptr
-    var tn_len: i32 = recv.len as i32
-    if tn == null or tn_len == 0
-        bk_receiver(s, e.left, @tn, @tn_len)
-    if tn == null or tn_len == 0
+    var tn: StrView = method_recv_type_name(s, e)
+    if tn.ptr == null or tn.len == 0
+        bk_receiver(s, e.left, @tn)
+    if tn.ptr == null or tn.len == 0
         return strview_empty()
-    StrView { ptr: (tn), len: (tn_len) as i64 }
+    tn
 
 fn bk_method(s: *EmitterState, e: *Expr) -> i32
     if name_eq(e.ident, "is_some") == 1 or name_eq(e.ident, "is_none") == 1
@@ -191,54 +188,46 @@ fn bk_call(s: *EmitterState, e: *Expr) -> i32
 
 # The struct `e` is, or points at, for the receiver forms member_field_def
 # leaves out: `(*p).f`, `a[i].f`, `(x as *S).f`.
-fn bk_receiver(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+fn bk_receiver(s: *EmitterState, e: *Expr, out: *StrView)
+    *out = strview_empty()
     if e.kind == ExprKind.Unary and e.op == OpKind.Deref
-        bk_receiver(s, e.operand, out_name, out_len)
+        bk_receiver(s, e.operand, out)
     else if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         # AGAST #3948: `(*(@x)).f` — the address carries x's own struct type,
         # as deref_pointee_struct_name reads it for the emitter's lowering.
-        bk_receiver(s, e.operand, out_name, out_len)
+        bk_receiver(s, e.operand, out)
     else if e.kind == ExprKind.Binary and (e.op == OpKind.Add or e.op == OpKind.Sub)
-        bk_receiver(s, e.left, out_name, out_len)
+        bk_receiver(s, e.left, out)
     else if e.kind == ExprKind.Index
         # AGAST #3948: the element's own struct, as member_field_def reads an
         # `a[i].f` base — a Vec's or Span's element, not the container's name.
         let elem_sv: StrView = index_elem_struct_name(s, e)
-        *out_name = elem_sv.ptr
-        *out_len = elem_sv.len as i32
-        if *out_name == null
-            bk_receiver(s, e.left, out_name, out_len)
+        *out = elem_sv
+        if out.ptr == null
+            bk_receiver(s, e.left, out)
     else if e.kind == ExprKind.Cast and (e.ident.len as i32) > 0
-        *out_name = e.ident.ptr
-        *out_len = e.ident.len as i32
+        *out = e.ident
     else
         match e.kind
             ExprKind.Ident =>
                 let idx: i32 = find_local_idx(s, e.ident)
                 if idx >= 0
                     let loc: *LocalVar = local_at(s, idx)
-                    *out_name = lv_type_name(loc)
-                    *out_len = lv_type_name_len(loc)
+                    *out = StrView { ptr: lv_type_name(loc), len: (lv_type_name_len(loc)) as i64 }
                 else
                     let g: *GlobalVarDef = find_global(s, e.ident)
                     if g != null
-                        *out_name = g.type_name.ptr
-                        *out_len = g.type_name.len as i32
+                        *out = g.type_name
             ExprKind.Member =>
                 let f: *StructField = member_field_def(s, e)
                 if f != null
                     if f.field_type == TypeKind.Array
-                        *out_name = f.array_elem_type_name.ptr
-                        *out_len = f.array_elem_type_name.len as i32
+                        *out = f.array_elem_type_name
                     else
-                        *out_name = f.field_type_name.ptr
-                        *out_len = f.field_type_name.len as i32
+                        *out = f.field_type_name
             _ =>
                 let resolved: StrView = resolve_expr_struct_name(s, e)
-                *out_name = resolved.ptr
-                *out_len = resolved.len as i32
+                *out = resolved
 
 fn bk_member(s: *EmitterState, e: *Expr) -> i32
     var f: *StructField = member_field_def(s, e)
@@ -248,12 +237,11 @@ fn bk_member(s: *EmitterState, e: *Expr) -> i32
         if ce != null
             return bk_of_type(ce.const_type, ce.type_name)
     if f == null
-        var name: *u8 = null
-        var len: i32 = 0
-        bk_receiver(s, e.left, @name, @len)
-        if name == null or len <= 0
+        var name: StrView = strview_empty()
+        bk_receiver(s, e.left, @name)
+        if name.ptr == null or name.len <= 0
             return BK_UNSURE
-        let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
+        let st: *StructDef = find_struct(s, name)
         if st == null
             return BK_UNSURE
         let idx: i32 = find_field_index(st, e.ident)

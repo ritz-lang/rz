@@ -267,18 +267,14 @@ pub fn resolve_expr_struct_name(s: *EmitterState, e: *Expr) -> StrView
             var other: i32 = 0
             let ei: i32 = bare_unit_variant_enum(s, e, @vi, @other)
             if ei >= 0
-                var en_len: i32 = 0
-                let en: *u8 = enum_name_at(s.sym.mono.pctx, ei, @en_len)
-                return StrView { ptr: en, len: en_len as i64 }
+                return enum_name_at(s.sym.mono.pctx, ei)
             return no_name()
         # Function-call return-type lookup.
         ExprKind.Call =>
             # AGAST #1797: a user-enum payload ctor `Holds(x)` is the enum.
-            var uv: *u8 = null
-            var uv_len: i32 = 0
-            user_variant_ctor_enum(s.sym.mono.pctx, e, @uv, @uv_len)
-            if uv != null
-                return StrView { ptr: uv, len: uv_len as i64 }
+            let uv: StrView = user_variant_ctor_enum(s.sym.mono.pctx, e)
+            if uv.ptr != null
+                return uv
             let fdr: *FnDef = find_call_fn(s, e)
             if fdr != null and fdr.return_type == TypeKind.Struct and fdr.return_type_name.len > 0
                 return fdr.return_type_name
@@ -549,9 +545,7 @@ pub fn resolve_member_chain_field(s: *EmitterState, e: *Expr) -> *StructField
                 # there was no `%E` to its consumers: `g.f as i32` truncated it
                 # as an i64.
                 else if mglob != null
-                    var gp_len: i32 = 0
-                    let gp: *u8 = global_pointee_struct(mglob, @gp_len)
-                    sname = StrView { ptr: gp, len: gp_len as i64 }
+                    sname = global_pointee_struct(mglob)
         ExprKind.Member =>
             # Recurse: resolve parent's field, then dereference into the field's struct
             let parent_field: *StructField = resolve_member_chain_field(s, e.left)
@@ -990,9 +984,7 @@ pub fn member_field_def(s: *EmitterState, e: *Expr) -> *StructField
                     # AGAST #1554: `g.f` with `var g: *S` / `@S`.  Unnamed,
                     # `g.items + 1` on an `items: *D` field strode 1 byte, SILENT.
                     if recv.ptr == null
-                        var gp_len: i32 = 0
-                        let gp: *u8 = global_pointee_struct(glob, @gp_len)
-                        recv = StrView { ptr: gp, len: gp_len as i64 }
+                        recv = global_pointee_struct(glob)
                 else
                     # AGAST #3824: `K.f` on a struct const.  Unnamed, `K.ptr + 4`
                     # was untyped and `*(K.ptr + 4)` loaded an i64, SILENT.
@@ -1057,9 +1049,8 @@ fn get_ptr_elem_size(s: *EmitterState, e: *Expr) -> i64
             if lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.Ref or lv_var_type(loc) == TypeKind.MutRef
                 # AGAST #2330, LARB R9: `p + i` on a `*[N]T` walks rows, at stride `[N]T`.
                 if lv_pointee_type(loc) == TypeKind.Array and lv_pointee_array_size(loc) > 0
-                    var row_len: i32 = 0
-                    let row_name: *u8 = array_ptr_elem_name(loc, @row_len)   # #2548
-                    let row_elem: i64 = ptr_pointee_size(s, lv_pointee_array_elem_type(loc), StrView { ptr: (row_name), len: (row_len) as i64 })
+                    let row_name: StrView = array_ptr_elem_name(loc)   # #2548
+                    let row_elem: i64 = ptr_pointee_size(s, lv_pointee_array_elem_type(loc), row_name)
                     if row_elem > 0
                         return row_elem * (lv_pointee_array_size(loc) as i64)
                 let size: i64 = ptr_pointee_size(s, lv_pointee_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
@@ -2175,10 +2166,8 @@ pub fn synth_slot_ty(s: *EmitterState, e: *Expr) -> TypeKind
                 return mem_builtin_result_type(s, e, mem_id)
             # AGAST #3995: a user-enum variant ctor `One(3)` / `Rect(3, 4)` is
             # its enum, as emit_expr_call builds it ahead of any fn of the name.
-            var uen: *u8 = null
-            var uen_len: i32 = 0
-            user_enum_ctor_call(s.sym.mono.pctx, e, @uen, @uen_len)
-            if uen != null
+            let uen: StrView = user_enum_ctor_call(s.sym.mono.pctx, e)
+            if uen.ptr != null
                 return TypeKind.Struct
             # Look up function return type
             # Build full function name with type suffix if generic
@@ -2930,9 +2919,7 @@ pub fn deref_pointee_struct_name(s: *EmitterState, op: *Expr) -> StrView
                 # type_name is set only for a by-value `var g: S`.  Reading
                 # type_name gave null here, so `G + i` strode 1 byte.  #1554:
                 # and an `@S` / `@&S` global, whose `*g` loaded i64.
-                var gp_len: i32 = 0
-                let gp: *u8 = global_pointee_struct(glob, @gp_len)
-                cand = StrView { ptr: gp, len: gp_len as i64 }
+                cand = global_pointee_struct(glob)
         ExprKind.Index =>
             # AGAST #2332: `*a[i]` / `*(a[i] + k)` with `a: [N]*S`.
             cand = array_elem_pointee(s, base).name
@@ -3182,9 +3169,8 @@ pub fn vec_name_elem_type(name: StrView) -> TypeKind
 
 pub fn enum_declares_variant(ctx: *ParseCtx, ei: i32, name_sv: StrView) -> i32
     for vi in 0..enum_variant_count(ctx, ei)
-        var vlen: i32 = 0
-        let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
-        if name_eq(StrView { ptr: (vname), len: (vlen) as i64 }, name_sv) == 1
+        let vname: StrView = enum_variant_name(ctx, ei, vi)
+        if name_eq(vname, name_sv) == 1
             return 1
     0
 
@@ -3221,7 +3207,7 @@ pub fn match_scrutinee_builds(s: *EmitterState, e: *Expr) -> i32
     var len: i32 = 0
     match e.kind
         ExprKind.Call =>
-            user_variant_ctor_enum(s.sym.mono.pctx, e, @name, @len)
+            name = user_variant_ctor_enum(s.sym.mono.pctx, e).ptr
         ExprKind.Method =>
             qualified_variant_enum(s, e, @name, @len)
         _ => pass
@@ -3247,9 +3233,7 @@ pub fn generic_ctor_enum(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
     let ei: i32 = generic_enum_of_variant(s.sym.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, out_vi)
     if ei < 0
         return 0 - 1
-    var en_len: i32 = 0
-    let en_ptr: *u8 = enum_name_at(s.sym.mono.pctx, ei, @en_len)
-    let en: StrView = StrView { ptr: en_ptr, len: en_len as i64 }
+    let en: StrView = enum_name_at(s.sym.mono.pctx, ei)
     if en.eq("Option") or en.eq("Result")
         return 0 - 1
 

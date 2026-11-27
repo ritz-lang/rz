@@ -122,11 +122,9 @@ fn sema_call_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
         return sema_ty_none(t)
     # AGAST #3995: a user-enum variant ctor `One(3)` builds its enum, ahead
     # of a local or fn of that name (emit_expr_call's order).
-    var en: *u8 = null
-    var en_len: i32 = 0
-    user_enum_ctor_call(sm.pctx, e, @en, @en_len)
-    if en != null
-        return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (en), len: (en_len) as i64 }, TypeKind.Void, null)
+    let en: StrView = user_enum_ctor_call(sm.pctx, e)
+    if en.ptr != null
+        return sema_ty_set(t, TypeKind.Struct, en, TypeKind.Void, null)
     # A call through a local is its signature's, never a fn of that name.
     let v: *SemaVar = sema_find_local(sm, e.func_name)
     if v != null
@@ -565,37 +563,33 @@ fn sema_tagged_primitive_payload(name_sv: StrView, is_err: i32) -> TypeKind
 # AGAST #4448: the primitive `T` a one-level pointer payload points at, for a
 # mangled `ptr_T` argument; TypeKind.Void otherwise.  As the emitter's
 # carrier_payload_ptr_primitive reads it.
-fn sema_ptr_primitive_name(name: *u8, len: i32) -> TypeKind
-    if len <= 4 or not (StrView { ptr: (name), len: (len) as i64 }).starts_with("ptr_")
+fn sema_ptr_primitive_name(name: StrView) -> TypeKind
+    if name.len <= 4 or not name.starts_with("ptr_")
         return TypeKind.Void
-    primitive_type_from_name(StrView { ptr: (name + 4), len: (len - 4) as i64 })
+    primitive_type_from_name(name.skip(4))
 
 # AGAST #4448: the primitive pointer kind `Option<*T>` / `Result<*T, E>`
 # carries in its Some / Ok (is_err 0) or Err (is_err 1) payload, or
 # TypeKind.Void.  The emitter binds such an arm's `n` as a `*T` local; without
 # this, Sema left the binding unknown and the checks read it as an i64.
-fn sema_tagged_pointer_payload(name: *u8, len: i32, is_err: i32) -> TypeKind
-    var d: i32 = 0
-    while d < len and *(name + d) != '$'
-        d += 1
-    if d >= len
+fn sema_tagged_pointer_payload(name: StrView, is_err: i32) -> TypeKind
+    let d: i64 = name.find_byte('$')
+    if d >= name.len
         return TypeKind.Void
-    let sfx: *u8 = name + d + 1
-    let sfx_len: i32 = len - d - 1
-    if name_eq(StrView { ptr: (name), len: (d) as i64 }, "Option") == 1
+    let base: StrView = name.take(d)
+    let sfx: StrView = name.skip(d + 1)
+    if base.eq("Option")
         if is_err == 1
             return TypeKind.Void
-        return sema_ptr_primitive_name(sfx, sfx_len)
-    if name_eq(StrView { ptr: (name), len: (d) as i64 }, "Result") == 0
+        return sema_ptr_primitive_name(sfx)
+    if not base.eq("Result")
         return TypeKind.Void
-    var cut: i32 = 0
-    while cut < sfx_len
-        if *(sfx + cut) == '$'
-            if is_err == 0
-                return sema_ptr_primitive_name(sfx, cut)
-            return sema_ptr_primitive_name(sfx + cut + 1, sfx_len - cut - 1)
-        cut += 1
-    TypeKind.Void
+    let cut: i64 = sfx.find_byte('$')
+    if cut >= sfx.len
+        return TypeKind.Void
+    if is_err == 0
+        return sema_ptr_primitive_name(sfx.take(cut))
+    sema_ptr_primitive_name(sfx.skip(cut + 1))
 
 # A match arm's binding `V(x)` on `scrut`: V's payload.  Unknown for a
 # catch-all name, as the emitter left it: a `match` on a struct value is
@@ -630,7 +624,7 @@ pub fn sema_named_payload_ty(sm: *Sema, arm: *MatchArm, name_sv: StrView, t: *Se
             return sema_ty_set(t, TypeKind.Struct, en_sv, TypeKind.Void, null)
         # AGAST #4448: a one-level pointer payload (`Option<*u8>`'s
         # `Some(n)`) is that `*T`, as the emitter binds the local.
-        let pk_ptr: TypeKind = sema_tagged_pointer_payload(s.name.ptr, (s.name.len as i32), is_err)
+        let pk_ptr: TypeKind = sema_tagged_pointer_payload(s.name, is_err)
         if pk_ptr != TypeKind.Void
             return sema_ty_set(t, TypeKind.Ptr, strview_empty(), pk_ptr, null)
         # AGAST #4410: a primitive payload (`Option<f64>`'s `Some(v)`,
@@ -2127,10 +2121,8 @@ fn sx_call_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
         return sx_mem_pointee(sm, e.args)
     if name_eq(e.func_name, "xgetbv") == 1
         return TypeKind.U64   # AGAST #4657
-    var en: *u8 = null
-    var en_len: i32 = 0
-    user_enum_ctor_call(sm.pctx, e, @en, @en_len)
-    if en != null
+    let en: StrView = user_enum_ctor_call(sm.pctx, e)
+    if en.ptr != null
         return TypeKind.Struct
     let fd: *FnDef = sx_call_fn(sm, e)
     if fd != null
