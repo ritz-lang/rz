@@ -1121,21 +1121,21 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
     var src: Vec<u8> = read_source_file(file)
     if src.len == 0
         return null
+    # The source's text, without the NUL read_source_file appends.
+    let src_text: StrView = StrView { ptr: src.data, len: src.len - 1 }
 
     # Its store key is a sha256 of the source: computed once, for the
     # lookup and for the store on a miss (AGAST #4851).
-    var text_path: String = iface_text_path(StrView { ptr: (src.data), len: (src.len - 1) })
+    var text_path: String = iface_text_path(src_text)
     var text: Vec<u8> = read_iface_text(@&text_path)
-    var lex_buf: *u8 = src.data
-    var lex_len: i64 = src.len - 1
+    var lex_text: StrView = src_text
     if text.len > 0
-        lex_buf = text.data
-        lex_len = text.len - 1
+        lex_text = StrView { ptr: text.data, len: text.len - 1 }
     else
         parse_log_note(file)
 
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
-    let lex_err: i32 = tokenize(file, StrView { ptr: (lex_buf), len: (lex_len) }, @tokens)
+    let lex_err: i32 = tokenize(file, lex_text, @tokens)
     if lex_err > 0
         err2("Lexer errors in: ", file)
         return null
@@ -1143,7 +1143,7 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
     # A miss: the interface text, from the tokens as the lexer made them.
     var made: Vec<u8> = vec_new<u8>()
     var made_ok: bool = false
-    if text.len == 0 and iface_text_build(StrView { ptr: (src.data), len: (src.len - 1) }, tokens.data, tokens.len, @&made) == 0
+    if text.len == 0 and iface_text_build(src_text, tokens.data, tokens.len, @&made) == 0
         made_ok = true
 
     # AGAST #4609: the twins this file sees, renamed for the second pass;
@@ -1159,24 +1159,23 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
     # The cached IR depends on the interface text (AGAST #1807, #2113): the
     # one read, or the one stored now.  If none could be stored, on the
     # source's bytes, which fn_cache's check reads when there is no text.
-    var dep_buf: *u8 = src.data
-    var dep_len: i64 = src.len - 1
+    var dep_text: StrView = src_text
     if text.len > 0
-        iface_fix_extern_decls(mod, StrView { ptr: (lex_buf), len: (lex_len) }, StrView { ptr: (src.data), len: (src.len - 1) })   # AGAST #3419
-        dep_buf = text.data
-        dep_len = text.len - 1
+        # lex_text is the interface text here.
+        iface_fix_extern_decls(mod, lex_text, src_text)   # AGAST #3419
+        dep_text = lex_text
     else if made_ok
         # Stored only once the source has parsed, as ritz0 does.
-        if iface_text_store(@&text_path, StrView { ptr: (made.data), len: (made.len) }) == 0
-            dep_buf = made.data
-            dep_len = made.len
+        let made_text: StrView = StrView { ptr: made.data, len: made.len }
+        if iface_text_store(@&text_path, made_text) == 0
+            dep_text = made_text
     if add_enum_from_fns(ctx, mod, file) < 0
         return null
 
-    dep_record_note(file, StrView { ptr: (dep_buf), len: (dep_len) })
+    dep_record_note(file, dep_text)
 
     # Keep the lexed buffer alive: AST nodes point into it.
-    keep_source_alive(lex_buf)
+    keep_source_alive(lex_text.ptr)
     src.data = null  # Prevent Vec Drop from freeing.
     text.data = null
 
@@ -1678,14 +1677,16 @@ pub fn main(argv: Span<StrView>) -> i32
     var src: Vec<u8> = read_source_file(args.input_path)
     if src.len == 0
         return 1
+    # The source's text, without the NUL read_source_file appends.
+    let src_text: StrView = StrView { ptr: src.data, len: src.len - 1 }
 
     # The interface text alone: lexed, never parsed (AGAST #2113).
     if args.iface_text == 1
         var itoks: Vec<Token> = vec_with_cap<Token>(24000)
-        if tokenize(args.input_path, StrView { ptr: (src.data), len: (src.len - 1) }, @itoks) > 0
+        if tokenize(args.input_path, src_text, @itoks) > 0
             return 1
         var itext: Vec<u8> = vec_new<u8>()
-        if iface_text_build(StrView { ptr: (src.data), len: (src.len - 1) }, itoks.data, itoks.len, @&itext) < 0
+        if iface_text_build(src_text, itoks.data, itoks.len, @&itext) < 0
             err2("Error: a declared fn has no body lines in: ", args.input_path)
             return 1
         if write_output_file(args.output_path, StrView { ptr: (itext.data), len: (itext.len) }) < 0
@@ -1706,7 +1707,7 @@ pub fn main(argv: Span<StrView>) -> i32
     # no-op rebuilds (full-stack 12m30s → ~30s).
     # Test mode's IR is not the module's: it neither reads nor writes the sig
     # (ritz0 skips its fn cache in test mode too).
-    if parse_only == 0 and args.test_table == 0 and check_source_unchanged(args.input_path, StrView { ptr: (src.data), len: (src.len - 1) }, args.output_path, cache_fp) == 1
+    if parse_only == 0 and args.test_table == 0 and check_source_unchanged(args.input_path, src_text, args.output_path, cache_fp) == 1
         var skip_msg: String = string_from("Skipped (unchanged): ")
         skip_msg.push_str(args.input_path)
         println_string(@skip_msg)
@@ -1717,7 +1718,7 @@ pub fn main(argv: Span<StrView>) -> i32
     parse_log_note(args.input_path)
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
     let lex_start: i64 = if parse_only == 1 then now_nanos() else 0
-    let lex_errors: i32 = tokenize(args.input_path, StrView { ptr: (src.data), len: (src.len - 1) }, @tokens)
+    let lex_errors: i32 = tokenize(args.input_path, src_text, @tokens)
     let lex_end: i64 = if parse_only == 1 then now_nanos() else 0
     if lex_errors > 0
         var msg: String = string_from("Lexer errors: ")
@@ -1933,7 +1934,7 @@ pub fn main(argv: Span<StrView>) -> i32
         return 0
     var sig_out: *SigData = sig_data_new()
     if sig_out != null
-        sig_out.source_hash = source_file_hash(StrView { ptr: (src.data), len: (src.len - 1) })
+        sig_out.source_hash = source_file_hash(src_text)
         # Stamp the sig with *this* binary's identity (AGAST #1279).  Without
         # it the cache is keyed on the source alone, so a rebuilt ritz1 reuses
         # IR emitted by the compiler it replaced.
