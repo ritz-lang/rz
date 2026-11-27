@@ -67,19 +67,12 @@ fn asm_is_name_char(c: i32) -> i32
 # without `: reg`.  The kind word is judged in stmt_asm: `in` is a keyword,
 # the others are IDENTs.  For `clobber r11` the register is the "name".
 pub fn asm_clause_new(p: *Parser, kind_sv: StrView, kline: i32, kcol: i32, name_sv: StrView, line: i32, col: i32, reg_sv: StrView, rline: i32, rcol: i32) -> *AsmOperand
-    var kind: *u8 = kind_sv.ptr
-    var kind_len: i32 = kind_sv.len as i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     var reg: *u8 = reg_sv.ptr
-    var reg_len: i32 = reg_sv.len as i32
     let o: *AsmOperand = parser_alloc(p, sizeof(AsmOperand)) as *AsmOperand
-    o.name = name
-    o.name_len = name_len
+    o.name = name_sv
     o.span.line = line
     o.span.col = col
-    o.kind = kind
-    o.kind_len = kind_len
+    o.kind = kind_sv
     o.kind_span.line = kline
     o.kind_span.col = kcol
     o.dir = ASM_UNKNOWN
@@ -92,8 +85,7 @@ pub fn asm_clause_new(p: *Parser, kind_sv: StrView, kline: i32, kcol: i32, name_
     else if kind_sv.eq("clobber")
         o.dir = ASM_CLOBBER
     o.reg = ASM_REG_NONE
-    o.reg_name = reg
-    o.reg_name_len = reg_len
+    o.reg_name = reg_sv
     o.reg_span.line = rline
     o.reg_span.col = rcol
     if reg != null
@@ -125,10 +117,9 @@ pub fn asm_line_link(first: *AsmLine, rest: *AsmLine) -> *AsmLine
 
 # The operand of `b` named `name`, or null.
 fn asm_find_operand(b: *AsmBlock, name_sv: StrView) -> *AsmOperand
-    var len: i32 = name_sv.len as i32
     var o: *AsmOperand = b.operands
     while o != null
-        if (StrView { ptr: (o.name), len: (o.name_len) as i64 }).eq(name_sv)
+        if (o.name).eq(name_sv)
             return o
         o = o.next
     null
@@ -169,25 +160,25 @@ fn asm_take_clauses(ctx: *ParseCtx, b: *AsmBlock, clauses: *AsmOperand, report: 
             b.first_clause = o.kind_span
         if o.dir == ASM_UNKNOWN
             if report == 1
-                asm_error(ctx, o.kind_span.line, o.kind_span.col, "unknown asm clause '", StrView { ptr: (o.kind), len: (o.kind_len) as i64 }, "' (in, out, inout or clobber)")
+                asm_error(ctx, o.kind_span.line, o.kind_span.col, "unknown asm clause '", o.kind, "' (in, out, inout or clobber)")
         else if o.dir == ASM_CLOBBER
-            if o.reg_name != null
+            if o.reg_name.ptr != null
                 if report == 1
-                    asm_error(ctx, o.reg_span.line, o.reg_span.col, "'clobber' takes one register, not '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, ": ...'")
+                    asm_error(ctx, o.reg_span.line, o.reg_span.col, "'clobber' takes one register, not '", o.name, ": ...'")
             else
-                let reg: i32 = asm_reg_index(StrView { ptr: (o.name), len: (o.name_len) as i64 })
-                if asm_reg_ok(ctx, reg, StrView { ptr: (o.name), len: (o.name_len) as i64 }, o.span, report) == 1
+                let reg: i32 = asm_reg_index(o.name)
+                if asm_reg_ok(ctx, reg, o.name, o.span, report) == 1
                     b.clobbers = b.clobbers | (1 << reg)
-        else if asm_find_operand(b, StrView { ptr: (o.name), len: (o.name_len) as i64 }) != null
+        else if asm_find_operand(b, o.name) != null
             if report == 1
-                asm_error(ctx, o.span.line, o.span.col, "'", StrView { ptr: (o.name), len: (o.name_len) as i64 }, "' is named in two asm clauses")
+                asm_error(ctx, o.span.line, o.span.col, "'", o.name, "' is named in two asm clauses")
         else
-            if o.reg_name != null
-                if asm_reg_ok(ctx, o.reg, StrView { ptr: (o.reg_name), len: (o.reg_name_len) as i64 }, o.reg_span, report) == 0
+            if o.reg_name.ptr != null
+                if asm_reg_ok(ctx, o.reg, o.reg_name, o.reg_span, report) == 0
                     o.reg = ASM_REG_NONE
                 else if (pinned & (1 << o.reg)) != 0
                     if report == 1
-                        asm_error(ctx, o.reg_span.line, o.reg_span.col, "asm register '", StrView { ptr: (o.reg_name), len: (o.reg_name_len) as i64 }, "' is pinned twice")
+                        asm_error(ctx, o.reg_span.line, o.reg_span.col, "asm register '", o.reg_name, "' is pinned twice")
                 else
                     pinned = pinned | (1 << o.reg)
             asm_append_operand(b, o)
@@ -230,18 +221,15 @@ fn asm_scan_line(p: *Parser, b: *AsmBlock, l: *AsmLine, report: i32)
                 var o: *AsmOperand = asm_find_operand(b, StrView { ptr: (name), len: (len) as i64 })
                 if o == null
                     o = parser_alloc(p, sizeof(AsmOperand)) as *AsmOperand
-                    o.name = name
-                    o.name_len = len
+                    o.name = StrView { ptr: name, len: len as i64 }
                     o.span.line = l.span.line
                     o.span.col = l.span.col + i + 1
                     o.dir = ASM_IN
                     o.reg = ASM_REG_NONE
-                    o.reg_name = null
-                    o.reg_name_len = 0
+                    o.reg_name = strview_empty()
                     o.in_clause = 0
                     o.text_span.line = 0
-                    o.kind = null
-                    o.kind_len = 0
+                    o.kind = strview_empty()
                     asm_append_operand(b, o)
                 if o.text_span.line == 0
                     o.text_span.line = l.span.line
@@ -266,15 +254,13 @@ fn asm_scan_line(p: *Parser, b: *AsmBlock, l: *AsmLine, report: i32)
 # Grammar action for an asm block (LANGUAGE_SPEC §18.6, AGAST #3394).
 pub fn stmt_asm(p: *Parser, arch_sv: StrView, aline: i32, acol: i32, clauses: *AsmOperand, lines: *AsmLine, line: i32, col: i32) -> *Stmt
     var arch: *u8 = arch_sv.ptr
-    var arch_len: i32 = arch_sv.len as i32
     # A block the parser backtracked over and builds again is not re-reported.
     var report: i32 = 0
     if p.ctx.asm_last_block == null or (arch as i64) > (p.ctx.asm_last_block as i64)
         report = 1
         p.ctx.asm_last_block = arch
     let b: *AsmBlock = parser_alloc(p, sizeof(AsmBlock)) as *AsmBlock
-    b.arch = arch
-    b.arch_len = arch_len
+    b.arch = arch_sv
     b.lines = lines
     b.operands = null
     b.clobbers = 0
@@ -292,8 +278,8 @@ pub fn stmt_asm(p: *Parser, arch_sv: StrView, aline: i32, acol: i32, clauses: *A
     # An unpinned clause operand has no register but the one {name} picks.
     var o: *AsmOperand = b.operands
     while o != null
-        if o.in_clause == 1 and o.reg_name == null and o.text_span.line == 0 and report == 1
-            asm_error(p.ctx, o.span.line, o.span.col, "asm operand '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, "' is in a clause but not in the text: write {name} or pin it to a register")
+        if o.in_clause == 1 and o.reg_name.ptr == null and o.text_span.line == 0 and report == 1
+            asm_error(p.ctx, o.span.line, o.span.col, "asm operand '", o.name, "' is in a clause but not in the text: write {name} or pin it to a register")
         o = o.next
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = StmtKind.Asm
@@ -317,7 +303,7 @@ pub fn asm_check_naked(ctx: *ParseCtx, f: *FnDef)
             var o: *AsmOperand = b.operands
             while o != null
                 if o.text_span.line != 0
-                    asm_error(ctx, o.text_span.line, o.text_span.col, "an asm block in a [[naked]] fn takes no {name}: '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, "' has no frame to live in")
+                    asm_error(ctx, o.text_span.line, o.text_span.col, "an asm block in a [[naked]] fn takes no {name}: '", o.name, "' has no frame to live in")
                 o = o.next
         st = st.next
 

@@ -1000,7 +1000,7 @@ pub fn tn_note_tok(p: *Parser, tok: Token)
 fn tn_note_args(p: *Parser, ga: *GenericArg)
     var cur: *GenericArg = ga
     while cur != null
-        tn_note(p, StrView { ptr: (cur.written), len: (cur.written_len) as i64 })
+        tn_note(p, cur.written)
         cur = cur.next
 
 # cast_type_end_check: a cast's type ran on into a comparison (`a as Id < b,
@@ -1378,13 +1378,13 @@ pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token) -> StrView
 # the bytes' address in *out.
 pub fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
     if ga.ty == TypeKind.Struct or ga.ty == TypeKind.Ptr or ga.ty == TypeKind.PtrPtr or ga.ty == TypeKind.Array or ga.ty == TypeKind.Void or ga.ty == TypeKind.Ref or ga.ty == TypeKind.MutRef
-        *out = ga.name
-        return ga.name_len
+        *out = ga.name.ptr
+        return ga.name.len as i32
     # AGAST #2198: `usize` / `isize`, as written (`Vec$usize`).  AGAST #3464:
     # `usize` is TypeKind.U64 now; its spelling is unchanged.
-    if (ty_int_bits(ga.ty) == 64) and ga.name != null and ga.name_len > 0
-        *out = ga.name
-        return ga.name_len
+    if (ty_int_bits(ga.ty) == 64) and ga.name.ptr != null and (ga.name.len as i32) > 0
+        *out = ga.name.ptr
+        return ga.name.len as i32
     # AGAST #4780: primitive_arg_spelling's out-param is `*StrView`; this
     # fn's own `out` stays `**u8` (its other branches hand back `ga.name`,
     # a `*u8` AST field — #4773's territory), so unwrap at the boundary.
@@ -1450,7 +1450,7 @@ pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericAr
     tn_note_base(p, base_name_sv)   # AGAST #4654
     var cur: *GenericArg = ga
     while cur != null
-        tn_note(p, StrView { ptr: (cur.written), len: (cur.written_len) as i64 })   # AGAST #4021
+        tn_note(p, cur.written)   # AGAST #4021
         cur = cur.next
     let mangled_sv: StrView = mangle_generic_args(p, base_name_sv, ga)
     if p.skip_item == 0
@@ -1483,10 +1483,8 @@ pub fn generic_use_note(ctx: *ParseCtx, name_sv: StrView, suffix_sv: StrView, ar
     if name == null or name_len <= 0 or suffix == null or suffix_len <= 0
         return
     let u: *GenericUse = malloc(sizeof(GenericUse)) as *GenericUse
-    u.name = name
-    u.name_len = name_len
-    u.suffix = suffix
-    u.suffix_len = suffix_len
+    u.name = name_sv
+    u.suffix = suffix_sv
     u.args = args
     u.at = at
     u.file = file
@@ -2016,20 +2014,17 @@ pub fn cast_tail_new(p: *Parser, tr: *TypeRef, next: *CastTail, as_line: i32, as
     if next == null and ty == TypeKind.Ptr and f.pointee_type == TypeKind.Array
         ct.ptr_array = ptr_array_of_type(p, tr)
     ct.pointee_type = (TypeKind.Void as i32)
-    ct.pointee_name = null
-    ct.pointee_name_len = 0
+    ct.pointee_name = strview_empty()
     # AGAST #1453: record the pointee of `as *T` for the outermost cast only —
     # earlier tails stay unknown rather than pick up a later type's name.
     if next == null and ty == TypeKind.Ptr
         ct.pointee_type = (f.pointee_type as i32)
         if f.pointee_type == TypeKind.Struct
-            ct.pointee_name = f.type_name
-            ct.pointee_name_len = f.type_name_len
+            ct.pointee_name = StrView { ptr: f.type_name, len: f.type_name_len as i64 }
     # AGAST #3443: and the struct of `as @S` / `as @&S`.
     if next == null and (ty == TypeKind.Ref or ty == TypeKind.MutRef) and f.ref_inner_type == TypeKind.Struct
         ct.pointee_type = (TypeKind.Struct as i32)
-        ct.pointee_name = f.type_name
-        ct.pointee_name_len = f.type_name_len
+        ct.pointee_name = StrView { ptr: f.type_name, len: f.type_name_len as i64 }
     # AGAST #3757: and the scalar of `as @T` / `as @&T` (`(p as @&i32)[i] = v`
     # strides by it).
     if next == null and (ty == TypeKind.Ref or ty == TypeKind.MutRef) and primitive_name_len(f.ref_inner_type) > 0
@@ -2037,15 +2032,13 @@ pub fn cast_tail_new(p: *Parser, tr: *TypeRef, next: *CastTail, as_line: i32, as
     # AGAST #2288: and the struct of `as C`, so `c as C` with `c:& C` can
     # read the referent.  pointee_type stays TypeKind.Void: there's no pointee.
     if next == null and ty == TypeKind.Struct
-        ct.pointee_name = f.type_name
-        ct.pointee_name_len = f.type_name_len
+        ct.pointee_name = StrView { ptr: f.type_name, len: f.type_name_len as i64 }
     # AGAST #2544: and of `as **S` (`***S`, ...): pointee_type is the packed
     # inner-pointee slot a `**S` local records (ptr_ptr_inner_pointee).
     if next == null and ty == TypeKind.PtrPtr
         ct.pointee_type = ptr_ptr_inner_pointee(p, tr)
         if ptr_ptr_slot_inner(ct.pointee_type) == TypeKind.Struct
-            ct.pointee_name = f.type_name
-            ct.pointee_name_len = f.type_name_len
+            ct.pointee_name = StrView { ptr: f.type_name, len: f.type_name_len as i64 }
     return ct
 
 # AGAST #3435: the grammar's block_ended.  Matches nothing, and fails unless
@@ -2119,7 +2112,7 @@ pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
     while ct != null
         result = expr_cast(p, result, ct.cast_type, ct.cast_pointee)
         result.cast_ptr_kind = ct.pointee_type
-        result.ident = StrView { ptr: ct.pointee_name, len: ct.pointee_name_len as i64 }
+        result.ident = ct.pointee_name
         result.fn_sig = ct.fn_sig
         result.cast_array = ct.array
         result.cast_ptr_array = ct.ptr_array   # AGAST #4122
@@ -2149,11 +2142,9 @@ pub fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
 pub fn generic_tok_arg(p: *Parser, tok: Token) -> *GenericArg
     let ga: *GenericArg = parser_alloc(p, sizeof(GenericArg)) as *GenericArg
     ga.ty = TypeKind.Void
-    ga.name = null
-    ga.name_len = 0
+    ga.name = strview_empty()
     ga.next = null
-    ga.written = tok.start
-    ga.written_len = tok.len
+    ga.written = StrView { ptr: tok.start, len: tok.len as i64 }
     ga.at = diag_span(tok.line, tok.col)
     ga
 
@@ -2210,14 +2201,13 @@ pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *Po
 # own kinds (f32/f64; usize/isize, AGAST #2198).  A generic instantiation's
 # captured name contains '$' and is a type whatever its case.
 fn generic_arg_is_value_like(ga: *GenericArg) -> i32
-    if ga.ty != TypeKind.Struct or ga.name == null or ga.name_len <= 0
+    if ga.ty != TypeKind.Struct or ga.name.ptr == null or ga.name.len <= 0
         return 0
-    let c0: u8 = *ga.name
+    let c0: u8 = *ga.name.ptr
     if c0 != '_' and (c0 < 'a' or c0 > 'z')  # not '_' and not 'a'..'z'
         return 0
-    for i in 0..ga.name_len
-        if *(ga.name + i) == '$'  # '$'
-            return 0
+    if ga.name.find_byte('$') < ga.name.len   # a generic instance's mangled name
+        return 0
     return 1
 
 # Generic call with a full type-argument list (AGAST #1612): `second<i64,
@@ -2391,11 +2381,8 @@ pub fn apply_postfix_paren_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
 # =============================================================================
 
 pub fn field_init_new(p: *Parser, name_sv: StrView, val: *Expr) -> *FieldInit
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let f: *FieldInit = parser_alloc(p, sizeof(FieldInit)) as *FieldInit
-    f.name = name as *u8
-    f.name_len = len
+    f.name = name_sv
     f.value = val
     f.next = null
     return f
@@ -2475,21 +2462,16 @@ pub fn named_forms_reset(ctx: *ParseCtx)
 
 # `head` is where the form begins: the qualifier of `E.V { .. }`.
 fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv: StrView)
-    var qual: *u8 = qual_sv.ptr
-    var qual_len: i32 = qual_sv.len as i32
     if p.skip_item != 0
         return
     let f: *NamedForm = parser_alloc(p, sizeof(NamedForm)) as *NamedForm
     f.arm = arm
     f.lit = lit
     if arm != null
-        f.name = arm.pattern_name.ptr
-        f.name_len = arm.pattern_name.len as i32
+        f.name = arm.pattern_name
     else
-        f.name = lit.ident.ptr
-        f.name_len = lit.ident.len as i32
-    f.qual = qual
-    f.qual_len = qual_len
+        f.name = lit.ident
+    f.qual = qual_sv
     f.span.line = head.line
     f.span.col = head.col
     f.file = parse_file_copy_shared(p)
