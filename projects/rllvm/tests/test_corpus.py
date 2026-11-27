@@ -46,13 +46,9 @@ FREESTANDING = {
     "freestanding/kernel.ll": ("freestanding/kernel.ld", False),
     "freestanding/large.ll": ("freestanding/linker.ld", True),
 }
-# Entries whose remaining gap is another ticket's lowering, named in the
-# xfail. abi_a/abi_b: the call ABI is done; their bodies use float and vector
-# arithmetic (fadd, fmul, fptrunc, extractelement).
-WAITS_ON = {
-    "hosted/abi_a.ll": "#4805 float and vector lowering",
-    "hosted/abi_b.ll": "#4805 float and vector lowering",
-}
+# Entries rllvm must compile: exit 2 on one is a failure, never an xfail.
+# abi_a/abi_b: the call ABI (#4804) linked against clang's object both ways.
+REQUIRED = {"hosted/abi_a.ll", "hosted/abi_b.ll"}
 LINUX_SHIM = "hosted/shim.ll"
 HARLAND_SHIM = "freestanding/harland_start.ll"
 
@@ -115,13 +111,13 @@ def rllvm() -> list[str]:
 
 
 def rllvm_compile(rllvm: list[str], rel: str, root: Path) -> Path:
-    """rllvm's object for `rel`, its relocations checked; xfail on exit 2."""
+    """rllvm's object for `rel`, its relocations checked; xfail on exit 2
+    unless `rel` is REQUIRED."""
     e = c.entry(rel)
     out = root / f"{e.stem}.rllvm.o"
     r = c.compile_entry(rllvm, e, out)
-    if r.returncode == EXIT_UNSUPPORTED:
-        waits = f" (waits on {WAITS_ON[rel]})" if rel in WAITS_ON else ""
-        pytest.xfail(f"rllvm does not compile {rel} yet{waits}: {r.stderr.strip()}")
+    if r.returncode == EXIT_UNSUPPORTED and rel not in REQUIRED:
+        pytest.xfail(f"rllvm does not compile {rel} yet: {r.stderr.strip()}")
     assert r.returncode == 0, f"rllvm {rel}: exit {r.returncode}: {r.stderr}"
     assert c.check_relocations(out, e.profile, c.asm_symbols(e.path)) == []
     return out
@@ -187,10 +183,10 @@ def test_rllvm_link_and_disassembly(build, rllvm, tmp_path, rel):
                 if any(f in name for name in refs)] == []
 
 
-@pytest.mark.parametrize("rllvm_side", ["abi_a", "abi_b"])
+@pytest.mark.parametrize("rllvm_side", ["abi_a", "abi_b", "both"])
 def test_rllvm_abi_both_directions(build, oracle_runs, rllvm, tmp_path, rllvm_side):
     objs = [rllvm_compile(rllvm, f"hosted/{side}.ll", tmp_path)
-            if side == rllvm_side else build.clang(f"hosted/{side}.ll")
+            if rllvm_side in (side, "both") else build.clang(f"hosted/{side}.ll")
             for side in ("abi_a", "abi_b")]
     assert c.run(build.hosted(objs, f"abi.{rllvm_side}")) == oracle_runs["abi"]
 

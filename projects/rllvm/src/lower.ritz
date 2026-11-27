@@ -127,6 +127,26 @@ fn opcode_name(op: Opcode) -> StrView
         Opcode.Phi => "phi"
         Opcode.Call => "call"
 
+# A pointer constant folded to a symbol plus an addend. `sym` is None for
+# one built on `null` (ritz1's sizeof and offsetof idiom): `addend` is then
+# the whole value, an absolute integer that needs no relocation.
+pub struct ConstAddr
+    sym: Option<StrView>
+    addend: i64
+
+# The address constant `vid` names: a global, null, a constant
+# getelementptr off any of these (chains included), or a ptrtoint of one.
+pub fn const_address(m: @Module, vid: i64, line: i64) -> Result<ConstAddr, Fail>
+    let v: IrValue = m.values.get(vid)
+    match v.kind
+        ValueKind.Global => Ok(ConstAddr { sym: Some(symbol_of(v.text)), addend: 0 })
+        ValueKind.Null => Ok(ConstAddr { sym: None, addend: 0 })
+        ValueKind.Gep =>
+            let base: ConstAddr = const_address(m, m.value_lists.get(v.first), line)?
+            Ok(ConstAddr { sym: base.sym, addend: base.addend +% const_gep_offset(m, v)? })
+        ValueKind.PtrToInt => const_address(m, m.value_lists.get(v.first), line)
+        _ => Err(fail_unsupported(line, "this pointer constant"))
+
 # The byte offset a constant getelementptr adds to its base.
 pub fn const_gep_offset(m: @Module, v: IrValue) -> Result<i64, Fail>
     var ty: i64 = v.src_ty
@@ -411,13 +431,17 @@ impl FnLower
             ValueKind.Undef => g.constant(r, 0, 64)
             ValueKind.Zero => g.constant(r, 0, 64)
             ValueKind.Global => g.address(r, symbol_of(v.text), 0)
-            ValueKind.Gep =>
-                let base: IrValue = self.value(self.m.value_lists.get(v.first))
-                if base.kind != ValueKind.Global
-                    return Err(fail_unsupported(g.line, "constant getelementptr off a non-global"))
-                g.address(r, symbol_of(base.text), const_gep_offset(self.m, v)?)
-            ValueKind.PtrToInt => self.load_scalar(g, r, self.m.value_lists.get(v.first))
+            ValueKind.Gep => self.load_const_address(g, r, vid, 64)
+            ValueKind.PtrToInt => self.load_const_address(g, r, vid, int_width(self.m, v.src_ty))
             _ => Err(fail_unsupported(g.line, "a float, vector or aggregate constant as a scalar"))
+
+    # Address constant `vid` into `r`: its symbol's address plus the
+    # addend, or with no symbol the absolute value cut to `bits`.
+    fn load_const_address(self: @FnLower, g: @&Gen, r: i64, vid: i64, bits: i64) -> Result<(), Fail>
+        let a: ConstAddr = const_address(self.m, vid, g.line)?
+        match a.sym
+            Some(s) => g.address(r, s, a.addend)
+            None => g.constant(r, a.addend, bits)
 
     # Write value `vid` of type `ty` to disp(%base) through %r11, so `base`
     # is never %r11.
@@ -1094,33 +1118,57 @@ impl FnLower
                 None => pass
         Ok(())
 
-    # extractelement/insertelement/shufflevector, constant indices and
-    # mask only (DESIGN.md "Optimization bar": -O0 needs no more).
+    # extractelement/insertelement take a constant or a runtime index;
+    # shufflevector's mask is constant (DESIGN.md "Optimization bar").
     fn lower_extract_element(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         let s: ValueSlot = match self.result_slot(inst)
             Some(s) => s
             None => return Ok(())
         let vec_vid: i64 = self.operand(inst, 0)
-        let idxv: IrValue = self.value(self.operand(inst, 1))
-        if idxv.kind != ValueKind.Int
-            return Err(fail_unsupported(inst.line, "extractelement with a non-constant index"))
         let src: ValueSlot = match self.slot_of(self.value(vec_vid).text)
             Some(x) => x
             None => return Err(fail_malformed(inst.line, "use of an undefined value"))
         let ebytes: i64 = type_size(self.m, s.ty)
-        g.copy(RBP, 0 - s.offset, RBP, int_value(idxv.text) * ebytes - src.offset, ebytes)
+        let idxv: IrValue = self.value(self.operand(inst, 1))
+        if idxv.kind == ValueKind.Int
+            return g.copy(RBP, 0 - s.offset, RBP, int_value(idxv.text) * ebytes - src.offset, ebytes)
+        self.lane_address(g, src, self.operand(inst, 1), inst.line)?
+        g.copy(RBP, 0 - s.offset, RCX, 0, ebytes)
 
     fn lower_insert_element(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         let s: ValueSlot = match self.result_slot(inst)
             Some(s) => s
             None => return Ok(())
         self.store_value(g, RBP, 0 - s.offset, self.operand(inst, 0), s.ty)?
-        let idxv: IrValue = self.value(self.operand(inst, 2))
-        if idxv.kind != ValueKind.Int
-            return Err(fail_unsupported(inst.line, "insertelement with a non-constant index"))
         let elem_ty: i64 = self.m.types.get(self.m.resolve(s.ty)).elem
         let ebytes: i64 = type_size(self.m, elem_ty)
-        self.store_value(g, RBP, int_value(idxv.text) * ebytes - s.offset, self.operand(inst, 1), elem_ty)
+        let idxv: IrValue = self.value(self.operand(inst, 2))
+        if idxv.kind == ValueKind.Int
+            return self.store_value(g, RBP, int_value(idxv.text) * ebytes - s.offset, self.operand(inst, 1), elem_ty)
+        self.lane_address(g, s, self.operand(inst, 2), inst.line)?
+        self.store_value(g, RCX, 0, self.operand(inst, 1), elem_ty)
+
+    # %rcx = the address of lane `idx` (a runtime value) of the vector in
+    # `vec`. The index is masked to the lane count, a power of two for every
+    # vector type in the subset, so an out-of-range index (poison) still
+    # reads or writes inside the slot.
+    fn lane_address(self: @FnLower, g: @&Gen, vec: ValueSlot, idx: i64, line: i64) -> Result<(), Fail>
+        let t: Type = self.m.types.get(self.m.resolve(vec.ty))
+        let ebytes: i64 = type_size(self.m, t.elem)
+        var shift: i64 = 0
+        while (1 << shift) < ebytes
+            shift += 1
+        if (1 << shift) != ebytes or (t.width & (t.width - 1)) != 0
+            return Err(fail_unsupported(line, "a runtime lane index on this vector type"))
+        self.load_scalar(g, RAX, idx)?
+        let mask: Operand = g.imm(t.width - 1)
+        g.op2("and", OpSize.Quad, mask, r64(RAX))?
+        if shift > 0
+            let by: Operand = g.imm(shift)
+            g.op2("shl", OpSize.Quad, by, r64(RAX))?
+        let base: Operand = g.mem(RBP, 0 - vec.offset)
+        g.op2("lea", OpSize.Quad, base, r64(RCX))?
+        g.op2("add", OpSize.Quad, r64(RAX), r64(RCX))
 
     fn lower_shuffle_vector(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         let s: ValueSlot = match self.result_slot(inst)

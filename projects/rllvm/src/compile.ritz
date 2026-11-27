@@ -15,7 +15,7 @@ import rllvm.ir
 import rllvm.layout
 import rllvm.gen
 import rllvm.inline_asm { decode_string }
-import rllvm.lower { FnLower, const_gep_offset, fn_lower, int_value, symbol_of }
+import rllvm.lower { ConstAddr, FnLower, const_address, fn_lower, int_value, symbol_of }
 import rllvm.parse { Fail, FailKind }
 
 fn binding_of(l: Linkage) -> Binding
@@ -58,8 +58,7 @@ fn has_address(m: @Module, vid: i64) -> bool
     let v: IrValue = m.values.get(vid)
     match v.kind
         ValueKind.Global => true
-        ValueKind.Gep => true
-        ValueKind.PtrToInt => true
+        ValueKind.Gep | ValueKind.PtrToInt => has_address(m, m.value_lists.get(v.first))
         ValueKind.Struct | ValueKind.Array | ValueKind.Vector =>
             for i in 0..v.count
                 if has_address(m, m.value_lists.get(v.first + i))
@@ -67,22 +66,14 @@ fn has_address(m: @Module, vid: i64) -> bool
             false
         _ => false
 
-# The symbol and addend a pointer constant names.
-struct Target
-    sym: StrView
-    addend: i64
-
-fn pointer_target(m: @Module, vid: i64, line: i64) -> Result<Target, Fail>
-    let v: IrValue = m.values.get(vid)
-    match v.kind
-        ValueKind.Global => Ok(Target { sym: symbol_of(v.text), addend: 0 })
-        ValueKind.Gep =>
-            let base: IrValue = m.values.get(m.value_lists.get(v.first))
-            if base.kind != ValueKind.Global
-                return Err(fail_unsupported(line, "constant getelementptr off a non-global"))
-            Ok(Target { sym: symbol_of(base.text), addend: const_gep_offset(m, v)? })
-        ValueKind.PtrToInt => pointer_target(m, m.value_lists.get(v.first), line)
-        _ => Err(fail_unsupported(line, "this pointer constant"))
+# The low `size` bytes of `n`, little-endian, appended to `sec`.
+fn emit_int(g: @&Gen, sec: SectionId, n: i64, size: i64) -> Result<(), Fail>
+    var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+    for i in 0..8
+        b[i] = ((n >> (i * 8)) & 0xff) as u8
+    let all: [u8] = @b
+    g.bytes(sec, all.to(size))?
+    Ok(())
 
 # Constant `vid` of type `ty` appended to `sec`. A pointer is eight zero
 # bytes and an R_X86_64_64 fixup, in every profile.
@@ -90,14 +81,7 @@ fn emit_const(g: @&Gen, m: @Module, sec: SectionId, vid: i64, ty: i64, line: i64
     let v: IrValue = m.values.get(vid)
     let size: i64 = type_size(m, ty)
     match v.kind
-        ValueKind.Int =>
-            let n: i64 = int_value(v.text)
-            var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
-            for i in 0..8
-                b[i] = ((n >> (i * 8)) & 0xff) as u8
-            let all: [u8] = @b
-            g.bytes(sec, all.to(size))?
-            Ok(())
+        ValueKind.Int => emit_int(g, sec, int_value(v.text), size)
         ValueKind.Null | ValueKind.Zero | ValueKind.Undef => g.zeros(sec, size)
         ValueKind.Struct | ValueKind.Array =>
             let start: i64 = g.obj.size(sec)
@@ -113,12 +97,15 @@ fn emit_const(g: @&Gen, m: @Module, sec: SectionId, vid: i64, ty: i64, line: i64
             g.bytes(sec, b.as_view().as_bytes())?
             Ok(())
         ValueKind.Global | ValueKind.Gep | ValueKind.PtrToInt =>
+            let a: ConstAddr = const_address(m, vid, line)?
+            let sym: StrView = match a.sym
+                Some(s) => s
+                None => return emit_int(g, sec, a.addend, size)
             if size != 8
                 return Err(fail_unsupported(line, "a pointer constant narrower than 64 bits"))
-            let t: Target = pointer_target(m, vid, line)?
             let at: i64 = g.obj.size(sec)
             g.zeros(sec, 8)?
-            g.fixup(sec, at, Fixup { offset: 0, width: 8, kind: FixupKind.Absolute, target: t.sym, addend: t.addend })
+            g.fixup(sec, at, Fixup { offset: 0, width: 8, kind: FixupKind.Absolute, target: sym, addend: a.addend })
         _ => Err(fail_unsupported(line, "a float or vector constant in data"))
 
 fn emit_global(g: @&Gen, m: @Module, gl: Global) -> Result<(), Fail>

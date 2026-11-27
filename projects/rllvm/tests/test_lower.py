@@ -795,3 +795,177 @@ def test_core_instructions_match_clang(rllvm_bin, tmp_path):
     oracle, ours = results
     assert oracle.status == 42 and oracle.stdout.count(b"\n") == 24
     assert ours == oracle
+
+
+# --- constant getelementptr off null and off another GEP -----------------
+
+# ritz1's sizeof/offsetof idiom, `ptrtoint (getelementptr (T, ptr null,
+# ...))`, folds to an absolute integer: in an instruction operand, as a call
+# argument, in data. A GEP whose base is itself a GEP off a global keeps the
+# global's symbol with the summed addend. A ptrtoint to i32 truncates.
+CONST_GEP_IR = r"""
+%Pair = type { i32, i64 }
+%Nest = type { i8, %Pair, [3 x i16] }
+
+declare void @rt_hex(...)
+
+@nest = internal global %Nest { i8 -1, %Pair { i32 7, i64 -9 }, [3 x i16] [i16 1, i16 -2, i16 3] }
+@sizes = internal constant [3 x i64] [i64 ptrtoint (ptr getelementptr (%Nest, ptr null, i32 1) to i64), i64 ptrtoint (ptr getelementptr (%Nest, ptr null, i64 0, i32 2, i64 1) to i64), i64 ptrtoint (ptr getelementptr (i8, ptr null, i64 -3) to i64)]
+@deep = internal global ptr getelementptr (i8, ptr getelementptr (%Nest, ptr @nest, i64 0, i32 1), i64 8)
+@from_null = internal global ptr getelementptr (%Pair, ptr null, i64 3)
+@abs_only = constant i64 ptrtoint (ptr getelementptr (%Nest, ptr null, i32 2) to i64)
+
+define internal i64 @take(i64 %a, i32 %b) {
+entry:
+  %w = zext i32 %b to i64
+  %s = shl i64 %w, 8
+  %r = add i64 %a, %s
+  ret i64 %r
+}
+
+define i32 @main() {
+entry:
+  %size = add i64 ptrtoint (ptr getelementptr (%Nest, ptr null, i32 1) to i64), 0
+  call void (...) @rt_hex(i64 %size)
+  %off = add i64 ptrtoint (ptr getelementptr (%Nest, ptr null, i64 0, i32 2, i64 1) to i64), 0
+  call void (...) @rt_hex(i64 %off)
+  %t = add i32 ptrtoint (ptr getelementptr (i8, ptr null, i64 -1) to i32), 0
+  %t64 = zext i32 %t to i64
+  call void (...) @rt_hex(i64 %t64)
+  %arg = call i64 @take(i64 ptrtoint (ptr getelementptr (%Pair, ptr null, i32 1) to i64), i32 ptrtoint (ptr getelementptr (i8, ptr null, i64 5) to i32))
+  call void (...) @rt_hex(i64 %arg)
+  %p = getelementptr i8, ptr getelementptr (%Nest, ptr @nest, i64 0, i32 1), i64 8
+  %deep_v = load i64, ptr getelementptr (i8, ptr getelementptr (%Nest, ptr @nest, i64 0, i32 1), i64 8)
+  call void (...) @rt_hex(i64 %deep_v)
+  %dp = load ptr, ptr @deep
+  %same = icmp eq ptr %dp, getelementptr (%Nest, ptr @nest, i64 0, i32 1, i32 1)
+  %same64 = zext i1 %same to i64
+  call void (...) @rt_hex(i64 %same64)
+  %np = load ptr, ptr @from_null
+  %npi = ptrtoint ptr %np to i64
+  call void (...) @rt_hex(i64 %npi)
+  %nullp = icmp eq ptr getelementptr (i8, ptr null, i64 0), null
+  %nullp64 = zext i1 %nullp to i64
+  call void (...) @rt_hex(i64 %nullp64)
+  %sum = alloca i64
+  store i64 0, ptr %sum
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %ep = getelementptr [3 x i64], ptr @sizes, i64 0, i64 %i
+  %e = load i64, ptr %ep
+  call void (...) @rt_hex(i64 %e)
+  %i1 = add i64 %i, 1
+  %more = icmp ult i64 %i1, 3
+  br i1 %more, label %loop, label %done
+done:
+  %a = load i64, ptr @abs_only
+  call void (...) @rt_hex(i64 %a)
+  %st = trunc i64 %a to i32
+  ret i32 %st
+}
+"""
+
+
+def test_constant_gep_off_null_and_nested_match_clang(rllvm_bin, tmp_path):
+    src = tmp_path / "cgep.ll"
+    src.write_text(HEAD + CONST_GEP_IR)
+    shim = c.clang_compile(c.entry("hosted/shim.ll"), tmp_path / "shim.o")
+    extra = c.assemble("hosted", tmp_path / "extra.o")
+    results = []
+    for tool in (["clang"], [rllvm_bin]):
+        obj = tmp_path / f"cgep.{Path(tool[0]).name}.o"
+        p = run([*tool, *c.PROFILE_FLAGS["hosted"], str(src), "-o", str(obj)])
+        assert p.returncode == 0, p.stderr
+        assert c.check_relocations(obj, "hosted") == []
+        exe = tmp_path / f"cgep.{Path(tool[0]).name}"
+        link = c.link_hosted([shim, obj, extra], exe)
+        assert link.returncode == 0, link.stderr
+        results.append(c.run(exe))
+    oracle, ours = results
+    assert oracle.status == 64 and oracle.stdout.count(b"\n") == 12
+    assert ours == oracle
+
+
+def test_constant_gep_off_null_carries_no_relocation(rllvm_bin, tmp_path):
+    obj = compile_ll(rllvm_bin, tmp_path, CONST_GEP_IR)
+    syms = readelf("-s", obj)
+    sections = readelf("-S", obj)
+    # A constant with no symbol in it is read-only data, as clang places it.
+    ndx = symbol_line(syms, "abs_only").split()[6]
+    assert f"[{int(ndx):2}] .rodata" in sections
+    relocs = {r.symbol.name for r in c.read_elf(obj).relocs}
+    assert "" not in relocs and None not in relocs
+
+
+# --- extractelement / insertelement at a runtime index --------------------
+
+# The index comes from a call, so it is never a constant. Every lane of an
+# <8 x i32>, a <2 x i64> and a <16 x i8> is read back after an insert at a
+# runtime lane; the index is in range (out of range is poison).
+VAR_LANE_IR = r"""
+declare void @rt_hex(...)
+
+define internal i32 @id(i32 %x) noinline {
+entry:
+  ret i32 %x
+}
+
+define i32 @main() {
+entry:
+  %v8 = insertelement <8 x i32> <i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 16, i32 17>, i32 -1, i32 0
+  %vq = insertelement <2 x i64> <i64 1, i64 2>, i64 3, i32 1
+  %vb = insertelement <16 x i8> zeroinitializer, i8 7, i32 15
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %loop ]
+  %acc = phi i64 [ 0, %entry ], [ %acc1, %loop ]
+  %k = call i32 @id(i32 %i)
+  %k8 = and i32 %k, 7
+  %e = extractelement <8 x i32> %v8, i32 %k8
+  %e64 = sext i32 %e to i64
+  call void (...) @rt_hex(i64 %e64)
+  %k2 = and i32 %k, 1
+  %ins = insertelement <2 x i64> %vq, i64 -9, i32 %k2
+  %f = extractelement <2 x i64> %ins, i32 %k2
+  %g = extractelement <2 x i64> %ins, i64 1
+  %fs = xor i64 %f, %g
+  call void (...) @rt_hex(i64 %fs)
+  %kb = mul i32 %k, 2
+  %bi = insertelement <16 x i8> %vb, i8 -3, i32 %kb
+  %b = extractelement <16 x i8> %bi, i32 %kb
+  %b15 = extractelement <16 x i8> %bi, i32 15
+  %b64 = zext i8 %b to i64
+  %b1564 = zext i8 %b15 to i64
+  %bs = shl i64 %b1564, 8
+  %bo = or i64 %b64, %bs
+  call void (...) @rt_hex(i64 %bo)
+  %acc1 = add i64 %acc, %e64
+  %i1 = add i32 %i, 1
+  %more = icmp ult i32 %i1, 8
+  br i1 %more, label %loop, label %done
+done:
+  %r = trunc i64 %acc1 to i32
+  ret i32 %r
+}
+"""
+
+
+def test_variable_lane_index_matches_clang(rllvm_bin, tmp_path):
+    src = tmp_path / "lane.ll"
+    src.write_text(HEAD + VAR_LANE_IR)
+    shim = c.clang_compile(c.entry("hosted/shim.ll"), tmp_path / "shim.o")
+    extra = c.assemble("hosted", tmp_path / "extra.o")
+    results = []
+    for tool in (["clang"], [rllvm_bin]):
+        obj = tmp_path / f"lane.{Path(tool[0]).name}.o"
+        p = run([*tool, *c.PROFILE_FLAGS["hosted"], str(src), "-o", str(obj)])
+        assert p.returncode == 0, p.stderr
+        exe = tmp_path / f"lane.{Path(tool[0]).name}"
+        link = c.link_hosted([shim, obj, extra], exe)
+        assert link.returncode == 0, link.stderr
+        results.append(c.run(exe))
+    oracle, ours = results
+    assert oracle.status == (-1 + 11 + 12 + 13 + 14 + 15 + 16 + 17) & 0xFF
+    assert oracle.stdout.count(b"\n") == 24
+    assert ours == oracle
