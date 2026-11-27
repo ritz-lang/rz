@@ -1,5 +1,5 @@
 """A store through a reference drops the old value; through `*T` it doesn't
-(LARB R58, AGAST #3474 ritz0 / #3475 ritz1).
+(LARB R58, AGAST #3474 ritz0 / #3475 ritz1, #4905 a `self: @&T` receiver).
 
 LANGUAGE_SPEC §13.6: a store through an `@&T`, a `:&` parameter, or a place
 reached through one, drops the old value, in the same order as a store to an
@@ -180,22 +180,50 @@ fn f()
     var s = S { x: 1 }
     put(@&s, Some(5))
 """, RAW),
-    "deref_through_pointer": ("""\
+    # Through a `*T` every store is a raw write: `*p = v`, `p.t = v`, a
+    # `self: *T` receiver's field (AGAST #4905), and a `*T` param beside a
+    # `self: @&T` receiver.  v (8) four times, nothing drops; at the scope
+    # end h.t (7), then s (9).
+    "stores_through_pointer": ("""\
 fn put(p: *S)
     *p = mk(5)
+
+fn put_t(p: *Holder)
+    p.t = mk(6)
+
+impl Holder
+    fn put_raw(self: *Holder)
+        self.t = mk(7)
+
+    fn put_via(self: @&Holder, p: *S)
+        *p = mk(9)
 
 fn f()
     var s = S { x: 1 }
     put(@&s)
-""", RAW),
-    "field_through_pointer": ("""\
-fn put(p: *Holder)
-    p.t = mk(5)
+    var h = Holder { t: S { x: 2 } }
+    put_t(@&h)
+    h.put_raw()
+    h.put_via(@&s)
+""", 888879),
+    # Through a `self: @&T` method receiver (AGAST #4905): a Drop field, then
+    # a field with drop glue only.  v (8), the old h.t (1); v (8), the old
+    # o.h's S (2); at the scope end o.h.t (6), then h.t (5).
+    "field_through_self_receiver": ("""\
+impl Holder
+    fn put(self: @&Holder)
+        self.t = mk(5)
+
+impl Outer
+    fn put(self: @&Outer)
+        self.h = Holder { t: mk(6) }
 
 fn f()
     var h = Holder { t: S { x: 1 } }
-    put(@&h)
-""", RAW),
+    h.put()
+    var o = Outer { h: Holder { t: S { x: 2 } } }
+    o.put()
+""", 818265),
 }
 
 
