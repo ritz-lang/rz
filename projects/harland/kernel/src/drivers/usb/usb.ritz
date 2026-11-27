@@ -1,0 +1,557 @@
+# Harland USB enumeration (AGAST #4887, docs/USB.md)
+#
+# Each root port's device, driven by events (docs/USB.md "xHCI bring-up,
+# in order", steps 6-7): a USB 2 port with a device is reset, then a port
+# that is enabled gets Enable Slot, Address Device (EP0's max packet size
+# from the port speed), GET_DESCRIPTOR of the device (a full- or low-speed
+# device's first 8 bytes first, and Evaluate Context when its EP0 is
+# bigger than 8), GET_DESCRIPTOR of the configuration (its 9-byte header,
+# then wTotalLength) and SET_CONFIGURATION. Every step is a command or a
+# control transfer whose completion event moves the port's state on; none
+# waits. Endpoint configuration and the HID keyboard are #4888's, detach
+# and every controller #4889's, hubs #4890's.
+#
+# xhci_irq is the controller's interrupt (irq_handler, on the BSP, from
+# the vector drivers/usb/xhci.ritz aims there): it drains the event ring
+# into this state machine. Like the controller, all of it is BSP-owned and
+# has no lock (SMP_USER.md section 2, "In-kernel drivers"). Any other BSP
+# path into it (usb_init here; the console readers and the tick poll of
+# #4888 and #4891) runs with interrupts off, so xhci_irq never interleaves
+# with it.
+
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span { span_from_ptr }
+import klog { klog, klog_dec, klog_hex, klog_hex_width }
+import io { interrupts_enabled, disable_interrupts, enable_interrupts }
+import mm.vmm { phys_to_virt }
+import drivers.usb.xhci { XhciError, EVENTS_PER_IRQ, xhci_init, xhci_error_name, xhci_running, xhci_ctx64, xhci_max_ports, xhci_port_protocol, xhci_portsc, xhci_portsc_write, xhci_set_device_context, xhci_doorbell, xhci_command, xhci_command_done, xhci_irq_ack, xhci_next_event, xhci_events_done, xhci_dead, xhci_alloc_page }
+import usb_abi.regs { UsbSpeed, PORTSC_CCS, PORTSC_PED, PORTSC_CHANGE, portsc_ack, portsc_start_reset, portsc_speed, speed_from_psiv, speed_name, ep0_max_packet, ep_interval }
+import usb_abi.trb { Trb, Completion, completion_ok, Event, CommandEvent, TransferEvent, trb_enable_slot, trb_address_device, trb_evaluate_context, trb_setup_stage, trb_data_stage, trb_status_stage }
+import usb_abi.ring { TrbPage, TrbRing, RING_TRBS }
+import usb_abi.context { InputContext, DeviceContext, EpType, ADD_SLOT, ADD_EP0, input_control, slot_ctx, ep_ctx, slot_address }
+import usb_abi.desc { SetupPacket, DeviceDesc, ConfigHeader, DescWalk, DescError, setup_get_descriptor, setup_set_configuration, parse_device, device_max_packet0, parse_config_header, DESC_DEVICE, DESC_CONFIG, DEVICE_DESC_LEN, CONFIG_DESC_LEN }
+
+# Root ports with a device slot of their own here. A controller with more
+# logs the ports it skips (chungus's have 2 to 8 each).
+const PORTS_MAX: u8 = 32
+# The descriptor buffer is one page: a configuration longer than that is
+# read to its first 4096 bytes and refused as truncated.
+const BUF_BYTES: u16 = 4096
+# The EP0 control endpoint's device context index.
+const DCI_EP0: u8 = 1
+
+# Where a port's device is in enumeration.
+enum DevState
+    Empty                   # nothing connected, or not yet seen
+    Resetting               # USB 2 port reset in flight
+    EnablingSlot            # Enable Slot queued
+    Addressing              # Address Device queued
+    ReadingMps              # the device descriptor's first 8 bytes
+    FixingMps               # Evaluate Context with EP0's real size
+    ReadingDevice           # the 18-byte device descriptor
+    ReadingConfigHead       # the configuration's 9-byte header
+    ReadingConfig           # the whole configuration
+    SettingConfig           # SET_CONFIGURATION
+    Configured
+    Failed                  # stopped; the port waits for a disconnect
+
+# One root port's device. Its four DMA pages are allocated at its first
+# attach and kept.
+struct UsbDevice
+    state: DevState
+    port: u8
+    speed: UsbSpeed
+    slot: u8
+    slot_type: u8
+    mps0: u16
+    in_ctx: u64             # input context (phys)
+    dev_ctx: u64            # device context (phys)
+    ep0_page: u64           # EP0's transfer ring (phys)
+    ep0: TrbRing
+    buf: u64                # the descriptor buffer (phys)
+    want: u16               # bytes the data stage in flight asked for
+    config_len: u16         # wTotalLength, capped at BUF_BYTES
+    config_value: u8
+
+var usb_devs: [32]UsbDevice
+var usb_dead_logged: bool = false
+
+fn dev_of_port(port: u8) -> *UsbDevice
+    @usb_devs[port - 1]
+
+fn dev_of_slot(slot: u8) -> Option<*UsbDevice>
+    if slot == 0
+        return None
+    for i in 0..PORTS_MAX
+        let d: *UsbDevice = @usb_devs[i]
+        if d.slot == slot and d.state != DevState.Empty
+            return Some(d)
+    None
+
+fn log_port(port: u8)
+    klog("[usb] port ")
+    klog_dec(port as i64)
+
+fn log_slot(d: *UsbDevice)
+    klog("[usb] slot ")
+    klog_dec(d.slot as i64)
+
+fn completion_name(c: Completion) -> StrView
+    match c
+        Success => "success"
+        ShortPacket => "short packet"
+        Stall => "stall"
+        TransactionError => "transaction error"
+        TrbError => "TRB error"
+        Babble => "babble"
+        NoSlots => "no slots"
+        ParameterError => "parameter error"
+        ContextState => "context state error"
+        DataBuffer => "data buffer error"
+        Resource => "resource error"
+        Bandwidth => "bandwidth error"
+        SlotNotEnabled => "slot not enabled"
+        EpNotEnabled => "endpoint not enabled"
+        RingUnderrun => "ring underrun"
+        RingOverrun => "ring overrun"
+        EventRingFull => "event ring full"
+        Stopped => "stopped"
+        StoppedShort => "stopped (short)"
+        Other(_) => "error"
+
+# The raw code, for a completion the driver has no name for.
+fn completion_code(c: Completion) -> Option<u8>
+    match c
+        Other(n) => Some(n)
+        Success | DataBuffer | Babble | TransactionError | TrbError | Stall | Resource | Bandwidth | NoSlots | SlotNotEnabled | EpNotEnabled | ShortPacket | RingUnderrun | RingOverrun | ParameterError | ContextState | EventRingFull | Stopped | StoppedShort => None
+
+fn fail(d: *UsbDevice, what: StrView)
+    log_port(d.port)
+    klog(": ")
+    klog(what)
+    klog("; device left unconfigured\n")
+    d.state = DevState.Failed
+
+fn fail_code(d: *UsbDevice, what: StrView, c: Completion)
+    log_port(d.port)
+    klog(": ")
+    klog(what)
+    klog(" failed: ")
+    klog(completion_name(c))
+    match completion_code(c)
+        Some(n) =>
+            klog(" (")
+            klog_dec(n as i64)
+            klog(")")
+        None => pass
+    klog("; device left unconfigured\n")
+    d.state = DevState.Failed
+
+# ============================================================================
+# Commands and control transfers
+# ============================================================================
+
+fn command(d: *UsbDevice, t: Trb, next: DevState)
+    match xhci_command(t, d.port)
+        Ok(_) =>
+            d.state = next
+        Err(_) => fail(d, "command ring full")
+
+# The device's pages, allocated at its first attach.
+fn ensure_pages(d: *UsbDevice) -> bool
+    if d.buf != 0
+        return true
+    var got: [4]u64 = [0, 0, 0, 0]
+    for i in 0..4
+        match xhci_alloc_page()
+            Ok(p) =>
+                got[i] = p
+            Err(_) => return false
+    d.in_ctx = got[0]
+    d.dev_ctx = got[1]
+    d.ep0_page = got[2]
+    d.buf = got[3]
+    true
+
+fn zero_page(phys: u64)
+    let w: *u64 = phys_to_virt(phys) as *u64
+    for i in 0..512
+        *(w + i) = 0
+
+fn input(d: *UsbDevice) -> InputContext
+    InputContext.over(phys_to_virt(d.in_ctx), xhci_ctx64())
+
+# A control transfer on EP0 reading `len` bytes into the buffer: Setup,
+# Data (IN), Status (OUT, the interrupt). `next` is the state its
+# Transfer Event lands in.
+fn control_in(d: *UsbDevice, s: SetupPacket, next: DevState)
+    if d.ep0.free() < 3
+        fail(d, "EP0 ring full")
+        return
+    let len: u16 = s.length
+    let b: *u8 = phys_to_virt(d.buf) as *u8
+    for i in 0..len as u64
+        *(b + i) = 0
+    d.ep0.push(trb_setup_stage(s))
+    d.ep0.push(trb_data_stage(d.buf, len as u32, true))
+    d.ep0.push(trb_status_stage(false))
+    d.want = len
+    d.state = next
+    xhci_doorbell(d.slot, DCI_EP0)
+
+# A control transfer with no data stage: Setup, Status (IN).
+fn control_nodata(d: *UsbDevice, s: SetupPacket, next: DevState)
+    if d.ep0.free() < 2
+        fail(d, "EP0 ring full")
+        return
+    d.ep0.push(trb_setup_stage(s))
+    d.ep0.push(trb_status_stage(true))
+    d.want = 0
+    d.state = next
+    xhci_doorbell(d.slot, DCI_EP0)
+
+# The bytes the last data stage read: what it asked for less the
+# residual its event reported.
+fn received(d: *UsbDevice, residual: u32) -> [u8]
+    var n: i64 = d.want as i64
+    if residual as i64 <= n
+        n = n - residual as i64
+    span_from_ptr<u8>(phys_to_virt(d.buf) as *u8, n)
+
+# ============================================================================
+# Ports
+# ============================================================================
+
+# The port is enabled at a known speed: ask for a slot.
+fn enable_slot(d: *UsbDevice, portsc: u32)
+    match speed_from_psiv(portsc_speed(portsc))
+        Some(s) => d.speed = s
+        None =>
+            fail(d, "unknown port speed")
+            return
+    log_port(d.port)
+    klog(": enabled, ")
+    klog(speed_name(d.speed))
+    klog(" speed\n")
+    command(d, trb_enable_slot(d.slot_type), DevState.EnablingSlot)
+
+# A Port Status Change (or the boot's first look at a port): acknowledge
+# its changes and move its device on.
+fn port_changed(port: u8)
+    if port == 0 or port > xhci_max_ports()
+        return
+    if port > PORTS_MAX
+        log_port(port)
+        klog(": past the ")
+        klog_dec(PORTS_MAX as i64)
+        klog(" ports this driver tracks; ignored\n")
+        return
+    let v: u32 = xhci_portsc(port)
+    if (v & PORTSC_CHANGE) != 0
+        xhci_portsc_write(port, portsc_ack(v))
+    let d: *UsbDevice = dev_of_port(port)
+    d.port = port
+    if (v & PORTSC_CCS) == 0
+        if d.state != DevState.Empty
+            log_port(port)
+            klog(": disconnected\n")
+            d.state = DevState.Empty
+            d.slot = 0
+        return
+    let usb3: bool = match xhci_port_protocol(port)
+        Some(p) =>
+            d.slot_type = p.slot_type
+            p.major >= 3
+        None => false
+    match d.state
+        Empty =>
+            log_port(port)
+            klog(": connected (USB ")
+            klog_dec(if usb3 then 3 else 2)
+            klog(")\n")
+            if (v & PORTSC_PED) != 0
+                enable_slot(d, v)
+            else if not usb3
+                # A USB 2 port needs a reset to enable; Port Reset Change
+                # says when it is done. A USB 3 port links up by itself.
+                xhci_portsc_write(port, portsc_start_reset(v))
+                d.state = DevState.Resetting
+        Resetting =>
+            if (v & PORTSC_PED) != 0
+                enable_slot(d, v)
+        _ => pass
+
+# ============================================================================
+# Enumeration
+# ============================================================================
+
+# Slot granted: lay out the input context and address the device.
+fn address_device(d: *UsbDevice, slot: u8)
+    d.slot = slot
+    if not ensure_pages(d)
+        fail(d, "out of DMA memory")
+        return
+    zero_page(d.in_ctx)
+    zero_page(d.dev_ctx)
+    zero_page(d.ep0_page)
+    d.ep0 = TrbRing.new(phys_to_virt(d.ep0_page) as *TrbPage, d.ep0_page, RING_TRBS)
+    d.mps0 = ep0_max_packet(d.speed)
+    xhci_set_device_context(slot, d.dev_ctx)
+    let ic: InputContext = input(d)
+    *ic.control() = input_control(0, ADD_SLOT | ADD_EP0)
+    *ic.slot() = slot_ctx(d.speed, d.port, DCI_EP0)
+    *ic.ep(DCI_EP0) = ep_ctx(EpType.Control, d.mps0, 0, d.ep0.dequeue_ptr())
+    command(d, trb_address_device(d.in_ctx, slot, false), DevState.Addressing)
+
+fn read_device_descriptor(d: *UsbDevice)
+    control_in(d, setup_get_descriptor(DESC_DEVICE, 0, DEVICE_DESC_LEN as u16), DevState.ReadingDevice)
+
+fn addressed(d: *UsbDevice)
+    let dc: DeviceContext = DeviceContext.over(phys_to_virt(d.dev_ctx), xhci_ctx64())
+    log_slot(d)
+    klog(" addressed: port ")
+    klog_dec(d.port as i64)
+    klog(", address ")
+    klog_dec(slot_address(*dc.slot()) as i64)
+    klog(", EP0 ")
+    klog_dec(d.mps0 as i64)
+    klog(" bytes\n")
+    match d.speed
+        # LS/FS EP0 size is unknown until the first 8 bytes are read.
+        Low | Full => control_in(d, setup_get_descriptor(DESC_DEVICE, 0, 8), DevState.ReadingMps)
+        High | Super | SuperPlus => read_device_descriptor(d)
+
+# The first 8 bytes say EP0's real size: tell the controller if it is not
+# the 8 it was addressed with.
+fn got_mps(d: *UsbDevice, b: [u8])
+    let m: u8 = match device_max_packet0(b)
+        Ok(m) => m
+        Err(_) =>
+            fail(d, "device descriptor unreadable")
+            return
+    if m != 8 and m != 16 and m != 32 and m != 64
+        fail(d, "bad EP0 max packet size")
+        return
+    log_slot(d)
+    klog(": EP0 max packet ")
+    klog_dec(m as i64)
+    klog(" (from the device descriptor)\n")
+    if m as u16 == d.mps0
+        read_device_descriptor(d)
+        return
+    d.mps0 = m as u16
+    let ic: InputContext = input(d)
+    zero_page(d.in_ctx)
+    *ic.control() = input_control(0, ADD_EP0)
+    *ic.ep(DCI_EP0) = ep_ctx(EpType.Control, d.mps0, 0, d.ep0.dequeue_ptr())
+    command(d, trb_evaluate_context(d.in_ctx, d.slot), DevState.FixingMps)
+
+fn got_device(d: *UsbDevice, b: [u8])
+    let dd: DeviceDesc = match parse_device(b)
+        Ok(x) => x
+        Err(_) =>
+            fail(d, "device descriptor malformed")
+            return
+    log_slot(d)
+    klog(": device ")
+    klog_hex_width(dd.vendor as u64, 4)
+    klog(":")
+    klog_hex_width(dd.product as u64, 4)
+    klog(", USB ")
+    klog_hex((dd.usb_version >> 8) as u64)
+    klog(".")
+    klog_hex(((dd.usb_version >> 4) & 0xF) as u64)
+    klog(", class ")
+    klog_dec(dd.class as i64)
+    klog(", ")
+    klog_dec(dd.num_configs as i64)
+    klog(" configuration(s)\n")
+    if dd.num_configs == 0
+        fail(d, "no configurations")
+        return
+    control_in(d, setup_get_descriptor(DESC_CONFIG, 0, CONFIG_DESC_LEN as u16), DevState.ReadingConfigHead)
+
+fn got_config_head(d: *UsbDevice, b: [u8])
+    let h: ConfigHeader = match parse_config_header(b)
+        Ok(x) => x
+        Err(_) =>
+            fail(d, "configuration header malformed")
+            return
+    d.config_value = h.value
+    d.config_len = if h.total_length > BUF_BYTES then BUF_BYTES else h.total_length
+    control_in(d, setup_get_descriptor(DESC_CONFIG, 0, d.config_len), DevState.ReadingConfig)
+
+fn log_desc_error(e: DescError)
+    match e
+        Truncated => klog("truncated")
+        BadLength => klog("bad length")
+        WrongType => klog("wrong type")
+
+# The whole configuration: log what it holds, then select it.
+fn got_config(d: *UsbDevice, b: [u8])
+    var w = match DescWalk.new(b)
+        Ok(w) => w
+        Err(_) =>
+            fail(d, "configuration malformed")
+            return
+    log_slot(d)
+    klog(": config ")
+    klog_dec(d.config_value as i64)
+    klog(", ")
+    klog_dec(b.len)
+    klog(" bytes\n")
+    var more: bool = true
+    while more
+        match w.next()
+            Ok(item) =>
+                match item
+                    Interface(i) =>
+                        log_slot(d)
+                        klog(":   interface ")
+                        klog_dec(i.number as i64)
+                        klog(" class ")
+                        klog_dec(i.class as i64)
+                        klog("/")
+                        klog_dec(i.subclass as i64)
+                        klog("/")
+                        klog_dec(i.protocol as i64)
+                        klog(", ")
+                        klog_dec(i.num_endpoints as i64)
+                        klog(" endpoint(s)\n")
+                    Endpoint(e) =>
+                        log_slot(d)
+                        klog(":   endpoint 0x")
+                        klog_hex_width(e.address as u64, 2)
+                        klog(", ")
+                        klog_dec(e.max_packet() as i64)
+                        klog(" bytes, interval ")
+                        klog_dec(ep_interval(d.speed, e.kind(), e.interval) as i64)
+                        klog("\n")
+                    Other(_) => pass
+                    End =>
+                        more = false
+            Err(e) =>
+                log_slot(d)
+                klog(": configuration ")
+                log_desc_error(e)
+                klog("; descriptors after it skipped\n")
+                more = false
+    control_nodata(d, setup_set_configuration(d.config_value), DevState.SettingConfig)
+
+fn configured(d: *UsbDevice)
+    d.state = DevState.Configured
+    log_slot(d)
+    klog(": configured (configuration ")
+    klog_dec(d.config_value as i64)
+    klog(")\n")
+
+# ============================================================================
+# Events
+# ============================================================================
+
+fn on_command(c: CommandEvent)
+    let port: u8 = match xhci_command_done(c.trb)
+        Some(p) => p
+        None => return
+    if port == 0 or port > PORTS_MAX
+        return
+    let d: *UsbDevice = dev_of_port(port)
+    if not completion_ok(c.code)
+        fail_code(d, "command", c.code)
+        return
+    match d.state
+        EnablingSlot => address_device(d, c.slot)
+        Addressing => addressed(d)
+        FixingMps => read_device_descriptor(d)
+        _ => pass
+
+fn on_transfer(x: TransferEvent)
+    let d: *UsbDevice = match dev_of_slot(x.slot)
+        Some(d) => d
+        None => return
+    if x.dci != DCI_EP0
+        return
+    # Err means x.trb is not on this ring (a stale or foreign event): there
+    # is nothing to retire, and the completion is still handled below.
+    let _ = d.ep0.retire(x.trb)
+    if not completion_ok(x.code)
+        fail_code(d, "control transfer", x.code)
+        return
+    let b: [u8] = received(d, x.residual)
+    match d.state
+        ReadingMps => got_mps(d, b)
+        ReadingDevice => got_device(d, b)
+        ReadingConfigHead => got_config_head(d, b)
+        ReadingConfig => got_config(d, b)
+        SettingConfig => configured(d)
+        _ => pass
+
+fn on_event(ev: Event)
+    match ev
+        CommandDone(c) => on_command(c)
+        PortChange(p) => port_changed(p)
+        Transfer(x) => on_transfer(x)
+        HostController(c) =>
+            klog("[xhci] host controller event: ")
+            klog(completion_name(c))
+            klog("\n")
+        Other(_) => pass
+
+# The controller's interrupt: drain up to EVENTS_PER_IRQ events into the
+# port state machines, then tell the controller how far it got. Called
+# from irq_handler on the BSP for xHCI's vector.
+pub fn xhci_irq()
+    if not xhci_running()
+        return
+    xhci_irq_ack()
+    var n: u32 = 0
+    while n < EVENTS_PER_IRQ
+        match xhci_next_event()
+            Some(ev) => on_event(ev)
+            None => break
+        n += 1
+    xhci_events_done()
+    if not usb_dead_logged and xhci_dead()
+        usb_dead_logged = true
+        klog("[xhci] controller error (USBSTS HSE/HCE or gone); recovery is not implemented\n")
+
+# ============================================================================
+# Boot
+# ============================================================================
+
+# Bring up the first xHCI controller and look at every root port once:
+# a device already connected starts enumerating now, and finishes on its
+# events. Boot only, on the BSP. Interrupts are held off throughout (and
+# restored after), because xhci_irq is the state's only other user: an
+# event taken mid-scan would run port_changed inside port_changed.
+fn usb_init() -> Result<bool, XhciError>
+    let was_on: bool = interrupts_enabled()
+    disable_interrupts()
+    let r: Result<bool, XhciError> = usb_init_quiet()
+    if was_on
+        enable_interrupts()
+    r
+
+fn usb_init_quiet() -> Result<bool, XhciError>
+    xhci_init()?
+    for p in 1..=xhci_max_ports()
+        if (xhci_portsc(p) & PORTSC_CCS) != 0
+            port_changed(p)
+    Ok(true)
+
+# kernel_main's USB step (docs/USB.md, AGAST #4887): usb_init, then its
+# boot-status line. Here rather than in main.ritz, which is held to a SLOC
+# cap (test_harland_postinit_klog.py). It runs after the APIC is up (the
+# MSI-X vector is aimed at the BSP) and before any AP runs a process; the
+# reset and BIOS handoff are the driver's only busy-waits.
+pub fn usb_boot()
+    match usb_init()
+        Ok(_) => klog("  [OK] USB (xHCI)\n")
+        Err(e) =>
+            match e
+                NotFound => klog("  [..] USB (no xHCI controller)\n")
+                _ =>
+                    klog("  [!!] USB (xHCI: ")
+                    klog(xhci_error_name(e))
+                    klog(")\n")

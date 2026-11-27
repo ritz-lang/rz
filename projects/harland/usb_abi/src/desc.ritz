@@ -1,0 +1,243 @@
+# Harland USB descriptors and standard requests (AGAST #4887, docs/USB.md)
+#
+# The standard requests enumeration sends on EP0 (USB 2.0 section 9.4), and
+# the parser for what GET_DESCRIPTOR returns: the device descriptor, the
+# configuration descriptor's header, and a walk over the interface,
+# endpoint and class descriptors that follow it. The bytes come from a
+# device, so every length is checked against the bytes actually there: a
+# short read or a descriptor that claims more than it has is an error, not
+# a read past the buffer.
+
+import usb_abi.regs { EpKind, ep_kind }
+
+# ============================================================================
+# Standard requests
+# ============================================================================
+
+pub const REQ_GET_STATUS: u8 = 0
+pub const REQ_SET_ADDRESS: u8 = 5
+pub const REQ_GET_DESCRIPTOR: u8 = 6
+pub const REQ_GET_CONFIGURATION: u8 = 8
+pub const REQ_SET_CONFIGURATION: u8 = 9
+
+# bmRequestType: direction (bit 7), type (6:5), recipient (4:0).
+pub const REQTYPE_IN: u8 = 0x80
+pub const REQTYPE_STANDARD_DEVICE: u8 = 0x00
+
+pub const DESC_DEVICE: u8 = 1
+pub const DESC_CONFIG: u8 = 2
+pub const DESC_STRING: u8 = 3
+pub const DESC_INTERFACE: u8 = 4
+pub const DESC_ENDPOINT: u8 = 5
+pub const DESC_HID: u8 = 0x21
+
+pub const DEVICE_DESC_LEN: u8 = 18
+pub const CONFIG_DESC_LEN: u8 = 9
+const INTERFACE_DESC_LEN: u8 = 9
+const ENDPOINT_DESC_LEN: u8 = 7
+
+# The 8-byte SETUP packet.
+pub struct SetupPacket
+    request_type: u8
+    request: u8
+    value: u16
+    index: u16
+    length: u16
+
+# GET_DESCRIPTOR of type `dtype`, index `index`, the first `length` bytes.
+pub fn setup_get_descriptor(dtype: u8, index: u8, length: u16) -> SetupPacket
+    SetupPacket {
+        request_type: REQTYPE_IN | REQTYPE_STANDARD_DEVICE,
+        request: REQ_GET_DESCRIPTOR,
+        value: ((dtype as u16) << 8) | (index as u16),
+        index: 0,
+        length: length
+    }
+
+pub fn setup_set_configuration(value: u8) -> SetupPacket
+    SetupPacket {
+        request_type: REQTYPE_STANDARD_DEVICE,
+        request: REQ_SET_CONFIGURATION,
+        value: value as u16,
+        index: 0,
+        length: 0
+    }
+
+# ============================================================================
+# Parsing
+# ============================================================================
+
+pub enum DescError
+    Truncated               # fewer bytes than the descriptor needs or claims
+    BadLength               # bLength too small for its type, or 0
+    WrongType               # bDescriptorType is not the one asked for
+
+fn le16(b: [u8], at: i64) -> u16
+    (b[at] as u16) | ((b[at + 1] as u16) << 8)
+
+# The header every descriptor starts with: bLength must be at least `min`
+# and within `b`, and bDescriptorType must be `dtype`.
+fn check_header(b: [u8], dtype: u8, min: u8) -> Result<u8, DescError>
+    if b.len < 2
+        return Err(DescError.Truncated)
+    if b[1] != dtype
+        return Err(DescError.WrongType)
+    if b[0] < min
+        return Err(DescError.BadLength)
+    if (b[0] as i64) > b.len
+        return Err(DescError.Truncated)
+    Ok(b[0])
+
+pub struct DeviceDesc
+    usb_version: u16        # bcdUSB
+    class: u8
+    subclass: u8
+    protocol: u8
+    max_packet0: u8         # EP0's max packet size (a power of two up to 64; SuperSpeed: the exponent)
+    vendor: u16
+    product: u16
+    device_version: u16     # bcdDevice
+    num_configs: u8
+
+pub fn parse_device(b: [u8]) -> Result<DeviceDesc, DescError>
+    if b.len < DEVICE_DESC_LEN as i64
+        return Err(DescError.Truncated)
+    match check_header(b, DESC_DEVICE, DEVICE_DESC_LEN)
+        Err(e) => return Err(e)
+        Ok(_) => pass
+    Ok(DeviceDesc {
+        usb_version: le16(b, 2),
+        class: b[4],
+        subclass: b[5],
+        protocol: b[6],
+        max_packet0: b[7],
+        vendor: le16(b, 8),
+        product: le16(b, 10),
+        device_version: le16(b, 12),
+        num_configs: b[17]
+    })
+
+# bMaxPacketSize0 from the first 8 bytes of the device descriptor: what a
+# full-speed device's EP0 is read for before its max packet size is known.
+pub fn device_max_packet0(b: [u8]) -> Result<u8, DescError>
+    if b.len < 8
+        return Err(DescError.Truncated)
+    if b[1] != DESC_DEVICE
+        return Err(DescError.WrongType)
+    if b[0] < DEVICE_DESC_LEN
+        return Err(DescError.BadLength)
+    Ok(b[7])
+
+pub struct ConfigHeader
+    total_length: u16       # the configuration and everything after it
+    num_interfaces: u8
+    value: u8               # bConfigurationValue, for SET_CONFIGURATION
+    attributes: u8
+    max_power: u8           # in 2 mA units (8 mA SuperSpeed)
+
+pub fn parse_config_header(b: [u8]) -> Result<ConfigHeader, DescError>
+    if b.len < CONFIG_DESC_LEN as i64
+        return Err(DescError.Truncated)
+    match check_header(b, DESC_CONFIG, CONFIG_DESC_LEN)
+        Err(e) => return Err(e)
+        Ok(_) => pass
+    Ok(ConfigHeader {
+        total_length: le16(b, 2),
+        num_interfaces: b[4],
+        value: b[5],
+        attributes: b[7],
+        max_power: b[8]
+    })
+
+pub struct InterfaceDesc
+    number: u8
+    alternate: u8
+    num_endpoints: u8
+    class: u8
+    subclass: u8
+    protocol: u8
+
+pub struct EndpointDesc
+    address: u8             # bit 7: IN; bits 3:0: the endpoint number
+    attributes: u8          # bits 1:0: the transfer type
+    max_packet_raw: u16     # wMaxPacketSize as sent (bits 12:11: high-bandwidth)
+    interval: u8            # bInterval, as sent
+
+impl EndpointDesc
+    pub fn is_in(self: @EndpointDesc) -> bool
+        (self.address & 0x80) != 0
+
+    pub fn number(self: @EndpointDesc) -> u8
+        self.address & 0x0F
+
+    pub fn kind(self: @EndpointDesc) -> EpKind
+        ep_kind(self.attributes)
+
+    # The packet size, without the high-bandwidth multiplier bits.
+    pub fn max_packet(self: @EndpointDesc) -> u16
+        self.max_packet_raw & 0x7FF
+
+# One step of a configuration walk.
+pub enum Desc
+    Interface(InterfaceDesc)
+    Endpoint(EndpointDesc)
+    Other(u8)               # a class or vendor descriptor, by type
+    End
+
+# A walk over the descriptors after a configuration descriptor, within its
+# wTotalLength.
+pub struct DescWalk
+    bytes: [u8]
+    pos: i64
+
+impl DescWalk
+    # The full configuration read: at least wTotalLength bytes, or
+    # Truncated. Bytes past wTotalLength are not walked.
+    pub fn new(config: [u8]) -> Result<DescWalk, DescError>
+        let h: ConfigHeader = match parse_config_header(config)
+            Ok(h) => h
+            Err(e) => return Err(e)
+        let total: i64 = h.total_length as i64
+        if total > config.len
+            return Err(DescError.Truncated)
+        if total < config[0] as i64
+            return Err(DescError.BadLength)
+        Ok(DescWalk { bytes: config[0..total], pos: config[0] as i64 })
+
+    # The next descriptor, End after the last, or why the bytes stop it.
+    pub fn next(self: @&DescWalk) -> Result<Desc, DescError>
+        if self.pos >= self.bytes.len
+            return Ok(Desc.End)
+        let rest: [u8] = self.bytes[self.pos..self.bytes.len]
+        if rest.len < 2
+            return Err(DescError.Truncated)
+        let len: u8 = rest[0]
+        if len < 2
+            return Err(DescError.BadLength)
+        if (len as i64) > rest.len
+            return Err(DescError.Truncated)
+        self.pos += len as i64
+        let dtype: u8 = rest[1]
+        if dtype == DESC_INTERFACE
+            if len < INTERFACE_DESC_LEN
+                return Err(DescError.BadLength)
+            let i = InterfaceDesc {
+                number: rest[2],
+                alternate: rest[3],
+                num_endpoints: rest[4],
+                class: rest[5],
+                subclass: rest[6],
+                protocol: rest[7]
+            }
+            return Ok(Desc.Interface(i))
+        if dtype == DESC_ENDPOINT
+            if len < ENDPOINT_DESC_LEN
+                return Err(DescError.BadLength)
+            let e = EndpointDesc {
+                address: rest[2],
+                attributes: rest[3],
+                max_packet_raw: le16(rest, 4),
+                interval: rest[6]
+            }
+            return Ok(Desc.Endpoint(e))
+        Ok(Desc.Other(dtype))

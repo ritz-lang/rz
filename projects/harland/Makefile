@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all build clean test test-smp test-tier1 kernel iso help inventory-img test-inventory
+.PHONY: all build clean test test-smp test-tier1 test-usb kernel iso help inventory-img test-inventory
 
 all: kernel
 
@@ -77,6 +77,12 @@ test-smp:
 test-tier1:
 	./tools/test_tier1_boot.sh
 
+# AGAST #4887 (docs/USB.md "Tests"): the xHCI bring-up boot. QEMU's
+# qemu-xhci with two usb-kbd keyboards (high and full speed); each must be
+# addressed and configured on MSI-X events, and init's Tier-1 suite pass.
+test-usb:
+	./tools/test_usb_boot.sh
+
 # Hardware-inventory USB stick (AGAST #3406): HWINV.EFI on a GPT + FAT32
 # image for `dd` or Etcher. See inventory/README.md.
 INVENTORY_IMG ?= $(BUILD_DIR)/hwinv.img
@@ -112,6 +118,7 @@ help:
 	@echo "  test         - Run the boot test (= test-tier1)"
 	@echo "  test-smp     - Boot with -smp 2 and check two CPUs in SYSCALL at once (#4192)"
 	@echo "  test-tier1   - Boot with indium under OVMF, check init Tier-1 suite"
+	@echo "  test-usb     - Boot with qemu-xhci + usb-kbd, check enumeration (#4887)"
 	@echo "  inventory-img  - Build the hardware-inventory USB stick image (build/hwinv.img)"
 	@echo "  test-inventory - Boot the inventory stick in QEMU and check its dump"
 	@echo "  clean        - Remove build artifacts"

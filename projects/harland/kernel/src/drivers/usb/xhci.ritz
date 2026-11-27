@@ -1,0 +1,462 @@
+# Harland xHCI host controller (AGAST #4887, docs/USB.md)
+#
+# One controller, the first PCI function of class 0C/03/30, brought up once
+# in kernel_main (docs/USB.md "xHCI bring-up, in order", steps 1-6): BAR0,
+# the USB Legacy Support handoff, halt and reset, the DCBAA, scratchpad,
+# command ring, event ring and ERST, interrupter 0 on one MSI-X vector
+# aimed at the BSP, then Run/Stop and port power. The layouts, rings and
+# decoders are usb_abi's; this file is the register access and the memory.
+#
+# Ownership (SMP_USER.md section 2, the "In-kernel drivers" row): every
+# field here is BSP-owned and has no lock. Only the BSP touches it: the
+# boot (interrupts off, before any AP runs a process), and xhci_irq
+# (drivers/usb/usb.ritz) from the MSI-X vector this file aims at the BSP.
+# It is never lent to an AP.
+#
+# Waiting: the halt, reset and BIOS handoff are the only busy-waits, each
+# under a TSC deadline, and run only at boot. Everything after boot is a
+# command or a transfer whose completion arrives as an event.
+
+import ritzlib.option
+import ritzlib.result
+import klog { klog, klog_dec, klog_hex, klog_hex_width }
+import io { cpu_pause }
+import drivers.pci { PciDevice, PCI_CLASS_SERIAL_BUS, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory }
+import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry }
+import mm.vmm { vmm_map_mmio, phys_to_virt }
+import mm.dma { dma_alloc_zeroed }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import usb_abi.regs { HcParams, hc_params, cap_length, hci_version, CAP_LENGTH_VERSION, CAP_HCSPARAMS1, CAP_HCSPARAMS2, CAP_HCCPARAMS1, CAP_DBOFF, CAP_RTSOFF, DBOFF_MASK, RTSOFF_MASK, OP_USBCMD, OP_USBSTS, OP_PAGESIZE, OP_CRCR, OP_DCBAAP, OP_CONFIG, USBCMD_RS, USBCMD_HCRST, USBCMD_INTE, USBCMD_HSEE, USBSTS_HCH, USBSTS_HSE, USBSTS_EINT, USBSTS_PCD, USBSTS_CNR, USBSTS_HCE, PAGESIZE_4K, RT_IR0, IR_IMAN, IR_IMOD, IR_ERSTSZ, IR_ERSTBA, IR_ERDP, IMAN_IP, IMAN_IE, ERDP_EHB, DB_HOST, PORTSC_PP, portsc_reg, portsc_power_on, XCap, xcap_decode, XCAP_LEGACY, XCAP_PROTOCOL, LEGSUP_BIOS_OWNED, LEGSUP_OS_OWNED, LEGCTL_OFFSET, legctl_quiet, PortProtocol, protocol_decode }
+import usb_abi.trb { Trb, Event, event_decode }
+import usb_abi.ring { TrbPage, TrbRing, RingError, EventRing, ErstEntry, erst_entry, RING_TRBS }
+
+const PCI_SUBCLASS_USB: u8 = 0x03
+const PCI_PROGIF_XHCI: u8 = 0x30
+
+# Boot-time deadlines (docs/USB.md): the BIOS may hold the controller for
+# up to a second of SMI work; halt and reset take tens of milliseconds.
+const HANDOFF_US: u64 = 1000000
+const HALT_US: u64 = 100000
+const RESET_US: u64 = 1000000
+
+# Supported Protocol capabilities kept; a controller lists two or three.
+const PROTOCOLS_MAX: u32 = 8
+# The extended-capability walk stops here whatever the list says: a
+# looping or garbage list cannot hang the boot.
+const XCAPS_MAX: u32 = 64
+# Events handled per xhci_irq before the ERDP write; the rest are taken
+# on the next interrupt (the controller re-asserts while any remain).
+pub const EVENTS_PER_IRQ: u32 = 64
+
+pub enum XhciError
+    NotFound                # no 0C/03/30 function
+    BadBar                  # BAR0 missing, I/O space, or not mappable
+    PageSize                # the controller cannot do 4 KiB pages
+    HaltTimeout             # HCHalted not set within HALT_US
+    ResetTimeout            # HCRST or CNR still set after RESET_US
+    StartTimeout            # HCHalted still set after Run/Stop
+    NoMemory                # dma_alloc_zeroed failed
+    Above4G                 # a DMA page above 4 GiB, without AC64
+
+pub fn xhci_error_name(e: XhciError) -> StrView
+    match e
+        NotFound => "no xHCI controller"
+        BadBar => "BAR0 unusable"
+        PageSize => "no 4 KiB page size"
+        HaltTimeout => "halt timed out"
+        ResetTimeout => "reset timed out"
+        StartTimeout => "start timed out"
+        NoMemory => "out of DMA memory"
+        Above4G => "DMA page above 4 GiB without AC64"
+
+# The controller. BSP-owned (see the header).
+struct Xhci
+    pci: *PciDevice
+    mmio: u64               # BAR0, the capability registers
+    op: u64                 # the operational registers
+    rt: u64                 # the runtime registers
+    db: u64                 # the doorbell array
+    params: HcParams
+    dcbaa: u64              # device context base address array (phys)
+    cmd: TrbRing
+    cmd_owner: [256]u8      # the root port each outstanding command is for
+    events: EventRing
+    erst: u64               # the event ring segment table (phys)
+    msix: MsixInfo
+    vector: u8              # interrupter 0's MSI-X vector, 0 if none
+    protocols: [8]PortProtocol
+    nprotocols: u32
+    running: bool
+
+var xhc: Xhci
+
+# ============================================================================
+# Register access
+# ============================================================================
+
+fn rd32(addr: u64) -> u32
+    volatile_load(addr as *u32)
+
+fn wr32(addr: u64, v: u32)
+    volatile_store(addr as *u32, v)
+
+# A 64-bit register as two dwords, low first: the high write is the one a
+# controller acts on (QEMU's CRCR and ERSTBA among them).
+fn wr64(addr: u64, v: u64)
+    wr32(addr, (v & 0xFFFFFFFF) as u32)
+    wr32(addr + 4, (v >> 32) as u32)
+
+fn op_rd(reg: u64) -> u32
+    rd32(xhc.op + reg)
+
+fn op_wr(reg: u64, v: u32)
+    wr32(xhc.op + reg, v)
+
+fn ir0() -> u64
+    xhc.rt + RT_IR0
+
+# Poll operational register `reg` until (value & mask) == want, or the
+# deadline `us` from now passes. Boot only.
+fn op_wait(reg: u64, mask: u32, want: u32, us: u64) -> bool
+    let deadline: u64 = deadline_after_us(us)
+    while (op_rd(reg) & mask) != want
+        if deadline_passed(deadline)
+            return false
+        cpu_pause()
+    true
+
+# ============================================================================
+# Memory
+# ============================================================================
+
+# One zeroed DMA page the controller can address: below 4 GiB unless it
+# does 64-bit addresses. Kernel DMA is physical (docs/USB.md step 4).
+pub fn xhci_alloc_page() -> Result<u64, XhciError>
+    let p: u64 = match dma_alloc_zeroed(1)
+        Some(p) => p
+        None => return Err(XhciError.NoMemory)
+    if not xhc.params.ac64 and p >= 0x100000000
+        return Err(XhciError.Above4G)
+    Ok(p)
+
+fn alloc_pages(n: u32) -> Result<u64, XhciError>
+    let p: u64 = match dma_alloc_zeroed(n)
+        Some(p) => p
+        None => return Err(XhciError.NoMemory)
+    if not xhc.params.ac64 and p + (n as u64) * 4096 > 0x100000000
+        return Err(XhciError.Above4G)
+    Ok(p)
+
+# The DCBAA's entry `i` (0: the scratchpad array; a slot ID otherwise).
+fn dcbaa_entry(i: u8) -> *u64
+    (phys_to_virt(xhc.dcbaa) + (i as u64) * 8) as *u64
+
+# ============================================================================
+# Bring-up
+# ============================================================================
+
+fn find_controller() -> Option<*PciDevice>
+    let n: i32 = pci_get_device_count()
+    for i in 0..n
+        let d: *PciDevice = pci_get_device(i)
+        if d.class_code == PCI_CLASS_SERIAL_BUS and d.subclass == PCI_SUBCLASS_USB and d.prog_if == PCI_PROGIF_XHCI
+            return Some(d)
+    None
+
+fn log_bdf(d: *PciDevice)
+    klog_hex_width(d.bus as u64, 2)
+    klog(":")
+    klog_hex_width(d.device as u64, 2)
+    klog(".")
+    klog_dec(d.function as i64)
+
+# USB Legacy Support at `cap` (BAR0-relative): take the controller from
+# the BIOS (docs/USB.md step 2). After HANDOFF_US the BIOS's claim is
+# cleared by hand and the boot goes on; either way every SMI is turned off.
+fn bios_handoff(cap: u64)
+    let addr: u64 = xhc.mmio + cap
+    let v: u32 = rd32(addr)
+    if (v & LEGSUP_BIOS_OWNED) != 0
+        wr32(addr, v | LEGSUP_OS_OWNED)
+        let deadline: u64 = deadline_after_us(HANDOFF_US)
+        var held: bool = true
+        while held
+            held = (rd32(addr) & LEGSUP_BIOS_OWNED) != 0
+            if held and deadline_passed(deadline)
+                break
+            cpu_pause()
+        if held
+            klog("[xhci] BIOS kept ownership past 1 s: taking it\n")
+            wr32(addr, (rd32(addr) & (0xFFFFFFFF ^ LEGSUP_BIOS_OWNED)) | LEGSUP_OS_OWNED)
+        else
+            klog("[xhci] BIOS handoff done\n")
+    else
+        wr32(addr, v | LEGSUP_OS_OWNED)
+    let ctl: u64 = addr + LEGCTL_OFFSET
+    wr32(ctl, legctl_quiet(rd32(ctl)))
+
+# Walk the extended capabilities: hand off from the BIOS and keep each
+# Supported Protocol.
+fn walk_xcaps()
+    var off: u64 = xhc.params.xecp as u64
+    var n: u32 = 0
+    while off != 0 and n < XCAPS_MAX
+        let cap: XCap = xcap_decode(rd32(xhc.mmio + off))
+        if cap.id == XCAP_LEGACY
+            bios_handoff(off)
+        if cap.id == XCAP_PROTOCOL and xhc.nprotocols < PROTOCOLS_MAX
+            let a: u64 = xhc.mmio + off
+            match protocol_decode(rd32(a), rd32(a + 4), rd32(a + 8), rd32(a + 12))
+                Ok(p) =>
+                    xhc.protocols[xhc.nprotocols] = p
+                    xhc.nprotocols += 1
+                    klog("[xhci] ports ")
+                    klog_dec(p.first_port as i64)
+                    klog("-")
+                    klog_dec((p.first_port as i64) + (p.count as i64) - 1)
+                    klog(": USB ")
+                    klog_dec(p.major as i64)
+                    klog(".")
+                    klog_hex(p.minor as u64)
+                    klog("\n")
+                Err(_) => pass
+        if cap.next == 0
+            return
+        off += cap.next as u64
+        n += 1
+
+# Halt, then reset (docs/USB.md step 3).
+fn halt_and_reset() -> Result<bool, XhciError>
+    op_wr(OP_USBCMD, op_rd(OP_USBCMD) & (0xFFFFFFFF ^ (USBCMD_RS | USBCMD_INTE)))
+    if not op_wait(OP_USBSTS, USBSTS_HCH, USBSTS_HCH, HALT_US)
+        return Err(XhciError.HaltTimeout)
+    op_wr(OP_USBCMD, USBCMD_HCRST)
+    if not op_wait(OP_USBCMD, USBCMD_HCRST, 0, RESET_US)
+        return Err(XhciError.ResetTimeout)
+    if not op_wait(OP_USBSTS, USBSTS_CNR, 0, RESET_US)
+        return Err(XhciError.ResetTimeout)
+    Ok(true)
+
+# The scratchpad buffer array and its pages (HCSPARAMS2), in DCBAA[0].
+fn setup_scratchpad() -> Result<bool, XhciError>
+    let n: u32 = xhc.params.scratchpads
+    if n == 0
+        return Ok(true)
+    let array: u64 = alloc_pages((n * 8 + 4095) / 4096)?
+    for i in 0..n
+        let page: u64 = xhci_alloc_page()?
+        *((phys_to_virt(array) + (i as u64) * 8) as *u64) = page
+    *dcbaa_entry(0) = array
+    Ok(true)
+
+# DCBAA, scratchpad, command ring, event ring and ERST, programmed into
+# the halted controller (docs/USB.md step 4).
+fn setup_memory() -> Result<bool, XhciError>
+    xhc.dcbaa = xhci_alloc_page()?
+    setup_scratchpad()?
+    let cmd: u64 = xhci_alloc_page()?
+    xhc.cmd = TrbRing.new(phys_to_virt(cmd) as *TrbPage, cmd, RING_TRBS)
+    let ev: u64 = xhci_alloc_page()?
+    xhc.events = EventRing.new(phys_to_virt(ev) as *TrbPage, ev, RING_TRBS)
+    xhc.erst = xhci_alloc_page()?
+    *(phys_to_virt(xhc.erst) as *ErstEntry) = erst_entry(ev, RING_TRBS)
+
+    op_wr(OP_CONFIG, (op_rd(OP_CONFIG) & 0xFFFFFF00) | (xhc.params.max_slots as u32))
+    wr64(xhc.op + OP_DCBAAP, xhc.dcbaa)
+    wr64(xhc.op + OP_CRCR, xhc.cmd.dequeue_ptr())
+    # Interrupter 0: one segment, the dequeue pointer at its start, then
+    # the table's address (the write that makes the controller read it).
+    wr32(ir0() + IR_ERSTSZ, 1)
+    wr64(ir0() + IR_ERDP, ev)
+    wr64(ir0() + IR_ERSTBA, xhc.erst)
+    Ok(true)
+
+# Interrupter 0's MSI-X entry 0 on a new vector, aimed at this CPU, the
+# BSP (msix_set_entry: irq_route_dest, and an IRTE when remapping is on).
+# False when the controller has no usable MSI-X: its events then wait for
+# the polled fallback (#4891).
+fn setup_vector() -> bool
+    if msix_probe(xhc.pci, @xhc.msix) != 0
+        return false
+    if msix_enable(@xhc.msix) != 0
+        return false
+    let v: u8 = msix_vector_alloc()
+    if v == 0
+        return false
+    if msix_set_entry(@xhc.msix, 0, v) != 0
+        return false
+    xhc.vector = v
+    true
+
+# Power every port when the controller switches port power (PPC); a port
+# that is already powered is left alone.
+fn power_ports()
+    if not xhc.params.ppc
+        return
+    for p in 1..=xhc.params.max_ports
+        let v: u32 = xhci_portsc(p)
+        if (v & PORTSC_PP) == 0
+            xhci_portsc_write(p, portsc_power_on(v))
+
+fn bring_up() -> Result<bool, XhciError>
+    let d: *PciDevice = match find_controller()
+        Some(d) => d
+        None => return Err(XhciError.NotFound)
+    xhc.pci = d
+    if d.bar[0] == 0 or d.bar_is_io[0] != 0 or d.bar_size[0] == 0
+        return Err(XhciError.BadBar)
+    xhc.mmio = vmm_map_mmio(d.bar[0], d.bar_size[0])
+    if xhc.mmio == 0
+        return Err(XhciError.BadBar)
+    pci_enable_memory(d)
+    pci_enable_bus_master(d)
+
+    let dw0: u32 = rd32(xhc.mmio + CAP_LENGTH_VERSION)
+    xhc.op = xhc.mmio + (cap_length(dw0) as u64)
+    xhc.rt = xhc.mmio + ((rd32(xhc.mmio + CAP_RTSOFF) & RTSOFF_MASK) as u64)
+    xhc.db = xhc.mmio + ((rd32(xhc.mmio + CAP_DBOFF) & DBOFF_MASK) as u64)
+    xhc.params = hc_params(rd32(xhc.mmio + CAP_HCSPARAMS1), rd32(xhc.mmio + CAP_HCSPARAMS2), rd32(xhc.mmio + CAP_HCCPARAMS1))
+
+    klog("[xhci] ")
+    log_bdf(d)
+    klog(" ")
+    klog_hex_width(d.vendor_id as u64, 4)
+    klog(":")
+    klog_hex_width(d.device_id as u64, 4)
+    let ver: u16 = hci_version(dw0)
+    klog(" v")
+    klog_hex((ver >> 8) as u64)
+    klog(".")
+    klog_hex_width((ver & 0xFF) as u64, 2)
+    klog(": ")
+    klog_dec(xhc.params.max_slots as i64)
+    klog(" slots, ")
+    klog_dec(xhc.params.max_ports as i64)
+    klog(" ports, ")
+    klog_dec(if xhc.params.ctx64 then 64 else 32)
+    klog("-byte contexts, ")
+    klog_dec(xhc.params.scratchpads as i64)
+    klog(" scratchpads")
+    if xhc.params.ac64
+        klog(", 64-bit DMA")
+    klog("\n")
+
+    walk_xcaps()
+    halt_and_reset()?
+    if (op_rd(OP_PAGESIZE) & PAGESIZE_4K) == 0
+        return Err(XhciError.PageSize)
+    setup_memory()?
+
+    let irq: bool = setup_vector()
+    # Moderation off at first (docs/USB.md step 5), then the interrupter.
+    wr32(ir0() + IR_IMOD, 0)
+    wr32(ir0() + IR_IMAN, IMAN_IE | IMAN_IP)
+    op_wr(OP_USBSTS, USBSTS_EINT | USBSTS_PCD | USBSTS_HSE)
+    op_wr(OP_USBCMD, USBCMD_RS | USBCMD_INTE | USBCMD_HSEE)
+    if not op_wait(OP_USBSTS, USBSTS_HCH, 0, HALT_US)
+        return Err(XhciError.StartTimeout)
+    xhc.running = true
+    power_ports()
+
+    klog("[xhci] running: ")
+    if irq
+        klog("MSI-X vector ")
+        klog_dec(xhc.vector as i64)
+        klog(" -> BSP\n")
+    else
+        klog("no MSI-X vector: events wait for the polled fallback\n")
+    Ok(true)
+
+# Bring up the first xHCI controller. Boot only, on the BSP, with
+# interrupts off and before any AP runs a process.
+pub fn xhci_init() -> Result<bool, XhciError>
+    match bring_up()
+        Ok(_) => Ok(true)
+        Err(e) =>
+            xhc.running = false
+            Err(e)
+
+# ============================================================================
+# What usb.ritz drives the controller with (all BSP, see the header)
+# ============================================================================
+
+pub fn xhci_running() -> bool
+    xhc.running
+
+pub fn xhci_ctx64() -> bool
+    xhc.params.ctx64
+
+pub fn xhci_max_ports() -> u8
+    xhc.params.max_ports
+
+# The Supported Protocol that covers root port `port`.
+pub fn xhci_port_protocol(port: u8) -> Option<PortProtocol>
+    for i in 0..xhc.nprotocols
+        let p: PortProtocol = xhc.protocols[i]
+        if p.covers(port)
+            return Some(p)
+    None
+
+pub fn xhci_portsc(port: u8) -> u32
+    op_rd(portsc_reg(port))
+
+# Write PORTSC; `v` is built from usb_abi's portsc_* helpers so it acts
+# only as meant.
+pub fn xhci_portsc_write(port: u8, v: u32)
+    op_wr(portsc_reg(port), v)
+
+# Point slot `slot`'s DCBAA entry at its device context.
+pub fn xhci_set_device_context(slot: u8, ctx: u64)
+    *dcbaa_entry(slot) = ctx
+
+# Ring slot `slot`'s doorbell for endpoint `dci` (0 and DB_HOST: the
+# command ring). The TRBs it announces are written before it.
+pub fn xhci_doorbell(slot: u8, dci: u8)
+    fence()
+    wr32(xhc.db + (slot as u64) * 4, dci as u32)
+
+# Queue command `t` on behalf of root port `port` and ring the host
+# doorbell. Its Command Completion Event names the TRB; xhci_command_done
+# gives `port` back.
+pub fn xhci_command(t: Trb, port: u8) -> Result<u64, RingError>
+    let p: u64 = xhc.cmd.push(t)?
+    match xhc.cmd.index_of(p)
+        Some(i) =>
+            xhc.cmd_owner[i] = port
+        None => pass
+    xhci_doorbell(0, DB_HOST as u8)
+    Ok(p)
+
+# The command TRB at `trb` completed: retire it and return the root port
+# it was queued for.
+pub fn xhci_command_done(trb: u64) -> Option<u8>
+    match xhc.cmd.retire(trb)
+        Ok(i) => Some(xhc.cmd_owner[i])
+        Err(_) => None
+
+# The interrupter's pending bit and the controller's event bit, cleared
+# before the event ring is drained so a later event raises a new interrupt.
+pub fn xhci_irq_ack()
+    wr32(ir0() + IR_IMAN, IMAN_IE | IMAN_IP)
+    op_wr(OP_USBSTS, USBSTS_EINT)
+
+pub fn xhci_next_event() -> Option<Event>
+    match xhc.events.next()
+        Some(t) => Some(event_decode(t))
+        None => None
+
+# Tell the controller how far the driver has read, clearing Event Handler
+# Busy.
+pub fn xhci_events_done()
+    wr64(ir0() + IR_ERDP, xhc.events.erdp() | ERDP_EHB)
+
+# USBSTS reads all-ones (the controller is gone) or reports a host system
+# error or controller error. Recovery is #4889's; this only lets the
+# caller log it once.
+pub fn xhci_dead() -> bool
+    let s: u32 = op_rd(OP_USBSTS)
+    s == 0xFFFFFFFF or (s & (USBSTS_HSE | USBSTS_HCE)) != 0
+
+# True if `vector` is this controller's MSI-X vector (irq_handler).
+pub fn xhci_owns_vector(vector: u64) -> bool
+    xhc.running and xhc.vector != 0 and vector == xhc.vector as u64

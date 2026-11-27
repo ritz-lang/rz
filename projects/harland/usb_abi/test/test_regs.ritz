@@ -1,0 +1,232 @@
+# Harland usb_abi register tests (AGAST #4887)
+#
+# The capability parameters a controller reports, PORTSC's write-back rule,
+# the extended capability walk (USB Legacy Support, Supported Protocol), the
+# port speed ID and the endpoint interval per speed. Plain integers in and
+# out: nothing here touches a device.
+
+import usb_abi.regs { HcParams, hc_params, cap_length, hci_version, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PP, PORTSC_CSC, PORTSC_PEC, PORTSC_PRC, PORTSC_LWS, PORTSC_WPR, PORTSC_CHANGE, portsc_neutral, portsc_ack, portsc_start_reset, portsc_power_on, portsc_speed, portsc_reg, XCap, xcap_decode, XCAP_LEGACY, XCAP_PROTOCOL, legctl_quiet, LEGSUP_BIOS_OWNED, LEGSUP_OS_OWNED, PortProtocol, ProtocolError, protocol_decode, UsbSpeed, speed_from_psiv, speed_psiv, ep0_max_packet, EpKind, ep_kind, ep_interval }
+
+fn is_speed(s: Option<UsbSpeed>, want: UsbSpeed) -> bool
+    match s
+        Some(v) => v == want
+        None => false
+
+# ---------------------------------------------------------------------------
+# Capability parameters
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_hc_params_fields() -> i32
+    # HCSPARAMS1: 64 slots, 16 interrupters, 8 ports.
+    # HCSPARAMS2: ERST Max 4 (16 segments), 34 scratchpads = hi 1 (bits
+    # 25:21), lo 2 (bits 31:27).
+    # HCCPARAMS1: AC64, CSZ, PPC, xECP 0x20 dwords.
+    let p: HcParams = hc_params(0x08001040, (2 << 27) | (1 << 21) | (4 << 4), 0x0020000D)
+    assert p.max_slots == 64
+    assert p.max_intrs == 16
+    assert p.max_ports == 8
+    assert p.scratchpads == 34
+    assert p.erst_max == 16
+    assert p.ac64
+    assert p.ctx64
+    assert p.ppc
+    assert p.xecp == 0x80
+    0
+
+[[test]]
+fn test_capability_dword0() -> i32
+    # QEMU's qemu-xhci: CAPLENGTH 0x40, HCIVERSION 1.0.
+    assert cap_length(0x01000040) == 0x40
+    assert hci_version(0x01000040) == 0x0100
+    assert hci_version(0x01100020) == 0x0110
+    0
+
+[[test]]
+fn test_hc_params_32_byte_contexts() -> i32
+    # QEMU's qemu-xhci: CSZ clear, AC64 set, no scratchpads.
+    let p: HcParams = hc_params(0x08000840, 0, 0x00080001)
+    assert p.max_intrs == 8
+    assert p.scratchpads == 0
+    assert p.erst_max == 1
+    assert p.ac64
+    assert not p.ctx64
+    assert not p.ppc
+    assert p.xecp == 0x20
+    0
+
+# ---------------------------------------------------------------------------
+# PORTSC
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_portsc_register_offsets() -> i32
+    # Port n (1-based) at 0x400 + 0x10 * (n - 1) of the operational block.
+    assert portsc_reg(1) == 0x400
+    assert portsc_reg(5) == 0x440
+    0
+
+[[test]]
+fn test_portsc_neutral_drops_write_to_act_bits() -> i32
+    # A connected, enabled, powered high-speed port mid-reset with two
+    # changes latched. Writing it back as read would disable the port
+    # (PED is RW1C), clear the changes and restart the reset.
+    let v: u32 = PORTSC_CCS | PORTSC_PED | PORTSC_PP | (3 << 10) | PORTSC_CSC | PORTSC_PRC | PORTSC_PR | PORTSC_LWS | PORTSC_WPR
+    let n: u32 = portsc_neutral(v)
+    assert n == (PORTSC_CCS | PORTSC_PP | (3 << 10))
+    assert (n & PORTSC_PED) == 0
+    assert (n & PORTSC_CHANGE) == 0
+    0
+
+[[test]]
+fn test_portsc_ack_clears_only_latched_changes() -> i32
+    let v: u32 = PORTSC_CCS | PORTSC_PED | PORTSC_PP | PORTSC_CSC | PORTSC_PRC
+    let a: u32 = portsc_ack(v)
+    assert (a & PORTSC_CHANGE) == (PORTSC_CSC | PORTSC_PRC)
+    assert (a & PORTSC_PEC) == 0
+    assert (a & PORTSC_PED) == 0
+    assert (a & PORTSC_PP) != 0
+    0
+
+[[test]]
+fn test_portsc_reset_and_power() -> i32
+    let v: u32 = PORTSC_CCS | PORTSC_PP | PORTSC_CSC
+    # Reset: PR set, the latched CSC not acknowledged by the same write.
+    assert portsc_start_reset(v) == (PORTSC_CCS | PORTSC_PP | PORTSC_PR)
+    assert portsc_power_on(0) == PORTSC_PP
+    assert portsc_speed(PORTSC_CCS | (4 << 10)) == 4
+    0
+
+# ---------------------------------------------------------------------------
+# Extended capabilities
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_xcap_decode() -> i32
+    let c: XCap = xcap_decode(0x01000401)
+    assert c.id == XCAP_LEGACY
+    assert c.next == 16                # 4 dwords, in bytes
+    let last: XCap = xcap_decode(0x00000002)
+    assert last.id == XCAP_PROTOCOL
+    assert last.next == 0
+    0
+
+[[test]]
+fn test_legacy_smi_quiet() -> i32
+    # Every SMI enable cleared, every latched SMI event (RW1C) cleared.
+    assert legctl_quiet(0x0000E011) == 0xE0000000
+    # Reserved bits pass through untouched.
+    assert legctl_quiet(0x00010000) == 0xE0010000
+    assert LEGSUP_BIOS_OWNED == 1 << 16
+    assert LEGSUP_OS_OWNED == 1 << 24
+    0
+
+[[test]]
+fn test_protocol_decode_usb3() -> i32
+    match protocol_decode(0x03000002, 0x20425355, 0x00000405, 0)
+        Ok(p) =>
+            assert p.major == 3
+            assert p.minor == 0
+            assert p.first_port == 5
+            assert p.count == 4
+            assert p.slot_type == 0
+            assert p.covers(5)
+            assert p.covers(8)
+            assert not p.covers(4)
+            assert not p.covers(9)
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_protocol_decode_refuses_bad_name_and_empty() -> i32
+    match protocol_decode(0x02000002, 0x20202020, 0x00000101, 0)
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == ProtocolError.NotUsb
+    match protocol_decode(0x02000002, 0x20425355, 0x00000001, 0)
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == ProtocolError.NoPorts
+    0
+
+# ---------------------------------------------------------------------------
+# Speed and EP0
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_speed_ids_round_trip() -> i32
+    assert is_speed(speed_from_psiv(1), UsbSpeed.Full)
+    assert is_speed(speed_from_psiv(2), UsbSpeed.Low)
+    assert is_speed(speed_from_psiv(3), UsbSpeed.High)
+    assert is_speed(speed_from_psiv(4), UsbSpeed.Super)
+    assert is_speed(speed_from_psiv(5), UsbSpeed.SuperPlus)
+    match speed_from_psiv(0)
+        Some(_) =>
+            assert false
+        None => pass
+    match speed_from_psiv(9)
+        Some(_) =>
+            assert false
+        None => pass
+    assert speed_psiv(UsbSpeed.Low) == 2
+    assert speed_psiv(UsbSpeed.SuperPlus) == 5
+    0
+
+[[test]]
+fn test_ep0_max_packet_per_speed() -> i32
+    # docs/USB.md bring-up step 7: 8 for low and full speed (corrected from
+    # the device descriptor), 64 for high, 512 for SuperSpeed.
+    assert ep0_max_packet(UsbSpeed.Low) == 8
+    assert ep0_max_packet(UsbSpeed.Full) == 8
+    assert ep0_max_packet(UsbSpeed.High) == 64
+    assert ep0_max_packet(UsbSpeed.Super) == 512
+    assert ep0_max_packet(UsbSpeed.SuperPlus) == 512
+    0
+
+# ---------------------------------------------------------------------------
+# Endpoint interval (xHCI 1.2 section 6.2.3.6)
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_ep_kind_from_attributes() -> i32
+    assert ep_kind(0x00) == EpKind.Control
+    assert ep_kind(0x05) == EpKind.Isoch
+    assert ep_kind(0x02) == EpKind.Bulk
+    assert ep_kind(0x03) == EpKind.Interrupt
+    0
+
+[[test]]
+fn test_interval_high_and_super_speed() -> i32
+    # bInterval is already an exponent: 2^(b-1) microframes.
+    assert ep_interval(UsbSpeed.High, EpKind.Interrupt, 4) == 3
+    assert ep_interval(UsbSpeed.Super, EpKind.Interrupt, 1) == 0
+    assert ep_interval(UsbSpeed.High, EpKind.Isoch, 16) == 15
+    # Out of range: clamped to 1..16 first.
+    assert ep_interval(UsbSpeed.High, EpKind.Interrupt, 0) == 0
+    assert ep_interval(UsbSpeed.Super, EpKind.Interrupt, 40) == 15
+    0
+
+[[test]]
+fn test_interval_full_and_low_speed_interrupt() -> i32
+    # bInterval in frames (ms): the largest power-of-two microframe count
+    # no longer than it, 2^3 (1 ms) to 2^10 (128 ms).
+    assert ep_interval(UsbSpeed.Full, EpKind.Interrupt, 1) == 3
+    assert ep_interval(UsbSpeed.Full, EpKind.Interrupt, 10) == 6
+    assert ep_interval(UsbSpeed.Low, EpKind.Interrupt, 10) == 6
+    assert ep_interval(UsbSpeed.Low, EpKind.Interrupt, 8) == 6
+    assert ep_interval(UsbSpeed.Full, EpKind.Interrupt, 255) == 10
+    assert ep_interval(UsbSpeed.Full, EpKind.Interrupt, 0) == 3
+    0
+
+[[test]]
+fn test_interval_full_speed_isoch_control_bulk() -> i32
+    # Full-speed isoch: 2^(b-1) frames = 2^(b+2) microframes.
+    assert ep_interval(UsbSpeed.Full, EpKind.Isoch, 1) == 3
+    assert ep_interval(UsbSpeed.Full, EpKind.Isoch, 4) == 6
+    # Control and bulk endpoints have no service interval.
+    assert ep_interval(UsbSpeed.High, EpKind.Bulk, 9) == 0
+    assert ep_interval(UsbSpeed.Full, EpKind.Control, 5) == 0
+    0

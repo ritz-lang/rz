@@ -1,0 +1,214 @@
+# Harland xHCI TRBs (AGAST #4887, docs/USB.md)
+#
+# The 16-byte Transfer Request Block every xHCI ring holds (xHCI 1.2
+# section 6.4): the encoders for the commands and control-transfer stages
+# the driver issues, and the decoder for the events the controller posts.
+# The cycle bit is the ring's to set (usb_abi.ring): every encoder here
+# leaves it clear.
+
+import usb_abi.desc { SetupPacket }
+
+pub const TRB_SIZE: u64 = 16
+
+pub struct Trb
+    param: u64              # a pointer, or immediate data (Setup Stage)
+    status: u32
+    control: u32            # cycle, flags, type (15:10), slot/endpoint IDs
+
+# Control-dword bits
+pub const TRB_CYCLE: u32 = 1 << 0
+pub const TRB_TC: u32 = 1 << 1             # Link: Toggle Cycle
+pub const TRB_ENT: u32 = 1 << 1            # Evaluate Next TRB (transfer TRBs)
+pub const TRB_ISP: u32 = 1 << 2            # Interrupt on Short Packet
+pub const TRB_CH: u32 = 1 << 4             # Chain
+pub const TRB_IOC: u32 = 1 << 5            # Interrupt On Completion
+pub const TRB_IDT: u32 = 1 << 6            # Immediate Data
+pub const TRB_BSR: u32 = 1 << 9            # Address Device: Block SET_ADDRESS
+pub const TRB_DIR_IN: u32 = 1 << 16        # Data/Status Stage direction
+
+# TRB types (control bits 15:10)
+pub const TRB_NORMAL: u32 = 1
+pub const TRB_SETUP: u32 = 2
+pub const TRB_DATA: u32 = 3
+pub const TRB_STATUS: u32 = 4
+pub const TRB_LINK: u32 = 6
+pub const TRB_NOOP: u32 = 8
+pub const TRB_ENABLE_SLOT: u32 = 9
+pub const TRB_DISABLE_SLOT: u32 = 10
+pub const TRB_ADDRESS_DEVICE: u32 = 11
+pub const TRB_CONFIGURE_ENDPOINT: u32 = 12
+pub const TRB_EVALUATE_CONTEXT: u32 = 13
+pub const TRB_RESET_ENDPOINT: u32 = 14
+pub const TRB_STOP_ENDPOINT: u32 = 15
+pub const TRB_NOOP_COMMAND: u32 = 23
+pub const TRB_EV_TRANSFER: u32 = 32
+pub const TRB_EV_COMMAND: u32 = 33
+pub const TRB_EV_PORT: u32 = 34
+pub const TRB_EV_HOST: u32 = 37
+
+pub fn trb_type(control: u32) -> u32
+    (control >> 10) & 0x3F
+
+fn slot_bits(slot: u8) -> u32
+    (slot as u32) << 24
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+# The ring's last TRB: the controller continues at `target` and toggles
+# its cycle state.
+pub fn trb_link(target: u64) -> Trb
+    Trb { param: target, status: 0, control: (TRB_LINK << 10) | TRB_TC }
+
+# Enable Slot for a device on a port whose Supported Protocol gives
+# `slot_type` (0 for USB).
+pub fn trb_enable_slot(slot_type: u8) -> Trb
+    Trb { param: 0, status: 0, control: (TRB_ENABLE_SLOT << 10) | (((slot_type as u32) & 0x1F) << 16) }
+
+pub fn trb_disable_slot(slot: u8) -> Trb
+    Trb { param: 0, status: 0, control: (TRB_DISABLE_SLOT << 10) | slot_bits(slot) }
+
+# Address Device with the input context at `input_ctx`. `bsr` stops short
+# of SET_ADDRESS (the slot goes to Default, not Addressed).
+pub fn trb_address_device(input_ctx: u64, slot: u8, bsr: bool) -> Trb
+    var c: u32 = (TRB_ADDRESS_DEVICE << 10) | slot_bits(slot)
+    if bsr
+        c = c | TRB_BSR
+    Trb { param: input_ctx, status: 0, control: c }
+
+# Evaluate Context: EP0's corrected max packet size.
+pub fn trb_evaluate_context(input_ctx: u64, slot: u8) -> Trb
+    Trb { param: input_ctx, status: 0, control: (TRB_EVALUATE_CONTEXT << 10) | slot_bits(slot) }
+
+pub fn trb_configure_endpoint(input_ctx: u64, slot: u8) -> Trb
+    Trb { param: input_ctx, status: 0, control: (TRB_CONFIGURE_ENDPOINT << 10) | slot_bits(slot) }
+
+# ============================================================================
+# Control transfer stages
+# ============================================================================
+
+# Transfer Type of a Setup Stage: no data, OUT data, IN data.
+const TRT_NO_DATA: u32 = 0
+const TRT_OUT: u32 = 2
+const TRT_IN: u32 = 3
+
+# The Setup Stage: the 8-byte packet as immediate data.
+pub fn trb_setup_stage(s: SetupPacket) -> Trb
+    let lo: u64 = (s.request_type as u64) | ((s.request as u64) << 8) | ((s.value as u64) << 16)
+    let hi: u64 = (s.index as u64) | ((s.length as u64) << 16)
+    var trt: u32 = TRT_NO_DATA
+    if s.length != 0
+        trt = if (s.request_type & 0x80) != 0 then TRT_IN else TRT_OUT
+    Trb { param: lo | (hi << 32), status: 8, control: TRB_IDT | (TRB_SETUP << 10) | (trt << 16) }
+
+# The Data Stage: `len` bytes at device address `buf`.
+pub fn trb_data_stage(buf: u64, len: u32, dir_in: bool) -> Trb
+    var c: u32 = TRB_DATA << 10
+    if dir_in
+        c = c | TRB_DIR_IN
+    Trb { param: buf, status: len & 0x1FFFF, control: c }
+
+# The Status Stage, the transfer's interrupt. Its direction is the data
+# stage's opposite, and IN when there is none: `dir_in` is that direction.
+pub fn trb_status_stage(dir_in: bool) -> Trb
+    var c: u32 = (TRB_STATUS << 10) | TRB_IOC
+    if dir_in
+        c = c | TRB_DIR_IN
+    Trb { param: 0, status: 0, control: c }
+
+# ============================================================================
+# Events
+# ============================================================================
+
+# A completion code (xHCI 1.2 section 6.4.5), the ones the driver acts on
+# by name and the rest as Other.
+pub enum Completion
+    Success
+    DataBuffer
+    Babble
+    TransactionError
+    TrbError
+    Stall
+    Resource
+    Bandwidth
+    NoSlots
+    SlotNotEnabled
+    EpNotEnabled
+    ShortPacket
+    RingUnderrun
+    RingOverrun
+    ParameterError
+    ContextState
+    EventRingFull
+    Stopped
+    StoppedShort
+    Other(u8)
+
+pub fn completion_of(code: u8) -> Completion
+    match code
+        1 => Completion.Success
+        2 => Completion.DataBuffer
+        3 => Completion.Babble
+        4 => Completion.TransactionError
+        5 => Completion.TrbError
+        6 => Completion.Stall
+        7 => Completion.Resource
+        8 => Completion.Bandwidth
+        9 => Completion.NoSlots
+        11 => Completion.SlotNotEnabled
+        12 => Completion.EpNotEnabled
+        13 => Completion.ShortPacket
+        14 => Completion.RingUnderrun
+        15 => Completion.RingOverrun
+        17 => Completion.ParameterError
+        19 => Completion.ContextState
+        21 => Completion.EventRingFull
+        26 => Completion.Stopped
+        28 => Completion.StoppedShort
+        _ => Completion.Other(code)
+
+# Success, or a short packet (the device sent less than asked: a
+# descriptor read's normal end).
+pub fn completion_ok(c: Completion) -> bool
+    match c
+        Success => true
+        ShortPacket => true
+        _ => false
+
+# A Command Completion Event: the command TRB at `trb` finished.
+pub struct CommandEvent
+    trb: u64
+    code: Completion
+    slot: u8                # Enable Slot's new slot; the command's slot otherwise
+
+# A Transfer Event: the TRB at `trb` of endpoint `dci` on `slot` finished
+# with `residual` bytes not transferred.
+pub struct TransferEvent
+    trb: u64
+    code: Completion
+    residual: u32
+    slot: u8
+    dci: u8
+
+pub enum Event
+    CommandDone(CommandEvent)
+    PortChange(u8)          # the root port (1-based) whose PORTSC changed
+    Transfer(TransferEvent)
+    HostController(Completion)
+    Other(u32)              # a TRB type the driver does not handle
+
+pub fn event_decode(t: Trb) -> Event
+    let code: Completion = completion_of(((t.status >> 24) & 0xFF) as u8)
+    let slot: u8 = ((t.control >> 24) & 0xFF) as u8
+    let ty: u32 = trb_type(t.control)
+    match ty
+        TRB_EV_COMMAND =>
+            let c = CommandEvent { trb: t.param, code: code, slot: slot }
+            Event.CommandDone(c)
+        TRB_EV_PORT => Event.PortChange(((t.param >> 24) & 0xFF) as u8)
+        TRB_EV_TRANSFER =>
+            let x = TransferEvent { trb: t.param, code: code, residual: t.status & 0xFFFFFF, slot: slot, dci: ((t.control >> 16) & 0x1F) as u8 }
+            Event.Transfer(x)
+        TRB_EV_HOST => Event.HostController(code)
+        _ => Event.Other(ty)

@@ -1,0 +1,231 @@
+# Harland usb_abi descriptor tests (AGAST #4887)
+#
+# The device and configuration descriptors a USB device returns to
+# GET_DESCRIPTOR, good and truncated: QEMU's usb-kbd (a HID boot keyboard)
+# is the good case, and every malformed shape a device can send stops the
+# walk with an error instead of reading past the bytes it sent.
+
+import usb_abi.desc { DeviceDesc, ConfigHeader, InterfaceDesc, EndpointDesc, Desc, DescWalk, DescError, parse_device, device_max_packet0, parse_config_header, SetupPacket, setup_get_descriptor, setup_set_configuration, DESC_DEVICE, DESC_CONFIG, DESC_HID, REQ_GET_DESCRIPTOR, REQ_SET_CONFIGURATION }
+import usb_abi.regs { EpKind }
+
+# usb-kbd's device descriptor: USB 2.0, MPS0 8, 0627:0001, one config.
+var g_dev: [18]u8 = [18, 1, 0x00, 0x02, 0, 0, 0, 8, 0x27, 0x06, 0x01, 0x00, 0x00, 0x00, 1, 4, 11, 1]
+
+# Its configuration: config (9), interface 0 HID boot keyboard (9), the HID
+# class descriptor (9), endpoint 0x81 interrupt IN, MPS 8, bInterval 10 (7).
+# wTotalLength 34.
+var g_cfg: [34]u8 = [9, 2, 34, 0, 1, 1, 6, 0xA0, 50, 9, 4, 0, 0, 1, 3, 1, 1, 7, 9, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x3F, 0, 7, 5, 0x81, 3, 8, 0, 10]
+
+fn is_err(r: Result<DeviceDesc, DescError>, want: DescError) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e == want
+
+fn walk_err(w: @&DescWalk, want: DescError) -> bool
+    match w.next()
+        Ok(_) => false
+        Err(e) => e == want
+
+# ---------------------------------------------------------------------------
+# Device descriptor
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_device_descriptor() -> i32
+    let b: [u8] = @g_dev
+    match parse_device(b)
+        Ok(d) =>
+            assert d.usb_version == 0x0200
+            assert d.class == 0
+            assert d.max_packet0 == 8
+            assert d.vendor == 0x0627
+            assert d.product == 0x0001
+            assert d.num_configs == 1
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_device_descriptor_truncated() -> i32
+    let b: [u8] = @g_dev
+    # The first 8 bytes, what a full-speed EP0 returns before its MPS is
+    # known: enough for bMaxPacketSize0, not the descriptor.
+    assert is_err(parse_device(b[0..8]), DescError.Truncated)
+    match device_max_packet0(b[0..8])
+        Ok(m) =>
+            assert m == 8
+        Err(_) =>
+            assert false
+    match device_max_packet0(b[0..7])
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == DescError.Truncated
+    0
+
+[[test]]
+fn test_device_descriptor_bad_header() -> i32
+    var d: [18]u8 = g_dev
+    d[1] = 2
+    assert is_err(parse_device(@d), DescError.WrongType)
+    d[1] = 1
+    d[0] = 9
+    assert is_err(parse_device(@d), DescError.BadLength)
+    0
+
+# ---------------------------------------------------------------------------
+# Configuration descriptor
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_config_header() -> i32
+    let b: [u8] = @g_cfg
+    # The 9-byte read that learns wTotalLength.
+    match parse_config_header(b[0..9])
+        Ok(h) =>
+            assert h.total_length == 34
+            assert h.num_interfaces == 1
+            assert h.value == 1
+            assert h.attributes == 0xA0
+            assert h.max_power == 50
+        Err(_) =>
+            assert false
+    match parse_config_header(b[0..8])
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == DescError.Truncated
+    0
+
+[[test]]
+fn test_config_walk_boot_keyboard() -> i32
+    let b: [u8] = @g_cfg
+    var w = match DescWalk.new(b)
+        Ok(w) => w
+        Err(_) => return 1
+    match w.next()
+        Ok(d) =>
+            match d
+                Interface(i) =>
+                    assert i.number == 0
+                    assert i.num_endpoints == 1
+                    assert i.class == 3
+                    assert i.subclass == 1
+                    assert i.protocol == 1
+                _ =>
+                    assert false
+        Err(_) =>
+            assert false
+    match w.next()
+        Ok(d) =>
+            match d
+                Other(t) =>
+                    assert t == DESC_HID
+                _ =>
+                    assert false
+        Err(_) =>
+            assert false
+    match w.next()
+        Ok(d) =>
+            match d
+                Endpoint(e) =>
+                    assert e.address == 0x81
+                    assert e.is_in()
+                    assert e.number() == 1
+                    assert e.kind() == EpKind.Interrupt
+                    assert e.max_packet() == 8
+                    assert e.interval == 10
+                _ =>
+                    assert false
+        Err(_) =>
+            assert false
+    match w.next()
+        Ok(d) =>
+            match d
+                End => pass
+                _ =>
+                    assert false
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_config_walk_truncated_read() -> i32
+    # A read shorter than wTotalLength: the walk refuses it up front.
+    let b: [u8] = @g_cfg
+    match DescWalk.new(b[0..20])
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == DescError.Truncated
+    0
+
+[[test]]
+fn test_config_walk_descriptor_past_end() -> i32
+    # The endpoint claims 9 bytes where 7 remain.
+    var c: [34]u8 = g_cfg
+    c[27] = 9
+    var w = match DescWalk.new(@c)
+        Ok(w) => w
+        Err(_) => return 1
+    match w.next()
+        Ok(_) => pass
+        Err(_) =>
+            assert false
+    match w.next()
+        Ok(_) => pass
+        Err(_) =>
+            assert false
+    assert walk_err(@&w, DescError.Truncated)
+    0
+
+[[test]]
+fn test_config_walk_zero_length_stops() -> i32
+    # bLength 0 would never advance: an error, not a loop.
+    var c: [34]u8 = g_cfg
+    c[9] = 0
+    var w = match DescWalk.new(@c)
+        Ok(w) => w
+        Err(_) => return 1
+    assert walk_err(@&w, DescError.BadLength)
+    0
+
+[[test]]
+fn test_config_walk_short_interface() -> i32
+    # An interface descriptor whose bLength is too small for its fields.
+    var c: [34]u8 = g_cfg
+    c[9] = 2
+    var w = match DescWalk.new(@c)
+        Ok(w) => w
+        Err(_) => return 1
+    assert walk_err(@&w, DescError.BadLength)
+    0
+
+[[test]]
+fn test_config_walk_wrong_type() -> i32
+    let b: [u8] = @g_dev
+    match DescWalk.new(b)
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == DescError.WrongType
+    0
+
+# ---------------------------------------------------------------------------
+# Setup packets
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_setup_packets() -> i32
+    let g: SetupPacket = setup_get_descriptor(DESC_CONFIG, 0, 9)
+    assert g.request_type == 0x80
+    assert g.request == REQ_GET_DESCRIPTOR
+    assert g.value == 0x0200
+    assert g.index == 0
+    assert g.length == 9
+    let s: SetupPacket = setup_set_configuration(1)
+    assert s.request_type == 0
+    assert s.request == REQ_SET_CONFIGURATION
+    assert s.value == 1
+    assert s.length == 0
+    0

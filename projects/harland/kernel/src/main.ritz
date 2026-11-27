@@ -31,7 +31,7 @@ import ipc.syscall { ipc_syscall_init }
 import cap.table { cap_table_init, cap_init_bootstrap }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_init_nth }
 import fs.vfs { vfs_init }
-import fs.kfs { kfs_init, kfs_get, kfs_read, kfs_has_storage, kfs_storage_refusal, kfs_record_boot, kfs_blob_count }
+import fs.kfs { kfs_init, kfs_get, kfs_read, kfs_boot }
 import goliath.namespace { Namespace }
 import fs.syscall { fs_syscall_init }
 import fs.initramfs { initramfs_load, initramfs_set_boot_image }
@@ -42,6 +42,7 @@ import drivers.display.mod { display_init, display_console_start, PIXEL_FORMAT_U
 # Input driver imports
 import drivers.virtio.input { virtio_input_init }
 import drivers.i8042.kbd { i8042_init }
+import drivers.usb.usb { usb_boot }
 
 # ACPI driver imports
 import arch.x86_64.cpu_map { num_cpus, cpu_index_of_apic_id }
@@ -438,27 +439,6 @@ fn init_devices()
         klog("\r  [..] VirtIO block device (not found)\n")
     heap_check_or_panic("virtio_blk_init")
 
-# This boot, counted in /var/boots and saved to the goliath image (#1881).
-fn record_boot_in_storage(storage_dev: *VirtioBlkDevice)
-    klog("  [..] Persistent storage")
-    if not kfs_has_storage()
-        if storage_dev != 0 as *VirtioBlkDevice
-            klog(kfs_storage_refusal())
-        else
-            klog("\r  [..] Persistent storage (not found)\n")
-        return
-    let boots: i64 = kfs_record_boot()
-    if boots > 0
-        klog("\r  [OK] Persistent storage (goliath image: boot ")
-        klog_dec(boots)
-        klog(", ")
-        klog_dec(kfs_blob_count() as i64)
-        klog(" blobs)\n")
-    else
-        klog("\r  [!!] Persistent storage (save failed: errno ")
-        klog_dec(0 - boots)
-        klog(")\n")
-
 # The initial filesystem: the TAR BOOTX64.EFI read from the ESP if BootInfo
 # carries one (AGAST #4253), or GRUB's multiboot2 module (#4258), else a
 # virtio-blk TAR disk. The kernel heap grows to fit it.
@@ -487,7 +467,7 @@ fn init_namespace(boot_info_addr: u64)
         return
     klog("\r  [OK] Kernel namespace (goliath)\n")
     heap_check_or_panic("kfs_init")
-    record_boot_in_storage(storage_dev)
+    kfs_boot(storage_dev)
     klog("  [..] Filesystem syscalls")
     fs_syscall_init()
     klog("\r  [OK] Filesystem syscalls\n")
@@ -574,6 +554,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     init_devices()
     init_namespace(boot_info_addr)
     init_smp(boot_info_addr)
+    usb_boot()
     init_ipc_and_capabilities()
 
     # The kernel self-tests run only in boot-test mode: the boot gate

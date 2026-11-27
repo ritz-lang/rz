@@ -1,0 +1,342 @@
+# Harland xHCI registers (AGAST #4887, docs/USB.md)
+#
+# Offsets and bits of the xHCI 1.2 register blocks the driver touches, and
+# the pure decoders over the values it reads: the capability parameters,
+# PORTSC's write-back rule, the extended capability list (USB Legacy
+# Support, Supported Protocol), the port speed ID and the endpoint service
+# interval per speed. Register access is the caller's: nothing here reads
+# or writes MMIO.
+
+# ============================================================================
+# Capability registers (from BAR0)
+# ============================================================================
+
+# Dword 0 holds CAPLENGTH (7:0) and HCIVERSION (31:16). Read it as one
+# dword: some controllers (QEMU's among them) answer only dword reads of
+# the capability block, so a byte or word read at 0x02 returns 0.
+pub const CAP_LENGTH_VERSION: u64 = 0x00
+pub const CAP_HCSPARAMS1: u64 = 0x04
+pub const CAP_HCSPARAMS2: u64 = 0x08
+pub const CAP_HCSPARAMS3: u64 = 0x0C
+pub const CAP_HCCPARAMS1: u64 = 0x10
+pub const CAP_DBOFF: u64 = 0x14            # doorbell array offset, dword aligned
+pub const CAP_RTSOFF: u64 = 0x18           # runtime block offset, 32-byte aligned
+
+# The operational block's offset from BAR0, from capability dword 0.
+pub fn cap_length(dw0: u32) -> u8
+    (dw0 & 0xFF) as u8
+
+# The interface version, BCD (0x0100 is 1.0), from capability dword 0.
+pub fn hci_version(dw0: u32) -> u16
+    ((dw0 >> 16) & 0xFFFF) as u16
+
+pub const DBOFF_MASK: u32 = 0xFFFFFFFC
+pub const RTSOFF_MASK: u32 = 0xFFFFFFE0
+
+# What the capability parameters say, decoded once at probe.
+pub struct HcParams
+    max_slots: u8           # HCSPARAMS1 MaxSlots
+    max_intrs: u16          # HCSPARAMS1 MaxIntrs
+    max_ports: u8           # HCSPARAMS1 MaxPorts
+    scratchpads: u32        # HCSPARAMS2 Max Scratchpad Buffers (hi:lo)
+    erst_max: u32           # event ring segment table entries, 2^ERST Max
+    ac64: bool              # HCCPARAMS1 AC64: 64-bit DMA addresses
+    ctx64: bool             # HCCPARAMS1 CSZ: 64-byte contexts
+    ppc: bool               # HCCPARAMS1 PPC: ports need power switched on
+    xecp: u32               # first extended capability, bytes from BAR0 (0: none)
+
+pub fn hc_params(hcs1: u32, hcs2: u32, hcc1: u32) -> HcParams
+    let sp_hi: u32 = (hcs2 >> 21) & 0x1F
+    let sp_lo: u32 = (hcs2 >> 27) & 0x1F
+    HcParams {
+        max_slots: (hcs1 & 0xFF) as u8,
+        max_intrs: ((hcs1 >> 8) & 0x7FF) as u16,
+        max_ports: ((hcs1 >> 24) & 0xFF) as u8,
+        scratchpads: (sp_hi << 5) | sp_lo,
+        erst_max: (1 as u32) << ((hcs2 >> 4) & 0xF),
+        ac64: (hcc1 & 1) != 0,
+        ctx64: (hcc1 & 4) != 0,
+        ppc: (hcc1 & 8) != 0,
+        xecp: ((hcc1 >> 16) & 0xFFFF) * 4
+    }
+
+# ============================================================================
+# Operational registers (from BAR0 + CAPLENGTH)
+# ============================================================================
+
+pub const OP_USBCMD: u64 = 0x00
+pub const OP_USBSTS: u64 = 0x04
+pub const OP_PAGESIZE: u64 = 0x08
+pub const OP_DNCTRL: u64 = 0x14
+pub const OP_CRCR: u64 = 0x18              # u64, written low then high
+pub const OP_DCBAAP: u64 = 0x30            # u64
+pub const OP_CONFIG: u64 = 0x38
+
+pub const USBCMD_RS: u32 = 1 << 0          # Run/Stop
+pub const USBCMD_HCRST: u32 = 1 << 1       # Host Controller Reset
+pub const USBCMD_INTE: u32 = 1 << 2        # Interrupter Enable
+pub const USBCMD_HSEE: u32 = 1 << 3        # Host System Error Enable
+
+pub const USBSTS_HCH: u32 = 1 << 0         # HCHalted
+pub const USBSTS_HSE: u32 = 1 << 2         # Host System Error
+pub const USBSTS_EINT: u32 = 1 << 3        # Event Interrupt (RW1C)
+pub const USBSTS_PCD: u32 = 1 << 4         # Port Change Detect (RW1C)
+pub const USBSTS_CNR: u32 = 1 << 11        # Controller Not Ready
+pub const USBSTS_HCE: u32 = 1 << 12        # Host Controller Error
+
+pub const PAGESIZE_4K: u32 = 1             # bit 0: 4 KiB pages supported
+
+pub const CRCR_RCS: u64 = 1                # Ring Cycle State
+
+# ============================================================================
+# Port registers
+# ============================================================================
+
+pub const PORTSC_CCS: u32 = 1 << 0         # Current Connect Status
+pub const PORTSC_PED: u32 = 1 << 1         # Port Enabled (RW1C: 1 disables)
+pub const PORTSC_OCA: u32 = 1 << 3         # Over-current Active
+pub const PORTSC_PR: u32 = 1 << 4          # Port Reset
+pub const PORTSC_PP: u32 = 1 << 9          # Port Power
+pub const PORTSC_LWS: u32 = 1 << 16        # Port Link State Write Strobe
+pub const PORTSC_CSC: u32 = 1 << 17        # Connect Status Change
+pub const PORTSC_PEC: u32 = 1 << 18        # Port Enabled/Disabled Change
+pub const PORTSC_WRC: u32 = 1 << 19        # Warm Port Reset Change
+pub const PORTSC_OCC: u32 = 1 << 20        # Over-current Change
+pub const PORTSC_PRC: u32 = 1 << 21        # Port Reset Change
+pub const PORTSC_PLC: u32 = 1 << 22        # Port Link State Change
+pub const PORTSC_CEC: u32 = 1 << 23        # Port Config Error Change
+pub const PORTSC_WPR: u32 = 1 << 31        # Warm Port Reset (USB 3)
+
+# Every change bit, all RW1C.
+pub const PORTSC_CHANGE: u32 = PORTSC_CSC | PORTSC_PEC | PORTSC_WRC | PORTSC_OCC | PORTSC_PRC | PORTSC_PLC | PORTSC_CEC
+
+# Bits a write acts on whatever their old value: PED (RW1C), the change
+# bits (RW1C), PR, LWS and WPR (writing 1 starts something).
+const PORTSC_ACTS: u32 = PORTSC_PED | PORTSC_CHANGE | PORTSC_PR | PORTSC_LWS | PORTSC_WPR
+
+# Port `port` (1-based)'s PORTSC, from the operational block.
+pub fn portsc_reg(port: u8) -> u64
+    0x400 + 0x10 * ((port as u64) - 1)
+
+# `v` as read, with every bit that acts on a write cleared: the base of
+# every PORTSC write, so a write changes only what it means to.
+pub fn portsc_neutral(v: u32) -> u32
+    v & (0xFFFFFFFF ^ PORTSC_ACTS)
+
+# The write that acknowledges the changes latched in `v` and nothing else.
+pub fn portsc_ack(v: u32) -> u32
+    portsc_neutral(v) | (v & PORTSC_CHANGE)
+
+# The write that starts a USB 2 port reset; PRC reports its end.
+pub fn portsc_start_reset(v: u32) -> u32
+    portsc_neutral(v) | PORTSC_PR
+
+# The write that powers the port (needed when HCCPARAMS1.PPC is set).
+pub fn portsc_power_on(v: u32) -> u32
+    portsc_neutral(v) | PORTSC_PP
+
+# PORTSC's Port Speed field: a protocol speed ID value (PSIV).
+pub fn portsc_speed(v: u32) -> u32
+    (v >> 10) & 0xF
+
+# ============================================================================
+# Runtime registers (from BAR0 + RTSOFF) and doorbells (from BAR0 + DBOFF)
+# ============================================================================
+
+pub const RT_IR0: u64 = 0x20               # interrupter 0's register set
+pub const RT_IR_STRIDE: u64 = 0x20
+pub const IR_IMAN: u64 = 0x00
+pub const IR_IMOD: u64 = 0x04
+pub const IR_ERSTSZ: u64 = 0x08
+pub const IR_ERSTBA: u64 = 0x10            # u64, written low then high
+pub const IR_ERDP: u64 = 0x18              # u64
+
+pub const IMAN_IP: u32 = 1 << 0            # Interrupt Pending (RW1C)
+pub const IMAN_IE: u32 = 1 << 1            # Interrupt Enable
+pub const ERDP_EHB: u64 = 1 << 3           # Event Handler Busy (RW1C)
+
+# Doorbell 0 rings the command ring; doorbell `slot` takes the target DCI.
+pub const DB_HOST: u32 = 0
+
+# ============================================================================
+# Extended capabilities (xHCI 1.2 section 7)
+# ============================================================================
+
+pub const XCAP_LEGACY: u8 = 1              # USB Legacy Support
+pub const XCAP_PROTOCOL: u8 = 2            # Supported Protocol
+
+# One extended capability's header dword: its ID and the byte distance to
+# the next one (0: it is the last).
+pub struct XCap
+    id: u8
+    next: u32
+
+pub fn xcap_decode(dw: u32) -> XCap
+    XCap { id: (dw & 0xFF) as u8, next: ((dw >> 8) & 0xFF) * 4 }
+
+# USBLEGSUP (the capability's first dword) and USBLEGCTLSTS (the second).
+pub const LEGSUP_BIOS_OWNED: u32 = 1 << 16
+pub const LEGSUP_OS_OWNED: u32 = 1 << 24
+pub const LEGCTL_OFFSET: u64 = 4
+
+# The SMI enables of USBLEGCTLSTS (USB SMI, host system error, OS
+# ownership change, PCI command, BAR) and its latched SMI events (RW1C).
+const LEGCTL_SMI_ENABLES: u32 = (1 << 0) | (1 << 4) | (1 << 13) | (1 << 14) | (1 << 15)
+const LEGCTL_SMI_EVENTS: u32 = (1 << 29) | (1 << 30) | (1 << 31)
+
+# The USBLEGCTLSTS write that turns every legacy SMI off and clears the
+# ones already latched: the last step of the BIOS handoff.
+pub fn legctl_quiet(v: u32) -> u32
+    (v & (0xFFFFFFFF ^ LEGCTL_SMI_ENABLES) & (0xFFFFFFFF ^ LEGCTL_SMI_EVENTS)) | LEGCTL_SMI_EVENTS
+
+# "USB " in the Supported Protocol capability's Name String dword.
+const PROTOCOL_NAME_USB: u32 = 0x20425355
+
+pub enum ProtocolError
+    NotUsb                  # the name string is not "USB "
+    NoPorts                 # the port range is empty
+
+# One Supported Protocol capability: USB `major`.`minor` on root ports
+# first_port..first_port + count - 1 (1-based).
+pub struct PortProtocol
+    major: u8
+    minor: u8
+    first_port: u8
+    count: u8
+    slot_type: u8           # Enable Slot's Slot Type for these ports
+
+impl PortProtocol
+    pub fn covers(self: @PortProtocol, port: u8) -> bool
+        port >= self.first_port and (port as u32) < (self.first_port as u32) + (self.count as u32)
+
+# The capability's four dwords, in order.
+pub fn protocol_decode(dw0: u32, dw1: u32, dw2: u32, dw3: u32) -> Result<PortProtocol, ProtocolError>
+    if dw1 != PROTOCOL_NAME_USB
+        return Err(ProtocolError.NotUsb)
+    let first: u8 = (dw2 & 0xFF) as u8
+    let count: u8 = ((dw2 >> 8) & 0xFF) as u8
+    if first == 0 or count == 0
+        return Err(ProtocolError.NoPorts)
+    Ok(PortProtocol {
+        major: ((dw0 >> 24) & 0xFF) as u8,
+        minor: ((dw0 >> 16) & 0xFF) as u8,
+        first_port: first,
+        count: count,
+        slot_type: (dw3 & 0x1F) as u8
+    })
+
+# ============================================================================
+# Speed
+# ============================================================================
+
+# A port's speed, from its default protocol speed ID (xHCI 1.2 section
+# 7.2.2.1.1): the IDs every controller uses when its Supported Protocol
+# capability lists no PSIs of its own.
+pub enum UsbSpeed
+    Low
+    Full
+    High
+    Super
+    SuperPlus
+
+pub fn speed_from_psiv(psiv: u32) -> Option<UsbSpeed>
+    match psiv
+        1 => Some(UsbSpeed.Full)
+        2 => Some(UsbSpeed.Low)
+        3 => Some(UsbSpeed.High)
+        4 => Some(UsbSpeed.Super)
+        5 => Some(UsbSpeed.SuperPlus)
+        _ => None
+
+# The speed ID a slot context carries.
+pub fn speed_psiv(s: UsbSpeed) -> u32
+    match s
+        Full => 1
+        Low => 2
+        High => 3
+        Super => 4
+        SuperPlus => 5
+
+pub fn speed_name(s: UsbSpeed) -> StrView
+    match s
+        Low => "low"
+        Full => "full"
+        High => "high"
+        Super => "super"
+        SuperPlus => "super+"
+
+# EP0's max packet size before the device descriptor is read: 8 for low
+# and full speed (a full-speed device may say 16, 32 or 64; the driver
+# reads its first 8 bytes and corrects it), 64 for high speed and 512 for
+# SuperSpeed (docs/USB.md, bring-up step 7).
+pub fn ep0_max_packet(s: UsbSpeed) -> u16
+    match s
+        Low => 8
+        Full => 8
+        High => 64
+        Super => 512
+        SuperPlus => 512
+
+# ============================================================================
+# Endpoint service interval (xHCI 1.2 section 6.2.3.6)
+# ============================================================================
+
+# An endpoint's transfer type, bmAttributes bits 1:0.
+pub enum EpKind
+    Control
+    Isoch
+    Bulk
+    Interrupt
+
+pub fn ep_kind(attributes: u8) -> EpKind
+    match attributes & 3
+        0 => EpKind.Control
+        1 => EpKind.Isoch
+        2 => EpKind.Bulk
+        _ => EpKind.Interrupt
+
+# The index of the highest set bit of `v`, plus one (0 for 0).
+fn bit_width(v: u32) -> u32
+    var n: u32 = 0
+    var x: u32 = v
+    while x != 0
+        n += 1
+        x = x >> 1
+    n
+
+fn clamp_u32(v: u32, lo: u32, hi: u32) -> u32
+    if v < lo
+        return lo
+    if v > hi
+        return hi
+    v
+
+# The endpoint context's Interval: the service period is 2^Interval
+# microframes (125 us each). Control and bulk endpoints have none (0).
+# High and SuperSpeed periodic endpoints, and full-speed isoch, give
+# bInterval as an exponent (1..16); full- and low-speed interrupt
+# endpoints give it in frames (1..255), rounded down to a power of two.
+pub fn ep_interval(speed: UsbSpeed, kind: EpKind, binterval: u8) -> u8
+    let periodic: bool = match kind
+        Control => false
+        Bulk => false
+        Isoch => true
+        Interrupt => true
+    if not periodic
+        return 0
+    let exp: u32 = clamp_u32(binterval as u32, 1, 16) - 1
+    let r: u32 = match speed
+        High => exp
+        Super => exp
+        SuperPlus => exp
+        # 2^(b-1) frames is 2^(b+2) microframes; the field stops at 15.
+        Full => if kind == EpKind.Isoch then clamp_u32(exp + 3, 3, 15) else frames_interval(binterval)
+        Low => frames_interval(binterval)
+    r as u8
+
+# A full- or low-speed interrupt endpoint's bInterval in frames: the
+# largest 2^n microframes no longer than it, within 2^3 (1 ms) to 2^10
+# (128 ms).
+fn frames_interval(binterval: u8) -> u32
+    let frames: u32 = clamp_u32(binterval as u32, 1, 255)
+    clamp_u32(bit_width(frames * 8) - 1, 3, 10)

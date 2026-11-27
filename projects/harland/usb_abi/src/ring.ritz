@@ -1,0 +1,141 @@
+# Harland xHCI rings (AGAST #4887, docs/USB.md)
+#
+# The producer side of a command or transfer ring and the consumer side of
+# an event ring (xHCI 1.2 section 4.9), each one segment of up to
+# RING_TRBS TRBs over one page the caller allocated and zeroed and names
+# both ways: `trbs` for the CPU, `phys` for the controller.
+#
+# Producer: the last TRB is a Link back to the start with Toggle Cycle.
+# Each TRB is written with the producer's cycle bit, its control dword
+# last and after a fence, so the controller never sees a half-written TRB
+# as new. Passing the link hands the controller its cycle bit and flips
+# ours. One TRB stays free so a full ring differs from an empty one; the
+# controller's progress comes back as the TRB pointer of each completion
+# event (retire).
+#
+# Consumer: a TRB whose cycle bit equals ours is new. Wrapping the segment
+# flips ours. The caller writes erdp() to the interrupter's ERDP after a
+# batch.
+
+import usb_abi.trb { Trb, TRB_SIZE, TRB_CYCLE, trb_link }
+
+pub const RING_TRBS: u32 = 256             # one 4 KiB page of TRBs
+pub type TrbPage = [RING_TRBS]Trb
+
+pub enum RingError
+    Full                    # no free TRB until the controller retires one
+    Foreign                 # a pointer to no TRB this ring handed out
+
+fn set_cycle(control: u32, cycle: bool) -> u32
+    let c: u32 = control & (0xFFFFFFFF ^ TRB_CYCLE)
+    if cycle then c | TRB_CYCLE else c
+
+# The control dword's address, for the volatile accesses that publish
+# (producer) and observe (consumer) a TRB.
+fn control_word(t: *Trb) -> *u32
+    @t.control
+
+pub struct TrbRing
+    trbs: *TrbPage
+    phys: u64
+    len: u32                # TRBs, the link included: 2..=RING_TRBS
+    enq: u32                # where the next TRB goes
+    deq: u32                # the first TRB the controller has not finished
+    cycle: bool             # the producer cycle state
+
+impl TrbRing
+    # A ring of `len` TRBs over zeroed memory: every TRB is the
+    # controller's to skip (cycle 0 against our 1) except the link.
+    pub fn new(trbs: *TrbPage, phys: u64, len: u32) -> TrbRing
+        (*trbs)[len - 1] = trb_link(phys)
+        TrbRing { trbs: trbs, phys: phys, len: len, enq: 0, deq: 0, cycle: true }
+
+    # The ring's start with the cycle state, for CRCR or an endpoint
+    # context's TR Dequeue Pointer.
+    pub fn dequeue_ptr(self: @TrbRing) -> u64
+        self.phys | 1
+
+    # TRBs that can be pushed before retire.
+    pub fn free(self: @TrbRing) -> u32
+        let usable: u32 = self.len - 1
+        (self.deq + usable - self.enq - 1) % usable
+
+    # Write `t` at the enqueue point with our cycle bit; its device address.
+    pub fn push(self: @&TrbRing, t: Trb) -> Result<u64, RingError>
+        if self.free() == 0
+            return Err(RingError.Full)
+        let i: u32 = self.enq
+        let slot: *Trb = @(*self.trbs)[i]
+        slot.param = t.param
+        slot.status = t.status
+        # Param and status are visible before the cycle bit makes the TRB
+        # the controller's.
+        fence()
+        volatile_store(control_word(slot), set_cycle(t.control, self.cycle))
+        self.enq = i + 1
+        if self.enq == self.len - 1
+            let link: *Trb = @(*self.trbs)[self.len - 1]
+            fence()
+            volatile_store(control_word(link), set_cycle(link.control, self.cycle))
+            self.cycle = not self.cycle
+            self.enq = 0
+        Ok(self.phys + (i as u64) * TRB_SIZE)
+
+    # The index of the TRB at device address `p`, if it is one this ring
+    # hands out (the link is not).
+    pub fn index_of(self: @TrbRing, p: u64) -> Option<u32>
+        if p < self.phys or (p - self.phys) % TRB_SIZE != 0
+            return None
+        let i: u64 = (p - self.phys) / TRB_SIZE
+        if i >= (self.len - 1) as u64
+            return None
+        Some(i as u32)
+
+    # The controller finished the TRB at `p` and every one before it: they
+    # are free again. The TRB's index.
+    pub fn retire(self: @&TrbRing, p: u64) -> Result<u32, RingError>
+        let i: u32 = match self.index_of(p)
+            Some(i) => i
+            None => return Err(RingError.Foreign)
+        self.deq = (i + 1) % (self.len - 1)
+        Ok(i)
+
+pub struct EventRing
+    trbs: *TrbPage
+    phys: u64
+    len: u32                # TRBs in the segment: 16..=RING_TRBS
+    deq: u32
+    cycle: bool             # the consumer cycle state
+
+impl EventRing
+    pub fn new(trbs: *TrbPage, phys: u64, len: u32) -> EventRing
+        EventRing { trbs: trbs, phys: phys, len: len, deq: 0, cycle: true }
+
+    # The next event, consumed, or None when the controller has posted no
+    # more.
+    pub fn next(self: @&EventRing) -> Option<Trb>
+        let slot: *Trb = @(*self.trbs)[self.deq]
+        let control: u32 = volatile_load(control_word(slot))
+        if ((control & TRB_CYCLE) != 0) != self.cycle
+            return None
+        # The rest of the TRB is read after the cycle bit that made it ours.
+        fence()
+        let t = Trb { param: slot.param, status: slot.status, control: control }
+        self.deq += 1
+        if self.deq == self.len
+            self.deq = 0
+            self.cycle = not self.cycle
+        Some(t)
+
+    # The dequeue pointer for ERDP: the next TRB the driver will read.
+    pub fn erdp(self: @EventRing) -> u64
+        self.phys + (self.deq as u64) * TRB_SIZE
+
+# One Event Ring Segment Table entry.
+pub struct ErstEntry
+    base: u64               # the segment, 64-byte aligned
+    size: u32               # TRBs in the segment
+    rsvd: u32
+
+pub fn erst_entry(base: u64, size: u32) -> ErstEntry
+    ErstEntry { base: base, size: size, rsvd: 0 }

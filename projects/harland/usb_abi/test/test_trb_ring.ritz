@@ -1,0 +1,390 @@
+# Harland usb_abi TRB and ring tests (AGAST #4887)
+#
+# TRB encoding for the commands and control-transfer stages the driver
+# issues, event decoding, the producer ring (enqueue, cycle bit, link TRB,
+# wrap and toggle, full, retire) and the event ring's dequeue and cycle
+# toggle, over TRB memory in a host global. The "controller" is plain
+# stores into that memory.
+
+import usb_abi.trb { Trb, TRB_SIZE, TRB_CYCLE, TRB_TC, TRB_IOC, TRB_IDT, TRB_BSR, TRB_DIR_IN, TRB_LINK, TRB_SETUP, TRB_DATA, TRB_STATUS, TRB_ENABLE_SLOT, TRB_DISABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_EVALUATE_CONTEXT, TRB_CONFIGURE_ENDPOINT, TRB_EV_TRANSFER, TRB_EV_COMMAND, TRB_EV_PORT, TRB_EV_HOST, trb_type, trb_link, trb_enable_slot, trb_disable_slot, trb_address_device, trb_evaluate_context, trb_configure_endpoint, trb_setup_stage, trb_data_stage, trb_status_stage, Completion, completion_of, completion_ok, Event, CommandEvent, TransferEvent, event_decode }
+import usb_abi.ring { TrbPage, TrbRing, RingError, EventRing, ErstEntry, erst_entry, RING_TRBS }
+import usb_abi.desc { SetupPacket, setup_get_descriptor, setup_set_configuration, DESC_DEVICE }
+
+var g_page: TrbPage
+const RING_PHYS: u64 = 0x7F000000
+
+fn zero_page()
+    for i in 0..RING_TRBS
+        g_page[i] = Trb { param: 0, status: 0, control: 0 }
+
+fn is_success(c: Completion) -> bool
+    match c
+        Success => true
+        _ => false
+
+fn is_short(c: Completion) -> bool
+    match c
+        ShortPacket => true
+        _ => false
+
+fn pushed_at(r: Result<u64, RingError>, want: u64) -> bool
+    match r
+        Ok(p) => p == want
+        Err(_) => false
+
+fn is_full(r: Result<u64, RingError>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e == RingError.Full
+
+# The "controller" writes event `t` with cycle bit `cycle` into slot `i`.
+fn device_event(i: u32, t: Trb, cycle: bool)
+    var c: u32 = t.control & (0xFFFFFFFF ^ TRB_CYCLE)
+    if cycle
+        c = c | TRB_CYCLE
+    g_page[i] = Trb { param: t.param, status: t.status, control: c }
+
+# ---------------------------------------------------------------------------
+# TRB encoding
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_trb_layout() -> i32
+    assert sizeof(Trb) as u64 == TRB_SIZE
+    assert TRB_SIZE == 16
+    assert sizeof(TrbPage) == 4096
+    assert sizeof(ErstEntry) == 16
+    0
+
+[[test]]
+fn test_command_trbs() -> i32
+    let e: Trb = trb_enable_slot(0)
+    assert trb_type(e.control) == TRB_ENABLE_SLOT
+    assert e.control == TRB_ENABLE_SLOT << 10
+    let a: Trb = trb_address_device(0x12340000, 7, false)
+    assert a.param == 0x12340000
+    assert a.control == ((TRB_ADDRESS_DEVICE << 10) | (7 << 24))
+    let b: Trb = trb_address_device(0x12340000, 7, true)
+    assert (b.control & TRB_BSR) != 0
+    let v: Trb = trb_evaluate_context(0x5000, 3)
+    assert v.control == ((TRB_EVALUATE_CONTEXT << 10) | (3 << 24))
+    let c: Trb = trb_configure_endpoint(0x6000, 2)
+    assert c.param == 0x6000
+    assert c.control == ((TRB_CONFIGURE_ENDPOINT << 10) | (2 << 24))
+    let x: Trb = trb_disable_slot(5)
+    assert x.param == 0
+    assert x.control == ((TRB_DISABLE_SLOT << 10) | (5 << 24))
+    0
+
+[[test]]
+fn test_link_trb() -> i32
+    let l: Trb = trb_link(0x40000)
+    assert l.param == 0x40000
+    assert trb_type(l.control) == TRB_LINK
+    assert (l.control & TRB_TC) != 0
+    assert (l.control & TRB_CYCLE) == 0
+    0
+
+[[test]]
+fn test_setup_stage_get_descriptor() -> i32
+    # GET_DESCRIPTOR(device, 0), 18 bytes: bmRequestType 0x80, bRequest 6,
+    # wValue 0x0100, wIndex 0, wLength 18; immediate data, IN data stage.
+    let s: SetupPacket = setup_get_descriptor(DESC_DEVICE, 0, 18)
+    let t: Trb = trb_setup_stage(s)
+    assert t.param == 0x0012000001000680
+    assert t.status == 8
+    assert t.control == (TRB_IDT | (TRB_SETUP << 10) | (3 << 16))
+    0
+
+[[test]]
+fn test_setup_stage_no_data() -> i32
+    # SET_CONFIGURATION(1): no data stage, TRT 0.
+    let t: Trb = trb_setup_stage(setup_set_configuration(1))
+    assert t.param == 0x0000000000010900
+    assert t.control == (TRB_IDT | (TRB_SETUP << 10))
+    0
+
+[[test]]
+fn test_data_and_status_stage() -> i32
+    let d: Trb = trb_data_stage(0x9000, 18, true)
+    assert d.param == 0x9000
+    assert d.status == 18
+    assert d.control == ((TRB_DATA << 10) | TRB_DIR_IN)
+    # The status stage runs opposite the data: OUT after an IN data stage,
+    # IN after none. It carries the interrupt.
+    let s_out: Trb = trb_status_stage(false)
+    assert s_out.control == ((TRB_STATUS << 10) | TRB_IOC)
+    let s_in: Trb = trb_status_stage(true)
+    assert s_in.control == ((TRB_STATUS << 10) | TRB_IOC | TRB_DIR_IN)
+    0
+
+# ---------------------------------------------------------------------------
+# Event decoding
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_decode_command_completion() -> i32
+    let t = Trb { param: 0x1230, status: 1 << 24, control: (TRB_EV_COMMAND << 10) | (5 << 24) | TRB_CYCLE }
+    match event_decode(t)
+        CommandDone(c) =>
+            assert c.trb == 0x1230
+            assert c.slot == 5
+            assert is_success(c.code)
+        _ =>
+            assert false
+    0
+
+[[test]]
+fn test_decode_port_change() -> i32
+    let t = Trb { param: 3 << 24, status: 1 << 24, control: TRB_EV_PORT << 10 }
+    match event_decode(t)
+        PortChange(p) =>
+            assert p == 3
+        _ =>
+            assert false
+    0
+
+[[test]]
+fn test_decode_transfer() -> i32
+    let t = Trb { param: 0x8810, status: (13 << 24) | 10, control: (TRB_EV_TRANSFER << 10) | (1 << 16) | (2 << 24) }
+    match event_decode(t)
+        Transfer(x) =>
+            assert x.trb == 0x8810
+            assert is_short(x.code)
+            assert x.residual == 10
+            assert x.slot == 2
+            assert x.dci == 1
+        _ =>
+            assert false
+    0
+
+[[test]]
+fn test_decode_host_and_other() -> i32
+    let h = Trb { param: 0, status: 21 << 24, control: TRB_EV_HOST << 10 }
+    match event_decode(h)
+        HostController(c) =>
+            match c
+                EventRingFull => pass
+                _ =>
+                    assert false
+        _ =>
+            assert false
+    let o = Trb { param: 0, status: 0, control: 39 << 10 }
+    match event_decode(o)
+        Other(ty) =>
+            assert ty == 39
+        _ =>
+            assert false
+    0
+
+[[test]]
+fn test_completion_codes() -> i32
+    assert is_success(completion_of(1))
+    assert is_short(completion_of(13))
+    match completion_of(6)
+        Stall => pass
+        _ =>
+            assert false
+    match completion_of(9)
+        NoSlots => pass
+        _ =>
+            assert false
+    match completion_of(200)
+        Other(c) =>
+            assert c == 200
+        _ =>
+            assert false
+    0
+
+[[test]]
+fn test_completion_ok() -> i32
+    assert completion_ok(Completion.Success)
+    assert completion_ok(Completion.ShortPacket)
+    assert not completion_ok(Completion.Stall)
+    assert not completion_ok(Completion.TransactionError)
+    assert not completion_ok(Completion.Other(1))
+    0
+
+# ---------------------------------------------------------------------------
+# Producer ring
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_ring_new_places_link() -> i32
+    zero_page()
+    let r = TrbRing.new(@g_page, RING_PHYS, 4)
+    assert trb_type(g_page[3].control) == TRB_LINK
+    assert g_page[3].param == RING_PHYS
+    assert (g_page[3].control & TRB_TC) != 0
+    # The dequeue pointer the controller starts from: the base, cycle 1.
+    assert r.dequeue_ptr() == (RING_PHYS | 1)
+    0
+
+[[test]]
+fn test_ring_push_sets_cycle_and_address() -> i32
+    zero_page()
+    var r = TrbRing.new(@g_page, RING_PHYS, 8)
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS)
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS + 16)
+    assert (g_page[0].control & TRB_CYCLE) != 0
+    assert (g_page[1].control & TRB_CYCLE) != 0
+    # Not yet written: the controller stops here.
+    assert (g_page[2].control & TRB_CYCLE) == 0
+    0
+
+[[test]]
+fn test_ring_full_then_retire() -> i32
+    zero_page()
+    # 4 TRBs: 3 usable, one kept free so full and empty differ.
+    var r = TrbRing.new(@g_page, RING_PHYS, 4)
+    assert r.free() == 2
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS)
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS + 16)
+    assert r.free() == 0
+    assert is_full(r.push(trb_enable_slot(0)))
+    # The controller finished the first TRB: one slot back.
+    match r.retire(RING_PHYS)
+        Ok(i) =>
+            assert i == 0
+        Err(_) =>
+            assert false
+    assert r.free() == 1
+    # Slot 2, the last before the link.
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS + 32)
+    assert r.free() == 0
+    0
+
+[[test]]
+fn test_ring_wrap_toggles_cycle() -> i32
+    zero_page()
+    var r = TrbRing.new(@g_page, RING_PHYS, 4)
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS)
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS + 16)
+    # Slot 2 is next; then the link at 3 hands the controller back to 0.
+    match r.retire(RING_PHYS + 16)
+        Ok(_) => pass
+        Err(_) =>
+            assert false
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS + 32)
+    # The link TRB now carries the old cycle (1), and the producer's
+    # cycle is 0: the TRB written at slot 0 next has cycle 0.
+    assert (g_page[3].control & TRB_CYCLE) != 0
+    assert pushed_at(r.push(trb_address_device(0x1000, 1, false)), RING_PHYS)
+    assert (g_page[0].control & TRB_CYCLE) == 0
+    assert trb_type(g_page[0].control) == TRB_ADDRESS_DEVICE
+    # A second lap toggles back.
+    match r.retire(RING_PHYS)
+        Ok(_) => pass
+        Err(_) =>
+            assert false
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS + 16)
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS + 32)
+    assert (g_page[3].control & TRB_CYCLE) == 0
+    assert (g_page[2].control & TRB_CYCLE) == 0
+    0
+
+[[test]]
+fn test_ring_retire_refuses_foreign() -> i32
+    zero_page()
+    var r = TrbRing.new(@g_page, RING_PHYS, 4)
+    assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS)
+    match r.retire(RING_PHYS + 4096)
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == RingError.Foreign
+    # Misaligned, and the link TRB itself, are not TRBs it handed out.
+    match r.retire(RING_PHYS + 8)
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == RingError.Foreign
+    match r.retire(RING_PHYS + 48)
+        Ok(_) =>
+            assert false
+        Err(e) =>
+            assert e == RingError.Foreign
+    match r.index_of(RING_PHYS + 32)
+        Some(i) =>
+            assert i == 2
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_ring_full_size_page() -> i32
+    zero_page()
+    var r = TrbRing.new(@g_page, RING_PHYS, RING_TRBS)
+    assert trb_type(g_page[255].control) == TRB_LINK
+    assert r.free() == 254
+    var n: u32 = 0
+    while n < 254
+        assert pushed_at(r.push(trb_enable_slot(0)), RING_PHYS + (n as u64) * 16)
+        n += 1
+    assert is_full(r.push(trb_enable_slot(0)))
+    0
+
+# ---------------------------------------------------------------------------
+# Event ring
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_event_ring_empty_on_zeroed_memory() -> i32
+    zero_page()
+    var ev = EventRing.new(@g_page, RING_PHYS, 4)
+    match ev.next()
+        Some(_) =>
+            assert false
+        None => pass
+    assert ev.erdp() == RING_PHYS
+    0
+
+[[test]]
+fn test_event_ring_dequeue_and_wrap() -> i32
+    zero_page()
+    var ev = EventRing.new(@g_page, RING_PHYS, 4)
+    let port = Trb { param: 1 << 24, status: 1 << 24, control: TRB_EV_PORT << 10 }
+    device_event(0, port, true)
+    match ev.next()
+        Some(t) =>
+            assert t.param == 1 << 24
+        None =>
+            assert false
+    assert ev.erdp() == RING_PHYS + 16
+    match ev.next()
+        Some(_) =>
+            assert false
+        None => pass
+    # Three more fill the segment; the fourth slot wraps to 0.
+    device_event(1, port, true)
+    device_event(2, port, true)
+    device_event(3, port, true)
+    var n: u32 = 0
+    while true
+        match ev.next()
+            Some(_) =>
+                n += 1
+            None => break
+    assert n == 3
+    assert ev.erdp() == RING_PHYS
+    # Slot 0 still holds last lap's cycle-1 event: not new.
+    match ev.next()
+        Some(_) =>
+            assert false
+        None => pass
+    # The controller's second lap writes cycle 0.
+    device_event(0, Trb { param: 2 << 24, status: 1 << 24, control: TRB_EV_PORT << 10 }, false)
+    match ev.next()
+        Some(t) =>
+            assert t.param == 2 << 24
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_erst_entry() -> i32
+    let e: ErstEntry = erst_entry(0x123000, 256)
+    assert e.base == 0x123000
+    assert e.size == 256
+    assert e.rsvd == 0
+    0

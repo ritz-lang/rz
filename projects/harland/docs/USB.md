@@ -204,7 +204,7 @@ controllers keep running.
 | Test | Where | Checks |
 |---|---|---|
 | `usb_abi` unit tests | host, `usb_abi/test` | TRB encode, ring wrap and cycle toggle, event dequeue, context sizing (CSZ), descriptor parsing (good and truncated), interval conversion per speed, report diff (press, release, rollover error `0x01` ignored), keymap with modifiers |
-| xHCI bring-up boot | `tools/test_usb_boot.sh`, QEMU `-device qemu-xhci -device usb-kbd` | the log shows the controller running, the port connected, slot 1 addressed, the configuration read |
+| xHCI bring-up boot | `tools/test_usb_boot.sh` (`make test-usb`), QEMU `-device qemu-xhci` and two `usb-kbd`, one at full speed (`usb_version=1`) | the log shows the controller running on its MSI-X vector, each port connected once, slots 1 and 2 addressed (the full-speed one's EP0 size read from its first 8 bytes), each configuration read and set |
 | Keyboard into rzsh | the same script, `-serial none`, `fbcon_screen.py` over QMP | `send-key` types `echo hi` and Enter, and the screen shows `hi` at rzsh's prompt. Ctrl-C kills a foreground `sleep` |
 | Hot-plug | the same script | QMP `device_del` and `device_add` of `usb-kbd`, then typing works again |
 | Hub | the same script, `-device usb-hub` with `usb-kbd` behind it | typing works through the hub |
