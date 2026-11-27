@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""CI must boot harland with an xHCI controller and USB keyboards (AGAST #4887).
+"""CI must boot harland with an xHCI controller and USB keyboards (AGAST #4887),
+and type into rzsh on one (AGAST #4888).
 
 projects/harland/tools/test_usb_boot.sh boots harland under OVMF with QEMU's
 qemu-xhci and two usb-kbd keyboards, one forced to full speed
@@ -15,6 +16,10 @@ aimed at the BSP and enumerates each keyboard on events alone. These pin:
     boot-time port scan), no MSI-X vector, a failed step, a panic and no
     Tier-1 verdict. A missing QEMU, or one without qemu-xhci, is a SETUP
     ERROR (exit 3).
+  * the keyboard boot (`test_usb_boot.sh keyboard`, #4888): its own CI step
+    after the enumeration boot, and `make test-usb-kbd`; against a stub
+    fbcon_screen.py, it boots with the USB keyboard as the only input (q35,
+    i8042=off, -serial none) and types each step the docs promise.
 
 Run with:
     python3 -m pytest projects/ritz/tools/test_ci_usb_boot.py -q
@@ -129,8 +134,18 @@ def _build_all() -> list[dict]:
     return yaml.safe_load(ci_local.WORKFLOW.read_text())["jobs"]["build-all"]["steps"]
 
 
-def _indices(steps: list[dict], script: str) -> list[int]:
-    return [i for i, s in enumerate(steps) if script in str(s.get("run", ""))]
+def _indices(steps: list[dict], script: str, mode: str = "") -> list[int]:
+    """Steps that run `script`; with `mode`, only those passing it, and
+    without, only those passing none."""
+    found = []
+    for i, s in enumerate(steps):
+        run = str(s.get("run", ""))
+        if script not in run:
+            continue
+        args = run.split(script, 1)[1].split()
+        if (args[:1] == [mode]) if mode else not args:
+            found.append(i)
+    return found
 
 
 def test_usb_boot_runs_after_the_irq_dest_boot_and_before_the_log_upload():
@@ -151,8 +166,25 @@ def test_usb_step_is_a_real_gate_with_a_timeout():
     assert "|| true" not in step["run"]
     assert step.get("timeout-minutes")
     assert "boot-logs" in step["run"]
-    parsed = [s for s in ci_local.load_steps() if USB_SCRIPT in s.run]
+    parsed = [s for s in ci_local.load_steps() if s.run.rstrip().endswith(USB_SCRIPT)]
     assert len(parsed) == 1 and not parsed[0].is_setup
+
+
+def test_keyboard_boot_is_its_own_gate_after_the_enumeration_boot():
+    steps = _build_all()
+    [usb] = _indices(steps, USB_SCRIPT)
+    [kbd] = _indices(steps, USB_SCRIPT, "keyboard")
+    uploads = [
+        i for i, s in enumerate(steps) if "upload-artifact" in str(s.get("uses", ""))
+    ]
+    assert usb < kbd < min(uploads)
+    step = steps[kbd]
+    assert "continue-on-error" not in step
+    assert "|| true" not in step["run"]
+    assert step.get("timeout-minutes")
+    assert "boot-logs" in step["run"]
+    text = (REPO / "projects/harland/Makefile").read_text()
+    assert "\ntest-usb-kbd:\n\t./tools/test_usb_boot.sh keyboard\n" in text
 
 
 def test_make_test_usb_runs_the_script():
@@ -306,3 +338,72 @@ def test_no_tier1_verdict_fails(tree):
     r = _run(tree, log(PASSED_LINES[:-1]))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "did not report ALL TESTS PASSED" in r.stdout
+
+
+# fbcon_screen.py's stand-in: its argv, one per line, then the exit code
+# the test asks for.
+FBCON_STUB = """import os, sys
+open(os.environ["FBCON_ARGV"], "w").write("\\n".join(sys.argv[1:]))
+sys.exit(int(os.environ.get("FBCON_RC", "0")))
+"""
+
+
+def _keyboard_run(tree, rc: int = 0) -> tuple[subprocess.CompletedProcess, list[str]]:
+    tools = tree["script"].parent
+    (tools / "fbcon_screen.py").write_text(FBCON_STUB)
+    for rel in ("projects/indium/build/debug/init_interactive.elf", "projects/rzsh/build/debug/rzsh.elf"):
+        p = tree["script"].parents[3] / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x7fELF")
+    argv_file = tree["tmp"] / "fbcon.argv"
+    stubs = tree["stubs"]
+    q = stubs / "qemu-system-x86_64"
+    q.write_text(QEMU_STUB)
+    q.chmod(0o755)
+    env = {
+        "PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(tree["tmp"]),
+        "SKIP_BUILD": "1",
+        "OVMF_CODE": str(tree["ovmf"]),
+        "FBCON_ARGV": str(argv_file),
+        "FBCON_RC": str(rc),
+    }
+    r = subprocess.run(
+        ["/bin/bash", str(tree["script"]), "keyboard"],
+        env=env, capture_output=True, text=True, timeout=60,
+    )
+    return r, argv_file.read_text().split("\n") if argv_file.exists() else []
+
+
+def _sends(argv: list[str]) -> list[tuple[str, str]]:
+    return [(argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == "--send"]
+
+
+@pytest.mark.integration
+def test_keyboard_boot_types_each_step_with_the_usb_keyboard_alone(tree):
+    r, argv = _keyboard_run(tree)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: typed into rzsh on a USB keyboard" in r.stdout
+    qemu = argv[argv.index("--") + 1 :]
+    # The USB keyboard is the only input and the screen the only output.
+    assert "q35,i8042=off" in qemu and qemu[qemu.index("-serial") + 1] == "none"
+    assert qemu.count("usb-kbd,bus=xhci.0") == 1
+    keys = [k for _, k in _sends(argv)]
+    assert keys == [
+        "e c h o spc h i ret",
+        "s p i n ret",
+        "ctrl-c",
+        "e c h o spc shift-4 shift-slash ret",
+        "e c h o spc caps_lock a b caps_lock c ret",
+        "e c h o spc x@1200 ret",
+    ]
+    expects = [argv[i + 1] for i, a in enumerate(argv) if a == "--expect"]
+    assert any("keyboard ready" in e for e in expects)
+    assert any("130" in e for e in expects), "Ctrl-C's kill must show $? = 130"
+
+
+@pytest.mark.integration
+def test_keyboard_boot_failure_fails(tree):
+    r, _ = _keyboard_run(tree, rc=1)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS" not in r.stdout

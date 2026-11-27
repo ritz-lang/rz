@@ -331,8 +331,12 @@ def test_read_zero_sleeps_on_the_console():
     assert "proc_block(BLOCK_TTY, 0)" in loop and "sched_block()" in loop, \
         "read(0) sleeps until an interrupt, no busy loop"
     assert "yield" not in loop and "cpu_pause" not in loop
-    irq = _body(_code(CONSOLE), "tty_console_irq")
-    assert "proc_wake(BLOCK_TTY)" in irq, "COM1's interrupt wakes the reader"
+    # COM1's interrupt, and every keyboard, wake it through the one console
+    # input entry (#4888).
+    assert "tty_console_pull(" in _body(_code(CONSOLE), "tty_console_irq")
+    assert "tty_console_input(" in _body(_code(CONSOLE), "tty_console_pull")
+    entry = _body(_code(CONSOLE), "tty_console_input")
+    assert "proc_wake(BLOCK_TTY)" in entry, "console input wakes the reader"
 
 
 def test_irq4_feeds_the_line_discipline_and_delivers_ctrl_c():
@@ -340,7 +344,8 @@ def test_irq4_feeds_the_line_discipline_and_delivers_ctrl_c():
     assert "tty_console_irq(" in irq
     assert "serial_poll" not in irq
     pull = _body(_code(CONSOLE), "tty_console_pull")
-    assert "ldisc_input(" in pull
+    assert "tty_console_input(" in pull
+    assert "ldisc_input(" in _body(_code(CONSOLE), "tty_console_input")
     kill = _body(_code(CONSOLE), "tty_console_kill_foreground")
     assert "process_kill_current(TTY_INTR_STATUS)" in kill
     assert re.search(r"TTY_INTR_STATUS: i32 = 130\b", _code(CONSOLE))

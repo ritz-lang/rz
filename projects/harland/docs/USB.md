@@ -86,8 +86,8 @@ the kernel keeps `virtio_net_init` for boots without an IOMMU.
 |---|---|
 | `projects/harland/usb_abi/` | New leaf package on the `virtio_abi` pattern, with no kernel imports and its own host unit tests. It holds the xHCI register and TRB layouts, the TRB ring (enqueue, cycle bit, link TRB, event dequeue), the context layouts (32- and 64-byte, `HCCPARAMS1.CSZ`), the USB descriptor parser, the endpoint-interval conversion, and the HID boot report decoder (report diff, US keymap, modifiers, escape sequences). |
 | `kernel/src/drivers/usb/xhci.ritz` | The controller: PCI probe, BIOS handoff, reset, DCBAA, scratchpad, command and event rings, interrupter 0, port handling. |
-| `kernel/src/drivers/usb/usb.ritz` | Device enumeration: slots, Address Device, control transfers, descriptors, Set Configuration, endpoint configuration. |
-| `kernel/src/drivers/usb/hid_kbd.ritz` | The HID boot keyboard: Set Protocol (boot), Set Idle, the interrupt-IN transfer, report to bytes into the console, typematic repeat. |
+| `kernel/src/drivers/usb/usb.ritz` | Device enumeration: slots, Address Device, control transfers, descriptors, Set Configuration; a configured device a class driver takes is `Bound` and its events go there. |
+| `kernel/src/drivers/usb/hid_kbd.ritz` | The HID boot keyboard: Set Protocol (boot), Set Idle, Configure Endpoint for the interrupt-IN endpoint, a Normal TRB always queued, report to bytes into the console, the Caps Lock LED, typematic repeat on the BSP tick. |
 | `kernel/src/drivers/usb/hub.ritz` | The hub class driver (USB 2.0 hubs, and USB 3 hubs on their SuperSpeed side). |
 
 ## Concurrency under SMP_USER.md
@@ -205,7 +205,7 @@ controllers keep running.
 |---|---|---|
 | `usb_abi` unit tests | host, `usb_abi/test` | TRB encode, ring wrap and cycle toggle, event dequeue, context sizing (CSZ), descriptor parsing (good and truncated), interval conversion per speed, report diff (press, release, rollover error `0x01` ignored), keymap with modifiers |
 | xHCI bring-up boot | `tools/test_usb_boot.sh` (`make test-usb`), QEMU `-device qemu-xhci` and two `usb-kbd`, one at full speed (`usb_version=1`) | the log shows the controller running on its MSI-X vector, each port connected once, slots 1 and 2 addressed (the full-speed one's EP0 size read from its first 8 bytes), each configuration read and set |
-| Keyboard into rzsh | the same script, `-serial none`, `fbcon_screen.py` over QMP | `send-key` types `echo hi` and Enter, and the screen shows `hi` at rzsh's prompt. Ctrl-C kills a foreground `sleep` |
+| Keyboard into rzsh | `tools/test_usb_boot.sh keyboard` (`make test-usb-kbd`): q35 with `i8042=off`, `-serial none`, one `usb-kbd`; `fbcon_screen.py --send` types over QMP | `send-key` types `echo hi` and Enter, and the screen shows `hi` at rzsh's prompt. Ctrl-C kills a foreground `spin` (ring 3, no syscalls, so the kill is the xHCI interrupt's) and `echo $?` shows 130. Caps Lock types `echo ABc` as typed; a key held 1.2 s repeats |
 | Hot-plug | the same script | QMP `device_del` and `device_add` of `usb-kbd`, then typing works again |
 | Hub | the same script, `-device usb-hub` with `usb-kbd` behind it | typing works through the hub |
 | Several controllers | the same script, two `qemu-xhci` devices, the keyboard on the second | the keyboard on any controller works, as on chungus |

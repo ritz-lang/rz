@@ -618,7 +618,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     test_ci_esp_initramfs_boot.py), the rzsh serial session (#4252;
     test_ci_shell_boot.py), the no-serial framebuffer boot (#4868;
     test_ci_fbcon_boot.py), the AHCI persist boot (#4884;
-    test_ci_ahci_boot.py) and the xHCI keyboard boot (#4887;
+    test_ci_ahci_boot.py), the xHCI keyboard boot (#4887;
+    test_ci_usb_boot.py) and typing into rzsh on that keyboard (#4888;
     test_ci_usb_boot.py). A new step here must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
     assert [s.run.strip().splitlines()[-1] for s in steps] == [
@@ -660,6 +661,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/harland/tools/test_irq_dest_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_usb_boot.sh",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
+        "bash projects/harland/tools/test_usb_boot.sh keyboard",
     ]
 
 

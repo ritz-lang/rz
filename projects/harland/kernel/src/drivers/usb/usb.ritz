@@ -8,16 +8,16 @@
 # bigger than 8), GET_DESCRIPTOR of the configuration (its 9-byte header,
 # then wTotalLength) and SET_CONFIGURATION. Every step is a command or a
 # control transfer whose completion event moves the port's state on; none
-# waits. Endpoint configuration and the HID keyboard are #4888's, detach
-# and every controller #4889's, hubs #4890's.
+# waits. A configured HID boot keyboard is handed to drivers/usb/hid_kbd.ritz
+# (#4888), which configures its endpoint and gets every later event for it;
+# detach and every controller are #4889's, hubs #4890's.
 #
 # xhci_irq is the controller's interrupt (irq_handler, on the BSP, from
 # the vector drivers/usb/xhci.ritz aims there): it drains the event ring
 # into this state machine. Like the controller, all of it is BSP-owned and
 # has no lock (SMP_USER.md section 2, "In-kernel drivers"). Any other BSP
-# path into it (usb_init here; the console readers and the tick poll of
-# #4888 and #4891) runs with interrupts off, so xhci_irq never interleaves
-# with it.
+# path into it (usb_init here; hid_kbd's tick repeat, and #4891's tick
+# poll) runs with interrupts off, so xhci_irq never interleaves with it.
 
 import ritzlib.option
 import ritzlib.result
@@ -30,6 +30,7 @@ import usb_abi.regs { UsbSpeed, PORTSC_CCS, PORTSC_PED, PORTSC_CHANGE, portsc_ac
 import usb_abi.trb { Trb, Completion, completion_ok, Event, CommandEvent, TransferEvent, trb_enable_slot, trb_address_device, trb_evaluate_context, trb_setup_stage, trb_data_stage, trb_status_stage }
 import usb_abi.ring { TrbPage, TrbRing, RING_TRBS }
 import usb_abi.context { InputContext, DeviceContext, EpType, ADD_SLOT, ADD_EP0, input_control, slot_ctx, ep_ctx, slot_address }
+import drivers.usb.hid_kbd { HidAttach, hid_kbd_attach, hid_kbd_command, hid_kbd_transfer, hid_kbd_detach }
 import usb_abi.desc { SetupPacket, DeviceDesc, ConfigHeader, DescWalk, DescError, setup_get_descriptor, setup_set_configuration, parse_device, device_max_packet0, parse_config_header, DESC_DEVICE, DESC_CONFIG, DEVICE_DESC_LEN, CONFIG_DESC_LEN }
 
 # Root ports with a device slot of their own here. A controller with more
@@ -54,6 +55,7 @@ enum DevState
     ReadingConfig           # the whole configuration
     SettingConfig           # SET_CONFIGURATION
     Configured
+    Bound                   # a class driver's (drivers/usb/hid_kbd.ritz)
     Failed                  # stopped; the port waits for a disconnect
 
 # One root port's device. Its four DMA pages are allocated at its first
@@ -254,6 +256,8 @@ fn port_changed(port: u8)
     d.port = port
     if (v & PORTSC_CCS) == 0
         if d.state != DevState.Empty
+            if d.state == DevState.Bound
+                hid_kbd_detach(port)
             log_port(port)
             klog(": disconnected\n")
             d.state = DevState.Empty
@@ -439,12 +443,17 @@ fn got_config(d: *UsbDevice, b: [u8])
                 more = false
     control_nodata(d, setup_set_configuration(d.config_value), DevState.SettingConfig)
 
+# SET_CONFIGURATION done. The configuration read is still in the buffer:
+# a HID boot keyboard in it takes the device.
 fn configured(d: *UsbDevice)
     d.state = DevState.Configured
     log_slot(d)
     klog(": configured (configuration ")
     klog_dec(d.config_value as i64)
     klog(")\n")
+    let a = HidAttach { slot: d.slot, port: d.port, speed: d.speed, in_ctx: d.in_ctx, ep0: @d.ep0 }
+    if hid_kbd_attach(a, span_from_ptr<u8>(phys_to_virt(d.buf) as *u8, d.config_len as i64))
+        d.state = DevState.Bound
 
 # ============================================================================
 # Events
@@ -457,6 +466,9 @@ fn on_command(c: CommandEvent)
     if port == 0 or port > PORTS_MAX
         return
     let d: *UsbDevice = dev_of_port(port)
+    if d.state == DevState.Bound
+        hid_kbd_command(port, c.code)
+        return
     if not completion_ok(c.code)
         fail_code(d, "command", c.code)
         return
@@ -466,18 +478,22 @@ fn on_command(c: CommandEvent)
         FixingMps => read_device_descriptor(d)
         _ => pass
 
-fn on_transfer(x: TransferEvent)
+# True for a Ctrl-C typed on a keyboard that must kill the process
+# `from_user` says was interrupted.
+fn on_transfer(x: TransferEvent, from_user: bool) -> bool
     let d: *UsbDevice = match dev_of_slot(x.slot)
         Some(d) => d
-        None => return
+        None => return false
+    if d.state == DevState.Bound
+        return hid_kbd_transfer(x, from_user)
     if x.dci != DCI_EP0
-        return
+        return false
     # Err means x.trb is not on this ring (a stale or foreign event): there
     # is nothing to retire, and the completion is still handled below.
     let _ = d.ep0.retire(x.trb)
     if not completion_ok(x.code)
         fail_code(d, "control transfer", x.code)
-        return
+        return false
     let b: [u8] = received(d, x.residual)
     match d.state
         ReadingMps => got_mps(d, b)
@@ -486,35 +502,44 @@ fn on_transfer(x: TransferEvent)
         ReadingConfig => got_config(d, b)
         SettingConfig => configured(d)
         _ => pass
+    false
 
-fn on_event(ev: Event)
+fn on_event(ev: Event, from_user: bool) -> bool
     match ev
         CommandDone(c) => on_command(c)
         PortChange(p) => port_changed(p)
-        Transfer(x) => on_transfer(x)
+        Transfer(x) => return on_transfer(x, from_user)
         HostController(c) =>
             klog("[xhci] host controller event: ")
             klog(completion_name(c))
             klog("\n")
         Other(_) => pass
+    false
 
 # The controller's interrupt: drain up to EVENTS_PER_IRQ events into the
 # port state machines, then tell the controller how far it got. Called
-# from irq_handler on the BSP for xHCI's vector.
-pub fn xhci_irq()
+# from irq_handler on the BSP for xHCI's vector; from_user: the interrupt
+# came from a process (any non-zero CPL). Returns true if the caller must
+# send its EOI and call tty_console_irq_kill: a Ctrl-C typed on a USB
+# keyboard for the process it interrupted.
+pub fn xhci_irq(from_user: bool) -> bool
     if not xhci_running()
-        return
+        return false
     xhci_irq_ack()
+    var kill: bool = false
     var n: u32 = 0
     while n < EVENTS_PER_IRQ
         match xhci_next_event()
-            Some(ev) => on_event(ev)
+            Some(ev) =>
+                if on_event(ev, from_user)
+                    kill = true
             None => break
         n += 1
     xhci_events_done()
     if not usb_dead_logged and xhci_dead()
         usb_dead_logged = true
         klog("[xhci] controller error (USBSTS HSE/HCE or gone); recovery is not implemented\n")
+    kill
 
 # ============================================================================
 # Boot
@@ -533,12 +558,17 @@ fn usb_init() -> Result<bool, XhciError>
         enable_interrupts()
     r
 
+# xhci_init's own Result is returned: a bare `Ok(...)` is ambiguous here,
+# where hid_kbd's imports bring enums with an `Ok` variant (syscall/errno.ritz).
 fn usb_init_quiet() -> Result<bool, XhciError>
-    xhci_init()?
-    for p in 1..=xhci_max_ports()
-        if (xhci_portsc(p) & PORTSC_CCS) != 0
-            port_changed(p)
-    Ok(true)
+    let r: Result<bool, XhciError> = xhci_init()
+    match r
+        Ok(_) =>
+            for p in 1..=xhci_max_ports()
+                if (xhci_portsc(p) & PORTSC_CCS) != 0
+                    port_changed(p)
+        Err(_) => pass
+    r
 
 # kernel_main's USB step (docs/USB.md, AGAST #4887): usb_init, then its
 # boot-status line. Here rather than in main.ritz, which is held to a SLOC

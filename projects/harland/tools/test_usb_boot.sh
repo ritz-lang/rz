@@ -25,10 +25,25 @@
 #   - init's Tier-1 suite reports ALL TESTS PASSED;
 #   - the kernel took no exception and did not panic.
 #
-# Usage: tools/test_usb_boot.sh
+# keyboard (AGAST #4888, docs/USB.md "Data path"): one usb-kbd on q35 with
+# the PS/2 controller off and `-serial none`, so the USB keyboard is the
+# only way in and the framebuffer the only way out. init_interactive runs
+# rzsh; tools/fbcon_screen.py reads the screen over QMP and types with
+# send-key once each step's text is on screen. Passes only if:
+#   - the keyboard is driven (SET_PROTOCOL, SET_IDLE, Configure Endpoint):
+#     "keyboard ready" in the boot log on screen;
+#   - `echo hi` + Enter at rzsh's prompt shows `hi` under it;
+#   - Ctrl-C kills `spin` (ring 3, no syscalls: the kill is the xHCI
+#     interrupt's) and `echo $?` then shows 130;
+#   - Caps Lock (with its LED report) types `echo ABc` as typed;
+#   - a key held 1.2 s repeats (the BSP tick's typematic repeat);
+#   - no panic or exception on screen.
+#
+# Usage: tools/test_usb_boot.sh [enumerate|keyboard]   (default enumerate)
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for the boot (default 120)
-#        KEEP_WORK=DIR  copy the serial log (usb.log) into DIR
+#        KEEP_WORK=DIR  copy the serial log (usb.log), or the keyboard boot's
+#                       screens (usb-kbd-screens.txt), into DIR
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
 #
 # Exit: 0 = pass; 1 = the boot or a check failed; 3 = a required tool is
@@ -36,6 +51,12 @@
 #       regression.
 
 set -u
+
+MODE="${1:-enumerate}"
+if [ "$MODE" != "enumerate" ] && [ "$MODE" != "keyboard" ]; then
+    echo "usage: $0 [enumerate|keyboard]" >&2
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
@@ -78,19 +99,25 @@ fi
 
 KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
 LOADER_EFI="$HARLAND_DIR/build/debug/BOOTX64.EFI"
-for f in "$KERNEL_ELF" "$LOADER_EFI" "$PROJECTS_DIR/indium/build/debug/init.elf"; do
+INIT=init
+[ "$MODE" = keyboard ] && INIT=init_interactive
+need_built=("$KERNEL_ELF" "$LOADER_EFI" "$PROJECTS_DIR/indium/build/debug/$INIT.elf")
+[ "$MODE" = keyboard ] && need_built+=("$PROJECTS_DIR/rzsh/build/debug/rzsh.elf")
+for f in "${need_built[@]}"; do
     [ -f "$f" ] || { echo "FAIL: not built: $f"; exit 1; }
 done
 
 WORK="$(mktemp -d)" || setup_error "mktemp -d failed (is TMPDIR full?)"
-trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm -rf "$WORK"' EXIT
+trap '[ -n "${KEEP_WORK:-}" ] && { cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; cp "$WORK/kbd/screens.txt" "$KEEP_WORK/usb-kbd-screens.txt" 2>/dev/null; }; rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
 for pkg in $USER_PKGS; do
     cp "$PROJECTS_DIR/$pkg"/build/debug/*.elf "$WORK/bin/" 2>/dev/null || true
 done
 ESP="$WORK/esp"
 mkdir -p "$ESP/EFI/BOOT" "$ESP/harland"
-python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" \
+init_arg=()
+[ "$MODE" = keyboard ] && init_arg=(--init "$INIT")
+python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" "${init_arg[@]}" \
     --output "$ESP/harland/initramfs.tar" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 cp "$LOADER_EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$ESP/harland/kernel.elf"
@@ -99,6 +126,41 @@ vars=()
 if [ -n "$OVMF_VARS" ]; then
     cp "$OVMF_VARS" "$WORK/vars.fd"
     vars=(-drive "if=pflash,format=raw,file=$WORK/vars.fd")
+fi
+
+if [ "$MODE" = keyboard ]; then
+    # Each --send waits for its text on screen, then types. `spin` prints
+    # one line and computes in ring 3 until killed; the prompt after its ^C
+    # is the one `echo $?` is typed at.
+    python3 "$SCRIPT_DIR/fbcon_screen.py" watch --qmp "$WORK/qmp.sock" --shots "$WORK/kbd" \
+        --timeout "$TIMEOUT" \
+        --expect '\[usb\] slot 1: keyboard ready \(endpoint 0x81, interval [0-9]+\)' \
+        --send '(?m)^rzsh>$' 'e c h o spc h i ret' \
+        --expect '(?m)^rzsh> echo hi\nhi$' \
+        --send '(?m)^hi\nrzsh>$' 's p i n ret' \
+        --send '(?m)^spin: running, Ctrl-C stops me$' 'ctrl-c' \
+        --send '(?m)^\^C\nrzsh>$' 'e c h o spc shift-4 shift-slash ret' \
+        --expect '(?m)^rzsh> echo \$\?\n130$' \
+        --send '(?m)^130\nrzsh>$' 'e c h o spc caps_lock a b caps_lock c ret' \
+        --expect '(?m)^rzsh> echo ABc\nABc$' \
+        --send '(?m)^ABc\nrzsh>$' 'e c h o spc x@1200 ret' \
+        --expect '(?m)^rzsh> echo xxxx+\nxxxx+$' \
+        --absent 'KERNEL PANIC|!!! EXCEPTION !!!' -- \
+        qemu-system-x86_64 -cpu Haswell-v1 -smp 1 -m 2G \
+        -machine q35,i8042=off -serial none -display none -vga std -no-reboot -monitor none \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
+        -drive "format=raw,file=fat:rw:$ESP" \
+        -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0
+    rc=$?
+    [ "$rc" -eq "$EXIT_SETUP" ] && setup_error "QEMU could not be started"
+    if [ "$rc" -ne 0 ]; then
+        echo "----- usb keyboard boot: last screen -----"
+        cat "$WORK/kbd/screen.txt" 2>/dev/null
+        echo "------------------------------------------"
+    else
+        echo "PASS: typed into rzsh on a USB keyboard (no COM1, framebuffer console)"
+    fi
+    exit "$rc"
 fi
 SERIAL="$WORK/usb.log"
 : > "$SERIAL"

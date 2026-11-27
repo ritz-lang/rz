@@ -175,3 +175,18 @@ def test_watch_without_qemu_is_a_setup_error(tmp_path):
     )
     assert r.returncode == 3
     assert "SETUP ERROR" in r.stderr
+
+
+def test_send_keys_parse_chords_and_hold_times():
+    """--send's KEYS (AGAST #4888): one QEMU key name per key, `-` joining a
+    chord, `@MS` a hold time; anything else is refused before QEMU starts."""
+    assert fbcon_screen.parse_keys("e spc ctrl-c shift-4 x@1200") == [
+        (["e"], None),
+        (["spc"], None),
+        (["ctrl", "c"], None),
+        (["shift", "4"], None),
+        (["x"], 1200),
+    ]
+    for bad in ("", "ctrl-", "x@", "x@soon"):
+        with pytest.raises(ValueError):
+            fbcon_screen.parse_keys(bad)

@@ -2,8 +2,9 @@
 #
 # Probe, port-1 enable and IRQ 1 live here. Scan codes and the probe
 # decisions live in drivers/i8042/decode.ritz, which has no port I/O.
-# The aux port is not initialized. Bytes go through ldisc_input, and
-# Ctrl-C uses the same tty_console_irq / tty_console_irq_kill path as COM1.
+# The aux port is not initialized. Bytes go to the console through
+# tty_console_input, and Ctrl-C uses the same tty_console_irq_kill path as
+# COM1 and the USB keyboard.
 
 import ritzlib.option
 import ritzlib.result
@@ -17,8 +18,8 @@ import drivers.acpi.tables {
 }
 import drivers.iommu.ir { ir_enabled }
 import arch.x86_64.apic { IoapicRouteError, ioapic_route_pin, ioapic_pin_count, ioapic_eoi }
-import tty.console { tty_console_irq }
-import tty.ldisc { ldisc_input }
+import ritzlib.strview { StrView }
+import tty.console { tty_console_input }
 import drivers.i8042.decode {
     ScanSet, KbdDec, PortOps, IsaWire, KbdProbeError,
     kbd_dec_new, kbd_feed, fadt_has_8042, isa_irq_wire, isa_gsi_pin, firmware_has_keyboard_hid,
@@ -44,6 +45,8 @@ var g_set: ScanSet = ScanSet.Set1
 var g_dec: KbdDec
 var g_pin: u8 = 1
 var g_level: bool = false
+# The bytes one IRQ 1 decoded, handed to the console together.
+var g_typed: [16]u8
 
 fn hw_status(ctx: *u8) -> u8
     cpu_pause()
@@ -173,13 +176,14 @@ pub fn i8042_init()
     if was_on
         enable_interrupts()
 
-# IRQ 1. Reads the keyboard byte, decodes it into the console line
-# discipline, then asks tty_console_irq whether a Ctrl-C should kill the
-# process that was current. Aux bytes are discarded, not decoded.
+# IRQ 1. Reads the keyboard bytes, decodes them and hands them to the
+# console (tty_console_input), whose answer says whether a Ctrl-C should
+# kill the process that was current. Aux bytes are discarded, not decoded.
 pub fn i8042_irq(from_user: bool) -> bool
     if not g_up
         return false
     var n: i32 = 0
+    var typed: i64 = 0
     while n < KBD_IRQ_DRAIN_MAX
         let st: u8 = inb(I8042_STATUS)
         if (st & I8042_ST_OBF) == 0
@@ -187,10 +191,12 @@ pub fn i8042_irq(from_user: bool) -> bool
         let b: u8 = inb(I8042_DATA)
         if (st & I8042_ST_AUX) == 0
             match kbd_feed(@&g_dec, g_set, b)
-                Some(ch) => ldisc_input(ch)
+                Some(ch) =>
+                    g_typed[typed] = ch
+                    typed = typed + 1
                 None => pass
         n = n + 1
-    tty_console_irq(from_user)
+    tty_console_input(StrView { ptr: @g_typed[0], len: typed }, from_user)
 
 # After lapic_eoi, when the MADT override made this pin level-triggered.
 pub fn i8042_irq_eoi()

@@ -1,0 +1,352 @@
+# Harland HID boot keyboard (AGAST #4888, docs/USB.md "Data path")
+#
+# What the kernel's hid_kbd driver (kernel/src/drivers/usb/hid_kbd.ritz)
+# does with each 8-byte boot report, with no hardware: diff it against the
+# last report (a press is a usage this report has and the last did not; a
+# report of ErrorRollOver, 0x01, says too many keys are down and changes
+# nothing), turn each press into the bytes a US terminal keyboard sends,
+# track Caps Lock (the driver sets its LED), and repeat the newest held key
+# on the tick, since a boot keyboard under Set Idle 0 does not repeat.
+#
+# The bytes are what COM1 would deliver for the same keys, so the console's
+# line discipline and rzsh's key reader (ritzlib/termsession.ritz) see no
+# difference: Enter is CR, Backspace is DEL (127), Ctrl+letter is the
+# control byte (Ctrl-C is 3), and the navigation keys are their ANSI
+# escape sequences.
+
+import usb_abi.desc { SetupPacket }
+
+pub const BOOT_REPORT_LEN: i64 = 8
+# Key usages a boot report carries after its modifier and reserved bytes.
+pub const HID_KEYS: i64 = 6
+
+# Modifier byte (report byte 0).
+pub const MOD_LCTRL: u8 = 0x01
+pub const MOD_LSHIFT: u8 = 0x02
+pub const MOD_LALT: u8 = 0x04
+pub const MOD_LGUI: u8 = 0x08
+pub const MOD_RCTRL: u8 = 0x10
+pub const MOD_RSHIFT: u8 = 0x20
+pub const MOD_RALT: u8 = 0x40
+pub const MOD_RGUI: u8 = 0x80
+const MOD_CTRL: u8 = MOD_LCTRL | MOD_RCTRL
+const MOD_SHIFT: u8 = MOD_LSHIFT | MOD_RSHIFT
+
+# Keyboard/Keypad page usages (HID Usage Tables 1.4, section 10).
+pub const USAGE_ROLLOVER: u8 = 0x01
+const USAGE_A: u8 = 0x04
+const USAGE_Z: u8 = 0x1D
+const USAGE_1: u8 = 0x1E
+const USAGE_0: u8 = 0x27
+const USAGE_ENTER: u8 = 0x28
+const USAGE_ESC: u8 = 0x29
+const USAGE_BACKSPACE: u8 = 0x2A
+const USAGE_TAB: u8 = 0x2B
+const USAGE_SPACE: u8 = 0x2C
+pub const USAGE_CAPS_LOCK: u8 = 0x39
+const USAGE_INSERT: u8 = 0x49
+const USAGE_HOME: u8 = 0x4A
+const USAGE_PAGE_UP: u8 = 0x4B
+const USAGE_DELETE: u8 = 0x4C
+const USAGE_END: u8 = 0x4D
+const USAGE_PAGE_DOWN: u8 = 0x4E
+const USAGE_RIGHT: u8 = 0x4F
+const USAGE_LEFT: u8 = 0x50
+const USAGE_DOWN: u8 = 0x51
+const USAGE_UP: u8 = 0x52
+const USAGE_KP_ENTER: u8 = 0x58
+
+# The output report's LED bits.
+pub const LED_NUM_LOCK: u8 = 0x01
+pub const LED_CAPS_LOCK: u8 = 0x02
+
+const CH_ESC: u8 = 0x1B
+const CH_DEL: u8 = 0x7F
+const CH_CR: u8 = 0x0D
+const CH_TAB: u8 = 0x09
+# Ctrl+letter is the letter's low five bits.
+const CTRL_MASK: u8 = 0x1F
+# Lower case is upper case plus this.
+const CASE_BIT: u8 = 0x20
+
+# Typematic repeat, in ticks of the kernel's 100 Hz BSP tick: 500 ms
+# before the first repeat, then every 3 ticks (about 33 a second).
+pub const REPEAT_DELAY_TICKS: u32 = 50
+pub const REPEAT_EVERY_TICKS: u32 = 3
+
+# ============================================================================
+# HID class requests (HID 1.11 section 7.2)
+# ============================================================================
+
+# Class request to the interface, host to device.
+const REQTYPE_CLASS_INTERFACE_OUT: u8 = 0x21
+pub const HID_REQ_SET_REPORT: u8 = 0x09
+pub const HID_REQ_SET_IDLE: u8 = 0x0A
+pub const HID_REQ_SET_PROTOCOL: u8 = 0x0B
+pub const HID_PROTOCOL_BOOT: u8 = 0
+# SET_REPORT's wValue: report type in the high byte (2: output), ID 0.
+const HID_REPORT_OUTPUT: u16 = 0x0200
+
+# SET_PROTOCOL(boot) on interface `iface`: the device sends 8-byte boot
+# reports whatever its report descriptor says.
+pub fn setup_set_protocol(iface: u8) -> SetupPacket
+    SetupPacket {
+        request_type: REQTYPE_CLASS_INTERFACE_OUT,
+        request: HID_REQ_SET_PROTOCOL,
+        value: HID_PROTOCOL_BOOT as u16,
+        index: iface as u16,
+        length: 0
+    }
+
+# SET_IDLE(0) on interface `iface`: a report only when the keys change
+# (the tick does the repeating).
+pub fn setup_set_idle(iface: u8) -> SetupPacket
+    SetupPacket {
+        request_type: REQTYPE_CLASS_INTERFACE_OUT,
+        request: HID_REQ_SET_IDLE,
+        value: 0,
+        index: iface as u16,
+        length: 0
+    }
+
+# SET_REPORT of the one-byte LED output report on interface `iface`.
+pub fn setup_set_report_leds(iface: u8) -> SetupPacket
+    SetupPacket {
+        request_type: REQTYPE_CLASS_INTERFACE_OUT,
+        request: HID_REQ_SET_REPORT,
+        value: HID_REPORT_OUTPUT,
+        index: iface as u16,
+        length: 1
+    }
+
+# ============================================================================
+# The boot report
+# ============================================================================
+
+pub struct BootReport
+    mods: u8
+    keys: [6]u8
+
+fn report_none() -> BootReport
+    BootReport { mods: 0, keys: [0, 0, 0, 0, 0, 0] }
+
+# The report in `b` (byte 1 is reserved), or None if it is short.
+pub fn boot_report(b: [u8]) -> Option<BootReport>
+    if b.len < BOOT_REPORT_LEN
+        return None
+    var r = report_none()
+    r.mods = b[0]
+    for i in 0..HID_KEYS
+        r.keys[i] = b[2 + i]
+    Some(r)
+
+# ErrorRollOver in the key slots: too many keys are down for the device to
+# say which. The report is not a key state.
+pub fn report_rollover(r: BootReport) -> bool
+    for i in 0..HID_KEYS
+        if r.keys[i] == USAGE_ROLLOVER
+            return true
+    false
+
+fn report_has(r: @BootReport, usage: u8) -> bool
+    for i in 0..HID_KEYS
+        if r.keys[i] == usage
+            return true
+    false
+
+# ============================================================================
+# Keymap (US)
+# ============================================================================
+
+# The bytes one report or tick sends to the console: at most six presses of
+# at most four bytes each. `leds_changed`: Caps Lock toggled, and the
+# driver sends HidKbd.leds() to the device.
+pub struct KeyOut
+    bytes: [32]u8
+    len: i64
+    leds_changed: bool
+
+impl KeyOut
+    pub fn empty() -> KeyOut
+        KeyOut { bytes: [0; 32], len: 0, leds_changed: false }
+
+    fn put(self: @&KeyOut, c: u8)
+        if self.len < 32
+            self.bytes[self.len] = c
+            self.len += 1
+
+    # ESC [ `final`: an arrow, Home or End.
+    fn csi(self: @&KeyOut, final: u8)
+        self.put(CH_ESC)
+        self.put('[')
+        self.put(final)
+
+    # ESC [ `digit` ~: Insert, Delete, Page Up or Page Down.
+    fn csi_tilde(self: @&KeyOut, digit: u8)
+        self.csi(digit)
+        self.put('~')
+
+    # Append the bytes key `usage` sends with modifiers `mods` and Caps
+    # Lock `caps`. False if it sends none: a modifier, Caps Lock, a
+    # function key or any usage the map does not have.
+    pub fn add_key(self: @&KeyOut, usage: u8, mods: u8, caps: bool) -> bool
+        let before: i64 = self.len
+        let shift: bool = (mods & MOD_SHIFT) != 0
+        if usage >= USAGE_A and usage <= USAGE_Z
+            let upper: u8 = 'A' + (usage - USAGE_A)
+            if (mods & MOD_CTRL) != 0
+                self.put(upper & CTRL_MASK)
+            else if shift != caps
+                self.put(upper)
+            else
+                self.put(upper | CASE_BIT)
+        else if usage >= USAGE_1 and usage <= USAGE_0
+            if shift
+                self.put(digit_shifted(usage))
+            else if usage == USAGE_0
+                self.put('0')
+            else
+                self.put('1' + (usage - USAGE_1))
+        else
+            match usage
+                USAGE_ENTER => self.put(CH_CR)
+                USAGE_KP_ENTER => self.put(CH_CR)
+                USAGE_ESC => self.put(CH_ESC)
+                USAGE_BACKSPACE => self.put(CH_DEL)
+                USAGE_TAB => self.put(CH_TAB)
+                USAGE_SPACE => self.put(' ')
+                USAGE_UP => self.csi('A')
+                USAGE_DOWN => self.csi('B')
+                USAGE_RIGHT => self.csi('C')
+                USAGE_LEFT => self.csi('D')
+                USAGE_HOME => self.csi('H')
+                USAGE_END => self.csi('F')
+                USAGE_INSERT => self.csi_tilde('2')
+                USAGE_DELETE => self.csi_tilde('3')
+                USAGE_PAGE_UP => self.csi_tilde('5')
+                USAGE_PAGE_DOWN => self.csi_tilde('6')
+                _ =>
+                    var c: u8 = punct(usage, shift)
+                    if c == 0
+                        c = keypad(usage)
+                    if c != 0
+                        self.put(c)
+        self.len > before
+
+# A digit row key's shifted symbol, from 1 to 0; 0 for any other usage.
+fn digit_shifted(usage: u8) -> u8
+    match usage
+        0x1E => '!'
+        0x1F => '@'
+        0x20 => '#'
+        0x21 => '$'
+        0x22 => '%'
+        0x23 => '^'
+        0x24 => '&'
+        0x25 => '*'
+        0x26 => '('
+        0x27 => ')'
+        _ => 0
+
+# The punctuation keys from - (0x2D) to / (0x38), unshifted and shifted. 0
+# for a usage that is not one; Non-US # (0x32) is not on a US keyboard.
+fn punct(usage: u8, shift: bool) -> u8
+    match usage
+        0x2D => if shift then '_' else '-'
+        0x2E => if shift then '+' else '='
+        0x2F => if shift then '{' else '['
+        0x30 => if shift then '}' else ']'
+        0x31 => if shift then '|' else '\\'
+        0x33 => if shift then ':' else ';'
+        0x34 => if shift then '"' else '\''
+        0x35 => if shift then '~' else '`'
+        0x36 => if shift then '<' else ','
+        0x37 => if shift then '>' else '.'
+        0x38 => if shift then '?' else '/'
+        _ => 0
+
+# The keypad's characters (Num Lock is not tracked: the keypad types its
+# digits), 0 for a usage that is not one.
+fn keypad(usage: u8) -> u8
+    match usage
+        0x54 => '/'
+        0x55 => '*'
+        0x56 => '-'
+        0x57 => '+'
+        0x59 => '1'
+        0x5A => '2'
+        0x5B => '3'
+        0x5C => '4'
+        0x5D => '5'
+        0x5E => '6'
+        0x5F => '7'
+        0x60 => '8'
+        0x61 => '9'
+        0x62 => '0'
+        0x63 => '.'
+        _ => 0
+
+# ============================================================================
+# The keyboard
+# ============================================================================
+
+# One boot keyboard's state between reports.
+pub struct HidKbd
+    last: BootReport
+    caps: bool
+    repeat: u8              # the usage repeating, 0 for none
+    ticks: u32              # ticks since its press or its last repeat
+    repeating: bool         # past the first delay
+
+impl HidKbd
+    pub fn new() -> HidKbd
+        HidKbd { last: report_none(), caps: false, repeat: 0, ticks: 0, repeating: false }
+
+    # The LED output report's byte.
+    pub fn leds(self: @HidKbd) -> u8
+        if self.caps then LED_CAPS_LOCK else 0
+
+    # A press: its bytes, and it becomes the key that repeats. Caps Lock
+    # toggles instead, and neither it nor a key with no bytes repeats.
+    fn press(self: @&HidKbd, usage: u8, mods: u8, out: @&KeyOut)
+        if usage == USAGE_CAPS_LOCK
+            self.caps = not self.caps
+            out.leds_changed = true
+            return
+        if out.add_key(usage, mods, self.caps)
+            self.repeat = usage
+            self.ticks = 0
+            self.repeating = false
+
+    # The report the interrupt-IN endpoint delivered: what its new presses
+    # send. A short report or a rollover report sends nothing and is not
+    # kept, so the next report is diffed against the last real one.
+    pub fn report(self: @&HidKbd, b: [u8]) -> KeyOut
+        var out = KeyOut.empty()
+        let cur: BootReport = match boot_report(b)
+            Some(r) => r
+            None => return out
+        if report_rollover(cur)
+            return out
+        for i in 0..HID_KEYS
+            let u: u8 = cur.keys[i]
+            if u > USAGE_ROLLOVER and not report_has(@self.last, u)
+                self.press(u, cur.mods, @&out)
+        if self.repeat != 0 and not report_has(@cur, self.repeat)
+            self.repeat = 0
+        self.last = cur
+        out
+
+    # One BSP tick: the held key's bytes when its repeat is due.
+    pub fn tick(self: @&HidKbd) -> KeyOut
+        var out = KeyOut.empty()
+        if self.repeat == 0
+            return out
+        self.ticks += 1
+        let due: u32 = if self.repeating then REPEAT_EVERY_TICKS else REPEAT_DELAY_TICKS
+        if self.ticks < due
+            return out
+        self.ticks = 0
+        self.repeating = true
+        out.add_key(self.repeat, self.last.mods, self.caps)
+        out

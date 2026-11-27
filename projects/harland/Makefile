@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all build clean test test-smp test-tier1 test-usb kernel iso help inventory-img test-inventory
+.PHONY: all build clean test test-smp test-tier1 test-usb test-usb-kbd kernel iso help inventory-img test-inventory
 
 all: kernel
 
@@ -83,6 +83,10 @@ test-tier1:
 test-usb:
 	./tools/test_usb_boot.sh
 
+# The USB keyboard types into rzsh: no COM1, the screen read over QMP (#4888).
+test-usb-kbd:
+	./tools/test_usb_boot.sh keyboard
+
 # Hardware-inventory USB stick (AGAST #3406): HWINV.EFI on a GPT + FAT32
 # image for `dd` or Etcher. See inventory/README.md.
 INVENTORY_IMG ?= $(BUILD_DIR)/hwinv.img
@@ -119,6 +123,7 @@ help:
 	@echo "  test-smp     - Boot with -smp 2 and check two CPUs in SYSCALL at once (#4192)"
 	@echo "  test-tier1   - Boot with indium under OVMF, check init Tier-1 suite"
 	@echo "  test-usb     - Boot with qemu-xhci + usb-kbd, check enumeration (#4887)"
+	@echo "  test-usb-kbd - Type into rzsh on a usb-kbd, no COM1 (#4888)"
 	@echo "  inventory-img  - Build the hardware-inventory USB stick image (build/hwinv.img)"
 	@echo "  test-inventory - Boot the inventory stick in QEMU and check its dump"
 	@echo "  clean        - Remove build artifacts"

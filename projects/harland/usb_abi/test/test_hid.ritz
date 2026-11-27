@@ -1,0 +1,393 @@
+# Harland usb_abi HID boot keyboard tests (AGAST #4888)
+#
+# The 8-byte boot report diffed against the last one (a press is a usage
+# new to this report; rollover's 0x01 reports change nothing), the US
+# keymap (Shift, Caps Lock and its LED, Ctrl+letter, Backspace 127, Enter
+# CR, the ANSI escapes rzsh's key reader decodes), typematic repeat on the
+# tick, and the HID class requests and Normal TRB the driver queues.
+
+import ritzlib.strview { StrView }
+import usb_abi.hid { HidKbd, KeyOut, BootReport, boot_report, report_rollover, setup_set_protocol, setup_set_idle, setup_set_report_leds, MOD_LCTRL, MOD_LSHIFT, MOD_RSHIFT, MOD_RCTRL, LED_CAPS_LOCK, REPEAT_DELAY_TICKS, REPEAT_EVERY_TICKS, HID_REQ_SET_PROTOCOL, HID_REQ_SET_IDLE, HID_REQ_SET_REPORT, HID_PROTOCOL_BOOT }
+import usb_abi.desc { SetupPacket }
+import usb_abi.trb { Trb, TRB_NORMAL, TRB_IOC, TRB_ISP, trb_type, trb_normal }
+
+# Usages (HID Usage Tables, Keyboard/Keypad page 0x07).
+const U_A: u8 = 0x04
+const U_C: u8 = 0x06
+const U_H: u8 = 0x0B
+const U_I: u8 = 0x0C
+const U_Z: u8 = 0x1D
+const U_1: u8 = 0x1E
+const U_4: u8 = 0x21
+const U_0: u8 = 0x27
+const U_ENTER: u8 = 0x28
+const U_ESC: u8 = 0x29
+const U_BKSP: u8 = 0x2A
+const U_TAB: u8 = 0x2B
+const U_SPACE: u8 = 0x2C
+const U_MINUS: u8 = 0x2D
+const U_SLASH: u8 = 0x38
+const U_CAPS: u8 = 0x39
+const U_HOME: u8 = 0x4A
+const U_DELETE: u8 = 0x4C
+const U_END: u8 = 0x4D
+const U_RIGHT: u8 = 0x4F
+const U_LEFT: u8 = 0x50
+const U_DOWN: u8 = 0x51
+const U_UP: u8 = 0x52
+const U_KP_ENTER: u8 = 0x58
+const U_F1: u8 = 0x3A
+const U_ROLLOVER: u8 = 0x01
+
+var g_rep: [8]u8
+
+# A report with modifiers `m` and keys k1, k2 (0: none) in the first slots.
+fn rep(m: u8, k1: u8, k2: u8) -> [u8]
+    for i in 0..8
+        g_rep[i] = 0
+    g_rep[0] = m
+    g_rep[2] = k1
+    g_rep[3] = k2
+    @g_rep
+
+# `o` sent exactly the bytes of `want`.
+fn sent(o: KeyOut, want: StrView) -> bool
+    if o.len != want.len
+        return false
+    for i in 0..o.len
+        if o.bytes[i] != want.get(i)
+            return false
+    true
+
+# The bytes one key gives on its own, with modifiers `m` and Caps `caps`.
+fn key(usage: u8, m: u8, caps: bool) -> KeyOut
+    var o = KeyOut.empty()
+    o.add_key(usage, m, caps)
+    o
+
+# Press `usage` (with modifiers `m`) and release it: what the press sent.
+fn tap(k: @&HidKbd, usage: u8, m: u8) -> KeyOut
+    let o: KeyOut = k.report(rep(m, usage, 0))
+    k.report(rep(0, 0, 0))
+    o
+
+# ---------------------------------------------------------------------------
+# The boot report
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_boot_report_parses_modifiers_and_six_keys() -> i32
+    var b: [8]u8 = [0x22, 0, 4, 5, 6, 7, 8, 9]
+    match boot_report(@b)
+        Some(r) =>
+            assert r.mods == 0x22
+            assert r.keys[0] == 4
+            assert r.keys[5] == 9
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_short_report_is_refused() -> i32
+    var b: [8]u8 = [0, 0, 4, 0, 0, 0, 0, 0]
+    let s: [u8] = @b
+    assert boot_report(s[0..7]).is_none()
+    0
+
+[[test]]
+fn test_rollover_report_is_recognised() -> i32
+    var b: [8]u8 = [0, 0, 1, 1, 1, 1, 1, 1]
+    match boot_report(@b)
+        Some(r) =>
+            assert report_rollover(r)
+        None =>
+            assert false
+    match boot_report(rep(0, U_A, 0))
+        Some(r) =>
+            assert not report_rollover(r)
+        None =>
+            assert false
+    0
+
+# ---------------------------------------------------------------------------
+# Report diff
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_press_sends_once_and_hold_or_release_sends_nothing() -> i32
+    var k = HidKbd.new()
+    assert sent(k.report(rep(0, U_A, 0)), "a")
+    # The same key still down in the next report is not a new press.
+    assert sent(k.report(rep(0, U_A, 0)), "")
+    assert sent(k.report(rep(0, 0, 0)), "")
+    # Pressed again after its release, it sends again.
+    assert sent(k.report(rep(0, U_A, 0)), "a")
+    0
+
+[[test]]
+fn test_second_key_in_a_report_sends_only_itself() -> i32
+    var k = HidKbd.new()
+    assert sent(k.report(rep(0, U_H, 0)), "h")
+    assert sent(k.report(rep(0, U_H, U_I)), "i")
+    # H released and I moved to the first slot: I is held, not pressed again.
+    assert sent(k.report(rep(0, U_I, 0)), "")
+    0
+
+[[test]]
+fn test_two_new_keys_in_one_report_send_in_slot_order() -> i32
+    var k = HidKbd.new()
+    assert sent(k.report(rep(0, U_H, U_I)), "hi")
+    0
+
+[[test]]
+fn test_rollover_report_changes_nothing() -> i32
+    var k = HidKbd.new()
+    assert sent(k.report(rep(0, U_A, 0)), "a")
+    var b: [8]u8 = [0, 0, 1, 1, 1, 1, 1, 1]
+    assert sent(k.report(@b), "")
+    # The report after rollover is diffed against the one before it: A was
+    # held throughout, so only C is new.
+    assert sent(k.report(rep(0, U_A, U_C)), "c")
+    0
+
+[[test]]
+fn test_modifier_only_report_sends_nothing() -> i32
+    var k = HidKbd.new()
+    assert sent(k.report(rep(MOD_LSHIFT, 0, 0)), "")
+    assert sent(k.report(rep(MOD_LSHIFT, U_A, 0)), "A")
+    0
+
+[[test]]
+fn test_garbage_short_report_changes_nothing() -> i32
+    var k = HidKbd.new()
+    let s: [u8] = rep(0, U_A, 0)
+    assert sent(k.report(s[0..4]), "")
+    assert sent(k.report(rep(0, U_A, 0)), "a")
+    0
+
+# ---------------------------------------------------------------------------
+# Keymap
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_letters_digits_and_shift() -> i32
+    assert sent(key(U_A, 0, false), "a")
+    assert sent(key(U_Z, 0, false), "z")
+    assert sent(key(U_A, MOD_LSHIFT, false), "A")
+    assert sent(key(U_Z, MOD_RSHIFT, false), "Z")
+    assert sent(key(U_1, 0, false), "1")
+    assert sent(key(U_0, 0, false), "0")
+    assert sent(key(U_1, MOD_LSHIFT, false), "!")
+    assert sent(key(U_4, MOD_LSHIFT, false), "$")
+    assert sent(key(U_0, MOD_LSHIFT, false), ")")
+    0
+
+[[test]]
+fn test_punctuation_and_shift() -> i32
+    assert sent(key(U_SPACE, 0, false), " ")
+    assert sent(key(U_MINUS, 0, false), "-")
+    assert sent(key(U_MINUS, MOD_LSHIFT, false), "_")
+    assert sent(key(U_SLASH, 0, false), "/")
+    assert sent(key(U_SLASH, MOD_RSHIFT, false), "?")
+    assert sent(key(0x34, MOD_LSHIFT, false), "\"")
+    assert sent(key(0x35, MOD_LSHIFT, false), "~")
+    0
+
+[[test]]
+fn test_caps_lock_shifts_letters_only() -> i32
+    assert sent(key(U_A, 0, true), "A")
+    # Shift with Caps Lock gives the lower case back.
+    assert sent(key(U_A, MOD_LSHIFT, true), "a")
+    assert sent(key(U_1, 0, true), "1")
+    assert sent(key(U_MINUS, 0, true), "-")
+    0
+
+[[test]]
+fn test_control_keys() -> i32
+    # Backspace is DEL, as a terminal's key sends; Enter is CR.
+    assert sent(key(U_BKSP, 0, false), "\x7f")
+    assert sent(key(U_ENTER, 0, false), "\r")
+    assert sent(key(U_KP_ENTER, 0, false), "\r")
+    assert sent(key(U_TAB, 0, false), "\t")
+    assert sent(key(U_ESC, 0, false), "\x1b")
+    0
+
+[[test]]
+fn test_ctrl_letter_is_the_control_byte() -> i32
+    assert sent(key(U_C, MOD_LCTRL, false), "\x03")
+    assert sent(key(U_A, MOD_RCTRL, false), "\x01")
+    assert sent(key(0x07, MOD_LCTRL, false), "\x04")
+    # Shift or Caps Lock do not change it.
+    assert sent(key(U_C, MOD_LCTRL | MOD_LSHIFT, true), "\x03")
+    0
+
+[[test]]
+fn test_navigation_keys_send_ansi_escapes() -> i32
+    assert sent(key(U_UP, 0, false), "\x1b[A")
+    assert sent(key(U_DOWN, 0, false), "\x1b[B")
+    assert sent(key(U_RIGHT, 0, false), "\x1b[C")
+    assert sent(key(U_LEFT, 0, false), "\x1b[D")
+    assert sent(key(U_HOME, 0, false), "\x1b[H")
+    assert sent(key(U_END, 0, false), "\x1b[F")
+    assert sent(key(U_DELETE, 0, false), "\x1b[3~")
+    0
+
+[[test]]
+fn test_unmapped_keys_send_nothing() -> i32
+    assert sent(key(U_F1, 0, false), "")
+    assert sent(key(0xE0, 0, false), "")
+    assert sent(key(0, 0, false), "")
+    0
+
+# ---------------------------------------------------------------------------
+# Caps Lock state and its LED
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_caps_lock_toggles_on_press_and_asks_for_the_led() -> i32
+    var k = HidKbd.new()
+    assert k.leds() == 0
+    let on: KeyOut = tap(@&k, U_CAPS, 0)
+    assert sent(on, "")
+    assert on.leds_changed
+    assert k.leds() == LED_CAPS_LOCK
+    assert sent(tap(@&k, U_A, 0), "A")
+    let off: KeyOut = tap(@&k, U_CAPS, 0)
+    assert off.leds_changed
+    assert k.leds() == 0
+    assert sent(tap(@&k, U_A, 0), "a")
+    0
+
+[[test]]
+fn test_held_caps_lock_toggles_once() -> i32
+    var k = HidKbd.new()
+    k.report(rep(0, U_CAPS, 0))
+    let again: KeyOut = k.report(rep(0, U_CAPS, 0))
+    assert not again.leds_changed
+    assert k.leds() == LED_CAPS_LOCK
+    0
+
+[[test]]
+fn test_ordinary_key_leaves_the_leds_alone() -> i32
+    var k = HidKbd.new()
+    assert not k.report(rep(0, U_A, 0)).leds_changed
+    0
+
+# ---------------------------------------------------------------------------
+# Typematic repeat on the tick
+# ---------------------------------------------------------------------------
+
+# Ticks until the next repeat sends something, or -1 within `limit`.
+fn ticks_to_repeat(k: @&HidKbd, limit: u32) -> i64
+    for t in 1..=limit
+        if k.tick().len > 0
+            return t as i64
+    -1
+
+[[test]]
+fn test_repeat_after_the_delay_then_every_few_ticks() -> i32
+    var k = HidKbd.new()
+    k.report(rep(0, U_A, 0))
+    assert ticks_to_repeat(@&k, 200) == REPEAT_DELAY_TICKS as i64
+    assert ticks_to_repeat(@&k, 200) == REPEAT_EVERY_TICKS as i64
+    assert ticks_to_repeat(@&k, 200) == REPEAT_EVERY_TICKS as i64
+    0
+
+[[test]]
+fn test_repeat_sends_the_held_key_with_current_modifiers() -> i32
+    var k = HidKbd.new()
+    k.report(rep(0, U_UP, 0))
+    for j in 1..REPEAT_DELAY_TICKS
+        assert k.tick().len == 0
+    assert sent(k.tick(), "\x1b[A")
+    0
+
+[[test]]
+fn test_release_stops_repeat() -> i32
+    var k = HidKbd.new()
+    k.report(rep(0, U_A, 0))
+    k.report(rep(0, 0, 0))
+    assert ticks_to_repeat(@&k, 200) == -1
+    0
+
+[[test]]
+fn test_newest_key_repeats_and_its_release_stops_it() -> i32
+    var k = HidKbd.new()
+    k.report(rep(0, U_A, 0))
+    for j in 0..10
+        k.tick()
+    k.report(rep(0, U_A, U_C))
+    # C is the newest: its own full delay, then C.
+    for j in 1..REPEAT_DELAY_TICKS
+        assert k.tick().len == 0
+    assert sent(k.tick(), "c")
+    # Releasing C stops the repeat, though A is still down.
+    k.report(rep(0, U_A, 0))
+    assert ticks_to_repeat(@&k, 200) == -1
+    0
+
+[[test]]
+fn test_releasing_another_key_keeps_the_repeat() -> i32
+    var k = HidKbd.new()
+    k.report(rep(0, U_A, U_C))
+    k.report(rep(0, U_C, 0))
+    assert ticks_to_repeat(@&k, 200) == REPEAT_DELAY_TICKS as i64
+    0
+
+[[test]]
+fn test_caps_lock_and_modifiers_do_not_repeat() -> i32
+    var k = HidKbd.new()
+    k.report(rep(MOD_LSHIFT, U_CAPS, 0))
+    assert ticks_to_repeat(@&k, 200) == -1
+    0
+
+[[test]]
+fn test_no_key_held_no_repeat() -> i32
+    var k = HidKbd.new()
+    assert ticks_to_repeat(@&k, 200) == -1
+    0
+
+# ---------------------------------------------------------------------------
+# HID class requests and the interrupt-IN TRB
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_set_protocol_boot() -> i32
+    let s: SetupPacket = setup_set_protocol(2)
+    assert s.request_type == 0x21
+    assert s.request == HID_REQ_SET_PROTOCOL
+    assert s.value == HID_PROTOCOL_BOOT as u16
+    assert s.index == 2
+    assert s.length == 0
+    0
+
+[[test]]
+fn test_set_idle_zero() -> i32
+    let s: SetupPacket = setup_set_idle(1)
+    assert s.request_type == 0x21
+    assert s.request == HID_REQ_SET_IDLE
+    assert s.value == 0
+    assert s.index == 1
+    assert s.length == 0
+    0
+
+[[test]]
+fn test_set_report_leds() -> i32
+    let s: SetupPacket = setup_set_report_leds(0)
+    assert s.request_type == 0x21
+    assert s.request == HID_REQ_SET_REPORT
+    # Output report (type 2), report ID 0, one byte.
+    assert s.value == 0x0200
+    assert s.index == 0
+    assert s.length == 1
+    0
+
+[[test]]
+fn test_normal_trb_interrupts_on_completion_and_short_packet() -> i32
+    let t: Trb = trb_normal(0x12345000, 8)
+    assert trb_type(t.control) == TRB_NORMAL
+    assert t.param == 0x12345000
+    assert (t.status & 0x1FFFF) == 8
+    assert (t.control & TRB_IOC) != 0
+    assert (t.control & TRB_ISP) != 0
+    0

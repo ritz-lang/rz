@@ -14,7 +14,7 @@ A cell under the cursor matches on its top 14 rows. Anything else is '?'.
 
   fbcon_screen.py watch --qmp SOCK --shots DIR --timeout S
                         [--expect RE]... [--absent RE]... [--idle-after RE]
-                        -- QEMU ARGV...
+                        [--send RE KEYS]... -- QEMU ARGV...
       start QEMU with `-qmp unix:SOCK,server=on,wait=off` appended, take a
       screendump every second, and pass once every --expect regex has been
       on screen (in any shot: the boot log scrolls) and, with --idle-after,
@@ -22,6 +22,13 @@ A cell under the cursor matches on its top 14 rows. Anything else is '?'.
       appeared. An --absent regex on screen fails at once. QEMU is killed
       at the end; the last screen's text is in DIR/screen.txt, every
       screen's in DIR/screens.txt.
+
+      --send RE KEYS types at the guest's keyboard (AGAST #4888): once RE is
+      on screen, each of KEYS (space-separated QEMU key names, `-` joining a
+      chord: "e c h o spc h i ret", "ctrl-c", "shift-4"; `@MS` holds it
+      down MS milliseconds: "a@1200") goes to QMP send-key in turn. The
+      --send steps run in order, each only after the one before it was
+      sent, and the watch passes only once all were sent.
 
 Exit: 0 pass; 1 fail (timeout, an --absent match, QEMU exited early);
 3 QEMU could not be started (a SETUP ERROR, as the other boot scripts).
@@ -177,6 +184,39 @@ class Qmp:
         return reply.get("return", "")
 
 
+KEY_GAP_S = 0.1  # between keys: each send-key is a press and a release
+
+
+Chord = tuple[list[str], int | None]
+
+
+def parse_keys(keys: str) -> list[Chord]:
+    """'e ctrl-c a@900' -> [(['e'], None), (['ctrl', 'c'], None), (['a'], 900)]:
+    one chord per key, with its hold time in ms if it has one."""
+    chords: list[Chord] = []
+    for token in keys.split():
+        names, at, hold = token.partition("@")
+        chord = names.split("-")
+        if any(not n for n in chord) or (at and not hold.isdigit()):
+            raise ValueError(f"bad key list: {keys!r}")
+        chords.append((chord, int(hold) if hold else None))
+    if not chords:
+        raise ValueError(f"bad key list: {keys!r}")
+    return chords
+
+
+def send_keys(qmp: Qmp, chords: list[Chord]) -> None:
+    for chord, hold in chords:
+        args: dict = {"keys": [{"type": "qcode", "data": n} for n in chord]}
+        if hold is not None:
+            args["hold-time"] = hold
+        reply = qmp.call("send-key", **args)
+        if "error" in reply:
+            raise ConnectionError(f"send-key {'-'.join(chord)}: {reply['error']}")
+        # send-key returns at once; a held key is released hold ms later.
+        time.sleep(KEY_GAP_S + (hold or 0) / 1000)
+
+
 def cpu0_halted(qmp: Qmp) -> bool:
     qmp.hmp("cpu 0")
     return re.search(r"\bHLT=1\b", qmp.hmp("info registers")) is not None
@@ -204,6 +244,7 @@ def watch(args: argparse.Namespace) -> int:
     idle_armed = False
     idle_seen = idle_re is None
     absent = [re.compile(a) for a in args.absent]
+    steps = [(re.compile(r), parse_keys(k)) for r, k in args.send]
     screens = (shots / "screens.txt").open("w")
     lines: list[str] = []
     rc = EXIT_FAIL
@@ -229,11 +270,15 @@ def watch(args: argparse.Namespace) -> int:
                 why = f"on screen, must not be: {bad}"
                 break
             pending = [e for e in pending if not re.search(e, text)]
+            if steps and steps[0][0].search(text):
+                send_keys(qmp, steps.pop(0)[1])
+                time.sleep(1)
+                continue
             if idle_re is not None and not idle_armed and idle_re.search(text):
                 idle_armed = True
             if idle_armed and not idle_seen:
                 idle_seen = any(cpu0_halted(qmp) for _ in range(20))
-            if not pending and idle_seen:
+            if not pending and idle_seen and not steps:
                 rc = 0
                 why = "pass"
                 break
@@ -252,6 +297,8 @@ def watch(args: argparse.Namespace) -> int:
         if idle_re is not None and not idle_seen:
             state = "after it appeared" if idle_armed else "(it never appeared)"
             print(f"  CPU 0 never idle (HLT=1) {state}: {args.idle_after}")
+        for r, _ in steps:
+            print(f"  never on screen to type at: {r.pattern}")
     return rc
 
 
@@ -267,6 +314,7 @@ def main(argv: list[str]) -> int:
     w.add_argument("--expect", action="append", default=[])
     w.add_argument("--absent", action="append", default=[])
     w.add_argument("--idle-after")
+    w.add_argument("--send", nargs=2, action="append", default=[], metavar=("RE", "KEYS"))
     w.add_argument("qemu", nargs=argparse.REMAINDER)
     args = ap.parse_args(argv)
     if args.cmd == "decode":
@@ -276,6 +324,11 @@ def main(argv: list[str]) -> int:
         args.qemu = args.qemu[1:]
     if not args.qemu:
         ap.error("watch needs -- QEMU ARGV")
+    for _, keys in args.send:
+        try:
+            parse_keys(keys)
+        except ValueError as e:
+            ap.error(str(e))
     return watch(args)
 
 

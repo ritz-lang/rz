@@ -576,9 +576,10 @@ def test_entry_registers_drv_irq_wait():
 
 
 def test_console_input_wakes_console_watchers():
-    """#4829: COM1's receive interrupt wakes the BLOCK_TTY readers and the
-    wait sets watching the console (a timed poll on fd 0)."""
-    body = _fn_body(CONSOLE.read_text(), "tty_console_irq")
+    """#4829: console input (COM1's receive interrupt, and since #4888 every
+    keyboard, all through tty_console_input) wakes the BLOCK_TTY readers and
+    the wait sets watching the console (a timed poll on fd 0)."""
+    body = _fn_body(CONSOLE.read_text(), "tty_console_input")
     assert "proc_wake(BLOCK_TTY)" in body and "waitset_console_ready()" in body, body
 
 

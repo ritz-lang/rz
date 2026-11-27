@@ -3,10 +3,11 @@
 # COM1 is the console: fds 0, 1 and 2 when they are not files. Output and
 # echo also go to the framebuffer console (drivers/display/fbcon.ritz,
 # AGAST #4868); on a machine with no COM1 (serial.ritz's probe) that is
-# the only one, and reads find no COM1 input. Received bytes
-# go through the line discipline (tty/ldisc.ritz) from the IRQ 4 handler;
-# read(0) sleeps until it has something; Ctrl-C kills the foreground
-# process.
+# the only one, and reads find no COM1 input. Received bytes (COM1's IRQ 4,
+# the PS/2 keyboard's IRQ 1, a USB keyboard's xHCI interrupt and its
+# repeat on the BSP tick) go through tty_console_input into the line
+# discipline (tty/ldisc.ritz); read(0) sleeps until it has something;
+# Ctrl-C kills the foreground process.
 #
 # Sleeping: read(0) disables interrupts, pulls whatever COM1's FIFO holds,
 # and if nothing is readable blocks in the scheduler (BLOCK_TTY,
@@ -68,14 +69,48 @@ fn tty_console_send_echo()
         fbcon_write(StrView { ptr: @g_console_echo[0], len: n })
         n = ldisc_take_echo(@g_console_echo[0], 64)
 
-# Move every byte COM1 holds through the line discipline. Interrupts off.
-fn tty_console_pull()
-    while serial_data_available()
-        let c: i32 = serial_read_byte_nonblock()
-        if c < 0
-            return
-        ldisc_input(c as u8)
+# Console input from any keyboard (AGAST #4888, docs/USB.md "Data path"):
+# COM1's receive half (tty_console_pull), the PS/2 keyboard's IRQ 1 and the
+# USB HID keyboard (drivers/usb/hid_kbd.ritz) all hand their bytes here, so
+# echo, wake and Ctrl-C do not depend on where a byte came from. Each byte
+# goes through the line discipline, its echo goes to COM1 and the
+# framebuffer, then a reader blocked in read(0) and a timed poll watching
+# the console look again. Interrupts off, on the CPU that took the input.
+# from_user: the interrupt came from a process (any non-zero CPL). Returns
+# true if the caller must send its EOI and call tty_console_irq_kill: a
+# process to kill for a Ctrl-C.
+pub fn tty_console_input(bytes: StrView, from_user: bool) -> bool
+    for i in 0..bytes.len
+        ldisc_input(bytes.get(i))
     tty_console_send_echo()
+    proc_wake(BLOCK_TTY)
+    waitset_console_ready()
+    from_user and tty_console_intr_due()
+
+var g_console_rx: [64]u8
+
+# Move every byte COM1 holds through tty_console_input, a FIFO's worth at a
+# time. Interrupts off. Returns tty_console_input's answer: a Ctrl-C for
+# the process `from_user` says was interrupted.
+fn tty_console_pull(from_user: bool) -> bool
+    var kill: bool = false
+    var more: bool = true
+    while more
+        var n: i64 = 0
+        while n < 64 and serial_data_available()
+            let c: i32 = serial_read_byte_nonblock()
+            if c < 0
+                more = false
+                break
+            g_console_rx[n] = c as u8
+            n = n + 1
+        if n == 0
+            return kill
+        if n < 64
+            more = false
+        if tty_console_input(StrView { ptr: @g_console_rx[0], len: n }, from_user)
+            kill = true
+    kill
 
 # A Ctrl-C is waiting and the running process is in the foreground to take
 # it. A Ctrl-C for anyone else is dropped here (the line already was).
@@ -92,16 +127,12 @@ fn tty_console_kill_foreground()
     ldisc_take_intr()
     process_kill_current(TTY_INTR_STATUS)
 
-# The IRQ 4 handler's receive half. from_user: the interrupt came from a
+# The IRQ 4 handler's receive half: COM1's bytes into tty_console_input.
+# from_user: the interrupt came from a
 # process (any non-zero CPL). Returns true if the caller must send its EOI
 # and call tty_console_irq_kill: a process to kill for a Ctrl-C.
 pub fn tty_console_irq(from_user: bool) -> bool
-    tty_console_pull()
-    # A reader blocked in read(0) looks again (a line, a byte, ^D or ^C),
-    # and so does a timed poll watching the console.
-    proc_wake(BLOCK_TTY)
-    waitset_console_ready()
-    from_user and tty_console_intr_due()
+    tty_console_pull(from_user)
 
 pub fn tty_console_irq_kill()
     tty_console_kill_foreground()
@@ -123,7 +154,7 @@ pub fn tty_console_read(buf: *u8, count: i64) -> i64
     var n: i64 = -1
     while n < 0
         disable_interrupts()
-        tty_console_pull()
+        tty_console_pull(false)
         if tty_console_intr_due()
             enable_interrupts()
             tty_console_kill_foreground()
@@ -141,7 +172,7 @@ pub fn tty_console_read(buf: *u8, count: i64) -> i64
 # read(0).
 pub fn tty_console_readable() -> bool
     disable_interrupts()
-    tty_console_pull()
+    tty_console_pull(false)
     if tty_console_intr_due()
         enable_interrupts()
         tty_console_kill_foreground()
@@ -160,7 +191,7 @@ pub fn tty_console_wait(for_input: bool, deadline: Option<u64>) -> bool
     let slot: i32 = proc_current_slot()
     var ready: bool = false
     while true
-        tty_console_pull()
+        tty_console_pull(false)
         if tty_console_intr_due()
             waitset_disarm(slot)
             enable_interrupts()
