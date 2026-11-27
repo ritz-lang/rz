@@ -11,7 +11,7 @@
 
 import klog { klog, klog_dec }
 import io { inb, outb, inw, outw, inl, outl }
-import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+import mm.pmm { pmm_alloc_contig, PAGE_SIZE }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_map_mmio, phys_to_virt }
 import drivers.pci { PciDevice, pci_enable_bus_master, pci_disable_bus_master, pci_enable_memory, pci_enable_io, pci_find_capability, pci_find_capability_nth, pci_dev_read_config8, pci_dev_read_config16, pci_dev_read_config32, pci_dev_sid, PCI_CAP_VENDOR }
@@ -357,23 +357,16 @@ pub fn vio_queue_alloc(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
     # Calculate memory needed and allocate
     let pages_needed: u64 = (virtq_ring_bytes(num) + PAGE_SIZE - 1) / PAGE_SIZE
 
-    # Allocate contiguous pages for the ring
-    # PMM allocates pages in ascending order, so consecutive calls give contiguous pages
-    let ring_phys: u64 = pmm_alloc_page()
+    # One physically contiguous run (3 pages for a VIRTQ_MAX_SIZE queue): the
+    # device reads every ring at ring_phys plus its offset. Not one
+    # pmm_alloc_page per page: a per-CPU frame cache is a stack, so once it
+    # holds freed frames consecutive pages are not adjacent, and the rings
+    # ran over whoever had the next ones (VT-d's own table, AGAST #4880).
+    let ring_phys: u64 = pmm_alloc_contig(pages_needed)
     if ring_phys == 0
         klog("[virtio] Failed to allocate ring memory\n")
         kfree(vq as *u8)
         return 0 as *Virtqueue
-
-    # Allocate additional pages if needed (3 pages for a VIRTQ_MAX_SIZE queue)
-    var extra_page: u64 = 1
-    while extra_page < pages_needed
-        let next_page: u64 = pmm_alloc_page()
-        if next_page == 0
-            klog("[virtio] Failed to allocate ring pages\n")
-            kfree(vq as *u8)
-            return 0 as *Virtqueue
-        extra_page = extra_page + 1
 
     # The device is told the physical address; the CPU reaches the ring
     # through the physmap (a process's address space has no identity map,
