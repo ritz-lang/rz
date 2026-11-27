@@ -44,8 +44,7 @@ const STRING_SCRATCH_INIT: i32 = 256
 # Lexer state
 # NOTE: Using i64 for position/length fields to handle large files; i32 elsewhere for efficiency
 struct Lexer
-  src: *u8
-  len: i64                 # File size (use i64 for large files)
+  src: StrView             # the source text
   pos: i64                 # Current position (use i64 for large files)
   line: i32
   col: i32
@@ -118,11 +117,8 @@ struct Lexer
   asm_body: i32            # 1 once the body's INDENT has been pushed
 
 # Point the lexer at a new source, keeping its string scratch buffer.
-pub fn lexer_reset(lex: *Lexer, src_sv: StrView) -> i32
-  var src: *u8 = src_sv.ptr
-  var len: i64 = src_sv.len
+pub fn lexer_reset(lex: *Lexer, src: StrView) -> i32
   lex.src = src
-  lex.len = len
   lex.pos = 0
   lex.line = 1
   lex.col = 1
@@ -168,7 +164,7 @@ fn lexer_asm_line_start(lex: *Lexer, out_tok: *Token) -> i32
     indent = indent + 1
   let c: i32 = lexer_peek_at(lex, indent)
   # A blank or comment-only line, a tab, or the end of input: as anywhere.
-  if c == 10 or c == '#' or c == 9 or lex.pos + indent >= lex.len
+  if c == 10 or c == '#' or c == 9 or lex.pos + indent >= lex.src.len
     return lexer_handle_indent(lex, out_tok)
   if indent <= lex.asm_base
     lex.asm_raw = 0
@@ -184,7 +180,7 @@ fn lexer_asm_line_start(lex: *Lexer, out_tok: *Token) -> i32
   lex.asm_body = 1
   lex.indent_stack[lex.indent_depth] = indent
   lex.indent_depth = lex.indent_depth + 1
-  *out_tok = token_new(TOK_INDENT, StrView { ptr: (lex.src + lex.pos), len: (0) as i64 }, lex.line, lex.col)
+  *out_tok = token_new(TOK_INDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
   1
 
 # One line of an asm body, from lex.pos (past its indentation) to the end of
@@ -195,16 +191,16 @@ fn lexer_asm_text(lex: *Lexer) -> Token
   let line: i32 = lex.line
   let col: i32 = lex.col
   var end: i64 = start
-  while end < lex.len and *(lex.src + end) != 10 and *(lex.src + end) != '#'
+  while end < lex.src.len and lex.src.get(end) != 10 and lex.src.get(end) != '#'
     end = end + 1
   var stop: i64 = end
-  while end < lex.len and *(lex.src + end) != 10
+  while end < lex.src.len and lex.src.get(end) != 10
     end = end + 1
-  while stop > start and (*(lex.src + stop - 1) == ' ' or *(lex.src + stop - 1) == 9 or *(lex.src + stop - 1) == 13)
+  while stop > start and (lex.src.get(stop - 1) == ' ' or lex.src.get(stop - 1) == 9 or lex.src.get(stop - 1) == 13)
     stop = stop - 1
   lex.col = lex.col + (end - start) as i32
   lex.pos = end
-  token_new(TOK_ASM_LINE, StrView { ptr: (lex.src + start), len: ((stop - start) as i32) as i64 }, line, col)
+  token_new(TOK_ASM_LINE, lex.src.skip(start).take(((stop - start) as i32) as i64), line, col)
 
 # 1 if `kind` is an infix operator, one a line can end in with the expression
 # going on: ritz0's Parser.PRECEDENCE less the ranges, which ritz1's grammar
@@ -249,7 +245,7 @@ fn lexer_fail_block(lex: *Lexer, start: *u8, line: i32, col: i32) -> Token
     lex.error_msg = "a block can't open inside `[`: bind the `if`/`match` to a `let` first"
   if bracket == 123
     lex.error_msg = "a block can't open inside `{`: bind the `if`/`match` to a `let` first"
-  lex.pos = lex.len
+  lex.pos = lex.src.len
   lex.pending_dedents = 0
   lex.cont_line = 0
   token_new(TOK_ERROR, StrView { ptr: (start), len: (1) as i64 }, line, col)
@@ -258,9 +254,9 @@ fn lexer_fail_block(lex: *Lexer, start: *u8, line: i32, col: i32) -> Token
 # the next lexer_next returns EOF.  The tab case used to return TOK_ERROR
 # without advancing, so tokenize looped forever printing the same error.
 fn lexer_fail(lex: *Lexer, out_tok: *Token, msg: StrView) -> i32
-  *out_tok = token_new(TOK_ERROR, StrView { ptr: (lex.src + lex.pos), len: (1) as i64 }, lex.line, lex.col)
+  *out_tok = token_new(TOK_ERROR, lex.src.skip(lex.pos).take(1), lex.line, lex.col)
   lex.error_msg = msg
-  lex.pos = lex.len
+  lex.pos = lex.src.len
   lex.pending_dedents = 0
   1
 
@@ -368,9 +364,9 @@ fn lexer_fail_escape(lex: *Lexer, pos: i64, line: i32, col: i32, p: *u8, code: i
     *(msg + n + 1) = 39
     n = n + 2
   lex.error_msg = StrView { ptr: msg, len: n }
-  lex.pos = lex.len
+  lex.pos = lex.src.len
   lex.pending_dedents = 0
-  token_new(TOK_ERROR, StrView { ptr: (lex.src + pos), len: (1) as i64 }, line, col)
+  token_new(TOK_ERROR, lex.src.skip(pos).take(1), line, col)
 
 # Initialize a lexer on `src` (`len` bytes).  Nothing to build: the scanner
 # is code (AGAST #1821).
@@ -429,13 +425,13 @@ fn lexer_str_finish(lex: *Lexer) -> StrView
 # Helper: get current character at position
 fn lexer_peek_at(lex: *Lexer, offset: i32) -> i32
   let pos: i64 = lex.pos + offset
-  if pos >= lex.len
+  if pos >= lex.src.len
     return 0  # EOF
-  (*(lex.src + pos)) & 255
+  lex.src.get(pos) as i32
 
 # Helper: skip a line comment (starting at #)
 fn lexer_skip_comment(lex: *Lexer) -> i32
-  while lex.pos < lex.len
+  while lex.pos < lex.src.len
     let ch: i32 = lexer_peek_at(lex, 0)
     if ch == 10  # newline
       return 0
@@ -500,7 +496,7 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
       return lexer_fail(lex, out_tok, "blocks nested more than 64 levels deep")
     lex.indent_stack[lex.indent_depth] = indent
     lex.indent_depth = lex.indent_depth + 1
-    *out_tok = token_new(TOK_INDENT, StrView { ptr: (lex.src + lex.pos), len: (0) as i64 }, lex.line, lex.col)
+    *out_tok = token_new(TOK_INDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
     lex.at_line_start = 0
     return 1
 
@@ -514,7 +510,7 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
       count = count + 1
     # Queue all but one DEDENT (we return the first one now)
     lex.pending_dedents = count - 1
-    *out_tok = token_new(TOK_DEDENT, StrView { ptr: (lex.src + lex.pos), len: (0) as i64 }, lex.line, lex.col)
+    *out_tok = token_new(TOK_DEDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
     lex.at_line_start = 0
     return 1
 
@@ -566,9 +562,9 @@ pub fn lexer_next(lex: *Lexer) -> Token
 # Byte at source offset `at`, or -1 past the end.  (lexer_peek_at answers 0
 # there, which a source's own NUL byte would be mistaken for.)
 fn lexer_at(lex: *Lexer, at: i64) -> i32
-  if at >= lex.len
+  if at >= lex.src.len
     return -1
-  (*(lex.src + at)) & 255
+  lex.src.get(at) as i32
 
 # Byte classes for lexer_run.
 const CLASS_DIGIT: i32 = 0    # [0-9]
@@ -621,7 +617,7 @@ fn lexer_scan_ident(lex: *Lexer, out_len: *i32) -> i32
   let at: i64 = lex.pos
   let n: i64 = 1 + lexer_run(lex, at + 1, CLASS_IDENT)
   *out_len = n as i32
-  lexer_keyword(lex.src + at, n)
+  lexer_keyword(lex.src.ptr + at, n)
 
 # lexer_match's kind for a number whose exponent has no digit (`1e`, `1e+`,
 # `2.0e-x`): *out_len is the offset of the byte where the digit should be.
@@ -697,7 +693,7 @@ fn lexer_scan_char(lex: *Lexer, out_len: *i32) -> i32
   if c1 == '\\'
     end = at + 3                                                 # '\c'
     if lexer_at(lex, at + 2) == 120                              # '\x...'
-      while end < lex.len and lexer_at(lex, end) != 39 and lexer_at(lex, end) != 10
+      while end < lex.src.len and lexer_at(lex, end) != 39 and lexer_at(lex, end) != 10
         end = end + 1
     else if lexer_at(lex, at + 2) < 0
       return -1
@@ -716,7 +712,7 @@ fn lexer_match(lex: *Lexer, out_len: *i32) -> i32
     return lexer_scan_number(lex, out_len)
   if c == '\''
     return lexer_scan_char(lex, out_len)
-  lexer_operator(lex.src + lex.pos, lex.len - lex.pos, out_len)
+  lexer_operator(lex.src.ptr + lex.pos, lex.src.len - lex.pos, out_len)
 
 # The one escape cooker (AGAST #1821): every string literal's body goes
 # through here, "..." and c"...".  Cooks the bytes from *at into the scratch
@@ -726,7 +722,7 @@ fn lexer_match(lex: *Lexer, out_len: *i32) -> i32
 # `start` offset, `line` and `col`.  `braces` is as for lexer_cook_escape_at.
 fn lexer_cook(lex: *Lexer, at: *i64, braces: i32, start: i64, line: i32, col: i32, err: *Token) -> i32
   lexer_str_begin(lex)
-  let end: i64 = lex.len
+  let end: i64 = lex.src.len
   var i: i64 = *at
   var status: i32 = 0
   while i < end
@@ -742,7 +738,7 @@ fn lexer_cook(lex: *Lexer, at: *i64, braces: i32, start: i64, line: i32, col: i3
       continue
     i = i + 1                    # the escape char
     if i < end
-      let p: *u8 = lex.src + i
+      let p: *u8 = lex.src.ptr + i
       let cooked: i32 = lexer_cook_escape_at(p, end - i, braces)
       if cooked < 0
         *err = lexer_fail_escape(lex, i, line, col + (i - start) as i32, p, cooked)
@@ -787,7 +783,7 @@ fn lexer_scan_string(lex: *Lexer, kind: i32, prefix: i32) -> Token
 
 # A token of `kind` at source offset `start`.
 fn lexer_token(lex: *Lexer, kind: i32, start: i64, len: i32, line: i32, col: i32) -> Token
-  token_new(kind, StrView { ptr: (lex.src + start), len: (len) as i64 }, line, col)
+  token_new(kind, lex.src.skip(start).take(len as i64), line, col)
 
 # Number literal fix-ups after the match; returns the kind, the length in
 # *len updated.
@@ -807,7 +803,7 @@ fn lexer_number_suffix(lex: *Lexer, kind: i32, len: *i32) -> i32
   let at: i64 = lex.pos + *len
   if kind == TOK_NUMBER
     *len = *len + lexer_int_suffix(lex, at)
-  if kind == TOK_FLOAT and at + 2 < lex.len
+  if kind == TOK_FLOAT and at + 2 < lex.src.len
     let f1: i32 = lexer_at(lex, at + 1)
     let f2: i32 = lexer_at(lex, at + 2)
     # f32 | f64
@@ -826,15 +822,15 @@ fn lexer_int_suffix(lex: *Lexer, at: i64) -> i32
     return 0
   var ext: i32 = 0
   # size
-  if at + 4 < lex.len and lexer_at(lex, at + 1) == 115 and lexer_at(lex, at + 2) == 105 and lexer_at(lex, at + 3) == 122 and lexer_at(lex, at + 4) == 101
+  if at + 4 < lex.src.len and lexer_at(lex, at + 1) == 115 and lexer_at(lex, at + 2) == 105 and lexer_at(lex, at + 3) == 122 and lexer_at(lex, at + 4) == 101
     ext = 5
-  if ext == 0 and at + 2 < lex.len
+  if ext == 0 and at + 2 < lex.src.len
     let c1: i32 = lexer_at(lex, at + 1)
     let c2: i32 = lexer_at(lex, at + 2)
     # 16 | 32 | 64
     if (c1 == '1' and c2 == '6') or (c1 == '3' and c2 == '2') or (c1 == '6' and c2 == '4')
       ext = 3
-  if ext == 0 and at + 1 < lex.len and lexer_at(lex, at + 1) == 56    # 8
+  if ext == 0 and at + 1 < lex.src.len and lexer_at(lex, at + 1) == 56    # 8
     ext = 2
   if ext > 0 and lexer_in_class(lexer_at(lex, at + ext), CLASS_IDENT) == 1
     return 0                     # part of a longer identifier: `usize_max`
@@ -893,12 +889,12 @@ fn lexer_drop_separators(tok: *Token)
 fn lexer_track_bracket(lex: *Lexer, kind: i32, start: i64, line: i32, col: i32, err: *Token) -> i32
   if kind == TOK_LPAREN or kind == TOK_LBRACKET or kind == TOK_LBRACE
     if lex.bracket_depth >= MAX_BRACKET_DEPTH
-      *err = token_new(TOK_ERROR, StrView { ptr: (lex.src + start), len: (1) as i64 }, line, col)
+      *err = token_new(TOK_ERROR, lex.src.skip(start).take(1), line, col)
       lex.error_msg = "brackets nested more than 64 levels deep"
-      lex.pos = lex.len
+      lex.pos = lex.src.len
       lex.pending_dedents = 0
       return 1
-    lex.bracket_kinds[lex.bracket_depth] = *(lex.src + start)
+    lex.bracket_kinds[lex.bracket_depth] = lex.src.get(start)
     lex.bracket_depth = lex.bracket_depth + 1
   if kind == TOK_RPAREN or kind == TOK_RBRACKET or kind == TOK_RBRACE
     if lex.bracket_depth > 0
@@ -911,7 +907,7 @@ fn lexer_track_bracket(lex: *Lexer, kind: i32, start: i64, line: i32, col: i32, 
 fn lexer_check_char(lex: *Lexer, start: i64, len: i32, line: i32, col: i32, err: *Token) -> i32
   if lexer_at(lex, start + 1) != 92
     return 0
-  let esc_p: *u8 = lex.src + start + 2
+  let esc_p: *u8 = lex.src.ptr + start + 2
   let avail: i64 = (len - 3) as i64   # bytes from esc char to the closing quote
   let cooked: i32 = lexer_cook_escape_at(esc_p, avail, 1)
   if cooked < 0
@@ -920,7 +916,7 @@ fn lexer_check_char(lex: *Lexer, start: i64, len: i32, line: i32, col: i32, err:
   if (lexer_escape_width(((*esc_p) as i32) & 255) as i64) != avail
     *err = lexer_token(lex, TOK_ERROR, start, 1, line, col)
     lex.error_msg = "Character literal must contain exactly one character"
-    lex.pos = lex.len
+    lex.pos = lex.src.len
     lex.pending_dedents = 0
     return 1
   0
@@ -1034,9 +1030,9 @@ fn lexer_newline(lex: *Lexer, out_tok: *Token) -> i32
 fn lexer_next_token(lex: *Lexer) -> Token
   if lex.pending_dedents > 0
     lex.pending_dedents = lex.pending_dedents - 1
-    return token_new(TOK_DEDENT, StrView { ptr: (lex.src + lex.pos), len: (0) as i64 }, lex.line, lex.col)
+    return token_new(TOK_DEDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
   var tok: Token = token_new(TOK_ERROR, strview_empty(), 0, 0)
-  while lex.pos < lex.len
+  while lex.pos < lex.src.len
     if lex.at_line_start == 1
       if lexer_line_start(lex, @tok) == 1
         return tok
@@ -1059,5 +1055,5 @@ fn lexer_next_token(lex: *Lexer) -> Token
   # End of input: close the open blocks, then EOF.
   if lex.indent_depth > 1
     lex.indent_depth = lex.indent_depth - 1
-    return token_new(TOK_DEDENT, StrView { ptr: (lex.src + lex.pos), len: (0) as i64 }, lex.line, lex.col)
-  token_new(TOK_EOF, StrView { ptr: (lex.src + lex.pos), len: (0) as i64 }, lex.line, lex.col)
+    return token_new(TOK_DEDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
+  token_new(TOK_EOF, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
