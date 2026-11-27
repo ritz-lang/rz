@@ -13,7 +13,8 @@ What these tests pin:
   `builder_matrix.py matrix`, in order (`builder_matrix.py woodpecker
   --write` regenerates it);
 * rules of the cluster (adele's, docs/gitea.md there): no privileged step,
-  no volumes (so no hostPath, no docker.sock), no services (no dind), no
+  no volume but the CAS's PVC (so no hostPath, no docker.sock;
+  AGAST #4857), no services (no dind), no
   secrets, no entrypoint override, no CPU limit, a memory cap; images
   pinned (the builder by the commit, the helper by digest);
 * routing: `labels: pool: rz-builder` sends it to the agent with that label
@@ -149,17 +150,32 @@ def test_every_package_runs_after_another_fails_but_the_wait_gates():
 # --- the cluster's rules ----------------------------------------------------
 
 @pytest.mark.unit
-def test_no_privilege_volumes_services_or_secrets():
+def test_no_privilege_services_or_secrets_and_no_volume_but_the_cas():
     # The YAML, not its header comment (which names what it leaves out).
     text = "\n".join(ln for ln in PIPELINE.read_text().splitlines()
                      if not ln.lstrip().startswith("#"))
-    for word in ("privileged", "volumes", "hostPath", "docker.sock", "from_secret",
+    for word in ("privileged", "hostPath", "docker.sock", "from_secret",
                  "secrets", "network_mode", "entrypoint", "services", "detach"):
         assert word not in text, word
     spec = _pipeline()
     assert not spec.get("services")
+    assert "volumes" not in spec
+    assert "volumes" not in _steps()[0]
     for s in _steps():
-        assert set(s) <= {"name", "image", "commands", "when", "backend_options"}, s
+        assert set(s) <= {"name", "image", "commands", "when", "backend_options",
+                          "volumes", "environment"}, s
+
+
+@pytest.mark.unit
+def test_package_steps_keep_the_cas_on_adeles_pvc():
+    """AGAST #4857: every package step mounts the PVC `rz-builder-cas`
+    (woodpecker-steps, local-path, 2Gi; adele, 2026-11-27) at /cache and names
+    it in RZ_BUILDER_CACHE, so the entrypoint keeps its CAS between runs. A
+    PVC by name, never a hostPath (baseline Pod Security). Only the package
+    steps: the image wait has nothing to cache."""
+    for s in _package_steps():
+        assert s["volumes"] == ["rz-builder-cas:/cache"], s["name"]
+        assert s["environment"] == {"RZ_BUILDER_CACHE": "/cache"}, s["name"]
 
 
 @pytest.mark.unit
@@ -261,6 +277,19 @@ def test_step_runs_the_entrypoint_on_the_checkout_and_counts_tests(tmp_path):
     out = call.split("RZ_OUT=")[1].split()[0]
     assert not out.startswith(str(ws)), "out must not land in the checkout"
     assert call.endswith("ARGS=projects/sage"), call
+
+
+@pytest.mark.integration
+def test_step_logs_what_the_cache_saved(tmp_path):
+    """AGAST #4857: summary.json lives in the step's temp dir and is gone
+    with the pod, so the log is where a cold and a warm run are told apart."""
+    r, _, _ = _step(tmp_path, "projects/sage",
+                    summary={"ok": True, "test": {"passed": 3},
+                             "cas": {"hits": 40, "misses": 2, "compiled": 1}})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "projects/sage: cache: 40 hits, 2 misses, 1 module(s) compiled" in r.stdout
+    r, _, _ = _step(tmp_path, "projects/sage", summary={"ok": True, "test": {"passed": 3}})
+    assert "cache:" not in r.stdout
 
 
 @pytest.mark.integration

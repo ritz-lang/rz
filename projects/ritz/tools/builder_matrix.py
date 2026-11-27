@@ -173,7 +173,11 @@ _WOODPECKER_HEADER = """\
 # `pool: rz-builder` routes the workflow to the agent carrying that label: for
 # now one of adele's shared agents, steps in `woodpecker-steps`, no rz quota
 # (projects/builder/README.md, "CI on huburght's Woodpecker"). No privilege,
-# volumes, services or secrets; uid 1000, never root; no CPU request or
+# services or secrets; one volume, the PVC rz-builder-cas at /cache on the
+# package steps: the entrypoint's CAS, kept between runs (AGAST #4857). It
+# needs the repo trusted for volumes, and every PR approved before it runs
+# (Aaron approved both, 2026-11-27).
+# uid 1000, never root; no CPU request or
 # limit (adele's no-CPU-limits rule, and the smallest CPU weight on the box);
 # 8Gi memory. No seccomp profile: ritzlib's io_uring tests (should the list
 # widen again) fail under RuntimeDefault, and baseline Pod Security forbids
@@ -214,6 +218,10 @@ def woodpecker_pipeline(entries: list[dict]) -> str:
                   "    image: ghcr.io/ritz-lang/rz-builder:${CI_COMMIT_SHA}",
                   "    commands:",
                   f"      - bash .github/scripts/woodpecker_builder_step.sh{flag} {e['path']}",
+                  "    environment:",
+                  "      RZ_BUILDER_CACHE: /cache",
+                  "    volumes:",
+                  "      - rz-builder-cas:/cache",
                   "    when:",
                   "      - status: [success, failure]",
                   "    backend_options:",

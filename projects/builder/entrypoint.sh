@@ -37,7 +37,9 @@
 # $RZ_BUILDER_CACHE_MAX_BYTES (default 1536MiB). A CAS key already covers
 # the compiler, clang, the flags and every source in a module's import
 # closure, so a stale object is never reused. Concurrent runs on one store
-# are safe (cas.py: atomic renames, a per-key lock).
+# are safe (cas.py: atomic renames, a per-key lock). A $RZ_BUILDER_CACHE the
+# run can't write warns and runs uncached: a missing cache never fails a
+# package.
 #
 #   rz-builder --cache-key
 #
@@ -290,9 +292,12 @@ export RITZ1
 CACHE_ROOT=${RZ_BUILDER_CACHE:-}
 if [[ -n $CACHE_ROOT ]]; then
     if [[ $CACHE_ROOT != /* || ! -d $CACHE_ROOT || ! -w $CACHE_ROOT ]]; then
-        echo "rz-builder: RZ_BUILDER_CACHE=$CACHE_ROOT is not a writable absolute directory" >&2
-        exit 2
+        echo "rz-builder: RZ_BUILDER_CACHE=$CACHE_ROOT is not a writable absolute directory;" \
+            "running uncached" >&2
+        CACHE_ROOT=
     fi
+fi
+if [[ -n $CACHE_ROOT ]]; then
     key=$(cache_key)
     for old in "$CACHE_ROOT"/ritz1-*; do
         if [[ -d $old && $old != "$CACHE_ROOT/$key" ]]; then

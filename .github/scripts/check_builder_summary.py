@@ -32,6 +32,12 @@ def main(argv: list[str]) -> int:
     summary_path, pkg, build_only = argv[1], argv[2], argv[3] == "1"
     with open(summary_path, encoding="utf-8") as f:
         summary = json.load(f)
+    # What the CAS saved (AGAST #4857): the summary goes with the step's temp
+    # dir, so the log is where a cold run and a warm one are told apart.
+    cas = summary.get("cas")
+    if isinstance(cas, dict):
+        print(f"run_builder_package: {pkg}: cache: {cas.get('hits', 0)} hits, "
+              f"{cas.get('misses', 0)} misses, {cas.get('compiled', 0)} module(s) compiled")
     if not summary.get("ok"):
         print(f"run_builder_package: {pkg}: run not ok: {json.dumps(summary)}",
               file=sys.stderr)

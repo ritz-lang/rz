@@ -103,8 +103,12 @@ package, and that a changed compiler misses.
 
 main.yml's hosted `builder-matrix` keeps the directory in `actions/cache`
 (`run_builder_package.sh --cache`), keyed by `--cache-key` and saved after
-every run. Woodpecker doesn't keep it yet: a volume on huburght needs the
-repo trusted for volumes, which is Aaron's call (adele, 2026-11-27).
+every run. `.woodpecker/builder.yml`'s package steps mount adele's PVC
+`rz-builder-cas` (namespace `woodpecker-steps`, local-path, 2Gi, reclaim
+`Delete`) at `/cache`. That needs the repo trusted for volumes and every PR
+approved before it runs (Aaron, 2026-11-27): a PR's pipeline could otherwise
+write objects a later `main` build links in. A cache the run can't write
+warns and runs uncached.
 
 ```bash
 bash projects/builder/accept.sh rz-builder:<tag>
@@ -252,8 +256,8 @@ python3 projects/ritz/tools/builder_matrix.py woodpecker --write
 
 `tools/test_woodpecker_builder.py` fails while it is stale. It also pins the
 cluster's rules:
-- no privileged step, volume (so no hostPath or docker.sock), service or
-  secret;
+- no privileged step, service or secret, and no volume but the package
+  steps' `rz-builder-cas:/cache` (so no hostPath or docker.sock);
 - uid 1000 (`runAsNonRoot`, no privilege escalation);
 - an 8Gi memory limit and no CPU request or limit (adele's no-CPU-limits
   rule; without a request, a step gets the smallest CPU weight on the box,

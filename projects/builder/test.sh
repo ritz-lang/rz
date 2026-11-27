@@ -19,7 +19,7 @@
 #     writes /out, and the binary prints the expected line;
 #   - with a cache mounted (RZ_BUILDER_CACHE), a second run of hello
 #     compiles nothing and gives the same binary, and a changed compiler
-#     misses into a store of its own;
+#     misses into a store of its own; a read-only cache runs uncached;
 #   - a package that does not compile exits non-zero, with summary.json ok false;
 #   - with the commit's tree mounted as RZ_ROOT, an in-tree package outside
 #     projects/ builds with the image's compiler and the mount is unchanged;
@@ -242,6 +242,21 @@ if [[ $other_rc -eq 0 && $other == "(True, 1)" && $stores -eq 1 && $hello_now ==
 else
     bad "cache: changed compiler rc=$other_rc $other (compiled any, tests), $stores store(s)"
     sed 's/^/     | /' "$work/other.log" | tail -20
+fi
+# A cache it can't write (huburght's volume before the repo is trusted, or a
+# misowned mount) runs uncached with a warning, never fails the package.
+mkdir -p "$work/ro-out"
+ro_rc=0
+docker run --rm --network=none --security-opt seccomp=unconfined \
+    -v "$work/hello:/src/projects/hello:ro" -v "$work/ro-out:/out" \
+    -v "$work/cas:/cache:ro" -e RZ_BUILDER_CACHE=/cache \
+    "$tag" /src/projects/hello >"$work/ro.log" 2>&1 || ro_rc=$?
+ro=$(cas_field ro '(s["cas"]["compiled"] > 0, s["test"]["passed"])')
+if [[ $ro_rc -eq 0 && $ro == "(True, 1)" ]] && grep -q 'running uncached' "$work/ro.log"; then
+    ok "cache: a read-only cache runs uncached, with a warning"
+else
+    bad "cache: read-only cache rc=$ro_rc $ro (compiled any, tests)"
+    sed 's/^/     | /' "$work/ro.log" | tail -20
 fi
 
 # A package that does not compile: non-zero exit, summary.json ok false.
