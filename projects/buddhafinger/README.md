@@ -17,7 +17,10 @@ loop and the platform save are still to come.
   state crosses a line in Ritz); `highlight` caches each line's colored runs
   for the screen, and an edit re-lexes only the lines it touched.
   `test_lexer.ritz` fails when ritz1's keyword table and the lexer's drift.
-- `src/platform/`: the platform adapters that do that I/O (`linux` so far).
+- `src/platform/`: the platform adapters that do that I/O: `linux` (the
+  terminal) and `save` (`LinuxFiles`, the Linux `core/files` `FileStore`: temp
+  file, fsync, rename, directory fsync, permissions kept, external-change
+  check).
 - `src/main.ritz`: the `buddhafinger` binary.
 - `test/`: the ritzunit suites. `test_buffer_fuzz.ritz` runs seeded random
   edits against a reference buffer; a failure prints its seed, and
