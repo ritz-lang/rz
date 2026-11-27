@@ -8,7 +8,8 @@
 
 import klog { klog, klog_dec, klog_hex }
 import mm.heap { kalloc, kfree }
-import mm.vmm { vmm_map_mmio }
+import mm.vmm { vmm_map_mmio_wc }
+import arch.x86_64.pat { pat_init }
 
 # Framebuffer pixel formats: HarlandBootInfo.framebuffer_format's values,
 # declared once in boot_abi/src/handoff.ritz (AGAST #4578)
@@ -56,10 +57,14 @@ pub fn fb_init(addr: u64, width: u32, height: u32, pitch: u32, bpp: u8, format: 
     # Calculate framebuffer size and map it into kernel address space
     let fb_size: u64 = (pitch as u64) * (height as u64)
 
-    # Map through the kernel MMIO window (cache-disabled, write-through):
-    # the framebuffer was identity-mapped before AGAST #1878, and the kernel
-    # draws under a process's CR3, which has no identity map.
-    let fb_virt: u64 = vmm_map_mmio(addr, fb_size)
+    # Map through the kernel MMIO window: the framebuffer was identity-mapped
+    # before AGAST #1878, and the kernel draws under a process's CR3, which
+    # has no identity map. Write-combining (AGAST #4868): the console's
+    # glyph stores burst out instead of crossing the bus one by one.
+    # PAT entry 4 must be WC on this CPU (the BSP) first; cpu_bringup sets
+    # it on every CPU, the BSP again included.
+    pat_init()
+    let fb_virt: u64 = vmm_map_mmio_wc(addr, fb_size)
     if fb_virt == 0
         klog("[fb] Failed to map framebuffer at ")
         klog_hex(addr)

@@ -10,8 +10,14 @@
 # took a u64 and printed 18446744073709551615).
 #
 # Moved out of main.ritz by AGAST #2752.
+#
+# The framebuffer console (drivers/display/fbcon.ritz, AGAST #4868) is the
+# third sink, once main.ritz has started it: klog_console_start replays the
+# ring onto it, so the screen shows the boot from its first line, and the
+# panic screen ends with klog_console_tail, the log's last lines.
 
-import serial { StrView, serial_print, serial_write, serial_write_byte }
+import serial { StrView, serial_out, serial_out_byte }
+import drivers.display.fbcon { fbcon_active, fbcon_write }
 import ritzlib.fmt.digits { fmt_i64_into, fmt_u64_into, fmt_u64_radix_into }
 
 # ============================================================================
@@ -27,9 +33,11 @@ pub const RING_BUFFER_SIZE: u64 = 16384
 var ring_buffer: [16384]u8
 var ring_head: u64 = 0         # Next write position
 var ring_wrapped: bool = false # Has the buffer wrapped around?
+var ring_total: u64 = 0        # Bytes ever written (klog_mark)
 
 fn ring_write_byte(c: u8)
     ring_buffer[ring_head as i64] = c
+    ring_total = ring_total + 1
     ring_head = ring_head + 1
     if ring_head >= RING_BUFFER_SIZE
         ring_head = 0
@@ -39,6 +47,7 @@ fn ring_write_byte(c: u8)
 pub fn ring_clear()
     ring_head = 0
     ring_wrapped = false
+    ring_total = 0
 
 # Valid bytes in the ring.
 fn ring_len() -> u64
@@ -69,13 +78,57 @@ pub fn ring_copy(dst: *u8, max: i64) -> i64
 # Write the whole ring to serial, oldest first, between markers. Serial
 # only: the dump must not feed the ring it is reading.
 pub fn ring_dump()
-    serial_print(c"\n=== RING BUFFER DUMP (kernel log) ===\n")
+    serial_out("\n=== RING BUFFER DUMP (kernel log) ===\n")
     let n: u64 = ring_len()
     var i: u64 = 0
     while i < n
-        serial_write_byte(ring_at(i))
+        serial_out_byte(ring_at(i))
         i = i + 1
-    serial_print(c"\n=== END RING BUFFER ===\n")
+    serial_out("\n=== END RING BUFFER ===\n")
+
+# Ring bytes [from, to) (0 = oldest) onto the console alone, in chunks: a
+# write per byte would redraw the cursor per byte.
+fn ring_to_console(from: u64, to: u64)
+    var chunk: [256]u8
+    let n: u64 = to
+    var i: u64 = from
+    while i < n
+        var k: i64 = 0
+        while k < 256 and i < n
+            chunk[k] = ring_at(i)
+            k = k + 1
+            i = i + 1
+        fbcon_write(StrView { ptr: @chunk[0], len: k })
+
+# The console just started: show it everything logged so far.
+pub fn klog_console_start()
+    ring_to_console(0, ring_len())
+
+# Where the log is now, for klog_console_tail: the count of bytes ever
+# logged.
+pub fn klog_mark() -> u64
+    ring_total
+
+# The last `lines` lines logged before `mark` (klog_mark), onto the console:
+# the panic screen's recent log, without the report logged after the mark.
+# A final '\n' does not count as a line of its own.
+pub fn klog_console_tail(lines: u32, mark: u64)
+    if lines == 0 or mark > ring_total
+        return
+    let after: u64 = ring_total - mark
+    let len: u64 = ring_len()
+    if after >= len
+        return
+    let n: u64 = len - after
+    var start: u64 = n
+    var seen: u32 = 0
+    while start > 0
+        if ring_at(start - 1) == 10 and start < n
+            seen = seen + 1
+            if seen == lines
+                break
+        start = start - 1
+    ring_to_console(start, n)
 
 # ============================================================================
 # klog: the one sink
@@ -88,10 +141,12 @@ var klog_to_serial: bool = true
 pub fn klog_serial(on: bool)
     klog_to_serial = on
 
-# Every kernel message ends here: serial, then the ring.
+# Every kernel message ends here: serial, the screen, then the ring.
 fn klog_bytes(ptr: *u8, len: i64)
     if klog_to_serial
-        serial_write(ptr, len)
+        serial_out(StrView { ptr: ptr, len: len })
+    if fbcon_active()
+        fbcon_write(StrView { ptr: ptr, len: len })
     var i: i64 = 0
     while i < len
         ring_write_byte(*(ptr + i))

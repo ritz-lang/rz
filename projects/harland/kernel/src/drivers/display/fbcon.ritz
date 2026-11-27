@@ -1,0 +1,289 @@
+# Harland framebuffer text console (AGAST #4868)
+#
+# The screen side of the kernel console, for machines with no serial port
+# (the Acer). klog.ritz writes every kernel message here as well as to COM1
+# and its crash ring, the tty (tty/console.ritz, syscall/runtime/file.ritz)
+# writes rzsh's output and the line discipline's echo, and exceptions.ritz
+# redraws it as the panic screen.
+#
+# The text is a TextGrid (textgrid.ritz) over a static cell array; the
+# glyphs are font8x16.ritz's, doubled on modes wider than 2000 px. Drawing
+# never reads the framebuffer: g_fbcon_shown holds the byte each cell shows, so a
+# flush redraws only the cells whose byte changed, and a scroll costs a
+# redraw of the cells that differ from the row below them (blank against
+# blank costs nothing). fb_init maps the framebuffer write-combining
+# (vmm_map_mmio_wc), so those writes go out in bursts.
+#
+# The panic path (fbcon_panic_begin) needs no heap and no interrupts:
+# everything here is static, the framebuffer address is copied in at
+# fbcon_init, and the lock it takes is broken first (the CPU that faulted
+# may hold it). A fault while drawing the panic screen turns the console
+# off, so the nested panic reports on COM1 only.
+#
+# Locking: fbcon_write takes g_fbcon_lock with interrupts off, so an IRQ
+# on the same CPU (the ldisc echo) can't spin on a lock its own CPU holds.
+# fbcon_draw is the unlocked core. A hosted test (test/test_fbcon.ritz)
+# draws on a framebuffer in ordinary memory and can't cli: it turns the
+# interrupt half off with fbcon_irqsave(false), as klog_serial(false) turns
+# off COM1.
+
+import io { interrupts_enabled, disable_interrupts, enable_interrupts, cpu_pause }
+import ritzlib.strview { StrView }
+import boot_abi.handoff { FB_FORMAT_RGBX, FB_FORMAT_BGRX }
+import drivers.display.font8x16 { FONT_W, FONT_H, font_row }
+import drivers.display.textgrid { TextGrid, GridGeometry, DirtyRows, GRID_BLANK, grid_geometry, grid_init, grid_clear, grid_put, grid_at, grid_take_dirty, grid_rows_left }
+
+# Cells the static grid holds: a 1920x1200 mode at x1 is 240x75 = 18000,
+# a 3840x2400 one at x2 the same; 32768 leaves room for 2000-px-wide modes
+# at x1. A bigger mode loses its bottom rows (grid_geometry).
+pub const FBCON_MAX_CELLS: u32 = 32768
+
+# g_fbcon_shown's "unknown": no cell holds it (the grid stores bytes >= 32), so
+# the next flush redraws a cell marked with it.
+const SHOWN_UNKNOWN: u8 = 0
+
+# Cursor: an underline over the glyph's bottom rows.
+const CURSOR_ROWS: u32 = 2
+
+# Colours: light grey on the boot frame's dark blue; the panic screen is
+# white on red. Both pass the screen decoder's brightness threshold
+# (tools/fbcon_screen.py: on is luma above 128).
+const BG_R: u8 = 0x10
+const BG_G: u8 = 0x20
+const BG_B: u8 = 0x40
+const FG_R: u8 = 0xC8
+const FG_G: u8 = 0xC8
+const FG_B: u8 = 0xC8
+const PANIC_BG_R: u8 = 0xA0
+const PANIC_BG_G: u8 = 0x00
+const PANIC_BG_B: u8 = 0x00
+const PANIC_FG_R: u8 = 0xFF
+const PANIC_FG_G: u8 = 0xFF
+const PANIC_FG_B: u8 = 0xFF
+
+# The framebuffer (kernel virtual address; 0: no console)
+var g_fbcon_base: u64 = 0
+var g_fbcon_width: u32 = 0
+var g_fbcon_height: u32 = 0
+var g_fbcon_pitch: u32 = 0
+var g_fbcon_format: u8 = 0
+
+var g_fbcon_geom: GridGeometry
+var g_fbcon_grid: TextGrid
+var g_fbcon_cells: [32768]u8
+var g_fbcon_shown: [32768]u8
+
+var g_fbcon_fg: u32 = 0
+var g_fbcon_bg: u32 = 0
+
+# Where the cursor was last drawn (its cell is redrawn when it moves).
+var g_fbcon_cursor_row: u32 = 0
+var g_fbcon_cursor_col: u32 = 0
+var g_fbcon_cursor_shown: bool = false
+
+var g_fbcon_panic: bool = false
+var g_fbcon_lock: u32 = 0
+var g_fbcon_irqsave: bool = true
+
+# Whether fbcon_write turns interrupts off around its draw (the kernel: on).
+pub fn fbcon_irqsave(on: bool)
+    g_fbcon_irqsave = on
+
+fn pack(format: u8, r: u8, g: u8, b: u8) -> u32
+    if format == FB_FORMAT_RGBX
+        return (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+    (b as u32) | ((g as u32) << 8) | ((r as u32) << 16)
+
+# Whether the console is drawing (fbcon_init found a usable mode).
+pub fn fbcon_active() -> bool
+    g_fbcon_base != 0
+
+# The grid's size, for tests and the panic screen's log tail.
+pub fn fbcon_geometry() -> GridGeometry
+    g_fbcon_geom
+
+# Lines the console can still write before it scrolls.
+pub fn fbcon_rows_left() -> u32
+    if g_fbcon_base == 0
+        return 0
+    grid_rows_left(@g_fbcon_grid)
+
+# The byte the grid holds at (row, col): what the screen shows there after
+# the next flush.
+pub fn fbcon_cell(row: u32, col: u32) -> u8
+    grid_at(@g_fbcon_grid, row, col)
+
+fn fill_screen(color: u32)
+    var y: u64 = 0
+    while y < g_fbcon_height as u64
+        let line: *u32 = (g_fbcon_base + y * g_fbcon_pitch as u64) as *u32
+        var x: u64 = 0
+        while x < g_fbcon_width as u64
+            *(line + x) = color
+            x = x + 1
+        y = y + 1
+
+# Draw byte c in cell (row, col); `underline` draws the cursor over it.
+fn draw_cell(row: u32, col: u32, c: u8, underline: bool)
+    let s: u32 = g_fbcon_geom.scale
+    let x0: u64 = (col * g_fbcon_geom.cell_w) as u64
+    let y0: u64 = (row * g_fbcon_geom.cell_h) as u64
+    var gy: u32 = 0
+    while gy < FONT_H
+        var bits: u8 = font_row(c, gy)
+        if underline and gy >= FONT_H - CURSOR_ROWS
+            bits = 0xFF
+        var sy: u32 = 0
+        while sy < s
+            let y: u64 = y0 + (gy * s + sy) as u64
+            let line: *u32 = (g_fbcon_base + y * g_fbcon_pitch as u64) as *u32
+            var gx: u32 = 0
+            var x: u64 = x0
+            while gx < FONT_W
+                var color: u32 = g_fbcon_bg
+                if (bits & (0x80 >> gx as u8)) != 0
+                    color = g_fbcon_fg
+                var sx: u32 = 0
+                while sx < s
+                    *(line + x) = color
+                    x = x + 1
+                    sx = sx + 1
+                gx = gx + 1
+            sy = sy + 1
+        gy = gy + 1
+
+fn cell_index(row: u32, col: u32) -> i64
+    (row as i64) * (g_fbcon_geom.cols as i64) + col as i64
+
+# Redraw the cells of `row` whose byte changed since they were drawn.
+fn flush_row(row: u32)
+    var col: u32 = 0
+    while col < g_fbcon_geom.cols
+        let i: i64 = cell_index(row, col)
+        let c: u8 = g_fbcon_cells[i]
+        if g_fbcon_shown[i] != c
+            draw_cell(row, col, c, false)
+            g_fbcon_shown[i] = c
+        col = col + 1
+
+# Bring the screen up to the grid: changed rows, then the cursor.
+fn flush()
+    if g_fbcon_cursor_shown
+        # Its cell shows the underline: redraw it from the grid.
+        g_fbcon_shown[cell_index(g_fbcon_cursor_row, g_fbcon_cursor_col)] = SHOWN_UNKNOWN
+        flush_row(g_fbcon_cursor_row)
+        g_fbcon_cursor_shown = false
+    let d: DirtyRows = grid_take_dirty(@g_fbcon_grid)
+    var r: u32 = d.lo
+    while r < d.hi
+        flush_row(r)
+        r = r + 1
+    # The cursor is at (row, col); col == cols waits to wrap and shows on
+    # the last column.
+    var col: u32 = g_fbcon_grid.col
+    if col >= g_fbcon_geom.cols
+        col = g_fbcon_geom.cols - 1
+    g_fbcon_cursor_row = g_fbcon_grid.row
+    g_fbcon_cursor_col = col
+    draw_cell(g_fbcon_cursor_row, g_fbcon_cursor_col, grid_at(@g_fbcon_grid, g_fbcon_cursor_row, g_fbcon_cursor_col), true)
+    g_fbcon_cursor_shown = true
+
+# Clear the screen to g_fbcon_bg and mark every cell blank on it.
+fn reset_screen()
+    fill_screen(g_fbcon_bg)
+    var i: i64 = 0
+    while i < FBCON_MAX_CELLS as i64
+        g_fbcon_shown[i] = GRID_BLANK
+        i = i + 1
+    g_fbcon_cursor_shown = false
+    grid_clear(@g_fbcon_grid)
+
+# Start the console on a width x height framebuffer at kernel virtual
+# address `base`, `pitch` bytes a line, 32 bits a pixel in FB_FORMAT_*
+# `format`. Clears the screen. Returns false (no console) for a mode it
+# can't draw: not 32 bpp, an unknown format, or smaller than one cell.
+pub fn fbcon_init(base: u64, width: u32, height: u32, pitch: u32, bpp: u8, format: u8) -> bool
+    g_fbcon_base = 0
+    if base == 0 or bpp != 32 or pitch < width * 4
+        return false
+    if format != FB_FORMAT_RGBX and format != FB_FORMAT_BGRX
+        return false
+    let geom: GridGeometry = grid_geometry(width, height, FONT_W, FONT_H, FBCON_MAX_CELLS)
+    if geom.cols == 0
+        return false
+    g_fbcon_geom = geom
+    g_fbcon_width = width
+    g_fbcon_height = height
+    g_fbcon_pitch = pitch
+    g_fbcon_format = format
+    g_fbcon_fg = pack(format, FG_R, FG_G, FG_B)
+    g_fbcon_bg = pack(format, BG_R, BG_G, BG_B)
+    g_fbcon_panic = false
+    grid_init(@g_fbcon_grid, @g_fbcon_cells[0], geom.cols, geom.rows)
+    g_fbcon_base = base
+    reset_screen()
+    flush()
+    true
+
+# Stop drawing (the screen keeps what it shows).
+pub fn fbcon_stop()
+    g_fbcon_base = 0
+
+# Write s at the cursor and bring the screen up to date. Unlocked: callers
+# are fbcon_write and the panic path, or a hosted test.
+pub fn fbcon_draw(s: StrView)
+    if g_fbcon_base == 0
+        return
+    var i: i64 = 0
+    while i < s.len
+        grid_put(@g_fbcon_grid, *(s.ptr + i))
+        i = i + 1
+    flush()
+
+fn lock_irqsave() -> bool
+    var was_on: bool = false
+    if g_fbcon_irqsave
+        was_on = interrupts_enabled()
+        disable_interrupts()
+    while atomic_xchg(@g_fbcon_lock as *u32, 1) != 0
+        cpu_pause()
+    was_on
+
+fn unlock_irqrestore(was_on: bool)
+    atomic_store(@g_fbcon_lock as *u32, 0)
+    if was_on
+        enable_interrupts()
+
+# Write s on the console: klog's sink, the tty's output, the ldisc echo.
+# A no-op until fbcon_init, and after it found no usable mode.
+pub fn fbcon_write(s: StrView)
+    if g_fbcon_base == 0
+        return
+    if g_fbcon_panic
+        # fbcon_panic_begin keeps the lock: other CPUs wait on it for good,
+        # and the crash path draws unlocked with interrupts off.
+        fbcon_draw(s)
+        return
+    let was_on: bool = lock_irqsave()
+    fbcon_draw(s)
+    unlock_irqrestore(was_on)
+
+# Turn the console into the panic screen: white on red, a banner on the
+# top line, the cursor below it; what the crash path logs next lands under
+# it. No heap, interrupts as the caller left them (off, in an exception).
+# A second call (a fault while drawing the first) stops the console
+# instead, so the nested report goes to COM1 alone.
+pub fn fbcon_panic_begin()
+    if g_fbcon_base == 0
+        return
+    if g_fbcon_panic
+        g_fbcon_base = 0
+        return
+    g_fbcon_panic = true
+    # The CPU that faulted may hold the lock mid-draw; it never resumes.
+    # Taken for good: only the crash path draws from here on.
+    atomic_store(@g_fbcon_lock as *u32, 1)
+    g_fbcon_fg = pack(g_fbcon_format, PANIC_FG_R, PANIC_FG_G, PANIC_FG_B)
+    g_fbcon_bg = pack(g_fbcon_format, PANIC_BG_R, PANIC_BG_G, PANIC_BG_B)
+    reset_screen()
+    fbcon_draw("*** KERNEL PANIC ***  Harland has stopped.\n\n")

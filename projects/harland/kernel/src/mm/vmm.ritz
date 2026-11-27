@@ -22,6 +22,9 @@ pub const PTE_CACHE_DISABLE: u64 = 16
 pub const PTE_ACCESSED: u64 = 32
 pub const PTE_DIRTY: u64 = 64
 pub const PTE_HUGE: u64 = 128
+# In a 4 KiB leaf, bit 7 is PAT, not PS: PAT=1 PCD=0 PWT=0 picks IA32_PAT
+# entry 4, which arch/x86_64/pat.ritz makes write-combining (AGAST #4868).
+pub const PTE_PAT_WC: u64 = 128
 pub const PTE_GLOBAL: u64 = 256
 pub const PTE_NO_EXECUTE: u64 = 9223372036854775808
 # Bit 9, left to the OS by the CPU: this PTE maps a device frame (MMIO such
@@ -714,9 +717,10 @@ pub fn vmm_init_mmio_window() -> i32
     vmm_set_entry(vmm_pml4_phys, MMIO_PML4_INDEX, pdpt | PTE_PRESENT | PTE_WRITABLE)
     return 0
 
-# Map size bytes of device memory at physical address paddr. Returns the
-# kernel virtual address of paddr itself (page offset kept), or 0 on failure.
-pub fn vmm_map_mmio(paddr: u64, size: u64) -> u64
+# Map size bytes of device memory at physical address paddr with the
+# caching bits `cache`. Returns the kernel virtual address of paddr itself
+# (page offset kept), or 0 on failure.
+fn vmm_map_mmio_cached(paddr: u64, size: u64, cache: u64) -> u64
     if size == 0
         return 0
     let page_mask: u64 = 0xFFFFFFFFFFFFF000
@@ -731,7 +735,7 @@ pub fn vmm_map_mmio(paddr: u64, size: u64) -> u64
     let virt: u64 = g_mmio_next
     var off: u64 = 0
     while off < len
-        if vmm_map_page(virt + off, first + off, PTE_WRITABLE | PTE_CACHE_DISABLE | PTE_WRITE_THROUGH | g_pte_nx) != 0
+        if vmm_map_page(virt + off, first + off, PTE_WRITABLE | cache | g_pte_nx) != 0
             klog("[vmm] MMIO map failed at phys ")
             klog_hex(first + off)
             klog("\n")
@@ -739,6 +743,15 @@ pub fn vmm_map_mmio(paddr: u64, size: u64) -> u64
         off = off + PAGE_SIZE
     g_mmio_next = virt + len
     return virt + (paddr - first)
+
+# Device registers: uncached (PCD|PWT).
+pub fn vmm_map_mmio(paddr: u64, size: u64) -> u64
+    vmm_map_mmio_cached(paddr, size, PTE_CACHE_DISABLE | PTE_WRITE_THROUGH)
+
+# A framebuffer: write-combining (PAT entry 4, set up by pat_init on every
+# CPU). Stores merge into bursts; reads are slow, so nothing reads it back.
+pub fn vmm_map_mmio_wc(paddr: u64, size: u64) -> u64
+    vmm_map_mmio_cached(paddr, size, PTE_PAT_WC)
 
 # ============================================================================
 # Debug Functions

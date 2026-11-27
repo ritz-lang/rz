@@ -1,0 +1,31 @@
+# Harland - the page attribute table: write-combining for the framebuffer
+# (AGAST #4868)
+#
+# The framebuffer console writes whole glyph rows at a time, and at 4K
+# that is 33 MB a full redraw. Mapped uncached (vmm_map_mmio's PCD|PWT),
+# every 4-byte store is its own bus transaction; write-combining lets the
+# CPU merge them into line-sized bursts. x86 has no WC page bit: a PTE's
+# PAT, PCD and PWT bits pick one of IA32_PAT's eight entries.
+#
+# The reset value is WB, WT, UC-, UC, WB, WT, UC-, UC (entries 0..7);
+# every mapping the kernel makes uses entries 0..3 (no PAT bit), so entry
+# 4 (PAT=1, PCD=0, PWT=0: vmm.ritz's PTE_PAT_WC) is free to become WC
+# with no mapping changing meaning, and no cache flush is needed. Every CPU
+# must hold the same table (SDM 11.12.4): cpu_bringup programs it on each
+# one, and fb_init on the BSP before it maps the framebuffer.
+
+import io { rdmsr, wrmsr }
+
+const IA32_PAT: u32 = 0x277
+
+const PAT_TYPE_WC: u64 = 0x01
+const PAT_ENTRY4_SHIFT: u64 = 32
+const PAT_ENTRY_MASK: u64 = 0xFF
+
+# The IA32_PAT value with entry 4 set to WC, the others kept.
+pub fn pat_with_wc(pat: u64) -> u64
+    (pat & ~(PAT_ENTRY_MASK << PAT_ENTRY4_SHIFT)) | (PAT_TYPE_WC << PAT_ENTRY4_SHIFT)
+
+# Make PAT entry 4 write-combining on this CPU.
+pub fn pat_init()
+    wrmsr(IA32_PAT, pat_with_wc(rdmsr(IA32_PAT)))

@@ -50,8 +50,8 @@ the AGAST ticket that fills the gap. Mapped on main as of 2026-11-27.
 | Class | Device | Harland | First boot |
 |---|---|---|---|
 | Boot, initramfs | UEFI loader, `\EFI\BOOT\BOOTX64.EFI` on the stick | `boot/` | needed: have |
-| Display | GOP framebuffer, 1920x1080 at 0x7ee0000000 | `drivers/display` maps and fills it; it draws **no text** | needed: have |
-| Kernel log, panic screen, tty output | framebuffer (there is no serial port) | gap: `klog` and `tty/console.ritz` write COM1 only. On-screen log + panic #4868 | **needed** |
+| Display | GOP framebuffer, 1920x1080 at 0x7ee0000000 | `drivers/display` maps it write-combining; `fbcon.ritz` draws text on it (#4868) | needed: have |
+| Kernel log, panic screen, tty output | framebuffer (there is no serial port) | `drivers/display/fbcon.ritz`: klog's and the tty's sink, and the panic screen (#4868) | needed: have |
 | Keyboard (USB) | AMD xHCI [1022:1503] 03:00.3, [1022:1504] 03:00.4, [1022:1505] 04:00.0 | gap: USB epic #4860 | **needed** |
 | Keyboard (internal) | i8042 PS/2, ACPI `MSFT0001` (in the DSDT); FADT `IAPC_BOOT_ARCH` has the 8042 flag | gap: PS/2 #4869 | not needed |
 | ACPI | XSDT, MADT, MCFG, FADT, `\_S5` | `drivers/acpi/tables.ritz` | needed: have |
@@ -70,8 +70,10 @@ the AGAST ticket that fills the gap. Mapped on main as of 2026-11-27.
   `serial_data_available()` (LSR bit 0) is always true and
   `tty_console_pull`'s `while serial_data_available()` loop never ends: the
   first console read hangs, feeding 0xFF bytes into the line discipline.
-  Output does not hang (THRE also reads set). The on-screen log ticket #4868
-  probes COM1 (scratch register / LSR 0xFF) and drops it when absent.
+  Output does not hang (THRE also reads set). Fixed by #4868: `serial_start`
+  probes COM1 (scratch register, LSR != 0xFF) and, with none, serial reads
+  find nothing and writes are dropped; the screen is the console
+  (`tools/test_fbcon_boot.sh` boots QEMU with `-serial none`).
 - **Timer calibration.** `tsc_calibrate` tries CPUID 0x15, then the PIT,
   then CPUID 0x16. Zen 2 has neither leaf, so the PIT is the only real
   source. If the FCH's 8254 doesn't tick, the TSC and LAPIC timer run on an

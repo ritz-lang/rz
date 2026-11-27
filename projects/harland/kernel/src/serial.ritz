@@ -4,11 +4,62 @@
 
 import io { outb, inb, cpu_pause }
 # The polled COM1 driver is boot_abi/src/serial.ritz, shared with the UEFI
-# loader (AGAST #4578). Re-exported: kernel modules import it from serial.
+# loader (AGAST #4578); the kernel wraps it below (COM1 may be absent).
 # Kernel messages go through klog.ritz, the one sink for COM1 and the crash
 # ring (AGAST #1885); only klog.ritz and the console echo write COM1 here.
-pub import boot_abi.serial { serial_init, serial_write_byte, serial_print, serial_write }
-import boot_abi.serial { COM1_DATA, COM1_IER, COM1_LSR, LSR_DR, LSR_THRE }
+import boot_abi.serial { COM1_DATA, COM1_IER, COM1_LSR, COM1_SCR, LSR_DR, LSR_THRE }
+import boot_abi.serial { serial_init, serial_write_byte, serial_write }
+
+# ============================================================================
+# Is there a COM1? (AGAST #4868)
+# ============================================================================
+#
+# The Acer has no UART. Port reads at 0x3F8.. then float to 0xFF, so LSR's
+# data-ready bit always reads set: tty_console_pull's `while
+# serial_data_available()` never ended and fed 0xFF into the line
+# discipline, and the first console read hung the boot. serial_init probes
+# first; with no COM1 every function here is a no-op (reads find nothing,
+# writes are dropped) and the framebuffer console is the only one.
+
+# Scratch-register patterns: a 16550 keeps what is written to SCR.
+pub const COM1_PROBE_A: u8 = 0x5A
+pub const COM1_PROBE_B: u8 = 0xA5
+const LSR_FLOATING: u8 = 0xFF
+
+var g_com1_present: bool = true
+
+# The probe's verdict from what it read back: both scratch patterns, and an
+# LSR that is not all ones (no 16550 reports every status bit at once).
+pub fn com1_probe_verdict(scratch_a: u8, scratch_b: u8, lsr: u8) -> bool
+    scratch_a == COM1_PROBE_A and scratch_b == COM1_PROBE_B and lsr != LSR_FLOATING
+
+fn com1_probe() -> bool
+    outb(COM1_SCR, COM1_PROBE_A)
+    let a: u8 = inb(COM1_SCR)
+    outb(COM1_SCR, COM1_PROBE_B)
+    let b: u8 = inb(COM1_SCR)
+    com1_probe_verdict(a, b, inb(COM1_LSR))
+
+# Whether serial_init found a COM1.
+pub fn serial_present() -> bool
+    g_com1_present
+
+# Probe COM1, then set it up (boot_abi's serial_init: 115200 8N1) if it is
+# there. Returns whether it is.
+pub fn serial_start() -> bool
+    g_com1_present = com1_probe()
+    if g_com1_present
+        serial_init()
+    g_com1_present
+
+# The kernel's polled COM1 output: boot_abi's, dropped with no COM1.
+pub fn serial_out_byte(c: u8)
+    if g_com1_present
+        serial_write_byte(c)
+
+pub fn serial_out(s: StrView)
+    if g_com1_present
+        serial_write(s.ptr, s.len)
 
 # ============================================================================
 # Serial Port Constants
@@ -70,6 +121,8 @@ pub import ritzlib.strview { StrView }
 
 # Check if data is available to read
 pub fn serial_data_available() -> bool
+    if not g_com1_present
+        return false
     return (inb(COM1_LSR) & LSR_DR) != 0
 
 # Read a single byte (blocking)
@@ -128,11 +181,13 @@ pub fn serial_buf_read_many(buf: *u8, max_len: i64) -> i64
 # Enable receive interrupts on COM1
 pub fn serial_enable_rx_interrupt()
     # Enable Received Data Available interrupt
-    outb(COM1_IER, IER_RDA)
+    if g_com1_present
+        outb(COM1_IER, IER_RDA)
 
 # Disable receive interrupts on COM1
 pub fn serial_disable_rx_interrupt()
-    outb(COM1_IER, 0x00)
+    if g_com1_present
+        outb(COM1_IER, 0x00)
 
 # ============================================================================
 # Serial Output Buffer Functions (Interrupt-driven TX)
@@ -143,7 +198,8 @@ var serial_ier_state: u8 = 0
 
 # Update IER register with current state
 fn serial_update_ier()
-    outb(COM1_IER, serial_ier_state)
+    if g_com1_present
+        outb(COM1_IER, serial_ier_state)
 
 # Enable TX interrupt (THRE - Transmitter Holding Register Empty)
 pub fn serial_enable_tx_interrupt()
@@ -171,6 +227,9 @@ pub fn serial_output_pending() -> i32
 # Write bytes to the output buffer (non-blocking)
 # Returns number of bytes actually written (may be less than len if buffer full)
 pub fn serial_buffer_write(buf: *u8, len: i64) -> i64
+    # No COM1: the bytes are taken and dropped (the screen has them).
+    if not g_com1_present
+        return len
     var bytes_written: i64 = 0
 
     while bytes_written < len
@@ -195,6 +254,8 @@ pub fn serial_buffer_write(buf: *u8, len: i64) -> i64
 
 # Write a single byte to output buffer
 pub fn serial_buffer_write_byte(c: u8) -> i32
+    if not g_com1_present
+        return 1
     if serial_output_count >= SERIAL_OUT_BUF_SIZE
         # Buffer full
         return 0
@@ -212,6 +273,9 @@ pub fn serial_buffer_write_byte(c: u8) -> i32
 # Returns number of bytes sent
 pub fn serial_drain_output() -> i32
     var bytes_sent: i32 = 0
+    if not g_com1_present
+        serial_output_count = 0
+        return 0
 
     # While buffer has data and hardware is ready
     while serial_output_count > 0 and (inb(COM1_LSR) & LSR_THRE) != 0

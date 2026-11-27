@@ -52,8 +52,8 @@ or to the AGAST ticket that fills the gap. Mapped on main as of 2026-11-27.
 | Class | Device | Harland | First boot |
 |---|---|---|---|
 | Boot, initramfs | UEFI loader on the stick | `boot/` | needed: have |
-| Display | GOP framebuffer on the GTX 1070 BAR1, 3840x2160 at 0xe0000000 | `drivers/display` maps and fills it; it draws **no text** | needed: have |
-| Kernel log, panic screen, tty output | framebuffer | gap: `klog` and `tty/console.ritz` write COM1 only. On-screen log + panic #4868 | **needed** |
+| Display | GOP framebuffer on the GTX 1070 BAR1, 3840x2160 at 0xe0000000 | `drivers/display` maps it write-combining; `fbcon.ritz` draws text on it, glyphs x2 at 4K (#4868) | needed: have |
+| Kernel log, panic screen, tty output | framebuffer | `drivers/display/fbcon.ritz`: klog's and the tty's sink, and the panic screen (#4868) | needed: have |
 | Keyboard (USB) | Intel xHCI [8086:8d31] 00:14.0 | gap: USB epic #4860 | **needed** |
 | USB 2.0 | EHCI [8086:8d26] 00:1d.0, [8086:8d2d] 00:1a.0 | none; out of scope unless a port is EHCI-only | no |
 | SATA | Intel [8086:2822] 00:1f.2, **RAID mode** | gap: SATA/AHCI epic #4861. Switch the firmware to AHCI first (the AHCI-mode ID is a different device ID) | no |
