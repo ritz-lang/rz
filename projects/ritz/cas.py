@@ -165,19 +165,93 @@ def _find_repo_root(start: Path) -> Optional[Path]:
 REPO_ROOT: Optional[Path] = _find_repo_root(Path(__file__).resolve().parent)
 
 
+# A directory holding this file is a package (docs/PACKAGES.md "Identity",
+# AGAST #4863): its files are named `pkg/<package name>/<relative path>`.
+PACKAGE_MARKER = "ritz-package.toml"
+
+# `name = "<name>"` in `[package]`, on one line, as `rz pack` writes it.
+# ritz1's diag_package_name scans for exactly this, so the two compilers
+# agree on every marker; anything else names no package.
+_MARKER_NAME_RE = re.compile(r'[ \t]*name[ \t]*=[ \t]*"([A-Za-z0-9_-]+)"[ \t]*(?:#.*)?')
+
+
+def package_marker_name(text: str) -> str | None:
+    """The package a `ritz-package.toml` names: the first `name = "…"` line
+    of its `[package]` table, letters, digits, `_` and `-` only. None when
+    there is none, and then the directory is not a package."""
+    section = None
+    for line in text.split("\n"):
+        head = line.strip()
+        if head.startswith("["):
+            section = head
+            continue
+        if section == "[package]":
+            m = _MARKER_NAME_RE.fullmatch(line)
+            if m:
+                return m.group(1)
+    return None
+
+
+_ANCHORS: dict[str, tuple] = {}
+
+
+def file_anchor(real: str) -> tuple:
+    """`(kind, key)` for the resolved file path `real`: what names it
+    independently of where it sits on disk.
+
+    Walking up from the file, the nearest directory that is a package (holds
+    a `ritz-package.toml` naming one) or a checkout (holds a `.git`):
+    `("pkg", "pkg/<name>/<path below it>")` or `("git", "<path below it>")`.
+    In one directory the marker wins. Neither: `(None, real)`.
+
+    A private fn's symbol hashes `key` (ritz0 symbol_file_key, ritz1
+    diag_symbol_file_key: the same rule), so two installs of a package, or
+    two worktrees of a repository, name a file's private fns alike.
+    """
+    hit = _ANCHORS.get(real)
+    if hit is None:
+        hit = (None, real)
+        d = os.path.dirname(real)
+        while True:
+            name = None
+            try:
+                with open(os.path.join(d, PACKAGE_MARKER), encoding="utf-8",
+                          errors="replace") as f:
+                    name = package_marker_name(f.read())
+            except OSError:
+                pass
+            if name is not None:
+                hit = ("pkg", f"pkg/{name}/{os.path.relpath(real, d)}")
+                break
+            if os.path.lexists(os.path.join(d, ".git")):
+                hit = ("git", os.path.relpath(real, d))
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        _ANCHORS[real] = hit
+    return hit
+
+
 def module_identity(path: Path, repo_root: Optional[Path] = None) -> str:
     """Worktree-independent name of a module.
 
-    Inside the repository: its repo-relative path. Outside it (a test's
-    scratch copy of a helper, a tmp_path fixture): just the file name. The
-    path reaches the IR through DWARF `DIFile` and through private fns'
-    symbols (AGAST #1858), which hash the path relative to the file's
-    checkout, so they agree across worktrees (AGAST #4626). Outside a
-    checkout they hash the absolute path: build_pipeline._path_bound_modules
-    adds that path to the key where an object's symbols can depend on it.
+    In a package (file_anchor, AGAST #4863): `pkg/<name>/<path in it>`,
+    wherever the package is installed. Else inside the repository: its
+    repo-relative path. Outside it (a test's scratch copy of a helper, a
+    tmp_path fixture): just the file name. The path reaches the IR through
+    DWARF `DIFile` and through private fns' symbols (AGAST #1858), which hash
+    file_anchor's key, so they agree across worktrees (AGAST #4626) and
+    installs. Outside a checkout or package they hash the absolute path:
+    build_pipeline._path_bound_modules adds that path to the key where an
+    object's symbols can depend on it.
     """
     root = repo_root if repo_root is not None else REPO_ROOT
     p = Path(path).resolve()
+    kind, key = file_anchor(str(p))
+    if kind == "pkg":
+        return key
     if root is not None:
         try:
             return p.relative_to(root).as_posix()

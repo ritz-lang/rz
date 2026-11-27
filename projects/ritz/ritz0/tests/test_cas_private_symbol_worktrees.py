@@ -168,3 +168,62 @@ def test_private_symbol_is_relative_to_its_checkout(compiler, tmp_path):
     assert _helper_symbol(compiler, tmp_path / "wt1") == _helper_symbol(compiler, tmp_path / "wt2")
     assert (_helper_symbol(compiler, tmp_path / "plain1")
             != _helper_symbol(compiler, tmp_path / "plain2"))
+
+
+# AGAST #4863 (docs/PACKAGES.md "Identity"): a directory holding
+# `ritz-package.toml` names its files `pkg/<package name>/<relative path>`,
+# in private fns' symbols and in the store's module identity alike, so an
+# installed package's prebuilt objects link against an importer's instances
+# wherever either was built.
+PACKAGE_MARKER = '[package]\nname = "lib"\nversion = "0.1.0"\n'
+
+
+def _mark(wt: Path, text: str = PACKAGE_MARKER) -> None:
+    (wt / "lib" / "ritz-package.toml").write_text(text)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_private_symbol_is_named_by_its_package(compiler, tmp_path):
+    """The symbol hashes `pkg/lib/a.ritz` in any directory, and the marker
+    wins over a `.git` above it; a marker naming no package is no marker."""
+    for name in ("pkg1", "pkg2", "nameless"):
+        _worktree(tmp_path / name, TEST_FILE)
+    _mark(tmp_path / "pkg1")
+    _mark(tmp_path / "pkg2")
+    (tmp_path / "pkg2" / ".git").write_text("gitdir: /nowhere\n")
+    _mark(tmp_path / "nameless", '[package]\nversion = "0.1.0"\n')
+    import hashlib
+
+    def mangled(key: str) -> str:
+        return "helper__" + hashlib.sha256(key.encode()).hexdigest()[:8]
+    assert _helper_symbol(compiler, tmp_path / "pkg1") == mangled("pkg/lib/a.ritz")
+    assert _helper_symbol(compiler, tmp_path / "pkg2") == mangled("pkg/lib/a.ritz")
+    nameless = (tmp_path / "nameless" / "lib" / "a.ritz").resolve()
+    assert _helper_symbol(compiler, tmp_path / "nameless") == mangled(str(nameless))
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_marked_package_links_across_directories(compiler, tmp_path, monkeypatch):
+    """A generic in a marked package calls a private fn. Built in one
+    directory, its object serves a harness built against a copy of the
+    package in another directory, and the binary links: neither directory
+    is a checkout, so before the marker the copies' symbols differed and
+    their paths joined the key (two objects for lib/a.ritz)."""
+    if compiler != "ritz0":
+        assert (RITZ1_BUILD / compiler).exists(), \
+            f"{compiler} missing; run `make -C ritz1 bootstrap`"
+    sys.path.insert(0, str(RITZ_ROOT / "ritz0"))
+    import test_runner
+
+    store = tmp_path / "cas"
+    monkeypatch.setenv("RITZ_CACHE_DIR", str(store))
+    monkeypatch.delenv("RITZ_NO_CAS", raising=False)
+    srcs = [_worktree(tmp_path / "install1", TEST_FILE),
+            _worktree(tmp_path / "install2", "# another directory\n" + TEST_FILE)]
+    objects = []
+    for src in srcs:
+        _mark(src.parent)
+        _build_and_run(test_runner, src, compiler, monkeypatch)
+        objects.append(set(store.rglob("*.o")))
+    # Only the second harness is new: the package's object was served.
+    assert len(objects[1] - objects[0]) == 1, sorted(objects[1] - objects[0])

@@ -51,9 +51,10 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.string
 import ritzlib.strview
+import ritzlib.option
 
 import ast
-import ritzlib.fs { lstat }   # the .git probe takes a StrView (AGAST #4774)
+import ritzlib.fs { lstat, read_file }   # the .git and package probes (AGAST #4774, #4863)
 
 # AGAST #4319: the input file, for located diagnostics from modules that do
 # not import the emitter.  The driver sets it once (main.ritz); emitter_core
@@ -284,25 +285,111 @@ pub fn diag_eprint_lent(e: *Expr)
                     _ =>
                         eprints("..")
 
-# AGAST #4626: what a private fn's symbol hashes for its file `abs` (from
-# emitter_core fn_def_file_abs): the path relative to the nearest directory
-# above it that holds a `.git` (a checkout or a worktree), else `abs` itself.
-# Two worktrees then spell one file's private fns alike, so the artifact
-# store every worktree on a host shares can serve one's object to the other;
-# with the absolute path a harness compiled in one declared `helper__<its
+# AGAST #4863: is `c` a byte of a package name (letters, digits, `_`, `-`)?
+fn diag_is_name_byte(c: u8) -> bool
+    (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-'
+
+# The first index at or after `i` of `s` that is not a space or a tab.
+fn diag_skip_blanks(s: StrView, i: i64) -> i64
+    var j: i64 = i
+    while j < s.len and (*(s.ptr + j) == ' ' or *(s.ptr + j) == '\t')
+        j += 1
+    j
+
+# The name in `line` when it is `name = "<name>"`, with blanks around each
+# part and an optional `# comment` after it.  A view into `line`.
+fn diag_marker_name_line(line: StrView) -> Option<StrView>
+    var i: i64 = diag_skip_blanks(line, 0)
+    if line.len - i < 4 or not StrView { ptr: line.ptr + i, len: 4 }.eq("name")
+        return None
+    i = diag_skip_blanks(line, i + 4)
+    if i >= line.len or *(line.ptr + i) != '='
+        return None
+    i = diag_skip_blanks(line, i + 1)
+    if i >= line.len or *(line.ptr + i) != '"'
+        return None
+    let first: i64 = i + 1
+    i = first
+    while i < line.len and diag_is_name_byte(*(line.ptr + i))
+        i += 1
+    if i == first or i >= line.len or *(line.ptr + i) != '"'
+        return None
+    let name: StrView = StrView { ptr: line.ptr + first, len: i - first }
+    i = diag_skip_blanks(line, i + 1)
+    if i < line.len and *(line.ptr + i) != '#'
+        return None
+    Some(name)
+
+# AGAST #4863: the package a `ritz-package.toml` holding `text` names: the
+# first `name = "<name>"` line of its `[package]` table.  None when there
+# is none, and then its directory is not a package.  The rule of cas.py's
+# package_marker_name, so the two compilers agree on every marker.  A view
+# into `text`.
+pub fn diag_package_name(text: StrView) -> Option<StrView>
+    var in_package: bool = false
+    var start: i64 = 0
+    while start <= text.len
+        var end: i64 = start
+        while end < text.len and *(text.ptr + end) != '\n'
+            end += 1
+        let line: StrView = StrView { ptr: text.ptr + start, len: end - start }
+        let head: StrView = line.trim()
+        if head.starts_with("[")
+            in_package = head.eq("[package]")
+        else if in_package
+            let name: Option<StrView> = diag_marker_name_line(line)
+            if name.is_some()
+                return name
+        start = end + 1
+    None
+
+# The name of the package whose directory `dir` is: the `[package]` name
+# in `dir/ritz-package.toml`, copied out of the file.
+fn diag_dir_package(dir: StrView) -> Option<String>
+    var marker: String = string_from_strview(dir)
+    marker.push_str("/ritz-package.toml")
+    if lstat(marker.as_view()).is_err()
+        return None
+    match read_file(marker.as_view())
+        Ok(text) =>
+            match diag_package_name(text.as_view())
+                Some(name) => Some(string_from_strview(name))
+                None => None
+        Err(_) => None
+
+# AGAST #4626, #4863: what a private fn's symbol hashes for its file `abs`
+# (from emitter_core fn_def_file_abs), as ritz0's symbol_file_key and
+# cas.py's file_anchor.  Walking up from the file to the nearest directory
+# that is a package (holds a `ritz-package.toml` naming one) or a checkout
+# (holds a `.git`, a checkout or a worktree), the marker first in one
+# directory: `pkg/<name>/<path below it>` or `<path below it>`; neither,
+# `abs` itself.  Two worktrees, or two installs of a package, then spell
+# one file's private fns alike, so the artifact store every worktree on a
+# host shares can serve one's object to the other, and a package's prebuilt
+# archive defines the symbols an importer's generic instances call; with
+# the absolute path a harness compiled in one declared `helper__<its
 # hash>` and linked against an object that defined `helper__<the other's>`.
-# As ritz0's symbol_file_key.  A view into `abs`.  Here, not in
-# emitter_core, which the M1.3 large-file ratchet holds.
-pub fn diag_symbol_file_key(abs: StrView) -> StrView
-    if abs.len + 6 > 4096
-        return abs
+# Here, not in emitter_core, which the M1.3 large-file ratchet holds.
+pub fn diag_symbol_file_key(abs: StrView) -> String
+    if abs.len + 18 > 4096   # "/ritz-package.toml"
+        return string_from_strview(abs)
     # Shortest dir last, as ritz0 walks up from the file.
     var k: i64 = abs.len - 1
     while k >= 0
         if *(abs.ptr + k) == '/'
-            var probe: String = string_from_strview(StrView { ptr: abs.ptr, len: k })
+            let dir: StrView = StrView { ptr: abs.ptr, len: k }
+            let rel: StrView = StrView { ptr: abs.ptr + k + 1, len: abs.len - k - 1 }
+            match diag_dir_package(dir)
+                Some(name) =>
+                    var key: String = string_from_strview("pkg/")
+                    key.push_str(name.as_view())
+                    key.push_str("/")
+                    key.push_str(rel)
+                    return key
+                None => pass
+            var probe: String = string_from_strview(dir)
             probe.push_str("/.git")
             if lstat(probe.as_view()).is_ok()
-                return StrView { ptr: abs.ptr + k + 1, len: abs.len - k - 1 }
+                return string_from_strview(rel)
         k -= 1
-    abs
+    string_from_strview(abs)

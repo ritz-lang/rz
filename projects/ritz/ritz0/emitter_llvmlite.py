@@ -643,38 +643,22 @@ def emits_definition(item: rast.Item, source_file: Optional[str],
     return defines_body(item, source_file, cached_fn_names) or inline_import(item, source_file)
 
 
-_SYMBOL_FILE_KEYS: Dict[str, str] = {}
-
-
 def symbol_file_key(path: str) -> str:
     """What a private fn's symbol hashes for its defining file (AGAST #4626).
 
-    The file's resolved path relative to the nearest directory above it that
-    holds a `.git` (a checkout or a worktree), else its resolved absolute
-    path.  Two worktrees of one repository therefore name a file's private
-    fns alike, so the artifact store, which every worktree on a host shares
-    and which keys an in-repository module by its repository-relative path,
-    may serve one worktree's object to another: the absolute path made the
-    symbol, and every harness declaring it, differ per worktree.  A file
-    outside any checkout keeps its absolute path, and the store adds it to
-    the key (build_pipeline._cas_key).  ritz1's emitter_core fn_symbol
-    computes the same key.
+    cas.file_anchor's key: `pkg/<name>/<path>` below the nearest directory
+    holding a `ritz-package.toml` (an installed package, AGAST #4863), the
+    path below the nearest one holding a `.git` (a checkout or a worktree),
+    whichever is nearer, else the resolved absolute path.  Two worktrees, or
+    two installs of a package, therefore name a file's private fns alike, so
+    the artifact store, which keys such a module by the same name, may serve
+    one's object to the other, and a package's prebuilt archive defines the
+    symbols an importer's generic instances call.  A file outside both keeps
+    its absolute path, and the store adds it to the key
+    (build_pipeline._cas_key).  ritz1's diag_symbol_file_key computes the
+    same key.
     """
-    real = os.path.realpath(path)
-    key = _SYMBOL_FILE_KEYS.get(real)
-    if key is None:
-        key = real
-        d = os.path.dirname(real)
-        while True:
-            if os.path.lexists(os.path.join(d, '.git')):
-                key = os.path.relpath(real, d)
-                break
-            parent = os.path.dirname(d)
-            if parent == d:
-                break
-            d = parent
-        _SYMBOL_FILE_KEYS[real] = key
-    return key
+    return module_interface.cas.file_anchor(os.path.realpath(path))[1]
 
 
 class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,

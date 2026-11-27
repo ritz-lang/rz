@@ -458,3 +458,68 @@ def test_ci_local_prints_the_gate_summary(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "[ritz-cas] gate: processes=1 hits=7 misses=2 compiled=1" in out
     assert "compiled more than once: ritzlib/io.ritz" in out
+
+
+# --- package identity (AGAST #4863, docs/PACKAGES.md "Identity") ------------
+
+def _package(root: Path, name: str = "mylib", marker: str | None = None) -> Path:
+    """`root` holding a `ritz-package.toml` naming `name`, and `sub/m.ritz`."""
+    (root / "sub").mkdir(parents=True, exist_ok=True)
+    if marker is None:
+        marker = f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
+    (root / cas.PACKAGE_MARKER).write_text(marker)
+    src = root / "sub" / "m.ritz"
+    src.write_text("fn helper() -> i32\n    1\npub fn wrap<T>(v: T) -> i32\n    helper()\n")
+    return src
+
+
+@pytest.mark.unit
+def test_package_name_reads_the_package_table():
+    name = cas.package_marker_name
+    assert name('[package]\nname = "ritzlib"\n') == "ritzlib"
+    assert name('# c\n[package]\n  name="a-b_1"   # trailing\n') == "a-b_1"
+    # Only `[package]`'s `name`; the first one wins.
+    assert name('[x]\nname = "no"\n[package]\nname = "yes"\nname = "no"\n') == "yes"
+    # No usable name: not a marker. The same rule as ritz1's scanner.
+    for text in ('', 'name = "top"\n', '[package]\nname = ""\n',
+                 '[package]\nname = "a/b"\n', "[package]\nname = 'q'\n",
+                 '[package]\nname = "x" y\n'):
+        assert name(text) is None, text
+
+
+@pytest.mark.unit
+def test_a_marked_module_is_named_by_its_package(tmp_path):
+    """Two installs of one package name a module alike, whatever their path,
+    and the marker wins over a `.git` further up."""
+    a = _package(tmp_path / "a" / "0.1.0")
+    b = _package(tmp_path / "repo" / "deep" / "0.1.0")
+    (tmp_path / "repo" / ".git").write_text("gitdir: /nowhere\n")
+    assert cas.module_identity(a) == "pkg/mylib/sub/m.ritz"
+    assert cas.module_identity(b, repo_root=tmp_path / "repo") == "pkg/mylib/sub/m.ritz"
+    assert _key(a, []) == _key(b, [], repo_root=tmp_path / "repo")
+    # Another package's file of the same relative path is another module.
+    c = _package(tmp_path / "c", name="otherlib")
+    assert cas.module_identity(c) == "pkg/otherlib/sub/m.ritz"
+
+
+@pytest.mark.unit
+def test_an_unusable_marker_or_a_nearer_git_is_not_a_package(tmp_path):
+    bad = _package(tmp_path / "bad", marker="[package]\nversion = \"1\"\n")
+    assert cas.module_identity(bad) == "ext/m.ritz"
+    # A checkout inside the package directory: the nearer anchor names it.
+    inner = _package(tmp_path / "outer")
+    (inner.parent / ".git").write_text("gitdir: /nowhere\n")
+    assert cas.module_identity(inner, repo_root=inner.parent) == "m.ritz"
+
+
+@pytest.mark.unit
+def test_path_bound_modules_skips_package_modules(tmp_path):
+    """A `pkg/` module's symbols don't depend on its directory, so its path
+    stays out of the key; an unmarked copy outside a checkout still joins."""
+    bp = importlib.import_module("build_pipeline")
+    marked = _package(tmp_path / "marked")
+    plain = tmp_path / "plain" / "m.ritz"
+    plain.parent.mkdir()
+    plain.write_text(marked.read_text())
+    assert bp._path_bound_modules(marked, []) == []
+    assert bp._path_bound_modules(plain, []) == [str(plain.resolve())]

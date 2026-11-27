@@ -11,8 +11,9 @@
 import ritzlib.process { process_id }
 import ritzlib.string
 import ritzlib.strview
+import ritzlib.option
 import ritzlib.fd
-import ritzlib.fs { mkdir, rmdir, unlink }
+import ritzlib.fs { mkdir, rmdir, unlink, write_file }
 import diag
 import fn_cache
 
@@ -72,13 +73,54 @@ fn test_symbol_file_key_is_the_path_below_the_git_root() -> i32
     assert mkdir(sub.as_view(), 493).is_ok()
     var src: String = string_from_strview(sub.as_view())
     src.push_str("/b.ritz")
-    assert diag_symbol_file_key(src.as_view()).eq("a/b.ritz")
+    assert diag_symbol_file_key(src.as_view()).as_view().eq("a/b.ritz")
     # No `.git` above: the whole path.
     var bare: String = scratch("nogit.ritz")
-    assert diag_symbol_file_key(bare.as_view()).eq(bare.as_view())
+    assert diag_symbol_file_key(bare.as_view()).as_view().eq(bare.as_view())
     rmdir(sub.as_view())
     rmdir(git.as_view())
     rmdir(root.as_view())
+    0
+
+# AGAST #4863: a directory holding a `ritz-package.toml` that names a
+# package names its files `pkg/<name>/<path>`, and wins over a `.git` above;
+# a marker naming none is no marker.  The marker's text rule is cas.py's
+# package_marker_name (tools/test_cas.py pins the same cases).
+[[test]]
+fn test_symbol_file_key_is_the_path_in_its_package() -> i32
+    var root: String = scratch("pkg")
+    var git: String = string_from_strview(root.as_view())
+    git.push_str("/.git")
+    var pkg: String = string_from_strview(root.as_view())
+    pkg.push_str("/lib")
+    var marker: String = string_from_strview(pkg.as_view())
+    marker.push_str("/ritz-package.toml")
+    assert mkdir(root.as_view(), 493).is_ok()
+    assert mkdir(git.as_view(), 493).is_ok()
+    assert mkdir(pkg.as_view(), 493).is_ok()
+    var src: String = string_from_strview(pkg.as_view())
+    src.push_str("/b.ritz")
+    assert write_file(marker.as_view(), "[package]\nname = \"mylib\"\n").is_ok()
+    assert diag_symbol_file_key(src.as_view()).as_view().eq("pkg/mylib/b.ritz")
+    assert write_file(marker.as_view(), "[package]\nversion = \"1\"\n").is_ok()
+    assert diag_symbol_file_key(src.as_view()).as_view().eq("lib/b.ritz")
+    unlink(marker.as_view())
+    rmdir(pkg.as_view())
+    rmdir(git.as_view())
+    rmdir(root.as_view())
+    0
+
+[[test]]
+fn test_package_name_reads_the_package_table() -> i32
+    assert diag_package_name("[package]\nname = \"ritzlib\"\n").unwrap_or("").eq("ritzlib")
+    assert diag_package_name("# c\n[package]\n  name=\"a-b_1\"   # trailing\n").unwrap_or("").eq("a-b_1")
+    assert diag_package_name("[x]\nname = \"no\"\n[package]\nname = \"yes\"\nname = \"no\"\n").unwrap_or("").eq("yes")
+    assert diag_package_name("").is_none()
+    assert diag_package_name("name = \"top\"\n").is_none()
+    assert diag_package_name("[package]\nname = \"\"\n").is_none()
+    assert diag_package_name("[package]\nname = \"a/b\"\n").is_none()
+    assert diag_package_name("[package]\nname = 'q'\n").is_none()
+    assert diag_package_name("[package]\nname = \"x\" y\n").is_none()
     0
 
 # A diagnostic for a source with no path names `<input>`.

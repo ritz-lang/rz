@@ -515,8 +515,10 @@ def _path_bound_modules(src: Path, closure) -> List[str]:
 
     A private fn's symbol hashes its file's path relative to its checkout
     (ritz0 symbol_file_key, ritz1 fn_symbol; AGAST #4626), which
-    cas.module_identity's repository-relative identity already pins. A file
-    outside the repository (a test's tmp_path fixture, another checkout) has
+    cas.module_identity's repository-relative identity already pins, or its
+    `pkg/<name>/<path>` in a package (AGAST #4863), which is its identity:
+    both are skipped. A file outside the repository and any package (a
+    test's tmp_path fixture, another checkout) has
     identity `ext/<name>` only, so two directories' copies shared a key while
     their objects named different symbols: a harness compiled in one linked
     against the other's object and failed with an undefined `helper__<hash>`.
