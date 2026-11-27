@@ -8,6 +8,7 @@
 # This is also the kernel's block-device interface: NVMe namespaces
 # (drivers/nvme) are handed out as block devices after the virtio disks, and
 # virtio_blk_read/virtio_blk_write pass them to the NVMe driver (#1850).
+# AHCI disks (drivers/ahci) follow the NVMe namespaces the same way (#4884).
 #
 # A disk with MSI-X (AGAST #3631) signals its request queue, and config
 # changes, on one vector (drivers/virtio/vmsix.ritz). A request issued with
@@ -25,11 +26,14 @@ import drivers.virtio.vmsix { VIO_MSIX_ENTRY, vio_msix_setup }
 import drivers.virtio.common { VirtioDevice, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, vio_setup_queue_vec, VIO_TRANSPORT_MMIO, vio_read_config64, vq_notify }
 import virtio_abi.virtq { Virtqueue, VringDesc, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_has_used, vq_get_used, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE }
 import drivers.nvme.nvme { NvmeNamespace, nvme_probe, nvme_get_namespace, nvme_ns_sectors, nvme_ns_read, nvme_ns_write }
-import drivers.ahci.ahci { ahci_probe }
+import drivers.ahci.ahci { AhciDisk, ahci_probe, ahci_get_disk, ahci_disk_rw }
+import drivers.ahci.fis { AhciDir, AHCI_SECTOR_BYTES }
 import mm.heap { kalloc, kfree }
 import mm.vmm { phys_to_virt }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
 import io { rdtsc, interrupts_enabled }
+import syscall.errno { Errno }
+import ritzlib.span { span_from_ptr }
 
 # ============================================================================
 # VirtIO Block Feature Bits
@@ -89,6 +93,7 @@ pub struct VirtioBlkDevice
     features: u32               # Negotiated features
     _padding: u32
     nvme: *NvmeNamespace        # Non-null: an NVMe namespace, not virtio
+    ahci: *AhciDisk             # Non-null: an AHCI disk, not virtio or NVMe
 
 # Size constants
 const VIRTIO_BLK_REQ_HDR_SIZE: u64 = 16  # sizeof(VirtioBlkReqHdr)
@@ -167,6 +172,7 @@ pub fn virtio_blk_init_nth(n: i32) -> *VirtioBlkDevice
 
     (*dev).virtio_dev = vdev
     (*dev).nvme = 0 as *NvmeNamespace
+    (*dev).ahci = 0 as *AhciDisk
     (*dev).block_size = 512  # Default
 
     # Feature negotiation
@@ -247,7 +253,7 @@ fn blk_init_nvme(n: i32) -> *VirtioBlkDevice
     nvme_probe()
     let ns: *NvmeNamespace = nvme_get_namespace(n - virtio_count)
     if ns == 0 as *NvmeNamespace
-        return 0 as *VirtioBlkDevice
+        return blk_init_ahci(n)
     let dev: *VirtioBlkDevice = kalloc(sizeof(VirtioBlkDevice) as u64) as *VirtioBlkDevice
     if dev == 0 as *VirtioBlkDevice
         return dev
@@ -258,11 +264,49 @@ fn blk_init_nvme(n: i32) -> *VirtioBlkDevice
     (*dev).features = 0
     (*dev)._padding = 0
     (*dev).nvme = ns
+    (*dev).ahci = 0 as *AhciDisk
     blk_devices[n] = dev
     blk_device_count = blk_device_count + 1
     klog("[blk] Device " as StrView)
     klog_dec(n as i64)
     klog(" is NVMe (" as StrView)
+    klog_dec((*dev).capacity / 2048)
+    klog(" MB)\n" as StrView)
+    return dev
+
+# Block device n past the virtio disks and the NVMe namespaces: AHCI disk
+# n - virtio_count - nvme_count, in PCI order and then port order (#4884).
+fn blk_init_ahci(n: i32) -> *VirtioBlkDevice
+    # Same probe virtio_blk_init already ran. A later call returns the count.
+    let _disks: u32 = match ahci_probe()
+        Ok(count) => count
+        Err(_) => 0
+    var virtio_count: i32 = 0
+    while pci_find_virtio_nth(VIRTIO_DEVICE_BLOCK, virtio_count) != 0 as *PciDevice
+        virtio_count = virtio_count + 1
+    nvme_probe()
+    var nvme_count: i32 = 0
+    while nvme_get_namespace(nvme_count) != 0 as *NvmeNamespace
+        nvme_count = nvme_count + 1
+    let disk: *AhciDisk = match ahci_get_disk(n - virtio_count - nvme_count)
+        Some(found) => found
+        None => return 0 as *VirtioBlkDevice
+    let dev: *VirtioBlkDevice = kalloc(sizeof(VirtioBlkDevice) as u64) as *VirtioBlkDevice
+    if dev == 0 as *VirtioBlkDevice
+        return dev
+    (*dev).virtio_dev = 0 as *VirtioDevice
+    (*dev).request_queue = 0 as *Virtqueue
+    (*dev).capacity = (*disk).sectors
+    (*dev).block_size = 512
+    (*dev).features = 0
+    (*dev)._padding = 0
+    (*dev).nvme = 0 as *NvmeNamespace
+    (*dev).ahci = disk
+    blk_devices[n] = dev
+    blk_device_count = blk_device_count + 1
+    klog("[blk] Device " as StrView)
+    klog_dec(n as i64)
+    klog(" is AHCI (" as StrView)
     klog_dec((*dev).capacity / 2048)
     klog(" MB)\n" as StrView)
     return dev
@@ -362,6 +406,17 @@ fn blk_reclaim(dev_idx: i32, vq: *Virtqueue) -> bool
         return true
     return blk_complete(dev_idx, vq, blk_inflight_head[dev_idx])
 
+# The block interface's raw buffer and i32 status, around ahci_disk_rw's
+# span and Result: 0, or Errno.Io for any AHCI failure.
+fn blk_ahci_rw(disk: *AhciDisk, sector: u64, count: u32, buf: *u8, write: bool) -> i32
+    let span: [u8] = span_from_ptr<u8>(buf, (count as i64) * (AHCI_SECTOR_BYTES as i64))
+    var dir: AhciDir = AhciDir.Read
+    if write
+        dir = AhciDir.Write
+    match ahci_disk_rw(disk, sector, span, dir)
+        Ok(_) => 0
+        Err(_) => Errno.Io as i32
+
 # Read (write=false) or write (write=true) `count` sectors at `sector`
 # through the device's one DMA page, bouncing through it to/from `buf`
 # (max 7 sectors = 3584 bytes; the page also holds the header and status).
@@ -369,6 +424,8 @@ fn blk_reclaim(dev_idx: i32, vq: *Virtqueue) -> bool
 pub fn virtio_blk_rw(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8, write: bool) -> i32
     if dev == 0 as *VirtioBlkDevice
         return -1
+    if (*dev).ahci != 0 as *AhciDisk
+        return blk_ahci_rw((*dev).ahci, sector, count, buf, write)
     if (*dev).nvme != 0 as *NvmeNamespace
         if write
             return nvme_ns_write((*dev).nvme, sector, count, buf)

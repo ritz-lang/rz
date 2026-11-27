@@ -1,0 +1,114 @@
+# ATA register FIS and AHCI PRDT encoding (AGAST #4884).
+#
+# Host tests fill a byte buffer. The kernel writes the same bytes into the
+# command table before it rings PxCI.
+
+import ritzlib.span
+import drivers.ahci.regs { ahci_rf_write }
+
+pub const AHCI_FIS_H2D: u8 = 0x27
+pub const AHCI_FIS_C: u8 = 0x80
+pub const AHCI_FIS_DEV_LBA: u8 = 0x40
+pub const AHCI_CMD_READ_DMA_EXT: u8 = 0x25
+pub const AHCI_CMD_WRITE_DMA_EXT: u8 = 0x35
+pub const AHCI_CMD_FLUSH_EXT: u8 = 0xEA
+pub const AHCI_CMD_IDENTIFY: u8 = 0xEC
+
+# Register H2D FIS length: 20 bytes, so CFL (in dwords) is 5.
+pub const AHCI_H2D_BYTES: i64 = 20
+pub const AHCI_HDR_CFL_H2D: u32 = 5
+# Command header DW0 W: the data goes host to device.
+pub const AHCI_HDR_W: u32 = 0x40
+pub const AHCI_HDR_BYTES: i64 = 16
+# PRDT entry DW3 I: interrupt on completion of this entry.
+pub const AHCI_PRDT_I: u32 = 0x80000000
+pub const AHCI_PRDT_ENTRY_BYTES: i64 = 16
+# The PRDT starts 0x80 bytes into the command table, after the CFIS, ACMD
+# and reserved areas.
+pub const AHCI_CT_PRDT_OFF: u64 = 0x80
+
+# One command moves at most 16 bounce pages (64 KiB, 128 sectors of 512).
+pub const AHCI_BOUNCE_PAGES: i32 = 16
+pub const AHCI_SECTOR_BYTES: u32 = 512
+pub const AHCI_PAGE_BYTES: u32 = 4096
+pub const AHCI_MAX_SECTORS: u32 = 128
+
+# Which way a command's data moves. A command with no data (FLUSH,
+# IDENTIFY's header W) is Read: W clear.
+pub enum AhciDir
+    Read
+    Write
+
+pub fn ahci_chunk_sectors(remaining: u32) -> u32
+    if remaining > AHCI_MAX_SECTORS
+        return AHCI_MAX_SECTORS
+    return remaining
+
+pub fn ahci_xfer_pages(bytes: u32) -> i32
+    if bytes == 0
+        return 0
+    return ((bytes + AHCI_PAGE_BYTES - 1) / AHCI_PAGE_BYTES) as i32
+
+# Register H2D FIS into dst[0..20]. `count` is the sector count (0 for
+# FLUSH). Writes nothing when dst is shorter than the FIS.
+pub fn ahci_fill_h2d(dst: [u8], command: u8, lba: u64, count: u32)
+    if dst.len < AHCI_H2D_BYTES
+        return
+    dst.to(AHCI_H2D_BYTES).zero()
+    dst[0] = AHCI_FIS_H2D
+    dst[1] = AHCI_FIS_C
+    dst[2] = command
+    dst[4] = (lba & 0xFF) as u8
+    dst[5] = ((lba >> 8) & 0xFF) as u8
+    dst[6] = ((lba >> 16) & 0xFF) as u8
+    dst[7] = AHCI_FIS_DEV_LBA
+    dst[8] = ((lba >> 24) & 0xFF) as u8
+    dst[9] = ((lba >> 32) & 0xFF) as u8
+    dst[10] = ((lba >> 40) & 0xFF) as u8
+    dst[12] = (count & 0xFF) as u8
+    dst[13] = ((count >> 8) & 0xFF) as u8
+
+# Command header into dst[0..16]. `ctba` is the command-table physical
+# address, `dir` sets W, PRDTL is the entry count. Writes nothing when dst is
+# shorter than a header.
+pub fn ahci_fill_header(dst: [u8], dir: AhciDir, prdtl: u32, ctba: u64)
+    if dst.len < AHCI_HDR_BYTES
+        return
+    var dw0: u32 = AHCI_HDR_CFL_H2D
+    match dir
+        AhciDir.Write => dw0 = dw0 | AHCI_HDR_W
+        AhciDir.Read => pass
+    dw0 = dw0 | (prdtl << 16)
+    ahci_rf_write(dst, 0, dw0)
+    ahci_rf_write(dst, 4, 0)
+    ahci_rf_write(dst, 8, (ctba & 0xFFFFFFFF) as u32)
+    ahci_rf_write(dst, 12, (ctba >> 32) as u32)
+
+# One PRDT entry per 4 KiB page in `phys`, enough for `total_bytes`. The last
+# entry's byte count is the remainder and is the only entry with I set.
+# Returns the entry count: 0 when there is nothing to move, too few pages, or
+# dst cannot hold the entries.
+pub fn ahci_fill_prdt(dst: [u8], phys: [u64], total_bytes: u32) -> i32
+    let pages: i32 = ahci_xfer_pages(total_bytes)
+    if pages == 0 or (pages as i64) > phys.len
+        return 0
+    if dst.len < (pages as i64) * AHCI_PRDT_ENTRY_BYTES
+        return 0
+    var left: u32 = total_bytes
+    var i: i32 = 0
+    while i < pages
+        var n: u32 = AHCI_PAGE_BYTES
+        if left < n
+            n = left
+        var dbc: u32 = n - 1
+        if i + 1 == pages
+            dbc = dbc | AHCI_PRDT_I
+        let addr: u64 = phys[i as i64]
+        let ent: [u8] = dst.from((i as i64) * AHCI_PRDT_ENTRY_BYTES)
+        ahci_rf_write(ent, 0, (addr & 0xFFFFFFFF) as u32)
+        ahci_rf_write(ent, 4, (addr >> 32) as u32)
+        ahci_rf_write(ent, 8, 0)
+        ahci_rf_write(ent, 12, dbc)
+        left = left - n
+        i = i + 1
+    return pages

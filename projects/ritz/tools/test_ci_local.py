@@ -617,7 +617,7 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     test_ci_nvme_ap_boot.py), the ESP-initramfs boot (#4253;
     test_ci_esp_initramfs_boot.py), the rzsh serial session (#4252;
     test_ci_shell_boot.py), the no-serial framebuffer boot (#4868;
-    test_ci_fbcon_boot.py) and the AHCI IDENTIFY boot (#4882;
+    test_ci_fbcon_boot.py) and the AHCI persist boot (#4884;
     test_ci_ahci_boot.py). A new step here must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
     assert [s.run.strip().splitlines()[-1] for s in steps] == [
