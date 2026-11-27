@@ -315,31 +315,23 @@ fn hex16_strict(s: StrView) -> u64
 #     when set, likewise.
 #   - `--no-red-zone` (#4308): the IR carries noredzone.  Likewise.
 # 0 (unknown) whenever the compiler fingerprint is.
-pub fn cache_fingerprint(target_os_sv: StrView, target_arch_sv: StrView, ritz_path_sv: StrView, input_path: StrView, deps_sv: StrView, stack_protector: i32, no_red_zone: i32, freestanding: i32) -> u64
-    var target_os: *u8 = target_os_sv.ptr
-    var target_os_len: i64 = target_os_sv.len
-    var target_arch: *u8 = target_arch_sv.ptr
-    var target_arch_len: i64 = target_arch_sv.len
-    var ritz_path: *u8 = ritz_path_sv.ptr
-    var ritz_path_len: i64 = ritz_path_sv.len
-    var deps: *u8 = deps_sv.ptr
-    var deps_len: i64 = deps_sv.len
+pub fn cache_fingerprint(target_os: StrView, target_arch: StrView, ritz_path: StrView, input_path: StrView, deps: StrView, stack_protector: i32, no_red_zone: i32, freestanding: i32) -> u64
     let fp: u64 = compiler_fingerprint()
     if fp == 0
         return 0
-    var h: u64 = fnv1a_mix_bytes(fp, target_os, target_os_len)
+    var h: u64 = fnv1a_mix_bytes(fp, target_os)
     # The target arch selects [[target_arch]] variants (#4117), so it is
     # part of the key exactly as the target OS is.
-    h = fnv1a_mix_bytes(h, target_arch, target_arch_len)
+    h = fnv1a_mix_bytes(h, target_arch)
 
     # Import search path: `:`-separated, empty entries skipped (as the
     # resolver does).
     var start: i64 = 0
     var i: i64 = 0
-    while i <= ritz_path_len
-        if i == ritz_path_len or *(ritz_path + i) == ':'
+    while i <= ritz_path.len
+        if i == ritz_path.len or ritz_path.get(i) == ':'
             if i > start
-                h = fnv1a_mix_dir(h, StrView { ptr: (ritz_path + start), len: (i - start) })
+                h = fnv1a_mix_dir(h, ritz_path.skip(start).take(i - start))
                 if h == 0
                     return 0
             start = i + 1
@@ -348,7 +340,7 @@ pub fn cache_fingerprint(target_os_sv: StrView, target_arch_sv: StrView, ritz_pa
     # The source's directory, as main.ritz's path_dir() computes it: up to
     # and including the last '/', empty (never probed) when there is none.
     let dir_len: i64 = input_path.len - path_basename(input_path).len
-    h = fnv1a_mix_bytes(fnv1a_mix_u64(h, 3), input_path.ptr, dir_len)
+    h = fnv1a_mix_bytes(fnv1a_mix_u64(h, 3), input_path.take(dir_len))
     if dir_len > 0
         if *(input_path.ptr) != '/'
             h = fnv1a_mix_cwd(h)
@@ -356,18 +348,18 @@ pub fn cache_fingerprint(target_os_sv: StrView, target_arch_sv: StrView, ritz_pa
 
     # `--dep` entries: `name=dir`, `:`-separated (main.ritz checks each has
     # its `=`).  The name by its bytes, the dir as a RITZ_PATH entry is.
-    if deps_len > 0
+    if deps.len > 0
         h = fnv1a_mix_u64(h, 5)
         var ds: i64 = 0
         var di: i64 = 0
-        while di <= deps_len
-            if di == deps_len or *(deps + di) == ':'
+        while di <= deps.len
+            if di == deps.len or deps.get(di) == ':'
                 var eq: i64 = ds
-                while eq < di and *(deps + eq) != '='
+                while eq < di and deps.get(eq) != '='
                     eq = eq + 1
-                h = fnv1a_mix_bytes(h, deps + ds, eq - ds)
+                h = fnv1a_mix_bytes(h, deps.skip(ds).take(eq - ds))
                 if eq + 1 < di
-                    h = fnv1a_mix_dir(h, StrView { ptr: (deps + eq + 1), len: (di - eq - 1) })
+                    h = fnv1a_mix_dir(h, deps.skip(eq + 1).take(di - eq - 1))
                     if h == 0
                         return 0
                 ds = di + 1
@@ -383,18 +375,18 @@ pub fn cache_fingerprint(target_os_sv: StrView, target_arch_sv: StrView, ritz_pa
         h = 1
     return h
 
-# Fold `p[0..n)` into `h`, length first, so adjacent fields cannot alias.
-fn fnv1a_mix_bytes(h: u64, p: *u8, n: i64) -> u64
-    var acc: u64 = fnv1a_mix_u64(h, n as u64)
-    if n > 0
-        acc = fnv1a_mix_u64(acc, fnv1a_bytes(StrView { ptr: (p), len: (n) }))
+# Fold `bytes` into `h`, length first, so adjacent fields cannot alias.
+fn fnv1a_mix_bytes(h: u64, bytes: StrView) -> u64
+    var acc: u64 = fnv1a_mix_u64(h, bytes.len as u64)
+    if bytes.len > 0
+        acc = fnv1a_mix_u64(acc, fnv1a_bytes(bytes))
     return acc
 
 # Fold the canonical current directory into `h`.
 fn fnv1a_mix_cwd(h: u64) -> u64
     var cwd: String = string_new()
     push_canonical_path(@cwd, ".")
-    let acc: u64 = fnv1a_mix_bytes(fnv1a_mix_u64(h, 4), cwd.as_ptr(), cwd.len())
+    let acc: u64 = fnv1a_mix_bytes(fnv1a_mix_u64(h, 4), cwd.as_view())
     return acc
 
 # Fold the canonical path of the directory `dir` into `h`.  A
@@ -405,7 +397,7 @@ fn fnv1a_mix_dir(h: u64, dir: StrView) -> u64
     var canon: String = string_new()
     var acc: u64 = h
     if push_canonical_path(@canon, dir) == 1
-        acc = fnv1a_mix_bytes(fnv1a_mix_u64(acc, 1), canon.as_ptr(), canon.len())
+        acc = fnv1a_mix_bytes(fnv1a_mix_u64(acc, 1), canon.as_view())
     return acc
 
 # Fold the 8 little-endian bytes of `v` into an in-progress FNV1a-64 state.
@@ -1082,11 +1074,11 @@ fn write_file_atomic(path: StrView, data: StrView) -> i32
 # File-level fast path
 # ============================================================================
 
-# 1 if the interface text of the source bytes buf[0..sz) hashes to `want`
+# 1 if the interface text of the source bytes `src` hashes to `want`
 # (AGAST #2113): the stored one, else derived here (lexed, not parsed, so
 # not stored: ritz0 and load_and_parse store only a text whose source parses).
-fn dep_text_matches(buf: *u8, sz: i64, want: u64) -> i32
-    var path: String = iface_text_path(StrView { ptr: (buf), len: (sz) })
+fn dep_text_matches(src: StrView, want: u64) -> i32
+    var path: String = iface_text_path(src)
     var tsz: i64 = 0
     var text: *u8 = null
     if path.len() > 0
@@ -1097,7 +1089,7 @@ fn dep_text_matches(buf: *u8, sz: i64, want: u64) -> i32
         free(text)
     else
         var made: Vec<u8> = vec_new<u8>()
-        if iface_text_derive(StrView { ptr: (buf), len: (sz) }, @&made) < 0
+        if iface_text_derive(src, @&made) < 0
             return 0
         h = fnv1a_bytes(StrView { ptr: (made.data), len: (made.len) })
     if h == want
@@ -1119,12 +1111,13 @@ fn sig_deps_unchanged(sd: *SigData) -> i32
         let buf: *u8 = read_file_to_buf(*(sd.dep_paths + i), @sz)
         if buf == null
             return 0
+        let src: StrView = StrView { ptr: buf, len: sz }
         let want: u64 = *(sd.dep_hashes + i)
         var same: i32 = 0
-        if fnv1a_bytes(StrView { ptr: (buf), len: (sz) }) == want
+        if fnv1a_bytes(src) == want
             same = 1
         else
-            same = dep_text_matches(buf, sz, want)
+            same = dep_text_matches(src, want)
         free(buf)
         if same == 0
             return 0
