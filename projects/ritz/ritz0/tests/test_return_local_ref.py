@@ -155,6 +155,8 @@ LANDINGS = {
     "early_return": ("fn f(b: i32, p: @C) -> @C\n" + C1 + "    if b > 0\n        return ^@c\n    p\n", "c"),
     "return_in_a_loop": ("fn f(b: i32) -> @C\n" + C1 + "    while b > 0\n        return ^@c\n    null\n", "c"),
     "tail_of_a_method": ("impl C\n    fn g(self: @C) -> @C\n" + "    " + C1 + "        ^@c\n", "c"),
+    # AGAST #4899: a local array's tail `@a` into a `[T]` is the Span over it.
+    "tail_as_a_span": ("fn f() -> [i32]\n    var a: [3]i32 = [1, 2, 3]\n    ^@a\n", "a"),
 }
 
 # (b).

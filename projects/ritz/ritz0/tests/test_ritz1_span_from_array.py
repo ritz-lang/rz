@@ -233,6 +233,54 @@ pub fn main() -> i32
 })
 
 
+# AGAST #4899: `@g`, `g` a global `[N]T`, as a `-> [T]` fn's `return` or
+# tail.  ritz1 returned the array's address, an i64, where the `%Span$T` goes:
+# SILENT, clang refused the IR.  A method's tail is emitted apart from a fn's.
+# Each row checks the span's length, and that a store through it reaches `g`.
+_RET_GLOBAL = """\
+var g: [512]{t}
+
+fn f() -> [{t}]
+{body}
+
+pub fn main() -> i32
+    let s: [{t}] = f()
+    s[3] = 7
+    if g[3] != 7
+        return 1
+    if s.len() != 512
+        return 2
+    9
+"""
+
+FORMS.update({
+    "return_global_u8": (SPAN + _RET_GLOBAL.format(t="u8", body="    return @g"), 9),
+    "tail_global_u8": (SPAN + _RET_GLOBAL.format(t="u8", body="    @g"), 9),
+    "return_global_i32": (SPAN + _RET_GLOBAL.format(t="i32", body="    return @g"), 9),
+    "tail_global_i32": (SPAN + _RET_GLOBAL.format(t="i32", body="    @g"), 9),
+    "method_tail_global_u8": (SPAN + """\
+var g: [512]u8
+
+struct Buf
+    tag: i64
+
+impl Buf
+    fn bytes(self: @Buf) -> [u8]
+        @g
+
+pub fn main() -> i32
+    let b: Buf = Buf { tag: 1 }
+    let s: [u8] = b.bytes()
+    s[3] = 7
+    if g[3] != 7
+        return 1
+    if s.len() != 512
+        return 2
+    9
+""", 9),
+})
+
+
 # Every row is a row of a table under its old id, less the compiler.  The runs
 # link the ritzlib modules they import (test_table_rows.ritzlib_build); the
 # refusals are test_table_rows's, which wants ELEMENT_MISMATCH whole at the `^`,
