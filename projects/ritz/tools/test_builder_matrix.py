@@ -43,21 +43,21 @@ def _fake_rz(swept, exclusions):
 @pytest.mark.unit
 def test_swept_packages_with_no_known_failure_are_included():
     rz = _fake_rz(["sage", "buddhafinger-not-here"], {})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown())
     assert got == ["buddhafinger-not-here", "sage"]
 
 
 @pytest.mark.unit
 def test_a_build_failure_under_ritz1_selfhosted_excludes_the_package():
     rz = _fake_rz(["sage", "angelo"], {})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown(build={"angelo"}))
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown(build={"angelo"}))
     assert got == ["sage"]
 
 
 @pytest.mark.unit
 def test_a_parity_failure_under_ritz1_selfhosted_excludes_the_package():
     rz = _fake_rz(["sage", "goliath"], {})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown(parity={"goliath"}))
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown(parity={"goliath"}))
     assert got == ["sage"]
 
 
@@ -65,14 +65,14 @@ def test_a_parity_failure_under_ritz1_selfhosted_excludes_the_package():
 def test_an_excluded_package_is_skipped_without_the_opt_in_marker():
     rz = _fake_rz([], {"projects/buddhafinger": "builds and tests with "
                        "ritz1_selfhosted only, no marker here"})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown())
     assert got == []
 
 
 @pytest.mark.unit
 def test_an_excluded_package_with_the_opt_in_marker_is_included():
     rz = _fake_rz([], {"projects/buddhafinger": f"... {builder_matrix.OPT_IN_MARKER} ..."})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown())
     assert got == ["buddhafinger"]
 
 
@@ -80,7 +80,7 @@ def test_an_excluded_package_with_the_opt_in_marker_is_included():
 def test_an_opt_in_marker_outside_projects_is_ignored():
     """Only paths under projects/ are rz ids; nothing else can opt in."""
     rz = _fake_rz([], {"docs/archive": f"retired, {builder_matrix.OPT_IN_MARKER}"})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown())
     assert got == []
 
 
@@ -88,14 +88,14 @@ def test_an_opt_in_marker_outside_projects_is_ignored():
 def test_swept_and_opted_in_merge_and_dedupe():
     rz = _fake_rz(["sage"],
                   {"projects/buddhafinger": f"{builder_matrix.OPT_IN_MARKER}"})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown())
     assert got == ["buddhafinger", "sage"]
 
 
 @pytest.mark.unit
 def test_cli_list_prints_a_json_array_sorted():
     rz = _fake_rz(["sage", "angelo"], {})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown())
     assert json.loads(json.dumps(got)) == sorted(got)
 
 
@@ -113,7 +113,7 @@ def test_buddhafinger_opts_in_via_rz_toml():
 @pytest.mark.integration
 def test_buddhafinger_is_in_the_real_matrix():
     got = builder_matrix.list_packages()
-    assert "buddhafinger" in got
+    assert got == ["buddhafinger"]
 
 
 @pytest.mark.integration
@@ -123,7 +123,54 @@ def test_cli_list_runs_and_includes_buddhafinger():
     assert r.returncode == 0, r.stdout + r.stderr
     packages = json.loads(r.stdout)
     assert isinstance(packages, list) and packages == sorted(packages)
-    assert "buddhafinger" in packages
+    assert packages == ["buddhafinger"]
+
+
+# --- AGAST #4846: the matrix runs buddhafinger only --------------------------
+
+
+@pytest.mark.unit
+def test_the_matrix_runs_buddhafinger_only():
+    """Aaron, 2026-11-27: on Woodpecker and in the hosted fallback alike, the
+    builder matrix runs buddhafinger and nothing else."""
+    assert builder_matrix.MATRIX_PACKAGES == ("buddhafinger",)
+
+
+@pytest.mark.unit
+def test_list_packages_is_the_run_list_not_every_eligible_package():
+    rz = _fake_rz(["sage", "goliath"],
+                  {"projects/buddhafinger": builder_matrix.OPT_IN_MARKER})
+    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    assert got == ["buddhafinger"]
+
+
+@pytest.mark.unit
+def test_list_packages_keeps_the_run_lists_order():
+    rz = _fake_rz(["sage", "angelo"], {})
+    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown(), only=("sage", "angelo"))
+    assert got == ["sage", "angelo"]
+
+
+@pytest.mark.unit
+def test_a_run_list_package_that_isnt_eligible_fails_loudly():
+    """An empty matrix would make GitHub's builder-matrix job error out and
+    Woodpecker run nothing; a package the eligibility rules drop (a lost
+    opt-in marker, a swept package's known failure) is an error, not a
+    silent skip."""
+    rz = _fake_rz(["sage"], {"projects/buddhafinger": "no marker"})
+    with pytest.raises(ValueError, match="buddhafinger"):
+        builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    rz = _fake_rz(["sage"], {})
+    with pytest.raises(ValueError, match="sage"):
+        builder_matrix.list_packages(rz=rz, known=_FakeKnown(parity={"sage"}),
+                                     only=("sage",))
+
+
+@pytest.mark.unit
+def test_an_empty_run_list_is_refused():
+    rz = _fake_rz(["sage"], {})
+    with pytest.raises(ValueError, match="empty"):
+        builder_matrix.list_packages(rz=rz, known=_FakeKnown(), only=())
 
 
 # --- AGAST #4847: what each matrix entry runs -------------------------------
@@ -135,7 +182,7 @@ def test_the_compiler_package_itself_is_never_in_the_matrix():
     projects/ritz with the mounted one, so its ritz1_selfhosted check can
     never pass (run 45804261861, exit 2). The bootstrap job gates it."""
     rz = _fake_rz(["ritz", "ritz/ritzlib/tests", "sage"], {})
-    got = builder_matrix.list_packages(rz=rz, known=_FakeKnown())
+    got = builder_matrix.eligible_packages(rz=rz, known=_FakeKnown())
     assert got == ["ritz/ritzlib/tests", "sage"]
     assert "ritz" in builder_matrix.NOT_IN_MATRIX
 
@@ -178,7 +225,8 @@ def test_entries_carry_a_normalized_workspace_path_and_build_only(tmp_path):
     _pkg(projects, "sage", test_file=True)
     _pkg(tmp_path, "bench/r/s2")
     rz = _fake_rz(["sage", "../bench/r/s2"], {})
-    got = builder_matrix.matrix_entries(rz=rz, known=_FakeKnown(), workspace=tmp_path)
+    got = builder_matrix.matrix_entries(rz=rz, known=_FakeKnown(), workspace=tmp_path,
+                                        only=("../bench/r/s2", "sage"))
     assert got == [
         {"package": "../bench/r/s2", "path": "bench/r/s2", "build_only": True},
         {"package": "sage", "path": "projects/sage", "build_only": False},
@@ -186,17 +234,24 @@ def test_entries_carry_a_normalized_workspace_path_and_build_only(tmp_path):
 
 
 @pytest.mark.integration
-def test_the_real_matrix_builds_only_the_packages_without_tests():
-    got = {e["package"]: e for e in builder_matrix.matrix_entries()}
-    assert "ritz" not in got
-    assert got["indium"]["build_only"] is True
-    assert got["buddhafinger"]["build_only"] is False
-    assert got["rllvm"]["build_only"] is False  # test.sh, pytest in the image
-    s2 = got["../bench/regressions/2026-05-04/s2_module_init"]
-    assert s2 == {"package": "../bench/regressions/2026-05-04/s2_module_init",
-                  "path": "bench/regressions/2026-05-04/s2_module_init",
-                  "build_only": True}
-    for e in got.values():
+def test_the_real_matrix_is_buddhafinger_with_its_tests():
+    got = builder_matrix.matrix_entries()
+    assert got == [{"package": "buddhafinger", "path": "projects/buddhafinger",
+                    "build_only": False}]
+    assert (REPO_ROOT / "projects/buddhafinger/ritz.toml").is_file()
+
+
+@pytest.mark.integration
+def test_every_eligible_package_would_still_map_to_a_real_path():
+    """The eligibility rules still run (list_packages checks the run list
+    against them), so their ids must stay valid workspace paths: widening
+    the run list again is then a one-line change."""
+    got = builder_matrix.matrix_entries(only=tuple(builder_matrix.eligible_packages()))
+    by_pkg = {e["package"]: e for e in got}
+    assert "ritz" not in by_pkg
+    assert by_pkg["indium"]["build_only"] is True
+    assert by_pkg["rllvm"]["build_only"] is False  # test.sh, pytest in the image
+    for e in got:
         assert (REPO_ROOT / e["path"] / "ritz.toml").is_file(), e
 
 

@@ -51,9 +51,9 @@ it read-only and name it as `RZ_ROOT`, and pass the package's in-tree path,
 under `projects/` or not. The compiler is still the image's
 `ritz1_selfhosted`, linked into the private workspace; the checkout's own
 `ritz1/build` is never used. That is how main.yml's `builder-matrix` runs
-every package (`.github/scripts/run_builder_package.sh`): a package's tests
-may read files the image doesn't ship (prism reads angelo's font fixture,
-buddhafinger ritz1's keyword table).
+each package in its list (`.github/scripts/run_builder_package.sh`): a
+package's tests may read files the image doesn't ship (prism reads angelo's
+font fixture, buddhafinger ritz1's keyword table).
 
 ```bash
 docker run --rm --network=none --security-opt seccomp=unconfined \
@@ -105,6 +105,15 @@ Woodpecker at `https://ci.fucken.ninja` (adele's stack: kubernetes backend
 on huburght, forge `git.fucken.ninja`; adele's `docs/gitea.md`). GitHub stays
 canonical, and its hosted `builder-matrix` is the fallback.
 
+The matrix runs **buddhafinger only** (Aaron, 2026-11-27), on Woodpecker and
+in the hosted fallback alike: `MATRIX_PACKAGES` in
+`projects/ritz/tools/builder_matrix.py`. The whole repo is still pushed to
+Gitea. `list_packages()` still checks each listed package against the
+eligibility rules (swept or opted in, no known `build`/`parity` failure)
+and fails rather than emit an empty matrix. Widening the matrix again means
+editing `MATRIX_PACKAGES` and regenerating the pipeline (below). Keeping
+the CAS between runs is AGAST #4857.
+
 On a push to main:
 
 1. main.yml's `gitea-push` pushes the commit to `main` of
@@ -142,7 +151,7 @@ On a push to main:
    - `wait-for-image` polls ghcr anonymously until `:<commit>` exists, for
      up to 40 minutes. A step whose pod can't pull its image fails at once.
    - Then comes one step per package, in the order `builder_matrix.py matrix`
-     gives. Each step is a pod whose image is
+     gives (today one step, `buddhafinger`). Each step is a pod whose image is
      `ghcr.io/ritz-lang/rz-builder:${CI_COMMIT_SHA}`, running
      `.github/scripts/woodpecker_builder_step.sh`. That script calls the
      entrypoint with `RZ_ROOT` set to the clone, then applies the same
@@ -160,8 +169,7 @@ On a push to main:
      both, never on neither.
 
 The pipeline is generated, so don't edit it. When the matrix moves (a
-package, or a known-failures `build`/`parity` entry under
-ritz1_selfhosted), regenerate it:
+change to `MATRIX_PACKAGES`), regenerate it:
 
 ```bash
 python3 projects/ritz/tools/builder_matrix.py woodpecker --write
@@ -178,9 +186,9 @@ cluster's rules:
 - no seccomp profile;
 - `labels: pool: rz-builder`.
 
-The seccomp profile matters. Under a RuntimeDefault-style profile (Docker's
-default), the image of 31d73e00e fails 19 of ritzlib's 896 tests, because
-they call io_uring. Pod Security `baseline` forbids naming `Unconfined`, so
+The seccomp profile matters if the matrix widens again. Under a
+RuntimeDefault-style profile (Docker's default), the image of 31d73e00e
+fails 19 of ritzlib's 896 tests, because they call io_uring. Pod Security `baseline` forbids naming `Unconfined`, so
 the pods depend on the kubelet's default staying unset (no
 `--seccomp-default`).
 
@@ -189,6 +197,12 @@ image with its entrypoint replaced, as uid 1000, the clone as the working
 directory, and no seccomp profile.
 
 ### Cluster side (adele's cluster, applied by adele)
+
+**For now** (Aaron, 2026-11-27) rz runs on one of adele's shared agents,
+which adele labelled `pool=rz-builder`. Its steps run in
+`woodpecker-steps`, with no rz LimitRange or ResourceQuota; the memory
+limit in each step is the only cap. Pipeline #1 (`97eacd11d`) went green
+on it. The dedicated agent below is the plan if that changes:
 
 - A public, empty Gitea repo `ritz-lang/rz` (no README or licence, so the
   first push, of GitHub's full history, is a fast-forward), with no branch

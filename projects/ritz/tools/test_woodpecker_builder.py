@@ -16,8 +16,8 @@ What these tests pin:
   no volumes (so no hostPath, no docker.sock), no services (no dind), no
   secrets, no entrypoint override, no CPU limit, a memory cap; images
   pinned (the builder by the commit, the helper by digest);
-* routing: `labels: pool: rz-builder` sends it to the rz agent (one workflow
-  at a time, its own namespace and quota); steps have no depends_on, so they
+* routing: `labels: pool: rz-builder` sends it to the agent with that label
+  (for now a shared one of adele's); steps have no depends_on, so they
   run one at a time, in order;
 * the step script, the image wait and the fleet probe, against stubs.
 """
