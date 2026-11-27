@@ -214,23 +214,47 @@ fn refuse_pointer_strlit_eq(s: *EmitterState, e: *Expr) -> bool
     emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
     true
 
+# A binary expression's value.  A compare, `and` and `or` are bools: their
+# condition (emit_binary_cond) widened to the i64 every value lives in (#1646).
 pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
-    # Short-circuit logical AND / OR.  Without this, ritz1 emits
-    #   %r = and i64 %left, %right
-    # which evaluates BOTH operands eagerly — `a and *p == 'x'` always
-    # dereferences `p` even when `a` is false.  ritz0 implements proper
-    # short-circuit via control flow + phi.  The selfhost-emit-strview
-    # SEGV (Wave 5E) was a downstream consequence: a code path inside
-    # emit_expr_call had `param_type == TypeKind.Struct and *(param_type_name + 0)
-    # == 'S' and ...` — when the param was a non-struct, the deref of a
-    # null name fired anyway.  See ritz0 _emit_short_circuit_and (~3942).
+    if is_bool_binary(e.op)
+        return bool_i1_value(s, emit_binary_cond(s, e))
+    emit_binary_op(s, e)
+
+# `and`, `or` and the compares: the binary ops whose value is a bool.
+pub fn is_bool_binary(op: OpKind) -> bool
+    op == OpKind.And or op == OpKind.Or or is_compare(op)
+
+# The i1 `cond` as a bool value: an i64 0 or 1.  0 (an error path) stays 0.
+fn bool_i1_value(s: *EmitterState, cond: i32) -> i32
+    if cond == 0
+        return 0
+    ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, cond)
+
+# AGAST #4854: a compare, `and` or `or` as the i1 a `br`, a phi or a `ret i1`
+# takes, never widened on the way: early SimplifyCFG folds a chain of compares
+# into one switch (isspace's single bit test) only when each `br` and phi reads
+# them directly.  emit_cond_impl's arm for ExprKind.Binary.
+#
+# `and` / `or` short-circuit.  Without that, ritz1 emitted
+#   %r = and i64 %left, %right
+# which evaluates BOTH operands eagerly — `a and *p == 'x'` always
+# dereferences `p` even when `a` is false.  The selfhost-emit-strview
+# SEGV (Wave 5E) was a downstream consequence: a code path inside
+# emit_expr_call had `param_type == TypeKind.Struct and *(param_type_name + 0)
+# == 'S' and ...` — when the param was a non-struct, the deref of a
+# null name fired anyway.  See ritz0 _emit_short_circuit_and (~3942).
+pub fn emit_binary_cond(s: *EmitterState, e: *Expr) -> i32
     match e.op
         OpKind.And =>
-            return emit_logical_and(s, e)
+            return emit_short_circuit(s, e, false)
         OpKind.Or =>
-            return emit_logical_or(s, e)
+            return emit_short_circuit(s, e, true)
         _ => pass
+    emit_binary_op(s, e)
 
+# Every binary op but `and` / `or`: an i64 value, or a compare's i1.
+fn emit_binary_op(s: *EmitterState, e: *Expr) -> i32
     # Check if this is pointer arithmetic (ptr + int or ptr - int).
     # If the left operand is a pointer, scale the right operand by the
     # pointee size.  ptr_arith_elem_size (emitter_core) owns the whole
@@ -385,7 +409,7 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     format_into(s, "  %.{result} = {opcode}%.{left_reg}, %.{scaled_right}\n")
 
     if is_compare(e.op)
-        return ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, result)
+        return result   # the i1; emit_expr_binary widens a value
 
     # LARB R63 (AGAST #3486): `+%` / `-%` / `*%` wrap at their operand type.
     # The sum is an i64 like every integer, so a wider slot would otherwise see
@@ -429,61 +453,36 @@ fn int_binop_opcode(op: OpKind, unsigned: bool, shr_unsigned: bool) -> StrView
         OpKind.Shr => if shr_unsigned then "lshr i64 " else "ashr i64 "
         OpKind.Unset | OpKind.And | OpKind.Or | OpKind.Neg | OpKind.Not | OpKind.Deref | OpKind.Addr | OpKind.BitNot | OpKind.AddrMut | OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap => no_name()
 
-# `a and b`, short-circuit: a phi over the two exits.
-fn emit_logical_and(s: *EmitterState, e: *Expr) -> i32
-    # Synthetic anchor block — gives us a known predecessor label for
-    # the phi.  s.fcx.current_label may be stale at the function entry
-    # block (which is named `entry`, not a number), so we can't rely
-    # on it being a valid number.  LLVM optimizes the trivial branch
-    # away.
-    let sa_anchor: i32 = next_label(s)
-    format_into(s, "  br label %L{sa_anchor}\n")
-    begin_block(s, sa_anchor)
-    let sa_left_val: i32 = emit_expr(s, e.left)
-    let sa_left_bool: i32 = next_reg(s)
-    format_into(s, "  %.{sa_left_bool} = icmp ne i64 %.{sa_left_val}, 0\n")
-    let sa_entry_label: i32 = s.fcx.current_label
-    let sa_right_label: i32 = next_label(s)
-    let sa_end_label: i32 = next_label(s)
-    format_into(s, "  br i1 %.{sa_left_bool}, label %L{sa_right_label}, label %L{sa_end_label}\n")
-    # Right branch — only entered when left was truthy
-    begin_block(s, sa_right_label)
-    let sa_right_val: i32 = emit_expr(s, e.right)
-    let sa_right_bool: i32 = next_reg(s)
-    format_into(s, "  %.{sa_right_bool} = icmp ne i64 %.{sa_right_val}, 0\n")
-    let sa_right_ext: i32 = ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, sa_right_bool)
-    let sa_right_exit: i32 = s.fcx.current_label
-    format_into(s, "  br label %L{sa_end_label}\n")
-    # End — phi merges short-circuit (false) and full-eval branches.
-    begin_block(s, sa_end_label)
-    let sa_phi: i32 = next_reg(s)
-    format_into(s, "  %.{sa_phi} = phi i64 [ 0, %L{sa_entry_label} ], [ %.{sa_right_ext}, %L{sa_right_exit} ]\n")
-    return sa_phi
-
-# `a or b`, short-circuit: a phi over the two exits.
-fn emit_logical_or(s: *EmitterState, e: *Expr) -> i32
-    let so_anchor: i32 = next_label(s)
-    format_into(s, "  br label %L{so_anchor}\n")
-    begin_block(s, so_anchor)
-    let so_left_val: i32 = emit_expr(s, e.left)
-    let so_left_bool: i32 = next_reg(s)
-    format_into(s, "  %.{so_left_bool} = icmp ne i64 %.{so_left_val}, 0\n")
-    let so_entry_label: i32 = s.fcx.current_label
-    let so_right_label: i32 = next_label(s)
-    let so_end_label: i32 = next_label(s)
-    # Inverted: if left truthy, skip right (result already true).
-    format_into(s, "  br i1 %.{so_left_bool}, label %L{so_end_label}, label %L{so_right_label}\n")
-    begin_block(s, so_right_label)
-    let so_right_val: i32 = emit_expr(s, e.right)
-    let so_right_bool: i32 = next_reg(s)
-    format_into(s, "  %.{so_right_bool} = icmp ne i64 %.{so_right_val}, 0\n")
-    let so_right_ext: i32 = ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, so_right_bool)
-    let so_right_exit: i32 = s.fcx.current_label
-    format_into(s, "  br label %L{so_end_label}\n")
-    begin_block(s, so_end_label)
-    let so_phi: i32 = next_reg(s)
-    format_into(s, "  %.{so_phi} = phi i64 [ 1, %L{so_entry_label} ], [ %.{so_right_ext}, %L{so_right_exit} ]\n")
-    return so_phi
+# `a and b` (`is_or` false) or `a or b`: the right operand runs only when the
+# left one doesn't decide, and the merge is `phi i1 [ <decided>, left ],
+# [ right, right's exit ]`.  Both operands are conditions (emit_cond), so a
+# chain of them is i1 end to end (AGAST #4854).
+fn emit_short_circuit(s: *EmitterState, e: *Expr, is_or: bool) -> i32
+    # Synthetic anchor block: a known predecessor label for the phi even at
+    # the fn's `entry` block, which has no number.  LLVM folds the trivial
+    # branch away.
+    let anchor: i32 = next_label(s)
+    format_into(s, "  br label %L{anchor}\n")
+    begin_block(s, anchor)
+    let left: i32 = emit_cond(s, e.left)
+    let left_exit: i32 = s.fcx.current_label
+    let right_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+    # `or` is decided by a true left, `and` by a false one.
+    var decided: StrView = "false"
+    if is_or
+        decided = "true"
+        format_into(s, "  br i1 %.{left}, label %L{end_label}, label %L{right_label}\n")
+    else
+        format_into(s, "  br i1 %.{left}, label %L{right_label}, label %L{end_label}\n")
+    begin_block(s, right_label)
+    let right: i32 = emit_cond(s, e.right)
+    let right_exit: i32 = s.fcx.current_label
+    format_into(s, "  br label %L{end_label}\n")
+    begin_block(s, end_label)
+    let phi: i32 = next_reg(s)
+    format_into(s, "  %.{phi} = phi i1 [ {decided}, %L{left_exit} ], [ %.{right}, %L{right_exit} ]\n")
+    phi
 
 # A float binary op at width `fty_t`: each operand coerced to it, then the
 # `f`-prefixed op or compare (AGAST #1965).
@@ -524,9 +523,7 @@ fn emit_float_binop(s: *EmitterState, e: *Expr, fty_t: TypeKind, left_in: i32, r
         return 0
     let result_f: i32 = next_reg(s)
     format_into(s, "  %.{result_f} = {opcode}{fty} %.{left_reg}, %.{scaled_right}\n")
-    # Comparison ops produce i1 — zext to i64 for unified value model.
-    if is_compare(e.op)
-        return ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, result_f)
+    # A compare's i1 is returned as is; emit_expr_binary widens a value.
     result_f
 
 # The float op or ordered compare, as the opcode and its trailing space.
@@ -1369,6 +1366,29 @@ fn neg_float_llvm_type(s: *EmitterState, operand: *Expr) -> StrView
         TypeKind.F64 => "double"
         _ => no_name()
 
+# `not x` as an i1 (AGAST #4854): the `xor` of x's condition when x is one
+# (a compare, `and` / `or`, a `not`), else `icmp eq i64 x, 0`, one instruction
+# either way.  emit_cond_impl's arm for `not`; emit_expr_unary widens a value.
+pub fn emit_not_cond(s: *EmitterState, e: *Expr) -> i32
+    if is_cond_shaped(e.operand)
+        let inner: i32 = emit_cond(s, e.operand)
+        let flipped: i32 = next_reg(s)
+        format_into(s, "  %.{flipped} = xor i1 %.{inner}, true\n")
+        return flipped
+    let operand: i32 = emit_expr(s, e.operand)
+    let result: i32 = next_reg(s)
+    format_into(s, "  %.{result} = icmp eq i64 %.{operand}, 0\n")
+    result
+
+# Does emit_cond lower `e` straight to an i1, rather than test an i64 value?
+# A compare, `and` / `or`, and `not`.
+pub fn is_cond_shaped(e: *Expr) -> bool
+    if e == null
+        return false
+    if e.kind == ExprKind.Binary
+        return is_bool_binary(e.op)
+    e.kind == ExprKind.Unary and e.op == OpKind.Not
+
 pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
     match e.op
         OpKind.Neg =>
@@ -1382,11 +1402,7 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             format_into(s, "  %.{result} = sub i64 0, %.{operand}\n")
             return result
         OpKind.Not =>
-            let operand: i32 = emit_expr(s, e.operand)
-            let result: i32 = next_reg(s)
-            format_into(s, "  %.{result} = icmp eq i64 %.{operand}, 0\n")
-            let ext: i32 = ir_zext_i1_i64(s.ir.out, @s.fcx.reg_counter, result)
-            return ext
+            return bool_i1_value(s, emit_not_cond(s, e))
         OpKind.Deref => emit_unary_deref(s, e)
         OpKind.Addr => emit_unary_addr(s, e)
         OpKind.AddrMut => emit_unary_addr_mut(s, e)

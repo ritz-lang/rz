@@ -892,30 +892,28 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 # shares its name with a sibling branch's `let`, #1755.)
                 # LARB R43 (#3385): a tail if / match of an `-> f64` fn is a float slot.
                 set_match_float_hint(s, stmt.expr, f.return_type, f.return_type_name)
-                let tail_raw: i32 = emit_expr(s, stmt.expr)
-                let tail_i64: i32 = ptr_slot_value(s, f.return_type, stmt.expr, tail_raw)
-                let tail_ptr: i32 = mut_ref_slot_value(s, f.return_type, stmt.expr, tail_i64)   # AGAST #2391
-                # AGAST #2074: a `1.0` tail in an `-> f32` fn is fptrunc'd.
-                let val: i32 = float_ret_value(s, tail_ptr, f.return_type, stmt.expr)
-                if ty_int_bits(f.return_type) == 32
-                    let trunc: i32 = ir_trunc_i64_i32(s.ir.out, @s.fcx.reg_counter, val)
-                    format_into(s, "  ret i32 %.{trunc}\n")
-                else if f.return_type == TypeKind.Bool
-                    # Comparisons zext to i64; trunc back for bool returns.
-                    # (task-99 cluster #1)
-                    let btrunc: i32 = ir_trunc_i64_i1(s.ir.out, @s.fcx.reg_counter, val)
-                    format_into(s, "  ret i1 %.{btrunc}\n")
-                else if ty_int_bits(f.return_type) == 8
-                    # Narrow byte return
-                    let btrunc8: i32 = ir_trunc_i64_i8(s.ir.out, @s.fcx.reg_counter, val)
-                    format_into(s, "  ret i8 %.{btrunc8}\n")
-                else if ty_int_bits(f.return_type) == 16
-                    let btrunc16: i32 = ir_trunc_i64_i16(s.ir.out, @s.fcx.reg_counter, val)
-                    format_into(s, "  ret i16 %.{btrunc16}\n")
-                else if f.return_type == TypeKind.Void
-                    format_into(s, "  ret void\n")
+                if f.return_type == TypeKind.Bool
+                    emit_ret_bool(s, stmt.expr)   # AGAST #4854: the i1, not a trunc
                 else
-                    format_into(s, "  ret {llvm_text(ty_value_llvm(f.return_type))} %.{val}\n")
+                    let tail_raw: i32 = emit_expr(s, stmt.expr)
+                    let tail_i64: i32 = ptr_slot_value(s, f.return_type, stmt.expr, tail_raw)
+                    let tail_ptr: i32 = mut_ref_slot_value(s, f.return_type, stmt.expr, tail_i64)   # AGAST #2391
+                    # AGAST #2074: a `1.0` tail in an `-> f32` fn is fptrunc'd.
+                    let val: i32 = float_ret_value(s, tail_ptr, f.return_type, stmt.expr)
+                    if ty_int_bits(f.return_type) == 32
+                        let trunc: i32 = ir_trunc_i64_i32(s.ir.out, @s.fcx.reg_counter, val)
+                        format_into(s, "  ret i32 %.{trunc}\n")
+                    else if ty_int_bits(f.return_type) == 8
+                        # Narrow byte return
+                        let btrunc8: i32 = ir_trunc_i64_i8(s.ir.out, @s.fcx.reg_counter, val)
+                        format_into(s, "  ret i8 %.{btrunc8}\n")
+                    else if ty_int_bits(f.return_type) == 16
+                        let btrunc16: i32 = ir_trunc_i64_i16(s.ir.out, @s.fcx.reg_counter, val)
+                        format_into(s, "  ret i16 %.{btrunc16}\n")
+                    else if f.return_type == TypeKind.Void
+                        format_into(s, "  ret void\n")
+                    else
+                        format_into(s, "  ret {llvm_text(ty_value_llvm(f.return_type))} %.{val}\n")
         else
             # AGAST #2823: only the LAST statement decides.  A `return` followed
             # by dead code (an `if` that returns, say) leaves the final block
@@ -1216,6 +1214,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     let val: i32 = next_reg(s)
                     format_into(s, "  %.{val} = load %{struct_name_ir.as_view()}, ptr %.{alloca_reg}\n")
                     format_into(s, "  ret %{struct_name_ir.as_view()} %.{val}\n")
+            else if method.return_type == TypeKind.Bool
+                set_match_float_hint(s, stmt.expr, method.return_type, method.return_type_name)
+                emit_ret_bool(s, stmt.expr)   # AGAST #4854: the i1, not a trunc
             else
                 # AGAST #1652: a tail `s` (`s: @&S`) from a `-> *S` fn is a `ptr`.
                 # (`let`, not `var` + reassign: ritz0 mis-scopes a `var` that
@@ -1230,11 +1231,6 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                 if ty_int_bits(method.return_type) == 32
                     let trunc: i32 = ir_trunc_i64_i32(s.ir.out, @s.fcx.reg_counter, val)
                     format_into(s, "  ret i32 %.{trunc}\n")
-                else if method.return_type == TypeKind.Bool
-                    # Comparisons zext to i64 in emit_binary; trunc back to
-                    # i1 for bool-returning methods. (task-99 cluster #1)
-                    let btrunc: i32 = ir_trunc_i64_i1(s.ir.out, @s.fcx.reg_counter, val)
-                    format_into(s, "  ret i1 %.{btrunc}\n")
                 else if ty_int_bits(method.return_type) == 8
                     let btrunc8: i32 = ir_trunc_i64_i8(s.ir.out, @s.fcx.reg_counter, val)
                     format_into(s, "  ret i8 %.{btrunc8}\n")
@@ -2445,7 +2441,7 @@ pub fn emit_module(m: *Module, out: *String, alloc: *Allocator, mono: *MonoCtx, 
             unknown_struct_name: no_name()   # AGAST #3362
         },
         own: null,
-        emit: EmitTable { expr: emit_expr_impl, stmt: emit_stmt_impl, lvalue_ptr: emit_lvalue_ptr_impl, member_ptr: emit_member_ptr_impl, into_slot: emit_expr_into_slot_impl, into_field: emit_expr_into_field_impl, method: emit_expr_method_impl, array_assign: emit_array_local_whole_assign_impl },   # AGAST #4697
+        emit: EmitTable { expr: emit_expr_impl, cond: emit_cond_impl, stmt: emit_stmt_impl, lvalue_ptr: emit_lvalue_ptr_impl, member_ptr: emit_member_ptr_impl, into_slot: emit_expr_into_slot_impl, into_field: emit_expr_into_field_impl, method: emit_expr_method_impl, array_assign: emit_array_local_whole_assign_impl },   # AGAST #4697
         own_before_ret_fn: own_before_ret,   # AGAST #3513
         ref_cast_reads_referent_fn: ref_cast_reads_referent
     }

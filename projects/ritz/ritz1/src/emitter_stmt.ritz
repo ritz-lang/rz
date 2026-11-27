@@ -1137,6 +1137,12 @@ fn emit_assign_to_expr(s: *EmitterState, stmt: *Stmt)
     assign_to_expr_generic(s, stmt, target_expr, orig_target, orig_reach)
 
 
+# `ret i1` of a `-> bool` fn's value `e`: its condition, so `return a or b`
+# returns the i1 phi with no zext / trunc round trip (AGAST #4854).
+pub fn emit_ret_bool(s: *EmitterState, e: *Expr)
+    let cond: i32 = emit_cond(s, e)
+    format_into(s, "  ret i1 %.{cond}\n")
+
 fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     if stmt.return_value == null
         format_into(s, "  ret void\n")
@@ -1154,6 +1160,9 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     if struct_return_as_int_refused(s, stmt.return_value, ret_type)   # AGAST #3008
         return
     set_match_float_hint(s, stmt.return_value, ret_type, s.fcx.ret_type_name)
+    if ret_type == TypeKind.Bool
+        emit_ret_bool(s, stmt.return_value)
+        return
     let val: i32 = emit_expr(s, stmt.return_value)
     match ty_int_bits(ret_type)
         32 =>
@@ -1183,12 +1192,6 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
             # so they get an inttoptr (as an `@&T` let's init does).
             let ret_pval: i32 = i64_value_to_ptr(s, stmt.return_value, val)
             format_into(s, "  ret ptr %.{ret_pval}\n")
-        TypeKind.Bool =>
-            # Bool returns: emit_expr always produces i64 (icmp result is
-            # zext-promoted to i64).  Truncate back to i1 for the return —
-            # squeeze.bits.bits_at_end and friends declare `-> bool`.
-            let bool_trunc: i32 = ir_trunc_i64_i1(s.ir.out, @s.fcx.reg_counter, val)
-            format_into(s, "  ret i1 %.{bool_trunc}\n")
         _ =>
             # Every other value type: ty_value_llvm is the table that spells
             # it, so this arm is the one path, not a default text (S-MATCH-3).
@@ -2301,7 +2304,7 @@ fn emit_if_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     match_result_init(@fr, 1)
     fr.float_ty = take_match_float_hint(s)
     fr.hint_ty = fr.float_ty
-    let cond_i1: i32 = cond_to_i1(s, emit_expr(s, stmt.if_cond))
+    let cond_i1: i32 = emit_cond(s, stmt.if_cond)
 
     let then_label: i32 = next_label(s)
     let else_label: i32 = next_label(s)
@@ -2467,7 +2470,7 @@ fn emit_while_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
 
     br_to(s, cond_label)
     begin_block(s, cond_label)
-    let cond_i1: i32 = cond_to_i1(s, emit_expr(s, stmt.while_cond))
+    let cond_i1: i32 = emit_cond(s, stmt.while_cond)
     own_cond_end(s)   # AGAST #2165: dropped on every evaluation
     br_if(s, cond_i1, body_label, end_label)
 

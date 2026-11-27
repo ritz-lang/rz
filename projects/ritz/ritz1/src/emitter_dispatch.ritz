@@ -17,7 +17,8 @@ import sema_probe            # RITZ1_SEMA_PROBE (AGAST #3501)
 import emitter_expr_access   # emit_expr_ident, emit_expr_index, emit_expr_member
 import emitter_aggregate     # emit_struct_lit_value
 import emitter_expr
-import emitter_expr_arith    # emit_expr_binary, emit_expr_unary
+import emitter_expr_arith    # emit_expr_binary, emit_expr_unary, emit_binary_cond, emit_not_cond
+import emitter_stmt_parts    # cond_to_i1
 import emitter_expr_call     # emit_expr_call, emit_expr_method
 import emitter_match         # emit_match, emit_if_expr
 
@@ -32,6 +33,33 @@ pub fn emit_expr_impl(s: *EmitterState, e: *Expr) -> i32
     let r: i32 = emit_expr_body(s, e)
     frame_mark(s, fm_line, fm_col)
     r
+
+# A condition `e` as an i1 register (AGAST #4854).  ritz1 has one value model,
+# every bool an i64 0 / 1 (#1646); this is the other end of a bool, where a
+# `br`, a phi or a `ret i1` reads it.  A compare, `and` / `or` and `not` are
+# lowered straight to their i1 (emit_binary_cond, emit_not_cond), so a chain
+# of them is never widened and tested again; any other bool is its value,
+# tested (cond_to_i1).  Their value form is this i1 zero-extended, once.
+pub fn emit_cond_impl(s: *EmitterState, e: *Expr) -> i32
+    if not is_cond_shaped(e)
+        return cond_to_i1(s, emit_expr(s, e))
+    # Located and probed as emit_expr_impl is.
+    if e.span.line == 0
+        return emit_cond_body(s, e)
+    let fm_line: i32 = s.fcx.fm_line
+    let fm_col: i32 = s.fcx.fm_col
+    frame_mark(s, e.span.line, e.span.col)
+    let r: i32 = emit_cond_body(s, e)
+    frame_mark(s, fm_line, fm_col)
+    r
+
+fn emit_cond_body(s: *EmitterState, e: *Expr) -> i32
+    if sema_probe_on() == 1
+        var em: SemaProbeEmitter = SemaProbeEmitter { s: s as *u8, bool_kind: probe_bool_kind, slot_type: probe_slot_type, source_file: probe_source_file }
+        sema_probe_expr(s.sym.mono.pctx, @em, e)
+    if e.kind == ExprKind.Binary
+        return emit_binary_cond(s, e)
+    emit_not_cond(s, e)
 
 fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
     # Safety check for null expression

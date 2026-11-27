@@ -1,0 +1,125 @@
+# Regression (AGAST #4854): ritz1 lowers a compare, `and` / `or` and `not`
+# where a condition reads them (`if`, `while`, an if-expression, `assert`, a
+# `-> bool` return) as i1, with an i1 phi at each short-circuit merge; a bool
+# VALUE (a `let`, an argument, a field, a compare's operand) is that i1
+# zero-extended to the i64 every value lives in.  Every position below gives
+# the same answer under all three compilers; the IR shape is pinned by
+# ritz0/tests/test_ritz1_bool_call_cond.py (test_ritz1_bool_condition_rows).
+
+struct Flags
+    hit: bool
+    n: i32
+
+var calls: i32 = 0
+
+# A side effect, so a skipped operand shows.
+fn bump(v: bool) -> bool
+    calls = calls + 1
+    v
+
+fn is_space(c: u8) -> bool
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r'
+
+fn in_range(c: u8) -> bool
+    c >= 'a' and c <= 'z'
+
+fn neither(a: bool, b: bool) -> bool
+    not (a or b)
+
+fn both_small(x: u64, y: u64) -> bool
+    x < 10 and y < 10
+
+fn out_of_unit(f: f64) -> bool
+    f < 0.0 or f > 1.0
+
+fn id(b: bool) -> bool
+    b
+
+impl Flags
+    fn ok(self: @Flags) -> bool
+        self.hit and self.n > 0
+
+[[test]]
+fn test_bool_i1_return_or_chain() -> i32
+    if not is_space(' ') or not is_space('\t') or not is_space('\n') or not is_space('\r')
+        return 1
+    if is_space('a') or is_space(0) or is_space(11)
+        return 2
+    0
+
+[[test]]
+fn test_bool_i1_tail_and() -> i32
+    if not in_range('m') or in_range('A') or in_range('{')
+        return 1
+    0
+
+[[test]]
+fn test_bool_i1_not_of_or() -> i32
+    if not neither(false, false) or neither(true, false) or neither(false, true)
+        return 1
+    0
+
+[[test]]
+fn test_bool_i1_unsigned_and_float() -> i32
+    # 1 << 63 is negative as an i64: a signed `<` would call it small.
+    let big: u64 = 1 << 63
+    if both_small(big, 1) or not both_small(3, 4)
+        return 1
+    if not out_of_unit(-0.5) or not out_of_unit(1.5) or out_of_unit(0.5)
+        return 2
+    0
+
+[[test]]
+fn test_bool_i1_short_circuit() -> i32
+    calls = 0
+    if bump(false) and bump(true)
+        return 1
+    if calls != 1
+        return 2
+    if not (bump(true) or bump(true))
+        return 3
+    if calls != 2
+        return 4
+    # Nested: the right `or` runs only when the left `and` was false.
+    if (bump(true) and bump(false)) or bump(true)
+        if calls != 5
+            return 5
+    else
+        return 6
+    0
+
+[[test]]
+fn test_bool_i1_values() -> i32
+    let x: i32 = 3
+    # Stored, passed, compared: the i1 widened to a value.
+    let a: bool = x > 1 and x < 5
+    let b: bool = not (x == 3)
+    if not a or b
+        return 1
+    if not id(x < 0 or x > 2)
+        return 2
+    if (x < 1) == (x > 5) and not (x < 4)
+        return 3
+    let f: Flags = Flags { hit: x == 3 or x == 4, n: x }
+    if not f.ok()
+        return 4
+    let g: Flags = Flags { hit: not f.hit, n: 1 }
+    if g.ok()
+        return 5
+    0
+
+[[test]]
+fn test_bool_i1_while_and_if_expr() -> i32
+    var i: i32 = 0
+    var n: i32 = 0
+    while i < 10 and not (i == 7)
+        i = i + 1
+        n = n + (if i > 2 and i < 5 then 10 else 1)
+    if i != 7
+        return 1
+    # i = 1..7: 1, 1, 10, 10, 1, 1, 1
+    if n != 25
+        return 2
+    assert i == 7 and n == 25
+    assert not (i < 0 or n < 0)
+    0
