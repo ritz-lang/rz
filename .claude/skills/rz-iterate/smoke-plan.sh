@@ -100,12 +100,19 @@
 # collect-only run, ~10-20 s, so in no smoke plan).  tools-unit and unit together subsume it
 # (tools/ and all of ritz0): a diff that plans both runs only those; either
 # alone does not.  So every plan holds tools-ratchets or tools-unit, and both
-# run the tree guards (AGAST #4902): tracked *.orig/*.rej/*.old leftovers
-# (test_project_root_hygiene.py) and ritz0/ritzlib orphans
-# (test_check_liveness.py::test_real_tree_is_live).  #4773's car tracked
-# ritz1/src/monomorph.ritz.orig; its ritz1-only smoke ran no tools-unit and
-# the train gate was first to see it.  ~3.3 s of work in tools-ratchets'
-# faster half.
+# run the tree guards (AGAST #4902, #4907), 19 node ids
+# (projects/ritz/Makefile's TOOLS_RATCHETS_NODES): tracked *.orig/*.rej/*.old
+# leftovers and the rest of test_project_root_hygiene.py's repo-wide checks
+# (tracked ELF/IR, a symlink into a build dir), ritz0/ritzlib orphans
+# (test_check_liveness.py::test_real_tree_is_live), every [[bin]] and
+# convenience link git-ignored, no fixed /tmp path in a test, and the
+# manifest/syscall/stray-tests/repo-cleanup/account-name checks.  #4773's car
+# tracked ritz1/src/monomorph.ritz.orig; its ritz1-only smoke ran no
+# tools-unit and the train gate was first to see it.  #4833
+# (projects/buddhafinger) hit the same gap on the bin-link and /tmp-path
+# guards: a package-only diff plans tools-ratchets, not tools-unit.  #4907's
+# audit swept in the rest of the class.  All 19 together are well under 5 s
+# of work in tools-ratchets' faster half.
 #
 # The floor, not the whole check (AGAST #4777, ROOM.md step 6): a room adds
 # targets for what its change can break beyond the files it touched, and

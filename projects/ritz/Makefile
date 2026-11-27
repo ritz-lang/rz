@@ -124,14 +124,47 @@ TOOLS_RATCHETS_OUT = tools/test_ritz1_incremental_deps.py
 # [tools/ unit tests].  All 35 files, ~10 s on 4 workers at load ~20: the
 # cshape files alone cost the same (one report of the tree).
 #
-# Plus two tree guards by node id, not whole files (AGAST #4902): #4773's car
+# Plus tree guards by node id, not whole files (AGAST #4902): #4773's car
 # tracked ritz1/src/monomorph.ritz.orig and its ritz1-only smoke never ran
 # tools-unit, so the train gate was first to see it.  ~3.3 s on one worker
 # (the liveness walk ~3 s), in the half that finishes first: measured on
 # huburght, the tools half ended 15-35 s before the ritz0 half.  tools-unit
 # still runs both.
+#
+# Two more (AGAST #4907): #4833 (projects/buddhafinger) passed its smoke
+# check, then turned train cf246290 red at [tools/ unit tests] on these same
+# class of guard - a buddhafinger-only diff plans tools-ratchets, not
+# tools-unit (pkg:buddhafinger covers the build; nothing in the path rules
+# names tools-unit), so neither guard ran until the train gate.  Both scan
+# the whole tree in well under a second alone.
+#
+# Plus the rest of the class an #4907 audit found: every other tools/
+# test_*.py test that reads tracked files across projects/ (not just
+# compiler sources), needs no build, and runs in low seconds alone - the
+# repo-wide siblings of test_no_merge_or_editor_leftovers_tracked in
+# test_project_root_hygiene.py (they share its one `git ls-files -s` walk),
+# the convenience-link sibling of the [[bin]] guard above, and six more
+# repo-wide content/manifest checks.  All 19 nodes together: well under 5 s
+# on one worker.
 TOOLS_RATCHETS_NODES = tools/test_project_root_hygiene.py::test_no_merge_or_editor_leftovers_tracked \
-	tools/test_check_liveness.py::test_real_tree_is_live
+	tools/test_project_root_hygiene.py::test_no_elf_tracked_in_repo \
+	tools/test_project_root_hygiene.py::test_elf_fixtures_exist \
+	tools/test_project_root_hygiene.py::test_no_compiler_output_ir_tracked \
+	tools/test_project_root_hygiene.py::test_ir_fixtures_exist \
+	tools/test_project_root_hygiene.py::test_walk_reads_tracked_files \
+	tools/test_project_root_hygiene.py::test_no_tracked_symlink_into_a_build_dir \
+	tools/test_check_liveness.py::test_real_tree_is_live \
+	tools/test_bin_links_ignored.py::test_every_bin_link_is_ignored \
+	tools/test_valet_http_tmp_paths.py::test_no_fixed_tmp_path_in_tests \
+	tools/test_convenience_links_ignored.py::test_every_convenience_link_is_ignored \
+	tools/test_legacy_printers_deleted.py::test_no_workspace_code_uses_a_legacy_printer \
+	tools/test_package_syscall_numbers.py::test_no_package_redeclares_syscall_numbers_beside_ritzlib_sys \
+	tools/test_package_syscall_numbers.py::test_no_package_passes_a_bare_syscall_number_beside_ritzlib_sys \
+	tools/test_manifest_schema.py::test_every_committed_manifest_validates \
+	tools/test_manifest_schema.py::test_every_test_sources_dir_exists \
+	tools/test_build_stray_tests_dir.py::test_no_package_in_the_repo_has_stray_tests \
+	tools/test_repo_cleanup.py::test_no_transcripts_or_generated_assets_are_tracked \
+	tools/test_room_account.py::test_repo_names_no_account_dirs
 
 #
 # The ratchets under ritz0/tests run too (AGAST #4622: train 2026-11-24 went

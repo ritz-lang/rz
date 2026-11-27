@@ -96,13 +96,38 @@ def test_standard_pins_are_ratchets():
     assert missing == [], f"tools-ratchets misses {missing}"
 
 
-#   The tree guards every smoke runs (AGAST #4902): #4773's car tracked
-# ritz1/src/monomorph.ritz.orig, its ritz1-only smoke planned no tools-unit,
-# and the train gate went red on the leftover guard.  ~3.3 s on one worker
-# (the liveness walk ~3 s), in the half that finishes first.
+#   The tree guards every smoke runs (AGAST #4902, #4907): #4773's car
+# tracked ritz1/src/monomorph.ritz.orig, its ritz1-only smoke planned no
+# tools-unit, and the train gate went red on the leftover guard.  #4833
+# (projects/buddhafinger) hit the same gap on the bin-link and fixed-/tmp
+# guards.  #4907's audit then swept in the rest of the class: every other
+# tools/ test that reads tracked files across projects/ (not just compiler
+# sources), needs no build, and runs in low seconds alone - the repo-wide
+# siblings of the leftover guard in test_project_root_hygiene.py (one shared
+# `git ls-files -s` walk), the convenience-link sibling of the [[bin]] guard,
+# and the manifest/syscall/stray-tests/repo-cleanup/account-name checks.
+# ~3.3 s of that is the liveness walk; all 19 together are well under 5 s on
+# one worker.
 TREE_GUARDS = [
     "tools/test_project_root_hygiene.py::test_no_merge_or_editor_leftovers_tracked",
+    "tools/test_project_root_hygiene.py::test_no_elf_tracked_in_repo",
+    "tools/test_project_root_hygiene.py::test_elf_fixtures_exist",
+    "tools/test_project_root_hygiene.py::test_no_compiler_output_ir_tracked",
+    "tools/test_project_root_hygiene.py::test_ir_fixtures_exist",
+    "tools/test_project_root_hygiene.py::test_walk_reads_tracked_files",
+    "tools/test_project_root_hygiene.py::test_no_tracked_symlink_into_a_build_dir",
     "tools/test_check_liveness.py::test_real_tree_is_live",
+    "tools/test_bin_links_ignored.py::test_every_bin_link_is_ignored",
+    "tools/test_valet_http_tmp_paths.py::test_no_fixed_tmp_path_in_tests",
+    "tools/test_convenience_links_ignored.py::test_every_convenience_link_is_ignored",
+    "tools/test_legacy_printers_deleted.py::test_no_workspace_code_uses_a_legacy_printer",
+    "tools/test_package_syscall_numbers.py::test_no_package_redeclares_syscall_numbers_beside_ritzlib_sys",
+    "tools/test_package_syscall_numbers.py::test_no_package_passes_a_bare_syscall_number_beside_ritzlib_sys",
+    "tools/test_manifest_schema.py::test_every_committed_manifest_validates",
+    "tools/test_manifest_schema.py::test_every_test_sources_dir_exists",
+    "tools/test_build_stray_tests_dir.py::test_no_package_in_the_repo_has_stray_tests",
+    "tools/test_repo_cleanup.py::test_no_transcripts_or_generated_assets_are_tracked",
+    "tools/test_room_account.py::test_repo_names_no_account_dirs",
 ]
 
 
