@@ -1,0 +1,500 @@
+# Polled AHCI probe (AGAST #4882). In the kernel, at CPL 0, beside NVMe.
+#
+# Class 01:06:01 is driven. Class 01:04 logs one RAID-mode line and is not
+# touched: no BAR map, no command-register write. The HBA is enabled, the
+# BIOS/OS handoff runs, firmware-started ports are quiesced, then GHC.HR.
+# Each implemented port shares one 1 s DET deadline. ATA disks are identified
+# with a polled IDENTIFY DEVICE in slot 0. 4Kn and non-LBA48 disks are logged
+# and skipped. Read/write DMA is #4884; this probe only brings the ports up
+# and logs them.
+
+import klog { klog, klog_dec }
+import io { memory_barrier, cpu_pause, rdtsc }
+import ritzlib.span { span_from_ptr }
+import drivers.pci {
+    PciDevice, pci_get_device_count, pci_get_device, pci_enable_bus_master,
+    pci_enable_memory, pci_dev_read_config16, pci_dev_write_config16
+}
+import mm.vmm { vmm_map_mmio, phys_to_virt }
+import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
+import arch.x86_64.tsc { tsc_hz }
+import arch.x86_64.tsc_calc { tsc_deadline, tsc_deadline_passed }
+import drivers.ahci.regs {
+    ahci_port_reg, ahci_pi_has, ahci_class_action, ahci_sig_kind, ahci_rf_read,
+    ahci_rf_write, ahci_handoff_init, ahci_handoff_step, AhciHandoff,
+    AHCI_REG_CAP, AHCI_REG_GHC, AHCI_REG_CAP2, AHCI_REG_BOHC, AHCI_REG_PI,
+    AHCI_CAP_SSS, AHCI_CAP_S64A, AHCI_GHC_HR, AHCI_GHC_AE, ClassAction, Handoff,
+    AHCI_PORT_DEADLINE_MS, AHCI_QUIESCE_MS, AHCI_RESET_MS, AHCI_DMA32_LIMIT,
+    AHCI_PX_CLB, AHCI_PX_CLBU, AHCI_PX_FB, AHCI_PX_FBU, AHCI_PX_IS, AHCI_PX_CMD,
+    AHCI_PX_TFD, AHCI_PX_SIG, AHCI_PX_SSTS, AHCI_PX_SERR, AHCI_PX_CI,
+    AHCI_PXCMD_ST, AHCI_PXCMD_SUD, AHCI_PXCMD_FRE, AHCI_PXCMD_FR, AHCI_PXCMD_CR,
+    AHCI_TFD_ERR, AHCI_TFD_DRQ, AHCI_TFD_BSY, AHCI_SSTS_DET_MASK, AHCI_SSTS_DET_UP,
+    AHCI_IS_TFES, SigKind
+}
+import drivers.ahci.identify {
+    IdentifyInfo, IdentifyError, ahci_parse_identify, AHCI_ID_BYTES
+}
+
+const AHCI_MAX_CTL: i32 = 4
+const AHCI_MAX_DISKS: i32 = 8
+const AHCI_CMD_TABLE: u64 = 2048
+const AHCI_FIS: u64 = 1024
+const PCI_COMMAND_REG: u8 = 0x04
+const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400
+const AHCI_MAP_LEN: u64 = 0x2000
+
+# Why a controller was not driven. A skipped port is not one of these:
+# the probe still owns the HBA and goes on to the next port.
+pub enum AhciError
+    Timeout
+    BarNotMemory
+    MapFailed
+    HandoffKept
+    NoDma
+    CtlFull
+
+# How many disks a scan found, or why that controller was not driven.
+type AhciPorts = Result<u32, AhciError>
+
+pub struct AhciCtl
+    pci: *PciDevice
+    bar: u64
+    map_len: u64
+    cap: u32
+    pi: u32
+
+pub struct AhciDisk
+    ctl: i32
+    port: i32
+    sectors: u64
+    write_cache: bool
+    page: u64
+
+var ahci_ctls: [4]AhciCtl
+var ahci_ctl_count: i32 = 0
+var ahci_disks: [8]AhciDisk
+var ahci_disk_count: i32 = 0
+var ahci_probed: bool = false
+
+pub fn ahci_get_disk_count() -> i32
+    ahci_disk_count
+
+# The nth identified disk, in probe order. None when n is outside the table.
+pub fn ahci_get_disk(n: i32) -> Option<@AhciDisk>
+    if n < 0 or n >= ahci_disk_count
+        return None
+    Some(@ahci_disks[n])
+
+fn ahci_r32(bar: u64, off: u32) -> u32
+    volatile_load((bar + off as u64) as *u32)
+
+fn ahci_w32(bar: u64, off: u32, value: u32)
+    volatile_store((bar + off as u64) as *u32, value)
+
+fn log_hex(value: u32, width: i32)
+    var i: i32 = width - 1
+    while i >= 0
+        let shift: u32 = (i * 4) as u32
+        let nib: u32 = (value >> shift) & 0xF
+        var ch: [1]u8
+        if nib < 10
+            ch[0] = (48 + nib) as u8
+        else
+            ch[0] = (87 + nib) as u8
+        klog(StrView { ptr: @ch[0], len: 1 })
+        i = i - 1
+
+fn log_bdf(pci: *PciDevice)
+    log_hex((*pci).bus as u32, 2)
+    klog(":")
+    log_hex((*pci).device as u32, 2)
+    klog(".")
+    log_hex((*pci).function as u32, 1)
+
+fn log_id(pci: *PciDevice)
+    klog("[")
+    log_hex((*pci).vendor_id as u32, 4)
+    klog(":")
+    log_hex((*pci).device_id as u32, 4)
+    klog("]")
+
+fn ahci_elapsed_ms(start: u64) -> i64
+    let hz: u64 = tsc_hz()
+    if hz == 0
+        return 100000
+    let now: u64 = rdtsc()
+    if now < start
+        return 0
+    ((now - start) * 1000 / hz) as i64
+
+fn ahci_wait_bit_clear(bar: u64, off: u32, bit: u32, ms: i64) -> Result<(), AhciError>
+    let deadline: u64 = tsc_deadline(rdtsc(), tsc_hz(), (ms as u64) * 1000)
+    while true
+        if (ahci_r32(bar, off) & bit) == 0
+            return Ok(())
+        if tsc_deadline_passed(rdtsc(), deadline)
+            return Err(AhciError.Timeout)
+        cpu_pause()
+
+fn ahci_take_ownership(bar: u64) -> Result<(), AhciError>
+    var mem: [48]u8
+    let bytes: [u8] = @mem
+    bytes.zero()
+    var h: AhciHandoff
+    ahci_handoff_init(@&h)
+    let start: u64 = rdtsc()
+    while true
+        ahci_rf_write(bytes, AHCI_REG_CAP2, ahci_r32(bar, AHCI_REG_CAP2))
+        ahci_rf_write(bytes, AHCI_REG_BOHC, ahci_r32(bar, AHCI_REG_BOHC))
+        let st: Handoff = ahci_handoff_step(@&h, bytes, ahci_elapsed_ms(start))
+        let want: u32 = ahci_rf_read(bytes, AHCI_REG_BOHC)
+        if want != ahci_r32(bar, AHCI_REG_BOHC)
+            ahci_w32(bar, AHCI_REG_BOHC, want)
+        match st
+            Handoff.Busy => cpu_pause()
+            Handoff.Taken => return Ok(())
+            Handoff.Kept => return Err(AhciError.HandoffKept)
+
+fn ahci_quiesce(pci: *PciDevice, bar: u64, pi: u32)
+    var port: i32 = 0
+    while port < 32
+        if ahci_pi_has(pi, port)
+            let cmd_off: u32 = ahci_port_reg(port, AHCI_PX_CMD)
+            var cmd: u32 = ahci_r32(bar, cmd_off)
+            if (cmd & (AHCI_PXCMD_ST | AHCI_PXCMD_CR)) != 0
+                ahci_w32(bar, cmd_off, cmd & ~AHCI_PXCMD_ST)
+                match ahci_wait_bit_clear(bar, cmd_off, AHCI_PXCMD_CR, AHCI_QUIESCE_MS)
+                    Ok(_) => pass
+                    Err(_) =>
+                        klog("[ahci] ")
+                        log_bdf(pci)
+                        klog(" port ")
+                        klog_dec(port as i64)
+                        klog(": firmware left CR set\n")
+            cmd = ahci_r32(bar, cmd_off)
+            if (cmd & (AHCI_PXCMD_FRE | AHCI_PXCMD_FR)) != 0
+                ahci_w32(bar, cmd_off, cmd & ~AHCI_PXCMD_FRE)
+                match ahci_wait_bit_clear(bar, cmd_off, AHCI_PXCMD_FR, AHCI_QUIESCE_MS)
+                    Ok(_) => pass
+                    Err(_) =>
+                        klog("[ahci] ")
+                        log_bdf(pci)
+                        klog(" port ")
+                        klog_dec(port as i64)
+                        klog(": firmware left FR set\n")
+        port = port + 1
+
+fn ahci_reset(bar: u64) -> Result<(), AhciError>
+    ahci_w32(bar, AHCI_REG_GHC, AHCI_GHC_HR)
+    match ahci_wait_bit_clear(bar, AHCI_REG_GHC, AHCI_GHC_HR, AHCI_RESET_MS)
+        Ok(_) => pass
+        Err(_) => return Err(AhciError.Timeout)
+    ahci_w32(bar, AHCI_REG_GHC, AHCI_GHC_AE)
+    Ok(())
+
+fn dma_low_ok(cap: u32, phys: u64) -> bool
+    if (cap & AHCI_CAP_S64A) != 0
+        return true
+    phys < AHCI_DMA32_LIMIT
+
+fn zero_page(phys: u64)
+    let virt: u64 = phys_to_virt(phys)
+    var i: u64 = 0
+    while i < PAGE_SIZE
+        *((virt + i) as *u64) = 0
+        i = i + 8
+
+fn alloc_page() -> u64
+    let p: u64 = pmm_alloc_page()
+    if p != 0
+        zero_page(p)
+    p
+
+fn mem_w8(phys: u64, off: u64, value: u8)
+    *((phys_to_virt(phys) + off) as *u8) = value
+
+fn mem_w32(phys: u64, off: u64, value: u32)
+    volatile_store((phys_to_virt(phys) + off) as *u32, value)
+
+fn ahci_identify(bar: u64, port: i32, page: u64, id: u64) -> Result<IdentifyInfo, IdentifyError>
+    let ct: u64 = page + AHCI_CMD_TABLE
+    mem_w32(page, 0, 5 | (1 << 16))
+    mem_w32(page, 4, 0)
+    mem_w32(page, 8, (ct & 0xFFFFFFFF) as u32)
+    mem_w32(page, 12, (ct >> 32) as u32)
+    var b: u64 = 0
+    while b < 20
+        mem_w8(ct, b, 0)
+        b = b + 1
+    mem_w8(ct, 0, 0x27)
+    mem_w8(ct, 1, 0x80)
+    mem_w8(ct, 2, 0xEC)
+    mem_w32(page, AHCI_CMD_TABLE + 0x80, (id & 0xFFFFFFFF) as u32)
+    mem_w32(page, AHCI_CMD_TABLE + 0x84, (id >> 32) as u32)
+    mem_w32(page, AHCI_CMD_TABLE + 0x88, 0)
+    mem_w32(page, AHCI_CMD_TABLE + 0x8C, 511 | 0x80000000)
+    memory_barrier()
+    let is_off: u32 = ahci_port_reg(port, AHCI_PX_IS)
+    let ci_off: u32 = ahci_port_reg(port, AHCI_PX_CI)
+    let cmd_off: u32 = ahci_port_reg(port, AHCI_PX_CMD)
+    ahci_w32(bar, is_off, 0xFFFFFFFF)
+    let cmd: u32 = ahci_r32(bar, cmd_off)
+    ahci_w32(bar, cmd_off, cmd | AHCI_PXCMD_ST)
+    ahci_w32(bar, ci_off, 1)
+    let deadline: u64 = tsc_deadline(rdtsc(), tsc_hz(), 1000000)
+    while (ahci_r32(bar, ci_off) & 1) != 0
+        if tsc_deadline_passed(rdtsc(), deadline)
+            return Err(IdentifyError.Io)
+        cpu_pause()
+    let tfd: u32 = ahci_r32(bar, ahci_port_reg(port, AHCI_PX_TFD))
+    let is: u32 = ahci_r32(bar, is_off)
+    if (tfd & AHCI_TFD_ERR) != 0 or (is & AHCI_IS_TFES) != 0
+        return Err(IdentifyError.Io)
+    let raw: [u8] = span_from_ptr<u8>(phys_to_virt(id) as *u8, AHCI_ID_BYTES)
+    ahci_parse_identify(raw)
+
+fn log_skip(pci: *PciDevice, port: i32, why: StrView)
+    klog("[ahci] ")
+    log_bdf(pci)
+    klog(" port ")
+    klog_dec(port as i64)
+    klog(": ")
+    klog(why)
+    klog("\n")
+
+fn log_disk(pci: *PciDevice, port: i32, info: @IdentifyInfo)
+    klog("[ahci] ")
+    log_bdf(pci)
+    klog(" port ")
+    klog_dec(port as i64)
+    klog(": ")
+    let model: StrView = info.model()
+    if model.len > 0
+        klog(model)
+    klog(" ")
+    let serial: StrView = info.serial()
+    if serial.len > 0
+        klog(serial)
+    klog(", ")
+    klog_dec(info.sectors as i64)
+    klog(" sectors, 512-byte sectors")
+    if info.write_cache
+        klog(", write cache")
+    klog("\n")
+
+fn ahci_program_port(bar: u64, cap: u32, port: i32, page: u64)
+    let cl: u64 = page
+    let fb: u64 = page + AHCI_FIS
+    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_CLB), (cl & 0xFFFFFFFF) as u32)
+    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_CLBU), (cl >> 32) as u32)
+    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_FB), (fb & 0xFFFFFFFF) as u32)
+    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_FBU), (fb >> 32) as u32)
+    var cmd: u32 = AHCI_PXCMD_FRE
+    if (cap & AHCI_CAP_SSS) != 0
+        cmd = cmd | AHCI_PXCMD_SUD
+    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_CMD), cmd)
+    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_SERR), 0xFFFFFFFF)
+    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_IS), 0xFFFFFFFF)
+
+# Disks added to the table: 1, or 0 when the port is not a 512-byte LBA48
+# disk. A skip is not a failure of the controller (S-RESULT-1).
+fn ahci_claim(pci: *PciDevice, bar: u64, ctl_index: i32, port: i32, page: u64, id_phys: u64) -> u32
+    let tfd_off: u32 = ahci_port_reg(port, AHCI_PX_TFD)
+    let deadline: u64 = tsc_deadline(rdtsc(), tsc_hz(), 1000000)
+    while (ahci_r32(bar, tfd_off) & (AHCI_TFD_BSY | AHCI_TFD_DRQ)) != 0
+        if tsc_deadline_passed(rdtsc(), deadline)
+            log_skip(pci, port, "busy, skipped")
+            return 0
+        cpu_pause()
+    match ahci_sig_kind(ahci_r32(bar, ahci_port_reg(port, AHCI_PX_SIG)))
+        SigKind.Atapi =>
+            log_skip(pci, port, "ATAPI, skipped")
+            return 0
+        SigKind.Pm =>
+            log_skip(pci, port, "port multiplier, skipped")
+            return 0
+        SigKind.Semb =>
+            log_skip(pci, port, "SEMB, skipped")
+            return 0
+        SigKind.Other =>
+            log_skip(pci, port, "not an ATA disk, skipped")
+            return 0
+        SigKind.Ata => pass
+    zero_page(id_phys)
+    match ahci_identify(bar, port, page, id_phys)
+        Ok(info) =>
+            if ahci_disk_count >= AHCI_MAX_DISKS
+                log_skip(pci, port, "disk table full, skipped")
+                return 0
+            log_disk(pci, port, @info)
+            ahci_disks[ahci_disk_count].ctl = ctl_index
+            ahci_disks[ahci_disk_count].port = port
+            ahci_disks[ahci_disk_count].sectors = info.sectors
+            ahci_disks[ahci_disk_count].write_cache = info.write_cache
+            ahci_disks[ahci_disk_count].page = page
+            ahci_disk_count = ahci_disk_count + 1
+            return 1
+        Err(e) =>
+            match e
+                IdentifyError.NoLba48 => log_skip(pci, port, "no LBA48, skipped")
+                IdentifyError.Sector4Kn(_) => log_skip(pci, port, "4Kn, skipped")
+                IdentifyError.Short => log_skip(pci, port, "IDENTIFY failed, skipped")
+                IdentifyError.Io => log_skip(pci, port, "IDENTIFY failed, skipped")
+            return 0
+
+fn ahci_scan_ports(dev: *PciDevice, bar: u64, mlen: u64, cap: u32, pi: u32, ctl: i32) -> AhciPorts
+    var pages: [32]u64
+    var port: i32 = 0
+    while port < 32
+        pages[port] = 0
+        port = port + 1
+    let id_phys: u64 = alloc_page()
+    if id_phys == 0 or not dma_low_ok(cap, id_phys)
+        if id_phys != 0
+            pmm_free_page(id_phys)
+        klog("[ahci] ")
+        log_bdf(dev)
+        klog(": no DMA page below 4 GiB; not driven\n")
+        return Err(AhciError.NoDma)
+    port = 0
+    while port < 32
+        if ahci_pi_has(pi, port)
+            let last: u32 = ahci_port_reg(port, AHCI_PX_CI) + 4
+            if last as u64 > mlen
+                log_skip(dev, port, "registers past the ABAR, skipped")
+            else
+                let page: u64 = alloc_page()
+                if page == 0 or not dma_low_ok(cap, page)
+                    if page != 0
+                        pmm_free_page(page)
+                    pmm_free_page(id_phys)
+                    klog("[ahci] ")
+                    log_bdf(dev)
+                    klog(": no DMA page below 4 GiB; not driven\n")
+                    return Err(AhciError.NoDma)
+                pages[port] = page
+                ahci_program_port(bar, cap, port, page)
+        port = port + 1
+    let deadline: u64 = tsc_deadline(rdtsc(), tsc_hz(), (AHCI_PORT_DEADLINE_MS as u64) * 1000)
+    var state: [32]i32
+    port = 0
+    while port < 32
+        state[port] = 0
+        port = port + 1
+    var found: i32 = 0
+    while true
+        var pending: i32 = 0
+        port = 0
+        while port < 32
+            if pages[port] != 0 and state[port] == 0
+                let det: u32 = ahci_r32(bar, ahci_port_reg(port, AHCI_PX_SSTS)) & AHCI_SSTS_DET_MASK
+                if det == AHCI_SSTS_DET_UP
+                    state[port] = 1
+                    found = found + ahci_claim(dev, bar, ctl, port, pages[port], id_phys) as i32
+                else
+                    pending = pending + 1
+            port = port + 1
+        if pending == 0 or tsc_deadline_passed(rdtsc(), deadline)
+            break
+        cpu_pause()
+    pmm_free_page(id_phys)
+    port = 0
+    while port < 32
+        if pages[port] != 0 and state[port] == 0
+            pmm_free_page(pages[port])
+        port = port + 1
+    Ok(found as u32)
+
+fn ahci_note_raid(pci: *PciDevice)
+    klog("[ahci] ")
+    log_bdf(pci)
+    klog(" ")
+    log_id(pci)
+    klog(" is a RAID-mode SATA controller (class 01:04): not driven. ")
+    klog("Set SATA mode to AHCI in firmware setup.\n")
+
+fn ahci_drive(pci: *PciDevice) -> AhciPorts
+    if (*pci).bar_is_io[5] != 0 or (*pci).bar[5] == 0
+        klog("[ahci] ")
+        log_bdf(pci)
+        klog(": BAR5 is not a memory BAR\n")
+        return Err(AhciError.BarNotMemory)
+    pci_enable_memory(pci)
+    pci_enable_bus_master(pci)
+    let cmd: u16 = pci_dev_read_config16(pci, PCI_COMMAND_REG)
+    pci_dev_write_config16(pci, PCI_COMMAND_REG, cmd | PCI_COMMAND_INTX_DISABLE)
+    var map_len: u64 = AHCI_MAP_LEN
+    if (*pci).bar_size[5] != 0 and (*pci).bar_size[5] < map_len
+        map_len = (*pci).bar_size[5]
+    let bar: u64 = vmm_map_mmio((*pci).bar[5], map_len)
+    if bar == 0
+        klog("[ahci] ")
+        log_bdf(pci)
+        klog(": could not map the ABAR\n")
+        return Err(AhciError.MapFailed)
+    ahci_w32(bar, AHCI_REG_GHC, AHCI_GHC_AE)
+    match ahci_take_ownership(bar)
+        Ok(_) => pass
+        Err(_) =>
+            klog("[ahci] ")
+            log_bdf(pci)
+            klog(": firmware kept AHCI ownership; not driven\n")
+            return Err(AhciError.HandoffKept)
+    let pi: u32 = ahci_r32(bar, AHCI_REG_PI)
+    ahci_quiesce(pci, bar, pi)
+    match ahci_reset(bar)
+        Ok(_) => pass
+        Err(_) =>
+            klog("[ahci] ")
+            log_bdf(pci)
+            klog(": HBA reset timed out; not driven\n")
+            return Err(AhciError.Timeout)
+    let cap: u32 = ahci_r32(bar, AHCI_REG_CAP)
+    let pi2: u32 = ahci_r32(bar, AHCI_REG_PI)
+    if ahci_ctl_count >= AHCI_MAX_CTL
+        klog("[ahci] ")
+        log_bdf(pci)
+        klog(": controller table full\n")
+        return Err(AhciError.CtlFull)
+    let index: i32 = ahci_ctl_count
+    ahci_ctls[index].pci = pci
+    ahci_ctls[index].bar = bar
+    ahci_ctls[index].map_len = map_len
+    ahci_ctls[index].cap = cap
+    ahci_ctls[index].pi = pi2
+    ahci_ctl_count = ahci_ctl_count + 1
+    # `?` does not treat a Result alias as a Result (LANGUAGE_SPEC §14.2).
+    let n: u32 = match ahci_scan_ports(pci, bar, map_len, cap, pi2, index)
+        Ok(found) => found
+        Err(e) => return Err(e)
+    klog("[ahci] ")
+    log_bdf(pci)
+    klog(": ")
+    klog_dec(n as i64)
+    if n == 1
+        klog(" disk\n")
+    else
+        klog(" disks\n")
+    Ok(n)
+
+# Find every AHCI HBA and identify its ATA disks. Runs once, from
+# virtio_blk_init, early, with IF=0. Later calls return the disk count.
+# A controller that cannot be driven is logged inside ahci_drive; the probe
+# still returns the disks it did find.
+pub fn ahci_probe() -> Result<u32, AhciError>
+    if ahci_probed
+        return Ok(ahci_disk_count as u32)
+    ahci_probed = true
+    let n: i32 = pci_get_device_count()
+    var i: i32 = 0
+    while i < n
+        let pci: *PciDevice = pci_get_device(i)
+        match ahci_class_action((*pci).class_code, (*pci).subclass, (*pci).prog_if)
+            ClassAction.Raid => ahci_note_raid(pci)
+            ClassAction.Drive =>
+                match ahci_drive(pci)
+                    Ok(_) => pass
+                    Err(_) => pass
+            ClassAction.Ignore => pass
+        i = i + 1
+    Ok(ahci_disk_count as u32)
