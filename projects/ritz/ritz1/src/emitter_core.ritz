@@ -52,8 +52,7 @@ struct NameList
 # A let/var seen so far in the current function, with the integer type its
 # annotation WROTE (TypeKind.NarrowUnknown when unannotated or not an integer).
 struct NarrowDecl
-    name: *u8
-    name_len: i32
+    name: StrView
     decl_type: TypeKind
     # AGAST #2124: what the declaration wrote, for `sizeof(local)`: the
     # annotation (Stmt.var_declared_type, TypeKind.Void when there is none) and
@@ -79,10 +78,8 @@ struct DeferredLoad
     reg: i32          # the load's result register (already burned)
     off: i64          # s.ir.out offset the line belongs at
     src_reg: i32      # `ptr %.N` source, or -1 when it is a named global
-    src_name: *u8     # `ptr @<name>` source when src_reg < 0
-    src_name_len: i32
-    ty: *u8          # the struct type name, internal (pre-emit_name) spelling
-    ty_len: i32
+    src_name: StrView     # `ptr @<name>` source when src_reg < 0
+    ty: StrView          # the struct type name, internal (pre-emit_name) spelling
     state: i32
     used: i32         # 1 once the IR referenced the register as an operand
 
@@ -374,8 +371,7 @@ struct Diag
     # AGAST #3362 — the last undeclared struct name already reported (by the
     # member access rule, or #3347's literal rule for `String`), so one
     # mistake is one error; see unknown_struct_member_refused.
-    unknown_struct_name: *u8
-    unknown_struct_name_len: i32
+    unknown_struct_name: StrView
 
 # AGAST #4697 — the emitter: four parts, the dispatch seam and the two
 # hooks into modules emitter_core does not import.
@@ -434,14 +430,12 @@ struct FrameMark
 # AGAST #3739 — register `reg` holds the local `name` (len bytes).
 struct FrameSlot
     reg: i32
-    name_len: i32
-    name: *u8
+    name: StrView
 
 # AGAST #2158 — a binding that owns a value of a move-only type
 # (LANGUAGE_SPEC §13.1): one that implements Drop or holds one.
 struct OwnBinding
-    name: *u8
-    name_len: i32
+    name: StrView
     local_idx: i32        # its index in s.fcx.locals when it was declared
     slot: i32             # register of its storage (alloca / byval pointer)
     flag: i32             # register of its `alloca i1` drop flag
@@ -1052,30 +1046,26 @@ pub fn dload_region_cannot_write(s: *EmitterState, from: i64) -> i32
         p = p + ll
     1
 
-fn dload_dup(p: *u8, n: i32) -> *u8
-    if p == null or n <= 0
-        return null
-    let d: *u8 = malloc(n as i64)
-    memcpy(d, p, n as i64)
-    d
+fn dload_dup(v: StrView) -> StrView
+    if v.ptr == null or v.len <= 0
+        return strview_empty()
+    let d: *u8 = malloc(v.len)
+    memcpy(d, v.ptr, v.len)
+    StrView { ptr: d, len: v.len }
 
-pub fn dload_add(s: *EmitterState, reg: i32, ty_sv: StrView, src_reg: i32, src_name: *u8, src_name_len: i32)
+pub fn dload_add(s: *EmitterState, reg: i32, ty: StrView, src_reg: i32, src_name: StrView)
     if s.ir.dload_count >= s.ir.dload_cap
         var cap: i32 = 8
         if s.ir.dload_cap > 0
             cap = s.ir.dload_cap * 2
         s.ir.dloads = realloc(s.ir.dloads as *u8, (cap as i64) * sizeof(DeferredLoad)) as *DeferredLoad
         s.ir.dload_cap = cap
-    var ty: *u8 = ty_sv.ptr
-    var ty_len: i32 = ty_sv.len as i32
     let r: *DeferredLoad = s.ir.dloads + (s.ir.dload_count as i64)
     r.reg = reg
     r.off = s.ir.out.data.len
     r.src_reg = src_reg
-    r.src_name = dload_dup(src_name, src_name_len)
-    r.src_name_len = src_name_len
-    r.ty = dload_dup(ty, ty_len)
-    r.ty_len = ty_len
+    r.src_name = dload_dup(src_name)
+    r.ty = dload_dup(ty)
     r.state = DLOAD_PENDING
     r.used = 0
     s.ir.dload_count = s.ir.dload_count + 1
@@ -1117,13 +1107,13 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
             s.ir.out = @line
             let dst: i32 = r.reg
             format_into(s, "  %.{dst} = load %")
-            emit_name(s, StrView { ptr: (r.ty), len: (r.ty_len) as i64 })
+            emit_name(s, r.ty)
             if r.src_reg >= 0
                 let src: i32 = r.src_reg
                 format_into(s, ", ptr %.{src}\n")
             else
                 format_into(s, ", ptr @")
-                emit_name(s, StrView { ptr: (r.src_name), len: (r.src_name_len) as i64 })
+                emit_name(s, r.src_name)
                 format_into(s, "\n")
             s.ir.out = saved
             let at: i64 = r.off + shift
@@ -1135,10 +1125,10 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
     var k: i32 = 0
     while k < s.ir.dload_count
         let r2: *DeferredLoad = s.ir.dloads + (k as i64)
-        if r2.ty != null
-            free(r2.ty)
-        if r2.src_name != null
-            free(r2.src_name)
+        if r2.ty.ptr != null
+            free(r2.ty.ptr)
+        if r2.src_name.ptr != null
+            free(r2.src_name.ptr)
         k += 1
     s.ir.dload_count = 0
 
@@ -1797,8 +1787,7 @@ pub fn add_local_full(s: *EmitterState, name_sv: StrView, reg: i32, var_type: Ty
         s.fcx.fs = realloc(s.fcx.fs as *u8, (s.fcx.fs_cap as i64) * sizeof(FrameSlot)) as *FrameSlot
     let fslot: *FrameSlot = s.fcx.fs + (s.fcx.fs_count as i64)
     fslot.reg = reg
-    fslot.name = name
-    fslot.name_len = len
+    fslot.name = name_sv
     s.fcx.fs_count = s.fcx.fs_count + 1
     let idx: i32 = s.fcx.local_count
     let loc: *LocalVar = local_at(s, idx)
@@ -2123,11 +2112,9 @@ struct MemberPtrResult
 # struct.  For a pointer element, what it points at, as elem_recorded_pointee has it.
 struct ForElem
     elem: TypeKind
-    name: *u8
-    name_len: i32
+    name: StrView
     pointee: TypeKind
-    pointee_name: *u8
-    pointee_name_len: i32
+    pointee_name: StrView
 
 pub fn namelist_init(l: *NameList, cap: i32)
     l.names = malloc((cap as i64) * 8) as **u8

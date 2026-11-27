@@ -81,7 +81,10 @@ SEMA_TYPE = SRC / "sema_type.ritz"
 # (ret_type_name, ctx_enum_name, ctx_slot_name, ctx_simd_name,
 # last_match_agg_name, last_if_stmt_agg_name, match_agg_hint) is one
 # StrView, so the same state is seven fields fewer.
-MEASURED_FIELDS = 96
+#
+# #4773 slice 15 removed one more: Diag.unknown_struct_name is a StrView, not
+# a `*u8` + unknown_struct_name_len pair.
+MEASURED_FIELDS = 95
 
 # AGAST #4697: EmitterState is these four parts (field -> struct), the
 # dispatch seam and the hooks.  Each part is a struct in emitter_core.ritz.

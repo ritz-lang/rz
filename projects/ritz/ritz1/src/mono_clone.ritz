@@ -506,7 +506,7 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
     match k
         StmtKind.Expr =>
             if s == mono.mono_tail
-                slice_into_expected(mono, m, s.expr, StrView { ptr: (mono.mono_ret_name), len: (mono.mono_ret_len) as i64 })   # AGAST #2877
+                slice_into_expected(mono, m, s.expr, mono.mono_ret_name)   # AGAST #2877
             collect_from_expr(mono, m, s.expr)
         StmtKind.VarDecl =>
             # Before tracking: `let t = v[1..3]` is `let t = v.slice(1, 3)`, so `t`
@@ -637,7 +637,7 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
             pass   # StmtKind.Asm holds no statement, expression or type (AGAST #3394).
         StmtKind.Return =>
             if s.return_value != null
-                slice_into_expected(mono, m, s.return_value, StrView { ptr: (mono.mono_ret_name), len: (mono.mono_ret_len) as i64 })   # AGAST #2877
+                slice_into_expected(mono, m, s.return_value, mono.mono_ret_name)   # AGAST #2877
                 collect_from_expr(mono, m, s.return_value)
         StmtKind.Assert =>
             # `assert <cond>` — cond stored in if_cond (slot reuse).  Generic
@@ -1168,9 +1168,9 @@ fn slice_into_expected(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView)
         slice_into_expected(mono, m, e.args, pay_sv)
 
 # The return type of the fn whose body collect_from_fn_body walks, and its
-# tail statement (a `-> T` fn's value), for slice_into_expected.  null in a
+# tail statement (a `-> T` fn's value), for slice_into_expected.  Empty in a
 # generic's specialisation, which is left as it was.
-# (MonoCtx.mono_ret_name, .mono_ret_len, .mono_tail)
+# (MonoCtx.mono_ret_name, .mono_tail)
 
 # If `e` is `b[i]` (or `(*b)[i]`) on a Vec or Span, the collection's "$T"
 # suffix; empty otherwise.  `b` is a tracked local (the collection itself, or
@@ -1418,24 +1418,22 @@ fn clone_and_specialize_function(mono: *MonoCtx, m: *Module, template: *FnDef, s
 fn collect_receiver_methods(mono: *MonoCtx, m: *Module, f: *FnDef)
     if f == null
         return
-    let saved_ret: *u8 = mono.mono_ret_name
-    let saved_ret_len: i32 = mono.mono_ret_len
+    let saved_ret: StrView = mono.mono_ret_name
     let saved_tail: *Stmt = mono.mono_tail
     reset_local_var_tracker(mono)
     var pp: *Param = f.params
     while pp != null
-        if mono.impl_self_len > 0 and param_is_self(pp) == 1 and pp.param_type_name.len == 0
+        if mono.impl_self_name.len > 0 and param_is_self(pp) == 1 and pp.param_type_name.len == 0
             # AGAST #3617: a bare `self` / `self:&` of the impl method being
             # specialised is its instance, which name_untyped_self names only
             # afterwards: `self.m()` wants `m` there alone.
-            track_typed_local_through(mono, pp.name, TypeKind.MutRef, TypeKind.Struct, StrView { ptr: (mono.impl_self_name), len: (mono.impl_self_len) as i64 })
+            track_typed_local_through(mono, pp.name, TypeKind.MutRef, TypeKind.Struct, mono.impl_self_name)
         else
             track_typed_local_through(mono, pp.name, pp.param_type, pp.param_pointee_type, pp.param_type_name)
         pp = pp.next
     set_mono_fn_context(mono, null)   # A specialisation has no slot context (#2877).
     collect_from_fn_body(mono, m, f.body)
     mono.mono_ret_name = saved_ret
-    mono.mono_ret_len = saved_ret_len
     mono.mono_tail = saved_tail
 
 # Rewrite every `$`-separated component of `name` that equals type_param to
@@ -3216,11 +3214,9 @@ fn specialize_impl_method(mono: *MonoCtx, m: *Module, ib: *ImplBlock, method: *F
     memcpy(self_name, type_name, type_name_len as i64)
     memcpy(self_name + type_name_len, suffix, suffix_len as i64)
     *(self_name + type_name_len + suffix_len) = 0
-    mono.impl_self_name = self_name
-    mono.impl_self_len = type_name_len + suffix_len
+    mono.impl_self_name = StrView { ptr: self_name, len: (type_name_len + suffix_len) as i64 }
     let specialized: *FnDef = clone_and_specialize_function(mono, m, template, suffix_sv)
-    mono.impl_self_name = null
-    mono.impl_self_len = 0
+    mono.impl_self_name = strview_empty()
     free(template as *u8)
     if specialized == null
         return null
