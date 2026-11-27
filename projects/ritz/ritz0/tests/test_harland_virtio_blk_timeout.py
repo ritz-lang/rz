@@ -174,8 +174,8 @@ pub fn nvme_ns_write(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i
 """
 
 # Physical == virtual, as in the kernel's identity map: pages come from a
-# page-aligned slice of .bss, consecutive calls give contiguous pages (the
-# ring allocator in common.ritz relies on that).
+# page-aligned slice of .bss, single pages and pmm_alloc_contig's runs (the
+# rings, common.ritz) handed out upwards.
 PMM_STUB = """\
 pub const PAGE_SIZE: u64 = 4096
 
@@ -191,6 +191,17 @@ pub fn pmm_alloc_page() -> u64
     let p: u64 = g_next
     g_next = g_next + 4096
     p
+
+pub fn pmm_alloc_contig(n: u64) -> u64
+    let first: u64 = pmm_alloc_page()
+    if first == 0
+        return 0
+    var i: u64 = 1
+    while i < n
+        if pmm_alloc_page() == 0
+            return 0
+        i = i + 1
+    first
 
 pub fn pmm_free_page(addr: u64) -> i32
     0
