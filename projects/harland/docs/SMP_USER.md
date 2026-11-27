@@ -80,7 +80,7 @@ These are the globals an AP-resident process reaches through its syscalls, IRQs 
 | fs / tty | `fs/syscall.ritz fs_procs` (shared part); `fs/kfs.ritz`, `vfs.ritz`; `tty/ldisc.ritz`; `serial.ritz` input buffers | read/write/open, console IRQ | BSP |
 | Log | `klog.ritz ring_buffer`, `ring_head`, the console sink; `serial.ritz` output ring | everywhere, including IRQ, NMI and panic | none: leaf lock `klog_lock` |
 | Dispatch | `syscall/dispatch.ritz g_syscall_count` | every syscall | each CPU its own count. `syscall_count()` sums them |
-| In-kernel drivers | `drivers/nvme`, `virtio/blk`, `virtio/net`, `ena` queue state | fs syscalls, the in-kernel net stack | BSP. Lent to an AP for one AP call (the survey's point 2 below) |
+| In-kernel drivers | `drivers/nvme`, `virtio/blk`, `virtio/net`, `ena` queue state; `drivers/usb` (xHCI + HID keyboard, `USB.md`) controller, slot, ring and HID state | fs syscalls, the in-kernel net stack; for `drivers/usb`, its MSI-X vector (aimed at the BSP), the BSP tick's polled fallback and the console it feeds | BSP. The block and net drivers are lent to an AP for one AP call (the survey's point 2 below). `drivers/usb` is never lent |
 
 #### Which syscalls run on the AP
 
