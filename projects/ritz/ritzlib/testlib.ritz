@@ -4,7 +4,7 @@
 # tier 2-4 test_*.ritz file:
 #
 #   * buf_eq / buf_contains  — byte-span comparison
-#   * sandbox_path           — pid-suffixed /tmp paths
+#   * sandbox_path           — pid-suffixed paths under $TMPDIR (else /tmp)
 #   * exec_capture           — run a binary with the given args, env and stdin
 #                              (delivered race-free via a temp file) and
 #                              capture its stdout and stderr, merged
@@ -38,6 +38,7 @@ pub import ritzlib.strview
 pub import ritzlib.span
 pub import ritzlib.result
 pub import ritzlib.process
+import ritzlib.os.env
 
 # ============================================================================
 # Buffer primitives
@@ -73,12 +74,31 @@ pub fn buf_contains(hay: Span<u8>, needle: Span<u8>) -> bool
 # Sandbox paths
 # ============================================================================
 
-# "/tmp/ritz_<prefix>_<pid>_<suffix>".  The pid keeps parallel test workers
-# (gate slots, compiler variants) from colliding; the suffix tells a test's
-# own paths apart ("src", "dst", "subdir").  A path the kernel wants as a C
-# string is `p.as_ptr()`; one going to a StrView API is `p.as_view()`.
+# "<tmp>/ritz_<prefix>_<pid>_<suffix>", where <tmp> is $TMPDIR when it is set
+# and non-empty, else /tmp.  $TMPDIR matters because a host's /tmp may be
+# mounted noexec: a test that links a program into its sandbox and runs it
+# then fails to spawn, so the gate gives every test an exec-capable $TMPDIR.
+# The pid keeps parallel test workers (gate slots, compiler variants) from
+# colliding; the suffix tells a test's own paths apart ("src", "dst",
+# "subdir").  A path the kernel wants as a C string is `p.as_ptr()`; one going
+# to a StrView API is `p.as_view()`.
 pub fn sandbox_path(prefix: StrView, suffix: StrView) -> String
-    var p: String = string_from("/tmp/ritz_")
+    match env_get("TMPDIR")
+        Some(dir) =>
+            return sandbox_path_under(dir, prefix, suffix)
+        None =>
+            return sandbox_path_under("", prefix, suffix)
+
+# sandbox_path with the directory given: "<dir>/ritz_<prefix>_<pid>_<suffix>".
+# An empty `dir` is /tmp, and a trailing '/' on it is not doubled.
+pub fn sandbox_path_under(dir: StrView, prefix: StrView, suffix: StrView) -> String
+    var base: StrView = "/tmp"
+    if not dir.is_empty()
+        base = dir
+    if base.len > 1 and base.ends_with("/")
+        base = StrView { ptr: base.ptr, len: base.len - 1 }
+    var p: String = string_from(base)
+    p.push_str("/ritz_")
     p.push_str(prefix)
     p.push('_')
     let pid: String = string_from_i64(sys_getpid() as i64)
