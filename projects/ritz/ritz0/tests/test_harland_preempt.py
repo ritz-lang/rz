@@ -220,9 +220,15 @@ def test_tick_preempts_only_a_process_after_its_eoi():
 def test_switch_points_everything_per_process_at_the_next_process():
     sw = _body(_code(SCHED), "sched_switch_to")
     order = ["proc_set_current(next)", "vmm_switch_pml4(p.pml4)", "sched_use_kstack(next)",
-             "fs_process_select(p.pid)", "sched_switch(@(*from).ksp, p.ksp)"]
+             "fs_process_select(p.pid)", "sched_switch(save_at, p.ksp)"]
     idx = [sw.index(s) for s in order]
     assert idx == sorted(idx), sw
+    # From a process its RSP goes in its slot; from the idle context (#4879)
+    # in the CPU's idle slot. Onto the idle context nothing per-process moves.
+    assert "save_at = @(*proc_at(prev)).ksp" in sw and "@sched_idle_ksp[cpu]" in sw
+    idle = sw[sw.index("if next < 0"):sw.index("let p: *Proc = proc_at(next)")]
+    assert "proc_set_current(-1)" in idle and "sched_switch(save_at, sched_idle_ksp[cpu])" in idle
+    assert "vmm_switch_pml4" not in idle and "sched_use_kstack" not in idle
     use = _body(_code(SCHED), "sched_use_kstack")
     assert "gdt_set_kernel_stack_cpu(cpu_index(), top)" in use and "kstack_set_current(top)" in use
 

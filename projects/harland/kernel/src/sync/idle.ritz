@@ -1,0 +1,78 @@
+# Harland CPU-level sleep: the idle handshake and the kick (AGAST #4879,
+# docs/SMP_USER.md §4 "CPU-level sleep")
+#
+# An idle CPU sleeps in `hlt` and is woken by a kick IPI. A wake-up must
+# never be lost between "nothing to do" and `hlt`, so the idle loop and the
+# waker run a handshake on this CPU's `pc_idle`:
+#
+#   idle loop (IF=0)                       waker (another CPU)
+#   1. cpu_idle_begin: xchg pc_idle, 1     a. make work: a CAS on a state
+#   2. re-check for work; if any:             word, or a mailbox post
+#      cpu_idle_cancel and run it          b. cpu_kick_if_idle: read pc_idle,
+#   3. else cpu_idle_sleep: sti; hlt          kick if it is 1
+#
+# Both sides do a locked op between their store and their load (the xchg;
+# the CAS, a full barrier), so on TSO at least one sees the other's store:
+# the re-check finds the work, or the waker finds pc_idle = 1 and kicks. A
+# kick sent after step 1 is held pending while IF=0, and `sti`'s interrupt
+# shadow delivers it only once `hlt` has started, so it wakes the hlt.
+# Mailbox posts always kick (sync/mbox.ritz), whatever pc_idle says.
+#
+# test/test_smp_proto.ritz models this handshake. `pc_idle` is a u32 word
+# because it is the operand of atomic ops; 0 and 1 are its only values.
+
+import io { sti_hlt, disable_interrupts }
+import arch.x86_64.cpu_map { MAX_CPUS }
+import sync.mbox { mbox_kick }
+
+# percpu.ritz: this CPU's cpu_map index (as sync/mbox.ritz declares it).
+extern fn cpu_index() -> i32
+
+# 1 while CPU c is between cpu_idle_begin and its wake (or cancel).
+var pc_idle: [64]u32
+
+fn valid_cpu(cpu: i32) -> bool
+    cpu >= 0 and cpu < MAX_CPUS
+
+# Step 1, called with IF=0: announce that this CPU is about to sleep. The
+# xchg is a locked op, so the re-check after it cannot be reordered before
+# the store (SMP_USER.md §4 step 1).
+pub fn cpu_idle_begin()
+    let me: i32 = cpu_index()
+    if valid_cpu(me)
+        atomic_xchg(@pc_idle[me], 1)
+
+# Step 2 found work: this CPU is not going to sleep.
+pub fn cpu_idle_cancel()
+    let me: i32 = cpu_index()
+    if valid_cpu(me)
+        atomic_store(@pc_idle[me], 0)
+
+# Step 3: sleep until an interrupt. `sti; hlt` back to back: a kick held
+# pending while IF=0 is delivered in hlt, never before it (§4 step 3).
+# Returns with IF=0 and this CPU no longer idle.
+pub fn cpu_idle_sleep()
+    sti_hlt()
+    disable_interrupts()
+    let me: i32 = cpu_index()
+    if valid_cpu(me)
+        atomic_store(@pc_idle[me], 0)
+
+# CPU `cpu` announced it is going to sleep and has not woken since.
+pub fn cpu_is_idle(cpu: i32) -> bool
+    if not valid_cpu(cpu)
+        return false
+    atomic_load(@pc_idle[cpu]) != 0
+
+# Send the kick IPI (sync/mbox.ritz KICK_VECTOR) to CPU `cpu`, unless it is
+# this CPU.
+pub fn cpu_kick(cpu: i32)
+    mbox_kick(cpu)
+
+# The waker's side, after its CAS made work for CPU `cpu` (the CAS is the
+# full barrier): kick only a CPU that announced it is going to sleep. A busy
+# CPU finds the work at its next pick, so it is not interrupted (§4, the
+# waker reads pc_idle after its CAS).
+pub fn cpu_kick_if_idle(cpu: i32)
+    if cpu_is_idle(cpu)
+        cpu_kick(cpu)

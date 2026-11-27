@@ -60,11 +60,11 @@ import syscall.errno { Errno }
 import cap.types { CapEntry, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, cap_handle_init }
 import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_revoke, cap_irq_owner }
 import mm.shm { shm_live, shm_detach_expired }
-import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_reap_pending }
+import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_unblock_current, proc_reap_pending }
 import proc.sched { sched_block }
 import proc.waitq { waitq_can_park }
 import proc.waitset { irq_object_known, irq_object_domain, waitset_arm, waitset_disarm }
-import proc.waitset { WaitPlan, Collected, Notify, wait_plan_new, wait_plan_irq, wait_plan_add, waitset_collect, shm_notify }
+import proc.waitset { WaitPlan, Collected, Notify, wait_plan_new, wait_plan_irq, wait_plan_add, waitset_collect, waitset_pending, shm_notify }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_ATTACH, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
 import mm.pmm { PAGE_SIZE }
@@ -204,7 +204,12 @@ fn wait_collect(pid: u32, ureq: *WaitRequest, checked: *CheckedRequest, deadline
             break
         waitset_arm(slot, deadline)
         drv_irq_wait_parks = drv_irq_wait_parks + 1
+        # The eventcount sleep (SMP_USER.md §4): announce BLOCKED with a
+        # locked xchg, then re-check; a post that landed after the collect
+        # above keeps it running ("sleep.announce", "sleep.recheck").
         proc_block(BLOCK_WAIT, 0)
+        if waitset_pending(@checked.plan, pid as u64)
+            proc_unblock_current()
         sched_block()
     waitset_disarm(slot)
     enable_interrupts()

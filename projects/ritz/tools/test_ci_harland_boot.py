@@ -214,6 +214,10 @@ SCHED_OK = "[sched] 356 ticks, 285 switches, 233 preemptions, 250 contended tick
 # The kernel's SMP syscall-stack self-test (AGAST #4192): all four CPUs were
 # in a ring-3 SYSCALL at once, each on its own per-CPU stack.
 SMP_OK = "[smp] syscall stacks OK: 4 CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\n"
+# The BSP pinged each of the three APs over its mailbox and every pong came
+# back in order (AGAST #4879, SMP_USER.md §6).
+MBOX_OK = "".join(f"[mbox] round trip OK: cpu {k} answered 64 pings\n" for k in (1, 2, 3))
+SMP_OK = SMP_OK + MBOX_OK
 PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
 # The native ESP carries \\harland\\klog-dump, so the kernel dumps its crash
 # ring before init: the dump must be exactly the kernel's serial output up to
@@ -583,6 +587,47 @@ def test_missing_per_cpu_syscall_stack_verdict_fails(tree):
     r = _run(tree, serial)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "no per-CPU syscall stack verdict" in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "mbox, verdict",
+    [
+        (MBOX_OK.replace("[mbox] round trip OK: cpu 3 answered 64 pings\n", ""),
+         "2 of 3 APs answered the mailbox round trip"),
+        (MBOX_OK.replace("[mbox] round trip OK: cpu 3 answered 64 pings\n",
+                         "[mbox] round trip FAIL: cpu 3 answered 17 of 64 pings\n"),
+         "an AP did not answer the BSP's pings over its mailbox"),
+        (MBOX_OK.replace("cpu 3", "cpu 2"), "2 of 3 APs answered the mailbox round trip"),
+    ],
+    ids=["missing-ap", "ap-failed", "same-ap-twice"],
+)
+def test_every_ap_must_answer_the_mailbox_round_trip(tree, mbox, verdict):
+    """Every AP -smp starts must answer the BSP's pings over its mailbox
+    (AGAST #4879): one OK line per distinct AP, and no FAIL line."""
+    r = _run(tree, PASSED.replace(MBOX_OK, mbox))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert verdict in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("line, rc", [("[mbox] no APs to ping\n", 0), ("", 1)], ids=["said", "silent"])
+def test_one_cpu_must_say_it_has_no_ap_to_ping(tree, line, rc):
+    """At -smp 1 there is no AP: the kernel says so, and silence fails. Nor
+    does it run the SMP syscall-stack self-test (init_smp needs an AP)."""
+    r = _run(tree, PASSED.replace(SMP_OK, line), env_extra={"QEMU_SMP": "1"})
+    assert r.returncode == rc, r.stdout + r.stderr
+    assert "PASS (native): one CPU, no SMP syscall-stack self-test to run" in r.stdout
+    if rc == 0:
+        assert "PASS (native): one CPU, no AP to ping over the mailbox" in r.stdout
+
+
+@pytest.mark.integration
+def test_one_cpu_with_an_smp_verdict_fails(tree):
+    """At one CPU the kernel runs no SMP self-test, so a verdict is news."""
+    r = _run(tree, PASSED.replace(MBOX_OK, "[mbox] no APs to ping\n"), env_extra={"QEMU_SMP": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "one CPU, but the SMP self-test said something" in r.stdout
 
 
 @pytest.mark.integration

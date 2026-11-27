@@ -123,7 +123,7 @@ slot: seq u64 | kind u32 | from u16 | flags u16 | pid u64 | arg[5] u64
 - **Taking.** The owner reads `slot[head % 16].seq`. It equals `head + 1` once the slot is published. The owner copies the body out, then stores `seq = head + 16` to free the slot. Freeing before the copy would let a producer overwrite the body the owner is still reading.
 - **Order:** FIFO by ticket, so FIFO per producer.
 - **Never full, by construction.** Each process has at most one `FORWARD` or `RETURN` in flight, and only the BSP sends requests, one at a time, so a mailbox holds at most `MAX_PROCS + 2` messages. 16 covers that, and the producer's wait for a free slot is an assertion (`[mbox] full`), not a path.
-- **The kick.** After posting, the producer sends the owner vector 240 (today's AP-call vector, renamed `KICK_VECTOR`), unless the owner is this CPU. The handler sends EOI. If it interrupted user mode or the idle `hlt`, it drains the mailbox. If it interrupted kernel code, it sets `pc_kick_pending`, and the mailbox is drained at that code's next safe point.
+- **The kick.** After posting, the producer runs `mfence`, then sends the owner vector 240 (today's AP-call vector, renamed `KICK_VECTOR`), unless the owner is this CPU. The fence matters in x2APIC mode: the kick is a `wrmsr` to the ICR, which is not ordered after the post's plain stores, so without it the owner can take the kick, find the slot unpublished and halt for good (`test_smp_proto.ritz` finds this; its step is `kick.fence`). The handler sends EOI and sets `pc_kick_pending`; it never drains in the IRQ. The mailbox is drained at the owner's next safe point: in #4879 that is the idle loop, whose `hlt` the kick ends. Draining at return to user (a pinned process spinning in user mode) comes with #4881. Running a `CALL` from the idle loop rather than the ISR also means no ISR is in service while the callee waits for its own device interrupt.
 - **Safe points:** return to user, the idle loop, and a block. Never in the middle of kernel code, because a message mutates owner state that the interrupted code may be halfway through changing. This is what makes "only the owner writes" hold against the owner's own IRQs too. Every message handler is short and never blocks: it queues a process, inserts a capability, edits PTEs or runs one AP call.
 
 **No deadlock.** Only the BSP ever busy-waits for another CPU: for a `CALL` result, and from #4880 for `UNMAP_DONE`. While it waits it takes only replies addressed to its own request, IF=1, and its own IRQs run. An AP never busy-waits on another CPU. A forwarded caller leaves the AP, which goes on to idle, a safe point, so the BSP's requests are always served. With no cycle of waiters there is no deadlock.
@@ -138,11 +138,11 @@ slot: seq u64 | kind u32 | from u16 | flags u16 | pid u64 | arg[5] u64
 
 #### The leaf locks
 
-- **`klog_lock`** (`klog.ritz`) covers the ring, the serial output ring and the console sink (`klog_console_start`, #4868). It is a ticket spinlock taken with IF saved and cleared. NMI and panic use trylock and write anyway. It calls up into nothing.
-  - **The host test (the survey's point 4).** `test/test_klog.ritz` runs klog and serial as an ordinary user program, where `cli` faults. So the lock has an IF-save switch, `klog_irqsave(false)`, exactly like `drivers/display/fbcon.ritz fbcon_irqsave`. The test turns it off next to its existing `klog_serial(false)`.
-- **`pmm_lock`** (`mm/pmm.ritz`) covers the global bitmap and its hints. It is held only for one batch (below) or one `pmm_alloc_contig`/`pmm_alloc_page_high`, never across anything else.
+- **`klog_lock`** (`klog.ritz`) covers the ring, COM1 (klog's polled output, and the output ring that `sys_write` fills and the COM1 IRQ drains, through `klog_serial_write`/`klog_serial_drain`) and the console sink (`klog_console_start`, #4868). It is a ticket spinlock taken with IF saved and cleared. One `klog` call is atomic: a line built from several calls can interleave with another CPU's at call boundaries, never inside one. A kernel panic calls `klog_emergency`, after which klog takes the lock only if it is free and writes anyway, so a CPU that died holding it cannot silence the report. The lock is written out in `klog.ritz` rather than taken from `sync/spin.ritz`, so klog stays a leaf: the host tests that log compile klog, serial and io alone.
+  - **The host tests (the survey's point 4).** Every host test that logs runs klog as an ordinary user program, where `cli` faults. So the lock's IF save is a switch, `klog_irqsave`, like `drivers/display/fbcon.ritz fbcon_irqsave`, but it starts off: `kernel_main` turns it on as its first step, while IF is still clear. No host test has to remember to turn it off.
+- **`pmm_lock`** (`mm/pmm.ritz`, a `sync/spin.ritz` ticket lock) covers the global bitmap and its hints. It is held only for one batch (below) or one `pmm_alloc_contig`/`pmm_alloc_page_high`, never across anything else.
 
-Lock order, outermost first: `pmm_lock` → `klog_lock`. Nothing takes a lock while holding `klog_lock`.
+Lock order, outermost first: `pmm_lock` → `klog_lock` → the console's own lock (`fbcon_write` takes it inside the console sink). Nothing else is taken while holding `klog_lock`.
 
 #### Per-CPU frame caches
 
@@ -155,7 +155,9 @@ Lock order, outermost first: `pmm_lock` → `klog_lock`. Nothing takes a lock wh
 
 #### The cpu-index hook (the survey's point 5)
 
-`proc_cur` and `fs_current` become per-CPU slots, so `proc/table.ritz` needs this CPU's index. It declares `extern fn cpu_index() -> i32`, the way `proc/waitset.ritz` declares `lapic_is_bsp` today. The kernel supplies `percpu.ritz cpu_index`. Every host test that compiles `table.ritz` supplies a stub returning 0 (one CPU), next to its `lapic_is_bsp` stub. The five pytest cases are `projects/ritz/ritz0/tests/test_harland_{errno,process_model,syscall_runtime,tty,waitset}.py`. harland's `test/test_cap_policy.ritz` and `test_cap_device.ritz` reach it through `cap.table` and get the stub too.
+`proc_cur`, `fs_current`, the frame caches and the dispatch count are per CPU, so `proc/table.ritz`, `fs/syscall.ritz`, `mm/pmm.ritz` and `syscall/dispatch.ritz` need this CPU's index. Each declares `extern fn cpu_index() -> i32`, the way `proc/waitset.ritz` declares `lapic_is_bsp`; `proc/table.ritz` also declares `sync/idle.ritz cpu_kick_if_idle` for its wakes. The kernel supplies `percpu.ritz cpu_index`, which answers 0 until the BSP's GS base is set (only the BSP runs before that, and an AP calls none of these before its own `cpu_bringup`). Each per-CPU slot stores its value plus one, so the zeroed BSS reads as "none" before anything is set.
+
+Every host test that compiles one of those modules supplies the stubs. The pytest harnesses (`projects/ritz/ritz0/tests/test_harland_{process_model,fd_tables,waitset,tty,syscall_dispatch}.py`, and `errno` through `syscall_dispatch`'s runner) append a `CPU_HOOKS` block to the program they build; `process_model`'s makes the CPU index and the kicks visible to its test. harland's `test/test_cap_policy.ritz`, `test_cap_device.ritz`, `test_dma.ritz`, `test_pmm_mb2.ritz` and `test_pmm_cache.ritz` define them directly. `fs/syscall.ritz`'s one `extern fn` is this arch hook: the fs layer still never asks the process layer who runs (`test_harland_fd_tables.py` pins both).
 
 #### Alternative considered: a big kernel lock
 
@@ -204,7 +206,7 @@ Design (#4880):
 
 **Process-level sleep (eventcount).** ShmWait(handle, seen): register as the latch's waiter, `xchg` the state to BLOCKED, then re-read the latch's sequence. If it is no longer `seen`, CAS back to RUNNING and return. Otherwise switch away.
 
-**The notifier.** ShmNotify is `lock xadd` on the latch's sequence, then a CAS of the registered waiter BLOCKED → RUNNING, then a kick if the waiter's CPU (its `on`) is idle (below). The IRQ latches (`irq_objects`) follow the same pattern, with MSI-X dispatch as the notifier. On TSO both sides do a locked RMW between their store and their load, so at least one side sees the other's store: the sleeper sees the new sequence, or the notifier sees BLOCKED. No wake-up is lost. With a plain store for either side's announce, x86's store buffer lets both miss.
+**The notifier.** ShmNotify is a locked RMW on the latch (`lock xadd` on a sequence; today's shm latches OR event bits in with `lock or`, the same kind of op), then a CAS of the registered waiter BLOCKED → RUNNING, then a kick if the waiter's CPU (its `on`) is idle (below). The IRQ latches (`irq_objects`) follow the same pattern, with MSI-X dispatch as the notifier. On TSO both sides do a locked RMW between their store and their load, so at least one side sees the other's store: the sleeper sees the new sequence, or the notifier sees BLOCKED. No wake-up is lost. With a plain store for the sleeper's announce (or the idle CPU's, below), x86's store buffer lets both miss. The notifier's bump needs no lock for this: its `notify.wake` CAS is a locked op that drains the bump before it reads the state, so the model finds no lost wake with a plain bump. It stays locked so two notifiers' bumps both count.
 
 **CPU-level sleep.** Each CPU's idle loop does the same handshake against its own work:
 
@@ -246,7 +248,7 @@ The model checks the protocol, not the compiled kernel. The boot tests (§6) exe
 | Test | Where | Checks |
 |---|---|---|
 | `test/test_smp_proto.ritz` (host) | the harland host tests (#4879) | the protocol of §4, mutation-checked |
-| `[mbox] round trip OK: cpu K answered N pings` | test-tier1, test-smp (#4879) | every started AP drains its mailbox and replies through the kick. The existing AP-call NVMe line still passes, now over the mailbox |
+| `[mbox] round trip OK: cpu K answered N pings` | test-tier1, test-smp (#4879) | `init_smp` sends 64 pings to every started AP (more than the 16-slot ring, so it wraps; 8 in flight) and each AP drains its mailbox from its idle loop and replies. At -smp 1 the line is `[mbox] no APs to ping`. Mutations: the AP's drain not replying, and a post without its kick, each turn the boot red. The existing AP-call NVMe line still passes, now over the mailbox |
 | `[smp] syscall stacks OK` (existing) | test-smp, test-tier1 | unchanged: the Smp syscall runs locally on every CPU |
 | `[tlb] owner unmap OK: cpu N saw the unmap` | test-smp, test-tier1 (#4880) | A first AP call loads a test PML4 on the AP, maps VA → frame A and reads A's marker. The BSP posts `UNMAP{va}` and waits for `UNMAP_DONE`. A second AP call maps VA → frame B and reads B's marker. Mutation: the owner skips the `invlpg`, and the second read sees the stale A |
 | `[smp-user] concurrent syscalls OK: cpu0 N cpuK M, forwarded F` | `\harland\smp-user`, test-smp (2 CPUs), test-tier1 (4) (#4881) | One process on the BSP and one on the last AP each make 100k calls to a forwarded test syscall that bumps a non-atomic BSP-owned counter, and 100k `SYS_LOCAL` calls that bump the CPU's own counter. Both totals are exact and the windows overlap. Mutation: mark the forwarded test syscall `SYS_LOCAL`, and counts are lost |
@@ -263,7 +265,7 @@ Each step lands green at -smp 1, 2 and 4.
 1. **#4879: per-CPU state, the lock-free wake, the mailbox, the leaf locks.** Processes still run only on the BSP, so behaviour does not change. The steps:
    - Slot state as the atomic word of §4, with the CAS wake and the eventcount sleep in ShmWait and the IRQ latches.
    - `proc_cur`, `fs_current`, the scheduler counters and the syscall count per CPU, through the `cpu_index` hook (§2 point 5).
-   - An idle context per CPU, with the idle handshake. `sched_exit` ends on it.
+   - An idle context per CPU, on its own guard-paged stack (`percpu.ritz CPU_IDLE`, the seventh per-CPU stack), with the idle handshake. `sched_block` with nothing runnable and `sched_exit` switch to it; until `sched_start` makes it, a boot self-test that blocks idles in place as before. The AP's boot-time idle loop runs the same handshake for its mailbox.
    - `sync/mbox.ritz` and `KICK_VECTOR`, with `apcall.ritz` rebuilt on them.
    - The `SYS_LOCAL` flag in the dispatch table, unused while every process is on the BSP.
    - Per-CPU frame caches and `pmm_lock`.

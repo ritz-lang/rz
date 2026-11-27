@@ -1,0 +1,78 @@
+# Harland leaf spinlocks (AGAST #4879, docs/SMP_USER.md §2 "The leaf locks")
+#
+# Kernel state is owned by one CPU and needs no lock (SMP_USER.md §2). The
+# few things no CPU owns take one of these: a ticket lock, FIFO across
+# CPUs, held for a short bounded section that calls up into nothing else.
+# The holder runs with IF cleared, so an IRQ on the same CPU cannot try to
+# take a lock its own CPU already holds.
+#
+# A hosted test runs the lock's users as an ordinary program, where `cli`
+# faults: spin_set_irqsave(lock, false) leaves IF alone, as
+# drivers/display/fbcon.ritz fbcon_irqsave does for the console.
+#
+# Ticket order: `next` is the ticket the next taker draws, `serving` the one
+# that holds the lock. Both wrap; only their equality matters.
+
+import ritzlib.option
+import io { interrupts_enabled, disable_interrupts, enable_interrupts, cpu_pause }
+
+pub struct SpinLock
+    next: u32
+    serving: u32
+    irqsave: bool
+    _pad: [7]u8
+
+# A free lock that saves and clears IF (the kernel's default).
+pub fn spin_new() -> SpinLock
+    SpinLock { next: 0, serving: 0, irqsave: true, _pad: [0, 0, 0, 0, 0, 0, 0] }
+
+# Whether taking `lock` clears IF (the kernel: on; a hosted test: off).
+pub fn spin_set_irqsave(lock: *SpinLock, on: bool)
+    (*lock).irqsave = on
+
+# What spin_lock saved: give it back to spin_unlock.
+pub struct SpinGuard
+    was_on: bool
+
+# IF saved and cleared as `lock` would (or left alone when its irqsave is
+# off), without taking it: for per-CPU state an IRQ on the same CPU also
+# touches, such as mm/pmm.ritz's frame caches. Give the guard back to
+# spin_irq_restore.
+pub fn spin_irq_off(lock: *SpinLock) -> SpinGuard
+    var was_on: bool = false
+    if lock.irqsave
+        was_on = interrupts_enabled()
+        disable_interrupts()
+    SpinGuard { was_on: was_on }
+
+pub fn spin_irq_restore(g: SpinGuard)
+    if g.was_on
+        enable_interrupts()
+
+# Take `lock`, waiting for every earlier ticket. IF is clear until
+# spin_unlock (when the lock saves it).
+pub fn spin_lock(lock: *SpinLock) -> SpinGuard
+    let g: SpinGuard = spin_irq_off(lock)
+    let ticket: u32 = atomic_fetch_add(@(*lock).next, 1)
+    while atomic_load(@(*lock).serving) != ticket
+        cpu_pause()
+    g
+
+# Take `lock` only if it is free now: Some(guard), or None with IF as it
+# was. NMI and panic use this and go on without the lock when it is held.
+pub fn spin_trylock(lock: *SpinLock) -> Option<SpinGuard>
+    let g: SpinGuard = spin_irq_off(lock)
+    let serving: u32 = atomic_load(@(*lock).serving)
+    if atomic_cmpxchg(@(*lock).next, serving, serving +% 1) == serving
+        return Some(g)
+    spin_irq_restore(g)
+    None
+
+# Release `lock` (taken with spin_lock or spin_trylock) and restore IF.
+pub fn spin_unlock(lock: *SpinLock, g: SpinGuard)
+    atomic_store(@(*lock).serving, atomic_load(@(*lock).serving) +% 1)
+    spin_irq_restore(g)
+
+# Someone holds `lock` (or waits for it): for asserts and the tests.
+pub fn spin_is_held(lock: *SpinLock) -> bool
+    atomic_load(@(*lock).next) != atomic_load(@(*lock).serving)

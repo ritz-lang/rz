@@ -51,6 +51,8 @@ import arch.x86_64.apic { pic_remap, apic_init_with_mb, apic_init_from_bootinfo,
 # syscall-stack self-test.
 import arch.x86_64.percpu { cpu_bringup }
 import arch.x86_64.cpu_smp { smp_syscall_selftest }
+import arch.x86_64.apcall { ap_ping_all }
+import sync.mbox { mbox_init }
 
 # Exception and IRQ handlers: only isr_stubs.s calls them; this import
 # keeps the module linked (#3458), and brings the panic-test trigger.
@@ -112,7 +114,7 @@ import stack_protector
 # ritzlib's platform hooks (#1881): ritzlib's core, which goliath uses, calls
 # them by name, so they too are linked by a bare import.
 import platform
-import klog { ring_clear, ring_dump, klog_banner, klog, klog_dec, klog_hex }
+import klog { ring_clear, ring_dump, klog_banner, klog, klog_dec, klog_hex, klog_irqsave }
 import postinit { boot_self_tests, boot_process_tests, postinit_diagnostics }
 import boot_options { mb2_cmdline_flags }
 
@@ -494,8 +496,9 @@ fn init_namespace(boot_info_addr: u64)
 # segments past 0 through the MCFG's ECAM (AGAST #4582: needs the ACPI
 # tables, and runs before any driver that looks for an MSI-X device), then
 # the BSP's per-CPU state (AGAST #4192: GS area, own TSS with guard-paged
-# kernel/IST stacks, IDT and SYSCALL MSRs), the APs, and the boot-time proof
-# that every CPU can be in SYSCALL at once.
+# kernel/IST stacks, IDT and SYSCALL MSRs), the APs, the boot-time proof
+# that every CPU can be in SYSCALL at once, and the mailbox round trip to
+# every AP (AGAST #4879).
 fn init_smp(boot_info_addr: u64)
     if boot_protocol == BOOT_PROTOCOL_HARLAND
         apic_init_from_bootinfo(harland_boot_info)
@@ -511,9 +514,14 @@ fn init_smp(boot_info_addr: u64)
         klog("[percpu] BSP bring-up failed\n")
         halt_loop()
     syscall_register_smp_test()
+    # Every CPU's mailbox is empty before any AP can post to one (#4879).
+    mbox_init()
     if num_cpus > 1
         ap_boot_all()
         smp_syscall_selftest(bsp_cpu)
+    # Every started AP answers pings over its mailbox from its idle loop
+    # (SMP_USER.md §6); with none, "[mbox] no APs to ping".
+    ap_ping_all()
 
 # Serial receive interrupts (IRQ 4, routed by ioapic_init; serial_enable_rx
 # tracks IER so TX interrupts coexist), IPC, and capabilities. Init (pid 1)
@@ -541,6 +549,9 @@ fn init_ipc_and_capabilities()
 pub fn kernel_main(boot_info_addr: u64) -> i32
     # BSS first: every global below lives there
     clear_bss()
+    # klog_lock saves and clears IF from here on (AGAST #4879): it starts
+    # off for the host tests that link klog. IF is still clear here.
+    klog_irqsave(true)
     serial_start()
     ring_clear()
     klog_banner()

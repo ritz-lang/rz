@@ -29,6 +29,17 @@ import pytest
 import fast_link
 from ritz0_inproc import run_ritz0
 
+# The per-CPU hooks proc/table.ritz, fs/syscall.ritz and syscall/dispatch.ritz
+# declare `extern` (AGAST #4879): the kernel's are arch/x86_64/percpu.ritz
+# cpu_index and sync/idle.ritz cpu_kick_if_idle. One CPU here.
+CPU_HOOKS = """
+pub fn cpu_index() -> i32
+    0
+
+pub fn cpu_kick_if_idle(cpu: i32)
+    return
+"""
+
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
 PROJECTS = RITZ_ROOT.parent
@@ -66,7 +77,7 @@ def _run(tmp_path, src):
         (tree / rel).write_text(real.read_text())
     objs = [str(_compile(tmp_path, tree / rel, rel[:-5].replace("/", "_"), ("--no-runtime",)))
             for rel in MODULES]
-    (tmp_path / "t.ritz").write_text(src)
+    (tmp_path / "t.ritz").write_text(src + CPU_HOOKS)
     objs.insert(0, str(_compile(tmp_path, tmp_path / "t.ritz", "t")))
     exe = tmp_path / "t"
     link = fast_link.clang(["clang", "-Wno-override-module", *objs, "-o", str(exe),
@@ -104,10 +115,10 @@ fn park(slot: i32, reason: u8)
     proc_set_current(was)
 
 fn parked(slot: i32, reason: u8) -> bool
-    proc_at(slot).state == PROC_BLOCKED and proc_at(slot).block == reason
+    proc_state(slot) == PROC_BLOCKED and proc_at(slot).block == reason
 
 fn running(slot: i32) -> bool
-    proc_at(slot).state == PROC_RUNNING
+    proc_state(slot) == PROC_RUNNING
 
 fn main() -> i32
     proc_table_reset()
@@ -300,10 +311,10 @@ fn park(slot: i32)
     proc_set_current(was)
 
 fn parked(slot: i32) -> bool
-    proc_at(slot).state == PROC_BLOCKED and proc_at(slot).block == BLOCK_WAIT
+    proc_state(slot) == PROC_BLOCKED and proc_at(slot).block == BLOCK_WAIT
 
 fn running(slot: i32) -> bool
-    proc_at(slot).state == PROC_RUNNING
+    proc_state(slot) == PROC_RUNNING
 
 fn is_posted(n: Notify) -> bool
     match n
@@ -383,6 +394,9 @@ fn main() -> i32
     # The driver's next wait copies it without parking, and the IRQ is cold:
     # the IRQ flag is clear (DrvIrqWait returns 2), one record, latch cleared.
     var plan: WaitPlan = driver_plan(EVENT_DATA)
+    # The eventcount sleeper's re-check (#4879) sees it and takes nothing.
+    if not waitset_pending(@plan, DRIVER) or shm_latch_bits(FRAME, DRIVER) != EVENT_DATA
+        return 80
     var got: Collected = waitset_collect(@plan, DRIVER, 8)
     if got.count != 1 or got.irq or not has(@got, 0, H_FRAME, EVENT_DATA)
         return 13
@@ -392,6 +406,8 @@ fn main() -> i32
     got = waitset_collect(@plan, DRIVER, 8)
     if got.count != 0 or got.irq
         return 15
+    if waitset_pending(@plan, DRIVER)
+        return 81
 
     # A notify wakes the peer parked on its wait set, and only it.
     park(d)

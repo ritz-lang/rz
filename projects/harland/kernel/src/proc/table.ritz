@@ -31,14 +31,52 @@
 # process to exit. It is not killed where it stands: its next return to user
 # (syscall_entry.s reap_if_marked) enters sys_exit_impl on its own kernel
 # stack instead.
+#
+# The state word (AGAST #4879, docs/SMP_USER.md §4). A slot's state is one
+# 64-bit atomic word, {generation: u32 (high), state: u32 (low)}, so a wake
+# from any CPU is a compare-and-swap and needs no lock. The generation is
+# bumped each time spawn reuses the slot, so a waker holding a stale view
+# (the slot's previous process) fails its CAS and touches nothing. The
+# transitions and who makes them:
+#   (new) -> RUNNING   spawn (the BSP, which owns the table's shared part):
+#                      fill the slot, then publish the word (atomic store)
+#   RUNNING -> BLOCKED the process itself: atomic xchg ("sleep.announce" in
+#                      test/test_smp_proto.ritz), then its caller re-checks
+#                      what it waits for and CASes back if it is already
+#                      there (proc_unblock_current, "sleep.recheck")
+#   BLOCKED -> RUNNING any waker: CAS on the whole word ("notify.wake"); a
+#                      failed CAS means it was already running or the slot
+#                      was reused: nothing to do. Then the process's CPU is
+#                      kicked if it is idle ("notify.kick")
+# The other fields (block, wait_pid, flags) are written only by the CPU that
+# owns the slot's part they belong to; a waker reads `block` after it has
+# seen BLOCKED (TSO keeps the owner's earlier stores before its xchg).
+#
+# Per CPU (SMP_USER.md §2): each CPU has its own current slot (-1 on its
+# idle context) and its own round-robin position. The CPU index comes from
+# `extern fn cpu_index` (arch/x86_64/percpu.ritz in the kernel; a host test
+# supplies a stub), declared rather than imported so this module stays pure.
+# Until #4881 every process's home is the BSP (PROC_HOME_CPU): another
+# CPU's pick finds nothing.
 
 import syscall.errno { Errno }
 import ritzlib.strview { StrView }
 import ritzlib.result { Result }
 
+# The kernel's are arch/x86_64/percpu.ritz cpu_index and sync/idle.ritz
+# cpu_kick_if_idle.
+extern fn cpu_index() -> i32
+extern fn cpu_kick_if_idle(cpu: i32)
+
 # Live and zombie processes at once; fs/syscall.ritz has FS_MAX_PROCS FsProcs
 # and syscall_entry.s one kernel stack per slot (PROC_KSTACK_SLOTS).
 pub const MAX_PROCS: i32 = 8
+
+# The CPU every process runs on until #4881 gives a process its own home.
+pub const PROC_HOME_CPU: i32 = 0
+
+# MAX_CPUS (arch/x86_64/cpu_map.ritz): the per-CPU arrays' literal length.
+const PROC_MAX_CPUS: i32 = 64
 
 pub const PROC_FREE: u8 = 0
 pub const PROC_RUNNING: u8 = 1
@@ -76,8 +114,8 @@ pub struct Cwd
 
 pub struct Proc
     pid: u64
+    word: u64               # the state word: generation << 32 | state (above); atomic only
     parent: i32             # procs index of the spawning process; -1 for init or detached
-    state: u8
     block: u8               # BLOCKED: why (BLOCK_*)
     detached: u8            # its parent exited: its exit frees it, no zombie
     flags: u8               # PROC_REAP
@@ -88,11 +126,66 @@ pub struct Proc
     cwd: Cwd
 
 var procs: [8]Proc
-var proc_cur: i32 = -1
+# This CPU's current slot plus one, by CPU index: 0 is none (before init, or
+# on the CPU's idle context), so the zeroed BSS means "nothing running".
+var proc_cur_by_cpu: [64]i32
+# Where this CPU's round robin last switched to: the pick starts after it.
+var proc_last_by_cpu: [64]i32
 var proc_next_pid: u64 = 2
 
+const STATE_MASK: u64 = 0xFFFFFFFF
+
+fn word_state(w: u64) -> u8
+    (w & STATE_MASK) as u8
+
+fn word_gen(w: u64) -> u64
+    w >> 32
+
+fn word_make(gen: u64, state: u8) -> u64
+    (gen << 32) | state as u64
+
+fn word_of(i: i32) -> u64
+    atomic_load(@procs[i].word)
+
+# The state of slot `i` (PROC_*), read atomically.
+pub fn proc_state(i: i32) -> u8
+    word_state(word_of(i))
+
+# The state of `p` (PROC_*), read atomically.
+pub fn proc_state_of(p: *Proc) -> u8
+    word_state(atomic_load(@(*p).word))
+
+# The owner sets slot `i`'s state, keeping its generation.
+fn set_state(i: i32, state: u8)
+    atomic_store(@procs[i].word, word_make(word_gen(word_of(i)), state))
+
+# This CPU's current slot, or -1.
+fn cur() -> i32
+    proc_cur_by_cpu[cpu_index()] - 1
+
+# BLOCKED -> RUNNING for slot `i` as last seen in `w`: one CAS
+# ("notify.wake"), then a kick if its CPU is idle ("notify.kick"). True if
+# this call woke it.
+fn wake_word(i: i32, w: u64) -> bool
+    if word_state(w) != PROC_BLOCKED
+        return false
+    if atomic_cmpxchg(@procs[i].word, w, word_make(word_gen(w), PROC_RUNNING)) != w
+        return false
+    cpu_kick_if_idle(PROC_HOME_CPU)
+    true
+
+# Slot `i`'s state word as a waker reads it before its CAS.
+pub fn proc_word(i: i32) -> u64
+    word_of(i)
+
+# A wake of slot `i` from a waker that read `w` earlier (proc_word): true if
+# it woke it, false if the slot moved on (another wake, or a reuse with a new
+# generation) and nothing changed.
+pub fn proc_wake_seen(i: i32, w: u64) -> bool
+    wake_word(i, w)
+
 fn proc_free(i: i32)
-    procs[i].state = PROC_FREE
+    set_state(i, PROC_FREE)
     procs[i].pid = 0
     procs[i].parent = -1
     procs[i].block = BLOCK_NONE
@@ -104,26 +197,34 @@ fn proc_free(i: i32)
 pub fn proc_table_reset()
     var i: i32 = 0
     while i < MAX_PROCS
+        atomic_store(@procs[i].word, 0)
         proc_free(i)
         i = i + 1
-    proc_cur = -1
+    var c: i32 = 0
+    while c < PROC_MAX_CPUS
+        proc_cur_by_cpu[c] = 0
+        proc_last_by_cpu[c] = 0
+        c = c + 1
     proc_next_pid = 2
 
 # The running process, or null before init.
 pub fn proc_current() -> *Proc
-    if proc_cur < 0
+    let c: i32 = cur()
+    if c < 0
         return 0 as *Proc
-    @procs[proc_cur]
+    @procs[c]
 
-# The running process's slot (its kernel stack's index), or -1 before init.
+# The running process's slot (its kernel stack's index), or -1 before init
+# and on this CPU's idle context.
 pub fn proc_current_slot() -> i32
-    proc_cur
+    cur()
 
 # The running process's pid, or 0 before init.
 pub fn proc_current_pid() -> u64
-    if proc_cur < 0
+    let c: i32 = cur()
+    if c < 0
         return 0
-    procs[proc_cur].pid
+    procs[c].pid
 
 # The Proc in slot `slot` (0 <= slot < MAX_PROCS).
 pub fn proc_at(slot: i32) -> *Proc
@@ -138,7 +239,7 @@ pub fn proc_live_count() -> i32
     var n: i32 = 0
     var i: i32 = 0
     while i < MAX_PROCS
-        if procs[i].state != PROC_FREE
+        if proc_state(i) != PROC_FREE
             n = n + 1
         i = i + 1
     n
@@ -148,7 +249,7 @@ pub fn proc_runnable_count() -> i32
     var n: i32 = 0
     var i: i32 = 0
     while i < MAX_PROCS
-        if procs[i].state == PROC_RUNNING
+        if proc_state(i) == PROC_RUNNING
             n = n + 1
         i = i + 1
     n
@@ -156,7 +257,7 @@ pub fn proc_runnable_count() -> i32
 fn proc_free_slot() -> i32
     var i: i32 = 0
     while i < MAX_PROCS
-        if procs[i].state == PROC_FREE
+        if proc_state(i) == PROC_FREE
             return i
         i = i + 1
     -1
@@ -170,7 +271,6 @@ pub fn proc_enter_init(pml4: u64) -> i32
     let p: *Proc = @procs[slot]
     (*p).pid = 1
     (*p).parent = -1
-    (*p).state = PROC_RUNNING
     (*p).block = BLOCK_NONE
     (*p).detached = 0
     (*p).flags = 0
@@ -181,7 +281,9 @@ pub fn proc_enter_init(pml4: u64) -> i32
     (*p).cwd.bytes[0] = 47  # '/'
     (*p).cwd.bytes[1] = 0
     (*p).cwd.len = 1
-    proc_cur = slot
+    # Filled: publish it, a new generation, RUNNING.
+    atomic_store(@(*p).word, word_make(word_gen(word_of(slot)) + 1, PROC_RUNNING))
+    proc_set_current(slot)
     0
 
 # The running process starts a child: a NEW Proc with the next pid and its
@@ -190,17 +292,20 @@ pub fn proc_enter_init(pml4: u64) -> i32
 # proc_abort_child()s it. The child's slot, or Errno.Srch with no running
 # process, or Errno.Again if the table is full.
 pub fn proc_new_child() -> i32
-    if proc_cur < 0
+    let me: i32 = cur()
+    if me < 0
         return Errno.Srch as i32
     let slot: i32 = proc_free_slot()
     if slot < 0
         return Errno.Again as i32
-    let parent: *Proc = @procs[proc_cur]
+    let parent: *Proc = @procs[me]
     let c: *Proc = @procs[slot]
+    # A new generation: a waker still holding the slot's last process fails
+    # its CAS.
+    atomic_store(@(*c).word, word_make(word_gen(word_of(slot)) + 1, PROC_NEW))
     (*c).pid = proc_next_pid
     proc_next_pid = proc_next_pid + 1
-    (*c).parent = proc_cur
-    (*c).state = PROC_NEW
+    (*c).parent = me
     (*c).block = BLOCK_NONE
     (*c).detached = 0
     (*c).flags = 0
@@ -213,32 +318,51 @@ pub fn proc_new_child() -> i32
 
 # A NEW child is built: it becomes runnable.
 pub fn proc_start(slot: i32)
-    if procs[slot].state == PROC_NEW
-        procs[slot].state = PROC_RUNNING
+    if proc_state(slot) == PROC_NEW
+        # Every field is written: the store publishes them (TSO keeps them
+        # before it), then its CPU is kicked if it idles.
+        set_state(slot, PROC_RUNNING)
+        cpu_kick_if_idle(PROC_HOME_CPU)
 
 # Undo proc_new_child for a child that never ran (a failed load): its slot is
 # freed, and nobody can wait for it.
 pub fn proc_abort_child(slot: i32)
-    if procs[slot].state == PROC_NEW
+    if proc_state(slot) == PROC_NEW
         proc_free(slot)
 
 # The running process blocks: for child `pid` to exit (BLOCK_CHILD) or for
 # console input (BLOCK_TTY, pid 0). It stays current until the scheduler
-# switches away.
+# switches away. The reason is written first, then the state word is
+# swapped to BLOCKED ("sleep.announce": a locked op, so the caller's
+# re-check below cannot be ordered before it). The caller then re-checks
+# what it waits for and, if it is already there, calls
+# proc_unblock_current; every wait loops on its condition anyway, so a
+# spurious wake costs one re-check.
 pub fn proc_block(reason: u8, pid: u64)
-    if proc_cur < 0
+    let me: i32 = cur()
+    if me < 0
         return
-    procs[proc_cur].state = PROC_BLOCKED
-    procs[proc_cur].block = reason
-    procs[proc_cur].wait_pid = pid
+    procs[me].block = reason
+    procs[me].wait_pid = pid
+    let w: u64 = word_of(me)
+    atomic_xchg(@procs[me].word, word_make(word_gen(w), PROC_BLOCKED))
+
+# The running process's re-check after proc_block found what it waits for
+# ("sleep.recheck"): it is runnable again, unless a waker got there first
+# (the CAS fails, and it is RUNNING either way).
+pub fn proc_unblock_current()
+    let me: i32 = cur()
+    if me < 0
+        return
+    wake_word(me, word_of(me))
 
 # Every process blocked for `reason` becomes runnable (BLOCK_TTY: input came).
 pub fn proc_wake(reason: u8)
     var i: i32 = 0
     while i < MAX_PROCS
-        if procs[i].state == PROC_BLOCKED and procs[i].block == reason
-            procs[i].state = PROC_RUNNING
-            procs[i].block = BLOCK_NONE
+        let w: u64 = word_of(i)
+        if word_state(w) == PROC_BLOCKED and procs[i].block == reason
+            wake_word(i, w)
         i = i + 1
 
 # Process `pid`, if it is blocked for `reason`, becomes runnable: true if
@@ -249,10 +373,11 @@ pub fn proc_wake_pid(pid: u64, reason: u8) -> bool
         return false
     var i: i32 = 0
     while i < MAX_PROCS
-        if procs[i].pid == pid and procs[i].state == PROC_BLOCKED and procs[i].block == reason
-            procs[i].state = PROC_RUNNING
-            procs[i].block = BLOCK_NONE
-            return true
+        # The word first, then pid and block: a slot reused in between has a
+        # new generation, and the CAS fails.
+        let w: u64 = word_of(i)
+        if word_state(w) == PROC_BLOCKED and procs[i].pid == pid and procs[i].block == reason
+            return wake_word(i, w)
         i = i + 1
     false
 
@@ -266,14 +391,15 @@ pub fn proc_mark_exit(pid: u64) -> Result<(), MarkError>
     var i: i32 = 0
     while i < MAX_PROCS
         let p: *Proc = @procs[i]
-        if p.pid == pid and p.state != PROC_FREE and p.state != PROC_ZOMBIE
+        let w: u64 = word_of(i)
+        let st: u8 = word_state(w)
+        if p.pid == pid and st != PROC_FREE and st != PROC_ZOMBIE
             if proc_is_init(p)
                 return Err(MarkError.Init)
             (*p).flags = p.flags | PROC_REAP
-            if p.state == PROC_BLOCKED
-                (*p).state = PROC_RUNNING
-                (*p).block = BLOCK_NONE
-                (*p).wait_pid = 0
+            # The flag before the wake: the woken process sees it on its way
+            # back to user.
+            wake_word(i, w)
             return Ok(())
         i = i + 1
     Err(MarkError.NoProcess)
@@ -286,7 +412,8 @@ pub fn proc_detach(pid: u64) -> bool
     var i: i32 = 0
     while i < MAX_PROCS
         let p: *Proc = @procs[i]
-        if pid != 0 and p.pid == pid and p.state != PROC_FREE and p.state != PROC_ZOMBIE
+        let st: u8 = proc_state(i)
+        if pid != 0 and p.pid == pid and st != PROC_FREE and st != PROC_ZOMBIE
             (*p).parent = -1
             (*p).detached = 1
             return true
@@ -300,7 +427,8 @@ pub fn proc_reap_pending(p: *Proc) -> bool
 # The running process is marked PROC_REAP: 1, else 0. A u64 for
 # syscall_entry.s reap_if_marked, which tests it in RAX.
 pub fn proc_reap_current() -> u64
-    if proc_cur >= 0 and proc_reap_pending(@procs[proc_cur])
+    let me: i32 = cur()
+    if me >= 0 and proc_reap_pending(@procs[me])
         return 1
     0
 
@@ -310,15 +438,17 @@ pub fn proc_reap_current() -> u64
 # stays current until the scheduler switches away. 0, or Errno.Srch with no
 # running process; init (no parent) leaves the table as it is: -1.
 pub fn proc_exit_current(code: i64) -> i32
-    if proc_cur < 0
+    let me: i32 = cur()
+    if me < 0
         return Errno.Srch as i32
-    let c: *Proc = @procs[proc_cur]
+    let c: *Proc = @procs[me]
     if proc_is_init(c)
         return -1
     var i: i32 = 0
     while i < MAX_PROCS
-        if procs[i].state != PROC_FREE and procs[i].parent == proc_cur and i != proc_cur
-            if procs[i].state == PROC_ZOMBIE
+        let st: u8 = proc_state(i)
+        if st != PROC_FREE and procs[i].parent == me and i != me
+            if st == PROC_ZOMBIE
                 proc_free(i)
             else
                 procs[i].parent = -1
@@ -328,26 +458,27 @@ pub fn proc_exit_current(code: i64) -> i32
     (*c).block = BLOCK_NONE
     if (*c).detached != 0 or (*c).parent < 0
         # Nobody will wait: the slot is free once the scheduler leaves it.
-        proc_free(proc_cur)
+        proc_free(me)
         return 0
-    (*c).state = PROC_ZOMBIE
-    let parent: *Proc = @procs[(*c).parent]
-    if parent.state == PROC_BLOCKED and parent.block == BLOCK_CHILD and parent.wait_pid == (*c).pid
-        (*parent).state = PROC_RUNNING
-        (*parent).block = BLOCK_NONE
-        (*parent).wait_pid = 0
+    set_state(me, PROC_ZOMBIE)
+    let pi: i32 = (*c).parent
+    let pw: u64 = word_of(pi)
+    if word_state(pw) == PROC_BLOCKED and procs[pi].block == BLOCK_CHILD and procs[pi].wait_pid == (*c).pid
+        wake_word(pi, pw)
     0
 
 # The running process's child `pid`: PROC_CHILD_EXITED with its exit code in
 # *code (not reaped), PROC_CHILD_LIVE while it runs or blocks, or
 # Errno.Child if `pid` is no child of the caller.
 pub fn proc_child_status(pid: u64, code: *i64) -> i32
-    if proc_cur < 0 or pid == 0
+    let me: i32 = cur()
+    if me < 0 or pid == 0
         return Errno.Child as i32
     var i: i32 = 0
     while i < MAX_PROCS
-        if procs[i].state != PROC_FREE and procs[i].pid == pid and procs[i].parent == proc_cur
-            if procs[i].state == PROC_ZOMBIE
+        let st: u8 = proc_state(i)
+        if st != PROC_FREE and procs[i].pid == pid and procs[i].parent == me
+            if st == PROC_ZOMBIE
                 *code = procs[i].exit_code
                 return PROC_CHILD_EXITED
             return PROC_CHILD_LIVE
@@ -357,39 +488,46 @@ pub fn proc_child_status(pid: u64, code: *i64) -> i32
 # The running process reaps its exited child `pid`: the child's exit code,
 # or Errno.Child if `pid` is no exited child of the caller.
 pub fn proc_wait(pid: u64) -> i64
-    if proc_cur < 0 or pid == 0
+    let me: i32 = cur()
+    if me < 0 or pid == 0
         return Errno.Child as i64
     var i: i32 = 0
     while i < MAX_PROCS
-        if procs[i].pid == pid and procs[i].parent == proc_cur and procs[i].state == PROC_ZOMBIE
+        if procs[i].pid == pid and procs[i].parent == me and proc_state(i) == PROC_ZOMBIE
             let code: i64 = procs[i].exit_code
             proc_free(i)
             return code
         i = i + 1
     Errno.Child as i64
 
-# Round robin: the first runnable slot after the current one, wrapping, the
-# current one last (so it keeps running when nothing else can). -1 if no
-# process is runnable.
+# Round robin on this CPU: the first runnable slot after the one it last
+# switched to, wrapping, that one last (so it keeps running when nothing
+# else can). -1 if no process is runnable here: on every CPU but
+# PROC_HOME_CPU until #4881.
 pub fn proc_pick_next() -> i32
-    var start: i32 = proc_cur + 1
-    if proc_cur < 0
-        start = 0
+    let cpu: i32 = cpu_index()
+    if cpu != PROC_HOME_CPU
+        return -1
+    let start: i32 = proc_last_by_cpu[cpu]
     var n: i32 = 0
     while n < MAX_PROCS
         let i: i32 = (start + n) % MAX_PROCS
-        if procs[i].state == PROC_RUNNING
+        if proc_state(i) == PROC_RUNNING
             return i
         n = n + 1
     -1
 
-# Slot `slot` is now the running process (the scheduler has switched to it).
+# Slot `slot` is now this CPU's running process (the scheduler has switched
+# to it), or -1: the CPU is on its idle context.
 pub fn proc_set_current(slot: i32)
-    proc_cur = slot
+    let cpu: i32 = cpu_index()
+    proc_cur_by_cpu[cpu] = slot + 1
+    if slot >= 0
+        proc_last_by_cpu[cpu] = (slot + 1) % MAX_PROCS
 
 # The running process's cwd. A NUL follows it (ptr[len] == 0).
 pub fn proc_cwd() -> StrView
-    let c: *Cwd = @procs[proc_cur].cwd
+    let c: *Cwd = @procs[cur()].cwd
     StrView { ptr: @(*c).bytes[0], len: (*c).len as i64 }
 
 # Set the running process's cwd to `path` (the caller checked it exists).
@@ -397,7 +535,7 @@ pub fn proc_cwd() -> StrView
 pub fn proc_set_cwd(path: StrView) -> i32
     if path.len > PROC_CWD_MAX
         return Errno.NameTooLong as i32
-    let c: *Cwd = @procs[proc_cur].cwd
+    let c: *Cwd = @procs[cur()].cwd
     var i: i64 = 0
     while i < path.len
         (*c).bytes[i] = *(path.ptr + i)
@@ -409,9 +547,10 @@ pub fn proc_set_cwd(path: StrView) -> i32
 # The running process descends from pid `root` (through `parent`), or is
 # it when or_self. The console's foreground asks (tty/fg.ritz, #4276).
 pub fn proc_current_descends_from(root: u64, or_self: bool) -> bool
-    if proc_cur < 0 or root == 0
+    let me: i32 = cur()
+    if me < 0 or root == 0
         return false
-    var i: i32 = proc_cur
+    var i: i32 = me
     if not or_self
         i = procs[i].parent
     var hops: i32 = 0

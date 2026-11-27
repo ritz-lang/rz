@@ -77,6 +77,9 @@
 #        QEMU_SMP=SPEC  QEMU -smp (default 4). The kernel's per-CPU syscall
 #                       stack self-test (AGAST #4192) must see every CPU, so
 #                       `QEMU_SMP=2` runs the acceptance boot at two CPUs.
+#                       Every AP must also answer the mailbox ping round
+#                       trip (AGAST #4879); at 1 CPU the kernel says it has
+#                       no AP to ping.
 #        COMPILER=NAME  ritz0, ritz1 or ritz1_selfhosted (AGAST #1848): build
 #                       with `./rz build PKG --compiler NAME`, and require
 #                       every binary the boot loads (kernel, BOOTX64.EFI,
@@ -750,6 +753,17 @@ net_nodev() {
 # ap_boot_all and before init, so it is in every boot's log.
 smp_stacks() {
     local line
+    # One CPU: main.ritz init_smp runs the self-test only with an AP to run
+    # it against, so there is no verdict to want, and any [smp] line is news.
+    if [ "$SMP_NCPUS" -le 1 ]; then
+        if grep -aq '\[smp\]' "$WORK/$1.log"; then
+            grep -a '\[smp\]' "$WORK/$1.log" | head -5
+            echo "FAIL ($1): one CPU, but the SMP self-test said something"
+            return 1
+        fi
+        echo "PASS ($1): one CPU, no SMP syscall-stack self-test to run"
+        return 0
+    fi
     line="$(grep -aoE '\[smp\] syscall stacks OK: [0-9]+ CPUs' "$WORK/$1.log" | head -1)"
     if [ "$line" = "[smp] syscall stacks OK: $SMP_NCPUS CPUs" ]; then
         echo "PASS ($1): $SMP_NCPUS CPUs in ring-3 SYSCALL at once on per-CPU stacks"
@@ -758,6 +772,36 @@ smp_stacks() {
         echo "FAIL ($1): no per-CPU syscall stack verdict for $SMP_NCPUS CPUs (got: ${line:-none})"
         return 1
     fi
+}
+
+# mbox_round_trip NAME: pass only if every AP -smp starts answered the BSP's
+# pings over its mailbox from its idle loop (AGAST #4879, docs/SMP_USER.md
+# §6): one "[mbox] round trip OK: cpu K answered 64 pings" line per AP, K
+# distinct (the crash-ring dump repeats each line). At one CPU there is no
+# AP, and the kernel must say "[mbox] no APs to ping" instead.
+mbox_round_trip() {
+    local want=$((SMP_NCPUS - 1)) got
+    if grep -aq '\[mbox\] round trip FAIL' "$WORK/$1.log"; then
+        grep -a '\[mbox\]' "$WORK/$1.log" | head -5
+        echo "FAIL ($1): an AP did not answer the BSP's pings over its mailbox"
+        return 1
+    fi
+    if [ "$want" -le 0 ]; then
+        if grep -aq '\[mbox\] no APs to ping' "$WORK/$1.log"; then
+            echo "PASS ($1): one CPU, no AP to ping over the mailbox"
+            return 0
+        fi
+        echo "FAIL ($1): one CPU, but no \"[mbox] no APs to ping\" line"
+        return 1
+    fi
+    got="$(grep -aoE '\[mbox\] round trip OK: cpu [0-9]+ answered 64 pings' "$WORK/$1.log" | sort -u | wc -l)"
+    if [ "$got" = "$want" ]; then
+        echo "PASS ($1): all $want APs answered 64 pings each over their mailboxes"
+        return 0
+    fi
+    grep -a '\[mbox\]' "$WORK/$1.log" | head -5
+    echo "FAIL ($1): $got of $want APs answered the mailbox round trip"
+    return 1
 }
 
 # sysret_ring0 NAME: pass only if the "sysret" self-test's non-canonical
@@ -809,6 +853,7 @@ if [ "$MODE" != grub ]; then
     stat_ok native || rc=1
     boot_tests_passed native || rc=1
     smp_stacks native || rc=1
+    mbox_round_trip native || rc=1
     ring_holds_boot native || rc=1
     blk_transport native modern || rc=1
     slow_disk native || rc=1
@@ -849,6 +894,7 @@ EOF
     stat_ok grub || rc=1
     boot_tests_passed grub || rc=1
     smp_stacks grub || rc=1
+    mbox_round_trip grub || rc=1
     blk_transport grub legacy || rc=1
     key_received grub || rc=1
     preempted grub || rc=1
@@ -861,6 +907,7 @@ EOF
     all_passed grub-reboot || rc=1
     boot_tests_passed grub-reboot || rc=1
     smp_stacks grub-reboot || rc=1
+    mbox_round_trip grub-reboot || rc=1
     persisted grub-reboot 2 || rc=1
     saved_subtree grub-reboot || rc=1
 fi

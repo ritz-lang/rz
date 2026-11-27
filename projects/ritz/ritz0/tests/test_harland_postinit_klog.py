@@ -232,7 +232,8 @@ def test_main_defines_none_of_it():
 
 def test_main_imports_what_it_calls():
     code = _code(MAIN)
-    assert _imports_from(code, "klog") == {"ring_clear", "ring_dump", "klog_banner", "klog", "klog_dec", "klog_hex"}
+    assert _imports_from(code, "klog") == {"ring_clear", "ring_dump", "klog_banner", "klog", "klog_dec", "klog_hex",
+                                             "klog_irqsave"}
     assert _imports_from(code, "postinit") == {"boot_self_tests", "boot_process_tests",
                                                   "postinit_diagnostics"}
 

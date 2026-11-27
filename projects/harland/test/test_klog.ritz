@@ -9,7 +9,8 @@
 # A hosted test has no I/O ports: klog_serial(false) leaves the ring as the
 # only sink, and ring_copy reads it back.
 
-import klog { klog, klog_dec, klog_udec, klog_hex, klog_hex_width, klog_serial, ring_clear, ring_copy, RING_BUFFER_SIZE }
+import klog { klog, klog_dec, klog_udec, klog_hex, klog_hex_width, klog_serial, ring_clear, ring_copy, RING_BUFFER_SIZE, klog_lock_held, klog_emergency, klog_test_hold, klog_test_release, LogHold }
+
 import ritzlib.strview { StrView }
 
 var g_out: [16384]u8
@@ -113,4 +114,33 @@ fn test_ring_wraps_to_newest() -> i32
     assert *(got.ptr + 0) == 120  # 'x'
     assert *(got.ptr + got.len - 3) == 69  # 'E'
     assert *(got.ptr + got.len - 1) == 68  # 'D'
+    0
+
+# klog_lock (AGAST #4879, SMP_USER.md §2 "The leaf locks"): each call takes
+# and releases it, so a CPU logging after this one is never shut out. The
+# lock's IF save is off here (it starts off; kernel_main turns it on).
+[[test]]
+fn test_klog_releases_its_lock() -> i32
+    fresh()
+    klog("one call\n")
+    klog_dec(7)
+    if klog_lock_held()
+        return 1
+    assert ring_is("one call\n7")
+    0
+
+# A panic's report is written even while another CPU holds the lock
+# (klog_emergency: trylock, and write anyway). Last: the mode is sticky.
+[[test]]
+fn test_klog_emergency_writes_past_a_held_lock() -> i32
+    fresh()
+    let g: LogHold = klog_test_hold()
+    klog_emergency()
+    klog("panic report\n")
+    if not klog_lock_held()
+        return 1
+    klog_test_release(g)
+    if klog_lock_held()
+        return 2
+    assert ring_is("panic report\n")
     0

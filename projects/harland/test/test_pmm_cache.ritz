@@ -1,0 +1,195 @@
+# Harland - the PMM's per-CPU frame caches (AGAST #4879, SMP_USER.md §2
+# "Per-CPU frame caches")
+#
+# pmm_alloc_page pops from this CPU's cache, refilling 32 frames from the
+# global pool in one locked pass when it is empty; pmm_free_page pushes,
+# and a cache past 64 hands its oldest 32 back. pmm_alloc_contig and
+# pmm_alloc_page_high go to the pool. A frame in a cache still counts as
+# free. The stub below is mm/pmm.ritz's cpu_index, so a test switches CPUs
+# by setting g_cpu.
+
+import mm.pmm { PAGE_SIZE, pmm_init, pmm_irqsave, pmm_mark_region_free, pmm_mark_region_used, pmm_alloc_page, pmm_alloc_page_high, pmm_alloc_contig, pmm_free_page, pmm_get_free_pages, pmm_pool_free_pages, pmm_cache_depth, pmm_range_has_free, pmm_fail_allocs_after, pmm_fail_allocs_off }
+
+# The kernel's is arch/x86_64/percpu.ritz cpu_index.
+var g_cpu: i32 = 0
+
+pub fn cpu_index() -> i32
+    g_cpu
+
+# 256 pages, page 0 never free: 255 frames.
+const PAGES: u64 = 256
+const FREE: u64 = 255
+var g_bm: [32]u8
+var g_got: [128]u64
+
+fn fresh()
+    g_cpu = 0
+    # A hosted test runs in ring 3, where cli faults.
+    pmm_irqsave(false)
+    pmm_init(@g_bm[0], PAGES)
+    pmm_mark_region_free(0, PAGES * PAGE_SIZE)
+
+fn seen(n: i32, addr: u64) -> bool
+    var i: i32 = 0
+    while i < n
+        if g_got[i] == addr
+            return true
+        i = i + 1
+    false
+
+[[test]]
+fn test_an_empty_cache_refills_32_from_the_pool() -> i32
+    fresh()
+    assert pmm_pool_free_pages() == FREE and pmm_cache_depth(0) == 0
+    # One pass from the hint: frames 1..32, the lowest handed out first.
+    assert pmm_alloc_page() == PAGE_SIZE
+    assert pmm_pool_free_pages() == FREE - 32
+    assert pmm_cache_depth(0) == 31
+    assert pmm_alloc_page() == 2 * PAGE_SIZE
+    assert pmm_pool_free_pages() == FREE - 32
+    0
+
+[[test]]
+fn test_each_cpu_has_its_own_cache_and_no_frame_is_handed_out_twice() -> i32
+    fresh()
+    pmm_alloc_page()
+    let depth0: u64 = pmm_cache_depth(0)
+    let pool0: u64 = pmm_pool_free_pages()
+    # CPU 1's first allocation refills CPU 1's cache, not CPU 0's.
+    g_cpu = 1
+    pmm_alloc_page()
+    assert pmm_pool_free_pages() < pool0
+    assert pmm_cache_depth(0) == depth0
+    assert pmm_cache_depth(1) == depth0
+    # 64 more each, interleaved: 128 frames, all distinct.
+    var n: i32 = 0
+    while n < 128
+        g_cpu = n % 2
+        let a: u64 = pmm_alloc_page()
+        assert a != 0 and not seen(n, a)
+        g_got[n] = a
+        n = n + 1
+    0
+
+[[test]]
+fn test_a_free_past_64_returns_the_oldest_32_to_the_pool() -> i32
+    fresh()
+    # contig bypasses the cache: 65 frames, the cache still empty.
+    let base: u64 = pmm_alloc_contig(65)
+    assert base != 0 and pmm_cache_depth(0) == 0
+    let pool: u64 = pmm_pool_free_pages()
+    var i: u64 = 0
+    while i < 64
+        assert pmm_free_page(base + i * PAGE_SIZE) == 0
+        i = i + 1
+    assert pmm_cache_depth(0) == 64 and pmm_pool_free_pages() == pool
+    assert pmm_free_page(base + 64 * PAGE_SIZE) == 0
+    assert pmm_cache_depth(0) == 33
+    assert pmm_pool_free_pages() == pool + 32
+    # The oldest 32 (the first freed) are back in the pool's bitmap.
+    assert pmm_alloc_contig(32) == base
+    0
+
+[[test]]
+fn test_free_pages_counts_the_caches() -> i32
+    fresh()
+    assert pmm_get_free_pages() == FREE
+    let a: u64 = pmm_alloc_page()
+    assert pmm_get_free_pages() == FREE - 1
+    g_cpu = 1
+    let b: u64 = pmm_alloc_page()
+    assert pmm_get_free_pages() == FREE - 2
+    # Freed on the other CPU: into that CPU's cache, still counted.
+    assert pmm_free_page(a) == 0
+    g_cpu = 0
+    assert pmm_free_page(b) == 0
+    assert pmm_get_free_pages() == FREE
+    0
+
+# Put n frames in a row in CPU 0's cache without a refill: contig takes them
+# from the pool, and each free pushes one. Returns the first.
+[[test_helper]]
+fn cache_frames(n: u64) -> u64
+    let first: u64 = pmm_alloc_contig(n)
+    assert first != 0
+    var i: u64 = 0
+    while i < n
+        assert pmm_free_page(first + i * PAGE_SIZE) == 0
+        i = i + 1
+    first
+
+[[test]]
+fn test_contig_and_high_bypass_the_cache() -> i32
+    fresh()
+    assert cache_frames(8) == PAGE_SIZE
+    let pool: u64 = pmm_pool_free_pages()
+    # The cache holds 1..8; contig starts at the pool's hint, 9.
+    assert pmm_alloc_contig(4) == 9 * PAGE_SIZE
+    assert pmm_alloc_page_high() == (PAGES - 1) * PAGE_SIZE
+    assert pmm_cache_depth(0) == 8
+    assert pmm_pool_free_pages() == pool - 5
+    0
+
+[[test]]
+fn test_contig_takes_back_this_cpus_cache_when_the_pool_has_no_run() -> i32
+    fresh()
+    # Everything but 1..32 used, and 1..32 in CPU 0's cache.
+    pmm_mark_region_used(33 * PAGE_SIZE, (PAGES - 33) * PAGE_SIZE)
+    assert cache_frames(32) == PAGE_SIZE
+    assert pmm_pool_free_pages() == 0
+    assert pmm_alloc_contig(8) == PAGE_SIZE
+    assert pmm_alloc_page_high() == 32 * PAGE_SIZE
+    assert pmm_cache_depth(0) == 0
+    assert pmm_pool_free_pages() == 32 - 8 - 1
+    0
+
+[[test]]
+fn test_fault_injection_fails_the_nth_allocation_on_any_cpu() -> i32
+    fresh()
+    pmm_alloc_page()
+    pmm_fail_allocs_after(2)
+    assert pmm_alloc_page() != 0
+    g_cpu = 1
+    assert pmm_alloc_page() != 0
+    assert pmm_alloc_page() == 0
+    g_cpu = 0
+    assert pmm_alloc_page() == 0
+    assert pmm_alloc_page_high() == 0
+    assert pmm_alloc_contig(1) == 0
+    pmm_fail_allocs_off()
+    assert pmm_alloc_page() != 0
+    0
+
+[[test]]
+fn test_a_double_free_into_a_cache_is_refused() -> i32
+    fresh()
+    let a: u64 = pmm_alloc_page()
+    assert pmm_free_page(a) == 0
+    let depth: u64 = pmm_cache_depth(0)
+    assert pmm_free_page(a) == -1
+    g_cpu = 1
+    assert pmm_free_page(a) == -1
+    assert pmm_cache_depth(0) == depth and pmm_cache_depth(1) == 0
+    0
+
+[[test]]
+fn test_a_cached_frame_is_free_to_range_has_free_and_mark_used_takes_it() -> i32
+    fresh()
+    let a: u64 = pmm_alloc_page()
+    assert not pmm_range_has_free(a, PAGE_SIZE)
+    assert pmm_free_page(a) == 0
+    assert pmm_range_has_free(a, PAGE_SIZE)
+    # Four frames in the cache, out of the pool: still free.
+    let f: u64 = cache_frames(4)
+    assert pmm_range_has_free(f + PAGE_SIZE, PAGE_SIZE)
+    # Reserving cached frames takes them out of the cache.
+    let depth: u64 = pmm_cache_depth(0)
+    let pool: u64 = pmm_pool_free_pages()
+    pmm_mark_region_used(f, 2 * PAGE_SIZE)
+    assert not pmm_range_has_free(f, 2 * PAGE_SIZE)
+    assert pmm_cache_depth(0) == depth - 2
+    assert pmm_pool_free_pages() == pool
+    # The cache's top two are the last two of the four.
+    assert pmm_alloc_page() == f + 3 * PAGE_SIZE
+    assert pmm_alloc_page() == f + 2 * PAGE_SIZE
+    0

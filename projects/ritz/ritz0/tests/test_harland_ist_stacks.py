@@ -102,7 +102,9 @@ def test_every_ist_slot_the_idt_uses_has_a_per_cpu_stack():
     percpu = _code(PERCPU)
     count = int(re.search(r"CPU_STACK_COUNT: i32 = (\d+)", percpu).group(1))
     pages = int(re.search(r"CPU_STACK_PAGES: u64 = (\d+)", percpu).group(1))
-    assert count == max(used) + 1, "one stack per IST slot, plus the kernel stack"
+    # One per IST slot, plus the kernel stack and the idle context's (#4879).
+    assert count == max(used) + 2, "one stack per IST slot, plus the kernel and idle stacks"
+    assert re.search(rf"CPU_IDLE: i32 = {count - 1}$", percpu, re.M)
     assert pages == 2 * count, "a guard page and a stack each"
     bringup = _ritz_fn(percpu, "cpu_bringup")
     for n in used:

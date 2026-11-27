@@ -172,8 +172,14 @@ def test_finished_aps_stay_alive_for_the_ap_call_ipi():
     """
     smp = CPU_SMP.read_text()
     assert "halt_loop" not in smp, "an AP that halts cannot answer an AP call"
+    # The idle loop is the handshake (sync/idle.ritz, #4879): announce with
+    # IF=0, re-check the mailbox, then drain it or sleep in sti;hlt.
     idle = _body(smp, "smp_ap_idle")
-    assert "sti_hlt()" in idle and "while true" in idle
+    assert "while true" in idle
+    order = [idle.index(s) for s in ("disable_interrupts()", "cpu_idle_begin()",
+                                     "mbox_has_work(me)", "cpu_idle_cancel()",
+                                     "mbox_drain()", "cpu_idle_sleep()")]
+    assert order == sorted(order), idle
     run = _body(smp, "smp_ap_run")
     assert "kstack_set_current(cpu_stack_top(cpu_idx, CPU_IST1))" in run
     handler = _body(smp, "sys_smp_test_handler")

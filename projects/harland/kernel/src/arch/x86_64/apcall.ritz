@@ -1,82 +1,160 @@
-# Harland AP call IPIs (AGAST #4220)
+# Harland AP calls over the mailbox (AGAST #4220, rebuilt on sync/mbox.ritz
+# by #4879; docs/SMP_USER.md §2 "The AP call on the mailbox")
 #
-# APs run no scheduler (proc/sched.ritz), so they idle with interrupts on.
-# The BSP can ask one AP to run a kernel function by sending it a fixed IPI on
-# vector AP_CALL_VECTOR; the AP's irq_handler calls ap_call_dispatch, which
-# runs the requested call with interrupts enabled (so the callee can wait for
-# its own device interrupt) and flags completion. The BSP waits for the flag,
-# bounded, and reads ap_call_status.
+# The BSP asks one AP to run a kernel function: it posts CALL{id, kind} to
+# the AP's mailbox (which kicks it) and waits for CALL_DONE{id, status} in
+# its own. The AP handles the CALL at its next safe point, its idle loop
+# (cpu_smp.ritz smp_ap_idle), with interrupts on so the callee can wait for
+# its own device interrupt.
 #
-# Calls are serialized: one kind in flight at a time, one AP at a time. That
-# is enough for the boot-time NVMe check, and it keeps the driver's shared
-# state (the HEAP allocator, the serial log) single-owner while the call runs.
+# The callee (today nvme_ap_probe) uses BSP-owned state: the heap, the NVMe
+# queue state and the serial log. The BSP lends those rows for the call: its
+# wait touches nothing but its own mailbox and `pause`. Only the BSP waits
+# on another CPU and an AP never does, so there is no cycle of waiters (§2
+# "No deadlock"). Calls are serialized: one in flight, to one AP.
 #
-# Today the one call is "read the end of your NVMe disk", which proves an
-# AP-issued command completes through an interrupt aimed at that AP rather
-# than by polling (drivers/nvme/nvme.ritz nvme_ap_probe).
+# The boot's mailbox self-test lives here too (ap_ping_all): the BSP pings
+# every started AP over the mailbox and checks the pongs.
 
+import ritzlib.option
+import ritzlib.result
 import klog { klog, klog_dec }
-import io { cpu_pause, memory_barrier, enable_interrupts, disable_interrupts }
-import arch.x86_64.apic { lapic_id, lapic_send_fixed_ipi }
+import io { cpu_pause, interrupts_enabled, enable_interrupts, disable_interrupts }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_started }
+import arch.x86_64.percpu { cpu_index }
+import sync.mbox { MboxMsg, MBOX_CALL, MBOX_CALL_DONE, MBOX_PING, MBOX_PONG, mbox_msg, mbox_post, mbox_take, mbox_drop_stray }
 import drivers.nvme.nvme { nvme_ap_probe }
 
-# IDT vector the AP-call IPI carries (kernel/isr_stubs.s IRQ_STUB 48, 240).
-pub const AP_CALL_VECTOR: u8 = 240
-
-const AP_CALL_NONE: u32 = 0
 const AP_CALL_NVME: u32 = 1
 
-# How long the BSP waits for an AP to finish one call.
+# How long the BSP waits for an AP to finish one call, and for one AP's pings.
 const AP_CALL_TIMEOUT_US: u64 = 10000000   # 10 s
 
-var ap_call_kind: u32 = AP_CALL_NONE
-var ap_call_done: u32 = 0
-var ap_call_status: i32 = 0
+# Pings sent to each AP: more than the ring's 16 slots, so both rings wrap.
+const PING_COUNT: u64 = 64
+# Pings in flight to one AP at once: under the ring size, so a mailbox is
+# never full (sync/mbox.ritz), and over one, so order is tested.
+const PING_WINDOW: u64 = 8
 
-# Called on the AP from irq_handler for AP_CALL_VECTOR. Runs the requested
-# call with interrupts on and flags completion. The caller still sends EOI.
-pub fn ap_call_dispatch()
-    let kind: u32 = ap_call_kind
-    if kind == AP_CALL_NONE
-        return
+# The id of the last CALL the BSP sent: a CALL_DONE carrying another is a
+# late reply to a call that timed out.
+var ap_call_id: u64 = 0
+
+pub enum ApCallError
+    NoAnswer       # no CALL_DONE within AP_CALL_TIMEOUT_US
+    Failed         # the callee returned non-zero
+
+# Run AP call `kind` on this CPU (sync/mbox.ritz's CALL handler, through its
+# `extern` hook), with interrupts on so the callee can wait for its device
+# interrupt. Returns the callee's status, 0 when it worked.
+pub fn ap_call_run(kind: u32) -> i32
+    let was_on: bool = interrupts_enabled()
     enable_interrupts()
     var status: i32 = -1
     if kind == AP_CALL_NVME
         status = nvme_ap_probe()
-    disable_interrupts()
-    ap_call_status = status
-    atomic_store(@ap_call_done as *u32, 1)
+    if not was_on
+        disable_interrupts()
+    status
 
-# Send one call to `apic_id` and wait for it. Returns the callee's status,
-# or -1 on timeout.
-fn ap_call_one(apic_id: u32, kind: u32) -> i32
-    atomic_store(@ap_call_done as *u32, 0)
-    ap_call_kind = kind
-    memory_barrier()
-    lapic_send_fixed_ipi(apic_id, AP_CALL_VECTOR)
-    let deadline: u64 = deadline_after_us(AP_CALL_TIMEOUT_US)
-    while atomic_load(@ap_call_done as *u32) == 0 and not deadline_passed(deadline)
-        cpu_pause()
-    ap_call_kind = AP_CALL_NONE
-    if atomic_load(@ap_call_done as *u32) == 0
-        klog("[apcall] AP ")
-        klog_dec(apic_id as i64)
-        klog(" did not answer\n")
-        return -1
-    return ap_call_status
+# Wait on this CPU's own mailbox for a `kind` reply from CPU `from` whose
+# arg[0] is `tag`, until `deadline`. Any other message is a stray (a late
+# reply to an earlier request) and is dropped. Touches nothing but the
+# mailbox and `pause`.
+fn ap_wait_reply(from: i32, kind: u32, tag: u64, deadline: u64) -> Option<MboxMsg>
+    let me: i32 = cpu_index()
+    while not deadline_passed(deadline)
+        match mbox_take(me)
+            Some(m) =>
+                if m.kind == kind and m.from as i32 == from and m.arg[0] == tag
+                    return Some(m)
+                mbox_drop_stray(m)
+            None => cpu_pause()
+    None
+
+# Send call `kind` to CPU `cpu` and wait for its CALL_DONE.
+fn ap_call_one(cpu: i32, kind: u32) -> Result<(), ApCallError>
+    ap_call_id = ap_call_id + 1
+    var call: MboxMsg = mbox_msg(MBOX_CALL)
+    call.arg[0] = ap_call_id
+    call.arg[1] = kind as u64
+    mbox_post(cpu, call)
+    match ap_wait_reply(cpu, MBOX_CALL_DONE, ap_call_id, deadline_after_us(AP_CALL_TIMEOUT_US))
+        Some(done) =>
+            if done.arg[1] != 0
+                return Err(ApCallError.Failed)
+            Ok(())
+        None =>
+            klog("[apcall] AP ")
+            klog_dec(cpu_apic_ids[cpu] as i64)
+            klog(" did not answer\n")
+            Err(ApCallError.NoAnswer)
+
+# The started CPUs other than this one, by cpu_map index.
+fn is_other_ap(i: i32) -> bool
+    i != cpu_index() and cpu_map_started(i) != 0
 
 # Ask every started AP (not this CPU) to read its NVMe disk through its own
-# MSI-X vector. Returns how many APs answered.
+# MSI-X vector. Returns how many APs answered with a good read.
 pub fn ap_run_nvme_probe() -> i32
-    let me: u32 = lapic_id()
     var n: i32 = 0
     var i: i32 = 0
     while i < num_cpus as i32 and i < MAX_CPUS
-        let apic_id: u32 = cpu_apic_ids[i]
-        if apic_id != me and cpu_map_started(i) != 0
-            if ap_call_one(apic_id, AP_CALL_NVME) == 0
-                n = n + 1
+        if is_other_ap(i)
+            match ap_call_one(i, AP_CALL_NVME)
+                Ok(_) => n = n + 1
+                Err(_) => pass
         i = i + 1
-    return n
+    n
+
+# Ping CPU `cpu` PING_COUNT times, PING_WINDOW in flight, and check the
+# pongs come back from it, each echoing its ping's number, in order. Returns
+# how many came back in order before the first miss.
+fn ap_ping_one(cpu: i32) -> u64
+    let deadline: u64 = deadline_after_us(AP_CALL_TIMEOUT_US)
+    var sent: u64 = 0
+    var answered: u64 = 0
+    while answered < PING_COUNT
+        while sent < PING_COUNT and sent - answered < PING_WINDOW
+            var ping: MboxMsg = mbox_msg(MBOX_PING)
+            ping.arg[0] = sent
+            mbox_post(cpu, ping)
+            sent = sent + 1
+        # The next pong must echo `answered`: one that echoes anything else
+        # is out of order (or lost one) and is dropped, and the wait runs out.
+        match ap_wait_reply(cpu, MBOX_PONG, answered, deadline)
+            Some(_) => answered = answered + 1
+            None => return answered
+    answered
+
+# The boot's mailbox self-test (SMP_USER.md §6): every started AP drains its
+# mailbox from its idle loop and answers through the kick. Logs, per AP,
+#   [mbox] round trip OK: cpu K answered N pings
+# or "[mbox] round trip FAIL: cpu K answered M of N pings", and with no AP
+# "[mbox] no APs to ping". tools/test_tier1_boot.sh wants an OK line from
+# every AP. Returns how many APs passed.
+pub fn ap_ping_all() -> i32
+    var n: i32 = 0
+    var aps: i32 = 0
+    var i: i32 = 0
+    while i < num_cpus as i32 and i < MAX_CPUS
+        if is_other_ap(i)
+            aps = aps + 1
+            let got: u64 = ap_ping_one(i)
+            if got == PING_COUNT
+                klog("[mbox] round trip OK: cpu ")
+                n = n + 1
+            else
+                klog("[mbox] round trip FAIL: cpu ")
+            klog_dec(i as i64)
+            klog(" answered ")
+            if got != PING_COUNT
+                klog_dec(got as i64)
+                klog(" of ")
+            klog_dec(PING_COUNT as i64)
+            klog(" pings\n")
+        i = i + 1
+    if aps == 0
+        klog("[mbox] no APs to ping\n")
+    n

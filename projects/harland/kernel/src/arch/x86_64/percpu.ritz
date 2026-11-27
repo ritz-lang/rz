@@ -13,7 +13,7 @@
 #   * TSS.rsp0 and TSS.ist1-5 (gdt.ritz) are per CPU, so two CPUs can take
 #     a ring-3 IRQ, a #PF or a tick at once without sharing a stack.
 #
-# Each CPU's stack block is twelve PMM pages, two per stack: an unmapped
+# Each CPU's stack block is fourteen PMM pages, two per stack: an unmapped
 # guard page, then the stack. The stack's lowest quadword holds a sentinel checked
 # by syscall/stack.ritz when a syscall leaves the kernel.
 #
@@ -47,19 +47,22 @@ const KERNEL_GS_BASE_MSR: u32 = 0xC0000102
 pub const CPU_STACK_GUARD: u64 = 4096
 pub const CPU_STACK_SIZE: u64 = 4096
 pub const CPU_STACK_STRIDE: u64 = 8192
-# Six stacks per CPU: syscall/kernel, then one per TSS IST slot the IDT uses
-# (idt.ritz, AGAST #4628): IST1 #DF/#SS, IST2 IRQs, IST3 the tick, IST4 NMI,
-# IST5 #MC. Stack `CPU_ISTn` is TSS.istn's.
-pub const CPU_STACK_COUNT: i32 = 6
+# Seven stacks per CPU: syscall/kernel, then one per TSS IST slot the IDT
+# uses (idt.ritz, AGAST #4628): IST1 #DF/#SS, IST2 IRQs, IST3 the tick, IST4
+# NMI, IST5 #MC; stack `CPU_ISTn` is TSS.istn's. Last, the CPU's idle
+# context (proc/sched.ritz, AGAST #4879): where it runs when no process
+# does, so it never idles on a blocked or exited process's stack.
+pub const CPU_STACK_COUNT: i32 = 7
 pub const CPU_KSTACK: i32 = 0
 pub const CPU_IST1: i32 = 1
 pub const CPU_IST2: i32 = 2
 pub const CPU_IST3: i32 = 3
 pub const CPU_IST4: i32 = 4
 pub const CPU_IST5: i32 = 5
-# Twelve pages = six (guard + stack) pairs.
-const CPU_STACK_PAGES: u64 = 12
-# Twelve pages of virtual space per CPU (guard + stack, six times), mapped in
+pub const CPU_IDLE: i32 = 6
+# Fourteen pages = seven (guard + stack) pairs.
+const CPU_STACK_PAGES: u64 = 14
+# Fourteen pages of virtual space per CPU (guard + stack, seven times), mapped in
 # the kernel half so every user PML4 (which shares PML4[256..511]) reaches
 # the stacks. PML4 index 300, clear of the physmap (256), MMIO (257) and the
 # kernel image (511).
@@ -71,6 +74,13 @@ pub const SYSCALL_STACK_SENTINEL: u64 = 0x5359534B53544B21   # "SYSKSTK!"
 
 # Stack block base by CPU index (0 = not allocated). Literal length: MAX_CPUS.
 var cpu_stack_bases: [64]u64
+
+# The BSP's GS base points at its area (cpu_bringup has run on it). Before
+# that GS is 0 and %gs:PC_CPU_INDEX would read linear address 8, so
+# cpu_index answers 0: only the BSP runs then. An AP calls nothing that asks
+# (the PMM, the process table) before its own cpu_bringup (apic.ritz
+# ap_entry), and the BSP's comes first.
+var g_gs_ready: bool = false
 
 # The base of CPU `cpu_idx`'s stack block, or 0 if it has none.
 pub fn cpu_stack_base(cpu_idx: i32) -> u64
@@ -92,7 +102,7 @@ pub fn cpu_stack_bottom(cpu_idx: i32, which: i32) -> u64
 pub fn cpu_stack_top(cpu_idx: i32, which: i32) -> u64
     return cpu_stack_guard(cpu_idx, which) + CPU_STACK_STRIDE
 
-# Allocate CPU `cpu_idx`'s twelve-page stack block and unmap its six guard
+# Allocate CPU `cpu_idx`'s fourteen-page stack block and unmap its seven guard
 # pages. The pages are identity-mapped and are used as physical addresses by
 # the AP trampoline, so a block that is not is a boot-time panic. Returns the
 # base, or 0 if the PMM is out of contiguous pages.
@@ -168,6 +178,7 @@ pub fn cpu_bringup(cpu_idx: i32) -> i32
     let area: u64 = percpu_area_init(cpu_idx as u64)
     wrmsr(GS_BASE_MSR, area)
     wrmsr(KERNEL_GS_BASE_MSR, 0)
+    g_gs_ready = true
 
     # EFER/STAR/LSTAR/SFMASK are per-CPU, and so is IA32_PAT: every CPU
     # maps the framebuffer write-combining (AGAST #4868).
@@ -178,8 +189,12 @@ pub fn cpu_bringup(cpu_idx: i32) -> i32
     kstack_set_current(ktop)
     return 0
 
-# The CPU index this code is running on (cpu_map order, not the APIC ID).
+# The CPU index this code is running on (cpu_map order, not the APIC ID):
+# the hook proc/table.ritz and mm/pmm.ritz declare `extern` (SMP_USER.md §2
+# "The cpu-index hook"). 0 on the BSP before its GS is set (g_gs_ready).
 pub fn cpu_index() -> i32
+    if not g_gs_ready
+        return 0
     return percpu_cpu_index() as i32
 
 # The per-CPU kernel stack top this CPU's syscalls currently use.

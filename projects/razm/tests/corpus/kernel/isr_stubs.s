@@ -524,9 +524,9 @@ IRQ_STUB 45, 77
 IRQ_STUB 46, 78
 IRQ_STUB 47, 79
 
-# AP call (vector 240, AGAST #4220): an IPI that makes one AP run a kernel
-# function. It uses the interrupted stack (no IST), so it works on an AP that
-# has no TSS.
+# The mailbox kick (vector 240, sync/mbox.ritz KICK_VECTOR, AGAST #4220,
+# #4879): an IPI that tells a CPU its mailbox has work. It uses the
+# interrupted stack (no IST), so it works on an AP that has no TSS.
 IRQ_STUB 48, 240
 
 # CPU-local MSI-X vectors 80-95 (drivers/msix.ritz, AGAST #4220): device

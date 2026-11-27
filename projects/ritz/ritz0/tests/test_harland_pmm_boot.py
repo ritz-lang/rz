@@ -27,16 +27,23 @@ MAIN_SRC = KERNEL_SRC / "main.ritz"
 # mm/pmm logs through klog (#1885), which imports serial, whose `asm x86_64:`
 # blocks only ritz0 parses (AGAST #1455/#1825), and ritz0 is what `rz build
 # harland` uses. klog imports ritzlib.fmt.digits (#1957) and ritzlib.str.
-PMM_MODULES = ["mm.pmm", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
+PMM_MODULES = ["mm.pmm", "sync.spin", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
 
 # Exit code i names the i-th failing check.
 PMM_PAGE_ZERO = """\
 import ritzlib.option
-import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_free_page, pmm_get_free_pages }
+import mm.pmm { PAGE_SIZE, pmm_irqsave, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_free_page, pmm_get_free_pages }
 
 var bm: [8]u8
 
+# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
+# frame caches (AGAST #4879): one CPU here.
+pub fn cpu_index() -> i32
+    0
+
 fn main() -> i32
+    # Ring 3: the PMM's cli would fault.
+    pmm_irqsave(false)
     pmm_init(@bm[0], 64)
     # Pages 0..3 reported usable by firmware: page 0 must not enter the pool.
     pmm_mark_region_free(0, 4 * PAGE_SIZE)
@@ -75,11 +82,18 @@ def test_pmm_never_hands_out_or_frees_page_zero(tmp_path):
 # --- contiguous runs (AGAST #4329: the AMD-Vi device table) ---------------------
 PMM_CONTIG = """\
 import ritzlib.option
-import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_alloc_contig, pmm_free_page, pmm_get_free_pages }
+import mm.pmm { PAGE_SIZE, pmm_irqsave, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_alloc_contig, pmm_free_page, pmm_get_free_pages }
 
 var bm: [8]u8
 
+# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
+# frame caches (AGAST #4879): one CPU here.
+pub fn cpu_index() -> i32
+    0
+
 fn main() -> i32
+    # Ring 3: the PMM's cli would fault.
+    pmm_irqsave(false)
     pmm_init(@bm[0], 64)
     # Pages 1..9 free, then a hole at 10, then 11..15.
     pmm_mark_region_free(0, 10 * PAGE_SIZE)
@@ -133,7 +147,7 @@ SIX_GIB_PAGES = 6 * GIB // 4096
 PMM_ABOVE_4G = f"""\
 import ritzlib.option
 import boot_abi.handoff {{ HarlandBootInfo, HarlandMemEntry, HARLAND_BOOT_MAGIC, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED }}
-import mm.pmm {{ PAGE_SIZE, Mb2BootInfo, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_bitmap_phys, pmm_init_from_bootinfo, pmm_init_from_multiboot }}
+import mm.pmm {{ PAGE_SIZE, pmm_irqsave, Mb2BootInfo, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_bitmap_phys, pmm_init_from_bootinfo, pmm_init_from_multiboot }}
 
 const FOUR_GIB: u64 = 0x100000000
 const SIX_GIB: u64 = 0x180000000
@@ -170,7 +184,14 @@ fn put64(a: u64, v: u64)
     let p: *u64 = a as *u64
     *p = v
 
+# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
+# frame caches (AGAST #4879): one CPU here.
+pub fn cpu_index() -> i32
+    0
+
 fn main() -> i32
+    # Ring 3: the PMM's cli would fault.
+    pmm_irqsave(false)
     # 1. The allocator itself: pages above 4 GiB enter the pool, come back
     #    from pmm_alloc_page_high, and free again.
     pmm_init(@bm[0], SIX_GIB_PAGES)
@@ -183,7 +204,10 @@ fn main() -> i32
         return 2
     if pmm_free_page(hi) != 0
         return 3
-    # Low pages first, then the ones above 4 GiB.
+    # The frame just freed comes back first, from this CPU's cache (#4879);
+    # then the pool's low pages, then the ones above 4 GiB.
+    if pmm_alloc_page() != hi
+        return 6
     pmm_alloc_page()
     pmm_alloc_page()
     if pmm_alloc_page() != FOUR_GIB
@@ -278,13 +302,20 @@ def test_pmm_tracks_memory_above_4gib_on_both_boot_paths(tmp_path):
 # hint must also move back down when a lower page is freed.
 PMM_HINT = """\
 import ritzlib.option
-import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_free_page }
+import mm.pmm { PAGE_SIZE, pmm_irqsave, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_free_page }
 
 const PAGES: u64 = 2097152
 
 var bm: [262144]u8
 
+# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
+# frame caches (AGAST #4879): one CPU here.
+pub fn cpu_index() -> i32
+    0
+
 fn main() -> i32
+    # Ring 3: the PMM's cli would fault.
+    pmm_irqsave(false)
     pmm_init(@bm[0], PAGES)
     pmm_mark_region_free(0, PAGES * PAGE_SIZE)
     var want: u64 = PAGE_SIZE
@@ -294,11 +325,29 @@ fn main() -> i32
         want = want + PAGE_SIZE
     if pmm_alloc_page() != 0
         return 2
-    # Free a high page, then a low one: the low one comes back first.
+    # Free a high page, then a low one, then 63 more: the 65th free overflows
+    # this CPU's cache (#4879), which gives its oldest 32 (400000, 5 and
+    # 1000..1029) back to the pool.
     pmm_free_page(400000 * PAGE_SIZE)
     pmm_free_page(5 * PAGE_SIZE)
+    var p: u64 = 1000
+    while p < 1063
+        pmm_free_page(p * PAGE_SIZE)
+        p = p + 1
+    # The cache's 33 come back newest first.
+    p = 1063
+    while p > 1030
+        p = p - 1
+        if pmm_alloc_page() != p * PAGE_SIZE
+            return 6
+    # Then the pool from the hint, which moved down: the low one first.
     if pmm_alloc_page() != 5 * PAGE_SIZE
         return 3
+    p = 1000
+    while p < 1030
+        if pmm_alloc_page() != p * PAGE_SIZE
+            return 7
+        p = p + 1
     if pmm_alloc_page() != 400000 * PAGE_SIZE
         return 4
     if pmm_alloc_page() != 0

@@ -7,10 +7,25 @@
 #
 # A number that is not a Syscall variant, or a variant with no handler
 # registered, is answered with Errno.NoSys (-ENOSYS).
+#
+# SYS_LOCAL (AGAST #4879, docs/SMP_USER.md §2 "Which syscalls run on the
+# AP"): a syscall marked local touches only its caller's own rows (its
+# slot, cap table, page table, wait set) or lock-free state, so it may run
+# on whichever CPU the caller is on. Every other syscall is forwarded to the
+# BSP, which owns the shared state. The list is an allowlist, made by
+# syscall_mark_local in syscall/runtime/entry.ritz: a new syscall is
+# forwarded until someone shows it touches only its caller's rows. Unused
+# while every process runs on the BSP; #4881's forwarding reads it.
+#
+# The dispatch count is per CPU (each CPU its own counter, summed by
+# syscall_count), through the cpu_index hook the kernel's
+# arch/x86_64/percpu.ritz supplies and a host test stubs.
 
 import ritzlib.option
 import syscall.numbers { Syscall }
 import syscall.errno { Errno }
+
+extern fn cpu_index() -> i32
 
 # Every handler is a `fn(u64, u64, u64, u64) -> i64`: it takes the four syscall
 # argument registers (rdi, rsi, rdx, r10) and returns the value for rax; a
@@ -23,12 +38,22 @@ const SYSCALL_TABLE_SIZE: u64 = 256
 var g_syscall_handlers: [256]fn(u64, u64, u64, u64) -> i64
 # 1 where g_syscall_handlers holds a registered handler (the table starts zeroed).
 var g_syscall_registered: [256]u8
+# The syscall's flags (SYS_LOCAL), 0 until syscall_mark_local.
+var g_syscall_flags: [256]u8
+
+# Runs on whichever CPU the caller is on; else it is forwarded to the BSP.
+pub const SYS_LOCAL: u8 = 1
 
 # Install `handler` for `nr`, replacing any earlier one.
 pub fn syscall_register(nr: Syscall, handler: fn(u64, u64, u64, u64) -> i64)
     let i: u64 = nr as u64
     g_syscall_handlers[i] = handler
     g_syscall_registered[i] = 1
+
+# `nr` touches only its caller's rows: it may run on an AP (SYS_LOCAL).
+pub fn syscall_mark_local(nr: Syscall)
+    let i: u64 = nr as u64
+    g_syscall_flags[i] = g_syscall_flags[i] | SYS_LOCAL
 
 # Table slot for `rax`, or SYSCALL_TABLE_SIZE if it is no syscall.
 fn syscall_slot(rax: u64) -> u64
@@ -43,16 +68,31 @@ pub fn syscall_has_handler(rax: u64) -> bool
         return false
     return g_syscall_registered[i] != 0
 
-# Syscalls dispatched since boot, known or not: the latency window's
-# per-echo cost on the ring path (net/latency.ritz, AGAST #4768).
-var g_syscall_count: u64 = 0
+# True if syscall number `rax` is marked SYS_LOCAL (false for no syscall).
+pub fn syscall_is_local(rax: u64) -> bool
+    let i: u64 = syscall_slot(rax)
+    if i >= SYSCALL_TABLE_SIZE
+        return false
+    return (g_syscall_flags[i] & SYS_LOCAL) != 0
 
+# Syscalls dispatched since boot, known or not, by CPU index (literal
+# length: MAX_CPUS): the latency window's per-echo cost on the ring path
+# (net/latency.ritz, AGAST #4768).
+var g_syscall_count: [64]u64
+
+# Every CPU's dispatches, summed (a racy sum: each count is its CPU's own).
 pub fn syscall_count() -> u64
-    g_syscall_count
+    var total: u64 = 0
+    var c: i32 = 0
+    while c < 64
+        total = total + g_syscall_count[c]
+        c = c + 1
+    total
 
 # Run the handler for `rax` with the four argument registers; Errno.NoSys if none.
 pub fn syscall_dispatch(rax: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
-    g_syscall_count = g_syscall_count + 1
+    let cpu: i32 = cpu_index()
+    g_syscall_count[cpu] = g_syscall_count[cpu] + 1
     if not syscall_has_handler(rax)
         return Errno.NoSys as i64
     let handler: fn(u64, u64, u64, u64) -> i64 = g_syscall_handlers[rax]

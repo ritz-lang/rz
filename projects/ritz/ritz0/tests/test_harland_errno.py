@@ -60,6 +60,14 @@ SERIAL = ["klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib
 # every compiler.
 ASM_DEPS = ["ritz0"]
 
+# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
+# frame caches (AGAST #4879); a program linking it supplies one CPU.
+PMM_STUB = """\
+pub fn cpu_index() -> i32
+    0
+
+"""
+
 
 def _declared_errno():
     src = ERRNO_SRC.read_text()
@@ -132,8 +140,8 @@ def test_uptr_faults_are_errno_fault(compiler, tmp_path):
         (f"uptr_check_write({kernel}, 8)", "Errno.Fault as i64"),
         ("uptr_validate_read(0 as *u8, 0)", "0"),
     ]
-    _check(compiler, tmp_path, "import ritzlib.option\nimport syscall.errno\nimport mm.uptr\n", cases,
-           ["syscall.errno", "mm.uptr", "mm.vmm", "mm.pmm", *SERIAL])
+    _check(compiler, tmp_path, "import ritzlib.option\nimport syscall.errno\nimport mm.uptr\n\n" + PMM_STUB, cases,
+           ["syscall.errno", "mm.uptr", "mm.vmm", "mm.pmm", "sync.spin", *SERIAL])
 
 
 @pytest.mark.integration
@@ -192,9 +200,9 @@ def test_ipc_errors_are_errno(compiler, tmp_path):
         (f"channel_close({none})", "Errno.Inval as i32"),
     ]
     header = ("import ritzlib.option\nimport syscall.errno\nimport ipc.message\n"
-              "import ipc.channel\nimport ipc.syscall\n")
+              "import ipc.channel\nimport ipc.syscall\n\n" + PMM_STUB)
     _check(compiler, tmp_path, header, cases,
-           ["syscall.errno", "ipc.syscall", "ipc.channel", "ipc.message", "mm.heap", "mm.pmm", "mm.vmm", *SERIAL],
+           ["syscall.errno", "ipc.syscall", "ipc.channel", "ipc.message", "mm.heap", "mm.pmm", "sync.spin", "mm.vmm", *SERIAL],
            prelude=CHANNEL_PRELUDE)
 
 
@@ -247,12 +255,12 @@ ELF_PRELUDE = """\
         return 106
 """
 
-ELF_MODULES = ["loader.image", "loader.elf", "mm.vmm", "mm.pmm", *SERIAL]
+ELF_MODULES = ["loader.image", "loader.elf", "mm.vmm", "mm.pmm", "sync.spin", *SERIAL]
 
 
 # elf_exec calls into the kernel (extern fns: alloc_user_stack is in
 # syscall/runtime/memory.ritz since #2751); the host program supplies them.
-ELF_STUBS = """\
+ELF_STUBS = PMM_STUB + """\
 pub fn alloc_user_stack() -> u64
     0
 

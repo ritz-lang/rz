@@ -1,0 +1,806 @@
+# The cross-CPU protocols of SMP_USER.md §2 "The mailbox" and §4 "Wake-ups
+# across CPUs", model-checked under x86-TSO (AGAST #4879 slice 2, SMP_USER.md
+# §4 "The host test of the protocol").
+#
+# This checks the protocol, not the compiled kernel: the boot tests (§6)
+# exercise the real code. Each virtual CPU runs a short op list that
+# transcribes the kernel's steps, and the checker explores every
+# interleaving of CPU steps and store-buffer drains by depth-first search,
+# with a visited set, so it ends.
+#
+# The TSO rules the model implements:
+# - Every CPU has a FIFO store buffer. A plain store goes into it.
+# - A drain is a step of its own, taken at any point: the buffer's oldest
+#   entry is written to memory.
+# - A load reads the newest entry for its address in its own buffer, else
+#   memory. So a CPU sees its own stores at once and other CPUs' only once
+#   they drain, and a store followed by a load of another address can be
+#   seen in the other order.
+# - A locked op (`xchg`, `lock cmpxchg`, `lock xadd`) and `mfence` drain the
+#   whole buffer first, then the locked op reads and writes memory as one
+#   step.
+# - A kick is the x2APIC ICR write (a WRMSR, arch/x86_64/apic.ritz
+#   lapic_send_icr). It is not serializing, so it is NOT ordered after the
+#   sender's buffered stores: the target can take it before they drain.
+#   SDM vol. 3 "x2APIC": a fence before the WRMSR orders them.
+# - Interrupts: a kick sets the target's pending flag. A CPU with IF=1 takes
+#   a pending kick before its next op (its handler consumes it). With IF=0
+#   the kick stays pending. `sti; hlt` is one op: `sti`'s interrupt shadow
+#   delivers a pending kick right after `hlt` starts, so a kick pending at
+#   `sti` wakes the `hlt`. A CPU in `hlt` is blocked until a kick is pending.
+#
+# Op labels are the step names the kernel sites cite in a comment
+# (proc/table.ritz, proc/waitset.ritz, sync/idle.ritz, sync/mbox.ritz):
+# - Mailbox (Vyukov's bounded MPSC queue): post.reserve (`lock xadd` the
+#   tail for ticket t), post.wait_free (wait for slot.seq == t), post.body
+#   (store the body words; two here, so a torn read shows), post.publish
+#   (store seq = t + 1), kick.fence (`mfence` before the ICR write),
+#   post.kick (kick the owner). take.check (seq == head + 1), take.copy
+#   (load the body), take.free (store seq = head + N).
+# - State word (the eventcount ShmWait): sleep.announce (`xchg` state :=
+#   BLOCKED), sleep.recheck (load the latch's seq; if it moved, CAS state
+#   BLOCKED -> RUNNING and return), sleep.switch (switch away: the CPU idles
+#   until the state is RUNNING). The notifier: notify.bump (`lock xadd` the
+#   latch's seq), notify.wake (`lock cmpxchg` the waiter BLOCKED -> RUNNING;
+#   a failed CAS means nothing to do), notify.kick (read the waiter CPU's
+#   pc_idle; kick it if 1).
+# - CPU idle: idle.announce (IF=0, `xchg pc_idle, 1`), idle.recheck (a
+#   RUNNING process on this CPU or a non-empty mailbox: pc_idle = 0 and run
+#   it), idle.sleep (`sti; hlt`; on wake pc_idle = 0 and loop).
+#
+# Each case takes a mutation selector, and the mutation tests assert that
+# the checker turns red on the broken protocol: a model that passed
+# everything would prove nothing.
+
+import ritzlib.strview { StrView }
+
+# ---------------------------------------------------------------------------
+# Memory: a few named words.
+
+const LATCH: i64 = 0        # the latch's sequence (ShmNotify / ShmWait)
+const PSTATE: i64 = 1       # the waiting process's state word
+const PC_IDLE: i64 = 2      # CPU 0's pc_idle
+const TAIL: i64 = 3         # CPU 0's mailbox tail
+const SLOT0: i64 = 4        # slot i at SLOT0 + i * SLOT_W: seq, body[0], body[1]
+const SLOT_W: i64 = 3
+const RING: i64 = 2         # slots: 2, so four messages wrap it twice
+const SEQ: i64 = 0
+const B0: i64 = 1
+const B1: i64 = 2
+const NMEM: i64 = 10
+
+const RUNNING: i64 = 1
+const BLOCKED: i64 = 2
+const SEEN: i64 = 0         # the seq the sleeper last saw (ShmWait's `seen`)
+
+# ---------------------------------------------------------------------------
+# A state is 64 bytes: memory, then each CPU's pc, flags, registers and
+# store buffer, then the "a check failed" flag. Every value fits a byte.
+
+const NCPU: i64 = 3
+const NREG: i64 = 4
+const NBUF: i64 = 4
+const CPU0: i64 = 10        # NMEM
+const CPU_W: i64 = 17
+const F_PC: i64 = 0
+const F_HALT: i64 = 1       # in `hlt`
+const F_IF: i64 = 2         # IF
+const F_KICK: i64 = 3       # a kick is pending
+const F_REG: i64 = 4        # NREG registers
+const F_BUFN: i64 = 8       # store-buffer depth
+const F_BUF: i64 = 9        # NBUF (address, value) pairs, oldest first
+const W_BAD: i64 = 61       # CPU0 + NCPU * CPU_W
+const SW: i64 = 64
+
+struct St
+    w: [64]u8
+
+const NOREG: i64 = -1
+
+# An address: `base`, plus slot (reg[ix] % RING) when ix is a register.
+struct Addr
+    base: i64
+    ix: i64
+
+# A value: reg[reg] + imm, or imm alone when reg is NOREG.
+struct Val
+    reg: i64
+    imm: i64
+
+enum K
+    Nop
+    Load
+    Store
+    Xchg
+    Cas
+    Xadd
+    Fence
+    Await
+    Beq
+    Bne
+    Jmp
+    Addi
+    Kick
+    Cli
+    Sti
+    StiHlt
+    Hlt
+    Record
+
+# One op. `step` is the kernel step it transcribes. Load/Xchg/Cas/Xadd put
+# their result in reg[r] (Cas: 1 if it swapped). Cas swaps `v` in if memory
+# holds `e`. Await blocks until the word at `a` is `e`. Beq/Bne compare
+# reg[r] with `e`. Kick targets CPU v.imm. Record checks one taken message.
+struct Op
+    kind: K
+    step: StrView
+    r: i64
+    a: Addr
+    v: Val
+    e: Val
+    target: i64
+
+enum Mut
+    Clean
+    SleepAnnounceStore      # (a) plain store for sleep.announce
+    BumpStore               # (b) plain load + store for notify.bump
+    IdleAnnounceStore       # (b) plain store for idle.announce
+    SeqBeforeBody           # (c) post.publish before post.body
+    FreeBeforeCopy          # (d) take.free before take.copy
+    NoKick                  # (e) no notify.kick / post.kick
+    StiBeforeRecheck        # (f) `sti` before idle.recheck, then a plain `hlt`
+    NoKickFence             # post.kick without kick.fence
+
+enum Verdict
+    Holds
+    Stuck       # a final state with a CPU not done: asleep in hlt with work, or waiting forever
+    Torn        # the consumer took a message lost, twice, torn or out of order
+    BadState    # the state word holds neither RUNNING nor BLOCKED
+    Lost        # the consumer finished without every message
+
+struct Run
+    states: i64
+    verdict: Verdict
+
+# ---------------------------------------------------------------------------
+# The programs.
+
+const MAXOPS: i64 = 40
+var g_prog: [120]Op         # NCPU * MAXOPS
+var g_nops: [3]i64
+var g_cur: i64              # the CPU being written
+var g_init: St
+var g_want_mask: i64        # the consumer's mask at the end, or 0: no consumer
+
+fn at(base: i64) -> Addr
+    Addr { base: base, ix: NOREG }
+
+fn slot(field: i64, ix: i64) -> Addr
+    Addr { base: SLOT0 + field, ix: ix }
+
+fn imm(v: i64) -> Val
+    Val { reg: NOREG, imm: v }
+
+fn reg(r: i64) -> Val
+    Val { reg: r, imm: 0 }
+
+fn regp(r: i64, k: i64) -> Val
+    Val { reg: r, imm: k }
+
+fn here() -> i64
+    g_nops[g_cur]
+
+[[test_helper]]
+fn emit(kind: K, step: StrView, r: i64, a: Addr, v: Val, e: Val, target: i64) -> i64
+    let pc: i64 = g_nops[g_cur]
+    assert pc < MAXOPS
+    g_prog[g_cur * MAXOPS + pc] = Op { kind: kind, step: step, r: r, a: a, v: v, e: e, target: target }
+    g_nops[g_cur] = pc + 1
+    pc
+
+fn patch(pc: i64, target: i64)
+    g_prog[g_cur * MAXOPS + pc].target = target
+
+fn o_nop(step: StrView) -> i64
+    emit(K.Nop, step, 0, at(0), imm(0), imm(0), 0)
+
+fn o_load(step: StrView, r: i64, a: Addr) -> i64
+    emit(K.Load, step, r, a, imm(0), imm(0), 0)
+
+fn o_store(step: StrView, a: Addr, v: Val) -> i64
+    emit(K.Store, step, 0, a, v, imm(0), 0)
+
+fn o_xchg(step: StrView, r: i64, a: Addr, v: Val) -> i64
+    emit(K.Xchg, step, r, a, v, imm(0), 0)
+
+fn o_cas(step: StrView, r: i64, a: Addr, expect: Val, new: Val) -> i64
+    emit(K.Cas, step, r, a, new, expect, 0)
+
+fn o_xadd(step: StrView, r: i64, a: Addr, v: Val) -> i64
+    emit(K.Xadd, step, r, a, v, imm(0), 0)
+
+fn o_fence(step: StrView) -> i64
+    emit(K.Fence, step, 0, at(0), imm(0), imm(0), 0)
+
+fn o_await(step: StrView, a: Addr, e: Val) -> i64
+    emit(K.Await, step, 0, a, imm(0), e, 0)
+
+fn o_beq(step: StrView, r: i64, e: Val, target: i64) -> i64
+    emit(K.Beq, step, r, at(0), imm(0), e, target)
+
+fn o_bne(step: StrView, r: i64, e: Val, target: i64) -> i64
+    emit(K.Bne, step, r, at(0), imm(0), e, target)
+
+fn o_jmp(step: StrView, target: i64) -> i64
+    emit(K.Jmp, step, 0, at(0), imm(0), imm(0), target)
+
+fn o_addi(step: StrView, r: i64, k: i64) -> i64
+    emit(K.Addi, step, r, at(0), imm(k), imm(0), 0)
+
+fn o_kick(step: StrView, cpu: i64) -> i64
+    emit(K.Kick, step, 0, at(0), imm(cpu), imm(0), 0)
+
+fn o_flag(kind: K, step: StrView) -> i64
+    emit(kind, step, 0, at(0), imm(0), imm(0), 0)
+
+fn o_record(step: StrView, r0: i64, r1: i64) -> i64
+    emit(K.Record, step, r0, at(0), reg(r1), imm(0), 0)
+
+# The CPU idle loop (sync/idle.ritz) for the CPU being written, ending when
+# it finds work. Scratch: r1.
+fn idle_prog(m: Mut)
+    let top: i64 = o_flag(K.Cli, "idle.announce")
+    if m == Mut.IdleAnnounceStore
+        o_store("idle.announce", at(PC_IDLE), imm(1))
+    else
+        o_xchg("idle.announce", 1, at(PC_IDLE), imm(1))
+    if m == Mut.StiBeforeRecheck
+        o_flag(K.Sti, "idle.sleep")
+    o_load("idle.recheck", 1, at(PSTATE))
+    let has_proc: i64 = o_beq("idle.recheck", 1, imm(RUNNING), 0)
+    o_load("idle.recheck", 1, at(SLOT0 + SEQ))      # head is 0: non-empty is seq == 1
+    let has_msg: i64 = o_beq("idle.recheck", 1, imm(1), 0)
+    if m == Mut.StiBeforeRecheck
+        o_flag(K.Hlt, "idle.sleep")
+    else
+        o_flag(K.StiHlt, "idle.sleep")
+    o_store("idle.sleep", at(PC_IDLE), imm(0))
+    o_jmp("idle.sleep", top)
+    patch(has_proc, here())
+    patch(has_msg, here())
+    o_store("idle.recheck", at(PC_IDLE), imm(0))
+
+# ShmWait(handle, SEEN) on CPU 0 (proc/waitset.ritz), registered as the
+# latch's waiter. Then its CPU idles until the state is RUNNING.
+fn sleeper_prog(m: Mut)
+    if m == Mut.SleepAnnounceStore
+        o_store("sleep.announce", at(PSTATE), imm(BLOCKED))
+    else
+        o_xchg("sleep.announce", 1, at(PSTATE), imm(BLOCKED))
+    o_load("sleep.recheck", 1, at(LATCH))
+    let unchanged: i64 = o_beq("sleep.recheck", 1, imm(SEEN), 0)
+    o_cas("sleep.recheck", 2, at(PSTATE), imm(BLOCKED), imm(RUNNING))
+    let ret: i64 = o_jmp("sleep.recheck", 0)
+    patch(unchanged, here())
+    o_nop("sleep.switch")
+    idle_prog(m)
+    patch(ret, here())
+
+# notify.wake and notify.kick on process PSTATE, homed on CPU 0.
+fn wake_prog(m: Mut)
+    o_cas("notify.wake", 1, at(PSTATE), imm(BLOCKED), imm(RUNNING))
+    let failed: i64 = o_beq("notify.wake", 1, imm(0), 0)
+    if m != Mut.NoKick
+        o_load("notify.kick", 2, at(PC_IDLE))
+        let busy: i64 = o_bne("notify.kick", 2, imm(1), 0)
+        o_kick("notify.kick", 0)
+        patch(busy, here())
+    patch(failed, here())
+
+# ShmNotify (proc/waitset.ritz).
+fn notifier_prog(m: Mut)
+    if m == Mut.BumpStore
+        o_load("notify.bump", 0, at(LATCH))
+        o_store("notify.bump", at(LATCH), regp(0, 1))
+    else
+        o_xadd("notify.bump", 0, at(LATCH), imm(1))
+    wake_prog(m)
+
+# One mbox post (sync/mbox.ritz) of message `id`: body {id, id + 100}.
+# Ticket: r0.
+fn post_prog(m: Mut, id: i64)
+    o_xadd("post.reserve", 0, at(TAIL), imm(1))
+    o_await("post.wait_free", slot(SEQ, 0), reg(0))
+    if m == Mut.SeqBeforeBody
+        o_store("post.publish", slot(SEQ, 0), regp(0, 1))
+    o_store("post.body", slot(B0, 0), imm(id))
+    o_store("post.body", slot(B1, 0), imm(id + 100))
+    if m != Mut.SeqBeforeBody
+        o_store("post.publish", slot(SEQ, 0), regp(0, 1))
+
+fn post_kick_prog(m: Mut)
+    if m == Mut.NoKick
+        return
+    if m != Mut.NoKickFence
+        o_fence("kick.fence")
+    o_kick("post.kick", 0)
+
+# The owner taking `count` messages (sync/mbox.ritz). head: r0, body: r1,
+# r2, the taken-message mask: r3.
+fn consumer_prog(m: Mut, count: i64)
+    let top: i64 = o_await("take.check", slot(SEQ, 0), regp(0, 1))
+    if m == Mut.FreeBeforeCopy
+        o_store("take.free", slot(SEQ, 0), regp(0, RING))
+    o_load("take.copy", 1, slot(B0, 0))
+    o_load("take.copy", 2, slot(B1, 0))
+    if m != Mut.FreeBeforeCopy
+        o_store("take.free", slot(SEQ, 0), regp(0, RING))
+    o_record("check", 1, 2)
+    o_addi("take.next", 0, 1)
+    o_bne("take.next", 0, imm(count), top)
+
+# ---------------------------------------------------------------------------
+# The machine.
+
+fn get(s: *St, i: i64) -> i64
+    (*s).w[i] as i64
+
+[[test_helper]]
+fn put(s: *St, i: i64, v: i64)
+    assert v >= 0 and v < 256
+    (*s).w[i] = v as u8
+
+fn cf(c: i64, f: i64) -> i64
+    CPU0 + c * CPU_W + f
+
+fn rg(s: *St, c: i64, r: i64) -> i64
+    get(s, cf(c, F_REG + r))
+
+fn set_rg(s: *St, c: i64, r: i64, v: i64)
+    put(s, cf(c, F_REG + r), v)
+
+fn val(s: *St, c: i64, v: Val) -> i64
+    if v.reg == NOREG
+        return v.imm
+    rg(s, c, v.reg) + v.imm
+
+fn addr(s: *St, c: i64, a: Addr) -> i64
+    if a.ix == NOREG
+        return a.base
+    a.base + (rg(s, c, a.ix) % RING) * SLOT_W
+
+fn op_at(c: i64, pc: i64) -> Op
+    g_prog[c * MAXOPS + pc]
+
+# A load: the CPU's own newest buffered store to `a`, else memory.
+fn load(s: *St, c: i64, a: i64) -> i64
+    var i: i64 = get(s, cf(c, F_BUFN)) - 1
+    while i >= 0
+        if get(s, cf(c, F_BUF + 2 * i)) == a
+            return get(s, cf(c, F_BUF + 2 * i + 1))
+        i -= 1
+    get(s, a)
+
+# Write the oldest buffered store to memory.
+fn drain1(s: *St, c: i64)
+    let n: i64 = get(s, cf(c, F_BUFN))
+    put(s, get(s, cf(c, F_BUF)), get(s, cf(c, F_BUF + 1)))
+    var i: i64 = 1
+    while i < n
+        put(s, cf(c, F_BUF + 2 * (i - 1)), get(s, cf(c, F_BUF + 2 * i)))
+        put(s, cf(c, F_BUF + 2 * (i - 1) + 1), get(s, cf(c, F_BUF + 2 * i + 1)))
+        i += 1
+    put(s, cf(c, F_BUF + 2 * (n - 1)), 0)
+    put(s, cf(c, F_BUF + 2 * (n - 1) + 1), 0)
+    put(s, cf(c, F_BUFN), n - 1)
+
+fn flush(s: *St, c: i64)
+    while get(s, cf(c, F_BUFN)) > 0
+        drain1(s, c)
+
+fn store(s: *St, c: i64, a: i64, v: i64)
+    let n: i64 = get(s, cf(c, F_BUFN))
+    put(s, cf(c, F_BUF + 2 * n), a)
+    put(s, cf(c, F_BUF + 2 * n + 1), v)
+    put(s, cf(c, F_BUFN), n + 1)
+
+fn done(s: *St, c: i64) -> bool
+    get(s, cf(c, F_PC)) >= g_nops[c]
+
+fn halted(s: *St, c: i64) -> bool
+    get(s, cf(c, F_HALT)) != 0
+
+fn kick_pending(s: *St, c: i64) -> bool
+    get(s, cf(c, F_KICK)) != 0
+
+fn if_on(s: *St, c: i64) -> bool
+    get(s, cf(c, F_IF)) != 0
+
+fn can_step(s: *St, c: i64) -> bool
+    if done(s, c)
+        return false
+    if halted(s, c)
+        return kick_pending(s, c)
+    if if_on(s, c) and kick_pending(s, c)
+        return true
+    let o: Op = op_at(c, get(s, cf(c, F_PC)))
+    match o.kind
+        K.Store => get(s, cf(c, F_BUFN)) < NBUF
+        K.Await => load(s, c, addr(s, c, o.a)) == val(s, c, o.e)
+        _ => true
+
+# The consumer took body {b0, b1}: a whole message, not taken before, after
+# its producer's earlier one (ids 1 then 2 from one producer, 3 then 4 from
+# the other). The mask of taken ids is in reg 3.
+fn record(s: *St, c: i64, b0: i64, b1: i64)
+    let mask: i64 = rg(s, c, 3)
+    var ok: bool = b0 >= 1 and b0 <= 4 and b1 == b0 + 100
+    if ok and (mask & (1 << b0)) != 0
+        ok = false
+    if ok and (b0 == 2 or b0 == 4) and (mask & (1 << (b0 - 1))) == 0
+        ok = false
+    if not ok
+        put(s, W_BAD, 1)
+        return
+    set_rg(s, c, 3, mask | (1 << b0))
+
+fn step(s: *St, c: i64)
+    let pc: i64 = get(s, cf(c, F_PC))
+    if halted(s, c)
+        # The kick wakes the hlt; its handler consumes it.
+        put(s, cf(c, F_HALT), 0)
+        put(s, cf(c, F_KICK), 0)
+        put(s, cf(c, F_PC), pc + 1)
+        return
+    if if_on(s, c) and kick_pending(s, c)
+        # IF=1: the kick is taken before the next op, and consumed.
+        put(s, cf(c, F_KICK), 0)
+        return
+    let o: Op = op_at(c, pc)
+    var next: i64 = pc + 1
+    match o.kind
+        K.Nop => next = pc + 1
+        K.Load => set_rg(s, c, o.r, load(s, c, addr(s, c, o.a)))
+        K.Store => store(s, c, addr(s, c, o.a), val(s, c, o.v))
+        K.Xchg =>
+            flush(s, c)
+            let a: i64 = addr(s, c, o.a)
+            let old: i64 = get(s, a)
+            put(s, a, val(s, c, o.v))
+            set_rg(s, c, o.r, old)
+        K.Cas =>
+            flush(s, c)
+            let a: i64 = addr(s, c, o.a)
+            if get(s, a) == val(s, c, o.e)
+                put(s, a, val(s, c, o.v))
+                set_rg(s, c, o.r, 1)
+            else
+                set_rg(s, c, o.r, 0)
+        K.Xadd =>
+            flush(s, c)
+            let a: i64 = addr(s, c, o.a)
+            let old: i64 = get(s, a)
+            put(s, a, old + val(s, c, o.v))
+            set_rg(s, c, o.r, old)
+        K.Fence => flush(s, c)
+        K.Await => next = pc + 1
+        K.Beq =>
+            if rg(s, c, o.r) == val(s, c, o.e)
+                next = o.target
+        K.Bne =>
+            if rg(s, c, o.r) != val(s, c, o.e)
+                next = o.target
+        K.Jmp => next = o.target
+        K.Addi => set_rg(s, c, o.r, rg(s, c, o.r) + o.v.imm)
+        K.Kick => put(s, cf(o.v.imm, F_KICK), 1)
+        K.Cli => put(s, cf(c, F_IF), 0)
+        K.Sti => put(s, cf(c, F_IF), 1)
+        K.StiHlt =>
+            put(s, cf(c, F_IF), 1)
+            if kick_pending(s, c)
+                put(s, cf(c, F_KICK), 0)
+            else
+                put(s, cf(c, F_HALT), 1)
+                next = pc
+        K.Hlt =>
+            put(s, cf(c, F_HALT), 1)
+            next = pc
+        K.Record => record(s, c, rg(s, c, o.r), rg(s, c, o.v.reg))
+    put(s, cf(c, F_PC), next)
+
+# ---------------------------------------------------------------------------
+# The search.
+
+const TAB: i64 = 65536      # visited-set slots (a power of two; the largest case visits ~7600)
+var g_tab: [65536]St
+var g_used: [65536]bool
+var g_states: i64
+var g_verdict: Verdict
+
+fn hash(s: *St) -> u64
+    var h: u64 = 14695981039346656037
+    var i: i64 = 0
+    while i < SW
+        h = (h ^ ((*s).w[i] as u64)) *% 1099511628211
+        i += 1
+    h
+
+fn same(a: *St, b: *St) -> bool
+    var i: i64 = 0
+    while i < SW
+        if (*a).w[i] != (*b).w[i]
+            return false
+        i += 1
+    true
+
+# Add `s` to the visited set: true if it is new.
+[[test_helper]]
+fn visit(s: *St) -> bool
+    assert g_states < TAB / 4 * 3
+    var i: i64 = (hash(s) & ((TAB - 1) as u64)) as i64
+    while g_used[i]
+        if same(@g_tab[i], s)
+            return false
+        i = (i + 1) & (TAB - 1)
+    g_used[i] = true
+    g_tab[i] = *s
+    g_states += 1
+    true
+
+fn state_ok(s: *St) -> Verdict
+    if get(s, W_BAD) != 0
+        return Verdict.Torn
+    let st: i64 = get(s, PSTATE)
+    if st != RUNNING and st != BLOCKED
+        return Verdict.BadState
+    Verdict.Holds
+
+# A final state (no step and no drain left): every CPU ran to its end.
+fn final_ok(s: *St) -> Verdict
+    var c: i64 = 0
+    while c < NCPU
+        if not done(s, c)
+            return Verdict.Stuck
+        c += 1
+    if g_want_mask != 0 and rg(s, 0, 3) != g_want_mask
+        return Verdict.Lost
+    Verdict.Holds
+
+fn explore(s: *St)
+    if g_verdict != Verdict.Holds
+        return
+    if not visit(s)
+        return
+    let v: Verdict = state_ok(s)
+    if v != Verdict.Holds
+        g_verdict = v
+        return
+    var moved: bool = false
+    var c: i64 = 0
+    while c < NCPU
+        if get(s, cf(c, F_BUFN)) > 0
+            var t: St = *s
+            drain1(@t, c)
+            explore(@t)
+            moved = true
+        if can_step(s, c)
+            var u: St = *s
+            step(@u, c)
+            explore(@u)
+            moved = true
+        c += 1
+    if not moved
+        let f: Verdict = final_ok(s)
+        if f != Verdict.Holds
+            g_verdict = f
+
+# Clear the programs and memory: every CPU at pc 0, IF=1, empty buffer.
+fn machine_reset()
+    var i: i64 = 0
+    while i < SW
+        g_init.w[i] = 0
+        i += 1
+    var c: i64 = 0
+    while c < NCPU
+        g_nops[c] = 0
+        put(@g_init, cf(c, F_IF), 1)
+        c += 1
+    # Slot i starts free for ticket i.
+    var k: i64 = 0
+    while k < RING
+        put(@g_init, SLOT0 + k * SLOT_W + SEQ, k)
+        k += 1
+    g_want_mask = 0
+
+fn on_cpu(c: i64)
+    g_cur = c
+
+fn check() -> Run
+    var i: i64 = 0
+    while i < TAB
+        g_used[i] = false
+        i += 1
+    g_states = 0
+    g_verdict = Verdict.Holds
+    var s: St = g_init
+    explore(@s)
+    Run { states: g_states, verdict: g_verdict }
+
+# ---------------------------------------------------------------------------
+# The cases.
+
+# Case 1 (`notifiers` 1) and 2 (2): ShmWait on CPU 0, ShmNotify on CPU 1
+# (and CPU 2). The process starts RUNNING; the latch at SEEN.
+fn case_sleep_wake(m: Mut, notifiers: i64) -> Run
+    machine_reset()
+    put(@g_init, PSTATE, RUNNING)
+    on_cpu(0)
+    sleeper_prog(m)
+    var n: i64 = 0
+    while n < notifiers
+        on_cpu(1 + n)
+        notifier_prog(m)
+        n += 1
+    check()
+
+# Case 3, waker: CPU 0 idles with its process BLOCKED; CPU 1 makes it
+# RUNNING (a wake from a deadline or an IRQ latch) and kicks.
+fn case_idle_waker(m: Mut) -> Run
+    machine_reset()
+    put(@g_init, PSTATE, BLOCKED)
+    on_cpu(0)
+    idle_prog(m)
+    on_cpu(1)
+    wake_prog(m)
+    check()
+
+# Case 3, mailbox: CPU 0 idles with its process BLOCKED; CPU 1 posts one
+# message to CPU 0's mailbox and kicks.
+fn case_idle_producer(m: Mut) -> Run
+    machine_reset()
+    put(@g_init, PSTATE, BLOCKED)
+    on_cpu(0)
+    idle_prog(m)
+    on_cpu(1)
+    post_prog(m, 1)
+    post_kick_prog(m)
+    check()
+
+# Case 4: CPU 0 takes four messages from a 2-slot ring; CPU 1 posts 1, 2
+# and CPU 2 posts 3, 4.
+fn case_mailbox(m: Mut) -> Run
+    machine_reset()
+    put(@g_init, PSTATE, RUNNING)
+    on_cpu(0)
+    consumer_prog(m, 4)
+    on_cpu(1)
+    post_prog(m, 1)
+    post_prog(m, 2)
+    on_cpu(2)
+    post_prog(m, 3)
+    post_prog(m, 4)
+    g_want_mask = 30            # ids 1..4
+    check()
+
+fn holds(r: Run) -> bool
+    r.states > 0 and r.verdict == Verdict.Holds
+
+fn red(r: Run, want: Verdict) -> bool
+    r.states > 0 and r.verdict == want
+
+# ---------------------------------------------------------------------------
+# The protocol holds.
+
+[[test]]
+fn test_sleep_wake_loses_no_wake() -> i32
+    if not holds(case_sleep_wake(Mut.Clean, 1))
+        return 1
+    0
+
+[[test]]
+fn test_two_notifiers_lose_no_wake() -> i32
+    if not holds(case_sleep_wake(Mut.Clean, 2))
+        return 1
+    0
+
+[[test]]
+fn test_idle_cpu_wakes_for_a_waker() -> i32
+    if not holds(case_idle_waker(Mut.Clean))
+        return 1
+    0
+
+[[test]]
+fn test_idle_cpu_wakes_for_a_post() -> i32
+    if not holds(case_idle_producer(Mut.Clean))
+        return 1
+    0
+
+[[test]]
+fn test_mailbox_whole_fifo_exactly_once() -> i32
+    if not holds(case_mailbox(Mut.Clean))
+        return 1
+    0
+
+# ---------------------------------------------------------------------------
+# Each break turns its case red.
+
+# (a) Plain store for sleep.announce: BLOCKED sits in the sleeper's buffer
+# while it reads the old seq, the notifier's CAS sees RUNNING and does
+# nothing, and the sleeper then sleeps for good.
+[[test]]
+fn test_mut_sleep_announce_store_is_caught() -> i32
+    if not red(case_sleep_wake(Mut.SleepAnnounceStore, 1), Verdict.Stuck)
+        return 1
+    if not red(case_sleep_wake(Mut.SleepAnnounceStore, 2), Verdict.Stuck)
+        return 2
+    0
+
+# (b) Plain store for idle.announce: pc_idle = 1 sits in the buffer while
+# the CPU re-checks, the waker reads pc_idle 0 and sends no kick, and the
+# CPU halts with its process RUNNING.
+[[test]]
+fn test_mut_idle_announce_store_is_caught() -> i32
+    if not red(case_idle_waker(Mut.IdleAnnounceStore), Verdict.Stuck)
+        return 1
+    if not red(case_sleep_wake(Mut.IdleAnnounceStore, 1), Verdict.Stuck)
+        return 2
+    0
+
+# (b) Plain load + store for notify.bump is NOT a lost wake: notify.wake's
+# `lock cmpxchg` drains the bump before it reads the state, so the
+# notifier's side already has its locked op between store and load. The
+# bump stays locked so two notifiers both count; this pins down that the
+# model sees it this way.
+[[test]]
+fn test_mut_bump_store_is_covered_by_the_wake_cas() -> i32
+    if not holds(case_sleep_wake(Mut.BumpStore, 1))
+        return 1
+    if not holds(case_sleep_wake(Mut.BumpStore, 2))
+        return 2
+    0
+
+# (c) post.publish before post.body: the owner sees the slot published and
+# copies the old body.
+[[test]]
+fn test_mut_seq_before_body_is_caught() -> i32
+    if not red(case_mailbox(Mut.SeqBeforeBody), Verdict.Torn)
+        return 1
+    0
+
+# (d) take.free before take.copy: a producer refills the slot while the
+# owner is still copying it.
+[[test]]
+fn test_mut_free_before_copy_is_caught() -> i32
+    if not red(case_mailbox(Mut.FreeBeforeCopy), Verdict.Torn)
+        return 1
+    0
+
+# (e) No kick: the idle CPU sleeps through the work it was given.
+[[test]]
+fn test_mut_no_kick_is_caught() -> i32
+    if not red(case_idle_waker(Mut.NoKick), Verdict.Stuck)
+        return 1
+    if not red(case_idle_producer(Mut.NoKick), Verdict.Stuck)
+        return 2
+    if not red(case_sleep_wake(Mut.NoKick, 1), Verdict.Stuck)
+        return 3
+    0
+
+# (f) `sti` before idle.recheck: a kick that lands during the re-check is
+# taken and consumed there, and the later `hlt` waits for good.
+[[test]]
+fn test_mut_sti_before_recheck_is_caught() -> i32
+    if not red(case_idle_waker(Mut.StiBeforeRecheck), Verdict.Stuck)
+        return 1
+    if not red(case_idle_producer(Mut.StiBeforeRecheck), Verdict.Stuck)
+        return 2
+    0
+
+# post.kick without kick.fence: the x2APIC ICR write is not ordered after
+# the post's plain stores, so the owner can wake, find the mailbox still
+# empty, and halt again before post.publish drains.
+[[test]]
+fn test_mut_kick_without_fence_is_caught() -> i32
+    if not red(case_idle_producer(Mut.NoKickFence), Verdict.Stuck)
+        return 1
+    0

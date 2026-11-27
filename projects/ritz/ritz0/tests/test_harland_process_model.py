@@ -35,6 +35,22 @@ import pytest
 from ritz0_inproc import run_ritz0
 from tracked import is_tracked
 
+# The per-CPU hooks proc/table.ritz, fs/syscall.ritz and syscall/dispatch.ritz
+# declare `extern` (AGAST #4879): the kernel's are arch/x86_64/percpu.ritz
+# cpu_index and sync/idle.ritz cpu_kick_if_idle. One CPU here.
+CPU_HOOKS = """
+var g_cpu: i32 = 0
+var g_kicks: i32 = 0
+var g_kicked: i32 = -1
+
+pub fn cpu_index() -> i32
+    g_cpu
+
+pub fn cpu_kick_if_idle(cpu: i32)
+    g_kicks = g_kicks + 1
+    g_kicked = cpu
+"""
+
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
 PROJECTS = RITZ_ROOT.parent
@@ -62,7 +78,7 @@ def _run(tmp_path, src):
     # Only the program brings the runtime's _start.
     objs = [str(_compile(tmp_path, tree / rel, rel[:-5].replace("/", "_"), ("--no-runtime",)))
             for rel in MODULES]
-    (tmp_path / "t.ritz").write_text(src)
+    (tmp_path / "t.ritz").write_text(src + CPU_HOOKS)
     objs.insert(0, str(_compile(tmp_path, tmp_path / "t.ritz", "t")))
     exe = tmp_path / "t"
     link = subprocess.run(["clang", "-Wno-override-module", *objs, "-o", str(exe),
@@ -138,9 +154,9 @@ fn main() -> i32
     if spawn_blocking() != 0 or proc_current_pid() != 4 or not cwd_is("/bin")
         return 8
     let cmd: *Proc = proc_current()
-    if init.state != PROC_BLOCKED or rzsh.state != PROC_BLOCKED or script.state != PROC_BLOCKED
+    if proc_state_of(init) != PROC_BLOCKED or proc_state_of(rzsh) != PROC_BLOCKED or proc_state_of(script) != PROC_BLOCKED
         return 9
-    if cmd.state != PROC_RUNNING or proc_live_count() != 4
+    if proc_state_of(cmd) != PROC_RUNNING or proc_live_count() != 4
         return 10
     # only the command can run: the round robin never picks a blocked ancestor
     if proc_pick_next() != proc_current_slot()
@@ -148,7 +164,7 @@ fn main() -> i32
     # command exits 42: script runs again in /bin and reaps it, once
     if exit_to_parent(42) != script or proc_current() != script
         return 12
-    if script.state != PROC_RUNNING or not cwd_is("/bin")
+    if proc_state_of(script) != PROC_RUNNING or not cwd_is("/bin")
         return 13
     if proc_wait(4) != 42 or proc_wait(4) != Errno.Child as i64
         return 14
@@ -196,13 +212,13 @@ fn main() -> i32
     # a spawn that fails before the child runs gives its slot back; init
     # never stopped running
     let c: i32 = proc_new_child()
-    if c < 0 or proc_at(c).pid != 2 or proc_at(c).state != PROC_NEW or proc_current() != init
+    if c < 0 or proc_at(c).pid != 2 or proc_state(c) != PROC_NEW or proc_current() != init
         return 3
     # a NEW child is never picked: it has no kernel stack to switch to yet
     if proc_pick_next() != proc_current_slot()
         return 4
     proc_abort_child(c)
-    if init.state != PROC_RUNNING or proc_live_count() != 1 or proc_wait(2) != Errno.Child as i64
+    if proc_state_of(init) != PROC_RUNNING or proc_live_count() != 1 or proc_wait(2) != Errno.Child as i64
         return 5
     # init -> a -> b: b exits unreaped, then a exits: a's zombie child goes
     # with it, a stays for init to reap
@@ -217,7 +233,7 @@ fn main() -> i32
         return 6
     proc_set_current(b)
     proc_exit_current(3)
-    if proc_live_count() != 3 or proc_at(b).state != PROC_ZOMBIE
+    if proc_live_count() != 3 or proc_state(b) != PROC_ZOMBIE
         return 7
     proc_set_current(a)
     proc_exit_current(5)
@@ -247,7 +263,7 @@ fn main() -> i32
     if proc_live_count() != 1
         return 12
     # init exiting has no parent: the table is left alone
-    if proc_exit_current(0) != -1 or proc_current() != init or init.state != PROC_RUNNING
+    if proc_exit_current(0) != -1 or proc_current() != init or proc_state_of(init) != PROC_RUNNING
         return 13
     0
 """
@@ -271,7 +287,7 @@ fn main() -> i32
     proc_start(b)
     let a_pid: u64 = proc_at(a).pid
     let b_pid: u64 = proc_at(b).pid
-    if proc_current_slot() != init or proc_at(init).state != PROC_RUNNING
+    if proc_current_slot() != init or proc_state(init) != PROC_RUNNING
         return 2
     # round robin: init -> a -> b -> init
     if proc_pick_next() != a
@@ -298,7 +314,7 @@ fn main() -> i32
         return 9
     # b exits: init still waits for a
     proc_exit_current(9)
-    if proc_at(init).state != PROC_BLOCKED or proc_at(b).state != PROC_ZOMBIE
+    if proc_state(init) != PROC_BLOCKED or proc_state(b) != PROC_ZOMBIE
         return 10
     if proc_pick_next() != a
         return 11
@@ -309,13 +325,13 @@ fn main() -> i32
         return 12
     # input comes: a runs again; init, waiting for a child, still waits
     proc_wake(BLOCK_TTY)
-    if proc_at(init).state != PROC_BLOCKED
+    if proc_state(init) != PROC_BLOCKED
         return 13
-    if proc_at(a).state != PROC_RUNNING or proc_pick_next() != a
+    if proc_state(a) != PROC_RUNNING or proc_pick_next() != a
         return 14
     # a exits: init wakes and sees both exit codes, unreaped until it waits
     proc_exit_current(4)
-    if proc_at(init).state != PROC_RUNNING or proc_pick_next() != init
+    if proc_state(init) != PROC_RUNNING or proc_pick_next() != init
         return 15
     proc_set_current(init)
     if proc_child_status(a_pid, @code) != PROC_CHILD_EXITED or code != 4
@@ -336,14 +352,14 @@ fn main() -> i32
     proc_start(q)
     let q_pid: u64 = proc_at(q).pid
     proc_exit_current(0)
-    if proc_at(q).detached == 0 or proc_at(q).parent != -1 or proc_at(q).state != PROC_RUNNING
+    if proc_at(q).detached == 0 or proc_at(q).parent != -1 or proc_state(q) != PROC_RUNNING
         return 20
     proc_set_current(init)
     if proc_child_status(q_pid, @code) != Errno.Child as i32 or proc_wait(p_pid) != 0
         return 21
     proc_set_current(q)
     proc_exit_current(3)
-    if proc_at(q).state != PROC_FREE or proc_live_count() != 1
+    if proc_state(q) != PROC_FREE or proc_live_count() != 1
         return 22
     # a detached process is not init: only pid 1 is
     if proc_is_init(proc_at(q)) or not proc_is_init(proc_at(init))
@@ -385,9 +401,9 @@ fn main() -> i32
     # a running pid is marked; nothing else changes, the caller least of all
     if proc_reap_pending(proc_at(d)) or not proc_mark_exit(d_pid).is_ok()
         return 4
-    if not proc_reap_pending(proc_at(d)) or proc_at(d).state != PROC_RUNNING
+    if not proc_reap_pending(proc_at(d)) or proc_state(d) != PROC_RUNNING
         return 5
-    if proc_current_slot() != init or proc_at(init).state != PROC_RUNNING or proc_reap_pending(proc_at(init))
+    if proc_current_slot() != init or proc_state(init) != PROC_RUNNING or proc_reap_pending(proc_at(init))
         return 6
     if proc_reap_pending(proc_at(b))
         return 7
@@ -397,7 +413,9 @@ fn main() -> i32
     proc_set_current(init)
     if not proc_mark_exit(b_pid).is_ok()
         return 8
-    if proc_at(b).state != PROC_RUNNING or proc_at(b).block != BLOCK_NONE or not proc_reap_pending(proc_at(b))
+    # The wake is the state word's CAS alone (#4879): `block` means something
+    # only while BLOCKED, and only its owner writes it.
+    if proc_state(b) != PROC_RUNNING or not proc_reap_pending(proc_at(b))
         return 9
     # the marked pid's exit: a zombie for init, and the mark goes with the slot
     proc_set_current(d)
@@ -496,6 +514,104 @@ def test_round_robin_blocking_and_detached_children(tmp_path):
 def test_mark_exit_refuses_init_and_wakes_a_parked_pid(tmp_path):
     rc = _run(tmp_path, REAP)
     assert rc == 0, REAP_CLAIMS.get(rc, f"exit {rc}")
+
+# The state word and per-CPU current (AGAST #4879, SMP_USER.md §2 and §4).
+# g_cpu, g_kicks and g_kicked are CPU_HOOKS's: the CPU index the table sees,
+# and the kicks its wakes sent.
+SMP_STATE = """\
+import syscall.errno { Errno }
+import proc.table
+
+fn main() -> i32
+    proc_table_reset()
+    proc_enter_init(0)
+    let init: i32 = proc_current_slot()
+    let a: i32 = proc_new_child()
+    g_kicks = 0
+    proc_start(a)
+    # A start publishes RUNNING and kicks the process's CPU (the BSP).
+    if proc_state(a) != PROC_RUNNING or g_kicks != 1 or g_kicked != PROC_HOME_CPU
+        return 1
+
+    # Per CPU: CPU 1 has no current process and its pick finds nothing
+    # (every process's home is the BSP until #4881); CPU 0's is untouched.
+    g_cpu = 1
+    if proc_current_slot() != -1 or proc_current() != 0 as *Proc or proc_pick_next() != -1
+        return 2
+    proc_set_current(a)
+    g_cpu = 0
+    if proc_current_slot() != init
+        return 3
+    g_cpu = 1
+    proc_set_current(-1)
+    g_cpu = 0
+
+    # The eventcount re-check: announce BLOCKED, find the condition met, run on.
+    proc_set_current(a)
+    proc_block(BLOCK_WAIT, 0)
+    if proc_state(a) != PROC_BLOCKED
+        return 4
+    proc_unblock_current()
+    if proc_state(a) != PROC_RUNNING
+        return 5
+
+    # A wake is one CAS: a waker that read the word, then lost the race to
+    # another wake, changes nothing.
+    proc_block(BLOCK_WAIT, 0)
+    let seen: u64 = proc_word(a)
+    g_kicks = 0
+    if not proc_wake_seen(a, seen) or proc_state(a) != PROC_RUNNING or g_kicks != 1
+        return 6
+    if proc_wake_seen(a, seen) or g_kicks != 1
+        return 7
+
+    # The generation: a waker that read the slot's last process cannot wake
+    # the next one in the same slot, though both are BLOCKED.
+    proc_block(BLOCK_WAIT, 0)
+    let stale: u64 = proc_word(a)
+    proc_set_current(init)
+    if not proc_mark_exit(proc_at(a).pid).is_ok()
+        return 8
+    proc_set_current(a)
+    proc_exit_current(0)
+    proc_set_current(init)
+    proc_wait(proc_at(a).pid)
+    if proc_state(a) != PROC_FREE
+        return 9
+    let b: i32 = proc_new_child()
+    if b != a
+        return 10
+    proc_start(b)
+    proc_set_current(b)
+    proc_block(BLOCK_WAIT, 0)
+    proc_set_current(init)
+    if proc_wake_seen(b, stale) or proc_state(b) != PROC_BLOCKED
+        return 11
+    if not proc_wake_pid(proc_at(b).pid, BLOCK_WAIT) or proc_state(b) != PROC_RUNNING
+        return 12
+    0
+"""
+
+SMP_STATE_CLAIMS = {
+    1: "a start publishes RUNNING and kicks the BSP once",
+    2: "another CPU has no current process and picks nothing",
+    3: "CPU 0's current process is its own",
+    4: "proc_block announces BLOCKED",
+    5: "the re-check's unblock makes it RUNNING",
+    6: "a wake from the word it read succeeds and kicks",
+    7: "a second wake from the same word does nothing",
+    8: "mark_exit",
+    9: "the exited, reaped slot is free",
+    10: "the next child reuses the slot",
+    11: "a wake from the last generation's word does nothing",
+    12: "a wake by pid wakes the new process",
+}
+
+
+@pytest.mark.integration
+def test_state_word_cas_generation_and_per_cpu_current(tmp_path):
+    rc = _run(tmp_path, SMP_STATE)
+    assert rc == 0, SMP_STATE_CLAIMS.get(rc, f"exit {rc}")
 
 # --- source-level acceptance -------------------------------------------------------
 

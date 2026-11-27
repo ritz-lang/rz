@@ -37,6 +37,17 @@ import test_ir
 
 from ritz0_inproc import run_ritz0
 
+# The per-CPU hooks proc/table.ritz, fs/syscall.ritz and syscall/dispatch.ritz
+# declare `extern` (AGAST #4879): the kernel's are arch/x86_64/percpu.ritz
+# cpu_index and sync/idle.ritz cpu_kick_if_idle. One CPU here.
+CPU_HOOKS = """
+pub fn cpu_index() -> i32
+    0
+
+pub fn cpu_kick_if_idle(cpu: i32)
+    return
+"""
+
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
@@ -167,7 +178,9 @@ def _run(compiler, tmp_path, src, modules):
         text = path.read_text()
         extra = ("--no-runtime",) if compiler == "ritz0" else ()
         objs.append(str(_compile(compiler, tmp_path, text, mod.replace(".", "_"), extra)))
-    objs.insert(0, str(_compile(compiler, tmp_path, src, "t")))
+    # A program with its own cpu_index stub (the PMM tests drive the CPU) keeps it.
+    hooked = src if "fn cpu_index" in src else src + CPU_HOOKS
+    objs.insert(0, str(_compile(compiler, tmp_path, hooked, "t")))
     if compiler != "ritz0":
         objs.insert(0, str(RITZ_START))
     exe = tmp_path / f"t_{compiler}"
@@ -261,6 +274,13 @@ fn main() -> i32
     # Every dispatch above counted, NoSys ones included: 3 + 4 + 1.
     if syscall_count() != 8
         return 12
+    # SYS_LOCAL (#4879): only what is marked; no syscall and an unregistered
+    # number are never local.
+    if syscall_is_local(0)
+        return 13
+    syscall_mark_local(Syscall.Read)
+    if not syscall_is_local(0) or syscall_is_local(1) or syscall_is_local(256)
+        return 14
     0
 """
 
@@ -393,6 +413,28 @@ def test_every_declared_syscall_is_dispatched():
     registered = set(re.findall(r"^\s+syscall_register\(Syscall\.(\w+),", src, re.M))
     assert set(_kernel_enum()) == registered, \
         f"declared, not dispatched: {sorted(set(_kernel_enum()) - registered)}"
+
+
+# docs/SMP_USER.md §2 "Which syscalls run on the AP" (AGAST #4879): exactly
+# these may run on an AP. A new entry needs the doc's row-by-row reason.
+SYS_LOCAL_ALLOWLIST = {
+    "Getpid", "Yield", "ShmWait", "ShmNotify", "DrvIrqWait",
+    "CapInfo", "CapCheck", "CapDerive", "Mmap", "Munmap", "DebugPrint", "Smp",
+}
+
+
+def test_sys_local_is_the_documented_allowlist():
+    src = ENTRY.read_text()
+    marked = re.findall(r"^\s+syscall_mark_local\(Syscall\.(\w+)\)", src, re.M)
+    assert len(marked) == len(set(marked)), marked
+    assert set(marked) == SYS_LOCAL_ALLOWLIST
+    doc = (HARLAND / "docs" / "SMP_USER.md").read_text()
+    table = doc[doc.index("| Runs locally on an AP (`SYS_LOCAL`)"):doc.index("Everything else is forwarded")]
+    for name in SYS_LOCAL_ALLOWLIST:
+        assert name in table, name
+    # Smp is marked where its handler is registered, before syscall_init.
+    smp = src[src.index("pub fn syscall_register_smp_test()"):]
+    assert "syscall_mark_local(Syscall.Smp)" in smp.split("\n\n", 1)[0]
 
 
 def test_no_second_kernel_syscall_table():

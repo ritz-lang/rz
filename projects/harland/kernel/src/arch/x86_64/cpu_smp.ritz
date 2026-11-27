@@ -14,8 +14,8 @@
 #      therefore in a syscall at the same instant.
 #   4. Phase 2: the BSP resumes the kernel caller through
 #      smp_test_resume_bsp (syscall_entry.s); an AP stays in the kernel on
-#      its IST1 stack, idling with interrupts on (so #4220's AP-call IPI and
-#      CPU-local device interrupts still reach it after boot).
+#      its IST1 stack, in its idle loop (smp_ap_idle), so its mailbox (#4220's
+#      AP call, #4879) and CPU-local device interrupts still reach it.
 #   5. The BSP checks that the recorded stacks and areas are distinct and
 #      prints the verdict the boot tests grep:
 #        [smp] syscall stacks OK: N CPUs in ring-3 SYSCALL at once
@@ -24,7 +24,9 @@
 # made step 3 impossible: the two CPUs overwrote each other's frame.
 
 import klog { klog, klog_dec, klog_hex }
-import io { memory_barrier, cpu_pause, sti_hlt, rdmsr, interrupts_enabled, enable_interrupts }
+import io { memory_barrier, cpu_pause, rdmsr, interrupts_enabled, enable_interrupts, disable_interrupts }
+import sync.idle { cpu_idle_begin, cpu_idle_cancel, cpu_idle_sleep }
+import sync.mbox { mbox_has_work, mbox_drain }
 import arch.x86_64.gdt { gdt_get_sysret_base, gdt_set_kernel_stack_cpu, gdt_user_segments_ok }
 import arch.x86_64.sysret_catch { sysret_catch_arm, sysret_catch_disarm, sysret_catch_caught, sysret_catch_vector, sysret_catch_rip, sysret_catch_cs, sysret_ring0_selftest }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page }
@@ -236,13 +238,29 @@ pub fn smp_syscall_selftest(bsp_cpu: i32) -> i32
     klog(" CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\n")
     return 0
 
-# An AP that has finished the self-test stays in the kernel with interrupts
-# on, idling on the IST1 stack smp_ap_run selected. It must not halt: #4220's
-# AP-call IPI (vector 240) and CPU-local device interrupts are what an AP does
-# after boot, and both need a live, interrupt-enabled CPU.
-fn smp_ap_idle()
+# An AP's idle loop: it never returns. After the self-test it runs inside
+# the Smp syscall handler on the IST1 stack smp_ap_run selected (an AP that
+# missed the test runs it from ap_entry on its bootstrap stack). It must not
+# halt for good: the mailbox (an AP call, a ping) and CPU-local device
+# interrupts are what an AP does after boot, and both need a CPU that wakes
+# for interrupts.
+#
+# Each round is the idle handshake (sync/idle.ritz, SMP_USER.md §4): with
+# IF=0 announce idle, re-check the mailbox, then either drain it (the safe
+# point: no ISR in service and no kernel code half done) or sleep in
+# sti;hlt. A kick that lands between the re-check and the hlt is held
+# pending while IF=0 and wakes the hlt, so no message waits for the next
+# interrupt. The drain runs AP calls with IF=1 (apcall.ritz ap_call_run).
+pub fn smp_ap_idle()
+    let me: i32 = cpu_index()
     while true
-        sti_hlt()
+        disable_interrupts()
+        cpu_idle_begin()
+        if mbox_has_work(me)
+            cpu_idle_cancel()
+            mbox_drain()
+        else
+            cpu_idle_sleep()
 
 # An AP's side: wait for the BSP to start the test, then enter the stub on
 # this CPU's own user stack. Returns with an error if the test never starts.
@@ -259,7 +277,7 @@ pub fn smp_ap_run(cpu_idx: i32) -> i32
         return -1
     # The test's syscalls run on this CPU's IST1 stack, clear of the bootstrap
     # stack the trampoline started us on: after phase 2 the AP idles there
-    # with interrupts on, ready for #4220's AP-call IPI.
+    # (smp_ap_idle), ready for its mailbox.
     # TSS.rsp0 too: a ring-3 #PF or #GP lands there (no IST, AGAST #4628),
     # and this CPU's kernel stack is its bootstrap stack's page.
     kstack_set_current(cpu_stack_top(cpu_idx, CPU_IST1))
@@ -279,7 +297,7 @@ pub fn sys_smp_test_handler(phase: u64, a2: u64, a3: u64, a4: u64) -> i64
     if smp_bsp_inside == 0
         # Outside the boot self-test SYS_SMP is not a user ABI. An AP can
         # only be our stub finishing phase 2 (the BSP resumed first): let it
-        # idle, ready for its AP-call IPIs and device interrupts. A user
+        # idle, ready for its mailbox and device interrupts. A user
         # program on the BSP gets ENOSYS instead of the test's resume
         # mechanism.
         if cpu != smp_bsp_cpu

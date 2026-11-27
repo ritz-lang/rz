@@ -32,6 +32,17 @@ import pytest
 
 from ritz0_inproc import run_ritz0
 
+# The per-CPU hooks proc/table.ritz, fs/syscall.ritz and syscall/dispatch.ritz
+# declare `extern` (AGAST #4879): the kernel's are arch/x86_64/percpu.ritz
+# cpu_index and sync/idle.ritz cpu_kick_if_idle. One CPU here.
+CPU_HOOKS = """
+pub fn cpu_index() -> i32
+    0
+
+pub fn cpu_kick_if_idle(cpu: i32)
+    return
+"""
+
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
 PROJECTS = RITZ_ROOT.parent
@@ -393,7 +404,7 @@ def test_foreground_group(tmp_path):
     for src, rel in [(ERRNO, "syscall/errno.ritz"), (PROC_TABLE, "proc/table.ritz"), (FG, "tty/fg.ritz")]:
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
         (tree / rel).write_text(src.read_text())
-    (tmp_path / "t.ritz").write_text(FG_PROGRAM)
+    (tmp_path / "t.ritz").write_text(FG_PROGRAM + CPU_HOOKS)
     env = dict(os.environ, RITZ_PATH=f"{tree}:{RITZ_ROOT}:{tmp_path}")
     objs = []
     for src, name, extra in [(tmp_path / "t.ritz", "t", ()),

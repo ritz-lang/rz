@@ -28,7 +28,7 @@ VMM_SRC = KERNEL_SRC / "mm" / "vmm.ritz"
 
 # vmm imports klog (#1885) and io; klog imports serial. Their `asm x86_64:`
 # blocks only ritz0 parses; klog imports ritzlib.fmt.digits (#1957) and ritzlib.str.
-VMM_MODULES = ["mm.vmm", "mm.pmm", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
+VMM_MODULES = ["mm.vmm", "mm.pmm", "sync.spin", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
 
 GIB = 1 << 30
 SIX_GIB_PAGES = 6 * GIB // 4096
@@ -37,7 +37,7 @@ HALF_GIB_PAGES = GIB // 2 // 4096
 # Exit code i names the i-th failing check.
 PHYSMAP_PROGRAM = f"""\
 import ritzlib.option
-import mm.pmm {{ PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page }}
+import mm.pmm {{ PAGE_SIZE, pmm_irqsave, pmm_init, pmm_mark_region_free, pmm_alloc_page }}
 import mm.vmm {{ PTE_PRESENT, PTE_WRITABLE, PTE_HUGE, PTE_ADDR_MASK, vmm_pml4_phys, vmm_physmap_fill }}
 
 const ONE_GIB: u64 = 0x40000000
@@ -91,7 +91,14 @@ fn pd_maps(pdpt: u64, g: u64, lo: u64, hi: u64) -> bool
         e = e + 1
     return true
 
+# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
+# frame caches (AGAST #4879): one CPU here.
+pub fn cpu_index() -> i32
+    0
+
 fn main() -> i32
+    # Ring 3: the PMM's cli would fault.
+    pmm_irqsave(false)
     # 1. -m 6G under OVMF: RAM at 0-2 GiB and 4-6 GiB, the PCI hole between.
     #    The loader identity-maps GiB 0 and two loader-data chunks with no
     #    usable page in them (BootInfo-like): one at 1 GiB, one at the top

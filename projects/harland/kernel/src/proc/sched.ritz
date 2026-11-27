@@ -20,24 +20,39 @@
 #     globals need no locks.
 #   * sched_yield: sys_yield.
 #   * sched_block: wait / blocking spawn (BLOCK_CHILD), read(0) (BLOCK_TTY).
-#     With nothing runnable the CPU idles in sti;hlt on the blocked
-#     process's stack until an IRQ wakes someone.
-#   * sched_exit: an exiting or killed process leaves for good.
+#     With nothing runnable the CPU switches to its idle context.
+#   * sched_exit: an exiting or killed process leaves for good, always onto
+#     the idle context, which picks what runs next.
 #
-# One CPU runs processes; the APs run the per-CPU syscall-stack self-test at
-# boot and then halt (per-CPU run queues: AGAST #4192). Every switch is on
-# the CPU's own per-CPU state (arch/x86_64/percpu.ritz), so a future AP
-# scheduler starts from the same pieces.
+# The idle context (AGAST #4879, docs/SMP_USER.md §4 "CPU-level sleep"):
+# each CPU that runs the scheduler has one, on its own per-CPU stack
+# (percpu.ritz CPU_IDLE), made by sched_start. It is "no process": the
+# CPU's current slot is -1 there, so an IRQ that lands while it sleeps
+# parks nobody (waitq_can_park), and a blocked or exited process's stack is
+# never the one the CPU idles on. Its loop is the handshake with every
+# waker and mailbox producer (sync/idle.ritz): announce idle with a locked
+# op, re-check for a runnable process or a mailbox message, and only then
+# sti;hlt. A kick sent after the announce is held while IF=0 and wakes the
+# hlt, so no wake-up is lost. Until sched_start has made it (boot
+# self-tests that block before the scheduler runs) sched_block idles in
+# place as before.
+#
+# Per CPU: the counters and `running` are each CPU's own (SMP_USER.md §2
+# inventory), summed for the reports. Processes still run on the BSP only
+# (proc/table.ritz PROC_HOME_CPU, until #4881); an AP's pick finds nothing.
 
 import klog { klog, klog_dec }
 import io { sti_hlt, disable_interrupts, enable_interrupts, interrupts_enabled, rdtsc }
 import mm.vmm { vmm_switch_pml4, vmm_get_current_pml4 }
 import arch.x86_64.gdt { gdt_set_kernel_stack_cpu }
-import arch.x86_64.percpu { cpu_index }
+import arch.x86_64.percpu { cpu_index, cpu_stack_top, CPU_IDLE }
+import arch.x86_64.cpu_map { MAX_CPUS }
+import sync.idle { cpu_idle_begin, cpu_idle_cancel, cpu_idle_sleep }
+import sync.mbox { mbox_has_work, mbox_drain }
 import arch.x86_64.apic { lapic_timer_start, lapic_timer_stop,lapic_tick_advance, lapic_watchdog_expired }
 import fs.syscall { fs_process_select }
 import syscall.stack { kstack_top }
-import proc.table { Proc, PROC_RUNNING, BLOCK_IRQ, proc_at, proc_current_slot, proc_pick_next, proc_set_current, proc_wake, proc_runnable_count }
+import proc.table { Proc, PROC_RUNNING, BLOCK_IRQ, proc_at, proc_state, proc_current_slot, proc_pick_next, proc_set_current, proc_wake, proc_runnable_count }
 import proc.waitset { waitset_tick }
 import mm.shm { shm_detach_expired, shm_detach_wake_due }
 
@@ -68,19 +83,47 @@ const USER_SS: u64 = 0x1B         # arch/x86_64/gdt.ritz GDT_USER_DATA
 const USER_RFLAGS: u64 = 0x202     # IF=1: the timer can preempt it
 const KERNEL_RFLAGS: u64 = 0x2     # IF=0 until proc_first_entry's iretq
 
-var sched_ticks: u64 = 0
-var sched_switches: u64 = 0
-# Switches that loaded another page table (CR3): the address-space switches
-# a CPL-3 driver and netd add per frame (AGAST #4768, the latency gate).
-var sched_cr3_switches: u64 = 0
-var sched_preemptions: u64 = 0
-# Ticks that found two or more processes runnable: each one a tick the
-# scheduler should have preempted on, whichever mode it interrupted. The
-# boot gate's #4332 check compares preemptions with these, not with every
-# tick: a program running alone (waiting on a slow disk, say) adds ticks
-# that no scheduler could preempt on (AGAST #4832).
-var sched_contended: u64 = 0
-var sched_running: bool = false
+# sched_switch's frame, then the fake return address an entered function
+# expects above it (the idle context's first switch).
+const IDLE_FRAME_WORDS: u64 = 9
+
+# One CPU's scheduler counters.
+struct SchedCounts
+    ticks: u64
+    switches: u64
+    # Switches that loaded another page table (CR3): the address-space
+    # switches a CPL-3 driver and netd add per frame (AGAST #4768, the
+    # latency gate).
+    cr3_switches: u64
+    preemptions: u64
+    # Ticks that found two or more processes runnable: each one a tick the
+    # scheduler should have preempted on, whichever mode it interrupted. The
+    # boot gate's #4332 check compares preemptions with these, not with
+    # every tick: a program running alone (waiting on a slow disk, say) adds
+    # ticks that no scheduler could preempt on (AGAST #4832).
+    contended: u64
+
+# Each CPU's own, by CPU index (literal length: MAX_CPUS); the reports sum
+# them (sched_totals).
+var sched_counts: [64]SchedCounts
+var sched_running: [64]bool
+# The idle context's saved kernel RSP while a process runs, and whether
+# sched_start has made it.
+var sched_idle_ksp: [64]u64
+var sched_idle_made: [64]bool
+
+# Every CPU's counters, summed (a racy sum: each is its CPU's own).
+fn sched_totals() -> SchedCounts
+    var t: SchedCounts = SchedCounts { ticks: 0, switches: 0, cr3_switches: 0, preemptions: 0, contended: 0 }
+    var c: i32 = 0
+    while c < MAX_CPUS
+        t.ticks = t.ticks + sched_counts[c].ticks
+        t.switches = t.switches + sched_counts[c].switches
+        t.cr3_switches = t.cr3_switches + sched_counts[c].cr3_switches
+        t.preemptions = t.preemptions + sched_counts[c].preemptions
+        t.contended = t.contended + sched_counts[c].contended
+        c = c + 1
+    t
 
 # The process in `slot` runs on its own kernel stack from now on: TSS.rsp0
 # and the syscall stack point at it. Only the switch and sched_start call
@@ -90,47 +133,102 @@ fn sched_use_kstack(slot: i32)
     gdt_set_kernel_stack_cpu(cpu_index(), top)
     kstack_set_current(top)
 
-# Switch to the runnable process in `next`. IF=0. Returns when something
-# switches back to the caller (never, for an exiting caller).
+# Switch to the runnable process in `next`, or to this CPU's idle context
+# (next < 0). IF=0. Returns when something switches back to the caller
+# (never, for an exiting caller). From the idle context (current slot -1)
+# its RSP is saved as the idle context's. Onto the idle context the page
+# table, TSS.rsp0 and the syscall stack stay as they were: it runs in ring
+# 0 only, and keeping CR3 means a process that wakes on this CPU again
+# costs no CR3 load.
 fn sched_switch_to(next: i32)
+    let cpu: i32 = cpu_index()
     let prev: i32 = proc_current_slot()
     if next == prev
+        return
+    var save_at: *u64 = @sched_idle_ksp[cpu]
+    if prev >= 0
+        save_at = @(*proc_at(prev)).ksp
+    if next < 0
+        proc_set_current(-1)
+        sched_switch(save_at, sched_idle_ksp[cpu])
         return
     let p: *Proc = proc_at(next)
     proc_set_current(next)
     if p.pml4 != vmm_get_current_pml4()
         vmm_switch_pml4(p.pml4)
-        sched_cr3_switches = sched_cr3_switches + 1
+        sched_counts[cpu].cr3_switches = sched_counts[cpu].cr3_switches + 1
     sched_use_kstack(next)
     fs_process_select(p.pid)
-    sched_switches = sched_switches + 1
-    let from: *Proc = proc_at(prev)
-    sched_switch(@(*from).ksp, p.ksp)
+    sched_counts[cpu].switches = sched_counts[cpu].switches + 1
+    sched_switch(save_at, p.ksp)
+
+# The idle context's loop: the CPU-level sleep of SMP_USER.md §4, step for
+# step as test/test_smp_proto.ritz models it. IF=0 throughout but for the
+# hlt. Entered by the first switch onto the idle context; never returns.
+fn sched_idle_main()
+    let cpu: i32 = cpu_index()
+    while true
+        # idle.announce: a locked xchg of this CPU's idle flag to 1.
+        cpu_idle_begin()
+        # idle.recheck: a runnable process, or a mailbox message, after the
+        # announce. A waker's CAS before our re-check is seen here; one
+        # after it reads the flag and kicks.
+        let next: i32 = proc_pick_next()
+        if next >= 0
+            cpu_idle_cancel()
+            sched_switch_to(next)
+        else if mbox_has_work(cpu)
+            cpu_idle_cancel()
+            mbox_drain()
+        else
+            # idle.sleep: sti;hlt. A kick held pending since the announce
+            # ends the hlt at once.
+            cpu_idle_sleep()
+
+# Make this CPU's idle context: a sched_switch frame at the top of its idle
+# stack that "returns" into sched_idle_main with IF=0, as
+# sched_prepare_user's does into proc_first_entry.
+fn sched_make_idle(cpu: i32)
+    if sched_idle_made[cpu]
+        return
+    let top: u64 = cpu_stack_top(cpu, CPU_IDLE)
+    let sw: *u64 = (top - IDLE_FRAME_WORDS * 8) as *u64
+    var i: u64 = 0
+    while i < IDLE_FRAME_WORDS
+        *(sw + i) = 0
+        i = i + 1
+    *sw = KERNEL_RFLAGS
+    *(sw + SWITCH_RET) = sched_idle_main as u64
+    sched_idle_ksp[cpu] = sw as u64
+    sched_idle_made[cpu] = true
 
 # init (the running process, slot `slot`) is about to enter ring 3: it runs
 # on its own kernel stack, and the periodic tick starts. Idempotent: once
 # the scheduler runs, a second call changes nothing (RING1_DRIVER.md §9:
 # pid 1 may start it before run_init does).
 pub fn sched_start(slot: i32)
-    if sched_running
+    let cpu: i32 = cpu_index()
+    if sched_running[cpu]
         return
+    sched_make_idle(cpu)
     sched_use_kstack(slot)
     lapic_timer_start(SCHED_HZ)
-    sched_running = true
+    sched_running[cpu] = true
 
-# The periodic tick drives preemption: sched_start ran and sched_stop has
-# not undone it.
+# The periodic tick drives preemption on this CPU: sched_start ran and
+# sched_stop has not undone it.
 pub fn sched_is_running() -> bool
-    sched_running
+    sched_running[cpu_index()]
 
 # Undo sched_start: the periodic tick stops and sched_tick preempts nothing
 # until sched_start runs again. The kernel stack stays the one sched_start
 # chose. A no-op when the scheduler is not running.
 pub fn sched_stop()
-    if not sched_running
+    let cpu: i32 = cpu_index()
+    if not sched_running[cpu]
         return
     lapic_timer_stop()
-    sched_running = false
+    sched_running[cpu] = false
 
 # Give the CPU to the next runnable process, if there is another; the
 # caller stays runnable and continues when its turn comes round.
@@ -150,22 +248,32 @@ pub fn sched_yield()
 pub fn sched_block()
     let was: bool = interrupts_enabled()
     disable_interrupts()
+    let cpu: i32 = cpu_index()
     let me: i32 = proc_current_slot()
-    while proc_at(me).state != PROC_RUNNING
+    while proc_state(me) != PROC_RUNNING
         let next: i32 = proc_pick_next()
-        if next < 0
+        if next >= 0
+            sched_switch_to(next)
+        else if sched_idle_made[cpu]
+            sched_switch_to(-1)
+        else
+            # No idle context yet (a boot self-test before sched_start):
+            # idle here, as before #4879.
             sti_hlt()
             disable_interrupts()
-        else
-            sched_switch_to(next)
     if was
         enable_interrupts()
 
-# The caller has exited (proc_exit_current: a zombie, or a free slot):
-# switch to anything runnable, idling until something is. Never returns;
-# nothing switches back to an exited process.
+# The caller has exited (proc_exit_current: a zombie, or a free slot): it
+# leaves for this CPU's idle context, which runs whatever is runnable.
+# Never returns; nothing switches back to an exited process, and nothing
+# runs on its stack again.
 pub fn sched_exit()
     disable_interrupts()
+    let cpu: i32 = cpu_index()
+    if sched_idle_made[cpu]
+        sched_switch_to(-1)
+    # No idle context (an exit before sched_start ever ran): as before.
     while true
         let next: i32 = proc_pick_next()
         if next < 0
@@ -177,9 +285,10 @@ pub fn sched_exit()
 # The timer IRQ (vector 32), after its EOI. from_user: it interrupted a
 # process (any non-zero CPL), the only place a process is preempted.
 pub fn sched_tick(from_user: bool)
-    sched_ticks = sched_ticks + 1
-    if sched_running and proc_runnable_count() >= 2
-        sched_contended = sched_contended + 1
+    let cpu: i32 = cpu_index()
+    sched_counts[cpu].ticks = sched_counts[cpu].ticks + 1
+    if sched_running[cpu] and proc_runnable_count() >= 2
+        sched_counts[cpu].contended = sched_counts[cpu].contended + 1
     # The NVMe watchdog rides this tick instead of reprogramming the timer
     # (#4220): count the tick, and wake a parked driver wait when it expires.
     lapic_tick_advance()
@@ -197,11 +306,11 @@ pub fn sched_tick(from_user: bool)
         shm_detach_expired()
     else
         shm_detach_wake_due()
-    if not from_user or not sched_running
+    if not from_user or not sched_running[cpu]
         return
     let next: i32 = proc_pick_next()
     if next >= 0 and next != proc_current_slot()
-        sched_preemptions = sched_preemptions + 1
+        sched_counts[cpu].preemptions = sched_counts[cpu].preemptions + 1
         sched_switch_to(next)
 
 # Build a new process's first frames on slot's kernel stack: its user frame
@@ -236,24 +345,25 @@ pub fn sched_prepare_user(slot: i32, entry: u64, user_rsp: u64, arg0: u64, arg1:
 # How many times sched_tick has preempted a process for another (the
 # driver-preempt boot test, #4713).
 pub fn sched_preemption_count() -> u64
-    sched_preemptions
+    sched_totals().preemptions
 
 # How many process switches, and how many of them loaded another page
 # table, since boot (the latency window's before/after, AGAST #4768).
 pub fn sched_switch_count() -> u64
-    sched_switches
+    sched_totals().switches
 
 pub fn sched_cr3_switch_count() -> u64
-    sched_cr3_switches
+    sched_totals().cr3_switches
 
 # Report the scheduler's counters (init's exit).
 pub fn sched_report()
+    let t: SchedCounts = sched_totals()
     klog("[sched] ")
-    klog_dec(sched_ticks)
+    klog_dec(t.ticks as i64)
     klog(" ticks, ")
-    klog_dec(sched_switches)
+    klog_dec(t.switches as i64)
     klog(" switches, ")
-    klog_dec(sched_preemptions)
+    klog_dec(t.preemptions as i64)
     klog(" preemptions, ")
-    klog_dec(sched_contended)
+    klog_dec(t.contended as i64)
     klog(" contended ticks\n")

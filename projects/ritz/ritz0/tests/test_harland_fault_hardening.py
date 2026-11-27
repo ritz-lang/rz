@@ -53,17 +53,24 @@ def _fn(path, name):
 
 # mm/pmm logs through klog (#1885), which imports serial, whose `asm x86_64:`
 # blocks only ritz0 parses; klog imports ritzlib.fmt.digits (#1957) and ritzlib.str.
-PMM_MODULES = ["mm.pmm", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
+PMM_MODULES = ["mm.pmm", "sync.spin", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
 
 # Exit code i names the i-th failing check.
 PMM_OWN_FRAMES = """\
 import ritzlib.option
-import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages }
+import mm.pmm { PAGE_SIZE, pmm_irqsave, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages }
 
 # A 4 GiB bitmap (the boot paths size theirs from the memory map, #4183).
 var bm: [131072]u8
 
+# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
+# frame caches (AGAST #4879): one CPU here.
+pub fn cpu_index() -> i32
+    0
+
 fn main() -> i32
+    # Ring 3: the PMM's cli would fault.
+    pmm_irqsave(false)
     pmm_init(@bm[0], 1048576)
     # RAM is pages 0..7 (page 0 stays out of the pool).
     pmm_mark_region_free(0, 8 * PAGE_SIZE)

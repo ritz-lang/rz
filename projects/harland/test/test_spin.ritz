@@ -1,0 +1,68 @@
+# sync/spin.ritz's ticket lock (AGAST #4879, SMP_USER.md §2 "The leaf
+# locks"), single-threaded: ticket order, trylock and the held check. The
+# cross-CPU protocol is test_smp_proto.ritz's model.
+
+import ritzlib.option
+import sync.spin { SpinLock, SpinGuard, spin_new, spin_set_irqsave, spin_lock, spin_trylock, spin_unlock, spin_is_held, spin_irq_off, spin_irq_restore }
+
+var g_lock: SpinLock
+
+fn fresh() -> *SpinLock
+    g_lock = spin_new()
+    # A hosted test runs in ring 3, where cli faults.
+    spin_set_irqsave(@g_lock, false)
+    @g_lock
+
+[[test]]
+fn test_spin_lock_unlock() -> i32
+    let l: *SpinLock = fresh()
+    if spin_is_held(l)
+        return 1
+    let g: SpinGuard = spin_lock(l)
+    if not spin_is_held(l)
+        return 2
+    spin_unlock(l, g)
+    if spin_is_held(l)
+        return 3
+    0
+
+[[test]]
+fn test_spin_trylock_refuses_a_held_lock() -> i32
+    let l: *SpinLock = fresh()
+    let g: SpinGuard = spin_lock(l)
+    let got: bool = match spin_trylock(l)
+        Some(_) => true
+        None => false
+    if got
+        return 1
+    spin_unlock(l, g)
+    match spin_trylock(l)
+        Some(g2) => spin_unlock(l, g2)
+        None => return 2
+    if spin_is_held(l)
+        return 3
+    0
+
+[[test]]
+fn test_spin_tickets_wrap() -> i32
+    let l: *SpinLock = fresh()
+    (*l).next = 0xFFFFFFFF
+    (*l).serving = 0xFFFFFFFF
+    let g: SpinGuard = spin_lock(l)
+    spin_unlock(l, g)
+    if (*l).next != 0 or (*l).serving != 0 or spin_is_held(l)
+        return 1
+    0
+
+[[test]]
+fn test_spin_irq_off_takes_no_ticket() -> i32
+    # The IF save alone (mm/pmm.ritz's frame caches): the lock stays free,
+    # and with the save switched off there is no IF to give back.
+    let l: *SpinLock = fresh()
+    let g: SpinGuard = spin_irq_off(l)
+    if spin_is_held(l) or g.was_on
+        return 1
+    spin_irq_restore(g)
+    if spin_is_held(l)
+        return 2
+    0

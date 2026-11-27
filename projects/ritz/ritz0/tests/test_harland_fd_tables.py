@@ -35,6 +35,17 @@ import pytest
 
 from ritz0_inproc import run_ritz0
 
+# The per-CPU hooks proc/table.ritz, fs/syscall.ritz and syscall/dispatch.ritz
+# declare `extern` (AGAST #4879): the kernel's are arch/x86_64/percpu.ritz
+# cpu_index and sync/idle.ritz cpu_kick_if_idle. One CPU here.
+CPU_HOOKS = """
+pub fn cpu_index() -> i32
+    0
+
+pub fn cpu_kick_if_idle(cpu: i32)
+    return
+"""
+
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -367,7 +378,7 @@ def _run(compiler, tmp_path, src, modules):
     # to the tree's siblings (ritz1 looks next to the importing file first).
     objs = [str(_compile(compiler, tmp_path, tree / rel, rel[:-5].replace("/", "_"), extra))
             for rel in modules]
-    (tmp_path / "t.ritz").write_text(src)
+    (tmp_path / "t.ritz").write_text(src + CPU_HOOKS)
     objs.insert(0, str(_compile(compiler, tmp_path, tmp_path / "t.ritz", "t")))
     if compiler != "ritz0":
         objs.insert(0, str(RITZ_START))
@@ -735,20 +746,26 @@ def test_init_gets_a_table_before_it_runs():
 
 def test_fs_layer_does_not_import_the_process_layer():
     # No import cycle and no same-language `extern fn` (c6dc7be8): the process
-    # layer tells fs who runs; fs never asks.
+    # layer tells fs who runs; fs never asks. The one hook allowed is the
+    # arch layer's cpu_index (AGAST #4879): which CPU's current FsProc, not
+    # who runs.
     for rel in ("fs/syscall.ritz", "fs/fd.ritz"):
         src = (KERNEL_SRC / rel).read_text()
         assert not re.search(r"^import syscall\.runtime", src, re.M), rel
-        assert "extern fn" not in src, rel
+        externs = re.findall(r"^extern fn .*$", src, re.M)
+        assert externs in ([], ["extern fn cpu_index() -> i32"]), (rel, externs)
 
 
 def test_no_kernel_wide_fd_table_is_left():
     vfs = (KERNEL_SRC / "fs" / "vfs.ritz").read_text()
     assert "kernel_fds" not in vfs and "fn fd_alloc" not in vfs
     fs = (KERNEL_SRC / "fs" / "syscall.ritz").read_text()
-    # one heap FsProc per live process; the BSS keeps only the pointers
+    # one heap FsProc per live process; the BSS keeps only the pointers, and
+    # each CPU's current index (AGAST #4879)
     assert re.search(r"^var fs_procs: \[8\]\*FsProc$", fs, re.M)
-    assert not re.search(r"^var \w+: \[\d+\]", fs.replace("var fs_procs", ""), re.M)
+    assert re.search(r"^var fs_current_by_cpu: \[64\]i32$", fs, re.M)
+    rest = fs.replace("var fs_procs", "").replace("var fs_current_by_cpu", "")
+    assert not re.search(r"^var \w+: \[\d+\]", rest, re.M)
 
 
 def test_init_runs_the_fd_table_tests():

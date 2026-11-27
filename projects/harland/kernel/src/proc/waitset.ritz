@@ -44,6 +44,16 @@
 #
 # Processes run on the BSP only (proc/sched.ritz). A latch on another CPU
 # is recorded but wakes nobody, as waitq_wake_irq does.
+#
+# Lock-free across CPUs (AGAST #4879, docs/SMP_USER.md §4): an IRQ object's
+# `latched` count and a shm latch's `bits` are changed only by atomic
+# read-modify-writes ("notify.bump"), and a wake is proc/table.ritz's CAS
+# on the state word ("notify.wake"). A wait is the eventcount sleep: the
+# process announces BLOCKED with a locked xchg (proc_block), then re-checks
+# with waitset_pending ("sleep.recheck") and runs on if anything is hot. On
+# x86 both sides do a locked op between their store and their load, so
+# either the sleeper sees the post or the poster sees BLOCKED: no wake-up
+# is lost (test/test_smp_proto.ritz checks the protocol under TSO).
 
 import proc.table { MAX_PROCS, BLOCK_WAIT, proc_at, proc_wake_pid }
 import driver_abi.wait { WaitEvent, EVENT_DATA, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_USER_MASK, WAIT_SOURCE_CAP, WAIT_OUT_CAP }
@@ -141,7 +151,8 @@ pub fn irq_object_known(object_id: u64) -> bool
 # Latch the object in `slot` and wake its owner if it is parked on its wait
 # set. IF=0 (an interrupt handler, or the kernel under cli).
 fn irq_object_post(slot: i32)
-    irq_objects[slot].latched = irq_objects[slot].latched + 1
+    # notify.bump
+    atomic_fetch_add(@irq_objects[slot].latched, 1)
     if lapic_is_bsp()
         proc_wake_pid(cap_irq_owner(irq_objects[slot].object_id) as u64, BLOCK_WAIT)
 
@@ -171,10 +182,18 @@ pub fn irq_object_fire_vector(vector: u64)
 # False, and nothing changed, when it is cold or unregistered. IF=0.
 pub fn irq_object_take(object_id: u64) -> bool
     let slot: i32 = irq_object_slot(object_id)
-    if slot < 0 or irq_objects[slot].latched == irq_objects[slot].seen
+    if slot < 0
         return false
-    irq_objects[slot].seen = irq_objects[slot].latched
+    let latched: u64 = atomic_load(@irq_objects[slot].latched)
+    if latched == irq_objects[slot].seen
+        return false
+    irq_objects[slot].seen = latched
     true
+
+# `object_id` is hot, without taking it: the sleeper's re-check.
+fn irq_object_hot(object_id: u64) -> bool
+    let slot: i32 = irq_object_slot(object_id)
+    slot >= 0 and atomic_load(@irq_objects[slot].latched) != irq_objects[slot].seen
 
 # The process in `slot` parks on its wait set until TSC `deadline` (never
 # NO_DEADLINE). IF=0.
@@ -258,7 +277,8 @@ fn latch_slot(object_id: u64, pid: u64) -> i32
 # Post `bits` on latch `i` and wake its holder if it is parked on its wait
 # set. IF=0.
 fn latch_post(i: i32, bits: u32)
-    shm_latches[i].bits = shm_latches[i].bits | bits
+    # notify.bump
+    atomic_fetch_or(@shm_latches[i].bits, bits)
     if lapic_is_bsp()
         proc_wake_pid(shm_latches[i].pid, BLOCK_WAIT)
 
@@ -296,7 +316,7 @@ pub fn shm_latch_bits(object_id: u64, pid: u64) -> u32
     let i: i32 = latch_slot(object_id, pid)
     if i < 0
         return 0
-    shm_latches[i].bits
+    atomic_load(@shm_latches[i].bits)
 
 # A kernel post (PEER_CLOSE, DRIVER_GONE, LINK or a user bit) onto `pid`'s
 # latch for `object_id`, waking it if parked on its wait set. False, and
@@ -447,6 +467,27 @@ pub fn wait_plan_add(plan: *WaitPlan, handle: u64, object_id: u64, mask: u32) ->
     plan.source_count = plan.source_count + 1
     true
 
+# The latch bits a listed source reports: its mask's user bits, and every
+# kernel bit.
+fn source_bits(src: PlanSource) -> u32
+    (src.mask & EVENT_USER_MASK) | KERNEL_LATCH_BITS
+
+# Whether waitset_collect would find anything for `pid` under `plan`, with
+# nothing taken: the eventcount sleeper's re-check after it announced
+# BLOCKED ("sleep.recheck").
+pub fn waitset_pending(plan: *WaitPlan, pid: u64) -> bool
+    if plan.with_irq and irq_object_hot(plan.irq_object)
+        return true
+    var s: u32 = 0
+    while s < plan.source_count
+        let src: PlanSource = plan.sources[s as i32]
+        let i: i32 = latch_slot(src.object_id, pid)
+        if i >= 0 and (atomic_load(@shm_latches[i].bits) & source_bits(src)) != 0
+            return true
+        s = s + 1
+    let slot: i32 = inbox_slot(pid)
+    slot >= 0 and inbox_len[slot] > 0
+
 fn collected_push(got: *Collected, handle: u64, bits: u32)
     let i: i32 = got.count as i32
     got.events[i].handle = handle
@@ -474,9 +515,10 @@ pub fn waitset_collect(plan: *WaitPlan, pid: u64, out_cap: u32) -> Collected
         let src: PlanSource = plan.sources[s as i32]
         let i: i32 = latch_slot(src.object_id, pid)
         if i >= 0
-            let bits: u32 = shm_latches[i].bits & ((src.mask & EVENT_USER_MASK) | KERNEL_LATCH_BITS)
+            let bits: u32 = atomic_load(@shm_latches[i].bits) & source_bits(src)
             if bits != 0
-                shm_latches[i].bits = shm_latches[i].bits & ~bits
+                # Only these bits: one a poster ORs in meanwhile stays.
+                atomic_fetch_and(@shm_latches[i].bits, ~bits)
                 collected_push(@got, src.handle, bits)
         s = s + 1
     let slot: i32 = inbox_slot(pid)

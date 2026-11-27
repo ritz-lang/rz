@@ -27,14 +27,14 @@ VMM_SRC = KERNEL_SRC / "mm" / "vmm.ritz"
 
 # vmm imports klog (#1885) and io; klog imports serial. Their `asm x86_64:`
 # blocks only ritz0 parses; klog imports ritzlib.fmt.digits (#1957) and ritzlib.str.
-VMM_MODULES = ["mm.vmm", "mm.pmm", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
+VMM_MODULES = ["mm.vmm", "mm.pmm", "sync.spin", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
 
 # A fake kernel PML4 in a page-aligned slice of .bss (below 1 GiB in a -no-pie
 # binary, as vmm_alloc_low_table requires; phys == virt until the physmap is up).
 # Exit code i names the i-th failing check.
 WINDOW_PROGRAM = """\
 import ritzlib.option
-import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page }
+import mm.pmm { PAGE_SIZE, pmm_irqsave, pmm_init, pmm_mark_region_free, pmm_alloc_page }
 import mm.vmm { PTE_PRESENT, PTE_ADDR_MASK, MMIO_WINDOW_BASE, vmm_pml4_phys, vmm_init_mmio_window, vmm_create_user_pml4, vmm_read_pml4_entry }
 
 var g_mem: [266240]u8
@@ -48,7 +48,14 @@ fn zero_page(p: u64) -> i32
         i = i + 1
     return 0
 
+# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
+# frame caches (AGAST #4879): one CPU here.
+pub fn cpu_index() -> i32
+    0
+
 fn main() -> i32
+    # Ring 3: the PMM's cli would fault.
+    pmm_irqsave(false)
     # The window is the slot this test pins.
     if ((MMIO_WINDOW_BASE >> 39) & 511) != 257
         return 1

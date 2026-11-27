@@ -4,9 +4,32 @@
 # 1 = free, 0 = used
 #
 # This is the foundation of memory management - VMM and heap depend on it.
+#
+# Per-CPU frame caches (AGAST #4879, docs/SMP_USER.md §2 "Per-CPU frame
+# caches"). Each CPU keeps a stack of up to 64 free frames. pmm_alloc_page
+# pops from this CPU's stack; an empty stack takes 32 frames from the global
+# pool in one bitmap pass from pmm_next_free. pmm_free_page pushes; a stack
+# past 64 gives its oldest 32 back in one pass. A CPU touches only its own
+# stack, with IF saved and cleared, because the tick frees frames too
+# (shm_detach_expired). pmm_alloc_contig and pmm_alloc_page_high go to the
+# pool; when it has nothing that fits they take back this CPU's stack and
+# look once more. A frame in a stack is free: pmm_get_free_pages,
+# pmm_range_has_free and the double-free check count it.
+#
+# pmm_lock (SMP_USER.md §2 "The leaf locks") covers the bitmap, its count
+# and its hints. It is held for one batch, one contig or high allocation or
+# one region mark, and calls nothing else. Lock order: pmm_lock, then
+# klog_lock. A hosted test turns its IF save off with pmm_irqsave(false)
+# (cli faults in ring 3); the stacks' IF save follows the same switch.
 
 import klog { klog, klog_dec, klog_hex, klog_hex_prefix }
 import ritzlib.option
+import sync.spin { SpinLock, SpinGuard, spin_lock, spin_unlock, spin_set_irqsave, spin_irq_off, spin_irq_restore }
+
+# Declared, not imported, as proc/waitset.ritz declares lapic_is_bsp: the
+# kernel's is arch/x86_64/percpu.ritz cpu_index (0 before GS is set up), and
+# a host test that compiles this module supplies its own.
+extern fn cpu_index() -> i32
 
 # ============================================================================
 # Page Constants (shared with VMM and heap)
@@ -208,6 +231,22 @@ var pmm_initialized: bool = false
 var pmm_next_free: u64 = 1
 var pmm_high_free: u64 = 0
 
+# The frame caches: CPU c's stack is pmm_cache[c * 64 ..], pmm_cache_n[c]
+# deep, the top at the end. Literal lengths: PMM_MAX_CPUS (cpu_map.ritz
+# MAX_CPUS) times PMM_CACHE_MAX.
+const PMM_MAX_CPUS: i32 = 64
+const PMM_CACHE_MAX: u64 = 64
+const PMM_CACHE_BATCH: u64 = 32
+var pmm_cache: [4096]u64
+var pmm_cache_n: [64]u64
+
+var pmm_lock: SpinLock = SpinLock { next: 0, serving: 0, irqsave: true, _pad: [0, 0, 0, 0, 0, 0, 0] }
+
+# Whether pmm_lock and the frame caches save and clear IF (the kernel: on;
+# a hosted test, where cli faults: off).
+pub fn pmm_irqsave(on: bool)
+    spin_set_irqsave(@pmm_lock, on)
+
 # OOM injection for boot self-tests (AGAST #3552). While armed, each
 # allocation spends one unit of budget, and once it is spent every
 # allocation fails as if RAM had run out. Never armed outside a self-test.
@@ -276,6 +315,10 @@ pub fn pmm_init(bitmap: *u8, max_pages: u64)
     pmm_free_pages = 0
     pmm_next_free = 1
     pmm_high_free = 0
+    var c: i32 = 0
+    while c < PMM_MAX_CPUS
+        pmm_cache_n[c] = 0
+        c = c + 1
     pmm_initialized = true
 
 # Physical address of the bitmap (0 before a boot path set one up).
@@ -301,6 +344,8 @@ pub fn pmm_mark_region_free(base: u64, length: u64) -> i32
     if start_page >= end_page
         return 0
 
+    # Boot-time: no frame of the range sits in a cache.
+    let g: SpinGuard = spin_lock(@pmm_lock)
     var page: u64 = start_page
     while page < end_page
         if not pmm_test_bit(page)
@@ -314,6 +359,7 @@ pub fn pmm_mark_region_free(base: u64, length: u64) -> i32
         pmm_next_free = start_page
     if end_page > pmm_high_free
         pmm_high_free = end_page
+    spin_unlock(@pmm_lock, g)
     return 0
 
 # Mark a range of physical memory as used (reserved)
@@ -325,6 +371,13 @@ pub fn pmm_mark_region_used(base: u64, length: u64) -> i32
     if end_page > pmm_bitmap_pages
         end_page = pmm_bitmap_pages
 
+    # A frame of the range in this CPU's cache is used now too. Only the BSP
+    # marks regions, at boot, so no other cache holds one.
+    let irq: SpinGuard = spin_irq_off(@pmm_lock)
+    pmm_cache_drop_range(cpu_index(), start_page * PAGE_SIZE, end_page * PAGE_SIZE)
+    spin_irq_restore(irq)
+
+    let g: SpinGuard = spin_lock(@pmm_lock)
     var page: u64 = start_page
     while page < end_page
         if pmm_test_bit(page)
@@ -332,6 +385,7 @@ pub fn pmm_mark_region_used(base: u64, length: u64) -> i32
             if pmm_free_pages > 0
                 pmm_free_pages = pmm_free_pages - 1
         page = page + 1
+    spin_unlock(@pmm_lock, g)
 
     return 0
 
@@ -358,49 +412,23 @@ fn pmm_injected_failure() -> bool
     pmm_fail_budget = pmm_fail_budget - 1
     return false
 
-# Allocate a single physical page
-# Returns physical address or 0 on failure
-pub fn pmm_alloc_page() -> u64
-    if not pmm_initialized
-        return 0
+# ----------------------------------------------------------------------------
+# The global pool: callers hold pmm_lock
+# ----------------------------------------------------------------------------
 
-    if pmm_injected_failure()
-        return 0
+# Put `page` (bit clear, in no cache) back in the pool.
+fn pmm_pool_put(page: u64)
+    pmm_set_bit(page)
+    pmm_free_pages = pmm_free_pages + 1
+    if page < pmm_next_free
+        pmm_next_free = page
+    if page >= pmm_high_free
+        pmm_high_free = page + 1
 
+# The highest free page below the high hint, taken; 0 if none.
+fn pmm_pool_take_high() -> u64
     if pmm_free_pages == 0
         return 0
-
-    # Search up from the hint; page 0 is never handed out (#2749). Whole
-    # used bytes are skipped 8 pages at a time.
-    var page: u64 = pmm_next_free
-    while page < pmm_total_pages
-        if (page % 8) == 0 and *pmm_byte(page) == 0
-            page = page + 8
-            continue
-        if pmm_test_bit(page)
-            pmm_clear_bit(page)
-            pmm_free_pages = pmm_free_pages - 1
-            pmm_next_free = page + 1
-            return page * PAGE_SIZE
-        page = page + 1
-
-    pmm_next_free = pmm_total_pages
-    return 0
-
-# Allocate a single physical page, searching down from the top of RAM.
-# For pages the kernel only reaches through the physmap (page tables,
-# AGAST #3530), so low, identity-mapped memory stays for whatever needs it.
-# Returns physical address or 0 on failure
-pub fn pmm_alloc_page_high() -> u64
-    if not pmm_initialized
-        return 0
-
-    if pmm_injected_failure()
-        return 0
-
-    if pmm_free_pages == 0
-        return 0
-
     var page: u64 = pmm_high_free
     if page > pmm_total_pages
         page = pmm_total_pages
@@ -413,20 +441,13 @@ pub fn pmm_alloc_page_high() -> u64
             pmm_clear_bit(page)
             pmm_free_pages = pmm_free_pages - 1
             pmm_high_free = page
-            return page * PAGE_SIZE
-
+            return page
     pmm_high_free = 0
     return 0
 
-# Allocate `n` physically contiguous pages, searching up from the hint:
-# for tables a device reads by physical address and length, such as the
-# AMD-Vi device table (AGAST #4329). Returns the first page's physical
-# address, or 0 if no run of `n` free pages exists. Free page by page.
-pub fn pmm_alloc_contig(n: u64) -> u64
-    if not pmm_initialized or n == 0
-        return 0
-    if pmm_injected_failure()
-        return 0
+# The first page of a run of `n` free pages at or above the hint, taken; 0
+# if there is none.
+fn pmm_pool_take_run(n: u64) -> u64
     if pmm_free_pages < n
         return 0
     var start: u64 = 0
@@ -445,13 +466,172 @@ pub fn pmm_alloc_contig(n: u64) -> u64
                 pmm_free_pages = pmm_free_pages - n
                 if start == pmm_next_free
                     pmm_next_free = start + n
-                return start * PAGE_SIZE
+                return start
         else
             run = 0
         page = page + 1
     return 0
 
-# Free a physical page
+# ----------------------------------------------------------------------------
+# The frame caches: callers run with IF saved and cleared (spin_irq_off)
+# ----------------------------------------------------------------------------
+
+fn pmm_slot(cpu: i32, i: u64) -> i32
+    return cpu * (PMM_CACHE_MAX as i32) + i as i32
+
+# Fill CPU `cpu`'s empty cache with up to PMM_CACHE_BATCH frames, in one
+# locked pass up from the hint (page 0 is never free, #2749; whole used
+# bytes are skipped 8 pages at a time). The lowest ends on top, so frames come out
+# in address order as they did before the caches.
+fn pmm_cache_refill(cpu: i32)
+    let g: SpinGuard = spin_lock(@pmm_lock)
+    var got: u64 = 0
+    var page: u64 = pmm_next_free
+    while got < PMM_CACHE_BATCH and got < pmm_free_pages and page < pmm_total_pages
+        if (page % 8) == 0 and *pmm_byte(page) == 0
+            page = page + 8
+            continue
+        if pmm_test_bit(page)
+            pmm_clear_bit(page)
+            pmm_cache[pmm_slot(cpu, PMM_CACHE_BATCH - 1 - got)] = page * PAGE_SIZE
+            got = got + 1
+        page = page + 1
+    pmm_free_pages = pmm_free_pages - got
+    if page > pmm_total_pages
+        page = pmm_total_pages
+    pmm_next_free = page
+    spin_unlock(@pmm_lock, g)
+    # Slide the batch (filled from the top slot down) to the bottom.
+    let skip: u64 = PMM_CACHE_BATCH - got
+    var i: u64 = 0
+    while i < got
+        pmm_cache[pmm_slot(cpu, i)] = pmm_cache[pmm_slot(cpu, skip + i)]
+        i = i + 1
+    pmm_cache_n[cpu] = got
+
+# Give CPU `cpu`'s `k` oldest (bottom) frames back to the pool in one locked
+# pass.
+fn pmm_cache_return(cpu: i32, k: u64)
+    let n: u64 = pmm_cache_n[cpu]
+    let g: SpinGuard = spin_lock(@pmm_lock)
+    var i: u64 = 0
+    while i < k
+        pmm_pool_put(pmm_cache[pmm_slot(cpu, i)] / PAGE_SIZE)
+        i = i + 1
+    spin_unlock(@pmm_lock, g)
+    while i < n
+        pmm_cache[pmm_slot(cpu, i - k)] = pmm_cache[pmm_slot(cpu, i)]
+        i = i + 1
+    pmm_cache_n[cpu] = n - k
+
+# Drop the frames in [lo, hi) from CPU `cpu`'s cache (they are in use now).
+fn pmm_cache_drop_range(cpu: i32, lo: u64, hi: u64)
+    let n: u64 = pmm_cache_n[cpu]
+    var kept: u64 = 0
+    var i: u64 = 0
+    while i < n
+        let f: u64 = pmm_cache[pmm_slot(cpu, i)]
+        if f < lo or f >= hi
+            pmm_cache[pmm_slot(cpu, kept)] = f
+            kept = kept + 1
+        i = i + 1
+    pmm_cache_n[cpu] = kept
+
+# Some cache holds a frame in [lo, hi). Reads other CPUs' caches unlocked:
+# racy, as pmm_get_free_pages is.
+fn pmm_cache_holds(lo: u64, hi: u64) -> bool
+    var c: i32 = 0
+    while c < PMM_MAX_CPUS
+        let n: u64 = pmm_cache_n[c]
+        var i: u64 = 0
+        while i < n
+            let f: u64 = pmm_cache[pmm_slot(c, i)]
+            if f >= lo and f < hi
+                return true
+            i = i + 1
+        c = c + 1
+    return false
+
+# Give this CPU's whole cache back to the pool (a contig or high allocation
+# found nothing that fits without it).
+fn pmm_cache_flush_this_cpu()
+    let irq: SpinGuard = spin_irq_off(@pmm_lock)
+    let cpu: i32 = cpu_index()
+    pmm_cache_return(cpu, pmm_cache_n[cpu])
+    spin_irq_restore(irq)
+
+# ----------------------------------------------------------------------------
+# The allocation API
+# ----------------------------------------------------------------------------
+
+# Allocate a single physical page from this CPU's cache, refilling it from
+# the pool when it is empty. Returns physical address or 0 on failure
+pub fn pmm_alloc_page() -> u64
+    if not pmm_initialized
+        return 0
+
+    if pmm_injected_failure()
+        return 0
+
+    let irq: SpinGuard = spin_irq_off(@pmm_lock)
+    let cpu: i32 = cpu_index()
+    if pmm_cache_n[cpu] == 0
+        pmm_cache_refill(cpu)
+    var addr: u64 = 0
+    let n: u64 = pmm_cache_n[cpu]
+    if n > 0
+        addr = pmm_cache[pmm_slot(cpu, n - 1)]
+        pmm_cache_n[cpu] = n - 1
+    spin_irq_restore(irq)
+    return addr
+
+# Allocate a single physical page, searching down from the top of RAM.
+# For pages the kernel only reaches through the physmap (page tables,
+# AGAST #3530), so low, identity-mapped memory stays for whatever needs it.
+# Bypasses the caches. Returns physical address or 0 on failure
+pub fn pmm_alloc_page_high() -> u64
+    if not pmm_initialized
+        return 0
+
+    if pmm_injected_failure()
+        return 0
+
+    var page: u64 = pmm_locked_take_high()
+    if page == 0
+        pmm_cache_flush_this_cpu()
+        page = pmm_locked_take_high()
+    return page * PAGE_SIZE
+
+fn pmm_locked_take_high() -> u64
+    let g: SpinGuard = spin_lock(@pmm_lock)
+    let page: u64 = pmm_pool_take_high()
+    spin_unlock(@pmm_lock, g)
+    return page
+
+# Allocate `n` physically contiguous pages, searching up from the hint:
+# for tables a device reads by physical address and length, such as the
+# AMD-Vi device table (AGAST #4329). Bypasses the caches. Returns the first
+# page's physical address, or 0 if no run of `n` free pages exists. Free
+# page by page.
+pub fn pmm_alloc_contig(n: u64) -> u64
+    if not pmm_initialized or n == 0
+        return 0
+    if pmm_injected_failure()
+        return 0
+    var start: u64 = pmm_locked_take_run(n)
+    if start == 0
+        pmm_cache_flush_this_cpu()
+        start = pmm_locked_take_run(n)
+    return start * PAGE_SIZE
+
+fn pmm_locked_take_run(n: u64) -> u64
+    let g: SpinGuard = spin_lock(@pmm_lock)
+    let start: u64 = pmm_pool_take_run(n)
+    spin_unlock(@pmm_lock, g)
+    return start
+
+# Free a physical page onto this CPU's cache; a cache past 64 frames gives
+# its oldest 32 back to the pool.
 pub fn pmm_free_page(addr: u64) -> i32
     if not pmm_initialized
         return -1
@@ -466,24 +646,42 @@ pub fn pmm_free_page(addr: u64) -> i32
     if page >= pmm_total_pages
         return -1
 
-    if pmm_test_bit(page)
+    let frame: u64 = page * PAGE_SIZE
+    let irq: SpinGuard = spin_irq_off(@pmm_lock)
+    # Already free: in the pool, or in a cache.
+    if pmm_test_bit(page) or pmm_cache_holds(frame, frame + PAGE_SIZE)
+        spin_irq_restore(irq)
         return -1
-
-    pmm_set_bit(page)
-    pmm_free_pages = pmm_free_pages + 1
-    if page < pmm_next_free
-        pmm_next_free = page
-    if page >= pmm_high_free
-        pmm_high_free = page + 1
+    let cpu: i32 = cpu_index()
+    if pmm_cache_n[cpu] == PMM_CACHE_MAX
+        pmm_cache_return(cpu, PMM_CACHE_BATCH)
+    let n: u64 = pmm_cache_n[cpu]
+    pmm_cache[pmm_slot(cpu, n)] = frame
+    pmm_cache_n[cpu] = n + 1
+    spin_irq_restore(irq)
     return 0
 
 # ============================================================================
 # Statistics
 # ============================================================================
 
-# Get free memory statistics
+# Free frames: the pool's and every cache's. A racy sum, for the boot log
+# and the tests.
 pub fn pmm_get_free_pages() -> u64
+    var n: u64 = pmm_free_pages
+    var c: i32 = 0
+    while c < PMM_MAX_CPUS
+        n = n + pmm_cache_n[c]
+        c = c + 1
+    return n
+
+# Free frames in the global pool alone (the bitmap), without the caches.
+pub fn pmm_pool_free_pages() -> u64
     return pmm_free_pages
+
+# How many frames CPU `cpu`'s cache holds.
+pub fn pmm_cache_depth(cpu: i32) -> u64
+    return pmm_cache_n[cpu]
 
 pub fn pmm_get_total_pages() -> u64
     return pmm_total_pages
@@ -500,6 +698,8 @@ pub fn pmm_range_has_free(base: u64, length: u64) -> bool
         return false
     var page: u64 = base / PAGE_SIZE
     var end: u64 = (base + length + PAGE_SIZE - 1) / PAGE_SIZE
+    if pmm_cache_holds(page * PAGE_SIZE, end * PAGE_SIZE)
+        return true
     if end > pmm_total_pages
         end = pmm_total_pages
     while page < end

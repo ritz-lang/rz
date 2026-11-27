@@ -66,7 +66,20 @@ struct FsProc
 pub const FS_MAX_PROCS: i32 = 8
 
 var fs_procs: [8]*FsProc
-var fs_current: i32 = -1
+# Each CPU's current FsProc's index plus one, by CPU index (AGAST #4879,
+# docs/SMP_USER.md §2: the current slot is per CPU, like proc/table.ritz's).
+# 0 is none, so the zeroed BSS means nothing is current. The kernel's
+# cpu_index is arch/x86_64/percpu.ritz's; a host test supplies a stub.
+var fs_current_by_cpu: [64]i32
+
+extern fn cpu_index() -> i32
+
+# This CPU's current FsProc index, or -1.
+fn fs_current() -> i32
+    fs_current_by_cpu[cpu_index()] - 1
+
+fn fs_set_current(slot: i32)
+    fs_current_by_cpu[cpu_index()] = slot + 1
 var fs_syscall_initialized: bool = false
 
 const WRITE_BUFFER_INITIAL: u64 = 4096
@@ -79,9 +92,10 @@ pub fn fs_syscall_init()
     klog("fs_syscall: initialized\n" as StrView)
 
 fn fs_current_proc() -> *FsProc
-    if fs_current < 0
+    let c: i32 = fs_current()
+    if c < 0
         return 0 as *FsProc
-    fs_procs[fs_current]
+    fs_procs[c]
 
 # p's open file at fd, or null if fd is not an open file of p. A dup'd fd
 # has no FsFile of its own: it shares its owner's (fd_owner), so dups see
@@ -106,11 +120,11 @@ pub fn fs_process_start(pid: u64) -> i32
     if p == 0 as *FsProc
         return Errno.NoMem as i32
     (*p).pid = pid
-    (*p).parent = fs_current
+    (*p).parent = fs_current()
     (*p).mmap_next = 0
     fd_table_init(@(*p).table)
     fs_procs[slot] = p
-    fs_current = slot
+    fs_set_current(slot)
     0
 
 # The current process exits: close every fd it left open, flushing pending
@@ -129,8 +143,8 @@ pub fn fs_process_end() -> i32
             fs_close_file(p, fd, CloseBy.Exit)
             closed = closed + 1
         fd = fd + 1
-    fs_procs[fs_current] = 0 as *FsProc
-    fs_current = p.parent
+    fs_procs[fs_current()] = 0 as *FsProc
+    fs_set_current(p.parent)
     kfree(p as *u8)
     closed
 
@@ -142,10 +156,10 @@ pub fn fs_process_select(pid: u64) -> i32
     while slot < FS_MAX_PROCS
         let p: *FsProc = fs_procs[slot]
         if p != 0 as *FsProc and p.pid == pid
-            fs_current = slot
+            fs_set_current(slot)
             return 0
         slot = slot + 1
-    fs_current = -1
+    fs_set_current(-1)
     Errno.Srch as i32
 
 # The pid fs_process_start gave the current process, or 0 if none.

@@ -17,9 +17,84 @@
 # from its first line, and the panic screen ends with klog_console_tail, the
 # log's last lines. klog holds the console as a function so it links without
 # the display driver: every host test that logs links klog alone.
+#
+# klog_lock (AGAST #4879, docs/SMP_USER.md §2 "The leaf locks"): the log is
+# the one piece of kernel state every CPU writes, so it has a leaf lock
+# rather than an owner. One klog call is atomic: its bytes reach COM1, the
+# console and the ring together, and another CPU's call goes wholly before
+# or after it. A line built from several calls can interleave with another
+# CPU's at call boundaries, never inside one. The lock also covers COM1's
+# output ring (serial.ritz), which sys_write fills and the COM1 IRQ drains:
+# both go through klog_serial_write and klog_serial_drain, so polled klog
+# output and the ring's bytes never meet on the wire mid-call. It is a
+# ticket lock taken with IF saved and cleared, and it calls up into nothing
+# but the sinks (fbcon_write takes the console's own lock inside it).
+# A kernel panic calls klog_emergency: from then on klog takes the lock
+# only if it is free and writes anyway, so a CPU that dies holding it
+# cannot silence the report. The lock starts zeroed: free, and leaving IF
+# alone, because every host test that logs links klog and cli faults there.
+# kernel_main turns the IF save on (klog_irqsave(true)) before it first
+# enables interrupts; until then IF is clear anyway. The lock is the same
+# ticket lock as sync/spin.ritz's, written out here so klog stays a leaf:
+# the host tests that log compile klog, serial and io alone.
 
-import serial { StrView, serial_present, serial_out, serial_out_byte }
+import serial { StrView, serial_present, serial_out, serial_out_byte, serial_buffer_write, serial_drain_output }
+import io { interrupts_enabled, disable_interrupts, enable_interrupts, cpu_pause }
 import ritzlib.fmt.digits { fmt_i64_into, fmt_u64_into, fmt_u64_radix_into }
+
+# klog_lock's tickets: `next` the one the next taker draws, `serving` the
+# holder's. Zeroed: free. IF save off until kernel_main (above).
+var klog_next: u32 = 0
+var klog_serving: u32 = 0
+var klog_save_if: bool = false
+var klog_unlocked: bool = false
+
+# Whether klog_lock saves and clears IF (kernel_main: on; a hosted test
+# leaves it off).
+pub fn klog_irqsave(on: bool)
+    klog_save_if = on
+
+# A kernel panic is being reported: klog no longer waits for the lock.
+pub fn klog_emergency()
+    klog_unlocked = true
+
+# Some CPU holds klog_lock (or waits for it): for test/test_klog.ritz.
+pub fn klog_lock_held() -> bool
+    atomic_load(@klog_next) != atomic_load(@klog_serving)
+
+# What klog_take took: release it with klog_give.
+pub struct LogHold
+    held: bool              # the lock is ours (not an emergency write past it)
+    was_on: bool            # IF was set before the take
+
+fn klog_take() -> LogHold
+    var was_on: bool = false
+    if klog_save_if
+        was_on = interrupts_enabled()
+        disable_interrupts()
+    if klog_unlocked
+        # A panic: take the lock only if it is free, and write anyway.
+        let serving: u32 = atomic_load(@klog_serving)
+        let got: bool = atomic_cmpxchg(@klog_next, serving, serving +% 1) == serving
+        return LogHold { held: got, was_on: was_on }
+    let ticket: u32 = atomic_fetch_add(@klog_next, 1)
+    while atomic_load(@klog_serving) != ticket
+        cpu_pause()
+    LogHold { held: true, was_on: was_on }
+
+fn klog_give(h: LogHold)
+    if h.held
+        atomic_store(@klog_serving, atomic_load(@klog_serving) +% 1)
+    if h.was_on
+        enable_interrupts()
+
+# Take and keep klog_lock as another CPU would, until klog_test_release:
+# test/test_klog.ritz proves klog_emergency writes past a held lock.
+pub fn klog_test_hold() -> LogHold
+    klog_take()
+
+pub fn klog_test_release(h: LogHold)
+    klog_give(h)
 
 # ============================================================================
 # Ring Buffer
@@ -158,8 +233,16 @@ var klog_to_serial: bool = true
 pub fn klog_serial(on: bool)
     klog_to_serial = on
 
-# Every kernel message ends here: serial, the screen, then the ring.
+# Every kernel message ends here: serial, the screen, then the ring, all
+# under klog_lock.
 fn klog_bytes(ptr: *u8, len: i64)
+    let h: LogHold = klog_take()
+    klog_bytes_locked(StrView { ptr: ptr, len: len })
+    klog_give(h)
+
+fn klog_bytes_locked(text: StrView)
+    let ptr: *u8 = text.ptr
+    let len: i64 = text.len
     if klog_to_serial
         serial_out(StrView { ptr: ptr, len: len })
     if klog_console_on
@@ -169,6 +252,21 @@ fn klog_bytes(ptr: *u8, len: i64)
     while i < len
         ring_write_byte(*(ptr + i))
         i = i + 1
+
+# sys_write's bytes onto COM1's output ring, under klog_lock: how many it
+# took (fewer than `bytes` when the ring is full).
+pub fn klog_serial_write(bytes: StrView) -> i64
+    let h: LogHold = klog_take()
+    let n: i64 = serial_buffer_write(bytes.ptr, bytes.len)
+    klog_give(h)
+    n
+
+# Drain COM1's output ring to the UART (its IRQ, and sys_write when the ring
+# is full), under klog_lock.
+pub fn klog_serial_drain()
+    let h: LogHold = klog_take()
+    serial_drain_output()
+    klog_give(h)
 
 # Log a string: a "..." literal, or a runtime view (a path, a process name).
 pub fn klog(s: StrView)

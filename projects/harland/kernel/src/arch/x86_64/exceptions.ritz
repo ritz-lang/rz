@@ -3,10 +3,10 @@
 # Handles CPU exceptions (divide error, page fault, etc.) and hardware IRQs.
 # These handlers are called from isr_stubs.s assembly code.
 
-import klog { klog, klog_dec, klog_hex, klog_mark, klog_console_tail }
+import klog { klog, klog_dec, klog_hex, klog_mark, klog_console_tail, klog_serial_drain, klog_emergency }
 import drivers.display.fbcon { fbcon_panic_begin, fbcon_write, fbcon_rows_left }
 import io { halt_loop }
-import serial { StrView, serial_drain_output }
+import serial { StrView }
 import tty.console { tty_console_irq, tty_console_irq_kill }
 import mm.vmm { vmm_debug_page_tables }
 import drivers.msix { msix_dispatch }
@@ -14,7 +14,7 @@ import syscall.runtime.process { process_kill_current, current_pid }
 import syscall.stack { syscall_stack_guard_hit }
 import proc.sched { sched_tick }
 import proc.waitq { waitq_wake_irq }
-import arch.x86_64.apcall { ap_call_dispatch }
+import sync.mbox { mbox_kick_irq }
 import arch.x86_64.sysret_catch { sysret_selftest_catch }
 import arch.x86_64.nmi_probe { ist_nest_catch, nmi_probe_catch }
 
@@ -277,6 +277,8 @@ pub fn exception_handler(frame: *InterruptFrame)
     # the stack it interrupted (idt.ritz, AGAST #4628), so an overflow can't
     # push its frame and becomes a #DF on its own IST stack; CR2 still holds
     # the guard page address, as Linux's #DF handler reads it.
+    # The report must reach the log even if a CPU died holding klog_lock.
+    klog_emergency()
     fbcon_panic_begin()
     let report_mark: u64 = klog_mark()
     let vec: u64 = (*frame).vector
@@ -420,7 +422,7 @@ pub fn irq_handler(frame: *InterruptFrame)
         # COM1 serial port interrupt: received bytes go through the console's
         # line discipline (#4254), then any pending output is sent.
         let kill: bool = tty_console_irq(((*frame).cs & 3) != 0)
-        serial_drain_output()
+        klog_serial_drain()
         if kill
             # Ctrl-C while a process ran (non-zero CPL): it exits (130) and its
             # parent resumes; this handler never returns, so EOI first.
@@ -428,12 +430,11 @@ pub fn irq_handler(frame: *InterruptFrame)
             tty_console_irq_kill()
 
     if irq_num == 208
-        # Vector 240: an AP-call IPI (#4220). Acknowledge it *before*
-        # running the call: while this ISR is in service its priority (15)
-        # blocks the lower-priority completion and watchdog vectors the
-        # call is about to wait for.
-        lapic_eoi()
-        ap_call_dispatch()
+        # Vector 240: the mailbox kick (sync/mbox.ritz KICK_VECTOR). It
+        # sends EOI and marks the kick pending; the mailbox is drained at
+        # this CPU's next safe point (the idle loop), never in the IRQ, so
+        # an AP call runs with no ISR in service.
+        mbox_kick_irq()
         return
 
     # MSI-X vectors (64-79 and the CPU-local 80-95): count the interrupt

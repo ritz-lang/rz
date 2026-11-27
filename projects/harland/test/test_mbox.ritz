@@ -1,0 +1,215 @@
+# sync/mbox.ritz's rings and drain, and sync/idle.ritz's kick decisions
+# (AGAST #4879, SMP_USER.md §2 "The mailbox", §4 "CPU-level sleep"), on one
+# thread: the CPU is whatever g_me says. The cross-CPU interleavings are
+# test_smp_proto.ritz's model; the boot's `[mbox] round trip OK` line runs
+# the real thing.
+
+import ritzlib.option
+import klog { klog_serial }
+import arch.x86_64.cpu_map { cpu_apic_ids }
+import sync.mbox { MboxMsg, KICK_VECTOR, MBOX_SLOTS, MBOX_CALL, MBOX_CALL_DONE, MBOX_PING, MBOX_PONG, mbox_init, mbox_msg, mbox_post, mbox_take, mbox_has_work, mbox_drain, mbox_kick_irq, mbox_stray_count }
+import sync.idle { cpu_idle_begin, cpu_idle_cancel, cpu_is_idle, cpu_kick, cpu_kick_if_idle }
+
+# The kernel hooks sync/mbox.ritz and sync/idle.ritz declare `extern`.
+var g_me: i32 = 0
+var g_ipis: i32 = 0
+var g_ipi_dest: u32 = 0
+var g_ipi_vector: u8 = 0
+var g_eois: i32 = 0
+var g_call_kind: u32 = 0
+var g_call_status: i32 = 0
+
+pub fn cpu_index() -> i32
+    g_me
+
+pub fn lapic_send_fixed_ipi(dest_apic: u32, vector: u8)
+    g_ipis = g_ipis + 1
+    g_ipi_dest = dest_apic
+    g_ipi_vector = vector
+
+pub fn lapic_eoi()
+    g_eois = g_eois + 1
+
+pub fn ap_call_run(kind: u32) -> i32
+    g_call_kind = kind
+    g_call_status
+
+fn fresh()
+    # A hosted test has no COM1: the drop's log line goes to the ring only.
+    klog_serial(false)
+    mbox_init()
+    g_me = 0
+    g_ipis = 0
+    g_eois = 0
+    g_call_kind = 0
+    g_call_status = 0
+    var i: i32 = 0
+    while i < 4
+        cpu_apic_ids[i] = 10 + (i as u32)
+        i = i + 1
+
+fn ping(n: u64) -> MboxMsg
+    var m: MboxMsg = mbox_msg(MBOX_PING)
+    m.arg[0] = n
+    m
+
+# The next message in `cpu`'s box, or one of kind 0 if it is empty.
+fn take(cpu: i32) -> MboxMsg
+    match mbox_take(cpu)
+        Some(m) => m
+        None => MboxMsg { kind: 0, from: 0, flags: 0, pid: 0, arg: [0, 0, 0, 0, 0] }
+
+[[test]]
+fn test_empty_box_has_nothing() -> i32
+    fresh()
+    if take(1).kind != 0
+        return 1
+    if mbox_has_work(1)
+        return 2
+    0
+
+[[test]]
+fn test_post_kicks_the_owner_and_take_returns_the_body() -> i32
+    fresh()
+    var m: MboxMsg = mbox_msg(MBOX_CALL)
+    m.flags = 3
+    m.pid = 77
+    m.arg[0] = 5
+    m.arg[4] = 9
+    mbox_post(2, m)
+    if g_ipis != 1 or g_ipi_dest != 12 or g_ipi_vector != KICK_VECTOR
+        return 1
+    if not mbox_has_work(2) or mbox_has_work(1)
+        return 2
+    let got: MboxMsg = take(2)
+    if got.kind != MBOX_CALL or got.from != 0 or got.flags != 3 or got.pid != 77
+        return 3
+    if got.arg[0] != 5 or got.arg[4] != 9
+        return 4
+    if mbox_has_work(2) or take(2).kind != 0
+        return 5
+    0
+
+[[test]]
+fn test_post_to_this_cpu_sends_no_ipi() -> i32
+    fresh()
+    g_me = 1
+    mbox_post(1, ping(4))
+    if g_ipis != 0
+        return 1
+    if take(1).arg[0] != 4
+        return 2
+    0
+
+# 16 posts fill the ring exactly, and 40 more in batches of 10 wrap it
+# three times: every body comes back once, in order.
+[[test]]
+fn test_ring_is_fifo_across_wraps() -> i32
+    fresh()
+    var n: u64 = 0
+    while n < MBOX_SLOTS
+        mbox_post(1, ping(n))
+        n = n + 1
+    var want: u64 = 0
+    while want < MBOX_SLOTS
+        if take(1).arg[0] != want
+            return 1
+        want = want + 1
+    var batch: i32 = 0
+    while batch < 4
+        var k: i32 = 0
+        while k < 10
+            mbox_post(1, ping(n))
+            n = n + 1
+            k = k + 1
+        k = 0
+        while k < 10
+            let got: MboxMsg = take(1)
+            if got.kind != MBOX_PING or got.arg[0] != want
+                return 2
+            want = want + 1
+            k = k + 1
+        batch = batch + 1
+    if take(1).kind != 0
+        return 3
+    0
+
+# The drain answers a PING with a PONG echoing it and a CALL with a
+# CALL_DONE carrying the request id and the callee's status, each to the
+# sender's box.
+[[test]]
+fn test_drain_answers_ping_and_call() -> i32
+    fresh()
+    mbox_post(1, ping(42))
+    var call: MboxMsg = mbox_msg(MBOX_CALL)
+    call.arg[0] = 7
+    call.arg[1] = 1
+    mbox_post(1, call)
+    g_me = 1
+    g_call_status = -1
+    g_ipis = 0
+    mbox_drain()
+    if mbox_has_work(1)
+        return 1
+    if g_ipis != 2 or g_ipi_dest != 10
+        return 2
+    let pong: MboxMsg = take(0)
+    if pong.kind != MBOX_PONG or pong.from != 1 or pong.arg[0] != 42
+        return 3
+    let done: MboxMsg = take(0)
+    if done.kind != MBOX_CALL_DONE or done.from != 1 or done.arg[0] != 7
+        return 4
+    if g_call_kind != 1 or done.arg[1] as i64 != -1
+        return 5
+    0
+
+# A reply that reaches the drain had no waiter: dropped and counted.
+[[test]]
+fn test_drain_drops_a_late_reply() -> i32
+    fresh()
+    g_me = 1
+    mbox_post(0, mbox_msg(MBOX_PONG))
+    g_me = 0
+    g_ipis = 0
+    mbox_drain()
+    if mbox_stray_count(0) != 1 or g_ipis != 0
+        return 1
+    if mbox_has_work(0)
+        return 2
+    0
+
+# The kick's IRQ sends EOI and marks work pending; only the drain clears it.
+[[test]]
+fn test_kick_irq_marks_work_until_drained() -> i32
+    fresh()
+    g_me = 2
+    mbox_kick_irq()
+    if g_eois != 1 or not mbox_has_work(2)
+        return 1
+    mbox_drain()
+    if mbox_has_work(2)
+        return 2
+    0
+
+# A waker kicks only a CPU that announced idle, and never itself.
+[[test]]
+fn test_kick_if_idle_follows_the_announce() -> i32
+    fresh()
+    g_me = 3
+    cpu_idle_begin()
+    if not cpu_is_idle(3)
+        return 1
+    g_me = 0
+    cpu_kick_if_idle(3)
+    if g_ipis != 1 or g_ipi_dest != 13 or g_ipi_vector != KICK_VECTOR
+        return 2
+    g_me = 3
+    cpu_idle_cancel()
+    g_me = 0
+    cpu_kick_if_idle(3)
+    if cpu_is_idle(3) or g_ipis != 1
+        return 3
+    cpu_kick(0)
+    if g_ipis != 1
+        return 4
+    0

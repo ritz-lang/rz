@@ -1,0 +1,250 @@
+# Harland per-CPU mailboxes and the kick IPI (AGAST #4879, docs/SMP_USER.md
+# §2 "The mailbox")
+#
+# Every CPU owns its kernel state, and only the owner writes it. Another CPU
+# that needs a change posts the owner a message and kicks it. Each CPU has
+# one mailbox: a multi-producer, single-consumer ring of 16 slots, each one
+# cache line:
+#
+#   slot: seq u64 | kind u32 | from u16 | flags u16 | pid u64 | arg[5] u64
+#
+# It is Vyukov's bounded queue. `seq` says whose turn the slot is: `t` when
+# the producer holding ticket `t` may write it, `t + 1` once that producer
+# published it, `t + 16` once the owner took it (the next lap's free value).
+# Order is FIFO by ticket, so FIFO per producer.
+#
+# Never full, by construction: only the BSP sends requests, one at a time
+# (the boot ping keeps at most PING_WINDOW in flight), and each process will
+# have at most one FORWARD or RETURN in flight (#4881). A producer that finds
+# its slot taken logs `[mbox] full` and waits: an assertion, not a path.
+#
+# test/test_smp_proto.ritz models the post and take steps below on TSO; each
+# step's comment names its step in that model ("post.reserve", ...).
+#
+# The kick (KICK_VECTOR) only marks this CPU's `pc_kick_pending`. Messages
+# are handled at a safe point, never in the IRQ: today the idle loops
+# (cpu_smp.ritz smp_ap_idle, the BSP scheduler's), later return to user and
+# a block (#4881). A message mutates owner state that the interrupted kernel
+# code may be halfway through changing, so handling it in the IRQ would
+# break "only the owner writes" against the owner's own interrupts.
+#
+# The hardware hooks are `extern`, as proc/table.ritz's cpu_index is
+# (SMP_USER.md §2 "The cpu-index hook"): the kernel supplies them
+# (percpu.ritz, apic.ritz, apcall.ritz) and test/test_mbox.ritz stubs them,
+# so the ring runs as an ordinary host program.
+
+import ritzlib.option
+import klog { klog, klog_dec }
+import io { cpu_pause, compiler_barrier, memory_barrier }
+import arch.x86_64.cpu_map { MAX_CPUS, cpu_apic_ids }
+
+# percpu.ritz: this CPU's cpu_map index.
+extern fn cpu_index() -> i32
+# apic.ritz: a fixed IPI to one APIC ID, and this CPU's EOI.
+extern fn lapic_send_fixed_ipi(dest_apic: u32, vector: u8)
+extern fn lapic_eoi()
+# apcall.ritz: run AP call `kind` on this CPU; 0 when it worked.
+extern fn ap_call_run(kind: u32) -> i32
+
+# The kick IPI's vector (kernel/isr_stubs.s IRQ_STUB 48, 240; idt.ritz).
+# #4220's AP-call IPI, generalised: every mailbox post sends it.
+pub const KICK_VECTOR: u8 = 240
+
+# Message kinds. Requests come from the BSP; each reply goes to `from`.
+pub const MBOX_CALL: u32 = 1        # run AP call arg[1]; reply CALL_DONE
+pub const MBOX_CALL_DONE: u32 = 2   # arg[0] the request id, arg[1] the status (i64)
+pub const MBOX_PING: u32 = 3        # reply PONG echoing arg[0]
+pub const MBOX_PONG: u32 = 4        # arg[0] the PING's arg[0]
+# Reserved for later slices (SMP_USER.md §2-§3), not handled yet:
+#   UNMAP, UNMAP_DONE, KERNEL_INVLPG and its ack (#4880),
+#   FORWARD, RETURN, CAP_INSERT (#4881).
+
+# A message body: 56 bytes, so with `seq` a slot is one 64-byte line.
+pub struct MboxMsg
+    kind: u32
+    from: u16
+    flags: u16
+    pid: u64
+    arg: [5]u64
+
+struct MboxSlot
+    seq: u64
+    msg: MboxMsg
+
+# Slots per ring. The seq arithmetic needs a power of two.
+pub const MBOX_SLOTS: u64 = 16
+
+# Every CPU's ring: CPU c's slots are [c * 16, c * 16 + 16).
+# Literal length: MAX_CPUS * MBOX_SLOTS.
+var mbox_slots: [1024]MboxSlot
+# The next ticket a producer draws (lock xadd from any CPU).
+var mbox_tail: [64]u64
+# The next ticket the owner takes (the owner alone).
+var mbox_head: [64]u64
+# A kick arrived and the mailbox is not drained since (u32: an atomic word).
+var pc_kick_pending: [64]u32
+# The owner is inside mbox_drain (the owner alone).
+var mbox_draining: [64]bool
+# Replies nobody waited for (a late answer after a timeout): the owner's count.
+var mbox_strays: [64]u64
+
+# A message of `kind` from this CPU, arguments zero.
+pub fn mbox_msg(kind: u32) -> MboxMsg
+    MboxMsg { kind: kind, from: cpu_index() as u16, flags: 0, pid: 0, arg: [0, 0, 0, 0, 0] }
+
+fn slot_of(cpu: i32, ticket: u64) -> *MboxSlot
+    @mbox_slots[(cpu as u64) * MBOX_SLOTS + ticket % MBOX_SLOTS]
+
+fn valid_cpu(cpu: i32) -> bool
+    cpu >= 0 and cpu < MAX_CPUS
+
+# Empty every ring: slot i's seq is i, so ticket i finds it free. Call once
+# on the BSP before any CPU posts (main.ritz init_smp, before ap_boot_all).
+pub fn mbox_init()
+    var cpu: i32 = 0
+    while cpu < MAX_CPUS
+        mbox_tail[cpu] = 0
+        mbox_head[cpu] = 0
+        pc_kick_pending[cpu] = 0
+        mbox_draining[cpu] = false
+        mbox_strays[cpu] = 0
+        var i: u64 = 0
+        while i < MBOX_SLOTS
+            (*slot_of(cpu, i)).seq = i
+            i = i + 1
+        cpu = cpu + 1
+
+# Send KICK_VECTOR to CPU `cpu`, unless it is this CPU (sync/idle.ritz
+# cpu_kick is the name wakers use).
+pub fn mbox_kick(cpu: i32)
+    if not valid_cpu(cpu) or cpu == cpu_index()
+        return
+    # kick.fence: in x2APIC mode the IPI is a WRMSR to the ICR, which is not
+    # ordered after earlier plain stores (SDM 11.12.3). Without the mfence
+    # the owner could take the kick, re-check, find post.publish's seq not
+    # yet visible and hlt for good. Every kick fences, the waker's
+    # (cpu_kick_if_idle, already behind its CAS) included.
+    memory_barrier()
+    lapic_send_fixed_ipi(cpu_apic_ids[cpu], KICK_VECTOR)
+
+# Put `msg` in CPU `to`'s ring, without the kick.
+fn mbox_enqueue(to: i32, msg: MboxMsg)
+    # post.reserve: lock xadd on the tail draws ticket t.
+    let t: u64 = atomic_fetch_add(@mbox_tail[to], 1)
+    let slot: *MboxSlot = slot_of(to, t)
+    # post.wait_free: the slot is ours once the owner freed lap t - 16.
+    var logged: bool = false
+    while atomic_load(@(*slot).seq) != t
+        if not logged
+            klog("[mbox] full: cpu ")
+            klog_dec(to as i64)
+            klog(" ticket ")
+            klog_dec(t as i64)
+            klog("\n")
+            logged = true
+        cpu_pause()
+    # post.body: the plain stores of the body.
+    (*slot).msg = msg
+    # post.publish: TSO retires stores in order, so a plain store of seq
+    # after the body is the release; the compiler must not reorder them.
+    # The kick that follows (mbox_post) first fences: "kick.fence".
+    compiler_barrier()
+    volatile_store(@(*slot).seq, t + 1)
+
+# Post `msg` to CPU `to`'s mailbox, then kick it (unless `to` is this CPU).
+# Mailbox posts always kick: they are rare (SMP_USER.md §4).
+pub fn mbox_post(to: i32, msg: MboxMsg)
+    if not valid_cpu(to)
+        return
+    mbox_enqueue(to, msg)
+    mbox_kick(to)
+
+# Take the oldest published message from CPU `cpu`'s ring, or None. Only the
+# owner calls it, for its own box.
+pub fn mbox_take(cpu: i32) -> Option<MboxMsg>
+    if not valid_cpu(cpu)
+        return None
+    let head: u64 = mbox_head[cpu]
+    let slot: *MboxSlot = slot_of(cpu, head)
+    # take.check: published once seq is head + 1.
+    if atomic_load(@(*slot).seq) != head + 1
+        return None
+    # take.copy: the body out first. Freeing first would let a producer
+    # overwrite the body while it is read.
+    let msg: MboxMsg = (*slot).msg
+    # take.free: seq = head + 16 hands the slot to ticket head + 16.
+    compiler_barrier()
+    volatile_store(@(*slot).seq, head + MBOX_SLOTS)
+    mbox_head[cpu] = head + 1
+    Some(msg)
+
+# Work for CPU `cpu`'s safe point: a published message at the head, or a
+# kick not drained since.
+pub fn mbox_has_work(cpu: i32) -> bool
+    if not valid_cpu(cpu)
+        return false
+    if atomic_load(@pc_kick_pending[cpu]) != 0
+        return true
+    atomic_load(@(*slot_of(cpu, mbox_head[cpu])).seq) == mbox_head[cpu] + 1
+
+# The kick's IRQ (exceptions.ritz irq_handler, vector 240): EOI, then mark
+# the kick pending. The mailbox is drained at this CPU's next safe point,
+# not here. #4220 ran the AP call inside this ISR and had to EOI first, as an
+# in-service vector 240 blocked the completion vectors the call waits for.
+# Run from the idle loop, the call has no ISR in service at all.
+pub fn mbox_kick_irq()
+    lapic_eoi()
+    let me: i32 = cpu_index()
+    if valid_cpu(me)
+        atomic_store(@pc_kick_pending[me], 1)
+
+# A reply nobody waits for (a late CALL_DONE or PONG after its waiter timed
+# out): dropped and counted on this CPU.
+pub fn mbox_drop_stray(msg: MboxMsg)
+    let me: i32 = cpu_index()
+    if not valid_cpu(me)
+        return
+    mbox_strays[me] = mbox_strays[me] + 1
+    klog("[mbox] dropped a late reply: kind ")
+    klog_dec(msg.kind as i64)
+    klog(" from cpu ")
+    klog_dec(msg.from as i64)
+    klog("\n")
+
+# Replies CPU `cpu` dropped because nobody waited for them.
+pub fn mbox_stray_count(cpu: i32) -> u64
+    if not valid_cpu(cpu)
+        return 0
+    mbox_strays[cpu]
+
+# Handle one message on its owner. Short and never blocking.
+fn mbox_handle(msg: MboxMsg)
+    if msg.kind == MBOX_CALL
+        var done: MboxMsg = mbox_msg(MBOX_CALL_DONE)
+        done.arg[0] = msg.arg[0]
+        done.arg[1] = ap_call_run(msg.arg[1] as u32) as i64 as u64
+        mbox_post(msg.from as i32, done)
+    else if msg.kind == MBOX_PING
+        var pong: MboxMsg = mbox_msg(MBOX_PONG)
+        pong.arg[0] = msg.arg[0]
+        mbox_post(msg.from as i32, pong)
+    else
+        # CALL_DONE and PONG are taken by the waiter (apcall.ritz); one
+        # that reaches the drain came after its waiter gave up.
+        mbox_drop_stray(msg)
+
+# Drain this CPU's mailbox at a safe point: clear the pending kick, then
+# take and handle every message. The kick is cleared first, so one that
+# lands after the last take stays pending for the next safe point. A drain
+# reached from inside a handler returns at once.
+pub fn mbox_drain()
+    let me: i32 = cpu_index()
+    if not valid_cpu(me) or mbox_draining[me]
+        return
+    mbox_draining[me] = true
+    atomic_store(@pc_kick_pending[me], 0)
+    while true
+        match mbox_take(me)
+            Some(msg) => mbox_handle(msg)
+            None => break
+    mbox_draining[me] = false
