@@ -16,7 +16,7 @@
 
 import ritzlib.errno
 import ritzlib.fd
-import ritzlib.fs { chmod, cwd, mkdir, path_exists, read_file, remove_dir_all, write_file }
+import ritzlib.fs { chdir, chmod, cwd, mkdir, path_exists, read_file, remove_dir_all, write_file }
 import ritzlib.gvec
 import ritzlib.io { prints }
 import ritzlib.option
@@ -50,7 +50,10 @@ struct Child
     seen: String
     mark: i64
 
-fn spawn_editor(path: StrView, lang: @LangConfig) -> Option<Child>
+# The editor on a.ritz in `dir`, run from `dir`: the status line shows the
+# short name "a.ritz", so where it lands on the 80 columns doesn't depend
+# on how long TMPDIR's path is (a gate's sandbox can be 60+ bytes).
+fn spawn_editor(dir: @String, lang: @LangConfig) -> Option<Child>
     var pty: Pty = match pty_open()
         Ok(p) => p
         Err(_) => return None
@@ -62,14 +65,17 @@ fn spawn_editor(path: StrView, lang: @LangConfig) -> Option<Child>
     match fork()
         Ok(f) => match f
             ForkResult.Child =>
-                sys_exit(editor_child(@&pty, path, lang))
+                sys_exit(editor_child(@&pty, dir.as_view(), lang))
                 None
             ForkResult.Parent(pid) =>
                 Some(Child { pid: pid, pty: pty, before: before, seen: string_new(), mark: 0 })
         Err(_) => None
 
-fn editor_child(pty: @&Pty, path: StrView, lang: @LangConfig) -> i32
+fn editor_child(pty: @&Pty, dir: StrView, lang: @LangConfig) -> i32
     let closed = pty.master.close()
+    match chdir(dir)
+        Ok(_) => pass
+        Err(_) => return 123
     match new_session()
         Ok(_) => pass
         Err(_) => return 120
@@ -80,7 +86,7 @@ fn editor_child(pty: @&Pty, path: StrView, lang: @LangConfig) -> i32
         Ok(_) => pass
         Err(_) => return 122
     let cfg = lang_config(lang.server.as_view(), lang.ritz1.as_view())
-    run_editor_with(tty.raw(), path, cfg)
+    run_editor_with(tty.raw(), "a.ritz", cfg)
 
 impl Child
     fn pump(self: @&Child, ms: i64) -> bool
@@ -251,10 +257,22 @@ fn fixture(name: StrView) -> String
         Ok(s) => s
         Err(_) => string_new()
 
+# `p` from / (a relative TMPDIR made absolute): the server's path has to
+# hold after the editor's chdir.
+fn absolute(p: String) -> String
+    if p.as_view().starts_with("/")
+        return p
+    var out: String = match cwd()
+        Ok(d) => d
+        Err(_) => return p
+    out.push('/')
+    out.push_str(p.as_view())
+    out
+
 # A fresh directory with server.sh (prelude.sh then `script`) and a.ritz
 # holding `text`.
 fn setup(name: StrView, script: StrView, text: StrView) -> String
-    let dir = sandbox_path("bf_lspty", name)
+    let dir = absolute(sandbox_path("bf_lspty", name))
     let gone = remove_dir_all(dir.as_view())
     let made = mkdir(dir.as_view(), 448)
     if not script.is_empty()
@@ -294,8 +312,7 @@ fn test_overlay_hover_and_definition_with_a_scripted_server() -> i32
     let dir = setup("overlay", "editor.sh", SOURCE)
     let server = file_in(@dir, "server.sh")
     let cfg = lang_config(server.as_view(), "")
-    let src = file_in(@dir, "a.ritz")
-    var c: Child = match spawn_editor(src.as_view(), @cfg)
+    var c: Child = match spawn_editor(@dir, @cfg)
         Some(k) => k
         None => return 0     # no ptys here
     assert c.shows(4, "helper()")
@@ -333,8 +350,7 @@ fn test_typing_goes_on_while_the_server_stalls_and_floods_stderr() -> i32
     let dir = setup("stall", "stall_editor.sh", text.as_view())
     let server = file_in(@dir, "server.sh")
     let cfg = lang_config(server.as_view(), "")
-    let src = file_in(@dir, "a.ritz")
-    var c: Child = match spawn_editor(src.as_view(), @cfg)
+    var c: Child = match spawn_editor(@dir, @cfg)
         Some(k) => k
         None => return 0
     assert c.shows(0, "let value")
@@ -362,12 +378,11 @@ fn test_a_server_that_stops_reading_ends_the_session_not_the_editor() -> i32
     let dir = setup("epipe", "epipe.sh", SOURCE)
     let server = file_in(@dir, "server.sh")
     let cfg = lang_config(server.as_view(), "")
-    let src = file_in(@dir, "a.ritz")
-    var c: Child = match spawn_editor(src.as_view(), @cfg)
+    var c: Child = match spawn_editor(@dir, @cfg)
         Some(k) => k
         None => return 0
     assert c.shows(MESSAGE_ROW, "lsp: closed its input")
-    assert c.shows(STATUS_ROW, "  lsp: c")             # the tag, cut at the edge by the long path
+    assert c.shows(STATUS_ROW, "lsp: closed its input")   # the tag, whole: the name is short
     assert c.send("ggiStill here \e")
     assert c.shows(0, "Still here fn helper")
     assert c.send(":q!\r")
@@ -393,8 +408,7 @@ fn test_real_ritz_lsp_overlay_hover_and_definition() -> i32
         return 0
     let dir = setup("real", "", SOURCE)
     let cfg = lang_config(server.as_view(), ritz1.as_view())
-    let src = file_in(@dir, "a.ritz")
-    var c: Child = match spawn_editor(src.as_view(), @cfg)
+    var c: Child = match spawn_editor(@dir, @cfg)
         Some(k) => k
         None => return 0
     assert c.shows(4, "helper()")
