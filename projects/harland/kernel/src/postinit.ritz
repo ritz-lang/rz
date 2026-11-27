@@ -30,8 +30,9 @@ import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_t
 import net.ring { RxWait, SeatOpen, ring_seat_open, ring_driver_gone, take_rx, ring_seat_object, ring_driver_registered, ring_rx_rejects, ring_tx_full_yields, ring_endpoint_fails }
 import driver_abi.spsc { FrameBytes }
 import net.stack { net_ring_select, net_send, net_is_ready, net_stack_init, net_poll, net_wait_rx, net_configure_dhcp, net_is_configured, net_device_type, net_on_ring }
-import net.ip { ip_get_gateway, ip_print_config }
-import net.icmp { icmp_ping, icmp_distinct_reply_count, icmp_echo_request_count, icmp_echo_reply_sent_count }
+import net.ip { ip_get_gateway, ip_get_our_addr, ip_print_config }
+import net.latency { LatencyMark, NET_LATENCY_WINDOW_US, latency_open, latency_close }
+import net.icmp { icmp_ping, icmp_distinct_reply_count, icmp_echo_request_count, icmp_echo_reply_sent_count, icmp_set_echo_log }
 import net.arp { arp_cache_lookup, arp_send_request }
 import drivers.netdev { NETDEV_TYPE_ENA }
 import loader.elf { test_elf_loader }
@@ -2328,6 +2329,8 @@ fn network_dhcp_ping(run_net_responder: bool)
             # the device's queues (#1851).
             if run_net_responder and net_device_type() == NETDEV_TYPE_ENA
                 network_wait_for_peer_ping()
+            else if run_net_responder
+                network_latency_window()
             network_tx_burst()
         else
             klog("\n  DHCP timeout (no response in test window)\n")
@@ -2365,6 +2368,38 @@ fn network_wait_for_peer_ping()
         klog("\n")
     else
         klog("[net] peer ping: no echo request within 240s\n")
+
+# AGAST #4768: on any NIC but ENA, \harland\net-responder opens the latency
+# window (net/latency.ritz) for tools/net_latency.sh, which pings this
+# stack from the host: the in-kernel driver's, or the CPL-3 driver's with
+# the kernel stack in the frame seat. Interrupts are on and every wait
+# sleeps on the RX interrupt or parks on the ring, as in the DHCP window,
+# so an echo's latency is the stack's and not a poll interval's; the
+# per-echo [icmp] lines are off for the window, as netd logs none.
+fn network_latency_window()
+    let owner: StrView = if net_on_ring() then "kernel-ring" else "in-kernel"
+    let req0: u32 = icmp_echo_request_count()
+    let rep0: u32 = icmp_echo_reply_sent_count()
+    let ours: *u8 = ip_get_our_addr()
+    let mark: LatencyMark = latency_open(owner, [*ours, *(ours + 1), *(ours + 2), *(ours + 3)])
+    let window_end: u64 = deadline_after_us(NET_LATENCY_WINDOW_US)
+    icmp_set_echo_log(false)
+    enable_interrupts()
+    while not deadline_passed(window_end)
+        net_poll()
+        match net_wait_rx(window_end)
+            RxWait.NoDriver => break
+            _ => pass
+    disable_interrupts()
+    icmp_set_echo_log(true)
+    latency_close(owner, mark)
+    klog("[net-latency] echoes owner=")
+    klog(owner)
+    klog(" requests=")
+    klog_dec((icmp_echo_request_count() - req0) as i64)
+    klog(" replies=")
+    klog_dec((icmp_echo_reply_sent_count() - rep0) as i64)
+    klog("\n")
 
 # Switch the NVMe controllers nvme_probe found at boot (polled: the APIC was
 # not up yet) to MSI-X, then read each namespace with interrupts on, so every

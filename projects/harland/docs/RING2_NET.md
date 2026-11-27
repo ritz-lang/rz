@@ -99,7 +99,7 @@ The `SYS_*` numbers for these calls (`NetInfo` 224, `NetAddr` 225, `ShmMap` 227,
 
 ### Boot switch
 
-Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` is unchanged. Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling.
+Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` keeps the EC2 peer-ping window on ENA. On any other NIC it opens the latency window on each owner ("Rollout"). Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling.
 
 ## What the kernel does today
 
@@ -551,6 +551,46 @@ The first cutover runs three ring-3 programs. They are distribution apps in `pro
 `ping` publishes one `APP_PING` and prints the payload of the matching `EV_PING_REPLY`. One echo. No count and no interval. A quiet peer ends as `Errno.Io` after `PING_DEADLINE_MS`.
 
 A second bind of a port that is already live fails inside the service with `Errno.Exist` (-17). The program exits non-zero and holds no new handle.
+
+## Rollout
+
+The performance gate in `RING1_DRIVER.md` Rollout measures this service against the in-kernel stack before it builds further. `projects/harland/tools/net_latency.sh` runs it. It is local only and is not a CI step. Each run records its own date, host, and accelerator.
+
+### 2026-11-27: ICMP echo (AGAST #4768)
+
+**Setup.** Host huburght: WSL2 with nested KVM (`-accel kvm`), 12 CPUs, load average about 18 from other rooms' gates during every run. The machine is q35 with the split irqchip, `-cpu Haswell-v1 -smp 4 -m 2G`, and a modern virtio-net (`rx_queue_size=1024`). The in-kernel boot has no IOMMU, so it is untranslated. The ring boot adds `intel-iommu` and `iommu_platform=on`, which a ring-1 driver needs. The NIC sits on a QEMU hub with slirp, which serves DHCP, and a `-netdev dgram` port. The other end of that port is `tools/net_latency_wire.py`. It answers ARP for 10.0.2.200 and sends 20 warm-up echoes, then 200 timed ones. It sends one echo at a time, 10 ms apart, with a 56-byte body, and times each echo on the host from send to reply. This needs no root and no tap. The ESP carries `\harland\net-selftest` and `\harland\net-responder`. The kernel opens a 10 s window on each owner (`kernel/src/net/latency.ritz`) and logs the window's process switches, page-table loads (CR3), and syscalls. Three owners answer:
+
+- **in-kernel**: `virtio_net_init` and the kernel stack. 0 processes are in the path.
+- **kernel-ring**: the CPL-3 `/bin/virtio-net`, with the kernel stack (pid 1) still in the frame seat. This is the self-test window, before the handoff.
+- **netd**: the CPL-3 driver and `/bin/netd`, after the seat handoff. Pid 1 sleeps on its wait set for the window, so the window's switches are the echoes'.
+
+**wire-floor** pings slirp's gateway over the same hub with no guest in the path. It is QEMU's and the host's share of every RTT.
+
+**Results.** Three rounds on the final kernel, in µs. "Slow" counts the echoes over 10 ms out of 200.
+
+| owner | min | median | p99 | slow | switches/echo | CR3 loads/echo | syscalls/echo |
+|---|---|---|---|---|---|---|---|
+| wire-floor | 150 / 109 / 143 | 310 / 267 / 255 | 2531 / 1537 / 2188 | 0 / 0 / 0 | – | – | – |
+| in-kernel | 535 / 434 / 400 | 769 / 664 / 644 | 32509 / 14549 / 27110 | 3 / 3 / 3 | 0 | 0 | 0 |
+| kernel-ring | 434 / 656 / 423 | 854 / 1688 / 888 | 22757 / 28675 / 22804 | 3 / 21 / 3 | 4.00 | 4.00 | 5.3 |
+| netd | 681 / 792 / 746 | 1045 / 1548 / 1003 | 2120 / 11728 / 2026 | 0 / 4 / 0 | 4.03 | 4.03 | 7.4 |
+
+Two more runs agree. At a 20 ms interval the medians are 694, 953, and 1021 µs. At 600 echoes they are 678, 647, and 1411 µs. Every echo got its reply in every run. Round 8's kernel-ring row and the 600-echo run's netd and floor rows were taken while the host was busier. Use the quiet rounds for the comparison.
+
+**Reading.**
+
+- **The gap.** Subtract the floor's median from each owner's median for the guest's share. In the quiet rounds that is about 400–460 µs in-kernel, 550–630 µs on kernel-ring, and 735–750 µs on netd. The CPL-3 driver plus netd adds about 300 µs to an echo, roughly 1.6–1.9× the in-kernel stack's share. The minimums show the same gap, 250–300 µs.
+- **Where the gap comes from.** Every ring-path switch loads another page table: switches equal CR3 loads in every window. An echo costs 4 switches on both ring owners, from idle to the driver, to the seat, back to the driver, and back to idle. The seat is pid 1 or netd, and both have their own page table. So the driver alone adds 4 switches and about 100–200 µs (in-kernel to kernel-ring), or about 25–50 µs per switch with the driver's work included. The move from the kernel seat to netd adds no switches but about 150–200 µs and 2 syscalls per echo: netd's wait and notify, and its own processing. On this host, netd's path costs as much as the switches do.
+- **The tail.** The in-kernel p99 is not comparable. Both kernel-stack windows stall for 15–45 ms at the same echoes every run: the 27th, 91st, 219th, and 475th of the boot. The gaps double (64, 128, 256). The stall follows the packet count, not the time: it lands on the same echoes at 10 ms and 20 ms intervals. No frame crosses the wire at those points (the wire traced every frame), and netd never stalls there. Something in the kernel stack's per-frame path stalls at doubling frame counts. The cause is not found. Leave out those 3 or 4 echoes and the kernel windows' p99 is about 1.5 ms, under netd's 2.0–2.1 ms in the quiet rounds.
+- **The levers**, in order:
+  1. **Merge the driver and netd into one process.** The kernel-ring numbers bound this: 2 of the 4 switches go, worth about 50–100 µs of the 300 µs gap here.
+  2. **Cut netd's syscalls per echo, and batch per wake-up.** This is the other half of the gap. At one echo in flight there is nothing to batch, so it would help throughput more than this test's latency.
+  3. **PCID.** It cannot be tested on this host, because the CPU QEMU exposes has no PCID.
+  4. **Polling on a dedicated core.**
+
+**Decision.** Whether a gap of about 300 µs (1.6–1.9× the guest's share) under nested KVM matters is Aaron's call, flagged on #4768.
+
+**UDP round-trip** stays open in #4768 until #4752's udp tools land. The same window and wire carry it: the wire would send a datagram to a guest echo app instead of an ICMP echo.
 
 ## Open questions
 

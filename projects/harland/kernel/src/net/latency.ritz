@@ -1,0 +1,63 @@
+# net/latency.ritz - the ICMP latency window (AGAST #4768, RING2_NET.md
+# "Rollout")
+#
+# tools/net_latency.sh (local only, not CI) boots with \harland\net-selftest
+# and \harland\net-responder on a virtio-net NIC and pings the guest from
+# the host while a window is open. Each window logs
+#   [net-latency] ready owner=O ip=A.B.C.D window_ms=W
+# when the owner of the stack has a lease and answers echoes, and
+#   [net-latency] done owner=O switches=S cr3=C syscalls=N
+# when it closes: S process switches, C page-table loads (proc/sched.ritz)
+# and N syscalls (syscall/dispatch.ritz) in the window, so the script can
+# divide them by the echoes it sent.
+# O is the owner that answered:
+#   in-kernel   virtio_net_init and the kernel stack (an untranslated boot);
+#   kernel-ring the CPL-3 driver and the kernel stack in the frame seat (a
+#               translating boot's self-test window, before the handoff);
+#   netd        the CPL-3 driver and /bin/netd (after the seat handoff).
+# The window is a fixed length, the same on every owner: netd's echo count
+# lives in netd, so the kernel cannot end the window when the host stops.
+
+import klog { klog, klog_dec }
+import serial { StrView }
+import proc.sched { sched_switch_count, sched_cr3_switch_count }
+import syscall.dispatch { syscall_count }
+import net.ip { ip_print_addr }
+
+# How long each window stays open. The script sends its 220 echoes 10 ms
+# apart (about 2.2 s) once it reads the ready line.
+pub const NET_LATENCY_WINDOW_US: u64 = 10000000
+
+# The scheduler's counters when a window opened.
+pub struct LatencyMark
+    switches: u64
+    cr3: u64
+    syscalls: u64
+
+# Log the ready line for `owner` answering on `ip` and take the counters:
+# call right before the window opens.
+pub fn latency_open(owner: StrView, ip: [4]u8) -> LatencyMark
+    klog("[net-latency] ready owner=")
+    klog(owner)
+    klog(" ip=")
+    ip_print_addr(@ip[0])
+    klog(" window_ms=")
+    klog_dec((NET_LATENCY_WINDOW_US / 1000) as i64)
+    klog("\n")
+    LatencyMark { switches: sched_switch_count(), cr3: sched_cr3_switch_count(), syscalls: syscall_count() }
+
+# Log the done line: the switches, page-table loads and syscalls since
+# `mark`.
+pub fn latency_close(owner: StrView, mark: LatencyMark)
+    let switches: u64 = sched_switch_count() - mark.switches
+    let cr3: u64 = sched_cr3_switch_count() - mark.cr3
+    let syscalls: u64 = syscall_count() - mark.syscalls
+    klog("[net-latency] done owner=")
+    klog(owner)
+    klog(" switches=")
+    klog_dec(switches as i64)
+    klog(" cr3=")
+    klog_dec(cr3 as i64)
+    klog(" syscalls=")
+    klog_dec(syscalls as i64)
+    klog("\n")

@@ -76,8 +76,12 @@ import mm.vmm { phys_to_virt }
 import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_PUBLISH }
 import cap.table { CapTable, cap_kernel_grant, cap_table_get }
 import proc.table { Proc, MAX_PROCS, PROC_BLOCKED, BLOCK_WAIT, proc_at, proc_current, proc_current_slot, proc_detach }
-import proc.sched { sched_is_running, sched_start, sched_yield }
-import proc.waitset { irq_object_register, irq_object_bind_domain }
+import proc.sched { sched_is_running, sched_start, sched_yield, sched_block }
+import proc.table { proc_block }
+import proc.waitset { irq_object_register, irq_object_bind_domain, waitset_arm, waitset_disarm }
+import io { enable_interrupts, disable_interrupts, interrupts_enabled }
+import driver_abi.link { NetAddr }
+import net.latency { LatencyMark, NET_LATENCY_WINDOW_US, latency_open, latency_close }
 import net.ring { SeatOpen, Send, SeatIndexes, ring_seat_open, ring_seat_object, ring_send_once, ring_seat_handoff }
 import net.dhcp { Release, dhcp_release_frame, dhcp_print_lease }
 import net.stack { net_stack_release }
@@ -478,3 +482,50 @@ pub fn net_netd_restart_test(enabled: bool)
         restart_fail("was restarted past the budget", net_service_pid())
         return
     klog("[net-restart] NetAddr still NoDev 2000 ms after the budget was spent\n")
+
+# ============================================================================
+# The netd latency window (AGAST #4768, the \harland\net-responder option)
+# ============================================================================
+
+# Pid 1 sleeps until TSC `deadline`, parked on its own wait set, so the
+# window's switches are the driver's and netd's and none of them is a pid 1
+# that yields in a loop. A wake before the deadline (a latch on a handle
+# pid 1 still holds) parks it again.
+fn pid1_sleep_until(deadline: u64)
+    let was: bool = interrupts_enabled()
+    let slot: i32 = proc_current_slot()
+    disable_interrupts()
+    while not deadline_passed(deadline)
+        waitset_arm(slot, deadline)
+        proc_block(BLOCK_WAIT, 0)
+        sched_block()
+    waitset_disarm(slot)
+    if was
+        enable_interrupts()
+
+# As pid 1 after the handoff, before init (kernel_tail), when `enabled`: wait
+# for netd's lease as the restart test does, then open the latency window
+# (net/latency.ritz, owner "netd") on that address and sleep through it.
+# Nothing on a boot with no netd.
+pub fn net_latency_netd_window(enabled: bool)
+    if not enabled or not net_restart_armed()
+        return
+    let leased: u64 = deadline_after_us(NETD_LEASE_US)
+    var pid: u32 = 0
+    var ready: bool = false
+    while not ready and not deadline_passed(leased)
+        pid = net_service_pid()
+        ready = net_addr_configured_by(pid) and ring1_parked(pid as u64)
+        if not ready
+            sched_yield()
+    if not ready
+        klog("[net-latency] netd has no lease: no window\n")
+        return
+    let addr: NetAddr = match net_addr_snapshot()
+        Some(a) => a
+        None =>
+            klog("[net-latency] netd has no lease: no window\n")
+            return
+    let mark: LatencyMark = latency_open("netd", addr.address)
+    pid1_sleep_until(deadline_after_us(NET_LATENCY_WINDOW_US))
+    latency_close("netd", mark)

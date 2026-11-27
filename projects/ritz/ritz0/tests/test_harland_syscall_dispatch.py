@@ -230,6 +230,9 @@ fn main() -> i32
     syscall_register(Syscall.Write, h_sum)
     syscall_register(Syscall.DebugPrint, h_sum)
     syscall_register(Syscall.Read, h_seven)
+    # Nothing dispatched yet (#4768: the latency window's syscalls/echo).
+    if syscall_count() != 0
+        return 11
     # Registered: the handler runs with the caller's four arguments.
     if syscall_dispatch(1, 1, 2, 3, 4) != 4321
         return 1
@@ -255,6 +258,9 @@ fn main() -> i32
     syscall_register(Syscall.Read, h_sum)
     if syscall_dispatch(0, 1, 0, 0, 0) != 1
         return 10
+    # Every dispatch above counted, NoSys ones included: 3 + 4 + 1.
+    if syscall_count() != 8
+        return 12
     0
 """
 

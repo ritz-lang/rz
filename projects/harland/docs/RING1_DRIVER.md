@@ -776,7 +776,7 @@ PRs 3–6 are bootable on a machine with no NIC. The `driver-enter`, `driver-fau
 
 `test_harland_syscall_dispatch.py` is updated in the PR that adds each enum variant, not before, so a number is never declared without a handler.
 
-**Performance gate.** Running the driver and netd at CPL 3 in their own address spaces adds an address-space switch per hop that an in-kernel stack does not pay. Before the ring-1-tier driver and netd become the default owner, the translating `test_msix_boot.sh` run measures ICMP echo and UDP round-trip time through the CPL-3 driver and netd against the in-kernel stack on the same boot configuration (the M2.9 performance task). If the gap matters, the first lever is merging the driver and netd into one process, which removes a switch per frame. Then batching several frames per wake, then PCID so a CR3 switch keeps the TLB, then polling instead of a wake per frame. The gate does not reopen D8.
+**Performance gate.** Running the driver and netd at CPL 3 in their own address spaces adds an address-space switch per hop that an in-kernel stack does not pay. Before the ring-1-tier driver and netd become the default owner, the translating `test_msix_boot.sh` run measures ICMP echo and UDP round-trip time through the CPL-3 driver and netd against the in-kernel stack on the same boot configuration (the M2.9 performance task). If the gap matters, the first lever is merging the driver and netd into one process, which removes a switch per frame. Then batching several frames per wake, then PCID so a CR3 switch keeps the TLB, then polling instead of a wake per frame. The gate does not reopen D8. `tools/net_latency.sh` runs it; its numbers are in `RING2_NET.md` "Rollout".
 
 ## Tests
 
