@@ -1,0 +1,71 @@
+# core/paint.ritz - one frame: the editor's state onto the screen and into TermOut.
+#
+# A Painter holds what lives from frame to frame (the Screen with its two
+# grids and long-line checkpoints, the View, the styler with its lexical-
+# color cache and diagnostic marks, and the text revision they were built
+# for) and compose() turns the Editor into the bytes that update the
+# terminal. The language server's part comes from the caller: it fills
+# styler's marks (Session.build_marks) and passes the status line's tag and
+# the cursor line's diagnostic. The platform's event loop flushes
+# them (platform/linux.ritz); the benchmark (bench/) times compose() as the
+# paint half of edit-to-paint, so both measure the same code.
+#
+# TermOut only buffers, so this module does no terminal or OS I/O.
+
+import ritzlib.option
+import ritzlib.strview { StrView }
+import ritzlib.termsession { TermOut }
+
+import core.editor { Editor }
+import core.modes { Mode }
+import core.screen { Screen, Size, View, render_styled, screen_new, view_new }
+import syntax.marks { Marked, marked_new }
+
+pub struct Painter
+    screen: Screen
+    view: View
+    styler: Marked          # lexical colors with the diagnostics over them
+    drawn: Option<i64>      # the text_revision the caches were built for; None before the first frame
+
+pub fn painter_new(size: Size) -> Painter
+    Painter { screen: screen_new(size), view: view_new(), styler: marked_new(true), drawn: None }
+
+impl Painter
+    # A new terminal size: the next frame lays out and draws everything.
+    pub fn resize(self: @&Painter, size: Size)
+        self.screen.resize(size)
+
+    # The terminal's contents are unknown: the next frame draws everything.
+    pub fn invalidate_terminal(self: @&Painter)
+        self.screen.invalidate_terminal()
+
+    # Compose the editor's frame and append to `out` what changed, with the
+    # cursor hidden while it is drawn. Scrolls the editor's `top` with the
+    # view. A `.ritz` file is drawn in lexical colors; styler's marks are
+    # drawn over any file. `lang` is the status line's language-server tag
+    # (empty: none); `hint` is the message line when the editor has none
+    # and isn't on the command line (the diagnostic under the cursor).
+    pub fn compose(self: @&Painter, ed: @&Editor, lang: StrView, hint: StrView, out: @&TermOut)
+        let rev = ed.text_revision()
+        if self.drawn.unwrap_or(-1) != rev
+            # The text changed: every line's checkpoints and colors may be
+            # stale. The marks are the caller's to rebuild.
+            self.screen.text_changed(0, 0)
+            self.styler.text_changed()
+            self.drawn = Some(rev)
+        self.view.top = ed.top
+        self.view.cursor_line = ed.cursor.line
+        self.view.cursor_byte = ed.cursor.col
+        var message: StrView = match ed.mode
+            Mode.CommandLine => ed.command_line()
+            _ => ed.message.as_view()
+        if message.is_empty() and ed.mode != Mode.CommandLine
+            message = hint
+        var status = ed.status()
+        status.lang = lang
+        self.styler.lexical = ed.path.as_view().ends_with(".ritz")
+        render_styled(@&self.screen, ed, @&self.view, @&self.styler, status, message)
+        ed.top = self.view.top
+        out.hide_cursor()
+        self.screen.emit(out)
+        out.show_cursor()

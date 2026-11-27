@@ -29,8 +29,9 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
 ## Layout
 
 - `src/core/`: the editor core (`buffer` with its undo `history` and
-  `utf8` cursor stepping, `screen`, `modes`, `commands`, and `editor`,
-  which applies typed keys to the editor state). It does no terminal or OS
+  `utf8` cursor stepping, `screen`, `modes`, `commands`, `editor`, which
+  applies typed keys to the editor state, and `paint`, which composes one
+  frame of it for the terminal). It does no terminal or OS
   I/O, so it is tested without a terminal: files go through the
   `FileStore` seam in `files`, which the platform implements.
 - `src/syntax/`: lexical colors. `lexer` splits one line into tokens (no
@@ -55,6 +56,10 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   session).
 - `src/main.ritz`: the `buddhafinger` binary, `platform/linux`'s `run_editor`
   on stdin.
+- `src/bench/`: `buddhafinger-bench`, the performance workloads (a million
+  short lines, one 8 MiB line, ordinary Ritz sources). `bench/` holds their
+  regression limits and the recorded results; `bench/README.md` says how to
+  run them.
 - `test/`: the ritzunit suites. `test_buffer_fuzz.ritz` runs seeded random
   edits against a reference buffer; a failure prints its seed, and
   `BF_FUZZ_SEED=<seed> make -C projects/buddhafinger test` replays it alone.
@@ -79,3 +84,13 @@ passes it to every `rz` call (`rz`'s default is ritz0). rz.toml's
 `[workspace.exclude]` keeps the package out of the `rz build --all` /
 `rz test --all` sweeps, and CI runs the command above instead.
 `projects/ritz/tools/test_buddhafinger_isolation.py` checks both.
+
+## Benchmarks
+
+```bash
+make -C projects/buddhafinger bench         # the workloads, results printed
+make -C projects/buddhafinger bench-check   # held to bench/limits.txt
+```
+
+`bench/README.md` describes the workloads and metrics; `bench/RESULTS.md`
+has the baselines and the line representation decision they support.

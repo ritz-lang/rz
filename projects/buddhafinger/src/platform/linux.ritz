@@ -51,13 +51,13 @@ import ritzlib.timer { now_millis }
 import core.buffer { pos }
 import core.editor { Editor, LangAsk, editor_new, editor_open, handle_key, jump_to }
 import core.files { FileStore, LoadError }
-import core.modes { Mode }
-import core.screen { Screen, Size, View, render_styled, screen_new, text_rows, view_new }
+import core.paint { Painter, painter_new }
+import core.screen { Size, text_rows }
 import lsp.client { AskKind, Diag, Refused, Reply, path_of_uri, uri_of_path }
 import lsp.wire { byte_col, utf16_col }
 import platform.lsp { LangConfig, LangServer, LangState, lang_config_from_env, lang_idle }
 import platform.save { LinuxFiles, linux_files }
-import syntax.marks { DiagMark, Marked, marked_new }
+import syntax.marks { DiagMark }
 
 # Exit statuses besides 128 + a terminating signal.
 pub const EXIT_OK: i32 = 0
@@ -152,7 +152,7 @@ pub fn run_editor_with(tty: i32, path: StrView, lang: LangConfig) -> i32
             let back = old_mask.set_mask()
             report("not a terminal")
             return EXIT_FAILED
-    var s = Session { tty: tty, term: term, signals: signals, decoder: key_decoder(), escape_ms: ESCAPE_TIMEOUT_MS as i64, deadline: None, screen: screen_new(query_size(tty)), view: view_new(), styler: marked_new(true), out: term_out(), drawn: None, dirty: true, suspended: false, lang: lang_idle(), config: lang, uri_for: string_new(), uri: string_new(), marks_for: -1 }
+    var s = Session { tty: tty, term: term, signals: signals, decoder: key_decoder(), escape_ms: ESCAPE_TIMEOUT_MS as i64, deadline: None, painter: painter_new(query_size(tty)), out: term_out(), dirty: true, suspended: false, lang: lang_idle(), config: lang, uri_for: string_new(), uri: string_new(), marks_for: -1 }
     s.size_changed(@&ed)
     s.enter_screen()
     let exit = s.run(@&ed, @&files)
@@ -204,11 +204,8 @@ struct Session
     decoder: KeyDecoder
     escape_ms: i64          # how long an open key sequence waits for the rest
     deadline: Option<i64>   # when it stops waiting (now_millis()); None: none open
-    screen: Screen
-    view: View
-    styler: Marked          # lexical colors with the diagnostics over them
+    painter: Painter        # the screen, its view, the colors and diagnostic marks
     out: TermOut
-    drawn: Option<i64>      # the text_revision the caches were built for; None before the first paint
     dirty: bool             # a repaint is due
     suspended: bool         # stopped by Ctrl-Z or SIGTSTP; SIGCONT ends it
     lang: LangServer        # the language server session (platform/lsp.ritz)
@@ -382,7 +379,7 @@ impl Session
     # out again and repaint everything.
     fn size_changed(self: @&Session, ed: @&Editor)
         let size = query_size(self.tty)
-        self.screen.resize(size)
+        self.painter.resize(size)
         ed.page = text_rows(size) as i64
         self.dirty = true
 
@@ -393,36 +390,17 @@ impl Session
     # Compose the editor's frame and write what changed.
     fn paint(self: @&Session, ed: @&Editor) -> Result<(), Errno>
         let rev = ed.text_revision()
-        if self.drawn.unwrap_or(-1) != rev
-            # The text changed: every line's checkpoints and colors may be stale.
-            self.screen.text_changed(0, 0)
-            self.styler.text_changed()
-            self.drawn = Some(rev)
         if self.marks_for != rev
             self.build_marks(ed, rev)
-        self.view.top = ed.top
-        self.view.cursor_line = ed.cursor.line
-        self.view.cursor_byte = ed.cursor.col
-        var message: StrView = match ed.mode
-            Mode.CommandLine => ed.command_line()
-            _ => ed.message.as_view()
-        if message.is_empty() and ed.mode != Mode.CommandLine
-            message = self.diagnostic_at(ed.cursor.line, rev)
-        var status = ed.status()
-        status.lang = self.lang.tag()
-        self.styler.lexical = ed.path.as_view().ends_with(".ritz")
-        render_styled(@&self.screen, ed, @&self.view, @&self.styler, status, message)
-        ed.top = self.view.top
-        self.out.hide_cursor()
-        self.screen.emit(@&self.out)
-        self.out.show_cursor()
+        let hint = self.diagnostic_at(ed.cursor.line, rev)
+        self.painter.compose(ed, self.lang.tag(), hint, @&self.out)
         self.dirty = false
         self.out.flush(self.tty)
 
     # Onto the alternate screen; the next paint draws everything.
     fn enter_screen(self: @&Session)
         self.out.enter_alt_screen()
-        self.screen.invalidate_terminal()
+        self.painter.invalidate_terminal()
         let flushed = self.out.flush(self.tty)
 
     # Back to the shell's screen, in the default style, cursor shown.
@@ -571,7 +549,7 @@ impl Session
     # unless the server's latest list is for exactly this text.
     fn build_marks(self: @&Session, ed: @Editor, rev: i64)
         self.marks_for = rev
-        self.styler.clear_marks()
+        self.painter.styler.clear_marks()
         if not self.lang.running()
             return
         let ds = self.lang.client.diagnostics(rev)
@@ -584,9 +562,9 @@ impl Session
                 let text = ed.buf.line(l)
                 let a = if l == d.line then byte_col(text, d.start) else 0
                 let b = if l == d.end_line then byte_col(text, d.end) else text.len
-                self.styler.add(DiagMark { line: l, start: a, end: b, error: d.severity == 1 })
+                self.painter.styler.add(DiagMark { line: l, start: a, end: b, error: d.severity == 1 })
                 l += 1
-        self.styler.sort_marks()
+        self.painter.styler.sort_marks()
 
     # The message of the first diagnostic on line `l`, for the message line.
     fn diagnostic_at(self: @Session, l: i64, rev: i64) -> StrView

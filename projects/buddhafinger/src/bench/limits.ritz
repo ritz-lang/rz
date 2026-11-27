@@ -1,0 +1,72 @@
+# bench/limits.ritz - the regression limits `make bench-check` holds a run to.
+#
+# bench/limits.txt has one limit per line, `<workload> <metric> <max>`, with
+# `#` starting a comment. A result above its limit fails the check. The
+# limits come from repeated baseline runs (bench/RESULTS.md says how).
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result { Result }
+import ritzlib.string
+import ritzlib.strview { StrView, SplitPair }
+
+pub struct Limit
+    workload: String
+    metric: String
+    max: i64
+
+# A limits file line that isn't `<workload> <metric> <max>`.
+pub struct LimitsError
+    line: i64           # 1-based
+
+pub enum Verdict
+    Pass
+    Fail
+    NotThis             # the limit is for another workload or metric
+
+# Every limit in `text`, or the first malformed line.
+pub fn parse_limits(text: StrView) -> Result<Vec<Limit>, LimitsError>
+    var out: Vec<Limit> = vec_new<Limit>()
+    var rest = text
+    var line_no: i64 = 0
+    while not rest.is_empty()
+        line_no += 1
+        let split = first_line(rest)
+        rest = split.after
+        var line = split.before
+        let hash = line.find_byte('#')         # line.len: none
+        line = line.take(hash)
+        line = line.trim()
+        if line.is_empty()
+            continue
+        match parse_limit(line)
+            Some(lim) => out.push(lim)
+            None => return Err(LimitsError { line: line_no })
+    Ok(out)
+
+# `text` split after its first line: the line (without its LF) and the rest.
+pub fn first_line(text: StrView) -> SplitPair
+    match text.split_once('\n')
+        Some(p) => p
+        None => SplitPair { before: text, after: text.skip(text.len) }
+
+# `<workload> <metric> <max>`, fields split by blanks.
+fn parse_limit(line: StrView) -> Option<Limit>
+    let a = match line.split_once(' ')
+        Some(p) => p
+        None => return None
+    let b = match a.after.trim_start().split_once(' ')
+        Some(p) => p
+        None => return None
+    let max = match b.after.trim().parse_i64()
+        Some(n) => n
+        None => return None
+    if a.before.is_empty() or b.before.is_empty()
+        return None
+    Some(Limit { workload: string_from(a.before), metric: string_from(b.before), max: max })
+
+# Whether `value`, the run's `metric` for `workload`, is within `lim`.
+pub fn check_limit(lim: @Limit, workload: StrView, metric: StrView, value: i64) -> Verdict
+    if not lim.workload.as_view().eq(workload) or not lim.metric.as_view().eq(metric)
+        return Verdict.NotThis
+    if value > lim.max then Verdict.Fail else Verdict.Pass

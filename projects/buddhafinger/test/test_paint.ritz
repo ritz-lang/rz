@@ -1,0 +1,139 @@
+# test/test_paint.ritz - core/paint's Painter: one edit-to-paint frame (AGAST #4821).
+#
+# The event loop (platform/linux.ritz) and the benchmark (bench/) both paint
+# through Painter.compose, so these pin what a frame is: the editor's text
+# and cursor on screen, colors for a `.ritz` file, a repaint after a resize.
+
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.string
+import ritzlib.termsession { Key, TermOut, term_out }
+
+import core.editor { Editor, editor_open }
+import core.paint { Painter, painter_new }
+import core.screen { Size }
+import syntax.highlight { kind_style }
+import syntax.lexer { Kind }
+import core.screen { style_eq }
+import core.modes { Mode }
+import syntax.marks { DiagMark }
+
+fn size(rows: i32, cols: i32) -> Size
+    Size { rows: rows, cols: cols }
+
+[[test]]
+fn test_compose_draws_the_text_and_the_cursor() -> i32
+    var ed = editor_open("a.txt", span_from_strview("one\ntwo\n"))
+    var p = painter_new(size(5, 20))
+    var out = term_out()
+    p.compose(@&ed, "", "", @&out)
+    let row = p.screen.row_text(1)
+    assert row.as_view().starts_with("  2 two")
+    assert p.screen.cursor_row() == 0
+    assert p.screen.cursor_col() == 4       # past the 3-digit gutter and its space
+    assert not out.as_view().is_empty()
+    0
+
+[[test]]
+fn test_compose_after_an_edit_shows_the_new_text() -> i32
+    var ed = editor_open("a.txt", span_from_strview("one\n"))
+    var p = painter_new(size(5, 20))
+    var out = term_out()
+    p.compose(@&ed, "", "", @&out)
+    ed.buf.insert(ed.cursor, span_from_strview("X"))
+    p.compose(@&ed, "", "", @&out)
+    assert p.screen.row_text(0).as_view().starts_with("  1 Xone")
+    0
+
+[[test]]
+fn test_compose_colors_a_ritz_file_only() -> i32
+    var ed = editor_open("a.ritz", span_from_strview("fn f\n"))
+    var p = painter_new(size(5, 20))
+    var out = term_out()
+    p.compose(@&ed, "", "", @&out)
+    assert style_eq(p.screen.cell(0, 4).style, kind_style(Kind.Keyword))
+    var plain = editor_open("a.txt", span_from_strview("fn f\n"))
+    var q = painter_new(size(5, 20))
+    q.compose(@&plain, "", "", @&out)
+    assert not style_eq(q.screen.cell(0, 4).style, kind_style(Kind.Keyword))
+    0
+
+[[test]]
+fn test_an_edit_recolors_the_changed_line() -> i32
+    var ed = editor_open("a.ritz", span_from_strview("fn f\n"))
+    var p = painter_new(size(5, 20))
+    var out = term_out()
+    p.compose(@&ed, "", "", @&out)
+    assert style_eq(p.screen.cell(0, 4).style, kind_style(Kind.Keyword))
+    # `# ` in front: the line is a comment now, `fn` included.
+    ed.buf.insert(ed.cursor, span_from_strview("# "))
+    p.compose(@&ed, "", "", @&out)
+    assert style_eq(p.screen.cell(0, 6).style, kind_style(Kind.Comment))
+    0
+
+[[test]]
+fn test_resize_repaints_at_the_new_size() -> i32
+    var ed = editor_open("a.txt", span_from_strview("one\n"))
+    var p = painter_new(size(5, 20))
+    var out = term_out()
+    p.compose(@&ed, "", "", @&out)
+    out.buf.clear()
+    p.compose(@&ed, "", "", @&out)
+    # Nothing changed: no cells, only the cursor hidden for the frame and shown.
+    assert out.as_view().eq("\e[?25l\e[?25h")
+    p.resize(size(6, 30))
+    p.compose(@&ed, "", "", @&out)
+    assert out.as_view().contains("\e[2J")  # cleared and drawn again
+    assert p.screen.row_text(0).len() == 30
+    0
+
+# The language server's part (AGAST #4828): its tag on the status line, the
+# cursor line's diagnostic on an otherwise empty message line, marks
+# underlined over any file's colors.
+
+[[test]]
+fn test_lang_tag_shows_on_the_status_line() -> i32
+    var ed = editor_open("a.ritz", span_from_strview("one\n"))
+    var p = painter_new(size(5, 40))
+    var out = term_out()
+    p.compose(@&ed, "lsp: exited", "", @&out)
+    assert p.screen.row_text(3).as_view().contains("lsp: exited")
+    p.compose(@&ed, "", "", @&out)
+    assert not p.screen.row_text(3).as_view().contains("lsp")
+    0
+
+[[test]]
+fn test_hint_fills_only_an_empty_message_line() -> i32
+    var ed = editor_open("a.ritz", span_from_strview("one\n"))
+    var p = painter_new(size(5, 40))
+    var out = term_out()
+    p.compose(@&ed, "", "unknown name", @&out)
+    assert p.screen.row_text(4).as_view().starts_with("unknown name")
+    ed.say("written")
+    p.compose(@&ed, "", "unknown name", @&out)
+    assert p.screen.row_text(4).as_view().starts_with("written")
+    ed.say("")
+    ed.mode = Mode.CommandLine
+    p.compose(@&ed, "", "unknown name", @&out)
+    assert not p.screen.row_text(4).as_view().contains("unknown name")
+    0
+
+[[test]]
+fn test_marks_are_underlined_in_any_file() -> i32
+    var ed = editor_open("a.ritz", span_from_strview("fn f\n"))
+    var p = painter_new(size(5, 20))
+    var out = term_out()
+    p.styler.add(DiagMark { line: 0, start: 3, end: 4, error: true })
+    p.styler.sort_marks()
+    p.compose(@&ed, "", "", @&out)
+    assert style_eq(p.screen.cell(0, 4).style, kind_style(Kind.Keyword))
+    assert p.screen.cell(0, 7).style.underline
+    var plain = editor_open("a.txt", span_from_strview("fn f\n"))
+    var q = painter_new(size(5, 20))
+    q.styler.add(DiagMark { line: 0, start: 0, end: 2, error: false })
+    q.styler.sort_marks()
+    q.compose(@&plain, "", "", @&out)
+    assert q.screen.cell(0, 4).style.underline
+    assert not q.screen.cell(0, 7).style.underline
+    0

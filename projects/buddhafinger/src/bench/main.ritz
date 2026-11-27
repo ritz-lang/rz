@@ -1,0 +1,535 @@
+# bench/main.ritz - buddhafinger-bench: the editor's performance workloads (AGAST #4821).
+#
+#   buddhafinger-bench WORKLOAD DIR [SOURCE] [--check LIMITS]
+#
+# WORKLOAD is one of:
+#   lines, lines-hl   a million short lines (`.txt`: plain; `-hl`: `.ritz`, colored)
+#   long, long-hl     one 8 MiB line, likewise
+#   src               SOURCE, an ordinary Ritz file (colored)
+# The file is written into DIR (a scratch directory) and the run opens it
+# from there, edits it and saves it back; a source file is copied first, so
+# SOURCE itself is never written.
+#
+# One workload per process, so peak memory is the workload's own. Output is
+# one `<workload> <metric> <value>` line per measurement (bench/README.md
+# lists them), after `# ` lines naming the environment. With --check, each
+# result is held to its limit in the LIMITS file (src/bench/limits.ritz) and
+# a result over its limit exits 1.
+#
+# Edit-to-paint, the latency measured for every key below, is what one
+# typed key costs the event loop (platform/linux.ritz): handle_key, then
+# Painter.compose (core/paint.ritz), then the flush (to /dev/null here, not
+# a terminal, so the terminal's own drawing is not in it).
+
+import ritzlib.errno { Errno }
+import ritzlib.fd { Fd, fd_open }
+import ritzlib.fs { read_file, path_basename, unlink }
+import ritzlib.gvec
+import ritzlib.io { prints, eprints }
+import ritzlib.option
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_from_strview, span_from_vec }
+import ritzlib.string
+import ritzlib.strview { StrView }
+import ritzlib.sys
+import ritzlib.termsession { Key, TermOut, term_out }
+import ritzlib.timer { now_nanos }
+
+import core.buffer { pos }
+import core.editor { Editor, editor_open, handle_key }
+import core.files { FileStore }
+import core.paint { Painter, painter_new }
+import core.screen { Size, text_rows }
+import platform.save { LinuxFiles, linux_files }
+
+import bench.limits { Limit, Verdict, check_limit, first_line, parse_limits }
+import bench.stats { Samples, samples_new }
+import bench.workloads { NEEDLE, long_line, many_lines }
+
+const USAGE: StrView = "usage: buddhafinger-bench lines|lines-hl|long|long-hl|src DIR [SOURCE] [--check LIMITS]\n"
+
+const EXIT_OK: i32 = 0
+const EXIT_FAILED: i32 = 1
+const EXIT_USAGE: i32 = 2
+
+# The workloads' sizes (the proposal's "a million short lines" and "a
+# single multi-megabyte line").
+const MANY_LINES: i64 = 1000000
+const LONG_BYTES: i64 = 8388608         # 8 MiB
+
+# The terminal the frames are composed for, and the size a resize toggles to.
+const ROWS: i32 = 40
+const COLS: i32 = 120
+const ALT_ROWS: i32 = 50
+const ALT_COLS: i32 = 200
+
+# Samples per latency series.
+const TYPED: i64 = 200          # keys typed at each place
+const SPLITS: i64 = 100         # Enter, then as many Backspaces
+const DELETES: i64 = 100        # x, then u for each, then Ctrl-R for each
+const TYPING_UNDOS: i64 = 20    # Insert sessions undone whole
+const SEARCHES: i64 = 20        # /NEEDLE from the top, then n
+const PAGES: i64 = 200          # Ctrl-F
+const LINE_STEPS: i64 = 500     # j, or w along a long line
+const JUMPS: i64 = 20           # G and gg, or $ and 0
+const RESIZES: i64 = 20
+
+# ============================================================================
+# Results
+# ============================================================================
+
+struct Metric
+    name: String
+    value: i64
+
+struct Bench
+    workload: String
+    ed: Editor
+    files: LinuxFiles
+    painter: Painter
+    out: TermOut
+    sink: Fd                # /dev/null: where frames are flushed
+    results: Vec<Metric>
+
+impl Bench
+    fn record(self: @&Bench, name: StrView, value: i64)
+        self.results.push(Metric { name: string_from(name), value: value })
+        prints(self.workload.as_view())
+        prints(" ")
+        prints(name)
+        prints(" ")
+        var line = string_new()
+        line.push_i64(value)
+        line.push('\n')
+        prints(line.as_view())
+
+    # A series' p50, p95 and max in microseconds, and its sample count.
+    fn record_series(self: @&Bench, name: StrView, s: @&Samples)
+        self.record_suffixed(name, "_p50_us", s.percentile(50) / 1000)
+        self.record_suffixed(name, "_p95_us", s.percentile(95) / 1000)
+        self.record_suffixed(name, "_max_us", s.max() / 1000)
+        self.record_suffixed(name, "_n", s.count())
+
+    fn record_suffixed(self: @&Bench, name: StrView, suffix: StrView, value: i64)
+        var full = string_from(name)
+        full.push_str(suffix)
+        self.record(full.as_view(), value)
+
+    # ------------------------------------------------------------------
+    # One key, edit to paint
+    # ------------------------------------------------------------------
+
+    # Apply `k` and paint the frame; the nanoseconds it took.
+    fn key(self: @&Bench, k: Key) -> i64
+        let t0 = now_nanos()
+        handle_key<LinuxFiles>(@&self.ed, @&self.files, k)
+        self.paint()
+        now_nanos() - t0
+
+    fn paint(self: @&Bench)
+        self.painter.compose(@&self.ed, "", "", @&self.out)
+        let flushed = self.out.flush(self.sink.raw())
+
+    fn keys(self: @&Bench, text: StrView)
+        for i in 0..text.len
+            let spent = self.key(Key.Char(text.get(i) as u32))
+
+    # `k`, `n` times, into `s`.
+    fn repeat(self: @&Bench, k: Key, n: i64, s: @&Samples)
+        for i in 0..n
+            s.add(self.key(k))
+
+    # The cursor to (line, col), as a motion would leave it, and painted.
+    fn go(self: @&Bench, line: i64, col: i64)
+        self.ed.place(pos(line, col))
+        self.paint()
+
+    # The middle of the text: the middle line, at the middle of its bytes.
+    fn go_middle(self: @&Bench)
+        let l = self.ed.last() / 2
+        self.go(l, self.ed.buf.line_len(l) / 2)
+
+    # ------------------------------------------------------------------
+    # The series
+    # ------------------------------------------------------------------
+
+    # TYPED characters in one Insert session at the cursor.
+    fn type_here(self: @&Bench, name: StrView)
+        var s = samples_new()
+        let spent = self.key(Key.Char('i' as u32))
+        self.repeat(Key.Char('x' as u32), TYPED, @&s)
+        let done = self.key(Key.Escape)
+        self.record_series(name, @&s)
+
+    fn edits(self: @&Bench)
+        self.go(0, 0)
+        self.type_here("type_start")
+        self.go_middle()
+        self.type_here("type_middle")
+        let last = self.ed.last()
+        self.go(last, self.ed.buf.line_len(last))
+        self.type_here("type_end")
+
+        # Line splits and joins in the middle: the line vector shifts.
+        self.go_middle()
+        var split = samples_new()
+        var join = samples_new()
+        let into = self.key(Key.Char('i' as u32))
+        self.repeat(Key.Enter, SPLITS, @&split)
+        self.repeat(Key.Backspace, SPLITS, @&join)
+        let out = self.key(Key.Escape)
+        self.record_series("split_middle", @&split)
+        self.record_series("join_middle", @&join)
+
+        # Normal-mode deletes, each its own undo step; undone and redone.
+        self.go_middle()
+        var del = samples_new()
+        var undo = samples_new()
+        var redo = samples_new()
+        self.repeat(Key.Char('x' as u32), DELETES, @&del)
+        self.repeat(Key.Char('u' as u32), DELETES, @&undo)
+        self.repeat(Key.Ctrl('r'), DELETES, @&redo)
+        self.record_series("delete_middle", @&del)
+        self.record_series("undo_delete", @&undo)
+        self.record_series("redo_delete", @&redo)
+
+        # A whole Insert session (TYPED / 10 keys) undone as one step.
+        var undo_typing = samples_new()
+        for r in 0..TYPING_UNDOS
+            self.go_middle()
+            let into2 = self.key(Key.Char('i' as u32))
+            for k in 0..TYPED / 10
+                let typed = self.key(Key.Char('y' as u32))
+            let out2 = self.key(Key.Escape)
+            undo_typing.add(self.key(Key.Char('u' as u32)))
+        self.record_series("undo_typing", @&undo_typing)
+
+    # /NEEDLE from the top (the match is at the end), then n (which wraps
+    # around the whole file back to it).
+    fn search(self: @&Bench)
+        var slash = samples_new()
+        for r in 0..SEARCHES
+            self.go(0, 0)
+            let open = self.key(Key.Char('/' as u32))
+            self.keys(NEEDLE)
+            slash.add(self.key(Key.Enter))
+        var next = samples_new()
+        self.repeat(Key.Char('n' as u32), SEARCHES, @&next)
+        self.record_series("search", @&slash)
+        self.record_series("search_next", @&next)
+
+    # Down the file a page and a line at a time, and the jumps to its ends
+    # (`G`, `gg`); along a one-line file a word at a time, and to its ends
+    # (`$`, `0`).
+    fn scroll(self: @&Bench)
+        self.go(0, 0)
+        var page = samples_new()
+        self.repeat(Key.Ctrl('f'), PAGES, @&page)
+        self.record_series("page_down", @&page)
+        self.go(0, 0)
+        if self.ed.shown() == 1
+            self.steps(Key.Char('w' as u32), "word_right")
+            self.jumps(Key.Char('$' as u32), Key.Char('0' as u32), 1)
+        else
+            self.steps(Key.Char('j' as u32), "line_down")
+            self.jumps(Key.Char('G' as u32), Key.Char('g' as u32), 2)
+
+    # `step`, LINE_STEPS times, as the series `name`.
+    fn steps(self: @&Bench, step: Key, name: StrView)
+        var s = samples_new()
+        self.repeat(step, LINE_STEPS, @&s)
+        self.record_series(name, @&s)
+
+    # `to_end`, then `to_start` pressed `presses` times (gg is two), JUMPS
+    # times; each jump's last key is its sample.
+    fn jumps(self: @&Bench, to_end: Key, to_start: Key, presses: i64)
+        var ends = samples_new()
+        var starts = samples_new()
+        for r in 0..JUMPS
+            ends.add(self.key(to_end))
+            for k in 0..presses - 1
+                let first = self.key(to_start)
+            starts.add(self.key(to_start))
+        self.record_series("jump_end", @&ends)
+        self.record_series("jump_start", @&starts)
+
+    # The terminal resized back and forth, cursor mid-file: lay out and
+    # draw everything.
+    fn resize(self: @&Bench)
+        self.go_middle()
+        var s = samples_new()
+        for r in 0..RESIZES
+            let size = if r % 2 == 0 then Size { rows: ALT_ROWS, cols: ALT_COLS } else Size { rows: ROWS, cols: COLS }
+            let t0 = now_nanos()
+            self.painter.resize(size)
+            self.ed.page = text_rows(size) as i64
+            self.paint()
+            s.add(now_nanos() - t0)
+        self.record_series("resize", @&s)
+
+    fn save(self: @&Bench, path: StrView) -> bool
+        let t0 = now_nanos()
+        let saved = self.files.save(path, @self.ed.buf)
+        self.record("save_ms", (now_nanos() - t0) / 1000000)
+        match saved
+            Ok(_) => true
+            Err(_) => false
+
+# ============================================================================
+# The process: its environment and its memory
+# ============================================================================
+
+# A line of /proc/self/status (`VmHWM`, `VmRSS`) in kB; 0 when unreadable.
+fn status_kb(field: StrView) -> i64
+    match read_file("/proc/self/status")
+        Ok(text) => proc_field(text.as_view(), field)
+        Err(_) => 0
+
+# The number at the start of `<field>:` in /proc's `key: value` text (the
+# `<n>` of `VmHWM:   <n> kB`); 0 when there is none.
+fn proc_field(text: StrView, field: StrView) -> i64
+    let v = proc_text(text, field)
+    match v.take(v.find_byte(' ')).parse_i64()
+        Some(n) => n
+        None => 0
+
+# The text after `<field>:` on the first such line of `text`, trimmed; ""
+# when there is none.
+fn proc_text(text: StrView, field: StrView) -> StrView
+    var rest = text
+    while not rest.is_empty()
+        let split = first_line(rest)
+        rest = split.after
+        match split.before.split_once(':')
+            Some(kv) =>
+                if kv.before.trim().eq(field)
+                    return kv.after.trim()
+            None => pass
+    ""
+
+# Reset the peak resident size (VmHWM) to the current one: the workload's
+# peak, not the generator's (proc(5), /proc/pid/clear_refs, "5").
+fn reset_peak_rss()
+    match fd_open("/proc/self/clear_refs", O_WRONLY + O_CLOEXEC, 0)
+        Ok(f) =>
+            var fd = f
+            let wrote = fd.write_str("5")
+            let closed = fd.close()
+        Err(_) => pass
+
+# `# ` lines naming where the numbers came from.
+fn print_environment()
+    prints("# kernel ")
+    match read_file("/proc/sys/kernel/osrelease")
+        Ok(t) => prints(t.as_view().trim())
+        Err(_) => prints("?")
+    prints("\n# cpu ")
+    match read_file("/proc/cpuinfo")
+        Ok(t) =>
+            prints(proc_text(t.as_view(), "model name"))
+            # One `processor` line per logical CPU.
+            var cpus: i64 = 0
+            var rest = t.as_view()
+            while not rest.is_empty()
+                let split = first_line(rest)
+                rest = split.after
+                if split.before.starts_with("processor")
+                    cpus += 1
+            var n = string_from(" x")
+            n.push_i64(cpus)
+            prints(n.as_view())
+        Err(_) => prints("?")
+    prints("\n# memory ")
+    match read_file("/proc/meminfo")
+        Ok(t) =>
+            var m = string_new()
+            m.push_i64(proc_field(t.as_view(), "MemTotal"))
+            m.push_str(" kB")
+            prints(m.as_view())
+        Err(_) => prints("?")
+    prints("\n")
+
+# ============================================================================
+# The workload's file
+# ============================================================================
+
+fn write_bytes(path: StrView, data: [u8]) -> Result<(), Errno>
+    var f = fd_open(path, O_WRONLY + O_CREAT + O_TRUNC + O_CLOEXEC, 420)?
+    let wrote = f.write_all(data)
+    let closed = f.close()
+    wrote?
+    closed
+
+# Write the workload's file at `path`; false (reported) when it can't be.
+fn make_file(kind: StrView, path: StrView, source: StrView) -> bool
+    var data: Vec<u8> = vec_new<u8>()
+    if kind.starts_with("lines")
+        data = many_lines(MANY_LINES)
+    else if kind.starts_with("long")
+        data = long_line(LONG_BYTES)
+    else
+        match read_file(source)
+            Ok(t) => data.push_view(t.as_view())
+            Err(e) =>
+                eprints("buddhafinger-bench: cannot read the source file\n")
+                return false
+    match write_bytes(path, span_from_vec<u8>(@data))
+        Ok(_) => true
+        Err(e) =>
+            eprints("buddhafinger-bench: cannot write the workload file\n")
+            false
+
+# The editor on `path`, as `buddhafinger path` opens it; the bytes read are
+# dropped on the way out, as there.
+fn open_editor(files: @&LinuxFiles, path: StrView) -> Option<Editor>
+    match files.load(path)
+        Ok(bytes) => Some(editor_open(path, span_from_vec<u8>(@bytes)))
+        Err(_) => None
+
+# ============================================================================
+# main
+# ============================================================================
+
+pub fn main(args: Span<StrView>) -> i32
+    if args.len < 3
+        eprints(USAGE)
+        return EXIT_USAGE
+    let kind: StrView = args[1]
+    let dir: StrView = args[2]
+    var source: StrView = ""
+    var limits_path: StrView = ""
+    var i: i64 = 3
+    while i < args.len
+        let a: StrView = args[i]
+        if a.eq("--check") and i + 1 < args.len
+            limits_path = args[i + 1]
+            i += 2
+        else if source.is_empty() and not a.starts_with("--")
+            source = a
+            i += 1
+        else
+            eprints(USAGE)
+            return EXIT_USAGE
+    let known = kind.eq("lines") or kind.eq("lines-hl") or kind.eq("long") or kind.eq("long-hl") or kind.eq("src")
+    if not known or (kind.eq("src") and source.is_empty())
+        eprints(USAGE)
+        return EXIT_USAGE
+
+    # The workload's name in the results: a source file goes by its name.
+    var workload = string_from(kind)
+    if kind.eq("src")
+        workload.push(':')
+        workload.push_str(path_basename(source))
+    # Its file: `.ritz` (colored) for -hl and sources, `.txt` (plain) otherwise.
+    var path = string_from(dir)
+    path.push_str("/bench-")
+    path.push_str(kind)
+    if kind.ends_with("-hl") or kind.eq("src")
+        path.push_str(".ritz")
+    else
+        path.push_str(".txt")
+    if not make_file(kind, path.as_view(), source)
+        return EXIT_FAILED
+
+    let sink = match fd_open("/dev/null", O_WRONLY + O_CLOEXEC, 0)
+        Ok(f) => f
+        Err(_) =>
+            eprints("buddhafinger-bench: cannot open /dev/null\n")
+            return EXIT_FAILED
+
+    print_environment()
+    reset_peak_rss()
+    let base_kb = status_kb("VmRSS")
+
+    var files = linux_files()
+    let t0 = now_nanos()
+    let opened = open_editor(@&files, path.as_view())
+    let open_ns = now_nanos() - t0
+    var ed: Editor = match opened
+        Some(e) => e
+        None =>
+            eprints("buddhafinger-bench: cannot open the workload file\n")
+            return EXIT_FAILED
+    var b = Bench { workload: workload, ed: ed, files: files, painter: painter_new(Size { rows: ROWS, cols: COLS }), out: term_out(), sink: sink, results: vec_new<Metric>() }
+    b.ed.page = text_rows(Size { rows: ROWS, cols: COLS }) as i64
+    let t1 = now_nanos()
+    b.paint()
+    let first_ns = now_nanos() - t1
+
+    b.record("file_bytes", b.ed.buf.byte_len())
+    b.record("lines", b.ed.buf.line_count())
+    b.record("open_ms", open_ns / 1000000)
+    b.record("first_paint_us", first_ns / 1000)
+    b.record("open_rss_kb", status_kb("VmHWM") - base_kb)
+
+    b.edits()
+    b.search()
+    b.scroll()
+    b.resize()
+    let saved = b.save(path.as_view())
+    b.record("peak_rss_kb", status_kb("VmHWM") - base_kb)
+    let removed = unlink(path.as_view())
+    if not saved
+        eprints("buddhafinger-bench: the save failed\n")
+        return EXIT_FAILED
+
+    if limits_path.is_empty()
+        return EXIT_OK
+    match over_limits(@b, limits_path)
+        Ok(over) => if over > 0 then EXIT_FAILED else EXIT_OK
+        Err(e) =>
+            var msg = string_from("buddhafinger-bench: ")
+            match e
+                CheckError.Unreadable => msg.push_str("cannot read the limits file")
+                CheckError.Malformed(line) =>
+                    msg.push_str("limits file line ")
+                    msg.push_i64(line)
+                    msg.push_str(": not `<workload> <metric> <max>`")
+            msg.push('\n')
+            eprints(msg.as_view())
+            EXIT_FAILED
+
+# Why the limits couldn't be checked.
+enum CheckError
+    Unreadable          # the limits file can't be read
+    Malformed(i64)      # its line N isn't `<workload> <metric> <max>`
+
+# Hold every result to its limit in the file at `limits_path`: a `FAIL`
+# line for each over and a `check` summary line. How many were over.
+fn over_limits(b: @Bench, limits_path: StrView) -> Result<i64, CheckError>
+    let text = match read_file(limits_path)
+        Ok(t) => t
+        Err(_) => return Err(CheckError.Unreadable)
+    let limits = match parse_limits(text.as_view())
+        Ok(l) => l
+        Err(e) => return Err(CheckError.Malformed(e.line))
+    var failed: i64 = 0
+    var checked: i64 = 0
+    for k in 0..limits.len()
+        let lim = @limits[k]
+        for r in 0..b.results.len()
+            let m = @b.results[r]
+            let verdict = check_limit(lim, b.workload.as_view(), m.name.as_view(), m.value)
+            if verdict != Verdict.NotThis
+                checked += 1
+            if verdict == Verdict.Fail
+                failed += 1
+                var msg = string_from("FAIL ")
+                msg.push_str(b.workload.as_view())
+                msg.push(' ')
+                msg.push_str(m.name.as_view())
+                msg.push(' ')
+                msg.push_i64(m.value)
+                msg.push_str(" > ")
+                msg.push_i64(lim.max)
+                msg.push('\n')
+                prints(msg.as_view())
+    var summary = string_from("check ")
+    summary.push_str(b.workload.as_view())
+    summary.push(' ')
+    summary.push_i64(checked)
+    summary.push_str(" limits, ")
+    summary.push_i64(failed)
+    summary.push_str(" over\n")
+    prints(summary.as_view())
+    Ok(failed)

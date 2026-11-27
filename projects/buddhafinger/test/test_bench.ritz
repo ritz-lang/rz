@@ -1,0 +1,124 @@
+# test/test_bench.ritz - the benchmark harness's own logic (AGAST #4821).
+#
+# The timings themselves are not tested (bench/ is run by `make bench`, not
+# by the suite); what is: the percentiles reported, the workloads' shape
+# (what the numbers are numbers of), and the regression limits check.
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.span { Bytes, span_from_vec }
+import ritzlib.strview
+import ritzlib.string
+
+import bench.limits { Limit, Verdict, parse_limits, check_limit }
+import bench.stats { Samples, samples_new }
+import bench.workloads { many_lines, long_line, NEEDLE }
+import core.buffer { buffer_from_bytes }
+
+# ============================================================================
+# Percentiles: nearest rank over the sorted samples
+# ============================================================================
+
+[[test]]
+fn test_percentiles_are_nearest_rank() -> i32
+    var s = samples_new()
+    # 1..=100 in a scrambled order: p50 is the 50th smallest, p95 the 95th.
+    var k: i64 = 0
+    while k < 100
+        s.add((k * 37) % 100 + 1)
+        k += 1
+    assert s.count() == 100
+    assert s.percentile(50) == 50
+    assert s.percentile(95) == 95
+    assert s.percentile(100) == 100
+    assert s.max() == 100
+    0
+
+[[test]]
+fn test_percentiles_of_few_samples() -> i32
+    var s = samples_new()
+    s.add(30)
+    assert s.percentile(50) == 30
+    assert s.percentile(95) == 30
+    s.add(10)
+    s.add(20)
+    assert s.percentile(50) == 20       # rank ceil(1.5) = 2
+    assert s.percentile(95) == 30       # rank ceil(2.85) = 3
+    0
+
+[[test]]
+fn test_no_samples_is_zero() -> i32
+    var s = samples_new()
+    assert s.percentile(50) == 0
+    assert s.max() == 0
+    0
+
+# ============================================================================
+# Workloads
+# ============================================================================
+
+[[test]]
+fn test_many_lines_has_the_lines_asked_for_and_the_needle_last() -> i32
+    let text = many_lines(1000)
+    let buf = buffer_from_bytes(span_from_vec<u8>(@text))
+    # 1000 LF-terminated lines, then the empty line after the final newline.
+    assert buf.line_count() == 1001
+    let last = buf.line(999)
+    assert last.as_strview().contains(NEEDLE)
+    assert not buf.line(998).as_strview().contains(NEEDLE)
+    0
+
+[[test]]
+fn test_long_line_is_one_line_of_the_size_asked_for() -> i32
+    let text = long_line(100000)
+    assert text.len() == 100000
+    let buf = buffer_from_bytes(span_from_vec<u8>(@text))
+    assert buf.line_count() == 1
+    let line = buf.line(0)
+    # The needle once, at the very end, so a search scans the whole line.
+    assert line.as_strview().ends_with(NEEDLE)
+    assert not line[0..line.len - NEEDLE.len].as_strview().contains(NEEDLE)
+    0
+
+# ============================================================================
+# Regression limits
+# ============================================================================
+
+[[test]]
+fn test_parse_limits_skips_comments_and_blanks() -> i32
+    let text = "# workload metric limit\n\nlines type_start_p95_us 4000\nlong open_ms 250  # a comment\n"
+    let limits = parse_limits(text).unwrap()
+    assert limits.len() == 2
+    assert limits[0].workload.as_view().eq("lines")
+    assert limits[0].metric.as_view().eq("type_start_p95_us")
+    assert limits[0].max == 4000
+    assert limits[1].workload.as_view().eq("long")
+    assert limits[1].max == 250
+    # The last line needs no LF.
+    let unterminated = parse_limits("# x\nlong save_ms 9").unwrap()
+    assert unterminated.len() == 1
+    assert unterminated[0].max == 9
+    0
+
+[[test]]
+fn test_parse_limits_refuses_a_malformed_line() -> i32
+    assert malformed_line("lines type_start_p95_us\n") == 1
+    assert malformed_line("# ok\nlines x notanumber\n") == 2
+    assert malformed_line("lines x 5\n") == 0
+    0
+
+# The line parse_limits refuses; 0 when it accepts the text.
+fn malformed_line(text: StrView) -> i64
+    match parse_limits(text)
+        Ok(_) => 0
+        Err(e) => e.line
+
+[[test]]
+fn test_check_limit() -> i32
+    let limits = parse_limits("lines open_ms 100\n").unwrap()
+    let lim = @limits[0]
+    assert check_limit(lim, "lines", "open_ms", 100) == Verdict.Pass
+    assert check_limit(lim, "lines", "open_ms", 101) == Verdict.Fail
+    assert check_limit(lim, "long", "open_ms", 999) == Verdict.NotThis
+    assert check_limit(lim, "lines", "save_ms", 999) == Verdict.NotThis
+    0
