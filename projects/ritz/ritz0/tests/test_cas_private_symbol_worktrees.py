@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,7 +42,9 @@ import pytest
 from ritz0_inproc import run_ritz0
 import test_table_rows as table_rows
 
-pytestmark = pytest.mark.integration
+# One worker runs the file, so the warm stores below are seeded once (#4897).
+pytestmark = [pytest.mark.integration,
+              pytest.mark.xdist_group("cas_private_symbol_worktrees")]
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -64,6 +67,56 @@ fn test_wrap() -> i32
     assert wrap<i64>(5, 41) == 42
     0
 """
+
+
+# A test file importing nothing: its build stores ritzunit's and ritzlib's
+# objects and no object of `lib/a.ritz` or of TEST_FILE's harness.
+SEED_TEST = """\
+[[test]]
+fn test_seed() -> i32
+    0
+"""
+
+_WARM: dict = {}
+
+
+def _warm_store(store: Path, compiler: str, tmp_path_factory, monkeypatch) -> None:
+    """Make `store` a copy of one store seeded, once per compiler, by
+    building SEED_TEST (AGAST #4897): each test's first build otherwise
+    compiled ritzunit and ritzlib into an empty store, the file's whole cost.
+
+    The seed and every build after this one run with cas.REPO_ROOT at a
+    directory holding none of their sources (the store; a test may point it
+    at its own checkout), so ritzlib's identities read `ext/<name>` in all of
+    them and the seed's objects serve each test. It holds no object these
+    tests count or assert on: the modules under test (`lib/a.ritz`,
+    TEST_FILE's harness) miss in it as in an empty store, and their
+    identities are what they were (`ext/`, `pkg/` or checkout-relative)."""
+    import test_runner
+    cas = test_runner._build_module().cas
+    if compiler != "ritz0":
+        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+        assert (RITZ1_BUILD / compiler).exists(), \
+            f"{compiler} missing; run `make -C ritz1 bootstrap`"
+    warm = _WARM.get(compiler)
+    if warm is None:
+        root = tmp_path_factory.mktemp(f"seed-{compiler}")
+        warm = root / "cas"
+        warm.mkdir()
+        src = root / "seed.ritz"
+        src.write_text(SEED_TEST)
+        (root / "scratch").mkdir()
+        with monkeypatch.context() as m:
+            m.setenv("RITZ_CACHE_DIR", str(warm))
+            m.setenv("RITZ_PATH", f"{root}:{RITZ_ROOT}")
+            m.delenv("RITZ_NO_CAS", raising=False)
+            m.setattr(cas, "REPO_ROOT", warm)
+            _, error = test_runner.build_test_binary(
+                str(src), str(root / "scratch"), compiler)
+        assert error is None, f"{compiler} seed: {error}"
+        _WARM[compiler] = warm
+    shutil.copytree(warm, store)
+    monkeypatch.setattr(cas, "REPO_ROOT", store)
 
 
 def _worktree(root: Path, test_src: str) -> Path:
@@ -89,15 +142,12 @@ def _build_and_run(test_runner, src: Path, compiler: str, monkeypatch) -> None:
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_second_worktree_links_against_its_own_private_symbols(
-        compiler, tmp_path, monkeypatch):
-    if compiler != "ritz0":
-        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
-        assert (RITZ1_BUILD / compiler).exists(), \
-            f"{compiler} missing; run `make -C ritz1 bootstrap`"
+        compiler, tmp_path, tmp_path_factory, monkeypatch):
     sys.path.insert(0, str(RITZ_ROOT / "ritz0"))
     import test_runner
 
-    # One store for both worktrees, as on a host; empty at the start.
+    # One store for both worktrees, as on a host; nothing of theirs in it.
+    _warm_store(tmp_path / "cas", compiler, tmp_path_factory, monkeypatch)
     monkeypatch.setenv("RITZ_CACHE_DIR", str(tmp_path / "cas"))
     monkeypatch.delenv("RITZ_NO_CAS", raising=False)
     wt1 = _worktree(tmp_path / "wt1", TEST_FILE)
@@ -107,7 +157,8 @@ def test_second_worktree_links_against_its_own_private_symbols(
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_two_checkouts_share_the_store_and_link(compiler, tmp_path, monkeypatch):
+def test_two_checkouts_share_the_store_and_link(compiler, tmp_path, tmp_path_factory,
+                                                monkeypatch):
     """One package built from two checkout paths over one store, as two gate
     trees (`.trees/ritz-gate-train-N`) on one host do: the second checkout's
     harness misses, `lib/a.ritz`'s object hits, and the binary links.
@@ -118,14 +169,12 @@ def test_two_checkouts_share_the_store_and_link(compiler, tmp_path, monkeypatch)
     tempest-tab's harness declared `tag_is_p__7628e583` against a lexis
     object cached from another gate tree.
     """
-    if compiler != "ritz0":
-        assert (RITZ1_BUILD / compiler).exists(), \
-            f"{compiler} missing; run `make -C ritz1 bootstrap`"
     sys.path.insert(0, str(RITZ_ROOT / "ritz0"))
     import test_runner
     cas = test_runner._build_module().cas
 
     store = tmp_path / "cas"
+    _warm_store(store, compiler, tmp_path_factory, monkeypatch)
     monkeypatch.setenv("RITZ_CACHE_DIR", str(store))
     monkeypatch.delenv("RITZ_NO_CAS", raising=False)
     srcs = [_worktree(tmp_path / "wt1", TEST_FILE),
@@ -217,7 +266,7 @@ def test_private_symbol_is_named_by_its_package(tmp_path):
     _each_compiler(tmp_path, check)
 
 
-def test_marked_package_links_across_directories(tmp_path, monkeypatch):
+def test_marked_package_links_across_directories(tmp_path, tmp_path_factory, monkeypatch):
     """A generic in a marked package calls a private fn. Built in one
     directory, its object serves a harness built against a copy of the
     package in another directory, and the binary links: neither directory
@@ -229,10 +278,8 @@ def test_marked_package_links_across_directories(tmp_path, monkeypatch):
     monkeypatch.delenv("RITZ_NO_CAS", raising=False)
 
     def check(compiler: str, root: Path) -> None:
-        if compiler != "ritz0":
-            assert (RITZ1_BUILD / compiler).exists(), \
-                f"{compiler} missing; run `make -C ritz1 bootstrap`"
-        store = root / "cas"  # each compiler's own store, empty at its start
+        store = root / "cas"  # each compiler's own, with nothing of the package's
+        _warm_store(store, compiler, tmp_path_factory, monkeypatch)
         monkeypatch.setenv("RITZ_CACHE_DIR", str(store))
         srcs = [_worktree(root / "install1", TEST_FILE),
                 _worktree(root / "install2", "# another directory\n" + TEST_FILE)]
