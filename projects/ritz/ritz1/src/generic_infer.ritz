@@ -47,11 +47,9 @@ struct GiType
 # Locals of the fn being walked: params, then each let/var as it's declared.
 # Names are unique within a fn (#2395), so a flat table per fn is enough.
 # ----------------------------------------------------------------------------
-var g_gi_names: **u8 = null
-var g_gi_name_lens: *i32 = null
+var g_gi_names: *StrView = null
 var g_gi_kinds: *TypeKind = null
-var g_gi_tnames: **u8 = null
-var g_gi_tname_lens: *i32 = null
+var g_gi_tnames: *StrView = null
 var g_gi_pointees: *TypeKind = null
 var g_gi_count: i32 = 0
 var g_gi_cap: i32 = 0
@@ -61,33 +59,27 @@ var g_gi_input: StrView  # the file compiled
 var g_gi_file: StrView   # the file the fn being walked is written in
 
 fn gi_add_local(name_sv: StrView, t: *GiType)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     if g_gi_count >= g_gi_cap
         var cap: i64 = (g_gi_cap as i64) * 2
         if cap < 64
             cap = 64
-        g_gi_names = realloc(g_gi_names as *u8, cap * 8) as **u8
-        g_gi_name_lens = realloc(g_gi_name_lens as *u8, cap * 4) as *i32
+        g_gi_names = realloc(g_gi_names as *u8, cap * sizeof(StrView)) as *StrView
         g_gi_kinds = realloc(g_gi_kinds as *u8, cap * sizeof(TypeKind)) as *TypeKind
-        g_gi_tnames = realloc(g_gi_tnames as *u8, cap * 8) as **u8
-        g_gi_tname_lens = realloc(g_gi_tname_lens as *u8, cap * 4) as *i32
+        g_gi_tnames = realloc(g_gi_tnames as *u8, cap * sizeof(StrView)) as *StrView
         g_gi_pointees = realloc(g_gi_pointees as *u8, cap * sizeof(TypeKind)) as *TypeKind
         g_gi_cap = cap as i32
-    *(g_gi_names + g_gi_count) = name
-    *(g_gi_name_lens + g_gi_count) = name_len
+    *(g_gi_names + g_gi_count) = name_sv
     *(g_gi_kinds + g_gi_count) = t.kind
-    *(g_gi_tnames + g_gi_count) = t.name.ptr
-    *(g_gi_tname_lens + g_gi_count) = t.name.len as i32
+    *(g_gi_tnames + g_gi_count) = t.name
     *(g_gi_pointees + g_gi_count) = t.pointee
     g_gi_count = g_gi_count + 1
 
 fn gi_find_local(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     var i: i32 = g_gi_count - 1
     while i >= 0
-        if *(g_gi_name_lens + i) == name_len and memcmp(*(g_gi_names + i), name, name_len as i64) == 0
+        # A local: ritz1 cannot type `.eq` on `*(global + i)` (AGAST #4900).
+        let gn: StrView = *(g_gi_names + i)
+        if gn.eq(name_sv)
             return i
         i = i - 1
     -1
@@ -376,7 +368,7 @@ fn gi_type_of(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
             let idx: i32 = gi_find_local(e.ident)
             if idx < 0
                 return 0
-            return gi_set(out, *(g_gi_kinds + idx), StrView { ptr: (*(g_gi_tnames + idx)), len: (*(g_gi_tname_lens + idx)) as i64 }, *(g_gi_pointees + idx))
+            return gi_set(out, *(g_gi_kinds + idx), *(g_gi_tnames + idx), *(g_gi_pointees + idx))
         ExprKind.Cast =>
             if e.type_kind == TypeKind.Ptr
                 if e.cast_pointee == TypeKind.Struct and e.ident.ptr != null
@@ -485,21 +477,33 @@ fn gi_spell(t: *GiType) -> StrView
 # Binding: one slot per type param of the callee.
 # ----------------------------------------------------------------------------
 struct GiBind
-    names: **u8      # bound spelling, null when unbound
-    lens: *i32
+    names: *StrView  # bound spelling, a null ptr when unbound
     conflict: *i32   # 1 when two arguments bound it differently
     lit: *i32        # 1 when an integer literal would bind it (to i64)
 
-fn gi_bind(b: *GiBind, idx: i32, s: *u8, n: i32)
-    if s == null or n <= 0
+# `n` unbound slots, for gi_bind_free to release.
+fn gi_bind_init(b: *GiBind, n: i32)
+    b.names = malloc((n as i64) * sizeof(StrView)) as *StrView
+    b.conflict = malloc((n as i64) * 4) as *i32
+    b.lit = malloc((n as i64) * 4) as *i32
+    for i in 0..n
+        *(b.names + i) = strview_empty()
+        *(b.conflict + i) = 0
+        *(b.lit + i) = 0
+
+fn gi_bind_free(b: *GiBind)
+    free(b.names as *u8)
+    free(b.conflict as *u8)
+    free(b.lit as *u8)
+
+fn gi_bind(b: *GiBind, idx: i32, s: StrView)
+    if s.ptr == null or s.len <= 0
         return
-    let prev: *u8 = *(b.names + idx)
-    if prev == null
+    let prev: StrView = *(b.names + idx)
+    if prev.ptr == null
         *(b.names + idx) = s
-        *(b.lens + idx) = n
         return
-    let pl: i32 = *(b.lens + idx)
-    if pl != n or memcmp(prev, s, n as i64) != 0
+    if not prev.eq(s)
         *(b.conflict + idx) = 1
 
 # Match one `$`-component of a param type name, `_`-piece by `_`-piece
@@ -527,7 +531,7 @@ fn gi_match_pieces(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p_sv: StrView, a
             while xe < alen and *(a + xe) != '_' and *(a + xe) != '$'   # '_' '$'
                 xe = xe + 1
         if idx >= 0
-            gi_bind(b, idx, a + x, xe - x)   # an empty piece binds nothing
+            gi_bind(b, idx, a_sv.slice(x as i64, xe as i64))   # an empty piece binds nothing
         else if xe - x != pe - pi or memcmp(p + pi, a + x, (pe - pi) as i64) != 0
             return -1
         x = xe
@@ -561,7 +565,7 @@ fn gi_match_mangled(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p_sv: StrView, 
         var ae: i32 = ai
         if idx >= 0
             ae = mangled_arg_end(ctx, m, a_sv, ai)
-            gi_bind(b, idx, a + ai, ae - ai)
+            gi_bind(b, idx, a_sv.slice(ai as i64, ae as i64))
         else
             ae = gi_match_pieces(ctx, m, tps, StrView { ptr: (p + pi), len: (pe - pi) as i64 }, a_sv, ai, b)
             if ae < 0
@@ -575,7 +579,7 @@ fn gi_unify_named(ctx: *ParseCtx, m: *Module, tps: *TypeParam, pname_sv: StrView
     let idx: i32 = type_param_index(tps, pname_sv)
     if idx >= 0
         let s_sv: StrView = gi_spell(t)
-        gi_bind(b, idx, s_sv.ptr, s_sv.len as i32)
+        gi_bind(b, idx, s_sv)
         return
     if t.kind == TypeKind.Struct
         gi_match_mangled(ctx, m, tps, pname_sv, t.name, b)
@@ -653,15 +657,7 @@ fn gi_infer_call(mono: *MonoCtx, m: *Module, e: *Expr)
         return
     let n: i32 = count_type_params(f.type_params)
     var b: GiBind
-    b.names = malloc((n as i64) * 8) as **u8
-    b.lens = malloc((n as i64) * 4) as *i32
-    b.conflict = malloc((n as i64) * 4) as *i32
-    b.lit = malloc((n as i64) * 4) as *i32
-    for i in 0..n
-        *(b.names + i) = null
-        *(b.lens + i) = 0
-        *(b.conflict + i) = 0
-        *(b.lit + i) = 0
+    gi_bind_init(@b, n)
     var p: *Param = f.params
     var arg: *Expr = e.args
     while p != null and arg != null
@@ -681,17 +677,13 @@ fn gi_infer_call(mono: *MonoCtx, m: *Module, e: *Expr)
     var i: i32 = 0
     var failed: i32 = 0
     while tp != null
-        if *(b.names + i) == null and *(b.lit + i) == 1
-            # AGAST #4780: GiBind.names is a hand-rolled **u8/*i32 parallel
-            # array (its own StrView-array conversion is a separate,
-            # self-contained refactor); kept c"..." here to match.
-            *(b.names + i) = c"i64"
-            *(b.lens + i) = 3
-        if *(b.names + i) == null or *(b.conflict + i) == 1
+        if (*(b.names + i)).ptr == null and *(b.lit + i) == 1
+            *(b.names + i) = "i64"
+        if (*(b.names + i)).ptr == null or *(b.conflict + i) == 1
             if failed == 0
                 gi_error(e, tp, e.func_name)
             failed = 1
-        total = total + 1 + *(b.lens + i)
+        total = total + 1 + ((*(b.names + i)).len as i32)
         tp = tp.next
         i = i + 1
     if failed == 0
@@ -699,16 +691,14 @@ fn gi_infer_call(mono: *MonoCtx, m: *Module, e: *Expr)
         var pos: i32 = 0
         for j in 0..n
             *(buf + pos) = 36   # '$'
-            memcpy(buf + pos + 1, *(b.names + j), *(b.lens + j) as i64)
-            pos = pos + 1 + *(b.lens + j)
+            let bn: StrView = *(b.names + j)
+            memcpy(buf + pos + 1, bn.ptr, bn.len)
+            pos = pos + 1 + (bn.len as i32)
         *(buf + pos) = 0
         e.call_type_suffix = StrView { ptr: buf, len: pos as i64 }
         # A failed trait bound on an inferred argument is at the call (AGAST #3469).
         generic_use_note(mono.pctx, e.func_name, StrView { ptr: (buf), len: (pos) as i64 }, null, e.span, g_gi_file)
-    free(b.names as *u8)
-    free(b.lens as *u8)
-    free(b.conflict as *u8)
-    free(b.lit as *u8)
+    gi_bind_free(@b)
 
 # ----------------------------------------------------------------------------
 # The walk: statements in order, a let's value before its name is typed, a
@@ -838,15 +828,7 @@ fn gi_type_variant_let(mono: *MonoCtx, m: *Module, s: *Stmt)
         if n == 0
             return
         var b: GiBind
-        b.names = malloc((n as i64) * 8) as **u8
-        b.lens = malloc((n as i64) * 4) as *i32
-        b.conflict = malloc((n as i64) * 4) as *i32
-        b.lit = malloc((n as i64) * 4) as *i32
-        for i in 0..n
-            *(b.names + i) = null
-            *(b.lens + i) = 0
-            *(b.conflict + i) = 0
-            *(b.lit + i) = 0
+        gi_bind_init(@b, n)
         var f: *StructField = enum_variant_fields(mono.pctx, ei, vi)
         var arg: *Expr = args
         while f != null and arg != null
@@ -858,16 +840,14 @@ fn gi_type_variant_let(mono: *MonoCtx, m: *Module, s: *Stmt)
         var tp: *TypeParam = tps
         var i: i32 = 0
         while tp != null
-            if *(b.names + i) == null and *(b.lit + i) == 1
-                # AGAST #4780: see the matching note on GiBind.names above.
-                *(b.names + i) = c"i64"
-                *(b.lens + i) = 3
-            if (*(b.names + i) == null or *(b.conflict + i) == 1) and tname == null
+            if (*(b.names + i)).ptr == null and *(b.lit + i) == 1
+                *(b.names + i) = "i64"
+            if ((*(b.names + i)).ptr == null or *(b.conflict + i) == 1) and tname == null
                 gi_variant_error(init, tp, StrView { ptr: (name), len: (len) as i64 })
                 # `tname` is a latch ("an error already fired"), never read
                 # as text: any non-null value works equally well here.
                 tname = c""
-            total = total + 1 + *(b.lens + i)
+            total = total + 1 + ((*(b.names + i)).len as i32)
             tp = tp.next
             i = i + 1
         if tname == null
@@ -876,15 +856,13 @@ fn gi_type_variant_let(mono: *MonoCtx, m: *Module, s: *Stmt)
             var pos: i32 = (en.len as i32)
             for j in 0..n
                 *(buf + pos) = 36   # '$'
-                memcpy(buf + pos + 1, *(b.names + j), *(b.lens + j) as i64)
-                pos = pos + 1 + *(b.lens + j)
+                let bn: StrView = *(b.names + j)
+                memcpy(buf + pos + 1, bn.ptr, bn.len)
+                pos = pos + 1 + (bn.len as i32)
             *(buf + pos) = 0
             tname = buf
             tlen = pos
-        free(b.names as *u8)
-        free(b.lens as *u8)
-        free(b.conflict as *u8)
-        free(b.lit as *u8)
+        gi_bind_free(@b)
     if tlen <= 0
         return   # refused
     s.var_declared_type = TypeKind.Struct
@@ -1178,15 +1156,7 @@ fn gi_struct_lit_args(mono: *MonoCtx, m: *Module, e: *Expr, st: *StructDef)
     let tps: *TypeParam = st.type_params
     let n: i32 = count_type_params(tps)
     var b: GiBind
-    b.names = malloc((n as i64) * 8) as **u8
-    b.lens = malloc((n as i64) * 4) as *i32
-    b.conflict = malloc((n as i64) * 4) as *i32
-    b.lit = malloc((n as i64) * 4) as *i32
-    for i in 0..n
-        *(b.names + i) = null
-        *(b.lens + i) = 0
-        *(b.conflict + i) = 0
-        *(b.lit + i) = 0
+    gi_bind_init(@b, n)
     var fi: *FieldInit = e.args as *FieldInit
     while fi != null
         let f: *StructField = gi_field_named(st, fi.name)
@@ -1199,14 +1169,12 @@ fn gi_struct_lit_args(mono: *MonoCtx, m: *Module, e: *Expr, st: *StructDef)
     var tp: *TypeParam = tps
     var i: i32 = 0
     while tp != null
-        if *(b.names + i) == null and *(b.lit + i) == 1
-            # AGAST #4780: see the matching note on GiBind.names above.
-            *(b.names + i) = c"i64"
-            *(b.lens + i) = 3
-        if (*(b.names + i) == null or *(b.conflict + i) == 1) and failed == 0
+        if (*(b.names + i)).ptr == null and *(b.lit + i) == 1
+            *(b.names + i) = "i64"
+        if ((*(b.names + i)).ptr == null or *(b.conflict + i) == 1) and failed == 0
             gi_struct_lit_error(e, st, tp)
             failed = 1
-        total = total + 1 + *(b.lens + i)
+        total = total + 1 + ((*(b.names + i)).len as i32)
         tp = tp.next
         i = i + 1
     if failed == 0
@@ -1215,14 +1183,12 @@ fn gi_struct_lit_args(mono: *MonoCtx, m: *Module, e: *Expr, st: *StructDef)
         var pos: i32 = e.ident.len as i32
         for j in 0..n
             *(buf + pos) = 36   # '$'
-            memcpy(buf + pos + 1, *(b.names + j), *(b.lens + j) as i64)
-            pos = pos + 1 + *(b.lens + j)
+            let bn: StrView = *(b.names + j)
+            memcpy(buf + pos + 1, bn.ptr, bn.len)
+            pos = pos + 1 + (bn.len as i32)
         *(buf + pos) = 0
         e.ident = StrView { ptr: buf, len: pos as i64 }
-    free(b.names as *u8)
-    free(b.lens as *u8)
-    free(b.conflict as *u8)
-    free(b.lit as *u8)
+    gi_bind_free(@b)
 
 fn gi_walk_list(mono: *MonoCtx, m: *Module, list: *Expr)
     var cur: *Expr = list

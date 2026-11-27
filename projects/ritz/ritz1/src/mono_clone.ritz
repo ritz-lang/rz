@@ -25,8 +25,7 @@ import monomorph
 fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
     if e == null or e.kind != ExprKind.Member or e.left == null
         return null
-    var sname: *u8 = null
-    var sname_len: i32 = 0
+    var sname: StrView = strview_empty()
     # `(*p).f` is `p.f` (R9 rule 2, AGAST #4836): the field of what `p`
     # points at, one level.  Unstripped, `(*d).data[0..2]` had no field, so
     # it was never a slice of a Vec and the emitter refused it.
@@ -38,25 +37,21 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
             let idx: i32 = find_local_var_idx(mono, left.ident)
             if idx >= 0
                 sname = *(mono.lv_type_names + idx)
-                sname_len = *(mono.lv_type_name_lens + idx)
             else
                 # AGAST #4778: a global, `g_conns.ids` with `var g_conns:
                 # *Conns`.  Untyped, `g_conns.ids.get(0)` wanted `get` at
                 # every Vec instance, move-only ones too.
                 let g: *GlobalVarDef = si_global(m, left.ident)
                 if g != null and g.type_name.ptr != null
-                    sname = g.type_name.ptr
-                    sname_len = g.type_name.len as i32
+                    sname = g.type_name
                 else if g != null and g.pointee_type_name.ptr != null
-                    sname = g.pointee_type_name.ptr
-                    sname_len = g.pointee_type_name.len as i32
+                    sname = g.pointee_type_name
         # AGAST #4778: a field of a call's or a method's result,
         # `h.item(0).next` with `item` returning `@T` at Holder$Node.
         ExprKind.Call | ExprKind.Method =>
             let rsv: StrView = receiver_instance(mono, m, left)
             if rsv.ptr != null and rsv.len > 0
-                sname = rsv.ptr
-                sname_len = rsv.len as i32
+                sname = rsv
         # AGAST #4838: a field of a Vec's or Span's element, `edits[0].bytes`
         # with `edits: Vec<Edit>`.  Untyped, `edits[0].bytes.push_span(s)`
         # wanted `push_span` at every Vec instance, Vec$Edit's included, whose
@@ -64,21 +59,19 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
         ExprKind.Index =>
             let esv: StrView = indexed_element_name(mono, m, e.left)
             if esv.ptr != null and esv.len > 0
-                sname = esv.ptr
-                sname_len = esv.len as i32
+                sname = esv
         ExprKind.Member =>
             let parent: *StructField = resolve_member_field(mono, m, left)
             if parent != null
                 # Through a held `@T` / `@&T` as through a `*T` (AGAST #2383).
                 if parent.field_type == TypeKind.Struct or parent.field_type == TypeKind.Ptr or field_is_ref(parent) == 1
-                    sname = parent.field_type_name.ptr
-                    sname_len = parent.field_type_name.len as i32
+                    sname = parent.field_type_name
         _ => pass
-    if sname == null or sname_len <= 0
+    if sname.ptr == null or sname.len <= 0
         return null
-    let st: *StructDef = find_concrete_struct(m, StrView { ptr: (sname), len: (sname_len) as i64 })
+    let st: *StructDef = find_concrete_struct(m, sname)
     if st == null
-        return template_member_field(mono, m, StrView { ptr: (sname), len: (sname_len) as i64 }, e)
+        return template_member_field(mono, m, sname, e)
     var f: *StructField = st.fields
     while f != null
         if f.name.eq(e.ident)
@@ -710,7 +703,7 @@ fn si_expr_struct(mono: *MonoCtx, m: *Module, e: *Expr, out_how: *i32, out_recv:
                 return strview_empty()
             if bv == 2
                 *out_how = SI_THROUGH
-            return strview_from_ptr(*(mono.lv_type_names + idx), (*(mono.lv_type_name_lens + idx)) as i64)
+            return *(mono.lv_type_names + idx)
         ExprKind.Member =>
             let f: *StructField = resolve_member_field(mono, m, e)
             if f == null or f.field_type != TypeKind.Struct
@@ -726,17 +719,14 @@ fn si_expr_struct(mono: *MonoCtx, m: *Module, e: *Expr, out_how: *i32, out_recv:
             let eidx: i32 = find_local_var_idx(mono, e.left.ident)
             if eidx < 0 or *(mono.lv_prefix_kind + eidx) == 0 or *(mono.lv_by_value + eidx) == 0
                 return strview_empty()
-            let suf: *u8 = *(mono.lv_suffixes + eidx)
-            let suf_len: i32 = *(mono.lv_suffix_lens + eidx)
-            if suf == null or suf_len < 2 or *suf != '$'   # '$'
+            let suf: StrView = *(mono.lv_suffixes + eidx)
+            if suf.ptr == null or suf.len < 2 or suf.get(0) != '$'
                 return strview_empty()
             # A generic element (`Pair$i32`) or a nested collection isn't one name.
-            var d: i32 = 1
-            while d < suf_len
-                if *(suf + d) == '$'
-                    return strview_empty()
-                d = d + 1
-            return strview_from_ptr(suf + 1, (suf_len - 1) as i64)
+            let elem: StrView = suf.skip(1)
+            if elem.find_byte('$') < elem.len
+                return strview_empty()
+            return elem
         ExprKind.Call =>
             if e.call_type_suffix.len != 0
                 return strview_empty()
@@ -1035,9 +1025,9 @@ fn rewrite_value_slice(mono: *MonoCtx, m: *Module, e: *Expr)
         if by_value == 0 or (base != e.left and by_value != 2)
             return
         kind = *(mono.lv_prefix_kind + idx)
-        suf = StrView { ptr: *(mono.lv_suffixes + idx), len: (*(mono.lv_suffix_lens + idx)) as i64 }
+        suf = *(mono.lv_suffixes + idx)
         if kind == 0
-            if name_eq(StrView { ptr: (*(mono.lv_type_names + idx)), len: (*(mono.lv_type_name_lens + idx)) as i64 }, "String") == 0
+            if not (*(mono.lv_type_names + idx)).eq("String")
                 return
     else if base.kind == ExprKind.Member and base == e.left
         # AGAST #3803: `h.v[lo..hi]` on a field holding a Vec, Span or String
@@ -1112,14 +1102,14 @@ fn slice_into_span_slot(mono: *MonoCtx, m: *Module, e: *Expr, tn_sv: StrView) ->
         if idx < 0
             return 0
         let kind: i32 = *(mono.lv_prefix_kind + idx)
-        string = kind == 0 and name_eq(StrView { ptr: (*(mono.lv_type_names + idx)), len: (*(mono.lv_type_name_lens + idx)) as i64 }, "String") == 1
+        string = kind == 0 and (*(mono.lv_type_names + idx)).eq("String")
         if kind != 1 and not string
             return 0
         # The Vec itself, or one level from it (`(*p)` needs the level).
         let by_value: i32 = *(mono.lv_by_value + idx)
         if by_value == 0 or (base != e.left and by_value != 2)
             return 1
-        suf = StrView { ptr: *(mono.lv_suffixes + idx), len: (*(mono.lv_suffix_lens + idx)) as i64 }
+        suf = *(mono.lv_suffixes + idx)
     else if base == e.left and base.kind == ExprKind.Member
         # A by-value Vec or String field, `b.data[0..2]`: the same view of it.
         let rf: *StructField = resolve_member_field(mono, m, e.left)
@@ -1192,7 +1182,7 @@ fn indexed_collection_suffix(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
             # buffer of pointers there, not an element of the Vec.
             if idx < 0 or *(mono.lv_prefix_kind + idx) == 0 or *(mono.lv_by_value + idx) == 0
                 return strview_empty()
-            csuf = StrView { ptr: *(mono.lv_suffixes + idx), len: (*(mono.lv_suffix_lens + idx)) as i64 }
+            csuf = *(mono.lv_suffixes + idx)
         ExprKind.Member =>
             let rf: *StructField = resolve_member_field(mono, m, b)
             if rf == null or (rf.field_type != TypeKind.Struct and rf.field_type != TypeKind.Ptr)
@@ -3039,8 +3029,8 @@ fn receiver_instance(mono: *MonoCtx, m: *Module, recv: *Expr) -> StrView
             if idx < 0
                 return global_instance(m, r.ident)
             if *(mono.lv_prefix_kind + idx) == 0
-                return strview_from_ptr(*(mono.lv_type_names + idx), (*(mono.lv_type_name_lens + idx)) as i64)
-            return collection_instance_name(*(mono.lv_prefix_kind + idx), StrView { ptr: (*(mono.lv_suffixes + idx)), len: (*(mono.lv_suffix_lens + idx)) as i64 })
+                return *(mono.lv_type_names + idx)
+            return collection_instance_name(*(mono.lv_prefix_kind + idx), *(mono.lv_suffixes + idx))
         ExprKind.Member =>
             let rf: *StructField = resolve_member_field(mono, m, r)
             if rf == null or rf.field_type_name.ptr == null or rf.field_type_name.len <= 0

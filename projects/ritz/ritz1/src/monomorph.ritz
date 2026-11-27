@@ -44,17 +44,13 @@ pub struct MonoCtx
     # which the emitter imports, do not import the parser.
     interp_parse: fn(*ParseCtx, StrView, i32, i32) -> *Expr
     # Function instantiations, as parallel (name, "$T" suffix) arrays.
-    inst_names: **u8
-    inst_name_lens: *i32
-    inst_suffixes: **u8     # "$u8", "$i32", ...
-    inst_suffix_lens: *i32
+    inst_names: *StrView
+    inst_suffixes: *StrView     # "$u8", "$i32", ...
     inst_count: i32
     inst_cap: i32
     # Struct instantiations, likewise ("Pair", "Vec" + suffix).
-    struct_names: **u8
-    struct_name_lens: *i32
-    struct_suffixes: **u8
-    struct_suffix_lens: *i32
+    struct_names: *StrView
+    struct_suffixes: *StrView
     struct_count: i32
     struct_cap: i32
     # Each instance's generation (AGAST #3330, below).
@@ -64,23 +60,18 @@ pub struct MonoCtx
     mono_errors: i32
     # Generic-typed locals of the fn being specialised ("Local Variable Type
     # Tracking" below).
-    lv_names: **u8
-    lv_name_lens: *i32
+    lv_names: *StrView
     lv_prefix_kind: *i32    # 0 = plain struct, 1 = Vec, 2 = Span
-    lv_suffixes: **u8       # the "$T" portion (with leading $)
-    lv_suffix_lens: *i32
-    lv_type_names: **u8     # kind 0: the struct's name (e.g. "R")
-    lv_type_name_lens: *i32
+    lv_suffixes: *StrView       # the "$T" portion (with leading $)
+    lv_type_names: *StrView     # kind 0: the struct's name (e.g. "R")
     lv_by_value: *i32       # 1: the local IS the struct, not *T / @T (AGAST #2451)
     lv_shared: *i32         # 1: an `@T` param or local, which refuses writes (§3.2)
     lv_count: i32
     lv_cap: i32
     lv_initialized: i32
     # Array-typed locals: name -> element type.
-    al_names: **u8
-    al_name_lens: *i32
-    al_elems: **u8
-    al_elem_lens: *i32
+    al_names: *StrView
+    al_elems: *StrView
     al_count: i32
     al_cap: i32
     slice_kept: *Expr
@@ -143,52 +134,38 @@ const MAX_INSTANCE_DEPTH: i32 = 64
 pub fn init_instantiation_tracker(mono: *MonoCtx)
     # Initialize function tracking
     mono.inst_cap = INST_INIT_CAP
-    mono.inst_names = malloc((mono.inst_cap as i64) * 8) as **u8
-    mono.inst_name_lens = malloc((mono.inst_cap as i64) * 4) as *i32
-    mono.inst_suffixes = malloc((mono.inst_cap as i64) * 8) as **u8
-    mono.inst_suffix_lens = malloc((mono.inst_cap as i64) * 4) as *i32
+    mono.inst_names = malloc((mono.inst_cap as i64) * sizeof(StrView)) as *StrView
+    mono.inst_suffixes = malloc((mono.inst_cap as i64) * sizeof(StrView)) as *StrView
     mono.inst_gens = malloc((mono.inst_cap as i64) * 4) as *i32
     mono.inst_sites = malloc((mono.inst_cap as i64) * 8) as **InstSite
     mono.inst_count = 0
     # Initialize struct tracking
     mono.struct_cap = INST_INIT_CAP
-    mono.struct_names = malloc((mono.struct_cap as i64) * 8) as **u8
-    mono.struct_name_lens = malloc((mono.struct_cap as i64) * 4) as *i32
-    mono.struct_suffixes = malloc((mono.struct_cap as i64) * 8) as **u8
-    mono.struct_suffix_lens = malloc((mono.struct_cap as i64) * 4) as *i32
+    mono.struct_names = malloc((mono.struct_cap as i64) * sizeof(StrView)) as *StrView
+    mono.struct_suffixes = malloc((mono.struct_cap as i64) * sizeof(StrView)) as *StrView
     mono.struct_gens = malloc((mono.struct_cap as i64) * 4) as *i32
     mono.struct_count = 0
     mono.cur_gen = -1
     mono.mono_errors = 0
 
 pub fn add_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
     # Check if already tracked
     for i in 0..mono.inst_count
-        if *(mono.inst_name_lens + i) == name_len and *(mono.inst_suffix_lens + i) == suffix_len
-            if memcmp(*(mono.inst_names + i), name, name_len as i64) == 0
-                if memcmp(*(mono.inst_suffixes + i), suffix, suffix_len as i64) == 0
-                    inst_site_again(mono, *(mono.inst_sites + i))
-                    return 0  # Already tracked
+        if (*(mono.inst_names + i)).eq(name_sv) and (*(mono.inst_suffixes + i)).eq(suffix_sv)
+            inst_site_again(mono, *(mono.inst_sites + i))
+            return 0  # Already tracked
 
     # Add new entry
     if mono.inst_count >= mono.inst_cap
         let cap: i64 = (mono.inst_cap as i64) * 2
-        mono.inst_names = realloc(mono.inst_names as *u8, cap * 8) as **u8
-        mono.inst_name_lens = realloc(mono.inst_name_lens as *u8, cap * 4) as *i32
-        mono.inst_suffixes = realloc(mono.inst_suffixes as *u8, cap * 8) as **u8
-        mono.inst_suffix_lens = realloc(mono.inst_suffix_lens as *u8, cap * 4) as *i32
+        mono.inst_names = realloc(mono.inst_names as *u8, cap * sizeof(StrView)) as *StrView
+        mono.inst_suffixes = realloc(mono.inst_suffixes as *u8, cap * sizeof(StrView)) as *StrView
         mono.inst_gens = realloc(mono.inst_gens as *u8, cap * 4) as *i32
         mono.inst_sites = realloc(mono.inst_sites as *u8, cap * 8) as **InstSite
         mono.inst_cap = cap as i32
 
-    *(mono.inst_names + mono.inst_count) = name
-    *(mono.inst_name_lens + mono.inst_count) = name_len
-    *(mono.inst_suffixes + mono.inst_count) = suffix
-    *(mono.inst_suffix_lens + mono.inst_count) = suffix_len
+    *(mono.inst_names + mono.inst_count) = name_sv
+    *(mono.inst_suffixes + mono.inst_count) = suffix_sv
     *(mono.inst_gens + mono.inst_count) = mono.cur_gen + 1
     *(mono.inst_sites + mono.inst_count) = inst_site_new(mono)
     mono.inst_count = mono.inst_count + 1
@@ -253,53 +230,33 @@ pub fn get_instantiation_count(mono: *MonoCtx) -> i32
 pub fn get_instantiation_name(mono: *MonoCtx, idx: i32) -> StrView
     if idx >= mono.inst_count
         return strview_empty()
-    strview_from_ptr(*(mono.inst_names + idx), (*(mono.inst_name_lens + idx)) as i64)
-
-pub fn get_instantiation_name_len(mono: *MonoCtx, idx: i32) -> i32
-    if idx >= mono.inst_count
-        return 0
-    *(mono.inst_name_lens + idx)
+    *(mono.inst_names + idx)
 
 pub fn get_instantiation_suffix(mono: *MonoCtx, idx: i32) -> StrView
     if idx >= mono.inst_count
         return strview_empty()
-    strview_from_ptr(*(mono.inst_suffixes + idx), (*(mono.inst_suffix_lens + idx)) as i64)
-
-pub fn get_instantiation_suffix_len(mono: *MonoCtx, idx: i32) -> i32
-    if idx >= mono.inst_count
-        return 0
-    *(mono.inst_suffix_lens + idx)
+    *(mono.inst_suffixes + idx)
 
 # ============================================================================
 # Struct Instantiation Tracking
 # ============================================================================
 
 pub fn add_struct_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
     # Check if already tracked
     for i in 0..mono.struct_count
-        if *(mono.struct_name_lens + i) == name_len and *(mono.struct_suffix_lens + i) == suffix_len
-            if memcmp(*(mono.struct_names + i), name, name_len as i64) == 0
-                if memcmp(*(mono.struct_suffixes + i), suffix, suffix_len as i64) == 0
-                    return 0  # Already tracked
+        if (*(mono.struct_names + i)).eq(name_sv) and (*(mono.struct_suffixes + i)).eq(suffix_sv)
+            return 0  # Already tracked
 
     # Add new entry
     if mono.struct_count >= mono.struct_cap
         let cap: i64 = (mono.struct_cap as i64) * 2
-        mono.struct_names = realloc(mono.struct_names as *u8, cap * 8) as **u8
-        mono.struct_name_lens = realloc(mono.struct_name_lens as *u8, cap * 4) as *i32
-        mono.struct_suffixes = realloc(mono.struct_suffixes as *u8, cap * 8) as **u8
-        mono.struct_suffix_lens = realloc(mono.struct_suffix_lens as *u8, cap * 4) as *i32
+        mono.struct_names = realloc(mono.struct_names as *u8, cap * sizeof(StrView)) as *StrView
+        mono.struct_suffixes = realloc(mono.struct_suffixes as *u8, cap * sizeof(StrView)) as *StrView
         mono.struct_gens = realloc(mono.struct_gens as *u8, cap * 4) as *i32
         mono.struct_cap = cap as i32
 
-    *(mono.struct_names + mono.struct_count) = name
-    *(mono.struct_name_lens + mono.struct_count) = name_len
-    *(mono.struct_suffixes + mono.struct_count) = suffix
-    *(mono.struct_suffix_lens + mono.struct_count) = suffix_len
+    *(mono.struct_names + mono.struct_count) = name_sv
+    *(mono.struct_suffixes + mono.struct_count) = suffix_sv
     *(mono.struct_gens + mono.struct_count) = mono.cur_gen + 1
     mono.struct_count = mono.struct_count + 1
     return 1  # Added new
@@ -310,22 +267,12 @@ pub fn get_struct_instantiation_count(mono: *MonoCtx) -> i32
 pub fn get_struct_instantiation_name(mono: *MonoCtx, idx: i32) -> StrView
     if idx >= mono.struct_count
         return strview_empty()
-    strview_from_ptr(*(mono.struct_names + idx), (*(mono.struct_name_lens + idx)) as i64)
-
-pub fn get_struct_instantiation_name_len(mono: *MonoCtx, idx: i32) -> i32
-    if idx >= mono.struct_count
-        return 0
-    *(mono.struct_name_lens + idx)
+    *(mono.struct_names + idx)
 
 pub fn get_struct_instantiation_suffix(mono: *MonoCtx, idx: i32) -> StrView
     if idx >= mono.struct_count
         return strview_empty()
-    strview_from_ptr(*(mono.struct_suffixes + idx), (*(mono.struct_suffix_lens + idx)) as i64)
-
-pub fn get_struct_instantiation_suffix_len(mono: *MonoCtx, idx: i32) -> i32
-    if idx >= mono.struct_count
-        return 0
-    *(mono.struct_suffix_lens + idx)
+    *(mono.struct_suffixes + idx)
 
 # Find generic struct by name
 pub fn find_generic_struct(m: *Module, name_sv: StrView) -> *StructDef
@@ -761,13 +708,10 @@ pub fn init_local_var_tracker(mono: *MonoCtx)
     if mono.lv_initialized == 1
         return
     mono.lv_cap = LOCAL_VARS_INIT_CAP
-    mono.lv_names = malloc((mono.lv_cap as i64) * 8) as **u8
-    mono.lv_name_lens = malloc((mono.lv_cap as i64) * 4) as *i32
+    mono.lv_names = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
     mono.lv_prefix_kind = malloc((mono.lv_cap as i64) * 4) as *i32
-    mono.lv_suffixes = malloc((mono.lv_cap as i64) * 8) as **u8
-    mono.lv_suffix_lens = malloc((mono.lv_cap as i64) * 4) as *i32
-    mono.lv_type_names = malloc((mono.lv_cap as i64) * 8) as **u8
-    mono.lv_type_name_lens = malloc((mono.lv_cap as i64) * 4) as *i32
+    mono.lv_suffixes = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
+    mono.lv_type_names = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
     mono.lv_by_value = malloc((mono.lv_cap as i64) * 4) as *i32
     mono.lv_shared = malloc((mono.lv_cap as i64) * 4) as *i32
     mono.lv_initialized = 1
@@ -779,28 +723,20 @@ pub fn reset_local_var_tracker(mono: *MonoCtx)
 
 # `[N]S` locals (and `[N]*S`, `[N]@S`), name -> S, so `a[i].m()` is typed
 # (AGAST #4231, receiver_instance).  Reset with the tracker above.
-# (MonoCtx.al_names, .al_name_lens, .al_elems, .al_elem_lens, .al_count, .al_cap)
+# (MonoCtx.al_names, .al_elems, .al_count, .al_cap)
 
 pub fn track_array_local(mono: *MonoCtx, name_sv: StrView, elem_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    var elem: *u8 = elem_sv.ptr
-    var elem_len: i32 = elem_sv.len as i32
-    if elem == null or elem_len <= 0
+    if elem_sv.ptr == null or elem_sv.len <= 0
         return
     if mono.al_count >= mono.al_cap
         var cap: i32 = mono.al_cap * 2
         if cap == 0
             cap = 16
-        mono.al_names = realloc(mono.al_names as *u8, (cap as i64) * 8) as **u8
-        mono.al_name_lens = realloc(mono.al_name_lens as *u8, (cap as i64) * 4) as *i32
-        mono.al_elems = realloc(mono.al_elems as *u8, (cap as i64) * 8) as **u8
-        mono.al_elem_lens = realloc(mono.al_elem_lens as *u8, (cap as i64) * 4) as *i32
+        mono.al_names = realloc(mono.al_names as *u8, (cap as i64) * sizeof(StrView)) as *StrView
+        mono.al_elems = realloc(mono.al_elems as *u8, (cap as i64) * sizeof(StrView)) as *StrView
         mono.al_cap = cap
-    *(mono.al_names + mono.al_count) = name
-    *(mono.al_name_lens + mono.al_count) = name_len
-    *(mono.al_elems + mono.al_count) = elem
-    *(mono.al_elem_lens + mono.al_count) = elem_len
+    *(mono.al_names + mono.al_count) = name_sv
+    *(mono.al_elems + mono.al_count) = elem_sv
     mono.al_count = mono.al_count + 1
 
 # The element type name of `[N]S` local `name`, or null.  The latest
@@ -808,35 +744,25 @@ pub fn track_array_local(mono: *MonoCtx, name_sv: StrView, elem_sv: StrView)
 pub fn array_local_elem(mono: *MonoCtx, name_sv: StrView) -> StrView
     var i: i32 = mono.al_count - 1
     while i >= 0
-        if name_eq(StrView { ptr: (*(mono.al_names + i)), len: (*(mono.al_name_lens + i)) as i64 }, name_sv) == 1
-            return strview_from_ptr(*(mono.al_elems + i), (*(mono.al_elem_lens + i)) as i64)
+        if (*(mono.al_names + i)).eq(name_sv)
+            return *(mono.al_elems + i)
         i = i - 1
     strview_empty()
 
 pub fn add_local_var(mono: *MonoCtx, name_sv: StrView, prefix_kind: i32, suffix_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    var suffix: *u8 = suffix_sv.ptr
-    var suffix_len: i32 = suffix_sv.len as i32
     if mono.lv_count >= mono.lv_cap
         let cap: i64 = (mono.lv_cap as i64) * 2
-        mono.lv_names = realloc(mono.lv_names as *u8, cap * 8) as **u8
-        mono.lv_name_lens = realloc(mono.lv_name_lens as *u8, cap * 4) as *i32
+        mono.lv_names = realloc(mono.lv_names as *u8, cap * sizeof(StrView)) as *StrView
         mono.lv_prefix_kind = realloc(mono.lv_prefix_kind as *u8, cap * 4) as *i32
-        mono.lv_suffixes = realloc(mono.lv_suffixes as *u8, cap * 8) as **u8
-        mono.lv_suffix_lens = realloc(mono.lv_suffix_lens as *u8, cap * 4) as *i32
-        mono.lv_type_names = realloc(mono.lv_type_names as *u8, cap * 8) as **u8
-        mono.lv_type_name_lens = realloc(mono.lv_type_name_lens as *u8, cap * 4) as *i32
+        mono.lv_suffixes = realloc(mono.lv_suffixes as *u8, cap * sizeof(StrView)) as *StrView
+        mono.lv_type_names = realloc(mono.lv_type_names as *u8, cap * sizeof(StrView)) as *StrView
         mono.lv_by_value = realloc(mono.lv_by_value as *u8, cap * 4) as *i32
         mono.lv_shared = realloc(mono.lv_shared as *u8, cap * 4) as *i32
         mono.lv_cap = cap as i32
-    *(mono.lv_names + mono.lv_count) = name
-    *(mono.lv_name_lens + mono.lv_count) = name_len
+    *(mono.lv_names + mono.lv_count) = name_sv
     *(mono.lv_prefix_kind + mono.lv_count) = prefix_kind
-    *(mono.lv_suffixes + mono.lv_count) = suffix
-    *(mono.lv_suffix_lens + mono.lv_count) = suffix_len
-    *(mono.lv_type_names + mono.lv_count) = null
-    *(mono.lv_type_name_lens + mono.lv_count) = 0
+    *(mono.lv_suffixes + mono.lv_count) = suffix_sv
+    *(mono.lv_type_names + mono.lv_count) = strview_empty()
     *(mono.lv_by_value + mono.lv_count) = 0
     *(mono.lv_shared + mono.lv_count) = 0
     mono.lv_count = mono.lv_count + 1
@@ -851,13 +777,10 @@ pub fn mark_last_local_by_value(mono: *MonoCtx)
 # can resolve the field's type (AGAST #1512).  Kind 0 never matches a UFCS
 # prefix, so the ident-receiver path ignores these entries.
 pub fn add_local_struct_var(mono: *MonoCtx, name_sv: StrView, type_name_sv: StrView)
-    var type_name: *u8 = type_name_sv.ptr
-    var type_name_len: i32 = type_name_sv.len as i32
-    if type_name == null or type_name_len <= 0
+    if type_name_sv.ptr == null or type_name_sv.len <= 0
         return
     add_local_var(mono, name_sv, 0, strview_empty())
-    *(mono.lv_type_names + mono.lv_count - 1) = type_name
-    *(mono.lv_type_name_lens + mono.lv_count - 1) = type_name_len
+    *(mono.lv_type_names + mono.lv_count - 1) = type_name_sv
 
 # Record a binding of type `type_kind`/`type_name`: Vec/Span by-value go to
 # the UFCS kinds; any other named struct (by value, *T, @T, @&T) is kind 0.
@@ -902,9 +825,8 @@ pub fn track_address_of_local(mono: *MonoCtx, name_sv: StrView, of: *Expr)
     let idx: i32 = find_local_var_idx(mono, of.ident)
     if idx < 0 or *(mono.lv_by_value + idx) != 1
         return
-    add_local_var(mono, name_sv, *(mono.lv_prefix_kind + idx), StrView { ptr: (*(mono.lv_suffixes + idx)), len: (*(mono.lv_suffix_lens + idx)) as i64 })
+    add_local_var(mono, name_sv, *(mono.lv_prefix_kind + idx), *(mono.lv_suffixes + idx))
     *(mono.lv_type_names + mono.lv_count - 1) = *(mono.lv_type_names + idx)
-    *(mono.lv_type_name_lens + mono.lv_count - 1) = *(mono.lv_type_name_lens + idx)
     *(mono.lv_by_value + mono.lv_count - 1) = 2
 
 # A field holding an `@T` or `@&T`: one level, like a `*T` (AGAST #2383).
@@ -960,19 +882,18 @@ pub fn track_method_init_local(mono: *MonoCtx, m: *Module, name_sv: StrView, ini
         let rkind: i32 = classify_collection_type(tmpl.return_type_name, @rsuf)
         let tp: *TypeParam = cib.type_params
         if rkind > 0 and tp.name.eq(StrView { ptr: rsuf.ptr + 1, len: ((rsuf.len as i32) - 1) as i64 })
-            add_local_var(mono, name_sv, rkind, StrView { ptr: (*(mono.lv_suffixes + idx)), len: (*(mono.lv_suffix_lens + idx)) as i64 })
+            add_local_var(mono, name_sv, rkind, *(mono.lv_suffixes + idx))
             mark_last_local_by_value(mono)
         return
     # Struct receiver (by value or pointer): its non-generic impl method's
     # return type, recorded like an annotation of that type.
-    let tn: *u8 = *(mono.lv_type_names + idx)
-    let tn_len: i32 = *(mono.lv_type_name_lens + idx)
+    let tn: StrView = *(mono.lv_type_names + idx)
     # `s.slice(lo, hi)` on a String is string_slice, a String (no impl method
     # says so), and what `let t = s[lo..hi]` became (AGAST #2451).
-    if name_eq(StrView { ptr: (tn), len: (tn_len) as i64 }, "String") == 1 and name_eq(init.ident, "slice") == 1
+    if tn.eq("String") and init.ident.eq("slice")
         track_typed_local(mono, name_sv, TypeKind.Struct, "String")
         return
-    track_impl_method_local(mono, m, name_sv, StrView { ptr: (tn), len: (tn_len) as i64 }, init)
+    track_impl_method_local(mono, m, name_sv, tn, init)
 
 # Record local `name_sv`, set to `init` (a call of method `init.ident` on
 # struct `tn_sv` or a value of it), as that method's return type: from the
@@ -990,12 +911,9 @@ fn track_impl_method_local(mono: *MonoCtx, m: *Module, name_sv: StrView, tn_sv: 
         ib = ib.next
 
 pub fn find_local_var_idx(mono: *MonoCtx, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
     for i in 0..mono.lv_count
-        if *(mono.lv_name_lens + i) == name_len
-            if memcmp(*(mono.lv_names + i), name, name_len as i64) == 0
-                return i
+        if (*(mono.lv_names + i)).eq(name_sv)
+            return i
     return -1
 
 # If `type_name` is a Vec$T or Span$T mangled name, return the prefix kind
@@ -1250,7 +1168,7 @@ pub fn scrutinee_type_name(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
         let idx: i32 = find_local_var_idx(mono, e.ident)
         if idx < 0 or *(mono.lv_by_value + idx) != 1 or *(mono.lv_prefix_kind + idx) != 0
             return strview_empty()
-        return strview_from_ptr(*(mono.lv_type_names + idx), (*(mono.lv_type_name_lens + idx)) as i64)
+        return *(mono.lv_type_names + idx)
     if e.kind == ExprKind.Call and e.call_type_suffix.len == 0
         let f: *FnDef = find_fn_in_module(m, e.func_name)
         if f == null or f.type_params != null or f.return_type != TypeKind.Struct or f.return_type_name.ptr == null
