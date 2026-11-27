@@ -7,9 +7,20 @@
 # with a polled IDENTIFY DEVICE in slot 0. 4Kn and non-LBA48 disks are logged
 # and skipped. Reads and writes are READ/WRITE DMA EXT through bounce pages,
 # one command per port, flushed when the write cache is on.
+#
+# Interrupts (AGAST #4885): the probe is polled (IF=0, no APIC yet). Once the
+# APIC is up, ahci_enable_msi gives each HBA with an MSI capability one
+# message on a vector from msix_vector_alloc (through interrupt remapping
+# when it is on) and enables DHRS, PSS and the error bits in each disk's
+# PxIE. A command issued with IF=1 on the CPU the message reaches then
+# waits on the vector (irq_wait_vector, parking the process when it can),
+# and checks PxCI after every wake: PxCI is the ground truth, and a stale
+# interrupt completes nothing. PxIS and then the port's IS bit are cleared
+# after each command. An HBA with no MSI capability stays polled; INTx is
+# never used.
 
 import klog { klog, klog_dec, klog_udec }
-import io { memory_barrier, cpu_pause, rdtsc }
+import io { memory_barrier, cpu_pause, rdtsc, interrupts_enabled, disable_interrupts, enable_interrupts }
 import ritzlib.span { span_from_ptr }
 import drivers.pci {
     PciDevice, pci_get_device_count, pci_get_device, pci_enable_bus_master,
@@ -30,8 +41,11 @@ import drivers.ahci.regs {
     AHCI_PX_TFD, AHCI_PX_SIG, AHCI_PX_SSTS, AHCI_PX_SCTL, AHCI_PX_SERR, AHCI_PX_CI,
     AHCI_PXCMD_ST, AHCI_PXCMD_SUD, AHCI_PXCMD_FRE, AHCI_PXCMD_FR, AHCI_PXCMD_CR,
     AHCI_TFD_ERR, AHCI_TFD_DRQ, AHCI_TFD_BSY, AHCI_SSTS_DET_MASK, AHCI_SSTS_DET_UP,
-    AHCI_IS_TFES, AHCI_SCTL_DET_COMRESET, SigKind
+    AHCI_IS_TFES, AHCI_SCTL_DET_COMRESET, SigKind, AHCI_REG_IS, AHCI_PX_IE, AHCI_GHC_IE,
+    AHCI_PXIE_WANTED, CmdState, ahci_cmd_state, ahci_irq_waits
 }
+import drivers.msix { Msi, msi_probe, msi_enable, msix_vector_alloc, msix_vector_count, MSIX_NO_IRTE }
+import drivers.irq_wait { irq_wait_vector }
 import drivers.ahci.identify {
     IdentifyInfo, IdentifyError, ahci_parse_identify, AHCI_ID_BYTES
 }
@@ -43,6 +57,15 @@ import drivers.ahci.fis {
 }
 import sync.spin { SpinLock, SpinGuard, spin_new, spin_lock, spin_unlock }
 
+# Current CPU's Local APIC ID (arch/x86_64/apic.ritz)
+extern fn lapic_id() -> u32
+# The kernel's interrupt wait queue (proc/waitq.ritz). Declared, not
+# imported, as drivers/irq_wait.ritz does: proc/sched reaches the block
+# drivers, so importing it here would close an import cycle.
+extern fn waitq_can_park() -> bool
+extern fn waitq_park() -> i32
+extern fn waitq_wake_irq()
+
 const AHCI_MAX_CTL: i32 = 4
 const AHCI_MAX_DISKS: i32 = 8
 const AHCI_CMD_TABLE: u64 = 2048
@@ -52,6 +75,11 @@ const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400
 const AHCI_MAP_LEN: u64 = 0x2000
 const AHCI_CMD_TIMEOUT_US: u64 = 10000000
 const AHCI_FINGERPRINT_SECTORS: u32 = 200
+# A command's interrupt wait gives up after AHCI_IRQ_WATCHDOG_ROUNDS runs of
+# the LAPIC watchdog, each AHCI_IRQ_WATCHDOG_TICKS of bus clock / 16 (NVMe's
+# budget, ~1 s on QEMU), and polls the rest of the command's deadline.
+const AHCI_IRQ_WATCHDOG_TICKS: u32 = 0x01000000
+const AHCI_IRQ_WATCHDOG_ROUNDS: u32 = 4
 
 # Why a controller was not driven, or why a disk request failed. A skipped
 # port is not one of these: the probe still owns the HBA and goes on to the
@@ -76,6 +104,11 @@ pub struct AhciCtl
     map_len: u64
     cap: u32
     pi: u32
+    # MSI vector, 0 while polled; the APIC ID its message reaches, and the
+    # IRTE it names (MSIX_NO_IRTE without interrupt remapping).
+    vec: u8
+    msi_dest: u32
+    msi_irte: u32
 
 pub struct AhciDisk
     ctl: i32
@@ -84,7 +117,10 @@ pub struct AhciDisk
     write_cache: bool
     page: u64
     dead: bool
-    # One command per port: held across a whole ahci_disk_rw.
+    # One request per port: `busy` is held across a whole ahci_disk_rw, with
+    # interrupts as the caller had them, so a command can wait on the
+    # vector. `lock` guards `busy` only.
+    busy: bool
     lock: SpinLock
     bounce: [16]u64
 
@@ -93,6 +129,12 @@ var ahci_ctl_count: i32 = 0
 var ahci_disks: [8]AhciDisk
 var ahci_disk_count: i32 = 0
 var ahci_probed: bool = false
+# Commands that waited on their controller's MSI vector, those of them that
+# completed with no interrupt within the watchdog, and the hlts the waits
+# slept in (counters like NVMe's).
+var ahci_irq_waits_n: u64 = 0
+var ahci_irq_missed_n: u64 = 0
+var ahci_irq_halts_n: u64 = 0
 
 pub fn ahci_get_disk_count() -> i32
     ahci_disk_count
@@ -390,21 +432,52 @@ fn ahci_command(disk: *AhciDisk, op: u8, lba: u64, n: u32, dir: AhciDir) -> Resu
         let phys: [u64] = @(*disk).bounce
         ahci_fill_prdt(ct.from(AHCI_CT_PRDT_OFF as i64), phys, bytes)
     memory_barrier()
-    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_IS), 0xFFFFFFFF)
+    ahci_ack(bar, port)
+    # The vector's count is sampled before CI is written, so the completion
+    # interrupt cannot slip past unseen.
+    let vec: u8 = ahci_ctls[(*disk).ctl].vec
+    var waiting: bool = ahci_irq_waits(vec, interrupts_enabled(), lapic_id(), ahci_ctls[(*disk).ctl].msi_dest)
+    var seen: u64 = 0
+    if waiting
+        seen = msix_vector_count(vec)
+        ahci_irq_waits_n = ahci_irq_waits_n + 1
+    var gave_up: bool = false
     ahci_port_start(bar, cap, port)
     ahci_w32(bar, ahci_port_reg(port, AHCI_PX_CI), 1)
     let deadline: u64 = tsc_deadline(rdtsc(), tsc_hz(), AHCI_CMD_TIMEOUT_US)
-    while (ahci_r32(bar, ahci_port_reg(port, AHCI_PX_CI)) & 1) != 0
+    while true
+        let state: CmdState = ahci_cmd_state(ahci_r32(bar, ahci_port_reg(port, AHCI_PX_CI)), 1, ahci_r32(bar, ahci_port_reg(port, AHCI_PX_TFD)), ahci_r32(bar, ahci_port_reg(port, AHCI_PX_IS)))
+        match state
+            CmdState.Done =>
+                if gave_up
+                    ahci_irq_missed_n = ahci_irq_missed_n + 1
+                ahci_ack(bar, port)
+                return Ok(())
+            CmdState.Failed =>
+                ahci_recover(disk)?
+                ahci_ack(bar, port)
+                return Err(AhciError.Device)
+            CmdState.Busy => pass
         if tsc_deadline_passed(rdtsc(), deadline)
             ahci_recover(disk)?
+            ahci_ack(bar, port)
             return Err(AhciError.Timeout)
-        cpu_pause()
-    let tfd: u32 = ahci_r32(bar, ahci_port_reg(port, AHCI_PX_TFD))
-    let is: u32 = ahci_r32(bar, ahci_port_reg(port, AHCI_PX_IS))
-    if (tfd & AHCI_TFD_ERR) != 0 or (is & AHCI_IS_TFES) != 0
-        ahci_recover(disk)?
-        return Err(AhciError.Device)
-    Ok(())
+        if waiting
+            if irq_wait_vector(vec, seen, AHCI_IRQ_WATCHDOG_TICKS, AHCI_IRQ_WATCHDOG_ROUNDS, true, @ahci_irq_halts_n)
+                # Woken: take the new count before re-reading CI.
+                seen = msix_vector_count(vec)
+            else
+                gave_up = true
+                waiting = false
+        else
+            cpu_pause()
+
+# Clear the port's interrupt status, PxIS first and then its bit in the
+# global IS (AHCI 1.3.1 §5.6.4), so the HBA can signal the next command.
+fn ahci_ack(bar: u64, port: i32)
+    ahci_w32(bar, ahci_port_reg(port, AHCI_PX_IS), 0xFFFFFFFF)
+    let bit: u32 = 1
+    ahci_w32(bar, AHCI_REG_IS, bit << (port as u32))
 
 # The transfers of one request, with the disk's lock held.
 fn ahci_rw_locked(disk: *AhciDisk, lba: u64, buf: [u8], dir: AhciDir) -> Result<(), AhciError>
@@ -450,10 +523,38 @@ pub fn ahci_disk_rw(disk: *AhciDisk, lba: u64, buf: [u8], dir: AhciDir) -> Resul
     let sectors: u64 = (*disk).sectors
     if lba > sectors or count > sectors - lba
         return Err(AhciError.Range)
-    let g: SpinGuard = spin_lock(@(*disk).lock)
+    ahci_disk_take(disk)
     let rc: Result<(), AhciError> = ahci_rw_locked(disk, lba, buf, dir)
-    spin_unlock(@(*disk).lock, g)
+    ahci_disk_give(disk)
     rc
+
+# Own the disk for one request. Another owner (a process parked on the
+# vector, or another CPU) is waited out: parked on the interrupt wait queue
+# when this CPU can park, else spinning. Interrupts are as the caller had
+# them while it is owned.
+fn ahci_disk_take(disk: *AhciDisk)
+    while true
+        let g: SpinGuard = spin_lock(@(*disk).lock)
+        if not (*disk).busy
+            (*disk).busy = true
+            spin_unlock(@(*disk).lock, g)
+            return
+        spin_unlock(@(*disk).lock, g)
+        if waitq_can_park()
+            let was_on: bool = interrupts_enabled()
+            disable_interrupts()
+            waitq_park()
+            if was_on
+                enable_interrupts()
+        else
+            cpu_pause()
+
+# Give the disk up and wake processes parked for it.
+fn ahci_disk_give(disk: *AhciDisk)
+    let g: SpinGuard = spin_lock(@(*disk).lock)
+    (*disk).busy = false
+    spin_unlock(@(*disk).lock, g)
+    waitq_wake_irq()
 
 fn ahci_fnv1a(bytes: [u8]) -> u64
     var hash: u64 = 0x811C9DC5
@@ -564,6 +665,7 @@ fn ahci_claim(pci: *PciDevice, bar: u64, ctl_index: i32, port: i32, page: u64, i
             ahci_disks[slot].write_cache = info.write_cache
             ahci_disks[slot].page = page
             ahci_disks[slot].dead = false
+            ahci_disks[slot].busy = false
             ahci_disks[slot].lock = spin_new()
             var b: i32 = 0
             while b < AHCI_BOUNCE_PAGES
@@ -731,6 +833,9 @@ fn ahci_drive(pci: *PciDevice) -> Result<u32, AhciError>
     ahci_ctls[index].map_len = map_len
     ahci_ctls[index].cap = cap
     ahci_ctls[index].pi = pi2
+    ahci_ctls[index].vec = 0
+    ahci_ctls[index].msi_dest = 0
+    ahci_ctls[index].msi_irte = MSIX_NO_IRTE
     ahci_ctl_count = ahci_ctl_count + 1
     let n: u32 = ahci_scan_ports(pci, index)?
     klog("[ahci] ")
@@ -764,3 +869,139 @@ pub fn ahci_probe() -> Result<u32, AhciError>
             ClassAction.Ignore => pass
         i = i + 1
     Ok(ahci_disk_count as u32)
+
+# ============================================================================
+# MSI (AGAST #4885)
+# ============================================================================
+
+# Switch every driven HBA with an MSI capability to its one MSI message:
+# a vector from msix_vector_alloc, PxIE on each disk's port, then GHC.IE.
+# Needs the Local APIC (and interrupt remapping, when there is any) up; call
+# with interrupts off. Logs, per controller,
+#   [ahci] BB:DD.F: MSI on, vector V[, IRTE h -> APIC ID d]
+# or why it stays polled. Returns how many controllers are on MSI.
+pub fn ahci_enable_msi() -> u32
+    var on: u32 = 0
+    var c: i32 = 0
+    while c < ahci_ctl_count
+        if ahci_ctl_msi(c)
+            on = on + 1
+        c = c + 1
+    on
+
+fn ahci_ctl_msi(c: i32) -> bool
+    let pci: *PciDevice = ahci_ctls[c].pci
+    let bar: u64 = ahci_ctls[c].bar
+    let found: Option<Msi> = msi_probe(pci)
+    let m: Msi = match found
+        Some(v) => v
+        None =>
+            klog("[ahci] ")
+            log_bdf(pci)
+            klog(": no MSI capability, polled\n")
+            return false
+    let vector: u8 = msix_vector_alloc()
+    if vector == 0
+        klog("[ahci] ")
+        log_bdf(pci)
+        klog(": out of MSI vectors, polled\n")
+        return false
+    let on: Msi = match msi_enable(m, vector)
+        Ok(v) => v
+        Err(_) =>
+            klog("[ahci] ")
+            log_bdf(pci)
+            klog(": MSI not enabled, polled\n")
+            return false
+    var d: i32 = 0
+    while d < ahci_disk_count
+        if ahci_disks[d].ctl == c
+            let port: i32 = ahci_disks[d].port
+            ahci_ack(bar, port)
+            ahci_w32(bar, ahci_port_reg(port, AHCI_PX_IE), AHCI_PXIE_WANTED)
+        d = d + 1
+    ahci_w32(bar, AHCI_REG_GHC, ahci_r32(bar, AHCI_REG_GHC) | AHCI_GHC_IE)
+    ahci_ctls[c].msi_dest = on.dest
+    ahci_ctls[c].msi_irte = on.irte
+    # Last: from here a command issued with IF=1 waits on the vector.
+    ahci_ctls[c].vec = vector
+    klog("[ahci] ")
+    log_bdf(pci)
+    klog(": MSI on, vector ")
+    klog_dec(vector as i64)
+    if on.irte != MSIX_NO_IRTE
+        klog(", IRTE ")
+        klog_dec(on.irte as i64)
+        klog(" -> APIC ID ")
+        klog_dec(on.dest as i64)
+    klog("\n")
+    true
+
+# Read LBAs 1-200 of every disk on an MSI controller twice, polled (IF=0)
+# and then with interrupts on, so each command waits on the vector, and log
+#   [ahci] BB:DD.F port P: MSI read LBA 1-200 waited=W, interrupted=I, data: same|DIFFERENT
+# W is the commands that waited, I what the vector's count advanced by.
+# tools/test_ahci_boot.sh wants W > 0, I > 0 and "same". Call with
+# interrupts off; returns with them off.
+pub fn ahci_msi_read_check()
+    let bytes: u64 = AHCI_FINGERPRINT_SECTORS as u64 * AHCI_SECTOR_BYTES as u64
+    var d: i32 = 0
+    while d < ahci_disk_count
+        let disk: *AhciDisk = @ahci_disks[d]
+        let vec: u8 = ahci_ctls[(*disk).ctl].vec
+        if vec != 0 and (*disk).sectors > AHCI_FINGERPRINT_SECTORS as u64
+            ahci_msi_read_disk(disk, vec, bytes)
+        d = d + 1
+
+fn ahci_msi_read_disk(disk: *AhciDisk, vec: u8, bytes: u64)
+    let pci: *PciDevice = ahci_ctls[(*disk).ctl].pci
+    klog("[ahci] ")
+    log_bdf(pci)
+    klog(" port ")
+    klog_dec((*disk).port as i64)
+    klog(": MSI read LBA 1-")
+    klog_dec(AHCI_FINGERPRINT_SECTORS as i64)
+    # One allocation: the polled copy, then the interrupt-driven one.
+    let mem: *u8 = kalloc(bytes * 2)
+    if mem == 0 as *u8
+        klog(" failed (no memory)\n")
+        return
+    let both: [u8] = span_from_ptr<u8>(mem, (bytes * 2) as i64)
+    let polled: [u8] = both.slice(0, bytes as i64)
+    let irq: [u8] = both.slice(bytes as i64, (bytes * 2) as i64)
+    var ok: bool = ahci_disk_rw(disk, 1, polled, AhciDir.Read).is_ok()
+    let waits_before: u64 = ahci_irq_waits_n
+    let irqs_before: u64 = msix_vector_count(vec)
+    enable_interrupts()
+    if not ahci_disk_rw(disk, 1, irq, AhciDir.Read).is_ok()
+        ok = false
+    disable_interrupts()
+    klog(" waited=")
+    klog_udec(ahci_irq_waits_n - waits_before)
+    klog(", interrupted=")
+    klog_udec(msix_vector_count(vec) - irqs_before)
+    if not ok
+        klog(", read failed\n")
+    else if ahci_fnv1a(polled) == ahci_fnv1a(irq)
+        klog(", data: same\n")
+    else
+        klog(", data: DIFFERENT\n")
+    kfree(mem)
+
+# MSI interrupts delivered by every AHCI controller so far.
+pub fn ahci_irq_count() -> u64
+    var total: u64 = 0
+    var c: i32 = 0
+    while c < ahci_ctl_count
+        if ahci_ctls[c].vec != 0
+            total = total + msix_vector_count(ahci_ctls[c].vec)
+        c = c + 1
+    total
+
+# Commands that waited on their controller's MSI vector.
+pub fn ahci_irq_wait_count() -> u64
+    ahci_irq_waits_n
+
+# Commands that waited and completed with no interrupt within the watchdog.
+pub fn ahci_irq_missed_count() -> u64
+    ahci_irq_missed_n

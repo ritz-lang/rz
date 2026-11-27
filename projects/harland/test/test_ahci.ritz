@@ -1,6 +1,7 @@
 # Host checks for the AHCI probe's pure pieces (AGAST #4882): IDENTIFY
 # field parsing and the BIOS/OS handoff on a fake register file. The kernel
 # probe calls these functions; a wrong parse or a skipped OOS write fails here.
+# The completion state and the interrupt-wait choice (AGAST #4885) too.
 
 import ritzlib.span
 import ritzlib.strview
@@ -10,7 +11,9 @@ import drivers.ahci.identify {
 import drivers.ahci.regs {
     AhciHandoff, ahci_handoff_init, ahci_handoff_step, ahci_rf_read, ahci_rf_write,
     ahci_class_action, AHCI_REG_CAP2, AHCI_REG_BOHC, AHCI_CAP2_BOH, AHCI_BOHC_BOS,
-    AHCI_BOHC_OOS, AHCI_BOHC_BB, Handoff, ClassAction
+    AHCI_BOHC_OOS, AHCI_BOHC_BB, Handoff, ClassAction, CmdState, ahci_cmd_state,
+    ahci_irq_waits, AHCI_PXIE_WANTED, AHCI_IS_DHRS, AHCI_IS_PSS, AHCI_IS_TFES,
+    AHCI_IS_HBFS, AHCI_IS_HBDS, AHCI_IS_IFS, AHCI_IS_INFS, AHCI_IS_OFS
 }
 
 var g_id: [512]u8
@@ -228,4 +231,64 @@ fn test_raid_class_is_not_driven() -> i32
         return 4
     if ahci_class_action(0x01, 0x01, 0x80) != ClassAction.Ignore
         return 5
+    0
+
+# ---------------------------------------------------------------------------
+# Completion state and the interrupt wait (AGAST #4885)
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_cmd_state_busy_until_ci_clears() -> i32
+    if ahci_cmd_state(1, 1, 0x50, 0) != CmdState.Busy
+        return 1
+    # Another slot's bit is not this command.
+    if ahci_cmd_state(2, 1, 0x50, 0) != CmdState.Done
+        return 2
+    # A stale DHRS with CI still set completes nothing: PxCI is the truth.
+    if ahci_cmd_state(1, 1, 0x50, AHCI_IS_DHRS) != CmdState.Busy
+        return 3
+    0
+
+[[test]]
+fn test_cmd_state_device_error_fails() -> i32
+    if ahci_cmd_state(0, 1, 0x51, 0) != CmdState.Failed
+        return 1
+    # TFES stops the port with CI still set: failed now, not at the deadline.
+    if ahci_cmd_state(1, 1, 0x51, AHCI_IS_TFES) != CmdState.Failed
+        return 2
+    0
+
+[[test]]
+fn test_cmd_state_hba_errors_fail() -> i32
+    if ahci_cmd_state(1, 1, 0x50, AHCI_IS_HBFS) != CmdState.Failed
+        return 1
+    if ahci_cmd_state(1, 1, 0x50, AHCI_IS_HBDS) != CmdState.Failed
+        return 2
+    if ahci_cmd_state(1, 1, 0x50, AHCI_IS_IFS) != CmdState.Failed
+        return 3
+    0
+
+[[test]]
+fn test_pxie_enables_completion_and_error_bits() -> i32
+    let want: u32 = AHCI_IS_DHRS | AHCI_IS_PSS | AHCI_IS_TFES | AHCI_IS_HBFS | AHCI_IS_HBDS | AHCI_IS_IFS | AHCI_IS_INFS | AHCI_IS_OFS
+    if AHCI_PXIE_WANTED != want
+        return 1
+    # Port-change bits stay off: a hotplug must not count as a completion.
+    if (AHCI_PXIE_WANTED & 0x00400040) != 0
+        return 2
+    0
+
+[[test]]
+fn test_irq_wait_needs_vector_if_and_this_cpu() -> i32
+    if not ahci_irq_waits(66, true, 0, 0)
+        return 1
+    # Polled controller (no MSI capability): vector 0.
+    if ahci_irq_waits(0, true, 0, 0)
+        return 2
+    # IF=0 (the probe, early boot): the vector cannot be taken.
+    if ahci_irq_waits(66, false, 0, 0)
+        return 3
+    # The MSI goes to another CPU: this one would only wake on its watchdog.
+    if ahci_irq_waits(66, true, 1, 0)
+        return 4
     0

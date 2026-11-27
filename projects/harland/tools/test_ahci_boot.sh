@@ -20,12 +20,20 @@
 # is not set: kfs still treats a disk with no goliath header as blank
 # (#4883 owns the guard).
 #
+# MSI (#4885): both boots switch the HBA to its one MSI message and read
+# harland-data polled and then on the vector; each must log commands that
+# waited and interrupts counted, the same data, and no completion without
+# its interrupt. Boot 2 is q35,kernel-irqchip=split with
+# -device intel-iommu,intremap=on,eim=on, so the message goes through
+# interrupt remapping (its MSI line names an IRTE).
+#
 # Usage: tools/test_ahci_boot.sh
 #        AHCI_EMPTY=1   empty controller
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for each qemu (default 240)
 #        KEEP_WORK=DIR  copy the serial logs into DIR
 #        OVMF_CODE=F    OVMF firmware (default: search the usual paths)
+#        ACCEL=kvm      run under KVM
 #
 # Exit: 0 = pass; 1 = the boot or a check failed; 3 = a required tool is
 #       missing: a SETUP ERROR, not a regression.
@@ -155,13 +163,21 @@ fi
 
 # One qemu. AHCI_WHICH selects which fake serial a CI stub writes.
 # -nodefaults drops QEMU's default ide-cd, which would show up as ATAPI.
+# AHCI_IR=1: the interrupt-remapping machine (the IOMMU before the devices).
 run_qemu() {
     local which="$1"
     local serial="$2"
     local stop_re="$3"
+    local machine=q35 iommu=() accel=()
+    [ "${ACCEL:-}" = kvm ] && accel=(-accel kvm)
+    if [ "${AHCI_IR:-0}" = 1 ]; then
+        machine=q35,kernel-irqchip=split
+        iommu=(-device intel-iommu,intremap=on,eim=on)
+    fi
     export AHCI_WHICH="$which"
     : > "$serial"
-    timeout "$TIMEOUT" qemu-system-x86_64 -machine q35 -cpu Haswell-v1 -smp 1 -m "$MEM" \
+    timeout "$TIMEOUT" qemu-system-x86_64 -machine "$machine" "${accel[@]}" -cpu Haswell-v1 -smp 1 -m "$MEM" \
+        "${iommu[@]}" \
         -nodefaults -display none -vga std -no-reboot -monitor none \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -device qemu-xhci,id=xhci \
@@ -281,6 +297,37 @@ check_persist() {
     fi
 }
 
+# check_msi SERIAL IR: the MSI read waited on the vector and was counted;
+# IR=1 also wants the message through an IRTE.
+check_msi() {
+    local serial="$1" ir="$2" bdf="[0-9a-f]{2}:[0-9a-f]{2}\\.[0-9a-f]"
+    if [ "$ir" = 1 ]; then
+        if grep -aqE "\[ahci\] $bdf: MSI on, vector [0-9]+, IRTE [0-9]+ -> APIC ID [0-9]+" "$serial"; then
+            note "PASS: AHCI MSI goes through an IRTE (interrupt remapping)"
+        else
+            note "FAIL: no 'MSI on, vector V, IRTE h' line on the intremap boot"
+            rc=1
+        fi
+    elif grep -aqE "\[ahci\] $bdf: MSI on, vector [0-9]+$" "$serial"; then
+        note "PASS: AHCI MSI on, not remapped"
+    else
+        note "FAIL: no 'MSI on, vector V' line"
+        rc=1
+    fi
+    if grep -aqE "\[ahci\] $bdf port 1: MSI read LBA 1-200 waited=[1-9][0-9]*, interrupted=[1-9][0-9]*, data: same" "$serial"; then
+        note "PASS: harland-data read on the vector: waited, interrupted, same data"
+    else
+        note "FAIL: harland-data MSI read did not wait, was not interrupted, or differed"
+        rc=1
+    fi
+    if grep -aqE "\[ahci\] msi interrupts: [1-9][0-9]*, commands waited: [1-9][0-9]*, completions without one: 0$" "$serial"; then
+        note "PASS: AHCI interrupts counted, commands waited, none missed"
+    else
+        note "FAIL: AHCI msi summary wants interrupts > 0, waited > 0, 0 without one"
+        rc=1
+    fi
+}
+
 SERIAL1="$WORK/ahci-persist-1.log"
 run_qemu 1 "$SERIAL1" "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC|EXCEPTION"
 echo "----- ahci persist boot 1 -----"
@@ -292,15 +339,17 @@ if [ "$timed_out" = "1" ]; then
 fi
 check_identify "$SERIAL1"
 check_persist "$SERIAL1" 1
+check_msi "$SERIAL1" 0
 if [ "$rc" -ne 0 ]; then
     exit "$rc"
 fi
 
 SERIAL2="$WORK/ahci-persist-2.log"
-run_qemu 2 "$SERIAL2" "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC|EXCEPTION"
+AHCI_IR=1 run_qemu 2 "$SERIAL2" "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC|EXCEPTION"
 echo "----- ahci persist boot 2 -----"
 grep -aE "\[ahci\]|\[initramfs\] Loaded|Persistent storage|ALL TESTS PASSED|TESTS FAILED" "$SERIAL2" | head -30
 echo "---------------------------------"
+check_msi "$SERIAL2" 1
 if [ "$timed_out" = "1" ]; then
     note "FAIL: boot 2 timed out"
     rc=1

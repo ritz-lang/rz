@@ -20,6 +20,7 @@ import syscall.errno { Errno }
 import drivers.pci { pci_print_all_devices }
 import drivers.msix { msix_print_all, msix_vector_alloc, msix_vector_count }
 import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_ring1_vector, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
+import drivers.ahci.ahci { ahci_enable_msi, ahci_msi_read_check, ahci_irq_count, ahci_irq_wait_count, ahci_irq_missed_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop, rdtsc }
 import tty.console { tty_console_irq, tty_console_get_flags, tty_console_set_flags }
@@ -2440,6 +2441,24 @@ fn nvme_msix_check()
     klog_dec(idle_halts)
     klog("\n")
 
+# Switch the AHCI controllers ahci_probe drove (polled: the APIC was not up
+# yet) to their one MSI message, then read each disk polled and again with
+# interrupts on, so those commands wait on the vector (AGAST #4885). Logs
+#   [ahci] msi interrupts: N, commands waited: W, completions without one: M
+# tools/test_ahci_boot.sh wants N > 0, W > 0 and M = 0, on a plain q35 boot
+# and through interrupt remapping.
+fn ahci_msi_check()
+    if ahci_enable_msi() == 0
+        return
+    ahci_msi_read_check()
+    klog("[ahci] msi interrupts: ")
+    klog_dec(ahci_irq_count())
+    klog(", commands waited: ")
+    klog_dec(ahci_irq_wait_count())
+    klog(", completions without one: ")
+    klog_dec(ahci_irq_missed_count())
+    klog("\n")
+
 fn virtio_blk_check()
     # Initialized early, for the initramfs; its read test is a boot-test
     # mode self-test (boot_self_tests)
@@ -2507,5 +2526,7 @@ pub fn postinit_diagnostics(run_net_selftests: bool, run_net_responder: bool)
         klog("[net] Network self-tests skipped: boot option \\harland\\net-selftest not set\n")
 
     nvme_msix_check()
+
+    ahci_msi_check()
 
     virtio_blk_check()
