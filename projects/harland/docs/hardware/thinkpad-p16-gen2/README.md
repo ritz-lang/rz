@@ -73,6 +73,49 @@ get `.dsl`.
 
 All ACPI table checksums are valid as committed (FACS has no checksum).
 
+## Harland driver map
+
+bangerang is **not a test-boot target**: booting it is too disruptive. The
+first real-hardware boot is chungus (the Acer), then the X99 desktop. This
+map says what harland would need here. Each device class maps to a harland
+driver (path under `kernel/src/`) or to the AGAST ticket that fills the gap.
+Mapped on main as of 2026-11-27.
+
+| Class | Device | Harland |
+|---|---|---|
+| Boot, initramfs | UEFI loader on a USB stick | `boot/` |
+| Display | GOP on the iGPU [8086:a788], 3840x2400 at 0x4000000000 | `drivers/display` maps and fills it; it draws **no text** |
+| Kernel log, panic screen, tty output | framebuffer (no serial connector, though `DBGP` names a 16550 at I/O 0x3f8) | gap: on-screen log + panic #4868 |
+| Keyboard, TrackPoint | i8042 PS/2, IRQ 1 under Linux (`PNP0F13` mouse in the DSDT) | gap: PS/2 #4869 |
+| USB | Intel xHCI [8086:7a60] 00:14.0; Thunderbolt xHCI [8086:1138] 48:00.0 | gap: USB epic #4860 (Thunderbolt is out of its scope) |
+| NVMe | Samsung PM9A1 [144d:a80a] 07:00.0, no VMD | `drivers/nvme` |
+| ACPI | XSDT, MADT, MCFG, FADT, `\_S5` | `drivers/acpi/tables.ritz` |
+| PCIe config | ECAM 0xc0000000, buses 0-255 | `drivers/pci.ritz`, `drivers/pci_ecam.ritz` |
+| Interrupts | x2APIC, 1 IOAPIC, MSI-X | `arch/x86_64/apic.ritz`, `drivers/msix.ritz` |
+| IOMMU | VT-d, `DMAR` | `drivers/iommu/vtd.ritz`, `dmar.ritz` (interrupt remapping) |
+| WiFi, Bluetooth | CNVi AX211 [8086:7a70], BT [8087:0033] on USB | none, not planned |
+| dGPU | NVIDIA AD104GLM [10de:27bb] 01:00.0 | none: ignore |
+| Audio | HDA [8086:7a50], [10de:22bc] | none |
+| Card reader | Realtek RTS5261 [10ec:5261] 0a:00.0 | none |
+| Thunderbolt 4 | Maple Ridge bridges, NHI [8086:1137] | none: firmware's tunnels only |
+| I2C, SPI, HECI, SMBus, DPTF | Serial IO and PCH functions | none, not needed |
+
+### Real-hardware risks
+
+- **SMP bring-up:** 28 threads on a hybrid part (8 P-cores with HT, 12
+  E-cores), APIC IDs 0-86, not contiguous. All fit xAPIC IDs, but harland
+  runs x2APIC when the CPU has it. The MADT also lists 4 entries with APIC
+  ID 255 and flags 0, which `cpu_map` skips. P- and E-cores differ in speed,
+  so per-CPU timings differ.
+- **Timer calibration.** Raptor Lake has CPUID 0x15 with a crystal
+  frequency, so `tsc_calibrate` should not need the PIT. HPET is at
+  0xfed00000.
+- **S0ix ("modern standby")** is the only low-power state firmware
+  advertises (`LOW_POWER_S0_IDLE_CAPABLE`); power-off through `\_S5` is
+  separate and still applies.
+- **Framebuffer size.** 3840x2400x4 is 35 MiB of uncached device memory; see
+  the X99 README.
+
 ## What's missing
 
 What Linux could not show, or what the Linux capture did not include. The
