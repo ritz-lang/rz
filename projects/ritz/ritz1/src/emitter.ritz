@@ -71,11 +71,12 @@ fn method_returns_named_struct(method: *FnDef) -> bool
 
 # AGAST #3147: a tail in a `-> S` method is a copy into the return slot, as
 # `return e` is (#2996), so a whole struct element (`p[i]`, `(*r)[i]`) is
-# loaded rather than refused.  emit_struct_copy's `ty` for that tail.
-fn method_tail_copy_type(method: *FnDef) -> TypeKind
+# loaded rather than refused, and a tail `@g` into a `-> [T]` is the Span
+# (AGAST #4899).  Any other tail is emitted as a value.
+fn method_tail_value(s: *EmitterState, method: *FnDef, e: *Expr) -> i32
     if method_returns_named_struct(method)
-        return TypeKind.Struct
-    TypeKind.Void
+        return ret_struct_copy(s, e, method.return_type_name)
+    emit_struct_copy(s, e, TypeKind.Void)
 
 # The span of a body's last statement: the value an implicit return returns.
 fn body_tail_span(body: *Stmt) -> SrcSpan
@@ -874,12 +875,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                         emit_llvm_type_struct(s, TypeKind.Struct, s.fcx.ret_type_name)
                         format_into(s, " %.{val}\n")
                 else if s.fcx.ret_sret == 1
-                    emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TypeKind.Struct))   # AGAST #1730
+                    emit_sret_ret_value(s, ret_struct_copy(s, stmt.expr, s.fcx.ret_type_name))   # AGAST #1730
                 else
                     # Function call or other expression returning struct.
                     # AGAST #1643: a tail `"..."` is a %Span$u8; coerce it to a
                     # %StrView return the way `return "..."` does (#168).
-                    let val: i32 = emit_struct_copy(s, stmt.expr, TypeKind.Struct)
+                    # AGAST #4899: a tail `@g` into a `-> [T]` is the Span.
+                    let val: i32 = ret_struct_copy(s, stmt.expr, s.fcx.ret_type_name)
                     let ret_reg: i32 = coerce_struct_ret_value(s, stmt.expr, val, s.fcx.ret_type_name)
                     format_into(s, "  ret ")
                     emit_llvm_type_struct(s, TypeKind.Struct, s.fcx.ret_type_name)
@@ -1220,7 +1222,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                 # shares its name with a sibling branch's `let`, #1755.)
                 # LARB R43 (#3385): a tail if / match of an `-> f64` fn is a float slot.
                 set_match_float_hint(s, stmt.expr, method.return_type, method.return_type_name)
-                let tail_raw: i32 = emit_struct_copy(s, stmt.expr, method_tail_copy_type(method))
+                let tail_raw: i32 = method_tail_value(s, method, stmt.expr)
                 let tail_i64: i32 = ptr_slot_value(s, method.return_type, stmt.expr, tail_raw)
                 let tail_ptr: i32 = mut_ref_slot_value(s, method.return_type, stmt.expr, tail_i64)   # AGAST #2391
                 # AGAST #2074: a `1.0` tail in an `-> f32` method is fptrunc'd.

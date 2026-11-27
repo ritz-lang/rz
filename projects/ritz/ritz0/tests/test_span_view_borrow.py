@@ -75,6 +75,9 @@ REFUSED = {
                            returns_local("v")),
     "return_an_array_view": ("fn f() -> Span<i32>\n    var a: [3]i32 = [1, 2, 3]\n    return ^@a\n",
                              returns_local("a")),
+    # AGAST #4899: a tail `@a` is the same return.
+    "tail_an_array_view": ("fn f() -> Span<i32>\n    var a: [3]i32 = [1, 2, 3]\n    ^@a\n",
+                           returns_local("a")),
     "move_a_borrowed_vec": ("fn f()\n    var v: Vec<T> = vec_new<T>()\n    let p = @v\n"
                             "    let w = ^v\n", _held("v", "v", "move")),
     # R2's binding hop: a Span `let` holding a view of a local.
