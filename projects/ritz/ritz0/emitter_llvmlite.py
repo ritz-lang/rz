@@ -5466,8 +5466,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # cycle-breaking externs) and `fn f()`'s body takes the first
         # declaration's type, so a `void` extern turned the body's
         # `ret i32 0` into invalid IR. The caller discards the i32, so a C
-        # or asm `void` callee is still called correctly.
-        ret_type = self._ritz_type_to_llvm(extern.ret_type) if extern.ret_type else self.i32
+        # or asm `void` callee is still called correctly. `-> void` is the
+        # same procedure (#4652): _ret_llvm lowers both spellings.
+        ret_type = self._ret_llvm(extern.ret_type)
 
         fn_type = ir.FunctionType(ret_type, param_types)
 
@@ -5567,7 +5568,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         # Build function type - use _param_to_llvm_type for RERITZ Borrow support
         param_types = [self._param_to_llvm_type(p) for p in fn_def.params]
-        ret_type = self._ritz_type_to_llvm(fn_def.ret_type) if fn_def.ret_type else self.i32
+        ret_type = self._ret_llvm(fn_def.ret_type)
 
         self._refuse_huge_byval(fn_def.params, param_types)   # AGAST #3668
         # AGAST #1736: large struct returns become an sret parameter.
@@ -5741,7 +5742,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
     def _emit_function_body_inner(self, fn_def: rast.FnDef) -> ir.Function:
         fn, _ = self.functions[fn_def.name]
-        ret_type = self._ritz_type_to_llvm(fn_def.ret_type) if fn_def.ret_type else self.i32
+        ret_type = self._ret_llvm(fn_def.ret_type)
 
         # A generic's instance is emitted in every object that uses it, so
         # each object's copy is its own: internal (AGAST #4609).  It was
@@ -6056,6 +6057,17 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         so `fn(i64) -> void` is a procedure exactly as `fn(i64)` is."""
         return declared is not None and not (
             isinstance(declared, rast.NamedType) and declared.name == 'void')
+
+    def _ret_llvm(self, declared: rast.Type | None) -> ir.Type:
+        """The LLVM return type of a fn or extern declaring `declared`.
+
+        A procedure (no return type, or `-> void`) is `i32` with a dummy
+        return, one lowering for both spellings and both an `extern fn` and
+        a definition (AGAST #4625, #4652): `void` alone lowers to `i8`, so
+        `extern fn f() -> void` beside `fn f()` mismatched."""
+        if not self._ret_is_a_value(declared):
+            return self.i32
+        return self._ritz_type_to_llvm(declared)
 
     @staticmethod
     def _is_procedure(fn_def: Optional[rast.FnDef]) -> bool:
