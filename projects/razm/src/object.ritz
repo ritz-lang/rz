@@ -1,5 +1,656 @@
 # Object: the ELF64 relocatable writer, holding sections, symbols, COMDAT
-# groups and fixups. DESIGN.md "Object contract".
+# groups and fixups (DESIGN.md "Library", "Object contract").
+#
+# A PC-relative or PLT fixup to a local symbol in its own section is applied
+# to the bytes. Every other fixup is a RELA relocation: against the section
+# symbol plus the target's offset when the target is a defined local, else
+# against the target itself.
+import ritzlib.errno { Errno }
+import ritzlib.fs { write_file }
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.hashmap { HashMap, hashmap_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.span { Bytes, Span, span_empty, span_from_vec }
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import razm.fixup { Fixup, FixupKind }
 
 pub const ELF_ET_REL: u16 = 1
 pub const ELF_EM_X86_64: u16 = 62
+
+const EHDR_SIZE: i64 = 64
+const SHDR_SIZE: i64 = 64
+const SYM_SIZE: i64 = 24
+const RELA_SIZE: i64 = 24
+
+const SHT_PROGBITS: i64 = 1
+const SHT_SYMTAB: i64 = 2
+const SHT_STRTAB: i64 = 3
+const SHT_RELA: i64 = 4
+const SHT_NOBITS: i64 = 8
+const SHT_GROUP: i64 = 17
+
+const SHF_WRITE: i64 = 0x1
+const SHF_ALLOC: i64 = 0x2
+const SHF_EXECINSTR: i64 = 0x4
+const SHF_INFO_LINK: i64 = 0x40
+const SHF_GROUP: i64 = 0x200
+
+const SHN_ABS: i64 = 0xfff1
+const SHN_LORESERVE: i64 = 0xff00
+const GRP_COMDAT: i64 = 1
+
+const STB_LOCAL: i64 = 0
+const STB_GLOBAL: i64 = 1
+const STB_WEAK: i64 = 2
+const STT_NOTYPE: i64 = 0
+const STT_OBJECT: i64 = 1
+const STT_FUNC: i64 = 2
+const STT_SECTION: i64 = 3
+
+const R_X86_64_64: i64 = 1
+const R_X86_64_PC32: i64 = 2
+const R_X86_64_PLT32: i64 = 4
+const R_X86_64_32: i64 = 10
+const R_X86_64_32S: i64 = 11
+const R_X86_64_16: i64 = 12
+const R_X86_64_PC16: i64 = 13
+const R_X86_64_8: i64 = 14
+const R_X86_64_PC8: i64 = 15
+const R_X86_64_PC64: i64 = 24
+const R_X86_64_REX_GOTPCRELX: i64 = 42
+
+# Symbol.section for a symbol with no section.
+const UNDEFINED: i64 = -1
+const ABSOLUTE: i64 = -2
+
+pub enum SectionKind
+    Progbits
+    Nobits      # SHT_NOBITS: a size, no file bytes
+
+pub struct SectionFlags
+    alloc: bool
+    write: bool
+    exec: bool
+
+pub enum Binding
+    Local
+    Global
+    Weak
+
+pub enum SymbolType
+    NoType
+    Data        # STT_OBJECT
+    Func
+
+pub enum ObjectError
+    DuplicateSection
+    DuplicateSymbol
+    BadAlignment            # not a power of two
+    NegativeSize
+    NobitsData              # a non-zero byte for a NOBITS section
+    NoRelocation            # no relocation type has this kind and width
+    FixupOutsideSection
+    FixupOverflow           # a resolved value does not fit its field
+    UndefinedLabel          # a `.L` symbol that is used and never defined
+    TooManySections
+    Io(Errno)
+
+pub struct SectionId
+    index: i64
+
+struct Section
+    name: String
+    kind: SectionKind
+    flags: SectionFlags
+    align: i64
+    data: Vec<u8>   # empty for NOBITS
+    size: i64
+    group: i64      # index in Object.groups, or -1
+
+struct Symbol
+    name: String
+    section: i64    # a section index, UNDEFINED or ABSOLUTE
+    value: i64
+    size: i64
+    binding: Binding
+    stype: SymbolType
+    referenced: bool
+
+struct SectionFixup
+    section: i64
+    at: i64         # the field's offset in the section
+    width: i64
+    kind: FixupKind
+    symbol: i64
+    addend: i64
+
+struct Group
+    signature: i64  # symbol index
+
+# A fixup left for the linker, in `section` at `at`. It is against symbol
+# `symbol`, or when that is -1 against the section symbol of `via`, with the
+# target's offset already in `addend`.
+struct Reloc
+    section: i64
+    at: i64
+    rtype: i64
+    symbol: i64
+    via: i64
+    addend: i64
+
+pub struct Object
+    sections: Vec<Section>
+    symbols: Vec<Symbol>
+    by_name: HashMap<StrView, i64>  # keys view each Symbol's own name
+    fixups: Vec<SectionFixup>
+    groups: Vec<Group>
+
+# A Vec frees its buffer, not its elements: each Section's and Symbol's own
+# buffers are dropped here, as they are popped.
+impl Drop for Object
+    fn drop(self: @&Object)
+        while self.sections.len > 0
+            self.sections.pop()
+        while self.symbols.len > 0
+            self.symbols.pop()
+
+pub fn object_new() -> Object
+    Object {
+        sections: vec_new<Section>(),
+        symbols: vec_new<Symbol>(),
+        by_name: hashmap_new<StrView, i64>(),
+        fixups: vec_new<SectionFixup>(),
+        groups: vec_new<Group>()
+    }
+
+# The ELF relocation type for a field, or None when there is none.
+fn reloc_type(kind: FixupKind, width: i64) -> Option<i64>
+    match kind
+        Absolute =>
+            if width == 1
+                return Some(R_X86_64_8)
+            if width == 2
+                return Some(R_X86_64_16)
+            if width == 4
+                return Some(R_X86_64_32)
+            if width == 8
+                return Some(R_X86_64_64)
+            None
+        AbsoluteSigned => if width == 4 then Some(R_X86_64_32S) else None
+        PcRelative =>
+            if width == 1
+                return Some(R_X86_64_PC8)
+            if width == 2
+                return Some(R_X86_64_PC16)
+            if width == 4
+                return Some(R_X86_64_PC32)
+            if width == 8
+                return Some(R_X86_64_PC64)
+            None
+        Plt => if width == 4 then Some(R_X86_64_PLT32) else None
+        GotPcRelx => if width == 4 then Some(R_X86_64_REX_GOTPCRELX) else None
+
+# Whether the fixup is applied here when its target is a local in its section.
+fn resolves_locally(kind: FixupKind) -> bool
+    match kind
+        PcRelative => true
+        Plt => true
+        Absolute => false
+        AbsoluteSigned => false
+        GotPcRelx => false
+
+# Whether `v` fits a signed field of `width` bytes.
+fn fits_signed(v: i64, width: i64) -> bool
+    if width >= 8
+        return true
+    let half: i64 = 1 << (width * 8 - 1)
+    v >= 0 - half and v < half
+
+fn is_power_of_two(n: i64) -> bool
+    n > 0 and (n & (n - 1)) == 0
+
+fn binding_bits(b: Binding) -> i64
+    match b
+        Local => STB_LOCAL
+        Global => STB_GLOBAL
+        Weak => STB_WEAK
+
+fn type_bits(t: SymbolType) -> i64
+    match t
+        NoType => STT_NOTYPE
+        Data => STT_OBJECT
+        Func => STT_FUNC
+
+fn section_flag_bits(f: SectionFlags) -> i64
+    var bits: i64 = 0
+    if f.alloc
+        bits = bits | SHF_ALLOC
+    if f.write
+        bits = bits | SHF_WRITE
+    if f.exec
+        bits = bits | SHF_EXECINSTR
+    bits
+
+# Little-endian appends and patches.
+fn push_le(out: @&Vec<u8>, v: i64, width: i64)
+    for i in 0..width
+        out.push(((v >> (i * 8)) & 0xff) as u8)
+
+fn patch_le(out: @&Vec<u8>, at: i64, v: i64, width: i64)
+    for i in 0..width
+        out[at + i] = ((v >> (i * 8)) & 0xff) as u8
+
+fn pad_to(out: @&Vec<u8>, align: i64)
+    while out.len % align != 0
+        out.push(0)
+
+# Append `name` and its NUL to a string table; the name's offset in it.
+fn add_name(table: @&Vec<u8>, name: StrView) -> i64
+    let at: i64 = table.len
+    table.push_view(name)
+    table.push(0)
+    at
+
+fn push_shdr(out: @&Vec<u8>, h: Header)
+    push_le(out, h.name, 4)
+    push_le(out, h.stype, 4)
+    push_le(out, h.flags, 8)
+    push_le(out, 0, 8)          # sh_addr
+    push_le(out, h.offset, 8)
+    push_le(out, h.size, 8)
+    push_le(out, h.link, 4)
+    push_le(out, h.info, 4)
+    push_le(out, h.align, 8)
+    push_le(out, h.entsize, 8)
+
+fn push_sym(out: @&Vec<u8>, name: i64, bind: i64, stype: i64, shndx: i64, value: i64, size: i64)
+    push_le(out, name, 4)
+    out.push(((bind << 4) | stype) as u8)
+    out.push(0)                 # st_other: STV_DEFAULT
+    push_le(out, shndx, 2)
+    push_le(out, value, 8)
+    push_le(out, size, 8)
+
+# One section header, its body already in the file at `offset`.
+struct Header
+    name: i64       # offset in .shstrtab
+    stype: i64
+    flags: i64
+    link: i64
+    info: i64
+    align: i64
+    entsize: i64
+    offset: i64
+    size: i64
+
+# Append `body` to the file at `align`; the header of the section it is.
+fn header(out: @&Vec<u8>, name: i64, stype: i64, flags: i64, link: i64, info: i64, align: i64, entsize: i64, body: Span<u8>) -> Header
+    pad_to(out, align)
+    let offset: i64 = out.len
+    out.push_span(body)
+    Header { name: name, stype: stype, flags: flags, link: link, info: info, align: align, entsize: entsize, offset: offset, size: body.len }
+
+impl Object
+    # A new, empty section. Its alignment starts at 1.
+    pub fn add_section(self: @&Object, name: StrView, kind: SectionKind, flags: SectionFlags) -> Result<SectionId, ObjectError>
+        match self.find_section(name)
+            Some(_) => return Err(ObjectError.DuplicateSection)
+            None => pass
+        self.sections.push(Section {
+            name: string_from(name),
+            kind: kind,
+            flags: flags,
+            align: 1,
+            data: vec_new<u8>(),
+            size: 0,
+            group: -1
+        })
+        Ok(SectionId { index: self.sections.len - 1 })
+
+    # A new section in the COMDAT group whose signature is the symbol
+    # `signature`; the group is made by the first section that names it.
+    # The section and its relocations carry SHF_GROUP.
+    pub fn add_group_section(self: @&Object, name: StrView, kind: SectionKind, flags: SectionFlags, signature: StrView) -> Result<SectionId, ObjectError>
+        let id: SectionId = self.add_section(name, kind, flags)?
+        let sig: i64 = self.symbol(signature)
+        self.sym_mut(sig).referenced = true
+        var group: i64 = -1
+        for g in 0..self.groups.len
+            if self.groups[g].signature == sig
+                group = g
+        if group < 0
+            self.groups.push(Group { signature: sig })
+            group = self.groups.len - 1
+        self.sec_mut(id.index).group = group
+        Ok(id)
+
+    pub fn find_section(self: @Object, name: StrView) -> Option<SectionId>
+        for i in 0..self.sections.len
+            let s: @Section = self.sec(i)
+            if s.name.as_view().eq(name)
+                return Some(SectionId { index: i })
+        None
+
+    # The section's size: its bytes, or a NOBITS section's reserved space.
+    pub fn size(self: @Object, sec: SectionId) -> i64
+        self.sec(sec.index).size
+
+    # Append `bytes`; the offset they start at. A NOBITS section takes only
+    # zero bytes, as space.
+    pub fn emit(self: @&Object, sec: SectionId, bytes: Span<u8>) -> Result<i64, ObjectError>
+        let at: i64 = self.sec(sec.index).size
+        if self.sec(sec.index).kind == SectionKind.Nobits
+            for i in 0..bytes.len
+                if bytes[i] != 0
+                    return Err(ObjectError.NobitsData)
+        else
+            self.sec_mut(sec.index).data.push_span(bytes)
+        self.sec_mut(sec.index).size = at + bytes.len
+        Ok(at)
+
+    # Append `n` zero bytes; the offset they start at.
+    pub fn reserve(self: @&Object, sec: SectionId, n: i64) -> Result<i64, ObjectError>
+        if n < 0
+            return Err(ObjectError.NegativeSize)
+        let at: i64 = self.sec(sec.index).size
+        if self.sec(sec.index).kind == SectionKind.Progbits
+            for i in 0..n
+                self.sec_mut(sec.index).data.push(0)
+        self.sec_mut(sec.index).size = at + n
+        Ok(at)
+
+    # Raise the section's alignment to `align` bytes, a power of two. The
+    # alignment is the largest asked for; padding is the caller's to emit.
+    pub fn raise_align(self: @&Object, sec: SectionId, align: i64) -> Result<(), ObjectError>
+        if not is_power_of_two(align)
+            return Err(ObjectError.BadAlignment)
+        if align > self.sec(sec.index).align
+            self.sec_mut(sec.index).align = align
+        Ok(())
+
+    # The index of symbol `name`, made undefined, local and untyped if new.
+    fn symbol(self: @&Object, name: StrView) -> i64
+        match self.by_name.get(name)
+            Some(i) => return i
+            None => pass
+        self.symbols.push(Symbol {
+            name: string_from(name),
+            section: UNDEFINED,
+            value: 0,
+            size: 0,
+            binding: Binding.Local,
+            stype: SymbolType.NoType,
+            referenced: false
+        })
+        let i: i64 = self.symbols.len - 1
+        self.by_name.insert(self.sym(i).name.as_view(), i)
+        i
+
+    # Define `name` at `value` in `sec`. A name starting `.L` is an
+    # assembler label: it is not written unless a relocation needs it.
+    pub fn define(self: @&Object, name: StrView, sec: SectionId, value: i64) -> Result<(), ObjectError>
+        self.place(name, sec.index, value)
+
+    # Define `name` as the absolute `value` (SHN_ABS).
+    pub fn define_absolute(self: @&Object, name: StrView, value: i64) -> Result<(), ObjectError>
+        self.place(name, ABSOLUTE, value)
+
+    fn place(self: @&Object, name: StrView, section: i64, value: i64) -> Result<(), ObjectError>
+        let i: i64 = self.symbol(name)
+        if self.sym(i).section != UNDEFINED
+            return Err(ObjectError.DuplicateSymbol)
+        self.sym_mut(i).section = section
+        self.sym_mut(i).value = value
+        Ok(())
+
+    # Symbols start Local. An undefined symbol is written as an undefined
+    # Global reference (Weak stays Weak), whatever its binding.
+    pub fn set_binding(self: @&Object, name: StrView, binding: Binding)
+        let i: i64 = self.symbol(name)
+        self.sym_mut(i).binding = binding
+
+    pub fn set_type(self: @&Object, name: StrView, stype: SymbolType)
+        let i: i64 = self.symbol(name)
+        self.sym_mut(i).stype = stype
+
+    pub fn set_size(self: @&Object, name: StrView, size: i64)
+        let i: i64 = self.symbol(name)
+        self.sym_mut(i).size = size
+
+    # Record `f` for the instruction or datum at offset `at` of `sec`; the
+    # field is at `at + f.offset` and must already be emitted.
+    pub fn add_fixup(self: @&Object, sec: SectionId, at: i64, f: Fixup) -> Result<(), ObjectError>
+        match reloc_type(f.kind, f.width)
+            Some(_) => pass
+            None => return Err(ObjectError.NoRelocation)
+        let field: i64 = at + f.offset
+        let s: @Section = self.sec(sec.index)
+        if s.kind == SectionKind.Nobits or field < 0 or field + f.width > s.size
+            return Err(ObjectError.FixupOutsideSection)
+        let sym: i64 = self.symbol(f.target)
+        self.sym_mut(sym).referenced = true
+        self.fixups.push(SectionFixup {
+            section: sec.index,
+            at: field,
+            width: f.width,
+            kind: f.kind,
+            symbol: sym,
+            addend: f.addend
+        })
+        Ok(())
+
+    # The section and symbol tables' elements own buffers, so they are
+    # borrowed in place, never read out by value.
+    fn sec(self: @Object, i: i64) -> @Section
+        let p: *Section = span_from_vec<Section>(@self.sections).get_ptr(i)
+        @*p
+
+    fn sym(self: @Object, i: i64) -> @Symbol
+        let p: *Symbol = span_from_vec<Symbol>(@self.symbols).get_ptr(i)
+        @*p
+
+    fn sec_mut(self: @&Object, i: i64) -> @&Section
+        let p: *Section = self.sections.get_ptr(i)
+        @&*p
+
+    fn sym_mut(self: @&Object, i: i64) -> @&Symbol
+        let p: *Symbol = self.symbols.get_ptr(i)
+        @&*p
+
+    fn is_label(self: @Object, sym: i64) -> bool
+        let s: @Symbol = self.sym(sym)
+        s.name.as_view().starts_with(".L")
+
+    # Whether the symbol is written as STB_LOCAL.
+    fn is_local(self: @Object, sym: i64) -> bool
+        self.sym(sym).section != UNDEFINED and self.sym(sym).binding == Binding.Local
+
+    # Apply the fixups that resolve here to `data` (each section's bytes, in
+    # order, back to back from `base`), and return the rest as relocations.
+    fn resolve(self: @Object, data: @&Vec<u8>, base: @Vec<i64>) -> Result<Vec<Reloc>, ObjectError>
+        var relocs: Vec<Reloc> = vec_new<Reloc>()
+        for i in 0..self.fixups.len
+            let f: @SectionFixup = @self.fixups[i]
+            let t: @Symbol = self.sym(f.symbol)
+            if t.section == UNDEFINED and self.is_label(f.symbol)
+                return Err(ObjectError.UndefinedLabel)
+            let local: bool = self.is_local(f.symbol)
+            if local and t.section == f.section and resolves_locally(f.kind)
+                let v: i64 = t.value + f.addend - f.at
+                if not fits_signed(v, f.width)
+                    return Err(ObjectError.FixupOverflow)
+                patch_le(data, base[f.section] + f.at, v, f.width)
+                continue
+            let rtype: i64 = match reloc_type(f.kind, f.width)
+                Some(r) => r
+                None => return Err(ObjectError.NoRelocation)
+            # A defined local goes through its section's symbol.
+            let via_section: bool = local and t.section >= 0
+            relocs.push(Reloc {
+                section: f.section,
+                at: f.at,
+                rtype: rtype,
+                symbol: if via_section then -1 else f.symbol,
+                via: t.section,
+                addend: if via_section then t.value + f.addend else f.addend
+            })
+        Ok(relocs)
+
+    # The whole object file.
+    pub fn to_bytes(self: @Object) -> Result<Vec<u8>, ObjectError>
+        let nsec: i64 = self.sections.len
+        # Every section's bytes, back to back, so resolved fixups patch them.
+        var data: Vec<u8> = vec_new<u8>()
+        var base: Vec<i64> = vec_new<i64>()
+        for i in 0..nsec
+            base.push(data.len)
+            data.push_span(span_from_vec<u8>(@self.sec(i).data))
+        let relocs: Vec<Reloc> = self.resolve(@&data, @base)?
+
+        var has_rela: Vec<bool> = vec_new<bool>()
+        for i in 0..nsec
+            has_rela.push(false)
+        for r in 0..relocs.len
+            has_rela[relocs[r].section] = true
+
+        # Header indices: null, the groups, each section then its .rela,
+        # then .symtab, .strtab, .shstrtab.
+        var shndx: Vec<i64> = vec_new<i64>()
+        var rela_index: Vec<i64> = vec_new<i64>()
+        var next: i64 = 1 + self.groups.len
+        for i in 0..nsec
+            shndx.push(next)
+            next += 1
+            rela_index.push(if has_rela[i] then next else -1)
+            if has_rela[i]
+                next += 1
+        let symtab_index: i64 = next
+        let strtab_index: i64 = next + 1
+        let shstrtab_index: i64 = next + 2
+        let shnum: i64 = next + 3
+        if shnum >= SHN_LORESERVE
+            return Err(ObjectError.TooManySections)
+
+        # Which symbols are written: any not a `.L` label, and a label a
+        # relocation names itself.
+        var written: Vec<bool> = vec_new<bool>()
+        for s in 0..self.symbols.len
+            let sym: @Symbol = self.sym(s)
+            let undefined_unused: bool = sym.section == UNDEFINED and not sym.referenced and sym.binding == Binding.Local
+            written.push(not self.is_label(s) and not undefined_unused)
+        for r in 0..relocs.len
+            if relocs[r].symbol >= 0
+                written[relocs[r].symbol] = true
+
+        # Symbol indices: null, one section symbol per section, the locals,
+        # then the globals; sh_info is the first global.
+        var strtab: Vec<u8> = vec_new<u8>()
+        strtab.push(0)
+        var symtab: Vec<u8> = vec_new<u8>()
+        push_sym(@&symtab, 0, 0, 0, 0, 0, 0)
+        for i in 0..nsec
+            push_sym(@&symtab, 0, STB_LOCAL, STT_SECTION, shndx[i], 0, 0)
+        var sym_index: Vec<i64> = vec_new<i64>()
+        for s in 0..self.symbols.len
+            sym_index.push(-1)
+        var count: i64 = 1 + nsec
+        var first_global: i64 = 0
+        for pass_globals in 0..2
+            if pass_globals == 1
+                first_global = count
+            for s in 0..self.symbols.len
+                let this_pass: bool = if pass_globals == 0 then self.is_local(s) else not self.is_local(s)
+                if written[s] and this_pass
+                    let sym: @Symbol = self.sym(s)
+                    var bind: i64 = binding_bits(sym.binding)
+                    var where: i64 = 0
+                    if sym.section == UNDEFINED
+                        if bind == STB_LOCAL
+                            bind = STB_GLOBAL
+                    else if sym.section == ABSOLUTE
+                        where = SHN_ABS
+                    else
+                        where = shndx[sym.section]
+                    let name: i64 = add_name(@&strtab, sym.name.as_view())
+                    push_sym(@&symtab, name, bind, type_bits(sym.stype), where, sym.value, sym.size)
+                    sym_index[s] = count
+                    count += 1
+
+        # The file: the ELF header, each body at its alignment as its header
+        # is made, then the section header table.
+        var out: Vec<u8> = vec_new<u8>()
+        for i in 0..EHDR_SIZE
+            out.push(0)
+        var shstrtab: Vec<u8> = vec_new<u8>()
+        shstrtab.push(0)
+        var headers: Vec<Header> = vec_new<Header>()
+        for g in 0..self.groups.len
+            var body: Vec<u8> = vec_new<u8>()
+            push_le(@&body, GRP_COMDAT, 4)
+            for i in 0..nsec
+                if self.sec(i).group == g
+                    push_le(@&body, shndx[i], 4)
+                    if has_rela[i]
+                        push_le(@&body, rela_index[i], 4)
+            let name: i64 = add_name(@&shstrtab, ".group")
+            let signature: i64 = sym_index[self.groups[g].signature]
+            headers.push(header(@&out, name, SHT_GROUP, 0, symtab_index, signature, 4, 4, span_from_vec<u8>(@body)))
+        for i in 0..nsec
+            let s: @Section = self.sec(i)
+            let grouped: i64 = if s.group >= 0 then SHF_GROUP else 0
+            let flags: i64 = section_flag_bits(s.flags) | grouped
+            let name: i64 = add_name(@&shstrtab, s.name.as_view())
+            if s.kind == SectionKind.Nobits
+                var h: Header = header(@&out, name, SHT_NOBITS, flags, 0, 0, s.align, 0, span_empty<u8>())
+                h.size = s.size
+                headers.push(h)
+            else
+                let bytes: Span<u8> = span_from_vec<u8>(@data).slice(base[i], base[i] + s.size)
+                headers.push(header(@&out, name, SHT_PROGBITS, flags, 0, 0, s.align, 0, bytes))
+            if has_rela[i]
+                var rela: Vec<u8> = vec_new<u8>()
+                for r in 0..relocs.len
+                    let rel: @Reloc = @relocs[r]
+                    if rel.section == i
+                        let target: i64 = if rel.symbol < 0 then 1 + rel.via else sym_index[rel.symbol]
+                        push_le(@&rela, rel.at, 8)
+                        push_le(@&rela, (target << 32) | rel.rtype, 8)
+                        push_le(@&rela, rel.addend, 8)
+                var rname: String = string_from(".rela")
+                rname.push_str(s.name.as_view())
+                let rn: i64 = add_name(@&shstrtab, rname.as_view())
+                headers.push(header(@&out, rn, SHT_RELA, SHF_INFO_LINK | grouped, symtab_index, shndx[i], 8, RELA_SIZE, span_from_vec<u8>(@rela)))
+        let symtab_name: i64 = add_name(@&shstrtab, ".symtab")
+        headers.push(header(@&out, symtab_name, SHT_SYMTAB, 0, strtab_index, first_global, 8, SYM_SIZE, span_from_vec<u8>(@symtab)))
+        let strtab_name: i64 = add_name(@&shstrtab, ".strtab")
+        headers.push(header(@&out, strtab_name, SHT_STRTAB, 0, 0, 0, 1, 0, span_from_vec<u8>(@strtab)))
+        let shstrtab_name: i64 = add_name(@&shstrtab, ".shstrtab")
+        headers.push(header(@&out, shstrtab_name, SHT_STRTAB, 0, 0, 0, 1, 0, span_from_vec<u8>(@shstrtab)))
+
+        pad_to(@&out, 8)
+        let shoff: i64 = out.len
+        push_shdr(@&out, Header { name: 0, stype: 0, flags: 0, link: 0, info: 0, align: 0, entsize: 0, offset: 0, size: 0 })
+        for h in 0..headers.len
+            push_shdr(@&out, headers[h])
+
+        let ident: [8]u8 = [0x7f, 'E', 'L', 'F', 2, 1, 1, 0]  # ELFCLASS64, ELFDATA2LSB, EV_CURRENT, SysV
+        for i in 0..8
+            out[i] = ident[i]
+        patch_le(@&out, 16, ELF_ET_REL as i64, 2)
+        patch_le(@&out, 18, ELF_EM_X86_64 as i64, 2)
+        patch_le(@&out, 20, 1, 4)               # e_version
+        patch_le(@&out, 40, shoff, 8)
+        patch_le(@&out, 52, EHDR_SIZE, 2)
+        patch_le(@&out, 58, SHDR_SIZE, 2)
+        patch_le(@&out, 60, shnum, 2)
+        patch_le(@&out, 62, shstrtab_index, 2)
+        Ok(out)
+
+    # Write the object to `path`; the number of bytes written.
+    pub fn write(self: @Object, path: StrView) -> Result<i64, ObjectError>
+        let bytes: Vec<u8> = self.to_bytes()?
+        match write_file(path, span_from_vec<u8>(@bytes).as_strview())
+            Ok(n) => Ok(n)
+            Err(e) => Err(ObjectError.Io(e))
