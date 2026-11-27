@@ -1,0 +1,205 @@
+# compile: a parsed module to one relocatable object (DESIGN.md "Object
+# contract"). Globals go to .rodata, .data or .bss; functions to .text, or a
+# COMDAT function to its own .text.<name> in the group named for it. Symbol
+# bindings follow the linkage table; available_externally has no symbol and
+# no body.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.span { Span }
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import razm.fixup { Fixup, FixupKind }
+import razm.object { Binding, SectionId, SectionKind, SymbolType }
+import rllvm.ir
+import rllvm.layout
+import rllvm.gen
+import rllvm.inline_asm { decode_string }
+import rllvm.lower { FnLower, const_gep_offset, fn_lower, int_value, symbol_of }
+import rllvm.parse { Fail, FailKind }
+
+fn binding_of(l: Linkage) -> Binding
+    match l
+        Linkage.External => Binding.Global
+        Linkage.Internal => Binding.Local
+        Linkage.Private => Binding.Local
+        Linkage.Weak => Binding.Weak
+        Linkage.WeakOdr => Binding.Weak
+        Linkage.LinkonceOdr => Binding.Weak
+        Linkage.AvailableExternally => Binding.Global
+
+fn is_local_linkage(l: Linkage) -> bool
+    l == Linkage.Internal or l == Linkage.Private
+
+# Every byte of the constant is zero: it can live in .bss.
+fn is_zero(m: @Module, vid: i64) -> bool
+    let v: IrValue = m.values.get(vid)
+    match v.kind
+        ValueKind.Int => int_value(v.text) == 0
+        ValueKind.Null => true
+        ValueKind.Zero => true
+        ValueKind.Undef => true
+        ValueKind.Struct | ValueKind.Array | ValueKind.Vector =>
+            for i in 0..v.count
+                if not is_zero(m, m.value_lists.get(v.first + i))
+                    return false
+            true
+        ValueKind.Bytes =>
+            let b: String = decode_string(v.text)
+            for i in 0..b.len()
+                if b.get(i) != 0
+                    return false
+            true
+        _ => false
+
+# The constant holds an address: a relocation the loader may write, so it
+# never goes in .rodata.
+fn has_address(m: @Module, vid: i64) -> bool
+    let v: IrValue = m.values.get(vid)
+    match v.kind
+        ValueKind.Global => true
+        ValueKind.Gep => true
+        ValueKind.PtrToInt => true
+        ValueKind.Struct | ValueKind.Array | ValueKind.Vector =>
+            for i in 0..v.count
+                if has_address(m, m.value_lists.get(v.first + i))
+                    return true
+            false
+        _ => false
+
+# The symbol and addend a pointer constant names.
+struct Target
+    sym: StrView
+    addend: i64
+
+fn pointer_target(m: @Module, vid: i64, line: i64) -> Result<Target, Fail>
+    let v: IrValue = m.values.get(vid)
+    match v.kind
+        ValueKind.Global => Ok(Target { sym: symbol_of(v.text), addend: 0 })
+        ValueKind.Gep =>
+            let base: IrValue = m.values.get(m.value_lists.get(v.first))
+            if base.kind != ValueKind.Global
+                return Err(fail_unsupported(line, "constant getelementptr off a non-global"))
+            Ok(Target { sym: symbol_of(base.text), addend: const_gep_offset(m, v)? })
+        ValueKind.PtrToInt => pointer_target(m, m.value_lists.get(v.first), line)
+        _ => Err(fail_unsupported(line, "this pointer constant"))
+
+# Constant `vid` of type `ty` appended to `sec`. A pointer is eight zero
+# bytes and an R_X86_64_64 fixup, in every profile.
+fn emit_const(g: @&Gen, m: @Module, sec: SectionId, vid: i64, ty: i64, line: i64) -> Result<(), Fail>
+    let v: IrValue = m.values.get(vid)
+    let size: i64 = type_size(m, ty)
+    match v.kind
+        ValueKind.Int =>
+            let n: i64 = int_value(v.text)
+            var b: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+            for i in 0..8
+                b[i] = ((n >> (i * 8)) & 0xff) as u8
+            let all: [u8] = @b
+            g.bytes(sec, all.to(size))?
+            Ok(())
+        ValueKind.Null | ValueKind.Zero | ValueKind.Undef => g.zeros(sec, size)
+        ValueKind.Struct | ValueKind.Array =>
+            let start: i64 = g.obj.size(sec)
+            for i in 0..v.count
+                let e: Member = member(m, ty, i)
+                g.zeros(sec, start + e.offset - g.obj.size(sec))?
+                emit_const(g, m, sec, m.value_lists.get(v.first + i), e.ty, line)?
+            g.zeros(sec, start + size - g.obj.size(sec))
+        ValueKind.Bytes =>
+            let b: String = decode_string(v.text)
+            if b.len() != size
+                return Err(fail_malformed(line, "a c\"...\" constant's length differs from its type"))
+            g.bytes(sec, b.as_view().as_bytes())?
+            Ok(())
+        ValueKind.Global | ValueKind.Gep | ValueKind.PtrToInt =>
+            if size != 8
+                return Err(fail_unsupported(line, "a pointer constant narrower than 64 bits"))
+            let t: Target = pointer_target(m, vid, line)?
+            let at: i64 = g.obj.size(sec)
+            g.zeros(sec, 8)?
+            g.fixup(sec, at, Fixup { offset: 0, width: 8, kind: FixupKind.Absolute, target: t.sym, addend: t.addend })
+        _ => Err(fail_unsupported(line, "a float or vector constant in data"))
+
+fn emit_global(g: @&Gen, m: @Module, gl: Global) -> Result<(), Fail>
+    g.line = gl.line
+    if gl.init < 0 or gl.linkage == Linkage.AvailableExternally
+        return Ok(())
+    let name: StrView = symbol_of(gl.name)
+    let sa: SizeAlign = size_align(m, gl.ty)
+    let align: i64 = if gl.align > sa.align then gl.align else sa.align
+    var sec_name: StrView = ".data"
+    var kind: SectionKind = SectionKind.Progbits
+    var write: bool = true
+    if gl.is_const and not has_address(m, gl.init)
+        sec_name = ".rodata"
+        write = false
+    else if is_zero(m, gl.init)
+        sec_name = ".bss"
+        kind = SectionKind.Nobits
+    let sec: SectionId = g.section(sec_name, kind, write, false)?
+    g.raise_align(sec, align)?
+    let here: i64 = g.obj.size(sec)
+    let pad: i64 = round_up(here, align) - here
+    if kind == SectionKind.Nobits
+        g.reserve(sec, pad)?
+        g.reserve(sec, sa.size)?
+    else
+        g.zeros(sec, pad)?
+        emit_const(g, m, sec, gl.init, gl.ty, gl.line)?
+    g.define(name, sec, here + pad)?
+    g.obj.set_binding(name, binding_of(gl.linkage))
+    g.obj.set_type(name, SymbolType.Data)
+    g.obj.set_size(name, sa.size)
+    Ok(())
+
+fn emit_function(g: @&Gen, m: @Module, f: Function) -> Result<(), Fail>
+    g.line = f.line
+    let name: StrView = symbol_of(f.name)
+    if f.comdat
+        var sec_name = string_from(".text.")
+        sec_name.push_str(name)
+        g.sec = g.group_section(sec_name.as_view(), name)?
+    else
+        g.sec = g.section(".text", SectionKind.Progbits, false, true)?
+    g.raise_align(g.sec, 16)?
+    let nops: [16]u8 = [0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]
+    let fill: [u8] = @nops
+    let pad: i64 = round_up(g.here(), 16) - g.here()
+    if pad > 0
+        g.bytes(g.sec, fill.to(pad))?
+    let start: i64 = g.here()
+    g.define(name, g.sec, start)?
+    var fl: FnLower = fn_lower(m, f)
+    fl.lower(g)?
+    g.obj.set_binding(name, binding_of(f.linkage))
+    g.obj.set_type(name, SymbolType.Func)
+    g.obj.set_size(name, g.here() - start)
+    Ok(())
+
+fn defines(f: @Function) -> bool
+    not f.is_decl and f.linkage != Linkage.AvailableExternally
+
+# `m` lowered under `profile` and written to `out`.
+pub fn compile_module(m: @Module, profile: Profile, out: StrView) -> Result<(), Fail>
+    var g: Gen = gen_new(profile)
+    for i in 0..m.funcs.len
+        let f: Function = m.funcs.get(i)
+        if defines(@f) and is_local_linkage(f.linkage)
+            g.locals.insert(symbol_of(f.name), 1)
+    for i in 0..m.globals.len
+        let gl: Global = m.globals.get(i)
+        if gl.init >= 0 and is_local_linkage(gl.linkage)
+            g.locals.insert(symbol_of(gl.name), 1)
+    for i in 0..m.globals.len
+        emit_global(@&g, m, m.globals.get(i))?
+    for i in 0..m.funcs.len
+        let f: Function = m.funcs.get(i)
+        if defines(@f)
+            emit_function(@&g, m, f)?
+    match g.obj.write(out)
+        Ok(_) => Ok(())
+        Err(_) =>
+            var s = string_from("cannot write ")
+            s.push_str(out)
+            Err(Fail { kind: FailKind.Malformed, line: 0, what: s })

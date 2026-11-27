@@ -1,0 +1,217 @@
+# inline_asm: the text side of `call asm sideeffect` (DESIGN.md "Inline asm"):
+# the template's LLVM string decoded, the constraint list read, and `$$`,
+# `$N` and `${N}` substituted, giving razm-dialect text for razm's `parse`.
+#
+# This slice lowers pinned operands (`={reg}`, `=&{reg}`, `{reg}`), inputs
+# tied to an output, and every clobber: what the shims and ritz1's syscall and
+# trap blocks use. Unpinned `r` / `=&r` operands are #4806's.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import razm.encode { encode }
+import razm.emit { Encoded }
+import razm.parse { Item, Mode, Program, Stmt, parse }
+import rllvm.gen { Gen, fail_named }
+import rllvm.parse { Fail, FailKind }
+
+pub enum ConKind
+    Output
+    Input
+    Clobber
+
+pub struct Constraint
+    kind: ConKind
+    reg: i64            # the pinned GPR's number; -1 for a non-GPR clobber
+    tied: i64           # an input tied to that output's operand; else -1
+
+const ASM_GPR64: [16]StrView = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+const ASM_GPR32: [16]StrView = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
+                            "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"]
+const ASM_GPR16: [16]StrView = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di",
+                            "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"]
+const ASM_GPR8: [16]StrView = ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil",
+                           "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"]
+
+# The GPR a constraint names at any width (`rax`, `eax`, `ax`, `al`), or -1.
+pub fn gpr_number(name: StrView) -> i64
+    for i in 0..16
+        if ASM_GPR64[i].eq(name) or ASM_GPR32[i].eq(name) or ASM_GPR16[i].eq(name) or ASM_GPR8[i].eq(name)
+            return i
+    -1
+
+# The register's name at an operand `bytes` wide, for substitution.
+pub fn gpr_name(num: i64, bytes: i64) -> StrView
+    if bytes == 1
+        return ASM_GPR8[num]
+    if bytes == 2
+        return ASM_GPR16[num]
+    if bytes == 4
+        return ASM_GPR32[num]
+    ASM_GPR64[num]
+
+fn hex_digit(c: u8) -> i64
+    if c >= '0' and c <= '9'
+        return (c - '0') as i64
+    if c >= 'a' and c <= 'f'
+        return (c - 'a') as i64 + 10
+    if c >= 'A' and c <= 'F'
+        return (c - 'A') as i64 + 10
+    -1
+
+# The bytes of an LLVM string literal: `"..."` or `c"..."`, quotes included,
+# with `\XX` hex escapes and `\\`.
+pub fn decode_string(lit: StrView) -> String
+    var body: StrView = lit
+    if body.starts_with("c")
+        body = body.skip(1)
+    if body.len >= 2
+        body = body.skip(1).take(body.len - 2)
+    var out = string_from("")
+    var i: i64 = 0
+    while i < body.len
+        let c: u8 = body.get(i)
+        if c == '\\' and i + 1 < body.len and body.get(i + 1) == '\\'
+            out.push('\\')
+            i += 2
+        else if c == '\\' and i + 2 < body.len and hex_digit(body.get(i + 1)) >= 0 and hex_digit(body.get(i + 2)) >= 0
+            out.push((hex_digit(body.get(i + 1)) * 16 + hex_digit(body.get(i + 2))) as u8)
+            i += 3
+        else
+            out.push(c)
+            i += 1
+    out
+
+# `{name}` -> name; anything else -> "".
+fn braced(s: StrView) -> StrView
+    if s.len >= 2 and s.get(0) == '{' and s.get(s.len - 1) == '}'
+        return s.skip(1).take(s.len - 2)
+    ""
+
+fn all_digits(s: StrView) -> bool
+    if s.len == 0
+        return false
+    for i in 0..s.len
+        if s.get(i) < '0' or s.get(i) > '9'
+            return false
+    true
+
+fn digits_value(s: StrView) -> i64
+    var n: i64 = 0
+    for i in 0..s.len
+        n = n * 10 + (s.get(i) - '0') as i64
+    n
+
+fn clobber_ok(name: StrView) -> bool
+    name.eq("memory") or name.eq("dirflag") or name.eq("fpsr") or name.eq("flags") or name.eq("cc")
+
+# The constraint list (decoded). Err names the first constraint this slice
+# does not lower.
+pub fn parse_constraints(text: StrView) -> Result<Vec<Constraint>, String>
+    var out = vec_new<Constraint>()
+    var rest: StrView = text
+    while rest.len > 0
+        let comma: i64 = rest.find_byte(',')
+        let end: i64 = if comma < rest.len then comma else rest.len
+        let c: StrView = rest.take(end)
+        rest = if comma < rest.len then rest.skip(comma + 1) else ""
+        if c.starts_with("~")
+            let name: StrView = braced(c.skip(1))
+            let n: i64 = gpr_number(name)
+            if n < 0 and not clobber_ok(name)
+                return Err(constraint_error(c))
+            out.push(Constraint { kind: ConKind.Clobber, reg: n, tied: -1 })
+        else if c.starts_with("=")
+            var spec: StrView = c.skip(1)
+            if spec.starts_with("&")
+                spec = spec.skip(1)
+            let n: i64 = gpr_number(braced(spec))
+            if n < 0
+                return Err(constraint_error(c))
+            out.push(Constraint { kind: ConKind.Output, reg: n, tied: -1 })
+        else if all_digits(c)
+            out.push(Constraint { kind: ConKind.Input, reg: -1, tied: digits_value(c) })
+        else
+            let n: i64 = gpr_number(braced(c))
+            if n < 0
+                return Err(constraint_error(c))
+            out.push(Constraint { kind: ConKind.Input, reg: n, tied: -1 })
+    Ok(out)
+
+fn constraint_error(c: StrView) -> String
+    var s = string_from("inline asm constraint '")
+    s.push_str(c)
+    s.push_str("'")
+    s
+
+# One operand as the template sees it: outputs first, then inputs.
+pub struct AsmOperand
+    reg: i64
+    bytes: i64
+
+# The template with `$$` as `$` and `$N` / `${N}` as `%reg` at the operand's
+# width. Err names a placeholder with no operand.
+pub fn substitute(template: StrView, ops: @Vec<AsmOperand>) -> Result<String, String>
+    var out = string_from("")
+    var i: i64 = 0
+    while i < template.len
+        let c: u8 = template.get(i)
+        if c != '$' or i + 1 >= template.len
+            out.push(c)
+            i += 1
+            continue
+        let d: u8 = template.get(i + 1)
+        if d == '$'
+            out.push('$')
+            i += 2
+            continue
+        var j: i64 = i + 1
+        let open: bool = d == '{'
+        if open
+            j += 1
+        let start: i64 = j
+        while j < template.len and template.get(j) >= '0' and template.get(j) <= '9'
+            j += 1
+        if j == start
+            out.push(c)
+            i += 1
+            continue
+        let n: i64 = digits_value(template.skip(start).take(j - start))
+        if open
+            if j >= template.len or template.get(j) != '}'
+                return Err(string_from("inline asm placeholder without '}'"))
+            j += 1
+        if n >= ops.len
+            return Err(string_from("inline asm placeholder past the last operand"))
+        let op: AsmOperand = ops.get(n)
+        out.push('%')
+        out.push_str(gpr_name(op.reg, op.bytes))
+        i = j
+    Ok(out)
+
+# Encode the substituted template into the current section: razm parses it,
+# razm encodes each instruction. A directive or label in a template is not
+# lowered yet (#4806).
+pub fn assemble(g: @&Gen, text: StrView) -> Result<(), Fail>
+    let prog: Program = match parse(text)
+        Ok(p) => p
+        Err(e) =>
+            var s = string_from("inline asm: ")
+            s.push_str(e.what.as_view())
+            return Err(Fail { kind: FailKind.Unsupported, line: g.line, what: s })
+    for i in 0..prog.stmts.len
+        let st: Stmt = prog.stmts.get(i)
+        match st.item
+            Item.Instruction(insn) =>
+                let enc: Encoded = match encode(@insn, Mode.Code64, @prog.exprs, @prog.syms)
+                    Ok(e) => e
+                    Err(_) => return Err(fail_named(g.line, "inline asm instruction", insn.name))
+                g.emit_encoded(@enc, false)?
+            Item.CodeMode(m) =>
+                if m != Mode.Code64
+                    return Err(fail_named(g.line, "inline asm directive", ".code16/.code32"))
+            Item.Label(name) => return Err(fail_named(g.line, "inline asm label", name))
+            _ => return Err(fail_named(g.line, "inline asm directive", "in a template"))
+    Ok(())

@@ -1,0 +1,402 @@
+# gen: the machine-code side of lowering. Builds razm `Insn`s, encodes them
+# with razm's `encode` and appends the bytes and fixups to razm's `Object`
+# (DESIGN.md "Library": rllvm writes no ELF bytes itself). The relocation
+# profile (DESIGN.md "Relocations") decides how a symbol's address and a call
+# are spelled.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.hashmap { HashMap, hashmap_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.span { Span }
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import razm.expr { BinOp, Expr, ExprNode, Exprs, SymTable, exprs_new, symtable_new }
+import razm.fixup { Fixup, FixupKind }
+import razm.insn { Insn, Mem, OpSize, Operand, Prefix, Reg, RegClass, insn_new }
+import razm.parse { Mode }
+import razm.emit { Encoded }
+import razm.encode { encode }
+import razm.object { Object, ObjectError, SectionFlags, SectionId, SectionKind, object_new }
+import rllvm.parse { Fail, FailKind }
+
+# The relocation set (DESIGN.md "Relocations"). Small PIC and small PIE
+# write the same set, so they share one profile.
+pub enum Profile
+    SmallPic
+    Kernel
+    Large
+
+# Hardware register numbers.
+pub const RAX: i64 = 0
+pub const RCX: i64 = 1
+pub const RDX: i64 = 2
+pub const RBX: i64 = 3
+pub const RSP: i64 = 4
+pub const RBP: i64 = 5
+pub const RSI: i64 = 6
+pub const RDI: i64 = 7
+pub const R8: i64 = 8
+pub const R9: i64 = 9
+pub const R10: i64 = 10
+pub const R11: i64 = 11
+
+# The integer argument registers, in order.
+pub const ARG_REGS: [6]i64 = [7, 6, 2, 1, 8, 9]
+# The integer return registers, in order.
+pub const RET_REGS: [3]i64 = [0, 2, 1]
+
+pub fn fail_unsupported(line: i64, what: StrView) -> Fail
+    var s = string_from(what)
+    s.push_str(" (not lowered yet)")
+    Fail { kind: FailKind.Unsupported, line: line, what: s }
+
+pub fn fail_named(line: i64, what: StrView, word: StrView) -> Fail
+    var s = string_from(what)
+    s.push_str(" '")
+    s.push_str(word)
+    s.push_str("' (not lowered yet)")
+    Fail { kind: FailKind.Unsupported, line: line, what: s }
+
+pub fn fail_malformed(line: i64, what: StrView) -> Fail
+    Fail { kind: FailKind.Malformed, line: line, what: string_from(what) }
+
+# The operand size of an access `bytes` wide.
+pub fn size_of_bytes(bytes: i64) -> OpSize
+    if bytes == 1
+        return OpSize.Byte
+    if bytes == 2
+        return OpSize.Word
+    if bytes == 4
+        return OpSize.Long
+    OpSize.Quad
+
+pub fn gpr(num: i64, size: OpSize) -> Reg
+    let class: RegClass = match size
+        OpSize.Byte => RegClass.Gpr8
+        OpSize.Word => RegClass.Gpr16
+        OpSize.Long => RegClass.Gpr32
+        OpSize.Quad => RegClass.Gpr64
+        OpSize.Unsized => RegClass.Gpr64
+    Reg { class: class, num: num as u8 }
+
+pub fn reg_op(num: i64, size: OpSize) -> Operand
+    Operand.Register(gpr(num, size))
+
+pub fn r64(num: i64) -> Operand
+    reg_op(num, OpSize.Quad)
+
+pub fn r32(num: i64) -> Operand
+    reg_op(num, OpSize.Long)
+
+fn section_flags(write: bool, exec: bool) -> SectionFlags
+    SectionFlags { alloc: true, write: write, exec: exec }
+
+# Label `n`'s name. `@` is not an LLVM identifier byte, so no IR symbol can
+# collide with it, and the `.L` prefix keeps it out of the symtab.
+fn label_name(n: i64) -> String
+    var s = string_from(".L@")
+    s.push_i64(n)
+    s
+
+pub struct Gen
+    obj: Object
+    x: Exprs
+    syms: SymTable          # always empty: every symbol becomes a fixup
+    profile: Profile
+    sec: SectionId          # where code goes now
+    labels: i64             # the last label number handed out
+    line: i64               # the IR line being lowered, for errors
+    locals: HashMap<StrView, i64>   # defined internal/private symbols (no @)
+
+pub fn gen_new(profile: Profile) -> Gen
+    Gen {
+        obj: object_new(),
+        x: exprs_new(),
+        syms: symtable_new(),
+        profile: profile,
+        sec: SectionId { index: -1 },
+        labels: 0,
+        line: 0,
+        locals: hashmap_new<StrView, i64>()
+    }
+
+fn object_fail(line: i64, e: ObjectError) -> Fail
+    let what: StrView = match e
+        ObjectError.DuplicateSection => "duplicate section"
+        ObjectError.DuplicateSymbol => "a symbol is defined twice"
+        ObjectError.BadAlignment => "alignment is not a power of two"
+        ObjectError.NegativeSize => "negative size"
+        ObjectError.NobitsData => "data in a NOBITS section"
+        ObjectError.NoRelocation => "no relocation type for a fixup"
+        ObjectError.FixupOutsideSection => "fixup outside its section"
+        ObjectError.FixupOverflow => "a resolved value does not fit its field"
+        ObjectError.UndefinedLabel => "a label is used and never defined"
+        ObjectError.TooManySections => "too many sections"
+        ObjectError.Io(_) => "cannot write the object"
+    fail_malformed(line, what)
+
+impl Gen
+    # ------------------------------------------------------------ sections
+
+    # The section `name`, made on first use.
+    pub fn section(self: @&Gen, name: StrView, kind: SectionKind, write: bool, exec: bool) -> Result<SectionId, Fail>
+        match self.obj.find_section(name)
+            Some(s) => return Ok(s)
+            None => pass
+        match self.obj.add_section(name, kind, section_flags(write, exec))
+            Ok(s) => Ok(s)
+            Err(e) => Err(object_fail(self.line, e))
+
+    # A function's own section in the COMDAT group named for it.
+    pub fn group_section(self: @&Gen, name: StrView, signature: StrView) -> Result<SectionId, Fail>
+        match self.obj.add_group_section(name, SectionKind.Progbits, section_flags(false, true), signature)
+            Ok(s) => Ok(s)
+            Err(e) => Err(object_fail(self.line, e))
+
+    pub fn here(self: @Gen) -> i64
+        self.obj.size(self.sec)
+
+    # Raw bytes at the end of `sec`; their offset.
+    pub fn bytes(self: @&Gen, sec: SectionId, b: Span<u8>) -> Result<i64, Fail>
+        match self.obj.emit(sec, b)
+            Ok(at) => Ok(at)
+            Err(e) => Err(object_fail(self.line, e))
+
+    pub fn zeros(self: @&Gen, sec: SectionId, n: i64) -> Result<(), Fail>
+        let z: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+        let all: [u8] = @z
+        var left: i64 = n
+        while left > 0
+            let k: i64 = if left > 8 then 8 else left
+            self.bytes(sec, all.to(k))?
+            left -= k
+        Ok(())
+
+    pub fn raise_align(self: @&Gen, sec: SectionId, align: i64) -> Result<(), Fail>
+        match self.obj.raise_align(sec, align)
+            Ok(_) => Ok(())
+            Err(e) => Err(object_fail(self.line, e))
+
+    pub fn reserve(self: @&Gen, sec: SectionId, n: i64) -> Result<(), Fail>
+        match self.obj.reserve(sec, n)
+            Ok(_) => Ok(())
+            Err(e) => Err(object_fail(self.line, e))
+
+    pub fn fixup(self: @&Gen, sec: SectionId, at: i64, f: Fixup) -> Result<(), Fail>
+        match self.obj.add_fixup(sec, at, f)
+            Ok(_) => Ok(())
+            Err(e) => Err(object_fail(self.line, e))
+
+    pub fn define(self: @&Gen, name: StrView, sec: SectionId, at: i64) -> Result<(), Fail>
+        match self.obj.define(name, sec, at)
+            Ok(_) => Ok(())
+            Err(e) => Err(object_fail(self.line, e))
+
+    # ------------------------------------------------------------ operands
+
+    pub fn imm(self: @&Gen, n: i64) -> Operand
+        Operand.Imm(self.x.num(n))
+
+    # $sym+addend
+    pub fn sym_imm(self: @&Gen, sym: StrView, addend: i64) -> Operand
+        Operand.Imm(self.sym_expr(sym, addend))
+
+    fn sym_expr(self: @&Gen, sym: StrView, addend: i64) -> Expr
+        let s: Expr = self.x.sym(sym)
+        if addend == 0
+            return s
+        let n: Expr = self.x.num(addend)
+        self.x.add(ExprNode.Bin(BinOp.Add, s, n))
+
+    # disp(%base)
+    pub fn mem(self: @&Gen, base: i64, disp: i64) -> Operand
+        let d: Expr = self.x.num(disp)
+        Operand.Memory(Mem { seg: None, disp: Some(d), base: Some(gpr(base, OpSize.Quad)), index: None, scale: 1 })
+
+    # sym+addend(%rip)
+    pub fn rip(self: @&Gen, sym: StrView, addend: i64) -> Operand
+        let d: Expr = self.sym_expr(sym, addend)
+        Operand.Memory(Mem { seg: None, disp: Some(d), base: Some(Reg { class: RegClass.Rip, num: 0 }), index: None, scale: 1 })
+
+    # A direct branch or call target.
+    pub fn target(self: @&Gen, sym: StrView) -> Operand
+        let d: Expr = self.x.sym(sym)
+        Operand.Memory(Mem { seg: None, disp: Some(d), base: None, index: None, scale: 1 })
+
+    # ------------------------------------------------------------ emission
+
+    # The encoded instruction's bytes and fixups, in the current section.
+    # `got` turns its PC-relative field into a GOTPCRELX load.
+    pub fn emit_encoded(self: @&Gen, enc: @Encoded, got: bool) -> Result<(), Fail>
+        let at: i64 = self.bytes(self.sec, enc.bytes())?
+        let fx: Span<Fixup> = enc.fixups()
+        for i in 0..fx.len
+            var f: Fixup = fx[i]
+            if got and f.kind == FixupKind.PcRelative
+                f.kind = FixupKind.GotPcRelx
+            self.fixup(self.sec, at, f)?
+        Ok(())
+
+    fn put_insn(self: @&Gen, insn: Insn, got: bool) -> Result<(), Fail>
+        let enc: Encoded = match encode(@insn, Mode.Code64, @self.x, @self.syms)
+            Ok(e) => e
+            Err(_) =>
+                var s = string_from("internal error: cannot encode '")
+                s.push_str(insn.name)
+                s.push_str("'")
+                return Err(Fail { kind: FailKind.Malformed, line: self.line, what: s })
+        self.emit_encoded(@enc, got)?
+        # Each instruction's expressions are encoded and done with.
+        self.x = exprs_new()
+        Ok(())
+
+    pub fn op0(self: @&Gen, name: StrView, size: OpSize) -> Result<(), Fail>
+        self.put_insn(insn_new(Prefix.NoPrefix, name, size), false)
+
+    pub fn op1(self: @&Gen, name: StrView, size: OpSize, a: Operand) -> Result<(), Fail>
+        var i = insn_new(Prefix.NoPrefix, name, size)
+        i.push(a)
+        self.put_insn(i, false)
+
+    # AT&T order: source, destination.
+    pub fn op2(self: @&Gen, name: StrView, size: OpSize, src: Operand, dst: Operand) -> Result<(), Fail>
+        var i = insn_new(Prefix.NoPrefix, name, size)
+        i.push(src)
+        i.push(dst)
+        self.put_insn(i, false)
+
+    pub fn op3(self: @&Gen, name: StrView, size: OpSize, a: Operand, b: Operand, c: Operand) -> Result<(), Fail>
+        var i = insn_new(Prefix.NoPrefix, name, size)
+        i.push(a)
+        i.push(b)
+        i.push(c)
+        self.put_insn(i, false)
+
+    # -------------------------------------------------------------- labels
+
+    pub fn new_label(self: @&Gen) -> i64
+        self.labels += 1
+        self.labels
+
+    pub fn bind(self: @&Gen, n: i64) -> Result<(), Fail>
+        let name: String = label_name(n)
+        let at: i64 = self.here()
+        self.define(name.as_view(), self.sec, at)
+
+    # jmp / jcc (`name`) to label `n`, in the near form.
+    pub fn jump(self: @&Gen, name: StrView, n: i64) -> Result<(), Fail>
+        let label: String = label_name(n)
+        let t: Operand = self.target(label.as_view())
+        self.op1(name, OpSize.Unsized, t)
+
+    # ------------------------------------------------------- the profiles
+
+    pub fn is_local(self: @Gen, sym: StrView) -> bool
+        self.locals.get(sym).is_some()
+
+    # sym+addend's address into the 64-bit register `r`, touching no other.
+    pub fn address(self: @&Gen, r: i64, sym: StrView, addend: i64) -> Result<(), Fail>
+        let local: bool = self.is_local(sym)
+        match self.profile
+            Profile.Large =>
+                let a: Operand = self.sym_imm(sym, addend)
+                return self.op2("movabs", OpSize.Quad, a, r64(r))
+            Profile.Kernel =>
+                if local
+                    let a: Operand = self.sym_imm(sym, addend)
+                    return self.op2("mov", OpSize.Quad, a, r64(r))
+            Profile.SmallPic =>
+                if local
+                    let a: Operand = self.rip(sym, addend)
+                    return self.op2("lea", OpSize.Quad, a, r64(r))
+        # Preemptible: the address comes from the GOT.
+        var i = insn_new(Prefix.NoPrefix, "mov", OpSize.Quad)
+        i.push(self.rip(sym, 0))
+        i.push(r64(r))
+        self.put_insn(i, true)?
+        if addend != 0
+            let d: Operand = self.mem(r, addend)
+            self.op2("lea", OpSize.Quad, d, r64(r))?
+        Ok(())
+
+    # A direct call to `sym`: rel32 PLT32, or in the large model movabs of
+    # the address and an indirect call.
+    pub fn call(self: @&Gen, sym: StrView) -> Result<(), Fail>
+        if self.profile == Profile.Large
+            let a: Operand = self.sym_imm(sym, 0)
+            self.op2("movabs", OpSize.Quad, a, r64(R11))?
+            return self.op1("call", OpSize.Unsized, Operand.Indirect(gpr(R11, OpSize.Quad)))
+        let t: Operand = self.target(sym)
+        self.op1("call", OpSize.Unsized, t)
+
+    # ---------------------------------------------------------- data moves
+
+    # Zero-extending load of `bytes` (1, 2, 4 or 8) at disp(%base) into `r`.
+    pub fn load(self: @&Gen, r: i64, base: i64, disp: i64, bytes: i64) -> Result<(), Fail>
+        let m: Operand = self.mem(base, disp)
+        if bytes == 1
+            return self.op2("movzb", OpSize.Long, m, r32(r))
+        if bytes == 2
+            return self.op2("movzw", OpSize.Long, m, r32(r))
+        if bytes == 4
+            return self.op2("mov", OpSize.Long, m, r32(r))
+        self.op2("mov", OpSize.Quad, m, r64(r))
+
+    # The low `bytes` of `r` to disp(%base).
+    pub fn store(self: @&Gen, r: i64, base: i64, disp: i64, bytes: i64) -> Result<(), Fail>
+        let size: OpSize = size_of_bytes(bytes)
+        let m: Operand = self.mem(base, disp)
+        self.op2("mov", size, reg_op(r, size), m)
+
+    # $n into `r`, zero-extended from `bits`.
+    pub fn constant(self: @&Gen, r: i64, n: i64, bits: i64) -> Result<(), Fail>
+        var v: i64 = n
+        if bits < 64
+            v = n & ((1 << bits) - 1)
+        if v >= 0 and v <= 0xFFFFFFFF
+            let i: Operand = self.imm(v)
+            return self.op2("mov", OpSize.Long, i, r32(r))
+        let i: Operand = self.imm(v)
+        self.op2("mov", OpSize.Quad, i, r64(r))
+
+    # Copy `n` bytes from sdisp(%src) to ddisp(%dst) through %r11, widest
+    # moves first. Neither base may be %r11.
+    pub fn copy(self: @&Gen, dst: i64, ddisp: i64, src: i64, sdisp: i64, n: i64) -> Result<(), Fail>
+        var off: i64 = 0
+        while off < n
+            let left: i64 = n - off
+            var w: i64 = 8
+            while w > left
+                w = w / 2
+            self.load(R11, src, sdisp + off, w)?
+            self.store(R11, dst, ddisp + off, w)?
+            off += w
+        Ok(())
+
+    # Zero `n` bytes at disp(%base).
+    pub fn fill_zero(self: @&Gen, base: i64, disp: i64, n: i64) -> Result<(), Fail>
+        var off: i64 = 0
+        while off < n
+            let left: i64 = n - off
+            var w: i64 = 8
+            while w > left
+                w = w / 2
+            let z: Operand = self.imm(0)
+            let m: Operand = self.mem(base, disp + off)
+            self.op2("mov", size_of_bytes(w), z, m)?
+            off += w
+        Ok(())
+
+    # Sign-extend the low `bits` of `r` to 64 bits.
+    pub fn sign_extend(self: @&Gen, r: i64, bits: i64) -> Result<(), Fail>
+        if bits == 1
+            let one: Operand = self.imm(1)
+            self.op2("and", OpSize.Quad, one, r64(r))?
+            return self.op1("neg", OpSize.Quad, r64(r))
+        if bits == 8
+            return self.op2("movsb", OpSize.Quad, reg_op(r, OpSize.Byte), r64(r))
+        if bits == 16
+            return self.op2("movsw", OpSize.Quad, reg_op(r, OpSize.Word), r64(r))
+        if bits == 32
+            return self.op2("movsl", OpSize.Quad, r32(r), r64(r))
+        Ok(())

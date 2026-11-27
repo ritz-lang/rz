@@ -1,0 +1,957 @@
+# lower: one function to x86-64 at -O0 (DESIGN.md "Optimization bar"). Every
+# SSA value lives in its own stack slot below %rbp; each instruction loads its
+# operands into scratch registers (%rax, %rcx, %rdx, %r10, %r11), computes,
+# and stores its result. Nothing lives in a register across instructions, so
+# no value is ever addressed below %rsp: a `noredzone` function and any other
+# get the same frame.
+#
+# Calls take integer and pointer arguments and returns, flattened in order
+# (DESIGN.md "ABI": rdi..r9 then the stack; rax, rdx, rcx, else demoted to a
+# hidden pointer). Floats, vectors and byval are #4804/#4805.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.hashmap { HashMap, hashmap_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import razm.insn { OpSize, Operand }
+import rllvm.ir
+import rllvm.layout
+import rllvm.gen
+import rllvm.inline_asm
+import rllvm.parse { Fail, FailKind }
+
+# An integer literal as LLVM prints it (signed decimal, true, false).
+pub fn int_value(text: StrView) -> i64
+    if text.eq("true")
+        return 1
+    if text.eq("false")
+        return 0
+    var neg: bool = false
+    var i: i64 = 0
+    if text.starts_with("-")
+        neg = true
+        i = 1
+    var n: i64 = 0
+    while i < text.len
+        n = n *% 10 +% (text.get(i) - '0') as i64
+        i += 1
+    if neg
+        return 0 -% n
+    n
+
+# The symbol a `@name` value names.
+pub fn symbol_of(text: StrView) -> StrView
+    text.skip(1)
+
+fn cc_of(pred: StrView) -> StrView
+    if pred.eq("eq")
+        return "e"
+    if pred.eq("ne")
+        return "ne"
+    if pred.eq("ugt")
+        return "a"
+    if pred.eq("uge")
+        return "ae"
+    if pred.eq("ult")
+        return "b"
+    if pred.eq("ule")
+        return "be"
+    if pred.eq("sgt")
+        return "g"
+    if pred.eq("sge")
+        return "ge"
+    if pred.eq("slt")
+        return "l"
+    "le"
+
+fn set_cc(pred: StrView) -> String
+    var s = string_from("set")
+    s.push_str(cc_of(pred))
+    s
+
+fn opcode_name(op: Opcode) -> StrView
+    match op
+        Opcode.Ret => "ret"
+        Opcode.Br => "br"
+        Opcode.Unreachable => "unreachable"
+        Opcode.Alloca => "alloca"
+        Opcode.Load => "load"
+        Opcode.Store => "store"
+        Opcode.Gep => "getelementptr"
+        Opcode.Cmpxchg => "cmpxchg"
+        Opcode.AtomicRmw => "atomicrmw"
+        Opcode.Fence => "fence"
+        Opcode.Add => "add"
+        Opcode.Sub => "sub"
+        Opcode.Mul => "mul"
+        Opcode.UDiv => "udiv"
+        Opcode.SDiv => "sdiv"
+        Opcode.URem => "urem"
+        Opcode.SRem => "srem"
+        Opcode.Shl => "shl"
+        Opcode.LShr => "lshr"
+        Opcode.AShr => "ashr"
+        Opcode.And => "and"
+        Opcode.Or => "or"
+        Opcode.Xor => "xor"
+        Opcode.FNeg => "fneg"
+        Opcode.FAdd => "fadd"
+        Opcode.FSub => "fsub"
+        Opcode.FMul => "fmul"
+        Opcode.FDiv => "fdiv"
+        Opcode.ICmp => "icmp"
+        Opcode.FCmp => "fcmp"
+        Opcode.Trunc => "trunc"
+        Opcode.ZExt => "zext"
+        Opcode.SExt => "sext"
+        Opcode.FPTrunc => "fptrunc"
+        Opcode.FPExt => "fpext"
+        Opcode.SIToFP => "sitofp"
+        Opcode.UIToFP => "uitofp"
+        Opcode.FPToSI => "fptosi"
+        Opcode.Bitcast => "bitcast"
+        Opcode.IntToPtr => "inttoptr"
+        Opcode.PtrToInt => "ptrtoint"
+        Opcode.ExtractValue => "extractvalue"
+        Opcode.InsertValue => "insertvalue"
+        Opcode.ExtractElement => "extractelement"
+        Opcode.InsertElement => "insertelement"
+        Opcode.ShuffleVector => "shufflevector"
+        Opcode.Select => "select"
+        Opcode.Phi => "phi"
+        Opcode.Call => "call"
+
+# The byte offset a constant getelementptr adds to its base.
+pub fn const_gep_offset(m: @Module, v: IrValue) -> Result<i64, Fail>
+    var ty: i64 = v.src_ty
+    var off: i64 = 0
+    for k in 1..v.count
+        let iv: IrValue = m.values.get(m.value_lists.get(v.first + k))
+        if iv.kind != ValueKind.Int
+            return Err(fail_unsupported(0, "a constant getelementptr with a variable index"))
+        let n: i64 = int_value(iv.text)
+        if k == 1
+            off = off +% n *% type_size(m, ty)
+        else
+            let e: Member = member(m, ty, n)
+            if m.types.get(m.resolve(ty)).kind == TypeKind.Struct
+                off = off +% e.offset
+            else
+                off = off +% n *% type_size(m, e.ty)
+            ty = e.ty
+    Ok(off)
+
+struct ValueSlot
+    offset: i64         # the value's first byte is -offset(%rbp)
+    ty: i64
+    is_alloca: bool     # the value is the address -offset(%rbp) itself
+    phi_in: i64         # a phi's incoming copy at -phi_in(%rbp); else 0
+
+# One integer leaf of a call's arguments: which value, its type, and where
+# the leaf sits in it.
+struct ArgLeaf
+    vid: i64
+    ty: i64
+    leaf: Leaf
+
+pub struct FnLower
+    m: @Module
+    f: Function
+    slots: HashMap<StrView, i64>    # %name -> index in slot_list
+    slot_list: Vec<ValueSlot>
+    frame: i64          # bytes below %rbp
+    guard: i64          # the stack protector's copy; 0: none
+    sret: i64           # the hidden return pointer's slot; 0: none
+    saved: Vec<i64>     # callee-saved registers an asm block uses
+    saved_at: Vec<i64>  # and their slots
+    first_label: i64    # block i's label is first_label + i
+    ssp_fail: i64       # the label of the __stack_chk_fail call
+    block: i64          # the block being lowered
+
+pub fn fn_lower(m: @Module, f: Function) -> FnLower
+    FnLower {
+        m: m,
+        f: f,
+        slots: hashmap_new<StrView, i64>(),
+        slot_list: vec_new<ValueSlot>(),
+        frame: 0,
+        guard: 0,
+        sret: 0,
+        saved: vec_new<i64>(),
+        saved_at: vec_new<i64>(),
+        first_label: 0,
+        ssp_fail: 0,
+        block: 0
+    }
+
+impl FnLower
+    fn value(self: @FnLower, vid: i64) -> IrValue
+        self.m.values.get(vid)
+
+    fn operand(self: @FnLower, inst: @Inst, k: i64) -> i64
+        self.m.value_lists.get(inst.first + k)
+
+    fn ty_kind(self: @FnLower, ty: i64) -> TypeKind
+        self.m.types.get(self.m.resolve(ty)).kind
+
+    # i1 lives in a byte as 0 or 1; a register's other bits are undefined.
+    fn is_i1(self: @FnLower, ty: i64) -> bool
+        self.ty_kind(ty) == TypeKind.Int and int_width(self.m, ty) == 1
+
+    fn has(self: @FnLower, attr: i64) -> bool
+        (self.f.attrs & attr) != 0
+
+    # ------------------------------------------------------------- frame
+
+    fn reserve(self: @&FnLower, size: i64, align: i64) -> i64
+        let a: i64 = if align < 1 then 1 else align
+        let n: i64 = if size < 1 then 1 else size
+        self.frame = round_up(self.frame + n, a)
+        self.frame
+
+    fn add_slot(self: @&FnLower, name: StrView, s: ValueSlot)
+        self.slot_list.push(s)
+        self.slots.insert(name, self.slot_list.len - 1)
+
+    fn slot_of(self: @FnLower, name: StrView) -> Option<ValueSlot>
+        match self.slots.get(name)
+            Some(i) => Some(self.slot_list.get(i))
+            None => None
+
+    # The type an instruction's result has.
+    fn result_type(self: @FnLower, inst: @Inst) -> Result<i64, Fail>
+        match inst.op
+            Opcode.Alloca => Ok(TY_PTR)
+            Opcode.Gep => Ok(TY_PTR)
+            Opcode.ICmp => Ok(TY_I1)
+            Opcode.Load => Ok(inst.ty)
+            Opcode.Phi => Ok(inst.ty)
+            Opcode.Trunc => Ok(inst.ty)
+            Opcode.ZExt => Ok(inst.ty)
+            Opcode.SExt => Ok(inst.ty)
+            Opcode.Bitcast => Ok(inst.ty)
+            Opcode.IntToPtr => Ok(inst.ty)
+            Opcode.PtrToInt => Ok(inst.ty)
+            Opcode.Add | Opcode.Sub | Opcode.Mul | Opcode.UDiv | Opcode.SDiv | Opcode.URem | Opcode.SRem | Opcode.Shl | Opcode.LShr | Opcode.AShr | Opcode.And | Opcode.Or | Opcode.Xor => Ok(self.value(self.operand(inst, 0)).ty)
+            Opcode.Select => Ok(self.value(self.operand(inst, 1)).ty)
+            Opcode.InsertValue => Ok(self.value(self.operand(inst, 0)).ty)
+            Opcode.ExtractValue =>
+                var ty: i64 = self.value(self.operand(inst, 0)).ty
+                for k in 0..inst.idx_count
+                    ty = member(self.m, ty, self.m.ints.get(inst.idx_first + k)).ty
+                Ok(ty)
+            Opcode.Call => Ok(self.call_return_type(inst))
+            _ => Err(fail_named(inst.line, "instruction", opcode_name(inst.op)))
+
+    fn call_return_type(self: @FnLower, inst: @Inst) -> i64
+        let t: Type = self.m.types.get(inst.ty)
+        if t.kind == TypeKind.Func
+            return t.elem
+        inst.ty
+
+    # Callee-saved registers an asm block pins or clobbers.
+    fn note_asm_registers(self: @&FnLower, call: IrValue)
+        let text: String = decode_string(call.text2)
+        match parse_constraints(text.as_view())
+            Ok(cs) =>
+                for i in 0..cs.len
+                    let c: Constraint = cs.get(i)
+                    let r: i64 = c.reg
+                    if r == RBX or r >= 12
+                        var seen: bool = false
+                        for k in 0..self.saved.len
+                            if self.saved.get(k) == r
+                                seen = true
+                        if not seen
+                            self.saved.push(r)
+                            self.saved_at.push(self.reserve(8, 8))
+            Err(_) => pass
+
+    # A slot for every parameter and named result.
+    fn lay_out(self: @&FnLower) -> Result<(), Fail>
+        if self.has(FA_SSPSTRONG)
+            self.guard = self.reserve(8, 8)
+        if self.demoted(self.f.ret_ty)
+            self.sret = self.reserve(8, 8)
+        for i in 0..self.f.nparams
+            let p: Param = self.m.params.get(self.f.first_param + i)
+            let sa: SizeAlign = size_align(self.m, p.ty)
+            let off: i64 = self.reserve(sa.size, sa.align)
+            self.add_slot(p.name, ValueSlot { offset: off, ty: p.ty, is_alloca: false, phi_in: 0 })
+        for b in 0..self.f.nblocks
+            let blk: Block = self.m.blocks.get(self.f.first_block + b)
+            for k in 0..blk.count
+                let inst: Inst = self.m.insts.get(blk.first + k)
+                if inst.op == Opcode.Call
+                    let callee: IrValue = self.value(self.operand(@inst, 0))
+                    if callee.kind == ValueKind.Asm
+                        self.note_asm_registers(callee)
+                if inst.name.len == 0
+                    continue
+                if inst.op == Opcode.Alloca
+                    let sa: SizeAlign = size_align(self.m, inst.ty)
+                    let align: i64 = if inst.align > sa.align then inst.align else sa.align
+                    if align > 16
+                        return Err(fail_unsupported(inst.line, "alloca aligned past 16"))
+                    let off: i64 = self.reserve(sa.size, align)
+                    self.add_slot(inst.name, ValueSlot { offset: off, ty: inst.ty, is_alloca: true, phi_in: 0 })
+                    continue
+                let ty: i64 = self.result_type(@inst)?
+                let sa: SizeAlign = size_align(self.m, ty)
+                let off: i64 = self.reserve(sa.size, sa.align)
+                var phi_in: i64 = 0
+                if inst.op == Opcode.Phi
+                    phi_in = self.reserve(sa.size, sa.align)
+                self.add_slot(inst.name, ValueSlot { offset: off, ty: ty, is_alloca: false, phi_in: phi_in })
+        self.frame = round_up(self.frame, 16)
+        Ok(())
+
+    # Does a value of type `ty` come back through a hidden pointer?
+    fn demoted(self: @FnLower, ty: i64) -> bool
+        leaves(self.m, ty).len > 3
+
+    # Every leaf of `ty` is an integer or pointer.
+    fn check_int_leaves(self: @FnLower, ty: i64, line: i64, what: StrView) -> Result<Vec<Leaf>, Fail>
+        let ls: Vec<Leaf> = leaves(self.m, ty)
+        for i in 0..ls.len
+            if not is_int_or_ptr(self.m, ls.get(i).ty)
+                return Err(fail_unsupported(line, what))
+        Ok(ls)
+
+    # ------------------------------------------------------------ values
+
+    # A scalar value into the 64-bit register `r`, zero-extended from its
+    # width, touching no other register.
+    fn load_scalar(self: @FnLower, g: @&Gen, r: i64, vid: i64) -> Result<(), Fail>
+        let v: IrValue = self.value(vid)
+        match v.kind
+            ValueKind.Local =>
+                let s: ValueSlot = match self.slot_of(v.text)
+                    Some(s) => s
+                    None => return Err(fail_malformed(g.line, "use of an undefined value"))
+                let d: Operand = g.mem(RBP, 0 - s.offset)
+                if s.is_alloca
+                    return g.op2("lea", OpSize.Quad, d, r64(r))
+                g.load(r, RBP, 0 - s.offset, type_size(self.m, s.ty))
+            ValueKind.Int => g.constant(r, int_value(v.text), int_width(self.m, v.ty))
+            ValueKind.Null => g.constant(r, 0, 64)
+            ValueKind.Undef => g.constant(r, 0, 64)
+            ValueKind.Zero => g.constant(r, 0, 64)
+            ValueKind.Global => g.address(r, symbol_of(v.text), 0)
+            ValueKind.Gep =>
+                let base: IrValue = self.value(self.m.value_lists.get(v.first))
+                if base.kind != ValueKind.Global
+                    return Err(fail_unsupported(g.line, "constant getelementptr off a non-global"))
+                g.address(r, symbol_of(base.text), const_gep_offset(self.m, v)?)
+            ValueKind.PtrToInt => self.load_scalar(g, r, self.m.value_lists.get(v.first))
+            _ => Err(fail_unsupported(g.line, "a float, vector or aggregate constant as a scalar"))
+
+    # Write value `vid` of type `ty` to disp(%base) through %r11, so `base`
+    # is never %r11.
+    fn store_value(self: @FnLower, g: @&Gen, base: i64, disp: i64, vid: i64, ty: i64) -> Result<(), Fail>
+        let v: IrValue = self.value(vid)
+        let size: i64 = type_size(self.m, ty)
+        if not is_aggregate(self.m, ty)
+            if v.kind == ValueKind.Local
+                let s: ValueSlot = match self.slot_of(v.text)
+                    Some(s) => s
+                    None => return Err(fail_malformed(g.line, "use of an undefined value"))
+                if not s.is_alloca and not is_int_or_ptr(self.m, ty)
+                    return g.copy(base, disp, RBP, 0 - s.offset, size)
+            self.load_scalar(g, R11, vid)?
+            return g.store(R11, base, disp, size)
+        match v.kind
+            ValueKind.Local =>
+                let s: ValueSlot = match self.slot_of(v.text)
+                    Some(s) => s
+                    None => return Err(fail_malformed(g.line, "use of an undefined value"))
+                g.copy(base, disp, RBP, 0 - s.offset, size)
+            ValueKind.Undef => Ok(())
+            ValueKind.Zero => g.fill_zero(base, disp, size)
+            ValueKind.Struct | ValueKind.Array =>
+                for i in 0..v.count
+                    let e: Member = member(self.m, ty, i)
+                    self.store_value(g, base, disp + e.offset, self.m.value_lists.get(v.first + i), e.ty)?
+                Ok(())
+            ValueKind.Bytes =>
+                let b: String = decode_string(v.text)
+                for i in 0..b.len()
+                    let n: Operand = g.imm(b.get(i) as i64)
+                    let d: Operand = g.mem(base, disp + i)
+                    g.op2("mov", OpSize.Byte, n, d)?
+                Ok(())
+            _ => Err(fail_unsupported(g.line, "this aggregate constant"))
+
+    # Leaf `l` of value `vid` (type `ty`) into register `r`, zero-extended.
+    fn load_leaf(self: @FnLower, g: @&Gen, r: i64, vid: i64, ty: i64, l: Leaf) -> Result<(), Fail>
+        if not is_aggregate(self.m, ty)
+            return self.load_scalar(g, r, vid)
+        let v: IrValue = self.value(vid)
+        let bytes: i64 = type_size(self.m, l.ty)
+        match v.kind
+            ValueKind.Local =>
+                let s: ValueSlot = match self.slot_of(v.text)
+                    Some(s) => s
+                    None => return Err(fail_malformed(g.line, "use of an undefined value"))
+                g.load(r, RBP, l.offset - s.offset, bytes)
+            ValueKind.Struct | ValueKind.Array =>
+                for i in 0..v.count
+                    let e: Member = member(self.m, ty, i)
+                    let esize: i64 = type_size(self.m, e.ty)
+                    if l.offset >= e.offset and l.offset < e.offset + esize
+                        let inner = Leaf { ty: l.ty, offset: l.offset - e.offset }
+                        return self.load_leaf(g, r, self.m.value_lists.get(v.first + i), e.ty, inner)
+                Err(fail_malformed(g.line, "aggregate constant without that element"))
+            ValueKind.Bytes =>
+                let b: String = decode_string(v.text)
+                g.constant(r, b.get(l.offset) as i64, 8)
+            _ => g.constant(r, 0, 64)
+
+    fn result_slot(self: @FnLower, inst: @Inst) -> Option<ValueSlot>
+        if inst.name.len == 0
+            return None
+        self.slot_of(inst.name)
+
+    # The low bytes of `r` to the instruction's result slot; `bits` 1 is
+    # masked to 0/1 first.
+    fn store_result(self: @FnLower, g: @&Gen, inst: @Inst, r: i64) -> Result<(), Fail>
+        match self.result_slot(inst)
+            Some(s) =>
+                if self.is_i1(s.ty)
+                    let one: Operand = g.imm(1)
+                    g.op2("and", OpSize.Long, one, r32(r))?
+                g.store(r, RBP, 0 - s.offset, type_size(self.m, s.ty))
+            None => Ok(())
+
+    # ------------------------------------------------------------- blocks
+
+    fn block_index(self: @FnLower, label: StrView, line: i64) -> Result<i64, Fail>
+        let name: StrView = label.skip(1)
+        for b in 0..self.f.nblocks
+            if self.m.blocks.get(self.f.first_block + b).name.eq(name)
+                return Ok(b)
+        Err(fail_malformed(line, "branch to an undefined block"))
+
+    # Store the values the phis at the top of block `target` take on the edge
+    # from the current block into their incoming slots.
+    fn phi_copies(self: @FnLower, g: @&Gen, target: i64) -> Result<(), Fail>
+        let here: StrView = self.m.blocks.get(self.f.first_block + self.block).name
+        let blk: Block = self.m.blocks.get(self.f.first_block + target)
+        for k in 0..blk.count
+            let inst: Inst = self.m.insts.get(blk.first + k)
+            if inst.op != Opcode.Phi
+                break
+            let s: ValueSlot = match self.result_slot(@inst)
+                Some(s) => s
+                None => continue
+            var p: i64 = 0
+            while p + 1 < inst.count
+                let from: IrValue = self.value(self.operand(@inst, p + 1))
+                if from.text.skip(1).eq(here)
+                    self.store_value(g, RBP, 0 - s.phi_in, self.operand(@inst, p), inst.ty)?
+                    break
+                p += 2
+        Ok(())
+
+    fn branch_to(self: @FnLower, g: @&Gen, target: i64) -> Result<(), Fail>
+        self.phi_copies(g, target)?
+        g.jump("jmp", self.first_label + target)
+
+    # -------------------------------------------------------- the function
+
+    pub fn lower(self: @&FnLower, g: @&Gen) -> Result<(), Fail>
+        g.line = self.f.line
+        if self.has(FA_NAKED)
+            return self.lower_naked(g)
+        self.lay_out()?
+        self.first_label = g.labels + 1
+        g.labels += self.f.nblocks
+        self.ssp_fail = g.new_label()
+        self.prologue(g)?
+        for b in 0..self.f.nblocks
+            self.block = b
+            g.bind(self.first_label + b)?
+            let blk: Block = self.m.blocks.get(self.f.first_block + b)
+            for k in 0..blk.count
+                let inst: Inst = self.m.insts.get(blk.first + k)
+                g.line = inst.line
+                self.lower_inst(g, @inst)?
+        if self.guard != 0
+            g.bind(self.ssp_fail)?
+            g.call("__stack_chk_fail")?
+            g.op0("ud2", OpSize.Unsized)?
+        Ok(())
+
+    # A naked body is inline asm and then `unreachable`: no frame, no slots.
+    fn lower_naked(self: @&FnLower, g: @&Gen) -> Result<(), Fail>
+        for b in 0..self.f.nblocks
+            let blk: Block = self.m.blocks.get(self.f.first_block + b)
+            for k in 0..blk.count
+                let inst: Inst = self.m.insts.get(blk.first + k)
+                g.line = inst.line
+                if inst.op == Opcode.Unreachable
+                    g.op0("ud2", OpSize.Unsized)?
+                    continue
+                if inst.op != Opcode.Call or inst.count != 1 or self.value(self.operand(@inst, 0)).kind != ValueKind.Asm or inst.name.len > 0
+                    return Err(fail_unsupported(inst.line, "a naked function body other than operand-less inline asm"))
+                self.lower_asm(g, @inst)?
+        Ok(())
+
+    fn prologue(self: @&FnLower, g: @&Gen) -> Result<(), Fail>
+        g.op1("push", OpSize.Quad, r64(RBP))?
+        g.op2("mov", OpSize.Quad, r64(RSP), r64(RBP))?
+        if self.frame > 0
+            let n: Operand = g.imm(self.frame)
+            g.op2("sub", OpSize.Quad, n, r64(RSP))?
+        for i in 0..self.saved.len
+            g.store(self.saved.get(i), RBP, 0 - self.saved_at.get(i), 8)?
+        if self.guard != 0
+            g.address(R11, "__stack_chk_guard", 0)?
+            g.load(R11, R11, 0, 8)?
+            g.store(R11, RBP, 0 - self.guard, 8)?
+        var next: i64 = 0
+        if self.sret != 0
+            g.store(RDI, RBP, 0 - self.sret, 8)?
+            next = 1
+        var stack: i64 = 16
+        for i in 0..self.f.nparams
+            let p: Param = self.m.params.get(self.f.first_param + i)
+            if p.attr == ParamAttr.Byval
+                return Err(fail_unsupported(self.f.line, "a byval parameter"))
+            let s: ValueSlot = match self.slot_of(p.name)
+                Some(s) => s
+                None => continue
+            let ls: Vec<Leaf> = self.check_int_leaves(p.ty, self.f.line, "a float or vector parameter")?
+            for k in 0..ls.len
+                let l: Leaf = ls.get(k)
+                let bytes: i64 = type_size(self.m, l.ty)
+                var r: i64 = R11
+                if next < 6
+                    r = ARG_REGS[next]
+                    next += 1
+                else
+                    g.load(R11, RBP, stack, 8)?
+                    stack += 8
+                if self.is_i1(l.ty)
+                    let one: Operand = g.imm(1)
+                    g.op2("and", OpSize.Long, one, r32(r))?
+                g.store(r, RBP, l.offset - s.offset, bytes)?
+        Ok(())
+
+    fn epilogue(self: @FnLower, g: @&Gen) -> Result<(), Fail>
+        for i in 0..self.saved.len
+            g.load(self.saved.get(i), RBP, 0 - self.saved_at.get(i), 8)?
+        g.op2("mov", OpSize.Quad, r64(RBP), r64(RSP))?
+        g.op1("pop", OpSize.Quad, r64(RBP))?
+        g.op0("ret", OpSize.Unsized)
+
+    # ------------------------------------------------------- instructions
+
+    fn lower_inst(self: @&FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        match inst.op
+            Opcode.Ret => self.lower_ret(g, inst)
+            Opcode.Br => self.lower_br(g, inst)
+            Opcode.Unreachable => g.op0("ud2", OpSize.Unsized)
+            Opcode.Alloca => Ok(())
+            Opcode.Phi =>
+                match self.result_slot(inst)
+                    Some(s) => g.copy(RBP, 0 - s.offset, RBP, 0 - s.phi_in, type_size(self.m, s.ty))
+                    None => Ok(())
+            Opcode.Load => self.lower_load(g, inst)
+            Opcode.Store => self.lower_store(g, inst)
+            Opcode.Gep => self.lower_gep(g, inst)
+            Opcode.Add | Opcode.Sub | Opcode.Mul | Opcode.UDiv | Opcode.SDiv | Opcode.URem | Opcode.SRem | Opcode.Shl | Opcode.LShr | Opcode.AShr | Opcode.And | Opcode.Or | Opcode.Xor => self.lower_binary(g, inst)
+            Opcode.ICmp => self.lower_icmp(g, inst)
+            Opcode.Trunc | Opcode.ZExt | Opcode.SExt | Opcode.Bitcast | Opcode.IntToPtr | Opcode.PtrToInt => self.lower_cast(g, inst)
+            Opcode.Select => self.lower_select(g, inst)
+            Opcode.ExtractValue => self.lower_extract(g, inst)
+            Opcode.InsertValue => self.lower_insert(g, inst)
+            Opcode.Call => self.lower_call(g, inst)
+            _ => Err(fail_named(inst.line, "instruction", opcode_name(inst.op)))
+
+    fn lower_ret(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        if self.guard != 0
+            g.address(R11, "__stack_chk_guard", 0)?
+            g.load(R11, R11, 0, 8)?
+            let saved: Operand = g.mem(RBP, 0 - self.guard)
+            g.op2("cmp", OpSize.Quad, saved, r64(R11))?
+            g.jump("jne", self.ssp_fail)?
+        if inst.count == 1
+            let vid: i64 = self.operand(inst, 0)
+            let ty: i64 = self.f.ret_ty
+            if self.sret != 0
+                g.load(R10, RBP, 0 - self.sret, 8)?
+                self.store_value(g, R10, 0, vid, ty)?
+                g.op2("mov", OpSize.Quad, r64(R10), r64(RAX))?
+            else
+                let ls: Vec<Leaf> = self.check_int_leaves(ty, inst.line, "a float or vector return")?
+                for k in 0..ls.len
+                    self.load_leaf(g, RET_REGS[k], vid, ty, ls.get(k))?
+        self.epilogue(g)
+
+    fn lower_br(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        if inst.count == 1
+            let t: i64 = self.block_index(self.value(self.operand(inst, 0)).text, inst.line)?
+            return self.branch_to(g, t)
+        let t: i64 = self.block_index(self.value(self.operand(inst, 1)).text, inst.line)?
+        let f: i64 = self.block_index(self.value(self.operand(inst, 2)).text, inst.line)?
+        self.load_scalar(g, RAX, self.operand(inst, 0))?
+        g.op2("test", OpSize.Long, r32(RAX), r32(RAX))?
+        let other: i64 = g.new_label()
+        g.jump("je", other)?
+        self.branch_to(g, t)?
+        g.bind(other)?
+        self.branch_to(g, f)
+
+    fn lower_load(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        if inst.is_atomic
+            return Err(fail_unsupported(inst.line, "load atomic"))
+        let s: ValueSlot = match self.result_slot(inst)
+            Some(s) => s
+            None => return Ok(())
+        self.load_scalar(g, RAX, self.operand(inst, 0))?
+        g.copy(RBP, 0 - s.offset, RAX, 0, type_size(self.m, inst.ty))
+
+    fn lower_store(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        if inst.is_atomic
+            return Err(fail_unsupported(inst.line, "store atomic"))
+        let vid: i64 = self.operand(inst, 0)
+        self.load_scalar(g, RAX, self.operand(inst, 1))?
+        self.store_value(g, RAX, 0, vid, self.value(vid).ty)
+
+    fn lower_gep(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        self.load_scalar(g, RAX, self.operand(inst, 0))?
+        var ty: i64 = inst.ty
+        var off: i64 = 0
+        for k in 1..inst.count
+            let ivid: i64 = self.operand(inst, k)
+            let iv: IrValue = self.value(ivid)
+            var scale: i64 = 0
+            if k == 1
+                scale = type_size(self.m, ty)
+            else if self.ty_kind(ty) == TypeKind.Struct
+                if iv.kind != ValueKind.Int
+                    return Err(fail_malformed(inst.line, "a struct index is not a constant"))
+                let e: Member = member(self.m, ty, int_value(iv.text))
+                off = off +% e.offset
+                ty = e.ty
+                continue
+            else if self.ty_kind(ty) == TypeKind.Array
+                ty = self.m.types.get(self.m.resolve(ty)).elem
+                scale = type_size(self.m, ty)
+            else
+                return Err(fail_unsupported(inst.line, "getelementptr into a vector"))
+            if iv.kind == ValueKind.Int
+                off = off +% int_value(iv.text) *% scale
+                continue
+            self.load_scalar(g, RCX, ivid)?
+            g.sign_extend(RCX, int_width(self.m, iv.ty))?
+            if scale != 1
+                let n: Operand = g.imm(scale)
+                g.op3("imul", OpSize.Quad, n, r64(RCX), r64(RCX))?
+            g.op2("add", OpSize.Quad, r64(RCX), r64(RAX))?
+        if off != 0
+            g.constant(RCX, off, 64)?
+            g.op2("add", OpSize.Quad, r64(RCX), r64(RAX))?
+        self.store_result(g, inst, RAX)
+
+    fn lower_binary(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let ty: i64 = self.value(self.operand(inst, 0)).ty
+        if self.ty_kind(ty) != TypeKind.Int
+            return Err(fail_named(inst.line, "instruction on vectors", opcode_name(inst.op)))
+        let bits: i64 = int_width(self.m, ty)
+        self.load_scalar(g, RAX, self.operand(inst, 0))?
+        self.load_scalar(g, RCX, self.operand(inst, 1))?
+        let q: OpSize = OpSize.Quad
+        var result: i64 = RAX
+        match inst.op
+            Opcode.Add => g.op2("add", q, r64(RCX), r64(RAX))?
+            Opcode.Sub => g.op2("sub", q, r64(RCX), r64(RAX))?
+            Opcode.Mul => g.op2("imul", q, r64(RCX), r64(RAX))?
+            Opcode.And => g.op2("and", q, r64(RCX), r64(RAX))?
+            Opcode.Or => g.op2("or", q, r64(RCX), r64(RAX))?
+            Opcode.Xor => g.op2("xor", q, r64(RCX), r64(RAX))?
+            Opcode.Shl => g.op2("shl", q, reg_op(RCX, OpSize.Byte), r64(RAX))?
+            Opcode.LShr => g.op2("shr", q, reg_op(RCX, OpSize.Byte), r64(RAX))?
+            Opcode.AShr =>
+                g.sign_extend(RAX, bits)?
+                g.op2("sar", q, reg_op(RCX, OpSize.Byte), r64(RAX))?
+            Opcode.UDiv | Opcode.URem =>
+                g.op2("xor", OpSize.Long, r32(RDX), r32(RDX))?
+                g.op1("div", q, r64(RCX))?
+                if inst.op == Opcode.URem
+                    result = RDX
+            Opcode.SDiv | Opcode.SRem =>
+                g.sign_extend(RAX, bits)?
+                g.sign_extend(RCX, bits)?
+                g.op0("cqo", OpSize.Unsized)?
+                g.op1("idiv", q, r64(RCX))?
+                if inst.op == Opcode.SRem
+                    result = RDX
+            _ => return Err(fail_named(inst.line, "instruction", opcode_name(inst.op)))
+        self.store_result(g, inst, result)
+
+    fn lower_icmp(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let ty: i64 = self.value(self.operand(inst, 0)).ty
+        if not is_int_or_ptr(self.m, ty)
+            return Err(fail_unsupported(inst.line, "icmp on vectors"))
+        let bits: i64 = int_width(self.m, ty)
+        self.load_scalar(g, RAX, self.operand(inst, 0))?
+        self.load_scalar(g, RCX, self.operand(inst, 1))?
+        if inst.pred.starts_with("s")
+            g.sign_extend(RAX, bits)?
+            g.sign_extend(RCX, bits)?
+        g.op2("cmp", OpSize.Quad, r64(RCX), r64(RAX))?
+        let set: String = set_cc(inst.pred)
+        g.op1(set.as_view(), OpSize.Unsized, reg_op(RAX, OpSize.Byte))?
+        g.op2("movzb", OpSize.Long, reg_op(RAX, OpSize.Byte), r32(RAX))?
+        self.store_result(g, inst, RAX)
+
+    fn lower_cast(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let vid: i64 = self.operand(inst, 0)
+        let from: i64 = self.value(vid).ty
+        if not is_int_or_ptr(self.m, from) or not is_int_or_ptr(self.m, inst.ty)
+            return Err(fail_named(inst.line, "cast of floats or vectors", opcode_name(inst.op)))
+        self.load_scalar(g, RAX, vid)?
+        if inst.op == Opcode.SExt
+            g.sign_extend(RAX, int_width(self.m, from))?
+        self.store_result(g, inst, RAX)
+
+    fn lower_select(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let cond: i64 = self.operand(inst, 0)
+        if self.ty_kind(self.value(cond).ty) != TypeKind.Int
+            return Err(fail_unsupported(inst.line, "select on a vector condition"))
+        let s: ValueSlot = match self.result_slot(inst)
+            Some(s) => s
+            None => return Ok(())
+        let a: i64 = self.operand(inst, 1)
+        let b: i64 = self.operand(inst, 2)
+        if is_int_or_ptr(self.m, s.ty)
+            self.load_scalar(g, RAX, a)?
+            self.load_scalar(g, RCX, b)?
+            self.load_scalar(g, RDX, cond)?
+            g.op2("test", OpSize.Long, r32(RDX), r32(RDX))?
+            g.op2("cmove", OpSize.Quad, r64(RCX), r64(RAX))?
+            return self.store_result(g, inst, RAX)
+        let other: i64 = g.new_label()
+        let done: i64 = g.new_label()
+        self.load_scalar(g, RAX, cond)?
+        g.op2("test", OpSize.Long, r32(RAX), r32(RAX))?
+        g.jump("je", other)?
+        self.store_value(g, RBP, 0 - s.offset, a, s.ty)?
+        g.jump("jmp", done)?
+        g.bind(other)?
+        self.store_value(g, RBP, 0 - s.offset, b, s.ty)?
+        g.bind(done)
+
+    # The member the indices pick: copied out of the operand's slot, or out
+    # of a constant aggregate element by element.
+    fn lower_extract(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let s: ValueSlot = match self.result_slot(inst)
+            Some(s) => s
+            None => return Ok(())
+        var vid: i64 = self.operand(inst, 0)
+        var ty: i64 = self.value(vid).ty
+        var off: i64 = 0
+        var konst: bool = self.value(vid).kind != ValueKind.Local
+        for k in 0..inst.idx_count
+            let i: i64 = self.m.ints.get(inst.idx_first + k)
+            let e: Member = member(self.m, ty, i)
+            if konst
+                let v: IrValue = self.value(vid)
+                if v.kind == ValueKind.Struct or v.kind == ValueKind.Array
+                    vid = self.m.value_lists.get(v.first + i)
+                else if v.kind == ValueKind.Zero or v.kind == ValueKind.Undef
+                    return g.fill_zero(RBP, 0 - s.offset, type_size(self.m, s.ty))
+                else
+                    return Err(fail_unsupported(inst.line, "extractvalue of this constant"))
+            off += e.offset
+            ty = e.ty
+        if konst
+            return self.store_value(g, RBP, 0 - s.offset, vid, ty)
+        let src: ValueSlot = match self.slot_of(self.value(vid).text)
+            Some(x) => x
+            None => return Err(fail_malformed(inst.line, "use of an undefined value"))
+        g.copy(RBP, 0 - s.offset, RBP, off - src.offset, type_size(self.m, ty))
+
+    fn lower_insert(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let s: ValueSlot = match self.result_slot(inst)
+            Some(s) => s
+            None => return Ok(())
+        self.store_value(g, RBP, 0 - s.offset, self.operand(inst, 0), s.ty)?
+        var ty: i64 = s.ty
+        var off: i64 = 0
+        for k in 0..inst.idx_count
+            let e: Member = member(self.m, ty, self.m.ints.get(inst.idx_first + k))
+            off += e.offset
+            ty = e.ty
+        self.store_value(g, RBP, off - s.offset, self.operand(inst, 1), ty)
+
+    # --------------------------------------------------------------- calls
+
+    fn is_variadic_callee(self: @FnLower, inst: @Inst, callee: IrValue) -> bool
+        let t: Type = self.m.types.get(inst.ty)
+        if t.kind == TypeKind.Func and t.packed
+            return true
+        if callee.kind == ValueKind.Global
+            for i in 0..self.m.funcs.len
+                let f: Function = self.m.funcs.get(i)
+                if f.name.eq(callee.text)
+                    return f.variadic
+        false
+
+    fn lower_call(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let cvid: i64 = self.operand(inst, 0)
+        let callee: IrValue = self.value(cvid)
+        if callee.kind == ValueKind.Asm
+            return self.lower_asm(g, inst)
+        if callee.kind == ValueKind.Global and callee.text.starts_with("@llvm.")
+            return self.lower_intrinsic(g, inst, symbol_of(callee.text))
+        let ret_ty: i64 = self.call_return_type(inst)
+        let rls: Vec<Leaf> = self.check_int_leaves(ret_ty, inst.line, "a call returning floats or vectors")?
+        let demote: bool = rls.len > 3
+        # Every argument leaf, in order.
+        var args = vec_new<ArgLeaf>()
+        for k in 1..inst.count
+            let vid: i64 = self.operand(inst, k)
+            let a: IrValue = self.value(vid)
+            if a.attr == ParamAttr.Byval
+                return Err(fail_unsupported(inst.line, "a byval argument"))
+            let ls: Vec<Leaf> = self.check_int_leaves(a.ty, inst.line, "a float or vector argument")?
+            for i in 0..ls.len
+                args.push(ArgLeaf { vid: vid, ty: a.ty, leaf: ls.get(i) })
+        let first_reg: i64 = if demote then 1 else 0
+        let in_regs: i64 = 6 - first_reg
+        let n_stack: i64 = if args.len > in_regs then args.len - in_regs else 0
+        let area: i64 = round_up(n_stack * 8, 16)
+        if area > 0
+            let n: Operand = g.imm(area)
+            g.op2("sub", OpSize.Quad, n, r64(RSP))?
+        for j in 0..n_stack
+            let a: ArgLeaf = args.get(in_regs + j)
+            self.load_leaf(g, R11, a.vid, a.ty, a.leaf)?
+            g.store(R11, RSP, j * 8, 8)?
+        let s: Option<ValueSlot> = self.result_slot(inst)
+        if demote
+            match s
+                Some(slot) =>
+                    let d: Operand = g.mem(RBP, 0 - slot.offset)
+                    g.op2("lea", OpSize.Quad, d, r64(RDI))?
+                None => return Err(fail_unsupported(inst.line, "an unnamed call returning through memory"))
+        let n_regs: i64 = if args.len < in_regs then args.len else in_regs
+        for j in 0..n_regs
+            let a: ArgLeaf = args.get(j)
+            self.load_leaf(g, ARG_REGS[first_reg + j], a.vid, a.ty, a.leaf)?
+        if self.is_variadic_callee(inst, callee)
+            g.op2("xor", OpSize.Long, r32(RAX), r32(RAX))?
+        if callee.kind == ValueKind.Global
+            g.call(symbol_of(callee.text))?
+        else
+            self.load_scalar(g, R11, cvid)?
+            g.op1("call", OpSize.Unsized, Operand.Indirect(gpr(R11, OpSize.Quad)))?
+        if area > 0
+            let n: Operand = g.imm(area)
+            g.op2("add", OpSize.Quad, n, r64(RSP))?
+        if demote
+            return Ok(())
+        match s
+            Some(slot) =>
+                for k in 0..rls.len
+                    let l: Leaf = rls.get(k)
+                    let r: i64 = RET_REGS[k]
+                    if self.is_i1(l.ty)
+                        let one: Operand = g.imm(1)
+                        g.op2("and", OpSize.Long, one, r32(r))?
+                    g.store(r, RBP, l.offset - slot.offset, type_size(self.m, l.ty))?
+                Ok(())
+            None => Ok(())
+
+    # The intrinsics this slice needs: llvm.trap and the overflow checks
+    # ritz1 puts on every `+`, `-` and `*`. The rest are #4806's.
+    fn lower_intrinsic(self: @FnLower, g: @&Gen, inst: @Inst, name: StrView) -> Result<(), Fail>
+        if name.eq("llvm.trap")
+            return g.op0("ud2", OpSize.Unsized)
+        # llvm.{s,u}{add,sub,mul}.with.overflow.iN
+        let rest: StrView = name.skip(5)
+        let op: StrView = rest.skip(1).take(3)
+        let known: bool = op.eq("add") or op.eq("sub") or op.eq("mul")
+        if not known or not rest.skip(4).starts_with(".with.overflow.") or not (rest.starts_with("s") or rest.starts_with("u"))
+            return Err(fail_named(inst.line, "intrinsic", name))
+        let signed: bool = rest.starts_with("s")
+        let ty: i64 = self.value(self.operand(inst, 1)).ty
+        let bits: i64 = int_width(self.m, ty)
+        let size: OpSize = size_of_bytes(bits / 8)
+        self.load_scalar(g, RAX, self.operand(inst, 1))?
+        self.load_scalar(g, RCX, self.operand(inst, 2))?
+        if op.eq("add")
+            g.op2("add", size, reg_op(RCX, size), reg_op(RAX, size))?
+        else if op.eq("sub")
+            g.op2("sub", size, reg_op(RCX, size), reg_op(RAX, size))?
+        else if signed and bits > 8
+            g.op2("imul", size, reg_op(RCX, size), reg_op(RAX, size))?
+        else if signed
+            g.op1("imul", size, reg_op(RCX, size))?
+        else
+            g.op1("mul", size, reg_op(RCX, size))?
+        let flag: StrView = if signed then "seto" else "setb"
+        g.op1(flag, OpSize.Unsized, reg_op(RCX, OpSize.Byte))?
+        match self.result_slot(inst)
+            Some(s) =>
+                g.store(RAX, RBP, 0 - s.offset, bits / 8)?
+                let f: Member = member(self.m, s.ty, 1)
+                g.store(RCX, RBP, f.offset - s.offset, 1)
+            None => Ok(())
+
+    # ---------------------------------------------------------- inline asm
+
+    fn lower_asm(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let call: IrValue = self.value(self.operand(inst, 0))
+        let ctext: String = decode_string(call.text2)
+        let cs: Vec<Constraint> = match parse_constraints(ctext.as_view())
+            Ok(c) => c
+            Err(what) => return Err(fail_unsupported(inst.line, what.as_view()))
+        let ret_ty: i64 = self.call_return_type(inst)
+        let outs: Vec<Leaf> = self.check_int_leaves(ret_ty, inst.line, "an inline asm float or vector output")?
+        var ops = vec_new<AsmOperand>()
+        var out_regs = vec_new<i64>()
+        for i in 0..cs.len
+            let c: Constraint = cs.get(i)
+            if c.kind == ConKind.Output
+                if out_regs.len >= outs.len
+                    return Err(fail_malformed(inst.line, "more asm outputs than result values"))
+                out_regs.push(c.reg)
+                ops.push(AsmOperand { reg: c.reg, bytes: type_size(self.m, outs.get(out_regs.len - 1).ty) })
+        var arg: i64 = 1
+        for i in 0..cs.len
+            let c: Constraint = cs.get(i)
+            if c.kind != ConKind.Input
+                continue
+            if arg >= inst.count
+                return Err(fail_malformed(inst.line, "more asm inputs than arguments"))
+            var r: i64 = c.reg
+            if c.tied >= 0
+                if c.tied >= out_regs.len
+                    return Err(fail_malformed(inst.line, "asm input tied to no output"))
+                r = out_regs.get(c.tied)
+            if r == RSP or r == RBP
+                return Err(fail_unsupported(inst.line, "an asm operand in %rsp or %rbp"))
+            let vid: i64 = self.operand(inst, arg)
+            let ty: i64 = self.value(vid).ty
+            if not is_int_or_ptr(self.m, ty)
+                return Err(fail_unsupported(inst.line, "an inline asm float or vector input"))
+            self.load_scalar(g, r, vid)?
+            ops.push(AsmOperand { reg: r, bytes: type_size(self.m, ty) })
+            arg += 1
+        let template: String = decode_string(call.text)
+        let text: String = match substitute(template.as_view(), @ops)
+            Ok(t) => t
+            Err(what) => return Err(fail_unsupported(inst.line, what.as_view()))
+        assemble(g, text.as_view())?
+        match self.result_slot(inst)
+            Some(s) =>
+                for k in 0..out_regs.len
+                    let l: Leaf = outs.get(k)
+                    g.store(out_regs.get(k), RBP, l.offset - s.offset, type_size(self.m, l.ty))?
+                Ok(())
+            None => Ok(())

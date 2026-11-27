@@ -1,0 +1,114 @@
+# layout: the x86-64 ELF data layout (DESIGN.md "Object contract"): each
+# type's size and alignment, where a struct's fields and an array's elements
+# sit, and the scalar leaves an aggregate flattens into (DESIGN.md "ABI",
+# Flattening).
+import ritzlib.gvec { Vec, vec_new }
+import rllvm.ir
+
+pub fn round_up(n: i64, align: i64) -> i64
+    (n + align - 1) / align * align
+
+# The aligned size and alignment of `ty`.
+pub struct SizeAlign
+    size: i64
+    align: i64
+
+fn int_bytes(bits: i64) -> i64
+    if bits <= 8
+        return 1
+    bits / 8
+
+pub fn size_align(m: @Module, ty: i64) -> SizeAlign
+    let t: Type = m.types.get(m.resolve(ty))
+    match t.kind
+        TypeKind.Int =>
+            let n: i64 = int_bytes(t.width)
+            SizeAlign { size: n, align: n }
+        TypeKind.Float => SizeAlign { size: 4, align: 4 }
+        TypeKind.Double => SizeAlign { size: 8, align: 8 }
+        TypeKind.Ptr => SizeAlign { size: 8, align: 8 }
+        TypeKind.Array =>
+            let e: SizeAlign = size_align(m, t.elem)
+            SizeAlign { size: e.size * t.width, align: e.align }
+        TypeKind.Vector =>
+            let e: SizeAlign = size_align(m, t.elem)
+            let n: i64 = e.size * t.width
+            SizeAlign { size: n, align: n }
+        TypeKind.Struct =>
+            var off: i64 = 0
+            var align: i64 = 1
+            for i in 0..t.count
+                let f: SizeAlign = size_align(m, m.type_lists.get(t.first + i))
+                let fa: i64 = if t.packed then 1 else f.align
+                off = round_up(off, fa) + f.size
+                if fa > align
+                    align = fa
+            SizeAlign { size: round_up(off, align), align: align }
+        TypeKind.Void => SizeAlign { size: 0, align: 1 }
+        TypeKind.Label => SizeAlign { size: 0, align: 1 }
+        TypeKind.Func => SizeAlign { size: 0, align: 1 }
+        TypeKind.Named => SizeAlign { size: 0, align: 1 }
+
+pub fn type_size(m: @Module, ty: i64) -> i64
+    size_align(m, ty).size
+
+# A struct's or array's element `i`: its type and byte offset.
+pub struct Member
+    ty: i64
+    offset: i64
+
+pub fn member(m: @Module, ty: i64, i: i64) -> Member
+    let t: Type = m.types.get(m.resolve(ty))
+    if t.kind == TypeKind.Struct
+        var off: i64 = 0
+        for k in 0..i + 1
+            let fty: i64 = m.type_lists.get(t.first + k)
+            let f: SizeAlign = size_align(m, fty)
+            off = if t.packed then off else round_up(off, f.align)
+            if k == i
+                return Member { ty: fty, offset: off }
+            off += f.size
+    Member { ty: t.elem, offset: type_size(m, t.elem) * i }
+
+pub fn is_aggregate(m: @Module, ty: i64) -> bool
+    let k: TypeKind = m.types.get(m.resolve(ty)).kind
+    k == TypeKind.Struct or k == TypeKind.Array
+
+# How many elements an aggregate has.
+pub fn member_count(m: @Module, ty: i64) -> i64
+    let t: Type = m.types.get(m.resolve(ty))
+    if t.kind == TypeKind.Struct
+        return t.count
+    t.width
+
+# One scalar of a flattened value: its type and byte offset in the value.
+pub struct Leaf
+    ty: i64
+    offset: i64
+
+fn flatten_into(m: @Module, ty: i64, base: i64, out: @&Vec<Leaf>)
+    if not is_aggregate(m, ty)
+        out.push(Leaf { ty: ty, offset: base })
+        return
+    for i in 0..member_count(m, ty)
+        let e: Member = member(m, ty, i)
+        flatten_into(m, e.ty, base + e.offset, out)
+
+# The scalar and vector elements of `ty` in order, nesting and padding gone.
+pub fn leaves(m: @Module, ty: i64) -> Vec<Leaf>
+    var out = vec_new<Leaf>()
+    if m.types.get(m.resolve(ty)).kind != TypeKind.Void
+        flatten_into(m, ty, 0, @&out)
+    out
+
+# Is `ty` an integer or a pointer: what the general-purpose registers hold?
+pub fn is_int_or_ptr(m: @Module, ty: i64) -> bool
+    let k: TypeKind = m.types.get(m.resolve(ty)).kind
+    k == TypeKind.Int or k == TypeKind.Ptr
+
+# The bit width of an integer type (64 for a pointer).
+pub fn int_width(m: @Module, ty: i64) -> i64
+    let t: Type = m.types.get(m.resolve(ty))
+    if t.kind == TypeKind.Int
+        return t.width
+    64

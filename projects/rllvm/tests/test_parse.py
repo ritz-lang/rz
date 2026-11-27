@@ -58,10 +58,10 @@ def test_round_trip_matches_clang(rllvm_ir_bin, rel, tmp_path):
 
 
 @pytest.mark.parametrize("rel", CORPUS_FILES)
-def test_rllvm_parses_every_corpus_file(rllvm_bin, rel):
-    p = run([rllvm_bin, "-c", str(TESTS / rel), "-o", "/dev/null"])
-    assert p.returncode == 2, p
-    assert "unsupported: lowering is not implemented" in p.stderr, p.stderr
+def test_rllvm_parses_every_corpus_file(rllvm_bin, rel, tmp_path):
+    # Past the parser: an object, or a construct lowering does not have yet.
+    p = run([rllvm_bin, "-c", str(TESTS / rel), "-o", str(tmp_path / "out.o")])
+    assert p.returncode == 0 or (p.returncode == 2 and "(not lowered yet)" in p.stderr), p
 
 
 def test_metadata_is_skipped(rllvm_ir_bin, tmp_path):
