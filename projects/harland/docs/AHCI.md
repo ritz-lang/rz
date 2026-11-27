@@ -43,9 +43,11 @@ and Aaron has confirmed the same on the X99 with the firmware set to AHCI.
   physmap, a TSC deadline on every command, a per-queue `busy` owner and the
   kernel wait queue (`proc/waitq.ritz`) once interrupts are up, and
   512-byte-sector translation at the interface.
-- **Interrupts.** `drivers/msix.ritz` programs MSI-X only, through interrupt
-  remapping when it is on (`ir_set`, `ir_msi_addr`, `ir_msi_data`). There is
-  **no plain MSI** support. INTx is not used by any storage driver.
+- **Interrupts.** `drivers/msix.ritz` programs MSI-X and, since #4885, plain
+  single-message MSI (`msi_probe`, `msi_enable`; layout in
+  `drivers/msi_cap.ritz`), both through interrupt remapping when it is on
+  (`ir_set`, `ir_msi_addr`, `ir_msi_data`). INTx is not used by any storage
+  driver.
 - **IOMMU.** On a translating boot (#4723) `vtd_dma_init` gives every
   requester on a segment an identity domain over all RAM before setting TE,
   so in-kernel bus masters (virtio-blk, NVMe) keep working. An AHCI HBA gets
@@ -307,9 +309,11 @@ protects the Acer's and the ThinkPad's NVMe disks too.
     second boot of the same disks reports `/var/boots` = 2 (the data
     survives a reboot), with the sectors around the image still holding
     the pattern;
-  - once MSI is in, the log shows AHCI commands that waited on the vector
-    and interrupts counted, on both an untranslated boot and an
-    `intel-iommu,intremap=on` boot (interrupt remapping);
+  - the log shows AHCI commands that waited on the vector and interrupts
+    counted, with the same data as a polled read and no completion without
+    its interrupt, on the plain q35 boot and on boot 2, which is
+    `q35,kernel-irqchip=split` + `intel-iommu,intremap=on` (its MSI line
+    names an IRTE);
   - no exception.
 - **Existing q35 boots** prove the empty-controller path: they must not get
   slower by more than the shared port deadline, and must log the one
