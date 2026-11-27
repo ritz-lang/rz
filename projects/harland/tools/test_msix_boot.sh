@@ -61,7 +61,10 @@
 #     vector between polls instead of spinning a fixed delay (AGAST #3631);
 #     the vtd run's owner parks instead (below);
 #   - the kernel took no exception, and init's Tier-1 suite still reports
-#     ALL TESTS PASSED with the NIC and NVMe attached.
+#     ALL TESTS PASSED with the NIC and NVMe attached;
+#   - on every boot, vmm_free_pml4's lazy-CR3 assert ("[vmm] vmm_free_pml4:
+#     ... still loaded", AGAST #4880) never fired: no page table was freed
+#     while a CPU still had it loaded (an exit that slept came back on it).
 #
 # It boots twice, with the same devices and the same checks (AGAST #4723,
 # docs/RING1_DRIVER.md "DMA domain", PR 5b):
@@ -415,6 +418,15 @@ ring1_checks() {
 # P"), and netd then ran DHCP itself and logged its own lease ("[netd]
 # configured A") after that line. The kernel's DHCPRELEASE is best effort
 # and not checked. Sets rc=1 on any failure.
+# The lazy-CR3 assert (above) on the boot logged in $1.
+pml4_free_check() {
+    if grep -aq '\[vmm\] vmm_free_pml4: .* still loaded' "$1"; then
+        grep -a '\[vmm\] vmm_free_pml4' "$1" | head -5
+        echo "FAIL: a PML4 was freed while a CPU still had it loaded"
+        rc=1
+    fi
+}
+
 seat_checks() {
     local SERIAL="$1" seat_line seat_pid addr
     seat_line=$(grep -anE "\[net\] seat -> netd pid [0-9]+" "$SERIAL" | head -1)
@@ -520,6 +532,7 @@ check() {
         echo "FAIL: kernel exception during boot"
         rc=1
     fi
+    pml4_free_check "$SERIAL"
     # QEMU's NVMe controller is PCI 1b36:0010.
     if grep -aiqE "\[msix\] [0-9a-f:.]+ 1b36:0010: [1-9][0-9]* vectors" "$SERIAL"; then
         echo "PASS: NVMe controller's MSI-X table found"
@@ -780,6 +793,7 @@ net_shell_boot() {
         echo "FAIL: kernel exception or panic on the vtd-shell boot"
         rc=1
     fi
+    pml4_free_check "$log"
     seat_checks "$log"
 }
 
