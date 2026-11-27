@@ -1,0 +1,397 @@
+# platform/save.ritz - loading and saving files on Linux (AGAST #4820).
+#
+# docs/BUDDHAFINGER_PROPOSAL.md, "Saving files". LinuxFiles is the editor's
+# file store (core/files.ritz's FileStore): load_disk() reads a file and
+# records its size and mtime, and save_disk() refuses to replace a file that
+# changed since then. A save:
+#
+#   1. stats the target and compares its size and mtime with the record
+#      (overwrite() skips this: the user confirmed with `:w!`);
+#   2. writes a temp file in the target's directory, streaming the buffer's
+#      line slices through a staging chunk;
+#   3. gives it the target's permission bits and fsyncs it;
+#   4. closes it and renames it over the target;
+#   5. fsyncs the directory, so the rename survives a crash.
+#
+# A failure before the rename removes the temp file and leaves the target
+# as it was. A failed directory fsync comes after the rename: the new bytes
+# are in place but not known durable, so it is still an Err. The store
+# never marks the buffer saved: the editor does, on Ok only, so a failed
+# save leaves it dirty.
+#
+# The store records one file, the one being edited (the first release has
+# one buffer). Saving to another path checks that path as a new file: one
+# already there is Changed until overwrite().
+#
+# The disk is reached through SaveIo, so the tests inject short writes,
+# ENOSPC and failing fsyncs or renames; LinuxIo is the real one.
+#
+# Not handled: a symlink target is replaced by a regular file (the rename
+# replaces the link, not what it points to), and the owner and group of a
+# file someone else owns become the editor's.
+
+import ritzlib.errno
+import ritzlib.fd
+import ritzlib.fs
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.process { process_id }
+import ritzlib.result
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.sys { Stat }
+
+import core.buffer { Buffer, term_text }
+import core.files { FileStore, LoadError, SaveError }
+
+# Bytes staged before a write: line slices are small, write(2) calls aren't.
+const SAVE_CHUNK: i64 = 65536
+# Temp names tried (`disk_temp_path` n = 0..) before giving up.
+const SAVE_TEMP_TRIES: i64 = 100
+# Permission bits of st_mode (07777: rwx for all three, setuid, setgid, sticky).
+const MODE_BITS: i32 = 4095
+
+# ============================================================================
+# Errors
+# ============================================================================
+
+# Why load_disk() failed.
+pub enum DiskLoadError
+    NotFound                # no file there: a new file (load recorded it so)
+    Failed(Errno)
+
+# Why a save failed, by step. Every step but Changed and SyncDir leaves the
+# target as it was and no temp file behind.
+pub enum DiskError
+    Changed                 # the target changed since load or the last save
+    Stat(Errno)             # stat of the target
+    Create(Errno)           # creating the temp file
+    Write(Errno)            # writing it
+    Chmod(Errno)            # giving it the target's permissions
+    Sync(Errno)             # fsync of it
+    Close(Errno)            # closing it (NFS reports write errors here)
+    Rename(Errno)           # renaming it over the target
+    SyncDir(Errno)          # fsync of the directory: the target is replaced
+
+impl DiskError
+    # The step that failed: "changed", "stat", "create", "write", "chmod",
+    # "sync", "close", "rename" or "sync-dir".
+    pub fn step_name(self: DiskError) -> StrView
+        match self
+            Changed => "changed"
+            Stat(_) => "stat"
+            Create(_) => "create"
+            Write(_) => "write"
+            Chmod(_) => "chmod"
+            Sync(_) => "sync"
+            Close(_) => "close"
+            Rename(_) => "rename"
+            SyncDir(_) => "sync-dir"
+
+    # The errno of the failed step; None for Changed.
+    pub fn errno(self: DiskError) -> Option<Errno>
+        match self
+            Changed => None
+            Stat(e) => Some(e)
+            Create(e) => Some(e)
+            Write(e) => Some(e)
+            Chmod(e) => Some(e)
+            Sync(e) => Some(e)
+            Close(e) => Some(e)
+            Rename(e) => Some(e)
+            SyncDir(e) => Some(e)
+
+    # A line for the message area: "write failed: No space left on device".
+    pub fn describe(self: DiskError) -> String
+        match self.errno()
+            None => string_from("file changed on disk since it was read (:w! overwrites)")
+            Some(e) =>
+                var s: String = string_from(self.step_name())
+                s.push_str(" failed: ")
+                s.push_str(e.message())
+                s
+
+# ============================================================================
+# The disk seam
+# ============================================================================
+
+# The calls a save makes that can fail on a real disk. LinuxIo passes them
+# through; a test's fake injects faults.
+pub trait SaveIo
+    # One write(2) of at most data.len bytes: Ok(bytes taken), maybe short.
+    fn write(self: @&Self, fd: @Fd, data: [u8]) -> Result<i64, Errno>
+    # fsync(2) of a file or a directory.
+    fn fsync(self: @&Self, fd: @Fd) -> Result<(), Errno>
+    fn rename(self: @&Self, from: StrView, to: StrView) -> Result<(), Errno>
+
+# The real disk. Stateless: the field is there because a struct has one.
+pub struct LinuxIo
+    unused: i32
+
+pub fn linux_io() -> LinuxIo
+    LinuxIo { unused: 0 }
+
+impl SaveIo for LinuxIo
+    fn write(self: @&LinuxIo, fd: @Fd, data: [u8]) -> Result<i64, Errno>
+        fd.write(data)
+
+    fn fsync(self: @&LinuxIo, fd: @Fd) -> Result<(), Errno>
+        fd.fsync()
+
+    fn rename(self: @&LinuxIo, from: StrView, to: StrView) -> Result<(), Errno>
+        rename(from, to)
+
+# ============================================================================
+# The store
+# ============================================================================
+
+# What a save compares the target with.
+pub struct DiskStamp
+    size: i64
+    mtime: i64
+    mtime_ns: i64
+
+fn stamp_of(st: @Stat) -> DiskStamp
+    DiskStamp { size: st.st_size, mtime: st.st_mtime, mtime_ns: st.st_mtime_ns }
+
+fn same_stamp(a: @DiskStamp, b: @DiskStamp) -> bool
+    a.size == b.size and a.mtime == b.mtime and a.mtime_ns == b.mtime_ns
+
+# Whether a save checks the target against the record.
+pub enum DiskCheck
+    Checked                 # `:w`: refuse a target that changed
+    Overwrite               # `:w!`: the user confirmed
+
+pub struct LinuxFiles
+    path: String            # the file the record is for ("" before a load)
+    stamp: Option<DiskStamp>    # None: no file there when last seen
+
+pub fn linux_files() -> LinuxFiles
+    LinuxFiles { path: string_new(), stamp: None }
+
+impl LinuxFiles
+    # Read the file at `path` whole and record its size and mtime. A missing
+    # file is Err(NotFound), recorded as new, so saving creates it.
+    pub fn load_disk(self: @&LinuxFiles, path: StrView) -> Result<Vec<u8>, DiskLoadError>
+        self.path.clear()
+        self.path.push_str(path)
+        self.stamp = None
+        var f: Fd = fd_adopt(-1)
+        match fd_open(path, O_RDONLY + O_CLOEXEC, 0)
+            Ok(opened) => f = opened
+            Err(e) =>
+                match e
+                    NoEnt => return Err(DiskLoadError.NotFound)
+                    _ => return Err(DiskLoadError.Failed(e))
+        let got = read_all(@f)
+        let closed = f.close()
+        match got
+            Ok(data) =>
+                self.stamp = Some(data.stamp)
+                Ok(data.bytes)
+            Err(e) => Err(DiskLoadError.Failed(e))
+
+    # Write `buf` to `path` as described at the top. Err(Changed) when the
+    # target changed since load or the last save; else the failed step.
+    pub fn save_disk(self: @&LinuxFiles, path: StrView, buf: @Buffer) -> Result<(), DiskError>
+        var io = linux_io()
+        linux_save_with(self, path, buf, DiskCheck.Checked, @&io)
+
+    # save_disk() without the change check: the user confirmed the overwrite.
+    pub fn overwrite(self: @&LinuxFiles, path: StrView, buf: @Buffer) -> Result<(), DiskError>
+        var io = linux_io()
+        linux_save_with(self, path, buf, DiskCheck.Overwrite, @&io)
+
+    # The record for `path`: Some(stamp) for a file seen there, None for
+    # none seen (a new file, or a path never loaded or saved).
+    fn record_for(self: @LinuxFiles, path: StrView) -> Option<DiskStamp>
+        if not self.path.as_view().eq(path)
+            return None
+        self.stamp
+
+# The editor's view: the step a save failed at folds into Failed(errno);
+# errno() is None for Changed alone.
+impl FileStore for LinuxFiles
+    fn load(self: @&LinuxFiles, path: StrView) -> Result<Vec<u8>, LoadError>
+        match self.load_disk(path)
+            Ok(bytes) => Ok(bytes)
+            Err(e) =>
+                match e
+                    NotFound => Err(LoadError.NotFound)
+                    Failed(n) => Err(LoadError.Failed(n))
+
+    fn save(self: @&LinuxFiles, path: StrView, buf: @Buffer) -> Result<(), SaveError>
+        match self.save_disk(path, buf)
+            Ok(_) => Ok(())
+            Err(e) =>
+                match e.errno()
+                    None => Err(SaveError.Changed)
+                    Some(n) => Err(SaveError.Failed(n))
+
+# A file's bytes and the stamp they were read under.
+struct ReadAll
+    bytes: Vec<u8>
+    stamp: DiskStamp
+
+fn read_all(f: @Fd) -> Result<ReadAll, Errno>
+    let st = f.stat()?
+    var bytes: Vec<u8> = vec_with_cap<u8>(st.st_size)
+    var chunk: [4096]u8
+    loop
+        let n = f.read(Span<u8> { ptr: @chunk[0], len: 4096 })?
+        if n == 0
+            break
+        bytes.push_span(Span<u8> { ptr: @chunk[0], len: n })
+    Ok(ReadAll { bytes: bytes, stamp: stamp_of(@st) })
+
+# ============================================================================
+# The save
+# ============================================================================
+
+# The n-th temp name for `path`: ".<name>.<pid>-<n>.bf~" beside it, so the
+# rename stays on one filesystem.
+pub fn disk_temp_path(path: StrView, n: i64) -> String
+    var name: String = string_from(".")
+    name.push_str(path_basename(path))
+    name.push('.')
+    name.push_i64(process_id() as i64)
+    name.push('-')
+    name.push_i64(n)
+    name.push_str(".bf~")
+    path_join(path_dirname(path), name.as_view())
+
+# The target's status now: Some(stat), None if there is no file, Err(Changed)
+# when that differs from what `files` recorded (and `check` is Checked).
+fn check_target(files: @LinuxFiles, path: StrView, check: DiskCheck) -> Result<Option<Stat>, DiskError>
+    var now: Option<Stat> = None
+    match stat(path)
+        Ok(st) => now = Some(st)
+        Err(e) =>
+            match e
+                NoEnt => pass
+                _ => return Err(DiskError.Stat(e))
+    if check == DiskCheck.Overwrite
+        return Ok(now)
+    let was = files.record_for(path)
+    match now
+        Some(st) =>
+            match was
+                Some(w) =>
+                    let n = stamp_of(@st)
+                    if not same_stamp(@w, @n)
+                        return Err(DiskError.Changed)
+                None => return Err(DiskError.Changed)
+        None =>
+            if was.is_some()
+                return Err(DiskError.Changed)
+    Ok(now)
+
+# Create a fresh temp file for `path`: the Fd and its name.
+struct Temp
+    fd: Fd
+    path: String
+
+fn create_temp(path: StrView) -> Result<Temp, DiskError>
+    for n in 0..SAVE_TEMP_TRIES
+        let name = disk_temp_path(path, n)
+        # 0600 until the target's bits are copied over: never readable by
+        # others while it holds bytes of a private file.
+        match fd_open(name.as_view(), O_WRONLY + O_CREAT + O_EXCL + O_CLOEXEC, 384)
+            Ok(f) => return Ok(Temp { fd: f, path: name })
+            Err(e) =>
+                match e
+                    Exist => pass
+                    _ => return Err(DiskError.Create(e))
+    Err(DiskError.Create(Errno.Exist))
+
+# Write all of `data`, finishing short writes. Err(Io) if a write takes
+# nothing.
+fn write_all_via<T: SaveIo>(io: @&T, fd: @Fd, data: [u8]) -> Result<(), Errno>
+    var done: i64 = 0
+    while done < data.len
+        let n = io.write(fd, data[done..data.len])?
+        if n <= 0
+            return Err(Errno.Io)
+        done += n
+    Ok(())
+
+# Append `piece` to `stage`, writing the stage out first when the piece
+# would overflow it; a piece of a chunk or more is written straight through.
+fn stage_piece<T: SaveIo>(io: @&T, fd: @Fd, stage: @&Vec<u8>, piece: [u8]) -> Result<(), Errno>
+    if stage.len() + piece.len > SAVE_CHUNK
+        write_all_via(io, fd, span_from_vec<u8>(stage))?
+        stage.clear()
+    if piece.len >= SAVE_CHUNK
+        return write_all_via(io, fd, piece)
+    stage.push_span(piece)
+    Ok(())
+
+# Stream `buf` to `fd` line by line: each line's bytes, then its terminator.
+fn write_buffer<T: SaveIo>(io: @&T, fd: @Fd, buf: @Buffer) -> Result<(), Errno>
+    var stage: Vec<u8> = vec_with_cap<u8>(SAVE_CHUNK)
+    for l in 0..buf.line_count()
+        stage_piece(io, fd, @&stage, buf.line(l))?
+        stage_piece(io, fd, @&stage, span_from_strview(term_text(buf.line_term(l))))?
+    write_all_via(io, fd, span_from_vec<u8>(@stage))
+
+# Steps 2-4 on the open temp file: write, chmod, fsync, stat, close,
+# rename. Ok(the stamp the target now has).
+fn fill_and_rename<T: SaveIo>(tmp: @&Temp, path: StrView, buf: @Buffer, target: @Option<Stat>, io: @&T) -> Result<DiskStamp, DiskError>
+    match write_buffer(io, @tmp.fd, buf)
+        Err(e) => return Err(DiskError.Write(e))
+        Ok(_) => pass
+    match *target
+        Some(st) =>
+            match tmp.fd.chmod(st.st_mode & MODE_BITS)
+                Err(e) => return Err(DiskError.Chmod(e))
+                Ok(_) => pass
+        None => pass
+    match io.fsync(@tmp.fd)
+        Err(e) => return Err(DiskError.Sync(e))
+        Ok(_) => pass
+    # The rename keeps the mtime: this is the stamp the target will have.
+    var stamp = DiskStamp { size: 0, mtime: 0, mtime_ns: 0 }
+    match tmp.fd.stat()
+        Ok(st) => stamp = stamp_of(@st)
+        Err(e) => return Err(DiskError.Stat(e))
+    match tmp.fd.close()
+        Err(e) => return Err(DiskError.Close(e))
+        Ok(_) => pass
+    match io.rename(tmp.path.as_view(), path)
+        Err(e) => return Err(DiskError.Rename(e))
+        Ok(_) => pass
+    Ok(stamp)
+
+# fsync of the directory holding `path`.
+fn sync_dir<T: SaveIo>(path: StrView, io: @&T) -> Result<(), Errno>
+    var d: Fd = fd_open(path_dirname(path), O_RDONLY + O_DIRECTORY + O_CLOEXEC, 0)?
+    let synced = io.fsync(@d)
+    let closed = d.close()
+    synced
+
+# Record that `path` now holds the file a save wrote, stamped `stamp`.
+#
+# standard-exempt: free-fn-method: called from the generic linux_save_with,
+# whose instance is emitted in the caller's module, and ritz1 does not link
+# a private method from there (a private fn links)
+fn record_saved(files: @&LinuxFiles, path: StrView, stamp: DiskStamp)
+    files.path.clear()
+    files.path.push_str(path)
+    files.stamp = Some(stamp)
+
+# The save, through `io`. `files` records the target's new stamp once the
+# rename has replaced it, so the next save checks against the bytes written.
+pub fn linux_save_with<T: SaveIo>(files: @&LinuxFiles, path: StrView, buf: @Buffer, check: DiskCheck, io: @&T) -> Result<(), DiskError>
+    let target = check_target(files, path, check)?
+    var tmp = create_temp(path)?
+    match fill_and_rename(@&tmp, path, buf, @target, io)
+        Ok(stamp) => record_saved(files, path, stamp)
+        Err(e) =>
+            let closed = tmp.fd.close()
+            let removed = unlink(tmp.path.as_view())
+            return Err(e)
+    match sync_dir(path, io)
+        Err(e) => return Err(DiskError.SyncDir(e))
+        Ok(_) => pass
+    Ok(())

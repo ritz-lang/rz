@@ -1,0 +1,630 @@
+# test/test_save.ritz - the Linux save's ritzunit suite (AGAST #4820).
+#
+# LinuxFiles.load_disk records the file's size and mtime; save writes a temp file in
+# the same directory, fsyncs it, gives it the target's permissions, renames
+# it over the target and fsyncs the directory
+# (docs/BUDDHAFINGER_PROPOSAL.md, "Saving files"). FaultIo stands in for the
+# disk through the SaveIo seam: short writes, ENOSPC after a byte budget, a
+# failing fsync or rename. Every case checks the dirty flag, the target's
+# bytes and that no temp file is left behind. `Ed` plays the editor: it
+# marks the buffer saved on Ok only, as the editor does.
+#
+# Each test owns a directory under /tmp named by pid and test, so concurrent
+# runs (gate slots, compiler variants) stay apart.
+
+import ritzlib.errno
+import ritzlib.fd
+import ritzlib.fs
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.process { process_id }
+import ritzlib.result
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview
+
+import core.buffer { Buffer, buffer_new, buffer_from_bytes, pos }
+import core.files { FileStore, LoadError, SaveError }
+import platform.save { DiskCheck, DiskError, DiskLoadError, LinuxFiles, SaveIo, disk_temp_path, linux_files, linux_save_with }
+
+# ============================================================================
+# Fixtures
+# ============================================================================
+
+# A fresh empty directory "/tmp/bf_save_<pid>_<name>".
+fn fixture_dir(name: StrView) -> String
+    var d: String = string_from("/tmp/bf_save_")
+    d.push_i64(process_id() as i64)
+    d.push('_')
+    d.push_str(name)
+    let gone = remove_dir_all(d.as_view())
+    let made = mkdir(d.as_view(), 493)
+    d
+
+# `dir`/`name`.
+fn in_dir(dir: @String, name: StrView) -> String
+    path_join(dir.as_view(), name)
+
+# Create `path` holding `text`, with permission bits `mode`.
+fn put(path: @String, text: StrView, mode: i32)
+    let w = write_file(path.as_view(), text)
+    let c = chmod(path.as_view(), mode)
+
+# The bytes at `path` (empty if it can't be read).
+fn contents(path: @String) -> String
+    match read_file(path.as_view())
+        Ok(s) => s
+        Err(_) => string_new()
+
+fn holds(path: @String, want: StrView) -> bool
+    let got = contents(path)
+    got.as_view().eq(want)
+
+# The permission bits of `path`, -1 if it can't be stat'd.
+fn mode_of(path: @String) -> i32
+    match stat(path.as_view())
+        Ok(st) => st.st_mode & 4095
+        Err(_) => -1
+
+# How many entries `dir` holds besides . and ..: a leftover temp file
+# makes it more than the files the test made.
+fn entries(dir: @String) -> i64
+    var n: i64 = 0
+    match dir_open(dir.as_view())
+        Ok(it) =>
+            var d = it
+            loop
+                match d.next_entry()
+                    Some(e) =>
+                        let name = e.name
+                        if not name.eq(".") and not name.eq("..")
+                            n += 1
+                    None => break
+            d.close()
+        Err(_) => return -1
+    n
+
+# The editor's side of a save: one buffer, its path and the file store.
+struct Ed
+    files: LinuxFiles
+    buffer: Buffer
+    path: String
+
+# Open `path` for editing, as the editor does: a missing file is a new,
+# empty buffer.
+[[test_helper]]
+fn open_ok(path: @String) -> Ed
+    var files = linux_files()
+    var buf = buffer_new()
+    match files.load_disk(path.as_view())
+        Ok(bytes) => buf = buffer_from_bytes(span_from_vec<u8>(@bytes))
+        Err(e) =>
+            match e
+                NotFound => pass
+                Failed(_) =>
+                    assert false
+    Ed { files: files, buffer: buf, path: string_from(path.as_view()) }
+
+# `:w` through `io`, marking the buffer saved on Ok. A free fn: a method
+# can't have its own type parameters yet.
+fn write_via<T: SaveIo>(o: @&Ed, check: DiskCheck, io: @&T) -> Result<(), DiskError>
+    let r = linux_save_with(@&o.files, o.path.as_view(), @o.buffer, check, io)
+    if r.is_ok()
+        o.buffer.mark_saved()
+    r
+
+impl Ed
+    # `:w` on the real disk.
+    fn write(self: @&Ed) -> Result<(), DiskError>
+        let r = self.files.save_disk(self.path.as_view(), @self.buffer)
+        if r.is_ok()
+            self.buffer.mark_saved()
+        r
+
+    # `:w!` on the real disk.
+    fn write_over(self: @&Ed) -> Result<(), DiskError>
+        let r = self.files.overwrite(self.path.as_view(), @self.buffer)
+        if r.is_ok()
+            self.buffer.mark_saved()
+        r
+
+# "ok" for Ok, else the error's step ("changed", "write", ...).
+fn step_of(r: Result<(), DiskError>) -> StrView
+    match r
+        Ok(_) => "ok"
+        Err(e) => e.step_name()
+
+# The errno an Err carries, "" for Ok or Changed.
+fn errno_of(r: Result<(), DiskError>) -> StrView
+    match r
+        Ok(_) => ""
+        Err(e) =>
+            match e.errno()
+                Some(n) => n.name()
+                None => ""
+
+# Insert `text` at the start of the buffer.
+fn edit(o: @&Ed, text: StrView)
+    let at = o.buffer.insert(pos(0, 0), span_from_strview(text))
+
+# ============================================================================
+# FaultIo: the disk, with faults
+# ============================================================================
+
+struct FaultIo
+    max_chunk: i64          # most bytes one write takes (0: no limit)
+    budget: i64             # bytes written before ENOSPC (-1: no limit)
+    fail_fsync: i64         # the n-th fsync (1-based) fails with EIO (0: none)
+    fail_rename: bool
+    fsyncs: i64
+    log: String             # W per write call, F per fsync, R per rename
+
+fn fault_io() -> FaultIo
+    FaultIo { max_chunk: 0, budget: -1, fail_fsync: 0, fail_rename: false, fsyncs: 0, log: string_new() }
+
+impl SaveIo for FaultIo
+    fn write(self: @&FaultIo, fd: @Fd, data: [u8]) -> Result<i64, Errno>
+        let w = self.log.push('W')
+        var n = data.len
+        if self.max_chunk > 0 and n > self.max_chunk
+            n = self.max_chunk
+        if self.budget >= 0
+            if self.budget == 0
+                return Err(Errno.NoSpc)
+            if n > self.budget
+                n = self.budget
+            self.budget -= n
+        fd.write(data[0..n])
+
+    fn fsync(self: @&FaultIo, fd: @Fd) -> Result<(), Errno>
+        let w = self.log.push('F')
+        self.fsyncs += 1
+        if self.fsyncs == self.fail_fsync
+            return Err(Errno.Io)
+        fd.fsync()
+
+    fn rename(self: @&FaultIo, from: StrView, to: StrView) -> Result<(), Errno>
+        let w = self.log.push('R')
+        if self.fail_rename
+            return Err(Errno.Acces)
+        rename(from, to)
+
+# ============================================================================
+# Round trips
+# ============================================================================
+
+[[test]]
+fn test_save_round_trips_endings_and_untouched_bytes() -> i32
+    let d = fixture_dir("roundtrip")
+    let p = in_dir(@d, "f.txt")
+    # LF, CRLF, a lone CR, a NUL and no final newline.
+    put(@p, "one\ntwo\r\nthree\rfo\x00ur", 420)
+    var o = open_ok(@p)
+    assert not o.buffer.is_dirty()
+    edit(@&o, "X")
+    assert o.buffer.is_dirty()
+    assert step_of(o.write()).eq("ok")
+    assert holds(@p, "Xone\ntwo\r\nthree\rfo\x00ur")
+    assert not o.buffer.is_dirty()
+    assert entries(@d) == 1
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_save_keeps_the_final_newline() -> i32
+    let d = fixture_dir("finalnl")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "a\r\nb\r\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "z")
+    assert step_of(o.write()).eq("ok")
+    assert holds(@p, "za\r\nb\r\n")
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_save_streams_a_file_bigger_than_one_chunk() -> i32
+    let d = fixture_dir("big")
+    let p = in_dir(@d, "f.txt")
+    var want: String = string_new()
+    for i in 0..20000
+        want.push_str("line ")
+        want.push_i64(i)
+        want.push('\n')
+    put(@p, want.as_view(), 420)
+    var o = open_ok(@p)
+    edit(@&o, "#")
+    assert step_of(o.write()).eq("ok")
+    var full: String = string_from("#")
+    full.push_str(want.as_view())
+    assert holds(@p, full.as_view())
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_open_missing_file_then_save_creates_it() -> i32
+    let d = fixture_dir("newfile")
+    let p = in_dir(@d, "new.txt")
+    var o = open_ok(@p)
+    assert o.buffer.byte_len() == 0
+    edit(@&o, "hello\n")
+    assert step_of(o.write()).eq("ok")
+    assert holds(@p, "hello\n")
+    assert not o.buffer.is_dirty()
+    assert entries(@d) == 1
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_second_save_checks_against_the_first() -> i32
+    # The save records the new size and mtime, so saving again is not
+    # mistaken for an external change.
+    let d = fixture_dir("twice")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "a\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "b")
+    assert step_of(o.write()).eq("ok")
+    edit(@&o, "cc")
+    assert step_of(o.write()).eq("ok")
+    assert holds(@p, "ccba\n")
+    let gone = remove_dir_all(d.as_view())
+    0
+
+# ============================================================================
+# Permissions
+# ============================================================================
+
+[[test]]
+fn test_save_preserves_permissions() -> i32
+    let d = fixture_dir("perms")
+    let p = in_dir(@d, "run.sh")
+    put(@p, "echo hi\n", 488)                 # 0750
+    var o = open_ok(@p)
+    edit(@&o, "#")
+    assert step_of(o.write()).eq("ok")
+    assert mode_of(@p) == 488
+    let q = in_dir(@d, "secret")
+    put(@q, "k\n", 384)                       # 0600
+    var s = open_ok(@q)
+    edit(@&s, "#")
+    assert step_of(s.write()).eq("ok")
+    assert mode_of(@q) == 384
+    let gone = remove_dir_all(d.as_view())
+    0
+
+# ============================================================================
+# Changed underneath
+# ============================================================================
+
+[[test]]
+fn test_save_refuses_a_file_changed_underneath() -> i32
+    let d = fixture_dir("changed")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "mine\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "+")
+    put(@p, "theirs, longer\n", 420)
+    let r = o.write()
+    assert step_of(r).eq("changed")
+    assert holds(@p, "theirs, longer\n")
+    assert o.buffer.is_dirty()
+    assert entries(@d) == 1
+    # Confirmed: the overwrite goes ahead.
+    assert step_of(o.write_over()).eq("ok")
+    assert holds(@p, "+mine\n")
+    assert not o.buffer.is_dirty()
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_save_refuses_a_same_size_file_with_a_new_mtime() -> i32
+    let d = fixture_dir("mtime")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "abc\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "+")
+    let t = set_times(p.as_view(), FileTime.Now, FileTime.At(1000000000))
+    assert step_of(o.write()).eq("changed")
+    assert holds(@p, "abc\n")
+    assert o.buffer.is_dirty()
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_save_refuses_a_new_file_created_underneath() -> i32
+    let d = fixture_dir("appeared")
+    let p = in_dir(@d, "f.txt")
+    var o = open_ok(@p)
+    edit(@&o, "mine\n")
+    put(@p, "theirs\n", 420)
+    assert step_of(o.write()).eq("changed")
+    assert holds(@p, "theirs\n")
+    assert o.buffer.is_dirty()
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_save_refuses_a_file_deleted_underneath() -> i32
+    let d = fixture_dir("deleted")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "mine\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "+")
+    let u = unlink(p.as_view())
+    assert step_of(o.write()).eq("changed")
+    assert entries(@d) == 0
+    assert o.buffer.is_dirty()
+    let gone = remove_dir_all(d.as_view())
+    0
+
+# ============================================================================
+# Injected faults
+# ============================================================================
+
+[[test]]
+fn test_short_writes_are_finished() -> i32
+    let d = fixture_dir("short")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "alpha\nbeta\ngamma\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, ">")
+    var io = fault_io()
+    io.max_chunk = 3
+    assert step_of(write_via(@&o, DiskCheck.Checked, @&io)).eq("ok")
+    assert holds(@p, ">alpha\nbeta\ngamma\n")
+    assert not o.buffer.is_dirty()
+    assert entries(@d) == 1
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_enospc_keeps_the_old_file_and_the_buffer_dirty() -> i32
+    let d = fixture_dir("enospc")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "old contents\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "new ")
+    var io = fault_io()
+    io.budget = 5
+    let r = write_via(@&o, DiskCheck.Checked, @&io)
+    assert step_of(r).eq("write")
+    assert errno_of(r).eq("ENOSPC")
+    assert holds(@p, "old contents\n")
+    assert o.buffer.is_dirty()
+    assert entries(@d) == 1
+    # The record is untouched: a later save is not refused as a change.
+    assert step_of(o.write()).eq("ok")
+    assert holds(@p, "new old contents\n")
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_failed_fsync_keeps_the_old_file() -> i32
+    let d = fixture_dir("fsync")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "old\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "x")
+    var io = fault_io()
+    io.fail_fsync = 1
+    let r = write_via(@&o, DiskCheck.Checked, @&io)
+    assert step_of(r).eq("sync")
+    assert errno_of(r).eq("EIO")
+    assert holds(@p, "old\n")
+    assert o.buffer.is_dirty()
+    assert entries(@d) == 1
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_failed_rename_keeps_the_old_file() -> i32
+    let d = fixture_dir("rename")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "old\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "x")
+    var io = fault_io()
+    io.fail_rename = true
+    let r = write_via(@&o, DiskCheck.Checked, @&io)
+    assert step_of(r).eq("rename")
+    assert holds(@p, "old\n")
+    assert o.buffer.is_dirty()
+    assert entries(@d) == 1
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_failed_directory_fsync_reports_and_stays_dirty() -> i32
+    # The rename already replaced the file: the new bytes are there, but
+    # not known durable, so the buffer stays dirty. The record is the new
+    # file's, so saving again is not refused as a change.
+    let d = fixture_dir("dirsync")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "old\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "x")
+    var io = fault_io()
+    io.fail_fsync = 2
+    let r = write_via(@&o, DiskCheck.Checked, @&io)
+    assert step_of(r).eq("sync-dir")
+    assert holds(@p, "xold\n")
+    assert o.buffer.is_dirty()
+    assert entries(@d) == 1
+    assert step_of(o.write()).eq("ok")
+    assert not o.buffer.is_dirty()
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_save_order_is_write_fsync_rename_fsync_dir() -> i32
+    let d = fixture_dir("order")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "a\n", 420)
+    var o = open_ok(@p)
+    edit(@&o, "b")
+    var io = fault_io()
+    assert step_of(write_via(@&o, DiskCheck.Checked, @&io)).eq("ok")
+    assert io.log.as_view().eq("WFRF")
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_save_into_a_missing_directory_fails_at_create() -> i32
+    let d = fixture_dir("nodir")
+    let p = in_dir(@d, "f.txt")
+    var o = open_ok(@p)
+    edit(@&o, "x")
+    let gone = remove_dir_all(d.as_view())
+    let r = o.write()
+    assert step_of(r).eq("create")
+    assert errno_of(r).eq("ENOENT")
+    assert o.buffer.is_dirty()
+    0
+
+[[test]]
+fn test_a_stale_temp_file_is_stepped_around() -> i32
+    # A temp file left by a crash under this pid is neither reused nor
+    # removed: the save picks the next name.
+    let d = fixture_dir("stale")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "a\n", 420)
+    let stale = disk_temp_path(p.as_view(), 0)
+    put(@stale, "crash leftovers", 420)
+    var o = open_ok(@p)
+    edit(@&o, "b")
+    assert step_of(o.write()).eq("ok")
+    assert holds(@p, "ba\n")
+    assert holds(@stale, "crash leftovers")
+    assert entries(@d) == 2
+    let gone = remove_dir_all(d.as_view())
+    0
+
+# ============================================================================
+# Load and the messages
+# ============================================================================
+
+[[test]]
+fn test_load_reports_a_missing_file_and_a_directory() -> i32
+    let d = fixture_dir("load")
+    var files = linux_files()
+    let p = in_dir(@d, "absent")
+    var missing = false
+    match files.load_disk(p.as_view())
+        Ok(_) => pass
+        Err(e) =>
+            match e
+                NotFound => missing = true
+                Failed(_) => pass
+    assert missing
+    var why: StrView = ""
+    match files.load_disk(d.as_view())
+        Ok(_) => pass
+        Err(e) =>
+            match e
+                NotFound => pass
+                Failed(n) => why = n.name()
+    assert why.eq("EISDIR")
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_describe_names_the_step_and_the_error() -> i32
+    let w: DiskError = DiskError.Write(Errno.NoSpc)
+    let full: String = w.describe()
+    assert full.as_view().eq("write failed: No space left on device")
+    let sd: DiskError = DiskError.SyncDir(Errno.Io)
+    let dir: String = sd.describe()
+    assert dir.as_view().eq("sync-dir failed: Input/output error")
+    let c: DiskError = DiskError.Changed
+    let changed: String = c.describe()
+    assert changed.as_view().eq("file changed on disk since it was read (:w! overwrites)")
+    0
+
+# ============================================================================
+# The FileStore seam (core/files.ritz): what the editor calls
+# ============================================================================
+
+# `:e` through any FileStore, as the editor does: a missing file is a new,
+# empty buffer; any other failure fails the test.
+[[test_helper]]
+fn store_open<S: FileStore>(s: @&S, path: StrView) -> Buffer
+    var buf = buffer_new()
+    match s.load(path)
+        Ok(bytes) => buf = buffer_from_bytes(span_from_vec<u8>(@bytes))
+        Err(e) =>
+            match e
+                NotFound => pass
+                Failed(_) =>
+                    assert false
+    buf
+
+# `:w` through any FileStore: "ok", "changed" or the Failed errno's name.
+# Marks the buffer saved on Ok only, as the editor does.
+fn store_write<S: FileStore>(s: @&S, path: StrView, buf: @&Buffer) -> StrView
+    let r = s.save(path, buf)
+    match r
+        Ok(_) =>
+            buf.mark_saved()
+            "ok"
+        Err(e) =>
+            match e
+                Changed => "changed"
+                Failed(n) => n.name()
+
+# Load through any FileStore: "ok", "not-found" or the Failed errno's name.
+fn store_load_error<S: FileStore>(s: @&S, path: StrView) -> StrView
+    match s.load(path)
+        Ok(_) => "ok"
+        Err(e) =>
+            match e
+                NotFound => "not-found"
+                Failed(n) => n.name()
+
+[[test]]
+fn test_file_store_loads_and_saves_through_the_trait() -> i32
+    let d = fixture_dir("store")
+    let p = in_dir(@d, "f.txt")
+    put(@p, "one\r\ntwo", 384)
+    var files = linux_files()
+    var buf = store_open(@&files, p.as_view())
+    assert not buf.is_dirty()
+    let at = buf.insert(pos(0, 0), span_from_strview("X"))
+    assert store_write(@&files, p.as_view(), @&buf).eq("ok")
+    assert holds(@p, "Xone\r\ntwo")
+    assert mode_of(@p) == 384
+    assert not buf.is_dirty()
+    assert entries(@d) == 1
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_file_store_maps_missing_changed_and_failed() -> i32
+    let d = fixture_dir("storeerr")
+    let p = in_dir(@d, "f.txt")
+    var files = linux_files()
+    # Missing: NotFound, an empty buffer, and the save creates the file.
+    var buf = store_open(@&files, p.as_view())
+    let at = buf.insert(pos(0, 0), span_from_strview("mine\n"))
+    assert store_write(@&files, p.as_view(), @&buf).eq("ok")
+    assert holds(@p, "mine\n")
+    # Changed underneath: Changed, the file kept, the buffer dirty.
+    let at2 = buf.insert(pos(0, 0), span_from_strview("+"))
+    put(@p, "theirs, longer\n", 420)
+    assert store_write(@&files, p.as_view(), @&buf).eq("changed")
+    assert holds(@p, "theirs, longer\n")
+    assert buf.is_dirty()
+    # A failing step: Failed with its errno, the buffer dirty.
+    let q = in_dir(@d, "gone/f.txt")
+    assert store_write(@&files, q.as_view(), @&buf).eq("ENOENT")
+    assert buf.is_dirty()
+    let gone = remove_dir_all(d.as_view())
+    0
+
+[[test]]
+fn test_file_store_load_reports_other_failures_as_failed() -> i32
+    let d = fixture_dir("storeload")
+    var files = linux_files()
+    assert store_load_error(@&files, d.as_view()).eq("EISDIR")
+    let gone = remove_dir_all(d.as_view())
+    0
