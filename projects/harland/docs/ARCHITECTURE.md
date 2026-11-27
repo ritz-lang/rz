@@ -145,7 +145,9 @@ Each connection/channel uses a **shared ring buffer**:
 > preemptive scheduling (AGAST #3629), ring-3 syscalls (`syscall` entry,
 > `iretq` return, not SYSRET), capabilities, and an in-kernel virtio-net
 > driver. Ring-1 drivers are designed in [`RING1_DRIVER.md`](RING1_DRIVER.md).
-> That design grants MMIO, DMA and IRQ wait but not port I/O.
+> That design grants MMIO, DMA and IRQ wait but not port I/O. User processes
+> on the APs (pinned first), the big kernel lock and TLB shootdown are
+> designed in [`SMP_USER.md`](SMP_USER.md).
 
 ### Phase 1: Multi-core & APIC
 1. **Local APIC initialization**
