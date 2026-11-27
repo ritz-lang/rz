@@ -3,13 +3,15 @@
 | | |
 |---|---|
 | Status | Draft |
-| Date | 2026-11-25 (placement, respawn, and boot switch decided; D8 = (b): netd runs at CPL 3) |
+| Date | 2026-11-25 (placement, respawn, and boot switch decided; D8 = (b): netd runs at CPL 3). 2026-11-27: D9, network drivers live inside netd |
 | Audience | Harland kernel |
 | Seat | Ring 2, a tier name: a CPL-3 process with service capabilities. This pass draws the service. It does not build it. |
 
 ## Overview
 
 The network service is one ring-2-tier process. Ring 2 is a tier, not a CPU privilege level: `/bin/netd` runs at CPL 3 in its own address space, like every non-kernel process, and what makes it a system service is the capabilities the kernel grants at spawn (D8 in `RING1_DRIVER.md`). It owns Ethernet demux, ARP, IPv4, ICMP, UDP, and DHCP. TCP is a later milestone in the same service, not part of the first cutover. The first cutover is DHCP, ARP, ping, and a ring-3 UDP bind, datagram send, and datagram receive. The service consumes and produces the SPSC frame rings from `RING1_DRIVER.md`. Ring 3 apps talk to it on a separate exchange. The service publishes its own address record. `NetInfo` (224) stays the ring-1 driver's link record and carries no lease. `NetAddr` (225) copies the address snapshot. Numbers 60 and 61 stay free.
+
+**D9 (Aaron, 2026-11-27): network drivers live inside netd.** One process owns the NIC and the stack. The virtio-net driver is a library linked into `/bin/netd`, behind a small NIC interface, and netd holds the NIC's `CAP_TYPE_MMIO`, `CAP_TYPE_IRQ`, and translated DMA domain. `/bin/virtio-net` goes away, and so does every exchange between a driver process and the service. "Drivers inside netd (D9)" below is the specification, and `RING1_DRIVER.md` "Decision D9" records the options and the reason: #4768's latency gate. Where later sections of this draft still name the ring-1 driver and the service as two processes, they describe the cutover as built (#4735, #4744, #4745). PR 8 in `RING1_DRIVER.md` folds them, and D9 wins where the two disagree. Ring 1 and ring 2 stay tier names. netd now holds both tiers' grants for its NIC.
 
 Until that process exists, the in-kernel stack in `kernel/src/net/` sits in the consumer seat. Taking the seat later does not change `FrameDesc`. The virtio device ring stays inside the ring-1 driver. `ipc/channel.ritz` stays a copied control queue. Neither is the dataplane. The service gets no port I/O.
 
@@ -19,9 +21,9 @@ Until that process exists, the in-kernel stack in `kernel/src/net/` sits in the 
 
 | Bytes | Owner | Where they move |
 |---|---|---|
-| Device queues, BAR, virtio header | Ring-1 driver | Virtio avail and used rings, inside the driver |
-| Ethernet frames, virtio header already stripped on RX | Frame rings | RX: driver produces, service consumes. TX: service produces, driver consumes and adds the virtio header |
-| MAC, link up, MTU, device type | Ring-1 driver | `NetInfo` (224) |
+| Device queues, BAR, virtio header | netd's NIC library (D9) | Virtio avail and used rings, inside netd |
+| Ethernet frames, virtio header already stripped on RX | netd, after the seat handoff. The frame rings only while the kernel holds the seat | RX: the NIC library hands netd's stack the frame in its device buffer. TX: the stack builds the frame in a device buffer after the virtio header. Before the handoff the rings carry frames between netd's NIC library and the kernel seat |
+| MAC, link up, MTU, device type | netd's NIC library (D9) | `NetInfo` (224) |
 | IPv4 address, gateway, netmask, DNS | Ring-2 service | The service's address page. Apps read it with `NetAddr` (225) |
 | Address snapshot | Ring 0 | A read-only copy of one generation, refreshed only by `NetPublish` (226). Invalidated if the service faults |
 | ARP cache, DHCP client state | Ring-2 service | Private to the service |
@@ -33,19 +35,17 @@ ENA stays an in-kernel `NetDevice` until its own driver moves. On that path the 
 
 ## Placement
 
-Ring 0 grants shared pages through `CAP_TYPE_SHM` (`CapGrant` 40, `ShmMap` 227, `CapRevoke` 41). Each process has one wait set. Spawn of the driver and of this service is the kernel exercising that path. An app that attaches later uses it again. There is no second sharing mechanism. Ring 0 does not parse a frame and does not parse an app request slot. The ring-1-tier driver is the only process that programs the NIC. The ring-2-tier service is the only process that answers ARP or runs DHCP. Both run at CPL 3; their capabilities, not their CPL, keep them apart. It is also where TCP will live, once that milestone exists. Ring 3 sees datagrams and the address snapshot. The userspace calls for a byte stream are named below and wait for the TCP milestone. The first cutover is the one named in the overview.
+Ring 0 grants shared pages through `CAP_TYPE_SHM` (`CapGrant` 40, `ShmMap` 227, `CapRevoke` 41). Each process has one wait set. Spawn of the driver and of this service is the kernel exercising that path. An app that attaches later uses it again. There is no second sharing mechanism. Ring 0 does not parse a frame and does not parse an app request slot. netd is the only process that programs the NIC, and the only process that answers ARP or runs DHCP (D9). It runs at CPL 3, and its capabilities, not its CPL, are its authority. It is also where TCP will live, once that milestone exists. Ring 3 sees datagrams and the address snapshot. The userspace calls for a byte stream are named below and wait for the TCP milestone. The first cutover is the one named in the overview.
 
 ```mermaid
 flowchart TB
   subgraph r3 [Ring 3 apps]
     app[App]
   end
-  subgraph r2 [Ring 2 network service]
+  subgraph netd [netd: ring-1 and ring-2 grants, one process, D9]
     svc[Ethernet ARP IPv4 ICMP UDP DHCP]
     addr[Address record]
-  end
-  subgraph r1 [Ring 1 NIC driver]
-    nic[virtio-net]
+    nic[NIC library: virtio-net]
     link[Link record NetInfo]
   end
   subgraph r0 [Ring 0]
@@ -57,21 +57,19 @@ flowchart TB
   svc -->|event ring| app
   svc -->|writes| addr
   app -->|NetAddr 225| addr
-  svc -->|TX frame ring| nic
-  nic -->|RX frame ring| svc
+  svc -->|tx_submit, direct call| nic
+  nic -->|rx_poll, direct call| svc
   nic -->|writes| link
   app -->|NetInfo 224| link
-  svc -->|reads MAC| link
-  kern -->|maps the rings| svc
-  kern -->|maps the rings| nic
+  kern -->|maps exchanges, grants MMIO IRQ DMA| netd
   nic -->|queues| dev
 ```
 
-The frame path is the pair of SPSC rings. The address path is the service's record, copied out by `NetAddr` (225), beside `NetInfo` (224), so the lease does not travel with the link. `NetInfo` is a separate object mapped only into the driver. Apps do not map the service's address page. The driver never writes the address record. The service never maps `NetInfo`. TCP is not in the box because the first cutover does not expose streams. Its home is still this service. The TCP section draws that later path.
+The frame path is a direct call between netd's stack and its NIC library (D9). The pair of SPSC frame rings carries frames only while the kernel holds the seat, before the handoff. The address path is the service's record, copied out by `NetAddr` (225), beside `NetInfo` (224), so the lease does not travel with the link. `NetInfo` is a separate object mapped only into the driver. Apps do not map the service's address page. The stack writes the address record and the NIC library writes `NetInfo`. Both are in netd, on two pages with one writer each. TCP is not in the box because the first cutover does not expose streams. Its home is still this service. The TCP section draws that later path.
 
 ### Privilege level
 
-`netd` is a kernel-spawned CPL-3 process, on the same spawn path as the ring-1-tier driver (`RING1_DRIVER.md` §2). It runs on `GDT_USER_CODE` / `GDT_USER_DATA` (`0x23` / `0x1B`), in its own PML4 with the kernel half `U/S = 0`, and returns with `sysretq` like every process. No descriptor is appended to the GDT, and no selector pair is chosen. User code never chooses its CPL. Its authority is the `CAP_TYPE_SHM` handles the kernel grants. It holds no `CAP_TYPE_MMIO` and no `CAP_TYPE_IRQ`.
+`netd` is a kernel-spawned CPL-3 process, on the same spawn path as the ring-1-tier driver (`RING1_DRIVER.md` §2). It runs on `GDT_USER_CODE` / `GDT_USER_DATA` (`0x23` / `0x1B`), in its own PML4 with the kernel half `U/S = 0`, and returns with `sysretq` like every process. No descriptor is appended to the GDT, and no selector pair is chosen. User code never chooses its CPL. Its authority is the capabilities the kernel grants. Under D9 those are the NIC's `CAP_TYPE_MMIO` (one per recorded window) and `CAP_TYPE_IRQ`, with the NIC's translated DMA domain behind that IRQ object. The `CAP_TYPE_SHM` handles are the link page, the address page, the frame object while the kernel holds the seat, and each app exchange. The IOMMU rule is unchanged: a boot with no translated DMA domain spawns no netd, and the kernel keeps the NIC (`virtio_net_init` and the in-kernel stack).
 
 ### Service binary and respawn
 
@@ -80,6 +78,8 @@ The service binary is `/bin/netd`. Its source is `projects/harland/system/src/ne
 The kernel writes netd's handles beside its address record, because the frame region's advisory span already holds the driver's `DriverBoot`. Before netd first runs, the kernel maps the address page into it at `DRV_RING_BASE` and writes one `ServiceBoot` (`driver_abi/src/boot.ritz`, magic `NSB1`) at `ADDR_BOOT_OFF` (0x40), past the record and its seqlock word, which are the only bytes `NetPublish` samples. The record holds the frame handle, the address handle and the kernel's TSC rate, `tsc_hz`. Harland has no user clock, and `ShmWait`'s deadline is relative for that reason, so netd times DHCP and ARP with the TSC (CR4.TSD is clear) divided by `tsc_hz / 1000`. netd copies the record once and checks it: the magic, `tsc_hz` of at least 1 MHz, and the address handle's `ShmMap` returning `DRV_RING_BASE`. Then it maps the frame object. Its host-tested loop body is `system/src/netsvc.ritz`.
 
 The kernel restarts `netd` when it exits or faults. Each death first runs the exit-or-fault path in the frame-seat section. That path invalidates the snapshot, closes every attachment, and retires the frame object. The kernel allows three restarts per boot, one after each of the first three deaths, with a doubling backoff before each restart: 250 ms after the first death, 500 ms after the second, and 1 s after the third. Each restart gets a new frame object, a new address page, and an empty attachment list, the same as a first spawn. The fourth death starts no process. The kernel logs that the restart budget is spent, `NetAddr` keeps returning `Errno.NoDev`, and networking stays down until reboot. The count is per boot and does not reset after a long healthy run. A boot that is still within its budget is down only for the backoff and the new process's start.
+
+Under D9 a death of netd is also the death of the NIC's driver, and the two are one path: netd's, with this budget and this backoff. The NIC is reset before a replacement maps it ("Drivers inside netd (D9)", Death and restart).
 
 Restart policy lives in the kernel for this cutover. A supervisor process, init, owning restart policy is a later option. It needs a privileged spawn-a-service call that this cutover does not add.
 
@@ -91,7 +91,8 @@ Indium is a distribution, not the kernel. Code that the kernel spawns, or that d
 |---|---|
 | `projects/harland/netstack/` | The protocol leaf package: Ethernet demux, ARP, IPv4, ICMP, UDP, DHCP. No kernel imports. Host-tested. It is the port of `docs/stack_example/`. |
 | `projects/harland/net_abi/` | `AppDesc`, the request and event records, and the app-exchange layout below. A leaf package on the `boot_abi` / `driver_abi` pattern. |
-| `projects/harland/system/` | New package for the programs the kernel spawns. `src/netd.ritz` is `[[bin]] netd`, this service. `src/virtio_net.ritz` is `[[bin]] virtio-net`, the ring-1 driver. Both use the same freestanding user target and linker script as Indium's bins. The Indium image build installs them as `/bin/netd` and `/bin/virtio-net`. |
+| `projects/harland/system/` | New package for the programs the kernel spawns. `src/netd.ritz` is `[[bin]] netd`, this service. `src/virtio_net.ritz` is `[[bin]] virtio-net`, the ring-1 driver as built, which D9 removes. Both use the same freestanding user target and linker script as Indium's bins. The Indium image build installs them as `/bin/netd` and `/bin/virtio-net`. |
+| `projects/harland/nic/` | New under D9: the NIC interface (`trait Nic`) and its virtio-net implementation, moved from `system/src/virtio_net.ritz` and `system/src/vnet.ritz`. A leaf package on the `virtio_abi` pattern, with no kernel imports. netd does the syscalls and passes in the mapped windows and DMA runs. ENA and e1000e implement the same trait later. |
 | `projects/harland/libnet/` | The ring-3 `net_*` library on `net_abi`: `net_bind`, `net_send_to`, `net_recv_from`, `net_ping`, `net_close`. |
 | `projects/indium/user/` | `ping`, `udp-send`, and `udp-recv`, which link `libnet`. |
 
@@ -99,7 +100,70 @@ The `SYS_*` numbers for these calls (`NetInfo` 224, `NetAddr` 225, `ShmMap` 227,
 
 ### Boot switch
 
-Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` keeps the EC2 peer-ping window on ENA. On any other NIC it opens the latency window on each owner ("Rollout"). Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling.
+Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. Under D9 it spawns `/bin/netd` alone, in `/bin/virtio-net`'s place. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` keeps the EC2 peer-ping window on ENA. On any other NIC it opens the latency window on each owner ("Rollout"). Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling. The gate ran on 2026-11-27 ("Rollout"), and D9 takes the first lever.
+
+### Drivers inside netd (D9)
+
+**Decided (Aaron, 2026-11-27, on #4768's latency gate): network drivers live inside netd.** One CPL-3 process owns the NIC and the stack. `RING1_DRIVER.md` "Decision D9" keeps the two-process design as the alternative considered. The reason is #4768's numbers ("Rollout", 2026-11-27). An ICMP echo costs 4 process switches on the ring path: idle to the driver, to the seat, back to the driver, and back to idle. Each switch is a CR3 load. With the driver inside netd an echo costs 2: idle to netd and back. The kernel-ring row bounds what the 2 switches are worth: about 25–50 µs each with the driver's work included, so about 50–100 µs of the 300 µs gap. The rest of the gap is netd's own path, about 150–200 µs and 2 syscalls per echo. Batching (#4876) is the lever for that.
+
+**Authority.** The kernel grants netd the NIC's `CAP_TYPE_MMIO` (one per recorded window), its `CAP_TYPE_IRQ`, and its translated DMA domain, which is bound to that IRQ object as it is today. netd is the recorded owner of the IRQ object, so `driver_quiesce` runs on netd's exit. The kernel also grants the link page with `CAP_RIGHT_PUBLISH`, the address page with `CAP_RIGHT_PUBLISH`, and the frame object while the kernel holds the seat. `DrvMmioMap`, `DrvDmaAlloc`, and `DrvDmaFree` check the same capabilities they check today. A `sys_spawn` from userspace still never receives device capabilities. MMIO and IRQ capabilities still cannot be transferred. The IOMMU rule is unchanged: no translation means no ring tiers, no netd, and the kernel keeps the NIC.
+
+**Driver shape.** The virtio-net driver becomes a library in `projects/harland/nic/`, linked into netd. netd's loop is generic over one trait. Ritz traits are static (LANGUAGE_SPEC §12), so this is a bound, not a vtable. One netd binary links the NIC library it serves.
+
+```ritz
+# A frame the NIC received. `bytes` start at the Ethernet header and lie in
+# the NIC's own DMA buffer: netd's until rx_release returns it to the device.
+struct RxFrame
+    bytes: [u8]
+    token: u32
+
+# A device buffer for one outgoing frame, past the space for the NIC's own
+# header: netd's until tx_submit hands it to the device.
+struct TxFrame
+    bytes: [u8]
+    token: u32
+
+trait Nic
+    fn rx_poll(self: @&Self) -> Option<RxFrame>        # next received frame, or None
+    fn rx_release(self: @&Self, f: RxFrame)            # repost its buffer
+    fn tx_buffer(self: @&Self) -> Option<TxFrame>      # reclaims sent buffers first. None: all in flight
+    fn tx_submit(self: @&Self, f: TxFrame, len: u32)   # adds the NIC header, queues it
+    fn tx_kick(self: @&Self)                           # one doorbell for everything submitted
+    fn irq_arm(self: @&Self)                           # interrupt on the next completion
+    fn link(self: @Self) -> NetInfo                    # MAC, link up, MTU, device type
+```
+
+The calls are direct. The SPSC frame rings do not stay as an in-process queue. A queue between two halves of one loop, on one thread, would cost the two copies the rings cost today, into the arena and out to a private copy. It would also keep the validation of a peer that no longer exists, and it would buy nothing.
+
+The calls do not copy, because the descriptor ownership rules allow it:
+
+- **RX.** Once the device has put a buffer on the used ring, it does not write that buffer again until the driver makes it available again (Virtio 1.2, the used ring). So `rx_poll` returns the frame where the device wrote it, header stripped. The stack parses it there and calls `rx_release`, which reposts the buffer, when it is done. Anything the stack keeps past `rx_release` it copies: a datagram into the app's event arena, which is the copy the app exchange already makes, and an ARP entry into the cache. The one-private-copy rule in `RING1_DRIVER.md` section 6 was against a peer process that could rewrite a slot after it was validated. The only other writer of an RX buffer is now the device, which the IOMMU fences and which the in-kernel stack trusts the same way. Ritz slices are bounds-checked, so a device that broke the used-ring rule could produce a wrong frame but not an out-of-bounds read.
+- **TX.** The stack builds the frame in the `TxFrame` that `tx_buffer` returned, and `tx_submit` writes the virtio header in front of it. From `tx_submit` until the used ring returns the buffer, it is the device's (the AGAST #4073 rule: the burst sends 300 and requires more than 256 distinct replies). When every TX buffer is in flight, `tx_buffer` returns `None`, and the frame goes on netd's private pending-TX queue. That is the one TX copy, and only under that pressure. It leaves when a TX completion frees a buffer. The completion is an interrupt on netd's own IRQ object, so it replaces the `SPACE` notify the driver sent.
+- **Kick and arm.** `tx_kick` rings the doorbell once per pass, not once per frame. `irq_arm` re-enables completion interrupts. After it, netd polls RX once more before it waits, so a frame that landed during the re-arm is not stranded. The fold task (#4875) may arm on every pass. Masking during a budgeted drain is #4876's.
+
+ENA and e1000e implement `Nic` later. Neither moves in this decision: ENA stays an in-kernel `NetDevice`.
+
+**What goes away.**
+
+- `/bin/virtio-net`: its `[[bin]]` in `system/ritz.toml`, its line in the Indium image build, and `system/src/virtio_net.ritz` as a program. Its code moves into the `nic` library.
+- The exchange between a driver process and the service. That covers `ATTACH` of a replacement frame object on the driver's inbox, `PEER_CLOSE` to the driver on netd's death, the driver's detach and `SHM_DETACH_TIMEOUT_MS` unmap of the old frame object, and `DRIVER_GONE` posted to the service. `DRIVER_GONE` (8) is no longer posted to a process. The bit stays reserved and is not reused. `ATTACH` stays for app exchanges and for the address page (below).
+- The driver's own death and restart path. Death and restart become one path, netd's: three restarts per boot, with the 250 ms, 500 ms, and 1 s backoff ("Service binary and respawn"). There is no "driver gone: exiting" case left in netd.
+
+**Death and restart.** netd's exit or fault runs `driver_quiesce` first, as the IRQ object's owner, in `sys_exit_impl` after the switch to the kernel PML4 and before `vmm_free_pml4`. It masks the MSI-X entries, writes virtio status 0 and waits `VIRTIO_RESET_TIMEOUT_US` for a 0 readback, invalidates the domain's IOVAs and waits for the IOTLB, and invalidates the `NetInfo` snapshot. Then the service's exit-or-fault path runs: invalidate `NetAddr`, close every attachment, and retire the frame object if the kernel still holds the seat. Then comes the restart, within the budget and after the backoff. The NIC is reset before the new netd maps it. The replacement is spawned only if that quiesce finished, with the status read back 0 and the invalidation complete. A NIC with any run on `dma_quarantine` from this death is not handed to a new process. The kernel logs it, `NetInfo` and `NetAddr` stay `Errno.NoDev`, and networking stays down until reboot, as it does when the budget is spent. A replacement gets what a first spawn gets: a new IRQ-owner record on the same IRQ object with its MSI-X entries unmasked, one MMIO capability per window, an empty DMA domain, a new link page, and a new address page. It gets no frame object, because the seat was handed over once, before the first death. It resets the device itself, as every bring-up does. The restart budget is armed once the handoff has run, as today. A netd that dies before the handoff is a driver death as today: no restart, and the kernel seat sees `NoDriver`.
+
+**Boot.** The kernel spawns `/bin/netd` at step 2 of `RING1_DRIVER.md` section 9, where it spawns `/bin/virtio-net` today. netd gets the device grants, the link page, and the frame object. `DriverBoot` moves from the frame region to the link page, past `NetInfo` and `link_seq`, the bytes `NetPublish` samples, as `ServiceBoot` sits past the address record. The link page is netd's first shared mapping, at `DRV_RING_BASE`. A restart, which has no frame object, then boots the same way. The record's frame handle is 0 on a restart. netd brings the NIC up, publishes link generation 2, and parks before pid 1's yield returns (step 3, unchanged). Until the handoff, netd's stack does not run. Its loop moves frames between the device and the frame object exactly as `/bin/virtio-net` does: RX published to the kernel seat, TX consumed from it, `Yield` on a full RX ring.
+
+**Unchanged.**
+
+- The frame-seat handoff from the kernel ("Frame seat"). At step 6a the kernel spawns nothing. It writes `ServiceBoot` into a fresh address page, registers netd as the service, arms the gate, and enqueues the address handle as `ATTACH` on netd's inbox. `NetAttach` returns `Errno.NoDev` until netd is registered as the service, so the first `ATTACH` netd sees is that page. netd maps it, checks `ServiceBoot` at the address `ShmMap` returned, and sends its ready `NetPublish`. Steps 6b–6d run as today: DHCPRELEASE, the kernel stack stops, and the kernel's indexes go into the record before the call returns. netd then finishes the frame object. It sends every TX slot the kernel published, the DHCPRELEASE included, and passes every RX slot the kernel did not consume to its stack. Then it `CapRevoke`s the frame object. From then on there is no frame object, and the stack calls `Nic`. On a restart the kernel enqueues the address page's `ATTACH` before netd first runs, and the ready `NetPublish` returns at once with both seat indexes 0. One netd path covers both.
+- `NetInfo` (224), now published by netd's NIC library on the link page, with the same seqlock, generation 2 first, and `NetPublish` as the only refresh. Once there is no frame object, a link `NetPublish` posts no `LINK` bit. netd knows its own link from the config interrupt.
+- `NetAddr` (225) and the address record.
+- The ring-3 app exchange, `NetAttach` (228), and `libnet`. Apps see no difference.
+- D8: netd is a kernel-spawned CPL-3 process in its own PML4. `MAX_PROCS` stays 8. The driver's slot is freed. The cap of five app exchanges stays ("Ring-3 app exchange").
+
+**Waits.** netd now blocks on IRQ and app-exchange events together, in one call: `DrvIrqWait` (220). It is `ShmWait` with the device's IRQ source added, over the same process wait set, and it already scans the inbox. netd no longer calls `ShmWait` (229). The call lists the app exchanges (at most five), and the frame object while the kernel holds the seat. With `out_cap` 8, the IRQ record, six sources, and one inbox record fit. `DrvIrqWait` today ignores `WaitRequest.deadline` and waits `DEVICE_WAIT_MS`. netd needs its protocol timers and its "check once", so under D9 `DrvIrqWait` reads the deadline as `ShmWait` does, in milliseconds from the call with 0 checking once, capped at `DEVICE_WAIT_MS` (100 ms), the quiet-link backstop. `kernel/driver_stub.s` passes `DEVICE_WAIT_MS` where its cases relied on the fixed deadline. The PROC_REAP rule stays exact: netd parks in exactly one place. #4746's lint (`test_harland_ring_blocking.py`) changes to one entry, netd, whose one blocking call is `DrvIrqWait`. `ShmWait` in netd is then a failure like any other blocking call, and the virtio-net entry goes. `Yield`, `DrvMmioMap`, `DrvDmaAlloc`, and `DrvDmaFree` join netd's non-blocking set.
+
+The implementation is PR 8 in `RING1_DRIVER.md` (#4875).
 
 ## What the kernel does today
 
@@ -108,6 +172,8 @@ Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a v
 Each protocol section below draws the service's receive path and send path. The caption names where today's kernel is narrower.
 
 ## Service wait
+
+Under D9 the one wait is `DrvIrqWait` (220), with the NIC's IRQ source added to everything below ("Drivers inside netd (D9)", Waits). After the handoff the frame object is not a source. An RX frame or a TX completion is the IRQ record. A pending send waits for a TX completion, not for `SPACE`. The rest of this section is the two-process wait as built.
 
 The service parks with one `ShmWait`. The call lists the frame object and every live app exchange, at most five, one per app process, each with its own mask. `proc_wake(reason)` in `proc/table.ritz` marks every `PROC_BLOCKED` process with that reason runnable, so the service does not use a shared reason. Each holding process has one latch per object, created when the kernel inserts its handle. A notify posts to the peer's latch, including before the peer maps the object or waits on it. The process inbox is scanned on every wait, including a wait that lists no exchanges. The kernel does not read the service's private pending-TX queue. The service builds the pairs. One return copies every matching source that fits in `out_cap` and writes that number to `out_count`.
 
@@ -122,6 +188,8 @@ The call parks only when every listed source is idle and the inbox is empty:
 - the deadline is still in the future
 
 The check runs under `cli` before the park. A notify that arrived while the service was still running is already on its latch, and the call returns every such handle instead of parking. A wake that matches nothing parks again until the deadline. The service includes `SPACE` only when the pending queue is non-empty and the TX ring has no free slot. A pending send that still fits is not a park: the service does not wait, it publishes. A free TX slot with an empty pending queue is idle, and `SPACE` stays out of the mask. The driver, after it stores its private TX `read_idx`, calls `ShmNotify` with `SPACE`. That wake carries no new frame and is how the pending send leaves. The service stores its private TX index before `ShmNotify` with `DATA`. That posts `DATA` to the driver's mapping, which is the driver's wake, including when the driver has not parked yet. An app does the same on its exchange: a request is `DATA` for the service, an event is `DATA` for the app. An app that posts `PEER_CLOSE` or `DRIVER_GONE` gets `Errno.Inval`, and the service stays attached.
+
+Under D9 the paragraph that follows has no case left between processes. netd's death is the NIC driver's death, the one path in "Drivers inside netd (D9)". `ATTACH` still delivers app exchanges and, once, the address page.
 
 `DRIVER_GONE` is latched on the service's mapping of the retired frame-object id. This cutover does not replace a dead driver. The service detaches and exits, and networking stays down until reboot. A wait that still names the old handle is not completed by some later object. Closing a peer latches `PEER_CLOSE` on that attachment only. The service detaches when it observes either bit. It does not ack a slot boundary first. `ATTACH` on the inbox is how a service with no exchanges yet learns a new app handle, and how a surviving driver learns a replacement frame object after this service exits.
 
@@ -330,7 +398,7 @@ An app does not map the frame rings and does not hold a device grant. It attache
 
 App to service, on the first cutover named in the overview: `net_bind`, `net_send_to`, `net_recv_from`, `net_ping`, and `net_close`. The TCP milestone adds `net_connect`, `net_read`, `net_write`, and `net_close` on a stream. Service to app: data, peer-closed, and error. A ping from an app is `net_ping`, an exchange request that the ICMP path answers with one event. It is not syscall 61. The address record is not carried as a field of these messages. The app reads the kernel snapshot with `NetAddr`. Connect and byte-stream events belong to the TCP milestone. The service reads an app request the way the frame consumer reads a descriptor: one private copy, then validation of that copy.
 
-Ring 0 grants the pages as `CAP_TYPE_SHM` and delivers the wake. The service holds that capability for the frame rings and for its address page. It does not hold `CAP_TYPE_MMIO` or `CAP_TYPE_IRQ`. An app holds `CAP_TYPE_SHM` only for its own exchange. On Harland the wake is the scheduler, and it names one endpoint. The app blocks when its event ring is empty, with the same recheck the frame-ring consumer uses. The service does not block on one empty request ring. Its park is the multi-source wait above. The service gets no port I/O, no BAR, and no DMA domain of the NIC.
+Ring 0 grants the pages as `CAP_TYPE_SHM` and delivers the wake. The service holds that capability for its link page, its address page, and the frame rings while the kernel holds the seat. Under D9 it also holds the NIC's `CAP_TYPE_MMIO` and `CAP_TYPE_IRQ`. An app holds `CAP_TYPE_SHM` only for its own exchange. On Harland the wake is the scheduler, and it names one endpoint. The app blocks when its event ring is empty, with the same recheck the frame-ring consumer uses. The service does not block on one empty request ring. Its park is the multi-source wait above. The service gets no port I/O. Its BAR windows and the NIC's DMA domain are D9's grants. An app gets neither.
 
 The app writes the request payloads and the request `write_idx`. The service reads a request and validates that private copy, then stores the request `read_idx`. A reply-producing request (`APP_BIND`, `APP_PING`, `APP_CLOSE`, and the reserved stream kinds) is consumed at that read. The owed reply stays in private per-attachment state until it is posted. It does not sit at the head of the request ring, so an `APP_SEND_TO` behind it is consumed while the reply is still owed. The service writes the event payloads and the event `write_idx`. The app reads them, validates, and then stores the event `read_idx`. The page is peer-writable, because those two indexes share a page. Each side validates the other's index and does not write it. A generic exchange handle has no `CAP_RIGHT_PUBLISH` and cannot call `NetPublish` or take the frame seat. `NetAttach` is what returns the handle. `CapGrant` is not how the app learns it.
 
@@ -354,7 +422,7 @@ flowchart LR
   sock --> ev --> call
 ```
 
-One pair of rings per attached app, and one live exchange per app process. A second bind of a live port fails inside the service with `Errno.Exist` (-17) and does not allocate a handle. One exchange has at most `MAX_ENDPOINTS` (16) live endpoints. A bind past that cap returns `Errno.NFile` (-23) and allocates no handle. A closed endpoint does not count. Handle numbers start at 1 and are not reused. `MAX_PROCS` is 8. Init, the ring-1 driver, and this service each hold a slot, so at most five apps attach. `NetAttach` (228) creates the `ShmObject` and returns the app's exchange handle. `ShmMap` (227) maps it. `CapRevoke` (41) drops the caller's handle and unmaps only that caller. The object's pages stay allocated while the other mapping is live. The wake word is the `u32` from the frame-ring layout.
+One pair of rings per attached app, and one live exchange per app process. A second bind of a live port fails inside the service with `Errno.Exist` (-17) and does not allocate a handle. One exchange has at most `MAX_ENDPOINTS` (16) live endpoints. A bind past that cap returns `Errno.NFile` (-23) and allocates no handle. A closed endpoint does not count. Handle numbers start at 1 and are not reused. `MAX_PROCS` is 8. Init, the ring-1 driver, and this service each held a slot, so at most five apps attach. D9 frees the driver's slot. The cap stays five: raising it changes `APP_ATTACH_CAP` and the wait's source list, and is not part of D9. `NetAttach` (228) creates the `ShmObject` and returns the app's exchange handle. `ShmMap` (227) maps it. `CapRevoke` (41) drops the caller's handle and unmaps only that caller. The object's pages stay allocated while the other mapping is live. The wake word is the `u32` from the frame-ring layout.
 
 The region is `0x23000` bytes. Indexes are monotonic `u64`. Depth is `APP_DEPTH = 32`. The slot is `seq & 31`. `APP_SLOT = 2048`, which is `FRAME_MAX`, so one datagram fits in one slot and the published MTU still caps the packet. Each side keeps a private copy of the index it owns.
 
@@ -467,6 +535,8 @@ The replacement service is `/bin/netd` again, within the per-boot budget of thre
 
 In-flight device buffers stay the driver's. The frame rings are CPU memory. Resetting an index does not free a DMA page.
 
+Under D9 the handoff is the frame object's last use. The kernel still writes its indexes into the record, and netd drains what the kernel left: it sends the TX slots and passes the RX slots to its stack. Then it revokes the object. The exit-or-fault path above then has no surviving driver to post `PEER_CLOSE` or `ATTACH` to, and no replacement frame object to create. It runs `driver_quiesce`, invalidates `NetAddr`, closes the attachments, and restarts netd as one process, with the NIC reset first ("Drivers inside netd (D9)", Death and restart).
+
 ## Constraints carried from the ring-1 seam
 
 The kernel is only the first consumer of the existing SPSC frame rings. The ring-2 service later takes that seat. `FrameDesc` does not change: length, flags, arena offset, depth 256, 2048-byte frames, virtio header stripped before publish and added by the driver on the way out.
@@ -475,7 +545,7 @@ The kernel is only the first consumer of the existing SPSC frame rings. The ring
 
 The virtio descriptor, avail, and used rings are the device DMA queue inside the ring-1 driver. They are not the service's dataplane. `ipc/channel.ritz` is a copied kernel queue. It is not the frame path and it is not the app exchange.
 
-The service is not given port I/O. IOPL stays 0. There is no I/O bitmap. Queue registers and the BAR stay with the ring-1 driver.
+The service is not given port I/O. IOPL stays 0. There is no I/O bitmap. Queue registers and the BAR stay with the ring-1 driver, which under D9 is netd's NIC library.
 
 ## What this draft leaves in place
 
@@ -483,7 +553,7 @@ Per-device DMA domains, `munmap` of the driver windows, page-granular MMIO, the 
 
 The kernel owns restart policy for `netd`: three restarts per boot with the 250 ms, 500 ms, 1 s backoff (Placement, "Service binary and respawn"). Moving that policy into a supervisor such as init is a later option. It needs a privileged spawn-a-service call, and this cutover does not add one.
 
-The kernel does not restart a dead ring-1 driver in this cutover. The frame-seat section covers that case.
+The kernel does not restart a dead ring-1 driver in this cutover. The frame-seat section covers that case. Under D9 the driver is restarted with netd, after the NIC reset, within netd's budget.
 
 The 21 per-CPU and syscall-stack checks exercise the current kernel. The handoff is implemented (AGAST #4744: `kernel/src/net/ring1.ritz` `net_seat_handoff`), and so is the exit-or-fault path with its restart policy (AGAST #4745: `kernel/src/syscall/runtime/process.ritz` `netd_restart`, `kernel/src/syscall/runtime/net.ritz` `net_service_install`). The kernel has no threads, so the backoff and the replacement's spawn run in the dead service's own exit path, after its handles, mappings and page table are gone. The `\harland\netd-restart` boot option has pid 1 kill each netd after its lease before init (that netd's own configured NetPublish, once it has parked again, so its `[netd] configured` line is out first: AGAST #4855), which `tools/test_msix_boot.sh` checks.
 
@@ -509,6 +579,8 @@ Stream, the TCP milestone, named now so the path is one stack:
 No HTTP, TLS, or DNS is defined on top of these calls. DNS stays an application that uses `net_send_to` and `net_recv_from`.
 
 ### Datagram receive
+
+Under D9 the two paths below lose their frame-ring hop. The NIC library strips the virtio header, and `rx_poll` hands the stack the frame in the device buffer, with no `ShmNotify` and no second copy. On send, the stack builds the frame in a `TxFrame` and calls `tx_submit` and `tx_kick`. The app side is unchanged. The text below is the two-process path as built.
 
 A device RX buffer holds a virtio-net header and one Ethernet frame. The ring-1 driver strips the virtio header, checks the frame length, and writes the Ethernet bytes into the RX arena. It stores the RX `write_idx`, then `ShmNotify` with `DATA`. The ring-2 service's `ShmWait` returns that frame object among every hot source. The service checks the destination MAC, the ethertype, the IPv4 header and its checksum, the IPv4 total length, the UDP checksum when it is non-zero, and the UDP ports. Bytes past the IPv4 total length are padding and are not part of the UDP datagram. Header checks run on the private copy of the frame. When the destination port matches a `net_bind` and the event ring still has its reply slot free, the service copies the UDP payload into that app's event arena, stores the event `write_idx`, and `ShmNotify` with `DATA`. A datagram that would take the reply slot is dropped and counted. `net_recv_from` returns those payload bytes. The bytes the application reads are the bytes that followed the UDP header in the device buffer.
 
@@ -588,13 +660,13 @@ Two more runs agree. At a 20 ms interval the medians are 694, 953, and 1021 µs.
   3. **PCID.** It cannot be tested on this host, because the CPU QEMU exposes has no PCID.
   4. **Polling on a dedicated core.**
 
-**Decision.** Whether a gap of about 300 µs (1.6–1.9× the guest's share) under nested KVM matters is Aaron's call, flagged on #4768.
+**Decision.** Whether a gap of about 300 µs (1.6–1.9× the guest's share) under nested KVM matters is Aaron's call, flagged on #4768. Decided 2026-11-27 (M2.9b, #4872). Lever 1 is D9, network drivers inside netd ("Drivers inside netd (D9)", #4875). Batching is #4876. Polling on a dedicated core is #4877, after APs run user processes (#4874). PCID is parked (#4878). Each landed lever adds its own dated entry here.
 
 **UDP round-trip** stays open in #4768 until #4752's udp tools land. The same window and wire carry it: the wire would send a datagram to a guest echo app instead of an ICMP echo.
 
 ## Open questions
 
-One service for every NIC that later grows a frame-ring pair, or one service per device. ENA is not on the rings yet.
+One netd for every NIC, linking each NIC's library, or one netd per device. D9 puts the driver inside netd but does not choose. ENA is not a `Nic` implementation yet.
 
 ARP lifetime, the pending-send cap, the ping deadline, DHCP retransmission, and the lease timers are decided above. TCP retransmission and congestion numbers are not open on this cutover. They belong to the TCP milestone, which is not part of it.
 
@@ -608,7 +680,8 @@ ARP lifetime, the pending-send cap, the ping deadline, DHCP retransmission, and 
 - `projects/harland/docs/RING_DESIGN_ROUND_2.md` — the round-2 review this text absorbs. The review file stays the review record.
 - `projects/harland/docs/RING_DESIGN_ROUND_3.md` — the round-3 review this text absorbs. The review file stays the review record.
 - `projects/harland/docs/stack_example/` — host traversal of `net_recv_from`, `net_send_to`, `net_read`, and `net_write`. The same run checks the peer-latch notify, the inbox, every hot source, the IPv4 total length, the ARP reply rule, and a broadcast echo request.
-- `projects/harland/system/src/netd.ritz` (`/bin/netd`) and `projects/harland/system/src/virtio_net.ritz` (`/bin/virtio-net`) — the programs the kernel spawns
+- `projects/harland/system/src/netd.ritz` (`/bin/netd`) and `projects/harland/system/src/virtio_net.ritz` (`/bin/virtio-net`) — the programs the kernel spawns. Under D9 only `/bin/netd`, with the driver in `projects/harland/nic/`
+- `projects/harland/docs/RING1_DRIVER.md` "Decision D9" and PR 8 — the options D9 weighed, and the fold
 - `projects/harland/netstack/`, `projects/harland/net_abi/`, `projects/harland/libnet/` — the protocol leaf, the app-exchange records, and the ring-3 library
 - `projects/harland/docs/ARCHITECTURE.md` — phase 5, the ring-2 stack; rings 1 and 2 as capability tiers at CPL 3
 - `projects/harland/docs/NETWORK_DESIGN.md` — ring-2 section; syscall 40/41 and the IOPORT line are stale

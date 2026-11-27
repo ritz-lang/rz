@@ -482,6 +482,12 @@ pub fn sys_net_addr(addr_ptr: *u8) -> i64
 > kernel. seL4, QNX, MINIX 3 and Fuchsia run drivers and network stacks the same
 > way. Items 1, 2 and 3 of "Required kernel changes" below are therefore not
 > needed: no ring 1/2 privilege levels, no `TSS.rsp1`/`rsp2`, no I/O port grants.
+>
+> **The NIC driver lives inside `netd`** (D9 in `RING1_DRIVER.md`, 2026-11-27).
+> One process holds the NIC's MMIO, IRQ and DMA-domain grants and runs the
+> stack, so frames are direct calls rather than a ring between two processes.
+> The Ring 1 / Ring 2 split below is now two halves of that one
+> process (`RING2_NET.md` "Drivers inside netd (D9)").
 
 Once the stack is properly organized, we can split it:
 

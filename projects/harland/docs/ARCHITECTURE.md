@@ -59,6 +59,11 @@ Everything else runs outside ring 0, in user-mode processes at CPL 3.
 > result. seL4, QNX, MINIX 3 and Fuchsia run drivers and services the same way:
 > user-mode processes with explicit grants. Harland adds no DPL-1/DPL-2
 > descriptors; every process returns with `sysretq`.
+>
+> A tier is a set of grants, so one process may hold two. Network drivers
+> live inside netd (decision D9): `/bin/netd` holds its NIC's ring-1 grants
+> and the ring-2 service's, with the driver linked in as a library, because a
+> separate driver process cost two extra switches per packet (#4768).
 
 ## IPC: Ring Buffers (Zeus/Valet Style)
 
