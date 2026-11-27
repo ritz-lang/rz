@@ -386,6 +386,10 @@ def tree(tmp_path):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"\x7fELF")
     shutil.copy(REPO / "projects/indium/initramfs.pkgs", root / "projects/indium/initramfs.pkgs")
+    # ...and stages its packages through indium's stager (AGAST #4834).
+    (root / "projects/indium/tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO / "projects/indium/tools/stage_initramfs.sh",
+                root / "projects/indium/tools/stage_initramfs.sh")
     stubs = tmp_path / "stubs"
     stubs.mkdir()
     ovmf = tmp_path / "OVMF_CODE.fd"

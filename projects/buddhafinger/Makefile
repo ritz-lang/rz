@@ -30,9 +30,12 @@ test: build
 	$(RZ) test buddhafinger --compiler $(COMPILER)
 	$(MAKE) harland-test
 
-# tools/test_harland_console.sh builds the kernel, rzsh and indium itself;
-# the editor is already built (above) by $(COMPILER), which it checks.
-harland-test: build
+# tools/test_harland_console.sh boots the packaged Indium image (AGAST
+# #4834): it builds the kernel, then indium's initramfs.pkgs through
+# indium/tools/stage_initramfs.sh, whose buddhafinger entry builds the editor
+# in the builder image with that image's $(COMPILER). It checks the staged
+# editor's manifest names $(COMPILER).
+harland-test:
 	bash tools/test_harland_console.sh
 
 # The benchmark workloads (AGAST #4821; bench/README.md): a release build of

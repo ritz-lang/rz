@@ -163,11 +163,13 @@ fi
 # tool is still a SETUP ERROR: indium/initramfs.pkgs, the one list shared
 # with indium's Makefile and tools/mkiso.sh (AGAST #2759). init's suite spawns
 # rzsh and prism's hello_gfx as well as indium's binaries.
-USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
-[ -n "$USER_PKGS" ] || { echo "FAIL: no packages in $PROJECTS_DIR/indium/initramfs.pkgs"; exit 1; }
+# indium/tools/stage_initramfs.sh is initramfs.pkgs' one reader: it builds
+# each package with the compiler its entry names and stages the ELFs
+# (AGAST #2759, #4834).
+STAGE="$PROJECTS_DIR/indium/tools/stage_initramfs.sh"
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-    for pkg in harland $USER_PKGS; do
+    for pkg in harland; do
         (cd "$ROOT_DIR" && ./rz build "$pkg" ${COMPILER:+--compiler "$COMPILER"})
         brc=$?
         # rz exits EXIT_SETUP when a toolchain binary is missing (lld-link
@@ -175,6 +177,10 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
         [ "$brc" -eq "$EXIT_SETUP" ] && setup_error "build of $pkg: a toolchain binary is missing"
         [ "$brc" -eq 0 ] || { echo "FAIL: build of $pkg failed"; exit 1; }
     done
+    COMPILER="$COMPILER" bash "$STAGE" --build-only
+    brc=$?
+    [ "$brc" -eq 3 ] && { echo "SETUP ERROR: building the initramfs packages: a toolchain binary or docker is missing" >&2; exit 3; }
+    [ "$brc" -eq 0 ] || { echo "FAIL: building the initramfs packages failed"; exit 1; }
 fi
 
 KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
@@ -191,13 +197,11 @@ python3 "$HARLAND_DIR/tools/check_no_red_zone.py" "$KERNEL_ELF" || exit 1
 # manifest (build.py writes BIN.manifest.json beside each output) records the
 # compiler; the build directory does not, so without this SKIP_BUILD, or a
 # build/debug a ritz0 build left behind, would boot and pass as ritz1's image.
+# The initramfs ELFs are checked as they are staged (stage_initramfs.sh
+# --check-compiler, below): a compiler= entry (Buddhafinger, the builder
+# image's ritz1_selfhosted, AGAST #4834) must name its own compiler instead.
 if [ -n "$COMPILER" ]; then
     BOOT_BINS=("$KERNEL_ELF" "$LOADER_EFI")
-    for pkg in $USER_PKGS; do
-        for f in "$PROJECTS_DIR/$pkg"/build/debug/*.elf; do
-            [ -f "$f" ] && BOOT_BINS+=("$f")
-        done
-    done
     for f in "${BOOT_BINS[@]}"; do
         m="$f.manifest.json"
         [ -f "$m" ] || { echo "FAIL: $(basename "$f") has no build manifest ($m)"; exit 1; }
@@ -207,7 +211,6 @@ if [ -n "$COMPILER" ]; then
             exit 1
         }
     done
-    echo "PASS: ${#BOOT_BINS[@]} boot binaries built by $COMPILER"
 fi
 
 WORK="$(mktemp -d)"
@@ -221,9 +224,12 @@ WORK="$(mktemp -d)"
 SOCK_DIR="$(sock_dir rz_tier1_mon. 123456789012345-mon.sock)" || exit 1
 trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm -rf "$WORK" "$SOCK_DIR"' EXIT
 mkdir -p "$WORK/bin"
-for pkg in $USER_PKGS; do
-    cp "$PROJECTS_DIR/$pkg"/build/debug/*.elf "$WORK/bin/" 2>/dev/null || true
-done
+bash "$STAGE" --no-build ${COMPILER:+--check-compiler "$COMPILER"} "$WORK/bin" || { echo "FAIL: staging the initramfs packages failed"; exit 1; }
+if [ -n "$COMPILER" ]; then
+    staged=("$WORK/bin"/*.elf)
+    [ -f "${staged[0]}" ] || staged=()
+    echo "PASS: $(( ${#BOOT_BINS[@]} + ${#staged[@]} )) boot binaries built by $COMPILER (or their initramfs.pkgs compiler=)"
+fi
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 

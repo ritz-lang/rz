@@ -117,6 +117,10 @@ def _tree(root: Path) -> Path:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.touch()
     (root / "projects" / "indium" / "initramfs.pkgs").write_text("indium\n")
+    # ...and stages its packages through indium's stager (AGAST #4834).
+    (root / "projects/indium/tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO / "projects/indium/tools/stage_initramfs.sh",
+                root / "projects/indium/tools/stage_initramfs.sh")
     return tools / TIER1_SH.name
 
 

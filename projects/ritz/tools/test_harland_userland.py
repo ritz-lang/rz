@@ -181,20 +181,41 @@ def fake_world(tmp_path: Path):
     logs and fails for any package named in $FAIL_PKGS, and fake
     grub-mkrescue / qemu-img on PATH."""
     pkgs_root = tmp_path / "pkgs"
-    pkgs = [
-        ln.split("#", 1)[0].strip()
+    entries = [
+        ln.split("#", 1)[0].split()
         for ln in (INDIUM / "initramfs.pkgs").read_text().splitlines()
-        if ln.split("#", 1)[0].strip()
+        if ln.split("#", 1)[0].split()
     ]
+    pkgs = [e[0] for e in entries]
     assert "rzsh" in pkgs, pkgs
-    for pkg in pkgs:
-        d = pkgs_root / pkg / "build" / "debug"
+    staged = []
+    for pkg, *fields in entries:
+        # A compiler= entry (Buddhafinger, AGAST #4834) is built in the
+        # builder image, whose /out is <pkg>/build/builder; its bin= fields
+        # name the ELFs and their /bin names.
+        pinned = any(f.startswith("compiler=") for f in fields)
+        d = pkgs_root / pkg / "build" / ("builder/build/debug" if pinned else "debug")
         d.mkdir(parents=True)
+        bins = [f[4:].split(":") for f in fields if f.startswith("bin=")]
         # A nested package (harland/system) builds into its own dir; its
         # fake ELF takes the last path component.
-        (d / f"{Path(pkg).name}.elf").write_bytes(b"\x7fELF fake")
+        for src, dest in bins or [(Path(pkg).name, Path(pkg).name)]:
+            (d / f"{src}.elf").write_bytes(b"\x7fELF fake")
+            Path(f"{d / src}.elf.manifest.json").write_text('{"compiler": "ritz1_selfhosted"}')
+            staged.append(f"{dest}.elf")
     bindir = tmp_path / "bin"
     bindir.mkdir()
+    # The builder run (run_builder_package.sh ... OUT): the stager empties
+    # OUT first, so the fake writes the /out above again.
+    pinned_bins = " ".join(
+        f.split("=", 1)[1].split(":")[0]
+        for _, *fields in entries if any(x.startswith("compiler=") for x in fields)
+        for f in fields if f.startswith("bin=")
+    )
+    _exe(bindir / "builder-run",
+         'echo "builder $*" >> "$RZ_LOG"\nd="${@: -1}/build/debug"; mkdir -p "$d"\n'
+         f'for n in {pinned_bins}; do printf "\\177ELF fake" > "$d/$n.elf"\n'
+         '  echo \'{"compiler": "ritz1_selfhosted"}\' > "$d/$n.elf.manifest.json"; done\n')
     log = tmp_path / "rz.log"
     rz = bindir / "rz"
     _exe(rz, f'echo "$*" >> {log}\nfor p in $FAIL_PKGS; do [ "$2" = "$p" ] && exit 1; done\nexit 0\n')
@@ -213,8 +234,12 @@ def fake_world(tmp_path: Path):
         KERNEL_ELF=str(kernel),
         BUILD_DIR=str(build),
         FAIL_PKGS="",
+        RZ_LOG=str(log),
+        RZ_BUILDER_IMAGE="rz-builder:fake",
+        RZ_BUILDER_RUN=str(bindir / "builder-run"),
     )
-    return {"env": env, "log": log, "pkgs_root": pkgs_root, "build": build, "pkgs": pkgs}
+    return {"env": env, "log": log, "pkgs_root": pkgs_root, "build": build, "pkgs": pkgs,
+            "staged": staged}
 
 
 def _mkiso(world) -> subprocess.CompletedProcess:
@@ -229,8 +254,8 @@ def test_mkiso_builds_with_every_package(fake_world):
     r = _mkiso(fake_world)
     assert r.returncode == 0, r.stdout + r.stderr
     assert (fake_world["build"] / "indium.iso").is_file()
-    staged = sorted(p.name for p in (fake_world["build"] / "initramfs-bin").iterdir())
-    assert staged == sorted(f"{Path(p).name}.elf" for p in fake_world["pkgs"])
+    staged = sorted(p.name for p in (fake_world["build"] / "initramfs-bin").glob("*.elf"))
+    assert staged == sorted(fake_world["staged"])
 
 
 def test_mkiso_loads_the_initramfs_as_a_multiboot2_module(fake_world):

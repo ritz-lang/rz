@@ -24,10 +24,10 @@ QEMU_CPU = -cpu Haswell-v1
 # Find OVMF firmware
 OVMF_CODE := $(shell for p in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd; do [ -f "$$p" ] && echo "$$p" && break; done)
 
-# Packages in the initramfs: the one list, shared with tools/mkiso.sh and
-# harland/tools/test_tier1_boot.sh (AGAST #2759). Their ELFs are staged in
+# Packages in the initramfs: initramfs.pkgs, the one list, staged by
+# tools/stage_initramfs.sh for this Makefile, tools/mkiso.sh and harland's
+# boot scripts alike (AGAST #2759, #4834). Their ELFs are staged in
 # INITRAMFS_BIN, not indium's own build/debug, which lacked prism's hello_gfx.
-INITRAMFS_PKGS := $(strip $(shell sed -e 's/\#.*//' initramfs.pkgs))
 INITRAMFS_BIN = $(BUILD_DIR)/initramfs-bin
 
 # Headless runs: make run-uefi QEMU_DISPLAY="-display none"
@@ -135,15 +135,12 @@ ec2-boot:
 # Run targets
 # ============================================================================
 
-# Build every package in initramfs.pkgs and stage its ELFs in INITRAMFS_BIN.
-# A package that builds no ELF is an error, not a silently thinner initramfs.
+# Build every package in initramfs.pkgs and stage its ELFs in INITRAMFS_BIN,
+# each with the compiler its entry names (Buddhafinger: the builder image's
+# ritz1_selfhosted). A package that builds no ELF is an error, not a
+# silently thinner initramfs.
 initramfs-bin:
-	@echo "=== Staging initramfs packages: $(INITRAMFS_PKGS) ==="
-	@rm -rf $(INITRAMFS_BIN) && mkdir -p $(INITRAMFS_BIN)
-	@for pkg in $(INITRAMFS_PKGS); do \
-		../../rz build $$pkg || exit 1; \
-		cp ../$$pkg/build/debug/*.elf $(INITRAMFS_BIN)/ || { echo "ERROR: $$pkg built no ELFs"; exit 1; }; \
-	done
+	bash ./tools/stage_initramfs.sh $(INITRAMFS_BIN)
 
 # Create initramfs TAR from the staged packages
 $(BUILD_DIR)/initramfs.tar: initramfs-bin

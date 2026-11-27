@@ -375,8 +375,9 @@ covers.
   unpacked ritzlib, so the image's archives never meet another tree's
   source. Every buddhafinger build and test in the image then compiles only
   buddhafinger.
-- **Indium staging** (`projects/indium/initramfs.pkgs`, Makefile
-  `initramfs-bin`). Each listed package builds its ELFs freestanding and
+- **Indium staging** (`projects/indium/initramfs.pkgs`, staged by
+  `projects/indium/tools/stage_initramfs.sh`; buddhafinger's entry builds in
+  the builder image, AGAST #4834). Each listed package builds its ELFs freestanding and
   compiles ritzlib for Harland again. With a harland-user archive in the
   ritzlib package, each package compiles only its own modules. In-tree,
   `make -C projects/indium` would `rz pack ritzlib --profile harland-user`

@@ -99,16 +99,22 @@ qemu-system-x86_64 -device help 2>/dev/null | grep -q '"qemu-xhci"' || setup_err
 
 # The initramfs packages: indium/initramfs.pkgs, the list test_tier1_boot.sh
 # and indium's Makefile share (AGAST #2759).
-USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
-[ -n "$USER_PKGS" ] || { echo "FAIL: no packages in $PROJECTS_DIR/indium/initramfs.pkgs"; exit 1; }
+# indium/tools/stage_initramfs.sh is initramfs.pkgs' one reader: it builds
+# each package with the compiler its entry names and stages the ELFs
+# (AGAST #2759, #4834).
+STAGE="$PROJECTS_DIR/indium/tools/stage_initramfs.sh"
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-    for pkg in harland $USER_PKGS; do
+    for pkg in harland; do
         (cd "$ROOT_DIR" && ./rz build "$pkg")
         brc=$?
         [ "$brc" -eq "$EXIT_SETUP" ] && setup_error "build of $pkg: a toolchain binary is missing"
         [ "$brc" -eq 0 ] || { echo "FAIL: build of $pkg failed"; exit 1; }
     done
+    bash "$STAGE" --build-only
+    brc=$?
+    [ "$brc" -eq 3 ] && { echo "SETUP ERROR: building the initramfs packages: a toolchain binary or docker is missing" >&2; exit 3; }
+    [ "$brc" -eq 0 ] || { echo "FAIL: building the initramfs packages failed"; exit 1; }
 fi
 
 KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
@@ -124,9 +130,7 @@ done
 WORK="$(mktemp -d)" || setup_error "mktemp -d failed (is TMPDIR full?)"
 trap '[ -n "${KEEP_WORK:-}" ] && { cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; cp "$WORK/kbd/screens.txt" "$KEEP_WORK/usb-kbd-screens.txt" 2>/dev/null; }; rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin"
-for pkg in $USER_PKGS; do
-    cp "$PROJECTS_DIR/$pkg"/build/debug/*.elf "$WORK/bin/" 2>/dev/null || true
-done
+bash "$STAGE" --no-build "$WORK/bin" || { echo "FAIL: staging the initramfs packages failed"; exit 1; }
 ESP="$WORK/esp"
 mkdir -p "$ESP/EFI/BOOT" "$ESP/harland"
 init_arg=()

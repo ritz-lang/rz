@@ -3,9 +3,12 @@
 # BUDDHAFINGER_PROPOSAL.md, "Harland acceptance"): the editor, built by
 # ritz1_selfhosted, run from rzsh on the serial console under QEMU.
 #
-# The image is the interactive shell's (tools/test_shell_boot.sh in
-# harland): init_interactive as /bin/init, rzsh and indium's programs (cat,
-# wc), plus the editor as /bin/buddhafinger. tools/harland_console.py plays
+# The image is the packaged Indium image (AGAST #4834): every package in
+# indium/initramfs.pkgs, built and staged by indium/tools/stage_initramfs.sh
+# as indium's Makefile stages them, with init_interactive as /bin/init (the
+# interactive shell's, tools/test_shell_boot.sh in harland). The editor is
+# initramfs.pkgs' buddhafinger entry: the builder image's ritz1_selfhosted
+# builds it, and its Harland ELF is /bin/buddhafinger. tools/harland_console.py plays
 # one session per boot; the storage disk (the second virtio-blk: /var's
 # goliath image) is the same qcow2 throughout, so each boot is a reboot of
 # the one before:
@@ -22,7 +25,8 @@
 # (the probe is test_tier1_boot.sh's), else TCG, said once up front.
 #
 # Usage: tools/test_harland_console.sh
-#        SKIP_BUILD=1    use the existing build/debug outputs
+#        SKIP_BUILD=1    stage the existing outputs (build/debug; the
+#                        editor's build/builder) without building
 #        BOOT_TIMEOUT=N  seconds to wait for each prompt or frame (default 120)
 #        KEEP_WORK=DIR   copy the serial transcripts (*.log) into DIR
 #        OVMF_CODE=F     OVMF firmware (default: search the usual paths)
@@ -64,36 +68,40 @@ else
     echo "boots: TCG (KVM unavailable)"
 fi
 
-# The kernel and the shell's programs with rz's default compiler, as the
-# shell boot builds them; the editor with ritz1_selfhosted only (#4813).
-build() {
-    (cd "$ROOT_DIR" && ./rz build "$@")
-    local brc=$?
-    [ "$brc" -eq "$EXIT_SETUP" ] && setup_error "build of $1: a toolchain binary is missing"
-    [ "$brc" -eq 0 ] || { echo "FAIL: build of $1 failed"; exit 1; }
-}
+# The kernel with rz's default compiler, as the shell boot builds it; the
+# initramfs packages through indium's stager, each with the compiler its
+# entry names (the editor: the builder image's ritz1_selfhosted, #4813).
+STAGE="$PROJECTS_DIR/indium/tools/stage_initramfs.sh"
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
-    build harland
-    build indium
-    build rzsh
-    build buddhafinger --compiler ritz1_selfhosted
+    (cd "$ROOT_DIR" && ./rz build harland)
+    brc=$?
+    [ "$brc" -eq "$EXIT_SETUP" ] && setup_error "build of harland: a toolchain binary is missing"
+    [ "$brc" -eq 0 ] || { echo "FAIL: build of harland failed"; exit 1; }
+    bash "$STAGE" --build-only
+    brc=$?
+    [ "$brc" -eq "$EXIT_SETUP" ] && setup_error "building the initramfs packages: a toolchain binary or docker is missing"
+    [ "$brc" -eq 0 ] || { echo "FAIL: building the initramfs packages failed"; exit 1; }
 fi
 
 KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
 LOADER_EFI="$HARLAND_DIR/build/debug/BOOTX64.EFI"
-EDITOR_ELF="$PKG_DIR/build/debug/buddhafinger.harland.elf"
-for f in "$KERNEL_ELF" "$LOADER_EFI" "$EDITOR_ELF" "$PROJECTS_DIR/rzsh/build/debug/rzsh.elf" \
-         "$PROJECTS_DIR/indium/build/debug/init_interactive.elf"; do
+for f in "$KERNEL_ELF" "$LOADER_EFI"; do
     [ -f "$f" ] || { echo "FAIL: not built: $f"; exit 1; }
 done
-grep -q '"compiler": *"ritz1_selfhosted"' "$EDITOR_ELF.manifest.json" \
-    || { echo "FAIL: $EDITOR_ELF was not built by ritz1_selfhosted"; exit 1; }
 
 WORK="$(mktemp -d)"
 trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/bin"
-cp "$PROJECTS_DIR/indium/build/debug/"*.elf "$PROJECTS_DIR/rzsh/build/debug/rzsh.elf" "$WORK/bin/"
-cp "$EDITOR_ELF" "$WORK/bin/buddhafinger.elf"
+# --no-build: the packages were built above (or, SKIP_BUILD, before).
+bash "$STAGE" --no-build "$WORK/bin" || { echo "FAIL: staging the initramfs packages failed"; exit 1; }
+EDITOR_ELF="$WORK/bin/buddhafinger.elf"
+for f in "$EDITOR_ELF" "$WORK/bin/rzsh.elf" "$WORK/bin/init_interactive.elf"; do
+    [ -f "$f" ] || { echo "FAIL: not in the packaged image: /bin/$(basename "$f" .elf)"; exit 1; }
+done
+# The stager already refuses a compiler= entry built by anything else; this
+# says so in the log, and fails if initramfs.pkgs ever drops the pin.
+grep -q '"compiler": *"ritz1_selfhosted"' "$EDITOR_ELF.manifest.json" \
+    || { echo "FAIL: the packaged /bin/buddhafinger was not built by ritz1_selfhosted"; exit 1; }
+echo "packaged: /bin/buddhafinger built by ritz1_selfhosted"
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" --init init_interactive \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 qemu-img create -q -f qcow2 "$WORK/storage.qcow2" 64M || { echo "FAIL: qemu-img create failed"; exit 1; }

@@ -278,6 +278,10 @@ def tree(tmp_path):
     shutil.copy(
         REPO / "projects/indium/initramfs.pkgs", root / "projects/indium/initramfs.pkgs"
     )
+    # ...and stages its packages through indium's stager (AGAST #4834).
+    (root / "projects/indium/tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO / "projects/indium/tools/stage_initramfs.sh",
+                root / "projects/indium/tools/stage_initramfs.sh")
     stubs = tmp_path / "stubs"
     stubs.mkdir()
     ovmf = tmp_path / "OVMF_CODE.fd"
@@ -1033,12 +1037,23 @@ def test_unknown_compiler_is_bad_usage(tree):
 def test_build_passes_the_compiler_to_rz(tree):
     log = tree["tmp"] / "rz.log"
     _stub(tree["root"], "rz", f'#!/usr/bin/env bash\necho "$@" >> {log}\n')
+    # initramfs.pkgs' compiler= entries (Buddhafinger, AGAST #4834) build in
+    # the builder image instead: a stub run, logged apart from rz's.
+    blog = tree["tmp"] / "builder.log"
+    _stub(tree["stubs"], "fake-builder-run", f'#!/usr/bin/env bash\necho "$@" >> {blog}\n')
     _all_built_by(tree, "ritz1_selfhosted")
-    r = _run(tree, PASSED, env_extra={"SKIP_BUILD": "0", "COMPILER": "ritz1_selfhosted"})
+    r = _run(tree, PASSED, env_extra={
+        "SKIP_BUILD": "0", "COMPILER": "ritz1_selfhosted",
+        "RZ_BUILDER_IMAGE": "rz-builder:fake",
+        "RZ_BUILDER_RUN": str(tree["stubs"] / "fake-builder-run"),
+    })
     assert r.returncode == 0, r.stdout + r.stderr
     calls = log.read_text().splitlines()
     assert calls and calls[0] == "build harland --compiler ritz1_selfhosted"
     assert all(c.endswith("--compiler ritz1_selfhosted") for c in calls), calls
+    assert not [c for c in calls if " buddhafinger" in c], calls
+    runs = blog.read_text().splitlines()
+    assert len(runs) == 1 and "rz-builder:fake projects/buddhafinger" in runs[0], runs
 
 
 # --------------------------------------------------------------------------

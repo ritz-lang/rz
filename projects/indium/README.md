@@ -172,9 +172,28 @@ table listing them here:
 | `hello_gfx` | `projects/prism` → `build/debug/hello_gfx.elf` |
 
 The initramfs packs every package listed in `initramfs.pkgs` (indium, rzsh,
-prism). That file is the one list: the Makefile's
-`build/initramfs.tar` and `run-uefi`, `tools/mkiso.sh` and harland's boot
-tests all read it (AGAST #2759).
+prism, harland/system, buddhafinger). That file is the one list, and
+`tools/stage_initramfs.sh` its one reader: the Makefile's
+`build/initramfs.tar` and `run-uefi`, `tools/mkiso.sh`, harland's boot tests
+and Buddhafinger's console acceptance test all stage through it (AGAST
+#2759, #4834).
+
+An entry may name the compiler and the ELFs. Buddhafinger builds with
+`ritz1_selfhosted` only, so its entry is
+
+    buddhafinger  compiler=ritz1_selfhosted  bin=buddhafinger.harland:buddhafinger
+
+`compiler=ritz1_selfhosted` builds the package in the builder image
+(`projects/builder`) with that image's compiler, through
+`.github/scripts/run_builder_package.sh` (persistent CAS in
+`~/.cache/rz-builder-cas`); the run's `/out` is
+`projects/buddhafinger/build/builder/`. Staging never bootstraps a compiler:
+`projects/builder/resolve_image.sh` finds `rz-builder:src-<key>` (the
+compiler-source key, #4903) locally, pulls it from ghcr, or builds the image.
+The staged ELF's manifest must name `ritz1_selfhosted`. `bin=` stages only
+the Harland ELF, as `/bin/buddhafinger`, not the Linux editor or bench.
+Staging therefore needs docker; `RZ_BUILDER_IMAGE` names an image to use
+instead.
 
 ## Dependencies
 

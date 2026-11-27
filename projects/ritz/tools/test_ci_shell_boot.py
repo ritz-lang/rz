@@ -290,6 +290,10 @@ def tree(tmp_path):
     pkgs = root / "projects" / "indium" / "initramfs.pkgs"
     pkgs.parent.mkdir(parents=True)
     pkgs.write_text("indium\nrzsh\n")
+    # ...and stages its packages through indium's stager (AGAST #4834).
+    (root / "projects/indium/tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO / "projects/indium/tools/stage_initramfs.sh",
+                root / "projects/indium/tools/stage_initramfs.sh")
     for rel in (
         "projects/harland/build/debug/harland.elf",
         "projects/harland/build/debug/BOOTX64.EFI",

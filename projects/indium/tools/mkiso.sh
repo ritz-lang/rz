@@ -62,19 +62,13 @@ mkdir -p "$BUILD_DIR"
 # Build userspace programs
 # ============================================================================
 
-# The packages in initramfs.pkgs, the one list shared with the Makefile and
-# harland/tools/test_tier1_boot.sh (AGAST #2759). Staged apart from indium's
-# own build/debug so another package's ELFs never land in it.
+# The packages in initramfs.pkgs, the one list, staged by
+# tools/stage_initramfs.sh as the Makefile and harland's boot scripts stage
+# them (AGAST #2759, #4834). Staged apart from indium's own build/debug so
+# another package's ELFs never land in it. RZ_CLI and PKGS_ROOT pass through.
 INITRAMFS_BIN="$BUILD_DIR/initramfs-bin"
-rm -rf "$INITRAMFS_BIN" && mkdir -p "$INITRAMFS_BIN"
-for pkg in $(sed -e 's/#.*//' "$PROJECT_ROOT/initramfs.pkgs"); do
-    echo "=== Building $pkg ==="
-    "$RZ_CLI" build "$pkg" || { echo "Error: $pkg failed to build"; exit 1; }
-    elfs=("$PKGS_ROOT/$pkg/build/debug/"*.elf)
-    [ -f "${elfs[0]}" ] || { echo "Error: $pkg built no ELFs"; exit 1; }
-    cp "${elfs[@]}" "$INITRAMFS_BIN/"
-    echo ""
-done
+RZ_CLI="$RZ_CLI" PKGS_ROOT="$PKGS_ROOT" bash "$SCRIPT_DIR/stage_initramfs.sh" "$INITRAMFS_BIN" \
+    || { echo "Error: staging the initramfs packages failed"; exit 1; }
 
 # List what we're including
 echo ""

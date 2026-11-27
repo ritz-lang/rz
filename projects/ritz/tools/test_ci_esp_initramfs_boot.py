@@ -141,6 +141,10 @@ def tree(tmp_path):
     (tools / "mkinitramfs.py").write_text(MKINITRAMFS_STUB)
     (root / "projects" / "indium").mkdir(parents=True)
     (root / "projects" / "indium" / "initramfs.pkgs").write_text("indium  # init\n")
+    # ...and stages its packages through indium's stager (AGAST #4834).
+    (root / "projects/indium/tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy(REPO / "projects/indium/tools/stage_initramfs.sh",
+                root / "projects/indium/tools/stage_initramfs.sh")
     for rel in (
         "projects/harland/build/debug/harland.elf",
         "projects/harland/build/debug/BOOTX64.EFI",

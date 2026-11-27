@@ -620,7 +620,9 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     test_ci_fbcon_boot.py), the AHCI persist boot (#4884;
     test_ci_ahci_boot.py), the xHCI keyboard boot (#4887;
     test_ci_usb_boot.py) and typing into rzsh on that keyboard (#4888;
-    test_ci_usb_boot.py). A new step here must make the same promise."""
+    test_ci_usb_boot.py). So does resolving the builder image the boots
+    stage Buddhafinger with (#4834; projects/builder/resolve_image.sh: 3
+    only for a missing docker). A new step here must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
     assert [s.run.strip().splitlines()[-1] for s in steps] == [
         "./rz build --all",
@@ -633,6 +635,7 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/valet/test/test_static_conn.sh",
         "bash projects/valet/test/test_cli.sh",
         "python3 projects/ritz/tools/smoke_stack",
+        "bash projects/builder/resolve_image.sh",
         # The tier1 step ends with its KVM boot (#4612; SKIP, exit 0, without
         # /dev/kvm; exit 3 only for the same missing tools).
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
