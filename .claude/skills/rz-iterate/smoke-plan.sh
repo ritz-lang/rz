@@ -54,6 +54,14 @@
 #   projects/builder/**                  builder (projects/builder/test.sh:
 #                                        the image build and its in-container
 #                                        checks; no ritz.toml, AGAST #4822)
+#   projects/harland/**                  unit as well as the package rule
+#                                        below (AGAST #4898: train 0000283f
+#                                        went red after #4882 changed
+#                                        kernel/src/drivers/virtio/blk.ritz,
+#                                        which ritz0/tests/test_harland_*.py
+#                                        compile; they read kernel/src, boot,
+#                                        the *_abi trees, tools, build.py and
+#                                        ritz.toml, so every harland path)
 #   projects/<pkg>/**                    ritz1-bootstrap pkg:<pkg>  (./rz
 #                                        build under ritz0, ritz1 and
 #                                        ritz1_selfhosted, then ./rz test),
@@ -219,6 +227,9 @@ targets_of() {
         projects/ritz/*)          echo unit; echo tools-unit ;;
         projects/builder/*)       echo builder ;;
         projects/*/*)             rest="${p#projects/}"; echo ritz1-bootstrap
+                                  # ritz0's test_harland_*.py compile and
+                                  # read harland's trees (#4898).
+                                  [[ "$p" != projects/harland/* ]] || echo unit
                                   if grep -qxF -- "projects/${rest%%/*}" <<<"$EXCLUDED"; then
                                       echo "entry:${rest%%/*}"; return
                                   fi
