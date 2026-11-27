@@ -1,0 +1,150 @@
+# The driver's layout (DESIGN.md "Text razm accepts"): alignment fill, branch
+# sizing, sizing of operands defined later, and the errors that name a line.
+# tests/test_razm.py compares whole files with `as --64`; these pin each rule.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new }
+import razm.parse { Mode, Program, parse }
+import razm.object { Object }
+import razm.assemble { assemble, nop_fill }
+
+# --- helpers -----------------------------------------------------------------
+
+[[test_helper]]
+fn hex(v: @Vec<u8>) -> String
+    let digits: StrView = "0123456789abcdef"
+    var out: String = string_new()
+    for i in 0..v.len
+        out.push(digits.get((v[i] >> 4) as i64))
+        out.push(digits.get((v[i] & 15) as i64))
+    out
+
+[[test_helper]]
+fn fill(count: i64, mode: Mode, end_mode: Mode, after_data: bool, want: StrView)
+    var out: Vec<u8> = vec_new<u8>()
+    nop_fill(@&out, count, mode, end_mode, after_data)
+    let got: String = hex(@out)
+    if not got.as_view().starts_with(want) or out.len != count
+        print("fill {count}: got {got.as_view()}, want {want}...\n")
+    assert out.len == count
+    assert got.as_view().starts_with(want)
+
+# The size of `.text` once `text` is assembled.
+[[test_helper]]
+fn text_size(text: StrView) -> i64
+    var p: Program = match parse(text)
+        Ok(prog) => prog
+        Err(_) =>
+            assert false, "parse"
+            return -1
+    match assemble(@&p)
+        Ok(obj) =>
+            match obj.find_section(".text")
+                Some(id) => obj.size(id)
+                None => -1
+        Err(e) =>
+            let line: i64 = e.line
+            print("assemble failed at line {line}: {e.what.as_view()}\n")
+            assert false
+            -1
+
+# The error `text` fails with; it must name `line` and mention `needle`.
+[[test_helper]]
+fn fails(text: StrView, line: i64, needle: StrView)
+    var p: Program = match parse(text)
+        Ok(prog) => prog
+        Err(_) =>
+            assert false, "parse"
+            return
+    match assemble(@&p)
+        Ok(_) =>
+            assert false, "assembled; expected an error"
+        Err(e) =>
+            if e.line != line or not e.what.contains(needle)
+                let got: i64 = e.line
+                print("error at line {got}: {e.what.as_view()}\n")
+            assert e.line == line
+            assert e.what.contains(needle)
+
+# --- alignment fill ----------------------------------------------------------
+
+[[test]]
+fn test_fill_uses_the_longest_nops_remainder_first() -> i32
+    fill(1, Mode.Code64, Mode.Code64, false, "90")
+    fill(3, Mode.Code64, Mode.Code64, false, "0f1f00")
+    fill(11, Mode.Code64, Mode.Code64, false, "66662e0f1f840000000000")
+    fill(12, Mode.Code64, Mode.Code64, false, "9066662e0f1f840000000000")
+    fill(5, Mode.Code16, Mode.Code16, false, "2e8db40000")
+    fill(6, Mode.Code16, Mode.Code16, false, "902e8db40000")
+    0
+
+[[test]]
+fn test_fill_after_data_starts_with_a_one_byte_nop() -> i32
+    fill(3, Mode.Code64, Mode.Code64, true, "906690")
+    fill(12, Mode.Code32, Mode.Code64, true, "9066662e0f1f840000000000")
+    0
+
+[[test]]
+fn test_long_fill_jumps_over_its_nops() -> i32
+    fill(87, Mode.Code64, Mode.Code64, false, "662e0f1f84")
+    fill(88, Mode.Code64, Mode.Code64, false, "eb56")
+    fill(129, Mode.Code64, Mode.Code64, false, "eb7f")
+    fill(130, Mode.Code64, Mode.Code64, false, "e97d000000")
+    fill(14, Mode.Code16, Mode.Code16, false, "8db40000")
+    fill(15, Mode.Code16, Mode.Code16, false, "eb0d")
+    0
+
+[[test]]
+fn test_rel32_fill_jump_follows_the_mode_at_the_end_of_the_file() -> i32
+    fill(130, Mode.Code64, Mode.Code16, false, "66e97c000000")
+    fill(130, Mode.Code16, Mode.Code64, false, "e97d000000")
+    0
+
+# --- branch sizing -----------------------------------------------------------
+
+[[test]]
+fn test_jmp_is_rel8_up_to_127_bytes_then_near() -> i32
+    assert text_size("jmp 1f\n.rept 127\nnop\n.endr\n1:\n") == 2 + 127
+    assert text_size("jmp 1f\n.rept 128\nnop\n.endr\n1:\n") == 5 + 128
+    assert text_size("1:\n.rept 126\nnop\n.endr\njz 1b\n") == 126 + 2
+    assert text_size("1:\n.rept 127\nnop\n.endr\njz 1b\n") == 127 + 6
+    0
+
+[[test]]
+fn test_a_growing_branch_grows_the_branch_over_it() -> i32
+    # The jz fits only while the jmp inside its span stays short.
+    assert text_size("jz 2f\njmp 1f\n.rept 123\nnop\n.endr\n2:\n.rept 200\nnop\n.endr\n1:\n") == 6 + 5 + 123 + 200
+    0
+
+[[test]]
+fn test_branch_to_a_global_label_here_is_sized_and_resolved() -> i32
+    assert text_size(".global g\ng:\njmp g\n") == 2
+    0
+
+[[test]]
+fn test_call_is_always_rel32() -> i32
+    assert text_size("1:\ncall 1b\n") == 5
+    0
+
+[[test]]
+fn test_loop_out_of_range_is_an_error_naming_its_line() -> i32
+    fails("1:\n.rept 200\nnop\n.endr\nloop 1b\n", 5, "out of range")
+    0
+
+# --- operands defined later ---------------------------------------------------
+
+[[test]]
+fn test_a_later_constant_takes_the_widest_immediate() -> i32
+    assert text_size(".equ K, 1\naddq $K, %rbx\n") == 4
+    assert text_size("addq $K, %rbx\n.equ K, 1\n") == 7
+    0
+
+[[test]]
+fn test_a_value_that_does_not_fit_its_field_names_its_line() -> i32
+    fails("nop\nmovb $M, %al\n.equ M, 300\n", 2, "does not fit")
+    0
+
+[[test]]
+fn test_a_set_naming_a_label_is_an_error_naming_its_line() -> i32
+    fails("foo:\nnop\n.set foo, 1\n", 3, "defined twice")
+    0

@@ -1,0 +1,688 @@
+# assemble: a parsed file to an Object, the `.s` driver's layout (DESIGN.md
+# "Text razm accepts", "What razm checks").
+#
+# Layout walks the statements in passes. A jmp or jcc to a local label in its
+# own section starts in its rel8 form; a pass grows each one whose
+# displacement does not fit, and passes repeat until the layout stops
+# changing, as `as` does. A last pass writes the Object.
+#
+# An operand that names a symbol not defined yet at that point (a later label
+# or `.set`, or an undefined symbol) is sized as `as` sizes it, with its
+# widest field: the encoder sees a stand-in symbol, and the field is then
+# filled from the laid-out value, or left as a fixup when the value names a
+# symbol.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.hashmap { HashMap, hashmap_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_from_vec, span_from_strview }
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new, string_from }
+import razm.expr { Expr, ExprError, Reloc, SymDef, SymTable, Value, eval, first_undefined, symtable_new }
+import razm.fixup { Fixup, FixupKind }
+import razm.insn { Insn, Mem, Operand }
+import razm.parse { Mode, Program, Stmt }
+import razm.emit { EncodeError, Encoded, fits_field, fits_signed }
+import razm.encode { encode, encode_short }
+import razm.object { Binding, Object, ObjectError, SectionFlags, SectionId, SectionKind, SymbolType, object_new }
+
+# Passes after which a layout that still changes is an error.
+const MAX_PASSES: i64 = 100
+
+# GNU as's nops for 32- and 64-bit code, 1 to 11 bytes; the n-byte one starts
+# at n * (n - 1) / 2.
+const NOP_LONG: [66]u8 = [
+    0x90,
+    0x66, 0x90,
+    0x0F, 0x1F, 0x00,
+    0x0F, 0x1F, 0x40, 0x00,
+    0x0F, 0x1F, 0x44, 0x00, 0x00,
+    0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00,
+    0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00,
+    0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00]
+
+# The same for 16-bit code, 1 to 5 bytes.
+const NOP_16: [15]u8 = [
+    0x90,
+    0x89, 0xF6,
+    0x8D, 0x74, 0x00,
+    0x8D, 0xB4, 0x00, 0x00,
+    0x2E, 0x8D, 0xB4, 0x00, 0x00]
+
+# Stand-in symbols for a not-yet-defined operand, one per operand slot. A
+# space keeps them out of the names the parser accepts.
+const STAND_IN: [3]StrView = ["razm stand-in 0", "razm stand-in 1", "razm stand-in 2"]
+
+# Why a file does not assemble, at a 1-based line.
+pub struct AsmError
+    line: i64
+    what: String
+    unsupported: bool           # outside the dialect or the encoder set
+
+fn asm_error(line: i64, what: String) -> AsmError
+    AsmError { line: line, what: what, unsupported: false }
+
+fn le_bytes(out: @&Vec<u8>, v: i64, width: i64)
+    for i in 0..width
+        out.push(((v >> (i * 8)) & 0xFF) as u8)
+
+fn is_code16(mode: Mode) -> bool
+    match mode
+        Code16 => true
+        _ => false
+
+fn push_nop(out: @&Vec<u8>, len: i64, code16: bool)
+    let at: i64 = len * (len - 1) / 2
+    for i in 0..len
+        out.push(if code16 then NOP_16[at + i] else NOP_LONG[at + i])
+
+# Append `count` bytes of GNU as's alignment fill for code in `mode`. A long
+# fill starts with a jump over the rest; the nops are the longest form, with
+# the remainder first. After data (anything but an instruction, an alignment
+# included) `as` starts the fill with a one-byte nop. A rel32 jump carries a
+# 0x66 prefix when `end_mode`, the mode at the end of the file, is .code16:
+# `as` writes the fill then, not where the `.align` is.
+pub fn nop_fill(out: @&Vec<u8>, count: i64, mode: Mode, end_mode: Mode, after_data: bool)
+    var n: i64 = count
+    if n <= 0
+        return
+    if after_data
+        out.push(0x90)
+        n -= 1
+    let code16: bool = is_code16(mode)
+    let longest: i64 = if code16 then 5 else 11
+    let jump_from: i64 = if code16 then 15 else 88
+    if n >= jump_from
+        if n - 2 <= 127
+            out.push(0xEB)
+            out.push((n - 2) as u8)
+            n -= 2
+        else
+            let prefixed: bool = is_code16(end_mode)
+            let width: i64 = if prefixed then 6 else 5
+            if prefixed
+                out.push(0x66)
+            out.push(0xE9)
+            le_bytes(out, n - width, 4)
+            n -= width
+    let rest: i64 = n % longest
+    if rest > 0
+        push_nop(out, rest, code16)
+    for i in 0..(n / longest)
+        push_nop(out, longest, code16)
+
+fn fits_i8(v: i64) -> bool
+    v >= -128 and v <= 127
+
+pub fn encode_error_message(e: EncodeError) -> String
+    match e
+        UnknownMnemonic => string_from("the mnemonic is outside the encoder set")
+        BadOperands => string_from("the operands do not fit the mnemonic")
+        NoSize => string_from("no suffix or register gives the operand size")
+        SizeMismatch => string_from("a register's width disagrees with the suffix")
+        NotInMode => string_from("the form does not exist in this .code mode")
+        BadRegister => string_from("a register is misused (ah/ch/dh/bh beside a REX prefix?)")
+        BadAddress => string_from("an addressing form razm does not encode")
+        ImmRange => string_from("an immediate does not fit its field")
+        DispRange => string_from("a displacement does not fit its field")
+        NoShortForm => string_from("the instruction has no rel8 form")
+        BadExpr(err) => err.message()
+
+pub fn object_error_message(e: ObjectError) -> String
+    match e
+        DuplicateSection => string_from("a section is defined twice")
+        DuplicateSymbol => string_from("a symbol is defined twice")
+        BadAlignment => string_from("an alignment is not a power of two")
+        NegativeSize => string_from("a negative size")
+        NobitsData => string_from("non-zero bytes in a @nobits section")
+        NoRelocation => string_from("no relocation type has this field's kind and width")
+        FixupOutsideSection => string_from("a fixup outside its section")
+        FixupOverflow => string_from("a resolved value does not fit its field")
+        UndefinedLabel => string_from("a `.L` label is used and never defined")
+        TooManySections => string_from("too many sections")
+        Io(_) => string_from("cannot write the object")
+
+# A direct branch target: its offset when it is a label in the branch's own
+# section, `known` false while that label is not laid out yet. A `forward`
+# target's offset is the last pass's, and `stmt` is the label's statement.
+struct LocalTarget
+    offset: i64
+    known: bool
+    forward: bool
+    stmt: i64
+
+# One pass's running state.
+struct Pass
+    syms: SymTable              # labels and `.set`s defined so far
+    offsets: Vec<i64>           # per section, the current location
+    after_insn: Vec<bool>       # per section, the last thing was an instruction
+    labels: Vec<i64>            # each label's offset, in statement order
+    sets: Vec<StrView>          # every `.set` name, once
+    set_lines: Vec<i64>         # the line of each one's first `.set`
+    sec: i64
+    mode: Mode
+    decide: bool                # grow branches that do not fit
+    emit: bool                  # write the Object
+    grew: bool
+
+# What a pass leaves for the next.
+struct Layout
+    syms: SymTable
+    labels: Vec<i64>
+    grew: bool
+
+struct Asm
+    obj: Object
+    parse_sec: Vec<i64>         # parse's section index to the Object's
+    exec: Vec<bool>             # per Object section, SHF_EXECINSTR
+    long: Vec<bool>             # per statement, a branch grown to near
+    at: Vec<i64>                # per statement, its offset in the last pass
+    label_stmt: HashMap<StrView, i64>   # each label's statement
+    globals: HashMap<StrView, bool>
+    stand_in: [3]Expr
+    end_mode: Mode              # the .code mode at the end of the file
+
+fn flags(alloc: bool, write: bool, exec: bool) -> SectionFlags
+    SectionFlags { alloc: alloc, write: write, exec: exec }
+
+# Assemble a parsed file into an Object.
+pub fn assemble(prog: @&Program) -> Result<Object, AsmError>
+    let s0: Expr = prog.exprs.sym(STAND_IN[0])
+    let s1: Expr = prog.exprs.sym(STAND_IN[1])
+    let s2: Expr = prog.exprs.sym(STAND_IN[2])
+    var a: Asm = Asm {
+        obj: object_new(),
+        parse_sec: vec_new<i64>(),
+        exec: vec_new<bool>(),
+        long: vec_new<bool>(),
+        at: vec_new<i64>(),
+        label_stmt: hashmap_new<StrView, i64>(),
+        globals: hashmap_new<StrView, bool>(),
+        stand_in: [s0, s1, s2],
+        end_mode: Mode.Code64
+    }
+    a.scan(prog)?
+    var known: SymTable = symtable_new()
+    var prev: Vec<i64> = vec_new<i64>()
+    var decide: bool = false
+    var passes: i64 = 0
+    while true
+        let layout: Layout = a.walk(prog, @&known, decide, false)?
+        let settled: bool = decide and not layout.grew and same_offsets(@prev, @layout.labels)
+        known = layout.syms
+        prev = layout.labels
+        if settled
+            break
+        decide = true
+        passes += 1
+        if passes > MAX_PASSES
+            return Err(asm_error(0, string_from("the layout does not settle")))
+    let last: Layout = a.walk(prog, @&known, true, true)?
+    if last.grew
+        return Err(asm_error(0, string_from("the layout changed in the last pass")))
+    Ok(a.obj)
+
+fn same_offsets(a: @Vec<i64>, b: @Vec<i64>) -> bool
+    if a.len != b.len
+        return false
+    for i in 0..a.len
+        if a[i] != b[i]
+            return false
+    true
+
+impl Asm
+    # Make every section, `.text`, `.data` and `.bss` first as `as` does.
+    fn scan(self: @&Asm, prog: @Program) -> Result<(), AsmError>
+        self.add_section(".text", SectionKind.Progbits, flags(true, false, true), 0)?
+        self.add_section(".data", SectionKind.Progbits, flags(true, true, false), 0)?
+        self.add_section(".bss", SectionKind.Nobits, flags(true, true, false), 0)?
+        var names: Vec<StrView> = vec_new<StrView>()
+        names.push(".text")
+        self.parse_sec.push(0)
+        for i in 0..prog.stmts.len
+            let st: Stmt = prog.stmts.get(i)
+            self.long.push(false)
+            self.at.push(0)
+            match st.item
+                Label(name) => self.label_stmt.insert(name, i)
+                Global(name) => self.globals.insert(name, true)
+                CodeMode(m) => self.end_mode = m
+                Section(decl) =>
+                    let kind: SectionKind = if decl.nobits then SectionKind.Nobits else SectionKind.Progbits
+                    let f: SectionFlags = flags(decl.flags.alloc, decl.flags.write, decl.flags.exec)
+                    self.add_section(decl.name, kind, f, st.line)?
+                    var seen: bool = false
+                    for n in 0..names.len
+                        if names[n].eq(decl.name)
+                            seen = true
+                    if not seen
+                        names.push(decl.name)
+                        self.parse_sec.push(self.section_of(decl.name))
+                _ => pass
+        Ok(())
+
+    fn add_section(self: @&Asm, name: StrView, kind: SectionKind, f: SectionFlags, line: i64) -> Result<(), AsmError>
+        match self.obj.find_section(name)
+            Some(_) => return Ok(())
+            None => pass
+        match self.obj.add_section(name, kind, f)
+            Ok(_) =>
+                self.exec.push(f.exec)
+                Ok(())
+            Err(e) => Err(asm_error(line, object_error_message(e)))
+
+    fn section_of(self: @Asm, name: StrView) -> i64
+        match self.obj.find_section(name)
+            Some(id) => id.index
+            None => 0
+
+    fn walk(self: @&Asm, prog: @Program, known: @&SymTable, decide: bool, emit: bool) -> Result<Layout, AsmError>
+        var p: Pass = Pass {
+            syms: symtable_new(),
+            offsets: vec_new<i64>(),
+            after_insn: vec_new<bool>(),
+            labels: vec_new<i64>(),
+            sets: vec_new<StrView>(),
+            set_lines: vec_new<i64>(),
+            sec: 0,
+            mode: Mode.Code64,
+            decide: decide,
+            emit: emit,
+            grew: false
+        }
+        for i in 0..self.exec.len
+            p.offsets.push(0)
+            p.after_insn.push(false)
+        for i in 0..prog.stmts.len
+            let st: Stmt = prog.stmts.get(i)
+            self.statement(prog, i, st, @&p, known)?
+        if emit
+            self.define_sets(@p)?
+        Ok(Layout { syms: p.syms, labels: p.labels, grew: p.grew })
+
+    fn statement(self: @&Asm, prog: @Program, i: i64, st: Stmt, p: @&Pass, known: @&SymTable) -> Result<(), AsmError>
+        let line: i64 = st.line
+        let here: i64 = p.offsets[p.sec]
+        let id: SectionId = SectionId { index: p.sec }
+        match st.item
+            Label(name) =>
+                p.syms.define(name, SymDef.Label(p.sec, here))
+                p.labels.push(here)
+                if p.emit
+                    match self.obj.define(name, id, here)
+                        Ok(_) => pass
+                        Err(e) => return Err(asm_error(line, object_error_message(e)))
+            Instruction(insn) => self.instruction(prog, i, line, insn, p, known)?
+            Section(decl) => p.sec = self.section_of(decl.name)
+            CodeMode(m) => p.mode = m
+            Global(name) =>
+                if p.emit
+                    self.obj.set_binding(name, Binding.Global)
+            Extern(_) => pass
+            TypeFunction(name) =>
+                if p.emit
+                    self.obj.set_type(name, SymbolType.Func)
+            Size(name, e) =>
+                if p.emit
+                    match self.value_at(prog, e, p, known, here)
+                        Ok(v) =>
+                            match v
+                                Absolute(n) => self.obj.set_size(name, n)
+                                Relocatable(_) =>
+                                    var what: String = string_new()
+                                    format_into(@&what, "`.size {name}` is not an absolute value")
+                                    return Err(asm_error(line, what))
+                        Err(err) => return Err(asm_error(line, err.message()))
+            Align(n) => self.align(n, line, p)?
+            Set(name, e) => self.set(prog, name, e, line, p, known)?
+            Data(width, e) => self.data(prog, width, e, line, p, known)?
+            Bytes(text) =>
+                if p.emit
+                    self.put(line, p.sec, span_from_strview(text))?
+                p.offsets[p.sec] = here + text.len
+                p.after_insn[p.sec] = false
+            Space(n, fill) =>
+                if p.emit
+                    if fill == 0
+                        match self.obj.reserve(id, n)
+                            Ok(_) => pass
+                            Err(e) => return Err(asm_error(line, object_error_message(e)))
+                    else
+                        var bytes: Vec<u8> = vec_new<u8>()
+                        for k in 0..n
+                            bytes.push(fill)
+                        self.put(line, p.sec, span_from_vec<u8>(@bytes))?
+                p.offsets[p.sec] = here + n
+                p.after_insn[p.sec] = false
+        Ok(())
+
+    fn put(self: @&Asm, line: i64, sec: i64, bytes: Span<u8>) -> Result<i64, AsmError>
+        match self.obj.emit(SectionId { index: sec }, bytes)
+            Ok(at) => Ok(at)
+            Err(e) => Err(asm_error(line, object_error_message(e)))
+
+    # `e` at offset `here` of the current section: against this pass's
+    # symbols when every one is defined by now, else against the laid-out
+    # ones.
+    fn value_at(self: @Asm, prog: @Program, e: Expr, p: @&Pass, known: @&SymTable, here: i64) -> Result<Value, ExprError>
+        let loc: SymDef = SymDef.Label(p.sec, here)
+        if first_undefined(@prog.exprs, e, @p.syms).is_none()
+            p.syms.set_here(loc)
+            return eval(@prog.exprs, e, @p.syms)
+        known.set_here(loc)
+        eval(@prog.exprs, e, known)
+
+    fn align(self: @&Asm, n: i64, line: i64, p: @&Pass) -> Result<(), AsmError>
+        let here: i64 = p.offsets[p.sec]
+        let pad: i64 = (n - here % n) % n
+        if p.emit
+            let id: SectionId = SectionId { index: p.sec }
+            match self.obj.raise_align(id, n)
+                Ok(_) => pass
+                Err(e) => return Err(asm_error(line, object_error_message(e)))
+            if self.exec[p.sec]
+                var fill: Vec<u8> = vec_new<u8>()
+                nop_fill(@&fill, pad, p.mode, self.end_mode, not p.after_insn[p.sec])
+                self.put(line, p.sec, span_from_vec<u8>(@fill))?
+            else
+                match self.obj.reserve(id, pad)
+                    Ok(_) => pass
+                    Err(e) => return Err(asm_error(line, object_error_message(e)))
+        p.offsets[p.sec] = here + pad
+        if n > 1
+            p.after_insn[p.sec] = false
+        Ok(())
+
+    # `.set`: a constant, or a label plus an offset. One whose value is not
+    # known yet waits for a later pass.
+    fn set(self: @&Asm, prog: @Program, name: StrView, e: Expr, line: i64, p: @&Pass, known: @&SymTable) -> Result<(), AsmError>
+        let here: i64 = p.offsets[p.sec]
+        var def: SymDef = SymDef.Undefined
+        match self.value_at(prog, e, p, known, here)
+            Ok(v) =>
+                match v
+                    Absolute(n) => def = SymDef.Constant(n)
+                    Relocatable(r) =>
+                        var at: SymDef = p.syms.lookup(r.sym)
+                        match at
+                            Undefined => at = known.lookup(r.sym)
+                            _ => pass
+                        match at
+                            Label(s, o) => def = SymDef.Label(s, o + r.addend)
+                            _ => pass
+            Err(err) =>
+                if p.emit
+                    return Err(asm_error(line, err.message()))
+        match def
+            Undefined =>
+                if p.emit
+                    var what: String = string_new()
+                    format_into(@&what, "`{name}` is set to an undefined symbol")
+                    return Err(asm_error(line, what))
+                return Ok(())
+            _ => pass
+        p.syms.define(name, def)
+        for k in 0..p.sets.len
+            if p.sets[k].eq(name)
+                return Ok(())
+        p.sets.push(name)
+        p.set_lines.push(line)
+        Ok(())
+
+    # Each `.set` name, at its last value: a constant is SHN_ABS.
+    fn define_sets(self: @&Asm, p: @Pass) -> Result<(), AsmError>
+        for k in 0..p.sets.len
+            let name: StrView = p.sets[k]
+            let r: Result<(), ObjectError> = match p.syms.lookup(name)
+                Constant(n) => self.obj.define_absolute(name, n)
+                Label(s, o) => self.obj.define(name, SectionId { index: s }, o)
+                _ => Ok(())
+            match r
+                Ok(_) => pass
+                Err(e) =>
+                    let why: String = object_error_message(e)
+                    var what: String = string_new()
+                    format_into(@&what, "`{name}`: {why.as_view()}")
+                    return Err(asm_error(p.set_lines[k], what))
+        Ok(())
+
+    # `.byte`/`.word`/`.long`/`.quad`: a constant, a symbol plus an addend
+    # (R_X86_64_8/16/32/64), or `sym - .` (PC-relative).
+    fn data(self: @&Asm, prog: @Program, width: i64, e: Expr, line: i64, p: @&Pass, known: @&SymTable) -> Result<(), AsmError>
+        let here: i64 = p.offsets[p.sec]
+        p.offsets[p.sec] = here + width
+        p.after_insn[p.sec] = false
+        if not p.emit
+            return Ok(())
+        var bytes: Vec<u8> = vec_new<u8>()
+        var fix: Option<Fixup> = None
+        match self.value_at(prog, e, p, known, here)
+            Ok(v) =>
+                match v
+                    Absolute(n) => le_bytes(@&bytes, n, width)
+                    Relocatable(r) =>
+                        le_bytes(@&bytes, 0, width)
+                        fix = Some(Fixup { offset: 0, width: width, kind: FixupKind.Absolute, target: r.sym, addend: r.addend })
+            Err(err) =>
+                match self.pc_relative(prog, e, p, known, here)
+                    Some(r) =>
+                        le_bytes(@&bytes, 0, width)
+                        fix = Some(Fixup { offset: 0, width: width, kind: FixupKind.PcRelative, target: r.sym, addend: r.addend })
+                    None => return Err(asm_error(line, err.message()))
+        let at: i64 = self.put(line, p.sec, span_from_vec<u8>(@bytes))?
+        match fix
+            Some(f) =>
+                match self.obj.add_fixup(SectionId { index: p.sec }, at, f)
+                    Ok(_) => pass
+                    Err(oe) => return Err(asm_error(line, object_error_message(oe)))
+            None => pass
+        Ok(())
+
+    # `sym - .` whose symbol is undefined or in another section.
+    fn pc_relative(self: @Asm, prog: @Program, e: Expr, p: @&Pass, known: @&SymTable, here: i64) -> Option<Reloc>
+        match prog.exprs.node(e)
+            Bin(op, l, r) =>
+                match op
+                    Sub => pass
+                    _ => return None
+                match prog.exprs.node(r)
+                    Here => pass
+                    _ => return None
+                match self.value_at(prog, l, p, known, here)
+                    Ok(v) =>
+                        match v
+                            Relocatable(rel) => Some(rel)
+                            Absolute(_) => None
+                    Err(_) => None
+            _ => None
+
+    # The target of a direct jmp/jcc/loop when it is a label in the current
+    # section. `as` sizes and resolves these here even for a global label;
+    # only `call` and other fields keep a relocation to one.
+    fn local_target(self: @Asm, prog: @Program, insn: @Insn, p: @&Pass, known: @&SymTable) -> Option<LocalTarget>
+        let x: Expr = match insn.ops[0]
+            Operand.Memory(m) =>
+                if m.base.is_some() or m.index.is_some() or m.seg.is_some()
+                    return None
+                match m.disp
+                    Some(d) => d
+                    None => return None
+            _ => return None
+        let rel: Reloc = match self.value_at(prog, x, p, known, p.offsets[p.sec])
+            Ok(v) =>
+                match v
+                    Relocatable(r) => r
+                    Absolute(_) => return None
+            Err(_) => return None
+        if rel.sym.eq(".")
+            return Some(LocalTarget { offset: p.offsets[p.sec] + rel.addend, known: true, forward: false, stmt: -1 })
+        match prog.syms.lookup(rel.sym)
+            Unplaced(ps) =>
+                if ps < 0 or self.parse_sec[ps] != p.sec
+                    return None
+            _ => return None
+        match p.syms.lookup(rel.sym)
+            Label(_, o) => return Some(LocalTarget { offset: o + rel.addend, known: true, forward: false, stmt: -1 })
+            _ => pass
+        let stmt: i64 = match self.label_stmt.get(rel.sym)
+            Some(n) => n
+            None => -1
+        match known.lookup(rel.sym)
+            Label(_, o) => Some(LocalTarget { offset: o + rel.addend, known: true, forward: true, stmt: stmt })
+            _ => Some(LocalTarget { offset: 0, known: false, forward: true, stmt: stmt })
+
+    fn instruction(self: @&Asm, prog: @Program, i: i64, line: i64, insn: Insn, p: @&Pass, known: @&SymTable) -> Result<(), AsmError>
+        let here: i64 = p.offsets[p.sec]
+        # Operands not defined yet are sized through a stand-in.
+        var sub: Insn = insn
+        var orig: [3]Expr = self.stand_in
+        var stood: [3]bool = [false, false, false]
+        for k in 0..insn.n_ops
+            match insn.ops[k]
+                Operand.Imm(e) =>
+                    if first_undefined(@prog.exprs, e, @p.syms).is_some()
+                        orig[k] = e
+                        stood[k] = true
+                        sub.ops[k] = Operand.Imm(self.stand_in[k])
+                Operand.Memory(m) =>
+                    match m.disp
+                        Some(e) =>
+                            if first_undefined(@prog.exprs, e, @p.syms).is_some()
+                                orig[k] = e
+                                stood[k] = true
+                                var m2: Mem = m
+                                m2.disp = Some(self.stand_in[k])
+                                sub.ops[k] = Operand.Memory(m2)
+                        None => pass
+                _ => pass
+        p.syms.set_here(SymDef.Label(p.sec, here))
+        var enc: Encoded = match encode(@sub, p.mode, @prog.exprs, @p.syms)
+            Ok(x) => x
+            Err(e) => return Err(self.encode_failure(line, insn, e))
+        # A jmp, jcc or loop to a label in this section: its offset.
+        var branch: Option<LocalTarget> = None
+        match encode_short(@sub, p.mode, @prog.exprs, @p.syms)
+            Ok(short) =>
+                branch = self.local_target(prog, @insn, p, known)
+                match branch
+                    Some(t) =>
+                        if not self.long[i]
+                            let target: i64 = if t.forward then t.offset + self.stretch(prog, i, t.stmt, here - self.at[i], p.sec) else t.offset
+                            let fits: bool = not t.known or fits_i8(target - (here + short.len))
+                            if fits or not p.decide
+                                enc = short
+                            else
+                                self.long[i] = true
+                                p.grew = true
+                    None => pass
+            Err(_) => pass
+        if p.emit
+            match branch
+                Some(t) =>
+                    let width: i64 = enc.fixups()[0].width
+                    let disp: i64 = t.offset - (here + enc.len)
+                    if not fits_signed(disp, width)
+                        let name: StrView = insn.name
+                        var what: String = string_new()
+                        format_into(@&what, "`{name}` target is out of range ({disp} bytes)")
+                        return Err(asm_error(line, what))
+                    self.emit_branch(line, @enc, disp, p)?
+                None => self.emit_insn(prog, line, @enc, orig, stood, p, known)?
+        p.offsets[p.sec] = here + enc.len
+        p.after_insn[p.sec] = true
+        self.at[i] = here
+        Ok(())
+
+    # Where a forward target has moved to so far in this pass, as `as`
+    # estimates it: by `grown`, the growth before the branch, less what each
+    # `.align` between the branch at `from` and the target at `to` absorbs.
+    fn stretch(self: @Asm, prog: @Program, from: i64, to: i64, grown: i64, sec: i64) -> i64
+        var s: i64 = grown
+        var cur: i64 = sec
+        var k: i64 = from + 1
+        while k < to and s != 0
+            match prog.stmts.get(k).item
+                Section(decl) => cur = self.section_of(decl.name)
+                Align(n) =>
+                    if cur == sec
+                        s = if s < 0 then 0 - ((0 - s) & (0 - n)) else s & (0 - n)
+                _ => pass
+            k += 1
+        s
+
+    fn encode_failure(self: @Asm, line: i64, insn: Insn, e: EncodeError) -> AsmError
+        let name: StrView = insn.name
+        let why: String = encode_error_message(e)
+        var what: String = string_new()
+        format_into(@&what, "`{name}`: {why.as_view()}")
+        AsmError { line: line, what: what, unsupported: true }
+
+    # A call or jump to a label that is not global needs no PLT: `as` writes
+    # R_X86_64_PC32.
+    fn plt_to_local(self: @Asm, f: Fixup, known: @SymTable) -> Fixup
+        match f.kind
+            Plt => pass
+            _ => return f
+        if self.globals.contains(f.target)
+            return f
+        match known.lookup(f.target)
+            Label(_, _) => Fixup { offset: f.offset, width: f.width, kind: FixupKind.PcRelative, target: f.target, addend: f.addend }
+            _ => f
+
+    # Write a branch to a label in its own section, its displacement filled in.
+    fn emit_branch(self: @&Asm, line: i64, enc: @Encoded, disp: i64, p: @&Pass) -> Result<(), AsmError>
+        var bytes: Vec<u8> = vec_new<u8>()
+        bytes.push_span(enc.bytes())
+        let f: Fixup = enc.fixups()[0]
+        for b in 0..f.width
+            bytes[f.offset + b] = ((disp >> (b * 8)) & 0xFF) as u8
+        self.put(line, p.sec, span_from_vec<u8>(@bytes))?
+        Ok(())
+
+    # Write an encoded instruction, filling each stand-in field from its
+    # laid-out value.
+    fn emit_insn(self: @&Asm, prog: @Program, line: i64, enc: @Encoded, orig: [3]Expr, stood: [3]bool, p: @&Pass, known: @&SymTable) -> Result<(), AsmError>
+        let here: i64 = p.offsets[p.sec]
+        var bytes: Vec<u8> = vec_new<u8>()
+        bytes.push_span(enc.bytes())
+        var fixes: Vec<Fixup> = vec_new<Fixup>()
+        let fx: Span<Fixup> = enc.fixups()
+        for j in 0..fx.len
+            let f: Fixup = fx[j]
+            var slot: i64 = -1
+            for k in 0..3
+                if stood[k] and f.target.eq(STAND_IN[k])
+                    slot = k
+            if slot < 0
+                fixes.push(self.plt_to_local(f, known))
+                continue
+            known.set_here(SymDef.Label(p.sec, here))
+            match eval(@prog.exprs, orig[slot], known)
+                Ok(v) =>
+                    match v
+                        Relocatable(r) =>
+                            let real: Fixup = Fixup { offset: f.offset, width: f.width, kind: f.kind, target: r.sym, addend: f.addend + r.addend }
+                            fixes.push(self.plt_to_local(real, known))
+                        Absolute(n) =>
+                            let signed: bool = match f.kind
+                                Absolute => false
+                                AbsoluteSigned => true
+                                _ => return Err(asm_error(line, string_from("a PC-relative field with an absolute value")))
+                            let value: i64 = n + f.addend
+                            let fits: bool = if signed then fits_signed(value, f.width) else fits_field(value, f.width)
+                            if not fits
+                                var what: String = string_new()
+                                format_into(@&what, "the value {value} does not fit its field")
+                                return Err(asm_error(line, what))
+                            for b in 0..f.width
+                                bytes[f.offset + b] = ((value >> (b * 8)) & 0xFF) as u8
+                Err(err) => return Err(asm_error(line, err.message()))
+        let at: i64 = self.put(line, p.sec, span_from_vec<u8>(@bytes))?
+        for j in 0..fixes.len
+            match self.obj.add_fixup(SectionId { index: p.sec }, at, fixes[j])
+                Ok(_) => pass
+                Err(e) => return Err(asm_error(line, object_error_message(e)))
+        Ok(())

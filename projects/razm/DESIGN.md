@@ -78,9 +78,14 @@ Relocation types follow from the field and the mode, matching GNU as:
 | Absolute memory operand (`movq sym, %rax`, `lgdt sym`) | `R_X86_64_32S` | `R_X86_64_32` | — |
 | `movabsq $sym` | `R_X86_64_64` | — | — |
 | `sym(%rip)` | `R_X86_64_PC32` | — | — |
-| `call` / `jmp` / `jcc` to a symbol that is global, undefined, or in another section | `R_X86_64_PLT32` | `R_X86_64_PC32` | `R_X86_64_PC16` |
+| `call` / `jmp` / `jcc` to a symbol that is undefined or global (a `call` to a global in its own section included) | `R_X86_64_PLT32` | `R_X86_64_PC32` | `R_X86_64_PC16` |
+| `call` / `jmp` / `jcc` to a local label in another section | `R_X86_64_PC32` | `R_X86_64_PC32` | `R_X86_64_PC16` |
 
-A `jmp`, `jcc`, or `call` to a local label in the same section needs no relocation. `jmp` and `jcc` to such a label use the short (rel8) form when the displacement fits and the near form otherwise, decided by iterating until no branch grows, as `as` does. `call` is always rel32. `loop` is rel8 only, and an out-of-range `loop` is an error. Alignment fill in an executable section is GNU as's multi-byte `nop` sequence, and zero bytes elsewhere.
+A `jmp` or `jcc` to a label in its own section needs no relocation, even when the label is global, and neither does a `call` to a local label there. `jmp` and `jcc` to such a label use the short (rel8) form when the displacement fits and the near form otherwise, decided by iterating until no branch grows, as `as` does. In a pass, a target behind the branch is at its new offset. A target ahead of it is at its last-pass offset moved by the growth before the branch, less what each `.align` between them absorbs (GNU as's `relax_frag` estimate). `call` is always rel32. `loop` is rel8 only, and an out-of-range `loop` is an error.
+
+Alignment fill in an executable section is GNU as's multi-byte `nop` sequence, and zero bytes elsewhere. The nops are the longest form (11 bytes in `.code32`/`.code64`, 5 in `.code16`) with the remainder first. A fill of 88 bytes or more (15 in `.code16`) starts with a jump over the rest: `eb rel8` up to 129 bytes, else `e9 rel32`, which takes a `66` prefix when the file ends in `.code16`, because `as` writes every fill at the end. A fill after anything but an instruction (data, or another `.align`) starts with a one-byte `nop`.
+
+An operand that names a symbol not defined yet at that line (a later label or `.set`, or an undefined symbol) takes its widest form, as `as` sizes it: `addq $K, %rbx` before `.equ K, 1` is `81 /0 imm32`, and after it `83 /0 imm8`.
 
 Prefixes, only in front of an instruction: `lock`, `rep`.
 
