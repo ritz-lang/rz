@@ -1,0 +1,355 @@
+# platform/harland_save.ritz - loading and saving files on Harland (AGAST #4833).
+#
+# docs/BUDDHAFINGER_PROPOSAL.md, "Saving files" / "Harland". Harland's
+# kernel gives a file opened for writing a per-fd buffer that replaces the
+# whole file on close (or at process exit), and has no rename, so the Linux
+# save (temp file, rename) does not apply. HarlandFiles is the editor's file
+# store there; a save:
+#
+#   1. stats the target and compares its size and modified time with the
+#      record from load or the last save (stat, #4832): a file that changed
+#      since is not written;
+#   2. builds the whole file in one buffer (Buffer.serialize);
+#   3. opens the target O_WRONLY | O_CREAT | O_TRUNC, with the target's mode
+#      (a new file gets 0644);
+#   4. writes it in ONE write that must take every byte: a kill between two
+#      writes would commit the prefix written so far, a kill before the
+#      write leaves the old file;
+#   5. closes it and checks the close: that is where the kernel commits;
+#   6. for /var (the persistent subtree), syncs (syscall 162) and requires
+#      that to succeed too.
+#
+# An empty buffer skips the write: the O_TRUNC fd commits the empty file on
+# the explicit close (#4830).
+#
+# Failures, and what the file holds after each:
+#
+#   Changed, Stat, Open  nothing was written; the file is as it was.
+#   Write                the fd is abandoned, not closed: the explicit close
+#                        of an O_TRUNC fd would commit what the kernel holds
+#                        (nothing, or a prefix), while process exit commits an
+#                        empty buffer never. One fd stays open until exit.
+#   Close                a RAM-only path: the commit failed.
+#   Unpersisted          /var: the close (the persistent subtree's update)
+#                        or the sync failed. The running system may already
+#                        see the new bytes while the next boot loads the old
+#                        file, so the message says the live file may already
+#                        have changed. Transactional replacement across the
+#                        two trees is the save-parity track (#4792).
+#
+# The store never marks the buffer saved: the editor does, on Ok only, so
+# every failure leaves it dirty.
+#
+# Paths: Harland's kernel takes absolute paths only, so the store resolves
+# a relative one against the working directory (ritzlib.path) first.
+#
+# The disk is reached through OneWriteIo, so test/test_harland_save.ritz runs
+# every step and failure on Linux with a scripted fake; HarlandDisk is the
+# real one. HarlandDisk can also stop a save before or after its write
+# (SavePause, `--pause-save`) so the QEMU acceptance test can kill the editor
+# at exactly that point. The sync is ritzlib.fs's sync (162 on both
+# targets; on Linux, where only the tests and the library build this
+# module, it flushes everything and is Ok).
+
+import ritzlib.errno
+import ritzlib.fd
+import ritzlib.fs { stat, sync }
+import ritzlib.gvec
+import ritzlib.io { prints }
+import ritzlib.option
+import ritzlib.path { path_absolute }
+import ritzlib.result
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.sys { Stat }
+import ritzlib.termsession { TermState }
+
+import core.buffer { Buffer }
+import core.files { FileStore, LoadError, SaveError }
+
+# open(2) flags, Linux's numbers, which Harland's open takes too.
+const OPEN_READ: i32 = 0            # O_RDONLY
+const OPEN_REPLACE: i32 = 577       # O_WRONLY | O_CREAT | O_TRUNC (1 | 64 | 512)
+# A new file's permission bits: rw-r--r--.
+const MODE_NEW: i32 = 420
+# Permission bits of st_mode (07777).
+const MODE_BITS: i32 = 4095
+
+# ============================================================================
+# Errors
+# ============================================================================
+
+# Why a save failed, by step (the table at the top).
+pub enum OneWriteError
+    Changed                 # the target changed since load or the last save
+    Stat(Errno)             # stat of the target
+    Open(Errno)             # the O_TRUNC open
+    Write(Errno)            # the write failed or was short (Io)
+    Close(Errno)            # the close of a RAM-only path
+    Unpersisted(Errno)      # /var: the close or the sync failed
+
+impl OneWriteError
+    # "changed", "stat", "open", "write", "close" or "unpersisted".
+    pub fn step_name(self: OneWriteError) -> StrView
+        match self
+            Changed => "changed"
+            Stat(_) => "stat"
+            Open(_) => "open"
+            Write(_) => "write"
+            Close(_) => "close"
+            Unpersisted(_) => "unpersisted"
+
+    # The editor's SaveError for it.
+    pub fn save_error(self: OneWriteError) -> SaveError
+        match self
+            Changed => SaveError.Changed
+            Stat(e) => SaveError.Failed(e)
+            Open(e) => SaveError.Failed(e)
+            Write(e) => SaveError.Failed(e)
+            Close(e) => SaveError.Failed(e)
+            Unpersisted(e) => SaveError.Unpersisted(e)
+
+# ============================================================================
+# The disk seam
+# ============================================================================
+
+# What a save compares the target with, and the mode it keeps.
+pub struct FileStamp
+    size: i64
+    mtime: i64
+    mtime_ns: i64
+    mode: i32               # permission bits only
+
+fn stamp_of(st: @Stat) -> FileStamp
+    FileStamp { size: st.st_size, mtime: st.st_mtime, mtime_ns: st.st_mtime_ns, mode: st.st_mode & MODE_BITS }
+
+fn same_stamp(a: @FileStamp, b: @FileStamp) -> bool
+    a.size == b.size and a.mtime == b.mtime and a.mtime_ns == b.mtime_ns
+
+# A file's bytes and the stamp they were read under.
+pub struct Loaded
+    bytes: Vec<u8>
+    stamp: FileStamp
+
+# The calls a load and a save make. One file is open at a time: create()
+# opens it, write() and close() (or abandon()) act on it.
+pub trait OneWriteIo
+    # The whole file and its stamp; Err(NoEnt) when there is none.
+    fn read(self: @&Self, path: StrView) -> Result<Loaded, Errno>
+    # The file's stamp now; None when there is no file.
+    fn stat(self: @&Self, path: StrView) -> Result<Option<FileStamp>, Errno>
+    # open(path, O_WRONLY | O_CREAT | O_TRUNC, mode).
+    fn create(self: @&Self, path: StrView, mode: i32) -> Result<(), Errno>
+    # One write(2) of `data`: Ok(bytes taken).
+    fn write(self: @&Self, data: [u8]) -> Result<i64, Errno>
+    # close(2): the commit.
+    fn close(self: @&Self) -> Result<(), Errno>
+    # Forget the open file without closing it (Write, above).
+    fn abandon(self: @&Self)
+    # sync(2): the persistent subtree to the storage device.
+    fn sync(self: @&Self) -> Result<(), Errno>
+
+# Where HarlandDisk stops a save for the acceptance test to kill the editor.
+pub enum SavePause
+    Never
+    BeforeWrite             # after the O_TRUNC open, before the write
+    AfterWrite              # after the write, before the close
+
+# The real disk.
+pub struct HarlandDisk
+    file: Fd                # the file create() opened
+    pause: SavePause
+    console: Option<TermState>  # the session's raw mode, for a pause to hand back
+
+pub fn harland_disk(pause: SavePause, console: Option<TermState>) -> HarlandDisk
+    HarlandDisk { file: fd_adopt(-1), pause: pause, console: console }
+
+impl OneWriteIo for HarlandDisk
+    fn read(self: @&HarlandDisk, path: StrView) -> Result<Loaded, Errno>
+        var f: Fd = fd_open(path, OPEN_READ, 0)?
+        let got = read_all(@f)
+        let closed = f.close()
+        got
+
+    fn stat(self: @&HarlandDisk, path: StrView) -> Result<Option<FileStamp>, Errno>
+        match stat(path)
+            Ok(st) => Ok(Some(stamp_of(@st)))
+            Err(e) =>
+                match e
+                    NoEnt => Ok(None)
+                    _ => Err(e)
+
+    fn create(self: @&HarlandDisk, path: StrView, mode: i32) -> Result<(), Errno>
+        self.file = fd_open(path, OPEN_REPLACE, mode)?
+        if self.pause == SavePause.BeforeWrite
+            hold_console("before write", self.console)
+        Ok(())
+
+    fn write(self: @&HarlandDisk, data: [u8]) -> Result<i64, Errno>
+        let n = self.file.write(data)?
+        if self.pause == SavePause.AfterWrite
+            hold_console("after write", self.console)
+        Ok(n)
+
+    fn close(self: @&HarlandDisk) -> Result<(), Errno>
+        self.file.close()
+
+    fn abandon(self: @&HarlandDisk)
+        self.file = fd_adopt(-1)
+
+    fn sync(self: @&HarlandDisk) -> Result<(), Errno>
+        sync()
+
+fn read_all(f: @Fd) -> Result<Loaded, Errno>
+    let st = f.stat()?
+    var bytes: Vec<u8> = vec_with_cap<u8>(st.st_size)
+    var chunk: [4096]u8
+    loop
+        let n = f.read(Span<u8> { ptr: @chunk[0], len: 4096 })?
+        if n == 0
+            break
+        bytes.push_span(Span<u8> { ptr: @chunk[0], len: n })
+    Ok(Loaded { bytes: bytes, stamp: stamp_of(@st) })
+
+# The pause: say where the save stopped, then hand the console back as the
+# shell left it (the session's restore: TTY_ISIG on, cooked) and wait for a
+# line, so the console's Ctrl-C kills the editor right here (Harland has no
+# kill syscall). A line typed instead resumes the save, in raw mode again.
+# `console` is a copy of the session's TermState: restore and resume only
+# set the attributes it holds. Without one the save stops nowhere.
+fn hold_console(point: StrView, console: Option<TermState>)
+    match console
+        Some(t) =>
+            prints("\r\nbuddhafinger: save paused ")
+            prints(point)
+            prints("\r\n")
+            var held = t
+            let cooked = held.restore()
+            var line: [64]u8
+            let n = fd_borrow(held.fd()).read(Span<u8> { ptr: @line[0], len: 64 })
+            let raw = held.resume()
+        None => pass
+
+# ============================================================================
+# The store
+# ============================================================================
+
+pub struct HarlandFiles
+    path: String                # the absolute path the record is for ("" before a load)
+    stamp: Option<FileStamp>    # None: no file there when last seen
+    pause: SavePause            # HarlandDisk's; Never but in the acceptance test
+    console: Option<TermState>  # HarlandDisk's: set by the session (hold_console)
+
+pub fn harland_files(pause: SavePause) -> HarlandFiles
+    HarlandFiles { path: string_new(), stamp: None, pause: pause, console: None }
+
+# Whether `path` (absolute) is in the persistent subtree: /var and below.
+pub fn is_persistent(path: StrView) -> bool
+    path.eq("/var") or path.starts_with("/var/")
+
+# The record for `path`: Some(stamp) for a file seen there, None for none
+# seen (a new file, or a path never loaded or saved).
+fn record_for(files: @HarlandFiles, path: StrView) -> Option<FileStamp>
+    if not files.path.as_view().eq(path)
+        return None
+    files.stamp
+
+fn record(files: @&HarlandFiles, path: StrView, stamp: Option<FileStamp>)
+    files.path.clear()
+    files.path.push_str(path)
+    files.stamp = stamp
+
+# Load `path` (absolute) through `io` and record its stamp. A missing file
+# is Err(NotFound), recorded as new, so a save creates it.
+pub fn harland_load_with<T: OneWriteIo>(files: @&HarlandFiles, path: StrView, io: @&T) -> Result<Vec<u8>, LoadError>
+    record(files, path, None)
+    match io.read(path)
+        Ok(got) =>
+            files.stamp = Some(got.stamp)
+            Ok(got.bytes)
+        Err(e) =>
+            match e
+                NoEnt => Err(LoadError.NotFound)
+                _ => Err(LoadError.Failed(e))
+
+# The save described at the top, of `buf` to `path` (absolute), through `io`.
+# Ok only once every step has succeeded; `files` then records the target's
+# new stamp, so the next save checks against the bytes written.
+pub fn harland_save_with<T: OneWriteIo>(files: @&HarlandFiles, path: StrView, buf: @Buffer, io: @&T) -> Result<(), OneWriteError>
+    # 1. The change check.
+    let now: Option<FileStamp> = match io.stat(path)
+        Ok(s) => s
+        Err(e) => return Err(OneWriteError.Stat(e))
+    let was = record_for(files, path)
+    match now
+        Some(n) =>
+            match was
+                Some(w) =>
+                    if not same_stamp(@w, @n)
+                        return Err(OneWriteError.Changed)
+                None => return Err(OneWriteError.Changed)
+        None =>
+            if was.is_some()
+                return Err(OneWriteError.Changed)
+    let mode: i32 = match now
+        Some(n) => n.mode
+        None => MODE_NEW
+    # 2-4. One buffer, one open, one write.
+    let bytes = buf.serialize()
+    match io.create(path, mode)
+        Ok(_) => pass
+        Err(e) => return Err(OneWriteError.Open(e))
+    if bytes.len() > 0
+        match io.write(span_from_vec<u8>(@bytes))
+            Ok(n) =>
+                if n != bytes.len()
+                    io.abandon()
+                    return Err(OneWriteError.Write(Errno.Io))
+            Err(e) =>
+                io.abandon()
+                return Err(OneWriteError.Write(e))
+    # 5. The close commits; 6. sync for /var.
+    let persistent = is_persistent(path)
+    match io.close()
+        Ok(_) => pass
+        Err(e) =>
+            if persistent
+                return Err(OneWriteError.Unpersisted(e))
+            return Err(OneWriteError.Close(e))
+    if persistent
+        match io.sync()
+            Ok(_) => pass
+            Err(e) => return Err(OneWriteError.Unpersisted(e))
+    # The bytes are saved. A stat that fails now leaves no record, so the
+    # next save reports the file changed rather than guess.
+    match io.stat(path)
+        Ok(s) => record(files, path, s)
+        Err(_) => record(files, "", None)
+    Ok(())
+
+impl HarlandFiles
+    # Read `path` whole and record its stamp (harland_load_with on the disk).
+    pub fn load_disk(self: @&HarlandFiles, path: StrView) -> Result<Vec<u8>, LoadError>
+        let abs: String = match path_absolute(path)
+            Ok(a) => a
+            Err(e) => return Err(LoadError.Failed(e))
+        var io = harland_disk(SavePause.Never, None)
+        harland_load_with(self, abs.as_view(), @&io)
+
+    # Save `buf` to `path` (harland_save_with on the disk).
+    pub fn save_disk(self: @&HarlandFiles, path: StrView, buf: @Buffer) -> Result<(), OneWriteError>
+        let abs: String = match path_absolute(path)
+            Ok(a) => a
+            Err(e) => return Err(OneWriteError.Open(e))
+        var io = harland_disk(self.pause, self.console)
+        harland_save_with(self, abs.as_view(), buf, @&io)
+
+impl FileStore for HarlandFiles
+    fn load(self: @&HarlandFiles, path: StrView) -> Result<Vec<u8>, LoadError>
+        self.load_disk(path)
+
+    fn save(self: @&HarlandFiles, path: StrView, buf: @Buffer) -> Result<(), SaveError>
+        match self.save_disk(path, buf)
+            Ok(_) => Ok(())
+            Err(e) => Err(e.save_error())

@@ -9,6 +9,7 @@
 #   queries      stat / lstat -> Result<Stat, Errno>, file_size -> Result<i64, Errno>
 #   whole files  read_file -> Result<String, Errno>, write_file -> Result<i64, Errno>
 #   mutation     mkdir / unlink / rmdir -> Result<i32, Errno> (Ok(0)), copy_file
+#   storage      sync -> Result<(), Errno>
 #   directories  dir_open -> Result<DirIter, Errno>; dir_next -> bool;
 #                dir_entry_type -> Option<u8>; dir_entry / dir_next_entry
 #   paths        path_join -> String; path_basename / dirname / extension / stem
@@ -18,9 +19,9 @@
 # without a variant), never a -1 / null sentinel or a bare number (AGAST
 # #4248). A path of FS_PATH_MAX bytes or more fails with NameTooLong.
 #
-# Targets (AGAST #4830, #4832): read_file, write_file, copy_file, stat /
-# lstat, the predicates, file_size, the path utilities and the mode_is_*
-# helpers compile for Linux and Harland. The rest (mkdir/unlink/rmdir,
+# Targets (AGAST #4830, #4832, #4833): read_file, write_file, copy_file,
+# stat / lstat, sync, the predicates, file_size, the path utilities and the
+# mode_is_* helpers compile for Linux and Harland. The rest (mkdir/unlink/rmdir,
 # access .. set_times, dir_open, remove_dir_all) is [[target_os = "linux"]]:
 # it rests on syscalls Harland does not have. Harland has no symlinks, so
 # there lstat is stat and is_symlink is false.
@@ -344,13 +345,28 @@ fn fs_write_result(werr: i32, cerr: i32, len: i64) -> Result<i64, Errno>
 # Harland. On Harland a write fd buffers its writes and close is what puts
 # them in the file (harland kernel/src/fs/syscall.ritz), so the close result
 # is checked: Ok means the file holds `content`. A save that has to survive a
-# reboot under Harland's /var also calls sys_sync.
+# reboot under Harland's /var also calls sync (below).
 pub fn write_file(path: StrView, content: StrView) -> Result<i64, Errno>
     let fd: i32 = fs_open(path, FS_CREATE_FLAGS, 420)  # 0644
     if fd < 0
         return Err(errno_from_raw(fd))
     let werr: i32 = fs_write_all(fd, content.ptr, content.len)
     fs_write_result(werr, sys_close(fd), content.len)
+
+# sync(2)'s number on both targets (sys.ritz's SYS_SYNC is Harland's only).
+const FS_SYS_SYNC: i64 = 162
+
+# Save what the file systems hold to their storage now: sync(2), number 162
+# on Linux and on Harland. Linux flushes every file system and never fails.
+# Harland saves the persistent /var subtree to its storage device: a /var
+# file is in the image the next boot loads only once this is Ok (a close
+# only schedules that save), and it is Err(Other(19)) (ENODEV) when there is
+# no storage device (AGAST #4833: Buddhafinger's save).
+pub fn sync() -> Result<(), Errno>
+    let rc: i32 = syscall0(FS_SYS_SYNC) as i32
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(())
 
 # Copy `src` to `dest` (created or truncated with `mode`).
 # Ok carries the number of bytes copied. `dest` is not created if `src`

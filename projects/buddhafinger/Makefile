@@ -14,7 +14,7 @@
 COMPILER := ritz1_selfhosted
 RZ := ../../rz
 
-.PHONY: all build test bench-build bench bench-check
+.PHONY: all build test harland-test bench-build bench bench-check
 all: build
 
 # ritz1-bootstrap builds ritz1 + ritz1_selfhosted; a no-op when both are
@@ -24,8 +24,16 @@ build:
 	$(RZ) build ritz-lsp --compiler $(COMPILER)
 	$(RZ) build buddhafinger --compiler $(COMPILER)
 
+# The ritzunit suites, then the Harland acceptance test (AGAST #4833): the
+# editor on Harland's serial console under QEMU, KVM where it works.
 test: build
 	$(RZ) test buddhafinger --compiler $(COMPILER)
+	$(MAKE) harland-test
+
+# tools/test_harland_console.sh builds the kernel, rzsh and indium itself;
+# the editor is already built (above) by $(COMPILER), which it checks.
+harland-test: build
+	bash tools/test_harland_console.sh
 
 # The benchmark workloads (AGAST #4821; bench/README.md): a release build of
 # buddhafinger-bench, then each workload in its own process, so each peak
