@@ -60,7 +60,8 @@ import syscall.errno { Errno }
 import cap.types { CapEntry, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, cap_handle_init }
 import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_revoke, cap_irq_owner }
 import mm.shm { shm_live, shm_detach_expired }
-import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_unblock_current, proc_reap_pending }
+import proc.table { BLOCK_WAIT, proc_current, proc_current_pid, proc_current_slot, proc_block, proc_unblock_current, proc_reap_pending, proc_on_cpu }
+import mm.tlb { TLB_CLEAR, TLB_QUARANTINE, tlb_unmap_on }
 import proc.sched { sched_block }
 import proc.waitq { waitq_can_park }
 import proc.waitset { irq_object_known, irq_object_domain, waitset_arm, waitset_disarm }
@@ -68,7 +69,7 @@ import proc.waitset { WaitPlan, Collected, Notify, wait_plan_new, wait_plan_irq,
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_ATTACH, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
 import mm.pmm { PAGE_SIZE }
-import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_quarantine_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
+import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
 import mm.dma { dma_alloc_zeroed, dma_free_pages, dma_quarantine_iova }
 import mm.dma_runs { DmaRun, DmaRange, dma_run_room, dma_run_add, dma_run_take, dma_run_take_pid, dma_run_take_device, dma_hole_put, dma_hole_take, dma_hole_floor, dma_holes_drop_pid }
 import drivers.virtio.window { VioWindow, vio_window_find, vio_window_pages, vio_window_guarded, vio_window_queue_regs }
@@ -370,19 +371,17 @@ fn run_left_domain(run: DmaRun) -> bool
         confirmed = false
     confirmed
 
-# Clear the `pages` leaves from `vaddr` in `pml4`; the frames stay the caller's.
-fn unmap_run(pml4: u64, vaddr: u64, pages: u64)
-    var p: u64 = 0
-    while p < pages
-        vmm_unmap_page_in(pml4, vaddr + p * PAGE_SIZE)
-        p = p + 1
+# Clear the `pages` leaves from `vaddr` in process `pid`'s `pml4`; the frames
+# stay the caller's. The driver may be on another CPU (netd on its AP,
+# #4875), so the CPU it is on clears and flushes them (mm/tlb.ritz), and
+# this returns only once it has: the caller frees the frames after.
+fn unmap_run(pid: u32, pml4: u64, vaddr: u64, pages: u64)
+    tlb_unmap_on(proc_on_cpu(pid as u64), pid as u64, pml4, vaddr, pages, TLB_CLEAR)
 
-# Quarantine the `pages` leaves from `vaddr` in `pml4` (vmm_quarantine_page_in).
-fn quarantine_leaves(pml4: u64, vaddr: u64, pages: u64)
-    var p: u64 = 0
-    while p < pages
-        vmm_quarantine_page_in(pml4, vaddr + p * PAGE_SIZE)
-        p = p + 1
+# Quarantine the `pages` leaves from `vaddr` in process `pid`'s `pml4`
+# (vmm_quarantine_page_in), on the CPU it is on as unmap_run.
+fn quarantine_leaves(pid: u32, pml4: u64, vaddr: u64, pages: u64)
+    tlb_unmap_on(proc_on_cpu(pid as u64), pid as u64, pml4, vaddr, pages, TLB_QUARANTINE)
 
 # The next free address of `pid`'s DMA window for `pages` more pages: past
 # its last leaf (a quarantined one included) and past every range on its
@@ -485,11 +484,11 @@ fn drv_dma_free(pid: u32, pml4: u64, irq_handle: u64, vaddr: u64, size: u64) -> 
         Some(r) => r
         None => return Errno.Inval as i64
     if run_left_domain(run)
-        unmap_run(pml4, run.vaddr, run.pages)
+        unmap_run(pid, pml4, run.vaddr, run.pages)
         dma_free_pages(run.phys, run.pages as u32)
         dma_hole_put(pid, object_id, DmaRange { vaddr: run.vaddr, iova: run.iova, pages: run.pages })
     else
-        quarantine_leaves(pml4, run.vaddr, run.pages)
+        quarantine_leaves(pid, pml4, run.vaddr, run.pages)
         dma_quarantine_iova(run.phys, run.pages, run.iova)
     0
 
@@ -505,7 +504,7 @@ pub fn drv_dma_process_end(pid: u32, pml4: u64)
             Some(r) => r
             None => break
         if not run_left_domain(run)
-            quarantine_leaves(pml4, run.vaddr, run.pages)
+            quarantine_leaves(pid, pml4, run.vaddr, run.pages)
             dma_quarantine_iova(run.phys, run.pages, run.iova)
     dma_holes_drop_pid(pid)
 
@@ -581,7 +580,7 @@ fn quiesce_device(pid: u32, pml4: u64, dev: DrvDevice)
         if reset_ok and left
             continue
         if pml4 != 0
-            quarantine_leaves(pml4, run.vaddr, run.pages)
+            quarantine_leaves(pid, pml4, run.vaddr, run.pages)
         dma_quarantine_iova(run.phys, run.pages, run.iova)
         quarantined = quarantined + run.pages
     klog("[quiesce] pid ")

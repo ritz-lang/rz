@@ -224,7 +224,7 @@ def test_quarantined_leaf_is_kept_and_counted():
     PTE_DEVICE and the frame: vmm_free_user_pt never frees it, and
     vmm_slot_end counts the page so the VA is not handed out again."""
     src = VMM.read_text()
-    q = _body(src, "vmm_quarantine_page_in")
+    q = _body(src, "vmm_quarantine_leaf_in")
     assert "| PTE_DEVICE" in q and "PTE_PRESENT" not in q.split("vmm_set_entry", 1)[1].split("\n", 1)[0]
     assert "PTE_DEVICE" in _body(src, "vmm_slot_end")
 

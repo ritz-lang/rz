@@ -35,7 +35,7 @@ VMM_MODULES = ["mm.vmm", "mm.pmm", "sync.spin", "klog", "serial", "io", "boot_ab
 WINDOW_PROGRAM = """\
 import ritzlib.option
 import mm.pmm { PAGE_SIZE, pmm_irqsave, pmm_init, pmm_mark_region_free, pmm_alloc_page }
-import mm.vmm { PTE_PRESENT, PTE_ADDR_MASK, MMIO_WINDOW_BASE, vmm_pml4_phys, vmm_init_mmio_window, vmm_create_user_pml4, vmm_read_pml4_entry }
+import mm.vmm { PTE_PRESENT, PTE_ADDR_MASK, MMIO_WINDOW_BASE, vmm_set_walk_pml4, vmm_init_mmio_window, vmm_create_user_pml4, vmm_read_pml4_entry }
 
 var g_mem: [266240]u8
 # Tracks the low 1 GiB, where g_mem is (#4183: the caller supplies the bitmap).
@@ -48,8 +48,8 @@ fn zero_page(p: u64) -> i32
         i = i + 1
     return 0
 
-# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
-# frame caches (AGAST #4879): one CPU here.
+# mm/pmm.ritz and mm/vmm.ritz declare the kernel's percpu.ritz cpu_index, for
+# the per-CPU frame caches and PC_ACTIVE_PML4 (AGAST #4879, #4880): one CPU here.
 pub fn cpu_index() -> i32
     0
 
@@ -65,7 +65,7 @@ fn main() -> i32
     if kpml4 == 0
         return 2
     zero_page(kpml4)
-    vmm_pml4_phys = kpml4
+    vmm_set_walk_pml4(kpml4)
 
     # Boot: the window's PML4 entry exists before any process.
     if vmm_init_mmio_window() != 0

@@ -79,7 +79,9 @@
 #                       `QEMU_SMP=2` runs the acceptance boot at two CPUs.
 #                       Every AP must also answer the mailbox ping round
 #                       trip (AGAST #4879); at 1 CPU the kernel says it has
-#                       no AP to ping.
+#                       no AP to ping. Every AP must also serve the
+#                       owner-side unmap and the kernel-half one (AGAST
+#                       #4880); at 1 CPU the kernel says it has no AP for it.
 #        COMPILER=NAME  ritz0, ritz1 or ritz1_selfhosted (AGAST #1848): build
 #                       with `./rz build PKG --compiler NAME`, and require
 #                       every binary the boot loads (kernel, BOOTX64.EFI,
@@ -804,6 +806,45 @@ mbox_round_trip() {
     return 1
 }
 
+# tlb_owner_unmap NAME: pass only if every AP -smp starts unmapped a page
+# from a space it had loaded, on the BSP's UNMAP request, and saw a
+# kernel-half unmap (AGAST #4880, docs/SMP_USER.md §3, §6): per AP one
+# "[tlb] owner unmap OK: cpu K saw the unmap" and one "[tlb] kernel invlpg
+# OK: cpu K saw the unmap" line, K distinct, and no FAIL. At one CPU the
+# kernel must say "[tlb] no APs for the owner unmap" instead. At any count,
+# vmm_free_pml4's lazy-CR3 assert ("[vmm] vmm_free_pml4: ... still loaded")
+# must never fire: a CPU kept a space loaded that was being freed.
+tlb_owner_unmap() {
+    local want=$((SMP_NCPUS - 1)) owner kernel
+    if grep -aq '\[vmm\] vmm_free_pml4: .* still loaded' "$WORK/$1.log"; then
+        grep -a '\[vmm\] vmm_free_pml4' "$WORK/$1.log" | head -5
+        echo "FAIL ($1): a PML4 was freed while a CPU still had it loaded"
+        return 1
+    fi
+    if grep -aq '\[tlb\] .* FAIL' "$WORK/$1.log"; then
+        grep -a '\[tlb\]' "$WORK/$1.log" | head -5
+        echo "FAIL ($1): an AP missed an unmap (owner-side UNMAP or KERNEL_INVLPG)"
+        return 1
+    fi
+    if [ "$want" -le 0 ]; then
+        if grep -aq '\[tlb\] no APs for the owner unmap' "$WORK/$1.log"; then
+            echo "PASS ($1): one CPU, no AP for the owner unmap"
+            return 0
+        fi
+        echo "FAIL ($1): one CPU, but no \"[tlb] no APs for the owner unmap\" line"
+        return 1
+    fi
+    owner="$(grep -aoE '\[tlb\] owner unmap OK: cpu [0-9]+ saw the unmap' "$WORK/$1.log" | sort -u | wc -l)"
+    kernel="$(grep -aoE '\[tlb\] kernel invlpg OK: cpu [0-9]+ saw the unmap' "$WORK/$1.log" | sort -u | wc -l)"
+    if [ "$owner" = "$want" ] && [ "$kernel" = "$want" ]; then
+        echo "PASS ($1): all $want APs saw the owner-side unmap and the kernel-half one"
+        return 0
+    fi
+    grep -a '\[tlb\]' "$WORK/$1.log" | head -5
+    echo "FAIL ($1): $owner (owner) and $kernel (kernel) of $want APs saw the unmap"
+    return 1
+}
+
 # sysret_ring0 NAME: pass only if the "sysret" self-test's non-canonical
 # return RIP faulted in ring 0 at syscall_exit_iret (CS 8), the path #4610's
 # fixup covers and TCG never takes (AGAST #4612).
@@ -854,6 +895,7 @@ if [ "$MODE" != grub ]; then
     boot_tests_passed native || rc=1
     smp_stacks native || rc=1
     mbox_round_trip native || rc=1
+    tlb_owner_unmap native || rc=1
     ring_holds_boot native || rc=1
     blk_transport native modern || rc=1
     slow_disk native || rc=1
@@ -895,6 +937,7 @@ EOF
     boot_tests_passed grub || rc=1
     smp_stacks grub || rc=1
     mbox_round_trip grub || rc=1
+    tlb_owner_unmap grub || rc=1
     blk_transport grub legacy || rc=1
     key_received grub || rc=1
     preempted grub || rc=1
@@ -908,6 +951,7 @@ EOF
     boot_tests_passed grub-reboot || rc=1
     smp_stacks grub-reboot || rc=1
     mbox_round_trip grub-reboot || rc=1
+    tlb_owner_unmap grub-reboot || rc=1
     persisted grub-reboot 2 || rc=1
     saved_subtree grub-reboot || rc=1
 fi

@@ -14,7 +14,8 @@
 # Order is FIFO by ticket, so FIFO per producer.
 #
 # Never full, by construction: only the BSP sends requests, one at a time
-# (the boot ping keeps at most PING_WINDOW in flight), and each process will
+# to each CPU (the boot ping keeps at most PING_WINDOW in flight; a
+# KERNEL_INVLPG goes to every CPU at once, one each), and each process will
 # have at most one FORWARD or RETURN in flight (#4881). A producer that finds
 # its slot taken logs `[mbox] full` and waits: an assertion, not a path.
 #
@@ -45,6 +46,9 @@ extern fn lapic_send_fixed_ipi(dest_apic: u32, vector: u8)
 extern fn lapic_eoi()
 # apcall.ritz: run AP call `kind` on this CPU; 0 when it worked.
 extern fn ap_call_run(kind: u32) -> i32
+# mm/tlb.ritz: serve an UNMAP or KERNEL_INVLPG on this CPU (the owner);
+# the reply's arg[1].
+extern fn tlb_serve(kind: u32, pml4: u64, vaddr: u64, pages: u64, mode: u64) -> u64
 
 # The kick IPI's vector (kernel/isr_stubs.s IRQ_STUB 48, 240; idt.ritz).
 # #4220's AP-call IPI, generalised: every mailbox post sends it.
@@ -55,9 +59,17 @@ pub const MBOX_CALL: u32 = 1        # run AP call arg[1]; reply CALL_DONE
 pub const MBOX_CALL_DONE: u32 = 2   # arg[0] the request id, arg[1] the status (i64)
 pub const MBOX_PING: u32 = 3        # reply PONG echoing arg[0]
 pub const MBOX_PONG: u32 = 4        # arg[0] the PING's arg[0]
-# Reserved for later slices (SMP_USER.md §2-§3), not handled yet:
-#   UNMAP, UNMAP_DONE, KERNEL_INVLPG and its ack (#4880),
-#   FORWARD, RETURN, CAP_INSERT (#4881).
+# Owner-side unmap (SMP_USER.md §3, mm/tlb.ritz): clear `pages` leaves from
+# arg[2] in PML4 arg[1] (arg[4]: TLB_CLEAR or TLB_QUARANTINE), flushing
+# them if that space is loaded here; reply UNMAP_DONE. pid names the process.
+pub const MBOX_UNMAP: u32 = 5
+pub const MBOX_UNMAP_DONE: u32 = 6       # arg[0] the request id, arg[1] leaves changed
+# Flush `pages` kernel-half pages from arg[2] (0: the whole TLB); reply
+# KERNEL_INVLPG_DONE.
+pub const MBOX_KERNEL_INVLPG: u32 = 7
+pub const MBOX_KERNEL_INVLPG_DONE: u32 = 8   # arg[0] the request id
+# Reserved for #4881 (SMP_USER.md §2), not handled yet: FORWARD, RETURN,
+# CAP_INSERT.
 
 # A message body: 56 bytes, so with `seq` a slot is one 64-byte line.
 pub struct MboxMsg
@@ -228,9 +240,21 @@ fn mbox_handle(msg: MboxMsg)
         var pong: MboxMsg = mbox_msg(MBOX_PONG)
         pong.arg[0] = msg.arg[0]
         mbox_post(msg.from as i32, pong)
+    else if msg.kind == MBOX_UNMAP or msg.kind == MBOX_KERNEL_INVLPG
+        # The PTE edit and its flush happen before the reply is posted: the
+        # requester frees the frames only once it has the reply.
+        var reply_kind: u32 = MBOX_UNMAP_DONE
+        if msg.kind == MBOX_KERNEL_INVLPG
+            reply_kind = MBOX_KERNEL_INVLPG_DONE
+        var done: MboxMsg = mbox_msg(reply_kind)
+        done.pid = msg.pid
+        done.arg[0] = msg.arg[0]
+        done.arg[1] = tlb_serve(msg.kind, msg.arg[1], msg.arg[2], msg.arg[3], msg.arg[4])
+        mbox_post(msg.from as i32, done)
     else
-        # CALL_DONE and PONG are taken by the waiter (apcall.ritz); one
-        # that reaches the drain came after its waiter gave up.
+        # CALL_DONE, PONG, UNMAP_DONE and KERNEL_INVLPG_DONE are taken by
+        # their waiter (apcall.ritz, mm/tlb.ritz); one that reaches the
+        # drain came after its waiter gave up.
         mbox_drop_stray(msg)
 
 # Drain this CPU's mailbox at a safe point: clear the pending kick, then
