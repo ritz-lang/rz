@@ -22,6 +22,7 @@ import rllvm.layout
 import rllvm.gen
 import rllvm.abi
 import rllvm.inline_asm
+import rllvm.intrinsics
 import rllvm.parse { Fail, FailKind }
 
 # An integer literal as LLVM prints it (signed decimal, true, false).
@@ -249,23 +250,26 @@ impl FnLower
             return t.elem
         inst.ty
 
-    # Callee-saved registers an asm block pins or clobbers.
+    # Callee-saved registers an asm block pins, clobbers or is given for an
+    # unpinned operand: the prologue saves them, the epilogue restores them.
     fn note_asm_registers(self: @&FnLower, call: IrValue)
         let text: String = decode_string(call.text2)
-        match parse_constraints(text.as_view())
-            Ok(cs) =>
-                for i in 0..cs.len
-                    let c: Constraint = cs.get(i)
-                    let r: i64 = c.reg
-                    if r == RBX or r >= 12
-                        var seen: bool = false
-                        for k in 0..self.saved.len
-                            if self.saved.get(k) == r
-                                seen = true
-                        if not seen
-                            self.saved.push(r)
-                            self.saved_at.push(self.reserve(8, 8))
-            Err(_) => pass
+        let cs: Vec<Constraint> = match parse_constraints(text.as_view())
+            Ok(cs) => cs
+            Err(_) => return
+        let regs: Vec<i64> = match allocate(@cs)
+            Ok(r) => r
+            Err(_) => return
+        for i in 0..regs.len
+            let r: i64 = regs.get(i)
+            if r == RBX or r >= 12
+                var seen: bool = false
+                for k in 0..self.saved.len
+                    if self.saved.get(k) == r
+                        seen = true
+                if not seen
+                    self.saved.push(r)
+                    self.saved_at.push(self.reserve(8, 8))
 
     # A slot for every parameter and named result.
     fn lay_out(self: @&FnLower) -> Result<(), Fail>
@@ -1012,41 +1016,67 @@ impl FnLower
                 store_xmm(g, @pt, RBP, dest + pt.offset)?
         Ok(())
 
-    # The intrinsics this slice needs: llvm.trap and the overflow checks
-    # ritz1 puts on every `+`, `-` and `*`. The rest are #4806's.
+    # A call to an intrinsic (DESIGN.md "Intrinsics"): the operands loaded
+    # where intrinsics.ritz expects them, its row emitted, the result stored.
     fn lower_intrinsic(self: @FnLower, g: @&Gen, inst: @Inst, name: StrView) -> Result<(), Fail>
-        if name.eq("llvm.trap")
-            return g.op0("ud2", OpSize.Unsized)
-        # llvm.{s,u}{add,sub,mul}.with.overflow.iN
-        let rest: StrView = name.skip(5)
-        let op: StrView = rest.skip(1).take(3)
-        let known: bool = op.eq("add") or op.eq("sub") or op.eq("mul")
-        if not known or not rest.skip(4).starts_with(".with.overflow.") or not (rest.starts_with("s") or rest.starts_with("u"))
-            return Err(fail_named(inst.line, "intrinsic", name))
-        let signed: bool = rest.starts_with("s")
-        let ty: i64 = self.value(self.operand(inst, 1)).ty
-        let bits: i64 = int_width(self.m, ty)
-        let size: OpSize = size_of_bytes(bits / 8)
-        self.load_scalar(g, RAX, self.operand(inst, 1))?
-        self.load_scalar(g, RCX, self.operand(inst, 2))?
-        if op.eq("add")
-            g.op2("add", size, reg_op(RCX, size), reg_op(RAX, size))?
-        else if op.eq("sub")
-            g.op2("sub", size, reg_op(RCX, size), reg_op(RAX, size))?
-        else if signed and bits > 8
-            g.op2("imul", size, reg_op(RCX, size), reg_op(RAX, size))?
-        else if signed
-            g.op1("imul", size, reg_op(RCX, size))?
-        else
-            g.op1("mul", size, reg_op(RCX, size))?
-        let flag: StrView = if signed then "seto" else "setb"
-        g.op1(flag, OpSize.Unsized, reg_op(RCX, OpSize.Byte))?
-        match self.result_slot(inst)
-            Some(s) =>
-                g.store(RAX, RBP, 0 - s.offset, bits / 8)?
+        var c = IntrinCall { name: name, bits: 0, same: false, imm: 0, features: self.f.features }
+        var ints: i64 = 0
+        var xmms: i64 = 0
+        for k in 1..inst.count
+            let vid: i64 = self.operand(inst, k)
+            let v: IrValue = self.value(vid)
+            if ignores_operand(name, k - 1)
+                continue
+            if k == inst.count - 1 and takes_imm(name)
+                if v.kind != ValueKind.Int
+                    return Err(fail_malformed(inst.line, "an intrinsic immediate is not a constant"))
+                c.imm = int_value(v.text)
+                continue
+            if is_int_or_ptr(self.m, v.ty)
+                if ints >= 3
+                    return Err(fail_malformed(inst.line, "too many intrinsic operands"))
+                if ints == 0
+                    c.bits = int_width(self.m, v.ty)
+                self.load_scalar(g, INT_OPS[ints], vid)?
+                ints += 1
+            else
+                self.load_xmm_value(g, xmms, vid)?
+                xmms += 1
+        if inst.count > 2
+            c.same = self.same_value(self.operand(inst, 1), self.operand(inst, 2))
+        if width_from_result(name)
+            c.bits = int_width(self.m, self.call_return_type(inst))
+        let out: IntrinOut = emit_intrinsic(g, @c)?
+        let s: ValueSlot = match self.result_slot(inst)
+            Some(s) => s
+            None => return Ok(())
+        match out
+            IntrinOut.Nothing => Ok(())
+            IntrinOut.Gpr => g.store(RAX, RBP, 0 - s.offset, type_size(self.m, s.ty))
+            IntrinOut.Overflow =>
+                let r: Member = member(self.m, s.ty, 0)
+                g.store(RAX, RBP, 0 - s.offset, type_size(self.m, r.ty))?
                 let f: Member = member(self.m, s.ty, 1)
                 g.store(RCX, RBP, f.offset - s.offset, 1)
-            None => Ok(())
+            IntrinOut.Xmm => g.xmm_store(0, RBP, 0 - s.offset, type_size(self.m, s.ty))
+
+    # Are two operands the same SSA value or the same constant?
+    fn same_value(self: @FnLower, a: i64, b: i64) -> bool
+        let x: IrValue = self.value(a)
+        let y: IrValue = self.value(b)
+        a == b or (x.kind == y.kind and x.text.eq(y.text) and (x.kind == ValueKind.Local or x.kind == ValueKind.Int))
+
+    # A float or 128-bit vector value into %xmm`x`.
+    fn load_xmm_value(self: @FnLower, g: @&Gen, x: i64, vid: i64) -> Result<(), Fail>
+        let v: IrValue = self.value(vid)
+        match v.kind
+            ValueKind.Local =>
+                let s: ValueSlot = match self.slot_of(v.text)
+                    Some(s) => s
+                    None => return Err(fail_malformed(g.line, "use of an undefined value"))
+                g.xmm_load(x, RBP, 0 - s.offset, type_size(self.m, s.ty))
+            ValueKind.Zero | ValueKind.Undef => g.op2("xorps", OpSize.Unsized, xmm(x), xmm(x))
+            _ => Err(fail_unsupported(g.line, "a float or vector constant operand"))
 
     # ---------------------------------------------------------- inline asm
 
@@ -1056,29 +1086,27 @@ impl FnLower
         let cs: Vec<Constraint> = match parse_constraints(ctext.as_view())
             Ok(c) => c
             Err(what) => return Err(fail_unsupported(inst.line, what.as_view()))
+        let regs: Vec<i64> = match allocate(@cs)
+            Ok(r) => r
+            Err(what) => return Err(fail_unsupported(inst.line, what.as_view()))
         let ret_ty: i64 = self.call_return_type(inst)
         let outs: Vec<Leaf> = self.check_int_leaves(ret_ty, inst.line, "an inline asm float or vector output")?
+        # Operands in template order: outputs, then inputs.
         var ops = vec_new<AsmOperand>()
         var out_regs = vec_new<i64>()
         for i in 0..cs.len
-            let c: Constraint = cs.get(i)
-            if c.kind == ConKind.Output
+            if cs.get(i).kind == ConKind.Output
                 if out_regs.len >= outs.len
                     return Err(fail_malformed(inst.line, "more asm outputs than result values"))
-                out_regs.push(c.reg)
-                ops.push(AsmOperand { reg: c.reg, bytes: type_size(self.m, outs.get(out_regs.len - 1).ty) })
+                out_regs.push(regs.get(i))
+                ops.push(AsmOperand { reg: regs.get(i), bytes: type_size(self.m, outs.get(out_regs.len - 1).ty) })
         var arg: i64 = 1
         for i in 0..cs.len
-            let c: Constraint = cs.get(i)
-            if c.kind != ConKind.Input
+            if cs.get(i).kind != ConKind.Input
                 continue
             if arg >= inst.count
                 return Err(fail_malformed(inst.line, "more asm inputs than arguments"))
-            var r: i64 = c.reg
-            if c.tied >= 0
-                if c.tied >= out_regs.len
-                    return Err(fail_malformed(inst.line, "asm input tied to no output"))
-                r = out_regs.get(c.tied)
+            let r: i64 = regs.get(i)
             if r == RSP or r == RBP
                 return Err(fail_unsupported(inst.line, "an asm operand in %rsp or %rbp"))
             let vid: i64 = self.operand(inst, arg)

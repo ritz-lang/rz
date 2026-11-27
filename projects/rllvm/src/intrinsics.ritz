@@ -1,0 +1,362 @@
+# intrinsics: DESIGN.md "Intrinsics", one row at a time. lower.ritz loads
+# the call's operands, this module emits the row's sequence, and lower.ritz
+# stores what it leaves:
+#
+#   integer operand k (k = 0, 1, 2)     in INT_OPS[k]: %rax, %rdx, %rcx,
+#                                       zero-extended from its width
+#   float or vector operand k           in %xmm k
+#   a trailing i8 immediate             in IntrinCall.imm
+#
+# Every sequence is baseline x86-64 plus the function's "target-features".
+# No row calls compiler-rt or libc, and none consults the host CPU.
+import ritzlib.result { Result }
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import razm.insn { OpSize, Operand }
+import rllvm.gen
+import rllvm.abi { xmm }
+import rllvm.parse { Fail, FailKind }
+
+# Where operand k of an integer row is loaded.
+pub const INT_OPS: [3]i64 = [0, 2, 1]
+
+pub struct IntrinCall
+    name: StrView       # without the @
+    bits: i64           # the integer width: the operands', or fpto*.sat's result
+    same: bool          # operands 0 and 1 are one value (fshl/fshr rotate)
+    imm: i64            # the trailing i8 of aeskeygenassist and pclmulqdq
+    features: StrView   # the function's "target-features" value
+
+# What a row leaves for lower.ritz to store.
+pub enum IntrinOut
+    Nothing     # llvm.trap
+    Gpr         # the iN result in %rax
+    Overflow    # the iN result in %rax, the i1 flag in %cl
+    Xmm         # the float or vector result in %xmm0
+
+# Does the row take its last operand as an immediate rather than a register?
+pub fn takes_imm(name: StrView) -> bool
+    name.eq("llvm.x86.aesni.aeskeygenassist") or name.eq("llvm.x86.pclmulqdq")
+
+# Is operand k a flag the lowering ignores? ctlz/cttz's i1 asks whether a
+# zero input is poison; returning N for it is right either way.
+pub fn ignores_operand(name: StrView, k: i64) -> bool
+    k == 1 and (name.starts_with("llvm.ctlz.") or name.starts_with("llvm.cttz."))
+
+# fpto{s,u}i.sat: its width comes from the result, not the float operand.
+pub fn width_from_result(name: StrView) -> bool
+    name.starts_with("llvm.fptosi.sat.") or name.starts_with("llvm.fptoui.sat.")
+
+pub fn emit_intrinsic(g: @&Gen, c: @IntrinCall) -> Result<IntrinOut, Fail>
+    let name: StrView = c.name
+    if name.eq("llvm.trap")
+        g.op0("ud2", OpSize.Unsized)?
+        return Ok(IntrinOut.Nothing)
+    if name.starts_with("llvm.x86.")
+        return emit_x86(g, c)
+    if name.starts_with("llvm.fabs.")
+        return emit_fabs(g, name.eq("llvm.fabs.f64"))
+    if width_from_result(name)
+        return emit_sat(g, c.bits, name.starts_with("llvm.fptosi"), name.ends_with(".f64"))
+    if name.ends_with(".with.overflow.i8") or name.ends_with(".with.overflow.i16") or name.ends_with(".with.overflow.i32") or name.ends_with(".with.overflow.i64")
+        return emit_overflow(g, name.skip(5), c.bits)
+    if name.starts_with("llvm.fshl.") or name.starts_with("llvm.fshr.")
+        return emit_funnel(g, name.starts_with("llvm.fshl."), c.bits, c.same)
+    if name.starts_with("llvm.ctlz.")
+        return emit_ctlz(g, c.bits)
+    if name.starts_with("llvm.cttz.")
+        return emit_cttz(g, c.bits)
+    if name.starts_with("llvm.ctpop.")
+        return emit_ctpop(g)
+    if name.starts_with("llvm.bswap.")
+        return emit_bswap(g, c.bits)
+    Err(fail_named(g.line, "intrinsic", name))
+
+fn rax_at(bits: i64) -> Operand
+    reg_op(RAX, size_of_bytes(bits / 8))
+
+fn rdx_at(bits: i64) -> Operand
+    reg_op(RDX, size_of_bytes(bits / 8))
+
+fn cl() -> Operand
+    reg_op(RCX, OpSize.Byte)
+
+# ------------------------------------------------------------ integer rows
+
+# llvm.{s,u}{add,sub,mul}.with.overflow.iN; `rest` starts at s/u. Signed
+# overflow is OF, unsigned CF. x86 has no two-operand 8-bit multiply, and
+# unsigned multiply is one-operand `mul` at every width.
+fn emit_overflow(g: @&Gen, rest: StrView, bits: i64) -> Result<IntrinOut, Fail>
+    let signed: bool = rest.starts_with("s")
+    let op: StrView = rest.skip(1).take(3)
+    let size: OpSize = size_of_bytes(bits / 8)
+    let a: Operand = rax_at(bits)
+    let b: Operand = rdx_at(bits)
+    if op.eq("add")
+        g.op2("add", size, b, a)?
+    else if op.eq("sub")
+        g.op2("sub", size, b, a)?
+    else if signed and bits > 8
+        g.op2("imul", size, b, a)?
+    else if signed
+        g.op1("imul", size, b)?
+    else
+        g.op1("mul", size, b)?
+    let flag: StrView = if signed then "seto" else "setb"
+    g.op1(flag, OpSize.Unsized, cl())?
+    Ok(IntrinOut.Overflow)
+
+# fshl/fshr. One value twice is a rotate (rol/ror by %cl reduce the count
+# at every width). Distinct values: shld/shrd at 32 and 64, which mask the
+# count to the width; at 16 the count is reduced mod 16 first, since 16-bit
+# shld/shrd leave counts 16-31 undefined; at 8 the bytes are combined into
+# one word, shifted by the count mod 8, and the result byte taken out.
+fn emit_funnel(g: @&Gen, left: bool, bits: i64, same: bool) -> Result<IntrinOut, Fail>
+    let size: OpSize = size_of_bytes(bits / 8)
+    if same
+        let rot: StrView = if left then "rol" else "ror"
+        g.op2(rot, size, cl(), rax_at(bits))?
+        return Ok(IntrinOut.Gpr)
+    if bits == 8
+        let eight: Operand = g.imm(8)
+        g.op2("shl", OpSize.Long, eight, r32(RAX))?
+        g.op2("or", OpSize.Long, r32(RDX), r32(RAX))?
+        let seven: Operand = g.imm(7)
+        g.op2("and", OpSize.Long, seven, r32(RCX))?
+        if left
+            g.op2("shl", OpSize.Long, cl(), r32(RAX))?
+            let back: Operand = g.imm(8)
+            g.op2("shr", OpSize.Long, back, r32(RAX))?
+        else
+            g.op2("shr", OpSize.Long, cl(), r32(RAX))?
+        return Ok(IntrinOut.Gpr)
+    if bits == 16
+        let fifteen: Operand = g.imm(15)
+        g.op2("and", OpSize.Long, fifteen, r32(RCX))?
+    if left
+        g.op3("shld", size, cl(), rdx_at(bits), rax_at(bits))?
+    else
+        g.op3("shrd", size, cl(), rax_at(bits), rdx_at(bits))?
+        g.op2("mov", OpSize.Quad, r64(RDX), r64(RAX))?
+    Ok(IntrinOut.Gpr)
+
+# The width bsr/bsf run at: the operand is zero-extended to 32 or 64 bits.
+fn scan_size(bits: i64) -> OpSize
+    if bits == 64
+        return OpSize.Quad
+    OpSize.Long
+
+# ctlz: N-1 minus bsr's index. bsr leaves its destination undefined on zero
+# and sets ZF, so a zero input takes -1 by cmov first and comes out as N.
+fn emit_ctlz(g: @&Gen, bits: i64) -> Result<IntrinOut, Fail>
+    let size: OpSize = scan_size(bits)
+    g.op2("bsr", size, reg_op(RAX, size), reg_op(RAX, size))?
+    g.constant(RCX, -1, 64)?
+    g.op2("cmove", size, reg_op(RCX, size), reg_op(RAX, size))?
+    g.constant(RDX, bits - 1, 64)?
+    g.op2("sub", size, reg_op(RAX, size), reg_op(RDX, size))?
+    g.op2("mov", OpSize.Quad, r64(RDX), r64(RAX))?
+    Ok(IntrinOut.Gpr)
+
+# cttz: bsf's index, or N by cmov on zero (the operand is zero-extended, so
+# a nonzero iN has its lowest set bit below N).
+fn emit_cttz(g: @&Gen, bits: i64) -> Result<IntrinOut, Fail>
+    let size: OpSize = scan_size(bits)
+    g.op2("bsf", size, reg_op(RAX, size), reg_op(RAX, size))?
+    g.constant(RCX, bits, 64)?
+    g.op2("cmove", size, reg_op(RCX, size), reg_op(RAX, size))?
+    Ok(IntrinOut.Gpr)
+
+fn shr_into(g: @&Gen, dst: i64, src: i64, n: i64) -> Result<(), Fail>
+    g.op2("mov", OpSize.Quad, r64(src), r64(dst))?
+    let k: Operand = g.imm(n)
+    g.op2("shr", OpSize.Quad, k, r64(dst))
+
+# ctpop: the SWAR count on the zero-extended 64-bit value, the same at every
+# width. popcnt is not baseline x86-64.
+fn emit_ctpop(g: @&Gen) -> Result<IntrinOut, Fail>
+    let q: OpSize = OpSize.Quad
+    # x -= (x >> 1) & 0x55..
+    shr_into(g, RCX, RAX, 1)?
+    g.constant(RDX, 0x5555555555555555, 64)?
+    g.op2("and", q, r64(RDX), r64(RCX))?
+    g.op2("sub", q, r64(RCX), r64(RAX))?
+    # x = (x & 0x33..) + ((x >> 2) & 0x33..)
+    shr_into(g, RCX, RAX, 2)?
+    g.constant(RDX, 0x3333333333333333, 64)?
+    g.op2("and", q, r64(RDX), r64(RCX))?
+    g.op2("and", q, r64(RDX), r64(RAX))?
+    g.op2("add", q, r64(RCX), r64(RAX))?
+    # x = (x + (x >> 4)) & 0x0f..
+    shr_into(g, RCX, RAX, 4)?
+    g.op2("add", q, r64(RCX), r64(RAX))?
+    g.constant(RDX, 0x0F0F0F0F0F0F0F0F, 64)?
+    g.op2("and", q, r64(RDX), r64(RAX))?
+    # the byte sums gather in the top byte
+    g.constant(RDX, 0x0101010101010101, 64)?
+    g.op2("imul", q, r64(RDX), r64(RAX))?
+    let top: Operand = g.imm(56)
+    g.op2("shr", q, top, r64(RAX))?
+    Ok(IntrinOut.Gpr)
+
+# bswap at 32 and 64; `rolw $8` at 16, where bswap has no defined form.
+fn emit_bswap(g: @&Gen, bits: i64) -> Result<IntrinOut, Fail>
+    if bits == 16
+        let eight: Operand = g.imm(8)
+        g.op2("rol", OpSize.Word, eight, rax_at(16))?
+    else
+        let size: OpSize = size_of_bytes(bits / 8)
+        g.op1("bswap", size, rax_at(bits))?
+    Ok(IntrinOut.Gpr)
+
+# -------------------------------------------------------------- float rows
+
+# fabs clears the sign bit with an andps/andpd mask built in %xmm1.
+fn emit_fabs(g: @&Gen, double: bool) -> Result<IntrinOut, Fail>
+    if double
+        g.constant(RAX, 0x7FFFFFFFFFFFFFFF, 64)?
+        g.xmm_from_gpr(1, RAX, 8)?
+        g.op2("andpd", OpSize.Unsized, xmm(1), xmm(0))?
+    else
+        g.constant(RAX, 0x7FFFFFFF, 32)?
+        g.xmm_from_gpr(1, RAX, 4)?
+        g.op2("andps", OpSize.Unsized, xmm(1), xmm(0))?
+    Ok(IntrinOut.Xmm)
+
+# The bits of +/-2^k as a float or double.
+fn pow2_bits(k: i64, double: bool, negative: bool) -> i64
+    if double
+        let b: i64 = (1023 + k) << 52
+        return if negative then b | (1 << 63) else b
+    let b: i64 = (127 + k) << 23
+    if negative then b | (1 << 31) else b
+
+# Compare %xmm0 with the bound `bits` (a float's or double's bits), put in
+# %xmm1; the flags are ucomis's.
+fn compare_bound(g: @&Gen, bits: i64, double: bool) -> Result<(), Fail>
+    let bytes: i64 = if double then 8 else 4
+    g.constant(RAX, bits, bytes * 8)?
+    g.xmm_from_gpr(1, RAX, bytes)?
+    let cmp: StrView = if double then "ucomisd" else "ucomiss"
+    g.op2(cmp, OpSize.Unsized, xmm(1), xmm(0))
+
+# %xmm0 truncated to a 64-bit integer in %rax.
+fn truncate(g: @&Gen, double: bool) -> Result<(), Fail>
+    let cvt: StrView = if double then "cvttsd2si" else "cvttss2si"
+    g.op2(cvt, OpSize.Unsized, xmm(0), r64(RAX))
+
+# fpto{s,u}i.sat.iN: NaN is 0 (ucomis of the value with itself is
+# unordered), below the low bound is the minimum, at or above the high bound
+# (an exact power of two) the maximum, all decided before any convert, so
+# cvtt's out-of-range value never reaches the result. In range, a 64-bit
+# truncate holds every iN; fptoui.i64 at or above 2^63 subtracts 2^63 first
+# and puts the top bit back.
+fn emit_sat(g: @&Gen, bits: i64, signed: bool, double: bool) -> Result<IntrinOut, Fail>
+    let cmp: StrView = if double then "ucomisd" else "ucomiss"
+    let zero: i64 = g.new_label()
+    let low: i64 = g.new_label()
+    let high: i64 = g.new_label()
+    let done: i64 = g.new_label()
+    g.op2(cmp, OpSize.Unsized, xmm(0), xmm(0))?
+    g.jump("jp", zero)?
+    if signed
+        compare_bound(g, pow2_bits(bits - 1, double, true), double)?
+        g.jump("jb", low)?
+        compare_bound(g, pow2_bits(bits - 1, double, false), double)?
+    else
+        compare_bound(g, 0, double)?
+        g.jump("jb", low)?
+        compare_bound(g, pow2_bits(bits, double, false), double)?
+    g.jump("jae", high)?
+    if not signed and bits == 64
+        let small: i64 = g.new_label()
+        compare_bound(g, pow2_bits(63, double, false), double)?
+        g.jump("jb", small)?
+        let sub: StrView = if double then "subsd" else "subss"
+        g.op2(sub, OpSize.Unsized, xmm(1), xmm(0))?
+        truncate(g, double)?
+        g.constant(RCX, 1 << 63, 64)?
+        g.op2("xor", OpSize.Quad, r64(RCX), r64(RAX))?
+        g.jump("jmp", done)?
+        g.bind(small)?
+    truncate(g, double)?
+    g.jump("jmp", done)?
+    g.bind(zero)?
+    g.op2("xor", OpSize.Long, r32(RAX), r32(RAX))?
+    g.jump("jmp", done)?
+    g.bind(low)?
+    let min: i64 = if signed then 0 -% (1 << (bits - 1)) else 0
+    g.constant(RAX, min, 64)?
+    g.jump("jmp", done)?
+    g.bind(high)?
+    var max: i64 = -1
+    if signed
+        max = (1 << (bits - 1)) -% 1
+    else if bits < 64
+        max = (1 << bits) - 1
+    g.constant(RAX, max, 64)?
+    g.bind(done)?
+    Ok(IntrinOut.Gpr)
+
+# ---------------------------------------------------------------- x86 rows
+
+# The feature an x86 row needs, or "" for a baseline row.
+fn feature_of(name: StrView) -> StrView
+    if name.starts_with("llvm.x86.sha256")
+        return "+sha"
+    if name.starts_with("llvm.x86.aesni.")
+        return "+aes"
+    if name.eq("llvm.x86.pclmulqdq")
+        return "+pclmul"
+    ""
+
+# Is `f` one of the comma-separated members of `features`?
+fn has_feature(features: StrView, f: StrView) -> bool
+    var rest: StrView = features
+    while rest.len > 0
+        let comma: i64 = rest.find_byte(',')
+        let end: i64 = if comma < rest.len then comma else rest.len
+        if rest.take(end).eq(f)
+            return true
+        rest = if comma < rest.len then rest.skip(comma + 1) else ""
+    false
+
+# The instruction an x86 row lowers to.
+fn x86_mnemonic(name: StrView) -> StrView
+    if name.eq("llvm.x86.sse2.psad.bw")
+        return "psadbw"
+    if name.starts_with("llvm.x86.aesni.")
+        return name.skip(15)
+    name.skip(9)
+
+# The x86 rows, gated by the function's "target-features" alone. Operands are
+# in %xmm0.. in order; the result goes to %xmm0.
+fn emit_x86(g: @&Gen, c: @IntrinCall) -> Result<IntrinOut, Fail>
+    let name: StrView = c.name
+    let need: StrView = feature_of(name)
+    if need.len > 0 and not has_feature(c.features, need)
+        var s = string_from("intrinsic '")
+        s.push_str(name)
+        s.push_str("' in a function without \"target-features\" ")
+        s.push_str(need)
+        return Err(Fail { kind: FailKind.Unsupported, line: g.line, what: s })
+    let u: OpSize = OpSize.Unsized
+    let op: StrView = x86_mnemonic(name)
+    if op.eq("sha256rnds2")
+        # sha256rnds2's round keys are %xmm0, implicitly: the state moves to
+        # %xmm3 and the keys (operand 2) into %xmm0.
+        g.op2("movdqa", u, xmm(0), xmm(3))?
+        g.op2("movdqa", u, xmm(2), xmm(0))?
+        g.op3("sha256rnds2", u, xmm(0), xmm(1), xmm(3))?
+        g.op2("movdqa", u, xmm(3), xmm(0))?
+    else if op.eq("aesimc")
+        g.op2("aesimc", u, xmm(0), xmm(0))?
+    else if op.eq("aeskeygenassist")
+        let n: Operand = g.imm(c.imm & 0xFF)
+        g.op3("aeskeygenassist", u, n, xmm(0), xmm(0))?
+    else if op.eq("pclmulqdq")
+        let n: Operand = g.imm(c.imm & 0xFF)
+        g.op3("pclmulqdq", u, n, xmm(1), xmm(0))?
+    else
+        g.op2(op, u, xmm(1), xmm(0))?
+    Ok(IntrinOut.Xmm)
