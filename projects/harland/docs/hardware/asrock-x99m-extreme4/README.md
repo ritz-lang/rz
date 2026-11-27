@@ -57,7 +57,7 @@ or to the AGAST ticket that fills the gap. Mapped on main as of 2026-11-27.
 | Keyboard (USB) | Intel xHCI [8086:8d31] 00:14.0 | gap: USB epic #4860 | **needed** |
 | USB 2.0 | EHCI [8086:8d26] 00:1d.0, [8086:8d2d] 00:1a.0 | none; out of scope unless a port is EHCI-only | no |
 | SATA | Intel [8086:2822] 00:1f.2, **RAID mode** | gap: SATA/AHCI epic #4861, design in `docs/AHCI.md`. Switch the firmware to AHCI first (the AHCI-mode ID is a different device ID); in RAID mode harland logs the controller and leaves it alone | no |
-| Ethernet | Intel I218-V [8086:15a1] 00:19.0 | gap: Intel Ethernet epic #4862 | no |
+| Ethernet | Intel I218-V [8086:15a1] 00:19.0 | gap: Intel Ethernet epic #4862, planned in `docs/E1000E.md` | no |
 | Ethernet | Qualcomm Atheros QCA8171 [1969:10a1] 04:00.0 | none, not planned | no |
 | ACPI | XSDT, MADT, MCFG, FADT, `\_S5` | `drivers/acpi/tables.ritz` | needed: have |
 | PCIe config | ECAM 0x80000000, buses 0-255 | `drivers/pci.ritz`, `drivers/pci_ecam.ritz` | needed: have |

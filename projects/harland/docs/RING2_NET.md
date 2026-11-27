@@ -141,7 +141,7 @@ The calls do not copy, because the descriptor ownership rules allow it:
 - **TX.** The stack builds the frame in the `TxFrame` that `tx_buffer` returned, and `tx_submit` writes the virtio header in front of it. From `tx_submit` until the used ring returns the buffer, it is the device's (the AGAST #4073 rule: the burst sends 300 and requires more than 256 distinct replies). When every TX buffer is in flight, `tx_buffer` returns `None`, and the frame goes on netd's private pending-TX queue. That is the one TX copy, and only under that pressure. It leaves when a TX completion frees a buffer. The completion is an interrupt on netd's own IRQ object, so it replaces the `SPACE` notify the driver sent.
 - **Kick and arm.** `tx_kick` rings the doorbell once per pass, not once per frame. `irq_arm` re-enables completion interrupts. After it, netd polls RX once more before it waits, so a frame that landed during the re-arm is not stranded. The fold task (#4875) may arm on every pass. Masking during a budgeted drain is #4876's.
 
-ENA and e1000e implement `Nic` later. Neither moves in this decision: ENA stays an in-kernel `NetDevice`.
+ENA and e1000e implement `Nic` later. Neither moves in this decision: ENA stays an in-kernel `NetDevice`. The e1000e plan (82574L in QEMU, I218-V on the X99) is `E1000E.md` (#4862).
 
 **What goes away.**
 
