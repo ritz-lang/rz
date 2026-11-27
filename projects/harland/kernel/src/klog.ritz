@@ -12,12 +12,13 @@
 # Moved out of main.ritz by AGAST #2752.
 #
 # The framebuffer console (drivers/display/fbcon.ritz, AGAST #4868) is the
-# third sink, once main.ritz has started it: klog_console_start replays the
-# ring onto it, so the screen shows the boot from its first line, and the
-# panic screen ends with klog_console_tail, the log's last lines.
+# third sink, once display_console_start has registered it:
+# klog_console_start replays the ring onto it, so the screen shows the boot
+# from its first line, and the panic screen ends with klog_console_tail, the
+# log's last lines. klog holds the console as a function so it links without
+# the display driver: every host test that logs links klog alone.
 
-import serial { StrView, serial_out, serial_out_byte }
-import drivers.display.fbcon { fbcon_active, fbcon_write }
+import serial { StrView, serial_present, serial_out, serial_out_byte }
 import ritzlib.fmt.digits { fmt_i64_into, fmt_u64_into, fmt_u64_radix_into }
 
 # ============================================================================
@@ -86,9 +87,23 @@ pub fn ring_dump()
         i = i + 1
     serial_out("\n=== END RING BUFFER ===\n")
 
+# The console sink (fbcon_write once registered); writes before then go to
+# serial and the ring only.
+var klog_console_on: bool = false
+var klog_console_sink: fn(StrView)
+
+# Make `sink` the console from here on, without a replay
+# (klog_console_start replays; test/test_fbcon.ritz registers alone).
+pub fn klog_console(sink: fn(StrView))
+    klog_console_sink = sink
+    klog_console_on = true
+
 # Ring bytes [from, to) (0 = oldest) onto the console alone, in chunks: a
 # write per byte would redraw the cursor per byte.
 fn ring_to_console(from: u64, to: u64)
+    if not klog_console_on
+        return
+    let sink: fn(StrView) = klog_console_sink
     var chunk: [256]u8
     let n: u64 = to
     var i: u64 = from
@@ -98,10 +113,12 @@ fn ring_to_console(from: u64, to: u64)
             chunk[k] = ring_at(i)
             k = k + 1
             i = i + 1
-        fbcon_write(StrView { ptr: @chunk[0], len: k })
+        sink(StrView { ptr: @chunk[0], len: k })
 
-# The console just started: show it everything logged so far.
-pub fn klog_console_start()
+# The console just started: register it, then show it everything logged so
+# far.
+pub fn klog_console_start(sink: fn(StrView))
+    klog_console(sink)
     ring_to_console(0, ring_len())
 
 # Where the log is now, for klog_console_tail: the count of bytes ever
@@ -145,8 +162,9 @@ pub fn klog_serial(on: bool)
 fn klog_bytes(ptr: *u8, len: i64)
     if klog_to_serial
         serial_out(StrView { ptr: ptr, len: len })
-    if fbcon_active()
-        fbcon_write(StrView { ptr: ptr, len: len })
+    if klog_console_on
+        let sink: fn(StrView) = klog_console_sink
+        sink(StrView { ptr: ptr, len: len })
     var i: i64 = 0
     while i < len
         ring_write_byte(*(ptr + i))
@@ -155,6 +173,19 @@ fn klog_bytes(ptr: *u8, len: i64)
 # Log a string: a "..." literal, or a runtime view (a path, a process name).
 pub fn klog(s: StrView)
     klog_bytes(s.ptr, s.len)
+
+# The boot banner, kernel_main's first log lines (tools/test_tier1_boot.sh
+# matches them byte for byte), then whether serial_start found a COM1: with
+# none, the screen is the only place the log shows (AGAST #4868).
+pub fn klog_banner()
+    klog("\n")
+    klog("========================================\n")
+    klog("    Hello from Harland!\n")
+    klog("========================================\n")
+    klog("\n")
+    klog("Harland kernel starting...\n")
+    if not serial_present()
+        klog("No COM1 (serial probe): the console is the framebuffer alone\n")
 
 # ============================================================================
 # Numbers (digits from ritzlib.fmt.digits)
