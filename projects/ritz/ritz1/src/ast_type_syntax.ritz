@@ -261,31 +261,28 @@ pub fn tn_claim(p: *Parser, inner: *TypeParam, f: *FnDef)
 # FnDef.return_type_name), so the two spellings can't drift (AGAST #4324).
 pub fn ret_name_of_type(p: *Parser, tr: *TypeRef) -> StrView
     let ret: TypeKind = tr_kind(tr)
-    var out: StrView = strview_empty()
     if ret == TypeKind.Struct
-        out = tr.name
+        return tr.name
     else if (ret == TypeKind.Ref or ret == TypeKind.MutRef) and tr_ref_inner(tr) != TypeKind.Struct
         # AGAST #1453: `-> @i64` names nothing; only a struct referent does.
-        out = strview_empty()
+        return strview_empty()
     else if ret == TypeKind.Ptr and primitive_name_len(tr_pointee_kind(tr)) > 0
         # AGAST #1984: `-> *i32` / `-> *u64` name the primitive pointee.
-        out = primitive_name_sv(tr_pointee_kind(tr))
+        return primitive_name_sv(tr_pointee_kind(tr))
     else
         match ret
             TypeKind.PtrPtr =>
                 # AGAST #2791: `-> **U` names U as monomorph names a `*T` at T = *U.
                 let inner: TypeKind = ptr_slot_flat(tr_ptr_ptr_inner_pointee(tr))
                 if primitive_name_len(inner) > 0
-                    out = primitive_name_sv(inner)
+                    return primitive_name_sv(inner)
                 else if inner == TypeKind.Struct
-                    out = tr_name(tr)
-                else
-                    out = strview_empty()
+                    return tr_name(tr)
+                return strview_empty()
             TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
-                out = tr_name(tr)
+                return tr_name(tr)
             _ =>
-                out = strview_empty()
-    out
+                return strview_empty()
 
 # (line, col) strictly after (line2, col2).
 pub fn pos_after(line: i32, col: i32, line2: i32, col2: i32) -> i32
@@ -304,7 +301,6 @@ fn pop_var_latch(p: *Parser, line: i32, col: i32)
         return
     p.ctx.var_latch = mine.below
     p.var_type_name = mine.type_name
-    p.var_type_name_len = mine.type_name_len
     p.var_pointee = mine.pointee
     p.var_inner_pointee = mine.inner_pointee
     p.var_inner_ref = mine.inner_ref
@@ -317,7 +313,6 @@ fn pop_var_latch(p: *Parser, line: i32, col: i32)
     p.ctx.var_ptr_array_elem_pointee = mine.ptr_array_elem_pointee
     p.ctx.var_ptr_array_shape = mine.ptr_array_shape
     p.ctx.var_ptr_array_elem_name = mine.ptr_array_elem_name
-    p.ctx.var_ptr_array_elem_name_len = mine.ptr_array_elem_name_len
 
 # =============================================================================
 # Function-pointer types (AGAST #1671)
@@ -2063,7 +2058,6 @@ pub fn stmt_let_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     return s
 
 pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, line: i32, col: i32) -> *Stmt
-    var len: i32 = name_sv.len as i32
     let ty: TypeKind = tr_kind(tr)
     let facts: *TypeFacts = type_facts(p, tr)
     note_pass_binding(p.ctx, name_sv)   # AGAST #3320
@@ -2109,20 +2103,20 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     # Use var_type_name if available (set by capture_var_type before parsing initializer)
     # This prevents the type name from being clobbered by generic calls in the initializer
     if ty == TypeKind.Struct
-        if p.var_type_name != null
-            s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
+        if p.var_type_name.ptr != null
+            s.var_type_name = p.var_type_name
         else
             s.var_type_name = facts.type_name
-    else if ty == TypeKind.Ptr and p.var_pointee == TypeKind.Struct and p.var_type_name != null
+    else if ty == TypeKind.Ptr and p.var_pointee == TypeKind.Struct and p.var_type_name.ptr != null
         # AGAST #2822: `*S`, latched by capture_var_type (every typed decl
         # goes through it) before a `<*B>` in the initializer re-set it.
-        s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
-    else if (ty == TypeKind.Ref or ty == TypeKind.MutRef) and p.var_type_name != null
+        s.var_type_name = p.var_type_name
+    else if (ty == TypeKind.Ref or ty == TypeKind.MutRef) and p.var_type_name.ptr != null
         # AGAST #1754: reference to struct, latched by capture_var_type.
-        s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
-    else if ty == TypeKind.PtrPtr and p.var_type_name != null
+        s.var_type_name = p.var_type_name
+    else if ty == TypeKind.PtrPtr and p.var_type_name.ptr != null
         # AGAST #1933: `**S` local, latched by capture_var_type.
-        s.var_type_name = StrView { ptr: p.var_type_name as *u8, len: p.var_type_name_len as i64 }
+        s.var_type_name = p.var_type_name
     else
         s.var_type_name = strview_empty()
     # Copy array info from parser state if this is an array type
@@ -2177,7 +2171,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     s.var_pointee_array_elem_pointee = TypeKind.Void
     s.var_pointee_array_elem_name = strview_empty()
     if ty != TypeKind.Void
-        s.var_pointee_array_elem_name = StrView { ptr: p.ctx.var_ptr_array_elem_name, len: p.ctx.var_ptr_array_elem_name_len as i64 }
+        s.var_pointee_array_elem_name = p.ctx.var_ptr_array_elem_name
         s.var_pointee_array_size = p.ctx.var_ptr_array_size
         s.var_pointee_array_elem_type = p.ctx.var_ptr_array_elem
         s.var_pointee_array_elem_pointee = p.ctx.var_ptr_array_elem_pointee

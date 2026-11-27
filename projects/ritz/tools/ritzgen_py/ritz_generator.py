@@ -330,6 +330,7 @@ class RitzGenerator:
         self._emit('import ast')
         self._emit('import ast_helpers')
         self._emit('import tokens_gen')
+        self._emit('import ritzlib.strview')
         self._emit('')
 
         # Parser helper functions
@@ -361,10 +362,8 @@ class RitzGenerator:
         self._emit('    p.heap_offset = 0')
         self._emit('    p.module = null')
         self._emit('    # Initialize all remaining Parser fields to prevent garbage values')
-        self._emit('    p.fn_return_type_name = null')
-        self._emit('    p.fn_return_type_name_len = 0')
-        self._emit('    p.var_type_name = null')
-        self._emit('    p.var_type_name_len = 0')
+        self._emit('    p.fn_return_type_name = strview_empty()')
+        self._emit('    p.var_type_name = strview_empty()')
         self._emit('    p.var_pointee = TypeKind.Void')
         self._emit('    p.var_inner_pointee = 0')
         self._emit('    p.var_inner_ref = 0')
