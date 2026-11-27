@@ -436,11 +436,10 @@ fn impl_has_type_param(ib: *ImplBlock, name_sv: StrView) -> i32
 # Same order as ritz0: the impl's own type parameter, then an alias, then a
 # primitive.
 fn impl_target_class(ctx: *ParseCtx, m: *Module, ib: *ImplBlock) -> i32
-    let name: *u8 = ib.type_name.ptr
-    let len: i32 = ib.type_name.len as i32
-    if impl_has_type_param(ib, StrView { ptr: (name), len: (len) as i64 }) == 1
+    let name: StrView = ib.type_name
+    if impl_has_type_param(ib, name) == 1
         return IMPL_TARGET_OK
-    if type_alias_declared(ctx, StrView { ptr: (name), len: (len) as i64 }) == 1
+    if type_alias_declared(ctx, name) == 1
         return IMPL_TARGET_ALIAS
     # R36's revisit (#4294): `impl Trait for *u8` — the parser spells the
     # target `ptr_u8` — is legal only in the trait's file.
@@ -448,7 +447,7 @@ fn impl_target_class(ctx: *ParseCtx, m: *Module, ib: *ImplBlock) -> i32
         if impl_in_trait_file(ctx, ib) == 1
             return IMPL_TARGET_OK
         return IMPL_TARGET_MISPLACED
-    if is_primitive_type_name(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if is_primitive_type_name(name) == 1
         # A trait impl on a primitive is legal in the trait's file; an
         # inherent impl still says "it can't have an `impl`".
         if impl_in_trait_file(ctx, ib) == 1
@@ -459,13 +458,13 @@ fn impl_target_class(ctx: *ParseCtx, m: *Module, ib: *ImplBlock) -> i32
     # `Span<T>` / `StrView` in the trait's file stand even when nothing
     # declares them (the emitter synthesizes them); outside it, the trait
     # impl is misplaced (#4294).
-    let module_sv: StrView = builtin_type_module(StrView { ptr: (name), len: (len) as i64 })
-    if module_sv.ptr != null and module_declares_type(ctx, m, StrView { ptr: (name), len: (len) as i64 }) == 0
-        if builtin_impl_target_allowed(StrView { ptr: (name), len: (len) as i64 }) == 1 and ib.trait_name.ptr != null
+    let module_sv: StrView = builtin_type_module(name)
+    if module_sv.ptr != null and module_declares_type(ctx, m, name) == 0
+        if builtin_impl_target_allowed(name) == 1 and ib.trait_name.ptr != null
             if impl_in_trait_file(ctx, ib) == 1
                 return IMPL_TARGET_OK
             return IMPL_TARGET_MISPLACED
-    if module_declares_type(ctx, m, StrView { ptr: (name), len: (len) as i64 }) == 1 or is_simd_vector_type_name(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if module_declares_type(ctx, m, name) == 1 or is_simd_vector_type_name(name) == 1
         return IMPL_TARGET_OK
     IMPL_TARGET_UNKNOWN
 
@@ -1005,14 +1004,13 @@ pub fn mangled_component_arity(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> 
 pub fn add_enum_impl_instance(mono: *MonoCtx, m: *Module, name: StrView, dollar_pos: i32)
     if enum_find(mono.pctx, name) < 0 or find_generic_impl(m.impls, name.take(dollar_pos)) == null
         return
-    let suffix: *u8 = name.ptr + dollar_pos
-    let suffix_len: i32 = (name.len as i32) - dollar_pos
-    if suffix_len == 2
-        let ch: i32 = *(suffix + 1) as i32
+    let suffix: StrView = name.skip(dollar_pos)
+    if suffix.len == 2
+        let ch: i32 = suffix.get(1) as i32
         if ch >= 'A' and ch <= 'Z'
-            if find_concrete_struct(m, StrView { ptr: (suffix + 1), len: (1) as i64 }) == null and names_concrete_enum(mono.pctx, StrView { ptr: (suffix + 1), len: (1) as i64 }) == 0
+            if find_concrete_struct(m, suffix.skip(1).take(1)) == null and names_concrete_enum(mono.pctx, suffix.skip(1).take(1)) == 0
                 return
-    add_struct_instantiation(mono, name.take(dollar_pos), StrView { ptr: (suffix), len: (suffix_len) as i64 })
+    add_struct_instantiation(mono, name.take(dollar_pos), suffix)
 
 # End (exclusive) of the mangled type argument that starts at s[pos]: its
 # first component plus, if that names a generic, one nested argument per
@@ -1140,7 +1138,7 @@ pub fn scrutinee_type_name(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
         let f: *FnDef = find_fn_in_module(m, e.func_name)
         if f == null or f.type_params != null or f.return_type != TypeKind.Struct or f.return_type_name.ptr == null
             return strview_empty()
-        return strview_from_ptr(f.return_type_name.ptr, f.return_type_name.len)
+        return f.return_type_name
     strview_empty()
 
 # Record `Ctor(x)`'s `x` at its payload's type, so `x[lo..hi]` is a slice of
@@ -1148,16 +1146,15 @@ pub fn scrutinee_type_name(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
 pub fn bind_arm_payload(mono: *MonoCtx, m: *Module, arm: *MatchArm, tn_sv: StrView)
     if arm.pattern_kind != PAT_VARIANT or arm.pattern_inner_kind != PAT_IDENT
         return
-    let name: *u8 = arm.pattern_inner_name.ptr
-    let name_len: i32 = arm.pattern_inner_name.len as i32
-    if name_len <= 0 or (name_len == 1 and *name == '_')   # `_`
+    let name: StrView = arm.pattern_inner_name
+    if name.len <= 0 or (name.len == 1 and name.get(0) == '_')   # `_`
         return
     var k: i32 = arm.pattern_field_sel
     if arm.pattern_binds == null
         k = 0 - 1
     let pay_sv: StrView = variant_field_payload_type(mono.pctx, m, tn_sv, arm.pattern_name, k)
     if pay_sv.ptr != null and pay_sv.len > 0
-        track_typed_local(mono, StrView { ptr: (name), len: (name_len) as i64 }, TypeKind.Struct, pay_sv)
+        track_typed_local(mono, name, TypeKind.Struct, pay_sv)
 
 # The mangled type variant `ctor` of `tn` carries, or null: Option's Some the
 # whole suffix, Result's Ok its T and Err its E, a non-generic user enum's
@@ -1181,15 +1178,14 @@ fn variant_field_payload_type(ctx: *ParseCtx, m: *Module, tn: StrView, ctor_sv: 
     if tn.len > 7 and tn.starts_with("Option$")
         if name_eq(ctor_sv, "Some") == 0
             return strview_empty()
-        return strview_from_ptr(tn.ptr + 7, ((tn.len as i32) - 7) as i64)
+        return tn.skip(7)
     if tn.len > 7 and tn.starts_with("Result$")
-        let sfx: *u8 = tn.ptr + 7
-        let sfx_len: i32 = (tn.len as i32) - 7
-        let t_len: i32 = mangled_type_extent(m, StrView { ptr: (sfx), len: (sfx_len) as i64 })
+        let sfx: StrView = tn.skip(7)
+        let t_len: i32 = mangled_type_extent(m, sfx)
         if name_eq(ctor_sv, "Ok") == 1
-            return strview_from_ptr(sfx, t_len as i64)
-        if name_eq(ctor_sv, "Err") == 1 and t_len + 1 < sfx_len
-            return strview_from_ptr(sfx + t_len + 1, (sfx_len - t_len - 1) as i64)
+            return strview_from_ptr(sfx.ptr, t_len as i64)
+        if name_eq(ctor_sv, "Err") == 1 and t_len + 1 < sfx.len
+            return sfx.skip(t_len + 1)
         return strview_empty()
     let ei: i32 = enum_find(ctx, tn)
     if ei < 0 or enum_is_generic(ctx, ei) == 1
@@ -1206,7 +1202,7 @@ fn variant_field_payload_type(ctx: *ParseCtx, m: *Module, tn: StrView, ctor_sv: 
         i += 1
     if f == null or f.field_type != TypeKind.Struct or f.field_type_name.ptr == null
         return strview_empty()
-    strview_from_ptr(f.field_type_name.ptr, f.field_type_name.len)
+    f.field_type_name
 
 # Byte length of the first whole type in the `$`-joined mangled list `p`
 # (AGAST #1574): `Vec$i32$i32` -> `Vec$i32`, `Result$Vec$u8$i32$i64` ->
@@ -1506,18 +1502,17 @@ pub fn parse_type_from_suffix(suffix: StrView) -> TypeKind
     if suffix_is_ptr(suffix) == 1
         return TypeKind.Ptr
 
-    let type_name: *u8 = suffix.ptr + 1
-    let type_len: i32 = (suffix.len as i32) - 1
+    let type_name: StrView = suffix.skip(1)
 
     # Every primitive ritz0 spells (AGAST #1922: only five were matched, so
     # `ident<u32>` substituted T as a struct named "u32").
-    let prim: TypeKind = primitive_type_from_name(StrView { ptr: (type_name), len: (type_len) as i64 })
+    let prim: TypeKind = primitive_type_from_name(type_name)
     if prim != TypeKind.Void
         return prim
 
     # AGAST #2832: `$arr2_i8` is the array `[2]i8`.
     var a: ArrayArg
-    if array_arg_decode(StrView { ptr: (type_name), len: (type_len) as i64 }, @a) == 1
+    if array_arg_decode(type_name, @a) == 1
         return TypeKind.Array
 
     # Could be a struct type
@@ -1582,16 +1577,14 @@ fn array_arg_decode_1d(name: StrView, out: *ArrayArg) -> i32
     if pos == 3 or pos + 1 >= name.len or name.get(pos) != '_'   # digits, '_', element
         return 0
     pos = pos + 1
-    var elem: *u8 = name.ptr + pos
-    var elem_len: i32 = (name.len as i32) - pos
+    var elem: StrView = name.skip(pos)
     out.size = size
     out.elem = TypeKind.Struct
     out.pointee = TypeKind.Void
-    if elem_len > 4 and (StrView { ptr: (elem), len: (elem_len) as i64 }).starts_with("ptr_")
+    if elem.len > 4 and elem.starts_with("ptr_")
         out.elem = TypeKind.Ptr
-        elem = elem + 4
-        elem_len = elem_len - 4
-    let prim: TypeKind = primitive_type_from_name(StrView { ptr: (elem), len: (elem_len) as i64 })
+        elem = elem.skip(4)
+    let prim: TypeKind = primitive_type_from_name(elem)
     if prim != TypeKind.Void
         out.name = strview_empty()
         if out.elem == TypeKind.Ptr
@@ -1599,7 +1592,7 @@ fn array_arg_decode_1d(name: StrView, out: *ArrayArg) -> i32
         else
             out.elem = prim
         return 1
-    out.name = StrView { ptr: elem, len: elem_len as i64 }
+    out.name = elem
     if out.elem == TypeKind.Ptr
         out.pointee = TypeKind.Struct
     1
@@ -1880,7 +1873,7 @@ pub fn call_result_type_name(m: *Module, call: *Expr) -> StrView
     if f == null or f.return_type_name.ptr == null or f.return_type_name.len <= 0
         return strview_empty()
     if f.type_params == null
-        return strview_from_ptr(f.return_type_name.ptr, f.return_type_name.len)
+        return f.return_type_name
     let tp: *TypeParam = f.type_params
     if tp.next != null or call.call_type_suffix.ptr == null or call.call_type_suffix.len <= 0
         return strview_empty()
@@ -1934,26 +1927,25 @@ pub fn impl_method_named(ib: *ImplBlock, meth: StrView) -> *FnDef
 
 fn method_ret_at(ib: *ImplBlock, f: *FnDef, tn: StrView, d: i32) -> StrView
     let tn_len: i32 = tn.len as i32
-    let rn: *u8 = f.return_type_name.ptr
-    let rl: i32 = f.return_type_name.len as i32
-    if rn == null or rl <= 0
+    let rn: StrView = f.return_type_name
+    if rn.ptr == null or rn.len <= 0
         return strview_empty()
     if ib.type_params == null
-        return strview_from_ptr(rn, rl as i64)
+        return rn
     let tp: *TypeParam = ib.type_params
     if tp.next != null
         return strview_empty()
-    if name_eq(StrView { ptr: (rn), len: (rl) as i64 }, tp.name) == 1
+    if name_eq(rn, tp.name) == 1
         # `-> T`: the instance's own argument.
         return strview_from_ptr(tn.ptr + d + 1, (tn_len - d - 1) as i64)
-    let rd: i32 = find_dollar_sign(StrView { ptr: (rn), len: (rl) as i64 })
+    let rd: i32 = find_dollar_sign(rn)
     if rd < 0
-        return strview_from_ptr(rn, rl as i64)   # a concrete type
-    if name_eq(StrView { ptr: (rn + rd + 1), len: (rl - rd - 1) as i64 }, tp.name) == 0
+        return rn   # a concrete type
+    if name_eq(rn.skip(rd + 1), tp.name) == 0
         return strview_empty()
     let n: i32 = rd + tn_len - d
     let out: *u8 = malloc(n as i64 + 1)
-    memcpy(out, rn, rd as i64)
+    memcpy(out, rn.ptr, rd as i64)
     memcpy(out + rd, tn.ptr + d, (tn_len - d) as i64)
     *(out + n) = 0
     strview_from_ptr(out, n as i64)

@@ -1,0 +1,2011 @@
+# ritz1/src/monomorph.ritz - Monomorphization pass for ritz1
+#
+# This pass transforms generic code into specialized (monomorphized) code.
+# Each instantiation of a generic function with concrete type arguments
+# results in a specialized version being generated.
+#
+# Example:
+#     fn vec_new<T>() -> Vec<T>
+#         ...
+#     vec_new<u8>()  # Creates call to vec_new$u8
+#
+# After monomorphization, vec_new$u8 is generated from the template.
+#
+# The pass lowers a construct by rewriting the Expr it is handed, in place, on
+# nodes it owns: "Lowering in place" below (AGAST #4411) says why that is safe
+# and which helpers do it.
+
+import ast
+import ast_helpers
+import ritzlib.strview
+import types         # view_struct_new / view_*_name: the one view (#4545)
+import struct_index   # AGAST #1635
+import ast_query   # name_eq & co., off emitter_core (AGAST #3513)
+import diag           # diag_error_at (AGAST #3445)
+import ritzlib.cstr
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+
+# ============================================================================
+# MonoCtx: the pass's state (AGAST #4454)
+# ============================================================================
+# One per compile, made by main (mono_ctx_new) and passed to every fn that
+# reads or writes it: generic inference, monomorphisation, trait_bound (which
+# reads the instance tables) and the emitter (EmitterState.mono: a generic
+# enum first named at emission is recorded here).  These were 50 module
+# globals; where one stood, a `# (MonoCtx.<field>)` comment still says more.
+pub struct MonoCtx
+    pctx: *ParseCtx   # AGAST #4623: the parse state; the emitter's too
+    # AGAST #4697: how a print placeholder's text is parsed, for the method
+    # calls it names (mono_clone.ritz, want_interp_methods): interp.ritz's
+    # interp_parse_expr, passed in by main.ritz, so monomorph and mono_clone,
+    # which the emitter imports, do not import the parser.
+    interp_parse: fn(*ParseCtx, StrView, i32, i32) -> *Expr
+    # Function instantiations, as parallel (name, "$T" suffix) arrays.
+    inst_names: *StrView
+    inst_suffixes: *StrView     # "$u8", "$i32", ...
+    inst_count: i32
+    inst_cap: i32
+    # Struct instantiations, likewise ("Pair", "Vec" + suffix).
+    struct_names: *StrView
+    struct_suffixes: *StrView
+    struct_count: i32
+    struct_cap: i32
+    # Each instance's generation (AGAST #3330, below).
+    inst_gens: *i32
+    struct_gens: *i32
+    cur_gen: i32            # generation being specialised; -1 outside
+    mono_errors: i32
+    # Generic-typed locals of the fn being specialised ("Local Variable Type
+    # Tracking" below).
+    lv_names: *StrView
+    lv_prefix_kind: *i32    # 0 = plain struct, 1 = Vec, 2 = Span
+    lv_suffixes: *StrView       # the "$T" portion (with leading $)
+    lv_type_names: *StrView     # kind 0: the struct's name (e.g. "R")
+    lv_by_value: *i32       # 1: the local IS the struct, not *T / @T (AGAST #2451)
+    lv_shared: *i32         # 1: an `@T` param or local, which refuses writes (§3.2)
+    lv_count: i32
+    lv_cap: i32
+    lv_initialized: i32
+    # Array-typed locals: name -> element type.
+    al_names: *StrView
+    al_elems: *StrView
+    al_count: i32
+    al_cap: i32
+    slice_kept: *Expr
+    # The fn being specialised: its return type name and tail statement.
+    mono_ret_name: StrView
+    mono_tail: *Stmt
+    mono_component_mode: i32   # whole-`$`-component name rewriting (see below)
+    tuple_module: *Module      # the module being monomorphized (AGAST #2975)
+    mono_module: *Module       # the module being specialised (AGAST #1926)
+    # clone_expr's memo of already-cloned nodes.
+    clone_memo_from: **Expr
+    clone_memo_to: **Expr
+    clone_memo_count: i32
+    clone_memo_cap: i32
+    clone_memo_on: i32
+    # Impl methods wanted by an instance, and those already specialised.
+    wanted_methods: *WantedMethod
+    done_methods: *WantedMethod
+    impl_self_name: StrView
+    # AGAST #4844: where each instance was first named (InstSite, ast.ritz),
+    # for the notes an error inside it carries.  inst_sites parallels the fn
+    # instantiation table; a wanted method's is on its WantedMethod.  A
+    # request is made in the body of `req_fn` (a non-generic fn) or of the
+    # instance `req_site` is being made for, at `site_line:site_col` (the
+    # call or method call being walked).
+    inst_sites: **InstSite
+    req_fn: *FnDef
+    req_site: *InstSite
+    site_line: i32
+    site_col: i32
+
+# A fresh MonoCtx: every table empty, outside any generation.
+pub fn mono_ctx_new(ctx: *ParseCtx, interp_parse: fn(*ParseCtx, StrView, i32, i32) -> *Expr) -> *MonoCtx
+    let mono: *MonoCtx = calloc(1, sizeof(MonoCtx)) as *MonoCtx
+    mono.cur_gen = -1
+    mono.pctx = ctx
+    mono.interp_parse = interp_parse
+    mono
+
+# ============================================================================
+# Instantiation Tracking
+# ============================================================================
+# Track generic function AND struct instantiations as (name, type_suffix) pairs
+
+# Initial capacity; the fn and struct tables each grow by doubling (AGAST
+# #1813).  add_instantiation used to return -1 when full and every caller
+# ignored it, so instantiations past 256 were silently never specialised
+# (#1325's root cause).
+const INST_INIT_CAP: i32 = 256
+
+# AGAST #3330: each instance's generation.  One named in the program is 0; one
+# first named while specialising a generation-g instance (its fields, its impl
+# methods, its body) is g + 1.  `impl<T> Cell<T>  fn wrap(..) -> Cell<Cell<T>>`
+# names a deeper instance at every generation, so instantiation never ended
+# (ritz1 hung).  Past MAX_INSTANCE_DEPTH generations it stops with a located
+# error instead; ritz0 uses the same cap (monomorph.py, MAX_INSTANCE_DEPTH).
+# Real code peaks at 4.
+const MAX_INSTANCE_DEPTH: i32 = 64
+
+pub fn init_instantiation_tracker(mono: *MonoCtx)
+    # Initialize function tracking
+    mono.inst_cap = INST_INIT_CAP
+    mono.inst_names = malloc((mono.inst_cap as i64) * sizeof(StrView)) as *StrView
+    mono.inst_suffixes = malloc((mono.inst_cap as i64) * sizeof(StrView)) as *StrView
+    mono.inst_gens = malloc((mono.inst_cap as i64) * 4) as *i32
+    mono.inst_sites = malloc((mono.inst_cap as i64) * 8) as **InstSite
+    mono.inst_count = 0
+    # Initialize struct tracking
+    mono.struct_cap = INST_INIT_CAP
+    mono.struct_names = malloc((mono.struct_cap as i64) * sizeof(StrView)) as *StrView
+    mono.struct_suffixes = malloc((mono.struct_cap as i64) * sizeof(StrView)) as *StrView
+    mono.struct_gens = malloc((mono.struct_cap as i64) * 4) as *i32
+    mono.struct_count = 0
+    mono.cur_gen = -1
+    mono.mono_errors = 0
+
+pub fn add_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: StrView) -> i32
+    # Check if already tracked
+    for i in 0..mono.inst_count
+        if (*(mono.inst_names + i)).eq(name_sv) and (*(mono.inst_suffixes + i)).eq(suffix_sv)
+            inst_site_again(mono, *(mono.inst_sites + i))
+            return 0  # Already tracked
+
+    # Add new entry
+    if mono.inst_count >= mono.inst_cap
+        let cap: i64 = (mono.inst_cap as i64) * 2
+        mono.inst_names = realloc(mono.inst_names as *u8, cap * sizeof(StrView)) as *StrView
+        mono.inst_suffixes = realloc(mono.inst_suffixes as *u8, cap * sizeof(StrView)) as *StrView
+        mono.inst_gens = realloc(mono.inst_gens as *u8, cap * 4) as *i32
+        mono.inst_sites = realloc(mono.inst_sites as *u8, cap * 8) as **InstSite
+        mono.inst_cap = cap as i32
+
+    *(mono.inst_names + mono.inst_count) = name_sv
+    *(mono.inst_suffixes + mono.inst_count) = suffix_sv
+    *(mono.inst_gens + mono.inst_count) = mono.cur_gen + 1
+    *(mono.inst_sites + mono.inst_count) = inst_site_new(mono)
+    mono.inst_count = mono.inst_count + 1
+    return 1  # Added new
+
+# AGAST #4844: the request being made now, at mono's site in its body.
+pub fn inst_site_new(mono: *MonoCtx) -> *InstSite
+    let site: *InstSite = calloc(1, sizeof(InstSite)) as *InstSite
+    site.line = mono.site_line
+    site.col = mono.site_col
+    site.from = mono.req_fn
+    site.from_site = mono.req_site
+    site
+
+# Another place names the instance `site` records.
+pub fn inst_site_again(mono: *MonoCtx, site: *InstSite)
+    if site == null
+        return
+    if site.line != mono.site_line or site.col != mono.site_col or site.from != mono.req_fn or site.from_site != mono.req_site
+        site.more += 1
+
+# Instance `name<args>.method`'s own copy of request `req` (a wanted
+# method's is shared by every instance an unknown receiver reaches); null
+# when nothing recorded one.
+pub fn inst_site_made(req: *InstSite, name: StrView, args: StrView, method: StrView) -> *InstSite
+    if req == null
+        return null
+    let site: *InstSite = calloc(1, sizeof(InstSite)) as *InstSite
+    site.line = req.line
+    site.col = req.col
+    site.from = req.from
+    site.from_site = req.from_site
+    site.more = req.more
+    site.name = name
+    site.args = args
+    site.method = method
+    site
+
+# Walk the body the request `site` will be made for; returns the request
+# context it replaces, for inst_site_leave.
+pub fn inst_site_enter(mono: *MonoCtx, site: *InstSite) -> *InstSite
+    let saved: *InstSite = mono.req_site
+    mono.req_site = site
+    mono.req_fn = null
+    saved
+
+# `site`'s instance is `f` (null: none was made).
+pub fn inst_site_leave(mono: *MonoCtx, site: *InstSite, f: *FnDef, saved: *InstSite)
+    mono.req_site = saved
+    if site != null and f != null
+        site.inst = f
+        f.inst_site = site
+
+# The call or method call at `e` is the one being walked.
+pub fn inst_site_at(mono: *MonoCtx, e: *Expr)
+    mono.site_line = e.span.line
+    mono.site_col = e.span.col
+
+pub fn get_instantiation_count(mono: *MonoCtx) -> i32
+    mono.inst_count
+
+pub fn get_instantiation_name(mono: *MonoCtx, idx: i32) -> StrView
+    if idx >= mono.inst_count
+        return strview_empty()
+    *(mono.inst_names + idx)
+
+pub fn get_instantiation_suffix(mono: *MonoCtx, idx: i32) -> StrView
+    if idx >= mono.inst_count
+        return strview_empty()
+    *(mono.inst_suffixes + idx)
+
+# ============================================================================
+# Struct Instantiation Tracking
+# ============================================================================
+
+pub fn add_struct_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: StrView) -> i32
+    # Check if already tracked
+    for i in 0..mono.struct_count
+        if (*(mono.struct_names + i)).eq(name_sv) and (*(mono.struct_suffixes + i)).eq(suffix_sv)
+            return 0  # Already tracked
+
+    # Add new entry
+    if mono.struct_count >= mono.struct_cap
+        let cap: i64 = (mono.struct_cap as i64) * 2
+        mono.struct_names = realloc(mono.struct_names as *u8, cap * sizeof(StrView)) as *StrView
+        mono.struct_suffixes = realloc(mono.struct_suffixes as *u8, cap * sizeof(StrView)) as *StrView
+        mono.struct_gens = realloc(mono.struct_gens as *u8, cap * 4) as *i32
+        mono.struct_cap = cap as i32
+
+    *(mono.struct_names + mono.struct_count) = name_sv
+    *(mono.struct_suffixes + mono.struct_count) = suffix_sv
+    *(mono.struct_gens + mono.struct_count) = mono.cur_gen + 1
+    mono.struct_count = mono.struct_count + 1
+    return 1  # Added new
+
+pub fn get_struct_instantiation_count(mono: *MonoCtx) -> i32
+    mono.struct_count
+
+pub fn get_struct_instantiation_name(mono: *MonoCtx, idx: i32) -> StrView
+    if idx >= mono.struct_count
+        return strview_empty()
+    *(mono.struct_names + idx)
+
+pub fn get_struct_instantiation_suffix(mono: *MonoCtx, idx: i32) -> StrView
+    if idx >= mono.struct_count
+        return strview_empty()
+    *(mono.struct_suffixes + idx)
+
+# Find generic struct by name
+pub fn find_generic_struct(m: *Module, name_sv: StrView) -> *StructDef
+    var st: *StructDef = m.structs
+    while st != null
+        if st.type_params != null
+            if st.name.eq(name_sv)
+                return st
+        st = st.next
+    return null
+
+# AGAST #3162: an `impl` on a built-in type is refused, at the `impl`.
+# `Span<T>`, `StrView`, `Option<T>` and `Result<T, E>` exist with no
+# declaration, and their methods are lowered by the compiler, so an impl's
+# methods were lost (`Span_is_empty` defined, `Span$u8_is_empty` called; an
+# `Option<i32>` method undefined at link).  Aaron (2026-11-15, rz-larb): the
+# built-ins are closed, as R15 made built-in indexing.  A struct or enum of
+# that name the program declares or imports (ritzlib.span, .strview,
+# .option, .result) is ordinary, and its impls stand.  Run after imports are
+# merged and before ensure_builtin_span_template adds its `Span`.  ritz0
+# says the same (ritz0/builtin_types.py).
+
+# The ritzlib module declaring `name` if it is a built-in type, else null.
+# The base name of a concrete generic instance: `Span$u8` names `Span`.
+# AGAST #4294: an impl target on a built-in may be a concrete instantiation
+# (`impl Display for Span<u8>`), and the parser spells it mangled.
+fn type_base_len(name: StrView) -> i32
+    var i: i32 = 0
+    while i < name.len and name.get(i) != '$'   # '$'
+        i = i + 1
+    i
+
+fn builtin_type_module(name: StrView) -> StrView
+    let base: i32 = type_base_len(name)
+    if name.take(base).eq("Span")
+        return "ritzlib.span"
+    if name.take(base).eq("StrView")
+        return "ritzlib.strview"
+    if name.take(base).eq("Option")
+        return "ritzlib.option"
+    if name.take(base).eq("Result")
+        return "ritzlib.result"
+    strview_empty()
+
+pub fn module_declares_type(ctx: *ParseCtx, m: *Module, name: StrView) -> i32
+    # AGAST #3494 (R65): a trait impl's target may be a concrete instance
+    # (`Result$i32$i32`, `Span$u8`); the declaration is under its base name.
+    let base: i32 = type_base_len(name)
+    var st: *StructDef = m.structs
+    while st != null
+        if st.name.eq(name.take(base as i64))
+            return 1
+        st = st.next
+    if enum_find(ctx, name.take(base)) >= 0
+        return 1
+    0
+
+# AGAST #4294 (R36's revisit): a trait impl on a primitive/built-in is legal
+# in the file that declares the trait.  `ib.def_file` is the file the impl was
+# parsed from; the trait log records each trait's file.
+fn impl_in_trait_file(ctx: *ParseCtx, ib: *ImplBlock) -> i32
+    if ib.trait_name.ptr == null
+        return 0
+    trait_declared_in_file(ctx, ib.trait_name, ib.def_file)
+
+# R36's revisit admits `Span<T>` and `StrView`, not Option/Result.  A concrete
+# instance (`Span$u8`) is judged by its base.
+fn builtin_impl_target_allowed(name: StrView) -> i32
+    let base: i32 = type_base_len(name)
+    if name.take(base).eq("Span")
+        return 1
+    if name.take(base).eq("StrView")
+        return 1
+    0
+
+# The target's source spelling: `Span$u8` names `Span`, `ptr_u8` is `*u8`,
+# anything else is as written.
+fn eprint_impl_target(ib: *ImplBlock)
+    if ib.ptr_target == 1
+        eprint_char('*')
+        if ib.type_name.len > 4
+            sys_write(2, ib.type_name.ptr + 4, ((ib.type_name.len as i32) - 4) as i64)
+        return
+    let base: i32 = type_base_len(ib.type_name)
+    sys_write(2, ib.type_name.ptr, base as i64)
+
+# Errors reported; `path` is the main file, for blocks it parsed.
+pub fn refuse_impls_on_builtin_types(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
+    var errors: i32 = 0
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        let module_sv: StrView = builtin_type_module(ib.type_name)
+        # A trait impl on Span/StrView is R36's revisit (#4294); it is this
+        # check's to refuse only when inherent, and the placement is
+        # impl_target_class's.
+        let allowed_trait: i32 = (builtin_impl_target_allowed(ib.type_name) == 1 and ib.trait_name.ptr != null) as i32
+        if module_sv.ptr != null and module_declares_type(ctx, m, ib.type_name) == 0 and allowed_trait == 0
+            if ib.def_file.len > 0
+                eprints(ib.def_file)
+            else
+                eprints(path)
+            eprint_char(':')
+            eprint_i64(ib.impl_span.line as i64)
+            eprint_char(':')
+            eprint_i64(ib.impl_span.col as i64)
+            eprints(": error: `")
+            eprint_impl_target(ib)
+            eprints("` is a built-in type and can't be extended here: import ")
+            sys_write(2, module_sv.ptr, module_sv.len)
+            eprints(" or declare your own type\n")
+            errors += 1
+        ib = ib.next
+    errors
+
+# AGAST #3264: an `impl` on a type nothing declares or imports is "unknown
+# type `Foo`", at the impl's type name.  `impl Foo` with no `struct Foo` /
+# `enum Foo` compiled and its methods were unreachable; so did `impl Vec<u8>`
+# without ritzlib.vec.  Known: a struct or enum of the merged module, a SIMD
+# vector, or one of the impl's own type parameters.  `impl Self` is unknown:
+# Self names no type outside an impl.  Two targets never get here: an
+# undeclared built-in (refuse_impls_on_builtin_types runs first, and main
+# stops on its errors) and a primitive (below).
+#
+# AGAST #3369 (LARB R35): a `type` alias is known but no impl target: a
+# type's methods live under the name it was declared with.  `type Id = Foo`
+# then `impl Id` is "`Id` is a type alias for `Foo`: write `impl Foo`", at
+# `Id`, before the impl body is lowered (it failed later, unlocated, with
+# "unhandled EXPR_MEMBER").  ritz0 says the same
+# (ritz0/builtin_types.py, check_unknown_impl_targets).
+#
+# AGAST #3371 (LARB R36, #3288): a primitive is known but closed.  `impl u8`
+# and `impl Speak for i32` are "`i32` is a built-in type; it can't have an
+# `impl`", at the type, as in ritz0.  The grammar takes a type_name as the
+# target so a keyword type parses (it was an unlocated "Parse error at pos
+# 64"); `f64`, `usize` and the like lex as IDENTs and land here too.  A SIMD
+# vector (`v4i32`) stays a known target, as in ritz0.
+#
+# impl_target_class sorts a target; refuse_impls_on_unknown_types says each
+# refused class's message.  A new refusal is a new class and a new arm.
+#
+# AGAST #4211: the impl's trait is judged too, as ritz0 does (#4197): one no
+# parsed file declares (imports count) and no compiler trait names is
+# "unknown trait `Nonesuch`", at the trait name.  It compiled silently.
+
+const IMPL_TARGET_OK: i32 = 0
+const IMPL_TARGET_UNKNOWN: i32 = 1
+const IMPL_TARGET_ALIAS: i32 = 2
+const IMPL_TARGET_PRIMITIVE: i32 = 3
+# R36's revisit (#4294): a trait impl on a primitive / built-in / `*u8` that
+# is not in the file declaring the trait.
+const IMPL_TARGET_MISPLACED: i32 = 4
+
+fn impl_has_type_param(ib: *ImplBlock, name_sv: StrView) -> i32
+    var tp: *TypeParam = ib.type_params
+    while tp != null
+        if tp.name.eq(name_sv)
+            return 1
+        tp = tp.next
+    0
+
+# Same order as ritz0: the impl's own type parameter, then an alias, then a
+# primitive.
+fn impl_target_class(ctx: *ParseCtx, m: *Module, ib: *ImplBlock) -> i32
+    let name: StrView = ib.type_name
+    if impl_has_type_param(ib, name) == 1
+        return IMPL_TARGET_OK
+    if type_alias_declared(ctx, name) == 1
+        return IMPL_TARGET_ALIAS
+    # R36's revisit (#4294): `impl Trait for *u8` — the parser spells the
+    # target `ptr_u8` — is legal only in the trait's file.
+    if ib.ptr_target == 1
+        if impl_in_trait_file(ctx, ib) == 1
+            return IMPL_TARGET_OK
+        return IMPL_TARGET_MISPLACED
+    if is_primitive_type_name(name) == 1
+        # A trait impl on a primitive is legal in the trait's file; an
+        # inherent impl still says "it can't have an `impl`".
+        if impl_in_trait_file(ctx, ib) == 1
+            return IMPL_TARGET_OK
+        if ib.trait_name.ptr != null
+            return IMPL_TARGET_MISPLACED
+        return IMPL_TARGET_PRIMITIVE
+    # `Span<T>` / `StrView` in the trait's file stand even when nothing
+    # declares them (the emitter synthesizes them); outside it, the trait
+    # impl is misplaced (#4294).
+    let module_sv: StrView = builtin_type_module(name)
+    if module_sv.ptr != null and module_declares_type(ctx, m, name) == 0
+        if builtin_impl_target_allowed(name) == 1 and ib.trait_name.ptr != null
+            if impl_in_trait_file(ctx, ib) == 1
+                return IMPL_TARGET_OK
+            return IMPL_TARGET_MISPLACED
+    if module_declares_type(ctx, m, name) == 1 or is_simd_vector_type_name(name) == 1
+        return IMPL_TARGET_OK
+    IMPL_TARGET_UNKNOWN
+
+# R36's revisit (#4294): "`*u8` is a built-in type: a trait impl for it must
+# be in the trait's file (§12.2)", the target spelled as the source wrote it
+# (`ptr_u8` is `*u8`).
+fn eprint_misplaced_target(ib: *ImplBlock)
+    eprint_char('`')
+    eprint_impl_target(ib)
+    eprints("` is a built-in type: a trait impl for it must be in the trait's file (§12.2)\n")
+
+# "`Id` is a type alias for `Foo`: write `impl Foo`", the target as the
+# alias wrote it (#3625).  One with no recorded spelling drops the "for `T`".
+fn eprint_impl_on_alias(ctx: *ParseCtx, name: StrView)
+    let target: StrView = type_alias_target_spelling(ctx, name)
+    eprint_char('`')
+    sys_write(2, name.ptr, name.len)
+    if target.ptr == null
+        eprints("` is a type alias: write `impl` on the type it names\n")
+        return
+    eprints("` is a type alias for `")
+    sys_write(2, target.ptr, target.len)
+    eprints("`: write `impl ")
+    sys_write(2, target.ptr, target.len)
+    eprints("`\n")
+
+# The traits the compiler knows without a declaration, as ritz0's
+# trait_bounds.COMPILER_TRAITS.
+pub fn is_compiler_trait(name_sv: StrView) -> i32
+    if name_eq(name_sv, "Drop") == 1 or name_eq(name_sv, "Deref") == 1
+        return 1
+    if name_eq(name_sv, "DerefMut") == 1 or name_eq(name_sv, "Index") == 1
+        return 1
+    if name_eq(name_sv, "IndexMut") == 1 or name_eq(name_sv, "IndexSet") == 1
+        return 1
+    0
+
+fn impl_trait_unknown(ctx: *ParseCtx, ib: *ImplBlock) -> i32
+    if ib.trait_name.ptr == null
+        return 0
+    if trait_declared(ctx, ib.trait_name) == 1 or is_compiler_trait(ib.trait_name) == 1
+        return 0
+    1
+
+# AGAST #4002 (LARB R81): a generic impl declares its own parameters,
+# `impl<T> Box<T>`.  In `impl Box<T>` without `<T>`, `T` is an ordinary type
+# name; when nothing declares `T` it names nothing, at the `T`:
+#
+#     unknown type `T`: a generic impl declares it, `impl<T> Box<T>`
+#
+# The suggestion is the target's declared parameter list, as ritz0's
+# impl_placement._free_param prints it (`impl<> Foo<>` for a target with
+# none).  Judged only when the target itself is declared, so `impl Nope<T>`
+# stays "unknown type `Nope`" at the target.  Only a bare name is judged: a
+# nested instance is a mangled `Vec$u8` and a pointer starts `ptr_`, which
+# ritz0 skips too (its arg is then not a plain NamedType).  A declared
+# parameter, and any known type, is not free.
+fn impl_arg_is_bare(ga: *GenericArg) -> i32
+    if ga.ty != TypeKind.Struct or ga.name.ptr == null or ga.name.len <= 0
+        return 0
+    (ga.name.find_byte('$') == ga.name.len) as i32   # '$': a nested instance
+
+fn impl_arg_known(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> i32
+    if module_declares_type(ctx, m, name_sv) == 1 or type_alias_declared(ctx, name_sv) == 1
+        return 1
+    if trait_declared(ctx, name_sv) == 1
+        return 1
+    if is_primitive_type_name(name_sv) == 1 or is_simd_vector_type_name(name_sv) == 1
+        return 1
+    # The built-ins no module declares (ritz0's NameResolver.BUILTIN_TYPES).
+    if name_eq(name_sv, "StrView") == 1 or name_eq(name_sv, "Self") == 1
+        return 1
+    if name_eq(name_sv, "Option") == 1 or name_eq(name_sv, "Result") == 1
+        return 1
+    if name_eq(name_sv, "Span") == 1 or name_eq(name_sv, "void") == 1
+        return 1
+    name_eq(name_sv, "Future")
+
+# The target's declared parameters, when a struct or enum declares it.
+# `*found` says whether one did (an alias, a trait or an unknown name does
+# not, and then ritz0's check skips the impl too).
+fn impl_decl_params(ctx: *ParseCtx, m: *Module, name_sv: StrView, found: *i32) -> *TypeParam
+    var st: *StructDef = m.structs
+    while st != null
+        if st.name.eq(name_sv)
+            *found = 1
+            return st.type_params
+        st = st.next
+    let ei: i32 = enum_find(ctx, name_sv)
+    if ei >= 0
+        *found = 1
+        return generic_enum_params(ctx, ei)
+    *found = 0
+    null
+
+# The first argument that is neither the impl's own parameter nor a known
+# type, or null.
+fn impl_free_arg(ctx: *ParseCtx, m: *Module, ib: *ImplBlock) -> *GenericArg
+    var ga: *GenericArg = ib.impl_args
+    while ga != null
+        if impl_arg_is_bare(ga) == 1
+            if impl_has_type_param(ib, ga.name) == 0 and impl_arg_known(ctx, m, ga.name) == 0
+                return ga
+        ga = ga.next
+    null
+
+fn eprint_type_param_list(tp: *TypeParam)
+    var cur: *TypeParam = tp
+    var first: i32 = 1
+    while cur != null
+        if first == 0
+            eprints(", ")
+        first = 0
+        sys_write(2, cur.name.ptr, cur.name.len)
+        cur = cur.next
+
+# Errors reported; `path` is the main file, for blocks it parsed.
+pub fn refuse_impls_on_unknown_types(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
+    var errors: i32 = 0
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if impl_trait_unknown(ctx, ib) == 1
+            var tfile: StrView = path
+            if ib.def_file.len > 0
+                tfile = ib.def_file
+            diag_error_at(tfile, ib.trait_span)
+            eprints("unknown trait `")
+            sys_write(2, ib.trait_name.ptr, ib.trait_name.len)
+            eprints("`\n")
+            errors += 1
+        # AGAST #4002: R81's free parameter, before the target's class: in
+        # `impl Box<T>` the target `Box` is known, and it is `T` that names
+        # nothing.  The target's base names the declaration (`Box$T` too).
+        let base: i32 = type_base_len(ib.type_name)
+        var declared: i32 = 0
+        let params: *TypeParam = impl_decl_params(ctx, m, ib.type_name.take(base as i64), @declared)
+        if declared == 1
+            let free: *GenericArg = impl_free_arg(ctx, m, ib)
+            if free != null
+                var ffile: StrView = path
+                if ib.def_file.len > 0
+                    ffile = ib.def_file
+                diag_error_at(ffile, free.at)
+                eprints("unknown type `")
+                sys_write(2, free.name.ptr, free.name.len)
+                eprints("`: a generic impl declares it, `impl<")
+                eprint_type_param_list(params)
+                eprints("> ")
+                sys_write(2, ib.type_name.ptr, base as i64)
+                eprints("<")
+                eprint_type_param_list(params)
+                eprints(">`\n")
+                errors += 1
+                ib = ib.next
+                continue
+        let cls: i32 = impl_target_class(ctx, m, ib)
+        if cls != IMPL_TARGET_OK
+            var file: StrView = path
+            if ib.def_file.len > 0
+                file = ib.def_file
+            diag_error_at(file, ib.type_span)
+            if cls == IMPL_TARGET_ALIAS
+                eprint_impl_on_alias(ctx, ib.type_name)
+            else if cls == IMPL_TARGET_PRIMITIVE
+                eprint_char('`')
+                sys_write(2, ib.type_name.ptr, ib.type_name.len)
+                eprints("` is a built-in type; it can't have an `impl`\n")
+            else if cls == IMPL_TARGET_MISPLACED
+                eprint_misplaced_target(ib)
+            else
+                eprints("unknown type `")
+                sys_write(2, ib.type_name.ptr, ib.type_name.len)
+                eprints("`\n")
+            errors += 1
+        ib = ib.next
+    errors
+
+# AGAST #3127: `Span<T>` is a built-in shape, as in ritz0. Without
+# `import ritzlib.span` no template existed, so `Span<i32>` named a
+# `%Span$i32` no struct declared (clang: "invalid type for function
+# argument"), and `s.ptr` on it, or on any generic fn's `Span<X>` instance,
+# was "unhandled EXPR_MEMBER". Unless the program has a `Span` of its own
+# (ritzlib.span's, imported), add the template ritzlib.span spells:
+#
+#     struct Span<T>
+#         ptr: *T
+#         len: i64
+#
+# with the fields the parser builds for it (field_new): `*T` is a pointer
+# whose pointee is the struct named "T", which clone_struct_fields
+# substitutes. Unused, a template emits nothing.
+pub fn ensure_builtin_span_template(m: *Module)
+    var st: *StructDef = m.structs
+    while st != null
+        if st.name.eq("Span")
+            return
+        st = st.next
+    let tp: *TypeParam = calloc(1, sizeof(TypeParam)) as *TypeParam
+    tp.name = "T"
+    # The `{ ptr: *T, len: i64 }` shape comes from types.ritz (#4545); this
+    # site only adds its type parameter and PREPENDS it.
+    let span: *StructDef = view_struct_new("Span", 1)
+    span.type_params = tp
+    span.next = m.structs
+    m.structs = span
+
+# ============================================================================
+# Local-var Type Tracking (per fn body, for UFCS-driven instantiation)
+# ============================================================================
+# When we see `var v = vec_new<u16>()` at the AST level, monomorph normally
+# only records `vec_new$u16` (the explicit generic call).  But the later
+# `v.push(...)` call is an ExprKind.Method whose mangled fn name (`vec_push$u16`)
+# is computed at emit time — without a hook here, we never collect that
+# instantiation, the linker can't find `vec_push$u16`, and the UFCS dispatch
+# in emitter_expr_call.ritz falls back to the broken `Vec$u16_push` mangling.
+#
+# Solution: walk fn bodies tracking which local vars hold Vec<T> / Span<T>
+# (inferred from the initializer), then on every ExprKind.Method with an IDENT
+# receiver, register the corresponding `vec_<method>$<T>` / `span_<method>$<T>`
+# instantiation when a matching generic template exists.
+
+# Holds the Vec/Span locals AND the plain-struct locals (kind 0) that field
+# receivers resolve through (AGAST #1512).  Grows by doubling: entries past
+# the old fixed cap of 256 used to be dropped silently (AGAST #1813).
+const LOCAL_VARS_INIT_CAP: i32 = 256
+
+                                       # 2: a *T, @T or @&T of it, one level (AGAST #2448)
+
+pub fn init_local_var_tracker(mono: *MonoCtx)
+    if mono.lv_initialized == 1
+        return
+    mono.lv_cap = LOCAL_VARS_INIT_CAP
+    mono.lv_names = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
+    mono.lv_prefix_kind = malloc((mono.lv_cap as i64) * 4) as *i32
+    mono.lv_suffixes = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
+    mono.lv_type_names = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
+    mono.lv_by_value = malloc((mono.lv_cap as i64) * 4) as *i32
+    mono.lv_shared = malloc((mono.lv_cap as i64) * 4) as *i32
+    mono.lv_initialized = 1
+    mono.lv_count = 0
+
+pub fn reset_local_var_tracker(mono: *MonoCtx)
+    mono.lv_count = 0
+    mono.al_count = 0
+
+# `[N]S` locals (and `[N]*S`, `[N]@S`), name -> S, so `a[i].m()` is typed
+# (AGAST #4231, receiver_instance).  Reset with the tracker above.
+# (MonoCtx.al_names, .al_elems, .al_count, .al_cap)
+
+pub fn track_array_local(mono: *MonoCtx, name_sv: StrView, elem_sv: StrView)
+    if elem_sv.ptr == null or elem_sv.len <= 0
+        return
+    if mono.al_count >= mono.al_cap
+        var cap: i32 = mono.al_cap * 2
+        if cap == 0
+            cap = 16
+        mono.al_names = realloc(mono.al_names as *u8, (cap as i64) * sizeof(StrView)) as *StrView
+        mono.al_elems = realloc(mono.al_elems as *u8, (cap as i64) * sizeof(StrView)) as *StrView
+        mono.al_cap = cap
+    *(mono.al_names + mono.al_count) = name_sv
+    *(mono.al_elems + mono.al_count) = elem_sv
+    mono.al_count = mono.al_count + 1
+
+# The element type name of `[N]S` local `name`, or null.  The latest
+# declaration of the name wins.
+pub fn array_local_elem(mono: *MonoCtx, name_sv: StrView) -> StrView
+    var i: i32 = mono.al_count - 1
+    while i >= 0
+        if (*(mono.al_names + i)).eq(name_sv)
+            return *(mono.al_elems + i)
+        i = i - 1
+    strview_empty()
+
+pub fn add_local_var(mono: *MonoCtx, name_sv: StrView, prefix_kind: i32, suffix_sv: StrView)
+    if mono.lv_count >= mono.lv_cap
+        let cap: i64 = (mono.lv_cap as i64) * 2
+        mono.lv_names = realloc(mono.lv_names as *u8, cap * sizeof(StrView)) as *StrView
+        mono.lv_prefix_kind = realloc(mono.lv_prefix_kind as *u8, cap * 4) as *i32
+        mono.lv_suffixes = realloc(mono.lv_suffixes as *u8, cap * sizeof(StrView)) as *StrView
+        mono.lv_type_names = realloc(mono.lv_type_names as *u8, cap * sizeof(StrView)) as *StrView
+        mono.lv_by_value = realloc(mono.lv_by_value as *u8, cap * 4) as *i32
+        mono.lv_shared = realloc(mono.lv_shared as *u8, cap * 4) as *i32
+        mono.lv_cap = cap as i32
+    *(mono.lv_names + mono.lv_count) = name_sv
+    *(mono.lv_prefix_kind + mono.lv_count) = prefix_kind
+    *(mono.lv_suffixes + mono.lv_count) = suffix_sv
+    *(mono.lv_type_names + mono.lv_count) = strview_empty()
+    *(mono.lv_by_value + mono.lv_count) = 0
+    *(mono.lv_shared + mono.lv_count) = 0
+    mono.lv_count = mono.lv_count + 1
+
+# The local just added holds the struct itself, not a pointer to one.
+pub fn mark_last_local_by_value(mono: *MonoCtx)
+    if mono.lv_count > 0
+        *(mono.lv_by_value + mono.lv_count - 1) = 1
+
+# Record a local/param whose type is a (non-collection) struct or a pointer
+# or reference to one, so a field receiver rooted at it — `r.raw.push(9)` —
+# can resolve the field's type (AGAST #1512).  Kind 0 never matches a UFCS
+# prefix, so the ident-receiver path ignores these entries.
+pub fn add_local_struct_var(mono: *MonoCtx, name_sv: StrView, type_name_sv: StrView)
+    if type_name_sv.ptr == null or type_name_sv.len <= 0
+        return
+    add_local_var(mono, name_sv, 0, strview_empty())
+    *(mono.lv_type_names + mono.lv_count - 1) = type_name_sv
+
+# Record a binding of type `type_kind`/`type_name`: Vec/Span by-value go to
+# the UFCS kinds; any other named struct (by value, *T, @T, @&T) is kind 0.
+pub fn track_typed_local(mono: *MonoCtx, name_sv: StrView, type_kind: TypeKind, type_name: StrView)
+    if type_name.ptr == null or type_name.len <= 0
+        return
+    if type_kind != TypeKind.Struct and type_kind != TypeKind.Ptr and type_kind != TypeKind.Ref and type_kind != TypeKind.MutRef
+        return
+    var suf: StrView = strview_empty()
+    let kind: i32 = classify_collection_type(type_name, @suf)
+    if kind > 0
+        # By value or through *T / @T / @&T alike: the emitter's UFCS
+        # dispatch loads a pointer receiver itself, so `points:& Vec<P>`
+        # needs `vec_slice$P` registered just as a local Vec would
+        # (angelo's `points[:]`, AGAST #1794).
+        add_local_var(mono, name_sv, kind, suf)
+    else
+        add_local_struct_var(mono, name_sv, type_name)
+    if type_kind == TypeKind.Struct
+        mark_last_local_by_value(mono)
+
+# track_typed_local, and a `*T`, `@T` or `@&T` whose pointee is the struct
+# itself (not `**T`) is marked as one, so `p[lo..hi]` can slice what it points
+# at (AGAST #2448).  `pointee` is the param's or let's pointee type.
+pub fn track_typed_local_through(mono: *MonoCtx, name_sv: StrView, type_kind: TypeKind, pointee: TypeKind, type_name_sv: StrView)
+    let before: i32 = mono.lv_count
+    track_typed_local(mono, name_sv, type_kind, type_name_sv)
+    if mono.lv_count == before or pointee != TypeKind.Struct
+        return
+    if type_kind == TypeKind.Ptr or type_kind == TypeKind.Ref or type_kind == TypeKind.MutRef
+        *(mono.lv_by_value + mono.lv_count - 1) = 2
+    if type_kind == TypeKind.Ref
+        *(mono.lv_shared + mono.lv_count - 1) = 1
+
+# Un-annotated `let p = @v` / `@&v` of a by-value Vec, Span or String local:
+# `p` points at it, one level, as `let p: @Vec<T> = @v` would (AGAST #2448).
+pub fn track_address_of_local(mono: *MonoCtx, name_sv: StrView, of: *Expr)
+    if of == null or of.kind != ExprKind.Ident
+        return
+    let idx: i32 = find_local_var_idx(mono, of.ident)
+    if idx < 0 or *(mono.lv_by_value + idx) != 1
+        return
+    add_local_var(mono, name_sv, *(mono.lv_prefix_kind + idx), *(mono.lv_suffixes + idx))
+    *(mono.lv_type_names + mono.lv_count - 1) = *(mono.lv_type_names + idx)
+    *(mono.lv_by_value + mono.lv_count - 1) = 2
+
+# A field holding an `@T` or `@&T`: one level, like a `*T` (AGAST #2383).
+pub fn field_is_ref(f: *StructField) -> i32
+    (f.field_type == TypeKind.Ref or f.field_type == TypeKind.MutRef) as i32
+
+# The method `meth` of the inherent generic impl of Vec (kind 1) or Span
+# (kind 2), and through out_ib that impl, or null.  Method syntax reaches only
+# impl methods (LARB R66); the vec_/span_ prefix table this replaced went with
+# AGAST #4303.
+fn collection_impl_method(m: *Module, kind: i32, meth_sv: StrView, out_ib: **ImplBlock) -> *FnDef
+    var base: StrView = "Vec"
+    if kind == 2
+        base = "Span"
+    else if kind != 1
+        return null
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params != null and (ib.trait_name.ptr == null or ib.trait_name.len == 0) and name_eq(ib.type_name, base) == 1
+            var f: *FnDef = ib.methods
+            while f != null
+                if name_eq(f.name, meth_sv) == 1
+                    *out_ib = ib
+                    return f
+                f = f.next
+        ib = ib.next
+    null
+
+# AGAST #1798: record an un-annotated local initialised by a method call on a
+# tracked ident receiver -- `var s = a.slice(0, n)`, `var s = a[:]` (which
+# lowers to that call), `var v = b.items()` -- so a later `s.push(..)`
+# wants `Vec$T.push` even when no other receiver calls push.
+pub fn track_method_init_local(mono: *MonoCtx, m: *Module, name_sv: StrView, init: *Expr)
+    if init.left == null or init.left.kind != ExprKind.Ident
+        return
+    let idx: i32 = find_local_var_idx(mono, init.left.ident)
+    if idx < 0
+        # `let m = M.new()`: a static method of struct M.  Untyped, `m.get(..)`
+        # would want `get` on every generic instance (`Vec$L.get` at a
+        # move-only L nothing calls), AGAST #4588.
+        track_impl_method_local(mono, m, name_sv, init.left.ident, init)
+        return
+    let kind: i32 = *(mono.lv_prefix_kind + idx)
+    if kind > 0
+        # Vec/Span receiver: an impl method returning its own collection
+        # over the impl's type parameter (`fn slice(..) -> Vec<T>`, "Vec$T")
+        # gives that collection at the receiver's suffix.
+        var cib: *ImplBlock = null
+        let tmpl: *FnDef = collection_impl_method(m, kind, init.ident, @cib)
+        if tmpl == null or tmpl.return_type != TypeKind.Struct
+            return
+        var rsuf: StrView = strview_empty()
+        let rkind: i32 = classify_collection_type(tmpl.return_type_name, @rsuf)
+        let tp: *TypeParam = cib.type_params
+        if rkind > 0 and tp.name.eq(StrView { ptr: rsuf.ptr + 1, len: ((rsuf.len as i32) - 1) as i64 })
+            add_local_var(mono, name_sv, rkind, *(mono.lv_suffixes + idx))
+            mark_last_local_by_value(mono)
+        return
+    # Struct receiver (by value or pointer): its non-generic impl method's
+    # return type, recorded like an annotation of that type.
+    let tn: StrView = *(mono.lv_type_names + idx)
+    # `s.slice(lo, hi)` on a String is string_slice, a String (no impl method
+    # says so), and what `let t = s[lo..hi]` became (AGAST #2451).
+    if tn.eq("String") and init.ident.eq("slice")
+        track_typed_local(mono, name_sv, TypeKind.Struct, "String")
+        return
+    track_impl_method_local(mono, m, name_sv, tn, init)
+
+# Record local `name_sv`, set to `init` (a call of method `init.ident` on
+# struct `tn_sv` or a value of it), as that method's return type: from the
+# struct's non-generic impl.  Untracked when there is no such method.
+fn track_impl_method_local(mono: *MonoCtx, m: *Module, name_sv: StrView, tn_sv: StrView, init: *Expr)
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params == null and ib.type_name.eq(tn_sv)
+            var meth: *FnDef = ib.methods
+            while meth != null
+                if meth.name.eq(init.ident)
+                    track_typed_local(mono, name_sv, meth.return_type, meth.return_type_name)
+                    return
+                meth = meth.next
+        ib = ib.next
+
+pub fn find_local_var_idx(mono: *MonoCtx, name_sv: StrView) -> i32
+    for i in 0..mono.lv_count
+        if (*(mono.lv_names + i)).eq(name_sv)
+            return i
+    return -1
+
+# If `type_name` is a Vec$T or Span$T mangled name, return the prefix kind
+# (1 = Vec, 2 = Span) and write the inner suffix (with leading $) to out.
+# Returns 0 if no match.
+pub fn classify_collection_type(type_name: StrView, out: *StrView) -> i32
+    if type_name.ptr == null or type_name.len < 5
+        return 0
+    # "Vec$..." → kind 1, suffix starts at index 3
+    if type_name.starts_with("Vec$")
+        *out = type_name.skip(3)
+        return 1
+    # "Span$..." → kind 2, suffix starts at index 4 (need 6+ bytes)
+    if type_name.len >= 6 and type_name.starts_with("Span$")
+        *out = type_name.skip(4)
+        return 2
+    return 0
+
+# Walk module functions looking for any (generic or specialized) fn matching
+# the given name.  Used during collection to resolve a var-decl initializer
+# call's return type so we can infer the local var's struct type.
+pub fn find_fn_in_module(m: *Module, name_sv: StrView) -> *FnDef
+    var f: *FnDef = m.functions
+    while f != null
+        if f.name.eq(name_sv)
+            return f
+        f = f.next
+    return null
+
+# ============================================================================
+# Instantiation Collection
+# ============================================================================
+# Walk the AST to find all generic function and struct instantiations
+
+# Check if a name contains '$' (indicating a mangled generic)
+# Returns the position of '$' or -1 if not found
+pub fn find_dollar_sign(name: StrView) -> i32
+    for i in 0..(name.len as i32)
+        if name.get(i) == '$'  # '$'
+            return i
+    return -1
+
+# AGAST #1906: no fixed cap on type arguments (it was 8, and a 9th dropped the
+# instantiation, so the program failed at link).  Every argument starts with
+# its own `$`, so the suffix's `$` count bounds the argument count; callers
+# size split_mangled_args' starts/lens buffers with it.
+pub fn mangled_arg_capacity(suffix: StrView) -> i32
+    var n: i32 = 0
+    for i in 0..(suffix.len as i32)
+        if suffix.get(i) == '$'   # '$'
+            n = n + 1
+    if n == 0
+        return 1
+    n
+
+pub fn count_type_params(tp: *TypeParam) -> i32
+    var n: i32 = 0
+    var cur: *TypeParam = tp
+    while cur != null
+        n = n + 1
+        cur = cur.next
+    n
+
+# Arity of the generic type named by one `$`-component of a mangled name: a
+# generic struct template's parameter count, or Result/Option's (ritz1 keeps
+# no enum definitions, but their mangled names nest like structs).  0 for a
+# primitive or a concrete struct: a leaf.
+pub fn mangled_component_arity(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> i32
+    let t: *StructDef = find_generic_struct(m, name_sv)
+    if t != null
+        return count_type_params(t.type_params)
+    if name_sv.eq("Result")
+        return 2
+    if name_sv.eq("Option")
+        return 1
+    let gei: i32 = enum_find(ctx, name_sv)
+    if gei >= 0 and enum_is_generic(ctx, gei) == 1
+        return count_type_params(generic_enum_params(ctx, gei))   # AGAST #2422
+    0
+
+# ----------------------------------------------------------------------------
+# Generic user enums (AGAST #2422)
+# ----------------------------------------------------------------------------
+# `enum Slot<T>` records its variants with `T` unsubstituted, so `Slot<i32>`
+# (mangled `Slot$i32`) had no layout: ritz1 named `%Slot$i32` in signatures and
+# allocas and never declared it, and clang refused the IR.  Each instance a
+# program names is recorded here as a concrete enum of that name, its payload
+# fields cloned with every parameter substituted, exactly as a generic struct's
+# are.  From there it is any user enum: ritz0's layout, constructors, match.
+
+# generic_enum_params moved to ast_helpers (AGAST #3021): emitter_core's
+# te_component_arity needs a generic enum's parameter count too.
+
+# AGAST #3309: an instance of a generic enum with a generic impl (`Slot$i32`
+# for `impl<T> Slot<T>`) has that impl's methods specialised, as a generic
+# struct's instance has: `Slot.mk(5)` into a `Slot<i32>` calls `Slot$i32_mk`.
+# Queued as a struct instantiation, so specialize_pending_structs does it in
+# the fixpoint, under the same generation cap (find_generic_struct misses an
+# enum, so only the impl part runs).  `Slot$T`, the template's own spelling
+# of its type, is no instance.
+pub fn add_enum_impl_instance(mono: *MonoCtx, m: *Module, name: StrView, dollar_pos: i32)
+    if enum_find(mono.pctx, name) < 0 or find_generic_impl(m.impls, name.take(dollar_pos)) == null
+        return
+    let suffix: StrView = name.skip(dollar_pos)
+    if suffix.len == 2
+        let ch: i32 = suffix.get(1) as i32
+        if ch >= 'A' and ch <= 'Z'
+            if find_concrete_struct(m, suffix.skip(1).take(1)) == null and names_concrete_enum(mono.pctx, suffix.skip(1).take(1)) == 0
+                return
+    add_struct_instantiation(mono, name.take(dollar_pos), suffix)
+
+# End (exclusive) of the mangled type argument that starts at s[pos]: its
+# first component plus, if that names a generic, one nested argument per
+# parameter.  Stops early at the end of a truncated name.
+pub fn mangled_arg_end(ctx: *ParseCtx, m: *Module, s: StrView, pos: i32) -> i32
+    var end: i32 = pos
+    while end < s.len and s.get(end) != '$'   # '$'
+        end = end + 1
+    let arity: i32 = mangled_component_arity(ctx, m, s.skip(pos).take(end - pos))
+    for k in 0..arity
+        if end >= s.len
+            return end
+        end = mangled_arg_end(ctx, m, s, end + 1)
+    end
+
+# Split a suffix "$a1$a2..." into its top-level arguments.  Each
+# (suffix + starts[i], lens[i]) is itself a one-argument suffix "$ai", the
+# form parse_type_from_suffix / get_type_name_from_suffix take.  Returns the
+# argument count, or -1 for a malformed suffix.  starts/lens must hold
+# mangled_arg_capacity(suffix, suffix_len) entries.
+pub fn split_mangled_args(ctx: *ParseCtx, m: *Module, suffix: StrView, starts: *i32, lens: *i32) -> i32
+    var n: i32 = 0
+    var pos: i32 = 0
+    while pos < suffix.len
+        if suffix.get(pos) != '$'   # '$'
+            return -1
+        let end: i32 = mangled_arg_end(ctx, m, suffix, pos + 1)
+        *(starts + n) = pos
+        *(lens + n) = end - pos
+        n = n + 1
+        pos = end
+    n
+
+# Index of the type parameter named (name, len), or -1.
+pub fn type_param_index(tp: *TypeParam, name_sv: StrView) -> i32
+    var i: i32 = 0
+    var cur: *TypeParam = tp
+    while cur != null
+        if cur.name.eq(name_sv)
+            return i
+        i = i + 1
+        cur = cur.next
+    -1
+
+# AGAST #3748: the parameter a `$`-component ends in after its `_`-pieces
+# (`ptr_A`, `ptr_ptr_A`, `arr2_A`), its index, with the length of the pieces
+# before it in `out_head` (`ptr_` is 4).  -1 when the last piece is no
+# parameter, or the component has no `_`: a whole-component parameter is
+# substitute_params_in_mangled's own case.  Only the last piece takes an
+# argument, as gi_match_pieces binds it (#3516).
+pub fn piece_param_index(tp: *TypeParam, c: StrView, out_head: *i32) -> i32
+    let k: i32 = last_piece_start(c)
+    if k == 0
+        return -1
+    *out_head = k
+    type_param_index(tp, c.skip(k))
+
+# Where a `$`-component's last `_`-piece starts: 4 in `ptr_A`, 0 with no `_`
+# or when a piece before it is no type constructor the mangler writes (`ptr`,
+# `ref`, `refmut`, `arr<N>`): `My_A` is a struct's name, not `My` over A.
+fn last_piece_start(c: StrView) -> i32
+    var k: i32 = (c.len as i32)
+    while k > 0 and c.get(k - 1) != '_'   # '_'
+        k = k - 1
+    var p: i32 = 0
+    while p < k
+        var e: i32 = p
+        while c.get(e) != '_'
+            e = e + 1
+        if is_type_ctor_piece(c.ptr + p, e - p) == 0
+            return 0
+        p = e + 1
+    k
+
+# 1 for a mangled type-constructor piece: `ptr`, `ref`, `refmut`, `arr<N>`.
+fn is_type_ctor_piece(c: *u8, n: i32) -> i32
+    if (StrView { ptr: (c), len: (n) as i64 }).eq("ptr") or (StrView { ptr: (c), len: (n) as i64 }).eq("ref")
+        return 1
+    if (StrView { ptr: (c), len: (n) as i64 }).eq("refmut")
+        return 1
+    if n < 4 or not (StrView { ptr: (c), len: (n) as i64 }).starts_with("arr")
+        return 0
+    for i in 3..n
+        if *(c + i) < '0' or *(c + i) > '9'   # not '0'..'9'
+            return 0
+    1
+
+# piece_param_index for the one parameter (type_param, type_param_len): the
+# length of the pieces before it, `ptr_` (4) in `ptr_A`, or 0 for no match.
+pub fn piece_param_head(c: StrView, type_param: StrView) -> i32
+    let k: i32 = last_piece_start(c)
+    if k == 0 or (c.len as i32) - k != type_param.len or memcmp(c.ptr + k, type_param.ptr, type_param.len) != 0
+        return 0
+    k
+
+# 1 if (name, len) is a non-generic enum the module declares (AGAST #2411).
+pub fn names_concrete_enum(ctx: *ParseCtx, name_sv: StrView) -> i32
+    let ei: i32 = enum_find(ctx, name_sv)
+    if ei < 0 or enum_is_generic(ctx, ei) == 1
+        return 0
+    1
+
+# Find a non-generic struct by name.
+pub fn find_concrete_struct(m: *Module, name_sv: StrView) -> *StructDef
+    var st: *StructDef = m.structs
+    while st != null
+        if st.type_params == null
+            if st.name.eq(name_sv)
+                return st
+        st = st.next
+    return null
+
+# AGAST #2573: the mangled type of a match scrutinee, as far as this walk
+# knows it: a tracked local's (`let o = wrap(v)`, a param), or a plain fn
+# call's return type (`match wrap(v)`).  null for anything else.
+pub fn scrutinee_type_name(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
+    if e == null
+        return strview_empty()
+    if e.kind == ExprKind.Ident
+        let idx: i32 = find_local_var_idx(mono, e.ident)
+        if idx < 0 or *(mono.lv_by_value + idx) != 1 or *(mono.lv_prefix_kind + idx) != 0
+            return strview_empty()
+        return *(mono.lv_type_names + idx)
+    if e.kind == ExprKind.Call and e.call_type_suffix.len == 0
+        let f: *FnDef = find_fn_in_module(m, e.func_name)
+        if f == null or f.type_params != null or f.return_type != TypeKind.Struct or f.return_type_name.ptr == null
+            return strview_empty()
+        return strview_from_ptr(f.return_type_name.ptr, f.return_type_name.len)
+    strview_empty()
+
+# Record `Ctor(x)`'s `x` at its payload's type, so `x[lo..hi]` is a slice of
+# a Vec, Span or String (rewrite_value_slice) and `x.push(..)` instantiates.
+pub fn bind_arm_payload(mono: *MonoCtx, m: *Module, arm: *MatchArm, tn_sv: StrView)
+    if arm.pattern_kind != PAT_VARIANT or arm.pattern_inner_kind != PAT_IDENT
+        return
+    let name: StrView = arm.pattern_inner_name
+    if name.len <= 0 or (name.len == 1 and name.get(0) == '_')   # `_`
+        return
+    var k: i32 = arm.pattern_field_sel
+    if arm.pattern_binds == null
+        k = 0 - 1
+    let pay_sv: StrView = variant_field_payload_type(mono.pctx, m, tn_sv, arm.pattern_name, k)
+    if pay_sv.ptr != null and pay_sv.len > 0
+        track_typed_local(mono, name, TypeKind.Struct, pay_sv)
+
+# The mangled type variant `ctor` of `tn` carries, or null: Option's Some the
+# whole suffix, Result's Ok its T and Err its E, a non-generic user enum's
+# single-field tuple variant that field's struct type.
+pub fn variant_payload_type(ctx: *ParseCtx, m: *Module, tn_sv: StrView, ctor_sv: StrView) -> StrView
+    return variant_field_payload_type(ctx, m, tn_sv, ctor_sv, 0 - 1)
+
+# AGAST #1295: as variant_payload_type, for field `k` of a multi-field user
+# enum variant (`h` of `Rect(w, h)` is field 1).  k = -1 asks for the sole
+# field of a single-field variant (none for a multi-field one); Result /
+# Option have only that one.
+fn variant_field_payload_type(ctx: *ParseCtx, m: *Module, tn: StrView, ctor_sv: StrView, k: i32) -> StrView
+    if k > 0 and enum_find(ctx, tn) < 0
+        return strview_empty()
+    let sole: i32 = (k < 0) as i32
+    var want: i32 = k
+    if want < 0
+        want = 0
+    if tn.ptr == null or tn.len <= 0
+        return strview_empty()
+    if tn.len > 7 and tn.starts_with("Option$")
+        if name_eq(ctor_sv, "Some") == 0
+            return strview_empty()
+        return strview_from_ptr(tn.ptr + 7, ((tn.len as i32) - 7) as i64)
+    if tn.len > 7 and tn.starts_with("Result$")
+        let sfx: StrView = tn.skip(7)
+        let t_len: i32 = mangled_type_extent(m, sfx)
+        if name_eq(ctor_sv, "Ok") == 1
+            return strview_from_ptr(sfx.ptr, t_len as i64)
+        if name_eq(ctor_sv, "Err") == 1 and t_len + 1 < sfx.len
+            return strview_from_ptr(sfx.ptr + t_len + 1, ((sfx.len as i32) - t_len - 1) as i64)
+        return strview_empty()
+    let ei: i32 = enum_find(ctx, tn)
+    if ei < 0 or enum_is_generic(ctx, ei) == 1
+        return strview_empty()
+    let vi: i32 = enum_variant_index(ctx, tn, ctor_sv)
+    if vi < 0 or enum_variant_kind(ctx, ei, vi) != ENUM_VARIANT_TUPLE
+        return strview_empty()
+    var f: *StructField = enum_variant_fields(ctx, ei, vi)
+    if sole == 1 and f != null and f.next != null
+        return strview_empty()   # `V(x)` over a multi-field variant: the arity error's
+    var i: i32 = 0
+    while f != null and i < want
+        f = f.next
+        i += 1
+    if f == null or f.field_type != TypeKind.Struct or f.field_type_name.ptr == null
+        return strview_empty()
+    strview_from_ptr(f.field_type_name.ptr, f.field_type_name.len)
+
+# Byte length of the first whole type in the `$`-joined mangled list `p`
+# (AGAST #1574): `Vec$i32$i32` -> `Vec$i32`, `Result$Vec$u8$i32$i64` ->
+# `Result$Vec$u8$i32`.  A component takes as many types after it as it has
+# type parameters; one it doesn't know as generic takes none.
+fn mangled_type_extent(m: *Module, p: StrView) -> i32
+    var end: i32 = 0
+    while end < p.len and p.get(end) != '$'   # '$'
+        end = end + 1
+    var pos: i32 = end
+    let arity: i32 = mangled_generic_arity(m, p.take(end))
+    for a in 0..arity
+        if pos >= p.len
+            return pos
+        pos = pos + 1 + mangled_type_extent(m, p.skip(pos + 1))
+    return pos
+
+# How many type arguments the mangled name component `p` takes: a generic
+# struct's own count, and the three that may have no template here: Span
+# (`[u8]` needs no ritzlib.span), Option and Result.
+fn mangled_generic_arity(m: *Module, p_sv: StrView) -> i32
+    if name_eq(p_sv, "Span") == 1 or name_eq(p_sv, "Option") == 1
+        return 1
+    if name_eq(p_sv, "Result") == 1
+        return 2
+    let st: *StructDef = find_generic_struct(m, p_sv)
+    if st != null
+        return count_type_params(st.type_params)
+    return 0
+
+# ----------------------------------------------------------------------------
+# Lowering in place (AGAST #4411, part of #1816's AST-write-back audit)
+#
+# This pass owns the Exprs it lowers.  A module's bodies are parsed fresh for
+# this compile and collect_instantiations_from_module walks each body; a
+# generic body is cloned per instantiation (clone_expr) and only the clone is
+# rewritten.  Neither tree is shared with another module or another instance,
+# and the emitter receives the lowered tree afterwards.  So the six helpers
+# that turn one construct into another -- rewrite_enum_from_call,
+# si_into_deref, rewrite_struct_index, rewrite_value_slice,
+# span_view_in_place and slice_into_span_slot -- rewrite the node they are
+# given rather than build a replacement.  That is correct here, and unlike the
+# emitter's write-back #4408 removed it has no second owner to surprise.
+#
+# A helper must still refuse a node that is not the construct it names, which
+# is how "not owned" shows up in practice: rewrite_enum_from_call returns for
+# a local or param that shadows the enum's name, since then `E.from` is that
+# binding's method call; the rest only fire on a tracked local or field of
+# this module.  test_ritz1_monomorph_owns_nodes.py pins that boundary.
+# ----------------------------------------------------------------------------
+
+# Rewrite `E.from(args)` in place into the plain call `E__from(args)` of the
+# generated fn (main.ritz, add_enum_from_fns), as ritz0's enum_from.py does,
+# so type inference and emission see an ordinary call.  Done here because
+# this walk visits every body before emission.  Left alone when no such fn
+# exists: emit_expr_method then reports the located error.
+pub fn rewrite_enum_from_call(mono: *MonoCtx, m: *Module, e: *Expr)
+    if is_enum_from_call(mono.pctx, e) == 0
+        return
+    if find_local_var_idx(mono, e.left.ident) >= 0
+        return
+    let name_sv: StrView = enum_from_fn_name(e.left.ident)
+    if find_fn_in_module(m, name_sv) == null
+        return
+    e.kind = ExprKind.Call
+    e.func_name = name_sv
+    e.call_type_suffix = strview_empty()
+    e.left = null
+
+# ----------------------------------------------------------------------------
+# Indexing a struct (LANGUAGE_SPEC §7.8, LARB R15, AGAST #1635): `m[k]` on a
+# struct with `impl Index` / `IndexMut` / `IndexSet` becomes the method call it
+# means, in place.  struct_index.ritz says which, and holds the refusals.
+# ----------------------------------------------------------------------------
+
+# How `[]` reaches the struct a base expression is (AGAST #2847).
+const SI_BY_VALUE: i32 = 0    # the struct, a place: the receiver is the base
+const SI_THROUGH: i32 = 1     # a `*M`, `@M` or `@&M`: the receiver is that pointer
+const SI_TEMPORARY: i32 = 2   # a by-value call's result: `@` of it lends a temporary
+
+# The global `name`.  No param or local shadows one: binder_check refuses
+# that before monomorph runs (AGAST #2407).
+pub fn si_global(m: *Module, name_sv: StrView) -> *GlobalVarDef
+    var g: *GlobalVarDef = m.globals
+    while g != null
+        if name_eq(g.name, name_sv) == 1
+            return g
+        g = g.next
+    null
+
+# si_check, naming the type as the source spells it (`Pair<i64>`, #2847).
+pub fn si_check_shown(m: *Module, line: i32, col: i32, name_sv: StrView, mask: i32, use: i32) -> i32
+    let shown: StrView = si_shown(m, name_sv)
+    si_check(line, col, shown, mask, use)
+
+# `@<call>` (or `@&<call>`) of a by-value call's result, which `index` /
+# `index_mut` would lend and return a reference into: refused as ritz0's
+# _refuse_lent_into_reference refuses it (Aaron's ruling on AGAST #3215).
+# 1 when refused.
+pub fn si_refuse_lent_temporary(how: i32, base: *Expr, mutable: i32) -> i32
+    if how != SI_TEMPORARY
+        return 0
+    si_refuse_lent(base, mutable)
+    1
+
+# Where `x`'s `[` is, `x` an index on a struct: the parser's record of it
+# (AGAST #2847: counting from the base's name was off past a space).
+pub fn si_index_line(x: *Expr) -> i32
+    if x.bracket.line > 0
+        return x.bracket.line
+    x.span.line
+
+pub fn si_index_col(x: *Expr) -> i32
+    if x.bracket.line > 0
+        return x.bracket.col
+    x.span.col
+
+# `e`, an index on a struct, as `*<call>` in place.
+pub fn si_into_deref(e: *Expr, call: *Expr)
+    e.kind = ExprKind.Unary
+    e.op = OpKind.Deref
+    e.operand = call
+    e.left = null
+    e.right = null
+
+# Whether `e` is reached from `root` through a place's operands: an index's
+# base and key, a member's or cast's left, a deref, a binary's sides.  A call
+# is a leaf: its arguments are evaluated with it.
+fn place_reaches(root: *Expr, e: *Expr) -> i32
+    if root == null
+        return 0
+    if root == e
+        return 1
+    let k: ExprKind = root.kind
+    match k
+        ExprKind.Index | ExprKind.Binary =>
+            if place_reaches(root.left, e) == 1
+                return 1
+            return place_reaches(root.right, e)
+        ExprKind.Member | ExprKind.Cast =>
+            return place_reaches(root.left, e)
+        ExprKind.Unary =>
+            return place_reaches(root.operand, e)
+        _ => pass
+    0
+
+# Note each call in the read `e` that the store reaches from `a` or `b`.
+pub fn note_shared_calls(e: *Expr, a: *Expr, b: *Expr)
+    if e == null
+        return
+    let k: ExprKind = e.kind
+    if k == ExprKind.Call or k == ExprKind.Method
+        if si_once_find(e) < 0 and (place_reaches(a, e) == 1 or place_reaches(b, e) == 1)
+            si_once_add(e)
+        return
+    match k
+        ExprKind.Index | ExprKind.Binary =>
+            note_shared_calls(e.left, a, b)
+            note_shared_calls(e.right, a, b)
+        ExprKind.Member | ExprKind.Cast =>
+            note_shared_calls(e.left, a, b)
+        ExprKind.Unary =>
+            note_shared_calls(e.operand, a, b)
+        _ => pass
+
+# `v[lo..hi]` as `Span$T { ptr: v.<field> + lo, len: hi - lo }`: ritz0's
+# _emit_span_slice on a Span (`field` is `ptr`) and _emit_vec_span_slice on a
+# Vec (`data`, AGAST #2501).  `lo` is read twice: the caller takes only a
+# bound that's safe to, or registers it to be evaluated once.  Through a
+# pointer, `p.ptr` and `(*p).ptr` both read through it (AGAST #2448).
+pub fn span_view_in_place(e: *Expr, field_sv: StrView, suf: StrView)
+    let suf_len: i32 = suf.len as i32
+    let lo: *Expr = e.right.left
+    let hi: *Expr = e.right.right
+    let base: *Expr = slice_node(ExprKind.Member, e, e.left, null)
+    base.ident = field_sv
+    let at: *Expr = slice_node(ExprKind.Binary, e, base, lo)
+    at.op = OpKind.Add
+    let len: *Expr = slice_node(ExprKind.Binary, e, hi, lo)
+    len.op = OpKind.Sub
+    let name: *u8 = malloc((suf_len + 5) as i64) as *u8
+    let span_lit: StrView = "Span"
+    memcpy(name, span_lit.ptr, span_lit.len)
+    memcpy(name + 4, suf.ptr, suf.len)
+    *(name + 4 + suf_len) = 0
+    let ptr_field: *FieldInit = calloc(1, sizeof(FieldInit)) as *FieldInit
+    ptr_field.name = StrView { ptr: view_ptr_name().ptr, len: VIEW_PTR_NAME_LEN as i64 }
+    ptr_field.value = at
+    let len_field: *FieldInit = calloc(1, sizeof(FieldInit)) as *FieldInit
+    len_field.name = StrView { ptr: view_len_name().ptr, len: VIEW_LEN_NAME_LEN as i64 }
+    len_field.value = len
+    ptr_field.next = len_field
+    e.kind = ExprKind.StructLit
+    e.ident = StrView { ptr: name, len: (suf_len + 4) as i64 }
+    e.args = ptr_field as *Expr
+    e.left = null
+    e.right = null
+
+# A zeroed node of `kind` at `at`'s place.
+pub fn slice_node(kind: ExprKind, at: *Expr, left: *Expr, right: *Expr) -> *Expr
+    let n: *Expr = calloc(1, sizeof(Expr)) as *Expr
+    n.kind = kind
+    n.span = at.span
+    n.left = left
+    n.right = right
+    return n
+
+
+pub fn set_mono_fn_context(mono: *MonoCtx, f: *FnDef)
+    mono.mono_ret_name = strview_empty()
+    mono.mono_tail = null
+    if f == null or f.return_type_name.ptr == null or f.return_type_name.len <= 0
+        return
+    mono.mono_ret_name = f.return_type_name
+    var st: *Stmt = f.body
+    while st != null and st.next != null
+        st = st.next
+    if st != null and st.kind == StmtKind.Expr
+        mono.mono_tail = st
+
+# A plain (non-generic) fn call's callee, whose params type its arguments.
+pub fn slice_callee(m: *Module, e: *Expr) -> *FnDef
+    if e.call_type_suffix.len != 0
+        return null
+    let f: *FnDef = find_fn_in_module(m, e.func_name)
+    if f == null or f.type_params != null
+        return null
+    return f
+
+# 1 if reading `e` twice gives the same value with no effect: literals, names,
+# fields, and arithmetic, casts and derefs of those.  A call isn't.
+pub fn slice_bound_rereadable(e: *Expr) -> i32
+    if e == null
+        return 0
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.IntLit | ExprKind.Ident =>
+            return 1
+        ExprKind.Member | ExprKind.Cast =>
+            return slice_bound_rereadable(e.left)
+        ExprKind.Unary =>
+            return slice_bound_rereadable(e.operand)
+        _ => pass
+    if k == ExprKind.Binary
+        if slice_bound_rereadable(e.left) == 1
+            return slice_bound_rereadable(e.right)
+    return 0
+
+pub fn find_generic_function(m: *Module, name_sv: StrView) -> *FnDef
+    var f: *FnDef = m.functions
+    while f != null
+        if f.type_params != null
+            if f.name.eq(name_sv)
+                return f
+        f = f.next
+    return null
+
+# ============================================================================
+# Type Substitution
+# ============================================================================
+# Given a type suffix like "$u8", parse out the type name
+
+# AGAST #186: detect ritz0-compatible pointer suffix `$ptr_<TypeName>` so the
+# monomorphizer can substitute T with `*Concrete` instead of treating
+# "ptr_Foo" as the literal struct name.  Returns 1 iff suffix starts with
+# `$ptr_` (5-char prefix after the `$`) and has at least one char of payload.
+# AGAST #1794: `$ref_` (`id<@E>`, same length) counts too — a reference is a
+# pointer at the IR level, so T substitutes as `*E` either way.
+# AGAST #2384: `$refmut_` (`w<@&E>`) too, its prefix 3 bytes longer.
+fn suffix_is_ptr(suffix_sv: StrView) -> i32
+    (suffix_ptr_prefix(suffix_sv) > 0) as i32
+
+# Length of the `$ptr_` / `$ref_` (5) or `$refmut_` (8) a pointer-typed
+# suffix starts with, payload after it; 0 for any other suffix.
+fn suffix_ptr_prefix(suffix: StrView) -> i32
+    if suffix.len < 2 or suffix.get(0) != '$'   # '$'
+        return 0
+    let k: i32 = mangled_ref_prefix(suffix.skip(1))
+    if k == 0
+        return 0
+    k + 1
+
+# AGAST #2354: 1 for a `$refmut_` suffix (`w<@&E>`), which substitutes as
+# TypeKind.Ptr like the others but makes a by-value `T` param an `@&E` one.
+pub fn suffix_is_mut_ref(suffix_sv: StrView) -> i32
+    (suffix_ptr_prefix(suffix_sv) == 8) as i32
+
+pub fn parse_type_from_suffix(suffix: StrView) -> TypeKind
+    # Suffix format: "$typename" where typename is u8, i32, etc.
+    # Skip the leading $
+    if suffix.len < 2
+        return TypeKind.Void  # TypeKind.Void as unknown
+
+    # Pointer-typed generic instantiation (AGAST #186): suffix starts with
+    # `$ptr_` — substitute T → *<Pointee>.  TypeKind.Ptr represents the bare
+    # `*T` form; the pointee struct name is carried separately.
+    if suffix_is_ptr(suffix) == 1
+        return TypeKind.Ptr
+
+    let type_name: StrView = suffix.skip(1)
+
+    # Every primitive ritz0 spells (AGAST #1922: only five were matched, so
+    # `ident<u32>` substituted T as a struct named "u32").
+    let prim: TypeKind = primitive_type_from_name(type_name)
+    if prim != TypeKind.Void
+        return prim
+
+    # AGAST #2832: `$arr2_i8` is the array `[2]i8`.
+    var a: ArrayArg
+    if array_arg_decode(type_name, @a) == 1
+        return TypeKind.Array
+
+    # Could be a struct type
+    return TypeKind.Struct
+
+# AGAST #2832: an array type argument as ast_helpers' spell_last_array spells
+# it, "arr" N "_" E: E a primitive's name, a struct's, or "ptr_" + either.
+struct ArrayArg
+    size: i32
+    elem: TypeKind          # TYPE_* of the element
+    pointee: TypeKind       # for a TypeKind.Ptr element, its pointee's TYPE_*
+    name: StrView          # the struct named by the element or its pointee
+    # AGAST #3634: every dimension of an `arrN_arrM_..E` (elem is then
+    # TypeKind.Array and name null, as on an N-D local); null for a 1-D one.
+    shape: *ArrayShape
+
+# 1 and *out filled when name[0..len] spells an array, else 0.
+pub fn array_arg_decode(name_sv: StrView, out: *ArrayArg) -> i32
+    out.shape = null
+    if array_arg_decode_1d(name_sv, out) == 0
+        return 0
+    # AGAST #3634: an element that itself spells an array nests it.
+    if out.elem != TypeKind.Struct or out.name.len < 6
+        return 1
+    var inner: ArrayArg
+    if array_arg_decode(out.name, @inner) == 0
+        return 1
+    var inner_rank: i32 = 1
+    if inner.shape != null
+        inner_rank = inner.shape.rank
+    if inner_rank >= MAX_ARRAY_RANK
+        return 1
+    let sh: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
+    sh.rank = inner_rank + 1
+    sh.dims[0] = out.size
+    if inner.shape == null
+        sh.dims[1] = inner.size
+        sh.leaf_type = inner.elem
+        sh.leaf_pointee = inner.pointee
+        sh.leaf_name = inner.name
+    else
+        for d in 0..inner_rank
+            sh.dims[d + 1] = inner.shape.dims[d]
+        sh.leaf_type = inner.shape.leaf_type
+        sh.leaf_pointee = inner.shape.leaf_pointee
+        sh.leaf_name = inner.shape.leaf_name
+    out.elem = TypeKind.Array
+    out.pointee = TypeKind.Void
+    out.name = strview_empty()
+    out.shape = sh
+    1
+
+# One `arrN_` level of array_arg_decode, its element read as written.
+fn array_arg_decode_1d(name: StrView, out: *ArrayArg) -> i32
+    if name.ptr == null or name.len < 6 or not name.starts_with("arr")
+        return 0
+    var pos: i32 = 3
+    var size: i32 = 0
+    while pos < name.len and name.get(pos) >= '0' and name.get(pos) <= '9'
+        size = size * 10 + (name.get(pos) - 48) as i32
+        pos = pos + 1
+    if pos == 3 or pos + 1 >= name.len or name.get(pos) != '_'   # digits, '_', element
+        return 0
+    pos = pos + 1
+    var elem: StrView = name.skip(pos)
+    out.size = size
+    out.elem = TypeKind.Struct
+    out.pointee = TypeKind.Void
+    if elem.len > 4 and elem.starts_with("ptr_")
+        out.elem = TypeKind.Ptr
+        elem = elem.skip(4)
+    let prim: TypeKind = primitive_type_from_name(elem)
+    if prim != TypeKind.Void
+        out.name = strview_empty()
+        if out.elem == TypeKind.Ptr
+            out.pointee = prim
+        else
+            out.elem = prim
+        return 1
+    out.name = elem
+    if out.elem == TypeKind.Ptr
+        out.pointee = TypeKind.Struct
+    1
+
+pub fn get_type_name_from_suffix(suffix_sv: StrView) -> StrView
+    # Suffix format: "$typename" or (AGAST #186) "$ptr_<typename>".
+    # For the pointer form we return the underlying struct name (no `ptr_`
+    # prefix) so substitute_type_param_in_name can mangle dependent generics
+    # like `Option<T> -> Option$ptr_Page` correctly via the original
+    # `$ptr_Page` suffix passed alongside.
+    if suffix_sv.len < 2
+        return strview_empty()
+    let k: i32 = suffix_ptr_prefix(suffix_sv)
+    if k > 0
+        return suffix_sv.skip(k as i64)   # skip "$ptr_" / "$ref_" / "$refmut_"
+    suffix_sv.skip(1)
+
+# ============================================================================
+# Function Cloning and Substitution
+# ============================================================================
+# Clone a generic function and substitute the type parameter
+
+# ----------------------------------------------------------------------------
+# Multi-parameter generic fns (AGAST #1612)
+# ----------------------------------------------------------------------------
+# `second<T, U>` called as `second<i64, i32>` carries the suffix "$i64$i32".
+# The cloning machinery below substitutes ONE parameter at a time, so a
+# multi-parameter template is specialised in one pass per parameter: T at
+# "$i64" gives `second$i64` (U still free), then U at "$i32" gives
+# `second$i64$i32`.  Each pass appends its argument to the name, so the last
+# pass's name is the template's plus the whole suffix — the call site's
+# spelling.
+#
+# While those passes run, mono.mono_component_mode switches name rewriting to
+# whole `$`-components: `Result$T$E` must become `Result$i32$E` and then
+# `Result$i32$i64`, where single-parameter mode only rewrites a trailing
+# `$T` and otherwise APPENDS the suffix (its `@&Vec<T>` -> "Vec" + "$u8"
+# convention).  Nested generic calls are not registered mid-way — a pass-1
+# `helper<T, U>` would register the half-substituted `helper$i64$U` — but
+# once, from the finished body (collect_from_fn_body).
+# (MonoCtx.mono_component_mode)
+
+# AGAST #2329: a `*[N]T` field or return keeps N and T through a clone when T is
+# a scalar.  A named T may be the type parameter, so it's dropped, and `x[i]` on
+# one is left as it was before #2329.
+pub fn ptr_array_unless_generic(pa: *Param) -> *Param
+    if pa == null or pa.param_type_name.len > 0
+        return null
+    pa
+
+# An array field's element names a struct: `[N]S` or (AGAST #3099) `[N]*S`.
+pub fn array_elem_names_struct(f: *StructField) -> i32
+    if f.array_elem_type_name.ptr == null
+        return 0
+    if f.array_elem_type == TypeKind.Struct
+        return 1
+    if f.array_elem_type == TypeKind.Ptr and f.array_elem_pointee == TypeKind.Struct
+        return 1
+    0
+
+# AGAST #2332: a field `a: [N]*T`, at T = the argument (subst_type, subst_name).
+pub fn subst_array_ptr_field(cloned: *StructField, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView)
+    if cloned.array_elem_pointee != TypeKind.Struct or cloned.array_elem_type_name.ptr == null or not cloned.array_elem_type_name.eq(type_param_sv)
+        return
+    cloned.array_elem_pointee = subst_type
+    cloned.array_elem_type_name = subst_name_sv
+
+# AGAST #2390: a field `a: [N]T`, at T = the argument (subst_type, subst_name).
+# The parser records the element as a struct named "T"; it was copied as it
+# stood, so `W$i32` was `{[2 x %T]}` and clang refused the unsized alloca.
+# The element is encoded as field_new encodes a written one (and as
+# array_arg_decode does): a primitive by its type and no name, a struct by
+# its name, `*X` as TypeKind.Ptr with X the pointee.  An array argument (a nested
+# `[N][M]X`) isn't rewritten here.
+pub fn subst_array_elem_field(cloned: *StructField, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView)
+    if cloned.field_type != TypeKind.Array or cloned.array_elem_type != TypeKind.Struct
+        return
+    if cloned.array_elem_type_name.ptr == null or not cloned.array_elem_type_name.eq(type_param_sv)
+        return
+    match subst_type
+        TypeKind.Array | TypeKind.Void =>
+            return
+        TypeKind.Struct =>
+            cloned.array_elem_type_name = subst_name_sv
+            return
+        TypeKind.Ptr =>
+            cloned.array_elem_type = TypeKind.Ptr
+            let prim: TypeKind = primitive_type_from_name(subst_name_sv)
+            if prim != TypeKind.Void
+                cloned.array_elem_pointee = prim
+                cloned.array_elem_type_name = strview_empty()
+            else
+                cloned.array_elem_pointee = TypeKind.Struct
+                cloned.array_elem_type_name = subst_name_sv
+            return
+        _ => pass
+    cloned.array_elem_type = subst_type
+    cloned.array_elem_type_name = strview_empty()
+
+# A by-value field `x: T`, at T = the argument (subst_type, subst_name).
+pub fn subst_value_field(cloned: *StructField, subst_type: TypeKind, subst_name_sv: StrView)
+    cloned.field_type = subst_type
+    cloned.field_type_name = subst_name_sv
+    # AGAST #2832: `v: T` at T = `[4]i64` is the array field `v: [4]i64`,
+    # recorded as field_new records a written one.
+    var a: ArrayArg
+    if subst_type == TypeKind.Array and array_arg_decode(subst_name_sv, @a) == 1
+        cloned.field_type_name = strview_empty()
+        cloned.array_size = a.size
+        cloned.array_elem_type = a.elem
+        cloned.array_elem_pointee = a.pointee
+        cloned.array_elem_type_name = a.name
+        cloned.array_shape = a.shape   # AGAST #3634: `[N][M]E`
+
+# A `*T` / `@T` / `@&T` field at T = the argument.  The parser records a
+# struct pointee in field_type_name and a primitive one in array_elem_type;
+# field_new records a `*X`'s pointee kind in ptr_pointee too (TypeKind.Void
+# for a `**X`), which Sema types the field by (AGAST #4680).
+pub fn subst_pointee_field(cloned: *StructField, subst_type: TypeKind, subst_name_sv: StrView)
+    let prim: TypeKind = primitive_type_from_name(subst_name_sv)
+    if cloned.field_type == TypeKind.Ptr
+        cloned.ptr_pointee = TypeKind.Struct
+        if subst_type == TypeKind.Ptr
+            cloned.ptr_pointee = TypeKind.Void
+        else if prim != TypeKind.Void
+            cloned.ptr_pointee = prim
+    if subst_type == TypeKind.Ptr
+        # `*T` at T = *X is `**X`: the element is a pointer.  Checked before
+        # the primitive case: a `$ptr_u8` argument arrives as the name "u8"
+        # (get_type_name_from_suffix strips `ptr_`), and taking it as T = u8
+        # made Vec$ptr_u8.data a `*u8` — 1-byte stride, `load i8` (#1796).
+        # Encoded like a declared `**X` field (field_new): the innermost
+        # struct's name, or no name for a primitive.
+        cloned.field_type = TypeKind.PtrPtr
+        if prim != TypeKind.Void
+            cloned.field_type_name = strview_empty()
+        else
+            cloned.field_type_name = subst_name_sv
+    else if prim != TypeKind.Void
+        cloned.field_type_name = strview_empty()
+        cloned.array_elem_type = prim
+    else
+        cloned.field_type_name = subst_name_sv
+
+# AGAST #3184: a `**T` field (any depth) at T = the argument, encoded as
+# field_new records a written `**X`: the innermost pointee in the
+# inner-pointee slot (depth kept), named when it is a struct, unnamed when
+# a primitive.  T = *X is one level deeper: `**T` at T = *u8 is `***u8`.
+pub fn subst_ptr_ptr_field(cloned: *StructField, subst_type: TypeKind, subst_name_sv: StrView)
+    let prim: TypeKind = primitive_type_from_name(subst_name_sv)
+    var inner: TypeKind = TypeKind.Struct
+    if prim != TypeKind.Void
+        inner = prim
+    var slot: i32 = ptr_ptr_slot_subst(cloned.inner_pointee_type, inner)
+    if subst_type == TypeKind.Ptr
+        slot = ptr_slot_deepen(slot, 1)
+    cloned.inner_pointee_type = slot
+    if prim != TypeKind.Void
+        cloned.field_type_name = strview_empty()
+    else
+        cloned.field_type_name = subst_name_sv
+
+# AGAST #1520: the parser records an impl's type as its bare name (`Box`
+# for `impl<T> Box<T>` and `impl<T> Drop for Box<T>`; see impl_block in
+# grammars/ritz1.grammar), so a generic impl is one with type params whose
+# type name equals the instantiated struct's base name.  This used to look for
+# a `$` in the impl's type name, which the parser never produces, so no
+# generic impl method was ever specialized.  `start` resumes the search after
+# a previous match: a type can have several generic impls.
+pub fn find_generic_impl(start: *ImplBlock, type_name_sv: StrView) -> *ImplBlock
+    var ib: *ImplBlock = start
+    while ib != null
+        if ib.type_params != null and ib.type_name.eq(type_name_sv)
+            return ib
+        ib = ib.next
+    return null
+
+struct WantedMethod
+    base: StrView
+    suffix: StrView          # "$i32"; null: every instance
+    method: StrView
+    site: *InstSite      # AGAST #4844: where it was first wanted
+    next: *WantedMethod
+
+# The instance whose impl method is being specialised ("W$i32"), for its
+# bare `self` (collect_receiver_methods); empty outside.
+# (MonoCtx.impl_self_name)
+
+# 1 if an inherent generic impl of `base` (null: of any type) defines `meth`.
+pub fn inherent_generic_method(m: *Module, base_sv: StrView, meth_sv: StrView) -> i32
+    var base: *u8 = base_sv.ptr
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params != null and (ib.trait_name.ptr == null or ib.trait_name.len == 0)
+            if base == null or name_eq(ib.type_name, base_sv) == 1
+                var f: *FnDef = ib.methods
+                while f != null
+                    if name_eq(f.name, meth_sv) == 1
+                        return 1
+                    f = f.next
+        ib = ib.next
+    0
+
+pub fn wanted_in(list: *WantedMethod, base_sv: StrView, suffix_sv: StrView, meth_sv: StrView) -> i32
+    var w: *WantedMethod = list
+    while w != null
+        if name_eq(w.method, meth_sv) == 1
+            if w.suffix.ptr == null
+                return 1
+            if name_eq(w.base, base_sv) == 1 and name_eq(w.suffix, suffix_sv) == 1
+                return 1
+        w = w.next
+    0
+
+pub fn push_wanted(list: *WantedMethod, base_sv: StrView, suffix_sv: StrView, meth_sv: StrView) -> *WantedMethod
+    let w: *WantedMethod = malloc(sizeof(WantedMethod)) as *WantedMethod
+    w.base = base_sv
+    w.suffix = suffix_sv
+    w.method = meth_sv
+    w.site = null
+    w.next = list
+    w
+
+# AGAST #4844: where `base_sv suffix_sv`'s `meth` was first wanted: on that
+# instance, else on every one (a receiver the tracker couldn't type).
+pub fn wanted_site(list: *WantedMethod, base_sv: StrView, suffix_sv: StrView, meth_sv: StrView) -> *InstSite
+    var wild: *InstSite = null
+    var w: *WantedMethod = list
+    while w != null
+        if name_eq(w.method, meth_sv) == 1
+            if w.suffix.ptr == null
+                if wild == null
+                    wild = w.site
+            else if name_eq(w.base, base_sv) == 1 and name_eq(w.suffix, suffix_sv) == 1
+                return w.site
+        w = w.next
+    wild
+
+# A call wants `meth` on `base_sv suffix_sv` (null: every instance): a new
+# want records its site, a repeat counts another place.
+fn want_at(mono: *MonoCtx, base_sv: StrView, suffix_sv: StrView, meth_sv: StrView)
+    if wanted_in(mono.wanted_methods, base_sv, suffix_sv, meth_sv) == 1
+        inst_site_again(mono, wanted_site(mono.wanted_methods, base_sv, suffix_sv, meth_sv))
+        return
+    mono.wanted_methods = push_wanted(mono.wanted_methods, base_sv, suffix_sv, meth_sv)
+    mono.wanted_methods.site = inst_site_new(mono)
+
+# A call names `meth` on an instance of type `tn` ("W$i32"; null: unknown).
+pub fn want_method(mono: *MonoCtx, m: *Module, tn: StrView, meth_sv: StrView)
+    if tn.ptr == null or tn.len <= 0
+        if inherent_generic_method(m, strview_empty(), meth_sv) == 1
+            want_at(mono, strview_empty(), strview_empty(), meth_sv)
+        return
+    let d: i32 = find_dollar_sign(tn)
+    if d <= 0 or inherent_generic_method(m, tn.take(d), meth_sv) == 0
+        return
+    want_at(mono, tn.take(d), tn.skip(d), meth_sv)
+
+# "Vec$i32" / "Span$u8" for a Vec / Span of the tracker's kind and suffix.
+pub fn collection_instance_name(kind: i32, suf: StrView) -> StrView
+    var base: StrView = "Vec"
+    if kind == 2
+        base = "Span"
+    let bl: i32 = base.len as i32
+    let tn: *u8 = malloc((bl + (suf.len as i32)) as i64 + 1)
+    memcpy(tn, base.ptr, bl as i64)
+    memcpy(tn + bl, suf.ptr, suf.len)
+    *(tn + bl + (suf.len as i32)) = 0
+    strview_from_ptr(tn, (bl + (suf.len as i32)) as i64)
+
+# The type a call `f(..)` returns, by name: a plain fn's (or an impl method's
+# by its symbol, `String_from`), or a one-param generic fn's `Base$T` at the
+# call's own suffix (`vec_new<i32>()` -> "Vec$i32").  null when unknown.
+pub fn call_result_type_name(m: *Module, call: *Expr) -> StrView
+    var f: *FnDef = find_fn_in_module(m, call.func_name)
+    if f == null
+        f = find_impl_method_by_symbol(m, call.func_name)
+    if f == null or f.return_type_name.ptr == null or f.return_type_name.len <= 0
+        return strview_empty()
+    if f.type_params == null
+        return strview_from_ptr(f.return_type_name.ptr, f.return_type_name.len)
+    let tp: *TypeParam = f.type_params
+    if tp.next != null or call.call_type_suffix.ptr == null or call.call_type_suffix.len <= 0
+        return strview_empty()
+    let d: i32 = find_dollar_sign(f.return_type_name)
+    if d <= 0 or name_eq(StrView { ptr: (f.return_type_name.ptr + d + 1), len: ((f.return_type_name.len as i32) - d - 1) as i64 }, tp.name) == 0
+        return strview_empty()
+    let n: i32 = d + (call.call_type_suffix.len as i32)
+    let tn: *u8 = malloc(n as i64 + 1)
+    memcpy(tn, f.return_type_name.ptr, d as i64)
+    memcpy(tn + d, call.call_type_suffix.ptr, call.call_type_suffix.len)
+    *(tn + n) = 0
+    strview_from_ptr(tn, n as i64)
+
+# The type impl method `meth` of instance `tn` ("Vec$i32", or a plain "S")
+# returns, by name: a one-param generic impl's `T` / `Base$T` at tn's suffix,
+# or a concrete name as written.  null when unknown, or when the name still
+# holds a type param this can't substitute.
+pub fn method_result_type_name(m: *Module, tn_sv: StrView, meth_sv: StrView) -> StrView
+    let ib: *ImplBlock = impl_with_method(m, tn_sv, meth_sv, false)
+    if ib == null
+        return strview_empty()
+    method_ret_at(ib, impl_method_named(ib, meth_sv), tn_sv, find_dollar_sign(tn_sv))
+
+# The impl block of instance `tn` ("Vec$i32", or a plain "S") that defines
+# `meth`: a generic impl of tn's base, or a concrete one of tn itself.
+# Inherent impls only, unless `traits`: then an `impl Trait for S` too.
+pub fn impl_with_method(m: *Module, tn: StrView, meth: StrView, traits: bool) -> *ImplBlock
+    let d: i32 = find_dollar_sign(tn)
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if traits or ib.trait_name.ptr == null or ib.trait_name.len == 0
+            let ty: StrView = ib.type_name
+            var hit: bool = false
+            if ib.type_params != null
+                hit = d > 0 and name_eq(ty, StrView { ptr: (tn.ptr), len: (d) as i64 }) == 1
+            else
+                hit = name_eq(ty, tn) == 1
+            if hit and impl_method_named(ib, meth) != null
+                return ib
+        ib = ib.next
+    null
+
+# The method of `ib` named `meth`, or null.
+pub fn impl_method_named(ib: *ImplBlock, meth: StrView) -> *FnDef
+    var f: *FnDef = ib.methods
+    while f != null
+        if name_eq(f.name, meth) == 1
+            return f
+        f = f.next
+    null
+
+fn method_ret_at(ib: *ImplBlock, f: *FnDef, tn: StrView, d: i32) -> StrView
+    let tn_len: i32 = tn.len as i32
+    let rn: StrView = f.return_type_name
+    if rn.ptr == null or rn.len <= 0
+        return strview_empty()
+    if ib.type_params == null
+        return strview_from_ptr(rn.ptr, rn.len)
+    let tp: *TypeParam = ib.type_params
+    if tp.next != null
+        return strview_empty()
+    if name_eq(rn, tp.name) == 1
+        # `-> T`: the instance's own argument.
+        return strview_from_ptr(tn.ptr + d + 1, (tn_len - d - 1) as i64)
+    let rd: i32 = find_dollar_sign(rn)
+    if rd < 0
+        return strview_from_ptr(rn.ptr, rn.len)   # a concrete type
+    if name_eq(rn.skip(rd + 1).take((rn.len as i32) - rd - 1), tp.name) == 0
+        return strview_empty()
+    let n: i32 = rd + tn_len - d
+    let out: *u8 = malloc(n as i64 + 1)
+    memcpy(out, rn.ptr, rd as i64)
+    memcpy(out + rd, tn.ptr + d, (tn_len - d) as i64)
+    *(out + n) = 0
+    strview_from_ptr(out, n as i64)
+
+# AGAST #2318: an untyped receiver becomes the typed one it means: bare `self`
+# (param_self) is `self: T`, and bare `self:&` (param_self_lent) is `self:& T`,
+# as param_self_borrow records it.
+pub fn name_untyped_self(p: *Param, type_name_sv: StrView)
+    if param_is_self(p) == 0 or p.param_type != TypeKind.Struct or p.param_type_name.len > 0
+        return
+    p.param_type_name = type_name_sv
+    if p.is_self_borrow == 1
+        p.param_type = TypeKind.MutRef
+        p.param_pointee_type = TypeKind.Struct
+
+# ============================================================================
+# Main Monomorphization Entry Point
+# ============================================================================
+
+# Errors monomorphize_module reported (AGAST #3330); main stops on any.
+pub fn monomorph_errors(mono: *MonoCtx) -> i32
+    mono.mono_errors
+
+# AGAST #3330: `name` is still being instantiated MAX_INSTANCE_DEPTH
+# generations deep.  Located at its first generic impl, whose methods are what
+# name the deeper instance.  Without one, a generic fn `f<T>` calling
+# `f<Cell<T>>` (AGAST #3343) is located at the fn's definition, as ritz0 does
+# (monomorph.py, _recursion_error): a top-level fn starts at column 1.
+pub fn refuse_recursive_instance(mono: *MonoCtx, m: *Module, name: StrView)
+    let ib: *ImplBlock = find_generic_impl(m.impls, name)
+    var fd: *FnDef = null
+    if ib == null
+        fd = find_generic_function(m, name)
+    if ib != null and ib.def_file.len > 0
+        eprints(ib.def_file)
+    else if fd != null and fd.def_file.len > 0
+        eprints(fd.def_file)
+    else if struct_index_file().ptr != null
+        eprints(struct_index_file())
+    else
+        eprints("<input>")
+    if ib != null
+        eprint_char(':')
+        eprint_i64(ib.impl_span.line as i64)
+        eprint_char(':')
+        eprint_i64(ib.impl_span.col as i64)
+    else if fd != null and fd.line > 0
+        eprint_char(':')
+        eprint_i64(fd.line as i64)
+        eprints(":1")
+    eprints(": error: instantiating `")
+    sys_write(2, name.ptr, name.len)
+    eprints("` recurses: ")
+    if ib != null
+        sys_write(2, name.ptr, name.len)
+        eprint_char('<')
+        sys_write(2, name.ptr, name.len)
+        eprints("<...>> names a deeper instance at every level (stopped after ")
+    else
+        eprints("each instance names a deeper one (stopped after ")
+    eprint_i64(MAX_INSTANCE_DEPTH as i64)
+    eprints(")\n")
+    mono.mono_errors += 1
