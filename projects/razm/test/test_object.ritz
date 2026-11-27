@@ -1,0 +1,611 @@
+# Object, the ELF writer: objects built here are read back with readelf and
+# linked with ld.lld, and the linked programs run (DESIGN.md "Object contract").
+import ritzlib.fs { unlink }
+import ritzlib.gvec { Vec }
+import ritzlib.process { ProcessResult }
+import ritzlib.span { Bytes, Span, span_empty, span_from_vec }
+import ritzlib.string { String }
+import ritzlib.strview { StrView }
+import ritzlib.testlib
+import razm.fixup { Fixup, FixupKind }
+import razm.object
+
+const READELF: StrView = "/usr/bin/readelf"
+const LD_LLD: StrView = "/usr/bin/ld.lld"
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn text_flags() -> SectionFlags
+    SectionFlags { alloc: true, write: false, exec: true }
+
+fn data_flags() -> SectionFlags
+    SectionFlags { alloc: true, write: true, exec: false }
+
+fn rodata_flags() -> SectionFlags
+    SectionFlags { alloc: true, write: false, exec: false }
+
+[[test_helper]]
+fn section(obj: @&Object, name: StrView, kind: SectionKind, flags: SectionFlags) -> SectionId
+    match obj.add_section(name, kind, flags)
+        Ok(s) => s
+        Err(_) =>
+            assert false, "add_section"
+            SectionId { index: -1 }
+
+[[test_helper]]
+fn put(obj: @&Object, sec: SectionId, bytes: Span<u8>) -> i64
+    match obj.emit(sec, bytes)
+        Ok(at) => at
+        Err(_) =>
+            assert false, "emit"
+            -1
+
+[[test_helper]]
+fn def(obj: @&Object, name: StrView, sec: SectionId, value: i64)
+    let r: Result<(), ObjectError> = obj.define(name, sec, value)
+    assert r.is_ok(), "define"
+
+[[test_helper]]
+fn fix(obj: @&Object, sec: SectionId, at: i64, offset: i64, width: i64, kind: FixupKind, target: StrView, addend: i64)
+    let f = Fixup { offset: offset, width: width, kind: kind, target: target, addend: addend }
+    let r: Result<(), ObjectError> = obj.add_fixup(sec, at, f)
+    assert r.is_ok(), "add_fixup"
+
+# Write `obj` to this test's scratch file `name`.
+[[test_helper]]
+fn save(obj: @Object, name: StrView) -> String
+    let path: String = sandbox_path("razm_object", name)
+    let r: Result<i64, ObjectError> = obj.write(path.as_view())
+    assert r.is_ok(), "write"
+    path
+
+[[test_helper]]
+fn run(bin: StrView, args: Span<StrView>) -> Captured
+    match exec_capture(bin, args, span_empty<StrView>(), span_empty<u8>())
+        Ok(c) => c
+        Err(_) =>
+            assert false, "spawn"
+            Captured { status: ProcessResult { exit_code: -1, signaled: 0, signal: 0 }, out: vec_new<u8>() }
+
+fn text_of(c: @Captured) -> StrView
+    span_from_vec<u8>(@c.out).as_strview()
+
+# `readelf <flag> -W path`, which must exit 0 and print no warning.
+[[test_helper]]
+fn readelf(flag: StrView, path: @String) -> Captured
+    let args: [3]StrView = [flag, "-W", path.as_view()]
+    let c: Captured = run(READELF, @args)
+    assert c.status.exit_code == 0, "readelf exit"
+    assert not text_of(@c).contains("Warning"), "readelf warning"
+    assert not text_of(@c).contains("Error"), "readelf error"
+    c
+
+# The first line of `out` that contains `needle`, or "" when none does.
+fn line_with(out: StrView, needle: StrView) -> StrView
+    var rest: StrView = out
+    while rest.len > 0
+        var nl: i64 = rest.find_byte('\n')
+        if nl < 0
+            nl = rest.len
+        let line: StrView = rest.slice(0, nl)
+        if line.contains(needle)
+            return line
+        rest = rest.skip(nl + 1)
+    ""
+
+# How many lines of `out` end with `tail`, trailing blanks ignored.
+fn lines_ending(out: StrView, tail: StrView) -> i64
+    var rest: StrView = out
+    var n: i64 = 0
+    while rest.len > 0
+        var nl: i64 = rest.find_byte('\n')
+        if nl < 0
+            nl = rest.len
+        if rest.slice(0, nl).trim_end().ends_with(tail)
+            n += 1
+        rest = rest.skip(nl + 1)
+    n
+
+# The `readelf -s` line of symbol `name`, or "".
+fn symbol_line(out: StrView, name: StrView) -> StrView
+    var rest: StrView = out
+    while rest.len > 0
+        var nl: i64 = rest.find_byte('\n')
+        if nl < 0
+            nl = rest.len
+        let line: StrView = rest.slice(0, nl).trim_end()
+        if line.ends_with(name) and line.get(line.len - name.len - 1) == ' '
+            return line
+        rest = rest.skip(nl + 1)
+    ""
+
+# The blank-separated field `k` places from the end of `line` (0 is the last).
+fn field_from_end(line: StrView, k: i64) -> StrView
+    var rest: StrView = line.trim_end()
+    var n: i64 = 0
+    while rest.len > 0
+        var start: i64 = rest.len
+        while start > 0 and rest.get(start - 1) != ' '
+            start -= 1
+        if n == k
+            return rest.skip(start)
+        rest = rest.take(start).trim_end()
+        n += 1
+    ""
+
+# Link `objs` with `ld.lld -static`; the Captured holds the linker's verdict.
+[[test_helper]]
+fn link(objs: Span<StrView>, out: @String) -> Captured
+    var args: Vec<StrView> = vec_new<StrView>()
+    args.push("-static")
+    args.push("-o")
+    args.push(out.as_view())
+    for i in 0..objs.len
+        args.push(objs[i])
+    run(LD_LLD, span_from_vec<StrView>(@args))
+
+[[test_helper]]
+fn exit_code_of(exe: @String) -> i32
+    let c: Captured = run(exe.as_view(), span_empty<StrView>())
+    assert c.status.signaled == 0, "program killed by a signal"
+    c.status.exit_code
+
+fn le32(b: Span<u8>, at: i64) -> i64
+    (b[at] as i64) | ((b[at + 1] as i64) << 8) | ((b[at + 2] as i64) << 16) | ((b[at + 3] as i64) << 24)
+
+fn le16(b: Span<u8>, at: i64) -> i64
+    (b[at] as i64) | ((b[at + 1] as i64) << 8)
+
+# ============================================================================
+# Header and sections
+# ============================================================================
+
+[[test]]
+fn test_header_is_elf64_rel_x86_64_with_no_program_headers() -> i32
+    var obj: Object = object_new()
+    let bytes: Vec<u8> = match obj.to_bytes()
+        Ok(b) => b
+        Err(_) =>
+            assert false, "to_bytes"
+            vec_new<u8>()
+    let b: Span<u8> = span_from_vec<u8>(@bytes)
+    assert b[0] == 0x7f and b[1] == 'E' and b[2] == 'L' and b[3] == 'F'
+    assert b[4] == 2, "ELFCLASS64"
+    assert b[5] == 1, "ELFDATA2LSB"
+    assert b[6] == 1, "EV_CURRENT"
+    assert le16(b, 16) == 1, "ET_REL"
+    assert le16(b, 18) == 62, "EM_X86_64"
+    assert le32(b, 32) == 0 and le32(b, 36) == 0, "e_phoff"
+    assert le16(b, 52) == 64, "e_ehsize"
+    assert le16(b, 54) == 0 and le16(b, 56) == 0, "no program headers"
+    assert le16(b, 58) == 64, "e_shentsize"
+    let path: String = save(@obj, "empty.o")
+    let h: Captured = readelf("-h", @path)
+    assert text_of(@h).contains("REL (Relocatable file)")
+    assert text_of(@h).contains("Advanced Micro Devices X86-64")
+    let s: Captured = readelf("-S", @path)
+    assert line_with(text_of(@s), " .symtab ").contains("SYMTAB")
+    assert line_with(text_of(@s), " .strtab ").contains("STRTAB")
+    assert line_with(text_of(@s), " .shstrtab ").contains("STRTAB")
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_sections_keep_name_type_flags_alignment_and_size() -> i32
+    var obj: Object = object_new()
+    let text: SectionId = section(@&obj, ".text", SectionKind.Progbits, text_flags())
+    let code: [3]u8 = [0x90, 0x90, 0xc3]
+    assert put(@&obj, text, @code) == 0
+    assert obj.raise_align(text, 16).is_ok()
+    let data: SectionId = section(@&obj, ".data", SectionKind.Progbits, data_flags())
+    let word: [4]u8 = [1, 2, 3, 4]
+    put(@&obj, data, @word)
+    assert put(@&obj, data, @word) == 4, "emit returns the offset it wrote at"
+    let boot: SectionId = section(@&obj, ".boot.data", SectionKind.Progbits, rodata_flags())
+    put(@&obj, boot, @word)
+    let bss: SectionId = section(@&obj, ".bss", SectionKind.Nobits, data_flags())
+    assert obj.reserve(bss, 64).is_ok()
+    assert obj.raise_align(bss, 32).is_ok()
+    assert obj.raise_align(bss, 8).is_ok(), "alignment is the largest asked for"
+    assert obj.size(bss) == 64 and obj.size(data) == 8
+    let path: String = save(@obj, "sections.o")
+    let c: Captured = readelf("-S", @path)
+    let out: StrView = text_of(@c)
+    let t: StrView = line_with(out, " .text ")
+    assert t.contains("PROGBITS") and t.contains("000003") and t.contains(" AX ") and t.ends_with(" 16")
+    let d: StrView = line_with(out, " .data ")
+    assert d.contains("PROGBITS") and d.contains("000008") and d.contains(" WA ") and d.ends_with(" 1")
+    let o: StrView = line_with(out, " .boot.data ")
+    assert o.contains("PROGBITS") and o.contains(" A ")
+    let z: StrView = line_with(out, " .bss ")
+    assert z.contains("NOBITS") and z.contains("000040") and z.contains(" WA ") and z.ends_with(" 32")
+    assert line_with(out, ".rela").len == 0, "no fixups, no relocation sections"
+    let x: Captured = readelf("-x.data", @path)
+    assert text_of(@x).contains("01020304 01020304")
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_find_section_by_name() -> i32
+    var obj: Object = object_new()
+    let text: SectionId = section(@&obj, ".text", SectionKind.Progbits, text_flags())
+    let data: SectionId = section(@&obj, ".data", SectionKind.Progbits, data_flags())
+    match obj.find_section(".data")
+        Some(s) =>
+            if s.index != data.index
+                return 5
+        None => return 1
+    match obj.find_section(".text")
+        Some(s) =>
+            if s.index != text.index
+                return 6
+        None => return 2
+    match obj.find_section(".text.hot")
+        Some(_) => return 3
+        None => pass
+    match obj.find_section(".tex")
+        Some(_) => return 4
+        None => pass
+    0
+
+# ============================================================================
+# Symbols
+# ============================================================================
+
+[[test]]
+fn test_symbols_bindings_types_sizes_and_locals_first() -> i32
+    var obj: Object = object_new()
+    let text: SectionId = section(@&obj, ".text", SectionKind.Progbits, text_flags())
+    let code: [8]u8 = [0x90, 0x90, 0x90, 0x90, 0xe8, 0, 0, 0]
+    put(@&obj, text, @code)
+    let tail: [1]u8 = [0]
+    put(@&obj, text, @tail)
+    # Globals defined before locals: the writer still puts locals first.
+    def(@&obj, "global_fn", text, 1)
+    obj.set_binding("global_fn", Binding.Global)
+    obj.set_type("global_fn", SymbolType.Func)
+    obj.set_size("global_fn", 3)
+    def(@&obj, "weak_fn", text, 2)
+    obj.set_binding("weak_fn", Binding.Weak)
+    def(@&obj, "local_label", text, 3)
+    def(@&obj, ".Lhidden", text, 0)
+    assert obj.define_absolute("ABS_CONST", 4096).is_ok()
+    fix(@&obj, text, 4, 1, 4, FixupKind.Plt, "extern_fn", -4)
+    let path: String = save(@obj, "symbols.o")
+    let c: Captured = readelf("-s", @path)
+    let out: StrView = text_of(@c)
+    let g: StrView = symbol_line(out, "global_fn")
+    assert g.contains("0000000000000001") and g.contains(" 3 FUNC ") and g.contains(" GLOBAL ")
+    let w: StrView = symbol_line(out, "weak_fn")
+    assert w.contains("0000000000000002") and w.contains(" NOTYPE ") and w.contains(" WEAK ")
+    let l: StrView = symbol_line(out, "local_label")
+    assert l.contains("0000000000000003") and l.contains(" LOCAL ")
+    let a: StrView = symbol_line(out, "ABS_CONST")
+    assert a.contains("0000000000001000") and a.contains(" LOCAL ") and a.contains(" ABS ")
+    let e: StrView = symbol_line(out, "extern_fn")
+    assert e.contains(" GLOBAL ") and e.contains(" UND "), "an undefined reference is global"
+    assert symbol_line(out, ".Lhidden").len == 0, ".L labels are not written"
+    assert line_with(out, " SECTION ").contains(" LOCAL "), "the section symbols"
+    # sh_info is one past the last local: the null, the section, two locals.
+    let s: Captured = readelf("-S", @path)
+    let symtab: StrView = line_with(text_of(@s), " .symtab ")
+    assert field_from_end(symtab, 1).eq("4"), "sh_info of .symtab"
+    assert field_from_end(symtab, 0).eq("8"), "alignment of .symtab"
+    unlink(path.as_view())
+    0
+
+# ============================================================================
+# Fixups: resolved, against a section symbol, against the symbol itself
+# ============================================================================
+
+# _start: call f (local, same section: resolved); movq ptr(%rip), %rax (local
+# in .data: PC32 against .data); call *%rax, where ptr holds g (R_X86_64_64
+# against .text). f + g = 40 + 2 is the exit status.
+fn local_fixups_object() -> Object
+    var obj: Object = object_new()
+    let text: SectionId = section(@&obj, ".text", SectionKind.Progbits, text_flags())
+    let data: SectionId = section(@&obj, ".data", SectionKind.Progbits, data_flags())
+    let code: [39]u8 = [
+        0xe8, 0, 0, 0, 0,                 # 0: call f
+        0x89, 0xc3,                       # 5: mov %eax, %ebx
+        0x48, 0x8b, 0x05, 0, 0, 0, 0,     # 7: movq ptr(%rip), %rax
+        0xff, 0xd0,                       # 14: call *%rax
+        0x01, 0xd8,                       # 16: add %ebx, %eax
+        0x89, 0xc7,                       # 18: mov %eax, %edi
+        0xb8, 0x3c, 0, 0, 0,              # 20: mov $60, %eax
+        0x0f, 0x05,                       # 25: syscall
+        0xb8, 40, 0, 0, 0, 0xc3,          # 27: f: mov $40, %eax; ret
+        0xb8, 2, 0, 0, 0, 0xc3]           # 33: g: mov $2, %eax; ret
+    put(@&obj, text, @code)
+    def(@&obj, "_start", text, 0)
+    obj.set_binding("_start", Binding.Global)
+    fix(@&obj, text, 0, 1, 4, FixupKind.Plt, "f", -4)
+    fix(@&obj, text, 7, 3, 4, FixupKind.PcRelative, "ptr", -4)
+    let zeros: [16]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    put(@&obj, data, @zeros)
+    fix(@&obj, data, 8, 0, 8, FixupKind.Absolute, "g", 0)
+    # Defined after their uses, as a forward label is.
+    def(@&obj, "f", text, 27)
+    def(@&obj, "g", text, 33)
+    def(@&obj, "ptr", data, 8)
+    obj
+
+[[test]]
+fn test_local_fixups_resolve_or_go_through_the_section_symbol() -> i32
+    let obj: Object = local_fixups_object()
+    let path: String = save(@obj, "local.o")
+    let r: Captured = readelf("-r", @path)
+    let out: StrView = text_of(@r)
+    assert line_with(out, "R_X86_64_PC32").contains(".data + 4"), "ptr - 4, via .data"
+    assert line_with(out, "R_X86_64_64").contains(".text + 21"), "g, via .text"
+    assert line_with(out, "R_X86_64_PLT32").len == 0, "the call to f is resolved"
+    assert lines_ending(out, "+ 4") == 1 and lines_ending(out, "+ 21") == 1
+    let x: Captured = readelf("-x.text", @path)
+    assert text_of(@x).contains("e8160000 00"), "call f: 27 - 5 = 0x16"
+    let exe: String = sandbox_path("razm_object", "local")
+    let objs: [1]StrView = [path.as_view()]
+    let l: Captured = link(@objs, @exe)
+    assert l.status.exit_code == 0, "ld.lld links it"
+    assert exit_code_of(@exe) == 42
+    unlink(path.as_view())
+    unlink(exe.as_view())
+    0
+
+# _start: call get (global in the same section: PLT32 kept); movq
+# answer@GOTPCREL(%rip), %rax (defined in another object); movl (%rax), %edi;
+# exit with answer + get() = 40 + 2. `.data` holds get as a 32S.
+fn global_fixups_object() -> Object
+    var obj: Object = object_new()
+    let text: SectionId = section(@&obj, ".text", SectionKind.Progbits, text_flags())
+    let code: [31]u8 = [
+        0xe8, 0, 0, 0, 0,                 # 0: call get
+        0x89, 0xc3,                       # 5: mov %eax, %ebx
+        0x48, 0x8b, 0x05, 0, 0, 0, 0,     # 7: movq answer@GOTPCREL(%rip), %rax
+        0x8b, 0x38,                       # 14: mov (%rax), %edi
+        0x01, 0xdf,                       # 16: add %ebx, %edi
+        0xb8, 0x3c, 0, 0, 0,              # 18: mov $60, %eax
+        0x0f, 0x05,                       # 23: syscall
+        0xb8, 2, 0, 0, 0, 0xc3]           # 25: get: mov $2, %eax; ret
+    put(@&obj, text, @code)
+    def(@&obj, "_start", text, 0)
+    obj.set_binding("_start", Binding.Global)
+    def(@&obj, "get", text, 25)
+    obj.set_binding("get", Binding.Global)
+    obj.set_type("get", SymbolType.Func)
+    fix(@&obj, text, 0, 1, 4, FixupKind.Plt, "get", -4)
+    fix(@&obj, text, 7, 3, 4, FixupKind.GotPcRelx, "answer", -4)
+    let data: SectionId = section(@&obj, ".data", SectionKind.Progbits, data_flags())
+    let slot: [4]u8 = [0, 0, 0, 0]
+    put(@&obj, data, @slot)
+    fix(@&obj, data, 0, 0, 4, FixupKind.AbsoluteSigned, "get", 0)
+    obj
+
+fn answer_object() -> Object
+    var obj: Object = object_new()
+    let data: SectionId = section(@&obj, ".data", SectionKind.Progbits, data_flags())
+    let v: [4]u8 = [40, 0, 0, 0]
+    put(@&obj, data, @v)
+    def(@&obj, "answer", data, 0)
+    obj.set_binding("answer", Binding.Global)
+    obj.set_type("answer", SymbolType.Data)
+    obj.set_size("answer", 4)
+    obj
+
+[[test]]
+fn test_global_fixups_become_relocations_against_the_symbol() -> i32
+    let a: Object = global_fixups_object()
+    let b: Object = answer_object()
+    let pa: String = save(@a, "global.o")
+    let pb: String = save(@b, "answer.o")
+    let r: Captured = readelf("-r", @pa)
+    let out: StrView = text_of(@r)
+    assert line_with(out, "R_X86_64_PLT32").contains(" get - 4"), "global in the same section"
+    assert line_with(out, "R_X86_64_REX_GOTPCRELX").contains(" answer - 4")
+    assert line_with(out, "R_X86_64_32S").contains(" get + 0")
+    let s: Captured = readelf("-s", @pb)
+    assert symbol_line(text_of(@s), "answer").contains(" 4 OBJECT  GLOBAL ")
+    let exe: String = sandbox_path("razm_object", "global")
+    let objs: [2]StrView = [pa.as_view(), pb.as_view()]
+    let l: Captured = link(@objs, @exe)
+    assert l.status.exit_code == 0, "ld.lld links it"
+    assert exit_code_of(@exe) == 42
+    unlink(pa.as_view())
+    unlink(pb.as_view())
+    unlink(exe.as_view())
+    0
+
+[[test]]
+fn test_link_reports_an_undefined_symbol() -> i32
+    var obj: Object = object_new()
+    let text: SectionId = section(@&obj, ".text", SectionKind.Progbits, text_flags())
+    let code: [6]u8 = [0xe8, 0, 0, 0, 0, 0xc3]
+    put(@&obj, text, @code)
+    def(@&obj, "_start", text, 0)
+    obj.set_binding("_start", Binding.Global)
+    fix(@&obj, text, 0, 1, 4, FixupKind.Plt, "missing_fn", -4)
+    let path: String = save(@obj, "undef.o")
+    let exe: String = sandbox_path("razm_object", "undef")
+    let objs: [1]StrView = [path.as_view()]
+    let l: Captured = link(@objs, @exe)
+    assert l.status.exit_code != 0
+    assert text_of(@l).contains("undefined symbol: missing_fn")
+    unlink(path.as_view())
+    0
+
+# ============================================================================
+# COMDAT
+# ============================================================================
+
+# f in COMDAT group f: `movl val(%rip), %eax; ret`, val a local in the shared
+# .rodata, so .rela.text.f is a member too.
+[[test_helper]]
+fn comdat_object(value: u8) -> Object
+    var obj: Object = object_new()
+    let f: SectionId = match obj.add_group_section(".text.f", SectionKind.Progbits, text_flags(), "f")
+        Ok(s) => s
+        Err(_) =>
+            assert false, "add_group_section"
+            SectionId { index: -1 }
+    let code: [7]u8 = [0x8b, 0x05, 0, 0, 0, 0, 0xc3]
+    put(@&obj, f, @code)
+    def(@&obj, "f", f, 0)
+    obj.set_binding("f", Binding.Weak)
+    obj.set_type("f", SymbolType.Func)
+    obj.set_size("f", 7)
+    fix(@&obj, f, 0, 2, 4, FixupKind.PcRelative, "val", -4)
+    let ro: SectionId = section(@&obj, ".rodata", SectionKind.Progbits, rodata_flags())
+    let v: [4]u8 = [value, 0, 0, 0]
+    put(@&obj, ro, @v)
+    def(@&obj, "val", ro, 0)
+    obj
+
+# _start: call f; mov %eax, %edi; exit.
+fn comdat_caller() -> Object
+    var obj: Object = object_new()
+    let text: SectionId = section(@&obj, ".text", SectionKind.Progbits, text_flags())
+    let code: [14]u8 = [0xe8, 0, 0, 0, 0, 0x89, 0xc7, 0xb8, 0x3c, 0, 0, 0, 0x0f, 0x05]
+    put(@&obj, text, @code)
+    def(@&obj, "_start", text, 0)
+    obj.set_binding("_start", Binding.Global)
+    fix(@&obj, text, 0, 1, 4, FixupKind.Plt, "f", -4)
+    obj
+
+[[test]]
+fn test_comdat_group_section_and_members() -> i32
+    let a: Object = comdat_object(7)
+    let path: String = save(@a, "comdat.o")
+    let g: Captured = readelf("-g", @path)
+    let out: StrView = text_of(@g)
+    assert line_with(out, "COMDAT group section").contains("[f] contains 2 sections")
+    assert lines_ending(out, " .text.f") == 1
+    assert lines_ending(out, " .rela.text.f") == 1
+    let s: Captured = readelf("-S", @path)
+    let secs: StrView = text_of(@s)
+    assert line_with(secs, " .group ").contains(" GROUP ")
+    assert line_with(secs, " .text.f ").contains(" AXG ")
+    assert line_with(secs, " .rela.text.f ").contains(" IG ")
+    assert line_with(secs, " .rodata ").contains(" A "), "the constant is not in the group"
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_comdat_pair_links_twice_keeping_one_copy() -> i32
+    let main: Object = comdat_caller()
+    let a: Object = comdat_object(7)
+    let b: Object = comdat_object(8)
+    let pm: String = save(@main, "main.o")
+    let pa: String = save(@a, "a.o")
+    let pb: String = save(@b, "b.o")
+    let exe: String = sandbox_path("razm_object", "comdat")
+    # The linker keeps the first group f it sees and discards the other.
+    let ab: [3]StrView = [pm.as_view(), pa.as_view(), pb.as_view()]
+    let l1: Captured = link(@ab, @exe)
+    assert l1.status.exit_code == 0, "ld.lld links a then b"
+    assert exit_code_of(@exe) == 7
+    let s: Captured = readelf("-s", @exe)
+    assert lines_ending(text_of(@s), " f") == 1, "one definition of f"
+    let ba: [3]StrView = [pm.as_view(), pb.as_view(), pa.as_view()]
+    let l2: Captured = link(@ba, @exe)
+    assert l2.status.exit_code == 0, "ld.lld links b then a"
+    assert exit_code_of(@exe) == 8
+    unlink(pm.as_view())
+    unlink(pa.as_view())
+    unlink(pb.as_view())
+    unlink(exe.as_view())
+    0
+
+# ============================================================================
+# Errors
+# ============================================================================
+
+[[test]]
+fn test_building_errors() -> i32
+    var obj: Object = object_new()
+    let text: SectionId = section(@&obj, ".text", SectionKind.Progbits, text_flags())
+    match obj.add_section(".text", SectionKind.Progbits, text_flags())
+        Ok(_) => return 1
+        Err(e) => match e
+            DuplicateSection => pass
+            _ => return 2
+    def(@&obj, "x", text, 0)
+    match obj.define("x", text, 0)
+        Ok(_) => return 3
+        Err(e) => match e
+            DuplicateSymbol => pass
+            _ => return 4
+    match obj.raise_align(text, 12)
+        Ok(_) => return 5
+        Err(e) => match e
+            BadAlignment => pass
+            _ => return 6
+    let bss: SectionId = section(@&obj, ".bss", SectionKind.Nobits, data_flags())
+    let one: [1]u8 = [1]
+    match obj.emit(bss, @one)
+        Ok(_) => return 7
+        Err(e) => match e
+            NobitsData => pass
+            _ => return 8
+    let zero: [1]u8 = [0]
+    assert obj.emit(bss, @zero).is_ok(), "zeros are reserved space"
+    assert obj.size(bss) == 1
+    let code: [4]u8 = [0, 0, 0, 0]
+    put(@&obj, text, @code)
+    let f3 = Fixup { offset: 0, width: 3, kind: FixupKind.Absolute, target: "x", addend: 0 }
+    match obj.add_fixup(text, 0, f3)
+        Ok(_) => return 9
+        Err(e) => match e
+            NoRelocation => pass
+            _ => return 10
+    let past = Fixup { offset: 2, width: 4, kind: FixupKind.Absolute, target: "x", addend: 0 }
+    match obj.add_fixup(text, 0, past)
+        Ok(_) => return 11
+        Err(e) => match e
+            FixupOutsideSection => pass
+            _ => return 12
+    let inbss = Fixup { offset: 0, width: 1, kind: FixupKind.Absolute, target: "x", addend: 0 }
+    match obj.add_fixup(bss, 0, inbss)
+        Ok(_) => return 13
+        Err(e) => match e
+            FixupOutsideSection => pass
+            _ => return 14
+    0
+
+[[test]]
+fn test_writing_errors() -> i32
+    var far: Object = object_new()
+    let text: SectionId = section(@&far, ".text", SectionKind.Progbits, text_flags())
+    let jmp: [2]u8 = [0xeb, 0]
+    put(@&far, text, @jmp)
+    fix(@&far, text, 0, 1, 1, FixupKind.PcRelative, ".Lfar", -1)
+    let pad: Vec<u8> = vec_zeroed<u8>(200)
+    put(@&far, text, span_from_vec<u8>(@pad))
+    def(@&far, ".Lfar", text, 202)
+    match far.to_bytes()
+        Ok(_) => return 1
+        Err(e) => match e
+            FixupOverflow => pass
+            _ => return 2
+    var undef: Object = object_new()
+    let t2: SectionId = section(@&undef, ".text", SectionKind.Progbits, text_flags())
+    put(@&undef, t2, @jmp)
+    fix(@&undef, t2, 0, 1, 1, FixupKind.PcRelative, ".Lnowhere", -1)
+    match undef.to_bytes()
+        Ok(_) => return 3
+        Err(e) => match e
+            UndefinedLabel => pass
+            _ => return 4
+    # A rel8 that fits is written, and needs no relocation.
+    var near: Object = object_new()
+    let t3: SectionId = section(@&near, ".text", SectionKind.Progbits, text_flags())
+    put(@&near, t3, @jmp)
+    fix(@&near, t3, 0, 1, 1, FixupKind.PcRelative, ".Lback", -1)
+    def(@&near, ".Lback", t3, 0)
+    let r: Result<Vec<u8>, ObjectError> = near.to_bytes()
+    assert r.is_ok(), "to_bytes"
+    let path: String = save(@near, "near.o")
+    let x: Captured = readelf("-x.text", @path)
+    assert text_of(@x).contains(" ebfe "), "jmp to itself is -2"
+    unlink(path.as_view())
+    0
