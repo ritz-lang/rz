@@ -96,7 +96,7 @@ struct Lexer
   # Now: a single heap scratch buffer that grows on demand and is rewound
   # (`string_pos = 0`) at the start of each literal.  `lexer_str_finish`
   # copies the finished literal into its own exact-sized heap allocation,
-  # so token `string_val` pointers are stable for the life of the process
+  # so token `string_val` views are stable for the life of the process
   # and are unaffected by later growth or by `lexer_reset` between files.
   string_buf: *i8          # heap scratch; null until the first literal
   string_cap: i32          # bytes allocated in string_buf
@@ -541,11 +541,11 @@ pub fn lexer_next(lex: *Lexer) -> Token
   # for its `then` (the newline check in lexer_next_token).
   if lex.bracket_depth > 0
     if tok.kind == TOK_MATCH
-      return lexer_fail_block(lex, tok.start, tok.line, tok.col)
+      return lexer_fail_block(lex, tok.text.ptr, tok.line, tok.col)
     if tok.kind == TOK_IF
       lex.if_line = tok.line
       lex.if_col = tok.col
-      lex.if_start = tok.start
+      lex.if_start = tok.text.ptr
       lex.if_depth = lex.bracket_depth
     if tok.kind == TOK_THEN
       lex.if_line = 0
@@ -781,12 +781,10 @@ fn lexer_scan_string(lex: *Lexer, kind: i32, prefix: i32) -> Token
     return tok
   lex.pos = at + 1
   lex.col = col + (lex.pos - start) as i32
-  # A token's span length is bounded by Token.len, which is i32; the
-  # *position* stays i64 (#1399).
+  # A token's span length is passed as i32 (lexer_token); the *position*
+  # stays i64 (#1399).
   tok = lexer_token(lex, kind, start, (lex.pos - start) as i32, line, col)
-  let str_sv: StrView = lexer_str_finish(lex)
-  tok.string_val = str_sv.ptr
-  tok.string_len = str_sv.len as i32
+  tok.string_val = lexer_str_finish(lex)
   tok
 
 # A token of `kind` at source offset `start`.
@@ -872,24 +870,24 @@ fn lexer_check_separators(lex: *Lexer, len: i32, err: *Token) -> i32
 # every reader of the literal's text (parse_int, the 2^64 check, a float's
 # digits, a suffix) sees the plain digits.  A token without one is untouched.
 fn lexer_drop_separators(tok: *Token)
-  var n: i32 = 0
-  for i in 0..tok.len
-    if *(tok.start + i) != '_'
+  let text: StrView = tok.text
+  var n: i64 = 0
+  for i in 0..text.len
+    if text.get(i) != '_'
       n = n + 1
-  if n == tok.len
+  if n == text.len
     return
-  let out: *u8 = malloc((n as i64) + 1)
+  let out: *u8 = malloc(n + 1)
   if out == null
     return
-  var j: i32 = 0
-  for i in 0..tok.len
-    let b: u8 = *(tok.start + i)
-    if b != 95
+  var j: i64 = 0
+  for i in 0..text.len
+    let b: u8 = text.get(i)
+    if b != '_'
       *(out + j) = b
       j = j + 1
   *(out + n) = 0
-  tok.start = out
-  tok.len = n
+  tok.text = StrView { ptr: out, len: n }
 
 # Track bracket depth for a token of `kind` at `start` (no NEWLINE / INDENT /
 # DEDENT inside brackets).  Returns 1 with a fatal error in *err when they

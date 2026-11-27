@@ -73,7 +73,7 @@ fn probe(buf: *u8, n: i64, want_kind: i32) -> i64
     var tok: Token = lexer_next(@lex)
     if tok.kind != want_kind
         return -1
-    return (tok.start as i64) - (base as i64) - big
+    return (tok.text.ptr as i64) - (base as i64) - big
 
 fn main() -> i32
     let r: i64 = probe({buf} as *u8, {n}, {kind})

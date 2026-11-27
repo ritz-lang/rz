@@ -277,33 +277,29 @@ class RitzGenerator:
         # Token struct
         self._emit('# Token structure')
         self._emit('struct Token')
+        # The token's text is one StrView, not a `start: *u8` + `len: i32`
+        # pair every reader had to rebuild a view from (AGAST #4773).
         self._emit('    kind: i32')
-        self._emit('    start: *u8')
-        self._emit('    len: i32')
+        self._emit('    text: StrView')
         self._emit('    line: i32')
         self._emit('    col: i32')
-        self._emit('    # Extended fields for string content')
-        self._emit('    string_val: *u8')
-        self._emit('    string_len: i32')
+        self._emit('    # A string literal\'s decoded content (empty for other tokens)')
+        self._emit('    string_val: StrView')
         self._emit('')
 
         # token_new function
-        # It takes the token's source pointer, not an offset it would have no
-        # source to add to: it used to take `pos`, drop it and leave `start`
+        # It takes the token's source text, not an offset it would have no
+        # source to add to: it used to take `pos`, drop it and leave the text
         # null for every token the lexer did not patch (AGAST #3888).
-        self._emit('# A Token of `kind` whose `len` bytes start at `start` in the source')
+        self._emit('# A Token of `kind` whose `text` is its bytes in the source')
         self._emit('# (zero-length layout and EOF tokens point at the byte they stand on).')
-        self._emit('pub fn token_new(kind: i32, start_sv: StrView, line: i64, col: i64) -> Token')
-        self._emit('    var start: *u8 = start_sv.ptr')
-        self._emit('    var len: i32 = start_sv.len as i32')
+        self._emit('pub fn token_new(kind: i32, text: StrView, line: i64, col: i64) -> Token')
         self._emit('    Token {')
         self._emit('        kind: kind,')
-        self._emit('        start: start,')
-        self._emit('        len: len,')
+        self._emit('        text: text,')
         self._emit('        line: line as i32,')
         self._emit('        col: col as i32,')
-        self._emit('        string_val: null,')
-        self._emit('        string_len: 0')
+        self._emit('        string_val: strview_empty()')
         self._emit('    }')
 
         return self._get_output()
@@ -447,8 +443,8 @@ class RitzGenerator:
         self._emit('    if p.pos >= p.token_count')
         self._emit('        var eof: Token')
         self._emit('        eof.kind = TOK_EOF')
-        self._emit('        eof.start = null')
-        self._emit('        eof.len = 0')
+        self._emit('        eof.text = strview_empty()')
+        self._emit('        eof.string_val = strview_empty()')
         self._emit('        eof.line = 0')
         self._emit('        eof.col = 0')
         self._emit('        return eof')

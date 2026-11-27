@@ -37,11 +37,23 @@ def test_token_new_takes_the_source_pointer():
     sig = fn.splitlines()[0]
     # AGAST #4449: the (pointer, len) parameter pair is a StrView, so the
     # generated signature no longer carries a raw `*u8, len: i32` pair.
+    # AGAST #4773: Token's own `start` + `len` fields are one `text: StrView`,
+    # so the view is stored whole, not split back into a pointer and a length.
     assert (
         sig
-        == "pub fn token_new(kind: i32, start_sv: StrView, line: i64, col: i64) -> Token"
+        == "pub fn token_new(kind: i32, text: StrView, line: i64, col: i64) -> Token"
     )
-    assert "    var start: *u8 = start_sv.ptr" in fn
-    assert "    var len: i32 = start_sv.len as i32" in fn
-    assert "        start: start," in fn
+    assert "        text: text," in fn
+    assert "start" not in fn
     assert "pos" not in fn
+
+
+def test_token_text_is_one_strview():
+    # AGAST #4773: no `*u8` + `i32` text pair left on Token.
+    tokens = RitzGenerator(parse_grammar_file(str(GRAMMAR))).generate_tokens()
+    i = tokens.index("struct Token\n")
+    struct = tokens[i : tokens.find("\n\n", i)]
+    assert "    text: StrView" in struct
+    assert "    string_val: StrView" in struct
+    assert "*u8" not in struct
+    assert "_len" not in struct
