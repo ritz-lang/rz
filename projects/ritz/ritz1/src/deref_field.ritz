@@ -138,10 +138,9 @@ fn df_put_ellipsis(b: *DfBuf)
 
 # How many type parameters the generic struct `head` declares, 0 for any other name.
 fn df_arity(sm: *Sema, head_sv: StrView) -> i32
-    var len: i32 = head_sv.len as i32
     var st: *StructDef = sm.module.structs
     while st != null
-        if st.type_params != null and name_eq(StrView { ptr: (st.name), len: (st.name_len) as i64 }, head_sv) == 1
+        if st.type_params != null and name_eq(st.name, head_sv) == 1
             var n: i32 = 0
             var tp: *TypeParam = st.type_params
             while tp != null
@@ -288,7 +287,7 @@ fn df_struct_of(sm: *Sema, x: *Expr) -> *StructDef
     sema_expr_ty(sm, x, @b)
     let st: *StructDef = sema_recv_struct(sm, @b)
     # A container is no element's type: unknown, left alone.
-    if st != null and x.kind == ExprKind.Index and si_built_in(StrView { ptr: (st.name), len: (st.name_len) as i64 }) == 1
+    if st != null and x.kind == ExprKind.Index and si_built_in(st.name) == 1
         return null
     st
 
@@ -304,27 +303,27 @@ fn df_base_len(name_sv: StrView) -> i32
 # (`impl<T> Deref for Box<T>` is `Box$H`'s).
 fn df_traits(sm: *Sema, st: *StructDef) -> i32
     var mask: i32 = 0
-    let bl: i32 = df_base_len(StrView { ptr: (st.name), len: (st.name_len) as i64 })
+    let bl: i32 = df_base_len(st.name)
     var ib: *ImplBlock = sm.module.impls
     while ib != null
-        if ib.trait_name != null
+        if ib.trait_name.ptr != null
             var hit: i32 = 0
             if ib.type_params == null
-                hit = name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-            else if bl < st.name_len
-                hit = name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (st.name), len: (bl) as i64 })
+                hit = name_eq(ib.type_name, st.name)
+            else if bl < (st.name.len as i32)
+                hit = name_eq(ib.type_name, st.name.take(bl as i64))
             if hit == 1
-                if name_eq(StrView { ptr: (ib.trait_name), len: (ib.trait_name_len) as i64 }, "Deref") == 1
+                if name_eq(ib.trait_name, "Deref") == 1
                     mask = mask | DF_DEREF
-                else if name_eq(StrView { ptr: (ib.trait_name), len: (ib.trait_name_len) as i64 }, "DerefMut") == 1
+                else if name_eq(ib.trait_name, "DerefMut") == 1
                     mask = mask | DF_DEREF_MUT
         ib = ib.next
     mask
 
 # `st`'s `deref`, whose `-> @T` names the T it reaches; null when there's none.
 fn df_deref_fn(sm: *Sema, st: *StructDef) -> *FnDef
-    let fd: *FnDef = sema_method_fn(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, "deref")
-    if fd == null or fd.return_type_name == null or fd.return_type_name_len <= 0
+    let fd: *FnDef = sema_method_fn(sm, st.name, "deref")
+    if fd == null or fd.return_type_name.ptr == null or fd.return_type_name.len <= 0
         return null
     fd
 
@@ -350,10 +349,10 @@ pub fn df_member_field(sm: *Sema, e: *Expr) -> *StructField
 
 # The struct a field of that type is, by value or behind a pointer or reference.
 fn df_field_struct(sm: *Sema, f: *StructField) -> *StructDef
-    if f == null or f.field_type_name_len <= 0
+    if f == null or f.field_type_name.len <= 0
         return null
     if f.field_type == TypeKind.Struct or f.field_type == TypeKind.Ptr or f.field_type == TypeKind.Ref or f.field_type == TypeKind.MutRef
-        return sema_find_struct(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+        return sema_find_struct(sm, f.field_type_name)
     null
 
 # The struct `x` will be once its members are rewritten (a receiver's type,
@@ -368,7 +367,7 @@ fn df_peek_struct(sm: *Sema, x: *Expr) -> *StructDef
             if f == null and (df_traits(sm, bst) & DF_DEREF) != 0
                 let dfd: *FnDef = df_deref_fn(sm, bst)
                 if dfd != null
-                    f = df_field(sema_find_struct(sm, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 }), x.ident)
+                    f = df_field(sema_find_struct(sm, dfd.return_type_name), x.ident)
             return df_field_struct(sm, f)
     df_struct_of(sm, x)
 
@@ -390,19 +389,19 @@ fn df_no_field_text(sm: *Sema, e: *Expr, st: *StructDef) -> StrView
     var m: DfBuf
     df_buf_init(@m)
     df_putc(@m, '`')
-    df_display(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, @m)
+    df_display(sm, st.name, @m)
     df_put_sv(@m, "` has no field `")
     df_put_sv(@m, e.ident)
     df_putc(@m, '`')
     # A `*T` field whose T has it: the hint names the step.
     var f: *StructField = st.fields
     while f != null
-        if f.field_type == TypeKind.Ptr and f.field_type_name_len > 0
-            if df_field(sema_find_struct(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }), e.ident) != null
+        if f.field_type == TypeKind.Ptr and f.field_type_name.len > 0
+            if df_field(sema_find_struct(sm, f.field_type_name), e.ident) != null
                 df_put_sv(@m, ": it points at one: `")
                 df_spell(e.left, @m)
                 df_putc(@m, '.')
-                df_put(@m, f.name, f.name_len)
+                df_put_sv(@m, f.name)
                 df_putc(@m, '.')
                 df_put_sv(@m, e.ident)
                 df_put_sv(@m, "`, or implement `Deref`")
@@ -421,7 +420,7 @@ pub fn df_no_lit_field(sm: *Sema, st: *StructDef, field: StrView, line: i32, col
     var m: DfBuf
     df_buf_init(@m)
     df_putc(@m, '`')
-    df_display(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, @m)
+    df_display(sm, st.name, @m)
     df_put_sv(@m, "` has no field `")
     df_put_sv(@m, field)
     df_putc(@m, '`')
@@ -447,7 +446,7 @@ fn df_neither(sm: *Sema, e: *Expr, st: *StructDef, t_sv: StrView)
     var m: DfBuf
     df_buf_init(@m)
     df_put_sv(@m, "neither `")
-    df_display(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, @m)
+    df_display(sm, st.name, @m)
     df_put_sv(@m, "` nor `")
     df_display(sm, t_sv, @m)
     df_put_sv(@m, "` has a field `")
@@ -479,7 +478,7 @@ fn df_needs_mut(sm: *Sema, e: *Expr, st: *StructDef, ctx: i32, is_method: i32)
         df_put(@m, g_df_call, g_df_call_len)
         df_put_sv(@m, "()")
     df_put_sv(@m, "` needs `DerefMut`, and `")
-    df_display(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, @m)
+    df_display(sm, st.name, @m)
     df_put_sv(@m, "` implements only `Deref`")
     df_report(sm, df_line(e), df_col(e), df_view(@m))
 
@@ -493,11 +492,11 @@ fn df_step(sm: *Sema, x: *Expr, st: *StructDef, mutable: i32) -> *Expr
     var meth: StrView = "deref"
     if mutable == 1
         meth = "deref_mut"
-    let n: i32 = st.name_len + 1 + meth.len as i32
+    let n: i32 = (st.name.len as i32) + 1 + meth.len as i32
     let name: *u8 = malloc((n + 1) as i64)
-    memcpy(name, st.name, st.name_len as i64)
-    *(name + st.name_len) = '_'
-    memcpy(name + st.name_len + 1, meth.ptr, meth.len)
+    memcpy(name, st.name.ptr, st.name.len)
+    *(name + (st.name.len as i32)) = '_'
+    memcpy(name + (st.name.len as i32) + 1, meth.ptr, meth.len)
     *(name + n) = 0
     let call: *Expr = si_new_expr(ExprKind.Call, x.span.line, x.span.col)
     call.func_name = StrView { ptr: name, len: n as i64 }
@@ -520,7 +519,7 @@ fn df_step(sm: *Sema, x: *Expr, st: *StructDef, mutable: i32) -> *Expr
         recv = x
     call.args = arg
     let step: *DerefStep = malloc(sizeof(DerefStep)) as *DerefStep
-    step.fd = sema_method_fn(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, meth)
+    step.fd = sema_method_fn(sm, st.name, meth)
     step.recv = recv
     call.deref_step = step
     if g_df_once == 1
@@ -546,9 +545,9 @@ fn df_member(sm: *Sema, e: *Expr, ctx: i32)
     if dfd == null
         df_no_field(sm, e, st)
         return
-    let tst: *StructDef = sema_find_struct(sm, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 })
+    let tst: *StructDef = sema_find_struct(sm, dfd.return_type_name)
     if df_field(tst, e.ident) == null
-        df_neither(sm, e, st, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 })
+        df_neither(sm, e, st, dfd.return_type_name)
         return
     let mutable: i32 = df_mutable(ctx)
     if mutable == 1 and (mask & DF_DEREF_MUT) == 0
@@ -608,7 +607,7 @@ fn df_method_and_field(sm: *Sema, e: *Expr, st: *StructDef)
     df_putc(@m, '`')
     df_put_sv(@m, e.ident)
     df_put_sv(@m, "` is both a method and a field of `")
-    df_display(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, @m)
+    df_display(sm, st.name, @m)
     df_put_sv(@m, "`: write `(")
     df_put_call_part(e.left, @m)
     df_putc(@m, '.')
@@ -631,7 +630,7 @@ fn df_fn_field_call(sm: *Sema, e: *Expr) -> i32
     let f: *StructField = df_field(st, e.ident)
     if f == null or f.fn_sig == null
         return 0
-    if sema_method_fn(sm, StrView { ptr: (st.name), len: (st.name_len) as i64 }, e.ident) != null
+    if sema_method_fn(sm, st.name, e.ident) != null
         df_method_and_field(sm, e, st)
         return 0
     let callee: *Expr = si_new_expr(ExprKind.Member, e.left.span.line, e.left.span.col)
@@ -656,13 +655,13 @@ fn df_method(sm: *Sema, e: *Expr)
     var through: i32 = 0
     let rst: *StructDef = df_peek_struct(sm, x)
     if rst != null
-        fd = sema_method_fn(sm, StrView { ptr: (rst.name), len: (rst.name_len) as i64 }, e.ident)
+        fd = sema_method_fn(sm, rst.name, e.ident)
         if fd == null and (df_traits(sm, rst) & DF_DEREF) != 0
             let dfd: *FnDef = df_deref_fn(sm, rst)
             if dfd != null
-                let tst: *StructDef = sema_find_struct(sm, StrView { ptr: (dfd.return_type_name), len: (dfd.return_type_name_len) as i64 })
+                let tst: *StructDef = sema_find_struct(sm, dfd.return_type_name)
                 if tst != null
-                    fd = sema_method_fn(sm, StrView { ptr: (tst.name), len: (tst.name_len) as i64 }, e.ident)
+                    fd = sema_method_fn(sm, tst.name, e.ident)
                     if fd != null
                         through = 1
     let mutates: i32 = df_fn_mutates(fd)
@@ -888,23 +887,22 @@ pub fn deref_field_stmt(sm: *Sema, stmt: *Stmt)
 # ----------------------------------------------------------------------------
 
 fn df_impl_type(ib: *ImplBlock, out: *DfBuf)
-    df_put(out, ib.type_name, ib.type_name_len)
+    df_put_sv(out, ib.type_name)
     if ib.type_params == null
         return
     df_putc(out, '<')
     var tp: *TypeParam = ib.type_params
     while tp != null
-        df_put(out, tp.name, tp.name_len)
+        df_put_sv(out, tp.name)
         if tp.next != null
             df_put_sv(out, ", ")
         tp = tp.next
     df_putc(out, '>')
 
 fn df_impl_method(ib: *ImplBlock, name_sv: StrView) -> *FnDef
-    var len: i32 = name_sv.len as i32
     var f: *FnDef = ib.methods
     while f != null
-        if name_eq(StrView { ptr: (f.name), len: (f.name_len) as i64 }, name_sv) == 1
+        if name_eq(f.name, name_sv) == 1
             return f
         f = f.next
     null
@@ -912,10 +910,10 @@ fn df_impl_method(ib: *ImplBlock, name_sv: StrView) -> *FnDef
 pub fn deref_impls_check(sm: *Sema)
     var ib: *ImplBlock = sm.module.impls
     while ib != null
-        if ib.trait_name != null and name_eq(StrView { ptr: (ib.trait_name), len: (ib.trait_name_len) as i64 }, "DerefMut") == 1
+        if ib.trait_name.ptr != null and name_eq(ib.trait_name, "DerefMut") == 1
             var d: *ImplBlock = sm.module.impls
             while d != null
-                if d.trait_name != null and name_eq(StrView { ptr: (d.trait_name), len: (d.trait_name_len) as i64 }, "Deref") == 1 and name_eq(StrView { ptr: (d.type_name), len: (d.type_name_len) as i64 }, StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }) == 1 and (d.type_params == null) == (ib.type_params == null)
+                if d.trait_name.ptr != null and name_eq(d.trait_name, "Deref") == 1 and name_eq(d.type_name, ib.type_name) == 1 and (d.type_params == null) == (ib.type_params == null)
                     break
                 d = d.next
             var m: DfBuf
@@ -928,13 +926,13 @@ pub fn deref_impls_check(sm: *Sema)
             else
                 let fm: *FnDef = df_impl_method(ib, "deref_mut")
                 let fd: *FnDef = df_impl_method(d, "deref")
-                if fm != null and fd != null and fm.return_type_name != null and fd.return_type_name != null and name_eq(StrView { ptr: (fm.return_type_name), len: (fm.return_type_name_len) as i64 }, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 0
+                if fm != null and fd != null and fm.return_type_name.ptr != null and fd.return_type_name.ptr != null and name_eq(fm.return_type_name, fd.return_type_name) == 0
                     df_put_sv(@m, "`DerefMut` for `")
                     df_impl_type(ib, @m)
                     df_put_sv(@m, "` reaches `")
-                    df_put(@m, fm.return_type_name, fm.return_type_name_len)
+                    df_put_sv(@m, fm.return_type_name)
                     df_put_sv(@m, "`, but its `Deref` reaches `")
-                    df_put(@m, fd.return_type_name, fd.return_type_name_len)
+                    df_put_sv(@m, fd.return_type_name)
                     df_putc(@m, '`')
                     df_report(sm, ib.trait_span.line, ib.trait_span.col, df_view(@m))
         ib = ib.next

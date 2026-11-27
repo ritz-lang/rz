@@ -54,7 +54,7 @@ fn emit_member_gep_local(s: *EmitterState, e: *Expr, result: *MemberPtrResult, l
 # Helper to emit GEP from a base pointer register
 pub fn emit_member_gep_from_ptr(s: *EmitterState, result: *MemberPtrResult, base_ptr: i32, st: *StructDef, field_idx: i32, field: *StructField)
     let field_ptr: i32 = next_reg(s)
-    gep_struct_open(s, field_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+    gep_struct_open(s, field_ptr, st.name)
     format_into(s, ", ptr %.{base_ptr}, i32 0, i32 {field_idx}\n")
     result.reg = field_ptr
     result.field = field
@@ -87,9 +87,9 @@ fn emit_vec_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult
     if data_idx < 0
         return 0
     let data_field: *StructField = get_field_type(vec_st, data_idx)
-    if data_field.field_type != TypeKind.Ptr or data_field.field_type_name_len <= 0
+    if data_field.field_type != TypeKind.Ptr or data_field.field_type_name.len <= 0
         return 0
-    let elem_st: *StructDef = find_struct(s, StrView { ptr: (data_field.field_type_name), len: (data_field.field_type_name_len) as i64 })
+    let elem_st: *StructDef = find_struct(s, data_field.field_type_name)
     if elem_st == null
         return 0
     let field_idx: i32 = find_field_index(elem_st, e.ident)
@@ -97,12 +97,12 @@ fn emit_vec_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult
         return 0
     let field: *StructField = get_field_type(elem_st, field_idx)
     let data_pp: i32 = next_reg(s)
-    gep_struct_open(s, data_pp, StrView { ptr: (vec_st.name), len: (vec_st.name_len) as i64 })
+    gep_struct_open(s, data_pp, vec_st.name)
     format_into(s, ", ptr %.{loc.reg}, i32 0, i32 {data_idx}\n")
     let data_p: i32 = emit_load_ptr(s, data_pp)
     let idx_reg: i32 = emit_expr(s, e.left.right)
     let elem_ptr: i32 = next_reg(s)
-    gep_struct_open(s, elem_ptr, StrView { ptr: (elem_st.name), len: (elem_st.name_len) as i64 })
+    gep_struct_open(s, elem_ptr, elem_st.name)
     format_into(s, ", ptr %.{data_p}, i64 %.{idx_reg}\n")
     emit_member_gep_from_ptr(s, result, elem_ptr, elem_st, field_idx, field)
     return 1
@@ -135,13 +135,13 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
             # when no local of that name shadows the global.
             if loc == null
                 let glob: *GlobalVarDef = find_global(s, x.ident)
-                if glob == null or glob.var_type != TypeKind.Ptr or glob.pointee_type != TypeKind.Struct or glob.pointee_type_name_len <= 0
+                if glob == null or glob.var_type != TypeKind.Ptr or glob.pointee_type != TypeKind.Struct or glob.pointee_type_name.len <= 0
                     return 0
-                let gst: *StructDef = find_struct(s, StrView { ptr: (glob.pointee_type_name), len: (glob.pointee_type_name_len) as i64 })
+                let gst: *StructDef = find_struct(s, glob.pointee_type_name)
                 if gst == null
                     return 0
                 let gp: i32 = next_reg(s)
-                let g_ir: String = ir_name(StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+                let g_ir: String = ir_name(glob.name)
                 format_into(s, "  %.{gp} = load ptr, ptr @{g_ir.as_view()}\n")
                 *out_st = gst
                 *out_levels = 1
@@ -161,11 +161,11 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
             # AGAST #1635: `(*m.index(k)).f`, which a struct's `m[k].f` becomes.
             # The method returns an `@S`, `@&S` or `*S`: an address, in an i64.
             let fd: *FnDef = method_call_def(s, x)
-            if fd == null or fd.return_type_name_len <= 0
+            if fd == null or fd.return_type_name.len <= 0
                 return 0
             if fd.return_type != TypeKind.Ref and fd.return_type != TypeKind.MutRef and fd.return_type != TypeKind.Ptr
                 return 0
-            let mst: *StructDef = find_struct(s, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
+            let mst: *StructDef = find_struct(s, fd.return_type_name)
             if mst == null
                 return 0
             let addr: i32 = emit_expr(s, x)
@@ -179,7 +179,7 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
             if inner.success != 1
                 return 0
             let f: *StructField = inner.field
-            if f.field_type_name_len <= 0
+            if f.field_type_name.len <= 0
                 return 0
             var flevels: i32 = 0
             match f.field_type
@@ -190,7 +190,7 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
                 _ => pass
             if flevels == 0
                 return 0
-            let fst: *StructDef = find_struct(s, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+            let fst: *StructDef = find_struct(s, f.field_type_name)
             if fst == null
                 return 0
             *out_st = fst
@@ -279,9 +279,9 @@ fn ptr_ptr_struct_operand(s: *EmitterState, x: *Expr, out_st: **StructDef) -> i3
     var levels: i32 = 0
     if root.kind == ExprKind.Call
         let fd: *FnDef = find_call_fn(s, root)
-        if fd == null or fd.return_type != TypeKind.PtrPtr or fd.return_type_name == null
+        if fd == null or fd.return_type != TypeKind.PtrPtr or fd.return_type_name.ptr == null
             return 0
-        name = StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }
+        name = fd.return_type_name
         levels = 2
         while name.len > 4 and name.starts_with("ptr_")
             name = name.skip(4)
@@ -313,7 +313,7 @@ pub fn call_result_struct_levels(s: *EmitterState, e: *Expr, out_st: **StructDef
     if fd.return_type != TypeKind.Ref and fd.return_type != TypeKind.MutRef
         return 0
     let r: *Param = fd.ret_ref
-    if r == null or r.param_type_name_len <= 0
+    if r == null or r.param_type_name.len <= 0
         return 0
     var levels: i32 = 0
     if r.param_pointee_type == TypeKind.Ptr
@@ -322,7 +322,7 @@ pub fn call_result_struct_levels(s: *EmitterState, e: *Expr, out_st: **StructDef
         levels = 1 + ptr_ptr_ident_levels(r.param_inner_pointee_type)
     else
         return 0
-    let st: *StructDef = find_struct(s, StrView { ptr: (r.param_type_name), len: (r.param_type_name_len) as i64 })
+    let st: *StructDef = find_struct(s, r.param_type_name)
     if st == null
         return 0
     *out_st = st
@@ -349,7 +349,7 @@ fn emit_named_struct_array_member_ptr(s: *EmitterState, e: *Expr, result: *Membe
     let field: *StructField = get_field_type(st, fidx)
     let idx_reg: i32 = emit_expr(s, e.left.right)
     let elem_ptr: i32 = next_reg(s)
-    let st_ir: String = ir_name(StrView { ptr: (st.name), len: (st.name_len) as i64 })
+    let st_ir: String = ir_name(st.name)
     let arr_ir: String = ir_name(name_sv)
     format_into(s, "  %.{elem_ptr} = getelementptr [{size} x %{st_ir.as_view()}], ptr @{arr_ir.as_view()}, i64 0, i64 %.{idx_reg}\n")
     emit_member_gep_from_ptr(s, result, elem_ptr, st, fidx, field)
@@ -363,15 +363,15 @@ fn emit_struct_const_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrRe
     let ce: *ConstEntry = struct_const_global(s, e.left)
     if ce == null
         return
-    let st: *StructDef = find_struct(s, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 })
+    let st: *StructDef = find_struct(s, ce.type_name)
     if st == null
         return
     let field_idx: i32 = find_field_index(st, e.ident)
     if field_idx < 0
         return
     let field_ptr: i32 = next_reg(s)
-    let ce_ir: String = ir_name(StrView { ptr: (ce.name), len: (ce.name_len) as i64 })
-    gep_struct_open(s, field_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+    let ce_ir: String = ir_name(ce.name)
+    gep_struct_open(s, field_ptr, st.name)
     format_into(s, ", ptr @{ce_ir.as_view()}, i32 0, i32 {field_idx}\n")
     result.reg = field_ptr
     result.field = get_field_type(st, field_idx)
@@ -471,14 +471,14 @@ fn member_ptr_of_ident(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     let glob: *GlobalVarDef = find_global(s, e.left.ident)
     var gp_len: i32 = 0
     if glob != null
-        let glob_ir: String = ir_name(StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+        let glob_ir: String = ir_name(glob.name)
         if glob.var_type == TypeKind.Struct
-            let st: *StructDef = find_struct(s, StrView { ptr: (glob.type_name), len: (glob.type_name_len) as i64 })
+            let st: *StructDef = find_struct(s, glob.type_name)
             if st != null
                 let field_idx: i32 = find_field_index(st, e.ident)
                 if field_idx >= 0
                     let field_ptr: i32 = next_reg(s)
-                    gep_struct_open(s, field_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+                    gep_struct_open(s, field_ptr, st.name)
                     format_into(s, ", ptr @{glob_ir.as_view()}, i32 0, i32 {field_idx}\n")
                     result.reg = field_ptr
                     result.field = get_field_type(st, field_idx)
@@ -488,7 +488,7 @@ fn member_ptr_of_ident(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
         # reads and writes (which go through here via emit_assign) fell
         # through to "unhandled EXPR_MEMBER".  #1554: and `@S` / `@&S`.
         else if global_pointee_struct(glob, @gp_len) != null
-            let pst: *StructDef = find_struct(s, StrView { ptr: (glob.pointee_type_name), len: (gp_len) as i64 })
+            let pst: *StructDef = find_struct(s, glob.pointee_type_name.take(gp_len as i64))
             if pst != null
                 let pfield_idx: i32 = find_field_index(pst, e.ident)
                 if pfield_idx >= 0
@@ -496,8 +496,8 @@ fn member_ptr_of_ident(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                     format_into(s, "  %.{gp} = load ptr, ptr @{glob_ir.as_view()}\n")
                     emit_member_gep_from_ptr(s, result, gp, pst, pfield_idx, get_field_type(pst, pfield_idx))
         # AGAST #2372: and `var g: **S`.
-        else if glob.var_type == TypeKind.PtrPtr and glob.pointee_type_name_len > 0
-            let qst: *StructDef = find_struct(s, StrView { ptr: (glob.pointee_type_name), len: (glob.pointee_type_name_len) as i64 })
+        else if glob.var_type == TypeKind.PtrPtr and glob.pointee_type_name.len > 0
+            let qst: *StructDef = find_struct(s, glob.pointee_type_name)
             if qst != null
                 let qfield_idx: i32 = find_field_index(qst, e.ident)
                 if qfield_idx >= 0
@@ -523,18 +523,18 @@ fn member_ptr_of_member(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     let inner_field: *StructField = inner_result.field
     # Inner field must be a struct type to continue nesting
     if inner_field.field_type == TypeKind.Struct
-        let st: *StructDef = find_struct(s, StrView { ptr: (inner_field.field_type_name), len: (inner_field.field_type_name_len) as i64 })
+        let st: *StructDef = find_struct(s, inner_field.field_type_name)
         if st != null
             let field_idx: i32 = find_field_index(st, e.ident)
             if field_idx >= 0
                 emit_member_gep_from_ptr(s, result, inner_result.reg, st, field_idx, get_field_type(st, field_idx))
     # Handle pointer-to-struct field: load the pointer, then GEP into the pointed-to struct
     # AGAST #2372: a `**S` field is loaded down to the struct too.
-    else if (inner_field.field_type == TypeKind.Ptr or inner_field.field_type == TypeKind.PtrPtr) and inner_field.field_type_name_len > 0
+    else if (inner_field.field_type == TypeKind.Ptr or inner_field.field_type == TypeKind.PtrPtr) and inner_field.field_type_name.len > 0
         # Load the pointer value from the field
         let loaded: i32 = emit_load_levels(s, inner_result.reg, field_struct_levels(inner_field))
         # Now GEP into the pointed-to struct
-        let st: *StructDef = find_struct(s, StrView { ptr: (inner_field.field_type_name), len: (inner_field.field_type_name_len) as i64 })
+        let st: *StructDef = find_struct(s, inner_field.field_type_name)
         if st != null
             let field_idx: i32 = find_field_index(st, e.ident)
             if field_idx >= 0
@@ -556,7 +556,7 @@ fn member_ptr_of_struct_lit(s: *EmitterState, e: *Expr, result: *MemberPtrResult
     if sl_idx < 0
         return
     let sl_slot: i32 = next_reg(s)
-    let sl_ir: String = ir_name(StrView { ptr: (sl_st.name), len: (sl_st.name_len) as i64 })
+    let sl_ir: String = ir_name(sl_st.name)
     entry_alloca_reg_begin_named(s, sl_slot)
     format_into(s, "{sl_ir.as_view()}  ; struct-literal member\n")
     entry_alloca_reg_end(s)
@@ -575,7 +575,7 @@ fn member_ptr_of_call(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
         if cr_st != null
             let cr_idx: i32 = find_field_index(cr_st, e.ident)
             if cr_idx >= 0
-                let cr_sv: StrView = StrView { ptr: (cr_st.name), len: (cr_st.name_len) as i64 }
+                let cr_sv: StrView = cr_st.name
                 let cr_field: *StructField = get_field_type(cr_st, cr_idx)
                 let cr_val: i32 = emit_expr(s, e.left)
                 let cr_slot: i32 = next_reg(s)
@@ -702,8 +702,8 @@ fn member_ptr_of_addr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
             emit_member_ptr(s, a_op, @addr_inner)
             if addr_inner.success == 1
                 let af: *StructField = addr_inner.field
-                if af.field_type == TypeKind.Struct and af.field_type_name_len > 0
-                    let inner_st: *StructDef = find_struct(s, StrView { ptr: (af.field_type_name), len: (af.field_type_name_len) as i64 })
+                if af.field_type == TypeKind.Struct and af.field_type_name.len > 0
+                    let inner_st: *StructDef = find_struct(s, af.field_type_name)
                     if inner_st != null
                         let fidx2: i32 = find_field_index(inner_st, e.ident)
                         if fidx2 >= 0
@@ -741,8 +741,8 @@ fn member_ptr_of_binary(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
             if inner_result.success == 1
                 let inner_field: *StructField = inner_result.field
                 # If the field is a pointer to a struct, we can use it
-                if inner_field.field_type == TypeKind.Ptr and inner_field.field_type_name_len > 0
-                    st = find_struct(s, StrView { ptr: (inner_field.field_type_name), len: (inner_field.field_type_name_len) as i64 })
+                if inner_field.field_type == TypeKind.Ptr and inner_field.field_type_name.len > 0
+                    st = find_struct(s, inner_field.field_type_name)
         ExprKind.Ident =>
             # Direct identifier pointer arithmetic: (ptr_var + offset).field
             let loc: *LocalVar = find_local_struct_name(s, base_expr.ident)
@@ -825,7 +825,7 @@ fn member_ptr_of_nd_index(s: *EmitterState, e: *Expr, result: *MemberPtrResult, 
     var nd_el: NdIndexPtr
     emit_nd_index_ptr(s, e.left, @nd_el)
     let nd_fp: i32 = next_reg(s)
-    gep_struct_open(s, nd_fp, StrView { ptr: (nd_st.name), len: (nd_st.name_len) as i64 })
+    gep_struct_open(s, nd_fp, nd_st.name)
     format_into(s, ", ptr %.{nd_el.reg}, i32 0, i32 {nd_fidx}\n")
     result.reg = nd_fp
     result.field = get_field_type(nd_st, nd_fidx)
@@ -840,9 +840,9 @@ fn member_ptr_index_of_member(s: *EmitterState, e: *Expr, result: *MemberPtrResu
         let inner_field: *StructField = inner_result.field
         # The field should be an array type with struct elements
         # For arrays, the element type name is in array_elem_type_name, not field_type_name
-        if inner_field.field_type == TypeKind.Array and inner_field.array_elem_type_name_len > 0
+        if inner_field.field_type == TypeKind.Array and inner_field.array_elem_type_name.len > 0
             # Find the element struct type
-            let elem_st: *StructDef = find_struct(s, StrView { ptr: (inner_field.array_elem_type_name), len: (inner_field.array_elem_type_name_len) as i64 })
+            let elem_st: *StructDef = find_struct(s, inner_field.array_elem_type_name)
             if elem_st != null
                 let field_idx: i32 = find_field_index(elem_st, e.ident)
                 if field_idx >= 0
@@ -851,7 +851,7 @@ fn member_ptr_index_of_member(s: *EmitterState, e: *Expr, result: *MemberPtrResu
                     let idx_reg: i32 = emit_expr(s, e.left.right)
                     # GEP into the array to get the element
                     let elem_ptr: i32 = next_reg(s)
-                    let elem_ir: String = ir_name(StrView { ptr: (elem_st.name), len: (elem_st.name_len) as i64 })
+                    let elem_ir: String = ir_name(elem_st.name)
                     format_into(s, "  %.{elem_ptr} = getelementptr [{inner_field.array_size as i64} x %{elem_ir.as_view()}], ptr %.{inner_result.reg}, i64 0, i64 %.{idx_reg}\n")
                     # Now GEP into the element struct to get the field
                     emit_member_gep_from_ptr(s, result, elem_ptr, elem_st, field_idx, field)
@@ -865,8 +865,8 @@ fn member_ptr_index_of_member(s: *EmitterState, e: *Expr, result: *MemberPtrResu
         # Lowering: load the field (a ptr to the *Foo array) →
         # GEP by index using ptr stride → load to materialise the
         # i-th *Foo → GEP into Foo for the requested member.
-        else if inner_field.field_type == TypeKind.PtrPtr and inner_field.field_type_name_len > 0
-            let elem_st_pp: *StructDef = find_struct(s, StrView { ptr: (inner_field.field_type_name), len: (inner_field.field_type_name_len) as i64 })
+        else if inner_field.field_type == TypeKind.PtrPtr and inner_field.field_type_name.len > 0
+            let elem_st_pp: *StructDef = find_struct(s, inner_field.field_type_name)
             if elem_st_pp != null
                 let field_idx_pp: i32 = find_field_index(elem_st_pp, e.ident)
                 if field_idx_pp >= 0
@@ -905,7 +905,7 @@ fn member_ptr_index_of_ident(s: *EmitterState, e: *Expr, result: *MemberPtrResul
                     let field: *StructField = get_field_type(elem_st, field_idx)
                     let idx_reg: i32 = emit_expr(s, e.left.right)
                     let elem_ptr: i32 = next_reg(s)
-                    let elem_ir: String = ir_name(StrView { ptr: (elem_st.name), len: (elem_st.name_len) as i64 })
+                    let elem_ir: String = ir_name(elem_st.name)
                     format_into(s, "  %.{elem_ptr} = getelementptr [{lv_array_size(arr_loc) as i64} x %{elem_ir.as_view()}], ptr %.{arr_loc.reg}, i64 0, i64 %.{idx_reg}\n")
                     emit_member_gep_from_ptr(s, result, elem_ptr, elem_st, field_idx, field)
                     return
@@ -952,20 +952,20 @@ fn member_ptr_index_of_ident(s: *EmitterState, e: *Expr, result: *MemberPtrResul
     if arr_loc == null
         let g_arr: *GlobalVarDef = find_global(s, e.left.left.ident)
         if g_arr != null
-            if g_arr.var_type == TypeKind.Array and g_arr.array_elem_type == TypeKind.Struct and g_arr.array_elem_type_name_len > 0
-                if emit_named_struct_array_member_ptr(s, e, result, StrView { ptr: (g_arr.name), len: (g_arr.name_len) as i64 }, g_arr.array_size, StrView { ptr: (g_arr.array_elem_type_name), len: (g_arr.array_elem_type_name_len) as i64 })
+            if g_arr.var_type == TypeKind.Array and g_arr.array_elem_type == TypeKind.Struct and g_arr.array_elem_type_name.len > 0
+                if emit_named_struct_array_member_ptr(s, e, result, g_arr.name, g_arr.array_size, g_arr.array_elem_type_name)
                     return
             # AGAST #1908: `g[i].field` where g is a `*St` global
             # (ritzunit's `g_junit_results[i].name`).
-            if g_arr.var_type == TypeKind.Ptr and g_arr.pointee_type_name_len > 0
-                if emit_ptr_elem_member_ptr(s, e, result, StrView { ptr: (g_arr.pointee_type_name), len: (g_arr.pointee_type_name_len) as i64 }) == 1
+            if g_arr.var_type == TypeKind.Ptr and g_arr.pointee_type_name.len > 0
+                if emit_ptr_elem_member_ptr(s, e, result, g_arr.pointee_type_name) == 1
                     return
         # AGAST #3325: `KS[i].len` over a `const KS: [N]P = [...]`,
         # declared `[N x %P]` by emit_const_array_entry.
         else
             let c_arr: *ConstEntry = find_const_entry(s, e.left.left.ident)
-            if c_arr != null and c_arr.const_type == TypeKind.Array and c_arr.array_elem_type == TypeKind.Struct and c_arr.array_elem_type_name_len > 0 and c_arr.value_expr != null and (c_arr.value_expr.kind == ExprKind.ArrayLit or const_struct_fill_global(c_arr) == 1)
-                if emit_named_struct_array_member_ptr(s, e, result, StrView { ptr: (c_arr.name), len: (c_arr.name_len) as i64 }, c_arr.array_size, StrView { ptr: (c_arr.array_elem_type_name), len: (c_arr.array_elem_type_name_len) as i64 })
+            if c_arr != null and c_arr.const_type == TypeKind.Array and c_arr.array_elem_type == TypeKind.Struct and c_arr.array_elem_type_name.len > 0 and c_arr.value_expr != null and (c_arr.value_expr.kind == ExprKind.ArrayLit or const_struct_fill_global(c_arr) == 1)
+                if emit_named_struct_array_member_ptr(s, e, result, c_arr.name, c_arr.array_size, c_arr.array_elem_type_name)
                     return
 
 
@@ -1002,7 +1002,7 @@ fn emit_array_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResu
 # whose slot is at `field_reg`: load the pointer, GEP one St per index, then
 # the field.  True with `result` filled, false if St or the field is unknown.
 fn emit_ptr_field_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult, field_reg: i32, f: *StructField) -> bool
-    let st: *StructDef = find_struct(s, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+    let st: *StructDef = find_struct(s, f.field_type_name)
     if st == null
         return false
     let field_idx: i32 = find_field_index(st, e.ident)
@@ -1032,7 +1032,7 @@ pub fn emit_ptr_elem_addr(s: *EmitterState, ie: *Expr, st: *StructDef) -> i32
     let idx_reg: i32 = emit_expr(s, ie.right)
     let base_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, ptr_val)
     let elem_ptr: i32 = next_reg(s)
-    gep_struct_open(s, elem_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+    gep_struct_open(s, elem_ptr, st.name)
     format_into(s, ", ptr %.{base_ptr}, i64 %.{idx_reg}\n")
     elem_ptr
 
@@ -1459,7 +1459,7 @@ pub fn call_array_spill(s: *EmitterState, root: *Expr) -> *Expr
     let name: StrView = call_array_local_name()
     let ra: *Param = call_ret_array(s, call)
     let slot: i32 = emit_call_array_temp(s, call, ra)
-    add_local_full(s, name, slot, TypeKind.Array, StrView { ptr: (ra.param_type_name), len: (ra.param_type_name_len) as i64 }, TypeKind.I64, ra.param_array_size, ra.param_array_elem_type)
+    add_local_full(s, name, slot, TypeKind.Array, ra.param_type_name, TypeKind.I64, ra.param_array_size, ra.param_array_elem_type)
     let loc: *LocalVar = local_at(s, s.fcx.local_count - 1)
     lv_set_array_elem_pointee(loc, ra.param_array_elem_pointee)
     let id: *Expr = malloc(sizeof(Expr)) as *Expr

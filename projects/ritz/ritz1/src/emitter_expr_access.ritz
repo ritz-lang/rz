@@ -41,7 +41,7 @@ fn local_type_text(lv: *LocalVar) -> StrView
 
 # The struct type a field is declared with.
 fn field_type_text(f: *StructField) -> StrView
-    StrView { ptr: f.field_type_name, len: f.field_type_name_len as i64 }
+    f.field_type_name
 
 # The name of enum `ei`.
 fn enum_text(s: *EmitterState, ei: i32) -> StrView
@@ -173,9 +173,9 @@ fn emit_const_value(s: *EmitterState, e: *Expr, name: StrView) -> i32
         # a real `%StructTy` global (emit_const_struct_entry): load the
         # aggregate, so a site wanting the struct gets one and not the legacy
         # `add i64 0, 0`.
-        if ce.const_type == TypeKind.Struct and ce.type_name_len > 0 and ce.value_expr != null
+        if ce.const_type == TypeKind.Struct and ce.type_name.len > 0 and ce.value_expr != null
             let result: i32 = next_reg(s)
-            emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: ce.type_name, len: ce.type_name_len as i64 }, 0 - 1, StrView { ptr: ce.name, len: ce.name_len as i64 })
+            emit_struct_load_or_defer(s, TypeKind.Struct, result, ce.type_name, 0 - 1, ce.name)
             return result
         # AGAST #2341: a string `*u8` const is its literal.  Its folded value
         # is 0, which is what `*P` used to read.
@@ -234,11 +234,11 @@ fn emit_global_value(s: *EmitterState, e: *Expr, glob: *GlobalVarDef) -> i32
         emit_whole_array_error(s, e)   # AGAST #2287, as for a local
         return 0
     let result: i32 = next_reg(s)
-    if glob.var_type == TypeKind.Struct and glob.type_name_len > 0
-        emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: glob.type_name, len: glob.type_name_len as i64 }, 0 - 1, StrView { ptr: glob.name, len: glob.name_len as i64 })
+    if glob.var_type == TypeKind.Struct and glob.type_name.len > 0
+        emit_struct_load_or_defer(s, TypeKind.Struct, result, glob.type_name, 0 - 1, glob.name)
     else
         let ty: StrView = llvm_text(ty_value_llvm(glob.var_type))
-        let g: String = ir_name(StrView { ptr: glob.name, len: glob.name_len as i64 })
+        let g: String = ir_name(glob.name)
         format_into(s, "  %.{result} = load {ty}, ptr @{g.as_view()}\n")
     widen_slot_value(s, glob.var_type, result)
 
@@ -248,7 +248,7 @@ fn emit_global_value(s: *EmitterState, e: *Expr, glob: *GlobalVarDef) -> i32
 # emit_extern_declarations skips a fn this .ll defines, so an imported one gets
 # its `declare` and a local one doesn't.
 fn emit_fn_address(s: *EmitterState, f: *FnDef) -> i32
-    add_extern(s, StrView { ptr: f.name, len: f.name_len as i64 })
+    add_extern(s, f.name)
     let addr: i32 = next_reg(s)
     # AGAST #4356: a private free fn's symbol carries its file (fn_symbol).
     var sym_len: i32 = 0
@@ -574,7 +574,7 @@ fn global_store_pointee(s: *EmitterState, glob: *GlobalVarDef) -> StorePointee
         return pointer_pointee()
     if glob.var_type != TypeKind.Ptr
         return no_pointee()
-    let name: StrView = StrView { ptr: glob.pointee_type_name, len: glob.pointee_type_name_len as i64 }
+    let name: StrView = glob.pointee_type_name
     scalar_or_struct_pointee(s, glob.pointee_type, name)
 
 # AGAST #3757: the element type of `@a[i]` (`@` only, not `@&`) over an
@@ -860,18 +860,18 @@ fn emit_local_array_index(s: *EmitterState, e: *Expr, local: *LocalVar) -> i32
 fn try_emit_global_array_index(s: *EmitterState, e: *Expr, garr: *GlobalVarDef) -> Option<i32>
     if garr == null
         return None
-    let name: StrView = StrView { ptr: garr.name, len: garr.name_len as i64 }
+    let name: StrView = garr.name
     if garr.array_elem_type != TypeKind.Struct
         let ty: StrView = elem_mem_llvm(garr.array_elem_type)
         return Some(emit_global_array_index(s, name, garr.array_size, garr.array_elem_type, ty, e.right))
-    if garr.array_elem_type_name_len == 0
+    if garr.array_elem_type_name.len == 0
         return None
     # AGAST #1553: a whole struct element (`let q: P = g[i]`) is a struct
     # value: `load %P` from the `[N x %P]` GEP, the same form a struct-valued
     # deref or call yields, so a %P slot can take it.  AGAST #2996: a copy only.
     if whole_struct_elem_refused(s, e)
         return Some(0)
-    let elem: StrView = StrView { ptr: garr.array_elem_type_name, len: garr.array_elem_type_name_len as i64 }
+    let elem: StrView = garr.array_elem_type_name
     Some(emit_struct_array_elem_load(s, name, garr.array_size, elem, e.right))
 
 # AGAST #1534: `T[i]` on a module `const T: [N]X = [...]`, which
@@ -886,15 +886,15 @@ fn try_emit_const_array_index(s: *EmitterState, e: *Expr, carr: *ConstEntry) -> 
     let lit: bool = carr.value_expr.kind == ExprKind.ArrayLit
     if not lit and carr.value_expr.kind != ExprKind.ArrayFill
         return None
-    let name: StrView = StrView { ptr: carr.name, len: carr.name_len as i64 }
+    let name: StrView = carr.name
     # AGAST #3325: a struct element (`KS[1]` of `[N]StrView`) is read as a
     # global's is (#1553): emit_const_array_entry declares the const
     # `[N x %P]`.  AGAST #3946: a refused struct fill reads its placeholder
     # global.
-    if carr.array_elem_type == TypeKind.Struct and carr.array_elem_type_name_len > 0 and (lit or const_struct_fill_global(carr) == 1)
+    if carr.array_elem_type == TypeKind.Struct and carr.array_elem_type_name.len > 0 and (lit or const_struct_fill_global(carr) == 1)
         if whole_struct_elem_refused(s, e)
             return Some(0)
-        let elem: StrView = StrView { ptr: carr.array_elem_type_name, len: carr.array_elem_type_name_len as i64 }
+        let elem: StrView = carr.array_elem_type_name
         return Some(emit_struct_array_elem_load(s, name, carr.array_size, elem, e.right))
     let cty: StrView = const_elem_llvm(carr.array_elem_type)
     if unnamed(cty)
@@ -918,7 +918,7 @@ fn try_emit_view_local_index(s: *EmitterState, e: *Expr, local: *LocalVar) -> Op
 # `s.f[i]` with `f: [N]T` inline in s: the element at `mr`'s field address.
 fn emit_field_array_index(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, field: *StructField) -> i32
     let et: TypeKind = field.array_elem_type
-    if et != TypeKind.Struct or field.array_elem_type_name_len == 0
+    if et != TypeKind.Struct or field.array_elem_type_name.len == 0
         # AGAST #1814: the field's declared element type.  Integer and
         # pointer elements widen to i64, a bool's i1 zero-extends, and an
         # f32 / f64 element is its own `float` / `double` (AGAST #1954).
@@ -930,7 +930,7 @@ fn emit_field_array_index(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, fiel
     # AGAST #188: a struct element is GEP'd as `[N x %T]`, so the stride
     # matches the struct's layout, and loaded as `%T`, not as i64 (mausoleum
     # doc_remove_field's `doc.fields[i + 1]`).
-    let elem: StrView = StrView { ptr: field.array_elem_type_name, len: field.array_elem_type_name_len as i64 }
+    let elem: StrView = field.array_elem_type_name
     let idx: i32 = emit_expr(s, e.right)
     let elem_ptr: i32 = emit_struct_elem_addr(s, field.array_size, elem, mr.reg, idx)
     emit_struct_load(s, elem, elem_ptr)
@@ -952,7 +952,7 @@ fn try_emit_index_member(s: *EmitterState, e: *Expr) -> Option<i32>
     # *Foo (skip-list / hash-bucket pattern; tome's `update[k].forward[k]`):
     # load the field, GEP at a pointer's stride, load the i-th *Foo, and
     # carry it as an i64.
-    if ft == TypeKind.PtrPtr and field.field_type_name_len > 0
+    if ft == TypeKind.PtrPtr and field.field_type_name.len > 0
         let idx: i32 = emit_expr(s, e.right)
         let arr: i32 = next_reg(s)
         format_into(s, "  %.{arr} = load ptr, ptr %.{member_result.reg}\n")
@@ -990,7 +990,7 @@ fn try_emit_index_call(s: *EmitterState, e: *Expr) -> Option<i32>
     let cfn: *FnDef = find_call_fn(s, e.left)
     if cfn == null or cfn.return_type != TypeKind.Struct
         return None
-    let vec: StrView = StrView { ptr: cfn.return_type_name, len: cfn.return_type_name_len as i64 }
+    let vec: StrView = cfn.return_type_name
     if not is_vec_name(vec)
         return None
     let call_val: i32 = emit_expr(s, e.left)
@@ -1123,7 +1123,7 @@ fn unknown_field_refused(s: *EmitterState, e: *Expr) -> bool
     let field: StrView = ident_text(e)
     var f: *StructField = st.fields
     while f != null
-        let fname: StrView = StrView { ptr: f.name, len: f.name_len as i64 }
+        let fname: StrView = f.name
         if fname.eq(field)
             return false
         f = f.next
@@ -1255,8 +1255,8 @@ pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
                 None => pass
             # `m.K` / `m.f`: no `module.item` access (§15.3, AGAST #2215).  Was a
             # flat lookup of K (ritz0's too), so it compiled while `m.f()` did not.
-            if is_module_item(s, e.left.ident.ptr, (e.left.ident.len as i32), e.ident.ptr, (e.ident.len as i32)) == 1
-                return emit_module_item_error(s, e.left.ident.ptr, (e.left.ident.len as i32), e.ident.ptr, (e.ident.len as i32), e.span.line, e.span.col)
+            if is_module_item(s, e.left.ident, e.ident) == 1
+                return emit_module_item_error(s, e.left.ident, e.ident, e.span.line, e.span.col)
         ExprKind.StringLit =>
             return emit_strlit_field(s, e)
         _ => pass

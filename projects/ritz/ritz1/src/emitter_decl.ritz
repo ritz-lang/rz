@@ -178,7 +178,7 @@ fn infer_ref_to_scalar_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     # an i32 / u8 it stored an i64 that clang refused.
     else
         let glob: *GlobalVarDef = find_global(s, o.ident)
-        if glob == null or glob.type_name_len != 0 or scalar_pointee(glob.var_type) == 0
+        if glob == null or glob.type_name.len != 0 or scalar_pointee(glob.var_type) == 0
             return 0
         pointee = glob.var_type
     dt.var_type = TypeKind.Ref
@@ -403,7 +403,7 @@ fn infer_field_ref_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     if init.operand == null or init.operand.kind != ExprKind.Member
         return 0
     let f: *StructField = resolve_member_chain_field(s, init.operand)
-    if f == null or f.field_type_name_len != 0
+    if f == null or f.field_type_name.len != 0
         return 0
     let t: TypeKind = f.field_type
     if not type_is_scalar_leaf(t)
@@ -429,7 +429,7 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> StrVi
         return array_ptr_elem_view(pp)
     let pa: *Param = base_ptr_array(s, init)   # #2329
     if pa != null
-        return StrView { ptr: pa.param_type_name, len: pa.param_type_name_len as i64 }
+        return pa.param_type_name
     if init.kind != ExprKind.Unary or (init.op != OpKind.Addr and init.op != OpKind.AddrMut) or init.operand == null
         return no_name()
     let oper: *Expr = init.operand
@@ -442,7 +442,7 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> StrVi
         ExprKind.Member =>
             let fld: *StructField = resolve_member_chain_field(s, oper)
             if fld != null and fld.field_type == TypeKind.Array
-                return StrView { ptr: fld.array_elem_type_name, len: fld.array_elem_type_name_len as i64 }
+                return fld.array_elem_type_name
         ExprKind.Ident =>
             let arr: *LocalVar = find_local_struct_name(s, oper.ident)
             if arr != null
@@ -454,7 +454,7 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> StrVi
             else
                 let garr: *GlobalVarDef = global_array_named(s, oper)
                 if garr != null
-                    return StrView { ptr: garr.array_elem_type_name, len: garr.array_elem_type_name_len as i64 }
+                    return garr.array_elem_type_name
         _ => pass
     no_name()
 
@@ -500,7 +500,7 @@ fn addr_index_elem_struct(s: *EmitterState, ie: *Expr) -> StrView
     else if ie.left.kind == ExprKind.Member and ie.right != null and ie.right.kind != ExprKind.Range
         let f: *StructField = resolve_member_chain_field(s, ie.left)
         if ptr_field_struct_elem(s, f) == 1
-            name = StrView { ptr: f.field_type_name, len: f.field_type_name_len as i64 }
+            name = f.field_type_name
     if unnamed(name) or name.len <= 0
         return no_name()
     name
@@ -630,7 +630,7 @@ fn infer_elem_ptr_ptr_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
 # record was before, so arithmetic on it is refused, not a byte add.
 # Returns the local's var_type.
 fn infer_ptr_ptr_call_let(s: *EmitterState, dt: *DeclTy, fd: *FnDef) -> TypeKind
-    var name: StrView = StrView { ptr: fd.return_type_name, len: fd.return_type_name_len as i64 }
+    var name: StrView = fd.return_type_name
     if unnamed(name) or name.len <= 0
         return TypeKind.I64
     var extra: i32 = 0
@@ -641,8 +641,8 @@ fn infer_ptr_ptr_call_let(s: *EmitterState, dt: *DeclTy, fd: *FnDef) -> TypeKind
     if inner == TypeKind.Void   # primitive_type_from_name's miss value
         if find_struct(s, name) == null
             dt.var_type = TypeKind.Ptr
-            dt.var_type_name = fd.return_type_name
-            dt.var_type_name_len = fd.return_type_name_len
+            dt.var_type_name = fd.return_type_name.ptr
+            dt.var_type_name_len = fd.return_type_name.len as i32
             return TypeKind.Ptr
         inner = TypeKind.Struct
         set_decl_name(dt, name)
@@ -882,9 +882,9 @@ fn tuple_decl_method_struct_name(s: *EmitterState, init: *Expr) -> StrView
     if recv.len <= 0
         return no_name()
     let fd: *FnDef = method_callee_def(s, recv, init.ident)
-    if fd == null or fd.return_type != TypeKind.Struct or fd.return_type_name_len <= 0
+    if fd == null or fd.return_type != TypeKind.Struct or fd.return_type_name.len <= 0
         return no_name()
-    StrView { ptr: fd.return_type_name, len: fd.return_type_name_len as i64 }
+    fd.return_type_name
 
 # AGAST #2574: the struct `let (a, b) = init` destructures, or null/0.  A call
 # or method call (`mk(3)`, `c.tp(3)`, a static `C.sm(5)`) names it by its
@@ -908,8 +908,8 @@ pub fn tuple_decl_struct_name(s: *EmitterState, init: *Expr) -> StrView
     # A struct field (`h.p`, `hs[0].p`, `mk().p`) names its own type.
     if name.len == 0 and init.kind == ExprKind.Member
         let fld: *StructField = resolve_member_chain_field(s, init)
-        if fld != null and fld.field_type == TypeKind.Struct and fld.field_type_name_len > 0
-            name = StrView { ptr: fld.field_type_name, len: fld.field_type_name_len as i64 }
+        if fld != null and fld.field_type == TypeKind.Struct and fld.field_type_name.len > 0
+            name = fld.field_type_name
     # AGAST #2592: an element of a `[N]S` local, global or field (`ps[1]`,
     # `h.ps[1]`, `gp[0]`), which emit_expr_index loads as a `%S`.
     if name.len == 0 and init.kind == ExprKind.Index
@@ -920,8 +920,8 @@ pub fn tuple_decl_struct_name(s: *EmitterState, init: *Expr) -> StrView
     # A struct global, when no local has the name.
     if name.len == 0 and init.kind == ExprKind.Ident and find_local_struct_name(s, init.ident) == null
         let g: *GlobalVarDef = find_global(s, init.ident)
-        if g != null and g.var_type == TypeKind.Struct and g.type_name_len > 0
-            name = StrView { ptr: g.type_name, len: g.type_name_len as i64 }
+        if g != null and g.var_type == TypeKind.Struct and g.type_name.len > 0
+            name = g.type_name
     name
 
 # AGAST #2574: 1 if a destructured field of this kind can be bound as a local:
@@ -939,7 +939,7 @@ pub fn tuple_field_bindable(fld: *StructField) -> i32
         return 1
     if ft == TypeKind.F32 or ft == TypeKind.F64 or ft == TypeKind.Bool
         return 1
-    if ft == TypeKind.Struct and fld.field_type_name_len > 0
+    if ft == TypeKind.Struct and fld.field_type_name.len > 0
         return 1
     if ft == TypeKind.Ptr or ft == TypeKind.PtrPtr
         return 1
@@ -957,7 +957,7 @@ fn tuple_bind_array_field(s: *EmitterState, fld: *StructField, val: i32, name: S
     format_into(s, "  store ")
     emit_field_llvm_type(s, fld)
     format_into(s, " %.{val}, ptr %.{slot}\n")
-    add_local_full(s, name, slot, TypeKind.Array, StrView { ptr: (fld.array_elem_type_name), len: (fld.array_elem_type_name_len) as i64 }, TypeKind.I64, fld.array_size, fld.array_elem_type)
+    add_local_full(s, name, slot, TypeKind.Array, fld.array_elem_type_name, TypeKind.I64, fld.array_size, fld.array_elem_type)
     let loc: *LocalVar = local_at(s, s.fcx.local_count - 1)
     lv_set_array_elem_pointee(loc, fld.array_elem_pointee)
     lv_set_array_shape(loc, fld.array_shape)
@@ -970,7 +970,7 @@ fn tuple_bind_array_field(s: *EmitterState, fld: *StructField, val: i32, name: S
 # so an i16 / i8 / f32 field gave IR clang refused.
 pub fn tuple_bind_field(s: *EmitterState, fld: *StructField, sname_sv: StrView, init_reg: i32, idx: i32, name_sv: StrView)
     let ft: TypeKind = fld.field_type
-    let ft_name: StrView = StrView { ptr: fld.field_type_name, len: fld.field_type_name_len as i64 }
+    let ft_name: StrView = fld.field_type_name
     let val: i32 = next_reg(s)
     format_into(s, "  %.{val} = extractvalue %")
     emit_name(s, sname_sv)
@@ -1116,8 +1116,8 @@ pub fn decl_infer_array_src(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type
             dt.var_array_elem_type = lra.param_array_elem_type
             dt.var_array_elem_pointee = lra.param_array_elem_pointee
             dt.var_array_shape = lra.param_array_shape   # AGAST #3634: `[N][M]T`
-            dt.var_type_name = lra.param_type_name
-            dt.var_type_name_len = lra.param_type_name_len
+            dt.var_type_name = lra.param_type_name.ptr
+            dt.var_type_name_len = lra.param_type_name.len as i32
         # AGAST #3191: so is `let c = *p` of a `*[N]T` (local, field, global,
         # `p + k`): the `[N]T` local `let c: [N]T = *p` declares, copied.
         else if stmt.var_init.kind == ExprKind.Unary and stmt.var_init.op == OpKind.Deref
@@ -1174,8 +1174,8 @@ pub fn decl_infer_array_src(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type
                         dt.var_array_elem_type = af.array_elem_type
                         dt.var_array_elem_pointee = af.array_elem_pointee
                         dt.var_array_shape = af.array_shape
-                        dt.var_type_name = af.array_elem_type_name
-                        dt.var_type_name_len = af.array_elem_type_name_len
+                        dt.var_type_name = af.array_elem_type_name.ptr
+                        dt.var_type_name_len = af.array_elem_type_name.len as i32
                 # AGAST #3322: and `let r = g[i]`, a row of an `[N][M]T` (local,
                 # global, field, plane pointer; the inner row of a deeper one): the
                 # `[M]T` local `let r: [M]T = g[i]` declares, copied, as ritz0 binds
@@ -1271,22 +1271,22 @@ fn decl_infer_call(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Type
     if fn_def != null and fn_def.return_type == TypeKind.PtrPtr
         var_type = infer_ptr_ptr_call_let(s, dt, fn_def)
     else if fn_def != null and fn_def.return_type == TypeKind.Struct
-        if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
+        if fn_def.return_type_name.ptr != null and fn_def.return_type_name.len > 0
             var_type = TypeKind.Struct
             dt.var_type = TypeKind.Struct
-            dt.var_type_name = fn_def.return_type_name
-            dt.var_type_name_len = fn_def.return_type_name_len
+            dt.var_type_name = fn_def.return_type_name.ptr
+            dt.var_type_name_len = fn_def.return_type_name.len as i32
     # AGAST #1980: `let p = vec_as_ptr<i32>(@v)` -- monomorph names a
     # specialised `-> *T`'s pointee "i32".  That is a pointee kind, not
     # a struct: register p like `let p: *i32` (element stride/load
     # width from var_pointee_type), not as a pointer to struct %i32.
-    else if fn_def != null and fn_def.return_type == TypeKind.Ptr and primitive_type_from_name(StrView { ptr: (fn_def.return_type_name), len: (fn_def.return_type_name_len) as i64 }) != TypeKind.Void
+    else if fn_def != null and fn_def.return_type == TypeKind.Ptr and primitive_type_from_name(fn_def.return_type_name) != TypeKind.Void
         var_type = TypeKind.Ptr
         dt.var_type = TypeKind.Ptr
         dt.var_type_name = null
         dt.var_type_name_len = 0
-        dt.var_pointee_type = primitive_type_from_name(StrView { ptr: (fn_def.return_type_name), len: (fn_def.return_type_name_len) as i64 })
-    else if fn_def != null and fn_def.return_type == TypeKind.Ptr and fn_def.return_type_name != null and fn_def.return_type_name_len > 0
+        dt.var_pointee_type = primitive_type_from_name(fn_def.return_type_name)
+    else if fn_def != null and fn_def.return_type == TypeKind.Ptr and fn_def.return_type_name.ptr != null and fn_def.return_type_name.len > 0
         # `let cqe = uring_peek_cqe(...)` — fn returns `*IoUringCqe`.
         # Narrow the local to TypeKind.Ptr with the pointee struct name
         # so `cqe.user_data` resolves the struct field via the
@@ -1297,8 +1297,8 @@ fn decl_infer_call(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Type
         # ExprKind.Member".
         var_type = TypeKind.Ptr
         dt.var_type = TypeKind.Ptr
-        dt.var_type_name = fn_def.return_type_name
-        dt.var_type_name_len = fn_def.return_type_name_len
+        dt.var_type_name = fn_def.return_type_name.ptr
+        dt.var_type_name_len = fn_def.return_type_name.len as i32
     # Float-returning fn → narrow to TypeKind.F32/F64 so the alloca
     # and downstream loads/stores are the right width (was
     # defaulting to i64 → `store i64 <float>` rejected by clang).
@@ -1312,11 +1312,11 @@ fn decl_infer_call(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Type
     # the local has no type_name, and member access falls through to
     # "; ERROR: unhandled EXPR_MEMBER" with a stale `%.0`.
     else if fn_def != null and fn_def.return_type == TypeKind.Ptr
-        if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
+        if fn_def.return_type_name.ptr != null and fn_def.return_type_name.len > 0
             var_type = TypeKind.Ptr
             dt.var_type = TypeKind.Ptr
-            dt.var_type_name = fn_def.return_type_name
-            dt.var_type_name_len = fn_def.return_type_name_len
+            dt.var_type_name = fn_def.return_type_name.ptr
+            dt.var_type_name_len = fn_def.return_type_name.len as i32
     # AGAST #1453: reference-returning fn (`-> @L` / `-> @&L`).  A
     # reference is a pointer at the LLVM level, so register the local
     # exactly like #175's `-> *Foo` case: `let m = get(l); m.x` then
@@ -1329,12 +1329,12 @@ fn decl_infer_call(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Type
             var_type = TypeKind.Ptr
             dt.var_type = TypeKind.Ptr
             dt.var_pointee_type = ret_ref_scalar_pointee(fn_def)
-        else if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
-            if find_struct(s, StrView { ptr: (fn_def.return_type_name), len: (fn_def.return_type_name_len) as i64 }) != null
+        else if fn_def.return_type_name.ptr != null and fn_def.return_type_name.len > 0
+            if find_struct(s, fn_def.return_type_name) != null
                 var_type = TypeKind.Ptr
                 dt.var_type = TypeKind.Ptr
-                dt.var_type_name = fn_def.return_type_name
-                dt.var_type_name_len = fn_def.return_type_name_len
+                dt.var_type_name = fn_def.return_type_name.ptr
+                dt.var_type_name_len = fn_def.return_type_name.len as i32
     var_type
 
 # task-101: builtin method return-type table. Method calls like
@@ -1382,11 +1382,11 @@ fn decl_infer_method(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Ty
         if recv_tn.ptr != null and recv_tn.len > 0
             m = method_callee_def(s, recv_tn, stmt.var_init.ident)
         if m != null
-            if m.return_type == TypeKind.Struct and m.return_type_name_len > 0
+            if m.return_type == TypeKind.Struct and m.return_type_name.len > 0
                 var_type = TypeKind.Struct
                 dt.var_type = TypeKind.Struct
-                dt.var_type_name = m.return_type_name
-                dt.var_type_name_len = m.return_type_name_len
+                dt.var_type_name = m.return_type_name.ptr
+                dt.var_type_name_len = m.return_type_name.len as i32
             else if m.return_type == TypeKind.F32 or m.return_type == TypeKind.F64
                 # Float-returning method: narrow so alloca/store
                 # width match (was `alloca i64; store float`).
@@ -1396,7 +1396,7 @@ fn decl_infer_method(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Ty
                 var_type = TypeKind.Ptr   # AGAST #2308, as for a call
                 dt.var_type = TypeKind.Ptr
                 dt.var_pointee_type = ret_ref_scalar_pointee(m)
-            else if m.return_type == TypeKind.Ptr and primitive_type_from_name(StrView { ptr: (m.return_type_name), len: (m.return_type_name_len) as i64 }) != TypeKind.Void
+            else if m.return_type == TypeKind.Ptr and primitive_type_from_name(m.return_type_name) != TypeKind.Void
                 # AGAST #4537: `let p = v.as_ptr()` on a Vec<i32> is a
                 # `*i32`, as `let p = vec_as_ptr<i32>(@v)` was (#1980
                 # for a call).  The specialised method names the
@@ -1405,7 +1405,7 @@ fn decl_infer_method(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Ty
                 dt.var_type = TypeKind.Ptr
                 dt.var_type_name = null
                 dt.var_type_name_len = 0
-                dt.var_pointee_type = primitive_type_from_name(StrView { ptr: (m.return_type_name), len: (m.return_type_name_len) as i64 })
+                dt.var_pointee_type = primitive_type_from_name(m.return_type_name)
             else if m.return_type == TypeKind.PtrPtr
                 # AGAST #4537: `let q = v.as_ptr()` on a Vec<*S> /
                 # Vec<*u8> / Vec<**u8> is the `**S` / `**u8` /
@@ -1413,7 +1413,7 @@ fn decl_infer_method(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Ty
                 # was (#2791).  Same decoder as the call arm, so a
                 # `ptr_` per level past two is read back too.
                 var_type = infer_ptr_ptr_call_let(s, dt, m)
-            else if (m.return_type == TypeKind.Ptr or m.return_type == TypeKind.Ref or m.return_type == TypeKind.MutRef) and m.return_type_name_len > 0 and find_struct(s, StrView { ptr: (m.return_type_name), len: (m.return_type_name_len) as i64 }) != null
+            else if (m.return_type == TypeKind.Ptr or m.return_type == TypeKind.Ref or m.return_type == TypeKind.MutRef) and m.return_type_name.len > 0 and find_struct(s, m.return_type_name) != null
                 # AGAST #3620: `-> *S` / `-> @S` / `-> @&S` points
                 # at S, as a call's does (#175, #1453).  The local
                 # stayed i64, so prism's `let buf =
@@ -1421,8 +1421,8 @@ fn decl_infer_method(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Ty
                 # receiver type.
                 var_type = TypeKind.Ptr
                 dt.var_type = TypeKind.Ptr
-                dt.var_type_name = m.return_type_name
-                dt.var_type_name_len = m.return_type_name_len
+                dt.var_type_name = m.return_type_name.ptr
+                dt.var_type_name_len = m.return_type_name.len as i32
         else
             # AGAST #2576: `let t = r.unwrap()`, r an Option<S> or a
             # Result<S, E> (`mk().unwrap()`, angelo's ttf tests), is
@@ -1501,8 +1501,8 @@ fn decl_infer_ident(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Typ
         dt.var_array_size = src_g.array_size
         dt.var_array_elem_type = src_g.array_elem_type
         dt.var_array_shape = src_g.array_shape
-        dt.var_type_name = src_g.array_elem_type_name
-        dt.var_type_name_len = src_g.array_elem_type_name_len
+        dt.var_type_name = src_g.array_elem_type_name.ptr
+        dt.var_type_name_len = src_g.array_elem_type_name.len as i32
     # AGAST #3275: `var x = G` with `G: S`, a module-level struct or
     # enum -- `x` is an `S` too, as ritz0 types it.  The slot was i64,
     # so clang rejected `store i64 %<%S>`, `x.f` was "unhandled
@@ -1512,8 +1512,8 @@ fn decl_infer_ident(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Typ
         let src_sg: *GlobalVarDef = global_struct_named(s, stmt.var_init)
         var_type = TypeKind.Struct
         dt.var_type = TypeKind.Struct
-        dt.var_type_name = src_sg.type_name
-        dt.var_type_name_len = src_sg.type_name_len
+        dt.var_type_name = src_sg.type_name.ptr
+        dt.var_type_name_len = src_sg.type_name.len as i32
     # LARB R60 / R48: `let q = C` with `const C: S = S {...}` -- the
     # slot is `alloca %S`, as for a struct global above, so `q.f`
     # resolves and the init copies the read-only data.
@@ -1521,8 +1521,8 @@ fn decl_infer_ident(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Typ
         let src_sc: *ConstEntry = const_struct_named(s, stmt.var_init)
         var_type = TypeKind.Struct
         dt.var_type = TypeKind.Struct
-        dt.var_type_name = src_sc.type_name
-        dt.var_type_name_len = src_sc.type_name_len
+        dt.var_type_name = src_sc.type_name.ptr
+        dt.var_type_name_len = src_sc.type_name.len as i32
     # AGAST #1754: `let q = s` with `s: @&S` / `@S` -- `q` takes `s`'s
     # reference type and pointee, so `q.a` resolves and the slot holds
     # the same `ptr` / i64 `s` loads as.  (Was i64 with no struct name:
@@ -1596,16 +1596,16 @@ fn decl_infer_member(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Ty
         # chain for every root emit_member_ptr lowers (local,
         # global, call / method result, index, deref).
         let mf: *StructField = resolve_member_chain_field(s, stmt.var_init)
-        if mf != null and mf.field_type == TypeKind.Struct and mf.field_type_name_len > 0
+        if mf != null and mf.field_type == TypeKind.Struct and mf.field_type_name.len > 0
             # AGAST #3620: an `Option<T>` / `Result<T, E>` field is
             # its `%Option$T` slot too (find_struct knows no tagged
             # enum), as the `?` arm reads one (#2267).  prism's
             # `let action = self.hotkey_triggered` stored i64.
-            if find_struct(s, StrView { ptr: (mf.field_type_name), len: (mf.field_type_name_len) as i64 }) != null or is_tagged_enum_type(StrView { ptr: (mf.field_type_name), len: (mf.field_type_name_len) as i64 }) == 1
+            if find_struct(s, mf.field_type_name) != null or is_tagged_enum_type(mf.field_type_name) == 1
                 var_type = TypeKind.Struct
                 dt.var_type = TypeKind.Struct
-                dt.var_type_name = mf.field_type_name
-                dt.var_type_name_len = mf.field_type_name_len
+                dt.var_type_name = mf.field_type_name.ptr
+                dt.var_type_name_len = mf.field_type_name.len as i32
         # AGAST #2596: a `*T` field -- `let e = v.data` of a `Vec<E>`
         # -- is a `*T`, as if annotated (was i64: `e.b` "unhandled
         # ExprKind.Member").
@@ -1633,7 +1633,7 @@ fn decl_infer_try(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: TypeK
             ExprKind.Call =>
                 let fdr: *FnDef = find_call_fn(s, inner_call)
                 if fdr != null and fdr.return_type == TypeKind.Struct
-                    carrier = StrView { ptr: fdr.return_type_name, len: fdr.return_type_name_len as i64 }
+                    carrier = fdr.return_type_name
             ExprKind.Method =>
                 carrier = try_method_carrier(s, inner_call)
             # AGAST #2267: a field, `let x = h.r?` of `r: Result<T, E>`,
@@ -1641,9 +1641,9 @@ fn decl_infer_try(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: TypeK
             # unwrapped `%T` was stored as `i64` (invalid IR).
             ExprKind.Member =>
                 let cf: *StructField = resolve_member_chain_field(s, inner_call)
-                if cf != null and cf.field_type == TypeKind.Struct and cf.field_type_name_len > 0
-                    if is_tagged_enum_type(StrView { ptr: (cf.field_type_name), len: (cf.field_type_name_len) as i64 }) == 1
-                        carrier = StrView { ptr: cf.field_type_name, len: cf.field_type_name_len as i64 }
+                if cf != null and cf.field_type == TypeKind.Struct and cf.field_type_name.len > 0
+                    if is_tagged_enum_type(cf.field_type_name) == 1
+                        carrier = cf.field_type_name
             _ => pass
         if carrier.ptr != null and carrier.len > 0
             # The Ok payload's struct or user-enum type (AGAST
@@ -1685,8 +1685,8 @@ fn decl_infer_unary(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Typ
                     # `p.ptr.k` was "unhandled EXPR_MEMBER".
                     else
                         let aglob: *GlobalVarDef = find_global(s, addr_oper.ident)
-                        if aglob != null and aglob.var_type == TypeKind.Struct and aglob.type_name_len > 0
-                            addr_pointee = StrView { ptr: aglob.type_name, len: aglob.type_name_len as i64 }
+                        if aglob != null and aglob.var_type == TypeKind.Struct and aglob.type_name.len > 0
+                            addr_pointee = aglob.type_name
                 # @arr[i]  OR  @<chained-member>[i] — pointee = array element struct
                 ExprKind.Index =>
                     match addr_oper.left.kind
@@ -1700,21 +1700,21 @@ fn decl_infer_unary(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Typ
                             # so `p.x` was "unhandled EXPR_MEMBER".
                             else
                                 let agarr: *GlobalVarDef = find_global(s, addr_oper.left.ident)
-                                if agarr != null and agarr.var_type == TypeKind.Array and agarr.array_elem_type == TypeKind.Struct and agarr.array_elem_type_name_len > 0
-                                    addr_pointee = StrView { ptr: agarr.array_elem_type_name, len: agarr.array_elem_type_name_len as i64 }
+                                if agarr != null and agarr.var_type == TypeKind.Array and agarr.array_elem_type == TypeKind.Struct and agarr.array_elem_type_name.len > 0
+                                    addr_pointee = agarr.array_elem_type_name
                                 # AGAST #3976: `@T[i]` of a const struct table
                                 # (LARB R48) too.  It stayed i64, so `r.a`
                                 # was "unhandled EXPR_MEMBER".
                                 let actab: *ConstEntry = const_struct_table_named(s, addr_oper.left)
                                 if actab != null
-                                    addr_pointee = StrView { ptr: actab.array_elem_type_name, len: actab.array_elem_type_name_len as i64 }
+                                    addr_pointee = actab.array_elem_type_name
                         ExprKind.Member =>
                             # Walk arbitrary-depth member chain (`srv.pool.tasks[i]`)
                             # and pick up the array element type from the leaf field.
                             let arr_field: *StructField = resolve_member_chain_field(s, addr_oper.left)
                             if arr_field != null
-                                if arr_field.field_type == TypeKind.Array and arr_field.array_elem_type == TypeKind.Struct and arr_field.array_elem_type_name_len > 0
-                                    addr_pointee = StrView { ptr: arr_field.array_elem_type_name, len: arr_field.array_elem_type_name_len as i64 }
+                                if arr_field.field_type == TypeKind.Array and arr_field.array_elem_type == TypeKind.Struct and arr_field.array_elem_type_name.len > 0
+                                    addr_pointee = arr_field.array_elem_type_name
                         _ => pass
                     # AGAST #3972: and over a `*S` field, or through a Vec,
                     # Span or String (`@t.es[i]`, angelo's `@edge_table.edges[k]`).
@@ -1724,8 +1724,8 @@ fn decl_infer_unary(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Typ
                 ExprKind.Member =>
                     let mfield: *StructField = resolve_member_chain_field(s, addr_oper)
                     if mfield != null
-                        if mfield.field_type == TypeKind.Struct and mfield.field_type_name_len > 0
-                            addr_pointee = StrView { ptr: mfield.field_type_name, len: mfield.field_type_name_len as i64 }
+                        if mfield.field_type == TypeKind.Struct and mfield.field_type_name.len > 0
+                            addr_pointee = mfield.field_type_name
                 _ => pass
         if addr_pointee.ptr != null and addr_pointee.len > 0
             var_type = TypeKind.Ptr
@@ -1926,20 +1926,20 @@ pub fn decl_infer_addr_field_elem(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, va
                                     let mid_idx: i32 = find_field_index(outer_st, mb_outer.ident)
                                     if mid_idx >= 0
                                         let mid_field: *StructField = get_field_type(outer_st, mid_idx)
-                                        if mid_field.field_type == TypeKind.Struct and mid_field.field_type_name_len > 0
-                                            rcv_tn_a = mid_field.field_type_name
-                                            rcv_tn_a_len = mid_field.field_type_name_len
+                                        if mid_field.field_type == TypeKind.Struct and mid_field.field_type_name.len > 0
+                                            rcv_tn_a = mid_field.field_type_name.ptr
+                                            rcv_tn_a_len = mid_field.field_type_name.len as i32
                     if rcv_tn_a != null
                         let rst_a: *StructDef = find_struct(s, StrView { ptr: (rcv_tn_a), len: (rcv_tn_a_len) as i64 })
                         if rst_a != null
                             let fid_a: i32 = find_field_index(rst_a, mb.ident)
                             if fid_a >= 0
                                 let fa: *StructField = get_field_type(rst_a, fid_a)
-                                if fa.field_type == TypeKind.Array and fa.array_elem_type == TypeKind.Struct and fa.array_elem_type_name_len > 0
+                                if fa.field_type == TypeKind.Array and fa.array_elem_type == TypeKind.Struct and fa.array_elem_type_name.len > 0
                                     var_type = TypeKind.Ptr
                                     dt.var_type = TypeKind.Ptr
-                                    dt.var_type_name = fa.array_elem_type_name
-                                    dt.var_type_name_len = fa.array_elem_type_name_len
+                                    dt.var_type_name = fa.array_elem_type_name.ptr
+                                    dt.var_type_name_len = fa.array_elem_type_name.len as i32
     var_type
 
 # Register the declared local with every type fact inference recorded.
@@ -2205,7 +2205,7 @@ fn global_array_named(s: *EmitterState, e: *Expr) -> *GlobalVarDef
 # (`var G: S`, a struct or an enum, `Option<T>` included), or null.
 fn global_struct_named(s: *EmitterState, e: *Expr) -> *GlobalVarDef
     let g: *GlobalVarDef = find_global(s, e.ident)
-    if g == null or g.var_type != TypeKind.Struct or g.type_name_len <= 0
+    if g == null or g.var_type != TypeKind.Struct or g.type_name.len <= 0
         return null
     return g
 
@@ -2221,7 +2221,7 @@ fn const_struct_named(s: *EmitterState, e: *Expr) -> *ConstEntry
     if find_global(s, e.ident) != null
         return null
     let ce: *ConstEntry = find_const_entry(s, e.ident)
-    if ce == null or ce.const_type != TypeKind.Struct or ce.type_name_len <= 0 or ce.value_expr == null
+    if ce == null or ce.const_type != TypeKind.Struct or ce.type_name.len <= 0 or ce.value_expr == null
         return null
     return ce
 
@@ -2244,7 +2244,7 @@ fn if_array_shape(s: *EmitterState, e: *Expr, out: *ArraySrc, pointee: *TypeKind
                 let cra: *Param = call_ret_array(s, v)
                 if cra != null
                     *pointee = cra.param_array_elem_pointee
-                    return array_src_set(out, cra.param_array_size, cra.param_array_elem_type, StrView { ptr: (cra.param_type_name), len: (cra.param_type_name_len) as i64 })
+                    return array_src_set(out, cra.param_array_size, cra.param_array_elem_type, cra.param_type_name)
                 if arm.body_stmts == null and arg_array_shape(s, v, out) == 1
                     return 1
         arm = arm.next
@@ -2328,11 +2328,11 @@ pub fn try_method_carrier(s: *EmitterState, inner: *Expr) -> StrView
     if inner == null or inner.kind != ExprKind.Method
         return no_name()
     let md: *FnDef = method_call_def(s, inner)
-    if md == null or md.return_type != TypeKind.Struct or md.return_type_name_len <= 0
+    if md == null or md.return_type != TypeKind.Struct or md.return_type_name.len <= 0
         return no_name()
-    if is_tagged_enum_type(StrView { ptr: (md.return_type_name), len: (md.return_type_name_len) as i64 }) == 0
+    if is_tagged_enum_type(md.return_type_name) == 0
         return no_name()
-    StrView { ptr: md.return_type_name, len: md.return_type_name_len as i64 }
+    md.return_type_name
 
 # AGAST #2062 (moved from emitter_stmt by #2065): `val_reg` = emit_expr(value), stored into an f32 / f64 slot of
 # type `dst_ty`.  An integer-typed value (`var x: f64 = 3`, `*p = n`) is the
@@ -2457,8 +2457,7 @@ fn tuple_elem_ptr(s: *EmitterState, v: *Expr, f: *StructField) -> StrView
     f.field_type = TypeKind.Ptr
     f.ptr_pointee = pt
     if pt == TypeKind.Struct
-        f.field_type_name = pointee.ptr
-        f.field_type_name_len = pointee.len as i32
+        f.field_type_name = pointee
     else
         f.array_elem_type = pt
         pointee = primitive_spelling(pt)
@@ -2480,8 +2479,7 @@ fn tuple_elem_array(s: *EmitterState, v: *Expr, f: *StructField) -> StrView
             f.array_size = lv_array_size(loc)
             f.array_elem_type = lv_array_elem_type(loc)
             f.array_elem_pointee = lv_array_elem_pointee(loc)
-            f.array_elem_type_name = lv_type_name(loc)
-            f.array_elem_type_name_len = lv_type_name_len(loc)
+            f.array_elem_type_name = StrView { ptr: lv_type_name(loc), len: (lv_type_name_len(loc)) as i64 }
         ExprKind.Member =>
             let fld: *StructField = member_field_def(s, v)
             if fld == null or fld.field_type != TypeKind.Array or fld.array_shape != null
@@ -2490,7 +2488,6 @@ fn tuple_elem_array(s: *EmitterState, v: *Expr, f: *StructField) -> StrView
             f.array_elem_type = fld.array_elem_type
             f.array_elem_pointee = fld.array_elem_pointee
             f.array_elem_type_name = fld.array_elem_type_name
-            f.array_elem_type_name_len = fld.array_elem_type_name_len
         _ =>
             return no_name()
     let size: i32 = f.array_size
@@ -2502,7 +2499,7 @@ fn tuple_elem_array(s: *EmitterState, v: *Expr, f: *StructField) -> StrView
         leaf = f.array_elem_pointee
     var elem: StrView = no_name()
     if leaf == TypeKind.Struct
-        elem = StrView { ptr: f.array_elem_type_name, len: f.array_elem_type_name_len as i64 }
+        elem = f.array_elem_type_name
     else
         elem = primitive_spelling(leaf)
     if elem.len <= 0 or unnamed(elem)
@@ -2520,22 +2517,19 @@ fn tuple_elem_array(s: *EmitterState, v: *Expr, f: *StructField) -> StrView
 # when ritz1 can't type it (a `**T`, a reference, an N-D array, a struct it
 # can't name).
 fn tuple_elem_type(s: *EmitterState, v: *Expr, f: *StructField) -> StrView
-    f.field_type_name = null
-    f.field_type_name_len = 0
+    f.field_type_name = strview_empty()
     f.ptr_pointee = TypeKind.Void
     f.array_elem_pointee = TypeKind.Void
     f.inner_pointee_type = (TypeKind.Void as i32)
     if v.kind == ExprKind.StructLit
         f.field_type = TypeKind.Struct
-        f.field_type_name = v.ident.ptr
-        f.field_type_name_len = v.ident.len as i32
+        f.field_type_name = v.ident
         # A nested nameless tuple was named a moment ago by tuple_lit_infer;
         # its name lives in the side table, not on the node (AGAST #4408).
         if v.ident.len == 0
             match tuple_name_get(v)
                 Some(nested) =>
-                    f.field_type_name = nested.ptr
-                    f.field_type_name_len = nested.len as i32
+                    f.field_type_name = nested
                 None => pass
     else if bool_kind(s, v) == BK_BOOL
         f.field_type = TypeKind.Bool
@@ -2559,10 +2553,9 @@ fn tuple_elem_type(s: *EmitterState, v: *Expr, f: *StructField) -> StrView
         let named: StrView = tuple_decl_struct_name(s, v)
         if named.len > 0
             f.field_type = TypeKind.Struct
-            f.field_type_name = named.ptr
-            f.field_type_name_len = named.len as i32
+            f.field_type_name = named
     if f.field_type == TypeKind.Struct
-        return StrView { ptr: f.field_type_name, len: f.field_type_name_len as i64 }
+        return f.field_type_name
     primitive_spelling(f.field_type)
 
 # AGAST #4656: a reference to a struct, `@x` / `@&x` of a struct local or a
@@ -2591,8 +2584,7 @@ fn tuple_elem_ref(s: *EmitterState, v: *Expr, f: *StructField) -> StrView
     # Lowered as a `*S` field is (lowered_field_type, field_new's note).
     f.field_type = TypeKind.Ptr
     f.ptr_pointee = TypeKind.Struct
-    f.field_type_name = lv_type_name(loc)
-    f.field_type_name_len = lv_type_name_len(loc)
+    f.field_type_name = StrView { ptr: lv_type_name(loc), len: (lv_type_name_len(loc)) as i64 }
     let prefix: StrView = if kind == TypeKind.MutRef then "refmut_" else "ref_"
     ctor_join(prefix, lv_type_view(loc), "")
 
@@ -2609,13 +2601,11 @@ fn tuple_struct_new(s: *EmitterState, name: StrView, fields: *StructField) -> *S
         let nm: *u8 = malloc(TUPLE_FIELD_NAME_BUF)
         let nlen: i32 = write_dec_i32(nm, i)
         *(nm + nlen) = 0
-        f.name = nm
-        f.name_len = nlen
+        f.name = StrView { ptr: nm, len: nlen as i64 }
         i = i + 1
         f = f.next
     let st: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
-    st.name = name.ptr
-    st.name_len = name.len as i32
+    st.name = name
     st.fields = fields
     st.next = s.sym.module.structs
     s.sym.module.structs = st
@@ -2704,7 +2694,7 @@ pub fn tuple_lit_name(s: *EmitterState, e: *Expr, slot_sv: StrView) -> Option<St
         return known
     let st: *StructDef = tuple_slot_def(s, slot_sv, tuple_lit_arity(e))
     if st != null
-        let slot_name: StrView = StrView { ptr: st.name, len: st.name_len as i64 }
+        let slot_name: StrView = st.name
         tuple_name_note(e, slot_name)
         return Some(slot_name)
     tuple_lit_infer(s, e)
@@ -2860,7 +2850,7 @@ fn indexed_elem_type(s: *EmitterState, base: *Expr) -> TypeKind
             if f != null
                 if f.field_type == TypeKind.Array
                     return f.array_elem_type
-                let vt: TypeKind = vec_name_elem_type(StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+                let vt: TypeKind = vec_name_elem_type(f.field_type_name)
                 if vt != TypeKind.Unknown
                     return vt
                 return ptr_field_elem_kind(f)
@@ -2903,7 +2893,7 @@ pub fn const_array_global(ce: *ConstEntry) -> i32
 # so `@T[i]` is a `*S` into it: a literal, or a struct fill
 # (const_struct_fill_global).
 pub fn const_struct_table(c: *ConstEntry) -> i32
-    if const_array_global(c) == 0 or c.array_elem_type != TypeKind.Struct or c.array_elem_type_name_len <= 0
+    if const_array_global(c) == 0 or c.array_elem_type != TypeKind.Struct or c.array_elem_type_name.len <= 0
         return 0
     if c.value_expr.kind != ExprKind.ArrayLit and const_struct_fill_global(c) == 0
         return 0
@@ -2938,14 +2928,14 @@ pub fn match_scrutinee_type(s: *EmitterState, scr: *Expr) -> StrView
                 return no_name()
             let g: *GlobalVarDef = find_global(s, scr.ident)
             if g != null and g.var_type == TypeKind.Struct
-                return StrView { ptr: g.type_name, len: g.type_name_len as i64 }
+                return g.type_name
             # LARB R60 (#3480): a const is a whole value, so `match MODE` reads
             # the type its declaration wrote, as `match g` does.  Untyped, the
             # arms were judged against a scalar and every variant arm refused.
             if g == null
                 let ce: *ConstEntry = find_const_entry(s, scr.ident)
-                if ce != null and ce.const_type == TypeKind.Struct and ce.type_name_len > 0
-                    return StrView { ptr: ce.type_name, len: ce.type_name_len as i64 }
+                if ce != null and ce.const_type == TypeKind.Struct and ce.type_name.len > 0
+                    return ce.type_name
         ExprKind.Method | ExprKind.Call =>
             return call_result_struct_name(s, scr)
         ExprKind.Index =>
@@ -2953,7 +2943,7 @@ pub fn match_scrutinee_type(s: *EmitterState, scr: *Expr) -> StrView
         ExprKind.Member =>
             let fld: *StructField = resolve_member_chain_field(s, scr)
             if fld != null and fld.field_type == TypeKind.Struct
-                return StrView { ptr: fld.field_type_name, len: fld.field_type_name_len as i64 }
+                return fld.field_type_name
         _ =>
             if scr.kind == ExprKind.Cast and scr.type_kind == TypeKind.Struct and scr.ident.len > 0
                 # AGAST #2503: `x as B` is a B.  Untyped, the arms guessed the enum,

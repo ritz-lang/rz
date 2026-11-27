@@ -102,11 +102,8 @@ pub fn module_add_struct(m: *Module, s: *StructDef)
         curr.next = s
 
 pub fn struct_def_new(p: *Parser, name_sv: StrView, fields: *StructField, line: i32, col: i32) -> *StructDef
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let s: *StructDef = parser_alloc(p, sizeof(StructDef)) as *StructDef
-    s.name = name as *u8
-    s.name_len = len
+    s.name = name_sv
     s.fields = fields
     s.next = null
     s.type_params = null  # Non-generic struct (field at end to preserve layout)
@@ -141,13 +138,13 @@ pub fn field_new(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32, col: i32
     f.array_shape = null
     if is_nd_array_type(p, tr) == 1
         f.array_shape = facts.array_shape
-    f.name = name as *u8
+    f.name.ptr = name as *u8
     # AGAST #1924: `rows: **i32` -> `*(*(s.rows + i) + k)` loads an i32.
     # The slot (AGAST #1815 / #2372): a `@S` field records none, as the flat
     # parse left it, so lowered_field_type still makes it a `*S`.
     f.inner_pointee_type = tr_ptr_ptr_inner_pointee(tr)
     f.field_inner_ref = facts.inner_ref   # AGAST #2399
-    f.name_len = len
+    f.name.len = len as i64
     f.field_type = ty
     f.ptr_pointee = TypeKind.Void
     if ty == TypeKind.Ptr
@@ -165,48 +162,37 @@ pub fn field_new(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32, col: i32
     # field.  It comes from the chain, never from a sibling field.
     match ty
         TypeKind.Struct =>
-            f.field_type_name = facts.type_name
-            f.field_type_name_len = facts.type_name_len
+            f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
         TypeKind.Ptr =>
             if facts.pointee_type == TypeKind.Struct
-                f.field_type_name = facts.type_name
-                f.field_type_name_len = facts.type_name_len
+                f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
             else
-                f.field_type_name = null
-                f.field_type_name_len = 0
+                f.field_type_name = strview_empty()
         TypeKind.PtrPtr =>
             if facts.inner_pointee_type == (TypeKind.Struct as i32)
-                f.field_type_name = facts.type_name
-                f.field_type_name_len = facts.type_name_len
+                f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
             else
-                f.field_type_name = null
-                f.field_type_name_len = 0
+                f.field_type_name = strview_empty()
         TypeKind.Ref | TypeKind.MutRef =>
             if facts.ref_inner_type == TypeKind.Struct
-                f.field_type_name = facts.type_name
-                f.field_type_name_len = facts.type_name_len
+                f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
             else if ref_field_ptr_ptr_slot(p, tr) != (TypeKind.Void as i32)
-                f.field_type_name = facts.type_name
-                f.field_type_name_len = facts.type_name_len
+                f.field_type_name = StrView { ptr: facts.type_name, len: facts.type_name_len as i64 }
                 f.inner_pointee_type = ref_field_ptr_ptr_slot(p, tr)
             else
-                f.field_type_name = null
-                f.field_type_name_len = 0
+                f.field_type_name = strview_empty()
         _ =>
-            f.field_type_name = null
-            f.field_type_name_len = 0
+            f.field_type_name = strview_empty()
     # Copy array info if this is an array type.
     if ty == TypeKind.Array
         f.array_size = facts.array_size
         f.array_elem_type = facts.array_elem_type
         f.array_elem_pointee = facts.array_elem_pointee
-        f.array_elem_type_name = facts.array_elem_type_name
-        f.array_elem_type_name_len = facts.array_elem_type_name_len
+        f.array_elem_type_name = StrView { ptr: facts.array_elem_type_name, len: facts.array_elem_type_name_len as i64 }
     else
         f.array_size = 0
         f.array_elem_type = TypeKind.Void
-        f.array_elem_type_name = null
-        f.array_elem_type_name_len = 0
+        f.array_elem_type_name = strview_empty()
         # AGAST #1304: record the pointee of a primitive pointer field.
         if ty == TypeKind.Ptr and facts.pointee_type != TypeKind.Struct
             f.array_elem_type = facts.pointee_type
@@ -273,41 +259,33 @@ pub fn tn_claim(p: *Parser, inner: *TypeParam, f: *FnDef)
 # nothing where a name would be stale.  Shared by capture_fn_return_type (a
 # named fn writes p.fn_return_type_name) and type_fn (a fn type writes
 # FnDef.return_type_name), so the two spellings can't drift (AGAST #4324).
-pub fn ret_name_of_type(p: *Parser, tr: *TypeRef, out: **u8, out_len: *i32)
+pub fn ret_name_of_type(p: *Parser, tr: *TypeRef) -> StrView
     let ret: TypeKind = tr_kind(tr)
+    var out: StrView = strview_empty()
     if ret == TypeKind.Struct
-        *out = tr.name.ptr
-        *out_len = tr.name.len as i32
+        out = tr.name
     else if (ret == TypeKind.Ref or ret == TypeKind.MutRef) and tr_ref_inner(tr) != TypeKind.Struct
         # AGAST #1453: `-> @i64` names nothing; only a struct referent does.
-        *out = null
-        *out_len = 0
+        out = strview_empty()
     else if ret == TypeKind.Ptr and primitive_name_len(tr_pointee_kind(tr)) > 0
         # AGAST #1984: `-> *i32` / `-> *u64` name the primitive pointee.
-        *out = primitive_name_from_type(tr_pointee_kind(tr))
-        *out_len = primitive_name_len(tr_pointee_kind(tr))
+        out = primitive_name_sv(tr_pointee_kind(tr))
     else
         match ret
             TypeKind.PtrPtr =>
                 # AGAST #2791: `-> **U` names U as monomorph names a `*T` at T = *U.
                 let inner: TypeKind = ptr_slot_flat(tr_ptr_ptr_inner_pointee(tr))
                 if primitive_name_len(inner) > 0
-                    *out = primitive_name_from_type(inner)
-                    *out_len = primitive_name_len(inner)
+                    out = primitive_name_sv(inner)
                 else if inner == TypeKind.Struct
-                    let tn: StrView = tr_name(tr)
-                    *out = tn.ptr
-                    *out_len = tn.len as i32
+                    out = tr_name(tr)
                 else
-                    *out = null
-                    *out_len = 0
+                    out = strview_empty()
             TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
-                let tn2: StrView = tr_name(tr)
-                *out = tn2.ptr
-                *out_len = tn2.len as i32
+                out = tr_name(tr)
             _ =>
-                *out = null
-                *out_len = 0
+                out = strview_empty()
+    out
 
 # (line, col) strictly after (line2, col2).
 pub fn pos_after(line: i32, col: i32, line2: i32, col2: i32) -> i32
@@ -372,24 +350,22 @@ pub fn type_fn(p: *Parser, params: *Param, ret: *TypeRef, line: i32, col: i32) -
     f.ret_array_param = null
     if tr_kind(ret) == TypeKind.Array
         f.ret_array = array_elem_of_type(p, ret)   # AGAST #2343
-        f.ret_array_param = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ret)   # AGAST #2302
+        f.ret_array_param = param_of_type(p, strview_empty(), ret)   # AGAST #2302
     if tr_kind(ret) == TypeKind.Ref or tr_kind(ret) == TypeKind.MutRef
-        f.ret_ref = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ret)   # AGAST #2308
-    f.name = null
-    f.name_len = 0
+        f.ret_ref = param_of_type(p, strview_empty(), ret)   # AGAST #2308
+    f.name = strview_empty()
     f.params = params
     f.return_type = tr_kind(ret)
     # A `-> *T` / `-> @T` names its pointee as a named fn's return does, so a
     # fn-type slot spells and judges it (AGAST #4324).
-    ret_name_of_type(p, ret, @f.return_type_name, @f.return_type_name_len)
+    f.return_type_name = ret_name_of_type(p, ret)
     # AGAST #3286: `fn(..) -> void` returns nothing, as fn_def_new
     # normalises `-> void` for a named fn, so fn_is_procedure(sig)
     # refuses a use of its call's value instead of `%r = call void`.
-    let rt: *u8 = f.return_type_name
-    if f.return_type == TypeKind.Struct and f.return_type_name_len == 4 and rt != null and *rt == 'v' and *(rt + 1) == 'o' and *(rt + 2) == 'i' and *(rt + 3) == 'd'
+    let rt: *u8 = f.return_type_name.ptr
+    if f.return_type == TypeKind.Struct and f.return_type_name.len == 4 and rt != null and *rt == 'v' and *(rt + 1) == 'o' and *(rt + 2) == 'i' and *(rt + 3) == 'd'
         f.return_type = TypeKind.Void
-        f.return_type_name = null
-        f.return_type_name_len = 0
+        f.return_type_name = strview_empty()
     f.body = null
     f.line = line
     f.next = null
@@ -1573,7 +1549,7 @@ pub fn type_slice(p: *Parser, elem: *GenericArg) -> *TypeRef
 # *TypeRef (AGAST #4035: the type is the chain, not parser side state).
 pub fn tuple_elem_new(p: *Parser, tr: *TypeRef) -> *TupleElem
     let te: *TupleElem = parser_alloc(p, sizeof(TupleElem)) as *TupleElem
-    te.field = field_new(p, StrView { ptr: (null), len: (0) as i64 }, tr, parse_pos_line(p), parse_pos_col(p))
+    te.field = field_new(p, strview_empty(), tr, parse_pos_line(p), parse_pos_col(p))
     te.ga = capture_first_generic_arg(p, tr)
     te.next = null
     return te
@@ -1605,7 +1581,7 @@ pub fn tuple_reg_lookup(ctx: *ParseCtx, name_sv: StrView) -> *TupleReg
     var len: i32 = name_sv.len as i32
     var r: *TupleReg = ctx.tuple_regs
     while r != null
-        if r.def.name_len == len and memcmp(r.def.name, name, len as i64) == 0
+        if (r.def.name.len as i32) == len and memcmp(r.def.name.ptr, name, len as i64) == 0
             return r
         r = r.next
     return null
@@ -1666,8 +1642,7 @@ pub fn type_tuple(p: *Parser, elems: *TupleElem) -> *TypeRef
         while cur != null
             let f: *StructField = cur.field
             let idx_sv: StrView = tuple_index_name(p, i)
-            f.name = idx_sv.ptr
-            f.name_len = idx_sv.len as i32
+            f.name = idx_sv
             f.next = null
             if last == null
                 fields = f
@@ -1759,11 +1734,11 @@ fn tuple_resolve_expr(ctx: *ParseCtx, e: *Expr, slot: *StructDef)
         f = f.next
     if n_lit != n_slot
         return
-    e.ident = StrView { ptr: slot.name, len: slot.name_len as i64 }
+    e.ident = slot.name
     fi = e.args as *FieldInit
     f = slot.fields
     while fi != null
-        tuple_resolve_expr(ctx, fi.value, tuple_slot(ctx, f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }))
+        tuple_resolve_expr(ctx, fi.value, tuple_slot(ctx, f.field_type, f.field_type_name))
         fi = fi.next
         f = f.next
 
@@ -1983,7 +1958,7 @@ fn tuple_resolve_stmts(ctx: *ParseCtx, first: *Stmt, tail: *StructDef)
         s = s.next
 
 fn tuple_resolve_fn(ctx: *ParseCtx, f: *FnDef)
-    ctx.tuple_ret_slot = tuple_slot(ctx, f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
+    ctx.tuple_ret_slot = tuple_slot(ctx, f.return_type, f.return_type_name)
     tuple_resolve_stmts(ctx, f.body, ctx.tuple_ret_slot)
     ctx.tuple_ret_slot = null
 
@@ -1991,7 +1966,7 @@ fn type_params_name(tp: *TypeParam, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     while tp != null
-        if tp.name_len == len and memcmp(tp.name, name, len as i64) == 0
+        if (tp.name.len as i32) == len and memcmp(tp.name.ptr, name, len as i64) == 0
             return 1
         tp = tp.next
     return 0
@@ -2029,8 +2004,7 @@ fn tuple_param_add(acc: *TypeParam, name_sv: StrView) -> *TypeParam
     if type_params_name(acc, name_sv) == 1
         return acc
     let tp: *TypeParam = calloc(1, sizeof(TypeParam)) as *TypeParam
-    tp.name = name
-    tp.name_len = len
+    tp.name = name_sv
     tp.next = acc
     return tp
 
@@ -2053,8 +2027,8 @@ fn tuple_name_params(ctx: *ParseCtx, m: *Module, name_sv: StrView, acc: *TypePar
             if inner != null
                 var f: *StructField = inner.fields
                 while f != null
-                    if f.field_type == TypeKind.Struct and f.field_type_name != null
-                        out = tuple_name_params(ctx, m, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, out)
+                    if f.field_type == TypeKind.Struct and f.field_type_name.ptr != null
+                        out = tuple_name_params(ctx, m, f.field_type_name, out)
                     f = f.next
         pos = end + 1
     out
@@ -2075,13 +2049,13 @@ fn tuple_mark_generic(p: *Parser)
         var params: *TypeParam = null
         var f: *StructField = r.def.fields
         while f != null
-            if f.field_type == TypeKind.Struct and f.field_type_name != null
-                params = tuple_name_params(p.ctx, p.module, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, params)
+            if f.field_type == TypeKind.Struct and f.field_type_name.ptr != null
+                params = tuple_name_params(p.ctx, p.module, f.field_type_name, params)
                 f = f.next
-            else if (f.field_type == TypeKind.Ptr or f.field_type == TypeKind.PtrPtr or f.field_type == TypeKind.Ref or f.field_type == TypeKind.MutRef) and f.field_type_name != null and module_names_type_param(p.module, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 1
+            else if (f.field_type == TypeKind.Ptr or f.field_type == TypeKind.PtrPtr or f.field_type == TypeKind.Ref or f.field_type == TypeKind.MutRef) and f.field_type_name.ptr != null and module_names_type_param(p.module, f.field_type_name) == 1
                 # AGAST #3173: `*T` / `@T` / `@&T`, and `**T` (#3184);
                 # tuple_subst substitutes the pointee.
-                params = tuple_param_add(params, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+                params = tuple_param_add(params, f.field_type_name)
                 f = f.next
             else
                 f = f.next
@@ -2258,7 +2232,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
 # where the same type on a param stored one.
 pub fn stmt_take_var_ref(s: *Stmt)
     let r: *Param = s.var_ref
-    s.var_type_name = StrView { ptr: r.param_type_name, len: r.param_type_name_len as i64 }
+    s.var_type_name = r.param_type_name
     s.var_pointee_type = r.param_pointee_type
     s.var_pointee_array_size = r.param_pointee_array_size
     s.var_pointee_array_elem_type = r.param_pointee_array_elem_type

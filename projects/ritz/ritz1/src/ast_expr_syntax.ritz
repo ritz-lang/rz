@@ -150,25 +150,22 @@ pub fn param_of_type(p: *Parser, name_sv: StrView, ty: *TypeRef) -> *Param
     var len: i32 = name_sv.len as i32
     let kind: TypeKind = tr_kind(ty)
     let param: *Param = parser_alloc(p, sizeof(Param)) as *Param
-    param.name = name as *u8
+    param.name.ptr = name as *u8
     param.param_ty = ty   # AGAST #4528
     param.name_span.line = 0
     param.name_span.col = 0
-    param.name_len = len
+    param.name.len = len as i64
     param.param_type = kind
     # Copy the struct type name for a struct, or a pointer / reference whose
     # pointee is a named type.  AGAST #2139: only then.
     if param_type_names_pointee(p, ty) == 1
         let nm_sv: StrView = tr_name(ty)
-        param.param_type_name = nm_sv.ptr
-        param.param_type_name_len = nm_sv.len as i32
+        param.param_type_name = nm_sv
     else if kind == TypeKind.Array
         let nm_sv: StrView = tr_elem_name(ty)
-        param.param_type_name = nm_sv.ptr
-        param.param_type_name_len = nm_sv.len as i32
+        param.param_type_name = nm_sv
     else
-        param.param_type_name = null
-        param.param_type_name_len = 0
+        param.param_type_name = strview_empty()
     # Copy pointee/inner type if this is a pointer or reference type.
     match kind
         TypeKind.Ptr | TypeKind.PtrPtr =>
@@ -225,13 +222,13 @@ pub fn ptr_array_of_type(p: *Parser, tr: *TypeRef) -> *Param
     if tr == null
         return null
     if tr.kind == TypeKind.Ptr and tr.pointee != null and tr.pointee.kind == TypeKind.Array
-        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
+        return param_of_type(p, strview_empty(), tr)
     if (tr.kind == TypeKind.Ref or tr.kind == TypeKind.MutRef) and tr_ref_inner(tr) == TypeKind.Array
-        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
+        return param_of_type(p, strview_empty(), tr)
     # AGAST #4122: and a `**[N][M]..T`, the shape of the `*[N][M]..T` that `*x`
     # reads (plane_ptr_shape; base_ptr_array itself answers for `*` only).
     if tr.kind == TypeKind.PtrPtr and ptr_nd_pointee_shape(p, tr) != null
-        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
+        return param_of_type(p, strview_empty(), tr)
     null
 
 # 1 if `ty` is a declared type whose const must fold to an integer.
@@ -274,11 +271,11 @@ pub fn const_wrap_to_type(ty: TypeKind, v: i64) -> i64
 fn const_name_eq(c: *ConstEntry, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if c.name_len != len
+    if (c.name.len as i32) != len
         return 0
     var i: i32 = 0
     while i < len
-        if *(c.name + i) != *(name + i)
+        if *(c.name.ptr + i) != *(name + i)
             return 0
         i += 1
     1
@@ -2169,7 +2166,7 @@ pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *Postfi
     op.args = args
     # Type suffix: "$" + type_name (an alias spelled as its target, #2037).
     tn_note_tok(p, type_tok)   # AGAST #4171
-    let suffix_sv: StrView = generic_tok_suffix(p, StrView { ptr: (null), len: (0) as i64 }, type_tok)
+    let suffix_sv: StrView = generic_tok_suffix(p, strview_empty(), type_tok)
     op.call_type_suffix = suffix_sv
     op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
@@ -2203,7 +2200,7 @@ pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *Po
     op.args = args
     tn_note_args(p, ga)   # AGAST #4171
     # "" + "$" + arg → "$<arg>", from the same speller as type annotations.
-    let suffix_sv: StrView = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga)
+    let suffix_sv: StrView = mangle_generic_args(p, strview_empty(), ga)
     op.call_type_suffix = suffix_sv
     op.call_targs = ga
     op.next = null
@@ -2249,7 +2246,7 @@ pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *P
     let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
-    let suffix_sv: StrView = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga)
+    let suffix_sv: StrView = mangle_generic_args(p, strview_empty(), ga)
     op.call_type_suffix = suffix_sv
     op.call_targs = ga
     op.next = null
@@ -2440,7 +2437,7 @@ fn struct_lit_expr(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
     # AGAST #4187: a struct variant's name builds the variant
     # (`Log { level: 4 }`); named_variants.ritz turns it into the positional
     # call and accepts the name noted above.
-    named_form_note(p, null, e, tok, StrView { ptr: (null), len: (0) as i64 })
+    named_form_note(p, null, e, tok, strview_empty())
     return e
 
 # `E.V { a: 1, b: 2 }` (AGAST #4275): a qualified named variant literal.
@@ -2508,7 +2505,7 @@ fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv:
 pub fn pattern_variant_named(p: *Parser, head: Token, name: Token, binds: *TupleName) -> *MatchArm
     let a: *MatchArm = pattern_variant_binds(p, StrView { ptr: (name.start), len: (name.len) as i64 }, binds)
     if head.start == name.start
-        named_form_note(p, a, null, head, StrView { ptr: (null), len: (0) as i64 })
+        named_form_note(p, a, null, head, strview_empty())
     else
         named_form_note(p, a, null, head, StrView { ptr: (head.start), len: (head.len) as i64 })
     return a
@@ -3012,7 +3009,7 @@ pub fn pattern_variant_inner(p: *Parser, name_sv: StrView, inner_sv: StrView, li
     var inner_len: i32 = inner_sv.len as i32
     if inner_len == 1
         if *inner == '_'  # '_'
-            return match_arm_variant(p, name_sv, PAT_WILDCARD, StrView { ptr: (null), len: (0) as i64 })
+            return match_arm_variant(p, name_sv, PAT_WILDCARD, strview_empty())
     let a: *MatchArm = match_arm_variant(p, name_sv, PAT_IDENT, inner_sv)
     a.pattern_inner_span.line = line
     a.pattern_inner_span.col = col
@@ -3113,6 +3110,10 @@ pub fn primitive_name_from_type(t: TypeKind) -> *u8
             return c"bool"
         _ => pass
     null
+
+# primitive_name_from_type as a view: empty for a non-primitive kind.
+pub fn primitive_name_sv(t: TypeKind) -> StrView
+    StrView { ptr: primitive_name_from_type(t), len: primitive_name_len(t) as i64 }
 
 pub fn primitive_name_len(t: TypeKind) -> i32
     if ty_int_bits(t) == 8
