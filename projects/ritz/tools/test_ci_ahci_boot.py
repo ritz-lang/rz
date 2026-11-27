@@ -112,8 +112,17 @@ def _persist_serial(boot: int) -> str:
         lines += f"[ahci] 00:1f.2 port 1: LBA 1-200 fnv1a={fnv}\n"
         lines += "[initramfs] Loaded 4 files\n"
     lines += f"  [OK] Persistent storage (goliath image: boot {boot}, 1 blobs)\n"
+    lines += _msi_lines(boot)
     lines += "ALL TESTS PASSED\n"
     return lines
+
+
+def _msi_lines(boot: int, missed: int = 0) -> str:
+    # #4885: boot 2 is the interrupt-remapping boot, so its MSI names an IRTE.
+    irte = ", IRTE 192 -> APIC ID 0" if boot == 2 else ""
+    return (f"[ahci] 00:1f.2: MSI on, vector 64{irte}\n"
+            "[ahci] 00:1f.2 port 1: MSI read LBA 1-200 waited=2, interrupted=3, data: same\n"
+            f"[ahci] msi interrupts: 6, commands waited: 4, completions without one: {missed}\n")
 
 
 def _build_all() -> list[dict]:
@@ -153,7 +162,7 @@ def test_ahci_steps_are_real_gates_with_timeouts():
 def test_the_boot_uses_ide_hd_on_q35_without_virtio_blk():
     text = (REPO / AHCI_SCRIPT).read_text()
     cmd = text.split("qemu-system-x86_64", 1)[1]
-    assert "-machine q35" in cmd
+    assert '-machine "$machine"' in cmd and "local machine=q35 " in text
     assert "-nodefaults" in cmd
     assert "virtio-blk" not in cmd
     assert "ide-hd,drive=root,bus=ide.0,serial=harland-root" in text
@@ -245,6 +254,38 @@ def test_identify_lines_pass(tree):
     assert "serial=harland-root" in argv
     assert "serial=harland-data" in argv
     assert argv.index("harland-root") < argv.index("harland-data")
+    # #4885: boot 1 is plain q35, boot 2 the interrupt-remapping machine.
+    boot1, boot2 = argv.strip().splitlines()
+    assert "-machine q35 " in boot1 and "intel-iommu" not in boot1
+    assert "-machine q35,kernel-irqchip=split " in boot2
+    assert "intel-iommu,intremap=on,eim=on" in boot2
+    assert boot2.index("intel-iommu") < boot2.index("ide-hd")
+
+
+@pytest.mark.integration
+def test_msi_completion_without_interrupt_fails(tree):
+    bad = _persist_serial(1).replace("completions without one: 0", "completions without one: 1")
+    r = _run(tree, bad, env_extra={"FAKE_SERIAL2": _persist_serial(2), "FAKE_PERSIST": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: AHCI msi summary" in r.stdout
+
+
+@pytest.mark.integration
+def test_msi_read_that_did_not_wait_fails(tree):
+    bad = _persist_serial(1).replace("waited=2", "waited=0")
+    r = _run(tree, bad, env_extra={"FAKE_SERIAL2": _persist_serial(2), "FAKE_PERSIST": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: harland-data MSI read" in r.stdout
+
+
+@pytest.mark.integration
+def test_intremap_boot_without_an_irte_fails(tree):
+    r = _run(tree, _persist_serial(1), env_extra={
+        "FAKE_SERIAL2": _persist_serial(2).replace(", IRTE 192 -> APIC ID 0", ""),
+        "FAKE_PERSIST": "1",
+    })
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: no 'MSI on, vector V, IRTE h' line on the intremap boot" in r.stdout
 
 
 @pytest.mark.integration

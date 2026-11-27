@@ -23,12 +23,19 @@
 #   - counts each vector's interrupts (msix_dispatch, from irq_handler), so a
 #     driver or a test can see interrupts were delivered (msix_vector_count).
 #
+# It also programs plain MSI (capability 05h, AGAST #4885) for a function
+# with no MSI-X, such as an AHCI HBA: one message (msi_probe, msi_enable),
+# from the same vector pool and counted by the same msix_dispatch, through
+# interrupt remapping when it is on, as MSI-X entries are. The register
+# layout is in drivers/msi_cap.ritz.
+#
 # IDT gates for the vectors are set in arch/x86_64/idt.ritz; the stubs are
 # irq_stub_32..47 in isr_stubs.s (vector = 32 + stub number).
 
 import klog { klog, klog_dec, klog_hex, klog_hex_width }
 import mm.vmm { vmm_map_mmio }
-import drivers.pci { PciDevice, pci_find_capability, pci_dev_read_config16, pci_dev_read_config32, pci_dev_write_config16, pci_dev_sid, pci_enable_memory, pci_get_device_count, pci_get_device }
+import drivers.pci { PciDevice, pci_find_capability, pci_dev_read_config16, pci_dev_read_config32, pci_dev_write_config16, pci_dev_write_config32, pci_dev_sid, pci_enable_memory, pci_get_device_count, pci_get_device }
+import drivers.msi_cap { MsiLayout, msi_layout, msi_ctrl_one, msi_ctrl_off, PCI_CAP_MSI, MSI_CAP_CONTROL, MSI_CAP_ADDR_LO, MSI_CAP_ADDR_HI }
 import arch.x86_64.irq_dest { msi_addr_lo, msi_addr_dest, IRQ_DEST_NONE }
 import drivers.iommu.ir { ir_enabled, ir_set, ir_get_dest, ir_msi_addr, ir_msi_data, ir_msi_handle }
 import drivers.iommu.dmar { ir_handle_msi }
@@ -248,6 +255,93 @@ pub fn msix_set_entry_to(info: *MsixInfo, entry: u16, vector: u8, want: u32) -> 
     volatile_store((e + MSIX_ENTRY_DATA) as *u32, data)
     volatile_store((e + MSIX_ENTRY_CTRL) as *u32, 0)
     return 0
+
+# ============================================================================
+# Plain MSI (AGAST #4885)
+# ============================================================================
+
+# Why msi_enable left a function's MSI off.
+pub enum MsiError
+    # No CPU an MSI can reach (irq_route_dest).
+    NoCpu
+    # Interrupt remapping is on and the IRTE could not be set.
+    Irte
+
+# A function's MSI capability, and once msi_enable ran, where its one
+# message goes.
+pub struct Msi
+    dev: *PciDevice
+    cap: u8             # capability offset in config space
+    layout: MsiLayout
+    vector: u8          # 0 until enabled
+    dest: u32           # APIC ID the message reaches
+    irte: u32           # IRT handle the message names; MSIX_NO_IRTE if none
+
+# dev's MSI capability, or None when it has none.
+pub fn msi_probe(dev: *PciDevice) -> Option<Msi>
+    let cap: u8 = pci_find_capability(dev, PCI_CAP_MSI)
+    if cap == 0
+        return None
+    let ctrl: u16 = pci_dev_read_config16(dev, cap + MSI_CAP_CONTROL)
+    Some(Msi { dev: dev, cap: cap, layout: msi_layout(ctrl), vector: 0, dest: IRQ_DEST_NONE, irte: MSIX_NO_IRTE })
+
+# Point the function's single message at `vector` on the current CPU (the
+# BSP during boot), or the CPU irq_route_dest picks when an MSI can't reach
+# this one, and enable MSI with one message (MME = 0). With interrupt
+# remapping on, the message names IRTE ir_handle_msi(vector), which holds
+# the vector, the destination and the function's requester ID, as
+# msix_set_entry_to does. MSI stays off while the address and data are
+# rewritten. On an error MSI is left off.
+pub fn msi_enable(m: Msi, vector: u8) -> Result<Msi, MsiError>
+    let dev: *PciDevice = m.dev
+    let ctrl_off: u8 = m.cap + MSI_CAP_CONTROL
+    let ctrl: u16 = pci_dev_read_config16(dev, ctrl_off)
+    pci_dev_write_config16(dev, ctrl_off, msi_ctrl_off(ctrl))
+    let here: u32 = lapic_id()
+    let dest: u32 = irq_route_dest(here)
+    if dest == IRQ_DEST_NONE
+        klog("[msix] no CPU can take MSI vector ")
+        klog_dec(vector as i64)
+        klog(" (APIC ID ")
+        klog_dec(here as i64)
+        klog(": ")
+        irq_route_print_reason(here)
+        klog(")\n")
+        return Err(MsiError.NoCpu)
+    if dest != here
+        klog("[msix] MSI vector ")
+        klog_dec(vector as i64)
+        klog(" -> APIC ID ")
+        klog_dec(dest as i64)
+        klog(", not this CPU's ")
+        klog_dec(here as i64)
+        klog(": ")
+        irq_route_print_reason(here)
+        klog("\n")
+    # Fixed delivery, edge-triggered: data is just the vector.
+    var addr: u32 = msi_addr_lo(dest)
+    var data: u32 = vector as u32
+    var irte: u32 = MSIX_NO_IRTE
+    if ir_enabled()
+        let handle: u32 = ir_handle_msi(vector)
+        if ir_set(handle, vector, dest, false, pci_dev_sid(dev)) != 0
+            klog("[msix] MSI vector ")
+            klog_dec(vector as i64)
+            klog(": IRTE not set; MSI left off\n")
+            return Err(MsiError.Irte)
+        addr = ir_msi_addr(handle)
+        data = ir_msi_data(handle)
+        irte = handle
+    pci_dev_write_config32(dev, m.cap + MSI_CAP_ADDR_LO, addr)
+    if m.layout.is64
+        pci_dev_write_config32(dev, m.cap + MSI_CAP_ADDR_HI, 0)
+    pci_dev_write_config16(dev, m.cap + m.layout.data, (data & 0xFFFF) as u16)
+    # Per-vector masking: unmask message 0, the only one enabled.
+    if m.layout.mask != 0
+        let bits: u32 = pci_dev_read_config32(dev, m.cap + m.layout.mask)
+        pci_dev_write_config32(dev, m.cap + m.layout.mask, bits & 0xFFFFFFFE)
+    pci_dev_write_config16(dev, ctrl_off, msi_ctrl_one(ctrl))
+    Ok(Msi { dev: dev, cap: m.cap, layout: m.layout, vector: vector, dest: dest, irte: irte })
 
 # ============================================================================
 # Interrupt accounting

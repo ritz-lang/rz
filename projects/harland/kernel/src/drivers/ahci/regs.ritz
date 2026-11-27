@@ -16,6 +16,7 @@ pub const AHCI_CAP_SSS: u32 = 0x08000000
 pub const AHCI_CAP_S64A: u32 = 0x80000000
 pub const AHCI_CAP2_BOH: u32 = 0x00000001
 pub const AHCI_GHC_HR: u32 = 0x00000001
+pub const AHCI_GHC_IE: u32 = 0x00000002
 pub const AHCI_GHC_AE: u32 = 0x80000000
 pub const AHCI_BOHC_BOS: u32 = 0x00000001
 pub const AHCI_BOHC_OOS: u32 = 0x00000002
@@ -50,7 +51,22 @@ pub const AHCI_SSTS_DET_MASK: u32 = 0x0F
 pub const AHCI_SSTS_DET_UP: u32 = 0x03
 # PxSCTL.DET = 1: send COMRESET (AHCI 1.3.1 §3.3.11). 0 releases it.
 pub const AHCI_SCTL_DET_COMRESET: u32 = 0x01
+# PxIS / PxIE bits (AHCI 1.3.1 §3.3.5, §3.3.6).
+pub const AHCI_IS_DHRS: u32 = 0x00000001
+pub const AHCI_IS_PSS: u32 = 0x00000002
+pub const AHCI_IS_OFS: u32 = 0x01000000
+pub const AHCI_IS_INFS: u32 = 0x04000000
+pub const AHCI_IS_IFS: u32 = 0x08000000
+pub const AHCI_IS_HBDS: u32 = 0x10000000
+pub const AHCI_IS_HBFS: u32 = 0x20000000
 pub const AHCI_IS_TFES: u32 = 0x40000000
+# The fatal errors: the HBA stops the port with the command's CI bit still
+# set, so they end the wait without waiting for CI (AHCI 1.3.1 §6.1.2).
+const AHCI_IS_FATAL: u32 = AHCI_IS_TFES | AHCI_IS_HBFS | AHCI_IS_HBDS | AHCI_IS_IFS
+# PxIE once MSI is on (AGAST #4885): a D2H register FIS ends a DMA command,
+# a PIO setup FIS an IDENTIFY, and every error bit ends one too. Port and
+# PhyRdy changes stay off: a hotplug is not a completion.
+pub const AHCI_PXIE_WANTED: u32 = AHCI_IS_DHRS | AHCI_IS_PSS | AHCI_IS_OFS | AHCI_IS_INFS | AHCI_IS_IFS | AHCI_IS_HBDS | AHCI_IS_HBFS | AHCI_IS_TFES
 
 pub const AHCI_SIG_ATA: u32 = 0x00000101
 pub const AHCI_SIG_ATAPI: u32 = 0xEB140101
@@ -64,6 +80,12 @@ pub enum SigKind
     Semb
     Pm
     Other
+
+# Where an issued command is, from PxCI, PxTFD and PxIS.
+pub enum CmdState
+    Busy
+    Done
+    Failed
 
 # Class 01:06:01 is driven. Class 01:04 (RAID mode) is logged and left alone.
 pub enum ClassAction
@@ -108,6 +130,25 @@ pub fn ahci_pi_has(pi: u32, port: i32) -> bool
         return false
     let bit: u32 = 1
     (pi & (bit << (port as u32))) != 0
+
+# The state of the command in the slots `slot_bit` names. PxCI is the ground
+# truth: a completion interrupt (DHRS) with the bit still set is stale and
+# completes nothing. A fatal error fails the command at once, CI or not; a
+# command whose bit cleared fails if the device reported ERR.
+pub fn ahci_cmd_state(ci: u32, slot_bit: u32, tfd: u32, is: u32) -> CmdState
+    if (is & AHCI_IS_FATAL) != 0
+        return CmdState.Failed
+    if (ci & slot_bit) != 0
+        return CmdState.Busy
+    if (tfd & AHCI_TFD_ERR) != 0
+        return CmdState.Failed
+    CmdState.Done
+
+# Whether a command waits on the HBA's MSI vector rather than polling: the
+# controller has one (`vec` != 0), interrupts are on (`if_on`), and the
+# message goes to this CPU (`here` is its APIC ID, `dest` the message's).
+pub fn ahci_irq_waits(vec: u8, if_on: bool, here: u32, dest: u32) -> bool
+    vec != 0 and if_on and here == dest
 
 pub fn ahci_class_action(class_code: u8, subclass: u8, prog_if: u8) -> ClassAction
     if class_code != 0x01
