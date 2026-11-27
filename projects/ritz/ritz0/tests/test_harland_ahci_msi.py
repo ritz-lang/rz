@@ -39,12 +39,12 @@ def _body(code, name):
     return m.group(0)
 
 
-def test_msi_cap_module_is_import_free():
+def _check_msi_cap_module_is_import_free():
     # Host-compiled by projects/harland/test/test_msi_cap.ritz.
     assert not re.search(r"^import\b", _code(MSI_CAP), re.M)
 
 
-def test_msi_enable_uses_an_irte_when_remapping_is_on():
+def _check_msi_enable_uses_an_irte_when_remapping_is_on():
     body = _body(_code(MSIX), "msi_enable")
     assert "ir_enabled()" in body, body
     assert re.search(r"ir_set\(\s*\w+\s*,\s*vector\s*,\s*dest\s*,\s*\w+\s*,\s*pci_dev_sid\(dev\)", body), \
@@ -55,7 +55,7 @@ def test_msi_enable_uses_an_irte_when_remapping_is_on():
     assert "msi_addr_lo(dest)" in body and not re.search(r"<<\s*12", body)
 
 
-def test_msi_enable_writes_with_msi_off_and_enables_one_message():
+def _check_msi_enable_writes_with_msi_off_and_enables_one_message():
     body = _body(_code(MSIX), "msi_enable")
     off = body.index("msi_ctrl_off(")
     on = body.index("msi_ctrl_one(")
@@ -63,7 +63,7 @@ def test_msi_enable_writes_with_msi_off_and_enables_one_message():
     assert off < addr < on, "address and data must be written while MSI is off"
 
 
-def test_ahci_samples_the_vector_count_before_ci():
+def _check_ahci_samples_the_vector_count_before_ci():
     body = _body(_code(AHCI), "ahci_command")
     sample = body.index("seen = msix_vector_count(vec)")
     ci = body.index("AHCI_PX_CI), 1)")
@@ -74,12 +74,12 @@ def test_ahci_samples_the_vector_count_before_ci():
     assert "ahci_irq_waits(" in body
 
 
-def test_ahci_clears_port_status_before_global_is():
+def _check_ahci_clears_port_status_before_global_is():
     body = _body(_code(AHCI), "ahci_ack")
     assert body.index("AHCI_PX_IS") < body.index("AHCI_REG_IS")
 
 
-def test_ahci_request_does_not_hold_irqs_off():
+def _check_ahci_request_does_not_hold_irqs_off():
     # A spinlock held across the request would keep IF clear, so no command
     # could ever wait on the vector.
     body = _body(_code(AHCI), "ahci_disk_rw")
@@ -87,7 +87,7 @@ def test_ahci_request_does_not_hold_irqs_off():
     assert "ahci_disk_take(disk)" in body and "ahci_disk_give(disk)" in body
 
 
-def test_ahci_msi_comes_up_with_postinit_and_vector_last():
+def _check_ahci_msi_comes_up_with_postinit_and_vector_last():
     code = _code(POSTINIT)
     assert "ahci_enable_msi()" in _body(code, "ahci_msi_check")
     diag = _body(code, "postinit_diagnostics")
@@ -96,3 +96,26 @@ def test_ahci_msi_comes_up_with_postinit_and_vector_last():
     assert ctl.index("AHCI_PX_IE") < ctl.index("ahci_ctls[c].vec = vector"), \
         "PxIE and GHC.IE go on before commands start waiting on the vector"
     assert ctl.index("AHCI_GHC_IE") < ctl.index("ahci_ctls[c].vec = vector")
+
+
+# One table, one collected case: the suite's test budget counts cases, and
+# these are rows of a single source-pin check, not separate behaviours.
+CHECKS = (
+    _check_msi_cap_module_is_import_free,
+    _check_msi_enable_uses_an_irte_when_remapping_is_on,
+    _check_msi_enable_writes_with_msi_off_and_enables_one_message,
+    _check_ahci_samples_the_vector_count_before_ci,
+    _check_ahci_clears_port_status_before_global_is,
+    _check_ahci_request_does_not_hold_irqs_off,
+    _check_ahci_msi_comes_up_with_postinit_and_vector_last,
+)
+
+
+def test_ahci_msi_source_pins():
+    failures = []
+    for check in CHECKS:
+        try:
+            check()
+        except (AssertionError, ValueError) as e:
+            failures.append(f"{check.__name__}: {e}")
+    assert not failures, "\n".join(failures)
