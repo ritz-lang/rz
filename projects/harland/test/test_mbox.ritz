@@ -7,7 +7,7 @@
 import ritzlib.option
 import klog { klog_serial }
 import arch.x86_64.cpu_map { cpu_apic_ids }
-import sync.mbox { MboxMsg, KICK_VECTOR, MBOX_SLOTS, MBOX_CALL, MBOX_CALL_DONE, MBOX_PING, MBOX_PONG, mbox_init, mbox_msg, mbox_post, mbox_take, mbox_has_work, mbox_drain, mbox_kick_irq, mbox_stray_count }
+import sync.mbox { MboxMsg, KICK_VECTOR, MBOX_SLOTS, MBOX_CALL, MBOX_CALL_DONE, MBOX_PING, MBOX_PONG, MBOX_UNMAP, MBOX_UNMAP_DONE, MBOX_KERNEL_INVLPG, MBOX_KERNEL_INVLPG_DONE, mbox_init, mbox_msg, mbox_post, mbox_take, mbox_has_work, mbox_drain, mbox_kick_irq, mbox_stray_count }
 import sync.idle { cpu_idle_begin, cpu_idle_cancel, cpu_is_idle, cpu_kick, cpu_kick_if_idle }
 
 # The kernel hooks sync/mbox.ritz and sync/idle.ritz declare `extern`.
@@ -34,6 +34,21 @@ pub fn ap_call_run(kind: u32) -> i32
     g_call_kind = kind
     g_call_status
 
+# mm/tlb.ritz's hook: records what it was asked, on which CPU, and answers
+# g_tlb_answer.
+var g_tlb_calls: i32 = 0
+var g_tlb_cpu: i32 = -1
+var g_tlb_kind: u32 = 0
+var g_tlb_args: [4]u64
+var g_tlb_answer: u64 = 0
+
+pub fn tlb_serve(kind: u32, pml4: u64, vaddr: u64, pages: u64, mode: u64) -> u64
+    g_tlb_calls = g_tlb_calls + 1
+    g_tlb_cpu = g_me
+    g_tlb_kind = kind
+    g_tlb_args = [pml4, vaddr, pages, mode]
+    g_tlb_answer
+
 fn fresh()
     # A hosted test has no COM1: the drop's log line goes to the ring only.
     klog_serial(false)
@@ -43,6 +58,11 @@ fn fresh()
     g_eois = 0
     g_call_kind = 0
     g_call_status = 0
+    g_tlb_calls = 0
+    g_tlb_cpu = -1
+    g_tlb_kind = 0
+    g_tlb_args = [0, 0, 0, 0]
+    g_tlb_answer = 0
     var i: i32 = 0
     while i < 4
         cpu_apic_ids[i] = 10 + (i as u32)
@@ -163,16 +183,72 @@ fn test_drain_answers_ping_and_call() -> i32
         return 5
     0
 
+# The owner's drain serves an UNMAP (SMP_USER.md §3): mm/tlb.ritz's hook gets
+# the PML4, VA, page count and mode on the owner, and the UNMAP_DONE that
+# goes back to the sender's box echoes the request id and the pid and
+# carries the hook's count of leaves changed.
+[[test]]
+fn test_drain_serves_unmap_and_replies_done() -> i32
+    fresh()
+    var req: MboxMsg = mbox_msg(MBOX_UNMAP)
+    req.pid = 6
+    req.arg[0] = 31
+    req.arg[1] = 0x7000
+    req.arg[2] = 0x10000000000
+    req.arg[3] = 3
+    req.arg[4] = 1
+    mbox_post(2, req)
+    g_me = 2
+    g_tlb_answer = 3
+    g_ipis = 0
+    mbox_drain()
+    if g_tlb_calls != 1 or g_tlb_cpu != 2 or g_tlb_kind != MBOX_UNMAP
+        return 1
+    if g_tlb_args[0] != 0x7000 or g_tlb_args[1] != 0x10000000000 or g_tlb_args[2] != 3 or g_tlb_args[3] != 1
+        return 2
+    if g_ipis != 1 or g_ipi_dest != 10
+        return 3
+    let done: MboxMsg = take(0)
+    if done.kind != MBOX_UNMAP_DONE or done.from != 2 or done.pid != 6
+        return 4
+    if done.arg[0] != 31 or done.arg[1] != 3
+        return 5
+    if take(0).kind != 0
+        return 6
+    0
+
+# A KERNEL_INVLPG is served the same way and acknowledged with
+# KERNEL_INVLPG_DONE carrying its id.
+[[test]]
+fn test_drain_serves_kernel_invlpg_and_acks() -> i32
+    fresh()
+    var req: MboxMsg = mbox_msg(MBOX_KERNEL_INVLPG)
+    req.arg[0] = 8
+    req.arg[2] = 0xFFFF808000001000
+    mbox_post(3, req)
+    g_me = 3
+    mbox_drain()
+    if g_tlb_calls != 1 or g_tlb_cpu != 3 or g_tlb_kind != MBOX_KERNEL_INVLPG
+        return 1
+    if g_tlb_args[1] != 0xFFFF808000001000 or g_tlb_args[2] != 0
+        return 2
+    let ack: MboxMsg = take(0)
+    if ack.kind != MBOX_KERNEL_INVLPG_DONE or ack.from != 3 or ack.arg[0] != 8
+        return 3
+    0
+
 # A reply that reaches the drain had no waiter: dropped and counted.
 [[test]]
 fn test_drain_drops_a_late_reply() -> i32
     fresh()
     g_me = 1
     mbox_post(0, mbox_msg(MBOX_PONG))
+    mbox_post(0, mbox_msg(MBOX_UNMAP_DONE))
+    mbox_post(0, mbox_msg(MBOX_KERNEL_INVLPG_DONE))
     g_me = 0
     g_ipis = 0
     mbox_drain()
-    if mbox_stray_count(0) != 1 or g_ipis != 0
+    if mbox_stray_count(0) != 3 or g_ipis != 0 or g_tlb_calls != 0
         return 1
     if mbox_has_work(0)
         return 2

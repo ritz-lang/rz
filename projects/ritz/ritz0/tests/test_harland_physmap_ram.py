@@ -38,7 +38,7 @@ HALF_GIB_PAGES = GIB // 2 // 4096
 PHYSMAP_PROGRAM = f"""\
 import ritzlib.option
 import mm.pmm {{ PAGE_SIZE, pmm_irqsave, pmm_init, pmm_mark_region_free, pmm_alloc_page }}
-import mm.vmm {{ PTE_PRESENT, PTE_WRITABLE, PTE_HUGE, PTE_ADDR_MASK, vmm_pml4_phys, vmm_physmap_fill }}
+import mm.vmm {{ PTE_PRESENT, PTE_WRITABLE, PTE_HUGE, PTE_ADDR_MASK, vmm_set_walk_pml4, vmm_physmap_fill }}
 
 const ONE_GIB: u64 = 0x40000000
 const FOUR_GIB: u64 = 0x100000000
@@ -91,8 +91,8 @@ fn pd_maps(pdpt: u64, g: u64, lo: u64, hi: u64) -> bool
         e = e + 1
     return true
 
-# mm/pmm.ritz declares the kernel's percpu.ritz cpu_index for its per-CPU
-# frame caches (AGAST #4879): one CPU here.
+# mm/pmm.ritz and mm/vmm.ritz declare the kernel's percpu.ritz cpu_index, for
+# the per-CPU frame caches and PC_ACTIVE_PML4 (AGAST #4879, #4880): one CPU here.
 pub fn cpu_index() -> i32
     0
 
@@ -112,7 +112,7 @@ fn main() -> i32
     put(id_pdpt, 0, identity_pd(0, 0, 512) | PTE_PRESENT | PTE_WRITABLE)
     put(id_pdpt, 1, identity_pd(1, 0, 1) | PTE_PRESENT | PTE_WRITABLE)
     put(id_pdpt, 5, identity_pd(5, 511, 512) | PTE_PRESENT | PTE_WRITABLE)
-    vmm_pml4_phys = pml4
+    vmm_set_walk_pml4(pml4)
     let pdpt: u64 = table()
     let n: i64 = vmm_physmap_fill(pdpt, 6)
     if not pd_maps(pdpt, 0, 0, 512)
@@ -136,7 +136,7 @@ fn main() -> i32
     let id_pdptb: u64 = table()
     put(pml4b, 0, id_pdptb | PTE_PRESENT | PTE_WRITABLE)
     put(id_pdptb, 0, identity_pd(0, 0, 512) | PTE_PRESENT | PTE_WRITABLE)
-    vmm_pml4_phys = pml4b
+    vmm_set_walk_pml4(pml4b)
     let pdptb: u64 = table()
     let nb: i64 = vmm_physmap_fill(pdptb, 1)
     if not pd_maps(pdptb, 0, 0, 256)
