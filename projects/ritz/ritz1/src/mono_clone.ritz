@@ -81,9 +81,8 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
         return template_member_field(mono, m, StrView { ptr: (sname), len: (sname_len) as i64 }, e)
     var f: *StructField = st.fields
     while f != null
-        if (f.name.len as i32) == e.ident.len as i32
-            if memcmp(f.name.ptr, e.ident.ptr, e.ident.len) == 0
-                return f
+        if f.name.eq(e.ident)
+            return f
         f = f.next
     return null
 
@@ -1670,8 +1669,6 @@ fn tuple_elem_points_at(f: *StructField, type_param_sv: StrView) -> i32
 # Specialise `template` at ONE type parameter (type_param_name) bound to the
 # one-argument suffix "$arg".  The result's name is template.name + suffix.
 fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_param_name_sv: StrView, suffix_sv: StrView) -> *FnDef
-    var type_param_name: *u8 = type_param_name_sv.ptr
-    var type_param_len: i32 = type_param_name_sv.len as i32
     var suffix: *u8 = suffix_sv.ptr
     var suffix_len: i32 = suffix_sv.len as i32
     mono.mono_module = m  # AGAST #1926: see names_generic_struct
@@ -1734,17 +1731,16 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
         TypeKind.Struct =>
             if specialized.return_type_name.ptr != null
                 # Check if it matches the type param exactly (e.g., "T" -> "u8")
-                if (specialized.return_type_name.len as i32) == type_param_len
-                    if memcmp(specialized.return_type_name.ptr, type_param_name, type_param_len as i64) == 0
-                        # Substitute with concrete type
-                        specialized.return_type = subst_type
-                        specialized.return_type_name = StrView { ptr: subst_type_name, len: subst_type_len as i64 }
-                        # AGAST #2305: `-> T` at T = `[N]E` returns the `[N x E]`.
-                        if subst_type == TypeKind.Array and specialized.ret_array_param == null
-                            let rap: *Param = calloc(1, sizeof(Param)) as *Param
-                            if param_take_array_arg(rap, StrView { ptr: (subst_type_name), len: (subst_type_len) as i64 }) == 1
-                                specialized.ret_array_param = rap
-                                specialized.return_type_name = rap.param_type_name
+                if specialized.return_type_name.eq(type_param_name_sv)
+                    # Substitute with concrete type
+                    specialized.return_type = subst_type
+                    specialized.return_type_name = StrView { ptr: subst_type_name, len: subst_type_len as i64 }
+                    # AGAST #2305: `-> T` at T = `[N]E` returns the `[N x E]`.
+                    if subst_type == TypeKind.Array and specialized.ret_array_param == null
+                        let rap: *Param = calloc(1, sizeof(Param)) as *Param
+                        if param_take_array_arg(rap, StrView { ptr: (subst_type_name), len: (subst_type_len) as i64 }) == 1
+                            specialized.ret_array_param = rap
+                            specialized.return_type_name = rap.param_type_name
                 # Otherwise it might be a generic struct like "Vec$T" -> "Vec$u8"
                 else
                     specialized.return_type_name = substitute_type_param_in_name(mono, specialized.return_type_name, type_param_name_sv, suffix_sv)
@@ -1759,11 +1755,10 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
         # "T", which no stride lookup resolves, so `vec_as_ptr<*u8>(@v) + i`
         # added i BYTES and execve got byte-shifted argv pointers (#2790).
         TypeKind.Ptr =>
-            if specialized.return_type_name.ptr != null and (specialized.return_type_name.len as i32) == type_param_len
-                if memcmp(specialized.return_type_name.ptr, type_param_name, type_param_len as i64) == 0
-                    if subst_type == TypeKind.Ptr
-                        specialized.return_type = TypeKind.PtrPtr
-                    specialized.return_type_name = StrView { ptr: subst_type_name, len: subst_type_len as i64 }
+            if specialized.return_type_name.ptr != null and specialized.return_type_name.eq(type_param_name_sv)
+                if subst_type == TypeKind.Ptr
+                    specialized.return_type = TypeKind.PtrPtr
+                specialized.return_type_name = StrView { ptr: subst_type_name, len: subst_type_len as i64 }
             # AGAST #3179: `-> *W<T>` points at "W$T", as `-> W<T>` names it: the
             # instance is "W$i32".  Left unsubstituted, find_struct missed it and
             # `g(@w).v` / `w.g().v` were "unhandled EXPR_MEMBER".
@@ -1772,9 +1767,8 @@ fn specialize_fn_one_param(mono: *MonoCtx, m: *Module, template: *FnDef, type_pa
         # AGAST #3015: and `-> @T` / `-> @&T` (Deref's `deref`, R17): the referent
         # is T's concrete name, so `(*b.deref()).f` finds T's field.
         TypeKind.Ref | TypeKind.MutRef =>
-            if specialized.return_type_name.ptr != null and (specialized.return_type_name.len as i32) == type_param_len
-                if memcmp(specialized.return_type_name.ptr, type_param_name, type_param_len as i64) == 0
-                    specialized.return_type_name = StrView { ptr: subst_type_name, len: subst_type_len as i64 }
+            if specialized.return_type_name.ptr != null and specialized.return_type_name.eq(type_param_name_sv)
+                specialized.return_type_name = StrView { ptr: subst_type_name, len: subst_type_len as i64 }
         _ => pass
 
     # AGAST #3101: a bare `-> T` at T = `*[N]E` / `@&[N]E` returns that array
@@ -1823,11 +1817,7 @@ fn param_take_array_arg(param: *Param, name_sv: StrView) -> i32
     1
 
 fn name_is_type_param(name_sv: StrView, tp_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var tp: *u8 = tp_sv.ptr
-    var tp_len: i32 = tp_sv.len as i32
-    (name != null and len == tp_len and memcmp(name, tp, tp_len as i64) == 0) as i32
+    (name_sv.ptr != null and name_sv.eq(tp_sv)) as i32
 
 # AGAST #3101: the `*[N]E` a type argument spelled `arrN_E` points at, as a
 # Param ptr_array_of_last would record (N, E, E's pointee and name); null when
@@ -1916,8 +1906,6 @@ fn borrow_take_ptr_ptr_arg(param: *Param, subst_type: TypeKind, name_sv: StrView
     param.param_type_name = StrView { ptr: rest, len: rest_len as i64 }
 
 fn clone_params_with_suffix(mono: *MonoCtx, params: *Param, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView, suffix_sv: StrView) -> *Param
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
     if params == null
         return null
 
@@ -1985,44 +1973,43 @@ fn clone_params_with_suffix(mono: *MonoCtx, params: *Param, type_param_sv: StrVi
         # a struct name). Concretize pointee to subst_type (e.g. TypeKind.U8) so
         # get_ptr_elem_size yields 1 instead of defaulting struct-unknown=8,
         # and deref loads produce the right bit-width (load i8, not i64).
-        if (cloned.param_type_name.len as i32) == type_param_len
-            if memcmp(cloned.param_type_name.ptr, type_param, type_param_len as i64) == 0
-                # AGAST #2279: `c:& [2]T` names T too, but holds an array, and a
-                # by-value `T` slot must not read its first element.  So do
-                # `@[2]T` and `@&[2]T` (#2287), and `*[2]T`: `p[i]` means one
-                # thing for all three (#2321).
-                # AGAST #2378: `a:& [2]*T` names T as what its element points
-                # at.  The element stays a pointer: making it a T read `[2]*i16`
-                # as `[2]i16`, and refused the param's own array at the call.
-                if cloned.param_pointee_type == TypeKind.Array and params.param_pointee_array_elem_type == TypeKind.Ptr
-                    cloned.param_pointee_array_elem_pointee = subst_type
-                else if cloned.param_pointee_type == TypeKind.Array
-                    cloned.param_pointee_array_elem_type = subst_type
-                else if cloned.param_type != TypeKind.Ptr and cloned.param_pointee_type == TypeKind.Ptr
-                    # AGAST #2308: `@&*T` is still a reference to a pointer.
-                    set_ref_ptr_pointee(cloned, subst_type)
-                else
-                    cloned.param_pointee_type = subst_type
-                    # AGAST #2345: so is `@&T` at T = `*U`.  subst_type only says
-                    # TypeKind.Ptr, so `r:& T` was left as `r:& *<nothing>`: it never
-                    # bound as its referent, and `r = v` overwrote its own slot.
-                    if subst_type == TypeKind.Ptr
-                        set_ref_ptr_pointee(cloned, ptr_arg_pointee(subst_name_sv))
-                        # AGAST #3101: and `r:& T` at T = `*[N]E` borrows a
-                        # `*[N]E`, bound as #3103 binds a written `r:& *[N]E`.
-                        param_take_ptr_array_arg(cloned, subst_name_sv)
-                cloned.param_type_name = subst_name_sv
-                # AGAST #2832: a bare `c:& T` / `*T` at T = `[2]f64` points at
-                # that array, recorded as a written `c:& [2]f64` is (N, E, E's
-                # name).  Not `c:& [2]T`, which held TypeKind.Array already.
-                var arr: ArrayArg
-                if params.param_pointee_type != TypeKind.Array and cloned.param_pointee_type == TypeKind.Array and array_arg_decode(subst_name_sv, @arr) == 1
-                    cloned.param_pointee_array_size = arr.size
-                    cloned.param_pointee_array_elem_type = arr.elem
-                    cloned.param_pointee_array_elem_pointee = arr.pointee
-                    cloned.param_pointee_array_shape = null
-                    cloned.param_type_name = StrView { ptr: arr.name, len: arr.name_len as i64 }
-                borrow_take_ptr_ptr_arg(cloned, subst_type, subst_name_sv)
+        if cloned.param_type_name.eq(type_param_sv)
+            # AGAST #2279: `c:& [2]T` names T too, but holds an array, and a
+            # by-value `T` slot must not read its first element.  So do
+            # `@[2]T` and `@&[2]T` (#2287), and `*[2]T`: `p[i]` means one
+            # thing for all three (#2321).
+            # AGAST #2378: `a:& [2]*T` names T as what its element points
+            # at.  The element stays a pointer: making it a T read `[2]*i16`
+            # as `[2]i16`, and refused the param's own array at the call.
+            if cloned.param_pointee_type == TypeKind.Array and params.param_pointee_array_elem_type == TypeKind.Ptr
+                cloned.param_pointee_array_elem_pointee = subst_type
+            else if cloned.param_pointee_type == TypeKind.Array
+                cloned.param_pointee_array_elem_type = subst_type
+            else if cloned.param_type != TypeKind.Ptr and cloned.param_pointee_type == TypeKind.Ptr
+                # AGAST #2308: `@&*T` is still a reference to a pointer.
+                set_ref_ptr_pointee(cloned, subst_type)
+            else
+                cloned.param_pointee_type = subst_type
+                # AGAST #2345: so is `@&T` at T = `*U`.  subst_type only says
+                # TypeKind.Ptr, so `r:& T` was left as `r:& *<nothing>`: it never
+                # bound as its referent, and `r = v` overwrote its own slot.
+                if subst_type == TypeKind.Ptr
+                    set_ref_ptr_pointee(cloned, ptr_arg_pointee(subst_name_sv))
+                    # AGAST #3101: and `r:& T` at T = `*[N]E` borrows a
+                    # `*[N]E`, bound as #3103 binds a written `r:& *[N]E`.
+                    param_take_ptr_array_arg(cloned, subst_name_sv)
+            cloned.param_type_name = subst_name_sv
+            # AGAST #2832: a bare `c:& T` / `*T` at T = `[2]f64` points at
+            # that array, recorded as a written `c:& [2]f64` is (N, E, E's
+            # name).  Not `c:& [2]T`, which held TypeKind.Array already.
+            var arr: ArrayArg
+            if params.param_pointee_type != TypeKind.Array and cloned.param_pointee_type == TypeKind.Array and array_arg_decode(subst_name_sv, @arr) == 1
+                cloned.param_pointee_array_size = arr.size
+                cloned.param_pointee_array_elem_type = arr.elem
+                cloned.param_pointee_array_elem_pointee = arr.pointee
+                cloned.param_pointee_array_shape = null
+                cloned.param_type_name = StrView { ptr: arr.name, len: arr.name_len as i64 }
+            borrow_take_ptr_ptr_arg(cloned, subst_type, subst_name_sv)
         else
             cloned.param_type_name = substitute_type_param_in_name(mono, cloned.param_type_name, type_param_sv, suffix_sv)
 
@@ -2540,8 +2527,6 @@ fn is_store_stmt(k: StmtKind) -> i32
     return 0
 
 fn clone_expr(mono: *MonoCtx, e: *Expr, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView, suffix_sv: StrView) -> *Expr
-    var type_param: *u8 = type_param_sv.ptr
-    var type_param_len: i32 = type_param_sv.len as i32
     var subst_name: *u8 = subst_name_sv.ptr
     var suffix: *u8 = suffix_sv.ptr
     if e == null
@@ -2615,15 +2600,12 @@ fn clone_expr(mono: *MonoCtx, e: *Expr, type_param_sv: StrView, subst_type: Type
             let is_sizeof: bool = (cloned.func_name).eq("sizeof")
             if is_sizeof and e.args != null and e.args.kind == ExprKind.Ident
                 # Check if the argument matches our type parameter
-                if (e.args.ident.len as i32) == type_param_len
-                    if memcmp(e.args.ident.ptr, type_param, type_param_len as i64) == 0
-                        # Substitute the concrete type itself (AGAST #2124): a
-                        # TYPE_OPERAND, not an IDENT of subst_name, which for
-                        # a pointer or primitive T is no name the emitter knows
-                        # (and an unknown sizeof name is now an error).
-                        cloned.args = sizeof_subst_operand(e.args, subst_type, subst_name_sv)
-                    else
-                        cloned.args = clone_expr_list(mono, e.args, type_param_sv, subst_type, subst_name_sv, suffix_sv)
+                if e.args.ident.eq(type_param_sv)
+                    # Substitute the concrete type itself (AGAST #2124): a
+                    # TYPE_OPERAND, not an IDENT of subst_name, which for
+                    # a pointer or primitive T is no name the emitter knows
+                    # (and an unknown sizeof name is now an error).
+                    cloned.args = sizeof_subst_operand(e.args, subst_type, subst_name_sv)
                 else
                     cloned.args = clone_expr_list(mono, e.args, type_param_sv, subst_type, subst_name_sv, suffix_sv)
             else
@@ -2849,7 +2831,6 @@ fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef,
 # primitive_type_from_name lives in ast_helpers (AGAST #1980: the emitter's
 # let path needs it too).
 fn clone_struct_fields(mono: *MonoCtx, fields: *StructField, type_param_sv: StrView, subst_type: TypeKind, subst_name_sv: StrView, suffix_sv: StrView) -> *StructField
-    var type_param: *u8 = type_param_sv.ptr
     var type_param_len: i32 = type_param_sv.len as i32
     var suffix: *u8 = suffix_sv.ptr
     if fields == null
@@ -2884,7 +2865,7 @@ fn clone_struct_fields(mono: *MonoCtx, fields: *StructField, type_param_sv: StrV
             cloned.field_type = fields.field_type
             cloned.field_type_name = substitute_type_param_in_name(mono, fields.field_type_name, type_param_sv, suffix_sv)
         else if fields.field_type_name.ptr != null and (fields.field_type_name.len as i32) == type_param_len
-            if memcmp(fields.field_type_name.ptr, type_param, type_param_len as i64) == 0
+            if fields.field_type_name.eq(type_param_sv)
                 # Substitute with concrete type
                 subst_value_field(cloned, subst_type, subst_name_sv)
             else
@@ -2910,9 +2891,8 @@ fn clone_struct_fields(mono: *MonoCtx, fields: *StructField, type_param_sv: StrV
     # `Vec$Token.data + i` striding by 1 byte instead of sizeof(Token); the
     # hard-coded Vec$ layouts in the emitter hid that until #1440 removed them.
     if fields.field_type == TypeKind.Ptr or fields.field_type == TypeKind.Ref or fields.field_type == TypeKind.MutRef
-        if fields.field_type_name.ptr != null and (fields.field_type_name.len as i32) == type_param_len
-            if memcmp(fields.field_type_name.ptr, type_param, type_param_len as i64) == 0
-                subst_pointee_field(cloned, subst_type, subst_name_sv)
+        if fields.field_type_name.ptr != null and fields.field_type_name.eq(type_param_sv)
+            subst_pointee_field(cloned, subst_type, subst_name_sv)
         if fields.field_type_name.ptr != null and find_dollar_sign(fields.field_type_name) > 0
             # AGAST #3099: a generic pointee, `b: *Box<T>` is `*Box$T`:
             # rewrite its `$T`, as the by-value `b: Box<T>` above.  Copied as
