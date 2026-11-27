@@ -547,9 +547,9 @@ fn mkdir_parents(path: StrView)
 struct SigData
     source_hash:   u64
     # Cached whole-module LLVM IR (the entire output .ll), so the fast path
-    # can recreate an output the orchestrator deleted.  null = no cache.
-    module_ir:     *u8
-    module_ir_len: i64
+    # can recreate an output the orchestrator deleted.  Empty = no cache.
+    # Owned: a sig_copy_view copy that sig_data_free frees.
+    module_ir:     StrView
     # FNV1a-64 of the compiler binary + target OS + import search path that
     # produced `module_ir` (AGAST #1279).  0 means "unknown" and never matches.
     compiler_hash: u64
@@ -579,8 +579,7 @@ pub fn sig_data_new() -> *SigData
         return null
     sd.source_hash = 0
     sd.compiler_hash = 0
-    sd.module_ir = null
-    sd.module_ir_len = 0
+    sd.module_ir = strview_empty()
     sd.dep_paths = null
     sd.dep_hashes = null
     sd.dep_count = 0
@@ -631,14 +630,22 @@ pub fn sig_data_free(sd: *SigData)
         return
     sig_data_free_deps(sd)
     sig_data_free_misses(sd)
-    if sd.module_ir != null
-        free(sd.module_ir)
+    if sd.module_ir.ptr != null
+        free(sd.module_ir.ptr)
     free(sd as *u8)
 
-# Append a dependency, copying `path[0..path_len)`.
+# A heap copy of `v` with a NUL after its last byte, for a SigData to own
+# (sig_data_free frees it).  Empty (null ptr) when out of memory.
+pub fn sig_copy_view(v: StrView) -> StrView
+    let copy: *u8 = malloc(v.len + 1)
+    if copy == null
+        return strview_empty()
+    memcpy(copy, v.ptr, v.len)
+    *(copy + v.len) = 0
+    StrView { ptr: copy, len: v.len }
+
+# Append a dependency, copying `path_sv`.
 fn sig_data_add_dep(sd: *SigData, path_sv: StrView, h: u64)
-    var path: *u8 = path_sv.ptr
-    var path_len: i64 = path_sv.len
     if sd.dep_count >= sd.dep_cap
         var new_cap: i32 = sd.dep_cap * 2
         if new_cap < 16
@@ -657,20 +664,17 @@ fn sig_data_add_dep(sd: *SigData, path_sv: StrView, h: u64)
         sd.dep_paths = np
         sd.dep_hashes = nh
         sd.dep_cap = new_cap
-    let copy: *u8 = malloc(path_len + 1)
-    if copy == null
+    let copy: StrView = sig_copy_view(path_sv)
+    if copy.ptr == null
         return
-    memcpy(copy, path, path_len)
-    *(sd.dep_paths + sd.dep_count) = StrView { ptr: copy, len: path_len }
+    *(sd.dep_paths + sd.dep_count) = copy
     *(sd.dep_hashes + sd.dep_count) = h
     sd.dep_count = sd.dep_count + 1
 
-# Append a missed candidate, copying `path[0..path_len)`, unless it is
+# Append a missed candidate, copying `path_sv`, unless it is
 # already listed (one import probes the same candidates from every importer).
 # Returns 1 when the path is listed afterwards, 0 if out of memory.
 fn sig_data_add_miss(sd: *SigData, path_sv: StrView) -> i32
-    var path: *u8 = path_sv.ptr
-    var path_len: i64 = path_sv.len
     let h: u64 = fnv1a_bytes(path_sv)
     var i: i32 = 0
     while i < sd.miss_count
@@ -696,11 +700,10 @@ fn sig_data_add_miss(sd: *SigData, path_sv: StrView) -> i32
         sd.miss_paths = np
         sd.miss_hashes = nh
         sd.miss_cap = new_cap
-    let copy: *u8 = malloc(path_len + 1)
-    if copy == null
+    let copy: StrView = sig_copy_view(path_sv)
+    if copy.ptr == null
         return 0
-    memcpy(copy, path, path_len)
-    *(sd.miss_paths + sd.miss_count) = StrView { ptr: copy, len: path_len }
+    *(sd.miss_paths + sd.miss_count) = copy
     *(sd.miss_hashes + sd.miss_count) = h
     sd.miss_count = sd.miss_count + 1
     return 1
@@ -890,12 +893,7 @@ fn sig_read_root(root: @Json) -> *SigData
     match sig_str_field(root, "module_ir")
         Some(ir) =>
             if ir.len > 0
-                let mb: *u8 = malloc(ir.len + 1)
-                if mb != null
-                    memcpy(mb, ir.ptr, ir.len)
-                    *(mb + ir.len) = 0
-                    sd.module_ir = mb
-                    sd.module_ir_len = ir.len
+                sd.module_ir = sig_copy_view(ir)
         None => pass
 
     match root.get_field("import_hashes")
@@ -1006,8 +1004,8 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
 
     # Always present (null when empty) so the shape is fixed.
     buf.push_view("  \"module_ir\": ")
-    if sd.module_ir != null and sd.module_ir_len > 0
-        emit_sig_string(buf, StrView { ptr: (sd.module_ir), len: (sd.module_ir_len) })
+    if sd.module_ir.ptr != null and sd.module_ir.len > 0
+        emit_sig_string(buf, sd.module_ir)
     else
         let _: bool = buf.push_view("null")
     buf.push_view(",\n")
@@ -1187,7 +1185,7 @@ pub fn check_source_unchanged(src_path: StrView, src_sv: StrView, ll_path: StrVi
 
     # Everything above vouches for `module_ir`, not for whatever is at
     # `ll_path`; with no IR there is nothing to vouch for (AGAST #2023).
-    if sd.module_ir == null or sd.module_ir_len <= 0
+    if sd.module_ir.ptr == null or sd.module_ir.len <= 0
         sig_data_free(sd)
         return 0
 
@@ -1203,7 +1201,7 @@ pub fn check_source_unchanged(src_path: StrView, src_sv: StrView, ll_path: StrVi
     # {mode, ir_hash} for this (#2020); ritz1's sig already holds the IR
     # itself, under this mode's fingerprint, so a byte comparison is the same
     # check with nothing extra to keep in step.
-    if file_equals(ll_path, StrView { ptr: (sd.module_ir), len: (sd.module_ir_len) }) == 1
+    if file_equals(ll_path, sd.module_ir) == 1
         if ll_not_older(ll_path, src_path)
             sig_data_free(sd)
             return 1
@@ -1212,7 +1210,7 @@ pub fn check_source_unchanged(src_path: StrView, src_sv: StrView, ll_path: StrVi
     # source.  Splice the cached IR to the requested output path.
     var file: Fd = fd_open(ll_path, O_WRONLY + O_CREAT + O_TRUNC, 420).unwrap_or(fd_adopt(-1))
     if file.valid()
-        let wrote: bool = file.write_all(Span<u8> { ptr: sd.module_ir, len: sd.module_ir_len }).is_ok()
+        let wrote: bool = file.write_all(Span<u8> { ptr: sd.module_ir.ptr, len: sd.module_ir.len }).is_ok()
         file.close()
         if wrote
             sig_data_free(sd)
