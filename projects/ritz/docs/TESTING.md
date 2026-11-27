@@ -147,7 +147,9 @@ fn test_basic_invocation() -> i32
   child that exits 127.
 
 Scratch files go under `sandbox_path(prefix, suffix) -> String`
-(`/tmp/ritz_<prefix>_<pid>_<suffix>`; `p.as_ptr()` for a syscall,
+(`<tmp>/ritz_<prefix>_<pid>_<suffix>`, where `<tmp>` is `$TMPDIR` when it
+is set and non-empty, else `/tmp`: a host's `/tmp` may be noexec, so the gate
+gives each test an exec-capable `$TMPDIR`; `p.as_ptr()` for a syscall,
 `p.as_view()` for a StrView API), read and written with `ritzlib.fs`'s
 `read_file` / `write_file`. A test that cleans up before it asserts binds
 the `Result` first, cleans up, then matches it.

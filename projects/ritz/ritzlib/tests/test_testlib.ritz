@@ -4,7 +4,9 @@
 #   exec_capture(bin, args, env, stdin) -> Result<Captured, Errno>
 #       Captured { status: ProcessResult, out: Vec<u8> }: stdout and stderr
 #       merged (2>&1), stdin staged through a temp file, env exactly `env`.
-#   sandbox_path(prefix, suffix) -> String: "/tmp/ritz_<prefix>_<pid>_<suffix>"
+#   sandbox_path(prefix, suffix) -> String: "<tmp>/ritz_<prefix>_<pid>_<suffix>",
+#       <tmp> = $TMPDIR if set and non-empty, else /tmp
+#   sandbox_path_under(dir, prefix, suffix) -> String: the same, under `dir`
 #
 # Children are absolute paths (/bin/sh, /bin/cat, /usr/bin/env): the env they
 # get is exactly the one given, so PATH is not there to resolve a bare name.
@@ -15,6 +17,8 @@ import ritzlib.string
 import ritzlib.strview
 import ritzlib.span
 import ritzlib.result
+import ritzlib.option
+import ritzlib.os.env
 import ritzlib.testlib
 
 # `sh -c <script>` with no env and no stdin.
@@ -118,12 +122,52 @@ fn test_exec_capture_removes_its_stdin_file() -> i32
     assert sys_access(staged.as_ptr(), F_OK) < 0, "stdin temp file left behind"
     0
 
-[[test]]
-fn test_sandbox_path_shape() -> i32
-    var want: String = string_from("/tmp/ritz_pfx_")
+# "<dir>/ritz_pfx_<pid>_sfx", the shape every sandbox path has.
+fn want_path(dir: StrView) -> String
+    var want: String = string_from(dir)
+    want.push_str("/ritz_pfx_")
     var pid: String = string_from_i64(sys_getpid() as i64)
     want.push_string(@pid)
     want.push_str("_sfx")
+    want
+
+# sandbox_path lives under $TMPDIR when that is set, else /tmp: the gate gives
+# every test an exec-capable $TMPDIR because a host's /tmp may be noexec.
+[[test]]
+fn test_sandbox_path_uses_tmpdir_or_tmp() -> i32
+    var dir: StrView = "/tmp"
+    match env_get("TMPDIR")
+        Some(d) =>
+            if not d.is_empty()
+                dir = d
+        None =>
+            dir = "/tmp"
+    if dir.ends_with("/") and dir.len > 1
+        dir = StrView { ptr: dir.ptr, len: dir.len - 1 }
+    let want: String = want_path(dir)
     let got: String = sandbox_path("pfx", "sfx")
+    assert got.eq_string(@want)
+    0
+
+[[test]]
+fn test_sandbox_path_under_dir() -> i32
+    let want: String = want_path("/x/y")
+    let got: String = sandbox_path_under("/x/y", "pfx", "sfx")
+    assert got.eq_string(@want)
+    0
+
+# A trailing slash on the directory ("/x/y/", as TMPDIR often has) is not doubled.
+[[test]]
+fn test_sandbox_path_under_dir_trailing_slash() -> i32
+    let want: String = want_path("/x/y")
+    let got: String = sandbox_path_under("/x/y/", "pfx", "sfx")
+    assert got.eq_string(@want)
+    0
+
+# An empty directory (TMPDIR set but empty) falls back to /tmp.
+[[test]]
+fn test_sandbox_path_under_empty_dir_is_tmp() -> i32
+    let want: String = want_path("/tmp")
+    let got: String = sandbox_path_under("", "pfx", "sfx")
     assert got.eq_string(@want)
     0
