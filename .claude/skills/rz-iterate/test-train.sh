@@ -1141,16 +1141,19 @@ export RZ_TRAIN_HOSTS=hostx; rm -f "$T/host-hostx.env"
 
 # 13d. pending (the dispatch rule): gate at 8 cars, or after 60 s with no new
 # car; each car (a rebuild) restarts the 60 s.
+# The slack (50-60 s) is for a loaded host: #4902 saw `58s` at load ~30,
+# where three cars took ~2 s to build.  A window that did not restart
+# prints GATE, not WAIT.
 fetch; git -C "$M" checkout -q main
 two qa s/qa; bash "$TR" build "qa1:$c1" "qa2:$c2" >/dev/null 2>&1
 out="$(bash "$TR" pending)"
-has "$out" "^WAIT train 1 n=2 (59|60)s$" "a new train waits 60 s for more cars"
+has "$out" "^WAIT train 1 n=2 (5[0-9]|60)s$" "a new train waits 60 s for more cars"
 st="$(git -C "$T/train" rev-parse --absolute-git-dir)/RZ_TRAIN"
 sed -i "s/^BUILT=.*/BUILT=$(( $(date +%s) - 61 ))/" "$st"
 has "$(bash "$TR" pending)" "^GATE train 1 n=2 \(no new car for 60s\): train.sh gate --next$" "no new car for 60 s: gate it"
 c3="$(room qa3 s/qa3 X)"; fetch; git -C "$M" checkout -q main
 bash "$TR" build "qa1:$c1" "qa2:$c2" "qa3:$c3" >/dev/null 2>&1
-has "$(bash "$TR" pending)" "^WAIT train 1 n=3 (59|60)s$" "another car restarts the window"
+has "$(bash "$TR" pending)" "^WAIT train 1 n=3 (5[0-9]|60)s$" "another car restarts the window"
 log1="$(bash "$TR" gate)"
 [[ -z "$(bash "$TR" pending)" ]] && ok "a gating train is not pending" || bad "a gating train is not pending"
 # A train stacked behind a gating one buffers to 8: it takes no second slot

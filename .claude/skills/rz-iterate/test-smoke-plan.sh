@@ -73,6 +73,21 @@ has "$(bash "$SP" plan)" "^tools-ratchets	" "tools-unit alone does not subsume t
 change projects/ritz/build.py >/dev/null
 eq "$(targets)" "smoke tools-unit unit" "tools-unit and unit together do"
 
+# AGAST #4902: the tree guards (tracked *.orig/*.rej, liveness) run in
+# tools-ratchets and tools-unit, so every plan must hold one of the two.
+# #4773's car tracked ritz1/src/monomorph.ritz.orig and planned no tools-unit.
+mark="$(git rev-parse HEAD)"
+change projects/ritz/ritz1/src/monomorph.ritz.orig >/dev/null
+has "$(bash "$SP" plan)" "^tools-ratchets	" "a ritz1-only leftover runs the tree guards (tools-ratchets)"
+for p in docs/g.md projects/ritz/README.md projects/ritz/ritz0/g.py projects/ritz/ritzlib/g.ritz \
+         projects/ritz/test/g.ritz projects/ritz/examples/g.ritz projects/ritz/scripts/g.sh \
+         projects/ritz/build.py projects/builder/g projects/nexus/g.ritz projects/harland/g.ritz \
+         .claude/skills/rz-iterate/g.sh rz.toml .github/g.yml; do
+    change "$p" >/dev/null
+    has "$(targets)" "(^| )tools-(ratchets|unit)( |$)" "$p plans the tree guards"
+done
+git reset -q --hard "$mark"   # keep later ranges ($toml^..HEAD) as they were
+
 # AGAST #4777: two red trains from cars whose smoke passed.  #4772 changed
 # ritz1/src and broke ritz1/test (ritz1-unit, which nothing planned); #4739
 # changed a package that only ritz1 could not build (pkg: built with ritz0).

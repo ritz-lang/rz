@@ -81,6 +81,34 @@ def test_standard_caller_pins_are_a_ratchet():
     assert any("tools/test_standard_callers.py" in ln for ln in tools), tools
 
 
+#   The tree guards every smoke runs (AGAST #4902): #4773's car tracked
+# ritz1/src/monomorph.ritz.orig, its ritz1-only smoke planned no tools-unit,
+# and the train gate went red on the leftover guard.  ~3.3 s on one worker
+# (the liveness walk ~3 s), in the half that finishes first.
+TREE_GUARDS = [
+    "tools/test_project_root_hygiene.py::test_no_merge_or_editor_leftovers_tracked",
+    "tools/test_check_liveness.py::test_real_tree_is_live",
+]
+
+
+def test_tree_guards_are_ratchets():
+    tools = " ".join(ln for ln in _pytest_lines() if "tools/test_" in ln)
+    assert [g for g in TREE_GUARDS if g not in tools.split()] == [], tools
+
+
+def test_tree_guards_still_exist():
+    """A renamed guard would leave tools-ratchets naming nothing: pytest
+    errors on a missing node id, but say which here."""
+    proc = subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--co", "-q", *TREE_GUARDS],
+        cwd=RITZ, check=False, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
+    # Ids print relative to tools/'s rootdir (its pytest.ini).
+    got = {ln for ln in proc.stdout.splitlines() if "::" in ln}
+    assert {g.removeprefix("tools/") for g in TREE_GUARDS} <= got, proc.stdout[-2000:]
+
+
 def test_tools_and_ritz0_are_separate_pytests():
     """tools/ and ritz0/ in one pytest fails tools tests (read guard, #4032)."""
     for ln in _pytest_lines():

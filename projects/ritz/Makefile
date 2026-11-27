@@ -116,6 +116,15 @@ TOOLS_RATCHETS = tools/test_ritz1_*.py tools/test_ritz0_*.py tools/test_ritzgen_
 	tools/test_grammar_*.py tools/test_enum_ast_nodes.py tools/test_corpus_parses.py \
 	tools/test_known_failures.py tools/test_ci_local.py tools/test_standard_callers.py
 TOOLS_RATCHETS_OUT = tools/test_ritz1_incremental_deps.py
+#
+# Plus two tree guards by node id, not whole files (AGAST #4902): #4773's car
+# tracked ritz1/src/monomorph.ritz.orig and its ritz1-only smoke never ran
+# tools-unit, so the train gate was first to see it.  ~3.3 s on one worker
+# (the liveness walk ~3 s), in the half that finishes first: measured on
+# huburght, the tools half ended 15-35 s before the ritz0 half.  tools-unit
+# still runs both.
+TOOLS_RATCHETS_NODES = tools/test_project_root_hygiene.py::test_no_merge_or_editor_leftovers_tracked \
+	tools/test_check_liveness.py::test_real_tree_is_live
 
 #
 # The ratchets under ritz0/tests run too (AGAST #4622: train 2026-11-24 went
@@ -138,7 +147,7 @@ tools-ratchets:
 
 tools-ratchets-tools:
 	@echo "=== Running tools/ source-reading ratchets (-n $(RATCHETS_J)) ==="
-	@$(PYTHON) -m pytest -q -n $(RATCHETS_J) --dist loadgroup $(filter-out $(TOOLS_RATCHETS_OUT),$(wildcard $(TOOLS_RATCHETS)))
+	@$(PYTHON) -m pytest -q -n $(RATCHETS_J) --dist loadgroup $(filter-out $(TOOLS_RATCHETS_OUT),$(wildcard $(TOOLS_RATCHETS))) $(TOOLS_RATCHETS_NODES)
 
 tools-ratchets-ritz0:
 	@echo "=== Running ritz0 in-process tests: source ratchets (-m inproc, -n $(RATCHETS_J)) ==="
