@@ -243,7 +243,7 @@ fn gi_member_type(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
         return 0
     let st: *StructDef = find_concrete_struct(m, sn_sv)
     if st == null
-        return gi_instance_member_type(mono, m, sn_sv.ptr, sn_sv.len as i32, e, out)
+        return gi_instance_member_type(mono, m, sn_sv, e, out)
     var f: *StructField = st.fields
     while f != null
         if f.name.eq(e.ident)
@@ -274,13 +274,13 @@ fn gi_ptr_type(k: TypeKind, name_sv: StrView, pointee: TypeKind, out: *GiType) -
 # for the params (`T` is `Nope`; `V` of `Pair<K, V>` is the 2nd arg), then
 # typed as the one-argument suffix "$Nope" is.  Mirrors ritz0, which types
 # the member through the instantiated struct.
-fn gi_instance_member_type(mono: *MonoCtx, m: *Module, sn: *u8, sl: i32, e: *Expr, out: *GiType) -> i32
+fn gi_instance_member_type(mono: *MonoCtx, m: *Module, sn: StrView, e: *Expr, out: *GiType) -> i32
     var i: i32 = 0
-    while i < sl and *(sn + i) != '$'   # '$'
+    while i < sn.len and sn.get(i) != '$'   # '$'
         i = i + 1
-    if i == sl
+    if i == sn.len
         return 0
-    let st: *StructDef = find_generic_struct(m, StrView { ptr: (sn), len: (i) as i64 })
+    let st: *StructDef = find_generic_struct(m, sn.take(i))
     if st == null
         return 0
     let f: *StructField = gi_field_named(st, e.ident)
@@ -290,13 +290,12 @@ fn gi_instance_member_type(mono: *MonoCtx, m: *Module, sn: *u8, sl: i32, e: *Exp
         if gi_is_prim(f.field_type) == 1
             return gi_set(out, f.field_type, strview_empty(), TypeKind.Void)
         return 0
-    let suffix: *u8 = sn + i
-    let sfl: i32 = sl - i
-    let cap: i32 = mangled_arg_capacity(StrView { ptr: (suffix), len: (sfl) as i64 })
+    let suffix: StrView = sn.skip(i)
+    let cap: i32 = mangled_arg_capacity(suffix)
     let starts: *i32 = malloc((cap as i64) * 4) as *i32
     let lens: *i32 = malloc((cap as i64) * 4) as *i32
     var r: i32 = 0
-    if split_mangled_args(mono.pctx, m, StrView { ptr: (suffix), len: (sfl) as i64 }, starts, lens) == count_type_params(st.type_params)
+    if split_mangled_args(mono.pctx, m, suffix, starts, lens) == count_type_params(st.type_params)
         let tn_sv: StrView = substitute_params_in_mangled(mono, st.type_params, suffix, starts, lens, f.field_type_name)
         let fl: i32 = tn_sv.len as i32
         # As a one-argument suffix: "$" + the substituted type's name.
@@ -971,7 +970,7 @@ fn gi_slot_block(ctx: *ParseCtx, m: *Module, stmts: *Stmt, sn: StrView)
 # `tps`, the callee is generic and (suffix, starts, lens) its written args;
 # a null suffix, its args still inferred: only a param naming none of `tps`
 # is a slot (LARB R51a, #3431).
-fn gi_slot_args(mono: *MonoCtx, m: *Module, params: *Param, args: *Expr, tps: *TypeParam, suffix: *u8, starts: *i32, lens: *i32)
+fn gi_slot_args(mono: *MonoCtx, m: *Module, params: *Param, args: *Expr, tps: *TypeParam, suffix: StrView, starts: *i32, lens: *i32)
     var p: *Param = params
     var a: *Expr = args
     while p != null and a != null
@@ -979,7 +978,7 @@ fn gi_slot_args(mono: *MonoCtx, m: *Module, params: *Param, args: *Expr, tps: *T
             var pn: StrView = p.param_type_name
             if tps == null
                 gi_slot(mono.pctx, m, a, pn)
-            else if suffix != null
+            else if suffix.ptr != null
                 pn = substitute_params_in_mangled(mono, tps, suffix, starts, lens, pn)
                 gi_slot(mono.pctx, m, a, pn)
             else if gi_names_type_param(tps, pn) == 0
@@ -997,16 +996,16 @@ fn gi_slot_call(mono: *MonoCtx, m: *Module, e: *Expr)
     if f == null
         return
     if f.type_params == null
-        gi_slot_args(mono, m, f.params, e.args, null, null, null, null)
+        gi_slot_args(mono, m, f.params, e.args, null, strview_empty(), null, null)
         return
     if e.call_type_suffix.len <= 0
-        gi_slot_args(mono, m, f.params, e.args, f.type_params, null, null, null)
+        gi_slot_args(mono, m, f.params, e.args, f.type_params, strview_empty(), null, null)
         return
     let cap: i32 = mangled_arg_capacity(e.call_type_suffix)
     let starts: *i32 = malloc((cap as i64) * 4) as *i32
     let lens: *i32 = malloc((cap as i64) * 4) as *i32
     if split_mangled_args(mono.pctx, m, e.call_type_suffix, starts, lens) == count_type_params(f.type_params)
-        gi_slot_args(mono, m, f.params, e.args, f.type_params, e.call_type_suffix.ptr, starts, lens)
+        gi_slot_args(mono, m, f.params, e.args, f.type_params, e.call_type_suffix, starts, lens)
     free(starts as *u8)
     free(lens as *u8)
 
@@ -1026,7 +1025,7 @@ fn gi_slot_method(mono: *MonoCtx, m: *Module, e: *Expr)
                 if method.name.eq(e.ident)
                     let p: *Param = method.params
                     if p != null and p.name.eq("self")
-                        gi_slot_args(mono, m, p.next, e.args, null, null, null, null)
+                        gi_slot_args(mono, m, p.next, e.args, null, strview_empty(), null, null)
                     return
                 method = method.next
         ib = ib.next
@@ -1069,7 +1068,7 @@ fn gi_field_slots(mono: *MonoCtx, m: *Module, e: *Expr)
         return
     var st: *StructDef = find_concrete_struct(m, e.ident)
     var tps: *TypeParam = null
-    var suffix: *u8 = null
+    var suffix: StrView = strview_empty()
     var starts: *i32 = null
     var lens: *i32 = null
     if st == null
@@ -1081,12 +1080,11 @@ fn gi_field_slots(mono: *MonoCtx, m: *Module, e: *Expr)
             return
         tps = st.type_params
         if i < (e.ident.len as i32)
-            suffix = e.ident.ptr + i
-            let sfl: i32 = (e.ident.len as i32) - i
-            let cap: i32 = mangled_arg_capacity(StrView { ptr: (suffix), len: (sfl) as i64 })
+            suffix = e.ident.skip(i as i64)
+            let cap: i32 = mangled_arg_capacity(suffix)
             starts = malloc((cap as i64) * 4) as *i32
             lens = malloc((cap as i64) * 4) as *i32
-            if split_mangled_args(mono.pctx, m, StrView { ptr: (suffix), len: (sfl) as i64 }, starts, lens) != count_type_params(tps)
+            if split_mangled_args(mono.pctx, m, suffix, starts, lens) != count_type_params(tps)
                 free(starts as *u8)
                 free(lens as *u8)
                 return
@@ -1097,7 +1095,7 @@ fn gi_field_slots(mono: *MonoCtx, m: *Module, e: *Expr)
             var fname: StrView = f.field_type_name
             if tps == null
                 gi_slot(mono.pctx, m, fi.value, fname)
-            else if suffix != null
+            else if suffix.ptr != null
                 fname = substitute_params_in_mangled(mono, tps, suffix, starts, lens, fname)
                 gi_slot(mono.pctx, m, fi.value, fname)
             else if gi_names_type_param(tps, fname) == 0

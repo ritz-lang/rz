@@ -223,7 +223,7 @@ pub fn add_enum_instance(mono: *MonoCtx, m: *Module, name: StrView, dollar_pos: 
     let count: i32 = enum_variant_count(mono.pctx, base)
     let fields: **StructField = malloc((count as i64 + 1) * 8) as **StructField
     for vi in 0..count
-        *(fields + vi) = clone_struct_fields_multi(mono, enum_variant_fields(mono.pctx, base, vi), tp, suffix.ptr, starts, lens)
+        *(fields + vi) = clone_struct_fields_multi(mono, enum_variant_fields(mono.pctx, base, vi), tp, suffix, starts, lens)
     enum_record_instance(mono.pctx, base, name, fields)
     for vj in 0..count
         var f: *StructField = *(fields + vj)
@@ -235,14 +235,14 @@ pub fn add_enum_instance(mono: *MonoCtx, m: *Module, name: StrView, dollar_pos: 
 # Rewrite a mangled name, replacing every `$`-component that is a type
 # parameter with its argument: `Box$B` at <A=i64, B=i32> is `Box$i32`.
 # Returns `name` itself when no component is a parameter.
-pub fn substitute_params_in_mangled(mono: *MonoCtx, tp: *TypeParam, suffix: *u8, starts: *i32, lens: *i32, name0: StrView) -> StrView
+pub fn substitute_params_in_mangled(mono: *MonoCtx, tp: *TypeParam, suffix: StrView, starts: *i32, lens: *i32, name0: StrView) -> StrView
     # AGAST #2975: a tuple component over any of the parameters
     # (`Vec$tuple_K_V`) is its instantiation, one parameter at a time.
     var name: StrView = name0
     var ti: i32 = 0
     var tcur: *TypeParam = tp
     while tcur != null
-        let subst_sv: StrView = subst_components(mono, name, tcur.name, StrView { ptr: (suffix + *(starts + ti)), len: (*(lens + ti)) as i64 }, 0)
+        let subst_sv: StrView = subst_components(mono, name, tcur.name, mangled_arg(suffix, starts, lens, ti), 0)
         name = subst_sv
         tcur = tcur.next
         ti = ti + 1
@@ -282,20 +282,18 @@ pub fn substitute_params_in_mangled(mono: *MonoCtx, tp: *TypeParam, suffix: *u8,
         var head: i32 = 0
         let pidx: i32 = piece_param_index(tp, name.skip(pos).take(end - pos), @head)
         if idx >= 0
-            let a: *u8 = suffix + *(starts + idx) + 1
-            let a_len: i32 = *(lens + idx) - 1
-            for j in 0..a_len
-                *(out + o) = *(a + j)
+            let a: StrView = mangled_arg(suffix, starts, lens, idx).skip(1)
+            for j in 0..a.len
+                *(out + o) = a.get(j)
                 o = o + 1
         else if pidx >= 0
             # AGAST #3748: `ptr_A` at A = u8 is `ptr_u8`.
             for j in pos..(pos + head)
                 *(out + o) = name.get(j)
                 o = o + 1
-            let pa: *u8 = suffix + *(starts + pidx) + 1
-            let pa_len: i32 = *(lens + pidx) - 1
-            for j in 0..pa_len
-                *(out + o) = *(pa + j)
+            let pa: StrView = mangled_arg(suffix, starts, lens, pidx).skip(1)
+            for j in 0..pa.len
+                *(out + o) = pa.get(j)
                 o = o + 1
         else
             for j in pos..end
@@ -1345,7 +1343,6 @@ fn collect_from_expr(mono: *MonoCtx, m: *Module, e: *Expr)
 # Find the generic template for a given function name
 
 fn clone_and_specialize_function(mono: *MonoCtx, m: *Module, template: *FnDef, suffix_sv: StrView) -> *FnDef
-    var suffix: *u8 = suffix_sv.ptr
     let n: i32 = count_type_params(template.type_params)
     if n < 2
         var tp_name: StrView = strview_empty()
@@ -1367,7 +1364,7 @@ fn clone_and_specialize_function(mono: *MonoCtx, m: *Module, template: *FnDef, s
     var tp: *TypeParam = template.type_params
     var i: i32 = 0
     while tp != null
-        cur = specialize_fn_one_param(mono, m, cur, tp.name, StrView { ptr: (suffix + *(starts + i)), len: (*(lens + i)) as i64 })
+        cur = specialize_fn_one_param(mono, m, cur, tp.name, mangled_arg(suffix_sv, starts, lens, i))
         tp = tp.next
         i = i + 1
     mono.mono_component_mode = 0
@@ -2699,7 +2696,7 @@ fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef,
             return null
         let multi: *StructDef = malloc(sizeof(StructDef)) as *StructDef
         multi.name = StrView { ptr: mangled_name, len: mangled_name_len as i64 }
-        multi.fields = clone_struct_fields_multi(mono, template.fields, template.type_params, suffix.ptr, starts, lens)
+        multi.fields = clone_struct_fields_multi(mono, template.fields, template.type_params, suffix, starts, lens)
         multi.type_params = null
         multi.next = null
         if struct_is_packed(mono.pctx, template) == 1
@@ -2815,7 +2812,7 @@ fn clone_struct_fields(mono: *MonoCtx, fields: *StructField, type_param_sv: StrV
 # in its mangled name; any other type is copied as-is.  (The single-parameter
 # path appends the suffix to every non-parameter struct name instead, which
 # here would name `%B$i64`-style types.)
-fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypeParam, suffix: *u8, starts: *i32, lens: *i32) -> *StructField
+fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypeParam, suffix: StrView, starts: *i32, lens: *i32) -> *StructField
     if fields == null
         return null
 
@@ -2826,9 +2823,9 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
     if sh != null and sh.leaf_name.ptr != null
         let si: i32 = type_param_index(tp, sh.leaf_name)
         if si >= 0
-            let arg_s: *u8 = suffix + *(starts + si)
-            let sh_name: StrView = get_type_name_from_suffix(StrView { ptr: (arg_s), len: (*(lens + si)) as i64 })
-            cloned.array_shape = array_shape_subst(sh, sh.leaf_name, parse_type_from_suffix(StrView { ptr: (arg_s), len: (*(lens + si)) as i64 }), sh_name)
+            let arg_s: StrView = mangled_arg(suffix, starts, lens, si)
+            let sh_name: StrView = get_type_name_from_suffix(arg_s)
+            cloned.array_shape = array_shape_subst(sh, sh.leaf_name, parse_type_from_suffix(arg_s), sh_name)
         else if find_dollar_sign(sh.leaf_name) > 0
             # AGAST #3140: a generic leaf, `[2][3]P<T>` (leaf `P$T`) of a
             # `W<T, U>`, its parameters rewritten as array_elem_type_name's are.
@@ -2847,7 +2844,7 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
     var p: *TypeParam = tp
     var pi: i32 = 0
     while p != null
-        let p_arg: StrView = StrView { ptr: (suffix + *(starts + pi)), len: (*(lens + pi)) as i64 }
+        let p_arg: StrView = mangled_arg(suffix, starts, lens, pi)
         let p_sv: StrView = p.name
         let p_ty: TypeKind = parse_type_from_suffix(p_arg)
         let p_sub: StrView = get_type_name_from_suffix(p_arg)
@@ -2866,10 +2863,9 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
     if (by_value == 1 or by_ptr == 1) and fields.field_type_name.ptr != null
         let idx: i32 = type_param_index(tp, fields.field_type_name)
         if idx >= 0
-            let arg: *u8 = suffix + *(starts + idx)
-            let arg_len: i32 = *(lens + idx)
-            let subst_name: StrView = get_type_name_from_suffix(StrView { ptr: (arg), len: (arg_len) as i64 })
-            let subst_type: TypeKind = parse_type_from_suffix(StrView { ptr: (arg), len: (arg_len) as i64 })
+            let arg: StrView = mangled_arg(suffix, starts, lens, idx)
+            let subst_name: StrView = get_type_name_from_suffix(arg)
+            let subst_type: TypeKind = parse_type_from_suffix(arg)
             if by_value == 1
                 subst_value_field(cloned, subst_type, subst_name)
             else
@@ -2881,9 +2877,9 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
     if fields.array_elem_pointee == TypeKind.Struct and fields.array_elem_type_name.ptr != null
         let ai: i32 = type_param_index(tp, fields.array_elem_type_name)
         if ai >= 0
-            let arg_e: *u8 = suffix + *(starts + ai)
-            let ae_name: StrView = get_type_name_from_suffix(StrView { ptr: (arg_e), len: (*(lens + ai)) as i64 })
-            subst_array_ptr_field(cloned, fields.array_elem_type_name, parse_type_from_suffix(StrView { ptr: (arg_e), len: (*(lens + ai)) as i64 }), ae_name)
+            let arg_e: StrView = mangled_arg(suffix, starts, lens, ai)
+            let ae_name: StrView = get_type_name_from_suffix(arg_e)
+            subst_array_ptr_field(cloned, fields.array_elem_type_name, parse_type_from_suffix(arg_e), ae_name)
         else if ft == TypeKind.Array and find_dollar_sign(fields.array_elem_type_name) > 0
             # AGAST #3099: `a: [N]*Box<V>`, its pointee's parameters rewritten.
             let ap_sv: StrView = substitute_params_in_mangled(mono, tp, suffix, starts, lens, fields.array_elem_type_name)
@@ -2893,9 +2889,9 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
     if ft == TypeKind.Array and fields.array_elem_type == TypeKind.Struct and fields.array_elem_type_name.ptr != null
         let ei: i32 = type_param_index(tp, fields.array_elem_type_name)
         if ei >= 0
-            let arg_v: *u8 = suffix + *(starts + ei)
-            let ev_name: StrView = get_type_name_from_suffix(StrView { ptr: (arg_v), len: (*(lens + ei)) as i64 })
-            subst_array_elem_field(cloned, fields.array_elem_type_name, parse_type_from_suffix(StrView { ptr: (arg_v), len: (*(lens + ei)) as i64 }), ev_name)
+            let arg_v: StrView = mangled_arg(suffix, starts, lens, ei)
+            let ev_name: StrView = get_type_name_from_suffix(arg_v)
+            subst_array_elem_field(cloned, fields.array_elem_type_name, parse_type_from_suffix(arg_v), ev_name)
         else if find_dollar_sign(fields.array_elem_type_name) > 0
             let em_sv: StrView = substitute_params_in_mangled(mono, tp, suffix, starts, lens, fields.array_elem_type_name)
             cloned.array_elem_type_name = em_sv
