@@ -125,7 +125,15 @@ Installing mytool v1.2.0...
 
 ### 3.2 Libraries
 
-Libraries are **always source**. No pre-compiled artifacts.
+Libraries are **always source**: every package ships its full source, and
+importers compile against it.
+
+> **Amended (AGAST #4859): see [`../PACKAGES.md`](../PACKAGES.md).** A
+> package may also carry a prebuilt `lib<name>.a` per object profile. Source
+> stays the artefact of record; the archive is a verified, optional
+> accelerator, linked only when its stamp (each module's CAS key) matches the
+> building compiler and target, and otherwise ignored in favour of compiling
+> the shipped source.
 
 ```toml
 # mylib/ritz.toml
@@ -439,7 +447,7 @@ Bootstrap chain:
 |----------|--------|-----------|
 | Primary artifact | Source | Auditable, portable, no ABI issues |
 | Caching strategy | Content-addressed | Reproducible, shareable |
-| Library linking | Static (compile together) | LTO, dead code elim, simplicity |
+| Library linking | Static (compile together; a stamped prebuilt `.a` may stand in, [PACKAGES.md](../PACKAGES.md)) | LTO, dead code elim, simplicity |
 | Dependency source | URIs (path, git, ssh) | Universal, no central infra needed |
 | C interop | Escape hatch only | Ritz should stand alone |
 | Binary releases | Hybrid (binary + IR + source) | Quick adoption + auditability |
