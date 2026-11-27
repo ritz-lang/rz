@@ -32,6 +32,8 @@ _spec = importlib.util.spec_from_file_location("ritz_build_lib", RITZ_DIR / "bui
 build = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(build)
 
+import resolve  # after the sys.path inserts above
+
 
 def _package(root: Path, manifest: str, files: dict[str, str]) -> Path:
     """Write a package: `manifest` follows a generated [package] header."""
@@ -203,6 +205,28 @@ class TestWorkspaceManifests:
         pkg = WORKSPACE / "projects" / "zeus"
         modules = _modules(pkg, build.plan_binaries(pkg, _config(pkg)))["zeus"]
         assert modules and all(m.startswith("lib/") for m in modules)
+
+    @pytest.mark.unit
+    def test_ritzlib_is_one_library_of_every_module_but_its_tests(self):
+        """ritzlib is a package (AGAST #4864, docs/PACKAGES.md §5): its
+        [[lib]] archives every module, and tests/ stays its own package."""
+        pkg = RITZ_DIR / "ritzlib"
+        plan = build.plan_binaries(pkg, _config(pkg))
+        assert plan.buildable == [] and plan.unresolved == []
+        expected = sorted(str(m.relative_to(pkg)) for m in pkg.rglob("*.ritz")
+                          if m.relative_to(pkg).parts[0] not in ("tests", "build"))
+        assert "strview.ritz" in expected and "fmt/digits.ritz" in expected
+        assert _modules(pkg, plan) == {"ritzlib": expected}
+
+    @pytest.mark.unit
+    def test_a_dependent_needs_no_sources_override_for_ritzlib(self, tmp_path):
+        """`ritzlib = { path = ... }` takes ritzlib's own sources."""
+        ritzlib = RITZ_DIR / "ritzlib"
+        config = {"dependencies": {"ritzlib": {"path": str(ritzlib)}}}
+        spec = resolve.parse_dependencies(config, tmp_path)["ritzlib"]
+        assert spec.sources == [".", "!tests"]
+        assert spec.resolve_import(["strview"]) == ritzlib / "strview.ritz"
+        assert spec.resolve_import(["fmt", "digits"]) == ritzlib / "fmt" / "digits.ritz"
 
     @pytest.mark.unit
     def test_no_package_plans_a_default_binary_without_a_main(self):

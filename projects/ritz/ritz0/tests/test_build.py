@@ -1393,6 +1393,20 @@ class TestNamespaceSourceDirs:
                         f"zeus={tmp_path / 'zeus' / 'examples'}",
                         f"sq={tmp_path / 'sq' / 'src'}"], cmd
 
+    @pytest.mark.unit
+    def test_ritz1_compile_cmd_skips_exclusion_entries(self, tmp_path, monkeypatch):
+        """ritzlib's sources are [".", "!tests"] (AGAST #4864): `!tests`
+        excludes files from its [[lib]] and is no root to search."""
+        fake = tmp_path / "ritz1"
+        fake.write_text("")
+        monkeypatch.setitem(_build_module.RITZ1_FAMILY_BINS, "ritz1", (fake, "make"))
+        spec = _build_module.DependencySpec
+        cmd = _build_module.ritz1_compile_cmd("ritz1", tmp_path / "a.ritz", tmp_path / "a.ll", {
+            "ritzlib": spec(name="ritzlib", path=tmp_path / "ritzlib", sources=[".", "!tests"]),
+        })
+        deps = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--dep"]
+        assert deps == [f"ritzlib={tmp_path / 'ritzlib'}"], cmd
+
     # Real build.py without --no-cache: shared .ritz-cache (#1804, conftest.py).
     @pytest.mark.xdist_group("tree")
     @pytest.mark.integration

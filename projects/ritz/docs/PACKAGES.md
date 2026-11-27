@@ -125,7 +125,7 @@ A new dependency kind beside `path`, added to the schema at
 ```toml
 [dependencies]
 # Today: source from a directory.
-ritzlib = { path = "../ritz/ritzlib", sources = ["."] }
+ritzlib = { path = "../ritz/ritzlib" }
 
 # New: an installed package, by exact version.
 ritzlib = { version = "0.1.0+g562ea1330" }
@@ -337,9 +337,8 @@ freestanding builds would still link every closure object.
 
 ## 5. ritzlib as the first package
 
-ritzlib has no `ritz.toml`; dependents name it as
-`{ path = "../ritz/ritzlib", sources = ["."] }` (`buddhafinger/ritz.toml:30`,
-`ritzunit/ritz.toml`). It needs:
+Done in slice 2 (#4864). ritzlib had no `ritz.toml`, so dependents named it
+as `{ path = "../ritz/ritzlib", sources = ["."] }`. It now has:
 
 ```toml
 # projects/ritz/ritzlib/ritz.toml
@@ -353,10 +352,11 @@ name = "ritzlib"
 ```
 
 `ritzlib/tests/` keeps its own `ritz.toml` and stays a separate test package.
-`sources = ["."]` in dependents keeps working (it overrides). The slice
-checks that every module compiles for `hosted` (compile_library reports every
-failure, #1286) and that the default `sources` lets dependents drop their
-override.
+`rz build ritz/ritzlib` archives all its modules as `libritzlib.a`, and
+`rz build --all` now builds it, so a module that fails to compile for
+`hosted` fails the sweep even when nothing imports it. In-repo dependents
+dropped their `sources = ["."]`; it still works (it overrides). A `!path`
+entry gets no ritz1 `--dep` (`ritz1_compile_cmd`).
 
 **ritzunit is the second.** It path-depends on ritzlib and on itself
 (`ritzunit = { path = "." }`); pack turns the ritzlib dep into a package

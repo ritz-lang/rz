@@ -122,15 +122,16 @@ def copy_file(root: Path, dest: Path, rel: Path) -> None:
 
 def declared_roots(pkg: Path) -> set[str]:
     """The first path component of every `sources` entry in pkg's ritz.toml:
-    [package], each [[bin]] and each [[lib]].  A `!path` exclusion counts too,
-    harmlessly: its directory is a source root anyway."""
+    [package], each [[bin]] and each [[lib]].  A `!path` exclusion names no
+    root: ritzlib's `!tests` (AGAST #4864) must not keep tests/ in the image."""
     cfg = tomllib.loads((pkg / "ritz.toml").read_text())
     lists = [cfg.get("package", {}).get("sources")]
     lists += [t.get("sources") for kind in ("bin", "lib") for t in cfg.get(kind, [])]
     roots = set()
     for srcs in lists:
         for s in [srcs] if isinstance(srcs, str) else (srcs or []):
-            roots.add(Path(s.lstrip("!")).parts[0] if s.lstrip("!") else ".")
+            if not s.startswith("!"):
+                roots.add(Path(s).parts[0] if Path(s).parts else ".")
     return roots
 
 

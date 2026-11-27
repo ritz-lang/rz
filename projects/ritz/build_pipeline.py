@@ -825,6 +825,8 @@ def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path,
     per declared source root, in order: ritz0's `--deps` resolution, which
     reads a namespace's `sources`. Without it ritz1 probed only
     <ns>/{lib,src}, so zeus's `examples` root was invisible (AGAST #3825).
+    A `!path` entry (ritzlib's `!tests`, AGAST #4864) excludes files from a
+    [[lib]] and is no root, so it gets no `--dep`, as ritz0's resolver skips it.
 
     Returns None (after saying why) if the binary is missing.
     """
@@ -836,7 +838,8 @@ def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path,
     cmd = [str(ritz1_bin), str(src), "-o", str(ll_path), "-I", str(ROOT)]
     for name, spec in (namespaces or {}).items():
         for source in spec.sources:
-            cmd += ["--dep", f"{name}={Path(spec.path) / source}"]
+            if not source.startswith("!"):
+                cmd += ["--dep", f"{name}={Path(spec.path) / source}"]
     return cmd
 
 

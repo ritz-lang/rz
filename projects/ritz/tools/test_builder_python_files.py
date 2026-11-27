@@ -54,3 +54,24 @@ def test_the_pipeline_imports_from_the_staged_python_files_alone(tmp_path):
     assert r.returncode == 0, (
         "a module the image needs is missing from projects/builder/stage_tree.py "
         "PYTHON_FILES:\n" + r.stderr[-2000:])
+
+
+def _stage_tree():
+    spec = importlib.util.spec_from_file_location("stage_tree_4864", STAGE_TREE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.unit
+def test_staged_ritzlib_keeps_its_manifest_and_drops_its_tests(tmp_path):
+    """ritzlib's sources are [".", "!tests"] (AGAST #4864). An exclusion
+    names no source root, so tests/ stays out of the image (test.sh's
+    "no ritzlib ... test corpora" check) while ritz.toml goes in."""
+    ritzlib = REPO_ROOT / "projects" / "ritz" / "ritzlib"
+    _stage_tree().copy_sources(REPO_ROOT, tmp_path, ritzlib)
+    staged = tmp_path / "projects" / "ritz" / "ritzlib"
+    assert (staged / "ritz.toml").is_file()
+    assert (staged / "strview.ritz").is_file()
+    assert (staged / "fmt" / "digits.ritz").is_file()
+    assert not (staged / "tests").exists()
