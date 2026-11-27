@@ -14,8 +14,10 @@
 #   mode 2 (SPIN):  busy-wait RSI TSC cycles at CPL 3 (the timer preempts
 #                   it), then report and exit.
 #   mode 3 (IRQ_WAIT, #4719): RSI is a CAP_TYPE_IRQ handle the kernel
-#                   granted. Five DrvIrqWait calls, each checked; the exit
-#                   status is the number of the first that failed, else 0:
+#                   granted. Seven DrvIrqWait calls, each checked; the exit
+#                   status is the number of the first that failed, else 0.
+#                   Each passes WaitRequest.deadline DEVICE_WAIT_MS unless
+#                   it says otherwise (D9, #4875: DrvIrqWait reads it):
 #                   1  out_cap 0             -> Errno.Inval, out_count kept
 #                   2  out_cap 9             -> Errno.Inval, out_count kept
 #                   3  handle 0 (not held)   -> Errno.Perm, out_count kept
@@ -23,6 +25,9 @@
 #                      { handle, EVENT_DATA }, out[1] kept
 #                   5  the same again        -> 1 at the deadline:
 #                      out_count 0, out[0] kept
+#                   6  deadline SHM_WAIT_LONG_MS -> 1 at DEVICE_WAIT_MS, the
+#                      cap (the kernel's test gives the stub one second)
+#                   7  deadline 0            -> 1: checks once
 #   mode 4 (CONSOLE_POLL, #4829): one poll(2) on { fd 0, POLLIN } with
 #                   timeout RSI ms; the exit status is
 #                   revents << 8 | (the return & 0xFF).
@@ -295,6 +300,8 @@
 .equ EVENT_PEER_CLOSE, 4
 .equ ERRNO_NODEV,     -19
 .equ SHM_WAIT_LONG_MS, 5000
+# driver_abi/src/wait.ritz: DrvIrqWait's cap on WaitRequest.deadline
+.equ DEVICE_WAIT_MS, 100
 # Modes 7-9 (postinit.ritz ATTACH_* and LINK_TEST_*; driver_abi/src/link.ritz)
 .equ EVENT_ATTACH,    64
 .equ ERRNO_AGAIN,     -11
@@ -471,6 +478,24 @@ driver_stub_start:
     cmpq %rbx, WR_EVENTS+WE_HANDLE(%r14)
     jne .Lirq_wait_fail
 
+    movl $6, %r15d                       # 6: a long deadline, capped
+    movl $2, %esi
+    movq $SHM_WAIT_LONG_MS, %rdx
+    call .Lirq_wait_call_deadline
+    cmpq $1, %rax
+    jne .Lirq_wait_fail
+    cmpl $0, WR_OUT_COUNT(%r14)
+    jne .Lirq_wait_fail
+
+    movl $7, %r15d                       # 7: deadline 0 checks once
+    movl $2, %esi
+    xorl %edx, %edx
+    call .Lirq_wait_call_deadline
+    cmpq $1, %rax
+    jne .Lirq_wait_fail
+    cmpl $0, WR_OUT_COUNT(%r14)
+    jne .Lirq_wait_fail
+
     xorl %r15d, %r15d                    # every check held
 .Lirq_wait_fail:
     movl %r15d, %edi
@@ -479,10 +504,23 @@ driver_stub_start:
     ud2
 
 # Fill the request for out_cap ESI (no sources, out = the two slots,
-# out_count KEPT_COUNT, both slots the untouched pattern) and call
-# DrvIrqWait with the granted handle (r13). RAX = the result.
+# deadline DEVICE_WAIT_MS, out_count KEPT_COUNT, both slots the untouched
+# pattern) and call DrvIrqWait with the granted handle (r13). RAX = the
+# result.
 .Lirq_wait_call_cap:
     call .Lirq_wait_fill
+    movq $SYS_DRV_IRQ_WAIT, %rax
+    movq %r13, %rdi
+    movq %r14, %rsi
+    syscall
+    ret
+
+# The same with deadline RDX ms.
+.Lirq_wait_call_deadline:
+    pushq %rdx
+    call .Lirq_wait_fill
+    popq %rdx
+    movq %rdx, WR_DEADLINE(%r14)
     movq $SYS_DRV_IRQ_WAIT, %rax
     movq %r13, %rdi
     movq %r14, %rsi
@@ -495,7 +533,7 @@ driver_stub_start:
     movl %esi, WR_OUT_CAP(%r14)
     leaq WR_EVENTS(%r14), %rax
     movq %rax, WR_OUT(%r14)
-    movq $0, WR_DEADLINE(%r14)
+    movq $DEVICE_WAIT_MS, WR_DEADLINE(%r14)
     movl $KEPT_COUNT, WR_OUT_COUNT(%r14)
     movl $0, WR_PAD(%r14)
     movq %rbx, WR_EVENTS+WE_HANDLE(%r14)

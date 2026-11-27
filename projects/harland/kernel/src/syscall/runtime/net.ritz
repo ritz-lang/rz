@@ -51,15 +51,16 @@
 # today the net-attach, net-info and net-addr boot tests); nothing else
 # sets them.
 #
-# The restart (AGAST #4745, RING2_NET.md "Service binary and respawn"):
-# once the frame seat is the service's, ring1.ritz arms it with the
-# surviving driver's pid. A death of the armed service counts toward
-# NETD_RESTARTS per boot (net_service_death); sys_exit_impl waits out
-# net_restart_backoff_ms and spawns /bin/netd again, and
-# net_service_install gives it a new address page, a new frame object
-# (ATTACH on the driver's inbox) and the registration, before it runs.
-# The driver's death disarms it: a service that exits on DRIVER_GONE is
-# not restarted. Each handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
+# The restart (AGAST #4745, #4875, RING2_NET.md "Service binary and
+# respawn", "Drivers inside netd (D9)"): once the frame seat is the
+# service's, ring1.ritz arms it. Under D9 the service is the NIC's driver
+# too, so its death is the one death path: driver_quiesce resets the NIC,
+# then the death counts toward NETD_RESTARTS per boot (net_service_death);
+# sys_exit_impl waits out net_restart_backoff_ms and ring1.ritz
+# net_netd_respawn spawns /bin/netd again with the device grants, a new
+# link page and a new address page (net_service_page, net_service_boot,
+# net_service_attach_page), before it runs. It makes no frame object. Each
+# handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
 import ritzlib.option
@@ -77,8 +78,7 @@ import proc.waitset { INBOX_CAP, waitset_inbox_len, waitset_inbox_post, shm_latc
 import driver_abi.wait { EVENT_ATTACH, EVENT_LINK, APP_EXCHANGE_SIZE }
 import driver_abi.link { NetInfo, LinkSample, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, link_sample }
 import driver_abi.link { NetAddr, AddrSample, addr_sample }
-import driver_abi.boot { ServiceBoot, DRV_RING_BASE, SERVICE_BOOT_MAGIC, service_boot_at }
-import driver_abi.frame_ring { FRAME_REGION_SIZE }
+import driver_abi.boot { ServiceBoot, SERVICE_BOOT_MAGIC, service_boot_at }
 import arch.x86_64.tsc { tsc_hz }
 
 # ============================================================================
@@ -174,15 +174,14 @@ pub fn snapshot_invalidate()
 # Driver `pid` died or gave up its device (driver_quiesce step 4, #4733):
 # the snapshot is invalidated and, when `pid` holds the registered frame
 # object, that registration goes too. The object itself is retired by
-# cap_retire_held_shm (DRIVER_GONE); no replacement is made for it.
+# cap_retire_held_shm (DRIVER_GONE); no replacement is made for it. Under
+# D9 (#4875) the driver is netd, and whether it comes back is netd's
+# restart, decided by the device's fitness (driver.ritz drv_device_fit),
+# not here.
 pub fn net_driver_quiesced(pid: u32)
     snapshot_invalidate()
     if net_frame_object != 0 and cap_holds_object(pid, CAP_TYPE_SHM, net_frame_object)
         net_frame_register(0, 0)
-    # Driver death is not the restart path (RING1_DRIVER.md "Driver exit
-    # first"): the service exits on DRIVER_GONE and stays down.
-    if pid == net_restart_driver
-        net_restart_driver = 0
 
 # The snapshot, if a stable generation is in it.
 pub fn net_info_snapshot() -> Option<NetInfo>
@@ -296,8 +295,8 @@ pub fn net_addr_snapshot() -> Option<NetAddr>
     Some(copy)
 
 # The service's exit or fault path (sys_exit_impl, for every exiting
-# process, after cap_retire_held_shm has retired its exchanges and its frame
-# object, posting PEER_CLOSE to each app and to the driver): when `pid` is
+# process, after driver_quiesce has reset its NIC and cap_retire_held_shm
+# has retired its exchanges, posting DRIVER_GONE to each app): when `pid` is
 # the registered service, NetAddr answers NoDev from now on, the address
 # object and the service are unregistered, so no later publish revives the
 # snapshot and no NetAttach reaches the dead pid, and it is no longer the
@@ -510,8 +509,12 @@ fn revoke_packed(pid: u32, h: CapHandle)
         let generation: u32 = h.generation
         cap_revoke(cap_table_get(pid), cap_handle_init(index, generation))
 
-# A replacement service `service_pid` was spawned while ring-1 driver
-# `driver_pid` survives (RING1_DRIVER.md "Shared object"): a new frame
+# A replacement frame object between a surviving ring-1 driver and a new
+# service. Under D9 (#4875) netd's restart makes none (the driver is netd);
+# the shm-retire boot test (postinit.ritz, mode 13) still drives this
+# primitive of the shared-object lifecycle (#4729). A replacement service
+# `service_pid` was spawned while driver `driver_pid` survives
+# (RING1_DRIVER.md "Shared object"): a new frame
 # object of `page_count` zeroed pages (both ring indexes 0) at a new id,
 # never the retired one's, created without waiting for the driver to
 # detach from the old. The service gets a read-write handle and its mapping
@@ -565,32 +568,28 @@ pub fn net_frame_object_id() -> u64
 # Restarts per boot: one after each of the first three deaths.
 pub const NETD_RESTARTS: u32 = 3
 
-# The surviving ring-1 driver each replacement's frame object goes to; 0
-# while no restart is armed (before the handoff, or once the driver died).
-var net_restart_driver: u32 = 0
+# A death of the registered service is restarted (or spends the budget):
+# set once the frame seat is the service's; never cleared.
+var net_restart_on: bool = false
 # Deaths of the armed service since boot. Never reset: the budget is per
 # boot, not per healthy stretch.
 var net_service_deaths: u32 = 0
 
 # Pid 1, once the frame seat is the service's (ring1.ritz
-# net_seat_handoff): its deaths are restarted onto driver `driver_pid`.
-pub fn net_restart_arm(driver_pid: u32)
-    net_restart_driver = driver_pid
+# net_seat_handoff): its deaths are restarted from now on.
+pub fn net_restart_arm()
+    net_restart_on = true
 
 # A service death would be restarted (or would spend the budget).
 pub fn net_restart_armed() -> bool
-    net_restart_driver != 0
-
-# The driver a replacement's frame object goes to, or 0.
-pub fn net_restart_driver_pid() -> u32
-    net_restart_driver
+    net_restart_on
 
 # The registered service has died (sys_exit_impl, after
 # net_service_exited): which death this is, counting from 1, or 0 when no
-# restart is armed or the armed driver has no capability table left (it is
-# exiting too).
+# restart is armed (netd died before the handoff: the kernel seat sees
+# NoDriver and nothing restarts).
 pub fn net_service_death() -> u32
-    if net_restart_driver == 0 or cap_table_get(net_restart_driver) == 0 as *CapTable
+    if not net_restart_on
         return 0
     net_service_deaths = net_service_deaths + 1
     net_service_deaths
@@ -611,13 +610,12 @@ pub struct ServicePage
     object_id: u64
     handle: u64
 
-# A new address page for service `pid`, a process that has not run: one
-# zeroed page, a read-write handle with CAP_RIGHT_PUBLISH, mapped as its
-# first shared mapping (DRV_RING_BASE, where netd looks for its
-# ServiceBoot). None with nothing of it left.
+# A new address page for service `pid`: one zeroed page and a read-write
+# handle with CAP_RIGHT_PUBLISH, not mapped (D9, #4875: netd ShmMaps it
+# when its ATTACH comes, net_service_attach_page). None with nothing of it
+# left.
 pub fn net_service_page(pid: u32) -> Option<ServicePage>
-    let pml4: u64 = pml4_of(pid)
-    if pml4 == 0
+    if cap_table_get(pid) == 0 as *CapTable
         return None
     let object_id: u64 = match shm_create(1)
         Some(id) => id
@@ -627,47 +625,34 @@ pub fn net_service_page(pid: u32) -> Option<ServicePage>
     if not handle_ok(h)
         shm_destroy(object_id)
         return None
-    if shm_map(pid, pml4, object_id, true) != DRV_RING_BASE as i64
-        # The revoke of its one handle unmaps it, if it mapped at all.
-        revoke_packed(pid, h)
-        shm_destroy(object_id)
-        return None
     Some(ServicePage { object_id: object_id, handle: packed(h) })
 
 # The ServiceBoot in `page`, written through the physmap before the service
-# runs: the frame handle `frame`, the page's own handle and the TSC rate,
-# with the seat indexes at 0 (the handoff overwrites them for the first
-# netd; a replacement's frame object is new, both indexes 0).
-pub fn net_service_boot(page: ServicePage, frame: u64)
+# maps it: the page's own handle and the TSC rate, with the seat indexes at
+# 0 (the handoff overwrites them for the first netd; a replacement has no
+# seat). The frame field is 0: DriverBoot names the frame object (D9).
+pub fn net_service_boot(page: ServicePage)
     var boot: ServiceBoot
     boot.magic = SERVICE_BOOT_MAGIC
     boot._pad = 0
-    boot.frame = frame
+    boot.frame = 0
     boot.addr = page.handle
     boot.tsc_hz = tsc_hz()
     boot.seat_rx_read = 0
     boot.seat_tx_write = 0
     *service_boot_at(phys_to_virt(shm_page(page.object_id, 0))) = boot
 
-# Set up replacement service `pid`, spawned and not yet run, beside
-# surviving driver `driver_pid` (RING2_NET.md "Frame seat"): its address
-# page first, at DRV_RING_BASE; then a new frame object of a whole frame
-# region, mapped into it, with the driver's handle as ATTACH on the
-# driver's inbox (net_frame_replace); the ServiceBoot naming both; and only
-# then the address object and the service registered. 0, or the errno of
-# the step that failed (the caller's exit of `pid` drops what it holds; it
-# was never the registered service).
-pub fn net_service_install(pid: u32, driver_pid: u32) -> i64
-    let page: ServicePage = match net_service_page(pid)
-        Some(p) => p
-        None => return Errno.NoMem as i64
-    let frame: i64 = net_frame_replace(pid, driver_pid, FRAME_REGION_SIZE / PAGE_SIZE)
-    if frame < 0
-        return frame
-    net_service_boot(page, frame as u64)
-    net_addr_register(page.object_id)
-    net_service_register(pid)
-    0
+# {page.handle, ATTACH} on service `pid`'s inbox, before it is the
+# registered service, so it is the first ATTACH the service sees (NetAttach
+# is NoDev until the registration). False when the inbox is full or `pid`
+# has no process: the caller drops the page.
+pub fn net_service_attach_page(pid: u32, page: ServicePage) -> bool
+    disable_interrupts()
+    var posted: bool = false
+    if waitset_inbox_len(pid as u64) < INBOX_CAP
+        posted = waitset_inbox_post(pid as u64, page.handle, EVENT_ATTACH)
+    enable_interrupts()
+    posted
 
 # net_attach() -> the caller's exchange handle or -errno
 pub fn sys_net_attach_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

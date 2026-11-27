@@ -1,24 +1,30 @@
-# The ring-2 network service's loop body (AGAST #4743, docs/RING2_NET.md
-# "Service wait", "Ethernet demux", "Address publication", "Frame seat")
+# The ring-2 network service's loop body (AGAST #4743, #4875; docs/RING2_NET.md
+# "Drivers inside netd (D9)", "Ethernet demux", "Address publication")
 #
-# Everything /bin/netd does that is not a syscall: the frame-ring halves it
-# owns (RX consumer, TX producer), RX through netstack (Ethernet demux, ARP,
-# IPv4, ICMP echo, UDP, the DHCP client), the send side with its pending-TX
-# queue, the protocol timers, and the address page's seqlock writes. The
-# frame region and the address page are plain memory here, so
-# test/test_netsvc.ritz drives this file with the driver's halves of the
-# rings in the same process and a fake clock; netd.ritz adds the ShmWait,
-# the notifies, NetPublish and the clock.
+# Everything /bin/netd does after the frame-seat handoff that is not a
+# syscall: RX through netstack (Ethernet demux, ARP, IPv4, ICMP echo, UDP,
+# the DHCP client), the send side with its pending-TX queue, the protocol
+# timers, and the address page's seqlock writes. Under D9 the NIC is in
+# this process: NetSvc is generic over `trait Nic` (nic.nic) and holds the
+# NIC itself, and frames move by direct calls with no copy. The address page
+# is plain memory here, so test/test_netsvc.ritz drives this file on a
+# loopback Nic (nic.loopback) and a fake clock; netd.ritz adds the
+# DrvIrqWait, the notifies, NetPublish and the clock.
 #
-# The send side (RING2_NET.md "Ethernet demux"): a frame goes straight onto
-# the TX ring while it has a free slot and nothing is queued ahead of it.
-# A full ring queues it, up to PENDING_TX_CAP (32, one virtio posted pool),
-# and the service goes back to RX, timers and the rest; a send that finds
-# the queue full fails to its caller and RX continues. SPACE is in the wait
-# mask only while that queue is non-empty, which with the queue drained into
-# every free slot first means only while the TX ring is full, so a free
-# slot with nothing queued is idle and a queued frame leaves on the driver's
-# SPACE notify alone, with no RX frame needed.
+# RX: rx_poll hands a frame out where the device wrote it; the stack parses
+# it there and rx_release reposts the buffer. Anything kept past that is
+# copied: a datagram into the app's event arena, an ARP entry, a ping's
+# echoed bytes.
+#
+# The send side (RING2_NET.md "Ethernet demux"): a frame is built in the
+# TX buffer the NIC handed out (out_buf) and submitted in place while
+# nothing is queued ahead of it. With every buffer in flight it is built in
+# the private `out` and queued, up to PENDING_TX_CAP (32, one virtio posted
+# pool), and the service goes back to RX, timers and the rest; a send that
+# finds the queue full fails to its caller and RX continues. The queue
+# leaves on a TX completion, which is an interrupt on netd's own IRQ
+# object: the wait needs no SPACE. A pass ends with one tx_kick (one
+# doorbell for everything submitted) and irq_arm.
 #
 # An IPv4 send to a next hop ARP has not resolved waits in ArpWaits (the
 # service "keeps the pending send and finishes it when the reply arrives")
@@ -48,10 +54,11 @@
 # Errno.Io, and a reply after that is dropped. While the echo is in flight
 # it keeps one owed slot, so its terminal event always fits OWED_CAP.
 
-import driver_abi.frame_ring { FRAME_MAX, FRAME_RING_CAP }
+import driver_abi.frame_ring { FRAME_MAX }
 import driver_abi.link { NetInfo, NetAddr, addr_publish }
-import driver_abi.spsc { SpscProducer, SpscConsumer, SpscClose, Publish, Take, FrameBytes, spsc_rx_ring, spsc_tx_ring }
-import driver_abi.wait { WaitEvent, WaitSource, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK }
+import driver_abi.spsc { FrameBytes }
+import driver_abi.wait { WaitEvent, WaitSource, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE }
+import nic.nic { Nic, RxFrame, TxFrame }
 import netstack.ethernet { MacAddr, EtherType, EthRx, SendError, ETH_PAYLOAD_OFF, eth_demux }
 import netstack.arp { ArpOp, ArpRx, ArpLearn, ArpSend, ArpEvent, ArpTable, ARP_HOP_CAP, arp_parse, arp_request_write, arp_reply_write, arp_should_reply, arp_broadcast_mac }
 import netstack.ipv4 { Ipv4Config, Ipv4Rx, IpProto, IPV4_HEADER_MIN, IPV4_BROADCAST, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, ipv4_parse, ipv4_next_hop }
@@ -76,10 +83,10 @@ pub const ARP_WAIT_CAP: i64 = 16
 # lease, or no link): a wake that only re-arms the wait.
 pub const WAIT_IDLE_MS: u64 = 60000
 
-# The most RX frames one service pass takes, one ring's worth, so a driver
-# that keeps the ring full cannot keep the timers from running; netd checks
-# again without parking when a pass stopped there.
-pub const RX_BUDGET: i64 = FRAME_RING_CAP as i64
+# The most RX frames one service pass takes, a frame ring's worth, so a
+# link that keeps the NIC busy cannot keep the timers from running; netd
+# checks again without parking when a pass stopped there.
+pub const RX_BUDGET: i64 = 256
 
 # The DHCP payload buffer: a 576-byte minimum datagram covers every
 # message the client writes.
@@ -100,7 +107,7 @@ pub const PING_SEQ: u16 = 1
 
 # What happened to one send.
 pub enum Sent
-    Published                        # on the TX ring
+    Published                        # submitted to the NIC
     Queued                           # on the pending-TX queue
     Waiting                          # waiting for ARP to resolve the next hop
     Failed                           # the pending queue (or the ARP wait store) was full, or the frame did not build
@@ -122,11 +129,12 @@ pub struct ArpWait
     ping: bool
 
 pub struct NetCounters
-    rx_frames: u64                   # taken off the RX ring
-    rx_rejects: u64                  # bad RX slots (the driver's descriptor)
+    rx_frames: u64                   # handed out by the NIC
+    rx_rejects: u64                  # bad frames before the stack (the seat's slots)
     rx_drops: u64                    # dropped by a protocol check
     udp_unbound: u64                 # UDP for a port no one serves
-    tx_frames: u64                   # published on the TX ring
+    tx_frames: u64                   # submitted to the NIC
+    tx_copies: u64                   # of those, copied into the NIC's buffer (not built in it)
     tx_queued: u64                   # sends that waited on the pending-TX queue
     send_fails: u64                  # sends that failed to their caller
     arp_drops: u64                   # frames dropped when ARP gave up
@@ -188,29 +196,6 @@ pub struct AppNotify
 fn ip_of(b: [4]u8) -> u32
     ((b[0] as u32) << 24) | ((b[1] as u32) << 16) | ((b[2] as u32) << 8) | (b[3] as u32)
 
-# What a wait's events mean to the service.
-pub struct Wake
-    # DRIVER_GONE or PEER_CLOSE on the frame object: the driver is gone
-    # (this cutover does not replace it), so the service exits.
-    gone: bool
-    # LINK on the frame object: NetPublish took a new link snapshot; read
-    # NetInfo again.
-    link: bool
-
-# Sort one wait's events. DATA, SPACE and the deadline need nothing but a
-# service pass, which runs after every wait.
-pub fn wake_of(events: [WaitEvent], frame: u64) -> Wake
-    var w = Wake { gone: false, link: false }
-    for i in 0..events.len
-        let ev = events[i]
-        if ev.handle != frame
-            continue
-        if (ev.bits & (EVENT_DRIVER_GONE | EVENT_PEER_CLOSE)) != 0
-            w.gone = true
-        if (ev.bits & EVENT_LINK) != 0
-            w.link = true
-    w
-
 # The IPv4 address `ip` (a.b.c.d as a << 24 | ...) in wire order.
 fn ip_bytes(ip: u32) -> [4]u8
     [(ip >> 24) as u8, ((ip >> 16) & 0xFF) as u8, ((ip >> 8) & 0xFF) as u8, (ip & 0xFF) as u8]
@@ -240,9 +225,14 @@ pub fn addr_record(lease: Option<DhcpLease>) -> NetAddr
         None => pass
     rec
 
-pub struct NetSvc
-    rx: SpscConsumer
-    tx: SpscProducer
+pub struct NetSvc<N: Nic>
+    # The NIC, in this process (D9). netd brings it up before init.
+    nic: N
+    # A TX buffer the NIC handed out and no frame was submitted in yet: the
+    # next frame is built in it (out_buf).
+    tx_held: Option<TxFrame>
+    # Where the frame being built is: tx_held's bytes, or `out`.
+    cur: [u8]
     # The address page (netd's mapping): only this service writes it.
     addr_page: u64
     # The last link snapshot NetInfo copied, and whether DHCP is running
@@ -263,16 +253,11 @@ pub struct NetSvc
     # kernel has not sampled it yet (netd calls NetPublish).
     generation: u64
     publish_due: bool
-    # TX slots published since netd last posted DATA.
-    published: u32
-    # The frame ring is unusable: the driver's index is impossible.
-    closed: Option<SpscClose>
     # The last RX pass stopped at RX_BUDGET with frames maybe left.
     rx_more: bool
     rand: u32
     counters: NetCounters
-    rx_buf: FrameBytes               # the private copy of one RX slot
-    out: FrameBytes                  # where one TX frame is built
+    out: FrameBytes                  # where a frame is built while no TX buffer is free
     dhcp_buf: [576]u8                # DHCP_BUF_LEN
     # The app exchanges.
     apps: [5]AppAttach               # APP_ATTACH_CAP
@@ -290,13 +275,13 @@ pub struct NetSvc
     # The last ICMP identifier an echo used.
     ping_ident: u16
 
-impl NetSvc
-    # The service over the frame region at `region` and the address page
-    # at `addr_page`, both private indexes at 0, nothing published. `seed`
-    # (any non-zero value) seeds the DHCP jitter and transaction ids.
-    pub fn init(self: @&NetSvc, region: u64, addr_page: u64, seed: u32)
-        self.rx = SpscConsumer.new(spsc_rx_ring(region))
-        self.tx = SpscProducer.new(spsc_tx_ring(region))
+impl<N: Nic> NetSvc<N>
+    # The service over the address page at `addr_page`, nothing published,
+    # on the NIC already in `nic` (netd brought it up). `seed` (any non-zero
+    # value) seeds the DHCP jitter and transaction ids.
+    pub fn init(self: @&NetSvc<N>, addr_page: u64, seed: u32)
+        self.tx_held = None
+        self.cur = @self.out
         self.addr_page = addr_page
         self.link = NetInfo { mac: [0, 0, 0, 0, 0, 0], link_up: 0, device_type: 0, mtu: 0 }
         self.up = false
@@ -317,45 +302,50 @@ impl NetSvc
         self.ping_ident = 0
         self.generation = 0
         self.publish_due = false
-        self.published = 0
-        self.closed = None
         self.rx_more = false
         self.rand = seed
         if self.rand == 0
             self.rand = 0x6E657464           # "netd": xorshift needs a non-zero state
-        self.counters = NetCounters { rx_frames: 0, rx_rejects: 0, rx_drops: 0, udp_unbound: 0, tx_frames: 0, tx_queued: 0, send_fails: 0, arp_drops: 0 }
+        self.counters = NetCounters { rx_frames: 0, rx_rejects: 0, rx_drops: 0, udp_unbound: 0, tx_frames: 0, tx_copies: 0, tx_queued: 0, send_fails: 0, arp_drops: 0 }
 
     # The ready state (RING2_NET.md "Frame seat"): the rings are mapped and
     # the wait is about to be installed; publish the cleared record,
     # generation 2 on a fresh page, configured 0, before DHCP starts. The
     # NIC's MAC from the first link snapshot is DHCP's client hardware
     # address. Returns the generation; netd's next call is NetPublish.
-    pub fn ready(self: @&NetSvc, link: NetInfo) -> u64
+    pub fn ready(self: @&NetSvc<N>, link: NetInfo) -> u64
         self.link = link
         self.dhcp = DhcpClient.new(link.mac, self.next_rand())
         self.publish(None)
         self.generation
 
-    # The frame seat (RING2_NET.md "Frame seat", AGAST #4744): the kernel
-    # consumed RX and produced TX on these rings before netd, and its
-    # private indexes stopped at `rx_read` and `tx_write`. netd's halves
-    # resume there; halves at 0 would find an impossible occupancy and
-    # close the ring. Called once, after the ready NetPublish returned.
-    pub fn take_seat(self: @&NetSvc, rx_read: u64, tx_write: u64)
-        self.rx = SpscConsumer.resume(self.rx.ring, rx_read)
-        self.tx = SpscProducer.resume(self.tx.ring, tx_write)
+    # One frame that did not come from rx_poll: at the frame-seat handoff
+    # (RING2_NET.md "Frame seat", AGAST #4744), an RX frame netd's seat half
+    # published and the kernel did not consume. It goes through the stack
+    # as an RX frame does.
+    pub fn rx_frame(self: @&NetSvc<N>, frame: [u8], now: u64)
+        self.counters.rx_frames += 1
+        self.on_frame(frame, now)
+
+    # A TX buffer the NIC handed out before the handoff (netd's seat half
+    # held it): the next frame is built in it, or it goes back unsent.
+    pub fn adopt_tx(self: @&NetSvc<N>, t: TxFrame)
+        if self.tx_held.is_none()
+            self.tx_held = Some(t)
+        else
+            self.nic.tx_submit(t, 0)
 
     # The leased address, the one netd's last record carries as
     # configured; None once DHCP has cleared the lease (link down, NAK,
     # expiry).
-    pub fn address(self: @NetSvc) -> Option<u32>
+    pub fn address(self: @NetSvc<N>) -> Option<u32>
         match self.dhcp.lease
             Some(l) => Some(l.addr)
             None => None
 
     # A new link snapshot. Link up starts DHCP from Idle; link down clears
     # the record and leaves DHCP in Idle (RING2_NET.md "UDP and DHCP").
-    pub fn set_link(self: @&NetSvc, link: NetInfo, now: u64)
+    pub fn set_link(self: @&NetSvc<N>, link: NetInfo, now: u64)
         let mac = self.link.mac
         self.link = NetInfo { mac: mac, link_up: link.link_up, device_type: link.device_type, mtu: link.mtu }
         let want = link.link_up != 0
@@ -369,30 +359,23 @@ impl NetSvc
             let step = self.dhcp.link_down()
             self.dhcp_apply(step, now)
 
-    # One pass: move queued frames into free TX slots, take up to
-    # RX_BUDGET RX frames through the stack, run the protocol timers, and
-    # move queued frames again. Err when the frame ring is unusable.
-    pub fn service(self: @&NetSvc, now: u64) -> Result<(), SpscClose>
+    # One pass: move queued frames into free TX buffers, take up to
+    # RX_BUDGET RX frames through the stack, run the protocol timers and
+    # the app exchanges, and move queued frames again; then one doorbell for
+    # everything submitted, and arm the interrupt for the next completion.
+    pub fn service(self: @&NetSvc<N>, now: u64)
         self.flush()
         self.rx_pass(now)
         self.tick(now)
         self.apps_pass(now)
         self.flush()
-        match self.closed
-            Some(why) => Err(why)
-            None => Ok(())
+        self.nic.tx_kick()
+        self.nic.irq_arm()
 
-    # The ShmWait mask for the frame object: DATA always (an RX frame),
-    # SPACE only while the pending-TX queue holds a frame.
-    pub fn wait_mask(self: @&NetSvc) -> u32
-        if self.pend_count > 0
-            return EVENT_DATA | EVENT_SPACE
-        EVENT_DATA
-
-    # The ShmWait deadline, in ms from `now`: 0 when a timer is due or the
+    # The DrvIrqWait deadline, in ms from `now`: 0 when a timer is due or the
     # last RX pass left frames, else the nearest DHCP or ARP timer, at most
     # WAIT_IDLE_MS.
-    pub fn deadline(self: @&NetSvc, now: u64) -> u64
+    pub fn deadline(self: @&NetSvc<N>, now: u64) -> u64
         if self.rx_more or self.app_more
             return 0
         var at: u64 = now + WAIT_IDLE_MS
@@ -415,55 +398,68 @@ impl NetSvc
             return 0
         at - now
 
-    # TX slots published since the last call: netd posts DATA when it is
-    # non-zero.
-    pub fn take_published(self: @&NetSvc) -> u32
-        let n = self.published
-        self.published = 0
-        n
-
     # Whether the address page has a generation the kernel has not
     # sampled; clears it (netd calls NetPublish, and marks it due again
     # with publish_failed when that is refused).
-    pub fn take_publish_due(self: @&NetSvc) -> bool
+    pub fn take_publish_due(self: @&NetSvc<N>) -> bool
         let due = self.publish_due
         self.publish_due = false
         due
 
-    pub fn publish_failed(self: @&NetSvc)
+    pub fn publish_failed(self: @&NetSvc<N>)
         self.publish_due = true
 
-    pub fn pending_count(self: @&NetSvc) -> i64
+    pub fn pending_count(self: @&NetSvc<N>) -> i64
         self.pend_count
 
-    # Send one whole Ethernet frame: straight onto the TX ring when it has
-    # room and nothing is queued ahead, else onto the pending-TX queue, else
-    # it fails.
-    pub fn send_frame(self: @&NetSvc, frame: [u8]) -> Sent
+    # Send one whole Ethernet frame: to the NIC when a TX buffer is free and
+    # nothing is queued ahead (in place when it was built in that buffer),
+    # else onto the pending-TX queue, else it fails.
+    pub fn send_frame(self: @&NetSvc<N>, frame: [u8]) -> Sent
         if frame.len == 0 or frame.len as u64 > FRAME_MAX
             self.counters.send_fails += 1
             return Sent.Failed
         if self.pend_count == 0
-            match self.tx.publish(frame)
-                Publish.Done =>
-                    self.published += 1
-                    self.counters.tx_frames += 1
+            match self.tx_take()
+                Some(t) =>
+                    self.submit(t, frame)
                     return Sent.Published
-                Publish.Full => pass
-                Publish.BadLength =>
-                    self.counters.send_fails += 1
-                    return Sent.Failed
-                Publish.Close(why) =>
-                    self.closed = Some(why)
-                    self.counters.send_fails += 1
-                    return Sent.Failed
+                None => pass
         self.enqueue(frame)
+
+    # Where the next frame is built: the NIC's TX buffer, so it goes out
+    # with no copy, while nothing is queued and one is free; else the
+    # private `out`, and the send copies it. The caller builds from 0.
+    fn out_buf(self: @&NetSvc<N>) -> [u8]
+        if self.tx_held.is_none() and self.pend_count == 0
+            self.tx_held = self.nic.tx_buffer()
+        match self.tx_held
+            Some(t) => self.cur = t.bytes
+            None => self.cur = @self.out
+        self.cur
+
+    # A TX buffer for a send: the held one, else a new one from the NIC.
+    fn tx_take(self: @&NetSvc<N>) -> Option<TxFrame>
+        match self.tx_held
+            Some(t) =>
+                self.tx_held = None
+                Some(t)
+            None => self.nic.tx_buffer()
+
+    # Hand `frame` to the NIC in `t`: in place when it was built there,
+    # else copied in first.
+    fn submit(self: @&NetSvc<N>, t: TxFrame, frame: [u8])
+        if frame.ptr != t.bytes.ptr
+            t.bytes.slice(0, frame.len).copy_from(frame)
+            self.counters.tx_copies += 1
+        self.nic.tx_submit(t, frame.len as u32)
+        self.counters.tx_frames += 1
 
     # ------------------------------------------------------------------
     # The send side
     # ------------------------------------------------------------------
 
-    fn enqueue(self: @&NetSvc, frame: [u8]) -> Sent
+    fn enqueue(self: @&NetSvc<N>, frame: [u8]) -> Sent
         if self.pend_count >= PENDING_TX_CAP
             self.counters.send_fails += 1
             return Sent.Failed
@@ -475,31 +471,25 @@ impl NetSvc
         self.counters.tx_queued += 1
         Sent.Queued
 
-    # Publish queued frames, oldest first, into every free TX slot.
-    fn flush(self: @&NetSvc)
+    # Send queued frames, oldest first, into every free TX buffer.
+    fn flush(self: @&NetSvc<N>)
         while self.pend_count > 0
+            let t = match self.tx_take()
+                Some(x) => x
+                None => return
             let slot = self.pend_head
             let len = self.pend_lens[slot] as i64
             # span_from_ptr, not `@self.pend_frames[slot]`: ritz1 stores
             # the element's address where the span belongs.
             let frame: [u8] = span_from_ptr<u8>(@self.pend_frames[slot][0], len)
-            match self.tx.publish(frame)
-                Publish.Done =>
-                    self.published += 1
-                    self.counters.tx_frames += 1
-                Publish.Full => return
-                Publish.BadLength =>
-                    self.counters.send_fails += 1
-                Publish.Close(why) =>
-                    self.closed = Some(why)
-                    return
+            self.submit(t, frame)
             self.pend_head = (self.pend_head + 1) % PENDING_TX_CAP
             self.pend_count -= 1
 
-    # Send the IPv4 frame of `len` bytes built in `out`, whose destination
+    # Send the IPv4 frame of `len` bytes built in out_buf(), whose destination
     # MAC is not yet written, to next hop `hop`: the broadcast MAC for the
     # limited broadcast, the cached MAC, or a wait for ARP.
-    fn send_ip(self: @&NetSvc, hop: u32, len: i64, now: u64) -> Sent
+    fn send_ip(self: @&NetSvc<N>, hop: u32, len: i64, now: u64) -> Sent
         if hop == IPV4_BROADCAST
             self.set_out_mac(arp_broadcast_mac())
             return self.send_out(len)
@@ -516,20 +506,20 @@ impl NetSvc
                 self.counters.send_fails += 1
                 Sent.Failed
 
-    fn set_out_mac(self: @&NetSvc, mac: MacAddr)
+    fn set_out_mac(self: @&NetSvc<N>, mac: MacAddr)
         for i in 0..6
-            self.out[i] = mac[i]
+            self.cur[i] = mac[i]
 
-    fn send_out(self: @&NetSvc, len: i64) -> Sent
-        let out: [u8] = @self.out
+    fn send_out(self: @&NetSvc<N>, len: i64) -> Sent
+        let out: [u8] = self.cur
         self.send_frame(out[0..len])
 
-    # Keep the frame in `out` until ARP resolves `hop`.
-    fn park(self: @&NetSvc, hop: u32, len: i64) -> Sent
+    # Keep a copy of the frame being built until ARP resolves `hop`.
+    fn park(self: @&NetSvc<N>, hop: u32, len: i64) -> Sent
         for w in 0..ARP_WAIT_CAP
             if not self.waits[w].live
                 for i in 0..len
-                    self.waits[w].frame[i] = self.out[i]
+                    self.waits[w].frame[i] = self.cur[i]
                 self.waits[w].len = len as u32
                 self.waits[w].hop = hop
                 self.waits[w].live = true
@@ -543,7 +533,7 @@ impl NetSvc
         Sent.Failed
 
     # ARP resolved `hop` to `mac` at `now`: send every frame waiting on it.
-    fn release_waits(self: @&NetSvc, hop: u32, mac: MacAddr, now: u64)
+    fn release_waits(self: @&NetSvc<N>, hop: u32, mac: MacAddr, now: u64)
         for w in 0..ARP_WAIT_CAP
             if self.waits[w].live and self.waits[w].hop == hop
                 self.waits[w].live = false
@@ -557,7 +547,7 @@ impl NetSvc
                         None => pass
 
     # ARP gave up on `hop`: drop what waits on it.
-    fn drop_waits(self: @&NetSvc, hop: u32)
+    fn drop_waits(self: @&NetSvc<N>, hop: u32)
         for w in 0..ARP_WAIT_CAP
             if self.waits[w].live and self.waits[w].hop == hop
                 self.waits[w].live = false
@@ -576,7 +566,7 @@ impl NetSvc
 
     # The attachment whose ping echo wait `w` holds, while that attachment
     # is the one that parked it and its ping still waits for ARP.
-    fn ping_of_wait(self: @NetSvc, w: i64) -> Option<i64>
+    fn ping_of_wait(self: @NetSvc<N>, w: i64) -> Option<i64>
         match self.waits[w].app
             Some(a) =>
                 if self.apps[a].live and self.apps[a].serial == self.waits[w].serial and self.apps[a].ping == PingState.Arp
@@ -584,14 +574,14 @@ impl NetSvc
                 None
             None => None
 
-    fn our_ip(self: @&NetSvc) -> Option<u32>
+    fn our_ip(self: @&NetSvc<N>) -> Option<u32>
         self.dhcp.config().addr
 
-    fn send_arp_request(self: @&NetSvc, target: u32)
+    fn send_arp_request(self: @&NetSvc<N>, target: u32)
         let ours = match self.our_ip()
             Some(a) => a
             None => 0
-        let out: [u8] = @self.out
+        let out: [u8] = self.out_buf()
         match arp_request_write(out, self.link, ours, target)
             Ok(len) => self.send_frame(out[0..len])
             Err(_) => pass
@@ -600,26 +590,22 @@ impl NetSvc
     # Receive
     # ------------------------------------------------------------------
 
-    fn rx_pass(self: @&NetSvc, now: u64)
+    # Up to RX_BUDGET frames, each parsed where the device wrote it and its
+    # buffer released after.
+    fn rx_pass(self: @&NetSvc<N>, now: u64)
         self.rx_more = false
         var taken: i64 = 0
         while taken < RX_BUDGET
-            match self.rx.next(@&self.rx_buf, now, now + 1)
-                Take.Frame(len) =>
+            match self.nic.rx_poll()
+                Some(f) =>
                     self.counters.rx_frames += 1
-                    let buf: [u8] = @self.rx_buf
-                    self.on_frame(buf[0..len as i64], now)
-                Take.Rejected(_) =>
-                    self.counters.rx_rejects += 1
-                Take.Empty => return
-                Take.Timeout => return
-                Take.Close(why) =>
-                    self.closed = Some(why)
-                    return
+                    self.on_frame(f.bytes, now)
+                    self.nic.rx_release(f)
+                None => return
             taken += 1
         self.rx_more = true
 
-    fn on_frame(self: @&NetSvc, frame: [u8], now: u64)
+    fn on_frame(self: @&NetSvc<N>, frame: [u8], now: u64)
         match eth_demux(frame, self.link.mac)
             Err(_) =>
                 self.counters.rx_drops += 1
@@ -628,7 +614,7 @@ impl NetSvc
                     EtherType.Arp => self.on_arp(eth.payload, now)
                     EtherType.Ipv4 => self.on_ipv4(eth, now)
 
-    fn on_arp(self: @&NetSvc, payload: [u8], now: u64)
+    fn on_arp(self: @&NetSvc<N>, payload: [u8], now: u64)
         let rx = match arp_parse(payload)
             Ok(r) => r
             Err(_) =>
@@ -645,12 +631,12 @@ impl NetSvc
             ArpLearn.Resolved(_) => self.release_waits(rx.sender_ip, rx.sender_mac, now)
             _ => pass
         if arp_should_reply(rx, our_ip, ours.is_some())
-            let out: [u8] = @self.out
+            let out: [u8] = self.out_buf()
             match arp_reply_write(out, self.link, our_ip, rx.sender_mac, rx.sender_ip)
                 Ok(len) => self.send_frame(out[0..len])
                 Err(_) => pass
 
-    fn on_ipv4(self: @&NetSvc, eth: EthRx, now: u64)
+    fn on_ipv4(self: @&NetSvc<N>, eth: EthRx, now: u64)
         let cfg = self.dhcp.config()
         let ip = match ipv4_parse(eth.payload, cfg)
             Ok(p) => p
@@ -661,7 +647,7 @@ impl NetSvc
             IpProto.Udp => self.on_udp(ip, now)
             IpProto.Icmp => self.on_icmp(ip, eth.dst, cfg, now)
 
-    fn on_udp(self: @&NetSvc, ip: Ipv4Rx, now: u64)
+    fn on_udp(self: @&NetSvc<N>, ip: Ipv4Rx, now: u64)
         let udp = match udp_parse(ip.body, ip.src, ip.dst)
             Ok(u) => u
             Err(_) =>
@@ -679,7 +665,7 @@ impl NetSvc
             Err(_) =>
                 self.counters.rx_drops += 1
 
-    fn on_icmp(self: @&NetSvc, ip: Ipv4Rx, eth_dst: MacAddr, cfg: Ipv4Config, now: u64)
+    fn on_icmp(self: @&NetSvc<N>, ip: Ipv4Rx, eth_dst: MacAddr, cfg: Ipv4Config, now: u64)
         let msg = match icmp_parse(ip.body)
             Ok(m) => m
             Err(_) =>
@@ -698,7 +684,7 @@ impl NetSvc
             Err(_) =>
                 self.counters.send_fails += 1
                 return
-        let out: [u8] = @self.out
+        let out: [u8] = self.out_buf()
         match icmp_echo_reply_frame_write(out, self.link, [0, 0, 0, 0, 0, 0], ours, ip.src, msg.id, msg.seq, msg.body)
             Ok(len) => self.send_ip(hop, len, now)
             Err(_) =>
@@ -707,7 +693,7 @@ impl NetSvc
     # An echo reply from `src`: the EV_PING_REPLY of the attachment whose
     # echo it answers, before that echo's deadline; else dropped (no echo
     # of ours, or a late or duplicate reply).
-    fn on_echo_reply(self: @&NetSvc, src: u32, msg: IcmpRx, now: u64)
+    fn on_echo_reply(self: @&NetSvc<N>, src: u32, msg: IcmpRx, now: u64)
         for a in 0..APP_ATTACH_CAP
             if self.ping_answers(a, src, msg, now)
                 var n = msg.body.len
@@ -723,7 +709,7 @@ impl NetSvc
 
     # Whether `msg` from `src` at `now` answers attachment `a`'s echo:
     # that peer, that identifier and PING_SEQ, before the deadline.
-    fn ping_answers(self: @NetSvc, a: i64, src: u32, msg: IcmpRx, now: u64) -> bool
+    fn ping_answers(self: @NetSvc<N>, a: i64, src: u32, msg: IcmpRx, now: u64) -> bool
         if not self.apps[a].live or self.apps[a].ping != PingState.Echo
             return false
         self.apps[a].ping_dst == src and self.apps[a].ping_ident == msg.id and msg.seq == PING_SEQ and now < self.apps[a].ping_deadline
@@ -736,7 +722,7 @@ impl NetSvc
     # (an ATTACH record). The next pass drains its requests before netd
     # parks. False when APP_ATTACH_CAP attachments are live: netd revokes
     # the handle. A handle already attached is true and changes nothing.
-    pub fn attach(self: @&NetSvc, handle: u64, region: u64) -> bool
+    pub fn attach(self: @&NetSvc<N>, handle: u64, region: u64) -> bool
         if self.app_slot(handle).is_some()
             return true
         for a in 0..APP_ATTACH_CAP
@@ -759,13 +745,13 @@ impl NetSvc
         false
 
     # The live attachment for `handle`.
-    pub fn app_slot(self: @NetSvc, handle: u64) -> Option<i64>
+    pub fn app_slot(self: @NetSvc<N>, handle: u64) -> Option<i64>
         for a in 0..APP_ATTACH_CAP
             if self.apps[a].live and self.apps[a].handle == handle
                 return Some(a)
         None
 
-    pub fn app_count(self: @NetSvc) -> i64
+    pub fn app_count(self: @NetSvc<N>) -> i64
         var n: i64 = 0
         for a in 0..APP_ATTACH_CAP
             if self.apps[a].live
@@ -774,7 +760,7 @@ impl NetSvc
 
     # A wait's events for the exchanges: PEER_CLOSE (the app exited or
     # revoked) or DRIVER_GONE on one detaches it, without a slot ack.
-    pub fn app_wake(self: @&NetSvc, events: [WaitEvent])
+    pub fn app_wake(self: @&NetSvc<N>, events: [WaitEvent])
         for i in 0..events.len
             if (events[i].bits & (EVENT_PEER_CLOSE | EVENT_DRIVER_GONE)) != 0
                 match self.app_slot(events[i].handle)
@@ -783,7 +769,7 @@ impl NetSvc
 
     # The wait sources for the live attachments, written to `out` from 0;
     # their count. DATA is a request; SPACE joins while a reply is owed.
-    pub fn app_sources(self: @NetSvc, out: [WaitSource]) -> i64
+    pub fn app_sources(self: @NetSvc<N>, out: [WaitSource]) -> i64
         var n: i64 = 0
         for a in 0..APP_ATTACH_CAP
             if self.apps[a].live and n < out.len
@@ -795,7 +781,7 @@ impl NetSvc
         n
 
     # The next notify netd owes an attachment, cleared as it is taken.
-    pub fn take_notify(self: @&NetSvc) -> Option<AppNotify>
+    pub fn take_notify(self: @&NetSvc<N>) -> Option<AppNotify>
         for a in 0..APP_ATTACH_CAP
             if self.apps[a].live and (self.apps[a].posted > 0 or self.apps[a].taken > 0)
                 var bits: u32 = 0
@@ -810,7 +796,7 @@ impl NetSvc
 
     # The next handle of an attachment this service closed or detached:
     # netd CapRevokes it, which frees the slot.
-    pub fn take_revoke(self: @&NetSvc) -> Option<u64>
+    pub fn take_revoke(self: @&NetSvc<N>) -> Option<u64>
         for a in 0..APP_ATTACH_CAP
             if self.apps[a].revoke
                 self.apps[a].revoke = false
@@ -819,7 +805,7 @@ impl NetSvc
 
     # Stop serving attachment `a`: its ports are free, its owed replies
     # and unread requests are discarded, and netd revokes its handle.
-    fn close_app(self: @&NetSvc, a: i64)
+    fn close_app(self: @&NetSvc<N>, a: i64)
         if not self.apps[a].live
             return
         self.apps[a].live = false
@@ -828,7 +814,7 @@ impl NetSvc
         self.apps[a].ping = PingState.Idle
         self.ports.detach(a)
 
-    fn apps_pass(self: @&NetSvc, now: u64)
+    fn apps_pass(self: @&NetSvc<N>, now: u64)
         self.app_more = false
         for a in 0..APP_ATTACH_CAP
             if self.apps[a].live
@@ -838,7 +824,7 @@ impl NetSvc
 
     # Replies attachment `a` owes or will owe: the FIFO, and the terminal
     # event of a ping still in flight.
-    fn owed_load(self: @NetSvc, a: i64) -> i64
+    fn owed_load(self: @NetSvc<N>, a: i64) -> i64
         match self.apps[a].ping
             PingState.Arp => self.apps[a].owed_count + 1
             PingState.Echo => self.apps[a].owed_count + 1
@@ -848,7 +834,7 @@ impl NetSvc
 
     # Take up to APP_DEPTH requests of attachment `a`. Stops while its
     # owed replies fill OWED_CAP: the app is not reading events.
-    fn drain(self: @&NetSvc, a: i64, now: u64)
+    fn drain(self: @&NetSvc<N>, a: i64, now: u64)
         var n: u64 = 0
         while n < APP_DEPTH
             if not self.apps[a].live or self.owed_load(a) >= OWED_CAP
@@ -877,7 +863,7 @@ impl NetSvc
 
     # One validated request of attachment `a`, its payload `len` bytes of
     # req_buf.
-    fn dispatch(self: @&NetSvc, a: i64, d: AppDesc, len: u32, now: u64)
+    fn dispatch(self: @&NetSvc<N>, a: i64, d: AppDesc, len: u32, now: u64)
         self.apps[a].counters.requests += 1
         match app_request(d)
             AppReq.Bind(id, port) =>
@@ -904,10 +890,10 @@ impl NetSvc
             AppReq.Bad =>
                 self.apps[a].counters.rejects += 1
 
-    fn owe(self: @&NetSvc, a: i64, kind: u16, id: u32, handle: u32, port: u16, status: i16)
+    fn owe(self: @&NetSvc<N>, a: i64, kind: u16, id: u32, handle: u32, port: u16, status: i16)
         self.owe_at(a, kind, id, handle, port, status, [0, 0, 0, 0])
 
-    fn owe_at(self: @&NetSvc, a: i64, kind: u16, id: u32, handle: u32, port: u16, status: i16, addr: [4]u8)
+    fn owe_at(self: @&NetSvc<N>, a: i64, kind: u16, id: u32, handle: u32, port: u16, status: i16, addr: [4]u8)
         let slot = (self.apps[a].owed_head + self.apps[a].owed_count) % OWED_CAP
         self.apps[a].owed[slot] = Owed { kind: kind, id: id, handle: handle, port: port, status: status, addr: addr }
         self.apps[a].owed_count += 1
@@ -916,7 +902,7 @@ impl NetSvc
     # req_buf[0..len]. A second one while one is not Idle is Inval (the
     # library keeps one reply outstanding); no address or no route is Io,
     # and bytes past the link MTU are Inval.
-    fn ping_start(self: @&NetSvc, a: i64, id: u32, d: AppDesc, len: u32, now: u64)
+    fn ping_start(self: @&NetSvc<N>, a: i64, id: u32, d: AppDesc, len: u32, now: u64)
         if self.apps[a].ping != PingState.Idle
             self.owe(a, EV_ERROR, id, 0, 0, APP_EINVAL)
             return
@@ -936,7 +922,7 @@ impl NetSvc
         if self.ping_ident == 0
             self.ping_ident = 1
         let buf: [u8] = @self.req_buf
-        let out: [u8] = @self.out
+        let out: [u8] = self.out_buf()
         let n = match icmp_echo_request_frame_write(out, self.link, [0, 0, 0, 0, 0, 0], src, dst, self.ping_ident, PING_SEQ, buf[0..len as i64])
             Ok(n) => n
             Err(_) =>
@@ -955,31 +941,31 @@ impl NetSvc
 
     # Where attachment `a`'s echo went at `now`: out (the deadline starts,
     # once), waiting for ARP (still Arp), or failed (EV_ERROR Io).
-    fn ping_sent(self: @&NetSvc, a: i64, sent: Sent, now: u64)
+    fn ping_sent(self: @&NetSvc<N>, a: i64, sent: Sent, now: u64)
         match sent
             Sent.Published => self.ping_echo_out(a, now)
             Sent.Queued => self.ping_echo_out(a, now)
             Sent.Waiting => pass
             Sent.Failed => self.ping_fail(a)
 
-    fn ping_echo_out(self: @&NetSvc, a: i64, now: u64)
+    fn ping_echo_out(self: @&NetSvc<N>, a: i64, now: u64)
         self.apps[a].ping = PingState.Echo
         self.apps[a].ping_deadline = now + PING_DEADLINE_MS
 
     # Attachment `a`'s ping ends in its one EV_ERROR, Errno.Io.
-    fn ping_fail(self: @&NetSvc, a: i64)
+    fn ping_fail(self: @&NetSvc<N>, a: i64)
         self.owe(a, EV_ERROR, self.apps[a].ping_id, 0, 0, APP_EIO)
         self.apps[a].ping = PingState.Idle
 
     # Every echo whose deadline has passed: EV_ERROR Io.
-    fn ping_tick(self: @&NetSvc, now: u64)
+    fn ping_tick(self: @&NetSvc<N>, now: u64)
         for a in 0..APP_ATTACH_CAP
             if self.apps[a].live and self.apps[a].ping == PingState.Echo and now >= self.apps[a].ping_deadline
                 self.ping_fail(a)
 
     # Post attachment `a`'s owed replies, oldest first, while the event
     # ring has a slot.
-    fn post_owed(self: @&NetSvc, a: i64)
+    fn post_owed(self: @&NetSvc<N>, a: i64)
         let none: [u8] = @self.req_buf
         while self.apps[a].live and self.apps[a].owed_count > 0
             let o = self.apps[a].owed[self.apps[a].owed_head]
@@ -1007,7 +993,7 @@ impl NetSvc
     # A UDP datagram for `o`'s port from `src`:`src_port`. Posted as
     # EV_DATAGRAM only while one event slot stays free for a reply. `o` is
     # live: AppPorts holds only live attachments' ports.
-    fn deliver(self: @&NetSvc, o: AppOwner, src: u32, src_port: u16, payload: [u8])
+    fn deliver(self: @&NetSvc<N>, o: AppOwner, src: u32, src_port: u16, payload: [u8])
         let a = o.att
         self.post_owed(a)
         var ev = self.apps[a].ev
@@ -1037,7 +1023,7 @@ impl NetSvc
     # IPv4 and Ethernet. False when it cannot reach the wire: no live
     # handle, no address, unroutable, over the MTU (udp_frame_write's
     # check: IPv4 + UDP + payload), or no room.
-    fn app_send(self: @&NetSvc, a: i64, d: AppDesc, len: u32, now: u64) -> bool
+    fn app_send(self: @&NetSvc<N>, a: i64, d: AppDesc, len: u32, now: u64) -> bool
         let port = match self.ports.port_of(a, d.handle)
             Some(p) => p
             None => return false
@@ -1050,7 +1036,7 @@ impl NetSvc
             Ok(h) => h
             Err(_) => return false
         let buf: [u8] = @self.req_buf
-        let out: [u8] = @self.out
+        let out: [u8] = self.out_buf()
         let n = match udp_frame_write(out, self.link, [0, 0, 0, 0, 0, 0], src, dst, port, d.port, buf[0..len as i64])
             Ok(n) => n
             Err(_) => return false
@@ -1065,7 +1051,7 @@ impl NetSvc
     # DHCP, timers and the address record
     # ------------------------------------------------------------------
 
-    fn dhcp_apply(self: @&NetSvc, step: DhcpStep, now: u64)
+    fn dhcp_apply(self: @&NetSvc<N>, step: DhcpStep, now: u64)
         match step.record
             DhcpRecord.Write => self.publish(self.dhcp.lease)
             DhcpRecord.Clear => self.publish(None)
@@ -1076,7 +1062,7 @@ impl NetSvc
 
     # Write and send one DHCP message: UDP 68 to 67, broadcast or (a
     # renew) unicast to the selected server through ARP.
-    fn dhcp_send(self: @&NetSvc, kind: DhcpSend, now: u64) -> Sent
+    fn dhcp_send(self: @&NetSvc<N>, kind: DhcpSend, now: u64) -> Sent
         let buf: [u8] = @self.dhcp_buf
         let msg = match self.dhcp.payload_write(buf, kind)
             Ok(t) => t
@@ -1088,7 +1074,7 @@ impl NetSvc
             Err(_) =>
                 self.counters.send_fails += 1
                 return Sent.Failed
-        let out: [u8] = @self.out
+        let out: [u8] = self.out_buf()
         match udp_frame_write(out, self.link, [0, 0, 0, 0, 0, 0], msg.src, msg.dst, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, buf[0..msg.len])
             Ok(len) => self.send_ip(hop, len, now)
             Err(_) =>
@@ -1097,7 +1083,7 @@ impl NetSvc
 
     # DHCP retransmits and lease timers, ARP retries and give-ups, then
     # ping deadlines.
-    fn tick(self: @&NetSvc, now: u64)
+    fn tick(self: @&NetSvc<N>, now: u64)
         let r = self.next_rand()
         let step = self.dhcp.tick(now, r)
         self.dhcp_apply(step, now)
@@ -1111,13 +1097,13 @@ impl NetSvc
 
     # Writer steps 1-4 of the address page (the T36 seqlock) for `lease`,
     # or the cleared record; NetPublish is netd's.
-    fn publish(self: @&NetSvc, lease: Option<DhcpLease>)
+    fn publish(self: @&NetSvc<N>, lease: Option<DhcpLease>)
         let rec = addr_record(lease)
         self.generation = addr_publish(self.addr_page, @rec)
         self.publish_due = true
 
     # xorshift32: the DHCP jitter and transaction ids. Not a secret.
-    fn next_rand(self: @&NetSvc) -> u32
+    fn next_rand(self: @&NetSvc<N>) -> u32
         var x = self.rand
         x = x ^ (x << 13)
         x = x ^ (x >> 17)

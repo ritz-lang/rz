@@ -1,0 +1,109 @@
+# Host tests of the loopback Nic (AGAST #4875): it keeps the ownership the
+# virtio-net Nic keeps, so netd's host tests on it mean what they say.
+
+import driver_abi.link { NetInfo, ETH_HEADER_LEN }
+import nic.nic { Nic, RxFrame, TxFrame }
+import nic.loopback { LoopNic, LOOP_CAP }
+
+var g_nic: LoopNic
+
+fn info() -> NetInfo
+    NetInfo { mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], link_up: 1, device_type: 1, mtu: 1500 }
+
+fn fresh(tx_limit: u32) -> @&LoopNic
+    g_nic.init(info(), tx_limit)
+    @&g_nic
+
+fn frame_of(n: i64, seed: u8) -> [60]u8
+    var f: [60]u8
+    for i in 0..60
+        f[i] = 0
+    for i in 0..n
+        f[i] = seed +% (i as u8)
+    f
+
+[[test]]
+fn test_an_injected_frame_is_polled_in_place_until_released() -> i32
+    let n = fresh(4)
+    let a: [60]u8 = frame_of(60, 1)
+    assert n.inject(@a)
+    let f: RxFrame = match n.rx_poll()
+        Some(x) => x
+        None => return 1
+    assert f.bytes.len == 60 and f.bytes[0] == 1 and f.bytes[59] == 60
+    assert n.rx_poll().is_none()
+    assert n.rx_out() == 1 and n.rx_waiting() == 1
+    n.rx_release(f)
+    assert n.rx_out() == 0 and n.rx_waiting() == 0 and n.released == 1
+    0
+
+[[test]]
+fn test_a_slot_is_not_reused_before_its_release() -> i32
+    let n = fresh(4)
+    let a: [60]u8 = frame_of(60, 1)
+    let b: [60]u8 = frame_of(60, 9)
+    n.inject(@a)
+    let fa: RxFrame = match n.rx_poll()
+        Some(x) => x
+        None => return 1
+    n.inject(@b)
+    let fb: RxFrame = match n.rx_poll()
+        Some(x) => x
+        None => return 2
+    assert fa.token != fb.token and fa.bytes[0] == 1 and fb.bytes[0] == 9
+    # Released out of order: both slots free once the older one is.
+    n.rx_release(fb)
+    assert n.rx_waiting() == 2
+    n.rx_release(fa)
+    assert n.rx_waiting() == 0
+    0
+
+[[test]]
+fn test_tx_buffer_is_none_with_every_buffer_out() -> i32
+    let n = fresh(2)
+    let t1: TxFrame = match n.tx_buffer()
+        Some(x) => x
+        None => return 1
+    let t2: TxFrame = match n.tx_buffer()
+        Some(x) => x
+        None => return 2
+    assert t1.token != t2.token
+    assert n.tx_buffer().is_none() and n.tx_held() == 2
+    for i in 0..60
+        t1.bytes[i] = 0x40 +% (i as u8)
+    n.tx_submit(t1, 60)
+    assert n.tx_buffer().is_none() and n.wire_count() == 1
+    # The wire takes it: that buffer is free again.
+    match n.wire_take()
+        Some(w) =>
+            assert w.len == 60 and w[0] == 0x40 and w[59] == 0x40 + 59
+        None => return 3
+    assert n.tx_buffer().is_some()
+    n.tx_submit(t2, ETH_HEADER_LEN - 1)
+    assert n.refused == 1 and n.wire_count() == 0
+    0
+
+[[test]]
+fn test_kick_counts_once_per_submit_batch() -> i32
+    let n = fresh(4)
+    n.tx_kick()
+    assert n.kicks == 0
+    for i in 0..3
+        match n.tx_buffer()
+            Some(t) => n.tx_submit(t, 60)
+            None => return 1
+    n.tx_kick()
+    n.tx_kick()
+    assert n.kicks == 1
+    n.irq_arm()
+    assert n.arms == 1 and n.link().mtu == 1500
+    0
+
+[[test]]
+fn test_inject_refuses_past_capacity() -> i32
+    let n = fresh(4)
+    let a: [60]u8 = frame_of(60, 1)
+    for i in 0..LOOP_CAP
+        assert n.inject(@a)
+    assert not n.inject(@a)
+    0

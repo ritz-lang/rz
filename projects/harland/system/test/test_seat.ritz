@@ -1,0 +1,263 @@
+# Host tests of netd's half of the frame seat (AGAST #4744, #4875; harland
+# docs/RING2_NET.md "Frame seat", "Drivers inside netd (D9)")
+#
+# src/seat.ritz on a loopback Nic and a frame region that is a host global.
+# The kernel seat's halves (the RX consumer, the TX producer) are
+# driver_abi.spsc halves in this process: before the handoff netd is the
+# NIC's driver for them, as /bin/virtio-net was; at the handoff its stack
+# takes what the kernel left on both rings.
+
+import driver_abi.frame_ring { FrameDesc, FRAME_RING_CAP, FRAME_RX_ARENA_OFF, FRAME_REGION_SIZE }
+import driver_abi.link { NetInfo }
+import driver_abi.spsc { SpscProducer, SpscConsumer, Publish, Take, FrameBytes, spsc_rx_ring, spsc_tx_ring }
+import nic.nic { Nic, RxFrame, TxFrame }
+import nic.loopback { LoopNic }
+import system.netsvc { NetSvc }
+import system.seat { FrameSeat, SeatPass, SeatDrain, seat_pump, seat_hand_over }
+
+const FRAME_HANDLE: u64 = 7
+
+var g_region: [FRAME_REGION_SIZE / 8]u64
+var g_page: [512]u64
+var g_seat: FrameSeat
+var g_svc: NetSvc<LoopNic>
+var g_got: FrameBytes
+
+fn info() -> NetInfo
+    NetInfo { mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], link_up: 1, device_type: 1, mtu: 1500 }
+
+fn region() -> u64
+    @g_region as u64
+
+# A zeroed region with netd's seat on it, and a loopback NIC with
+# `tx_limit` TX buffers (the NIC lives in the service, as in netd).
+fn fresh(tx_limit: u32) -> @&FrameSeat
+    for i in 0..FRAME_RX_ARENA_OFF / 8
+        g_region[i] = 0
+    for i in 0..512
+        g_page[i] = 0
+    g_svc.nic.init(info(), tx_limit)
+    g_seat.open(FRAME_HANDLE, region())
+    @&g_seat
+
+fn nic() -> @&LoopNic
+    @&g_svc.nic
+
+# The kernel seat's halves.
+fn kernel_rx() -> SpscConsumer
+    SpscConsumer.new(spsc_rx_ring(region()))
+
+fn kernel_tx() -> SpscProducer
+    SpscProducer.new(spsc_tx_ring(region()))
+
+fn takes(c: @&SpscConsumer, len: u32) -> bool
+    match c.next(@&g_got, 0, 1)
+        Take.Frame(n) => n == len
+        _ => false
+
+fn frame_of(n: i64, seed: u8) -> [60]u8
+    var f: [60]u8
+    for i in 0..60
+        f[i] = 0
+    for i in 0..n
+        f[i] = seed +% (i as u8)
+    f
+
+fn head(f: [u8], n: i64) -> [u8]
+    f[0..n]
+
+# ---------------------------------------------------------------------------
+# Before the handoff: the seat's driver
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_a_received_frame_goes_to_the_kernel_and_its_buffer_back() -> i32
+    let seat = fresh(4)
+    let a: [60]u8 = frame_of(42, 0x30)
+    nic().inject(head(@a, 42))
+    let p: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p.published == 1 and not p.full and p.closed.is_none()
+    assert nic().rx_waiting() == 0 and nic().released == 1
+    var k: SpscConsumer = kernel_rx()
+    assert takes(@&k, 42)
+    assert g_got[0] == 0x30 and g_got[41] == 0x30 + 41
+    assert nic().arms == 1
+    0
+
+# RING1_DRIVER.md section 6: a full RX ring does not drop the frame. It
+# stays the NIC's buffer, unreleased, and goes first once the kernel frees
+# a slot.
+[[test]]
+fn test_a_full_ring_keeps_the_frame_on_the_nic() -> i32
+    let seat = fresh(4)
+    let a: [60]u8 = frame_of(20, 1)
+    for i in 0..FRAME_RING_CAP
+        match seat.rx.publish(head(@a, 20))
+            Publish.Done => pass
+            _ => return 1
+    let b: [60]u8 = frame_of(30, 9)
+    nic().inject(head(@b, 30))
+    let p: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p.full and p.published == 0
+    assert nic().rx_out() == 1 and nic().released == 0
+    var k: SpscConsumer = kernel_rx()
+    assert takes(@&k, 20)
+    let p2: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p2.published == 1 and not p2.full and nic().released == 1
+    0
+
+[[test]]
+fn test_a_kernel_tx_slot_goes_to_the_device() -> i32
+    let seat = fresh(4)
+    var k: SpscProducer = kernel_tx()
+    let a: [60]u8 = frame_of(60, 0x40)
+    match k.publish(@a)
+        Publish.Done => pass
+        _ => return 1
+    let p: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p.sent == 1 and p.rejected == 0 and seat.tx.read == 1
+    assert nic().kicks == 1
+    match nic().wire_take()
+        Some(w) =>
+            assert w.len == 60 and w[0] == 0x40 and w[59] == 0x40 + 59
+        None => return 2
+    0
+
+# A TX slot with no free device buffer stays on the ring: not consumed,
+# not lost, sent after a completion.
+[[test]]
+fn test_a_tx_slot_waits_for_a_device_buffer() -> i32
+    let seat = fresh(1)
+    var k: SpscProducer = kernel_tx()
+    let a: [60]u8 = frame_of(60, 1)
+    let b: [60]u8 = frame_of(60, 2)
+    k.publish(@a)
+    k.publish(@b)
+    let p: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p.sent == 1 and seat.tx.read == 1
+    let p2: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p2.sent == 0 and seat.tx.read == 1
+    nic().wire_take()
+    let p3: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p3.sent == 1 and seat.tx.read == 2
+    match nic().wire_take()
+        Some(w) =>
+            assert w[0] == 2
+        None => return 1
+    0
+
+# A bad slot (its descriptor rewritten after publish) and a runt are
+# consumed without reaching the device; the buffer they took serves the
+# next good slot.
+[[test]]
+fn test_bad_tx_slots_are_rejected_and_keep_the_buffer() -> i32
+    let seat = fresh(1)
+    var k: SpscProducer = kernel_tx()
+    let a: [60]u8 = frame_of(60, 1)
+    k.publish(@a)
+    k.publish(head(@a, 10))
+    k.publish(@a)
+    let descs: *[256]FrameDesc = seat.tx.ring.descs
+    descs[0].flags = 1
+    let p: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p.sent == 1 and p.rejected == 2 and seat.tx.read == 3
+    assert nic().wire_count() == 1 and nic().tx_held() == 0
+    0
+
+[[test]]
+fn test_a_detached_seat_releases_what_it_receives() -> i32
+    let seat = fresh(4)
+    seat.attached = false
+    let a: [60]u8 = frame_of(30, 1)
+    nic().inject(head(@a, 30))
+    let p: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p.published == 0 and p.dropped == 1 and nic().released == 1
+    0
+
+# ---------------------------------------------------------------------------
+# The handoff
+# ---------------------------------------------------------------------------
+
+# The kernel seat ran on this region first: one frame each way while netd
+# waited in its ready NetPublish (its DHCPRELEASE, an RX frame it did not
+# consume), and one more frame on the NIC that a full ring would have left.
+# The stack sends the kernel's TX slot and reads both RX frames; the seat is
+# detached after.
+[[test]]
+fn test_the_handoff_sends_the_kernels_tx_and_reads_what_it_left() -> i32
+    let seat = fresh(4)
+    g_svc.init(@g_page as u64, 0x1234)
+    g_svc.ready(info())
+    var k_rx: SpscConsumer = kernel_rx()
+    var k_tx: SpscProducer = kernel_tx()
+    let a: [60]u8 = frame_of(60, 0x10)
+    # Two RX frames published; the kernel consumes one.
+    nic().inject(@a)
+    nic().inject(@a)
+    seat_pump<LoopNic>(seat, nic())
+    assert takes(@&k_rx, 60)
+    # The kernel's DHCPRELEASE, published and not yet sent.
+    let r: [60]u8 = frame_of(60, 0x77)
+    k_tx.publish(@r)
+    let rx_before = g_svc.counters.rx_frames
+    let d: SeatDrain = seat_hand_over<LoopNic>(seat, @&g_svc, k_rx.read, 0)
+    assert d.tx_sent == 1 and d.rx_frames == 1 and d.rejects == 0
+    assert g_svc.counters.rx_frames == rx_before + 1
+    assert not seat.attached
+    match nic().wire_take()
+        Some(w) =>
+            assert w.len == 60 and w[0] == 0x77
+        None => return 1
+    0
+
+# A frame a full ring left on the NIC goes through the stack at the handoff,
+# and its buffer goes back.
+[[test]]
+fn test_the_handoff_reads_the_frame_a_full_ring_held() -> i32
+    let seat = fresh(4)
+    g_svc.init(@g_page as u64, 0x1234)
+    g_svc.ready(info())
+    let a: [60]u8 = frame_of(20, 1)
+    for i in 0..FRAME_RING_CAP
+        seat.rx.publish(head(@a, 20))
+    nic().inject(head(@a, 20))
+    seat_pump<LoopNic>(seat, nic())
+    assert nic().rx_out() == 1
+    var k_rx: SpscConsumer = kernel_rx()
+    # The kernel consumed all it had: the held frame is the one left.
+    for i in 0..FRAME_RING_CAP
+        assert takes(@&k_rx, 20)
+    let rx_before = g_svc.counters.rx_frames
+    let d: SeatDrain = seat_hand_over<LoopNic>(seat, @&g_svc, k_rx.read, 0)
+    assert d.rx_frames == 1 and nic().rx_out() == 0 and nic().released == 1
+    # Through the stack, not only released.
+    assert g_svc.counters.rx_frames == rx_before + 1
+    0
+
+# A device buffer a rejected TX slot left on the seat goes to the stack at
+# the handoff (NetSvc.adopt_tx): with one TX buffer on the NIC, the stack's
+# next frame (link up's DHCPDISCOVER) can only go out in it, and is built
+# there, not copied in.
+[[test]]
+fn test_the_handoff_gives_the_held_tx_buffer_to_the_stack() -> i32
+    let seat = fresh(1)
+    g_svc.init(@g_page as u64, 0x1234)
+    g_svc.ready(info())
+    var k_tx: SpscProducer = kernel_tx()
+    let a: [60]u8 = frame_of(60, 1)
+    # A runt: rejected, and the buffer it took stays on the seat.
+    k_tx.publish(head(@a, 10))
+    let p: SeatPass = seat_pump<LoopNic>(seat, nic())
+    assert p.rejected == 1 and p.sent == 0
+    assert seat.held_tx.is_some() and nic().tx_held() == 1
+    var k_rx: SpscConsumer = kernel_rx()
+    let d: SeatDrain = seat_hand_over<LoopNic>(seat, @&g_svc, k_rx.read, 0)
+    assert d.tx_sent == 0 and d.rejects == 0
+    # The stack holds it now: not sent, not given back.
+    assert seat.held_tx.is_none() and nic().tx_held() == 1 and nic().refused == 0
+    let frames = g_svc.counters.tx_frames
+    let copies = g_svc.counters.tx_copies
+    g_svc.set_link(info(), 1)
+    assert g_svc.counters.tx_frames == frames + 1 and g_svc.counters.tx_copies == copies
+    assert nic().wire_count() == 1 and nic().refused == 0
+    0

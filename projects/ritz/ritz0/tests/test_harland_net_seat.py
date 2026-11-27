@@ -1,20 +1,21 @@
-"""The frame-seat handoff to /bin/netd (AGAST #4744, ring plan T38,
-harland docs/RING2_NET.md "Frame seat").
+"""The frame-seat handoff to /bin/netd (AGAST #4744, #4875, ring plan T38,
+harland docs/RING2_NET.md "Frame seat", "Drivers inside netd (D9)").
 
-On the translating boot, after the in-kernel self-test window, the kernel
-spawns /bin/netd at CPL 3 with the frame and address handles in its
-ServiceBoot record. netd's ready NetPublish commits the snapshot and then
-waits in the kernel while pid 1, still the seat, tries one DHCPRELEASE (no
-ARP wait, no second TX try), stops the stack (net_poll, ip_set_config,
-ip_set_dns), and registers netd as the frame object's only consumer and
-producer. netd returns from NetPublish, adopts the kernel's ring indexes
-and starts DHCP from idle. The kernel does not copy its lease.
+On the translating boot netd is already running (D9: spawned at step 2 as
+the NIC's driver, the seat's producer and consumer). After the in-kernel
+self-test window the kernel spawns nothing: it grants netd an address page
+with its ServiceBoot record and enqueues it as ATTACH. netd's ready
+NetPublish commits the snapshot and then waits in the kernel while pid 1,
+still the seat, tries one DHCPRELEASE (no ARP wait, no second TX try),
+stops the stack (net_poll, ip_set_config, ip_set_dns), and closes the seat.
+netd returns from NetPublish, drains what the kernel left on both rings
+through its own stack, revokes the frame object and starts DHCP from idle.
+The kernel does not copy its lease.
 
 The behaviour is tools/test_msix_boot.sh's vtd run (its verdicts are
-host-tested in projects/ritz/tools/test_ci_msix_boot.py); the ring index
-adoption is host-tested in driver_abi/test/test_spsc.ritz and
-system/test/test_netsvc.ritz. These checks pin the order and the guards
-that run can't observe.
+host-tested in projects/ritz/tools/test_ci_msix_boot.py); the drain is
+host-tested in driver_abi/test/test_spsc.ritz and system/test/test_seat.ritz.
+These checks pin the order and the guards that run can't observe.
 """
 
 import re
@@ -59,25 +60,27 @@ def test_the_handoff_runs_after_the_self_test_window_and_before_init():
 
 
 @pytest.mark.unit
-def test_only_a_ring1_boot_with_a_published_link_spawns_netd():
-    """D7: an untranslated boot keeps virtio_net_init and spawns no netd."""
+def test_only_a_ring1_boot_with_a_published_link_hands_the_seat_over():
+    """D7: an untranslated boot keeps virtio_net_init and has no netd; the
+    handoff is a no-op unless step 2's netd published its link."""
     body = _fn_body(_code(RING1), "net_seat_handoff")
     guard = body.index("ring1_pid == 0")
-    assert guard < body.index('process_spawn_program("/bin/netd")')
-    assert "ring_driver_published()" in body[: body.index('process_spawn_program("/bin/netd")')]
+    assert guard < body.index("netd_service_page(pid)")
+    assert "ring_driver_published()" in body[: body.index("netd_service_page(pid)")]
+    assert "process_spawn_program" not in body
 
 
 @pytest.mark.unit
-def test_netd_is_set_up_before_it_runs():
-    """Its address page is its first shared mapping (DRV_RING_BASE) and the
-    ServiceBoot record is written before pid 1 first yields to it."""
-    body = _fn_body(_code(RING1), "netd_grant_to")
-    _in_order(body, "cap_kernel_grant(", "net_service_page(", "net_service_boot(")
-    # The page and record are the replacement's setup too (#4745).
-    _in_order(_fn_body(_code(NET_RT), "net_service_page"), "cap_kernel_grant(", "shm_map(", "DRV_RING_BASE")
+def test_the_address_page_is_set_up_before_pid_1_yields():
+    """The page is granted, its ServiceBoot written and its ATTACH enqueued
+    before pid 1 first yields to netd for the ready publish; the same setup
+    serves a replacement (#4745)."""
+    body = _fn_body(_code(RING1), "netd_service_page")
+    _in_order(body, "net_service_page(", "net_service_boot(", "net_addr_register(", "net_service_attach_page(")
+    assert "cap_kernel_grant(" in _fn_body(_code(NET_RT), "net_service_page")
     assert "service_boot_at(" in _fn_body(_code(NET_RT), "net_service_boot")
     handoff = _fn_body(_code(RING1), "net_seat_handoff")
-    _in_order(handoff, 'process_spawn_program("/bin/netd")', "netd_grant_to(", "net_handoff_arm(", "sched_yield()")
+    _in_order(handoff, "netd_service_page(pid)", "net_handoff_arm(", "sched_yield()")
 
 
 @pytest.mark.unit
@@ -115,10 +118,11 @@ def test_the_kernel_stops_its_stack_and_copies_no_lease():
 
 
 @pytest.mark.unit
-def test_the_seat_switch_makes_netd_the_only_consumer():
+def test_the_seat_switch_leaves_netd_the_only_holder():
+    """D9: pid 1 drops its handle and nobody is registered as the frame
+    object's consumer; netd, the seat's driver, drains and revokes it."""
     body = _fn_body(_code(RING), "ring_seat_handoff")
-    _in_order(body, "seat_close()", "net_frame_register(")
-    assert "service_pid" in body.split("net_frame_register(")[1].split(")")[0]
+    _in_order(body, "seat_driver != service_pid", "seat_close()", "net_frame_register(0, 0)")
 
 
 @pytest.mark.unit
@@ -130,7 +134,8 @@ def test_netpublish_holds_only_the_armed_service_until_the_switch():
 
 
 @pytest.mark.unit
-def test_netd_adopts_the_seat_after_its_ready_publish():
-    body = _fn_body(_code(NETD), "bring_up")
-    _in_order(body, "g_svc.ready(", "net_publish(", "service_boot_at(DRV_RING_BASE)",
-              "g_svc.take_seat(seat.seat_rx_read, seat.seat_tx_write)", "g_svc.set_link(")
+def test_netd_drains_the_seat_after_its_ready_publish():
+    body = _fn_body(_code(NETD), "take_over")
+    _in_order(body, "g_svc.ready(", "net_publish(g_addr)", "service_boot_at(g_addr_va)",
+              "seat_hand_over<VirtioNic>(@&g_seat, @&g_svc, at.seat_rx_read", "cap_revoke(g_seat.handle)",
+              "g_svc.set_link(")

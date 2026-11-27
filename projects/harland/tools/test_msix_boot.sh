@@ -88,22 +88,24 @@
 #     SID", and the unit's record for it), a received frame lands in a
 #     granted IOVA of domain D above every RAM address ("device DMA"), and
 #     net_ring1_allowed holds ("ring-1 owner allowed ... the owner is
-#     /bin/virtio-net"). The pc run must give the NIC no domain and refuse
-#     a ring-1 owner.
+#     /bin/netd"). The pc run must give the NIC no domain and refuse a
+#     ring-1 owner.
 #
-# The cutover (AGAST #4735, docs/RING1_DRIVER.md sections 8-9): the vtd
-# boot translates DMA, so the NIC is owned by the ring-1 driver
-# /bin/virtio-net, not by virtio_net_init. The kernel probe isolates the
-# NIC (its domain and fault probe, above) and programs MSI-X at the BSP
-# but sets up no virtqueue; the driver negotiates bit 33, caps the RX
-# queue, allocates its rings and pools with DrvDmaAlloc and parks in
-# DrvIrqWait. So on the vtd run:
-#   - the kernel spawned it and it parked with generation 2 published
-#     ("[net-ring1] /bin/virtio-net pid P parked: generation 2 published")
-#     and the driver logged its own banner ("[virtio-net] up: MAC
-#     published"), and the in-kernel driver's banners ("[netdev]
-#     Registered VirtIO-net device", "[virtio-net] Initialization
-#     complete!") are absent: one owner per boot, never both;
+# The cutover (AGAST #4735, #4875, docs/RING1_DRIVER.md sections 8-9 and
+# PR 8, RING2_NET.md "Drivers inside netd (D9)"): the vtd boot translates
+# DMA, so the NIC is owned by /bin/netd, whose virtio-net driver is a
+# library, not by virtio_net_init. The kernel probe isolates the NIC (its
+# domain and fault probe, above) and programs MSI-X at the BSP but sets up
+# no virtqueue; netd negotiates bit 33, caps the RX queue, allocates its
+# rings and pools with DrvDmaAlloc and parks in DrvIrqWait. So on the vtd
+# run:
+#   - the kernel spawned netd and it parked with generation 2 published
+#     ("[net-ring1] /bin/netd pid P parked: generation 2 published"), no
+#     /bin/virtio-net was spawned, netd's NIC library logged its banner
+#     ("[virtio-net] up: MAC published"), and the in-kernel driver's
+#     banners ("[netdev] Registered VirtIO-net device", "[virtio-net]
+#     Initialization complete!") are absent: one owner per boot, never
+#     both;
 #   - DHCP, the TX burst and the MSI-X interrupt count hold through it;
 #   - the driver parked: "[msix] virtio-net driver parks: P" has P > 0
 #     instead of the in-kernel RX waits' halted > 0 (a park is not a hlt);
@@ -112,15 +114,16 @@
 #     0xI in domain D", and the driver's "[virtio-net] device DMA: B bytes
 #     received into granted IOVA I" inside one of them).
 # Then the frame-seat handoff (AGAST #4744): after the self-test window
-# the kernel spawns /bin/netd, tries one DHCPRELEASE and hands it the
-# seat ("[net] seat -> netd pid P"); netd runs DHCP itself and logs
-# "[netd] configured A" after that line. The pc run spawns no netd.
-# Then netd's death and restart (AGAST #4745): this ESP carries the
+# the kernel spawns nothing; it tries one DHCPRELEASE and hands the seat to
+# the netd it spawned at step 2 ("[net] seat -> netd pid P", the same P as
+# the "[net-ring1]" line); netd runs DHCP itself and logs "[netd]
+# configured A" after that line. The pc run spawns no netd.
+# Then netd's death and restart (AGAST #4745, #4875): this ESP carries the
 # \harland\netd-restart marker, so before init pid 1 kills each netd after
-# its lease. Each death leaves NetAddr NoDev and the driver detached; the
-# kernel restarts netd 250 ms, 500 ms and 1 s after the first three, each
-# replacement's frame object reaching the driver as ATTACH and the
-# replacement reaching configured again; the fourth spends the budget and
+# its lease. Each death resets the NIC first ("[quiesce] pid P status 0",
+# the reset read back) and leaves NetAddr NoDev; the kernel restarts netd
+# 250 ms, 500 ms and 1 s after the first three, the NIC coming back each
+# time ("[netd] configured A" again); the fourth spends the budget and
 # NetAddr stays NoDev ("[net-restart] ..." and "[net] netd restart ..."
 # lines). init's net-tool checks then see no service.
 # The pc run keeps the in-kernel driver and every check it had.
@@ -187,8 +190,8 @@ for p in "${OVMF_CODE/CODE/VARS}" /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVM
 done
 
 # Same packages as test_tier1_boot.sh, from the one list: init's suite
-# spawns them, and harland/system builds /bin/virtio-net, the vtd boot's
-# NIC owner (AGAST #4735). The vtd-shell boot's init_interactive and rzsh
+# spawns them, and harland/system builds /bin/netd, the vtd boot's NIC
+# owner (AGAST #4735, #4875). The vtd-shell boot's init_interactive and rzsh
 # come from the same list.
 USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
 [ -n "$USER_PKGS" ] || { echo "FAIL: no packages in $PROJECTS_DIR/indium/initramfs.pkgs"; exit 1; }
@@ -369,7 +372,7 @@ nic_dma_checks() {
             rc=1
         fi
     fi
-    if grep -aqF "[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), NIC isolated; the owner is /bin/virtio-net" "$SERIAL"; then
+    if grep -aqF "[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), NIC isolated; the owner is /bin/netd" "$SERIAL"; then
         echo "PASS: net_ring1_allowed: translation, remapping and blocked compatibility format read from the unit"
     else
         grep -a "\[nic-dma\] ring-1" "$SERIAL" | head -3
@@ -378,40 +381,51 @@ nic_dma_checks() {
     fi
 }
 
-# ring1_checks SERIAL: the ring-1 driver owns the NIC on the translating
-# boot, and the in-kernel driver does not (AGAST #4735); sets rc=1 on any
-# failure.
+# ring1_checks SERIAL: netd owns the NIC on the translating boot, with the
+# driver inside it, and neither /bin/virtio-net nor the in-kernel driver
+# runs (AGAST #4735, #4875); sets rc=1 on any failure and ring1_pid to
+# netd's pid.
 ring1_checks() {
-    local SERIAL="$1" parks
-    if grep -aqE "\[net-ring1\] /bin/virtio-net pid [0-9]+ parked: generation 2 published" "$SERIAL"; then
-        echo "PASS: the kernel spawned /bin/virtio-net and it parked with generation 2 published"
+    local SERIAL="$1" parks line
+    ring1_pid=""
+    line=$(grep -aoE "\[net-ring1\] /bin/netd pid [0-9]+ parked: generation 2 published" "$SERIAL" | head -1)
+    if [ -n "$line" ]; then
+        ring1_pid=$(echo "$line" | sed -nE 's/.*pid ([0-9]+) parked.*/\1/p')
+        echo "PASS: the kernel spawned /bin/netd (pid $ring1_pid) and it parked with generation 2 published"
     else
         grep -a "\[net-ring1\]" "$SERIAL" | head -3
-        echo "FAIL: /bin/virtio-net was not spawned, or did not park with generation 2 published"
+        echo "FAIL: /bin/netd was not spawned, or did not park with generation 2 published"
         rc=1
     fi
+    if grep -aqF "/bin/virtio-net" "$SERIAL"; then
+        grep -aF "/bin/virtio-net" "$SERIAL" | head -3
+        echo "FAIL: the log names /bin/virtio-net: under D9 the driver is a library in netd"
+        rc=1
+    else
+        echo "PASS: no /bin/virtio-net: the driver is netd's library"
+    fi
     if grep -aqF "[virtio-net] up: MAC published" "$SERIAL"; then
-        echo "PASS: the ring-1 driver brought the NIC up"
+        echo "PASS: netd's NIC library brought the NIC up"
     else
         grep -a "\[virtio-net\]" "$SERIAL" | head -3
-        echo "FAIL: no \"[virtio-net] up: MAC published\" from the ring-1 driver"
+        echo "FAIL: no \"[virtio-net] up: MAC published\" from netd's NIC library"
         rc=1
     fi
     if grep -aqE "\[netdev\] Registered VirtIO-net device|\[virtio-net\] Initialization complete!" "$SERIAL"; then
-        echo "FAIL: the in-kernel virtio-net driver ran beside the ring-1 driver: one owner per boot"
+        echo "FAIL: the in-kernel virtio-net driver ran beside netd: one owner per boot"
         rc=1
     else
-        echo "PASS: virtio_net_init did not run: the ring-1 driver is the NIC's only owner"
+        echo "PASS: virtio_net_init did not run: netd is the NIC's only owner"
     fi
     parks=$(grep -aoE "\[msix\] virtio-net driver parks: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*parks: ([0-9]+)$/\1/p')
     if [ -z "$parks" ]; then
-        echo "FAIL: no ring-1 driver park count logged ([msix] virtio-net driver parks: P)"
+        echo "FAIL: no NIC owner park count logged ([msix] virtio-net driver parks: P)"
         rc=1
     elif [ "$parks" -eq 0 ]; then
-        echo "FAIL: the ring-1 driver never parked in DrvIrqWait: it spins"
+        echo "FAIL: netd never parked in DrvIrqWait: it spins"
         rc=1
     else
-        echo "PASS: the ring-1 driver parked $parks times in DrvIrqWait"
+        echo "PASS: netd parked $parks times in DrvIrqWait"
     fi
 }
 
@@ -441,6 +455,15 @@ seat_checks() {
     fi
     seat_pid=$(echo "$seat_line" | sed -nE 's/.*netd pid ([0-9]+).*/\1/p')
     echo "PASS: the kernel handed the frame seat to /bin/netd (pid $seat_pid)"
+    # D9: the handoff spawns nothing; the seat goes to the netd of step 2.
+    if [ -n "${ring1_pid:-}" ]; then
+        if [ "$seat_pid" = "$ring1_pid" ]; then
+            echo "PASS: the seat went to the netd the kernel spawned at boot (pid $seat_pid): no second spawn"
+        else
+            echo "FAIL: the seat went to pid $seat_pid, not the netd spawned at boot (pid $ring1_pid)"
+            rc=1
+        fi
+    fi
     addr=$(tail -n +"${seat_line%%:*}" "$SERIAL" | grep -aoE "\[netd\] configured [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1 | sed -nE 's/.*configured //p')
     if [ -n "$addr" ]; then
         echo "PASS: netd configured $addr itself, after the handoff"
@@ -453,14 +476,15 @@ seat_checks() {
 
 # restart_checks SERIAL: netd's death and restart on the translating boot
 # (AGAST #4745, docs/RING2_NET.md "Frame seat", "Service binary and
-# respawn"). Pid 1 killed netd four times, each after its lease, and saw
-# NetAddr NoDev after each death; the driver detached each frame object and
-# mapped each of the three replacements; restart N came after its backoff
-# (250 ms, 500 ms, 1 s) and its netd logged a lease before the next kill;
-# the kernel logged the spent budget and NetAddr stayed NoDev. Sets rc=1 on
-# any failure.
+# respawn", "Drivers inside netd (D9)"). Pid 1 killed netd four times,
+# each after its lease, and saw NetAddr NoDev after each death; each death
+# reset the NIC ("[quiesce] pid P status 0" for the killed pid, before the
+# restart's backoff line); restart N came after its backoff (250 ms, 500
+# ms, 1 s) and its netd logged a lease before the next kill, so the NIC came
+# back three times; the kernel logged the spent budget and NetAddr stayed
+# NoDev. Sets rc=1 on any failure.
 restart_checks() {
-    local SERIAL="$1" kills nodev attaches detaches n ms line next_kill lease
+    local SERIAL="$1" kills nodev n ms line next_kill lease pid kill_line quiesce backoff
     if grep -aqF "[net-restart] FAIL" "$SERIAL"; then
         grep -aF "[net-restart] FAIL" "$SERIAL" | head -3
         echo "FAIL: the netd restart test reported [net-restart] FAIL"
@@ -479,15 +503,31 @@ restart_checks() {
         echo "FAIL: NetAddr answered NoDev after $nodev of netd's 4 deaths"
         rc=1
     fi
-    detaches=$(grep -acF "[virtio-net] PEER_CLOSE: frame object detached" "$SERIAL")
-    attaches=$(grep -acF "[virtio-net] ATTACH: frame object mapped, both indexes at 0" "$SERIAL")
-    if [ "$detaches" = 4 ] && [ "$attaches" = 3 ]; then
-        echo "PASS: the driver detached 4 times and mapped 3 replacement frame objects"
-    else
-        [ "$detaches" != 4 ] && echo "FAIL: the driver detached $detaches times, not 4 (PEER_CLOSE on each netd's frame object)"
-        [ "$attaches" != 3 ] && echo "FAIL: the driver mapped $attaches replacement frame objects, not 3 (ATTACH)"
-        rc=1
-    fi
+    # Each kill's NIC reset: the killed pid's quiesce read status 0 back,
+    # after the kill and before that death's restart line.
+    n=0
+    while IFS= read -r kill_line; do
+        n=$((n + 1))
+        pid=$(echo "$kill_line" | sed -nE 's/.*killing netd pid ([0-9]+).*/\1/p')
+        quiesce=$(tail -n +"${kill_line%%:*}" "$SERIAL" | grep -anF "[quiesce] pid $pid status " | head -1)
+        if [ "$n" -le 3 ]; then
+            backoff=$(tail -n +"${kill_line%%:*}" "$SERIAL" | grep -anF "[net] netd restart $n of 3" | head -1 | cut -d: -f1)
+        else
+            backoff=$(tail -n +"${kill_line%%:*}" "$SERIAL" | grep -anF "[net] netd restart budget spent" | head -1 | cut -d: -f1)
+        fi
+        if [ -z "$quiesce" ]; then
+            echo "FAIL: netd pid $pid's death (kill $n) did not quiesce the NIC"
+            rc=1
+        elif ! echo "$quiesce" | grep -qE "status 0$"; then
+            echo "FAIL: netd pid $pid's NIC reset did not read back 0 (${quiesce#*:})"
+            rc=1
+        elif [ -n "$backoff" ] && [ "${quiesce%%:*}" -gt "$backoff" ]; then
+            echo "FAIL: netd pid $pid's NIC reset came after its restart line"
+            rc=1
+        else
+            echo "PASS: netd pid $pid's death reset the NIC (status read back 0) before its restart"
+        fi
+    done < <(grep -anF "[net-restart] killing netd pid" "$SERIAL")
     for n in 1 2 3; do
         ms=$((250 << (n - 1)))
         if ! grep -aqF "[net] netd restart $n of 3 in $ms ms" "$SERIAL"; then
@@ -505,7 +545,7 @@ restart_checks() {
         next_kill=$(tail -n +"$line" "$SERIAL" | grep -anF "[net-restart] killing netd pid" | head -1 | cut -d: -f1)
         lease=$(tail -n +"$line" "$SERIAL" | grep -anE "\[netd\] configured [0-9.]+" | head -1 | cut -d: -f1)
         if [ -n "$lease" ] && { [ -z "$next_kill" ] || [ "$lease" -lt "$next_kill" ]; }; then
-            echo "PASS: netd restart $n after $ms ms reached configured again"
+            echo "PASS: netd restart $n after $ms ms reached configured again: the NIC came back"
         else
             echo "FAIL: netd restart $n did not reach configured ([netd] configured A) before it was killed"
             rc=1
@@ -797,6 +837,8 @@ net_shell_boot() {
         rc=1
     fi
     pml4_free_check "$log"
+    # This boot's own netd: the vtd boot's pid is not this one's.
+    ring1_pid=$(grep -aoE "\[net-ring1\] /bin/netd pid [0-9]+ parked" "$log" | head -1 | sed -nE 's/.*pid ([0-9]+) parked.*/\1/p')
     seat_checks "$log"
 }
 

@@ -1,0 +1,457 @@
+# Host tests of the virtio-net Nic (AGAST #4734, #4875; harland
+# docs/RING1_DRIVER.md sections 6-8, docs/RING2_NET.md "Drivers inside netd
+# (D9)")
+#
+# src/virtio.ritz against a "device" that is plain memory: both queues'
+# rings and both buffer pools are host globals, and the device's writes are
+# stores to an RX buffer and to the used ring. The NIC has no registers
+# mapped here (VirtioNic.layout, not VirtioNic.up), so its doorbells are
+# counted and not written. The IOVAs are arbitrary numbers distinct from
+# the CPU addresses, so a mix-up of the two names no buffer.
+
+import driver_abi.boot { DriverBoot, DriverWindow, DRIVER_BOOT_MAGIC, VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_NOTIFY, VIRTIO_WINDOW_ISR, VIRTIO_WINDOW_DEVICE }
+import driver_abi.frame_ring { FRAME_MAX }
+import driver_abi.link { NetInfo, NETINFO_MTU_MAX, NETDEV_TYPE_VIRTIO, ETH_HEADER_LEN }
+import virtio_abi.virtq { Virtqueue, VringDesc, VringUsed, VringAvail, vq_get_desc }
+import nic.nic { Nic, RxFrame, TxFrame }
+import nic.virtio { VirtioNic, VirtioDma, DmaRun, Pool, RxBad, BootBad, BootWindows, VNET_HDR_LEGACY, VNET_HDR_V1, VNET_BUF_SIZE, RX_BUFFERS, TX_BUFFERS, vnet_hdr_len, rx_frame, net_info, boot_windows, pool_index_of, pool_buf_iova, pool_bytes }
+
+# ---------------------------------------------------------------------------
+# The fake device
+# ---------------------------------------------------------------------------
+
+const QNUM: u16 = 64
+const RX_RING_IOVA: u64 = 0x10000000
+const TX_RING_IOVA: u64 = 0x10010000
+const RX_POOL_IOVA: u64 = 0x20000000
+const TX_POOL_IOVA: u64 = 0x30000000
+
+# Ring memory for two QNUM queues (two pages each is plenty), u64s so it
+# is 8-aligned; and the pools.
+var g_rx_ring: [2 * 4096 / 8]u64
+var g_tx_ring: [2 * 4096 / 8]u64
+var g_rx_pool: [32 * 2112 / 8]u64
+var g_tx_pool: [32 * 2112 / 8]u64
+var g_nic: VirtioNic
+
+fn mac() -> [6]u8
+    [0x52, 0x54, 0, 0x12, 0x34, 0x56]
+
+# A NIC over zeroed rings, every RX buffer posted.
+fn fresh() -> @&VirtioNic
+    for i in 0..2 * 4096 / 8
+        g_rx_ring[i] = 0
+        g_tx_ring[i] = 0
+    let dma = VirtioDma { rx_ring: DmaRun { virt: @g_rx_ring as u64, iova: RX_RING_IOVA }, tx_ring: DmaRun { virt: @g_tx_ring as u64, iova: TX_RING_IOVA }, rx_pool: DmaRun { virt: @g_rx_pool as u64, iova: RX_POOL_IOVA }, tx_pool: DmaRun { virt: @g_tx_pool as u64, iova: TX_POOL_IOVA } }
+    g_nic.layout(dma, QNUM, QNUM, net_info(mac(), true, None))
+    @&g_nic
+
+# The device receives `frame` into the buffer descriptor `d` names (after
+# a header of 0xEE bytes) and returns `d` with that length.
+fn device_receive(n: @&VirtioNic, d: u16, frame: [u8])
+    let desc: *VringDesc = vq_get_desc(@n.q.rx, d)
+    let virt: u64 = n.q.rx_pool.virt + (desc.addr - n.q.rx_pool.iova)
+    for i in 0..VNET_HDR_V1 as u64
+        *((virt + i) as *u8) = 0xEE
+    for i in 0..frame.len
+        *((virt + VNET_HDR_V1 as u64 + i as u64) as *u8) = frame[i]
+    device_return(@n.q.rx, d as u32, VNET_HDR_V1 + frame.len as u32)
+
+fn device_return(vq: *Virtqueue, id: u32, len: u32)
+    let used: *VringUsed = vq.used
+    let slot: u16 = used.idx % vq.num
+    used.ring[slot].id = id
+    used.ring[slot].len = len
+    used.idx = used.idx +% 1
+
+# The descriptor head the driver last made available on `vq`.
+fn last_avail(vq: *Virtqueue) -> u16
+    let avail: *VringAvail = vq.avail
+    avail.ring[(avail.idx -% 1) % vq.num]
+
+fn avail_idx(vq: *Virtqueue) -> u16
+    let avail: *VringAvail = vq.avail
+    avail.idx
+
+# The next frame, or one with no bytes and token NONE when there is none.
+const NONE: u32 = 0xFFFFFFFF
+
+fn must_rx(n: @&VirtioNic) -> RxFrame
+    match n.rx_poll()
+        Some(f) => f
+        None =>
+            let none: [u8] = @g_empty
+            RxFrame { bytes: none[0..0], token: NONE }
+
+fn must_tx(n: @&VirtioNic) -> TxFrame
+    match n.tx_buffer()
+        Some(t) => t
+        None =>
+            let none: [u8] = @g_empty
+            TxFrame { bytes: none[0..0], token: NONE }
+
+var g_empty: [1]u8
+
+# The first n bytes of f.
+fn head(f: [u8], n: i64) -> [u8]
+    f[0..n]
+
+fn frame_of(n: i64, seed: u8) -> [60]u8
+    var f: [60]u8
+    for i in 0..60
+        f[i] = 0
+    for i in 0..n
+        f[i] = seed +% (i as u8)
+    f
+
+# ---------------------------------------------------------------------------
+# The header and the buffers
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_header_length_follows_version_1() -> i32
+    assert vnet_hdr_len(true) == VNET_HDR_V1 and VNET_HDR_V1 == 12
+    assert vnet_hdr_len(false) == VNET_HDR_LEGACY and VNET_HDR_LEGACY == 10
+    # A whole frame slot fits behind the larger header.
+    assert VNET_BUF_SIZE >= FRAME_MAX + VNET_HDR_V1 as u64
+    assert pool_bytes(32) == 32 * VNET_BUF_SIZE
+    0
+
+[[test]]
+fn test_pool_index_names_only_buffer_starts() -> i32
+    let p: Pool = Pool { virt: 0x5000, iova: 0x9000, count: 4 }
+    assert pool_buf_iova(p, 3) == 0x9000 + 3 * VNET_BUF_SIZE
+    assert pool_index_of(p, 0x9000).unwrap_or(99) == 0
+    assert pool_index_of(p, 0x9000 + 3 * VNET_BUF_SIZE).unwrap_or(99) == 3
+    assert pool_index_of(p, 0x9000 + 4 * VNET_BUF_SIZE).is_none()
+    assert pool_index_of(p, 0x9000 + 1).is_none()
+    assert pool_index_of(p, 0x8000).is_none()
+    # The CPU's address is not the device's.
+    assert pool_index_of(p, 0x5000).is_none()
+    0
+
+# ---------------------------------------------------------------------------
+# RX: the header strip
+# ---------------------------------------------------------------------------
+
+fn is_rx_bad(r: Result<[u8], RxBad>, want: RxBad) -> bool
+    match r
+        Ok(_) => false
+        Err(w) => w == want
+
+[[test]]
+fn test_rx_frame_strips_the_header() -> i32
+    var buf: [64]u8
+    for i in 0..64
+        buf[i] = i as u8
+    match rx_frame(@buf, 12 + 20, 12)
+        Ok(f) =>
+            assert f.len == 20
+            assert f[0] == 12 and f[19] == 31
+        Err(_) => return 1
+    # The legacy header is 10 bytes.
+    match rx_frame(@buf, 10 + 5, 10)
+        Ok(f) =>
+            assert f.len == 5 and f[0] == 10
+        Err(_) => return 2
+    0
+
+[[test]]
+fn test_rx_frame_refuses_short_and_overlong() -> i32
+    var buf: [64]u8
+    assert is_rx_bad(rx_frame(@buf, 12, 12), RxBad.Short)
+    assert is_rx_bad(rx_frame(@buf, 0, 12), RxBad.Short)
+    assert is_rx_bad(rx_frame(@buf, 65, 12), RxBad.Overlong)
+    var big: [2112]u8
+    # Fits the buffer, but the frame is longer than a frame slot.
+    assert is_rx_bad(rx_frame(@big, 12 + 2049, 12), RxBad.Overlong)
+    match rx_frame(@big, 12 + 2048, 12)
+        Ok(f) =>
+            assert f.len == 2048
+        Err(_) => return 1
+    0
+
+# ---------------------------------------------------------------------------
+# The link record and the boot record
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_net_info_clamps_the_mtu() -> i32
+    let m: [6]u8 = mac()
+    let a: NetInfo = net_info(m, true, None)
+    assert a.mtu == 1500 and a.link_up == 1 and a.device_type == NETDEV_TYPE_VIRTIO
+    assert a.mac[0] == 0x52 and a.mac[5] == 0x56
+    let b: NetInfo = net_info(m, false, Some(9000))
+    assert b.mtu == NETINFO_MTU_MAX and b.link_up == 0
+    assert net_info(m, true, Some(1400)).mtu == 1400
+    0
+
+# Without registers the link is the record layout stored: the MAC, up.
+[[test]]
+fn test_link_is_the_stored_record_without_registers() -> i32
+    let n = fresh()
+    let info: NetInfo = n.link()
+    assert info.mac[0] == 0x52 and info.mac[5] == 0x56
+    assert info.link_up == 1 and info.mtu == 1500 and info.device_type == NETDEV_TYPE_VIRTIO
+    0
+
+fn boot_record() -> DriverBoot
+    var b: DriverBoot
+    b.magic = DRIVER_BOOT_MAGIC
+    b.window_count = 4
+    let kinds: [4]u8 = [VIRTIO_WINDOW_ISR, VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_DEVICE, VIRTIO_WINDOW_NOTIFY]
+    for i in 0..4
+        b.windows[i].handle = 0x100000000 + i as u64
+        b.windows[i].offset = 0x100 * i as u32
+        b.windows[i].length = 0x40
+        b.windows[i].notify_multiplier = 0
+        b.windows[i].cfg_type = kinds[i]
+    b
+
+fn is_boot_bad(r: Result<BootWindows, BootBad>, want: BootBad) -> bool
+    match r
+        Ok(_) => false
+        Err(w) => w == want
+
+[[test]]
+fn test_boot_windows_picks_each_kind() -> i32
+    match boot_windows(boot_record())
+        Ok(w) =>
+            assert w.common == 1 and w.notify == 3
+            assert w.isr.unwrap_or(9) == 0 and w.device.unwrap_or(9) == 2
+        Err(_) => return 1
+    0
+
+[[test]]
+fn test_boot_windows_refuses_bad_records() -> i32
+    var b: DriverBoot = boot_record()
+    b.magic = 0
+    assert is_boot_bad(boot_windows(b), BootBad.Magic)
+    b = boot_record()
+    b.window_count = 9
+    assert is_boot_bad(boot_windows(b), BootBad.Count)
+    b = boot_record()
+    b.windows[2].offset = 4096
+    assert is_boot_bad(boot_windows(b), BootBad.Window)
+    b = boot_record()
+    b.windows[0].length = 0
+    assert is_boot_bad(boot_windows(b), BootBad.Window)
+    # No notify window, or no windows at all: a legacy-only device.
+    b = boot_record()
+    b.window_count = 3
+    assert is_boot_bad(boot_windows(b), BootBad.Legacy)
+    b = boot_record()
+    b.window_count = 0
+    assert is_boot_bad(boot_windows(b), BootBad.Legacy)
+    0
+
+# ---------------------------------------------------------------------------
+# RX: rx_poll and rx_release
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_layout_posts_every_rx_buffer() -> i32
+    let n = fresh()
+    assert avail_idx(@n.q.rx) == RX_BUFFERS as u16
+    # Every descriptor names its own buffer, device-writable, whole.
+    for d in 0..RX_BUFFERS
+        let desc: *VringDesc = vq_get_desc(@n.q.rx, d as u16)
+        assert desc.addr == pool_buf_iova(n.q.rx_pool, d)
+        assert desc.len as u64 == VNET_BUF_SIZE and desc.flags == 2
+    # Posted, so the first kick notifies the RX queue.
+    n.tx_kick()
+    assert n.rx_kicks == 1 and n.tx_kicks == 0
+    0
+
+[[test]]
+fn test_rx_poll_hands_out_the_frame_in_the_device_buffer() -> i32
+    let n = fresh()
+    let frame: [60]u8 = frame_of(42, 0x30)
+    device_receive(n, 5, head(@frame, 42))
+    let f: RxFrame = match n.rx_poll()
+        Some(x) => x
+        None => return 1
+    assert f.bytes.len == 42 and f.bytes[0] == 0x30 and f.bytes[41] == 0x30 + 41
+    # No copy: the bytes are the RX buffer's, past the header.
+    assert f.bytes.ptr as u64 == pool_buf_iova(n.q.rx_pool, 5) - RX_POOL_IOVA + n.q.rx_pool.virt + VNET_HDR_V1 as u64
+    # Nothing more.
+    assert n.rx_poll().is_none()
+    n.rx_release(f)
+    0
+
+# RING2_NET.md (D9): the device does not write a used buffer again until
+# the driver makes it available, so the buffer stays netd's until
+# rx_release; only then is it reposted, on the same descriptor.
+[[test]]
+fn test_a_buffer_is_not_reposted_before_its_release() -> i32
+    let n = fresh()
+    n.tx_kick()
+    let frame: [60]u8 = frame_of(42, 0x30)
+    device_receive(n, 5, head(@frame, 42))
+    let f: RxFrame = match n.rx_poll()
+        Some(x) => x
+        None => return 1
+    assert avail_idx(@n.q.rx) == RX_BUFFERS as u16
+    n.tx_kick()
+    assert n.rx_kicks == 1
+    n.rx_release(f)
+    assert avail_idx(@n.q.rx) == RX_BUFFERS as u16 + 1 and last_avail(@n.q.rx) == 5
+    let desc: *VringDesc = vq_get_desc(@n.q.rx, 5)
+    assert desc.addr == pool_buf_iova(n.q.rx_pool, 5) and desc.len as u64 == VNET_BUF_SIZE
+    # The repost is kicked once, with the next pass's doorbell.
+    n.tx_kick()
+    n.tx_kick()
+    assert n.rx_kicks == 2
+    0
+
+# Two frames out at once; each release reposts its own buffer.
+[[test]]
+fn test_frames_are_released_independently() -> i32
+    let n = fresh()
+    let a: [60]u8 = frame_of(20, 1)
+    let b: [60]u8 = frame_of(30, 2)
+    device_receive(n, 7, head(@a, 20))
+    device_receive(n, 9, head(@b, 30))
+    let fa: RxFrame = must_rx(n)
+    let fb: RxFrame = must_rx(n)
+    assert fa.bytes.len == 20 and fb.bytes.len == 30 and fb.bytes[0] == 2
+    n.rx_release(fb)
+    assert last_avail(@n.q.rx) == 9
+    n.rx_release(fa)
+    assert last_avail(@n.q.rx) == 7 and avail_idx(@n.q.rx) == RX_BUFFERS as u16 + 2
+    0
+
+# AGAST #4735: the first frame names the buffer's IOVA, the device's address
+# of it, and the frame's length; a drop does not.
+[[test]]
+fn test_the_first_frame_names_its_iova() -> i32
+    let n = fresh()
+    assert n.first_rx_len == 0
+    device_return(@n.q.rx, 2, VNET_HDR_V1)
+    let a: [60]u8 = frame_of(42, 0x30)
+    device_receive(n, 7, head(@a, 42))
+    let b: [60]u8 = frame_of(60, 0x10)
+    device_receive(n, 9, head(@b, 60))
+    let fa: RxFrame = must_rx(n)
+    let fb: RxFrame = must_rx(n)
+    assert n.first_rx_iova == pool_buf_iova(n.q.rx_pool, 7) and n.first_rx_len == 42
+    n.rx_release(fa)
+    n.rx_release(fb)
+    0
+
+[[test]]
+fn test_bad_completions_are_dropped_and_reposted() -> i32
+    let n = fresh()
+    # Header only; an id past the queue; a descriptor rewritten to name no
+    # buffer. Only the first is reposted: the others name no buffer.
+    device_return(@n.q.rx, 3, VNET_HDR_V1)
+    device_return(@n.q.rx, QNUM as u32 + 1, 100)
+    vq_get_desc(@n.q.rx, 4).addr = RX_POOL_IOVA + 1
+    device_return(@n.q.rx, 4, 100)
+    assert n.rx_poll().is_none()
+    assert n.rx_dropped == 3
+    assert avail_idx(@n.q.rx) == RX_BUFFERS as u16 + 1 and last_avail(@n.q.rx) == 3
+    0
+
+# ---------------------------------------------------------------------------
+# TX: tx_buffer, tx_submit, tx_kick
+# ---------------------------------------------------------------------------
+
+fn tx_desc_bytes(n: @&VirtioNic, d: u16) -> u64
+    let desc: *VringDesc = vq_get_desc(@n.q.tx, d)
+    n.q.tx_pool.virt + (desc.addr - n.q.tx_pool.iova)
+
+[[test]]
+fn test_tx_submit_queues_the_frame_behind_a_zero_header() -> i32
+    let n = fresh()
+    let t: TxFrame = match n.tx_buffer()
+        Some(x) => x
+        None => return 1
+    # The stack builds in place, past the header's room.
+    assert t.bytes.len as u64 == VNET_BUF_SIZE - VNET_HDR_V1 as u64
+    for i in 0..60
+        t.bytes[i] = 0x40 +% (i as u8)
+    let start: u64 = t.bytes.ptr as u64
+    # A dirty header: tx_submit writes it.
+    for i in 1..VNET_HDR_V1 as u64 + 1
+        *((start - i) as *u8) = 0xAA
+    n.tx_submit(t, 60)
+    assert avail_idx(@n.q.tx) == 1
+    let d: u16 = last_avail(@n.q.tx)
+    let desc: *VringDesc = vq_get_desc(@n.q.tx, d)
+    assert desc.len == 72 and desc.flags == 0
+    assert pool_index_of(n.q.tx_pool, desc.addr).is_some()
+    let virt: u64 = tx_desc_bytes(n, d)
+    assert virt + VNET_HDR_V1 as u64 == start
+    for i in 0..12 as u64
+        assert *((virt + i) as *u8) == 0
+    assert *((virt + 12) as *u8) == 0x40 and *((virt + 71) as *u8) == 0x40 + 59
+    # One doorbell for everything submitted: the RX queue's first post and
+    # this send, then nothing until the next submit.
+    n.tx_kick()
+    assert n.tx_kicks == 1
+    n.tx_kick()
+    assert n.tx_kicks == 1
+    0
+
+[[test]]
+fn test_a_runt_or_overlong_submit_gives_the_buffer_back() -> i32
+    let n = fresh()
+    let t: TxFrame = must_tx(n)
+    n.tx_submit(t, ETH_HEADER_LEN - 1)
+    let u: TxFrame = must_tx(n)
+    n.tx_submit(u, u.bytes.len as u32 + 1)
+    assert avail_idx(@n.q.tx) == 0 and n.tx_refused == 2
+    # Both buffers and descriptors are free again.
+    assert n.q.tx.free_count == QNUM
+    n.tx_kick()
+    assert n.tx_kicks == 0
+    0
+
+# The PR 8 test: with every buffer in flight tx_buffer is None, and a
+# completion gives one back (AGAST #4073: busy until the used ring).
+[[test]]
+fn test_tx_buffer_is_none_with_every_buffer_in_flight() -> i32
+    let n = fresh()
+    for i in 0..TX_BUFFERS
+        let t: TxFrame = match n.tx_buffer()
+            Some(x) => x
+            None => return 1
+        n.tx_submit(t, 60)
+    assert n.tx_buffer().is_none()
+    assert avail_idx(@n.q.tx) == TX_BUFFERS as u16
+    # The device returns the first descriptor: one buffer is free again.
+    let first: u16 = (*n.q.tx.avail).ring[0]
+    device_return(@n.q.tx, first as u32, 72)
+    let again: TxFrame = match n.tx_buffer()
+        Some(x) => x
+        None => return 2
+    assert n.tx_buffer().is_none()
+    n.tx_submit(again, 60)
+    0
+
+# A buffer handed out and not yet submitted is not handed out again.
+[[test]]
+fn test_an_unsubmitted_buffer_is_not_handed_out_twice() -> i32
+    let n = fresh()
+    var held: [32]u64
+    for i in 0..TX_BUFFERS
+        let t: TxFrame = match n.tx_buffer()
+            Some(x) => x
+            None => return 1
+        held[i] = t.bytes.ptr as u64
+        for j in 0..i
+            assert held[j] != held[i]
+    assert n.tx_buffer().is_none()
+    0
+
+[[test]]
+fn test_irq_arm_asks_for_every_completion() -> i32
+    let n = fresh()
+    let rx_avail: *VringAvail = n.q.rx.avail
+    let tx_avail: *VringAvail = n.q.tx.avail
+    rx_avail.flags = 1
+    tx_avail.flags = 1
+    n.irq_arm()
+    assert rx_avail.flags == 0 and tx_avail.flags == 0
+    0

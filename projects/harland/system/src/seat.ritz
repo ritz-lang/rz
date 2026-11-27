@@ -1,0 +1,188 @@
+# netd's half of the frame seat (AGAST #4744, #4875; docs/RING2_NET.md
+# "Frame seat", "Drivers inside netd (D9)", RING1_DRIVER.md section 6)
+#
+# Until the handoff the kernel's stack is the NIC's user: pid 1 consumes RX
+# and produces TX on the frame object, and netd runs the other halves, the
+# loop /bin/virtio-net ran before D9. seat_pump moves every received frame
+# onto the RX ring (header already stripped by the Nic) and every TX slot
+# to the device, validated on one private copy. A full RX ring keeps the
+# frame on the NIC (held_rx, not released) and the caller yields; a TX slot
+# with no free device buffer stays on the ring until a completion.
+#
+# At the handoff netd's stack takes over (seat_hand_over): it sends every
+# TX slot the kernel published, the DHCPRELEASE included, and passes every
+# RX slot the kernel did not consume through the stack. Then netd revokes
+# the frame object, and from then on the stack calls the Nic directly.
+#
+# Nothing here is a syscall: netd adds the DATA notify, the Yield and the
+# CapRevoke, and test/test_seat.ritz drives this file on a loopback Nic.
+
+import driver_abi.link { ETH_HEADER_LEN }
+import driver_abi.spsc { SpscProducer, SpscConsumer, SpscClose, Publish, Poll, Take, FrameBytes, spsc_rx_ring, spsc_tx_ring }
+import nic.nic { Nic, RxFrame, TxFrame }
+import system.netsvc { NetSvc }
+import ritzlib.span
+
+# The frame object netd's seat half runs on: RX producer, TX consumer.
+pub struct FrameSeat
+    attached: bool
+    handle: u64
+    rx: SpscProducer
+    tx: SpscConsumer
+    # A received frame the full RX ring did not take: still the NIC's
+    # buffer, published first on the next pass.
+    held_rx: Option<RxFrame>
+    # A device buffer no valid TX slot filled yet.
+    held_tx: Option<TxFrame>
+    scratch: FrameBytes              # the private copy of one TX slot
+
+impl FrameSeat
+    # The seat on frame object `handle`, mapped at `region`, both private
+    # indexes at 0.
+    pub fn open(self: @&FrameSeat, handle: u64, region: u64)
+        self.attached = true
+        self.handle = handle
+        self.rx = SpscProducer.new(spsc_rx_ring(region))
+        self.tx = SpscConsumer.new(spsc_tx_ring(region))
+        self.held_rx = None
+        self.held_tx = None
+
+# What one seat_pump pass did.
+pub struct SeatPass
+    published: u32                   # RX frames on the ring: DATA to the kernel
+    dropped: u32                     # RX frames no ring could carry
+    sent: u32                        # TX slots handed to the device
+    rejected: u32                    # TX slots consumed and not sent
+    full: bool                       # RX stopped on a full ring: the caller yields
+    closed: Option<SpscClose>        # a ring is unusable: the seat is detached
+
+fn pass_none() -> SeatPass
+    SeatPass { published: 0, dropped: 0, sent: 0, rejected: 0, full: false, closed: None }
+
+# The frame the full ring left, else the NIC's next.
+fn next_rx<N: Nic>(seat: @&FrameSeat, nic: @&N) -> Option<RxFrame>
+    match seat.held_rx
+        Some(f) =>
+            seat.held_rx = None
+            Some(f)
+        None => nic.rx_poll()
+
+# The device buffer a rejected slot left, else a new one.
+fn next_tx<N: Nic>(seat: @&FrameSeat, nic: @&N) -> Option<TxFrame>
+    match seat.held_tx
+        Some(t) =>
+            seat.held_tx = None
+            Some(t)
+        None => nic.tx_buffer()
+
+# One pass over both directions, then one doorbell and the interrupt armed.
+# With no seat attached a received frame has nowhere to go and is released,
+# so the device keeps receiving.
+pub fn seat_pump<N: Nic>(seat: @&FrameSeat, nic: @&N) -> SeatPass
+    var out: SeatPass = pass_none()
+    while true
+        let f: RxFrame = match next_rx(seat, nic)
+            Some(x) => x
+            None => break
+        if not seat.attached
+            out.dropped = out.dropped + 1
+            nic.rx_release(f)
+            continue
+        match seat.rx.publish(f.bytes)
+            Publish.Done =>
+                out.published = out.published + 1
+                nic.rx_release(f)
+            Publish.Full =>
+                seat.held_rx = Some(f)
+                out.full = true
+                break
+            Publish.BadLength =>
+                out.dropped = out.dropped + 1
+                nic.rx_release(f)
+            Publish.Close(why) =>
+                nic.rx_release(f)
+                out.closed = Some(why)
+                seat.attached = false
+    while seat.attached
+        let desc = match seat.tx.poll(0, 1)
+            Poll.Ready(c) => c
+            Poll.Close(why) =>
+                out.closed = Some(why)
+                seat.attached = false
+                break
+            _ => break
+        # The slot stays on the ring until a device buffer is free.
+        let t: TxFrame = match next_tx(seat, nic)
+            Some(x) => x
+            None => break
+        match seat.tx.take(desc, @&seat.scratch)
+            Take.Frame(n) =>
+                if n < ETH_HEADER_LEN or n as i64 > t.bytes.len
+                    out.rejected = out.rejected + 1
+                    seat.held_tx = Some(t)
+                    continue
+                let frame: [u8] = span_from_ptr<u8>(@seat.scratch[0], n as i64)
+                t.bytes.slice(0, n as i64).copy_from(frame)
+                nic.tx_submit(t, n)
+                out.sent = out.sent + 1
+            Take.Rejected(_) =>
+                out.rejected = out.rejected + 1
+                seat.held_tx = Some(t)
+            Take.Close(why) =>
+                seat.held_tx = Some(t)
+                out.closed = Some(why)
+                seat.attached = false
+            _ =>
+                seat.held_tx = Some(t)
+                break
+    nic.tx_kick()
+    nic.irq_arm()
+    out
+
+# What the handoff drain did.
+pub struct SeatDrain
+    tx_sent: u32                     # the kernel's TX slots, through the stack's send
+    rx_frames: u32                   # RX the kernel did not consume, through the stack
+    rejects: u32                     # slots of either ring that were bad
+
+# The frame-seat handoff, netd's side, after its ready NetPublish returned:
+# the kernel stopped at RX read index `rx_read` (its TX slots are on the
+# ring, up to the write index it stored). Every TX slot it published goes
+# out through `svc`'s send, and every RX slot it did not consume, and a
+# frame a full ring left on the NIC, through `svc`'s stack. A device buffer
+# the seat held goes to `svc`. The seat is detached after: netd revokes
+# the frame object.
+pub fn seat_hand_over<N: Nic>(seat: @&FrameSeat, svc: @&NetSvc<N>, rx_read: u64, now: u64) -> SeatDrain
+    var out = SeatDrain { tx_sent: 0, rx_frames: 0, rejects: 0 }
+    while seat.attached
+        match seat.tx.next(@&seat.scratch, 0, 1)
+            Take.Frame(n) =>
+                let frame: [u8] = span_from_ptr<u8>(@seat.scratch[0], n as i64)
+                svc.send_frame(frame)
+                out.tx_sent = out.tx_sent + 1
+            Take.Rejected(_) => out.rejects = out.rejects + 1
+            _ => break
+    if seat.attached
+        var kernel_rx: SpscConsumer = SpscConsumer.resume(seat.rx.ring, rx_read)
+        while true
+            match kernel_rx.next(@&seat.scratch, 0, 1)
+                Take.Frame(n) =>
+                    let frame: [u8] = span_from_ptr<u8>(@seat.scratch[0], n as i64)
+                    svc.rx_frame(frame, now)
+                    out.rx_frames = out.rx_frames + 1
+                Take.Rejected(_) => out.rejects = out.rejects + 1
+                _ => break
+    match seat.held_rx
+        Some(f) =>
+            seat.held_rx = None
+            svc.rx_frame(f.bytes, now)
+            svc.nic.rx_release(f)
+            out.rx_frames = out.rx_frames + 1
+        None => pass
+    match seat.held_tx
+        Some(t) =>
+            seat.held_tx = None
+            svc.adopt_tx(t)
+        None => pass
+    seat.attached = false
+    out

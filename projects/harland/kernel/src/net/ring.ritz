@@ -4,7 +4,7 @@
 #
 # Until the ring-2 service takes the seat, pid 1 at CPL 0 is the RX
 # consumer and the TX producer of the frame object the ring-1 driver
-# publishes into. This module is that seat, on driver_abi.spsc's halves:
+# (under D9, #4875, /bin/netd's NIC library) publishes into. This module is that seat, on driver_abi.spsc's halves:
 #
 #   * ring_seat_open, the spawn helper: makes the FRAME_REGION_SIZE frame
 #     object (zeroed, both indexes 0), grants it read-write to the driver and
@@ -37,8 +37,9 @@
 #
 # The seat ends at the frame-seat handoff (#4744, net/ring1.ritz
 # net_seat_handoff): ring_send_once sends the DHCPRELEASE, then
-# ring_seat_handoff closes the seat and registers /bin/netd as the
-# consumer; netd resumes the rings at the indexes it returns.
+# ring_seat_handoff closes the seat. Under D9 (#4875) the driver is
+# /bin/netd itself: it drains what the kernel left at the indexes the
+# handoff returns, through its own stack, and revokes the object.
 #
 # Every ring access runs as pid 1, whose page table holds the seat's
 # mapping: the seat functions refuse any other caller.
@@ -340,19 +341,19 @@ pub struct SeatIndexes
     rx_read: u64
     tx_write: u64
 
-# Hand the open seat to the ring-2 service `service_pid`, which already
-# holds a read-write handle for the frame object (so its latch gets the
-# driver's DATA): pid 1 drops its handle, which unmaps it and posts nothing
-# to the driver, and the service is registered as the frame object's
-# consumer, the latch NetPublish posts LINK to. The kernel is no longer a
-# consumer or producer. None when no seat is open or its driver is gone.
+# Hand the open seat to netd `service_pid`, the seat's driver, which
+# already holds a read-write handle for the frame object: pid 1 drops its
+# handle, which unmaps it and posts nothing, and no process is the frame
+# object's consumer any more (D9, #4875: netd drains the object through its
+# stack and revokes it, and knows its own link from the config interrupt,
+# so NetPublish posts LINK to no one). The kernel is no longer a consumer
+# or producer. None when no seat is open or its driver is gone.
 pub fn ring_seat_handoff(service_pid: u64) -> Option<SeatIndexes>
-    if proc_current_pid() != SEAT_PID or not seat_live()
+    if proc_current_pid() != SEAT_PID or not seat_live() or seat_driver != service_pid
         return None
-    let object_id: u64 = seat_object
     let at = SeatIndexes { rx_read: seat_rx.read, tx_write: seat_tx.write }
     seat_close()
-    net_frame_register(object_id, service_pid)
+    net_frame_register(0, 0)
     Some(at)
 
 # ============================================================================

@@ -1,8 +1,10 @@
-# net/ring1.ritz - the virtio-net cutover (AGAST #4735, docs/RING1_DRIVER.md
-# sections 8-9, ring plan T29)
+# net/ring1.ritz - the virtio-net cutover (AGAST #4735, #4875;
+# docs/RING1_DRIVER.md sections 8-9 and PR 8, docs/RING2_NET.md "Drivers
+# inside netd (D9)", ring plan T29)
 #
 # On every boot with a virtio-net and a translated DMA domain the NIC's
-# queues belong to /bin/virtio-net, a CPL-3 process the kernel spawns, and
+# queues belong to /bin/netd, a CPL-3 process the kernel spawns that runs
+# the virtio-net driver as a library beside the network stack (D9), and
 # virtio_net_init never runs (D7: the boot picks the owner, not a marker
 # file). An untranslated boot keeps virtio_net_init and spawns nothing.
 # kernel_main runs steps 1-4 before postinit_diagnostics and run_init,
@@ -16,62 +18,65 @@
 #      and calls net_ring1_spawn there.
 #   2. net_ring1_spawn: the device's IRQ object (latched by the vector,
 #      bound to the domain, recorded for driver_quiesce); the spawn of
-#      /bin/virtio-net with no capabilities of its own; then the grants:
-#      the frame object (ring_seat_open: mapped into the driver first, so
-#      at DRV_RING_BASE, and into pid 1, the kernel seat), the IRQ, a link
-#      page with the publish right, one MMIO handle per window; and the
-#      DriverBoot record at FRAME_ADVISORY_OFF of the frame region.
-#   3. Pid 1 yields while the scheduler is stopped: nothing preempts the
-#      driver, which resets the device, sets DRIVER_OK, publishes
-#      generation 2 (NetPublish), posts its RX buffers and parks in
-#      DrvIrqWait; that park is the switch back.
+#      /bin/netd with no capabilities of its own; then the grants
+#      (ring1_grant_to): a link page with the publish right, mapped first
+#      (DRV_RING_BASE) with the DriverBoot record in it; the frame object
+#      (ring_seat_open: mapped into netd, and into pid 1, the kernel seat);
+#      the IRQ; one MMIO handle per window.
+#   3. Pid 1 yields while the scheduler is stopped: nothing preempts netd,
+#      which resets the device, sets DRIVER_OK, publishes generation 2
+#      (NetPublish), posts its RX buffers and parks in DrvIrqWait; that
+#      park is the switch back.
 #   4. sched_start, once: run_init does not call it again.
 #
 # Step 5 is the self-test window (postinit.ritz network_dhcp_ping), only
 # with \harland\net-selftest: net_stack_init finds the published snapshot
-# and the stack's I/O is the frame ring.
+# and the stack's I/O is the frame ring, with netd as its driver.
 #
 # Step 6 is the frame-seat handoff (AGAST #4744, ring plan T38,
 # docs/RING2_NET.md "Frame seat"), net_seat_handoff, after the self-test
 # window (or in its place) and before run_init:
 #
-#   a. /bin/netd is spawned at CPL 3 (D8 = b, #4767: this spawn path, its
-#      own address space) with two handles and no others: the frame object
-#      (read-write) and a fresh address page (read-write, publish), mapped
-#      into it at DRV_RING_BASE with the ServiceBoot record written there.
-#      The page is registered as the address object and netd as the
-#      service, and the NetPublish gate is armed for it.
+#   a. The kernel spawns nothing (D9). A fresh address page (read-write,
+#      publish) is granted to netd, not mapped, with the ServiceBoot record
+#      written in it, registered as the address object, and its handle
+#      enqueued as ATTACH on netd's inbox; then netd is registered as the
+#      service and the NetPublish gate is armed for it. NetAttach is NoDev
+#      until that registration, so the page is the first ATTACH netd sees.
 #   b. Pid 1 yields until netd's ready NetPublish has committed; that call
 #      then holds netd in the kernel.
 #   c. Still the seat, pid 1 tries one DHCPRELEASE for the self-test's
 #      lease: the server's MAC from the ARP cache or not at all, one TX
 #      publish with no second try. Unsent, the lease is left to expire.
 #   d. Whether or not it went out: the kernel's stack stops (net_poll,
-#      ip_set_config, ip_set_dns), the seat closes, and netd is the frame
-#      object's only consumer and producer. The kernel's indexes go into
-#      the record and the held NetPublish returns; netd resumes the rings
-#      there and runs DHCP from idle. The kernel copies no lease into the
-#      page: netd is its one writer.
+#      ip_set_config, ip_set_dns) and the seat closes. The kernel's indexes
+#      go into the record and the held NetPublish returns; netd sends the
+#      TX slots the kernel published, passes the RX slots it did not
+#      consume to its stack, revokes the frame object and runs DHCP from
+#      idle. The kernel copies no lease into the page: netd is its one
+#      writer.
 #
-# Step 7 (AGAST #4745, ring plan T39) is netd's death and restart, armed
-# once step d has run: sys_exit_impl invalidates NetAddr, retires netd's
-# exchanges and frame object (PEER_CLOSE to each app and to the driver),
-# and restarts /bin/netd at most NETD_RESTARTS times a boot, each with a
-# new address page and a new frame object the driver gets as ATTACH
-# (syscall/runtime/process.ritz netd_restart). The \harland\netd-restart
-# boot option runs net_netd_restart_test before init: pid 1 kills each
-# netd after its lease and checks NetAddr, until the budget is spent.
+# Step 7 (AGAST #4745, #4875, ring plan T39) is netd's death and restart,
+# armed once step d has run: sys_exit_impl quiesces the NIC first
+# (driver_quiesce: MSI-X masked, virtio status 0 read back, its DMA out of
+# the domain, NetInfo NoDev), invalidates NetAddr, retires netd's exchanges
+# and restarts /bin/netd at most NETD_RESTARTS times a boot
+# (net_netd_respawn), only while every quiesce left the NIC fit, each with
+# the device grants and new link and address pages, and no frame object.
+# The \harland\netd-restart boot option runs net_netd_restart_test before
+# init: pid 1 kills each netd after its lease and checks NetAddr, until
+# the budget is spent.
 #
-# A refused NIC, a missing ELF or a driver that exits before it parks
-# leaves the boot with no NIC owner: logged, and the boot goes on. A netd
-# that is not spawned or does not publish ready leaves the seat with the
-# kernel, logged.
+# A refused NIC, a missing ELF or a netd that exits before it parks leaves
+# the boot with no NIC owner: logged, and the boot goes on. A netd that
+# does not publish ready leaves the seat with the kernel, logged, and stays
+# the seat's driver.
 
 import klog { klog, klog_dec }
 import serial { StrView }
 import ritzlib.option
 import ritzlib.result { Result }
-import mm.shm { shm_create, shm_page }
+import mm.shm { shm_create, shm_destroy, shm_page, shm_map }
 import mm.vmm { phys_to_virt }
 import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_PUBLISH }
 import cap.table { CapTable, cap_kernel_grant, cap_table_get }
@@ -87,13 +92,13 @@ import net.dhcp { Release, dhcp_release_frame, dhcp_print_lease }
 import net.stack { net_stack_release }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import syscall.runtime.net { net_link_register, ring_driver_published, net_addr_register, net_service_register, net_handoff_arm, net_handoff_ready, net_handoff_done }
-import syscall.runtime.net { ServicePage, NETD_RESTARTS, net_service_page, net_service_boot, net_restart_arm, net_restart_armed, net_service_pid, net_addr_configured_by, net_addr_snapshot }
-import syscall.runtime.driver { drv_device_bind }
+import syscall.runtime.net { ServicePage, NETD_RESTARTS, net_service_page, net_service_boot, net_service_attach_page, net_restart_arm, net_restart_armed, net_service_pid, net_addr_configured_by, net_addr_snapshot, pml4_of }
+import syscall.runtime.driver { drv_device_bind, drv_device_fit, drv_device_unmask }
 import syscall.runtime.process { process_create_init, process_spawn_program, process_mark_exit }
 import drivers.virtio.net { NicGrant, virtio_net_ring1_probe }
 import drivers.virtio.window { VioWindow, vio_window_find }
 import syscall.stack { kstack_top }
-import driver_abi.boot { DriverBoot, DriverWindow, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, driver_boot_at }
+import driver_abi.boot { DriverBoot, DriverWindow, DRV_RING_BASE, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, driver_boot_at }
 import driver_abi.boot { ServiceBoot, service_boot_at }
 
 # The driver's MSI-X table indexes: config changes, the RX and TX queues
@@ -106,17 +111,20 @@ const MSIX_ENTRIES: u32 = 3
 # The NIC's IRQ object: above every id a boot test uses, one per requester.
 const NIC_IRQ_OBJECT_BASE: u64 = 1 << 40
 
-# How many times pid 1 yields for the driver's first park (step 3). One is
-# enough when the driver parks; it yields back only on DrvIrqWait's Again.
 # Run body() on the kernel stack whose top is `top` (proc_switch.s).
 extern fn kstack_call(body: u64, top: u64)
 
+# How many times pid 1 yields for netd's first park (step 3). One is
+# enough when netd parks; it yields back only on DrvIrqWait's Again.
 const FIRST_PARK_YIELDS: i32 = 16
 
 # The probe's grant, from net_ring1_prepare to net_ring1_spawn (which runs
-# on another stack, through kstack_call, so takes no arguments).
+# on another stack, through kstack_call, so takes no arguments), and the
+# device's IRQ object; both again for each restart (net_netd_respawn).
 var ring1_grant: NicGrant
 var ring1_probed: bool = false
+var ring1_obj: u64 = 0
+# The first netd's pid (step 2), 0 before or without one.
 var ring1_pid: u64 = 0
 
 # Step 1, then the rest of the boot, `tail` (which starts with
@@ -141,7 +149,7 @@ fn net_ring1_prepare() -> bool
     process_create_init()
     proc_current() != 0 as *Proc
 
-# The pid of the ring-1 driver, 0 before or without one.
+# The pid of the first netd (step 2), 0 before or without one.
 pub fn net_ring1_pid() -> u64
     ring1_pid
 
@@ -173,25 +181,38 @@ fn ring1_device_object(g: NicGrant) -> Option<u64>
         return None
     Some(obj)
 
-# Step 2's grants to `pid`, a child that has not run, and its boot record.
-fn ring1_grant_to(pid: u64, obj: u64, g: NicGrant) -> bool
-    # The frame object first: the driver's first shared mapping, so it sits
-    # at DRV_RING_BASE; pid 1 maps it too and is the seat.
-    let frame: u64 = match ring_seat_open(pid)
-        SeatOpen.Opened(h) => h
-        _ => return ring1_fail("the frame object was not made")
-    let frame_obj: u64 = ring_seat_object().unwrap_or(0)
-    let irq: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, obj)
-    if not granted(irq)
-        return ring1_fail("the IRQ capability was not granted")
-    # The link page: only the driver maps it; NetPublish samples it.
+# The device grants to netd `pid`, a child that has not run, and its boot
+# record (step 2, and each restart): a link page with the publish right,
+# mapped first so it sits at DRV_RING_BASE, where netd finds DriverBoot;
+# with `with_seat` (step 2 only, as pid 1) the frame object, mapped into
+# netd and pid 1 (the seat); the IRQ; one MMIO handle per window. The
+# record is written on the link page through the physmap before netd runs;
+# netd copies it once and checks it, and the kernel trusts none of it. A
+# restart's record names no frame object.
+fn ring1_grant_to(pid: u64, obj: u64, g: NicGrant, with_seat: bool) -> bool
+    let pml4: u64 = pml4_of(pid as u32)
+    if pml4 == 0
+        return ring1_fail("netd has no page table")
+    # The link page: only netd maps it; NetPublish samples it.
     let link_obj: u64 = match shm_create(1)
         Some(id) => id
         None => return ring1_fail("no link page")
     let link: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_WRITE | CAP_RIGHT_PUBLISH, link_obj)
     if not granted(link)
+        shm_destroy(link_obj)
         return ring1_fail("the link page was not granted")
+    if shm_map(pid as u32, pml4, link_obj, true) != DRV_RING_BASE as i64
+        # netd's exit (the caller marks it) drops the handle and the object.
+        return ring1_fail("the link page is not netd's first mapping")
     net_link_register(link_obj)
+    var frame: u64 = 0
+    if with_seat
+        frame = match ring_seat_open(pid)
+            SeatOpen.Opened(h) => h
+            _ => return ring1_fail("the frame object was not made")
+    let irq: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, obj)
+    if not granted(irq)
+        return ring1_fail("the IRQ capability was not granted")
     var boot: DriverBoot
     boot.magic = DRIVER_BOOT_MAGIC
     boot.window_count = 0
@@ -213,9 +234,7 @@ fn ring1_grant_to(pid: u64, obj: u64, g: NicGrant) -> bool
         boot.windows[i] = DriverWindow { handle: packed(h), offset: w.offset as u32, length: w.length as u32, notify_multiplier: w.notify_multiplier, cfg_type: g.window_types[i], _pad: [0, 0, 0] }
         boot.window_count = i + 1
         i = i + 1
-    # Written through the physmap before the driver runs; the driver copies
-    # it once and checks it, and the kernel trusts none of it.
-    *driver_boot_at(phys_to_virt(shm_page(frame_obj, 0))) = boot
+    *driver_boot_at(phys_to_virt(shm_page(link_obj, 0))) = boot
     true
 
 # `pid` is parked on its own wait set (DrvIrqWait).
@@ -229,8 +248,8 @@ fn ring1_parked(pid: u64) -> bool
     false
 
 # Steps 2-4, as pid 1 on its own kernel stack (kstack_call), the scheduler
-# stopped. Logs "[net-ring1] /bin/virtio-net pid P parked: generation 2
-# published" when the driver is the NIC's owner.
+# stopped. Logs "[net-ring1] /bin/netd pid P parked: generation 2
+# published" when netd is the NIC's owner.
 pub fn net_ring1_spawn()
     if not ring1_probed or ring1_pid != 0 or sched_is_running()
         return
@@ -240,21 +259,24 @@ pub fn net_ring1_spawn()
         None =>
             ring1_fail("the device's IRQ object was not made")
             return
-    let pid: u64 = match process_spawn_program("/bin/virtio-net")
+    ring1_obj = obj
+    let pid: u64 = match process_spawn_program("/bin/netd")
         Result.Ok(p) => p
         Result.Err(e) =>
-            klog("[net-ring1] /bin/virtio-net was not spawned (errno ")
+            klog("[net-ring1] /bin/netd was not spawned (errno ")
             klog_dec(e as i64)
             klog("): the NIC has no owner on this boot\n")
             return
-    if not ring1_grant_to(pid, obj, g)
+    # Nobody waits for netd: its exit leaves no zombie (#4745).
+    proc_detach(pid)
+    if not ring1_grant_to(pid, obj, g, true)
         # It exits on its way to user mode (reap_if_marked); the seat and
         # every grant go with it.
         process_mark_exit(pid)
         sched_yield()
         return
     ring1_pid = pid
-    # Step 3: the driver runs, uninterrupted, until its first park.
+    # Step 3: netd runs, uninterrupted, until its first park.
     var yields: i32 = 0
     while not ring1_parked(pid) and yields < FIRST_PARK_YIELDS
         sched_yield()
@@ -262,11 +284,11 @@ pub fn net_ring1_spawn()
     # Step 4: the tick from now on; run_init does not start it again.
     sched_start(proc_current_slot())
     if ring1_parked(pid) and ring_driver_published()
-        klog("[net-ring1] /bin/virtio-net pid ")
+        klog("[net-ring1] /bin/netd pid ")
         klog_dec(pid as i64)
         klog(" parked: generation 2 published\n")
     else
-        klog("[net-ring1] /bin/virtio-net pid ")
+        klog("[net-ring1] /bin/netd pid ")
         klog_dec(pid as i64)
         klog(" did not park with its link published: the NIC has no owner on this boot\n")
 
@@ -283,22 +305,21 @@ fn seat_kept(why: StrView)
     klog(why)
     klog("\n")
 
-# Step a's grants to netd `pid`, a child that has not run: the frame
-# object's handle (no mapping: netd maps it), then the address page, mapped
-# as its first shared mapping (DRV_RING_BASE) with the ServiceBoot record in
-# it (net_service_page, net_service_boot: a replacement netd's setup too).
-# The address object's id, or None; netd's exit (the caller marks it) drops
-# what it was granted.
-fn netd_grant_to(pid: u64, frame_obj: u64) -> Option<u64>
-    let rw: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
-    let frame: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rw, frame_obj)
-    if not granted(frame)
-        return None
+# netd `pid`'s address page (step a, and each restart): granted, its
+# ServiceBoot written, registered as the address object, and its handle
+# enqueued as ATTACH on netd's inbox, all before netd is the registered
+# service. The page, or None with nothing of it registered (a handle that
+# was granted goes with netd's exit, or stays unused).
+fn netd_service_page(pid: u64) -> Option<ServicePage>
     let page: ServicePage = match net_service_page(pid as u32)
         Some(p) => p
         None => return None
-    net_service_boot(page, packed(frame))
-    Some(page.object_id)
+    net_service_boot(page)
+    net_addr_register(page.object_id)
+    if not net_service_attach_page(pid as u32, page)
+        net_addr_register(0)
+        return None
+    Some(page)
 
 # netd `pid` still has its capability table: it has not exited.
 fn netd_alive(pid: u64) -> bool
@@ -329,45 +350,39 @@ fn seat_release()
         Send.BadLength => klog("[net] DHCPRELEASE not sent: a bad frame length\n")
 
 # Step 6, as pid 1 after the diagnostics: a no-op unless this boot's NIC
-# went to the ring-1 driver and its link is published (D7: an untranslated
-# boot spawns no netd). Logs "[net] seat -> netd pid P" once netd owns the
-# seat.
+# went to netd and its link is published (D7: an untranslated boot has no
+# netd). Logs "[net] seat -> netd pid P" once netd's stack owns the seat:
+# the pid of step 2, since nothing is spawned here.
 pub fn net_seat_handoff()
     if ring1_pid == 0 or not ring_driver_published()
         return
-    let frame_obj: u64 = match ring_seat_object()
-        Some(id) => id
+    let pid: u64 = ring1_pid
+    match ring_seat_object()
+        Some(_) => pass
         None =>
             seat_kept("no frame seat is open")
             return
-    let pid: u64 = match process_spawn_program("/bin/netd")
-        Result.Ok(p) => p
-        Result.Err(e) =>
-            klog("[net] /bin/netd was not spawned (errno ")
-            klog_dec(e as i64)
-            klog("): the seat stays with the kernel\n")
-            return
-    # Nobody waits for netd: its exit leaves no zombie (#4745).
-    proc_detach(pid)
-    let addr_obj: u64 = match netd_grant_to(pid, frame_obj)
-        Some(id) => id
+    if not netd_alive(pid)
+        seat_kept("netd is gone")
+        return
+    let page: ServicePage = match netd_service_page(pid)
+        Some(p) => p
         None =>
-            process_mark_exit(pid)
-            sched_yield()
-            seat_kept("netd's handles or address page were not made")
+            seat_kept("netd's address page was not made")
             return
-    net_addr_register(addr_obj)
     net_service_register(pid as u32)
     net_handoff_arm(pid as u32)
-    # Step b: netd runs to its ready NetPublish, which holds it there.
+    # Step b: netd maps the page and runs to its ready NetPublish, which
+    # holds it there.
     let deadline: u64 = deadline_after_us(NETD_READY_US)
     while not net_handoff_ready() and netd_alive(pid) and not deadline_passed(deadline)
         sched_yield()
     if not net_handoff_ready()
+        # netd stays the seat's driver; its ready publish, if it comes, is
+        # refused (the address object is no longer registered).
         net_handoff_done()
-        if netd_alive(pid)
-            process_mark_exit(pid)
-            sched_yield()
+        net_service_register(0)
+        net_addr_register(0)
         seat_kept("netd did not publish ready")
         return
     # Steps c and d: the release, then the switch, whatever the release did.
@@ -376,19 +391,60 @@ pub fn net_seat_handoff()
     let at: SeatIndexes = match ring_seat_handoff(pid)
         Some(i) => i
         None =>
-            # The driver went meanwhile: netd's wait returns DRIVER_GONE.
+            # netd went meanwhile: its exit runs the driver's death.
             net_handoff_done()
-            seat_kept("the driver is gone")
+            seat_kept("netd is gone")
             return
-    let boot: *ServiceBoot = service_boot_at(phys_to_virt(shm_page(addr_obj, 0)))
+    let boot: *ServiceBoot = service_boot_at(phys_to_virt(shm_page(page.object_id, 0)))
     boot.seat_rx_read = at.rx_read
     boot.seat_tx_write = at.tx_write
     klog("[net] seat -> netd pid ")
     klog_dec(pid as i64)
     klog("\n")
-    # Step 7: from now on netd's death is restarted onto this driver.
-    net_restart_arm(ring1_pid as u32)
+    # Step 7: from now on netd's death is restarted.
+    net_restart_arm()
     net_handoff_done()
+
+# ============================================================================
+# Step 7: netd's restart (AGAST #4745, #4875)
+# ============================================================================
+
+# What net_netd_respawn did. Not a Result: VtdDma and goliath's ErrorCode,
+# in this module's import closure, declare `Ok` too (driver.ritz).
+pub enum Respawn
+    Started(u64)                     # the replacement's pid
+    Unfit                            # a quiesce did not confirm the reset, or quarantined DMA
+    Spawn                            # /bin/netd was not spawned
+    Grants                           # its device grants or link page were not made
+    Page                             # its address page was not made
+
+# A replacement netd, in the dead one's sys_exit_impl after its backoff
+# (syscall/runtime/process.ritz netd_restart): only onto a NIC whose
+# quiesces all read status 0 back and quarantined nothing, with what the
+# first netd got but the seat: a new IRQ-owner record on the same IRQ
+# object with its MSI-X entries unmasked, one MMIO handle per window, a new
+# link page (DriverBoot names no frame object) and a new address page as
+# ATTACH, then the registration. It resets the device itself, as every
+# bring-up does. Its pid, or why there is none.
+pub fn net_netd_respawn() -> Respawn
+    if not drv_device_fit(ring1_obj)
+        return Respawn.Unfit
+    let pid: u64 = match process_spawn_program("/bin/netd")
+        Result.Ok(p) => p
+        Result.Err(_) => return Respawn.Spawn
+    proc_detach(pid)
+    drv_device_unmask(ring1_obj)
+    if not ring1_grant_to(pid, ring1_obj, ring1_grant, false)
+        # Never the registered service: its exit restarts nothing.
+        process_mark_exit(pid)
+        return Respawn.Grants
+    match netd_service_page(pid)
+        Some(_) => pass
+        None =>
+            process_mark_exit(pid)
+            return Respawn.Page
+    net_service_register(pid as u32)
+    Respawn.Started(pid)
 
 # ============================================================================
 # The netd restart test (AGAST #4745, the \harland\netd-restart option)

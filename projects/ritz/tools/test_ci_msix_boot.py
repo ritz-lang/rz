@@ -255,49 +255,53 @@ NIC_DOMAIN = r"[nic-dma] private domain 2 for 0000:00:04.0 and 0 alias(es), neve
 NIC_FAULT_RECORD = r"[nic-dma] fault record: source 0000:00:04.0 IOVA 0x1000006000 reason 6 (read)\n"
 NIC_FAULT = r"[nic-dma] fault probe: the NIC's DMA to unmapped IOVA 0x1000006000 faulted with its source ID 0000:00:04.0\n"
 NIC_ALLOWED = (r"[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), "
-               r"NIC isolated; the owner is /bin/virtio-net\n")
-# The cutover (AGAST #4735): on the translating boot /bin/virtio-net owns the
-# NIC. Its rings and pools are DrvDmaAlloc runs in the NIC's domain (the
-# kernel logs each), and the frame it received lands in one of them (the
-# driver logs the IOVA in decimal: 0x1000007000 + 0x800).
+               r"NIC isolated; the owner is /bin/netd\n")
+# The cutover (AGAST #4735, #4875): on the translating boot /bin/netd owns
+# the NIC, its driver a library inside it (D9). Its rings and pools are
+# DrvDmaAlloc runs in the NIC's domain (the kernel logs each), and the frame
+# it received lands in one of them (netd's NIC library logs the IOVA in
+# decimal: 0x1000007000 + 0x800).
 DMA_RUN_RING = r"[nic-dma] DrvDmaAlloc: pid 2, 3 page(s) at IOVA 0x1000004000 in domain 2\n"
 DMA_RUN_POOL = r"[nic-dma] DrvDmaAlloc: pid 2, 16 page(s) at IOVA 0x1000007000 in domain 2\n"
 NIC_DMA = r"[virtio-net] device DMA: 602 bytes received into granted IOVA 68719507456\n"
 NIC_DMA_OK = NIC_DOMAIN + NIC_FAULT_RECORD + NIC_FAULT + NIC_ALLOWED + DMA_RUN_RING + DMA_RUN_POOL + NIC_DMA
-RING1_PARKED = r"[net-ring1] /bin/virtio-net pid 2 parked: generation 2 published\n"
+RING1_PARKED = r"[net-ring1] /bin/netd pid 2 parked: generation 2 published\n"
 DRIVER_UP = r"[virtio-net] up: MAC published, 32 RX buffers posted\n"
-# The frame-seat handoff (AGAST #4744): after the self-test window the
-# kernel spawns /bin/netd, tries one DHCPRELEASE, and hands it the seat;
-# netd then runs DHCP itself and logs its own lease.
+# The frame-seat handoff (AGAST #4744, #4875): after the self-test window
+# the kernel spawns nothing, tries one DHCPRELEASE, and hands the seat to
+# the netd of the "[net-ring1]" line; netd then runs DHCP itself and logs
+# its own lease.
 SEAT_RELEASE = r"[net] DHCPRELEASE sent for 10.0.2.15\n"
-SEAT_NETD = r"[net] seat -> netd pid 3\n"
+SEAT_NETD = r"[net] seat -> netd pid 2\n"
 NETD_CONFIGURED = r"[netd] configured 10.0.2.15\n"
 SEAT_OK = SEAT_RELEASE + SEAT_NETD + NETD_CONFIGURED
-# netd's death and restart (AGAST #4745, the \\harland\\netd-restart run):
-# pid 1 kills each netd after its lease; the kernel invalidates NetAddr,
-# the driver detaches and maps each replacement's frame object, and the
-# fourth death spends the budget.
-DRIVER_DETACH = r"[virtio-net] PEER_CLOSE: frame object detached\n"
-DRIVER_ATTACH = r"[virtio-net] ATTACH: frame object mapped, both indexes at 0\n"
+# netd's death and restart (AGAST #4745, #4875, the \\harland\\netd-restart
+# run): pid 1 kills each netd after its lease; its exit resets the NIC
+# (driver_quiesce, status read back 0) and the kernel invalidates NetAddr;
+# each replacement brings the NIC back to a lease; the fourth death spends
+# the budget.
 RESTART_SPENT = r"[net] netd restart budget spent: NetAddr stays NoDev until reboot\n"
 RESTART_SETTLED = r"[net-restart] NetAddr still NoDev 2000 ms after the budget was spent\n"
 
 
+def nic_reset(pid: int, status: int = 0) -> str:
+    return rf"[quiesce] pid {pid} status {status}\n"
+
+
 def netd_killed(pid: int) -> str:
-    return (rf"[net-restart] killing netd pid {pid} after its lease\n"
-            rf"[net] netd pid {pid} died (status 137): NetAddr NoDev, its attachments and frame object retired\n"
-            rf"[net-restart] NetAddr NoDev after netd pid {pid} died\n" + DRIVER_DETACH)
+    return (rf"[net-restart] killing netd pid {pid} after its lease\n" + nic_reset(pid)
+            + rf"[net] netd pid {pid} died (status 137): NetAddr NoDev, its NIC reset and its attachments retired\n"
+            rf"[net-restart] NetAddr NoDev after netd pid {pid} died\n")
 
 
 def netd_restarted(n: int, pid: int) -> str:
     ms = 250 << (n - 1)
     return (rf"[net] netd restart {n} of 3 in {ms} ms\n"
-            rf"[net] netd restart {n}: pid {pid}, frame object {5 + n} on driver pid 2\n"
-            + DRIVER_ATTACH + NETD_CONFIGURED)
+            rf"[net] netd restart {n}: pid {pid}\n" + NETD_CONFIGURED)
 
 
-RESTART_OK = (netd_killed(3) + netd_restarted(1, 4) + netd_killed(4) + netd_restarted(2, 5)
-              + netd_killed(5) + netd_restarted(3, 6) + netd_killed(6) + RESTART_SPENT + RESTART_SETTLED)
+RESTART_OK = (netd_killed(2) + netd_restarted(1, 3) + netd_killed(3) + netd_restarted(2, 4)
+              + netd_killed(4) + netd_restarted(3, 5) + netd_killed(5) + RESTART_SPENT + RESTART_SETTLED)
 
 
 def driver_parks(p: int) -> str:
@@ -315,7 +319,7 @@ KERNEL_NIC_UP = r"[virtio-net] Initialization complete!\n"
 # handoff and netd's lease, which seat_checks and the net session wait for.
 # (The fixtures' r"\n" is for the serial stub's printf %b; this one is sent
 # as is.)
-SHELL_OK = SEAT_OK.replace(r"\n", "\r\n")
+SHELL_OK = (RING1_PARKED + SEAT_OK).replace(r"\n", "\r\n")
 VTD_OK = (NVME_TABLE.replace(PCI_PORT_IO, "") + IR_ON + TE_ON + NET_MODERN + NIC_DMA_OK + NIC_ON
           + RING1_PARKED + NET_PLATFORM + RX_CAPPED + DRIVER_UP + DHCP_OK + TX_BURST_OK + interrupts(8)
           + driver_parks(41) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SEAT_OK + RESTART_OK + SUITE_PASSED)
@@ -773,7 +777,7 @@ def test_virtio_wait_check_fails(tree, waits, want):
         (VTD_OK.replace(DMA_RUN_POOL, ""), "is in no run DrvDmaAlloc granted the driver"),
         (VTD_OK.replace(NIC_ALLOWED, ""), "net_ring1_allowed is false on the translating boot"),
         # the pre-cutover verdict: the owner stayed in the kernel
-        (VTD_OK.replace(NIC_ALLOWED, NIC_ALLOWED.replace("the owner is /bin/virtio-net", "the owner stays in the kernel")),
+        (VTD_OK.replace(NIC_ALLOWED, NIC_ALLOWED.replace("the owner is /bin/netd", "the owner stays in the kernel")),
          "net_ring1_allowed is false on the translating boot"),
     ],
     ids=["no-domain", "not-held", "no-fault", "fault-from-another-source", "no-unit-record",
@@ -813,8 +817,8 @@ def test_nic_private_domain_on_pc_fails(tree, pc, want):
 
 
 # --------------------------------------------------------------------------
-# The cutover: the ring-1 driver owns the NIC on the translating boot
-# (AGAST #4735, RING1_DRIVER.md sections 8-9)
+# The cutover: netd owns the NIC on the translating boot, its driver a
+# library inside it (AGAST #4735, #4875, RING1_DRIVER.md sections 8-9, D9)
 # --------------------------------------------------------------------------
 
 
@@ -823,10 +827,11 @@ def test_ring1_owner_passes_on_the_translating_boot(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
     vtd = r.stdout.split("===== msix boot (vtd) =====")[1]
-    assert "PASS: the kernel spawned /bin/virtio-net and it parked with generation 2 published" in vtd
-    assert "PASS: the ring-1 driver brought the NIC up" in vtd
-    assert "PASS: virtio_net_init did not run: the ring-1 driver is the NIC's only owner" in vtd
-    assert "PASS: the ring-1 driver parked 41 times in DrvIrqWait" in vtd
+    assert "PASS: the kernel spawned /bin/netd (pid 2) and it parked with generation 2 published" in vtd
+    assert "PASS: no /bin/virtio-net: the driver is netd's library" in vtd
+    assert "PASS: netd's NIC library brought the NIC up" in vtd
+    assert "PASS: virtio_net_init did not run: netd is the NIC's only owner" in vtd
+    assert "PASS: netd parked 41 times in DrvIrqWait" in vtd
     # the in-kernel owner's RX-wait check is the pc run's alone
     assert "RX waited on its vector" not in vtd
     assert "PASS: virtio-net RX waited on its vector 880 times, halted 880" in r.stdout
@@ -836,20 +841,23 @@ def test_ring1_owner_passes_on_the_translating_boot(tree):
 @pytest.mark.parametrize(
     "vtd, want",
     [
-        (VTD_OK.replace(RING1_PARKED, ""), "/bin/virtio-net was not spawned, or did not park"),
+        (VTD_OK.replace(RING1_PARKED, ""), "/bin/netd was not spawned, or did not park"),
         (VTD_OK.replace(RING1_PARKED, RING1_PARKED.replace("generation 2", "generation 0")),
-         "/bin/virtio-net was not spawned, or did not park"),
+         "/bin/netd was not spawned, or did not park"),
+        # D9: the driver binary is gone
+        (VTD_OK.replace(RING1_PARKED, RING1_PARKED.replace("/bin/netd", "/bin/virtio-net")),
+         "the log names /bin/virtio-net"),
         (VTD_OK.replace(DRIVER_UP, ""), 'no "[virtio-net] up: MAC published"'),
         # both owners on one boot
-        (VTD_OK.replace(DRIVER_UP, DRIVER_UP + KERNEL_NETDEV), "ran beside the ring-1 driver"),
-        (VTD_OK.replace(DRIVER_UP, DRIVER_UP + KERNEL_NIC_UP), "ran beside the ring-1 driver"),
+        (VTD_OK.replace(DRIVER_UP, DRIVER_UP + KERNEL_NETDEV), "ran beside netd"),
+        (VTD_OK.replace(DRIVER_UP, DRIVER_UP + KERNEL_NIC_UP), "ran beside netd"),
         # the park counter replaces halted > 0
-        (VTD_OK.replace(driver_parks(41), ""), "no ring-1 driver park count logged"),
+        (VTD_OK.replace(driver_parks(41), ""), "no NIC owner park count logged"),
         (VTD_OK.replace(driver_parks(41), driver_parks(0)), "never parked in DrvIrqWait"),
-        (VTD_OK.replace(driver_parks(41), net_rx_waits()), "no ring-1 driver park count logged"),
+        (VTD_OK.replace(driver_parks(41), net_rx_waits()), "no NIC owner park count logged"),
     ],
-    ids=["not-spawned", "unpublished", "no-driver-banner", "netdev-banner-too", "kernel-banner-too",
-         "no-park-count", "never-parked", "halts-instead-of-parks"],
+    ids=["not-spawned", "unpublished", "driver-binary", "no-driver-banner", "netdev-banner-too",
+         "kernel-banner-too", "no-park-count", "never-parked", "halts-instead-of-parks"],
 )
 def test_ring1_owner_check_fails(tree, vtd, want):
     r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": vtd})
@@ -864,7 +872,7 @@ def test_ring1_checks_are_the_translating_boots_alone(tree):
     r = _run(tree, PASSED + KERNEL_NETDEV + KERNEL_NIC_UP)
     assert r.returncode == 0, r.stdout + r.stderr
     pc = r.stdout.split("===== msix boot (vtd) =====")[0]
-    assert "PASS: the ring-1 driver" not in pc and "ring-1 driver park" not in pc
+    assert "PASS: the kernel spawned /bin/netd" not in pc and "netd parked" not in pc
 
 
 @pytest.mark.integration
@@ -872,7 +880,8 @@ def test_seat_handoff_passes_on_the_translating_boot(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
     vtd = r.stdout.split("===== msix boot (vtd) =====")[1]
-    assert "PASS: the kernel handed the frame seat to /bin/netd (pid 3)" in vtd
+    assert "PASS: the kernel handed the frame seat to /bin/netd (pid 2)" in vtd
+    assert "PASS: the seat went to the netd the kernel spawned at boot (pid 2): no second spawn" in vtd
     assert "PASS: netd configured 10.0.2.15 itself, after the handoff" in vtd
 
 
@@ -881,6 +890,9 @@ def test_seat_handoff_passes_on_the_translating_boot(tree):
     "vtd, want",
     [
         (VTD_OK.replace(SEAT_NETD, ""), "the kernel did not hand the frame seat to /bin/netd"),
+        # D9: the handoff spawns nothing, so the seat goes to step 2's netd
+        (VTD_OK.replace(SEAT_NETD, SEAT_NETD.replace("pid 2", "pid 3")),
+         "the seat went to pid 3, not the netd spawned at boot (pid 2)"),
         (VTD_OK.replace(NETD_CONFIGURED, ""), "netd logged no lease of its own"),
         # netd's lease must come after the seat moved: before it, the kernel
         # still owned TX (and without the restart run, whose replacements
@@ -888,7 +900,7 @@ def test_seat_handoff_passes_on_the_translating_boot(tree):
         (VTD_OK.replace(RESTART_OK, "").replace(SEAT_OK, NETD_CONFIGURED + SEAT_RELEASE + SEAT_NETD),
          "netd logged no lease of its own"),
     ],
-    ids=["no-handoff", "no-netd-lease", "lease-before-handoff"],
+    ids=["no-handoff", "second-spawn", "no-netd-lease", "lease-before-handoff"],
 )
 def test_seat_handoff_check_fails(tree, vtd, want):
     r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": vtd})
@@ -919,8 +931,9 @@ def test_netd_restart_passes_on_the_translating_boot(tree):
     vtd = r.stdout.split("===== msix boot (vtd) =====")[1]
     assert "PASS: NetAddr answered NoDev after each of netd's 4 deaths" in vtd
     for n, ms in ((1, 250), (2, 500), (3, 1000)):
-        assert f"PASS: netd restart {n} after {ms} ms reached configured again" in vtd
-    assert "PASS: the driver detached 4 times and mapped 3 replacement frame objects" in vtd
+        assert f"PASS: netd restart {n} after {ms} ms reached configured again: the NIC came back" in vtd
+    for pid in (2, 3, 4, 5):
+        assert f"PASS: netd pid {pid}'s death reset the NIC (status read back 0) before its restart" in vtd
     assert "PASS: the restart budget was spent and NetAddr stayed NoDev" in vtd
 
 
@@ -931,14 +944,18 @@ def test_netd_restart_passes_on_the_translating_boot(tree):
         (VTD_OK.replace(RESTART_OK, ""), "pid 1 killed netd 0 times"),
         (VTD_OK.replace(r"[net-restart] NetAddr NoDev after netd pid 4 died\n", ""),
          "NetAddr answered NoDev after 3 of netd's 4 deaths"),
-        (VTD_OK.replace(DRIVER_ATTACH, "", 1), "the driver mapped 2 replacement frame objects"),
-        (VTD_OK.replace(DRIVER_DETACH, "", 1), "the driver detached 3 times"),
+        # D9: each death resets the NIC before the restart
+        (VTD_OK.replace(nic_reset(3), ""), "netd pid 3's death (kill 2) did not quiesce the NIC"),
+        (VTD_OK.replace(nic_reset(3), nic_reset(3, 2)), "netd pid 3's NIC reset did not read back 0"),
+        (VTD_OK.replace(netd_killed(3) + netd_restarted(2, 4),
+                        netd_killed(3).replace(nic_reset(3), "") + netd_restarted(2, 4) + nic_reset(3)),
+         "netd pid 3's NIC reset came after its restart line"),
         # A replacement that never got a lease
-        (VTD_OK.replace(netd_restarted(2, 5), netd_restarted(2, 5).replace(NETD_CONFIGURED, "")),
+        (VTD_OK.replace(netd_restarted(2, 4), netd_restarted(2, 4).replace(NETD_CONFIGURED, "")),
          "netd restart 2 did not reach configured"),
         # Restart 1 killed between its publish and its lease line (#4855)
-        (VTD_OK.replace(netd_restarted(1, 4) + netd_killed(4),
-                        netd_restarted(1, 4).replace(NETD_CONFIGURED, "") + netd_killed(4) + NETD_CONFIGURED),
+        (VTD_OK.replace(netd_restarted(1, 3) + netd_killed(3),
+                        netd_restarted(1, 3).replace(NETD_CONFIGURED, "") + netd_killed(3) + NETD_CONFIGURED),
          "netd restart 1 did not reach configured ([netd] configured A) before it was killed"),
         # The second restart came after the wrong backoff
         (VTD_OK.replace("restart 2 of 3 in 500 ms", "restart 2 of 3 in 250 ms"),
@@ -948,8 +965,8 @@ def test_netd_restart_passes_on_the_translating_boot(tree):
         (VTD_OK.replace(RESTART_SETTLED, r"[net-restart] FAIL: netd pid 6 never reached configured\n"),
          "[net-restart] FAIL"),
     ],
-    ids=["no-kills", "no-nodev", "no-attach", "no-detach", "no-lease", "lease-after-kill", "wrong-backoff",
-         "no-budget-log", "no-settle", "test-fail"],
+    ids=["no-kills", "no-nodev", "no-reset", "reset-not-zero", "reset-after-restart", "no-lease",
+         "lease-after-kill", "wrong-backoff", "no-budget-log", "no-settle", "test-fail"],
 )
 def test_netd_restart_check_fails(tree, vtd, want):
     r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": vtd})
@@ -959,7 +976,7 @@ def test_netd_restart_check_fails(tree, vtd, want):
 
 @pytest.mark.integration
 def test_an_untranslated_boot_runs_no_netd_restart(tree):
-    r = _run(tree, PASSED + netd_killed(3))
+    r = _run(tree, PASSED + netd_killed(2))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL: the pc machine ran the netd restart test: an untranslated boot has no netd" in r.stdout
 
@@ -972,8 +989,9 @@ def test_the_esp_asks_for_the_netd_restart_test():
 
 @pytest.mark.unit
 def test_the_boot_images_carry_the_driver():
-    """/bin/virtio-net comes from harland/system, which the shared package
-    list names: the script reads that list instead of its own."""
+    """/bin/netd, the NIC's owner and its driver (D9), comes from
+    harland/system, which the shared package list names: the script reads
+    that list instead of its own."""
     script = (REPO / MSIX_SCRIPT).read_text()
     assert "initramfs.pkgs" in script
     assert 'USER_PKGS="indium rzsh prism"' not in script
@@ -1007,7 +1025,8 @@ def test_vtd_shell_net_session_passes(tree):
     assert "PASS: the host listener on" in shell and "got one datagram `hello`" in shell
     assert "a second bind of live port" in shell and "FAIL" not in shell
     assert shell.count("from a new process rebinds the port") == 6
-    assert "PASS: the kernel handed the frame seat to /bin/netd (pid 3)" in shell
+    assert "PASS: the kernel handed the frame seat to /bin/netd (pid 2)" in shell
+    assert "PASS: the seat went to the netd the kernel spawned at boot (pid 2): no second spawn" in shell
     assert "PASS: `exit`: rzsh returns to init_interactive" in shell
 
 
@@ -1018,7 +1037,7 @@ def test_vtd_shell_net_session_passes(tree):
         ({"FAKE_PING": "ping: timeout"}, "FAIL: `ping 10.0.2.2`"),
         ({"FAKE_EXIST": "udp-recv: net_bind: Errno.Io (-5)"},
          "answered Errno.Exist"),
-        ({"FAKE_SHELL_BANNER": SHELL_OK.replace("[net] seat -> netd pid 3\r\n", "")},
+        ({"FAKE_SHELL_BANNER": SHELL_OK.replace("[net] seat -> netd pid 2\r\n", "")},
          "FAIL: the kernel did not hand the frame seat to /bin/netd"),
         ({"FAKE_SHELL_BANNER": ""}, "FAIL: netd logged no lease"),
     ],

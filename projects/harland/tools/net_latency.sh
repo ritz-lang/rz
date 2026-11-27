@@ -10,15 +10,16 @@
 # network stack, and a UDP round trip on the ring path:
 #   in-kernel    q35, no IOMMU: an untranslated boot, so virtio_net_init and
 #                the kernel stack own the NIC;
-#   kernel-ring  q35 + intel-iommu: the CPL-3 /bin/virtio-net owns the NIC,
-#                and the kernel stack is still in the frame seat (the
-#                self-test window, before the handoff);
-#   netd         the same boot after the seat handoff: the CPL-3 driver and
-#                /bin/netd.
+#   kernel-ring  q35 + intel-iommu: the CPL-3 /bin/netd owns the NIC (D9,
+#                #4875: the driver is a library in it), and the kernel stack
+#                is still in the frame seat (the self-test window, before
+#                the handoff);
+#   netd         the same boot after the seat handoff: netd's stack on its
+#                own NIC library, one CPL-3 process.
 #   netd-udp     the same boot after netd's window: the kernel spawns
 #                /bin/udp-echo (port 7), and the wire sends UDP datagrams
-#                to it and times each until its bytes come back: driver,
-#                netd and an app, the whole ring path.
+#                to it and times each until its bytes come back: netd and
+#                an app, the whole ring path.
 # Both boots are q35 with the split irqchip, the same CPU, memory and NIC
 # (modern virtio-net, rx_queue_size=1024); the translating one adds the
 # IOMMU and VIRTIO_F_ACCESS_PLATFORM, which a ring-1 driver needs.

@@ -4,7 +4,7 @@
 |---|---|
 | Author | Aaron Sinclair |
 | Date | 2026-11-24 |
-| Status | Draft. D8 decided 2026-11-25: (b), the driver runs at CPL 3. D9 decided 2026-11-27: network drivers live inside netd |
+| Status | Draft. D8 decided 2026-11-25: (b), the driver runs at CPL 3. D9 decided 2026-11-27: network drivers live inside netd, built the same day (PR 8, #4875) |
 | Audience | Harland kernel |
 
 ## Overview
@@ -13,7 +13,7 @@ Harland's NIC still runs in ring 0. `netdev_init` probes virtio-net and then ENA
 
 "Ring 1" (drivers) and "ring 2" (system services) are tier names, not CPU privilege levels. What separates a tier is the capabilities the kernel grants at spawn. Decision D8 (Open questions) is (b): `/bin/virtio-net` and `/bin/netd` run at CPL 3, each in its own address space (its own PML4, with the kernel half `U/S = 0` as for every user process), with device DMA fenced by the IOMMU domain and all authority from capabilities. The reason is the hardware. Every access at CPL < 3 is a supervisor-mode access (Intel SDM Vol 3 §4.6), and long mode has no segment limits, so a CPL-1 or CPL-2 process that shares the kernel half is not isolated from the kernel. Fencing it off (option (a), a reduced KPTI-style PML4 per process) costs more than CPL 3 does for the same result. So there are no DPL-1 or DPL-2 GDT descriptors, no per-CPU return selectors, and no exit path for an RPL other than 3: every process returns with `sysretq`, and #4610's non-canonical-RIP iret fallback stays. `TSS.rsp1` and `TSS.rsp2` stay 0. This design does not add a call gate, a socket API, or TCP.
 
-Decision D9 (Open questions) puts network drivers inside netd. One CPL-3 process, `/bin/netd`, owns the NIC and the stack. The virtio-net driver is a library linked into it, and `/bin/virtio-net` goes away. netd is granted the NIC's `CAP_TYPE_MMIO`, `CAP_TYPE_IRQ`, and translated DMA domain. The reason is #4768's latency gate: an echo costs 4 switches through two processes and 2 through one. Sections 2–9 describe the two-process cutover as built (#4735). PR 8 folds it, and `RING2_NET.md` "Drivers inside netd (D9)" specifies the result. Where the two disagree, D9 wins. Everything else in this substrate stays as written: the capabilities, the wait set, the DMA domain, `driver_quiesce`, `NetInfo`, and the IOMMU rule.
+Decision D9 (Open questions) puts network drivers inside netd. One CPL-3 process, `/bin/netd`, owns the NIC and the stack. The virtio-net driver is a library linked into it, and `/bin/virtio-net` goes away. netd is granted the NIC's `CAP_TYPE_MMIO`, `CAP_TYPE_IRQ`, and translated DMA domain. The reason is #4768's latency gate: an echo costs 4 switches through two processes and 2 through one. Sections 2–9 describe the two-process cutover as first built (#4735). PR 8 folded it (#4875), and `RING2_NET.md` "Drivers inside netd (D9)" specifies the result and records what was built. Where the two disagree, D9 wins. Everything else in this substrate stays as written: the capabilities, the wait set, the DMA domain, `driver_quiesce`, `NetInfo`, and the IOMMU rule.
 
 ## Background and motivation
 
@@ -973,7 +973,7 @@ D8 = (b) removes it. The GDT gains no DPL-1 or DPL-2 descriptors, and `GDT_ENTRI
 
 **Title:** harland: Fold the virtio-net driver into netd
 
-**AGAST:** #4875.
+**AGAST:** #4875. **Built** 2026-11-27; `RING2_NET.md` "Drivers inside netd (D9)", "As built", and "Rollout" have the details and the numbers.
 
 **Files:** `projects/harland/nic/` (new leaf package: `ritz.toml`, `src/nic.ritz` with `trait Nic`, `RxFrame` and `TxFrame`, and `src/virtio.ritz`, moved from `system/src/virtio_net.ritz` and `system/src/vnet.ritz`, plus their host tests), `system/src/netd.ritz` and `system/src/netsvc.ritz` (generic over `Nic`), `system/ritz.toml` (drop `[[bin]] virtio-net`, depend on `nic`), `projects/indium/initramfs.pkgs`, `driver_abi/src/boot.ritz` (`DriverBoot` on the link page), `kernel/src/net/ring1.ritz` (spawn `/bin/netd` at step 2, and step 6a without a spawn), `kernel/src/syscall/runtime/process.ritz` (`netd_restart` after `driver_quiesce`), `kernel/src/syscall/runtime/driver.ritz` (the `DrvIrqWait` deadline), `kernel/driver_stub.s`, `projects/ritz/ritz0/tests/test_harland_ring_blocking.py`, `tools/test_msix_boot.sh`, and `RING2_NET.md` "Rollout".
 

@@ -38,9 +38,10 @@ import loader.image { ElfStatus }
 import loader.elf { USER_IMAGE_BASE, ElfLoadResult, elf_load }
 import syscall.errno { Errno, errno_result }
 import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
-import syscall.runtime.net { NETD_RESTARTS, net_service_exited, net_service_death, net_restart_backoff_ms, net_restart_driver_pid, net_service_install, net_frame_object_id }
+import syscall.runtime.net { NETD_RESTARTS, net_service_exited, net_service_death, net_restart_backoff_ms }
+import net.ring1 { Respawn, net_netd_respawn }
 import syscall.runtime.argv { ArgvStatus, ArgvCapture, argv_capture, argv_buf, argv_offsets }
-import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait, proc_mark_exit, proc_detach, proc_runnable_count, MarkError }
+import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait, proc_mark_exit, proc_runnable_count, MarkError }
 import ritzlib.result { Result }
 import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report }
 import cap.table { CapTable, cap_process_has, cap_table_alloc, cap_table_free_pid, cap_inherit_ambient, cap_retire_held_shm }
@@ -288,7 +289,7 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: b
     return child_pid as i64
 
 # Start the program at `path`, an ELF the kernel chose (RING1_DRIVER.md
-# section 9 step 2: /bin/virtio-net, AGAST #4735), as a child of the running
+# section 9 step 2: /bin/netd, AGAST #4735, #4875), as a child of the running
 # process: no arguments, and no capabilities, since what a kernel-spawned
 # program holds the kernel grants. Runnable when this returns, without
 # waiting for it: its pid, or the errno with nothing changed (Errno.NoEnt
@@ -420,7 +421,8 @@ fn sys_exit_impl(code: i32) -> i64
         # back, its DMA runs out of the domain (quarantined unless both
         # confirmed), the link snapshot gone. While the capability table
         # still names it the IRQ owner, and before the retire below posts
-        # DRIVER_GONE.
+        # DRIVER_GONE. Under D9 (#4875) that process is netd, and this is
+        # the NIC reset its restart below waits on.
         driver_quiesce(me.pid as u32, my_pml4)
 
         # Close the fds it left open (flushing their writes) and free its
@@ -509,16 +511,18 @@ fn sys_exit_impl(code: i32) -> i64
     return 0
 
 # ============================================================================
-# netd's restart (AGAST #4745, harland docs/RING2_NET.md "Service binary
-# and respawn")
+# netd's restart (AGAST #4745, #4875, harland docs/RING2_NET.md "Service
+# binary and respawn", "Drivers inside netd (D9)")
 # ============================================================================
 #
 # The kernel has no threads of its own, so the restart runs in the dead
-# service's sys_exit_impl, after its handles, mappings and page table are
-# gone (its exchanges and frame object retired, NetAddr NoDev) and before
-# its slot is: it waits out the backoff, spawns /bin/netd as its own child
-# (detached: nobody reaps it), and has net_service_install set it up before
-# it first runs. The fourth death starts nothing.
+# service's sys_exit_impl, after driver_quiesce has reset its NIC and its
+# handles, mappings and page table are gone (its exchanges retired, NetAddr
+# NoDev) and before its slot is: it waits out the backoff, and
+# net/ring1.ritz net_netd_respawn spawns /bin/netd as its own child
+# (detached: nobody reaps it) with the device grants and new link and
+# address pages, before it first runs, if the NIC's quiesces left it fit.
+# The fourth death starts nothing.
 
 # The log line of the service's death.
 fn netd_died(pid: u64, code: i32)
@@ -530,7 +534,7 @@ fn netd_died(pid: u64, code: i32)
         klog_dec((0 - code) as i64)
     else
         klog_dec(code as i64)
-    klog("): NetAddr NoDev, its attachments and frame object retired\n")
+    klog("): NetAddr NoDev, its NIC reset and its attachments retired\n")
 
 # Wait `ms` in the kernel, letting every other process run: the dying
 # context is never preempted, so it yields, and sleeps to the next tick
@@ -550,14 +554,13 @@ fn netd_not_restarted(why: StrView)
 
 # The registered service just died, as the running process: restart it
 # within the budget. Logs "[net] netd restart N of 3 in MS ms" before the
-# backoff and "[net] netd restart N: pid P, frame object F on driver pid D"
-# once the replacement is set up; or "[net] netd restart budget spent:
-# NetAddr stays NoDev until reboot" for the death past the budget.
+# backoff and "[net] netd restart N: pid P" once the replacement is set up;
+# or "[net] netd restart budget spent: NetAddr stays NoDev until reboot" for
+# the death past the budget, or "[net] netd not restarted: why".
 fn netd_restart()
     let n: u32 = net_service_death()
     if n == 0
-        # Not armed: the handoff never completed, or the driver is gone
-        # (driver death stops networking until reboot).
+        # Not armed: the handoff never completed.
         return
     let ms: u64 = match net_restart_backoff_ms(n)
         Some(b) => b
@@ -572,31 +575,17 @@ fn netd_restart()
     klog_dec(ms as i64)
     klog(" ms\n")
     netd_backoff(ms)
-    # The driver may have died during the backoff.
-    let driver: u32 = net_restart_driver_pid()
-    if driver == 0
-        netd_not_restarted("the driver is gone")
-        return
-    let pid: u64 = match process_spawn_program("/bin/netd")
-        Result.Ok(p) => p
-        Result.Err(_) =>
-            netd_not_restarted("/bin/netd was not spawned")
-            return
-    proc_detach(pid)
-    if net_service_install(pid as u32, driver) != 0
-        # Never the registered service: its exit restarts nothing.
-        process_mark_exit(pid)
-        netd_not_restarted("its address page or frame object was not made")
-        return
-    klog("[net] netd restart ")
-    klog_dec(n as i64)
-    klog(": pid ")
-    klog_dec(pid as i64)
-    klog(", frame object ")
-    klog_dec(net_frame_object_id() as i64)
-    klog(" on driver pid ")
-    klog_dec(driver as i64)
-    klog("\n")
+    match net_netd_respawn()
+        Respawn.Started(pid) =>
+            klog("[net] netd restart ")
+            klog_dec(n as i64)
+            klog(": pid ")
+            klog_dec(pid as i64)
+            klog("\n")
+        Respawn.Unfit => netd_not_restarted("the NIC's reset was not confirmed or its DMA was quarantined: networking stays down until reboot")
+        Respawn.Spawn => netd_not_restarted("/bin/netd was not spawned")
+        Respawn.Grants => netd_not_restarted("its device grants or link page were not made")
+        Respawn.Page => netd_not_restarted("its address page was not made")
 
 # Terminate the running process with `status`, as if it had called
 # exit(status): its parent's wait sees it, or init's exit powers off. The

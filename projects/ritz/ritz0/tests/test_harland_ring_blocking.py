@@ -1,17 +1,20 @@
-"""virtio-net and netd block only in DrvIrqWait and ShmWait (AGAST #4746).
+"""netd blocks only in DrvIrqWait (AGAST #4746, #4875).
 
-RING_DESIGN_FINAL_REVIEW.md "Final pass" item 15: the ring-1 driver
-(/bin/virtio-net) and the ring-2 service (/bin/netd) park in exactly one
-place each, their own wait set: DrvIrqWait (220) for the driver, ShmWait
-(229) for netd. That is what keeps PROC_REAP complete: a process parked in
-its wait set is woken by endpoint_fail / driver_quiesce, and a process
-blocked anywhere else (read, wait, ipc_recv, ...) would not be.
+RING_DESIGN_FINAL_REVIEW.md "Final pass" item 15: a kernel-spawned network
+process parks in exactly one place, its own wait set. Under D9 (#4875,
+docs/RING2_NET.md "Drivers inside netd (D9)") the virtio-net driver is a
+library inside /bin/netd, which holds the NIC's IRQ capability: its one
+wait is DrvIrqWait (220), the IRQ and the app exchanges together, and
+ShmWait (229) in netd is a failure like any other blocking call. That is
+what keeps PROC_REAP complete: a process parked in its wait set is woken by
+endpoint_fail / driver_quiesce, and a process blocked anywhere else (read,
+wait, ipc_recv, ShmWait beside its real wait, ...) would not be.
 
 The lint is a source scan, so it reads the code as it is built, not a
 pinned call list (netd keeps growing):
 
-* it follows every `import` from the two entry modules transitively, through
-  the harland packages (system, driver_abi, virtio_abi, netstack, ...) and
+* it follows every `import` from the entry module transitively, through the
+  harland packages (system, nic, driver_abi, virtio_abi, netstack, ...) and
   ritzlib, resolving each package's namespaces from its own ritz.toml;
 * every function in a harland module of that closure is a root (dead code
   counts: it is one call away from live), and a function becomes reachable
@@ -22,9 +25,9 @@ pinned call list (netd keeps growing):
   must be one of ALLOWED. An unresolvable number, or an `asm` block issuing
   `syscall` outside ritzlib.sys's syscall0..6, fails too.
 
-The proof tests inject a sys_read, a sys_wait and a raw Wait into the real
-sources (netd, virtio_net, and netstack two imports away) and check each is
-named.
+The proof tests inject a sys_read, a sys_wait, a ShmWait and a raw Wait into
+the real sources (netd, the nic library, and netstack two imports away) and
+check each is named.
 """
 
 import re
@@ -45,23 +48,25 @@ HARLAND = RITZ_ROOT.parent / "harland"
 SYSTEM_SRC = HARLAND / "system" / "src"
 NUMBERS = HARLAND / "kernel" / "src" / "syscall" / "numbers.ritz"
 
+NIC_SRC = HARLAND / "nic" / "src"
+
 ENTRIES = {
-    "virtio-net": SYSTEM_SRC / "virtio_net.ritz",
     "netd": SYSTEM_SRC / "netd.ritz",
 }
 
-# The two waits: each binary's only place to park.
-BLOCKING = {"virtio-net": "DrvIrqWait", "netd": "ShmWait"}
+# The wait: the binary's only place to park.
+BLOCKING = {"netd": "DrvIrqWait"}
 
 # Syscalls that return without parking the caller: the ticket's set (Yield,
 # ShmNotify, map/alloc, NetPublish, Exit) plus NetInfo (a snapshot copy) and
-# CapRevoke (drops a handle) that netd and virtio-net use on their exit and
-# boot paths. Yield is runnable-to-runnable, not a block.
+# CapRevoke (drops a handle) that netd uses on its exit and boot paths. Yield
+# is runnable-to-runnable, not a block. Yield, DrvMmioMap, DrvDmaAlloc and
+# DrvDmaFree are netd's since D9 (#4875): it brings the NIC up itself.
 NON_BLOCKING = {
     "Yield", "ShmNotify", "ShmMap", "DrvMmioMap", "DrvDmaAlloc", "DrvDmaFree",
     "Mmap", "Munmap", "NetPublish", "NetInfo", "CapRevoke", "Exit",
 }
-ALLOWED = NON_BLOCKING | {"DrvIrqWait", "ShmWait"}
+ALLOWED = NON_BLOCKING | {"DrvIrqWait"}
 
 SYSCALL_CALL = re.compile(r"\bsyscall([0-6])\s*\(\s*([^,)]+?)\s*[,)]")
 IDENT = re.compile(r"\b[A-Za-z_]\w*\b")
@@ -273,8 +278,14 @@ def test_binary_blocks_only_in_its_wait(binary):
 
 def test_scan_follows_imports_transitively():
     _, _, mods = scan("netd")
-    assert {"system.netd", "system.netsvc", "driver_abi.wait", "ritzlib.sys"} <= mods, mods
+    assert {"system.netd", "system.netsvc", "nic.virtio", "driver_abi.wait", "ritzlib.sys"} <= mods, mods
     assert any(m.startswith("netstack.") for m in mods), mods
+
+
+def test_the_driver_is_a_library_not_a_binary():
+    """D9: /bin/virtio-net is gone; its code is the nic library netd links."""
+    assert not (SYSTEM_SRC / "virtio_net.ritz").exists()
+    assert (NIC_SRC / "virtio.ritz").exists()
 
 
 # --- proof: an added blocking call fails --------------------------------------
@@ -288,11 +299,19 @@ def _inject(path: Path, fn: str, line: str) -> dict[Path, str]:
 
 @pytest.mark.parametrize("binary,path,line,variant", [
     ("netd", ENTRIES["netd"], "sys_read(0, null, 0)", "Read"),
-    ("virtio-net", ENTRIES["virtio-net"], "sys_wait(1)", "Wait"),
+    ("netd", NIC_SRC / "virtio.ritz", "sys_wait(1)", "Wait"),
 ])
 def test_added_ritzlib_blocking_call_fails(binary, path, line, variant):
     violations, _, _ = scan(binary, _inject(path, "lint_probe", line))
     assert any(f"{variant} (" in v and "ritzlib/sys.ritz" in v for v in violations), violations
+
+
+def test_added_shm_wait_in_netd_fails():
+    # D9 (#4875): netd's one wait is DrvIrqWait; a ShmWait beside it is a
+    # second place to park, named like any other blocking call.
+    probe = _inject(ENTRIES["netd"], "lint_probe", "syscall1(229, 0)")
+    violations, _, _ = scan("netd", probe)
+    assert any("ShmWait (229) may block" in v and "system/src/netd.ritz:lint_probe" in v for v in violations), violations
 
 
 def test_added_raw_wait_two_imports_away_fails():

@@ -1,0 +1,185 @@
+# A loopback Nic: the device is plain memory (AGAST #4875, harland
+# docs/RING2_NET.md "Drivers inside netd (D9)")
+#
+# What netd's host tests run its stack and its seat pump on. The "wire"
+# side is the test's: inject() is a frame the device received, and
+# wire_take() a frame the device sent, whose completion frees its buffer.
+# It keeps the Nic rules the virtio-net Nic keeps, so a test that passes
+# here exercises the same ownership:
+#
+# - an RX frame's bytes are the NIC's buffer until rx_release, and its slot
+#   is not reused before then;
+# - a TX buffer is busy from tx_buffer until the wire takes the frame;
+#   with tx_limit buffers busy tx_buffer is None;
+# - tx_kick and irq_arm are counted.
+
+import driver_abi.frame_ring { FRAME_MAX }
+import driver_abi.link { NetInfo, ETH_HEADER_LEN }
+import driver_abi.spsc { FrameBytes }
+import nic.nic { Nic, RxFrame, TxFrame }
+import ritzlib.span
+
+# Frames each way: a frame ring's worth.
+pub const LOOP_CAP: u32 = 256
+
+# What one TX buffer holds.
+pub enum LoopBuf
+    Free
+    Held                             # tx_buffer handed it out
+    Wire                             # tx_submit sent it; wire_take completes it
+
+pub struct LoopNic
+    info: NetInfo
+    # RX: a FIFO of injected frames. The first rx_polled of the rx_count
+    # from rx_head are out to netd; a released one is freed once every
+    # older one is.
+    rx: [256]FrameBytes              # LOOP_CAP
+    rx_lens: [256]u32
+    rx_released: [256]bool
+    rx_head: u32
+    rx_count: u32
+    rx_polled: u32
+    # TX: buffer b's state; the sent ones in order.
+    tx: [256]FrameBytes
+    tx_lens: [256]u32
+    tx_state: [256]LoopBuf
+    wire: [256]u32
+    wire_head: u32
+    wire_count: u32
+    tx_next: u32
+    # The buffers tx_buffer may hand out: 1..=LOOP_CAP.
+    tx_limit: u32
+    # Counted for the tests.
+    released: u64
+    submitted: u64
+    refused: u64
+    kicks: u64
+    arms: u64
+    due: bool
+
+impl LoopNic
+    # An empty NIC with `info` as its link record and `tx_limit` TX buffers.
+    pub fn init(self: @&LoopNic, info: NetInfo, tx_limit: u32)
+        self.info = info
+        self.rx_head = 0
+        self.rx_count = 0
+        self.rx_polled = 0
+        for i in 0..LOOP_CAP
+            self.rx_released[i] = false
+            self.tx_state[i] = LoopBuf.Free
+        self.wire_head = 0
+        self.wire_count = 0
+        self.tx_next = 0
+        self.tx_limit = tx_limit
+        if self.tx_limit == 0 or self.tx_limit > LOOP_CAP
+            self.tx_limit = LOOP_CAP
+        self.released = 0
+        self.submitted = 0
+        self.refused = 0
+        self.kicks = 0
+        self.arms = 0
+        self.due = false
+
+    # The device received `frame`. False when LOOP_CAP frames wait, or the
+    # frame is empty or longer than FRAME_MAX.
+    pub fn inject(self: @&LoopNic, frame: [u8]) -> bool
+        if self.rx_count >= LOOP_CAP or frame.len == 0 or frame.len as u64 > FRAME_MAX
+            return false
+        let slot: u32 = (self.rx_head + self.rx_count) % LOOP_CAP
+        for i in 0..frame.len
+            self.rx[slot][i] = frame[i]
+        self.rx_lens[slot] = frame.len as u32
+        self.rx_released[slot] = false
+        self.rx_count = self.rx_count + 1
+        true
+
+    # Injected frames not yet released, polled or not.
+    pub fn rx_waiting(self: @LoopNic) -> u32
+        self.rx_count
+
+    # Frames polled and not released.
+    pub fn rx_out(self: @LoopNic) -> u32
+        var n: u32 = 0
+        for k in 0..self.rx_polled
+            if not self.rx_released[(self.rx_head + k) % LOOP_CAP]
+                n = n + 1
+        n
+
+    # The oldest frame the device sent, as bytes that stay valid until the
+    # next call; its buffer is free again (the completion). None when the
+    # wire is empty.
+    pub fn wire_take(self: @&LoopNic) -> Option<[u8]>
+        if self.wire_count == 0
+            return None
+        let b: u32 = self.wire[self.wire_head]
+        self.wire_head = (self.wire_head + 1) % LOOP_CAP
+        self.wire_count = self.wire_count - 1
+        self.tx_state[b] = LoopBuf.Free
+        Some(span_from_ptr<u8>(@self.tx[b][0], self.tx_lens[b] as i64))
+
+    # Frames sent and not taken.
+    pub fn wire_count(self: @LoopNic) -> u32
+        self.wire_count
+
+    # TX buffers out to netd and not submitted.
+    pub fn tx_held(self: @LoopNic) -> u32
+        var n: u32 = 0
+        for b in 0..self.tx_limit
+            if self.tx_state[b] == LoopBuf.Held
+                n = n + 1
+        n
+
+impl Nic for LoopNic
+    fn rx_poll(self: @&LoopNic) -> Option<RxFrame>
+        if self.rx_polled >= self.rx_count
+            return None
+        let slot: u32 = (self.rx_head + self.rx_polled) % LOOP_CAP
+        self.rx_polled = self.rx_polled + 1
+        let bytes: [u8] = span_from_ptr<u8>(@self.rx[slot][0], self.rx_lens[slot] as i64)
+        Some(RxFrame { bytes: bytes, token: slot })
+
+    fn rx_release(self: @&LoopNic, f: RxFrame)
+        if f.token >= LOOP_CAP
+            return
+        self.rx_released[f.token] = true
+        self.released = self.released + 1
+        while self.rx_polled > 0 and self.rx_released[self.rx_head]
+            self.rx_released[self.rx_head] = false
+            self.rx_head = (self.rx_head + 1) % LOOP_CAP
+            self.rx_count = self.rx_count - 1
+            self.rx_polled = self.rx_polled - 1
+
+    fn tx_buffer(self: @&LoopNic) -> Option<TxFrame>
+        for k in 0..self.tx_limit
+            let b: u32 = (self.tx_next + k) % self.tx_limit
+            if self.tx_state[b] == LoopBuf.Free
+                self.tx_state[b] = LoopBuf.Held
+                self.tx_next = (b + 1) % self.tx_limit
+                let bytes: [u8] = span_from_ptr<u8>(@self.tx[b][0], FRAME_MAX as i64)
+                return Some(TxFrame { bytes: bytes, token: b })
+        None
+
+    fn tx_submit(self: @&LoopNic, f: TxFrame, len: u32)
+        if f.token >= self.tx_limit or self.tx_state[f.token] != LoopBuf.Held
+            return
+        if len < ETH_HEADER_LEN or len as u64 > FRAME_MAX
+            self.tx_state[f.token] = LoopBuf.Free
+            self.refused = self.refused + 1
+            return
+        self.tx_state[f.token] = LoopBuf.Wire
+        self.tx_lens[f.token] = len
+        self.wire[(self.wire_head + self.wire_count) % LOOP_CAP] = f.token
+        self.wire_count = self.wire_count + 1
+        self.submitted = self.submitted + 1
+        self.due = true
+
+    fn tx_kick(self: @&LoopNic)
+        if self.due
+            self.due = false
+            self.kicks = self.kicks + 1
+
+    fn irq_arm(self: @&LoopNic)
+        self.arms = self.arms + 1
+
+    fn link(self: @LoopNic) -> NetInfo
+        self.info

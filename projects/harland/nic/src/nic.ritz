@@ -1,0 +1,45 @@
+# The NIC interface (decision D9, harland docs/RING2_NET.md "Drivers inside
+# netd (D9)", AGAST #4875)
+#
+# netd owns the NIC and the stack in one CPL-3 process. Its loop is generic
+# over this trait: Ritz traits are static (LANGUAGE_SPEC §12), so a bound,
+# not a vtable, and one netd binary links the NIC library it serves.
+#
+# The calls are direct and do not copy (RING2_NET.md, the descriptor
+# ownership rules):
+#
+# - RX. rx_poll hands out a frame where the device wrote it, its NIC
+#   header stripped. The buffer is netd's until rx_release gives it back to
+#   the device; anything netd keeps past that it copies.
+# - TX. tx_buffer hands out a device buffer, past the room for the NIC's own
+#   header; the stack builds a frame in it and tx_submit queues it. From
+#   tx_submit until the device returns it the buffer is the device's
+#   (AGAST #4073). With every buffer in flight tx_buffer is None and the
+#   frame waits in netd's pending-TX queue for a completion.
+# - tx_kick rings the doorbells once for everything submitted, and for every
+#   RX buffer released, since the last kick: once per pass, not per frame.
+# - irq_arm lets the device interrupt on its next completion. netd may arm
+#   on every pass (#4875); masking during a budgeted drain is #4876's.
+
+import driver_abi.link { NetInfo }
+
+# A frame the NIC received. `bytes` start at the Ethernet header and lie in
+# the NIC's own DMA buffer: netd's until rx_release returns it to the device.
+pub struct RxFrame
+    bytes: [u8]
+    token: u32
+
+# A device buffer for one outgoing frame, past the space for the NIC's own
+# header: netd's until tx_submit hands it to the device.
+pub struct TxFrame
+    bytes: [u8]
+    token: u32
+
+pub trait Nic
+    fn rx_poll(self: @&Self) -> Option<RxFrame>        # next received frame, or None
+    fn rx_release(self: @&Self, f: RxFrame)            # repost its buffer
+    fn tx_buffer(self: @&Self) -> Option<TxFrame>      # reclaims sent buffers first. None: all in flight
+    fn tx_submit(self: @&Self, f: TxFrame, len: u32)   # adds the NIC header, queues it
+    fn tx_kick(self: @&Self)                           # one doorbell for everything submitted
+    fn irq_arm(self: @&Self)                           # interrupt on the next completion
+    fn link(self: @Self) -> NetInfo                    # MAC, link up, MTU, device type

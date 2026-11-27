@@ -1,15 +1,16 @@
-"""The virtio-net cutover: the ring-1 driver owns the NIC's queues on every
-boot that translates DMA (AGAST #4735, RING1_DRIVER.md sections 8-9, ring
-plan T29).
+"""The virtio-net cutover: a CPL-3 process owns the NIC's queues on every
+boot that translates DMA (AGAST #4735, #4875; RING1_DRIVER.md sections 8-9
+and PR 8, RING2_NET.md "Drivers inside netd (D9)", ring plan T29).
 
 D7: the boot picks the owner, not a marker file. A boot with a virtio-net
 and a translated DMA domain probes the NIC in the kernel (isolation, MSI-X
 at the BSP, the windows recorded; no virtqueue, no DRIVER_OK), makes pid 1
-(process_create_init), spawns /bin/virtio-net on pid 1's kernel stack,
-yields to it until it parks with generation 2 published, and starts the
-scheduler once, all before postinit_diagnostics and run_init. netdev_init
-then skips virtio_net_init; net_stack_init finds the ring through the link
-snapshot. An untranslated boot keeps virtio_net_init and spawns nothing.
+(process_create_init), spawns /bin/netd (D9: the driver is a library in
+it) on pid 1's kernel stack, yields to it until it parks with generation 2
+published, and starts the scheduler once, all before postinit_diagnostics
+and run_init. netdev_init then skips virtio_net_init; net_stack_init finds
+the ring through the link snapshot. An untranslated boot keeps
+virtio_net_init and spawns nothing.
 
 The behaviour is tools/test_msix_boot.sh's vtd run (its verdicts are
 host-tested in projects/ritz/tools/test_ci_msix_boot.py). These checks pin
@@ -34,6 +35,8 @@ POSTINIT = KERNEL_SRC / "postinit.ritz"
 NVME = KERNEL_SRC / "drivers" / "nvme" / "nvme.ritz"
 TABLE = KERNEL_SRC / "proc" / "table.ritz"
 ERRNO = KERNEL_SRC / "syscall" / "errno.ritz"
+DRIVER = KERNEL_SRC / "syscall" / "runtime" / "driver.ritz"
+RING = KERNEL_SRC / "net" / "ring.ritz"
 
 
 def _code(path):
@@ -44,6 +47,14 @@ def _fn_body(src, name):
     m = re.search(rf"^(?:pub )?fn {name}\(.*?(?=^\S)", src + "\nEND", re.M | re.S)
     assert m, f"no fn {name}"
     return m.group(0)
+
+
+def _in_order(body, *needles):
+    at = -1
+    for n in needles:
+        i = body.find(n, at + 1)
+        assert i > at, f"{n!r} missing or out of order"
+        at = i
 
 
 @pytest.mark.unit
@@ -139,27 +150,72 @@ def test_prepare_makes_pid_1_only_after_the_probe_hands_the_nic_over():
 
 
 @pytest.mark.unit
-def test_spawn_grants_before_the_driver_runs_and_starts_the_scheduler_once():
+def test_spawn_grants_before_netd_runs_and_starts_the_scheduler_once():
+    """D9 (#4875): step 2 spawns /bin/netd, the NIC's driver and the stack
+    in one process, with the device grants and the frame object."""
     body = _fn_body(_code(RING1), "net_ring1_spawn")
     assert "sched_is_running()" in body.split("\n", 2)[1]     # a second call does nothing
     obj = body.index("ring1_device_object(g)")
-    spawn = body.index('process_spawn_program("/bin/virtio-net")')
-    grant = body.index("ring1_grant_to(pid, obj, g)")
+    spawn = body.index('process_spawn_program("/bin/netd")')
+    detach = body.index("proc_detach(pid)")
+    grant = body.index("ring1_grant_to(pid, obj, g, true)")
     yields = body.index("sched_yield()\n        yields = yields + 1")
     start = body.index("sched_start(proc_current_slot())")
-    assert obj < spawn < grant < yields < start
+    assert obj < spawn < detach < grant < yields < start
     assert body.count("sched_start(") == 1
+    assert "/bin/netd pid " in body and "parked: generation 2 published" in body
 
 
 @pytest.mark.unit
-def test_the_frame_object_is_the_drivers_first_mapping_and_the_record_is_written():
+def test_the_link_page_is_netds_first_mapping_and_holds_the_record():
+    """The link page maps first (DRV_RING_BASE, where netd finds DriverBoot),
+    then the frame object only when the seat goes with the spawn; the record
+    is written on the link page, the page every spawn of netd gets."""
     body = _fn_body(_code(RING1), "ring1_grant_to")
-    seat = body.index("ring_seat_open(pid)")
-    for later in ("CAP_TYPE_IRQ", "shm_create(1)", "CAP_TYPE_MMIO", "driver_boot_at("):
-        assert seat < body.index(later), later
-    assert "CAP_RIGHT_PUBLISH" in body and "net_link_register(link_obj)" in body
+    _in_order(body, "shm_create(1)", "CAP_RIGHT_PUBLISH", "shm_map(pid as u32", "DRV_RING_BASE",
+              "net_link_register(link_obj)", "if with_seat", "ring_seat_open(pid)", "CAP_TYPE_IRQ",
+              "CAP_TYPE_MMIO", "driver_boot_at(phys_to_virt(shm_page(link_obj, 0)))")
     assert "boot.magic = DRIVER_BOOT_MAGIC" in body
     assert "i < DRIVER_BOOT_WINDOWS" in body
+    # A restart's record names no frame object.
+    assert "var frame: u64 = 0" in body
+
+
+@pytest.mark.unit
+def test_no_kernel_path_spawns_the_driver_binary():
+    """D9: /bin/virtio-net is gone from the kernel, the system package and
+    the image's package list."""
+    for path in KERNEL_SRC.rglob("*.ritz"):
+        assert '"/bin/virtio-net"' not in path.read_text(), path
+    assert '"virtio-net"' not in (HARLAND / "system" / "ritz.toml").read_text()
+    assert not (HARLAND / "system" / "src" / "virtio_net.ritz").exists()
+
+
+# D9 (#4875), one row per function: (why, file, fn, calls in order, calls
+# absent).
+D9_CUTOVER_ROWS = (
+    ("netd's protocol timers ride on DrvIrqWait, which reads WaitRequest.deadline as ShmWait does",
+     DRIVER, "drv_irq_wait",
+     ("deadline_after_us(device_wait_ms(checked.deadline_ms) * US_PER_MS)",),
+     ("deadline_after_us(DEVICE_WAIT_MS",)),
+    ("the deadline is capped at DEVICE_WAIT_MS", DRIVER, "device_wait_ms",
+     ("if requested > DEVICE_WAIT_MS\n        return DEVICE_WAIT_MS",), ()),
+    ("after the handoff netd revokes the frame object: NetPublish posts no LINK to anyone "
+     "(RING2_NET.md \"Drivers inside netd (D9)\", Unchanged)",
+     RING, "ring_seat_handoff", ("seat_close()", "net_frame_register(0, 0)"), ("net_frame_register(object_id",)),
+)
+
+
+@pytest.mark.unit
+def test_d9_wait_deadline_and_handoff_rows():
+    for why, path, fn, ordered, absent in D9_CUTOVER_ROWS:
+        body = _fn_body(_code(path), fn)
+        try:
+            _in_order(body, *ordered)
+        except AssertionError as e:
+            raise AssertionError(f"{fn}: {why}: {e}") from None
+        for a in absent:
+            assert a not in body, f"{fn}: {why}: {a!r} present"
 
 
 @pytest.mark.unit

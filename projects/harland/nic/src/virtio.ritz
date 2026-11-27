@@ -1,0 +1,638 @@
+# The virtio-net Nic (AGAST #4734, #4875; harland docs/RING1_DRIVER.md
+# sections 6-8, docs/RING2_NET.md "Drivers inside netd (D9)")
+#
+# The virtio-net driver as a library linked into /bin/netd (D9): the
+# register bring-up, both queues, the 32-buffer pools, the header strip on
+# RX and fill on TX, and TX reclaim by the AGAST #4073 rule. It makes no
+# syscalls. netd copies the boot record, maps the device's windows
+# (DrvMmioMap) and allocates the DMA runs (DrvDmaAlloc), and passes in the
+# mapped register addresses (VirtioRegs) and the runs (VirtioDma);
+# VirtioNic.up resets, negotiates, lays the queues over the runs and sets
+# DRIVER_OK.
+#
+# The frames do not move through a copy (RING2_NET.md, the descriptor
+# ownership rules): rx_poll hands out the bytes where the device wrote them
+# and the buffer is reposted only on rx_release; tx_buffer hands out a
+# buffer the stack builds a frame in, and tx_submit writes the header in
+# front of it. VirtioNic.layout is the bring-up without registers, so
+# test/test_virtio.ritz drives the queues against a "device" that is stores
+# to the used ring; its doorbells are counted, not written.
+
+import driver_abi.boot { DriverBoot, DriverWindow, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_NOTIFY, VIRTIO_WINDOW_ISR, VIRTIO_WINDOW_DEVICE }
+import driver_abi.frame_ring { FRAME_MAX }
+import driver_abi.link { NetInfo, NETINFO_MTU_MAX, NETDEV_TYPE_VIRTIO, ETH_HEADER_LEN }
+import virtio_abi.features { VIRTIO_F_VERSION_1, VIRTIO_F_ACCESS_PLATFORM, virtio_driver_features, virtio_features_lo, virtio_features_hi, virtio_features_join }
+import virtio_abi.virtq { Virtqueue, VringDesc, VringAvail, VringUsedElem, TxSlots, VIRTQ_MAX_SIZE, VRING_DESC_F_WRITE, virtq_ring_bytes, virtq_init, virtq_desc_phys, virtq_avail_phys, virtq_used_phys, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_get_used, vq_peek_used, tx_slots_init, tx_slots_take, tx_slots_post, tx_slots_release, vq_reclaim_tx }
+import nic.nic { Nic, RxFrame, TxFrame }
+import ritzlib.span
+
+# ============================================================================
+# The virtio-net header (virtio 1.1 section 5.1.6)
+# ============================================================================
+
+# Without VIRTIO_F_VERSION_1 and MRG_RXBUF the header is 10 bytes; with
+# VERSION_1 it always carries num_buffers and is 12. This driver drives
+# modern devices only, so it is 12 in practice; both are handled.
+pub const VNET_HDR_LEGACY: u32 = 10
+pub const VNET_HDR_V1: u32 = 12
+
+pub fn vnet_hdr_len(version_1: bool) -> u32
+    if version_1
+        return VNET_HDR_V1
+    VNET_HDR_LEGACY
+
+# ============================================================================
+# Buffers
+# ============================================================================
+
+# RX and TX buffers posted to the device: RING1_DRIVER.md section 6's
+# "posted virtio pool is only 32 buffers".
+pub const RX_BUFFERS: u32 = 32
+pub const TX_BUFFERS: u32 = 32
+
+# One device buffer: a whole frame slot (FRAME_MAX) plus the largest
+# header, rounded up to a cache line, so RX never truncates a frame a frame
+# slot could carry and every frame the stack builds fits behind its header.
+pub const VNET_BUF_SIZE: u64 = 2112
+
+# Bytes of one pool of `count` buffers: what netd asks DrvDmaAlloc for.
+pub fn pool_bytes(count: u32) -> u64
+    (count as u64) * VNET_BUF_SIZE
+
+# Bytes of one queue's rings at the largest size this driver programs:
+# what netd asks DrvDmaAlloc for, before the device says its size.
+pub fn ring_run_bytes() -> u64
+    virtq_ring_bytes(VIRTQ_MAX_SIZE)
+
+# One DrvDmaAlloc run: the CPU's address and the device's (the IOVA in the
+# NIC's domain).
+pub struct DmaRun
+    virt: u64
+    iova: u64
+
+# The four runs netd allocates for the NIC: each queue's rings
+# (ring_run_bytes) and each pool (pool_bytes of RX_BUFFERS, TX_BUFFERS).
+pub struct VirtioDma
+    rx_ring: DmaRun
+    tx_ring: DmaRun
+    rx_pool: DmaRun
+    tx_pool: DmaRun
+
+# One pool of buffers. Buffer b is VNET_BUF_SIZE bytes at b * that.
+pub struct Pool
+    virt: u64
+    iova: u64
+    count: u32
+
+pub fn pool_buf_iova(p: Pool, b: u32) -> u64
+    p.iova + (b as u64) * VNET_BUF_SIZE
+
+pub fn pool_buf(p: Pool, b: u32) -> [u8]
+    span_from_ptr<u8>((p.virt + (b as u64) * VNET_BUF_SIZE) as *u8, VNET_BUF_SIZE as i64)
+
+# Which buffer a descriptor's device address names, or None for an address
+# that is not the start of one of this pool's buffers. The descriptor table
+# is device-writable memory, so it is checked, not trusted.
+pub fn pool_index_of(p: Pool, iova: u64) -> Option<u32>
+    if iova < p.iova
+        return None
+    let off: u64 = iova - p.iova
+    if off % VNET_BUF_SIZE != 0 or off / VNET_BUF_SIZE >= p.count as u64
+        return None
+    Some((off / VNET_BUF_SIZE) as u32)
+
+# ============================================================================
+# RX: strip the header
+# ============================================================================
+
+# Why a received completion carries no frame. Each is counted and the
+# buffer goes straight back to the device.
+pub enum RxBad
+    Short                            # the device wrote the header or less
+    Overlong                         # more than the buffer, or than a frame slot
+    Buffer                           # the used id or its address names no RX buffer
+
+# The frame in RX buffer `buf` after the device wrote `used_len` bytes:
+# the bytes after the `hdr`-byte virtio-net header.
+pub fn rx_frame(buf: [u8], used_len: u32, hdr: u32) -> Result<[u8], RxBad>
+    if used_len <= hdr
+        return Err(RxBad.Short)
+    if used_len as i64 > buf.len or (used_len - hdr) as u64 > FRAME_MAX
+        return Err(RxBad.Overlong)
+    Ok(buf[hdr as i64..used_len as i64])
+
+# ============================================================================
+# The link record
+# ============================================================================
+
+# The NetInfo netd publishes (section 7): the device's MAC, link_up from
+# status bit 0, NETDEV_TYPE_VIRTIO, and the MTU clamped to what a frame slot
+# holds. A device without VIRTIO_NET_F_MTU reports none: 1500.
+pub const VNET_DEFAULT_MTU: u32 = 1500
+
+pub fn net_info(mac: [6]u8, link_up: bool, device_mtu: Option<u16>) -> NetInfo
+    var mtu: u32 = VNET_DEFAULT_MTU
+    match device_mtu
+        Some(m) => mtu = m as u32
+        None => mtu = VNET_DEFAULT_MTU
+    if mtu > NETINFO_MTU_MAX
+        mtu = NETINFO_MTU_MAX
+    var link: u8 = 0
+    if link_up
+        link = 1
+    NetInfo { mac: mac, link_up: link, device_type: NETDEV_TYPE_VIRTIO, mtu: mtu }
+
+# ============================================================================
+# The boot record
+# ============================================================================
+
+# Why netd will not drive what the boot record describes. It exits.
+pub enum BootBad
+    Magic                            # not a record the kernel wrote
+    Count                            # more windows than the record holds
+    Window                           # an offset outside the first page, or length 0
+    Legacy                           # no common or notify window: not a modern device
+
+# The windows netd maps: indexes into DriverBoot.windows. ISR and device
+# config are optional to the transport; the driver needs the device config
+# for the MAC, and runs on MSI-X without the ISR.
+pub struct BootWindows
+    common: u32
+    notify: u32
+    isr: Option<u32>
+    device: Option<u32>
+
+const WINDOW_PAGE: u32 = 4096
+
+# Check the private copy of the boot record and pick the first window of
+# each kind.
+pub fn boot_windows(b: DriverBoot) -> Result<BootWindows, BootBad>
+    if b.magic != DRIVER_BOOT_MAGIC
+        return Err(BootBad.Magic)
+    if b.window_count > DRIVER_BOOT_WINDOWS
+        return Err(BootBad.Count)
+    var common: Option<u32> = None
+    var notify: Option<u32> = None
+    var isr: Option<u32> = None
+    var device: Option<u32> = None
+    for i in 0..b.window_count
+        let w: DriverWindow = b.windows[i]
+        if w.offset >= WINDOW_PAGE or w.length == 0
+            return Err(BootBad.Window)
+        if w.cfg_type == VIRTIO_WINDOW_COMMON and common.is_none()
+            common = Some(i)
+        else if w.cfg_type == VIRTIO_WINDOW_NOTIFY and notify.is_none()
+            notify = Some(i)
+        else if w.cfg_type == VIRTIO_WINDOW_ISR and isr.is_none()
+            isr = Some(i)
+        else if w.cfg_type == VIRTIO_WINDOW_DEVICE and device.is_none()
+            device = Some(i)
+    match common
+        Some(c) =>
+            match notify
+                Some(n) => Ok(BootWindows { common: c, notify: n, isr: isr, device: device })
+                None => Err(BootBad.Legacy)
+        None => Err(BootBad.Legacy)
+
+# The bytes of each register block the driver touches: netd refuses a
+# window shorter than its block (virtio 1.1 sections 4.1.4.3 and 5.1.4).
+pub const COMMON_LEN: u32 = 0x38
+pub const NOTIFY_LEN: u32 = 2
+pub const NET_CFG_LEN: u32 = 12
+
+# ============================================================================
+# Registers (virtio 1.1 sections 4.1.4.3 and 5.1.4)
+# ============================================================================
+
+const COMMON_DEVICE_FEATURE_SELECT: u64 = 0x00
+const COMMON_DEVICE_FEATURE: u64 = 0x04
+const COMMON_DRIVER_FEATURE_SELECT: u64 = 0x08
+const COMMON_DRIVER_FEATURE: u64 = 0x0C
+const COMMON_MSIX_CONFIG: u64 = 0x10
+const COMMON_DEVICE_STATUS: u64 = 0x14
+const COMMON_QUEUE_SELECT: u64 = 0x16
+const COMMON_QUEUE_SIZE: u64 = 0x18
+const COMMON_QUEUE_MSIX_VECTOR: u64 = 0x1A
+const COMMON_QUEUE_ENABLE: u64 = 0x1C
+const COMMON_QUEUE_NOTIFY_OFF: u64 = 0x1E
+const COMMON_QUEUE_DESC: u64 = 0x20
+const COMMON_QUEUE_DRIVER: u64 = 0x28
+const COMMON_QUEUE_DEVICE: u64 = 0x30
+
+const STATUS_ACKNOWLEDGE: u8 = 1
+const STATUS_DRIVER: u8 = 2
+const STATUS_DRIVER_OK: u8 = 4
+const STATUS_FEATURES_OK: u8 = 8
+const STATUS_NEEDS_RESET: u8 = 64
+const STATUS_FAILED: u8 = 128
+
+const MSI_NO_VECTOR: u16 = 0xFFFF
+
+# virtio-net device configuration: mac[6], status u16, max pairs u16, mtu u16
+const NET_CFG_MAC: u64 = 0
+const NET_CFG_STATUS: u64 = 6
+const NET_CFG_MTU: u64 = 10
+const NET_STATUS_LINK_UP: u16 = 1
+
+const VIRTIO_NET_F_MTU: u64 = 0x8
+const VIRTIO_NET_F_MAC: u64 = 0x20
+const VIRTIO_NET_F_STATUS: u64 = 0x10000
+
+const RX_QUEUE: u16 = 0
+const TX_QUEUE: u16 = 1
+
+# VRING_AVAIL_F_NO_INTERRUPT (virtio 1.1 section 2.6.7): the driver asks the
+# device not to interrupt on a used buffer. irq_arm clears it.
+const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1
+
+# How many reads of device_status the reset waits for 0 (virtio 1.1
+# 4.1.4.3.2). It cannot yield: until its first DrvIrqWait netd is the only
+# runnable process besides pid 1, which must not run mid-init
+# (RING1_DRIVER.md section 9 step 3).
+const RESET_POLLS: u32 = 10000000
+
+# Where netd mapped the device's register blocks (each window's first byte
+# of its block), with the notify window's length and multiplier.
+pub struct VirtioRegs
+    common: u64
+    notify: u64
+    notify_len: u32
+    notify_mult: u32
+    device: u64
+
+# The MSI-X table indexes the kernel handed over (DriverBoot): config
+# changes, then each queue.
+pub struct VirtioMsix
+    config: u16
+    rx: u16
+    tx: u16
+
+fn rd8(a: u64) -> u8
+    volatile_load(a as *u8)
+
+fn rd16(a: u64) -> u16
+    volatile_load(a as *u16)
+
+fn rd32(a: u64) -> u32
+    volatile_load(a as *u32)
+
+fn wr8(a: u64, v: u8)
+    volatile_store(a as *u8, v)
+
+fn wr16(a: u64, v: u16)
+    volatile_store(a as *u16, v)
+
+fn wr32(a: u64, v: u32)
+    volatile_store(a as *u32, v)
+
+fn wr64(a: u64, v: u64)
+    wr32(a, (v & 0xFFFFFFFF) as u32)
+    wr32(a + 4, (v >> 32) as u32)
+
+fn status(r: VirtioRegs) -> u8
+    rd8(r.common + COMMON_DEVICE_STATUS)
+
+fn add_status(r: VirtioRegs, bits: u8)
+    wr8(r.common + COMMON_DEVICE_STATUS, status(r) | bits)
+
+# Why VirtioNic.up stopped. netd exits with a status naming it.
+pub enum UpError
+    Reset                            # device_status never read 0
+    Features                         # no VERSION_1, ACCESS_PLATFORM or MAC
+    FeaturesOk                       # the device refused the features
+    Vector                           # an MSI-X vector read back NO_VECTOR
+    Queue                            # a queue is missing or its doorbell is outside the window
+    NeedsReset                       # DEVICE_NEEDS_RESET after DRIVER_OK
+
+# What VirtioNic.up brought up, for netd's log: each queue's size and the
+# device's maximum, and whether the link is up.
+pub struct VirtioUp
+    rx_num: u16
+    rx_max: u16
+    tx_num: u16
+    tx_max: u16
+
+# ============================================================================
+# The NIC
+# ============================================================================
+
+# Both device queues and their buffer pools. Queue 0 is RX, queue 1 TX.
+# RX descriptors are allocated once, one per RX buffer, and reposted as
+# they are released; TX descriptors come off the free list per buffer and
+# go back on it when the used ring returns them (vq_reclaim_tx).
+pub struct NetQueues
+    rx: Virtqueue
+    tx: Virtqueue
+    rx_pool: Pool
+    tx_pool: Pool
+    tx_slots: TxSlots
+    hdr: u32
+
+pub struct VirtioNic
+    q: NetQueues
+    regs: VirtioRegs                 # zero before up(): no registers (host tests)
+    features: u64
+    mac: [6]u8
+    mtu: Option<u16>
+    # The link record layout() was given; link() reads the status register
+    # instead once up() has mapped one.
+    info: NetInfo
+    # Each queue's doorbell: notify + queue_notify_off * notify_multiplier.
+    rx_doorbell: u64
+    tx_doorbell: u64
+    # A buffer was reposted or submitted since the last tx_kick.
+    rx_due: bool
+    tx_due: bool
+    # Doorbells rung, and frames handled, since layout().
+    rx_kicks: u64
+    tx_kicks: u64
+    rx_dropped: u64                  # completions with no frame (RxBad)
+    tx_refused: u64                  # submits of a runt or overlong frame
+    # The first received frame: the IOVA of the RX buffer the device wrote
+    # it to, and its length (0 for none yet). netd logs it once, as
+    # evidence of DMA into a granted page (AGAST #4735).
+    first_rx_iova: u64
+    first_rx_len: u32
+
+# A token names a descriptor and the buffer posted on it.
+fn token_of(d: u16, b: u32) -> u32
+    (d as u32) | (b << 16)
+
+fn token_desc(t: u32) -> u16
+    (t & 0xFFFF) as u16
+
+fn token_buf(t: u32) -> u32
+    t >> 16
+
+impl VirtioNic
+    # The queues over `dma`, `rx_num` and `tx_num` descriptors (each at
+    # most VIRTQ_MAX_SIZE, the size ring_run_bytes covers), with the link
+    # record `info`; every RX buffer posted, nothing kicked yet. The rings
+    # are zeroed memory (a DrvDmaAlloc run is). up() calls it once the
+    # device has said its queue sizes; host tests call it alone.
+    pub fn layout(self: @&VirtioNic, dma: VirtioDma, rx_num: u16, tx_num: u16, info: NetInfo)
+        virtq_init(@self.q.rx, RX_QUEUE, rx_num, dma.rx_ring.virt, dma.rx_ring.iova)
+        virtq_init(@self.q.tx, TX_QUEUE, tx_num, dma.tx_ring.virt, dma.tx_ring.iova)
+        self.q.rx_pool = Pool { virt: dma.rx_pool.virt, iova: dma.rx_pool.iova, count: RX_BUFFERS }
+        self.q.tx_pool = Pool { virt: dma.tx_pool.virt, iova: dma.tx_pool.iova, count: TX_BUFFERS }
+        # Never more buffers in flight than the queue has descriptors.
+        var tx_count: u32 = TX_BUFFERS
+        if (tx_num as u32) < tx_count
+            tx_count = tx_num as u32
+        tx_slots_init(@self.q.tx_slots, tx_count)
+        self.q.hdr = vnet_hdr_len(true)
+        self.info = info
+        self.mac = info.mac
+        # net_info already clamped it, so the link record round-trips.
+        self.mtu = Some(info.mtu as u16)
+        self.rx_due = false
+        self.tx_due = false
+        self.rx_kicks = 0
+        self.tx_kicks = 0
+        self.rx_dropped = 0
+        self.tx_refused = 0
+        self.first_rx_iova = 0
+        self.first_rx_len = 0
+        var b: u32 = 0
+        while b < self.q.rx_pool.count
+            let d: i32 = vq_alloc_desc(@self.q.rx)
+            if d < 0
+                break
+            self.rx_post(d as u16, b)
+            b = b + 1
+
+    # Bring the device up from reset over the mapped registers `r`, the DMA
+    # runs and the MSI-X table indexes: reset, ACKNOWLEDGE | DRIVER;
+    # VERSION_1 (bit 32), ACCESS_PLATFORM (bit 33: DMA through the domain;
+    # without it the device would DMA to guest-physical addresses, not
+    # these IOVAs) and MAC, plus STATUS and MTU when offered; FEATURES_OK;
+    # both queues laid over their runs and programmed, each signalling its
+    # MSI-X index; DRIVER_OK. Every RX buffer is posted; the first tx_kick
+    # notifies the RX queue.
+    pub fn up(self: @&VirtioNic, r: VirtioRegs, dma: VirtioDma, msix: VirtioMsix) -> Result<VirtioUp, UpError>
+        self.regs = r
+        self.features = negotiate(r)?
+        for i in 0..6
+            self.mac[i] = rd8(r.device + NET_CFG_MAC + i as u64)
+        self.mtu = None
+        if (self.features & VIRTIO_NET_F_MTU) != 0
+            self.mtu = Some(rd16(r.device + NET_CFG_MTU))
+        wr16(r.common + COMMON_MSIX_CONFIG, msix.config)
+        if rd16(r.common + COMMON_MSIX_CONFIG) == MSI_NO_VECTOR
+            return Err(UpError.Vector)
+        let rx_max: u16 = queue_max(r, RX_QUEUE)?
+        let tx_max: u16 = queue_max(r, TX_QUEUE)?
+        let rx_num: u16 = capped(rx_max)
+        let tx_num: u16 = capped(tx_max)
+        let mac = self.mac
+        self.layout(dma, rx_num, tx_num, net_info(mac, true, self.mtu))
+        self.rx_doorbell = program_queue(r, @self.q.rx, RX_QUEUE, msix.rx)?
+        self.tx_doorbell = program_queue(r, @self.q.tx, TX_QUEUE, msix.tx)?
+        add_status(r, STATUS_DRIVER_OK)
+        if (status(r) & STATUS_NEEDS_RESET) != 0
+            return Err(UpError.NeedsReset)
+        Ok(VirtioUp { rx_num: rx_num, rx_max: rx_max, tx_num: tx_num, tx_max: tx_max })
+
+    # Give RX buffer `b` to the device on descriptor `d`.
+    fn rx_post(self: @&VirtioNic, d: u16, b: u32)
+        let desc: *VringDesc = vq_get_desc(@self.q.rx, d)
+        desc.addr = pool_buf_iova(self.q.rx_pool, b)
+        desc.len = VNET_BUF_SIZE as u32
+        desc.flags = VRING_DESC_F_WRITE
+        desc.next = 0
+        vq_submit(@self.q.rx, d)
+        self.rx_due = true
+
+    # A TX buffer handed out and not sent goes back: its descriptor to the
+    # free list, its slot free.
+    fn tx_unsent(self: @&VirtioNic, d: u16)
+        tx_slots_release(@self.q.tx_slots, d)
+        vq_free_desc(@self.q.tx, d)
+
+    fn link_up(self: @VirtioNic) -> bool
+        if self.regs.device == 0
+            return self.info.link_up != 0
+        # Without VIRTIO_NET_F_STATUS the link is assumed up (virtio 1.1
+        # 5.1.4.2).
+        if (self.features & VIRTIO_NET_F_STATUS) == 0
+            return true
+        (rd16(self.regs.device + NET_CFG_STATUS) & NET_STATUS_LINK_UP) != 0
+
+impl Nic for VirtioNic
+    # The next completed RX buffer's frame, header stripped, in the buffer.
+    # A completion with no frame (RxBad) is counted and its buffer reposted
+    # at once; one whose id or address names no buffer is dropped.
+    fn rx_poll(self: @&VirtioNic) -> Option<RxFrame>
+        # The used idx the device stored is read before its elements.
+        fence()
+        while true
+            let elem: VringUsedElem = match vq_peek_used(@self.q.rx)
+                Some(e) => e
+                None => return None
+            vq_get_used(@self.q.rx)
+            if elem.id >= self.q.rx.num as u32
+                # Names no descriptor: nothing to repost.
+                self.rx_dropped = self.rx_dropped + 1
+                continue
+            let d: u16 = elem.id as u16
+            let b: u32 = match pool_index_of(self.q.rx_pool, vq_get_desc(@self.q.rx, d).addr)
+                Some(x) => x
+                None =>
+                    self.rx_dropped = self.rx_dropped + 1
+                    continue
+            match rx_frame(pool_buf(self.q.rx_pool, b), elem.len, self.q.hdr)
+                Ok(frame) =>
+                    if self.first_rx_len == 0
+                        self.first_rx_iova = pool_buf_iova(self.q.rx_pool, b)
+                        self.first_rx_len = frame.len as u32
+                    return Some(RxFrame { bytes: frame, token: token_of(d, b) })
+                Err(_) =>
+                    self.rx_dropped = self.rx_dropped + 1
+                    self.rx_post(d, b)
+
+    # Repost the frame's buffer on its descriptor; the next tx_kick tells
+    # the device.
+    fn rx_release(self: @&VirtioNic, f: RxFrame)
+        let d: u16 = token_desc(f.token)
+        let b: u32 = token_buf(f.token)
+        if d >= self.q.rx.num or b >= self.q.rx_pool.count
+            return
+        self.rx_post(d, b)
+
+    # Reclaim what the device has sent, then a free buffer on a free
+    # descriptor, or None with every buffer in flight. The buffer is
+    # recorded busy on that descriptor now, so it is not handed out again
+    # before the device returns it.
+    fn tx_buffer(self: @&VirtioNic) -> Option<TxFrame>
+        fence()
+        vq_reclaim_tx(@self.q.tx, @self.q.tx_slots)
+        let d: i32 = vq_alloc_desc(@self.q.tx)
+        if d < 0
+            return None
+        let b: u32 = match tx_slots_take(@self.q.tx_slots)
+            Some(x) => x
+            None =>
+                vq_free_desc(@self.q.tx, d as u16)
+                return None
+        tx_slots_post(@self.q.tx_slots, b, d as u16)
+        let buf: [u8] = pool_buf(self.q.tx_pool, b)
+        Some(TxFrame { bytes: buf[self.q.hdr as i64..buf.len], token: token_of(d as u16, b) })
+
+    # Write a zero virtio-net header (no checksum offload, GSO_NONE,
+    # num_buffers 0) in front of the frame's `len` bytes and make the
+    # descriptor available. A runt (shorter than an Ethernet header) or a
+    # frame past the buffer is not sent: the buffer goes back.
+    fn tx_submit(self: @&VirtioNic, f: TxFrame, len: u32)
+        let d: u16 = token_desc(f.token)
+        let b: u32 = token_buf(f.token)
+        if d >= self.q.tx.num or b >= self.q.tx_slots.count
+            return
+        if len < ETH_HEADER_LEN or len as i64 > f.bytes.len
+            self.tx_refused = self.tx_refused + 1
+            self.tx_unsent(d)
+            return
+        let buf: [u8] = pool_buf(self.q.tx_pool, b)
+        buf.slice(0, self.q.hdr as i64).zero()
+        let desc: *VringDesc = vq_get_desc(@self.q.tx, d)
+        desc.addr = pool_buf_iova(self.q.tx_pool, b)
+        desc.len = self.q.hdr + len
+        desc.flags = 0
+        desc.next = 0
+        vq_submit(@self.q.tx, d)
+        self.tx_due = true
+
+    # One doorbell per queue with something new: RX buffers reposted, TX
+    # frames submitted. The avail idx vq_submit stored is visible before
+    # the doorbell. Without registers (host tests) it only counts.
+    fn tx_kick(self: @&VirtioNic)
+        if not self.rx_due and not self.tx_due
+            return
+        fence()
+        if self.rx_due
+            self.rx_due = false
+            self.rx_kicks = self.rx_kicks + 1
+            if self.rx_doorbell != 0
+                wr16(self.rx_doorbell, RX_QUEUE)
+        if self.tx_due
+            self.tx_due = false
+            self.tx_kicks = self.tx_kicks + 1
+            if self.tx_doorbell != 0
+                wr16(self.tx_doorbell, TX_QUEUE)
+
+    # Interrupt on every used buffer of both queues. This driver never
+    # suppresses one, so arming only clears a flag nobody set (#4876 masks
+    # during a budgeted drain).
+    fn irq_arm(self: @&VirtioNic)
+        let rx_avail: *VringAvail = self.q.rx.avail
+        let tx_avail: *VringAvail = self.q.tx.avail
+        rx_avail.flags = rx_avail.flags & (0xFFFF ^ VRING_AVAIL_F_NO_INTERRUPT)
+        tx_avail.flags = tx_avail.flags & (0xFFFF ^ VRING_AVAIL_F_NO_INTERRUPT)
+
+    # The link record: the MAC, link_up from the status register (a config
+    # interrupt may mean it changed), the MTU.
+    fn link(self: @VirtioNic) -> NetInfo
+        net_info(self.mac, self.link_up(), self.mtu)
+
+# ============================================================================
+# Bring-up steps
+# ============================================================================
+
+# Reset, then negotiate. Returns the accepted features.
+fn negotiate(r: VirtioRegs) -> Result<u64, UpError>
+    wr8(r.common + COMMON_DEVICE_STATUS, 0)
+    var polls: u32 = 0
+    while status(r) != 0
+        polls = polls + 1
+        if polls >= RESET_POLLS
+            return Err(UpError.Reset)
+    add_status(r, STATUS_ACKNOWLEDGE)
+    add_status(r, STATUS_DRIVER)
+    wr32(r.common + COMMON_DEVICE_FEATURE_SELECT, 0)
+    let lo: u32 = rd32(r.common + COMMON_DEVICE_FEATURE)
+    wr32(r.common + COMMON_DEVICE_FEATURE_SELECT, 1)
+    let hi: u32 = rd32(r.common + COMMON_DEVICE_FEATURE)
+    let wanted: u64 = VIRTIO_F_ACCESS_PLATFORM | VIRTIO_NET_F_MAC | VIRTIO_NET_F_STATUS | VIRTIO_NET_F_MTU
+    let accepted: u64 = virtio_driver_features(virtio_features_join(lo, hi), wanted)
+    let required: u64 = VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM | VIRTIO_NET_F_MAC
+    if (accepted & required) != required
+        add_status(r, STATUS_FAILED)
+        return Err(UpError.Features)
+    wr32(r.common + COMMON_DRIVER_FEATURE_SELECT, 0)
+    wr32(r.common + COMMON_DRIVER_FEATURE, virtio_features_lo(accepted))
+    wr32(r.common + COMMON_DRIVER_FEATURE_SELECT, 1)
+    wr32(r.common + COMMON_DRIVER_FEATURE, virtio_features_hi(accepted))
+    add_status(r, STATUS_FEATURES_OK)
+    if (status(r) & STATUS_FEATURES_OK) == 0
+        add_status(r, STATUS_FAILED)
+        return Err(UpError.FeaturesOk)
+    Ok(accepted)
+
+# Queue `idx`'s maximum size; Queue when the device has no such queue.
+fn queue_max(r: VirtioRegs, idx: u16) -> Result<u16, UpError>
+    wr16(r.common + COMMON_QUEUE_SELECT, idx)
+    let max: u16 = rd16(r.common + COMMON_QUEUE_SIZE)
+    if max == 0
+        return Err(UpError.Queue)
+    Ok(max)
+
+fn capped(max: u16) -> u16
+    if max > VIRTQ_MAX_SIZE
+        return VIRTQ_MAX_SIZE
+    max
+
+# Tell the device where queue `idx` (laid out in `vq`) is and that it
+# signals MSI-X table index `vector`; enable it. Returns its doorbell.
+fn program_queue(r: VirtioRegs, vq: *Virtqueue, idx: u16, vector: u16) -> Result<u64, UpError>
+    wr16(r.common + COMMON_QUEUE_SELECT, idx)
+    wr16(r.common + COMMON_QUEUE_SIZE, vq.num)
+    wr16(r.common + COMMON_QUEUE_MSIX_VECTOR, vector)
+    if rd16(r.common + COMMON_QUEUE_MSIX_VECTOR) == MSI_NO_VECTOR
+        return Err(UpError.Vector)
+    let off: u64 = (rd16(r.common + COMMON_QUEUE_NOTIFY_OFF) as u64) * (r.notify_mult as u64)
+    if off + 2 > r.notify_len as u64
+        return Err(UpError.Queue)
+    wr64(r.common + COMMON_QUEUE_DESC, virtq_desc_phys(vq))
+    wr64(r.common + COMMON_QUEUE_DRIVER, virtq_avail_phys(vq))
+    wr64(r.common + COMMON_QUEUE_DEVICE, virtq_used_phys(vq))
+    wr16(r.common + COMMON_QUEUE_ENABLE, 1)
+    Ok(r.notify + off)

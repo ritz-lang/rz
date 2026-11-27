@@ -1,32 +1,37 @@
-# Harland ring-1 driver boot record (AGAST #4734, docs/RING1_DRIVER.md
-# sections 5 and 8)
+# Harland ring-1 driver boot record (AGAST #4734, #4875; docs/RING1_DRIVER.md
+# sections 5 and 8, docs/RING2_NET.md "Drivers inside netd (D9)")
 #
-# What a kernel-spawned virtio driver is handed besides its capabilities:
-# the handles the kernel granted it and the MSI-X table indexes it may
-# program into the device. Before the driver first runs, the kernel maps
-# the frame region into it at DRV_RING_BASE (the ShmMap path an attach
-# uses, so that is the process's first shared mapping) and writes one
-# DriverBoot at FRAME_ADVISORY_OFF in that region: the span section 6
-# names for the advisory copy of the window list and the MSI-X indexes.
+# What the kernel-spawned process that drives a device is handed besides
+# its capabilities: the handles the kernel granted it and the MSI-X table
+# indexes it may program into the device. Under D9 that process is /bin/netd.
+# Before it first runs, the kernel maps its link page into it at
+# DRV_RING_BASE (the ShmMap path an attach uses, so that is the process's
+# first shared mapping) and writes one DriverBoot at DRIVER_BOOT_OFF in that
+# page, past NetInfo and link_seq, the only bytes NetPublish samples, as
+# ServiceBoot sits past the address record. A restart has no frame object,
+# so the record cannot live in one: the link page is the one page every
+# spawn of netd gets.
 #
 # The record is advisory to the kernel, never authority: DrvMmioMap maps a
 # window from the kernel's own record of it (drivers/virtio/window.ritz),
-# and a handle the driver does not hold is Errno.Perm whatever the record
-# says. The page is peer-writable once the consumer maps the region, so the
-# driver copies the record into private memory once, before it publishes
-# anything, and checks the copy (the frame handle's ShmMap must return
-# DRV_RING_BASE, every window's offset and length must fit the pages
+# and a handle the process does not hold is Errno.Perm whatever the record
+# says. The process copies the record into private memory once, before it
+# publishes anything, and checks the copy (the link handle's ShmMap must
+# return DRV_RING_BASE, every window's offset and length must fit the pages
 # DrvMmioMap grants). Imports only this package.
 
-import driver_abi.frame_ring { FRAME_ADVISORY_OFF }
-
-# Where the kernel maps the frame region before the driver runs: the first
+# Where the kernel maps the link page before the process runs: the first
 # address of the shared-object window (kernel mm/vmm.ritz DRV_RING_BASE,
 # PML4[251]).
 pub const DRV_RING_BASE: u64 = 0x7D8000000000
 
+# DriverBoot's offset in the link page: the first cache line past NetInfo
+# (0x00..0x0C) and link_seq (0x20..0x28), as ADDR_BOOT_OFF is in the
+# address page.
+pub const DRIVER_BOOT_OFF: u64 = 0x40
+
 # DriverBoot.magic: "VBR1", the first layout. A record with any other value
-# is not one the kernel wrote; the driver exits.
+# is not one the kernel wrote; the process exits.
 pub const DRIVER_BOOT_MAGIC: u32 = 0x31524256
 
 # The most windows a record carries. A modern virtio-pci device has four
@@ -51,35 +56,35 @@ pub struct DriverWindow
     cfg_type: u8                     # VIRTIO_WINDOW_*
     _pad: [3]u8
 
-# The record at FRAME_ADVISORY_OFF of the frame region.
+# The record at DRIVER_BOOT_OFF of the link page.
 pub struct DriverBoot
     magic: u32                       # DRIVER_BOOT_MAGIC
     window_count: u32                # 0..=DRIVER_BOOT_WINDOWS
     irq: u64                         # CAP_TYPE_IRQ: DrvIrqWait, DrvDmaAlloc
-    frame: u64                       # CAP_TYPE_SHM: this frame region
-    link: u64                        # CAP_TYPE_SHM with CAP_RIGHT_PUBLISH
+    frame: u64                       # CAP_TYPE_SHM: the frame object while the kernel holds the seat; 0 on a restart
+    link: u64                        # CAP_TYPE_SHM with CAP_RIGHT_PUBLISH: this page
     msix_config: u16                 # MSI-X table index for config changes
     msix_rx: u16                     # ... for the RX queue (queue 0)
     msix_tx: u16                     # ... for the TX queue (queue 1)
     _pad: u16
     windows: [8]DriverWindow
 
-# The record's address in a frame region mapped at `region`.
-pub fn driver_boot_at(region: u64) -> *DriverBoot
-    (region + FRAME_ADVISORY_OFF) as *DriverBoot
+# The record's address in a link page mapped at `page`.
+pub fn driver_boot_at(page: u64) -> *DriverBoot
+    (page + DRIVER_BOOT_OFF) as *DriverBoot
 
 # ============================================================================
 # The ring-2 service's boot record (AGAST #4743, docs/RING2_NET.md "Service
 # binary and respawn")
 # ============================================================================
 #
-# What /bin/netd is handed besides its capabilities. netd holds no frame
-# region's advisory span of its own (that span is the driver's DriverBoot),
-# so the record lives in netd's address page instead: before netd first
-# runs, the kernel maps that page into it at DRV_RING_BASE (the ShmMap path,
-# so it is the process's first shared mapping) and writes one ServiceBoot at
-# ADDR_BOOT_OFF, past the NetAddr record and its seqlock word. The kernel's
-# NetPublish samples only the record and the word, never these bytes.
+# What /bin/netd is handed when it becomes the service: the record lives in
+# netd's address page, at ADDR_BOOT_OFF, past the NetAddr record and its
+# seqlock word. The kernel writes it through its physmap and enqueues the
+# page's handle as ATTACH on netd's inbox (D9, #4875: netd is running by
+# then, as the seat's driver); netd ShmMaps the handle and checks the record
+# at the address that returns. The kernel's NetPublish samples only the
+# record and the word, never these bytes.
 #
 # Harland has no user clock (ShmWait's deadline is relative for that
 # reason), and netd runs DHCP and ARP timers, so the record also carries the
@@ -89,9 +94,9 @@ pub fn driver_boot_at(region: u64) -> *DriverBoot
 # As with DriverBoot the record is advisory, never authority: a handle netd
 # does not hold is Errno.Perm whatever the record says. netd copies it into
 # private memory once, before it publishes anything, and checks the copy
-# (the magic, a usable tsc_hz, the address handle's ShmMap returning
-# DRV_RING_BASE). The two seat indexes are the exception: the kernel fills
-# them in at the handoff, and netd reads them after its ready NetPublish.
+# (the magic, a usable tsc_hz). The two seat indexes are the exception: the
+# kernel fills them in at the handoff, and netd reads them after its ready
+# NetPublish.
 
 # ServiceBoot.magic: "NSB1", the first layout.
 pub const SERVICE_BOOT_MAGIC: u32 = 0x3142534E
@@ -108,7 +113,7 @@ pub const SERVICE_BOOT_TSC_MIN_HZ: u64 = 1000000
 pub struct ServiceBoot
     magic: u32                       # SERVICE_BOOT_MAGIC
     _pad: u32
-    frame: u64                       # CAP_TYPE_SHM: the frame object
+    frame: u64                       # unused since D9 (#4875): DriverBoot names the frame object; 0
     addr: u64                        # CAP_TYPE_SHM with CAP_RIGHT_PUBLISH: this page
     tsc_hz: u64                      # the kernel's calibrated TSC rate
     # The frame-seat handoff (AGAST #4744): the kernel seat's private RX
