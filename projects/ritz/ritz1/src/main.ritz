@@ -292,10 +292,9 @@ fn lower_main(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
         return 0
     var text: String = string_new()
     main_abi_source(f, @&text)
-    let gen: *u8 = text.as_ptr()
-    let gen_len: i64 = text.len()
+    let gen: StrView = text.as_view()
     var tokens: Vec<Token> = vec_with_cap<Token>(1024)
-    if tokenize(path, StrView { ptr: (gen), len: (gen_len) }, @tokens) > 0
+    if tokenize(path, gen, @tokens) > 0
         err2("Lexer errors in the generated main adapter of: ", path)
         return -1
     let gm: *Module = parse_tokens(ctx, @tokens)
@@ -304,7 +303,7 @@ fn lower_main(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
         return -1
     # The AST slices the text: it lives as long as the compile. Steal the
     # buffer from `text`, or its Drop (AGAST #2159) frees it at return.
-    keep_source_alive(gen)
+    keep_source_alive(gen.ptr)
     text.data.data = null
     main_abi_rename(f)
     merge_module_into(m, gm)
@@ -459,8 +458,7 @@ fn import_is_ritzlib(imp: *ImportPath) -> i32
 # parser: a namespace's declared `sources`.  zeus declares
 # `sources = ["lib", "examples"]`; RITZ_PATH's <entry>/<ns>/{lib,src} probe
 # never looked in examples/, so `import zeus.echo_handler` failed under ritz1.
-var g_dep_ptr: *u8 = null
-var g_dep_len: i64 = 0
+var g_deps: StrView
 
 # `import <name>.<rest>` against each `--dep <name>=<dir>`, in order:
 # `<dir>/<rest>.ritz`, as ritz0's DependencyMapping.resolve_import probes
@@ -471,22 +469,19 @@ var g_dep_len: i64 = 0
 # those are what resolved every namespace before #3825, and a dep that lacks
 # the module must not break a build that resolved it there.
 fn try_open_dep_import(imp: *ImportPath) -> String
-    if imp == null or g_dep_len == 0
+    let deps: StrView = g_deps
+    if imp == null or deps.len == 0
         return string_new()
     if imp.next == null
         return string_new()
     var ds: i64 = 0
     var di: i64 = 0
-    while di <= g_dep_len
-        if di == g_dep_len or *(g_dep_ptr + di) == ':'
-            var eq: i64 = ds
-            while eq < di and *(g_dep_ptr + eq) != '='
-                eq = eq + 1
-            if eq + 1 < di and imp.segment.eq(StrView { ptr: g_dep_ptr + ds, len: eq - ds })
-                var dir: StrView
-                dir.ptr = g_dep_ptr + eq + 1
-                dir.len = di - eq - 1
-                var candidate: String = build_import_path(dir, imp.next)
+    while di <= deps.len
+        if di == deps.len or deps.get(di) == ':'
+            let entry: StrView = deps.slice(ds, di)
+            let eq: i64 = entry.find_byte('=')
+            if eq + 1 < entry.len and imp.segment.eq(entry.take(eq))
+                var candidate: String = build_import_path(entry.skip(eq + 1), imp.next)
                 if probe_candidate(candidate.as_view())
                     return candidate
             ds = di + 1
@@ -1056,16 +1051,14 @@ fn line_starts(buf_sv: StrView, out_count: *i32) -> *i64
 # 1 if line `n` (1-based) of buf, indexed by `starts`, holds `= extern`; 0
 # if not or past the end.
 fn line_has_extern_decl(buf_sv: StrView, starts: *i64, count: i32, n: i32) -> i32
-    var buf: *u8 = buf_sv.ptr
-    var len: i64 = buf_sv.len
     if n < 1 or n > count
         return 0
     var i: i64 = *(starts + (n - 1))
-    var stop: i64 = len
+    var stop: i64 = buf_sv.len
     if n < count
         stop = *(starts + n) - 1
     while i + 8 <= stop
-        if (StrView { ptr: (buf + i), len: (stop - i) as i64 }).starts_with("= extern")
+        if buf_sv.slice(i, stop).starts_with("= extern")
             return 1
         i = i + 1
     0
@@ -1337,31 +1330,31 @@ struct CliArgs
     # `--no-red-zone` (AGAST #4308): every fn ritz1 defines gets LLVM's
     # noredzone, as ritz0's --no-red-zone does.
     no_red_zone: i32
-    # Every `--dep <name>=<dir>` (AGAST #3825), in order, `:`-joined; null
-    # and 0 when there is none.  See g_dep_ptr.
-    deps_ptr: *u8
-    deps_len: i64
+    # Every `--dep <name>=<dir>` (AGAST #3825), in order, `:`-joined; empty
+    # when there is none.  See g_deps.
+    deps: StrView
 
-# Append `entry` to the `:`-joined list at `*ptr`/`*len`.  The old buffer is
-# leaked, like -I's merge below: the compiler runs once per process.
-fn deps_append(ptr: **u8, len: *i64, entry: *u8)
-    let n: i64 = strlen(entry)
-    let sep: i64 = if *len > 0 then 1 else 0
-    let buf: *u8 = malloc(*len + sep + n + 1)
-    if *len > 0
-        memcpy(buf, *ptr, *len)
-        *(buf + *len) = ':' as u8
-    memcpy(buf + *len + sep, entry, n)
-    *(buf + *len + sep + n) = 0 as u8
-    *ptr = buf
-    *len = *len + sep + n
+# Append `entry` to the `:`-joined list `*list`.  The old buffer is leaked,
+# like -I's merge below: the compiler runs once per process.
+fn deps_append(list: *StrView, entry: StrView)
+    let old: StrView = *list
+    let n: i64 = entry.len
+    let sep: i64 = if old.len > 0 then 1 else 0
+    let buf: *u8 = malloc(old.len + sep + n + 1)
+    if old.len > 0
+        memcpy(buf, old.ptr, old.len)
+        *(buf + old.len) = ':' as u8
+    memcpy(buf + old.len + sep, entry.ptr, n)
+    *(buf + old.len + sep + n) = 0 as u8
+    list.ptr = buf
+    list.len = old.len + sep + n
 
 # 1 when `s` is `<name>=<dir>` with neither part empty.
-fn dep_entry_ok(s: *u8) -> i32
-    let n: i64 = strlen(s)
+fn dep_entry_ok(s: StrView) -> i32
+    let n: i64 = s.len
     var i: i64 = 0
     while i < n
-        if *(s + i) == '='
+        if s.get(i) == '='
             if i > 0 and i + 1 < n
                 return 1
             return 0
@@ -1417,8 +1410,7 @@ fn parse_cli(argv: Span<StrView>) -> CliArgs
     args.parse_only = 0
     args.stack_protector = 0
     args.no_red_zone = 0
-    args.deps_ptr = null
-    args.deps_len = 0
+    args.deps = strview_empty()
 
     if argv.len < 2
         return args
@@ -1485,11 +1477,11 @@ fn parse_cli(argv: Span<StrView>) -> CliArgs
             args.no_red_zone = 1
             i = i + 1
         else if is_dep
-            if i + 1 >= argv.len or dep_entry_ok(argv[i + 1].ptr) == 0
+            if i + 1 >= argv.len or dep_entry_ok(argv[i + 1]) == 0
                 eprintln("Error: --dep needs <name>=<dir>")
                 args.input_path = strview_empty()
                 return args
-            deps_append(@&args.deps_ptr, @&args.deps_len, argv[i + 1].ptr)
+            deps_append(@&args.deps, argv[i + 1])
             i = i + 2
         else if is_dash_i or is_target_os or is_target_arch or is_target
             if i + 1 >= argv.len
@@ -1665,13 +1657,12 @@ pub fn main(argv: Span<StrView>) -> i32
     set_target_arch(ctx, args.target_arch)
     # Cached IR depends on the compiler, the target OS, the target arch and
     # the import roots (see cache_fingerprint in fn_cache.ritz).
-    g_dep_ptr = args.deps_ptr
-    g_dep_len = args.deps_len
+    g_deps = args.deps
     g_test_table = args.test_table   # lower_main (AGAST #200)
     emitter_set_stack_protector(args.stack_protector)   # AGAST #2590
     emitter_set_no_red_zone(args.no_red_zone)           # AGAST #4308
     let freestanding: i32 = target_is_freestanding(args.target)   # AGAST #4607
-    let cache_fp: u64 = cache_fingerprint(args.target_os, args.target_arch, args.ritz_path, args.input_path, StrView { ptr: (args.deps_ptr), len: (args.deps_len) }, args.stack_protector, args.no_red_zone, freestanding)
+    let cache_fp: u64 = cache_fingerprint(args.target_os, args.target_arch, args.ritz_path, args.input_path, args.deps, args.stack_protector, args.no_red_zone, freestanding)
 
     # Read source file
     var src: Vec<u8> = read_source_file(args.input_path)
