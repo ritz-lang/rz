@@ -1747,6 +1747,15 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     let converted_regs: *i32 = call_reg_slots(e.args, 0)
     let param_types: *TypeKind = call_reg_slots(e.args, 0) as *TypeKind
     call_convert_args(s, e, fn_def, arg_regs, arg_count, converted_regs, param_types)
+    # AGAST #4853: a callee declared by its typed prototype takes `ptr` for
+    # each pointer param, and gives a `ptr` result back as the i64 it is here.
+    let typed: bool = icall_sig == null and typed_proto_callee(s, fn_def, fn_from_impl)
+    if typed
+        var tp: *Param = fn_def.params
+        for j in 0..arg_count
+            if ty_is_ptr(tp.param_type) == 1
+                converted_regs[j] = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, converted_regs[j])
+            tp = tp.next
 
     # Now emit the call with converted registers.  A typed indirect call
     # loads the fn pointer from its slot here, after the args.
@@ -1775,7 +1784,10 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     else
         call_result = next_reg(s)
         format_into(s, "  %.{call_result}")
-        emit_call_ret_kw(s, fn_def, ret_type, ret_struct, llvm_text(call_cc))
+        if typed and ty_is_ptr(ret_type) == 1
+            format_into(s, " = call {llvm_text(call_cc)}ptr ")
+        else
+            emit_call_ret_kw(s, fn_def, ret_type, ret_struct, llvm_text(call_cc))
     if icall_fp_reg >= 0
         format_into(s, "%.{icall_fp_reg}(")
     else
@@ -1793,7 +1805,10 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     for j in 0..arg_count
         if j > 0 or call_sret > 0
             format_into(s, ", ")
-        if p != null
+        if p != null and typed
+            format_into(s, "{typed_proto_kind(p.param_type)}")
+            p = p.next
+        else if p != null
             emit_param_llvm_type(s, p)
             p = p.next
         else
@@ -1802,6 +1817,8 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         format_into(s, " %.{arg_reg}")
 
     format_into(s, ")\n")
+    if typed and ty_is_ptr(ret_type) == 1
+        call_result = ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, call_result)
     if call_sret > 0
         call_result = emit_call_sret_result(s, fn_def, call_result, call_sret, ret_struct)
 

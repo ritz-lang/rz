@@ -582,3 +582,57 @@ pub fn bare_unit_variant_enum(s: *EmitterState, e: *Expr, out_vi: *i32, out_othe
         *out_vi = 0 - 1
         return 0 - 1
     ei
+
+# ---- Typed prototypes (AGAST #4853) ----
+#
+# A callee another object defines is declared by its real prototype when
+# every param and its return are pointers or sized ints: `ptr` for a `*T` /
+# `**T`, `iN` for an int.  LLVM's TargetLibraryInfo matches a libc name
+# (memcmp, malloc, ...) only against its prototype, and attribute inference
+# wants real `ptr` params.  The call site bridges ritz1's i64 value model
+# with inttoptr / ptrtoint until #73 makes pointers native.  Anything else
+# (struct, bool, float, `@T`, `@&T`, array) keeps the `(...)` declare.
+
+# The LLVM type kind `t` takes in a typed prototype, or "" when it has none.
+pub fn typed_proto_kind(t: TypeKind) -> StrView
+    if ty_is_ptr(t) == 1
+        return "ptr"
+    let bits: i32 = ty_int_bits(t)
+    if bits == 8
+        return "i8"
+    if bits == 16
+        return "i16"
+    if bits == 32
+        return "i32"
+    if bits == 64
+        return "i64"
+    ""
+
+# The return of `f`'s typed prototype: `void`, `ptr` or `iN`.
+pub fn typed_proto_ret(f: *FnDef) -> StrView
+    if f.return_type == TypeKind.Void
+        return "void"
+    typed_proto_kind(f.return_type)
+
+# True when a call of `f` and its declare use `f`'s typed prototype: another
+# object defines it, it is a free fn (an impl method is called by the method
+# emitter's own untyped call), and every kind in its signature has a
+# typed_proto_kind.  The one test, so the declare and every call agree.  A
+# platform hook passes too: a test binary's weak define of one
+# (emit_platform_hooks) is typed already.
+pub fn typed_proto_callee(s: *EmitterState, f: *FnDef, is_method: bool) -> bool
+    if f == null or is_method
+        return false
+    if typed_proto_ret(f).len == 0
+        return false
+    var p: *Param = f.params
+    while p != null
+        if typed_proto_kind(p.param_type).len == 0
+            return false
+        p = p.next
+    # `f` is the one fn of its name this compile sees (keep_one_fn keeps the
+    # local one; two `pub` ones conflict), so its own flags say where it is
+    # defined: no scan of m.functions at every call site.  This file's body,
+    # or an [[inline]] import this .ll may define available_externally,
+    # keeps the i64 signature its `define` has.
+    not (f.is_local == 1 and f.body != null) and fn_inline_import(s.sym.mono.pctx, f) == 0
