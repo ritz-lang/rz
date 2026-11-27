@@ -8,6 +8,7 @@ import drivers.display.fbcon { fbcon_panic_begin, fbcon_write, fbcon_rows_left }
 import io { halt_loop }
 import serial { StrView }
 import tty.console { tty_console_irq, tty_console_irq_kill }
+import drivers.i8042.kbd { i8042_irq, i8042_irq_eoi }
 import mm.vmm { vmm_debug_page_tables }
 import drivers.msix { msix_dispatch }
 import syscall.runtime.process { process_kill_current, current_pid }
@@ -416,6 +417,18 @@ pub fn irq_handler(frame: *InterruptFrame)
         # again (#3629, #4711).
         lapic_eoi()
         sched_tick(((*frame).cs & 3) != 0)
+        return
+
+    if irq_num == 1
+        # PS/2 keyboard. Decoded bytes take the console line discipline, and
+        # Ctrl-C kills the current user process the way IRQ 4 does. EOI
+        # before the kill: that path does not return. A level pin then
+        # clears Remote IRR.
+        let kill: bool = i8042_irq(((*frame).cs & 3) != 0)
+        lapic_eoi()
+        i8042_irq_eoi()
+        if kill
+            tty_console_irq_kill()
         return
 
     if irq_num == 4

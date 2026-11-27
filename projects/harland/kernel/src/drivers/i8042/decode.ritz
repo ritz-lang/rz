@@ -1,0 +1,596 @@
+# i8042 PS/2 keyboard: scan codes and the controller probe (AGAST #4869).
+#
+# No port I/O. The driver (drivers/i8042/kbd.ritz) feeds this the bytes it
+# reads at 0x60 and 0x64, and a microsecond clock (the TSC); the hosted test
+# drives the same functions with a scripted controller and a fake clock.
+# Set 1 is what a controller with translation on delivers (scan set 2
+# folded to set 1). Set 2 is the raw keyboard set, break prefix 0xF0.
+
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span { Span, span_from_strview, span_from_ptr }
+import ritzlib.strview { StrView }
+
+# How long one wait (input buffer empty, or an output byte) may take. Linux
+# allows 500 ms (I8042_CTL_TIMEOUT) for the 0xAA self-test; a real LPC
+# controller can take hundreds of ms, so the bound is time, not a count of
+# status reads.
+pub const I8042_WAIT_US: u64 = 500000
+
+pub const I8042_ST_OBF: u8 = 0x01
+pub const I8042_ST_IBF: u8 = 0x02
+pub const I8042_ST_AUX: u8 = 0x20
+pub const I8042_ST_FLOAT: u8 = 0xFF
+
+pub const I8042_CMD_READ_CFG: u8 = 0x20
+pub const I8042_CMD_WRITE_CFG: u8 = 0x60
+pub const I8042_CMD_DISABLE2: u8 = 0xA7
+pub const I8042_CMD_DISABLE1: u8 = 0xAD
+pub const I8042_CMD_ENABLE1: u8 = 0xAE
+pub const I8042_CMD_SELF_TEST: u8 = 0xAA
+pub const I8042_SELF_TEST_OK: u8 = 0x55
+pub const I8042_KBD_ENABLE: u8 = 0xF4
+
+# Command byte: bit 0 IRQ1, bit 1 aux IRQ, bit 4 port 1 clock off,
+# bit 5 aux clock off, bit 6 scan-set translation.
+pub const I8042_CFG_IRQ1: u8 = 0x01
+pub const I8042_CFG_IRQ12: u8 = 0x02
+pub const I8042_CFG_DISABLE1: u8 = 0x10
+pub const I8042_CFG_DISABLE2: u8 = 0x20
+pub const I8042_CFG_TRANSLATE: u8 = 0x40
+
+# FADT IAPC_BOOT_ARCH bit 1. The driver logs it and does not accept or
+# reject the controller from it.
+pub const FADT_8042_BIT: u16 = 0x0002
+
+# MADT interrupt source override flags (ACPI 6.5 table 5.50): polarity in
+# bits 1:0, trigger mode in bits 3:2. 00 conforms to the ISA bus (edge,
+# active high); 01 is that explicit value; 11 is active low, or level.
+const MPS_INTI_MASK: u16 = 0x3
+const MPS_INTI_TRIGGER_SHIFT: u16 = 2
+const MPS_INTI_ACTIVE_LOW: u16 = 0x3
+const MPS_INTI_LEVEL: u16 = 0x3
+
+# Scan set 1 make codes the decoder treats as modifiers.
+const SC1_LSHIFT: u8 = 0x2A
+const SC1_RSHIFT: u8 = 0x36
+const SC1_CTRL: u8 = 0x1D
+const SC1_CAPS: u8 = 0x3A
+const SC1_ALT: u8 = 0x38
+# Set 1: bit 7 marks a break; the low seven bits are the key.
+const SC1_BREAK_BIT: u8 = 0x80
+const SC1_CODE_MASK: u8 = 0x7F
+# Both sets: E0 prefixes an extended key, E1 the Pause sequence.
+const SC_EXT: u8 = 0xE0
+const SC_PAUSE: u8 = 0xE1
+# Set 2: F0 prefixes a break.
+const SC2_BREAK: u8 = 0xF0
+
+# Control characters the keys produce.
+const ASCII_BS: u8 = 0x08
+const ASCII_TAB: u8 = 0x09
+const ASCII_LF: u8 = 0x0A
+const ASCII_ESC: u8 = 0x1B
+# Ctrl+letter is the letter's low five bits (Ctrl-C is 0x03).
+const ASCII_CTRL_MASK: u8 = 0x1F
+
+# AML DWordPrefix: an EisaId ("PNP0303") in a DSDT is this byte and the
+# compressed id, little-endian.
+const AML_DWORD_PREFIX: u8 = 0x0C
+const AML_EISAID_LEN: i64 = 5
+# EISA id: three letters, 5 bits each ('A' is 1), then four hex digits.
+const EISA_NAME_LEN: i64 = 7
+const EISA_LETTER_BASE: u8 = 0x40
+
+pub enum ScanSet
+    Set1
+    Set2
+
+pub struct KbdDec
+    lshift: bool
+    rshift: bool
+    lctrl: bool
+    rctrl: bool
+    caps: bool
+    ext: bool
+    brk: bool
+
+pub fn kbd_dec_new() -> KbdDec
+    KbdDec {
+        lshift: false, rshift: false, lctrl: false, rctrl: false,
+        caps: false, ext: false, brk: false
+    }
+
+pub fn fadt_has_8042(boot_arch: u16) -> bool
+    (boot_arch & FADT_8042_BIT) != 0
+
+pub struct IsaWire
+    level: bool
+    active_low: bool
+
+pub fn isa_irq_wire(flags: u16) -> IsaWire
+    let pol: u16 = flags & MPS_INTI_MASK
+    let trig: u16 = (flags >> MPS_INTI_TRIGGER_SHIFT) & MPS_INTI_MASK
+    IsaWire { level: trig == MPS_INTI_LEVEL, active_low: pol == MPS_INTI_ACTIVE_LOW }
+
+# The redirection entry a GSI names on an I/O APIC whose first GSI is
+# `base` and which has `pins` entries. None: the GSI is on another one.
+pub fn isa_gsi_pin(gsi: u32, base: u32, pins: u32) -> Option<u8>
+    if gsi < base
+        return None
+    let pin: u32 = gsi - base
+    if pin >= pins
+        return None
+    Some(pin as u8)
+
+fn hex_digit(c: u8) -> Option<u32>
+    if c >= '0' and c <= '9'
+        return Some((c - '0') as u32)
+    if c >= 'A' and c <= 'F'
+        return Some((c - 'A' + 10) as u32)
+    None
+
+# The dword AML's EisaId ("PNP0303") stores: 0x0303D041. None when `name`
+# is not three capital letters and four hex digits.
+pub fn eisa_id(name: StrView) -> Option<u32>
+    if name.len() != EISA_NAME_LEN
+        return None
+    var vendor: u32 = 0
+    var i: i64 = 0
+    while i < 3
+        let c: u8 = name.get(i)
+        if c < 'A' or c > 'Z'
+            return None
+        vendor = (vendor << 5) | ((c - EISA_LETTER_BASE) as u32)
+        i = i + 1
+    var product: u32 = 0
+    while i < EISA_NAME_LEN
+        match hex_digit(name.get(i))
+            Some(d) => product = (product << 4) | d
+            None => return None
+        i = i + 1
+    # Big-endian vendor word then product word, read as a little-endian dword.
+    let b0: u32 = (vendor >> 8) & 0xFF
+    let b1: u32 = vendor & 0xFF
+    let b2: u32 = (product >> 8) & 0xFF
+    let b3: u32 = product & 0xFF
+    Some(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+
+fn span_has_at(image: Span<u8>, at: i64, needle: Span<u8>) -> bool
+    if at + needle.len() > image.len()
+        return false
+    var i: i64 = 0
+    while i < needle.len()
+        if image.get(at + i) != needle.get(i)
+            return false
+        i = i + 1
+    true
+
+fn span_has(image: Span<u8>, needle: Span<u8>) -> bool
+    var at: i64 = 0
+    while at + needle.len() <= image.len()
+        if span_has_at(image, at, needle)
+            return true
+        at = at + 1
+    false
+
+fn has_ascii(image: Span<u8>, id: StrView) -> bool
+    span_has(image, span_from_strview(id))
+
+# DWordPrefix and the EisaId dword, little-endian.
+fn has_eisa(image: Span<u8>, name: StrView) -> bool
+    var id: u32 = 0
+    match eisa_id(name)
+        Some(v) => id = v
+        None => return false
+    var enc: [AML_EISAID_LEN]u8 = [AML_DWORD_PREFIX, (id & 0xFF) as u8, ((id >> 8) & 0xFF) as u8, ((id >> 16) & 0xFF) as u8, ((id >> 24) & 0xFF) as u8]
+    span_has(image, span_from_ptr<u8>(@enc[0], AML_EISAID_LEN))
+
+# A PC keyboard id as a string (_HID "PNP0303") or an EisaId.
+fn has_pnp(image: Span<u8>, name: StrView) -> bool
+    has_ascii(image, name) or has_eisa(image, name)
+
+# A keyboard HID in a DSDT image: the Acer's MSFT0001, or the PNP ids a
+# PC keyboard uses. The ThinkPad's mouse (PNP0F13) is not one of these.
+pub fn firmware_has_keyboard_hid(image: Span<u8>) -> bool
+    if has_ascii(image, "MSFT0001") or has_pnp(image, "PNP0303")
+        return true
+    has_pnp(image, "PNP0300") or has_pnp(image, "PNP0320")
+
+# Port-1 command byte to write. Aux IRQ and aux-disable stay as they were.
+# Port 1 is clocked, its IRQ is on, and translation (set 2 delivered as
+# set 1) is asked for; i8042_probe reads back whether the controller took it.
+pub fn i8042_port1_config(old: u8) -> u8
+    (old & (I8042_CFG_IRQ12 | I8042_CFG_DISABLE2)) | I8042_CFG_IRQ1 | I8042_CFG_TRANSLATE
+
+# --------------------------------------------------------------------------
+# Scan codes
+# --------------------------------------------------------------------------
+
+fn set1_unshifted(code: u8) -> u8
+    match code
+        0x01 => ASCII_ESC
+        0x02 => '1'
+        0x03 => '2'
+        0x04 => '3'
+        0x05 => '4'
+        0x06 => '5'
+        0x07 => '6'
+        0x08 => '7'
+        0x09 => '8'
+        0x0A => '9'
+        0x0B => '0'
+        0x0C => '-'
+        0x0D => '='
+        0x0E => ASCII_BS
+        0x0F => ASCII_TAB
+        0x10 => 'q'
+        0x11 => 'w'
+        0x12 => 'e'
+        0x13 => 'r'
+        0x14 => 't'
+        0x15 => 'y'
+        0x16 => 'u'
+        0x17 => 'i'
+        0x18 => 'o'
+        0x19 => 'p'
+        0x1A => '['
+        0x1B => ']'
+        0x1C => ASCII_LF
+        0x1E => 'a'
+        0x1F => 's'
+        0x20 => 'd'
+        0x21 => 'f'
+        0x22 => 'g'
+        0x23 => 'h'
+        0x24 => 'j'
+        0x25 => 'k'
+        0x26 => 'l'
+        0x27 => ';'
+        0x28 => '\''
+        0x29 => '`'
+        0x2B => '\\'
+        0x2C => 'z'
+        0x2D => 'x'
+        0x2E => 'c'
+        0x2F => 'v'
+        0x30 => 'b'
+        0x31 => 'n'
+        0x32 => 'm'
+        0x33 => ','
+        0x34 => '.'
+        0x35 => '/'
+        0x39 => ' '
+        _ => 0
+
+fn set1_shifted_symbol(code: u8) -> u8
+    match code
+        0x02 => '!'
+        0x03 => '@'
+        0x04 => '#'
+        0x05 => '$'
+        0x06 => '%'
+        0x07 => '^'
+        0x08 => '&'
+        0x09 => '*'
+        0x0A => '('
+        0x0B => ')'
+        0x0C => '_'
+        0x0D => '+'
+        0x1A => '{'
+        0x1B => '}'
+        0x27 => ':'
+        0x28 => '"'
+        0x29 => '~'
+        0x2B => '|'
+        0x33 => '<'
+        0x34 => '>'
+        0x35 => '?'
+        _ => 0
+
+# Set 2 make code to the set-1 make code the rest of the decoder uses.
+# 0: not a key we turn into a character or a modifier.
+fn set2_to_set1(code: u8) -> u8
+    match code
+        0x76 => 0x01
+        0x16 => 0x02
+        0x1E => 0x03
+        0x26 => 0x04
+        0x25 => 0x05
+        0x2E => 0x06
+        0x36 => 0x07
+        0x3D => 0x08
+        0x3E => 0x09
+        0x46 => 0x0A
+        0x45 => 0x0B
+        0x4E => 0x0C
+        0x55 => 0x0D
+        0x66 => 0x0E
+        0x0D => 0x0F
+        0x15 => 0x10
+        0x1D => 0x11
+        0x24 => 0x12
+        0x2D => 0x13
+        0x2C => 0x14
+        0x35 => 0x15
+        0x3C => 0x16
+        0x43 => 0x17
+        0x44 => 0x18
+        0x4D => 0x19
+        0x54 => 0x1A
+        0x5B => 0x1B
+        0x5A => 0x1C
+        0x14 => 0x1D
+        0x1C => 0x1E
+        0x1B => 0x1F
+        0x23 => 0x20
+        0x2B => 0x21
+        0x34 => 0x22
+        0x33 => 0x23
+        0x3B => 0x24
+        0x42 => 0x25
+        0x4B => 0x26
+        0x4C => 0x27
+        0x52 => 0x28
+        0x0E => 0x29
+        0x12 => 0x2A
+        0x5D => 0x2B
+        0x1A => 0x2C
+        0x22 => 0x2D
+        0x21 => 0x2E
+        0x2A => 0x2F
+        0x32 => 0x30
+        0x31 => 0x31
+        0x3A => 0x32
+        0x41 => 0x33
+        0x49 => 0x34
+        0x4A => 0x35
+        0x59 => 0x36
+        0x11 => 0x38
+        0x29 => 0x39
+        0x58 => 0x3A
+        _ => 0
+
+fn upper_letter(c: u8) -> u8
+    if c >= 'a' and c <= 'z'
+        return c - ('a' - 'A')
+    c
+
+fn glyph(code: u8, letter_up: bool, symbol_up: bool) -> u8
+    let base: u8 = set1_unshifted(code)
+    if base == 0
+        return 0
+    if base >= 'a' and base <= 'z'
+        if letter_up
+            return upper_letter(base)
+        return base
+    if symbol_up
+        let shifted: u8 = set1_shifted_symbol(code)
+        if shifted != 0
+            return shifted
+    base
+
+fn with_ctrl(ctrl: bool, ch: u8) -> u8
+    if not ctrl or ch == 0
+        return ch
+    let folded: u8 = upper_letter(ch)
+    if folded >= 'A' and folded <= 'Z'
+        return folded & ASCII_CTRL_MASK
+    ch
+
+fn accept_set1(d: @&KbdDec, code: u8, release: bool, ext: bool) -> Option<u8>
+    if code == SC1_LSHIFT and not ext
+        d.lshift = not release
+        return None
+    if code == SC1_RSHIFT and not ext
+        d.rshift = not release
+        return None
+    if code == SC1_CTRL
+        if ext
+            d.rctrl = not release
+        else
+            d.lctrl = not release
+        return None
+    if code == SC1_CAPS and not ext
+        if not release
+            d.caps = not d.caps
+        return None
+    if code == SC1_ALT
+        return None
+    if release
+        return None
+    let shifting: bool = d.lshift or d.rshift
+    let ch: u8 = with_ctrl(d.lctrl or d.rctrl, glyph(code, shifting != d.caps, shifting))
+    if ch == 0
+        return None
+    Some(ch)
+
+fn feed_set1(d: @&KbdDec, b: u8) -> Option<u8>
+    if b == SC_EXT
+        d.ext = true
+        return None
+    if b == SC_PAUSE
+        return None
+    let release: bool = (b & SC1_BREAK_BIT) != 0
+    let ext: bool = d.ext
+    d.ext = false
+    accept_set1(d, b & SC1_CODE_MASK, release, ext)
+
+fn feed_set2(d: @&KbdDec, b: u8) -> Option<u8>
+    if b == SC_EXT
+        d.ext = true
+        return None
+    if b == SC2_BREAK
+        d.brk = true
+        return None
+    if b == SC_PAUSE
+        return None
+    let code: u8 = set2_to_set1(b)
+    let release: bool = d.brk
+    let ext: bool = d.ext
+    d.brk = false
+    d.ext = false
+    if code == 0
+        return None
+    accept_set1(d, code, release, ext)
+
+# One scan byte. Some(ch) is a character for the line discipline. None is a
+# modifier, a break, or a prefix: a break never yields a second character.
+pub fn kbd_feed(d: @&KbdDec, set: ScanSet, b: u8) -> Option<u8>
+    match set
+        ScanSet.Set1 => feed_set1(d, b)
+        ScanSet.Set2 => feed_set2(d, b)
+
+# --------------------------------------------------------------------------
+# Controller probe. The driver supplies the port; a test supplies a double.
+# --------------------------------------------------------------------------
+
+pub struct PortOps
+    ctx: *u8
+    read_status: fn(*u8) -> u8
+    read_data: fn(*u8) -> u8
+    write_cmd: fn(*u8, u8)
+    write_data: fn(*u8, u8)
+    # Microseconds on a clock that only moves forward (the kernel's TSC).
+    now_us: fn(*u8) -> u64
+
+pub struct KbdProbe
+    translated: bool
+
+pub enum KbdProbeError
+    # No controller, or one that never answered inside I8042_WAIT_US.
+    NoAnswer
+    # The self-test answered something other than 0x55, and the firmware
+    # names no keyboard to vouch for the controller.
+    SelfTestFailed
+
+fn read_status(ops: @&PortOps) -> u8
+    let f: fn(*u8) -> u8 = ops.read_status
+    f(ops.ctx)
+
+fn read_data(ops: @&PortOps) -> u8
+    let f: fn(*u8) -> u8 = ops.read_data
+    f(ops.ctx)
+
+fn write_cmd(ops: @&PortOps, b: u8)
+    let f: fn(*u8, u8) = ops.write_cmd
+    f(ops.ctx, b)
+
+fn write_data(ops: @&PortOps, b: u8)
+    let f: fn(*u8, u8) = ops.write_data
+    f(ops.ctx, b)
+
+fn now_us(ops: @&PortOps) -> u64
+    let f: fn(*u8) -> u64 = ops.now_us
+    f(ops.ctx)
+
+fn deadline(ops: @&PortOps) -> u64
+    now_us(ops) + I8042_WAIT_US
+
+fn expired(ops: @&PortOps, until: u64) -> bool
+    now_us(ops) >= until
+
+# True when the input buffer has room for a command. 0xFF is a floating
+# bus (no controller): stop at once.
+fn wait_idle(ops: @&PortOps) -> bool
+    let until: u64 = deadline(ops)
+    loop
+        let s: u8 = read_status(ops)
+        if s == I8042_ST_FLOAT
+            return false
+        if (s & I8042_ST_IBF) == 0
+            return true
+        if expired(ops, until)
+            return false
+
+# The next keyboard-side output byte, or None when none arrives by the
+# deadline. An aux (mouse) byte is read and dropped: it is never the answer
+# to a controller command.
+fn read_obf(ops: @&PortOps) -> Option<u8>
+    let until: u64 = deadline(ops)
+    loop
+        let s: u8 = read_status(ops)
+        if s == I8042_ST_FLOAT
+            return None
+        if (s & I8042_ST_OBF) != 0
+            let b: u8 = read_data(ops)
+            if (s & I8042_ST_AUX) == 0
+                if b == I8042_ST_FLOAT
+                    return None
+                return Some(b)
+        else if expired(ops, until)
+            return None
+
+# Drain whatever the controller holds, keyboard or aux, until it is empty
+# or the deadline passes.
+fn flush_obf(ops: @&PortOps)
+    let until: u64 = deadline(ops)
+    loop
+        let s: u8 = read_status(ops)
+        if s == I8042_ST_FLOAT or (s & I8042_ST_OBF) == 0
+            return
+        read_data(ops)
+        if expired(ops, until)
+            return
+
+fn send_cmd(ops: @&PortOps, cmd: u8) -> Result<(), KbdProbeError>
+    if not wait_idle(ops)
+        return Err(KbdProbeError.NoAnswer)
+    write_cmd(ops, cmd)
+    Ok(())
+
+fn read_config(ops: @&PortOps) -> Option<u8>
+    if not wait_idle(ops)
+        return None
+    write_cmd(ops, I8042_CMD_READ_CFG)
+    read_obf(ops)
+
+fn write_config(ops: @&PortOps, cfg: u8) -> Result<(), KbdProbeError>
+    send_cmd(ops, I8042_CMD_WRITE_CFG)?
+    if not wait_idle(ops)
+        return Err(KbdProbeError.NoAnswer)
+    write_data(ops, cfg)
+    Ok(())
+
+# Write the port-1 command byte and read it back: the scan set the decoder
+# takes is the one the controller kept, not the one asked for. A failed
+# read-back trusts the byte written.
+fn configure_port1(ops: @&PortOps) -> bool
+    match read_config(ops)
+        Some(old) =>
+            let cfg: u8 = i8042_port1_config(old)
+            match write_config(ops, cfg)
+                Ok(_) => pass
+                Err(_) => return (cfg & I8042_CFG_TRANSLATE) != 0
+            match read_config(ops)
+                Some(now) => (now & I8042_CFG_TRANSLATE) != 0
+                None => (cfg & I8042_CFG_TRANSLATE) != 0
+        None => true
+
+# Disable both ports, flush, self-test. 0x55 brings port 1 back up. A
+# different answer does too when `acpi_kbd` is set (the keyboard device is
+# in the firmware); without it, SelfTestFailed. Silence, or a floating
+# 0xFF, is NoAnswer: every wait ends by I8042_WAIT_US on the PortOps clock.
+# The aux port is disabled (0xA7) so its bytes stay out of the answers, and
+# is not enabled again.
+pub fn i8042_probe(ops: @&PortOps, acpi_kbd: bool) -> Result<KbdProbe, KbdProbeError>
+    send_cmd(ops, I8042_CMD_DISABLE1)?
+    flush_obf(ops)
+    send_cmd(ops, I8042_CMD_DISABLE2)?
+    flush_obf(ops)
+    send_cmd(ops, I8042_CMD_SELF_TEST)?
+    match read_obf(ops)
+        Some(b) =>
+            if b != I8042_SELF_TEST_OK and not acpi_kbd
+                return Err(KbdProbeError.SelfTestFailed)
+        None => return Err(KbdProbeError.NoAnswer)
+    let translated: bool = configure_port1(ops)
+    send_cmd(ops, I8042_CMD_ENABLE1)?
+    if wait_idle(ops)
+        write_data(ops, I8042_KBD_ENABLE)
+        # The keyboard's ACK (0xFA). A keyboard that does not ACK still
+        # gets its IRQ routed: it may be plugged in later.
+        match read_obf(ops)
+            Some(_) => pass
+            None => pass
+    Ok(KbdProbe { translated: translated })

@@ -15,6 +15,7 @@
 # can be started. Without x2APIC the MMIO xAPIC is used and such CPUs are
 # skipped (#4184).
 
+import ritzlib.result
 import klog { klog, klog_dec, klog_hex }
 import io { outb, inb, cpu_pause, rdmsr, wrmsr, cpuid, CpuidResult, enable_interrupts }
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
@@ -221,6 +222,11 @@ fn irq_route_report()
 # Under x2APIC the LAPIC is MSRs and these are unused (but harmless).
 var lapic_mmio: u64 = 0
 var ioapic_mmio: u64 = 0
+# Destination ioapic_init programmed for the keyboard and COM1. A later
+# route (the MADT override's pin) uses the same CPU.
+var ioapic_bsp_dest: u32 = IRQ_DEST_NONE
+# Its redirection entries, from IOAPIC_VER at ioapic_init.
+var ioapic_pins: u32 = 0
 
 # Map the LAPIC and I/O APIC registers through the MMIO window. Returns 0, or
 # -1 on failure.
@@ -579,6 +585,33 @@ fn ioapic_set_irq_mode(irq: u8, vector: u8, dest_apic: u32, masked: bool, mode: 
 fn ioapic_set_irq(irq: u8, vector: u8, dest_apic: u32, masked: bool) -> i32
     return ioapic_set_irq_mode(irq, vector, dest_apic, masked, ioapic_rte_mode(false, false))
 
+pub enum IoapicRouteError
+    # ioapic_init did not bring the I/O APIC up, or no CPU takes its
+    # interrupts.
+    NotUp
+    # The pin is past the I/O APIC's last redirection entry.
+    NoSuchPin
+    # ioapic_set_irq_mode left the entry masked (no IRTE, or a level pin
+    # that needs a directed EOI the I/O APIC lacks).
+    Rejected
+
+# Redirection entries the I/O APIC has (IOAPIC_VER bits 23:16, plus one);
+# 0 before ioapic_init.
+pub fn ioapic_pin_count() -> u32
+    ioapic_pins
+
+# Point `pin` at `vector` on the CPU ioapic_init chose, with the trigger
+# and polarity of a MADT override.
+pub fn ioapic_route_pin(pin: u8, vector: u8, level: bool, active_low: bool, masked: bool) -> Result<(), IoapicRouteError>
+    if ioapic_mmio == 0 or ioapic_bsp_dest == IRQ_DEST_NONE
+        return Err(IoapicRouteError.NotUp)
+    if (pin as u32) >= ioapic_pins
+        return Err(IoapicRouteError.NoSuchPin)
+    let mode: u32 = ioapic_rte_mode(level, active_low)
+    if ioapic_set_irq_mode(pin, vector, ioapic_bsp_dest, masked, mode) != 0
+        return Err(IoapicRouteError.Rejected)
+    Ok(())
+
 # Set up a level-triggered I/O APIC redirection entry (PCI INTx pins are
 # active low). Its handler ends with lapic_eoi() and then ioapic_eoi(irq).
 # Returns 0, or -1 with the entry left masked: no IRTE, or (AMD-Vi) an
@@ -633,6 +666,7 @@ fn ioapic_init() -> i32
     let version: u32 = ioapic_read(IOAPIC_VER)
     ioapic_version = version
     let max_irqs: u32 = ((version >> 16) & 0xFF) + 1
+    ioapic_pins = max_irqs
 
     klog("      I/O APIC version: ")
     klog_hex((version & 0xFF) as u64)
@@ -663,6 +697,7 @@ fn ioapic_init() -> i32
         klog(" can't take I/O APIC interrupts (")
         irq_route_print_reason(bsp_apic_id)
         klog(")\n")
+    ioapic_bsp_dest = dest
 
     # Unmask keyboard (IRQ 1) - route to vector 33
     ioapic_set_irq(1, 33, dest, false)

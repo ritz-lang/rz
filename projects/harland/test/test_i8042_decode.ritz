@@ -1,0 +1,620 @@
+# Hosted tests for the i8042 scan-code decoder and the controller probe
+# (AGAST #4869). Both call the functions the kernel ships.
+
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span { Span, span_from_strview, span_from_ptr }
+import drivers.i8042.decode {
+    ScanSet, KbdDec, PortOps, KbdProbe, KbdProbeError,
+    kbd_dec_new, kbd_feed, fadt_has_8042, isa_irq_wire, isa_gsi_pin, eisa_id,
+    firmware_has_keyboard_hid, i8042_port1_config, i8042_probe, I8042_WAIT_US,
+    I8042_ST_OBF, I8042_ST_IBF, I8042_ST_AUX, I8042_ST_FLOAT,
+    I8042_CMD_DISABLE1, I8042_CMD_DISABLE2, I8042_CMD_ENABLE1, I8042_CMD_SELF_TEST,
+    I8042_CMD_READ_CFG, I8042_CMD_WRITE_CFG, I8042_KBD_ENABLE, I8042_SELF_TEST_OK,
+    I8042_CFG_IRQ1, I8042_CFG_DISABLE1, I8042_CFG_DISABLE2, I8042_CFG_TRANSLATE
+}
+
+fn take(d: @&KbdDec, set: ScanSet, b: u8) -> i32
+    match kbd_feed(d, set, b)
+        Some(c) => c as i32
+        None => -1
+
+# --------------------------------------------------------------------------
+# Scripted controller. Every status read advances a fake microsecond clock
+# by g_step: the probe's waits are bounded by that clock (the kernel's is
+# the TSC), not by how many reads they make.
+# --------------------------------------------------------------------------
+
+enum Script
+    Float
+    Stuck
+    Silent
+    Ok
+    BadSelf
+    AcpiBad
+    SlowSelf
+    AuxNoise
+    NoTranslate
+
+const Q_CAP: i32 = 8
+const CMD_CAP: i32 = 16
+const OUT_CAP: i32 = 4
+const SELF_TEST_BAD: u8 = 0xFC
+const KBD_ACK: u8 = 0xFA
+const MOUSE_BYTE: u8 = 0x08
+# A real controller takes up to hundreds of ms for 0xAA; this one takes 300.
+const SLOW_SELF_TEST_US: u64 = 300000
+
+var g_script: Script = Script.Float
+var g_clock: u64 = 0
+var g_step: u64 = 1
+var g_reads: i32 = 0
+var g_q: [Q_CAP]u8
+var g_qaux: [Q_CAP]bool
+var g_q_n: i32 = 0
+var g_ready_at: u64 = 0
+var g_cfg: u8 = 0
+var g_cfg_keep: u8 = 0xFF
+var g_cfg_pending: bool = false
+var g_cmds: [CMD_CAP]u8
+var g_cmd_n: i32 = 0
+var g_outs: [OUT_CAP]u8
+var g_out_n: i32 = 0
+var g_dummy: u8 = 0
+
+fn script_reset(s: Script, step: u64)
+    g_script = s
+    g_clock = 0
+    g_step = step
+    g_reads = 0
+    g_q_n = 0
+    g_ready_at = 0
+    g_cfg = I8042_CFG_DISABLE1
+    g_cfg_keep = 0xFF
+    if s == Script.NoTranslate
+        g_cfg_keep = 0xFF & ~I8042_CFG_TRANSLATE
+    g_cfg_pending = false
+    g_cmd_n = 0
+    g_out_n = 0
+    # A mouse byte already waiting when the probe starts.
+    if s == Script.AuxNoise
+        push(MOUSE_BYTE, true)
+
+fn push(b: u8, aux: bool)
+    if g_q_n < Q_CAP
+        g_q[g_q_n] = b
+        g_qaux[g_q_n] = aux
+        g_q_n = g_q_n + 1
+
+fn pop() -> u8
+    if g_q_n == 0
+        return 0
+    let b: u8 = g_q[0]
+    var i: i32 = 1
+    while i < g_q_n
+        g_q[i - 1] = g_q[i]
+        g_qaux[i - 1] = g_qaux[i]
+        i = i + 1
+    g_q_n = g_q_n - 1
+    b
+
+fn script_now(ctx: *u8) -> u64
+    g_clock
+
+fn script_status(ctx: *u8) -> u8
+    g_reads = g_reads + 1
+    g_clock = g_clock + g_step
+    match g_script
+        Script.Float => I8042_ST_FLOAT
+        Script.Stuck => I8042_ST_IBF
+        _ =>
+            if g_q_n == 0 or g_clock < g_ready_at
+                return 0
+            if g_qaux[0]
+                return I8042_ST_OBF | I8042_ST_AUX
+            I8042_ST_OBF
+
+fn script_data(ctx: *u8) -> u8
+    pop()
+
+# A mouse byte goes in front of each answer the controller gives.
+fn answer(b: u8)
+    if g_script == Script.AuxNoise
+        push(MOUSE_BYTE, true)
+    push(b, false)
+
+fn script_cmd(ctx: *u8, b: u8)
+    if g_cmd_n < CMD_CAP
+        g_cmds[g_cmd_n] = b
+        g_cmd_n = g_cmd_n + 1
+    if b == I8042_CMD_SELF_TEST
+        match g_script
+            Script.BadSelf => answer(SELF_TEST_BAD)
+            Script.AcpiBad => answer(SELF_TEST_BAD)
+            Script.Silent => pass
+            Script.SlowSelf =>
+                g_ready_at = g_clock + SLOW_SELF_TEST_US
+                answer(I8042_SELF_TEST_OK)
+            _ => answer(I8042_SELF_TEST_OK)
+    else if b == I8042_CMD_DISABLE2
+        g_cfg = g_cfg | I8042_CFG_DISABLE2
+    else if b == I8042_CMD_READ_CFG
+        answer(g_cfg)
+    else if b == I8042_CMD_WRITE_CFG
+        g_cfg_pending = true
+
+fn script_out(ctx: *u8, b: u8)
+    if g_out_n < OUT_CAP
+        g_outs[g_out_n] = b
+        g_out_n = g_out_n + 1
+    if g_cfg_pending
+        g_cfg = b & g_cfg_keep
+        g_cfg_pending = false
+    else if b == I8042_KBD_ENABLE
+        answer(KBD_ACK)
+
+fn ops() -> PortOps
+    PortOps {
+        ctx: @g_dummy,
+        read_status: script_status,
+        read_data: script_data,
+        write_cmd: script_cmd,
+        write_data: script_out,
+        now_us: script_now
+    }
+
+fn has_cmd(b: u8) -> bool
+    var i: i32 = 0
+    while i < g_cmd_n
+        if g_cmds[i] == b
+            return true
+        i = i + 1
+    false
+
+fn probe(acpi_kbd: bool) -> Result<KbdProbe, KbdProbeError>
+    var port: PortOps = ops()
+    i8042_probe(@&port, acpi_kbd)
+
+# --------------------------------------------------------------------------
+# Decoder
+# --------------------------------------------------------------------------
+
+[[test]]
+fn test_set1_letter_shift_break_and_ctrl_c() -> i32
+    var d: KbdDec = kbd_dec_new()
+    if take(@&d, ScanSet.Set1, 0x1E) != 'a' as i32
+        return 1
+    # Break of a must not emit a second character.
+    if take(@&d, ScanSet.Set1, 0x9E) != -1
+        return 2
+    if take(@&d, ScanSet.Set1, 0x2A) != -1
+        return 3
+    if take(@&d, ScanSet.Set1, 0x1E) != 'A' as i32
+        return 4
+    if take(@&d, ScanSet.Set1, 0x9E) != -1
+        return 5
+    if take(@&d, ScanSet.Set1, 0xAA) != -1
+        return 6
+    if take(@&d, ScanSet.Set1, 0x1D) != -1
+        return 7
+    if take(@&d, ScanSet.Set1, 0x2E) != 0x03
+        return 8
+    if take(@&d, ScanSet.Set1, 0xAE) != -1
+        return 9
+    0
+
+[[test]]
+fn test_set1_control_and_punctuation_bytes() -> i32
+    var d: KbdDec = kbd_dec_new()
+    if take(@&d, ScanSet.Set1, 0x01) != 27
+        return 1
+    if take(@&d, ScanSet.Set1, 0x0E) != 8
+        return 2
+    if take(@&d, ScanSet.Set1, 0x0F) != 9
+        return 3
+    if take(@&d, ScanSet.Set1, 0x1C) != 10
+        return 4
+    if take(@&d, ScanSet.Set1, 0x28) != '\'' as i32
+        return 5
+    if take(@&d, ScanSet.Set1, 0x2B) != '\\' as i32
+        return 6
+    take(@&d, ScanSet.Set1, 0x2A)
+    if take(@&d, ScanSet.Set1, 0x28) != '"' as i32
+        return 7
+    if take(@&d, ScanSet.Set1, 0x02) != '!' as i32
+        return 8
+    0
+
+[[test]]
+fn test_set1_caps_lock() -> i32
+    var d: KbdDec = kbd_dec_new()
+    if take(@&d, ScanSet.Set1, 0x3A) != -1
+        return 1
+    if take(@&d, ScanSet.Set1, 0xBA) != -1
+        return 2
+    if take(@&d, ScanSet.Set1, 0x1E) != 'A' as i32
+        return 3
+    if take(@&d, ScanSet.Set1, 0x9E) != -1
+        return 4
+    # Caps and Shift together are lowercase.
+    if take(@&d, ScanSet.Set1, 0x2A) != -1
+        return 5
+    if take(@&d, ScanSet.Set1, 0x1E) != 'a' as i32
+        return 6
+    if take(@&d, ScanSet.Set1, 0xAA) != -1
+        return 7
+    if take(@&d, ScanSet.Set1, 0x3A) != -1
+        return 8
+    if take(@&d, ScanSet.Set1, 0x1E) != 'a' as i32
+        return 9
+    0
+
+[[test]]
+fn test_set1_e0_right_ctrl() -> i32
+    var d: KbdDec = kbd_dec_new()
+    # E0 1D: right Ctrl make.
+    if take(@&d, ScanSet.Set1, 0xE0) != -1 or take(@&d, ScanSet.Set1, 0x1D) != -1
+        return 1
+    if take(@&d, ScanSet.Set1, 0x2E) != 0x03
+        return 2
+    # E0 9D: right Ctrl break. The prefix applies to that one byte only.
+    if take(@&d, ScanSet.Set1, 0xE0) != -1 or take(@&d, ScanSet.Set1, 0x9D) != -1
+        return 3
+    if take(@&d, ScanSet.Set1, 0x2E) != 'c' as i32
+        return 4
+    # Left Ctrl held through a right Ctrl press and release: still Ctrl.
+    take(@&d, ScanSet.Set1, 0x1D)
+    take(@&d, ScanSet.Set1, 0xE0)
+    take(@&d, ScanSet.Set1, 0x1D)
+    take(@&d, ScanSet.Set1, 0xE0)
+    take(@&d, ScanSet.Set1, 0x9D)
+    if take(@&d, ScanSet.Set1, 0x2E) != 0x03
+        return 5
+    0
+
+[[test]]
+fn test_set1_e0_fake_shift_is_not_shift() -> i32
+    var d: KbdDec = kbd_dec_new()
+    # E0 2A / E0 AA wrap the cursor keys on some keyboards: not a Shift.
+    if take(@&d, ScanSet.Set1, 0xE0) != -1 or take(@&d, ScanSet.Set1, 0x2A) != -1
+        return 1
+    if take(@&d, ScanSet.Set1, 0x1E) != 'a' as i32
+        return 2
+    # And its break must not release a real Shift.
+    take(@&d, ScanSet.Set1, 0x2A)
+    take(@&d, ScanSet.Set1, 0xE0)
+    take(@&d, ScanSet.Set1, 0xAA)
+    if take(@&d, ScanSet.Set1, 0x1E) != 'A' as i32
+        return 3
+    0
+
+[[test]]
+fn test_set2_letter_shift_break_and_ctrl_c() -> i32
+    var d: KbdDec = kbd_dec_new()
+    if take(@&d, ScanSet.Set2, 0x1C) != 'a' as i32
+        return 1
+    if take(@&d, ScanSet.Set2, 0xF0) != -1
+        return 2
+    if take(@&d, ScanSet.Set2, 0x1C) != -1
+        return 3
+    if take(@&d, ScanSet.Set2, 0x12) != -1
+        return 4
+    if take(@&d, ScanSet.Set2, 0x1C) != 'A' as i32
+        return 5
+    if take(@&d, ScanSet.Set2, 0xF0) != -1
+        return 6
+    if take(@&d, ScanSet.Set2, 0x12) != -1
+        return 7
+    if take(@&d, ScanSet.Set2, 0x14) != -1
+        return 8
+    if take(@&d, ScanSet.Set2, 0x21) != 0x03
+        return 9
+    if take(@&d, ScanSet.Set2, 0xF0) != -1
+        return 10
+    if take(@&d, ScanSet.Set2, 0x21) != -1
+        return 11
+    0
+
+[[test]]
+fn test_set2_caps_lock() -> i32
+    var d: KbdDec = kbd_dec_new()
+    if take(@&d, ScanSet.Set2, 0x58) != -1
+        return 1
+    if take(@&d, ScanSet.Set2, 0x21) != 'C' as i32
+        return 2
+    if take(@&d, ScanSet.Set2, 0xF0) != -1
+        return 3
+    if take(@&d, ScanSet.Set2, 0x21) != -1
+        return 4
+    0
+
+[[test]]
+fn test_set2_e0_f0_right_ctrl() -> i32
+    var d: KbdDec = kbd_dec_new()
+    # E0 14: right Ctrl make.
+    if take(@&d, ScanSet.Set2, 0xE0) != -1 or take(@&d, ScanSet.Set2, 0x14) != -1
+        return 1
+    if take(@&d, ScanSet.Set2, 0x21) != 0x03
+        return 2
+    take(@&d, ScanSet.Set2, 0xF0)
+    take(@&d, ScanSet.Set2, 0x21)
+    # E0 F0 14: right Ctrl break.
+    if take(@&d, ScanSet.Set2, 0xE0) != -1 or take(@&d, ScanSet.Set2, 0xF0) != -1
+        return 3
+    if take(@&d, ScanSet.Set2, 0x14) != -1
+        return 4
+    if take(@&d, ScanSet.Set2, 0x21) != 'c' as i32
+        return 5
+    # E0 12 (fake shift) is not a Shift.
+    take(@&d, ScanSet.Set2, 0xF0)
+    take(@&d, ScanSet.Set2, 0x21)
+    take(@&d, ScanSet.Set2, 0xE0)
+    take(@&d, ScanSet.Set2, 0x12)
+    if take(@&d, ScanSet.Set2, 0x1C) != 'a' as i32
+        return 6
+    0
+
+# --------------------------------------------------------------------------
+# Firmware tables: FADT bit, DSDT ids, MADT override wire and pin.
+# --------------------------------------------------------------------------
+
+[[test]]
+fn test_fadt_bit_and_wire() -> i32
+    if fadt_has_8042(0) or fadt_has_8042(1)
+        return 1
+    if not fadt_has_8042(2) or not fadt_has_8042(3)
+        return 2
+    let edge = isa_irq_wire(0)
+    if edge.level or edge.active_low
+        return 3
+    let level = isa_irq_wire(0x0F)
+    if not level.level or not level.active_low
+        return 4
+    0
+
+[[test]]
+fn test_eisa_id_compresses_pnp_names() -> i32
+    match eisa_id("PNP0303")
+        Some(v) =>
+            if v != 0x0303D041
+                return 1
+        None => return 2
+    match eisa_id("PNP0F13")
+        Some(v) =>
+            if v != 0x130FD041
+                return 3
+        None => return 4
+    # Not a 7-character EISA name, and not hex digits.
+    match eisa_id("MSFT0001")
+        Some(_) => return 5
+        None => pass
+    match eisa_id("PNP03G3")
+        Some(_) => return 6
+        None => pass
+    0
+
+[[test]]
+fn test_dsdt_ascii_hid() -> i32
+    if not firmware_has_keyboard_hid(span_from_strview("xxMSFT0001yy"))
+        return 1
+    if not firmware_has_keyboard_hid(span_from_strview("PNP0303"))
+        return 2
+    if firmware_has_keyboard_hid(span_from_strview("PNP0F13"))
+        return 3
+    0
+
+[[test]]
+fn test_dsdt_eisaid_dword_hid() -> i32
+    # Name (_HID, EisaId ("PNP0303")): DWordPrefix 0x0C, then 0x0303D041
+    # little-endian.
+    var kbd: [9]u8 = [0x08, '_', 'H', 'I', 'D', 0x0C, 0x41, 0xD0, 0x03]
+    var with_last: [10]u8
+    var i: i32 = 0
+    while i < 9
+        with_last[i] = kbd[i]
+        i = i + 1
+    with_last[9] = 0x03
+    if not firmware_has_keyboard_hid(span_from_ptr<u8>(@with_last[0], 10))
+        return 1
+    # Cut off before the last byte: no match.
+    if firmware_has_keyboard_hid(span_from_ptr<u8>(@with_last[0], 9))
+        return 2
+    # PNP0320 too.
+    with_last[8] = 0x03
+    with_last[9] = 0x20
+    if not firmware_has_keyboard_hid(span_from_ptr<u8>(@with_last[0], 10))
+        return 3
+    # The mouse, EisaId ("PNP0F13"), is not a keyboard.
+    with_last[8] = 0x0F
+    with_last[9] = 0x13
+    if firmware_has_keyboard_hid(span_from_ptr<u8>(@with_last[0], 10))
+        return 4
+    # The same bytes without DWordPrefix are not an EisaId.
+    with_last[5] = 0x00
+    with_last[8] = 0x03
+    with_last[9] = 0x03
+    if firmware_has_keyboard_hid(span_from_ptr<u8>(@with_last[0], 10))
+        return 5
+    0
+
+[[test]]
+fn test_gsi_pin_is_relative_to_the_ioapic() -> i32
+    match isa_gsi_pin(1, 0, 24)
+        Some(p) =>
+            if p != 1
+                return 1
+        None => return 2
+    # A second I/O APIC's GSI base: pin = GSI - base.
+    match isa_gsi_pin(25, 24, 24)
+        Some(p) =>
+            if p != 1
+                return 3
+        None => return 4
+    # Below the base, or past the last entry: not on this I/O APIC.
+    match isa_gsi_pin(1, 24, 24)
+        Some(_) => return 5
+        None => pass
+    match isa_gsi_pin(24, 0, 24)
+        Some(_) => return 6
+        None => pass
+    match isa_gsi_pin(23, 0, 24)
+        Some(p) =>
+            if p != 23
+                return 7
+        None => return 8
+    0
+
+# --------------------------------------------------------------------------
+# Probe. The FADT 8042 bit is not an argument: a clear flag still comes up
+# when the self-test answers, and a set flag cannot skip the wait.
+# --------------------------------------------------------------------------
+
+[[test]]
+fn test_port1_config_leaves_aux_bits() -> i32
+    # Keyboard disable cleared, aux disable and aux IRQ kept, IRQ1 and
+    # translation set.
+    if i8042_port1_config(0x10) != 0x41
+        return 1
+    if i8042_port1_config(0x22) != 0x63
+        return 2
+    0
+
+[[test]]
+fn test_self_test_brings_port1_up() -> i32
+    script_reset(Script.Ok, 1)
+    match probe(false)
+        Ok(p) =>
+            if not p.translated
+                return 1
+        Err(_) => return 2
+    if g_cmds[0] != I8042_CMD_DISABLE1 or g_cmds[1] != I8042_CMD_DISABLE2
+        return 3
+    if not has_cmd(I8042_CMD_SELF_TEST) or not has_cmd(I8042_CMD_ENABLE1)
+        return 4
+    if not has_cmd(I8042_CMD_WRITE_CFG)
+        return 5
+    # The aux port is disabled, never enabled or tested.
+    if has_cmd(0xA8) or has_cmd(0xA9)
+        return 6
+    # Port 1 clocked, IRQ1 and translation on, aux disable kept (0xA7 set it).
+    let want: u8 = I8042_CFG_IRQ1 | I8042_CFG_DISABLE2 | I8042_CFG_TRANSLATE
+    if g_outs[0] != want or g_outs[1] != I8042_KBD_ENABLE
+        return 7
+    0
+
+[[test]]
+fn test_translation_read_back_picks_set2() -> i32
+    # The controller keeps translation off whatever is written: the decoder
+    # must take raw set 2.
+    script_reset(Script.NoTranslate, 1)
+    match probe(false)
+        Ok(p) =>
+            if p.translated
+                return 1
+        Err(_) => return 2
+    0
+
+[[test]]
+fn test_aux_bytes_are_not_answers() -> i32
+    script_reset(Script.AuxNoise, 1)
+    match probe(false)
+        Ok(p) =>
+            if not p.translated
+                return 1
+        Err(_) => return 2
+    if not has_cmd(I8042_CMD_DISABLE2)
+        return 3
+    # The command byte written is from the real config, not the mouse byte.
+    let want: u8 = I8042_CFG_IRQ1 | I8042_CFG_DISABLE2 | I8042_CFG_TRANSLATE
+    if g_outs[0] != want
+        return 4
+    0
+
+[[test]]
+fn test_acpi_keyboard_brings_port1_up_without_0x55() -> i32
+    script_reset(Script.AcpiBad, 1)
+    match probe(true)
+        Ok(_) => pass
+        Err(_) => return 1
+    if not has_cmd(I8042_CMD_DISABLE1) or not has_cmd(I8042_CMD_ENABLE1)
+        return 2
+    0
+
+[[test]]
+fn test_bad_self_test_without_acpi_is_self_test_failed() -> i32
+    script_reset(Script.BadSelf, 1)
+    match probe(false)
+        Ok(_) => return 1
+        Err(e) =>
+            match e
+                KbdProbeError.SelfTestFailed => pass
+                _ => return 2
+    if has_cmd(I8042_CMD_ENABLE1)
+        return 3
+    0
+
+[[test]]
+fn test_slow_self_test_inside_the_deadline() -> i32
+    # 300 ms of 10 us status reads: 30000 reads, more than a count-bounded
+    # wait of the old kind allowed, well inside the time bound.
+    script_reset(Script.SlowSelf, 10)
+    match probe(false)
+        Ok(_) => pass
+        Err(_) => return 1
+    if not has_cmd(I8042_CMD_ENABLE1)
+        return 2
+    0
+
+[[test]]
+fn test_stuck_status_fails_at_the_deadline() -> i32
+    script_reset(Script.Stuck, 1)
+    match probe(true)
+        Ok(_) => return 1
+        Err(e) =>
+            match e
+                KbdProbeError.NoAnswer => pass
+                _ => return 2
+    if g_cmd_n != 0
+        return 3
+    # Gave up once the clock passed I8042_WAIT_US, not before or long after.
+    if g_clock < I8042_WAIT_US or g_clock > I8042_WAIT_US + 2
+        return 4
+    0
+
+[[test]]
+fn test_stuck_status_on_a_slow_clock_gives_up_by_time() -> i32
+    # Each read takes longer than the whole wait: a time bound stops after
+    # a read or two, where a count bound would keep reading.
+    script_reset(Script.Stuck, I8042_WAIT_US)
+    match probe(true)
+        Ok(_) => return 1
+        Err(_) => pass
+    if g_reads > 2
+        return 2
+    0
+
+[[test]]
+fn test_floating_bus_fails_at_once() -> i32
+    script_reset(Script.Float, 1)
+    match probe(true)
+        Ok(_) => return 1
+        Err(_) => pass
+    if g_reads != 1
+        return 2
+    0
+
+[[test]]
+fn test_silence_is_no_answer_even_with_acpi() -> i32
+    script_reset(Script.Silent, 1)
+    match probe(true)
+        Ok(_) => return 1
+        Err(e) =>
+            match e
+                KbdProbeError.NoAnswer => pass
+                _ => return 2
+    # One wait ran out (the self-test answer), and it did not wait twice.
+    if g_clock < I8042_WAIT_US or g_clock > I8042_WAIT_US + 100
+        return 3
+    if has_cmd(I8042_CMD_ENABLE1)
+        return 4
+    0

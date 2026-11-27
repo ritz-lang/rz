@@ -10,6 +10,7 @@
 # x86-64 systems provide ACPI for hardware discovery and power management.
 # We search for tables either via Multiboot2 tags or legacy BIOS scan.
 
+import ritzlib.option
 import klog { klog, klog_dec, klog_hex }
 import io { outw, disable_interrupts }
 import arch.x86_64.tsc { delay_us }
@@ -197,6 +198,47 @@ pub var local_apic_addr: u64 = 0
 pub var io_apic_addr: u64 = 0
 # The CPUs found in the MADT (num_cpus, cpu_apic_ids) live in
 # arch/x86_64/cpu_map.ritz, indexed by CPU index (#1883).
+
+# FADT IAPC_BOOT_ARCH and the DSDT the keyboard probe scans. Byte loads:
+# the FADT's later fields are not naturally aligned, so the struct above is
+# not how these are read. Offsets are ACPI 6.5 table 5.9.
+const FADT_DSDT_OFF: u64 = 40
+const FADT_IAPC_BOOT_ARCH_OFF: u64 = 109
+const FADT_X_DSDT_OFF: u64 = 140
+var g_acpi_boot_arch: u16 = 0
+var g_acpi_dsdt_phys: u64 = 0
+# The first I/O APIC's first GSI (MADT type 1): a GSI is a pin on it at
+# GSI - base.
+var g_ioapic_gsi_base: u32 = 0
+
+# MADT interrupt source overrides (type 2, ISA bus). A source IRQ names the
+# I/O APIC pin (GSI) and the ACPI polarity/trigger flags.
+const ISO_CAP: i32 = 16
+var g_iso_irq: [ISO_CAP]u8
+var g_iso_gsi: [ISO_CAP]u32
+var g_iso_flags: [ISO_CAP]u16
+var g_iso_n: i32 = 0
+
+pub struct IsaOverride
+    gsi: u32
+    flags: u16
+
+pub fn acpi_boot_arch() -> u16
+    g_acpi_boot_arch
+
+pub fn acpi_dsdt_phys() -> u64
+    g_acpi_dsdt_phys
+
+pub fn acpi_ioapic_gsi_base() -> u32
+    g_ioapic_gsi_base
+
+pub fn acpi_isa_override(irq: u8) -> Option<IsaOverride>
+    var i: i32 = 0
+    while i < g_iso_n
+        if g_iso_irq[i] == irq
+            return Some(IsaOverride { gsi: g_iso_gsi[i], flags: g_iso_flags[i] })
+        i = i + 1
+    None
 
 # ACPI power management state (from FADT)
 var acpi_pm1a_cnt_blk: u32 = 0  # PM1a Control Block I/O port
@@ -404,6 +446,62 @@ fn acpi_find_fadt() -> u64
 # Table Parsing
 # ============================================================================
 
+fn acpi_load_u8(addr: u64) -> u8
+    let p: *u8 = addr as *u8
+    *p
+
+fn acpi_load_u16(addr: u64) -> u16
+    let lo: u16 = acpi_load_u8(addr) as u16
+    let hi: u16 = acpi_load_u8(addr + 1) as u16
+    lo | (hi << 8)
+
+# Little-endian load at any alignment (ACPI tables pack their fields).
+pub fn acpi_load_u32(addr: u64) -> u32
+    let b0: u32 = acpi_load_u8(addr) as u32
+    let b1: u32 = acpi_load_u8(addr + 1) as u32
+    let b2: u32 = acpi_load_u8(addr + 2) as u32
+    let b3: u32 = acpi_load_u8(addr + 3) as u32
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+
+fn acpi_load_u64(addr: u64) -> u64
+    let lo: u64 = acpi_load_u32(addr) as u64
+    let hi: u64 = acpi_load_u32(addr + 4) as u64
+    lo | (hi << 32)
+
+# IAPC_BOOT_ARCH is two bytes. The DSDT is the 64-bit X_DSDT when the
+# table is long enough and that field is nonzero, otherwise the 32-bit DSDT.
+fn acpi_note_fadt(addr: u64, length: u64)
+    g_acpi_boot_arch = 0
+    g_acpi_dsdt_phys = 0
+    if length >= FADT_IAPC_BOOT_ARCH_OFF + 2
+        g_acpi_boot_arch = acpi_load_u16(addr + FADT_IAPC_BOOT_ARCH_OFF)
+    var dsdt: u64 = 0
+    if length >= FADT_X_DSDT_OFF + 8
+        dsdt = acpi_load_u64(addr + FADT_X_DSDT_OFF)
+    if dsdt == 0 and length >= FADT_DSDT_OFF + 4
+        dsdt = acpi_load_u32(addr + FADT_DSDT_OFF) as u64
+    g_acpi_dsdt_phys = dsdt
+
+fn acpi_note_iso(irq: u8, gsi: u32, flags: u16)
+    var i: i32 = 0
+    while i < g_iso_n
+        if g_iso_irq[i] == irq
+            g_iso_gsi[i] = gsi
+            g_iso_flags[i] = flags
+            return
+        i = i + 1
+    if g_iso_n >= ISO_CAP
+        klog("      IRQ ")
+        klog_dec(irq as i64)
+        klog(" override dropped: more than ")
+        klog_dec(ISO_CAP as i64)
+        klog(" overrides\n")
+        return
+    g_iso_irq[g_iso_n] = irq
+    g_iso_gsi[g_iso_n] = gsi
+    g_iso_flags[g_iso_n] = flags
+    g_iso_n = g_iso_n + 1
+
 # Parse FADT to get PM1 control block addresses
 fn acpi_parse_fadt(fadt_addr: u64) -> i32
     let fadt: *AcpiFadt = fadt_addr as *AcpiFadt
@@ -413,6 +511,8 @@ fn acpi_parse_fadt(fadt_addr: u64) -> i32
     if vmm_ensure_mapped(fadt_addr, fadt_length) != 0
         klog("      ERROR: Failed to map FADT!\n")
         return -1
+
+    acpi_note_fadt(fadt_addr, fadt_length)
 
     # Get PM1a/PM1b Control Block addresses
     acpi_pm1a_cnt_blk = (*fadt).pm1a_cnt_blk
@@ -459,6 +559,7 @@ fn acpi_parse_madt(madt_addr: u64) -> i32
     var entry_addr: u64 = madt_addr + 44  # After header
 
     cpu_map_reset()
+    g_iso_n = 0
 
     while entry_addr < madt_end
         let entry: *MadtEntryHeader = entry_addr as *MadtEntryHeader
@@ -476,9 +577,25 @@ fn acpi_parse_madt(madt_addr: u64) -> i32
             let ioapic: *MadtIoApic = entry_addr as *MadtIoApic
             if io_apic_addr == 0
                 io_apic_addr = (*ioapic).io_apic_addr as u64
+                g_ioapic_gsi_base = (*ioapic).gsi_base
                 klog("      I/O APIC at: ")
                 klog_hex(io_apic_addr)
                 klog("\n")
+        else if (*entry).entry_type == MADT_INT_SRC_OVERRIDE
+            # Type 2 is 10 bytes and may start unaligned; the GSI and flags
+            # are loaded a byte at a time. Bus 0 is the ISA IRQ space.
+            if (*entry).length >= 10
+                let bus: u8 = acpi_load_u8(entry_addr + 2)
+                if bus == 0
+                    let source: u8 = acpi_load_u8(entry_addr + 3)
+                    let gsi: u32 = acpi_load_u32(entry_addr + 4)
+                    let flags: u16 = acpi_load_u16(entry_addr + 8)
+                    acpi_note_iso(source, gsi, flags)
+                    klog("      IRQ ")
+                    klog_dec(source as i64)
+                    klog(" -> GSI ")
+                    klog_dec(gsi as i64)
+                    klog("\n")
         else if (*entry).entry_type == MADT_LOCAL_APIC_OVERRIDE
             # Update Local APIC address with 64-bit version
             let override_addr: *u64 = (entry_addr + 4) as *u64

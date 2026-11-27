@@ -1,0 +1,198 @@
+# i8042 keyboard port (AGAST #4869).
+#
+# Probe, port-1 enable and IRQ 1 live here. Scan codes and the probe
+# decisions live in drivers/i8042/decode.ritz, which has no port I/O.
+# The aux port is not initialized. Bytes go through ldisc_input, and
+# Ctrl-C uses the same tty_console_irq / tty_console_irq_kill path as COM1.
+
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span { Span, span_from_ptr }
+import io { inb, outb, cpu_pause, disable_interrupts, enable_interrupts, interrupts_enabled }
+import klog { klog, klog_dec }
+import mm.vmm { vmm_ensure_mapped }
+import arch.x86_64.tsc { time_ns }
+import drivers.acpi.tables {
+    acpi_boot_arch, acpi_dsdt_phys, acpi_isa_override, acpi_ioapic_gsi_base, acpi_load_u32
+}
+import drivers.iommu.ir { ir_enabled }
+import arch.x86_64.apic { IoapicRouteError, ioapic_route_pin, ioapic_pin_count, ioapic_eoi }
+import tty.console { tty_console_irq }
+import tty.ldisc { ldisc_input }
+import drivers.i8042.decode {
+    ScanSet, KbdDec, PortOps, IsaWire, KbdProbeError,
+    kbd_dec_new, kbd_feed, fadt_has_8042, isa_irq_wire, isa_gsi_pin, firmware_has_keyboard_hid,
+    i8042_probe, I8042_ST_OBF, I8042_ST_AUX
+}
+
+const I8042_DATA: u16 = 0x60
+const I8042_STATUS: u16 = 0x64
+const KBD_VECTOR: u8 = 33
+const KBD_IRQ: u8 = 1
+# Bytes one IRQ 1 takes before it returns: the controller's buffer is one
+# byte, so more than this is a stuck OBF, not typing.
+const KBD_IRQ_DRAIN_MAX: i32 = 16
+# Every ACPI table starts with a 36-byte header; its length is at offset 4.
+const ACPI_HEADER_LEN: u32 = 36
+const ACPI_HEADER_LENGTH_OFF: u64 = 4
+# A DSDT larger than this is a corrupt length, not one to map and scan.
+const ACPI_DSDT_MAX_LEN: u32 = 0x100000
+const NS_PER_US: u64 = 1000
+
+var g_up: bool = false
+var g_set: ScanSet = ScanSet.Set1
+var g_dec: KbdDec
+var g_pin: u8 = 1
+var g_level: bool = false
+
+fn hw_status(ctx: *u8) -> u8
+    cpu_pause()
+    inb(I8042_STATUS)
+
+fn hw_data(ctx: *u8) -> u8
+    inb(I8042_DATA)
+
+fn hw_cmd(ctx: *u8, value: u8)
+    outb(I8042_STATUS, value)
+
+fn hw_out(ctx: *u8, value: u8)
+    outb(I8042_DATA, value)
+
+# The probe's deadline clock: the TSC, calibrated (time_ns).
+fn hw_now_us(ctx: *u8) -> u64
+    time_ns() / NS_PER_US
+
+fn hw_ops() -> PortOps
+    PortOps {
+        ctx: 0 as *u8,
+        read_status: hw_status,
+        read_data: hw_data,
+        write_cmd: hw_cmd,
+        write_data: hw_out,
+        now_us: hw_now_us
+    }
+
+# True when the DSDT image names a keyboard. A missing table is false,
+# and the self-test still runs.
+fn acpi_keyboard() -> bool
+    let phys: u64 = acpi_dsdt_phys()
+    if phys == 0
+        return false
+    if vmm_ensure_mapped(phys, ACPI_HEADER_LEN as u64) != 0
+        return false
+    let len: u32 = acpi_load_u32(phys + ACPI_HEADER_LENGTH_OFF)
+    if len < ACPI_HEADER_LEN or len > ACPI_DSDT_MAX_LEN
+        return false
+    if vmm_ensure_mapped(phys, len as u64) != 0
+        return false
+    let image: Span<u8> = span_from_ptr<u8>(phys as *u8, len as i64)
+    firmware_has_keyboard_hid(image)
+
+fn keyboard_wire() -> IsaWire
+    match acpi_isa_override(KBD_IRQ)
+        Some(o) => isa_irq_wire(o.flags)
+        None => IsaWire { level: false, active_low: false }
+
+# The I/O APIC pin IRQ 1 arrives on: the MADT override's GSI less the I/O
+# APIC's GSI base, or pin 1 with no override. None: the GSI is not on this
+# I/O APIC.
+fn keyboard_pin() -> Option<u8>
+    match acpi_isa_override(KBD_IRQ)
+        Some(o) => isa_gsi_pin(o.gsi, acpi_ioapic_gsi_base(), ioapic_pin_count())
+        None => Some(KBD_IRQ)
+
+# Pin 1 masked: no keyboard, or IRQ 1 moved to another pin. Best effort:
+# an I/O APIC that is not up has nothing to mask.
+fn mask_pin1()
+    match ioapic_route_pin(KBD_IRQ, KBD_VECTOR, false, false, true)
+        Ok(_) => pass
+        Err(_) => pass
+
+fn route_keyboard(pin: u8, wire: IsaWire, masked: bool) -> Result<(), IoapicRouteError>
+    if pin != KBD_IRQ
+        # ioapic_init unmasked pin 1 for the keyboard; the override moved it.
+        mask_pin1()
+    ioapic_route_pin(pin, KBD_VECTOR, wire.level, wire.active_low, masked)
+
+fn log_probe_error(e: KbdProbeError)
+    match e
+        KbdProbeError.NoAnswer => klog("[i8042] no keyboard\n")
+        KbdProbeError.SelfTestFailed => klog("[i8042] no keyboard: self-test failed\n")
+
+fn log_route_error(e: IoapicRouteError)
+    klog("[i8042] no keyboard: IRQ 1 not routed (")
+    match e
+        IoapicRouteError.NotUp => klog("I/O APIC down")
+        IoapicRouteError.NoSuchPin => klog("no such pin")
+        IoapicRouteError.Rejected => klog("entry rejected")
+    klog(")\n")
+
+# Probe the controller and, when it answers, route IRQ 1 through the I/O
+# APIC (the MADT override's pin, and the remapping entry when that is on).
+# The FADT 8042 flag is logged and is not the decision.
+pub fn i8042_init()
+    let was_on: bool = interrupts_enabled()
+    disable_interrupts()
+    g_up = false
+    klog("[i8042] FADT 8042 ")
+    if fadt_has_8042(acpi_boot_arch())
+        klog("set\n")
+    else
+        klog("clear\n")
+    let acpi_kbd: bool = acpi_keyboard()
+    var port: PortOps = hw_ops()
+    match i8042_probe(@&port, acpi_kbd)
+        Ok(found) =>
+            g_dec = kbd_dec_new()
+            if found.translated
+                g_set = ScanSet.Set1
+            else
+                g_set = ScanSet.Set2
+            let wire: IsaWire = keyboard_wire()
+            match keyboard_pin()
+                Some(pin) =>
+                    g_pin = pin
+                    g_level = wire.level
+                    match route_keyboard(pin, wire, false)
+                        Ok(_) =>
+                            g_up = true
+                            klog("[i8042] keyboard on IRQ 1 GSI ")
+                            klog_dec((pin as u32 + acpi_ioapic_gsi_base()) as i64)
+                            if not found.translated
+                                klog(" set 2")
+                            if ir_enabled()
+                                klog(" remapped")
+                            klog("\n")
+                        Err(e) => log_route_error(e)
+                None =>
+                    mask_pin1()
+                    klog("[i8042] no keyboard: IRQ 1 GSI not on the I/O APIC\n")
+        Err(e) =>
+            mask_pin1()
+            log_probe_error(e)
+    if was_on
+        enable_interrupts()
+
+# IRQ 1. Reads the keyboard byte, decodes it into the console line
+# discipline, then asks tty_console_irq whether a Ctrl-C should kill the
+# process that was current. Aux bytes are discarded, not decoded.
+pub fn i8042_irq(from_user: bool) -> bool
+    if not g_up
+        return false
+    var n: i32 = 0
+    while n < KBD_IRQ_DRAIN_MAX
+        let st: u8 = inb(I8042_STATUS)
+        if (st & I8042_ST_OBF) == 0
+            break
+        let b: u8 = inb(I8042_DATA)
+        if (st & I8042_ST_AUX) == 0
+            match kbd_feed(@&g_dec, g_set, b)
+                Some(ch) => ldisc_input(ch)
+                None => pass
+        n = n + 1
+    tty_console_irq(from_user)
+
+# After lapic_eoi, when the MADT override made this pin level-triggered.
+pub fn i8042_irq_eoi()
+    if g_up and g_level
+        ioapic_eoi(g_pin)
