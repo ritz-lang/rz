@@ -173,6 +173,21 @@ pub fn nvme_ns_write(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i
     -1
 """
 
+# blk.ritz probes AHCI and ignores the count (AGAST #4882). The real probe
+# lives in the kernel; this stand-in keeps the virtio timeout tree linking.
+AHCI_STUB = """\
+pub enum AhciError
+    Timeout
+    BarNotMemory
+    MapFailed
+    HandoffKept
+    NoDma
+    CtlFull
+
+pub fn ahci_probe() -> Result<u32, AhciError>
+    Ok(0)
+"""
+
 # Physical == virtual, as in the kernel's identity map: pages come from a
 # page-aligned slice of .bss, single pages and pmm_alloc_contig's runs (the
 # rings, common.ritz) handed out upwards.
@@ -560,6 +575,7 @@ STUBS = {
     "io.ritz": IO_STUB,
     "drivers/pci.ritz": PCI_STUB,
     "drivers/nvme/nvme.ritz": NVME_STUB,
+    "drivers/ahci/ahci.ritz": AHCI_STUB,
     "drivers/msix.ritz": MSIX_STUB,
     "mm/pmm.ritz": PMM_STUB,
     "mm/heap.ritz": HEAP_STUB,
