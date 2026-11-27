@@ -18,4 +18,10 @@ Arguments: $ARGUMENTS
 4. Walk Parts A and B item by item. For an item marked ENFORCED, still read the
    diff: a ratchet counts, it doesn't judge.
 5. Report in REVIEW.md's "Output" form: one line per finding, the `c"` added /
-   removed counts, then **ACCEPT** or **REJECT**. Change nothing.
+   removed counts, then **ACCEPT** or **REJECT**. Change nothing during the
+   review itself.
+6. **The verdict is not the end of your turn.** If you ran this as a step of a
+   task (a task room's ROOM.md step 2a), go straight on in the same turn: on
+   REJECT, fix every blocking finding and run the review again; on ACCEPT,
+   carry on with the task's next step (squash, smoke check, push, REAP). Four
+   rooms stalled for 11-37 h on 2026-11-26/27 by stopping at this line.
