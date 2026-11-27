@@ -2,7 +2,7 @@
 # Tag and push the builder image that projects/builder/test.sh built and
 # tested (AGAST #4824).  .github/workflows/builder.yml runs it.
 #
-#   publish_builder.sh [--dry-run] [--commit-only] <commit> <image> <ref>
+#   publish_builder.sh [--dry-run] [--commit-only] [--src-key <key>] <commit> <image> <ref>
 #
 #   <commit>  the full 40-hex rz commit the image was built from
 #   <image>   the registry repository, no tag (ghcr.io/ritz-lang/rz-builder)
@@ -28,6 +28,14 @@
 # for huburght's Woodpecker, whose steps run it, and leaves :main to
 # builder.yml.
 #
+# --src-key <key> (AGAST #4903) also pushes <image>:src-<key>, <key> the hex
+# content key from projects/ritz/tools/builder_src_key.py: a later commit
+# whose key is the same finds this tag already in the registry and
+# retags it for its own commit instead of rebuilding. <key> must be
+# 1-64 lowercase hex characters; it is never sanitised like a git tag, so a
+# caller that passes something else is a caller bug, not a reserved-name
+# collision to detect.
+#
 # --dry-run prints the tags and pushes nothing; the workflow runs that on
 # every run.  Without --dry-run, inside Actions (GITHUB_ACTIONS=true) it
 # refuses anything but a push event for <ref> itself, under the job's own
@@ -39,9 +47,16 @@
 set -euo pipefail
 export LC_ALL=C   # the sanitiser's character class is per byte
 
-dry=0 commit_only=0
+dry=0 commit_only=0 src_key=
 if [[ "${1:-}" == "--dry-run" ]]; then dry=1; shift; fi
 if [[ "${1:-}" == "--commit-only" ]]; then commit_only=1; shift; fi
+if [[ "${1:-}" == "--src-key" ]]; then
+    src_key="${2:-}"
+    if [[ ! "$src_key" =~ ^[0-9a-f]{1,64}$ ]]; then
+        echo "publish_builder: --src-key wants 1-64 lowercase hex characters, got '$src_key'" >&2; exit 2
+    fi
+    shift 2
+fi
 if [[ $# -ne 3 ]]; then
     echo "usage: publish_builder.sh [--dry-run] [--commit-only] <commit> <image> <ref>" >&2; exit 2
 fi
@@ -117,6 +132,7 @@ main)   tags=("$image:main" "$image:$commit") ;;
 branch) tags=("$image:$commit") ;;
 esac
 [[ $commit_only -eq 1 ]] && tags=("$image:$commit")
+[[ -n "$src_key" ]] && tags+=("$image:src-$src_key")
 if [[ $dry -eq 1 ]]; then
     for t in "${tags[@]}"; do echo "would push $t (from $src)"; done
     [[ $publishable -eq 0 ]] && echo "$ref publishes nothing: only a push to main or a tag does"

@@ -833,6 +833,17 @@ jobs:
   # matrix. It waits for builder-watch, the final routing: Woodpecker's
   # first step waits for the image, and the watch needs only the pipeline
   # started, so neither waits on the other.
+  #
+  # AGAST #4903: before building, it computes this commit's content key
+  # (projects/ritz/tools/builder_src_key.py -- a hash of exactly the inputs
+  # Dockerfile/stage_tree.py build the image from, buddhafinger and every
+  # other builder_matrix.MATRIX_PACKAGES package excluded, since nothing
+  # ships them). If ghcr already has that key's image (an earlier commit
+  # whose source hashed the same), it retags that image for this commit
+  # (docker buildx imagetools create, seconds) instead of running test.sh
+  # again, and publishes :<commit> alone; otherwise it builds and tests as
+  # before and also publishes :src-<key>, for the next commit with this key
+  # to reuse. See projects/builder/README.md, "Image versioning by content".
   builder-image:
     needs: [builder-watch]
     if: ${{ !cancelled() }}
@@ -841,17 +852,20 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      BUILDER_IMAGE: ghcr.io/ritz-lang/rz-builder
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build and test the builder image of this commit
-        id: build
-        run: |
-          set -o pipefail
-          bash projects/builder/test.sh --keep "${{ github.sha }}" | tee "$RUNNER_TEMP/builder-test.log"
-          tag=$(sed -n 's/^builder image \(rz-builder:[^:]*\): all checks passed$/\1/p' "$RUNNER_TEMP/builder-test.log")
-          test -n "$tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      # The content key (AGAST #4903): a hash of exactly the inputs
+      # projects/builder/Dockerfile and stage_tree.py build the image from
+      # (projects/ritz/tools/builder_src_key.py). A commit touching only
+      # projects/buddhafinger (or another builder_matrix.py package) keeps
+      # it, since nothing ships buddhafinger's sources; a ritz1/ritzlib/
+      # runtime/builder change moves it.
+      - name: The image's content key
+        id: key
+        run: echo "key=$(python3 projects/ritz/tools/builder_src_key.py "${{ github.sha }}")" >> "$GITHUB_OUTPUT"
 
       - name: Log in to ghcr.io
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -860,13 +874,66 @@ jobs:
           REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      # Before the re-tag below: the script wants exactly one rz-builder:*
-      # image labelled with the commit.
-      - name: Publish the image for huburght's Woodpecker (:<commit> only)
+      # Only a push to main reuses a previous commit's image (the only case
+      # that publishes :src-<key> below); workflow_dispatch and any other
+      # branch always build fresh, as before this ticket.
+      - name: Does :src-<key> already exist?
+        id: reuse
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           DOCKER_CONFIG: ${{ runner.temp }}/docker-config
-        run: bash .github/scripts/publish_builder.sh --commit-only "${{ github.sha }}" ghcr.io/ritz-lang/rz-builder refs/heads/main
+        run: |
+          if docker buildx imagetools inspect "$BUILDER_IMAGE:src-${{ steps.key.outputs.key }}" >/dev/null 2>&1; then
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "reuse=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The content key didn't move: the image ghcr already has is the one
+      # this commit would build, byte for byte. A registry-side retag
+      # (seconds) instead of a full bootstrap (minutes) -- the whole point
+      # of AGAST #4903.
+      - name: Retag the existing image for this commit
+        if: steps.reuse.outputs.reuse == 'true'
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: |
+          docker buildx imagetools create \
+            --tag "$BUILDER_IMAGE:${{ github.sha }}" \
+            "$BUILDER_IMAGE:src-${{ steps.key.outputs.key }}"
+          echo "builder-image: reused \`:src-${{ steps.key.outputs.key }}\` for \`${{ github.sha }}\`, no bootstrap" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and test the builder image of this commit
+        id: build
+        if: steps.reuse.outputs.reuse != 'true'
+        run: |
+          set -o pipefail
+          bash projects/builder/test.sh --keep "${{ github.sha }}" | tee "$RUNNER_TEMP/builder-test.log"
+          tag=$(sed -n 's/^builder image \(rz-builder:[^:]*\): all checks passed$/\1/p' "$RUNNER_TEMP/builder-test.log")
+          test -n "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Before the re-tag below: the script wants exactly one rz-builder:*
+      # image labelled with the commit. :src-<key> too, so the NEXT commit
+      # with this same key can skip straight to the retag step above.
+      - name: Publish the image for huburght's Woodpecker (:<commit>, :src-<key>)
+        if: steps.reuse.outputs.reuse != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: bash .github/scripts/publish_builder.sh --commit-only --src-key "${{ steps.key.outputs.key }}" "${{ github.sha }}" ghcr.io/ritz-lang/rz-builder refs/heads/main
+
+      - name: Save the builder image for the hosted matrix
+        if: needs.builder-watch.outputs.hosted == 'true'
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: |
+          if [[ "${{ steps.reuse.outputs.reuse }}" == "true" ]]; then
+            docker pull "$BUILDER_IMAGE:src-${{ steps.key.outputs.key }}"
+            docker tag "$BUILDER_IMAGE:src-${{ steps.key.outputs.key }}" rz-builder:ci
+          else
+            docker tag "${{ steps.build.outputs.tag }}" rz-builder:ci
+          fi
+          docker save rz-builder:ci | gzip -1 > "$RUNNER_TEMP/rz-builder.tar.gz"
 
       - name: Log out of ghcr.io
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -875,12 +942,6 @@ jobs:
         run: |
           docker logout ghcr.io || true
           rm -rf "$DOCKER_CONFIG"
-
-      - name: Save the builder image for the hosted matrix
-        if: needs.builder-watch.outputs.hosted == 'true'
-        run: |
-          docker tag "${{ steps.build.outputs.tag }}" rz-builder:ci
-          docker save rz-builder:ci | gzip -1 > "$RUNNER_TEMP/rz-builder.tar.gz"
 
       - name: Upload the builder image
         if: needs.builder-watch.outputs.hosted == 'true'

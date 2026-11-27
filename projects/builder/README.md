@@ -127,6 +127,43 @@ tag is sanitised to a Docker tag, and one that would land on `main`,
 publishes `:main` and `:<commit>`. A manual run builds, tests and dry-runs,
 and pushes nothing.
 
+### Image versioning by content (AGAST #4903)
+
+`projects/ritz/tools/builder_src_key.py` hashes exactly what the Dockerfile's
+`bootstrap` stage builds from and `stage_tree.py` copies into `/stage`: ritz0,
+ritz1, ritzlib, the runtime shims, `requirements.lock`, the builder's own
+recipe (`Dockerfile`, `stage_tree.py`, `check_fixed_point.sh`,
+`collect_toolchain.sh`), and every library package some shipped package
+path-depends on (read from `stage_tree.library_packages()`, not a second
+hand-maintained list, so the two cannot drift apart). `projects/buddhafinger`
+and every other `builder_matrix.MATRIX_PACKAGES` entry is deliberately not an
+input: nothing ships them (they build from the mounted checkout,
+`RZ_ROOT`/the entrypoint's source mount, never `/rz`), so a commit touching
+only one of them computes the same key as its parent.
+
+main.yml's `builder-image` job computes this commit's key before building.
+On a push to main, if `ghcr.io/ritz-lang/rz-builder:src-<key>` is already in
+ghcr (an earlier commit with the same key published it), the job skips
+`test.sh` entirely and retags that image for this commit with `docker buildx
+imagetools create` -- a registry-side operation, seconds, not the ~4 min
+`test.sh` bootstrap. Otherwise it builds and tests as before and publishes
+`:src-<key>` alongside `:<commit>`, so the next commit with this key can take
+the fast path.
+
+Woodpecker's `wait-for-image` step still polls for `:<commit>` specifically
+(unchanged by this ticket): once the key stops moving, `builder-image`'s
+retag makes that tag appear in seconds instead of minutes, which is what
+buddhafinger's step was actually waiting on. The alternative -- resolving
+`:src-<key>` from the Woodpecker checkout and having the per-package step
+pull that tag directly, skipping the GitHub Actions round trip altogether --
+was not taken: Woodpecker's kubernetes backend resolves a step's `image:` at
+pipeline-definition time from `CI_*` built-ins, and `.woodpecker/builder.yml`
+is generated once per matrix change (`builder_matrix.py woodpecker --write`),
+not computed per run, so there is no step-to-step channel to feed a
+checkout-computed tag name into a later step's `image:` without a second
+generated pipeline variant. Keeping the per-package `image:` pinned to
+`:<commit>` and making that tag appear fast is the smaller, more honest fix.
+
 This directory is not a Ritz package and has no `ritz.toml`. `rz`'s
 `projects/**` glob only matches directories that have a `ritz.toml`
 (`tools/test_nested_packages.py` passes with it present). smoke-plan.sh maps
@@ -175,9 +212,12 @@ On a push to main:
    push, `97eacd11d`, went to Woodpecker, sat `pending` with no agent for the
    `pool: rz-builder` label, and got no matrix anywhere. The watch also says
    `why`, which `builder-packages` prints as a notice.
-4. `builder-image` builds and tests the image (`test.sh`) and pushes
-   `ghcr.io/ritz-lang/rz-builder:<commit>`. It hands the image to the hosted
-   matrix only when `builder-watch` says `hosted=true`.
+4. `builder-image` computes this commit's content key ("Image versioning by
+   content" above); if `:src-<key>` is already published it retags it as
+   `:<commit>` (seconds), else it builds and tests the image (`test.sh`) and
+   pushes `ghcr.io/ritz-lang/rz-builder:<commit>` and `:src-<key>`. It hands
+   the image to the hosted matrix only when `builder-watch` says
+   `hosted=true`.
 5. `builder-packages` and `builder-matrix` run only when `builder-watch`
    says `hosted=true`, so GitHub spends no matrix minutes while the fleet is
    up.

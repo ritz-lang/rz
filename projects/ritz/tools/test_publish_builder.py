@@ -192,6 +192,38 @@ def test_commit_only_dry_run_names_only_the_commit_tag(tmp_path):
     assert _writes(calls) == [], calls
 
 
+# --- --src-key (AGAST #4903) -----------------------------------------------
+
+@pytest.mark.integration
+def test_src_key_adds_a_src_tag_for_commit_only(tmp_path):
+    """main.yml's builder-image job passes --src-key so the NEXT commit with
+    the same content key can retag this push's image instead of rebuilding."""
+    r, calls = _run(tmp_path, [LOCAL], "--commit-only", "--src-key", "deadbeef1234",
+                    COMMIT, IMAGE, MAIN, env=_actions(MAIN))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _writes(calls) == [
+        f"tag {SRC} {IMAGE}:{COMMIT}", f"tag {SRC} {IMAGE}:src-deadbeef1234",
+        f"push {IMAGE}:{COMMIT}", f"push {IMAGE}:src-deadbeef1234",
+    ], calls
+
+
+@pytest.mark.integration
+def test_src_key_also_tags_on_a_main_publish(tmp_path):
+    r, calls = _run(tmp_path, [LOCAL], "--src-key", "deadbeef1234", COMMIT, IMAGE, MAIN,
+                    env=_actions(MAIN))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"push {IMAGE}:src-deadbeef1234" in calls, calls
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("key", ["", "DEADBEEF", "not-hex", "x" * 65])
+def test_src_key_rejects_a_bad_key(tmp_path, key):
+    r, calls = _run(tmp_path, [LOCAL], "--dry-run", "--src-key", key, COMMIT, IMAGE, MAIN)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "--src-key" in r.stderr, r.stderr
+    assert calls == [], calls  # nothing ran before the argument check
+
+
 # --- git tag name -> Docker tag --------------------------------------------
 
 @pytest.mark.integration
@@ -345,7 +377,8 @@ def test_main_yml_builds_the_image_once_and_publishes_only_its_commit_tag():
     assert image["permissions"] == {"contents": "read", "packages": "write"}
     publish = [s for s in image["steps"] if "publish_builder.sh" in str(s.get("run", ""))]
     assert len(publish) == 1, publish
-    assert re.search(r'publish_builder\.sh --commit-only "\$\{\{ github\.sha \}\}" '
+    assert re.search(r'publish_builder\.sh --commit-only --src-key '
+                     r'"\$\{\{ steps\.key\.outputs\.key \}\}" "\$\{\{ github\.sha \}\}" '
                      r'ghcr\.io/ritz-lang/rz-builder refs/heads/main', publish[0]["run"]), publish
 
 

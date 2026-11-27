@@ -88,6 +88,8 @@ LOCAL_MODULES = {
     "import_resolver",
     "resolve",
     "builder_matrix",  # tools/builder_matrix.py, the builder-matrix package list (AGAST #4825)
+    "builder_src_key",  # tools/builder_src_key.py, the image's content key (AGAST #4903)
+    "stage_tree",  # projects/builder/stage_tree.py, on sys.path by builder_src_key.py
     "fbcon_screen",  # projects/harland/tools/, the screendump decoder (AGAST #4868)
 }
 
