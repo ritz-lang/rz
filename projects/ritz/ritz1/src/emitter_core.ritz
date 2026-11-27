@@ -892,12 +892,10 @@ pub fn leave_slot_ctx(s: *EmitterState, saved: *SlotCtx)
 # The struct type the value being emitted lands in: the innermost slot's, or
 # outside any slot (a `return`, a tail) the fn's return type.  null when
 # neither is a struct.
-pub fn slot_struct_name(s: *EmitterState, out_len: *i32) -> *u8
+pub fn slot_struct_name(s: *EmitterState) -> StrView
     if s.fcx.ctx_slot_set == 1
-        *out_len = s.fcx.ctx_slot_name_len
-        return s.fcx.ctx_slot_name
-    *out_len = s.fcx.ret_type_name_len
-    return s.fcx.ret_type_name
+        return StrView { ptr: s.fcx.ctx_slot_name, len: s.fcx.ctx_slot_name_len as i64 }
+    StrView { ptr: s.fcx.ret_type_name, len: s.fcx.ret_type_name_len as i64 }
 
 # AGAST #1509: a multi-dimensional array use ritz1 does not lower, as
 # `<file>:<line>:<col>: error: <msg>`.  Counts like emit_ir_error_sv, so the
@@ -1969,16 +1967,15 @@ fn fn_def_file_abs(f: *FnDef) -> StrView
         olen = 1
     StrView { ptr: out, len: olen as i64 }
 
-# AGAST #4356: the IR symbol of `f`, its length in *out_len.  A private free
+# AGAST #4356: the IR symbol of `f`.  A private free
 # fn's symbol is its name and its defining file's hash (`helper__5e0ed276`),
 # so a generic's instance -- emitted in the object of the file that
 # instantiates it -- resolves the definition in its own module's object.
 # ritz0 does the same since #1858 (LLVMEmitter._symbol_name); every other
 # fn's symbol is its name.  A mangled result is freshly allocated.
-pub fn fn_symbol(f: *FnDef, out_len: *i32) -> *u8
-    *out_len = f.name.len as i32
+pub fn fn_symbol(f: *FnDef) -> StrView
     if fn_private_free(f) == 0
-        return f.name.ptr
+        return f.name
     var hex: [64]u8
     let key: String = diag_symbol_file_key(fn_def_file_abs(f))
     sha256_hex(key.as_view(), @hex[0])
@@ -1990,8 +1987,7 @@ pub fn fn_symbol(f: *FnDef, out_len: *i32) -> *u8
     for i in 0..8
         buf[(f.name.len as i32) + 2 + i] = hex[i]
     buf[n] = 0
-    *out_len = n
-    buf
+    StrView { ptr: buf, len: n as i64 }
 
 # AGAST #2260: is `e`'s value used by a statement being emitted?
 fn value_wanted(s: *EmitterState, e: *Expr) -> i32
@@ -2560,10 +2556,8 @@ pub fn is_float_type(t: TypeKind, name_sv: StrView) -> i32
 # has one argument, the whole suffix; for Result it is the shortest
 # `$`-bounded prefix of the suffix naming a concrete struct.  (Not the first
 # component alone: `Vec` there is the generic template.)
-fn tagged_enum_payload_struct(s: *EmitterState, name_sv: StrView, out_len: *i32) -> *u8
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    return tagged_enum_payload_named(s, StrView { ptr: (name), len: (name_len) as i64 }, out_len, 0)
+fn tagged_enum_payload_struct(s: *EmitterState, name_sv: StrView) -> StrView
+    tagged_enum_payload_named(s, name_sv, 0)
 
 # AGAST #2100: 1 if `name` is a concrete (non-generic) struct or, when
 # allow_enum is 1, a non-generic user enum: a type a tagged-enum payload is
@@ -2580,83 +2574,76 @@ pub fn is_concrete_payload_type(s: *EmitterState, name_sv: StrView, allow_enum: 
 
 # tagged_enum_payload_struct; with allow_enum 1 the carried type may also be
 # a non-generic user enum (AGAST #2100: `Some(x)` over `Option<Opt>`).
-pub fn tagged_enum_payload_named(s: *EmitterState, name_sv: StrView, out_len: *i32, allow_enum: i32) -> *u8
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    *out_len = 0
+pub fn tagged_enum_payload_named(s: *EmitterState, name_sv: StrView, allow_enum: i32) -> StrView
+    let name: *u8 = name_sv.ptr
+    let name_len: i32 = name_sv.len as i32
     if name == null
-        return null
+        return strview_empty()
     var dollar: i32 = 0
     while dollar < name_len and *(name + dollar) != '$'   # '$'
         dollar = dollar + 1
     let sfx: *u8 = name + dollar + 1
     let sfx_len: i32 = name_len - dollar - 1
     if sfx_len <= 0
-        return null
+        return strview_empty()
     if dollar == 6 and *name == 'O'   # "Option": the whole suffix
-        if allow_enum == 0 and find_struct(s, StrView { ptr: (sfx), len: (sfx_len) as i64 }) == null
-            return null
-        if allow_enum == 1 and is_concrete_payload_type(s, StrView { ptr: (sfx), len: (sfx_len) as i64 }, 1) == 0
-            return null
-        *out_len = sfx_len
-        return sfx
+        let whole: StrView = StrView { ptr: sfx, len: sfx_len as i64 }
+        if allow_enum == 0 and find_struct(s, whole) == null
+            return strview_empty()
+        if allow_enum == 1 and is_concrete_payload_type(s, whole, 1) == 0
+            return strview_empty()
+        return whole
     var end: i32 = 0
     while end < sfx_len
         end = end + 1
         while end < sfx_len and *(sfx + end) != '$'
             end = end + 1
-        if is_concrete_payload_type(s, StrView { ptr: (sfx), len: (end) as i64 }, allow_enum) == 1
-            *out_len = end
-            return sfx
-    return null
+        let head: StrView = StrView { ptr: sfx, len: end as i64 }
+        if is_concrete_payload_type(s, head, allow_enum) == 1
+            return head
+    strview_empty()
 
 # AGAST #1667: the struct type carried by `Result<T, E>`'s Err variant, i.e.
 # E, recovered from the mangled `Result$T$E` name.  When T itself names a
 # struct (tagged_enum_payload_struct), E is exactly the remainder after it.
 # Otherwise T is a primitive and E is the shortest `$`-suffix naming a
 # concrete (non-generic) struct: `Result$i64$ArgError` -> `ArgError`,
-# `Result$i32$Box$i64` -> `Box$i64`.  Returns null (out_len 0) when E is
+# `Result$i32$Box$i64` -> `Box$i64`.  Returns the empty view when E is
 # not a struct, or for non-Result names; callers then keep the i64 binding.
-fn tagged_enum_err_payload_struct(s: *EmitterState, name_sv: StrView, out_len: *i32) -> *u8
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    return tagged_enum_err_payload_named(s, StrView { ptr: (name), len: (name_len) as i64 }, out_len, 0)
+fn tagged_enum_err_payload_struct(s: *EmitterState, name_sv: StrView) -> StrView
+    tagged_enum_err_payload_named(s, name_sv, 0)
 
 # tagged_enum_err_payload_struct; with allow_enum 1, T and E may also be
 # non-generic user enums (AGAST #2100: `Err(e)` over `Result<i64, ArgError>`).
-pub fn tagged_enum_err_payload_named(s: *EmitterState, name_sv: StrView, out_len: *i32, allow_enum: i32) -> *u8
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    *out_len = 0
+pub fn tagged_enum_err_payload_named(s: *EmitterState, name_sv: StrView, allow_enum: i32) -> StrView
+    let name: *u8 = name_sv.ptr
+    let name_len: i32 = name_sv.len as i32
     if name == null or name_len <= 7
-        return null
+        return strview_empty()
     # "Result$"
     if *name != 'R' or *(name + 1) != 'e' or *(name + 6) != '$'
-        return null
+        return strview_empty()
     let sfx: *u8 = name + 7
     let sfx_len: i32 = name_len - 7
-    var ok_len: i32 = 0
-    let ok_st: *u8 = tagged_enum_payload_named(s, StrView { ptr: (name), len: (name_len) as i64 }, @ok_len, allow_enum)
-    if ok_st != null and ok_len > 0
+    let ok_st: StrView = tagged_enum_payload_named(s, name_sv, allow_enum)
+    if ok_st.ptr != null and ok_st.len > 0
+        let ok_len: i32 = ok_st.len as i32
         let rest_len: i32 = sfx_len - ok_len - 1
         if rest_len <= 0
-            return null
-        let rest: *u8 = sfx + ok_len + 1
-        if is_concrete_payload_type(s, StrView { ptr: (rest), len: (rest_len) as i64 }, allow_enum) == 0
-            return null
-        *out_len = rest_len
+            return strview_empty()
+        let rest: StrView = StrView { ptr: sfx + ok_len + 1, len: rest_len as i64 }
+        if is_concrete_payload_type(s, rest, allow_enum) == 0
+            return strview_empty()
         return rest
     # Shortest `$`-bounded suffix first; never the whole suffix (that is T).
     var start: i32 = sfx_len - 1
     while start > 0
         if *(sfx + start - 1) == '$'   # '$'
-            let cand: *u8 = sfx + start
-            let cand_len: i32 = sfx_len - start
-            if is_concrete_payload_type(s, StrView { ptr: (cand), len: (cand_len) as i64 }, allow_enum) == 1
-                *out_len = cand_len
+            let cand: StrView = StrView { ptr: sfx + start, len: (sfx_len - start) as i64 }
+            if is_concrete_payload_type(s, cand, allow_enum) == 1
                 return cand
         start = start - 1
-    return null
+    strview_empty()
 
 # =============================================================================
 # Tagged-enum layout (AGAST #1898) — byte-for-byte ritz0's _define_enum:
@@ -2691,13 +2678,11 @@ const TAGGED_ENUM_FALLBACK_BYTES: i64 = 144
 # (AGAST #4319); re-exported through `pub import ast_query` above.
 
 # The mangled type argument a tagged-enum variant carries: variant 0 is T
-# (Ok / Some), variant 1 is Result's E.  null (out_len 0) for Option's None,
+# (Ok / Some), variant 1 is Result's E.  The empty view for Option's None,
 # a non-tagged name, or a name that does not split into exactly its
 # arguments.  `Result$Vec$u8$i32`, variant 0 -> `Vec$u8`, 1 -> `i32`.
-pub fn tagged_enum_arg(s: *EmitterState, name_sv: StrView, variant: i32, out_len: *i32) -> *u8
-    let arg: StrView = tagged_enum_arg_in(s.sym.mono.pctx, @s.sym.struct_map, s.sym.module, name_sv, variant)
-    *out_len = arg.len as i32
-    arg.ptr
+pub fn tagged_enum_arg(s: *EmitterState, name_sv: StrView, variant: i32) -> StrView
+    tagged_enum_arg_in(s.sym.mono.pctx, @s.sym.struct_map, s.sym.module, name_sv, variant)
 
 # AGAST #2272: is a mangled argument `unit`, the `()` type?  It is zero bytes,
 # 1-aligned: `Result<(), i32>` is { i8, [3 x i8], [4 x i8] }, as in ritz0.
@@ -2747,22 +2732,20 @@ pub fn tagged_enum_layout(s: *EmitterState, name_sv: StrView, pad: *i64) -> i64
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     *pad = 7
-    var t_len: i32 = 0
-    let t: *u8 = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, 0, @t_len)
-    if t == null
+    let t: StrView = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, 0)
+    if t.ptr == null
         return TAGGED_ENUM_FALLBACK_BYTES
     var align: i64 = 1
-    var size: i64 = mangled_type_size_align(s, StrView { ptr: (t), len: (t_len) as i64 }, @align)
-    if size == 0 and is_unit_arg(StrView { ptr: (t), len: (t_len) as i64 }) == 0
+    var size: i64 = mangled_type_size_align(s, t, @align)
+    if size == 0 and is_unit_arg(t) == 0
         return TAGGED_ENUM_FALLBACK_BYTES
     if name_eq(StrView { ptr: (name), len: (6) as i64 }, "Result") == 1
-        var e_len: i32 = 0
-        let e: *u8 = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, 1, @e_len)
-        if e == null
+        let e: StrView = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, 1)
+        if e.ptr == null
             return TAGGED_ENUM_FALLBACK_BYTES
         var e_align: i64 = 1
-        let e_size: i64 = mangled_type_size_align(s, StrView { ptr: (e), len: (e_len) as i64 }, @e_align)
-        if e_size == 0 and is_unit_arg(StrView { ptr: (e), len: (e_len) as i64 }) == 0
+        let e_size: i64 = mangled_type_size_align(s, e, @e_align)
+        if e_size == 0 and is_unit_arg(e) == 0
             return TAGGED_ENUM_FALLBACK_BYTES
         if e_size > size
             size = e_size
@@ -2966,22 +2949,21 @@ pub fn tagged_enum_scalar_bits(s: *EmitterState, name_sv: StrView, variant: i32,
         if uf == null
             return 64
         return type_code_scalar_bits(uf.field_type, signed)
-    var c_len: i32 = 0
-    let c: *u8 = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, variant, @c_len)
-    if c == null
+    let c: StrView = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, variant)
+    if c.ptr == null
         return 64
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i8") == 1
+    if name_eq(c, "i8") == 1
         return 8
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i16") == 1
+    if name_eq(c, "i16") == 1
         return 16
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "i32") == 1
+    if name_eq(c, "i32") == 1
         return 32
     *signed = 0
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u8") == 1 or name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "bool") == 1
+    if name_eq(c, "u8") == 1 or name_eq(c, "bool") == 1
         return 8
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u16") == 1
+    if name_eq(c, "u16") == 1
         return 16
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "u32") == 1
+    if name_eq(c, "u32") == 1
         return 32
     *signed = 1
     64
@@ -3056,13 +3038,12 @@ pub fn tagged_enum_float_type(s: *EmitterState, name_sv: StrView, variant: i32) 
         if uf.field_type == TypeKind.F32 or uf.field_type == TypeKind.F64
             return uf.field_type
         return TypeKind.Void
-    var c_len: i32 = 0
-    let c: *u8 = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, variant, @c_len)
-    if c == null
+    let c: StrView = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, variant)
+    if c.ptr == null
         return TypeKind.Void
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "f32") == 1
+    if name_eq(c, "f32") == 1
         return TypeKind.F32
-    if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, "f64") == 1
+    if name_eq(c, "f64") == 1
         return TypeKind.F64
     TypeKind.Void
 
@@ -3380,16 +3361,12 @@ pub fn qualified_variant(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
 # AGAST #1466: the (non-generic) enum a qualified variant `E.V(args)` or
 # `E.V` builds, for type inference (untyped let, match scrutinee, an
 # aggregate payload).  null/0 otherwise.
-pub fn qualified_variant_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+pub fn qualified_variant_enum(s: *EmitterState, e: *Expr) -> StrView
     var vi: i32 = 0
     let ei: i32 = qualified_variant(s, e, @vi)
     if ei < 0 or enum_is_generic(s.sym.mono.pctx, ei) == 1
-        return
-    let en: StrView = enum_name_at(s.sym.mono.pctx, ei)
-    *out_name = en.ptr
-    *out_len = en.len as i32
+        return strview_empty()
+    enum_name_at(s.sym.mono.pctx, ei)
 
 # AGAST #4759: a qualified variant ritz1 cannot build, as
 # `<file>:<line>:<col>: error: 'E.V' <msg>`.  Counted like emit_ir_error, so
@@ -3822,19 +3799,17 @@ pub fn struct_const_global(s: *EmitterState, id: *Expr) -> *ConstEntry
     ce
 
 # What an array's record says its element points at: U for an `elem` of TypeKind.Ptr
-# recording `pointee` U, TypeKind.Void otherwise.  A struct U's name goes to *out_name.
-pub fn elem_recorded_pointee(s: *EmitterState, elem: TypeKind, pointee: TypeKind, name_sv: StrView, out_name: **u8, out_len: *i32) -> TypeKind
+# recording `pointee` U, TypeKind.Void otherwise.  A struct U's name goes to *out.
+pub fn elem_recorded_pointee(s: *EmitterState, elem: TypeKind, pointee: TypeKind, name_sv: StrView, out: *StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
-    *out_name = null
-    *out_len = 0
+    *out = strview_empty()
     if elem != TypeKind.Ptr
         return TypeKind.Void
     if pointee == TypeKind.Struct
         if name_len <= 0
             return TypeKind.Void
-        *out_name = name
-        *out_len = name_len
+        *out = StrView { ptr: name, len: name_len as i64 }
         return TypeKind.Struct
     if primitive_name_len(pointee) > 0
         return pointee
@@ -3843,7 +3818,7 @@ pub fn elem_recorded_pointee(s: *EmitterState, elem: TypeKind, pointee: TypeKind
 # ptr_root_pointee for a callee `fd` (a fn or, AGAST #3528, a method)
 # returning `*T`: TypeKind.Struct (name written) for a `*S`, the primitive kind for
 # a scalar `*T`, else 0 (fd null, or not a `*T` return).
-pub fn fn_ptr_return_pointee(s: *EmitterState, fd: *FnDef, out_name: **u8, out_len: *i32) -> TypeKind
+pub fn fn_ptr_return_pointee(s: *EmitterState, fd: *FnDef, out: *StrView) -> TypeKind
     if fd == null or fd.return_type != TypeKind.Ptr
         return TypeKind.Void
     # capture_fn_return_type names a primitive pointee ("i32") on
@@ -3856,8 +3831,7 @@ pub fn fn_ptr_return_pointee(s: *EmitterState, fd: *FnDef, out_name: **u8, out_l
     # AGAST #4450: a user enum pointee is named as a struct's is.
     if is_elem_aggregate_name(s, StrView { ptr: (name), len: (name_len) as i64 }) == 0
         return TypeKind.Void
-    *out_name = name
-    *out_len = name_len
+    *out = StrView { ptr: name, len: name_len as i64 }
     TypeKind.Struct
 
 # AGAST #2376: 1 when `x` (past any `+ k`) is an array element `a[i]` or its

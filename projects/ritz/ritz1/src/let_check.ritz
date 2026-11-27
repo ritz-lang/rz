@@ -400,10 +400,9 @@ fn let_value_ty(sm: *Sema, e: *Expr, out_kind: *TypeKind, out_name: *StrView, de
 # `r`'s mangled carrier name comes from sbk_receiver, the payload from
 # tagged_enum_arg_in (the same `ref_` / `refmut_` / `ptr_` spelling the emitter
 # reads).  Returns 1 when it typed the payload, 0 otherwise.
-pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr, out_kind: *TypeKind, out_name: **u8, out_len: *i32, out_pointee: *TypeKind) -> i32
+pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr, out_kind: *TypeKind, out: *StrView, out_pointee: *TypeKind) -> i32
     *out_kind = TypeKind.Void
-    *out_name = null
-    *out_len = 0
+    *out = strview_empty()
     *out_pointee = TypeKind.Void
     if e == null or e.kind != ExprKind.Method or e.left == null
         return 0
@@ -443,8 +442,7 @@ pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr, out_kind: *TypeKind, out_
         if kind == TypeKind.Ptr
             *out_kind = TypeKind.PtrPtr
             if sema_find_struct(sm, StrView { ptr: (inner), len: (inner_len) as i64 }) != null
-                *out_name = inner
-                *out_len = inner_len
+                *out = StrView { ptr: inner, len: inner_len as i64 }
             else if ty_from_name(StrView { ptr: (inner), len: (inner_len) as i64 }) == TypeKind.Void and is_tagged_enum_type(StrView { ptr: (inner), len: (inner_len) as i64 }) == 0 and user_enum_index(sm.pctx, StrView { ptr: (inner), len: (inner_len) as i64 }) < 0
                 return 0
         else
@@ -453,8 +451,7 @@ pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr, out_kind: *TypeKind, out_
         return 1
     if sema_find_struct(sm, StrView { ptr: (base), len: (base_len) as i64 }) != null or is_tagged_enum_type(StrView { ptr: (base), len: (base_len) as i64 }) == 1 or user_enum_index(sm.pctx, StrView { ptr: (base), len: (base_len) as i64 }) >= 0
         *out_kind = kind
-        *out_name = base
-        *out_len = base_len
+        *out = StrView { ptr: base, len: base_len as i64 }
         *out_pointee = TypeKind.Struct
         return 1
     let prim: TypeKind = ty_from_name(StrView { ptr: (base), len: (base_len) as i64 })
@@ -468,13 +465,12 @@ pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr, out_kind: *TypeKind, out_
 # when it can't type it.
 fn let_note_unwrap_pointer(sm: *Sema, init: *Expr, v: *SemaVar) -> i32
     var k: TypeKind = TypeKind.Void
-    var n: *u8 = null
-    var nl: i32 = 0
+    var n: StrView = strview_empty()
     var p: TypeKind = TypeKind.Void
-    if let_unwrap_payload_pointer(sm, init, @k, @n, @nl, @p) == 0
+    if let_unwrap_payload_pointer(sm, init, @k, @n, @p) == 0
         return 0
     v.let_kind = k
-    v.let_name = StrView { ptr: n, len: nl as i64 }
+    v.let_name = n
     v.let_pointee = p
     1
 
@@ -528,7 +524,7 @@ pub fn let_note_param(sm: *Sema, p: *Param)
 # `name`, through its buffer field as the emitter indexes it: 1 and the
 # element's kind (and struct name) in *out_*, else 0.
 # Sema's one element typer answers it (sema_buffer_ty, AGAST #4259).
-pub fn let_through_elem(sm: *Sema, kind: TypeKind, pointee: TypeKind, name_sv: StrView, out_kind: *TypeKind, out_name: **u8, out_len: *i32) -> i32
+pub fn let_through_elem(sm: *Sema, kind: TypeKind, pointee: TypeKind, name_sv: StrView, out_kind: *TypeKind, out: *StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0
@@ -544,8 +540,7 @@ pub fn let_through_elem(sm: *Sema, kind: TypeKind, pointee: TypeKind, name_sv: S
         return 0
     *out_kind = t.kind
     if t.name.ptr != null
-        *out_name = t.name.ptr
-        *out_len = t.name.len as i32
+        *out = t.name
     1
 
 # A `for` variable just bound: an element of `for x in <iterable>` is a
@@ -563,8 +558,7 @@ pub fn let_note_for(sm: *Sema, st: *Stmt)
     if e != null and e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         e = e.operand
     var kind: TypeKind = TypeKind.Unknown
-    var name: *u8 = null
-    var name_len: i32 = 0
+    var name: StrView = strview_empty()
     var sh: *ArrayShape = null
     if e != null and e.kind == ExprKind.Ident
         let lv: *SemaVar = sema_find_local(sm, e.ident)
@@ -572,29 +566,26 @@ pub fn let_note_for(sm: *Sema, st: *Stmt)
             sh = lv.shape
             if lv.let_kind == TypeKind.Array and lv.let_elem != TypeKind.Array
                 kind = lv.let_elem
-                name = lv.let_name.ptr
-                name_len = lv.let_name.len as i32
+                name = lv.let_name
             else
                 # A Vec<S> / Span<S> local (#2389's iterables): its element.
-                let_through_elem(sm, lv.let_kind, lv.let_pointee, lv.let_name, @kind, @name, @name_len)
+                let_through_elem(sm, lv.let_kind, lv.let_pointee, lv.let_name, @kind, @name)
         else
             let g: *GlobalVarDef = sbk_global(sm, e.ident)
             if g != null and g.var_type == TypeKind.Array
                 sh = g.array_shape
                 if g.array_elem_type != TypeKind.Array
                     kind = g.array_elem_type
-                    name = g.array_elem_type_name.ptr
-                    name_len = g.array_elem_type_name.len as i32
+                    name = g.array_elem_type_name
     else if e != null and e.kind == ExprKind.Member
         let f: *StructField = sbk_member_field(sm, e)
         if f != null and f.field_type == TypeKind.Array
             sh = f.array_shape
             if f.array_elem_type != TypeKind.Array
                 kind = f.array_elem_type
-                name = f.array_elem_type_name.ptr
-                name_len = f.array_elem_type_name.len as i32
+                name = f.array_elem_type_name
         else if f != null
-            let_through_elem(sm, f.field_type, f.ptr_pointee, f.field_type_name, @kind, @name, @name_len)
+            let_through_elem(sm, f.field_type, f.ptr_pointee, f.field_type_name, @kind, @name)
     sm.scope_top = sm.scope_top + 1
     # AGAST #2410 / #3379: over an N-D `[N][M]..T` each turn binds a row, an
     # `[M]T` local, or a plane, whose elements are arrays.
@@ -607,12 +598,12 @@ pub fn let_note_for(sm: *Sema, st: *Stmt)
         return
     # Only a scalar or a named struct element is typed: a pointer element's
     # pointee is not recorded here.
-    if kind == TypeKind.Struct and name_len <= 0
+    if kind == TypeKind.Struct and name.len <= 0
         return
     if kind == TypeKind.Ptr or kind == TypeKind.PtrPtr or kind == TypeKind.Ref or kind == TypeKind.MutRef
         return
     v.let_kind = kind
-    v.let_name = StrView { ptr: name, len: name_len as i64 }
+    v.let_name = name
 
 # =============================================================================
 # Resolving calls and methods as the emitter does
@@ -1028,8 +1019,8 @@ fn let_struct_name(sm: *Sema, e: *Expr, out: *StrView)
             *out = e.ident
 
 # 1 when `init` is a known struct of another type than the known struct `want`,
-# with its name in `*out` / `*out_len` (AGAST #2293, #3293).
-fn another_struct_source(sm: *Sema, init: *Expr, want_sv: StrView, out: **u8, out_len: *i32) -> i32
+# with its name in `*out` (AGAST #2293, #3293).
+fn another_struct_source(sm: *Sema, init: *Expr, want_sv: StrView, out: *StrView) -> i32
     var want: *u8 = want_sv.ptr
     var want_len: i32 = want_sv.len as i32
     if init == null or init.kind == ExprKind.Cast
@@ -1064,8 +1055,7 @@ fn another_struct_source(sm: *Sema, init: *Expr, want_sv: StrView, out: **u8, ou
         return 0
     if sema_find_struct(sm, StrView { ptr: (src), len: (src_len) as i64 }) == null or sema_find_struct(sm, want_sv) == null
         return 0
-    *out = src
-    *out_len = src_len
+    *out = StrView { ptr: src, len: src_len as i64 }
     return 1
 
 # `<head>`<name>` is declared `<want>` but <what> is a `<src>``, at (line, col).
@@ -1088,11 +1078,10 @@ fn let_error_another(sm: *Sema, line: i32, col: i32, head: StrView, name: StrVie
 fn let_check_another_struct(sm: *Sema, stmt: *Stmt)
     if stmt.var_declared_type != TypeKind.Struct
         return
-    var src: *u8 = null
-    var src_len: i32 = 0
-    if another_struct_source(sm, stmt.var_init, stmt.var_type_name, @src, @src_len) == 0
+    var src: StrView = strview_empty()
+    if another_struct_source(sm, stmt.var_init, stmt.var_type_name, @src) == 0
         return
-    let_error_another(sm, stmt.span.line, stmt.span.col, "`", stmt.var_name, stmt.var_type_name, "` but its initialiser is a `", StrView { ptr: (src), len: (src_len) as i64 })
+    let_error_another(sm, stmt.span.line, stmt.span.col, "`", stmt.var_name, stmt.var_type_name, "` but its initialiser is a `", src)
 
 # `let s: String = "abc"`: 1 when it reported one.  With no `String` in scope
 # (no `import ritzlib.string`, AGAST #3347) the literal has nothing to become:
@@ -1152,14 +1141,13 @@ pub fn return_check_another_struct(sm: *Sema, e: *Expr, line: i32, col: i32) -> 
     let f: *FnDef = sm.cur_fn
     if f == null or f.return_type != TypeKind.Struct
         return 0
-    var src: *u8 = null
-    var src_len: i32 = 0
-    if another_struct_source(sm, e, f.return_type_name, @src, @src_len) == 0
+    var src: StrView = strview_empty()
+    if another_struct_source(sm, e, f.return_type_name, @src) == 0
         return 0
     var env: LetEnv
     let_sema_env(sm, @env)
     let_error(@env, line, col, "the fn is declared `-> ", f.return_type_name, "` but its return value is a `")
-    let_eprint_name(StrView { ptr: (src), len: (src_len) as i64 })
+    let_eprint_name(src)
     eprints("`\n")
     return 1
 
@@ -1196,14 +1184,13 @@ fn let_check_another_struct_store(sm: *Sema, stmt: *Stmt)
             want_len = f.field_type_name.len as i32
         _ =>
             return
-    var src: *u8 = null
-    var src_len: i32 = 0
-    if another_struct_source(sm, stmt.assign_value, StrView { ptr: (want), len: (want_len) as i64 }, @src, @src_len) == 0
+    var src: StrView = strview_empty()
+    if another_struct_source(sm, stmt.assign_value, StrView { ptr: (want), len: (want_len) as i64 }, @src) == 0
         return
     var head: StrView = "`"
     if stmt.kind != StmtKind.Assign
         head = "field `"
-    let_error_another(sm, stmt.span.line, stmt.span.col, head, stmt.assign_target, StrView { ptr: (want), len: (want_len) as i64 }, "` but the value assigned is a `", StrView { ptr: (src), len: (src_len) as i64 })
+    let_error_another(sm, stmt.span.line, stmt.span.col, head, stmt.assign_target, StrView { ptr: (want), len: (want_len) as i64 }, "` but the value assigned is a `", src)
 
 # AGAST #3294: argument `a` for by-value param `p`, a struct of another type.
 # It reached clang as a `%C` passed to the `%D`.  let_another_struct_call /
@@ -1212,11 +1199,10 @@ fn let_check_another_struct_store(sm: *Sema, stmt: *Stmt)
 pub fn let_check_another_struct_arg(sm: *Sema, p: *Param, a: *Expr)
     if p.param_type != TypeKind.Struct or p.is_borrow == 1
         return
-    var src: *u8 = null
-    var src_len: i32 = 0
-    if another_struct_source(sm, a, p.param_type_name, @src, @src_len) == 0
+    var src: StrView = strview_empty()
+    if another_struct_source(sm, a, p.param_type_name, @src) == 0
         return
-    let_error_another(sm, a.span.line, a.span.col, "parameter `", p.name, p.param_type_name, "` but its argument is a `", StrView { ptr: (src), len: (src_len) as i64 })
+    let_error_another(sm, a.span.line, a.span.col, "parameter `", p.name, p.param_type_name, "` but its argument is a `", src)
 
 fn let_another_struct_args(sm: *Sema, params: *Param, args: *Expr)
     var p: *Param = params

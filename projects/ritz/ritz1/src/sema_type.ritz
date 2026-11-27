@@ -1184,32 +1184,30 @@ pub fn sema_note_elem_init(sm: *Sema, st: *Stmt)
     # `@a[i][j]` with `a: [N]*T` is `a[i] + j`, a `*T`: the element pointee
     # is the left operand's (elem_index_as_deref drops through the sum).
     if init.kind == ExprKind.Unary and (init.op == OpKind.Addr or init.op == OpKind.AddrMut) and init.operand != null and sx_is_array_elem_index(sm, init.operand) == 1
-        var pname: *u8 = null
-        var plen: i32 = 0
-        let pt: TypeKind = sx_array_elem_pointee(sm, init.operand.left, @pname, @plen)
+        var pname: StrView = strview_empty()
+        let pt: TypeKind = sx_array_elem_pointee(sm, init.operand.left, @pname)
         if pt != TypeKind.Void
             lv.kind = TypeKind.Ptr
             if ref_kind != TypeKind.Void
                 lv.kind = ref_kind
             lv.pointee = pt
             if pt == TypeKind.Struct
-                lv.type_name = StrView { ptr: pname, len: plen as i64 }
-            sx_note_init_levels(init, 1, pt, StrView { ptr: (pname), len: (plen) as i64 })
+                lv.type_name = pname
+            sx_note_init_levels(init, 1, pt, pname)
             return
     # `a[i]`, `a[i] + k` and a full-rank N-D leaf over a `[N]*T`: the
     # emitter's infer_array_elem_let types the local `*T` from the element
     # pointee (array_elem_pointee walks the sum to its left operand).
-    var pname: *u8 = null
-    var plen: i32 = 0
-    let pt: TypeKind = sx_array_elem_pointee(sm, init, @pname, @plen)
+    var pname: StrView = strview_empty()
+    let pt: TypeKind = sx_array_elem_pointee(sm, init, @pname)
     if pt != TypeKind.Void
         lv.kind = TypeKind.Ptr
         if ref_kind != TypeKind.Void
             lv.kind = ref_kind
         lv.pointee = pt
         if pt == TypeKind.Struct
-            lv.type_name = StrView { ptr: pname, len: plen as i64 }
-        sx_note_init_levels(init, 1, pt, StrView { ptr: (pname), len: (plen) as i64 })
+            lv.type_name = pname
+        sx_note_init_levels(init, 1, pt, pname)
         return
     # `let p = *r` with `r: **[N]T` is the `*[N]T` (array_ptr_ptr_deref_base).
     # Its element and shape come from r's recorded pointee array.
@@ -1226,21 +1224,19 @@ pub fn sema_note_elem_init(sm: *Sema, st: *Stmt)
         # `b[i][j]` with `b: [N]**T` is `*(b[i] + j)`, one level under b[i].
         if init.left != null and init.left.kind == ExprKind.Index
             var inner: TypeKind = TypeKind.Void
-            var lname: *u8 = null
-            var llen: i32 = 0
-            let levels: i32 = sx_ptr_levels_into(sm, init.left, @inner, @lname, @llen)
+            var lname: StrView = strview_empty()
+            let levels: i32 = sx_ptr_levels_into(sm, init.left, @inner, @lname)
             if levels >= 2 and inner != TypeKind.Void
-                sema_note_ptr_levels(lv, levels - 1, inner, StrView { ptr: (lname), len: (llen) as i64 }, ref_kind)
-                sx_note_init_levels(init, levels - 1, inner, StrView { ptr: (lname), len: (llen) as i64 })
+                sema_note_ptr_levels(lv, levels - 1, inner, lname, ref_kind)
+                sx_note_init_levels(init, levels - 1, inner, lname)
                 return
     var inner2: TypeKind = TypeKind.Void
-    var oname: *u8 = null
-    var olen: i32 = 0
-    let levels2: i32 = sx_ptr_levels_into(sm, init, @inner2, @oname, @olen)
+    var oname: StrView = strview_empty()
+    let levels2: i32 = sx_ptr_levels_into(sm, init, @inner2, @oname)
     if levels2 == 0 or inner2 == TypeKind.Void
         return
-    sema_note_ptr_levels(lv, levels2, inner2, StrView { ptr: (oname), len: (olen) as i64 }, ref_kind)
-    sx_note_init_levels(init, levels2, inner2, StrView { ptr: (oname), len: (olen) as i64 })
+    sema_note_ptr_levels(lv, levels2, inner2, oname, ref_kind)
+    sx_note_init_levels(init, levels2, inner2, oname)
 
 # ---- The slot type the emitter reads (AGAST #4410, rest of #4404) -----------
 #
@@ -2184,11 +2180,10 @@ fn sx_nd_index_shape(sm: *Sema, e: *Expr, out_depth: *i32) -> *ArrayShape
 # what it points at (U for `[N]*U`, the packed inner for `[N]**U`), and the
 # struct name.  TypeKind.Void in *out_elem when `b` isn't a whole element of a
 # recorded array (array_elem_record).
-fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *i32, out_name: **u8, out_len: *i32)
+fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *i32, out: *StrView)
     *out_elem = TypeKind.Void
     *out_pointee = (TypeKind.Void as i32)
-    *out_name = null
-    *out_len = 0
+    *out = strview_empty()
     if b == null or b.kind != ExprKind.Index or b.left == null
         return
     if b.right != null and b.right.kind == ExprKind.Range
@@ -2200,8 +2195,7 @@ fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *
         if pv != null and (pv.kind == TypeKind.Ptr or pv.kind == TypeKind.Ref or pv.kind == TypeKind.MutRef) and pv.pointee == TypeKind.Array and pv.shape == null
             *out_elem = pv.index_elem
             *out_pointee = (pv.elem_pointee as i32)
-            *out_name = pv.type_name.ptr
-            *out_len = pv.type_name.len as i32
+            *out = pv.type_name
             return
     var depth: i32 = 0
     let sh: *ArrayShape = sx_nd_index_shape(sm, b, @depth)
@@ -2209,8 +2203,7 @@ fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *
         if depth == sh.rank
             *out_elem = sh.leaf_type
             *out_pointee = (sh.leaf_pointee as i32)
-            *out_name = sh.leaf_name.ptr
-            *out_len = sh.leaf_name.len as i32
+            *out = sh.leaf_name
     else
         match b.left.kind
             ExprKind.Member =>
@@ -2218,8 +2211,7 @@ fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *
                 if f != null and f.field_type == TypeKind.Array
                     *out_elem = f.array_elem_type
                     *out_pointee = (f.array_elem_pointee as i32)
-                    *out_name = f.array_elem_type_name.ptr
-                    *out_len = f.array_elem_type_name.len as i32
+                    *out = f.array_elem_type_name
             ExprKind.Ident =>
                 let v: *SemaVar = sema_find_local(sm, b.left.ident)
                 if v != null
@@ -2228,62 +2220,54 @@ fn sx_array_elem_record(sm: *Sema, b: *Expr, out_elem: *TypeKind, out_pointee: *
                     if v.kind == TypeKind.Unknown and v.lent != null and v.lent.param_pointee_type == TypeKind.Array
                         *out_elem = v.lent.param_pointee_array_elem_type
                         *out_pointee = (v.lent.param_pointee_array_elem_pointee as i32)
-                        *out_name = v.lent.param_type_name.ptr
-                        *out_len = v.lent.param_type_name.len as i32
+                        *out = v.lent.param_type_name
                     else if v.kind == TypeKind.Array
                         *out_elem = v.index_elem
                         *out_pointee = (v.elem_pointee as i32)
-                        *out_name = v.type_name.ptr
-                        *out_len = v.type_name.len as i32
+                        *out = v.type_name
                 else
                     let g: *GlobalVarDef = sx_find_global(sm, b.left.ident)
                     if g != null and g.var_type == TypeKind.Array
                         *out_elem = g.array_elem_type
                         *out_pointee = (g.array_elem_pointee as i32)
-                        *out_name = g.array_elem_type_name.ptr
-                        *out_len = g.array_elem_type_name.len as i32
+                        *out = g.array_elem_type_name
                     else
                         # An element of a `const T: [N]*U` table (AGAST #1866).
                         let ce: *ConstEntry = sx_find_const(sm, b.left.ident)
                         if ce != null and ce.const_type == TypeKind.Array
                             *out_elem = ce.array_elem_type
                             *out_pointee = (ce.array_elem_pointee as i32)
-                            *out_name = ce.array_elem_type_name.ptr
-                            *out_len = ce.array_elem_type_name.len as i32
+                            *out = ce.array_elem_type_name
             _ => pass
 
 # U when `x` is an element of a `[N]*U` array (local, param, global, field or
 # const, N-D too) or that element `+ k`, with a struct U's name; VOID
 # otherwise (array_elem_pointee).  A `[N]**U` element is ptr_levels' shape.
-fn sx_array_elem_pointee(sm: *Sema, x: *Expr, out_name: **u8, out_len: *i32) -> TypeKind
-    *out_name = null
-    *out_len = 0
+fn sx_array_elem_pointee(sm: *Sema, x: *Expr, out: *StrView) -> TypeKind
+    *out = strview_empty()
     var b: *Expr = x
     while b != null and b.kind == ExprKind.Binary and (b.op == OpKind.Add or b.op == OpKind.Sub)
         # `q - p` is a count, not an element (is_ptr_distance).
         if b.op == OpKind.Sub
             var rinner: TypeKind = TypeKind.Void
-            if sx_ptr_levels_into(sm, b.right, @rinner, null, null) > 0
+            if sx_ptr_levels_into(sm, b.right, @rinner, null) > 0
                 return TypeKind.Void
             if sx_array_elem_pointee_kind(sm, b.right) != TypeKind.Void
                 return TypeKind.Void
         b = b.left
     var elem: TypeKind = TypeKind.Void
     var pointee_slot: i32 = 0
-    var name: *u8 = null
-    var name_len: i32 = 0
-    sx_array_elem_record(sm, b, @elem, @pointee_slot, @name, @name_len)
+    var name: StrView = strview_empty()
+    sx_array_elem_record(sm, b, @elem, @pointee_slot, @name)
     let pointee: TypeKind = ptr_slot_flat(pointee_slot)
     if sx_elem_recorded_pointee(elem, pointee) == TypeKind.Struct
-        *out_name = name
-        *out_len = name_len
+        *out = name
     sx_elem_recorded_pointee(elem, pointee)
 
 # array_elem_pointee, when the caller doesn't need a struct's name.
 fn sx_array_elem_pointee_kind(sm: *Sema, x: *Expr) -> TypeKind
-    var name: *u8 = null
-    var name_len: i32 = 0
-    sx_array_elem_pointee(sm, x, @name, @name_len)
+    var name: StrView = strview_empty()
+    sx_array_elem_pointee(sm, x, @name)
 
 # 1 when `e` is `a[i][j]` over an `a: [N]*T` element (is_array_elem_index).
 fn sx_is_array_elem_index(sm: *Sema, e: *Expr) -> i32
@@ -2305,72 +2289,60 @@ fn sx_elem_rooted(x: *Expr) -> i32
 
 # `@a[i]` points at an element that is itself a pointer: a `**U` for
 # `a: [N]*U`, one level more than the element for `a: [N]**U` (0 otherwise).
-fn sx_addr_of_elem_levels(sm: *Sema, x: *Expr, out_inner: *TypeKind, out_name: **u8, out_len: *i32) -> i32
+fn sx_addr_of_elem_levels(sm: *Sema, x: *Expr, out_inner: *TypeKind, out: *StrView) -> i32
     *out_inner = TypeKind.Void
-    if out_name != null
-        *out_name = null
-    if out_len != null
-        *out_len = 0
+    if out != null
+        *out = strview_empty()
     var elem: TypeKind = TypeKind.Void
     var pointee: i32 = (TypeKind.Void as i32)
-    var name: *u8 = null
-    var name_len: i32 = 0
-    sx_array_elem_record(sm, x, @elem, @pointee, @name, @name_len)
+    var name: StrView = strview_empty()
+    sx_array_elem_record(sm, x, @elem, @pointee, @name)
     if elem == TypeKind.Ptr
         let u: TypeKind = sx_elem_recorded_pointee(elem, ptr_slot_flat(pointee))
         if u == TypeKind.Void
             return 0
         *out_inner = u
         if u == TypeKind.Struct
-            if out_name != null
-                *out_name = name
-            if out_len != null
-                *out_len = name_len
+            if out != null
+                *out = name
         return 2
     if elem != TypeKind.PtrPtr or ptr_ptr_slot_levels(pointee) < 2
         return 0
     *out_inner = ptr_ptr_slot_inner(pointee)
     if *out_inner == TypeKind.Struct
-        if out_name != null
-            *out_name = name
-        if out_len != null
-            *out_len = name_len
+        if out != null
+            *out = name
     ptr_ptr_slot_levels(pointee) + 1
 
 # The static pointer levels of `x`, as emitter_core's ptr_levels_of reads
 # them, with the innermost pointee in *out_inner (a struct's name out too);
 # 0 for a plain `*T` base.
-fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out_name: **u8, out_len: *i32) -> i32
+fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out: *StrView) -> i32
     *out_inner = TypeKind.Void
-    if out_name != null
-        *out_name = null
-    if out_len != null
-        *out_len = 0
+    if out != null
+        *out = strview_empty()
     if x == null
         return 0
     match x.kind
         ExprKind.Binary =>
             if x.op == OpKind.Add or x.op == OpKind.Sub
-                return sx_ptr_levels_into(sm, x.left, out_inner, out_name, out_len)
+                return sx_ptr_levels_into(sm, x.left, out_inner, out)
             return 0
         ExprKind.Unary =>
             # `@a[i]` / `@&a[i]`: the element's address (addr_of_elem_levels).
             if (x.op == OpKind.Addr or x.op == OpKind.AddrMut) and x.operand != null and x.operand.kind == ExprKind.Index
-                return sx_addr_of_elem_levels(sm, x.operand, out_inner, out_name, out_len)
+                return sx_addr_of_elem_levels(sm, x.operand, out_inner, out)
             if x.op != OpKind.Deref or x.operand == null
                 return 0
             var inner: TypeKind = TypeKind.Void
-            var in_name: *u8 = null
-            var in_len: i32 = 0
-            let sub: i32 = sx_ptr_levels_into(sm, x.operand, @inner, @in_name, @in_len)
+            var in_name: StrView = strview_empty()
+            let sub: i32 = sx_ptr_levels_into(sm, x.operand, @inner, @in_name)
             if sub < 2
                 *out_inner = TypeKind.Void
                 return 0
             *out_inner = inner
-            if out_name != null
-                *out_name = in_name
-            if out_len != null
-                *out_len = in_len
+            if out != null
+                *out = in_name
             return sub - 1
         _ => pass
     var slot: i32 = (TypeKind.Void as i32)
@@ -2407,13 +2379,12 @@ fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out_name: **u8,
         ExprKind.Index =>
             # An element of a `[N]**T` array, which records T packed (AGAST #2376).
             var elem: TypeKind = TypeKind.Void
-            var el_name: *u8 = null
-            var el_len: i32 = 0
-            sx_array_elem_record(sm, x, @elem, @slot, @el_name, @el_len)
+            var el_name: StrView = strview_empty()
+            sx_array_elem_record(sm, x, @elem, @slot, @el_name)
             if elem != TypeKind.PtrPtr
                 return 0
-            name = el_name
-            name_len = el_len
+            name = el_name.ptr
+            name_len = (el_name.len as i32)
         ExprKind.Cast =>
             # `x as **S`, whose slot cast_tail_new records (AGAST #2544).
             if x.type_kind != TypeKind.PtrPtr
@@ -2445,10 +2416,8 @@ fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out_name: **u8,
     let inner: TypeKind = ptr_ptr_slot_inner(slot)
     *out_inner = inner
     if inner == TypeKind.Struct
-        if out_name != null
-            *out_name = name
-        if out_len != null
-            *out_len = name_len
+        if out != null
+            *out = StrView { ptr: name, len: name_len as i64 }
     levels
 
 # The scalar T behind `*base` when `base` is a `*T` (a `**T` deref), or VOID.
@@ -2456,7 +2425,7 @@ fn sx_deref_ptr_ptr_elem(sm: *Sema, base: *Expr) -> TypeKind
     if base == null or base.kind != ExprKind.Unary or base.op != OpKind.Deref
         return TypeKind.Void
     var inner: TypeKind = TypeKind.Void
-    if sx_ptr_levels_into(sm, base, @inner, null, null) != 1
+    if sx_ptr_levels_into(sm, base, @inner, null) != 1
         return TypeKind.Void
     if inner == TypeKind.Struct or inner == TypeKind.Void
         return TypeKind.Void
@@ -2493,7 +2462,7 @@ fn sx_ptr_ptr_index_scalar(sm: *Sema, x: *Expr) -> TypeKind
     if x == null
         return TypeKind.Void
     var inner: TypeKind = TypeKind.Void
-    if sx_ptr_levels_into(sm, x, @inner, null, null) != 2
+    if sx_ptr_levels_into(sm, x, @inner, null) != 2
         return TypeKind.Void
     if inner == TypeKind.Struct or inner == TypeKind.Void
         return TypeKind.Void
@@ -2563,7 +2532,7 @@ pub fn sema_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
                     return ix
             # `*(ppp + i)` with `ppp: ***T` is itself a `**T` (AGAST #1924).
             var dl_inner: TypeKind = TypeKind.Void
-            let dl_levels: i32 = sx_ptr_levels_into(sm, e, @dl_inner, null, null)
+            let dl_levels: i32 = sx_ptr_levels_into(sm, e, @dl_inner, null)
             if dl_levels >= 2
                 return TypeKind.PtrPtr
             # AGAST #2376: `*a[i]` with `a: [N]**T` (or `*@a[i]` with
