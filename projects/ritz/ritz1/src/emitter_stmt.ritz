@@ -186,7 +186,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     var pre_emitted: i32 = 0
     var_type = decl_pre_emit_arms(s, stmt, @dt, var_type, @pre_init_reg, @pre_emitted)
 
-    if var_type == TypeKind.I64 and dt.var_type_name_len == 0 and pre_emitted == 0
+    if var_type == TypeKind.I64 and dt.var_type_name.len == 0 and pre_emitted == 0
         if infer_ctor_let(s, stmt, @dt) == 1
             var_type = TypeKind.Struct
 
@@ -199,7 +199,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # When we see a plain TypeKind.I64 with no type-name but a call-style
     # initializer whose resolved function returns a struct, narrow
     # var_type to the struct so the alloca/store widths match.
-    if var_type == TypeKind.I64 and dt.var_type_name_len == 0 and stmt.var_init != null
+    if var_type == TypeKind.I64 and dt.var_type_name.len == 0 and stmt.var_init != null
         var_type = decl_infer_from_init(s, stmt, @dt, var_type)
 
     var_type = decl_infer_views(s, stmt, @dt, var_type)
@@ -214,7 +214,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # as ritz0 infers.  The slot stayed i64 and clang rejected
     # `store i64 <float>`.  A pre-emitted match / if already published its
     # phi type above, so it is not re-typed here.
-    if var_type == TypeKind.I64 and dt.var_type_name_len == 0 and stmt.var_init != null and pre_emitted == 0
+    if var_type == TypeKind.I64 and dt.var_type_name.len == 0 and stmt.var_init != null and pre_emitted == 0
         let init_fty: TypeKind = expr_slot_ty(stmt.var_init)
         if init_fty == TypeKind.F32 or init_fty == TypeKind.F64
             var_type = init_fty
@@ -233,14 +233,14 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         emit_array_shape_llvm(s, dt.var_array_shape, 0)
     else if var_type == TypeKind.Array
         let n: i64 = dt.var_array_size as i64
-        if dt.var_array_elem_type == TypeKind.Struct and dt.var_type_name_len > 0
-            let elem: String = ir_name(StrView { ptr: dt.var_type_name, len: dt.var_type_name_len as i64 })
+        if dt.var_array_elem_type == TypeKind.Struct and dt.var_type_name.len > 0
+            let elem: String = ir_name(dt.var_type_name)
             format_into(s, "[{n} x %{elem.as_view()}]")
         else
             # The spelling every access over the local uses (#1564, #1966).
             format_into(s, "[{n} x {elem_mem_llvm(dt.var_array_elem_type)}]")
     else
-        emit_llvm_type_struct(s, var_type, StrView { ptr: dt.var_type_name, len: dt.var_type_name_len as i64 })
+        emit_llvm_type_struct(s, var_type, dt.var_type_name)
     format_into(s, "\n")
     entry_alloca_reg_end(s)
 
@@ -266,7 +266,7 @@ fn decl_pre_emit_arms(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: T
     # match first and take the slot type from emit_match's phi.  Without
     # this the slot stayed i64 and clang rejected `store i64 <%StrView phi>`.
     # Shadowing is unaffected: `v` is registered after its initializer.
-    if var_type == TypeKind.I64 and dt.var_type_name_len == 0 and stmt.var_init != null
+    if var_type == TypeKind.I64 and dt.var_type_name.len == 0 and stmt.var_init != null
         # ExprKind.If (#1613) publishes its phi type the same way.
         if stmt.var_init.kind == ExprKind.Match or stmt.var_init.kind == ExprKind.If
             # Clear first so a stale type from an earlier match can't leak in.
@@ -292,8 +292,7 @@ fn decl_pre_emit_arms(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: T
             if s.fcx.last_match_agg_name != null and s.fcx.last_match_agg_name_len > 0
                 var_type = TypeKind.Struct
                 dt.var_type = TypeKind.Struct
-                dt.var_type_name = s.fcx.last_match_agg_name
-                dt.var_type_name_len = s.fcx.last_match_agg_name_len
+                dt.var_type_name = StrView { ptr: s.fcx.last_match_agg_name, len: s.fcx.last_match_agg_name_len as i64 }
             else if s.fcx.last_match_float_ty != TypeKind.Void
                 # AGAST #1946: float-valued arms, `let v = match o` with
                 # `Some(x) => x` over Option<f64>: a `double` slot.
@@ -303,8 +302,7 @@ fn decl_pre_emit_arms(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: T
                 # AGAST #2960: a `ptr` phi of `@&C` arms is an `@&C` slot.
                 var_type = TypeKind.MutRef
                 dt.var_type = TypeKind.MutRef
-                dt.var_type_name = ptr_phi.ptr
-                dt.var_type_name_len = ptr_phi.len as i32
+                dt.var_type_name = ptr_phi
                 dt.var_pointee_type = TypeKind.Struct
     var_type
 
@@ -365,7 +363,7 @@ fn decl_emit_init(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type: TypeKind
     # squeeze/cryptosec/valet rely on this for inflate/sbox tables.
     # Lowering strategy lives in emit_array_fill_into (emitter_expr).
     if var_type == TypeKind.Array and stmt.var_init.kind == ExprKind.ArrayFill
-        emit_array_fill_into(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 }, stmt.var_init.left)
+        emit_array_fill_into(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, dt.var_type_name, stmt.var_init.left)
         return
 
     # Array-literal init for typed [N]T slots (ritz0 parity —
@@ -378,13 +376,13 @@ fn decl_emit_init(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type: TypeKind
     # direct-element-store behaviour.
     if var_type == TypeKind.Array and stmt.var_init.kind == ExprKind.ArrayLit
         # `dt.var_type_name` names the element struct of `[N]T`.
-        emit_array_lit_into(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 }, stmt.var_init)
+        emit_array_lit_into(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, dt.var_type_name, stmt.var_init)
         return
 
     # AGAST #2035 / #2169: `let a: [N]T = x.f` / `= c` / `= *p` copy
     # the whole array.
     if var_type == TypeKind.Array
-        emit_array_local_whole_assign(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 }, stmt.var_init)
+        emit_array_local_whole_assign(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, dt.var_type_name, stmt.var_init)
         return
 
     # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
@@ -399,26 +397,26 @@ fn decl_emit_init(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type: TypeKind
     let _saved_simd: *u8 = s.fcx.ctx_simd_name
     let _saved_simd_len: i32 = s.fcx.ctx_simd_name_len
     if var_type == TypeKind.Struct
-        if dt.var_type_name_len > 0
-            if is_ctor_slot_enum(s.sym.mono.pctx, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 }) == 1
-                s.fcx.ctx_enum_name = dt.var_type_name
-                s.fcx.ctx_enum_name_len = dt.var_type_name_len
-            if is_simd_vector_type_name(StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 }) == 1
-                s.fcx.ctx_simd_name = dt.var_type_name
-                s.fcx.ctx_simd_name_len = dt.var_type_name_len
+        if dt.var_type_name.len > 0
+            if is_ctor_slot_enum(s.sym.mono.pctx, dt.var_type_name) == 1
+                s.fcx.ctx_enum_name = dt.var_type_name.ptr
+                s.fcx.ctx_enum_name_len = dt.var_type_name.len as i32
+            if is_simd_vector_type_name(dt.var_type_name) == 1
+                s.fcx.ctx_simd_name = dt.var_type_name.ptr
+                s.fcx.ctx_simd_name_len = dt.var_type_name.len as i32
     var init_reg: i32 = pre_init_reg
     if pre_emitted == 0
         # AGAST #2296: the annotation, if any, is the slot `Span.empty()`
         # takes its T from; an untyped let is a slot with no type.
         var saved_slot: SlotCtx
-        if dt.var_type_name_len > 0 and dt.var_type_name != null
-            enter_slot_ctx(s, @saved_slot, var_type, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 })
+        if dt.var_type_name.len > 0 and dt.var_type_name.ptr != null
+            enter_slot_ctx(s, @saved_slot, var_type, dt.var_type_name)
         else
             enter_slot_ctx(s, @saved_slot, TypeKind.Void, strview_empty())
-        set_match_float_hint(s, stmt.var_init, var_type, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 })
-        init_reg = emit_expr_by_value(s, stmt.var_init, var_type, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 })
+        set_match_float_hint(s, stmt.var_init, var_type, dt.var_type_name)
+        init_reg = emit_expr_by_value(s, stmt.var_init, var_type, dt.var_type_name)
         if var_type == TypeKind.Struct
-            init_reg = coerce_array_to_span(s, stmt.var_init, init_reg, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 })   # AGAST #2502
+            init_reg = coerce_array_to_span(s, stmt.var_init, init_reg, dt.var_type_name)   # AGAST #2502
         leave_slot_ctx(s, @saved_slot)
     s.fcx.ctx_enum_name = _saved_ctx
     s.fcx.ctx_enum_name_len = _saved_ctx_len
@@ -1516,11 +1514,10 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
 fn emit_for_literal(s: *EmitterState, e: *Expr, src: *ForIterSrc) -> i32
     let elem_kind: NamedKind = array_init_elem(s, e)
     let t: TypeKind = elem_kind.kind
-    src.elem_name = elem_kind.name.ptr
-    src.elem_name_len = elem_kind.name.len as i32
+    src.elem_name = elem_kind.name
     if t == TypeKind.Void
         return 0
-    let name: StrView = StrView { ptr: src.elem_name, len: src.elem_name_len as i64 }
+    let name: StrView = src.elem_name
     var n: i32 = 0
     var it: *Expr = e.args
     while it != null
@@ -1550,9 +1547,8 @@ fn emit_for_deref_array(s: *EmitterState, x: *Expr, src: *ForIterSrc) -> i32
         return 0
     src.elem_type = pa.param_pointee_array_elem_type
     src.arr_size = pa.param_pointee_array_size
-    src.elem_name = pa.param_type_name.ptr
-    src.elem_name_len = pa.param_type_name.len as i32
-    src.bind_pointee = elem_recorded_pointee(s, src.elem_type, pa.param_pointee_array_elem_pointee, StrView { ptr: src.elem_name, len: src.elem_name_len as i64 }, @src.bind_name)
+    src.elem_name = pa.param_type_name
+    src.bind_pointee = elem_recorded_pointee(s, src.elem_type, pa.param_pointee_array_elem_pointee, src.elem_name, @src.bind_name)
     let val: i32 = emit_expr(s, x)
     ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, val)
 
@@ -1573,8 +1569,7 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
     src.bind_pointee = TypeKind.Void
     src.bind_name = strview_empty()
     # AGAST #2375: the element's struct, for an element of `[N]S`.
-    src.elem_name = null
-    src.elem_name_len = 0
+    src.elem_name = strview_empty()
     # AGAST #2410: what an N-D iterable is, and how many of its indices are
     # applied.  for_nd_rows turns it into the walk.
     var nd_shape: *ArrayShape = null
@@ -1619,9 +1614,8 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
                     src.elem_type = fld.array_elem_type
                     src.arr_size = fld.array_size
                     src.data_reg = mr.reg
-                    src.elem_name = fld.array_elem_type_name.ptr
-                    src.elem_name_len = fld.array_elem_type_name.len as i32
-                    src.bind_pointee = elem_recorded_pointee(s, src.elem_type, fld.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name)
+                    src.elem_name = fld.array_elem_type_name
+                    src.bind_pointee = elem_recorded_pointee(s, src.elem_type, fld.array_elem_pointee, src.elem_name, @src.bind_name)
             _ =>
                 if iter.kind == ExprKind.Unary and iter.op == OpKind.Deref and iter.operand != null
                     # AGAST #2410: `*p` is the array `p` points at, not a copy of it.
@@ -1662,9 +1656,8 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
                                 src.iter_kind = ForIterKind.ArrayReg
                                 src.elem_type = cra.param_array_elem_type
                                 src.arr_size = cra.param_array_size
-                                src.elem_name = cra.param_type_name.ptr
-                                src.elem_name_len = cra.param_type_name.len as i32
-                                src.bind_pointee = elem_recorded_pointee(s, src.elem_type, cra.param_array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name)
+                                src.elem_name = cra.param_type_name
+                                src.bind_pointee = elem_recorded_pointee(s, src.elem_type, cra.param_array_elem_pointee, src.elem_name, @src.bind_name)
 
     if nd_shape != null
         # Rows of a `[N][M]T`, or the elements of a row.  AGAST #3379 (LARB
@@ -1677,9 +1670,8 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
         else if left > 2
             src.plane = nd_shape_from(nd_shape, nd_depth + 1)
         src.elem_type = nd_shape.leaf_type
-        src.elem_name = nd_shape.leaf_name.ptr
-        src.elem_name_len = nd_shape.leaf_name.len as i32
-        src.bind_pointee = elem_recorded_pointee(s, src.elem_type, nd_shape.leaf_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name)
+        src.elem_name = nd_shape.leaf_name
+        src.bind_pointee = elem_recorded_pointee(s, src.elem_type, nd_shape.leaf_pointee, src.elem_name, @src.bind_name)
 
     if src.iter_kind == ForIterKind.Unsupported and iter != null
         var hdr: *StructDef = null
@@ -1699,8 +1691,7 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
             src.type_name = hdr.name.ptr
             src.type_name_len = hdr.name.len as i32
             src.elem_type = fe.elem
-            src.elem_name = fe.name
-            src.elem_name_len = fe.name_len
+            src.elem_name = StrView { ptr: fe.name, len: fe.name_len as i64 }
             src.bind_pointee = fe.pointee
             src.bind_name = StrView { ptr: fe.pointee_name, len: fe.pointee_name_len as i64 }
 
@@ -1744,7 +1735,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     # `i1` in the array.  The body reads the binding as any other bool local.
     # A bool row or plane (AGAST #3379) stays `i1`s, as a bool array local is.
     let bool_slot: bool = src.elem_type == TypeKind.Bool and src.row_size == 0 and src.plane == null
-    let elem_name: StrView = StrView { ptr: src.elem_name, len: src.elem_name_len as i64 }
+    let elem_name: StrView = src.elem_name
     if bool_slot
         format_into(s, "i64")
     else
@@ -1764,7 +1755,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
         lv_set_array_elem_pointee(row_loc, src.bind_pointee)
     else if src.bind_pointee != TypeKind.Void
         add_local_full(s, stmt.for_var, var_reg, src.elem_type, src.bind_name, src.bind_pointee, 0, TypeKind.Void)
-    else if src.elem_type == TypeKind.Struct and src.elem_name_len > 0
+    else if src.elem_type == TypeKind.Struct and src.elem_name.len > 0
         add_local_struct(s, stmt.for_var, var_reg, src.elem_type, elem_name)
     else if src.elem_type == TypeKind.Bool
         add_local(s, stmt.for_var, var_reg, TypeKind.I64)

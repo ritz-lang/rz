@@ -36,7 +36,6 @@ EMITTER_DECL = SRC / "emitter_decl.ritz"   # DeclTy and the let inference (AGAST
 INFERRED_FIELDS = (
     "var_type",
     "var_type_name",
-    "var_type_name_len",
     "var_array_size",
     "var_array_elem_type",
     "var_array_elem_pointee",
