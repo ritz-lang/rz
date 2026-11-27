@@ -616,6 +616,7 @@ count elements as usual, and `data` is a non-null dangling pointer that
 | `v.first()` | `fn() -> T` | Get first element |
 | `v.last()` | `fn() -> T` | Get last element |
 | `v.as_ptr()` | `fn() -> *T` | Get raw pointer |
+| `v.as_view()` | `fn() -> StrView` | Borrow the elements' bytes (`len * sizeof(T)`); a `Vec<u8>` views as its text |
 | `v.slice(start, end)` | `fn(start: i64, end: i64) -> Vec<T>` | Copy of `[start, end)`, bounds clamped |
 | `v.clone()` | `fn() -> Vec<T>` | Copy every element; shallow, so a heap-owning `T` ends up owned twice |
 | `v.swap(i, j)` | `fn(i: i64, j: i64) -> bool` | Swap elements; false if either index is out of range |

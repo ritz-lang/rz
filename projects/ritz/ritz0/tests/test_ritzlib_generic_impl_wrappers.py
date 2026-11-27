@@ -68,7 +68,7 @@ VEC_METHODS = {
     "deinit", "valid", "len", "cap", "is_empty", "grow", "ensure_cap", "push",
     "pop", "get", "get_ptr", "set", "clear", "first", "last", "as_ptr",
     "slice", "clone", "push_bytes", "push_span", "push_view", "swap", "replace",
-    "find_lines",
+    "find_lines", "as_view",
 }
 # The operations that were free fns at 60b73372, whose names the twin check
 # below looks for.  Two methods spell a differently named twin: the manual
