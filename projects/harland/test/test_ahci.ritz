@@ -1,0 +1,234 @@
+# Host checks for the AHCI probe's pure pieces (AGAST #4882): IDENTIFY
+# field parsing and the BIOS/OS handoff on a fake register file. The kernel
+# probe calls these functions; a wrong parse or a skipped OOS write fails here.
+
+import ritzlib.span
+import ritzlib.strview
+import drivers.ahci.identify {
+    IdentifyInfo, IdentifyError, ahci_parse_identify
+}
+import drivers.ahci.regs {
+    AhciHandoff, ahci_handoff_init, ahci_handoff_step, ahci_rf_read, ahci_rf_write,
+    ahci_class_action, AHCI_REG_CAP2, AHCI_REG_BOHC, AHCI_CAP2_BOH, AHCI_BOHC_BOS,
+    AHCI_BOHC_OOS, AHCI_BOHC_BB, Handoff, ClassAction
+}
+
+var g_id: [512]u8
+var g_regs: [48]u8
+
+fn id_buf() -> [u8]
+    @g_id
+
+fn regs() -> [u8]
+    @g_regs
+
+fn zero_id()
+    id_buf().zero()
+
+fn put_word(word: i32, value: u32)
+    let off: i32 = word * 2
+    g_id[off] = (value & 0xFF) as u8
+    g_id[off + 1] = ((value >> 8) & 0xFF) as u8
+
+# Store `text` as an ATA string: each word's bytes are swapped.
+fn put_ata(word: i32, text: StrView)
+    var i: i64 = 0
+    while i < text.len
+        let c0: u32 = *(text.ptr + i) as u32
+        var c1: u32 = 0x20
+        if i + 1 < text.len
+            c1 = *(text.ptr + i + 1) as u32
+        put_word(word + (i / 2) as i32, (c0 << 8) | c1)
+        i = i + 2
+
+fn put_lba48_disk(sectors: u32)
+    zero_id()
+    put_ata(10, "WD-SERIAL-123456789")
+    put_ata(27, "QEMU HARDDISK")
+    put_word(76, 0x100)
+    put_word(83, 0x400)
+    put_word(85, 0x20)
+    put_word(100, sectors)
+    put_word(106, 0)
+
+fn expect_disk(info: IdentifyInfo) -> i32
+    if not info.model().eq("QEMU HARDDISK")
+        return 2
+    if not info.serial().eq("WD-SERIAL-123456789")
+        return 3
+    if info.sectors != 8192
+        return 4
+    if info.sector_size != 512
+        return 5
+    if not info.write_cache or not info.ncq
+        return 6
+    0
+
+[[test]]
+fn test_identify_swaps_strings_and_reads_lba48() -> i32
+    put_lba48_disk(8192)
+    match ahci_parse_identify(id_buf())
+        Ok(info) => return expect_disk(info)
+        Err(_) => return 1
+
+[[test]]
+fn test_identify_capacity_spans_words_100_to_103() -> i32
+    put_lba48_disk(0)
+    put_word(100, 0x0000)
+    put_word(101, 0x0001)
+    put_word(102, 0x0000)
+    put_word(103, 0x0000)
+    match ahci_parse_identify(id_buf())
+        Ok(info) =>
+            if info.sectors != 0x10000
+                return 2
+            return 0
+        Err(_) => return 1
+
+fn is_short(e: IdentifyError) -> bool
+    match e
+        IdentifyError.Short => true
+        IdentifyError.NoLba48 => false
+        IdentifyError.Sector4Kn(_) => false
+        IdentifyError.Io => false
+
+fn sector_4kn(e: IdentifyError) -> u32
+    match e
+        IdentifyError.Sector4Kn(sz) => sz
+        IdentifyError.Short => 0
+        IdentifyError.NoLba48 => 0
+        IdentifyError.Io => 0
+
+[[test]]
+fn test_identify_rejects_short_buffer_non_lba48_and_4kn() -> i32
+    put_lba48_disk(100)
+    match ahci_parse_identify(id_buf()[0..20])
+        Err(e) =>
+            if not is_short(e)
+                return 1
+        Ok(_) => return 1
+    put_word(83, 0)
+    match ahci_parse_identify(id_buf())
+        Err(e) =>
+            match e
+                IdentifyError.NoLba48 => pass
+                IdentifyError.Short => return 2
+                IdentifyError.Sector4Kn(_) => return 2
+                IdentifyError.Io => return 2
+        Ok(_) => return 2
+    put_lba48_disk(100)
+    # Logical sector size field valid, 2048 words = 4096 bytes: 4Kn.
+    put_word(106, 0x1000)
+    put_word(117, 2048)
+    match ahci_parse_identify(id_buf())
+        Err(e) =>
+            if sector_4kn(e) != 4096
+                return 3
+        Ok(_) => return 3
+    # 512e: the logical size field says 256 words (512 bytes). Still driven.
+    put_word(117, 256)
+    match ahci_parse_identify(id_buf())
+        Ok(info) =>
+            if info.sector_size != 512
+                return 4
+            return 0
+        Err(_) => return 4
+
+fn zero_regs()
+    regs().zero()
+
+fn step_at(h: @&AhciHandoff, now: i64) -> Handoff
+    ahci_handoff_step(h, regs(), now)
+
+[[test]]
+fn test_handoff_skips_when_boh_is_clear() -> i32
+    zero_regs()
+    var h: AhciHandoff
+    ahci_handoff_init(@&h)
+    if step_at(@&h, 0) != Handoff.Taken
+        return 1
+    if ahci_rf_read(regs(), AHCI_REG_BOHC) != 0
+        return 2
+    0
+
+[[test]]
+fn test_handoff_sets_oos_and_takes_when_bos_clears() -> i32
+    zero_regs()
+    ahci_rf_write(regs(), AHCI_REG_CAP2, AHCI_CAP2_BOH)
+    ahci_rf_write(regs(), AHCI_REG_BOHC, AHCI_BOHC_BOS)
+    var h: AhciHandoff
+    ahci_handoff_init(@&h)
+    if step_at(@&h, 0) != Handoff.Busy
+        return 1
+    let bohc: u32 = ahci_rf_read(regs(), AHCI_REG_BOHC)
+    if (bohc & AHCI_BOHC_OOS) == 0
+        return 2
+    # Firmware drops BOS inside the 25 ms window. BB stays clear.
+    ahci_rf_write(regs(), AHCI_REG_BOHC, bohc & ~AHCI_BOHC_BOS)
+    if step_at(@&h, 10) != Handoff.Taken
+        return 3
+    0
+
+[[test]]
+fn test_handoff_waits_out_bios_busy_then_takes() -> i32
+    zero_regs()
+    ahci_rf_write(regs(), AHCI_REG_CAP2, AHCI_CAP2_BOH)
+    ahci_rf_write(regs(), AHCI_REG_BOHC, AHCI_BOHC_BOS | AHCI_BOHC_BB)
+    var h: AhciHandoff
+    ahci_handoff_init(@&h)
+    if step_at(@&h, 0) != Handoff.Busy
+        return 1
+    let with_oos: u32 = ahci_rf_read(regs(), AHCI_REG_BOHC)
+    # BOS clears, BB still set: the extra 2 s wait starts.
+    ahci_rf_write(regs(), AHCI_REG_BOHC, (with_oos & ~AHCI_BOHC_BOS) | AHCI_BOHC_BB)
+    if step_at(@&h, 5) != Handoff.Busy
+        return 2
+    if step_at(@&h, 2004) != Handoff.Busy
+        return 3
+    ahci_rf_write(regs(), AHCI_REG_BOHC, with_oos & ~AHCI_BOHC_BOS & ~AHCI_BOHC_BB)
+    if step_at(@&h, 2004) != Handoff.Taken
+        return 4
+    0
+
+[[test]]
+fn test_handoff_firmware_keeps_ownership_on_either_deadline() -> i32
+    zero_regs()
+    ahci_rf_write(regs(), AHCI_REG_CAP2, AHCI_CAP2_BOH)
+    ahci_rf_write(regs(), AHCI_REG_BOHC, AHCI_BOHC_BOS)
+    var h: AhciHandoff
+    ahci_handoff_init(@&h)
+    if step_at(@&h, 0) != Handoff.Busy
+        return 1
+    if step_at(@&h, 24) != Handoff.Busy
+        return 2
+    if step_at(@&h, 25) != Handoff.Kept
+        return 3
+    zero_regs()
+    ahci_rf_write(regs(), AHCI_REG_CAP2, AHCI_CAP2_BOH)
+    ahci_rf_write(regs(), AHCI_REG_BOHC, AHCI_BOHC_BOS | AHCI_BOHC_BB)
+    var h2: AhciHandoff
+    ahci_handoff_init(@&h2)
+    if step_at(@&h2, 0) != Handoff.Busy
+        return 4
+    let with_oos: u32 = ahci_rf_read(regs(), AHCI_REG_BOHC)
+    ahci_rf_write(regs(), AHCI_REG_BOHC, (with_oos & ~AHCI_BOHC_BOS) | AHCI_BOHC_BB)
+    if step_at(@&h2, 1) != Handoff.Busy
+        return 5
+    if step_at(@&h2, 2001) != Handoff.Kept
+        return 6
+    0
+
+[[test]]
+fn test_raid_class_is_not_driven() -> i32
+    if ahci_class_action(0x01, 0x06, 0x01) != ClassAction.Drive
+        return 1
+    if ahci_class_action(0x01, 0x04, 0x00) != ClassAction.Raid
+        return 2
+    # A non-Intel RAID-mode function is the same refusal.
+    if ahci_class_action(0x01, 0x04, 0x01) != ClassAction.Raid
+        return 3
+    if ahci_class_action(0x01, 0x08, 0x02) != ClassAction.Ignore
+        return 4
+    if ahci_class_action(0x01, 0x01, 0x80) != ClassAction.Ignore
+        return 5
+    0
