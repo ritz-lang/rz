@@ -1,0 +1,276 @@
+# platform/harland.ritz - the Harland console session and loop (AGAST #4833).
+#
+# run_harland_editor(tty, args) is `buddhafinger FILE` on Harland's serial
+# console (docs/BUDDHAFINGER_PROPOSAL.md, "Harland console" and "Event
+# loop"). The editor core runs as on Linux; only the console around it
+# differs:
+#
+#   - Raw mode is ritzlib.termsession's: TTY_ECHO, TTY_ICANON and TTY_ISIG
+#     cleared, so Ctrl-C is a key, and restored by finish() on every way
+#     out of the loop.
+#   - Harland reports no window size: the viewport is --rows x --cols
+#     (24 x 80 by default) for the whole session.
+#   - termsession's KeyReader waits on the console in place of Linux's poll
+#     on a signalfd: Harland has no signals and no subprocess pipes yet.
+#     After an ESC it waits ESCAPE_TIMEOUT_MS with poll on fd 0 (the timed
+#     console read, #4829), so a bare Escape leaves Insert without the next
+#     keystroke.
+#   - Input the console dropped (its 16 KiB queue full, #4831) is reported
+#     in the message area as an input overrun.
+#   - Files go through platform/harland_save's HarlandFiles: one write, and
+#     sync for /var.
+#
+# A killed editor runs no cleanup (Harland has no signal delivery or exit
+# hook): rzsh restores the console flags at its next prompt.
+
+import ritzlib.errno { Errno }
+import ritzlib.gvec
+import ritzlib.io { eprints }
+import ritzlib.option
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_from_strview, span_from_vec }
+import ritzlib.strview { StrView }
+import ritzlib.string
+import ritzlib.termsession { InputEnd, KeyReader, TermOut, TermState, key_reader, term_out, term_state_raw }
+import ritzlib.timedread { wait_readable }
+
+import core.editor { Editor, editor_new, editor_open, handle_key }
+import core.files { FileStore, LoadError }
+import core.modes { Mode }
+import core.screen { Screen, Size, View, render, render_styled, screen_new, text_rows, view_new }
+import platform.harland_save { HarlandFiles, SavePause, harland_files }
+import syntax.highlight { Highlighter, highlighter_new }
+
+pub const HARLAND_EXIT_OK: i32 = 0
+pub const HARLAND_EXIT_FAILED: i32 = 1
+
+# The viewport without --rows / --cols.
+const DEFAULT_ROWS: i32 = 24
+const DEFAULT_COLS: i32 = 80
+# The least viewport the screen lays out: a text row, the status and the
+# message line, and a few columns.
+const MIN_ROWS: i64 = 3
+const MIN_COLS: i64 = 10
+const MAX_DIM: i64 = 1000
+
+pub const HARLAND_USAGE: StrView = "usage: buddhafinger [--rows N] [--cols N] [FILE]\n"
+
+# ============================================================================
+# Arguments
+# ============================================================================
+
+# What the command line asks for.
+pub struct HarlandArgs
+    path: StrView           # "" for a new, unnamed buffer
+    size: Size              # the viewport
+    pause: SavePause        # --pause-save: the acceptance test's kill point
+
+# Parse `buddhafinger [--rows N] [--cols N] [--pause-save WHEN] [FILE]`
+# (args[0] is the program). --pause-save before-write|after-write stops
+# each save there (platform/harland_save's SavePause) for the QEMU test.
+# Err: what is wrong, for the usage message.
+pub fn harland_args(args: Span<StrView>) -> Result<HarlandArgs, StrView>
+    var a = HarlandArgs { path: "", size: Size { rows: DEFAULT_ROWS, cols: DEFAULT_COLS }, pause: SavePause.Never }
+    var have_path = false
+    var i: i64 = 1
+    while i < args.len
+        let arg: StrView = args[i]
+        if arg.eq("--rows")
+            a.size.rows = dimension(option_value(args, i)?, MIN_ROWS, "--rows takes a number from 3 to 1000")?
+            i += 2
+        else if arg.eq("--cols")
+            a.size.cols = dimension(option_value(args, i)?, MIN_COLS, "--cols takes a number from 10 to 1000")?
+            i += 2
+        else if arg.eq("--pause-save")
+            a.pause = pause_point(option_value(args, i)?)?
+            i += 2
+        else if arg.starts_with("-") or have_path
+            return Err("unexpected argument")
+        else
+            a.path = arg
+            have_path = true
+            i += 1
+    Ok(a)
+
+# The value after the option at args[i].
+fn option_value(args: Span<StrView>, i: i64) -> Result<StrView, StrView>
+    if i + 1 >= args.len
+        return Err("an option is missing its value")
+    Ok(args[i + 1])
+
+# A viewport dimension from `min` to MAX_DIM; Err(`what`) otherwise.
+fn dimension(value: StrView, min: i64, what: StrView) -> Result<i32, StrView>
+    let n: i64 = value.parse_i64().unwrap_or(-1)
+    if n < min or n > MAX_DIM
+        return Err(what)
+    Ok(n as i32)
+
+fn pause_point(value: StrView) -> Result<SavePause, StrView>
+    if value.eq("before-write")
+        return Ok(SavePause.BeforeWrite)
+    if value.eq("after-write")
+        return Ok(SavePause.AfterWrite)
+    Err("--pause-save takes before-write or after-write")
+
+# ============================================================================
+# Start and finish
+# ============================================================================
+
+# Why the loop ended.
+enum Exit
+    Quit                # `:q`, `:wq`, `:q!`
+    Closed              # the console reached end of input
+    Failed(Errno)       # a read, write or tty call failed
+
+# "buddhafinger: <what>" on stderr: only once the console is restored.
+fn report(what: StrView)
+    eprints("buddhafinger: ")
+    eprints(what)
+    eprints("\n")
+
+# Edit `args.path` on the console `tty` until the editor quits. Returns the
+# exit status: HARLAND_EXIT_OK after `:q`, HARLAND_EXIT_FAILED when the file
+# can't be read, `tty` isn't a console or the console fails.
+pub fn run_harland_editor(tty: i32, args: @HarlandArgs) -> i32
+    var files = harland_files(args.pause)
+    var ed: Editor = match open_file(@&files, args.path)
+        Some(e) => e
+        None => return HARLAND_EXIT_FAILED
+    # A TermState, not a TermSession: the save's --pause-save hook takes a
+    # copy to hand the console back (harland_save hold_console), and finish()
+    # restores it, the one way out of the loop.
+    let term: TermState = match term_state_raw(tty)
+        Ok(t) => t
+        Err(_) =>
+            report("not a terminal")
+            return HARLAND_EXIT_FAILED
+    files.console = Some(term)
+    var c = Console { tty: tty, term: term, reader: key_reader(tty), screen: screen_new(args.size), view: view_new(), styler: highlighter_new(), out: term_out(), drawn: None }
+    ed.page = text_rows(args.size) as i64
+    c.enter_screen()
+    let exit = c.run(@&ed, @&files)
+    c.finish()
+    match exit
+        Exit.Quit => HARLAND_EXIT_OK
+        Exit.Closed => HARLAND_EXIT_FAILED
+        Exit.Failed(e) =>
+            report(e.message())
+            HARLAND_EXIT_FAILED
+
+# The editor on `path`: its bytes, or an empty buffer under that name when
+# there is no such file. None (reported) when it can't be read.
+fn open_file(files: @&HarlandFiles, path: StrView) -> Option<Editor>
+    if path.is_empty()
+        return Some(editor_new())
+    match files.load(path)
+        Ok(bytes) =>
+            var ed = editor_open(path, span_from_vec<u8>(@bytes))
+            let info = ed.file_info(path)
+            ed.say(info.as_view())
+            Some(ed)
+        Err(e) =>
+            match e
+                LoadError.NotFound =>
+                    var ed = editor_open(path, span_from_strview(""))
+                    ed.say_about(path, " [New]")
+                    Some(ed)
+                LoadError.Failed(err) =>
+                    var what = string_from(path)
+                    what.push_str(": ")
+                    what.push_str(err.message())
+                    report(what.as_view())
+                    None
+
+# ============================================================================
+# The loop
+# ============================================================================
+
+struct Console
+    tty: i32
+    term: TermState         # raw mode; restored by finish()
+    reader: KeyReader       # keys, with the Escape timeout
+    screen: Screen
+    view: View
+    styler: Highlighter
+    out: TermOut
+    drawn: Option<i64>      # the text_revision the caches were built for; None before the first paint
+
+impl Console
+    # Paint whenever no input is waiting, then wait for the next key.
+    fn run(self: @&Console, ed: @&Editor, files: @&HarlandFiles) -> Exit
+        var stale = true
+        loop
+            if ed.quit
+                return Exit.Quit
+            if stale and not self.input_waiting()
+                self.note_overruns(ed)
+                match self.paint(ed)
+                    Ok(_) => stale = false
+                    Err(e) => return Exit.Failed(e)
+            match self.reader.read_key()
+                Ok(k) =>
+                    handle_key<HarlandFiles>(ed, files, k)
+                    stale = true
+                Err(end) =>
+                    match end
+                        InputEnd.Eof => return Exit.Closed
+                        InputEnd.Failed(e) =>
+                            match e
+                                Errno.Intr => pass
+                                _ => return Exit.Failed(e)
+
+    # Whether the console has input a read would return now: then a paint
+    # waits, so a paste is applied before it is drawn.
+    fn input_waiting(self: @Console) -> bool
+        match wait_readable(self.tty, 0)
+            Ok(ready) => ready
+            Err(_) => false
+
+    # Bytes the console dropped since the last look: say so.
+    fn note_overruns(self: @&Console, ed: @&Editor)
+        let lost = self.reader.take_overruns()
+        if lost == 0
+            return
+        var msg = string_from("input overrun: ")
+        msg.push_i64(lost as i64)
+        msg.push_str(" bytes lost")
+        ed.say(msg.as_view())
+
+    # Compose the editor's frame and write what changed.
+    fn paint(self: @&Console, ed: @&Editor) -> Result<(), Errno>
+        let rev = ed.text_revision()
+        if self.drawn.unwrap_or(-1) != rev
+            # The text changed: every line's checkpoints and colors may be stale.
+            self.screen.text_changed(0, 0)
+            self.styler = highlighter_new()
+            self.drawn = Some(rev)
+        self.view.top = ed.top
+        self.view.cursor_line = ed.cursor.line
+        self.view.cursor_byte = ed.cursor.col
+        let message: StrView = match ed.mode
+            Mode.CommandLine => ed.command_line()
+            _ => ed.message.as_view()
+        if ed.path.as_view().ends_with(".ritz")
+            render_styled(@&self.screen, ed, @&self.view, @&self.styler, ed.status(), message)
+        else
+            render(@&self.screen, ed, @&self.view, ed.status(), message)
+        ed.top = self.view.top
+        self.out.hide_cursor()
+        self.screen.emit(@&self.out)
+        self.out.show_cursor()
+        self.out.flush(self.tty)
+
+    # Onto the alternate screen; the next paint draws everything.
+    fn enter_screen(self: @&Console)
+        self.out.enter_alt_screen()
+        self.screen.invalidate_terminal()
+        let flushed = self.out.flush(self.tty)
+
+    # Back to the shell's screen in the default style, cursor shown, and
+    # the console flags as they were found.
+    fn finish(self: @&Console)
+        self.out.reset_style()
+        self.out.show_cursor()
+        self.out.leave_alt_screen()
+        let flushed = self.out.flush(self.tty)
+        let restored = self.term.restore()

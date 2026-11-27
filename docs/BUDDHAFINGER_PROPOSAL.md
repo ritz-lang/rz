@@ -254,7 +254,11 @@ buffer clean. Close updates the runtime tree before updating the persistent
 subtree. If the second update fails, the new bytes may be visible in the
 running system while a reboot still loads the old file. A failed sync can
 also leave the on-disk version behind. Keep the buffer dirty in either case
-and report that the live file may already have changed. Keep transactional
+and report that the live file may already have changed. (The acceptance
+test, #4833, found that a read of a `/var` path is served from the
+persistent subtree, so after a failed persistent update `read` still
+returns the old bytes and only the runtime tree holds the new ones; after a
+failed sync both trees hold them.) Keep transactional
 replacement across the two trees and storage failure recovery on the Harland
 save-parity track.
 

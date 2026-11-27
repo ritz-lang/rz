@@ -6,6 +6,8 @@ is the design and AGAST epic #4782 tracks the work. The core (buffer,
 screen, modes and the first-release commands), the Linux save, the Linux
 event loop, lexical colors and the ritz-lsp client are in: `buddhafinger
 [FILE]` edits FILE on the terminal on stdin.
+On Harland, `buddhafinger [--rows N] [--cols N] [FILE]` edits it on the
+serial console (AGAST #4833).
 
 ## Language server
 
@@ -50,12 +52,18 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   deadline, Ctrl-Z/SIGTSTP suspend, SIGCONT resume, SIGWINCH resize,
   SIGTERM/SIGINT/SIGHUP exit, the terminal restored on every way out) and
   `save` (`LinuxFiles`, the Linux `core/files` `FileStore`: temp file, fsync,
-  rename, directory fsync, permissions kept, external-change check) and
+  rename, directory fsync, permissions kept, external-change check),
   `lsp` (ritz-lsp on nonblocking pipes in the same poll, a bounded amount of
   pipe work per loop turn, a bounded stderr log, EOF and EPIPE ending the
-  session).
+  session),
+  `harland` (the console session: termsession's raw mode, a `--rows` x
+  `--cols` viewport since Harland reports no window size, KeyReader's timed
+  console read for the Escape timeout, input overruns reported) and
+  `harland_save` (`HarlandFiles`: the whole file in one write, the close
+  checked, and for `/var` a `sync` too; a failure keeps the buffer dirty).
 - `src/main.ritz`: the `buddhafinger` binary, `platform/linux`'s `run_editor`
-  on stdin.
+  on stdin. `src/main_harland.ritz`: the Harland one
+  (`build/debug/buddhafinger.harland.elf`), `platform/harland` only.
 - `src/bench/`: `buddhafinger-bench`, the performance workloads (a million
   short lines, one 8 MiB line, ordinary Ritz sources). `bench/` holds their
   regression limits and the recorded results; `bench/README.md` says how to
@@ -72,11 +80,21 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   `test_terminal.ritz` runs the editor on a pty: open, edit, save and exit,
   a bare Escape, Ctrl-Z and SIGTSTP then SIGCONT, SIGTERM/SIGINT/SIGHUP and
   a resize, comparing the terminal's attributes before and after each.
+  `test_harland_save.ritz` runs the Harland save's every step and failure
+  against a scripted kernel.
+- `tools/test_harland_console.sh`: the Harland acceptance test. It boots the
+  shell image with the editor under QEMU (KVM where it works) six times on
+  one storage disk and drives it over the serial console
+  (`tools/harland_console.py`): edit, bare Escape, save, reopen, the shell's
+  terminal state, an empty save, kills before and after the save's write,
+  reboots, the `fault-persist` and `fault-sync` boot options, and a boot
+  with no storage device.
 
 ## Build and test
 
 ```bash
-make -C projects/buddhafinger test
+make -C projects/buddhafinger test            # the suites, then the QEMU test
+make -C projects/buddhafinger harland-test    # the QEMU test alone
 ```
 
 The editor builds and tests with `ritz1_selfhosted` only, and the Makefile

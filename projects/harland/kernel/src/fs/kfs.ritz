@@ -173,6 +173,8 @@ pub fn kfs_blob_count() -> i32
 pub fn kfs_save() -> i32
     if not kfs_has_storage()
         return Errno.NoDev as i32
+    if g_kfs_fault_sync
+        return Errno.Io as i32
     let rc: i32 = kfs_errno(block_store_save(@g_kfs_dev, @g_kfs_pns))
     # A failing disk is not retried harder either: the next save is still a
     # debounce interval away.
@@ -199,6 +201,24 @@ pub fn kfs_save_later() -> i32
         g_kfs_save_pending = true
         return KFS_OK
     kfs_save()
+
+# Fault injection (AGAST #4833; the fault-persist and fault-sync boot
+# options): when set, a /var write fails with EIO after the runtime tree took
+# it (kfs_commit), and every save to the storage device fails with EIO
+# (kfs_save). The editor's acceptance test checks what a save reports then,
+# and what the running system and the next boot read.
+var g_kfs_fault_persist: bool = false
+var g_kfs_fault_sync: bool = false
+
+# Arm the faults above; main.ritz calls this after kfs_boot, so the boot's
+# own /var write and save are not failed.
+pub fn kfs_inject_faults(persist: bool, sync: bool)
+    g_kfs_fault_persist = persist
+    g_kfs_fault_sync = sync
+    if persist
+        klog("kfs: fault-persist set: /var writes fail after the runtime tree\n" as StrView)
+    if sync
+        klog("kfs: fault-sync set: saves to the storage device fail\n" as StrView)
 
 # Whether a debounced save is owed to the storage device
 pub fn kfs_save_pending() -> bool
@@ -325,6 +345,8 @@ fn kfs_commit(path: StrView, data: *u8, size: u64, how: KfsMode, mode: u32) -> i
     let rc: i32 = kfs_write_meta(kfs_get(), path, data, size, how, mode, mtime)
     if rc != KFS_OK or not kfs_is_persist(path)
         return rc
+    if g_kfs_fault_persist
+        return Errno.Io as i32
     kfs_write_meta(@g_kfs_pns, kfs_local(path), data, size, how, mode, mtime)
 
 fn kfs_write_meta(ns: *Namespace, path: StrView, data: *u8, size: u64, how: KfsMode, mode: u32, mtime: u64) -> i32
