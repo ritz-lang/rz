@@ -11,32 +11,46 @@
 # configuration descriptors, SET_CONFIGURATION. There is no polled fallback
 # yet (#4891), so every step proves an MSI-X interrupt reached the BSP.
 #
-# Two keyboards: usb-kbd at its default high speed, and one with
+# Two controllers (AGAST #4889, docs/USB.md "Hot-plug"). The first, hc0,
+# has two keyboards: usb-kbd at its default high speed, and one with
 # usb_version=1 at full speed (EP0's size read from the device descriptor's
-# first 8 bytes before the rest). Passes only if:
-#   - the controller is found and running on an MSI-X vector aimed at the
-#     BSP;
-#   - two root ports report a keyboard connected (once each) and enabled,
-#     one at high speed and one at full speed;
-#   - slots 1 and 2 are addressed, their device descriptors read (0627:0001);
+# first 8 bytes before the rest). The second, hc1, has one keyboard, and the
+# boot option \harland\fault-usb forces one controller error on it once
+# that keyboard is ready. Passes only if:
+#   - both controllers are found, each running on its own MSI-X vector
+#     aimed at the BSP;
+#   - two of hc0's root ports report a keyboard connected (once each) and
+#     enabled, one at high speed and one at full speed;
+#   - hc0's slots 1 and 2 are addressed, their device descriptors read
+#     (0627:0001);
 #   - each configuration is read (interface 0 HID boot keyboard, endpoint
 #     0x81 interrupt IN) and SET_CONFIGURATION completes;
+#   - hc1 sees the error, resets alone and re-enumerates: its keyboard is
+#     ready twice, before the error and after the reset;
+#   - hc0 is never reset, and each of its keyboards is ready exactly once;
 #   - no enumeration step failed;
 #   - init's Tier-1 suite reports ALL TESTS PASSED;
 #   - the kernel took no exception and did not panic.
 #
 # keyboard (AGAST #4888, docs/USB.md "Data path"): one usb-kbd on q35 with
 # the PS/2 controller off and `-serial none`, so the USB keyboard is the
-# only way in and the framebuffer the only way out. init_interactive runs
-# rzsh; tools/fbcon_screen.py reads the screen over QMP and types with
-# send-key once each step's text is on screen. Passes only if:
-#   - the keyboard is driven (SET_PROTOCOL, SET_IDLE, Configure Endpoint):
-#     "keyboard ready" in the boot log on screen;
+# only way in and the framebuffer the only way out. There are two
+# controllers and the keyboard is on the second (AGAST #4889: chungus's
+# keyboard can be on any of its three). init_interactive runs rzsh;
+# tools/fbcon_screen.py reads the screen over QMP and types with send-key
+# once each step's text is on screen. Passes only if:
+#   - the keyboard is driven on the second controller (SET_PROTOCOL,
+#     SET_IDLE, Configure Endpoint): "hc1 slot 1: keyboard ready" in the
+#     boot log on screen;
 #   - `echo hi` + Enter at rzsh's prompt shows `hi` under it;
 #   - Ctrl-C kills `spin` (ring 3, no syscalls: the kill is the xHCI
 #     interrupt's) and `echo $?` then shows 130;
 #   - Caps Lock (with its LED report) types `echo ABc` as typed;
 #   - a key held 1.2 s repeats (the BSP tick's typematic repeat);
+#   - hot-plug (AGAST #4889): after QMP device_del of the keyboard its keys
+#     are released and its port is detached (endpoints stopped, Disable
+#     Slot completed), and after device_add it is ready again and
+#     `echo back` types;
 #   - no panic or exception on screen.
 #
 # Usage: tools/test_usb_boot.sh [enumerate|keyboard]   (default enumerate)
@@ -121,6 +135,8 @@ python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" "${init_arg[@]
     --output "$ESP/harland/initramfs.tar" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 cp "$LOADER_EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$ESP/harland/kernel.elf"
+# The enumerate boot fails its second controller once (AGAST #4889).
+[ "$MODE" = enumerate ] && : > "$ESP/harland/fault-usb"
 
 vars=()
 if [ -n "$OVMF_VARS" ]; then
@@ -134,7 +150,7 @@ if [ "$MODE" = keyboard ]; then
     # is the one `echo $?` is typed at.
     python3 "$SCRIPT_DIR/fbcon_screen.py" watch --qmp "$WORK/qmp.sock" --shots "$WORK/kbd" \
         --timeout "$TIMEOUT" \
-        --expect '\[usb\] slot 1: keyboard ready \(endpoint 0x81, interval [0-9]+\)' \
+        --expect '\[usb\] hc1 slot 1: keyboard ready \(endpoint 0x81, interval [0-9]+\)' \
         --send '(?m)^rzsh>$' 'e c h o spc h i ret' \
         --expect '(?m)^rzsh> echo hi\nhi$' \
         --send '(?m)^hi\nrzsh>$' 's p i n ret' \
@@ -145,12 +161,17 @@ if [ "$MODE" = keyboard ]; then
         --expect '(?m)^rzsh> echo ABc\nABc$' \
         --send '(?m)^ABc\nrzsh>$' 'e c h o spc x@1200 ret' \
         --expect '(?m)^rzsh> echo xxxx+\nxxxx+$' \
+        --qmp-do '(?m)^xxxx+\nrzsh>$' 'device_del id=kbd' \
+        --expect '\[usb\] hc1 slot [0-9]+: keyboard gone, keys released' \
+        --qmp-do '\[usb\] hc1 port [0-9]+: detached \(slot [0-9]+ disabled\)' 'device_add driver=usb-kbd id=kbd bus=xhci1.0' \
+        --send '(?s)hc1 port [0-9]+: detached \(slot [0-9]+ disabled\).*\[usb\] hc1 slot [0-9]+: keyboard ready[^\n]*\n' 'e c h o spc b a c k ret' \
+        --expect '(?m)^echo back\nback$' \
         --absent 'KERNEL PANIC|!!! EXCEPTION !!!' -- \
         qemu-system-x86_64 -cpu Haswell-v1 -smp 1 -m 2G \
         -machine q35,i8042=off -serial none -display none -vga std -no-reboot -monitor none \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$ESP" \
-        -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0
+        -device qemu-xhci,id=xhci0 -device qemu-xhci,id=xhci1 -device usb-kbd,id=kbd,bus=xhci1.0
     rc=$?
     [ "$rc" -eq "$EXIT_SETUP" ] && setup_error "QEMU could not be started"
     if [ "$rc" -ne 0 ]; then
@@ -168,8 +189,9 @@ timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 2 -m 2G \
     -display none -no-reboot -monitor none \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
     -drive "format=raw,file=fat:rw:$ESP" \
-    -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
-    -device usb-kbd,bus=xhci.0,usb_version=1 \
+    -device qemu-xhci,id=xhci0 -device usb-kbd,bus=xhci0.0 \
+    -device usb-kbd,bus=xhci0.0,usb_version=1 \
+    -device qemu-xhci,id=xhci1 -device usb-kbd,bus=xhci1.0 \
     -serial "file:$SERIAL" >/dev/null 2>&1 &
 pid=$!
 timed_out=1
@@ -182,7 +204,7 @@ kill "$pid" 2>/dev/null
 wait "$pid" 2>/dev/null
 
 echo "----- usb boot: xHCI and USB lines -----"
-grep -aE "\[xhci\]|\[usb\]|USB \(|KERNEL PANIC" "$SERIAL" | head -40
+grep -aE "\[xhci\]|\[usb\]|USB \(|fault-usb|KERNEL PANIC" "$SERIAL" | head -80
 echo "----------------------------------------"
 
 rc=0
@@ -202,31 +224,57 @@ if grep -aqE "EXCEPTION|KERNEL PANIC" "$SERIAL"; then
     echo "FAIL: kernel panic or exception during boot"
     rc=1
 fi
-need '^\[xhci\] [0-9A-F]{2}:[0-9A-F]{2}\.[0-7] 1B36:000D v1\.00: ' "the controller is found and its capabilities read (qemu-xhci, xHCI 1.0)"
-need '^\[xhci\] running: MSI-X vector [0-9]+ -> BSP$' "the xHCI controller is running on an MSI-X vector aimed at the BSP"
-# Two keyboards: usb-kbd at its default high speed, and one with
-# usb_version=1 at full speed, whose EP0 size is learned from the first 8
-# bytes of its device descriptor.
-connected=$(grep -acE '^\[usb\] port [0-9]+: connected \(USB 2\)$' "$SERIAL")
-ports=$(grep -aoE '^\[usb\] port [0-9]+: connected' "$SERIAL" | sort -u | wc -l)
-if [ "$connected" -eq 2 ] && [ "$ports" -eq 2 ]; then
-    echo "PASS: two root ports report a keyboard connected, once each"
+for hc in 0 1; do
+    need "^\\[xhci\\] hc$hc [0-9A-F]{2}:[0-9A-F]{2}\\.[0-7] 1B36:000D v1\\.00: " "hc$hc is found and its capabilities read (qemu-xhci, xHCI 1.0)"
+done
+vectors=$(grep -aoE '^\[xhci\] hc[01] running: MSI-X vector [0-9]+ -> BSP$' "$SERIAL" | sort -u | grep -oE 'vector [0-9]+' | sort -u | wc -l)
+if [ "$vectors" -eq 2 ]; then
+    echo "PASS: each controller is running on its own MSI-X vector aimed at the BSP"
 else
-    echo "FAIL: want 2 'connected' lines on 2 ports, got $connected on $ports"
+    echo "FAIL: want hc0 and hc1 running on two distinct MSI-X vectors -> BSP, got $vectors"
     rc=1
 fi
-need '^\[usb\] port [0-9]+: enabled, high speed$' "a port reset enabled the high-speed keyboard"
-need '^\[usb\] port [0-9]+: enabled, full speed$' "a port reset enabled the full-speed keyboard"
-need '^\[usb\] slot [12]: EP0 max packet 8 \(from the device descriptor\)$' "the full-speed keyboard's EP0 size came from its first 8 bytes"
+# hc0: usb-kbd at its default high speed, and one with usb_version=1 at
+# full speed, whose EP0 size is learned from the first 8 bytes of its
+# device descriptor.
+connected=$(grep -acE '^\[usb\] hc0 port [0-9]+: connected \(USB 2\)$' "$SERIAL")
+ports=$(grep -aoE '^\[usb\] hc0 port [0-9]+: connected' "$SERIAL" | sort -u | wc -l)
+if [ "$connected" -eq 2 ] && [ "$ports" -eq 2 ]; then
+    echo "PASS: two of hc0's root ports report a keyboard connected, once each"
+else
+    echo "FAIL: want 2 'hc0 ... connected' lines on 2 ports, got $connected on $ports"
+    rc=1
+fi
+need '^\[usb\] hc0 port [0-9]+: enabled, high speed$' "a port reset enabled the high-speed keyboard"
+need '^\[usb\] hc0 port [0-9]+: enabled, full speed$' "a port reset enabled the full-speed keyboard"
+need '^\[usb\] hc0 slot [12]: EP0 max packet 8 \(from the device descriptor\)$' "the full-speed keyboard's EP0 size came from its first 8 bytes"
 for slot in 1 2; do
-    need "^\\[usb\\] slot $slot addressed: port [0-9]+, address [1-9][0-9]*, EP0 (8|64) bytes$" "slot $slot is addressed"
-    need "^\\[usb\\] slot $slot: device 0627:0001, USB [12]\\.[01], class 0, 1 configuration\\(s\\)$" "slot $slot: the device descriptor is read (QEMU's usb-kbd, 0627:0001)"
-    need "^\\[usb\\] slot $slot: config 1, 34 bytes$" "slot $slot: the configuration is read"
-    need "^\\[usb\\] slot $slot:   interface 0 class 3/1/1, 1 endpoint\\(s\\)$" "slot $slot: its HID boot keyboard interface is parsed"
-    need "^\\[usb\\] slot $slot:   endpoint 0x81, 8 bytes, interval [0-9]+$" "slot $slot: its interrupt IN endpoint is parsed"
-    need "^\\[usb\\] slot $slot: configured \\(configuration 1\\)$" "slot $slot: SET_CONFIGURATION completed"
+    need "^\\[usb\\] hc0 slot $slot addressed: port [0-9]+, address [1-9][0-9]*, EP0 (8|64) bytes$" "hc0 slot $slot is addressed"
+    need "^\\[usb\\] hc0 slot $slot: device 0627:0001, USB [12]\\.[01], class 0, 1 configuration\\(s\\)$" "hc0 slot $slot: the device descriptor is read (QEMU's usb-kbd, 0627:0001)"
+    need "^\\[usb\\] hc0 slot $slot: config 1, 34 bytes$" "hc0 slot $slot: the configuration is read"
+    need "^\\[usb\\] hc0 slot $slot:   interface 0 class 3/1/1, 1 endpoint\\(s\\)$" "hc0 slot $slot: its HID boot keyboard interface is parsed"
+    need "^\\[usb\\] hc0 slot $slot:   endpoint 0x81, 8 bytes, interval [0-9]+$" "hc0 slot $slot: its interrupt IN endpoint is parsed"
+    need "^\\[usb\\] hc0 slot $slot: configured \\(configuration 1\\)$" "hc0 slot $slot: SET_CONFIGURATION completed"
 done
-if grep -aqE '^\[usb\] port [0-9]+: .*device left unconfigured' "$SERIAL"; then
+# hc1: the forced error, a reset of hc1 alone, and its keyboard again.
+# These run while init's suite prints, so a line may start mid-line.
+need '\[xhci\] hc1: fault-usb: forcing a controller error$' "the fault-usb boot option fails hc1 once its keyboard is ready"
+need '\[xhci\] hc1: controller error \(USBSTS 0x[0-9A-F]+\): resetting it alone$' "hc1's error is seen and only hc1 is reset"
+need '\[xhci\] hc1: reset done, ports re-enumerating$' "hc1 comes back from its reset"
+ready() { grep -acE "\\[usb\\] hc$1 slot [0-9]+: keyboard ready \\(endpoint 0x81, interval [0-9]+\\)$" "$SERIAL"; }
+if [ "$(ready 1)" -eq 2 ]; then
+    echo "PASS: hc1's keyboard is ready before the error and again after the reset"
+else
+    echo "FAIL: want hc1's keyboard ready twice (before and after its reset), got $(ready 1)"
+    rc=1
+fi
+if [ "$(ready 0)" -eq 2 ] && ! grep -aqE '\[xhci\] hc0: (controller error|reset)' "$SERIAL"; then
+    echo "PASS: hc0 kept running through hc1's reset (never reset, each keyboard ready once)"
+else
+    echo "FAIL: hc0 was disturbed by hc1's error (keyboards ready: $(ready 0), want 2; or hc0 reset)"
+    rc=1
+fi
+if grep -aqE '^\[usb\] hc[0-9] port [0-9]+: .*device left unconfigured' "$SERIAL"; then
     grep -aE 'device left unconfigured' "$SERIAL"
     echo "FAIL: a device's enumeration failed"
     rc=1

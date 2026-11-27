@@ -14,7 +14,7 @@ A cell under the cursor matches on its top 14 rows. Anything else is '?'.
 
   fbcon_screen.py watch --qmp SOCK --shots DIR --timeout S
                         [--expect RE]... [--absent RE]... [--idle-after RE]
-                        [--send RE KEYS]... -- QEMU ARGV...
+                        [--send RE KEYS]... [--qmp-do RE CMD]... -- QEMU ARGV...
       start QEMU with `-qmp unix:SOCK,server=on,wait=off` appended, take a
       screendump every second, and pass once every --expect regex has been
       on screen (in any shot: the boot log scrolls) and, with --idle-after,
@@ -29,6 +29,12 @@ A cell under the cursor matches on its top 14 rows. Anything else is '?'.
       down MS milliseconds: "a@1200") goes to QMP send-key in turn. The
       --send steps run in order, each only after the one before it was
       sent, and the watch passes only once all were sent.
+
+      --qmp-do RE CMD runs one QMP command once RE is on screen (AGAST
+      #4889's hot-plug): CMD is its name and key=value arguments,
+      "device_del id=kbd" or "device_add driver=usb-kbd id=kbd bus=xhci1.0".
+      It is a step in the same order as the --send steps; a QMP error fails
+      the watch.
 
 Exit: 0 pass; 1 fail (timeout, an --absent match, QEMU exited early);
 3 QEMU could not be started (a SETUP ERROR, as the other boot scripts).
@@ -205,6 +211,32 @@ def parse_keys(keys: str) -> list[Chord]:
     return chords
 
 
+def parse_qmp_do(cmd: str) -> tuple[str, dict[str, str]]:
+    """'device_del id=kbd' -> ('device_del', {'id': 'kbd'})."""
+    name, *pairs = cmd.split()
+    args: dict[str, str] = {}
+    for p in pairs:
+        k, eq, v = p.partition("=")
+        if not k or not eq:
+            raise ValueError(f"bad QMP command: {cmd!r}")
+        args[k] = v
+    return name, args
+
+
+def qmp_do(qmp: Qmp, cmd: tuple[str, dict[str, str]]) -> None:
+    reply = qmp.call(cmd[0], **cmd[1])
+    if "error" in reply:
+        raise ConnectionError(f"{cmd[0]}: {reply['error']}")
+
+
+class Step(argparse.Action):
+    """--send and --qmp-do append to one list, so they keep their order."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        steps = getattr(namespace, self.dest) or []
+        setattr(namespace, self.dest, steps + [(self.const, values[0], values[1])])
+
+
 def send_keys(qmp: Qmp, chords: list[Chord]) -> None:
     for chord, hold in chords:
         args: dict = {"keys": [{"type": "qcode", "data": n} for n in chord]}
@@ -244,7 +276,10 @@ def watch(args: argparse.Namespace) -> int:
     idle_armed = False
     idle_seen = idle_re is None
     absent = [re.compile(a) for a in args.absent]
-    steps = [(re.compile(r), parse_keys(k)) for r, k in args.send]
+    steps = [
+        (re.compile(r), kind, parse_keys(x) if kind == "keys" else parse_qmp_do(x))
+        for kind, r, x in args.steps
+    ]
     screens = (shots / "screens.txt").open("w")
     lines: list[str] = []
     rc = EXIT_FAIL
@@ -271,7 +306,11 @@ def watch(args: argparse.Namespace) -> int:
                 break
             pending = [e for e in pending if not re.search(e, text)]
             if steps and steps[0][0].search(text):
-                send_keys(qmp, steps.pop(0)[1])
+                _, kind, what = steps.pop(0)
+                if kind == "keys":
+                    send_keys(qmp, what)
+                else:
+                    qmp_do(qmp, what)
                 time.sleep(1)
                 continue
             if idle_re is not None and not idle_armed and idle_re.search(text):
@@ -297,8 +336,9 @@ def watch(args: argparse.Namespace) -> int:
         if idle_re is not None and not idle_seen:
             state = "after it appeared" if idle_armed else "(it never appeared)"
             print(f"  CPU 0 never idle (HLT=1) {state}: {args.idle_after}")
-        for r, _ in steps:
-            print(f"  never on screen to type at: {r.pattern}")
+        for r, kind, _ in steps:
+            act = "type at" if kind == "keys" else "run its QMP command at"
+            print(f"  never on screen to {act}: {r.pattern}")
     return rc
 
 
@@ -314,7 +354,8 @@ def main(argv: list[str]) -> int:
     w.add_argument("--expect", action="append", default=[])
     w.add_argument("--absent", action="append", default=[])
     w.add_argument("--idle-after")
-    w.add_argument("--send", nargs=2, action="append", default=[], metavar=("RE", "KEYS"))
+    w.add_argument("--send", nargs=2, action=Step, const="keys", dest="steps", default=[], metavar=("RE", "KEYS"))
+    w.add_argument("--qmp-do", nargs=2, action=Step, const="qmp", dest="steps", default=[], metavar=("RE", "CMD"))
     w.add_argument("qemu", nargs=argparse.REMAINDER)
     args = ap.parse_args(argv)
     if args.cmd == "decode":
@@ -324,9 +365,9 @@ def main(argv: list[str]) -> int:
         args.qemu = args.qemu[1:]
     if not args.qemu:
         ap.error("watch needs -- QEMU ARGV")
-    for _, keys in args.send:
+    for kind, _, x in args.steps:
         try:
-            parse_keys(keys)
+            parse_keys(x) if kind == "keys" else parse_qmp_do(x)
         except ValueError as e:
             ap.error(str(e))
     return watch(args)

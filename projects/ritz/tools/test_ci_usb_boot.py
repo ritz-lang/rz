@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""CI must boot harland with an xHCI controller and USB keyboards (AGAST #4887),
-and type into rzsh on one (AGAST #4888).
+"""CI must boot harland with xHCI controllers and USB keyboards (AGAST #4887),
+type into rzsh on one (AGAST #4888), and survive a controller error and a
+hot-plug (AGAST #4889).
 
-projects/harland/tools/test_usb_boot.sh boots harland under OVMF with QEMU's
-qemu-xhci and two usb-kbd keyboards, one forced to full speed
-(usb_version=1). drivers/usb brings the controller up on an MSI-X vector
-aimed at the BSP and enumerates each keyboard on events alone. These pin:
+projects/harland/tools/test_usb_boot.sh boots harland under OVMF with two of
+QEMU's qemu-xhci: the first with two usb-kbd keyboards, one forced to full
+speed (usb_version=1), the second with one keyboard and the fault-usb boot
+option, which fails that controller once its keyboard is ready.
+drivers/usb brings each controller up on its own MSI-X vector aimed at the
+BSP and enumerates each keyboard on events alone, then resets the failed
+controller alone and enumerates its keyboard again. These pin:
 
   * the wiring: the step runs after the APIC ID 256 boot and before the log
     upload, gates for real, has a timeout and keeps usb.log; `make test-usb`
@@ -13,13 +17,16 @@ aimed at the BSP and enumerates each keyboard on events alone. These pin:
   * the verdicts, against a stub QEMU (no QEMU, OVMF or kernel build): the
     real boot's log passes, and each enumeration step's line missing fails,
     as do a port seen connected twice (an interrupt re-entering the
-    boot-time port scan), no MSI-X vector, a failed step, a panic and no
-    Tier-1 verdict. A missing QEMU, or one without qemu-xhci, is a SETUP
+    boot-time port scan), no MSI-X vector, both controllers on one vector,
+    the failed controller not reset or not back, the other one disturbed, a
+    failed step, a panic and no Tier-1 verdict. A missing QEMU, or one without qemu-xhci, is a SETUP
     ERROR (exit 3).
   * the keyboard boot (`test_usb_boot.sh keyboard`, #4888): its own CI step
     after the enumeration boot, and `make test-usb-kbd`; against a stub
     fbcon_screen.py, it boots with the USB keyboard as the only input (q35,
-    i8042=off, -serial none) and types each step the docs promise.
+    i8042=off, -serial none) on the second of two controllers, types each
+    step the docs promise, then unplugs and replugs it over QMP and types
+    again.
 
 Run with:
     python3 -m pytest projects/ritz/tools/test_ci_usb_boot.py -q
@@ -66,37 +73,65 @@ out = sys.argv[sys.argv.index("--output") + 1]
 open(out, "wb").write(bytes(512))
 """
 
-# The xHCI and USB lines of a real boot (2026-11-27, QEMU 8.2), in order.
-CONTROLLER = (
-    r"[xhci] 00:04.0 1B36:000D v1.00: 64 slots, 8 ports, 32-byte contexts,"
-    r" 0 scratchpads, 64-bit DMA\n"
-    r"[xhci] ports 5-8: USB 2.0\n"
-    r"[xhci] ports 1-4: USB 3.0\n"
-)
-RUNNING = r"[xhci] running: MSI-X vector 64 -> BSP\n"
-CONNECTED_5 = r"[usb] port 5: connected (USB 2)\n"
-CONNECTED_6 = r"[usb] port 6: connected (USB 2)\n"
-ENABLED_HIGH = r"[usb] port 5: enabled, high speed\n"
-ENABLED_FULL = r"[usb] port 6: enabled, full speed\n"
-ADDRESSED_1 = r"[usb] slot 1 addressed: port 5, address 1, EP0 64 bytes\n"
-ADDRESSED_2 = r"[usb] slot 2 addressed: port 6, address 2, EP0 8 bytes\n"
-DEVICE_1 = r"[usb] slot 1: device 0627:0001, USB 2.0, class 0, 1 configuration(s)\n"
-MPS_2 = r"[usb] slot 2: EP0 max packet 8 (from the device descriptor)\n"
-DEVICE_2 = r"[usb] slot 2: device 0627:0001, USB 2.0, class 0, 1 configuration(s)\n"
-
-
-def config(slot: int) -> str:
+# The xHCI and USB lines of a real boot (2026-11-27, QEMU 10.2), in order.
+def controller(hc: int, bdf: str) -> str:
     return (
-        rf"[usb] slot {slot}: config 1, 34 bytes\n"
-        rf"[usb] slot {slot}:   interface 0 class 3/1/1, 1 endpoint(s)\n"
-        rf"[usb] slot {slot}:   endpoint 0x81, 8 bytes, interval 6\n"
+        rf"[xhci] hc{hc} {bdf} 1B36:000D v1.00: 64 slots, 8 ports, 32-byte contexts,"
+        r" 0 scratchpads, 64-bit DMA\n"
+        rf"[xhci] hc{hc} ports 5-8: USB 2.0\n"
+        rf"[xhci] hc{hc} ports 1-4: USB 3.0\n"
     )
 
 
-def configured(slot: int) -> str:
-    return rf"[usb] slot {slot}: configured (configuration 1)\n"
+def running(hc: int, vector: int) -> str:
+    return rf"[xhci] hc{hc} running: MSI-X vector {vector} -> BSP\n"
 
 
+CONTROLLER_0 = controller(0, "00:04.0")
+CONTROLLER_1 = controller(1, "00:05.0")
+RUNNING = running(0, 64)
+RUNNING_1 = running(1, 65)
+CONNECTED_5 = r"[usb] hc0 port 5: connected (USB 2)\n"
+CONNECTED_6 = r"[usb] hc0 port 6: connected (USB 2)\n"
+ENABLED_HIGH = r"[usb] hc0 port 5: enabled, high speed\n"
+ENABLED_FULL = r"[usb] hc0 port 6: enabled, full speed\n"
+ADDRESSED_1 = r"[usb] hc0 slot 1 addressed: port 5, address 1, EP0 64 bytes\n"
+ADDRESSED_2 = r"[usb] hc0 slot 2 addressed: port 6, address 2, EP0 8 bytes\n"
+DEVICE_1 = r"[usb] hc0 slot 1: device 0627:0001, USB 2.0, class 0, 1 configuration(s)\n"
+MPS_2 = r"[usb] hc0 slot 2: EP0 max packet 8 (from the device descriptor)\n"
+DEVICE_2 = r"[usb] hc0 slot 2: device 0627:0001, USB 2.0, class 0, 1 configuration(s)\n"
+
+
+def config(slot: int, hc: int = 0) -> str:
+    return (
+        rf"[usb] hc{hc} slot {slot}: config 1, 34 bytes\n"
+        rf"[usb] hc{hc} slot {slot}:   interface 0 class 3/1/1, 1 endpoint(s)\n"
+        rf"[usb] hc{hc} slot {slot}:   endpoint 0x81, 8 bytes, interval 6\n"
+    )
+
+
+def configured(slot: int, hc: int = 0) -> str:
+    return rf"[usb] hc{hc} slot {slot}: configured (configuration 1)\n"
+
+
+def ready(slot: int, hc: int = 0) -> str:
+    return rf"[usb] hc{hc} slot {slot}: keyboard ready (endpoint 0x81, interval 6)\n"
+
+
+# hc1's one keyboard, enumerated at boot and again after its reset.
+HC1_KEYBOARD = (
+    r"[usb] hc1 port 5: connected (USB 2)\n"
+    r"[usb] hc1 port 5: enabled, high speed\n"
+    r"[usb] hc1 slot 1 addressed: port 5, address 1, EP0 64 bytes\n"
+    + config(1, 1)
+    + configured(1, 1)
+)
+HC1_READY = ready(1, 1)
+HC1_READY_AGAIN = HC1_READY  # the same line, after the reset: `without` drops the last
+FAULT = r"[xhci] hc1: fault-usb: forcing a controller error\n"
+# The suite's output shares the line: the check must not need line start.
+HC1_ERROR = r"[test] mmap_isolation ... [xhci] hc1: controller error (USBSTS 0x00001008): resetting it alone\n"
+HC1_RESET = r"[xhci] hc1: reset done, ports re-enumerating\n"
 OK_LINE = r"  [OK] USB (xHCI)\n"
 SUITE_PASSED = r"  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
 ENUMERATION = [
@@ -113,8 +148,11 @@ ENUMERATION = [
     configured(1),
     config(2),
     configured(2),
+    ready(1),
+    ready(2),
 ]
-PASSED_LINES = [CONTROLLER, RUNNING, *ENUMERATION, OK_LINE, SUITE_PASSED]
+RECOVERY = [HC1_KEYBOARD, HC1_READY, FAULT, HC1_ERROR, HC1_RESET, HC1_KEYBOARD, HC1_READY_AGAIN]
+PASSED_LINES = [CONTROLLER_0, RUNNING, CONTROLLER_1, RUNNING_1, *ENUMERATION, OK_LINE, *RECOVERY, SUITE_PASSED]
 
 
 def log(lines: list[str]) -> str:
@@ -122,7 +160,12 @@ def log(lines: list[str]) -> str:
 
 
 def without(line: str) -> str:
-    return log([part for part in PASSED_LINES if part != line])
+    """The passing log with `line` taken out, once."""
+    parts = list(PASSED_LINES)
+    parts.reverse()
+    parts.remove(line)
+    parts.reverse()
+    return log(parts)
 
 
 # --------------------------------------------------------------------------
@@ -275,16 +318,17 @@ def test_passes_with_both_keyboards_configured(tree):
     assert "FAIL" not in r.stdout
     assert "configured (configuration 1)" in (keep / "usb.log").read_text()
     argv = (tree["tmp"] / "stub.log").read_text()
-    assert "-device qemu-xhci,id=xhci" in argv
-    assert argv.count("-device usb-kbd,bus=xhci.0") == 2
-    assert "usb-kbd,bus=xhci.0,usb_version=1" in argv
+    assert "-device qemu-xhci,id=xhci0" in argv and "-device qemu-xhci,id=xhci1" in argv
+    assert argv.count("-device usb-kbd,bus=xhci0.0") == 2
+    assert "usb-kbd,bus=xhci0.0,usb_version=1" in argv
+    assert argv.count("-device usb-kbd,bus=xhci1.0") == 1
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "line,why",
     [
-        pytest.param(RUNNING, "running on an MSI-X vector", id="not-running"),
+        pytest.param(RUNNING, "two distinct MSI-X vectors", id="not-running"),
         pytest.param(ENABLED_HIGH, "high-speed keyboard", id="no-high-speed"),
         pytest.param(ENABLED_FULL, "full-speed keyboard", id="no-full-speed"),
         pytest.param(MPS_2, "first 8 bytes", id="no-ep0-size-read"),
@@ -292,6 +336,9 @@ def test_passes_with_both_keyboards_configured(tree):
         pytest.param(DEVICE_1, "slot 1: the device descriptor", id="no-device-descriptor"),
         pytest.param(config(2), "slot 2: the configuration is read", id="no-config"),
         pytest.param(configured(1), "slot 1: SET_CONFIGURATION", id="not-configured"),
+        pytest.param(HC1_ERROR, "only hc1 is reset", id="hc1-error-unseen"),
+        pytest.param(HC1_RESET, "hc1 comes back", id="hc1-not-back"),
+        pytest.param(HC1_READY_AGAIN, "keyboard ready twice", id="hc1-not-ready-again"),
     ],
 )
 def test_each_missing_step_fails(tree, line, why):
@@ -304,15 +351,33 @@ def test_each_missing_step_fails(tree, line, why):
 def test_a_port_connected_twice_fails(tree):
     """The boot-time port scan run with interrupts on: the controller's event
     re-entered it, and the port was seen connected (and reset) twice."""
-    lines = [CONTROLLER, RUNNING, CONNECTED_5, *ENUMERATION, OK_LINE, SUITE_PASSED]
+    lines = [CONTROLLER_0, RUNNING, CONTROLLER_1, RUNNING_1, CONNECTED_5, *ENUMERATION, OK_LINE, *RECOVERY, SUITE_PASSED]
     r = _run(tree, log(lines))
     assert r.returncode == 1, r.stdout + r.stderr
-    assert "want 2 'connected' lines on 2 ports, got 3 on 2" in r.stdout
+    assert "want 2 'hc0 ... connected' lines on 2 ports, got 3 on 2" in r.stdout
+
+
+@pytest.mark.integration
+def test_both_controllers_on_one_vector_fails(tree):
+    lines = [running(1, 64) if part == RUNNING_1 else part for part in PASSED_LINES]
+    r = _run(tree, log(lines))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "two distinct MSI-X vectors" in r.stdout
+
+
+@pytest.mark.integration
+def test_hc1_error_disturbing_hc0_fails(tree):
+    """hc1's reset must leave hc0 alone: hc0 reset, or a keyboard of hc0's
+    ready a second time (re-enumerated), fails."""
+    for extra in (r"[xhci] hc0: controller error (USBSTS 0x00001008): resetting it alone\n", ready(1)):
+        r = _run(tree, log(PASSED_LINES[:-1] + [extra, SUITE_PASSED]))
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "hc0 was disturbed by hc1's error" in r.stdout
 
 
 @pytest.mark.integration
 def test_no_msix_vector_fails(tree):
-    polled = r"[xhci] running: no MSI-X vector: events wait for the polled fallback\n"
+    polled = r"[xhci] hc0 running: no MSI-X vector: events wait for the polled fallback\n"
     lines = [polled if part == RUNNING else part for part in PASSED_LINES]
     r = _run(tree, log(lines))
     assert r.returncode == 1, r.stdout + r.stderr
@@ -320,7 +385,7 @@ def test_no_msix_vector_fails(tree):
 
 @pytest.mark.integration
 def test_a_failed_step_fails_even_if_the_rest_passed(tree):
-    bad = r"[usb] port 7: command failed: no slots (9); device left unconfigured\n"
+    bad = r"[usb] hc0 port 7: command failed: no slots (9); device left unconfigured\n"
     r = _run(tree, log(PASSED_LINES[:-1] + [bad, SUITE_PASSED]))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "a device's enumeration failed" in r.stdout
@@ -328,7 +393,7 @@ def test_a_failed_step_fails_even_if_the_rest_passed(tree):
 
 @pytest.mark.integration
 def test_panic_fails(tree):
-    r = _run(tree, log([CONTROLLER, RUNNING, r"*** KERNEL PANIC ***\n"]))
+    r = _run(tree, log([CONTROLLER_0, RUNNING, r"*** KERNEL PANIC ***\n"]))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "kernel panic or exception" in r.stdout
 
@@ -379,6 +444,11 @@ def _sends(argv: list[str]) -> list[tuple[str, str]]:
     return [(argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == "--send"]
 
 
+def _steps(argv: list[str]) -> list[str]:
+    """The --send keys and --qmp-do commands, in the order they run."""
+    return [argv[i + 2] for i, a in enumerate(argv) if a in ("--send", "--qmp-do")]
+
+
 @pytest.mark.integration
 def test_keyboard_boot_types_each_step_with_the_usb_keyboard_alone(tree):
     r, argv = _keyboard_run(tree)
@@ -387,18 +457,24 @@ def test_keyboard_boot_types_each_step_with_the_usb_keyboard_alone(tree):
     qemu = argv[argv.index("--") + 1 :]
     # The USB keyboard is the only input and the screen the only output.
     assert "q35,i8042=off" in qemu and qemu[qemu.index("-serial") + 1] == "none"
-    assert qemu.count("usb-kbd,bus=xhci.0") == 1
-    keys = [k for _, k in _sends(argv)]
-    assert keys == [
+    # Two controllers, the keyboard on the second (#4889).
+    assert qemu.count("qemu-xhci,id=xhci0") == 1 and qemu.count("qemu-xhci,id=xhci1") == 1
+    assert qemu.count("usb-kbd,id=kbd,bus=xhci1.0") == 1
+    assert _steps(argv) == [
         "e c h o spc h i ret",
         "s p i n ret",
         "ctrl-c",
         "e c h o spc shift-4 shift-slash ret",
         "e c h o spc caps_lock a b caps_lock c ret",
         "e c h o spc x@1200 ret",
+        # Hot-plug: unplug, replug once the port is detached, type again.
+        "device_del id=kbd",
+        "device_add driver=usb-kbd id=kbd bus=xhci1.0",
+        "e c h o spc b a c k ret",
     ]
     expects = [argv[i + 1] for i, a in enumerate(argv) if a == "--expect"]
-    assert any("keyboard ready" in e for e in expects)
+    assert any("hc1 slot 1: keyboard ready" in e for e in expects)
+    assert any("back" in e for e in expects), "typing must work after the replug"
     assert any("130" in e for e in expects), "Ctrl-C's kill must show $? = 130"
 
 

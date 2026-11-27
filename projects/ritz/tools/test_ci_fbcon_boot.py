@@ -19,6 +19,7 @@ Run with:
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -190,3 +191,20 @@ def test_send_keys_parse_chords_and_hold_times():
     for bad in ("", "ctrl-", "x@", "x@soon"):
         with pytest.raises(ValueError):
             fbcon_screen.parse_keys(bad)
+
+
+def test_qmp_do_parses_and_keeps_its_place_among_the_sends():
+    """--qmp-do RE CMD (AGAST #4889's hot-plug): CMD is a QMP command's name
+    and key=value arguments, and it runs in order with the --send steps."""
+    assert fbcon_screen.parse_qmp_do("device_add driver=usb-kbd id=kbd bus=xhci1.0") == (
+        "device_add",
+        {"driver": "usb-kbd", "id": "kbd", "bus": "xhci1.0"},
+    )
+    for bad in ("device_del id", "device_del =kbd"):
+        with pytest.raises(ValueError):
+            fbcon_screen.parse_qmp_do(bad)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--send", nargs=2, action=fbcon_screen.Step, const="keys", dest="steps", default=[])
+    ap.add_argument("--qmp-do", nargs=2, action=fbcon_screen.Step, const="qmp", dest="steps", default=[])
+    args = ap.parse_args(["--send", "a", "x", "--qmp-do", "b", "device_del id=kbd", "--send", "c", "y"])
+    assert args.steps == [("keys", "a", "x"), ("qmp", "b", "device_del id=kbd"), ("keys", "c", "y")]

@@ -77,13 +77,17 @@ test-smp:
 test-tier1:
 	./tools/test_tier1_boot.sh
 
-# AGAST #4887 (docs/USB.md "Tests"): the xHCI bring-up boot. QEMU's
-# qemu-xhci with two usb-kbd keyboards (high and full speed); each must be
-# addressed and configured on MSI-X events, and init's Tier-1 suite pass.
+# AGAST #4887 (docs/USB.md "Tests"): the xHCI bring-up boot. Two of QEMU's
+# qemu-xhci: two usb-kbd keyboards (high and full speed) on the first, each
+# addressed and configured on MSI-X events; one on the second, which the
+# fault-usb option fails and which must reset alone and come back (#4889).
+# init's Tier-1 suite must pass.
 test-usb:
 	./tools/test_usb_boot.sh
 
-# The USB keyboard types into rzsh: no COM1, the screen read over QMP (#4888).
+# The USB keyboard types into rzsh: no COM1, the screen read over QMP (#4888);
+# it is on the second of two controllers, and is unplugged and replugged
+# over QMP before typing again (#4889).
 test-usb-kbd:
 	./tools/test_usb_boot.sh keyboard
 

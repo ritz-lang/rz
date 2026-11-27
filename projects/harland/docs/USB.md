@@ -85,8 +85,8 @@ the kernel keeps `virtio_net_init` for boots without an IOMMU.
 | Path | Contents |
 |---|---|
 | `projects/harland/usb_abi/` | New leaf package on the `virtio_abi` pattern, with no kernel imports and its own host unit tests. It holds the xHCI register and TRB layouts, the TRB ring (enqueue, cycle bit, link TRB, event dequeue), the context layouts (32- and 64-byte, `HCCPARAMS1.CSZ`), the USB descriptor parser, the endpoint-interval conversion, and the HID boot report decoder (report diff, US keymap, modifiers, escape sequences). |
-| `kernel/src/drivers/usb/xhci.ritz` | The controller: PCI probe, BIOS handoff, reset, DCBAA, scratchpad, command and event rings, interrupter 0, port handling. |
-| `kernel/src/drivers/usb/usb.ritz` | Device enumeration: slots, Address Device, control transfers, descriptors, Set Configuration; a configured device a class driver takes is `Bound` and its events go there. |
+| `kernel/src/drivers/usb/xhci.ritz` | The controllers, each with its own state: PCI probe, BIOS handoff, reset, DCBAA, scratchpad, command and event rings, interrupter 0 (`setup_vector`, the one place a controller's interrupt source is chosen), port handling, and the tick-driven recovery reset (`xhci_tick`). |
+| `kernel/src/drivers/usb/usb.ritz` | Device enumeration per controller and root port: slots, Address Device, control transfers, descriptors, Set Configuration; a configured device a class driver takes is `Bound` and its events go there. Detach and re-attach, a failed controller's devices, and the entry points `usb_irq` (a vector) and `usb_tick` (the BSP tick). |
 | `kernel/src/drivers/usb/hid_kbd.ritz` | The HID boot keyboard: Set Protocol (boot), Set Idle, Configure Endpoint for the interrupt-IN endpoint, a Normal TRB always queued, report to bytes into the console, the Caps Lock LED, typematic repeat on the BSP tick. |
 | `kernel/src/drivers/usb/hub.ritz` | The hub class driver (USB 2.0 hubs, and USB 3 hubs on their SuperSpeed side). |
 
@@ -128,15 +128,17 @@ The driver adds no lock, no message kind and no CPU of its own.
   APs, the other in-kernel drivers, and the keystrokes themselves. So the
   controller reset (`CNR`, `HCHalted`, up to tens of milliseconds) and the
   BIOS handoff (up to one second of firmware SMI) run once, in `kernel_main`,
-  before any AP runs a process, with TSC deadlines. Everything at run time is
-  event-driven: port reset, Enable Slot, Address Device and every control
+  before any AP runs a process, with TSC deadlines. A recovery reset after
+  boot (see "Hot-plug") does not spin: the BSP tick checks each of its steps
+  once per tick. Everything else at run time is event-driven: port reset, Enable Slot, Address Device and every control
   transfer are commands or transfers whose completion arrives as an event, and
   each device is a state machine that the event moves forward. Hot-plug
   therefore never stalls the BSP's other work or keystroke latency, and never
   delays the forwarded calls of netd's core.
 - **Polling fallback.** A controller with no usable vector (MSI-only before
   MSI support lands, or a vector that never fires) is polled from the BSP's
-  100 Hz tick (`sched_tick`), which calls the same `xhci_irq` body. Ten
+  100 Hz tick (`usb_tick`, which already runs each controller's health check
+  and recovery), calling the same `xhci_irq` body. Ten
   milliseconds is well inside what typing needs. Only the BSP's tick polls, so
   the poll stays on the owner. The APs' ticks never call it.
 
@@ -199,16 +201,42 @@ Error or a dead controller (`USBSTS.HSE`, or registers reading all-ones)
 resets that controller alone and re-enumerates its ports. The other
 controllers keep running.
 
+How it is built (#4889):
+
+- **Detach.** The keyboard's held keys are released at once
+  (`HidKbd.release_all`). Then Stop Endpoint for its interrupt-IN endpoint
+  and EP0, and Disable Slot, are queued together; the command ring runs them
+  in order. The controller counts each root port's outstanding commands, and
+  when the port's last one completes, the slot's DCBAA entry is cleared and
+  the device's and keyboard's pages go back to the DMA allocator. An Enable
+  Slot that was in flight at the disconnect has its slot disabled too. If a
+  device is connected again by then, it enumerates from step 7.
+- **Recovery.** A Host Controller Error and a vanished controller raise no
+  interrupt, so the BSP tick reads each running controller's `USBSTS` every
+  100 ms (`HSE`, `HCE` or all-ones). A failed controller's keyboards release
+  their keys at once, and the reset then steps once per tick, each step under
+  its deadline: clear Run/Stop and wait for `HCHalted`, set `HCRST` and wait
+  for it and `CNR` to clear, reprogram the DCBAA and the rings (the pages are
+  kept), start, and wait for `HCHalted` to clear. Only then are its devices'
+  pages freed and its ports scanned as at boot. No step spins, so the BSP's
+  other work and the other controllers' keystrokes are not delayed. A reset
+  that times out (a controller that is gone) leaves that controller off and
+  its pages leaked, since a half-reset controller may still write them.
+- **Test hook.** The boot option `\harland\fault-usb` (GRUB: `fault-usb`)
+  fails the last controller once a keyboard on it is ready, by giving
+  interrupter 0 a segment table QEMU's controller refuses (it asserts
+  `HCE`). Only the enumerate boot sets it.
+
 ## Tests
 
 | Test | Where | Checks |
 |---|---|---|
 | `usb_abi` unit tests | host, `usb_abi/test` | TRB encode, ring wrap and cycle toggle, event dequeue, context sizing (CSZ), descriptor parsing (good and truncated), interval conversion per speed, report diff (press, release, rollover error `0x01` ignored), keymap with modifiers |
-| xHCI bring-up boot | `tools/test_usb_boot.sh` (`make test-usb`), QEMU `-device qemu-xhci` and two `usb-kbd`, one at full speed (`usb_version=1`) | the log shows the controller running on its MSI-X vector, each port connected once, slots 1 and 2 addressed (the full-speed one's EP0 size read from its first 8 bytes), each configuration read and set |
+| xHCI bring-up boot | `tools/test_usb_boot.sh` (`make test-usb`), two QEMU `qemu-xhci`: two `usb-kbd` on the first, one at full speed (`usb_version=1`), and one on the second, with `\harland\fault-usb` | the log shows each controller running on its own MSI-X vector, each port of the first connected once, its slots 1 and 2 addressed (the full-speed one's EP0 size read from its first 8 bytes), each configuration read and set. The second controller's forced error resets it alone and its keyboard is ready again; the first is never reset |
 | Keyboard into rzsh | `tools/test_usb_boot.sh keyboard` (`make test-usb-kbd`): q35 with `i8042=off`, `-serial none`, one `usb-kbd`; `fbcon_screen.py --send` types over QMP | `send-key` types `echo hi` and Enter, and the screen shows `hi` at rzsh's prompt. Ctrl-C kills a foreground `spin` (ring 3, no syscalls, so the kill is the xHCI interrupt's) and `echo $?` shows 130. Caps Lock types `echo ABc` as typed; a key held 1.2 s repeats |
-| Hot-plug | the same script | QMP `device_del` and `device_add` of `usb-kbd`, then typing works again |
+| Hot-plug | the keyboard boot (`fbcon_screen.py --qmp-do`) | QMP `device_del` of `usb-kbd`: its port is detached and its slot disabled. `device_add`: it is ready again and `echo back` types |
 | Hub | the same script, `-device usb-hub` with `usb-kbd` behind it | typing works through the hub |
-| Several controllers | the same script, two `qemu-xhci` devices, the keyboard on the second | the keyboard on any controller works, as on chungus |
+| Several controllers | the keyboard boot: two `qemu-xhci` devices, the keyboard on the second | the keyboard on any controller works, as on chungus |
 | MSI-only and polled | the same script, with MSI-X forced off by a boot option | typing works on the fallback path |
 
 The script joins the `test-tier1` family in `Makefile` as `test-usb`, and the

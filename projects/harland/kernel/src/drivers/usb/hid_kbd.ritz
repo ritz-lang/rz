@@ -15,6 +15,12 @@
 # SET_IDLE(0) does not repeat, so the BSP tick (hid_kbd_tick) repeats the
 # newest held key: 500 ms, then every 3 ticks.
 #
+# Keyboards on every controller (#4889) are told apart by controller and
+# slot, or controller and root port. A detach, or its controller failing,
+# releases the keyboard's held keys at once (hid_kbd_detach: no repeat
+# outlives the device); its pages are freed (hid_kbd_free) only once its
+# slot is disabled or its controller reset, when nothing can DMA to them.
+#
 # Ownership: BSP-owned with no lock, as the rest of drivers/usb (usb.ritz's
 # header): xhci_irq's events and the BSP tick, both with interrupts off.
 
@@ -25,7 +31,7 @@ import klog { klog, klog_dec, klog_hex_width }
 import mm.vmm { phys_to_virt }
 import arch.x86_64.apic { lapic_is_bsp }
 import tty.console { tty_console_input }
-import drivers.usb.xhci { xhci_ctx64, xhci_doorbell, xhci_command, xhci_alloc_page }
+import drivers.usb.xhci { xhci_ctx64, xhci_doorbell, xhci_command, xhci_alloc_page, xhci_free_page }
 import usb_abi.regs { UsbSpeed, EpKind, ep_interval }
 import usb_abi.trb { Completion, completion_ok, TransferEvent, trb_configure_endpoint, trb_setup_stage, trb_data_stage, trb_status_stage, trb_normal }
 import ritzlib.result
@@ -51,9 +57,11 @@ enum KbdState
     ConfiguringEndpoint     # Configure Endpoint queued
     Running                 # a Normal TRB is always queued
     Failed                  # stopped; waits for a disconnect
+    Detached                # gone, keys released; pages wait for hid_kbd_free
 
 # What usb.ritz hands over with a configured device.
 pub struct HidAttach
+    hc: u8                  # its controller
     slot: u8
     port: u8
     speed: UsbSpeed
@@ -62,6 +70,7 @@ pub struct HidAttach
 
 struct Kbd
     state: KbdState
+    hc: u8
     slot: u8
     port: u8
     speed: UsbSpeed
@@ -72,9 +81,10 @@ struct Kbd
     interval: u8            # the endpoint context's Interval
     in_ctx: u64
     ep0: *TrbRing
-    ring_page: u64          # the interrupt IN transfer ring (phys), kept
+    ring_page: u64          # the interrupt IN transfer ring (phys)
     ring: TrbRing
-    buf: u64                # report and LED byte (phys), kept
+    buf: u64                # report and LED byte (phys)
+    ep_on: bool             # its interrupt IN endpoint is configured
     ep0_busy: bool          # a SET_REPORT in flight
     leds_dirty: bool        # Caps Lock changed while it was
     keys: HidKbd
@@ -92,7 +102,9 @@ struct KbdIface
     binterval: u8
 
 fn log_slot(k: *Kbd)
-    klog("[usb] slot ")
+    klog("[usb] hc")
+    klog_dec(k.hc as i64)
+    klog(" slot ")
     klog_dec(k.slot as i64)
 
 fn fail(k: *Kbd, what: StrView)
@@ -131,32 +143,38 @@ fn find_iface(config: [u8]) -> Option<KbdIface>
                     End => return None
             Err(_) => return None
 
-fn kbd_of_slot(slot: u8) -> Option<*Kbd>
+# The keyboard on slot `slot` of controller `hc`, still driven.
+fn kbd_of_slot(hc: u8, slot: u8) -> Option<*Kbd>
     for i in 0..KBDS_MAX
         let k: *Kbd = @kbds[i]
-        if k.state != KbdState.Free and k.slot == slot
+        if k.state != KbdState.Free and k.state != KbdState.Detached and k.hc == hc and k.slot == slot
             return Some(k)
     None
 
-fn kbd_of_port(port: u8) -> Option<*Kbd>
+# The keyboard entry on root port `port` of controller `hc`, detached or
+# not.
+fn kbd_of_port(hc: u8, port: u8) -> Option<*Kbd>
     for i in 0..KBDS_MAX
         let k: *Kbd = @kbds[i]
-        if k.state != KbdState.Free and k.port == port
+        if k.state != KbdState.Free and k.hc == hc and k.port == port
             return Some(k)
     None
 
-# A free entry with its two pages, allocated at its first use and kept.
-fn kbd_entry() -> Option<*Kbd>
+# A free entry with its two pages from controller `hc`; hid_kbd_free gives
+# them back.
+fn kbd_entry(hc: u8) -> Option<*Kbd>
     for i in 0..KBDS_MAX
         let k: *Kbd = @kbds[i]
         if k.state == KbdState.Free
-            if k.buf == 0
-                match xhci_alloc_page()
-                    Ok(p) => k.ring_page = p
-                    Err(_) => return None
-                match xhci_alloc_page()
-                    Ok(p) => k.buf = p
-                    Err(_) => return None
+            let ring: u64 = match xhci_alloc_page(hc)
+                Ok(p) => p
+                Err(_) => return None
+            match xhci_alloc_page(hc)
+                Ok(p) => k.buf = p
+                Err(_) =>
+                    xhci_free_page(ring)
+                    return None
+            k.ring_page = ring
             return Some(k)
     None
 
@@ -172,7 +190,7 @@ fn control(k: *Kbd, s: SetupPacket, next: KbdState) -> Result<u64, RingError>
         k.ep0.push(trb_data_stage(k.buf + LED_OFFSET, s.length as u32, false))
     let status: Result<u64, RingError> = k.ep0.push(trb_status_stage(true))
     k.state = next
-    xhci_doorbell(k.slot, DCI_EP0)
+    xhci_doorbell(k.hc, k.slot, DCI_EP0)
     status
 
 # Send the Caps Lock LED, or mark it to send when the SET_REPORT in flight
@@ -190,7 +208,7 @@ fn send_leds(k: *Kbd)
 fn queue_report(k: *Kbd) -> Result<u64, RingError>
     let r: Result<u64, RingError> = k.ring.push(trb_normal(k.buf, BOOT_REPORT_LEN as u32))
     if r.is_ok()
-        xhci_doorbell(k.slot, k.dci)
+        xhci_doorbell(k.hc, k.slot, k.dci)
     r
 
 # SET_IDLE done: add the interrupt IN endpoint to the slot.
@@ -198,11 +216,11 @@ fn configure_endpoint(k: *Kbd)
     zero_page(k.in_ctx)
     zero_page(k.ring_page)
     k.ring = TrbRing.new(phys_to_virt(k.ring_page) as *TrbPage, k.ring_page, RING_TRBS)
-    let ic: InputContext = InputContext.over(phys_to_virt(k.in_ctx), xhci_ctx64())
+    let ic: InputContext = InputContext.over(phys_to_virt(k.in_ctx), xhci_ctx64(k.hc))
     *ic.control() = input_control(0, ADD_SLOT | add_flag(k.dci))
     *ic.slot() = slot_ctx(k.speed, k.port, k.dci)
     *ic.ep(k.dci) = ep_ctx(EpType.InterruptIn, k.mps, k.interval, k.ring.dequeue_ptr())
-    match xhci_command(trb_configure_endpoint(k.in_ctx, k.slot), k.port)
+    match xhci_command(k.hc, trb_configure_endpoint(k.in_ctx, k.slot), k.port)
         Ok(_) => k.state = KbdState.ConfiguringEndpoint
         Err(_) => fail(k, "command ring full")
 
@@ -216,9 +234,11 @@ fn deliver(out: KeyOut, from_user: bool) -> bool
 
 # A keyboard there is no entry or DMA page for: logged and left to
 # usb.ritz. False, hid_kbd_attach's answer.
-fn not_driven(slot: u8) -> bool
-    klog("[usb] slot ")
-    klog_dec(slot as i64)
+fn not_driven(a: HidAttach) -> bool
+    klog("[usb] hc")
+    klog_dec(a.hc as i64)
+    klog(" slot ")
+    klog_dec(a.slot as i64)
     klog(": HID boot keyboard not driven (no free keyboard or DMA page)\n")
     false
 
@@ -233,9 +253,10 @@ pub fn hid_kbd_attach(a: HidAttach, config: [u8]) -> bool
     let f: KbdIface = match find_iface(config)
         Some(f) => f
         None => return false
-    let k: *Kbd = match kbd_entry()
+    let k: *Kbd = match kbd_entry(a.hc)
         Some(k) => k
-        None => return not_driven(a.slot)
+        None => return not_driven(a)
+    k.hc = a.hc
     k.slot = a.slot
     k.port = a.port
     k.speed = a.speed
@@ -248,6 +269,7 @@ pub fn hid_kbd_attach(a: HidAttach, config: [u8]) -> bool
     k.interval = ep_interval(a.speed, EpKind.Interrupt, f.binterval)
     k.ep0_busy = false
     k.leds_dirty = false
+    k.ep_on = false
     k.keys = HidKbd.new()
     log_slot(k)
     klog(": HID boot keyboard on interface ")
@@ -259,19 +281,21 @@ pub fn hid_kbd_attach(a: HidAttach, config: [u8]) -> bool
         fail(k, "EP0 ring full")
     true
 
-# A command completed for the keyboard on root port `port`.
-pub fn hid_kbd_command(port: u8, code: Completion)
-    let k: *Kbd = match kbd_of_port(port)
+# A command completed for the keyboard on root port `port` of controller
+# `hc`. True when it made the keyboard ready.
+pub fn hid_kbd_command(hc: u8, port: u8, code: Completion) -> bool
+    let k: *Kbd = match kbd_of_port(hc, port)
         Some(k) => k
-        None => return
+        None => return false
     if k.state != KbdState.ConfiguringEndpoint
-        return
+        return false
     if not completion_ok(code)
         fail(k, "Configure Endpoint failed")
-        return
+        return false
+    k.ep_on = true
     if queue_report(k).is_err()
         fail(k, "report ring full")
-        return
+        return false
     k.state = KbdState.Running
     kbds_running += 1
     log_slot(k)
@@ -280,11 +304,12 @@ pub fn hid_kbd_command(port: u8, code: Completion)
     klog(", interval ")
     klog_dec(k.interval as i64)
     klog(")\n")
+    true
 
 # A transfer completed on one of a keyboard's endpoints. True for a Ctrl-C
 # that must kill the process `from_user` says was interrupted.
-pub fn hid_kbd_transfer(x: TransferEvent, from_user: bool) -> bool
-    let k: *Kbd = match kbd_of_slot(x.slot)
+pub fn hid_kbd_transfer(hc: u8, x: TransferEvent, from_user: bool) -> bool
+    let k: *Kbd = match kbd_of_slot(hc, x.slot)
         Some(k) => k
         None => return false
     if x.dci == DCI_EP0
@@ -333,16 +358,39 @@ fn on_ep0(k: *Kbd, x: TransferEvent)
                 send_leds(k)
         _ => pass
 
-# The device on root port `port` went away.
-pub fn hid_kbd_detach(port: u8)
-    match kbd_of_port(port)
-        Some(k) =>
-            if k.state == KbdState.Running
-                kbds_running -= 1
-            k.state = KbdState.Free
-            log_slot(k)
-            klog(": keyboard gone\n")
-        None => pass
+# The keyboard on root port `port` of controller `hc` went away, or its
+# controller failed: release its held keys now, so no repeat outlives it,
+# and stop driving it. The DCI of its interrupt IN endpoint if it was
+# configured (the endpoint the detach stops), else 0. Its pages stay until
+# hid_kbd_free.
+pub fn hid_kbd_detach(hc: u8, port: u8) -> u8
+    let k: *Kbd = match kbd_of_port(hc, port)
+        Some(k) => k
+        None => return 0
+    if k.state == KbdState.Detached
+        return 0
+    if k.state == KbdState.Running
+        kbds_running -= 1
+    k.keys.release_all()
+    k.state = KbdState.Detached
+    log_slot(k)
+    klog(": keyboard gone, keys released\n")
+    if k.ep_on then k.dci else 0
+
+# The keyboard's slot is disabled or its controller reset: nothing can
+# reach its pages, so they are freed and its entry is free again.
+pub fn hid_kbd_free(hc: u8, port: u8)
+    let k: *Kbd = match kbd_of_port(hc, port)
+        Some(k) => k
+        None => return
+    if k.state == KbdState.Running
+        kbds_running -= 1
+    xhci_free_page(k.ring_page)
+    xhci_free_page(k.buf)
+    k.ring_page = 0
+    k.buf = 0
+    k.ep_on = false
+    k.state = KbdState.Free
 
 # The periodic tick, on every CPU (irq_handler, after its EOI). On the BSP,
 # each running keyboard's held key repeats when due. True for a Ctrl-C

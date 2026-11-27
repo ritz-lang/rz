@@ -11,9 +11,7 @@ import tty.console { tty_console_irq, tty_console_irq_kill }
 import drivers.i8042.kbd { i8042_irq, i8042_irq_eoi }
 import mm.vmm { vmm_debug_page_tables }
 import drivers.msix { msix_dispatch }
-import drivers.usb.xhci { xhci_owns_vector }
-import drivers.usb.usb { xhci_irq }
-import drivers.usb.hid_kbd { hid_kbd_tick }
+import drivers.usb.usb { usb_irq, usb_tick }
 import syscall.runtime.process { process_kill_current, current_pid }
 import syscall.stack { syscall_stack_guard_hit }
 import proc.sched { sched_tick }
@@ -417,10 +415,12 @@ pub fn irq_handler(frame: *InterruptFrame)
         # The periodic LAPIC tick (or the NVMe watchdog's one-shot). EOI
         # first: if this tick preempts the process it interrupted (any
         # non-zero CPL), the switch returns here only when that process runs
-        # again (#3629, #4711). On the BSP a USB keyboard's held key
-        # repeats first (#4888); a repeated Ctrl-C kills as IRQ 4's does.
+        # again (#3629, #4711). On the BSP the USB driver's tick runs
+        # first: each xHCI controller's health check or recovery step
+        # (#4889) and a keyboard's held-key repeat (#4888); a repeated
+        # Ctrl-C kills as IRQ 4's does.
         lapic_eoi()
-        if hid_kbd_tick(((*frame).cs & 3) != 0)
+        if usb_tick(((*frame).cs & 3) != 0)
             tty_console_irq_kill()
         sched_tick(((*frame).cs & 3) != 0)
         return
@@ -458,14 +458,14 @@ pub fn irq_handler(frame: *InterruptFrame)
 
     # MSI-X vectors (64-79 and the CPU-local 80-95): count the interrupt
     # (drivers/msix.ritz). A driver waiting for it is parked; wake it to
-    # re-check its completion condition (#4220). The xHCI controller's
-    # vector (aimed at the BSP, so this is the BSP) also drains its event
-    # ring (docs/USB.md, "Concurrency under SMP_USER.md"); a Ctrl-C typed
-    # on a USB keyboard kills, after the EOI, as IRQ 4's does (#4888).
+    # re-check its completion condition (#4220). An xHCI controller's
+    # vector (each aimed at the BSP, so this is the BSP) also drains that
+    # controller's event ring (usb_irq; docs/USB.md, "Concurrency under
+    # SMP_USER.md"); a Ctrl-C typed on a USB keyboard kills, after the EOI,
+    # as IRQ 4's does (#4888).
     var usb_kill: bool = false
     if msix_dispatch((*frame).vector)
-        if xhci_owns_vector((*frame).vector)
-            usb_kill = xhci_irq(((*frame).cs & 3) != 0)
+        usb_kill = usb_irq((*frame).vector, ((*frame).cs & 3) != 0)
         waitq_wake_irq()
 
     # Send EOI to LAPIC (for APIC-delivered interrupts)
