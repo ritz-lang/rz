@@ -122,13 +122,24 @@ def check(report: dict, budget: dict, scale: float = 1.0,
         errs.append(f"suite: {raw:.1f} CPU-s raw / factor {factor:.3f} = "
                     f"{total:.1f} normalised, over its cap of {cap:.1f}")
 
-    # Not scaled: every machine runs the same number of tests.
-    max_tests = budget["suite"].get("tests")
     count = sum(int(v["tests"]) for v in files.values())
-    if max_tests is not None and count > int(max_tests):
-        errs.append(f"suite: {count} tests over its cap of {int(max_tests)}; "
-                    f"collapse a matrix into table rows before adding cases")
+    if (e := count_breach(count, budget)) is not None:
+        errs.append(e)
     return errs
+
+
+def count_breach(count: int, budget: dict) -> str | None:
+    """The `[suite] tests` breach line for `count` tests, or None.
+
+    Not scaled: every machine runs the same number of tests.  Shared with
+    tools/check_suite_count.py, which checks a collected count before a gate
+    (AGAST #4904), so both fail with this one message.
+    """
+    max_tests = budget["suite"].get("tests")
+    if max_tests is not None and count > int(max_tests):
+        return (f"suite: {count} tests over its cap of {int(max_tests)}; "
+                f"collapse a matrix into table rows before adding cases")
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:

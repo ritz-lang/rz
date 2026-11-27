@@ -1786,6 +1786,9 @@ if [[ "${RZ_FAKE_PRECHECK:-0}" != 0 ]]; then
     echo "ERROR tests/test_x.py::test_y - ImportError"
     echo "make[1]: *** [Makefile:130: tools-ratchets-tools] Error 1"
     echo "1 failed, 457 passed in 9.1s"
+    # AGAST #4904: suite-count's breach, as check_suite_count.py prints it.
+    echo "test budget: 1 breach(es), collected in 9.9 s (test_budget.toml):"
+    echo "  suite: 26801 tests over its cap of 26800; collapse a matrix into table rows before adding cases"
 fi
 exit "${RZ_FAKE_PRECHECK:-0}"
 PRE
@@ -1811,6 +1814,7 @@ out="$(RZ_FAKE_PRECHECK=1 bash "$TR" precheck 1 2>&1)"; rc=$?
 has "$out" "^PRECHECK train 1 tip=${tp:0:12} EXIT=1$" "a red precheck says EXIT=1"
 has "$out" "^FAILED tools/test_standard_callers.py::test_raw_api_callers_only_go_down" "it prints the FAILED lines"
 has "$out" "^ERROR tests/test_x.py::test_y" "and the ERROR lines"
+has "$out" "^  suite: 26801 tests over its cap of 26800; " "and the test-count cap line (AGAST #4904)"
 ! grep -q "noise\|^===" <<<"$out" && ok "and nothing else of the run" || { bad "and nothing else of the run"; sed 's/^/     | /' <<<"$out"; }
 has "$out" "log: .*precheck" "it names the full log"
 [[ $rc -ne 0 ]] && ok "a red precheck exits non-zero" || bad "a red precheck exits non-zero"
@@ -1837,10 +1841,11 @@ out="$(bash "$TR" precheck 1 2>&1)"; rc=$?
     || bad "precheck refuses a moved worktree"
 git -C "$T/train" reset -q --hard HEAD~1
 
-# 22e. The real command is `make -C projects/ritz tools-ratchets`.
+# 22e. The real command is `make -C projects/ritz train-precheck`:
+# tools-ratchets plus the ritz0 test-count cap (AGAST #4904).
 : > "$T/systemd-run-log"
 out="$(env -u RZ_PRECHECK_CMD bash "$TR" precheck 1 2>&1)"
-has "$(cat "$T/systemd-run-log")" "make -C projects/ritz tools-ratchets" "by default the precheck runs make tools-ratchets"
+has "$(cat "$T/systemd-run-log")" "make -C projects/ritz train-precheck$" "by default the precheck runs make train-precheck"
 unset RZ_PRECHECK_CMD
 
 # 23. Held tails and rz-resolve refs are swept up, not leaked forever

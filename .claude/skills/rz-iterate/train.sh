@@ -39,10 +39,11 @@
 #                                       behind a gating one buffers to 8);
 #                                       FAIL: a red train with nothing
 #                                       below it to bisect
-#   train.sh precheck [<k>]             make tools-ratchets on the tip of
-#                                       the train pending would gate, or
-#                                       train <k>, before it gates (AGAST
-#                                       #4672; see cmd_precheck)
+#   train.sh precheck [<k>]             make train-precheck (tools-ratchets
+#                                       and the ritz0 test-count cap) on the
+#                                       tip of the train pending would gate,
+#                                       or train <k>, before it gates (AGAST
+#                                       #4672, #4904; see cmd_precheck)
 #   train.sh land [<log>]               push the tail of the train <log>
 #                                       passed (train k) to main, landing
 #                                       trains 1..k and cancelling their
@@ -1703,15 +1704,19 @@ cmd_pending() {
 # but that disagree on the merged tree (two cars lowering one exact count,
 # two edits to one allowlist), in ~15 s instead of a red ~30 min gate.
 #
-# Runs `make -C projects/ritz tools-ratchets` (RZ_PRECHECK_CMD overrides it,
-# for tests) in train k's own worktree, never the shared checkout, as a
+# Runs `make -C projects/ritz train-precheck` (RZ_PRECHECK_CMD overrides it,
+# for tests): tools-ratchets plus suite-count, the ritz0 suite's test-count
+# cap from a collect-only run (AGAST #4904: #4899 and #4885 each turned a
+# train red on the count after a ~25 min gate; ~10-20 s, alongside the
+# ratchets, so not in every smoke).  In train k's own worktree, never the shared checkout, as a
 # waited-for unit in ritz-gate.slice at the gate's CPUWeight: the
 # coordinator's turn waits on it, and it must not be starved by room work.
 # The ratchets read tracked files only (#4672), so a reused train worktree
 # gives the verdict a fresh checkout would.
 #
 # Prints `PRECHECK train <k> tip=<12> EXIT=<n>`, then on red only the
-# failing lines (pytest's FAILED/ERROR) and the full log's path; appends
+# failing lines (pytest's FAILED/ERROR, the count's cap line) and the full
+# log's path; appends
 # `PRECHECK=<tip> <exit>` to the train's state (the last line is current; a
 # rebuild starts a new state).  Exits 0 on green, 1 on red.
 cmd_precheck() {
@@ -1728,7 +1733,7 @@ cmd_precheck() {
     st="$(state)"; tip="$(field TIP "$st")"
     [[ -n "$tip" && "$tip" == "$(g rev-parse HEAD)" ]] \
         || die "train $k's worktree moved since build; rebuild"
-    cmd="${RZ_PRECHECK_CMD:-make -C projects/ritz tools-ratchets}"
+    cmd="${RZ_PRECHECK_CMD:-make -C projects/ritz train-precheck}"
     mkdir -p "$GATES"
     log="$GATES/precheck-$(gname)-${tip:0:12}.log"
     unit="ritz-precheck-$(gname)"
@@ -1741,7 +1746,7 @@ cmd_precheck() {
     printf 'PRECHECK=%s %s\n' "$tip" "$rc" >> "$st"
     echo "PRECHECK train $k tip=${tip:0:12} EXIT=$rc"
     if [[ $rc -ne 0 ]]; then
-        grep -E '^(FAILED|ERROR) ' "$log" || true
+        grep -E '^(FAILED|ERROR) |^  suite: .* over its cap|^suite count: collection failed' "$log" || true
         echo "log: $log"
         return 1
     fi

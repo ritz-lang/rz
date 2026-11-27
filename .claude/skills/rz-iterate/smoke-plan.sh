@@ -93,8 +93,11 @@
 # in-process tests, `-m inproc`), ~15 s.  Trains went red on ratchets a car's
 # smoke never ran: #4587 and #4622 for compiler changes, then #4653 and
 # #4654 on test_standard_callers.py, whose cars ran tools-ratchets without
-# it.  The train conductor runs the same target on the train tip before it
-# gates (train.sh precheck).  tools-unit and unit together subsume it
+# it, nor test_standard_pins/ (#4904: #4820's car breached two test_cshape_*
+# pins and only tools-unit saw it).  The train conductor runs the same
+# target on the train tip before it gates (train.sh precheck: `make
+# train-precheck`, which adds the ritz0 suite's test-count cap from a
+# collect-only run, ~10-20 s, so in no smoke plan).  tools-unit and unit together subsume it
 # (tools/ and all of ritz0): a diff that plans both runs only those; either
 # alone does not.  So every plan holds tools-ratchets or tools-unit, and both
 # run the tree guards (AGAST #4902): tracked *.orig/*.rej/*.old leftovers

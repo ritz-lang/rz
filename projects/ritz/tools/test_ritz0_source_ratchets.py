@@ -81,6 +81,21 @@ def test_standard_caller_pins_are_a_ratchet():
     assert any("tools/test_standard_callers.py" in ln for ln in tools), tools
 
 
+def test_standard_pins_are_ratchets():
+    """tools/test_standard_pins/ (the down-only C-shape pins over ritzlib,
+    test_cshape_*.py) ran in tools-unit alone: #4820's car went 72>71 and
+    83>82, precheck said EXIT=0 and train-3-3bd3947b7953-1 went red at
+    [tools/ unit tests] (AGAST #4904).  The dir is in by glob, so a new pin
+    file is in too."""
+    tools = [ln for ln in _pytest_lines() if "tools/test_" in ln]
+    assert len(tools) == 1, tools
+    words = tools[0].split()
+    pins = sorted((RITZ / "tools" / "test_standard_pins").glob("test_*.py"))
+    assert any(p.name.startswith("test_cshape_") for p in pins), pins
+    missing = [p.name for p in pins if f"tools/test_standard_pins/{p.name}" not in words]
+    assert missing == [], f"tools-ratchets misses {missing}"
+
+
 #   The tree guards every smoke runs (AGAST #4902): #4773's car tracked
 # ritz1/src/monomorph.ritz.orig, its ritz1-only smoke planned no tools-unit,
 # and the train gate went red on the leftover guard.  ~3.3 s on one worker

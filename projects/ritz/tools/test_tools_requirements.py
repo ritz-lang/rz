@@ -57,6 +57,7 @@ LOCAL_MODULES = {
     "check_unused_imports",  # AGAST #3458
     "check_test_tempdirs",
     "check_test_budget",
+    "check_suite_count",  # AGAST #4904
     "cpu_calibrate",
     "example_tests",
     "known_failures",  # tools/known_failures.py, the known-failures schema (AGAST #1834)

@@ -114,8 +114,15 @@ tools-unit:
 # times, ~50 s, and is a build test, not a source ratchet.  tools-unit runs it.
 TOOLS_RATCHETS = tools/test_ritz1_*.py tools/test_ritz0_*.py tools/test_ritzgen_*.py \
 	tools/test_grammar_*.py tools/test_enum_ast_nodes.py tools/test_corpus_parses.py \
-	tools/test_known_failures.py tools/test_ci_local.py tools/test_standard_callers.py
+	tools/test_known_failures.py tools/test_ci_local.py tools/test_standard_callers.py \
+	tools/test_standard_pins/*.py
 TOOLS_RATCHETS_OUT = tools/test_ritz1_incremental_deps.py
+#
+# tools/test_standard_pins/ (AGAST #4904): the down-only C-shape pins over
+# ritzlib sources (test_cshape_*.py) ran in tools-unit alone, so #4820's car
+# (72>71, 83>82) passed precheck and turned train-3-3bd3947b7953-1 red at
+# [tools/ unit tests].  All 35 files, ~10 s on 4 workers at load ~20: the
+# cshape files alone cost the same (one report of the tree).
 #
 # Plus two tree guards by node id, not whole files (AGAST #4902): #4773's car
 # tracked ritz1/src/monomorph.ritz.orig and its ritz1-only smoke never ran
@@ -142,8 +149,9 @@ TOOLS_RATCHETS_NODES = tools/test_project_root_hygiene.py::test_no_merge_or_edit
 # tools/test_ritz0_source_ratchets.py holds the target to this.
 RATCHETS_J ?= $(shell j=$$(( $$(nproc) / 2 )); [ $$j -ge 2 ] && echo $$j || echo 2)
 .PHONY: tools-ratchets tools-ratchets-tools tools-ratchets-ritz0
+TOOLS_RATCHETS_HALVES = tools-ratchets-tools tools-ratchets-ritz0
 tools-ratchets:
-	@$(MAKE) --no-print-directory -j2 --output-sync=target tools-ratchets-tools tools-ratchets-ritz0
+	@$(MAKE) --no-print-directory -j2 --output-sync=target $(TOOLS_RATCHETS_HALVES)
 
 tools-ratchets-tools:
 	@echo "=== Running tools/ source-reading ratchets (-n $(RATCHETS_J)) ==="
@@ -152,6 +160,22 @@ tools-ratchets-tools:
 tools-ratchets-ritz0:
 	@echo "=== Running ritz0 in-process tests: source ratchets (-m inproc, -n $(RATCHETS_J)) ==="
 	@cd ritz0 && $(PYTHON) -m pytest -o tmp_path_retention_policy=failed -q --disable-plugin-autoload -p xdist -n $(RATCHETS_J) --dist loadgroup --no-ritz1-build -m inproc
+
+# The ritz0 suite's test-count cap ([suite] tests, tools/test_budget.toml),
+# from a collect-only run (AGAST #4904): the gate checks it only after the
+# whole suite, and on 2026-11-27 #4899 and #4885 each turned a train red
+# after a ~25 min gate on the count alone.  Same breach line as the gate's.
+# Collection is ~10-20 s (huburght, load ~11), so not in tools-ratchets
+# (every room's smoke): train-precheck, which `train.sh precheck` runs on a
+# train tip, has it beside the ratchets.  -k: one red half still reports the
+# other's verdict.
+.PHONY: suite-count train-precheck
+suite-count:
+	@echo "=== Checking the ritz0 suite's test count against its cap ==="
+	@$(PYTHON) tools/check_suite_count.py
+
+train-precheck:
+	@$(MAKE) --no-print-directory -k -j3 --output-sync=target $(TOOLS_RATCHETS_HALVES) suite-count
 
 # ritz1's measurements: modules, sizes, import graph and cycles, where each
 # check runs, long functions.  Printed, never committed (AGAST #3896: a block
