@@ -4,11 +4,13 @@
 # \harland\klog-dump, ...) into HarlandBootInfo.flags. A GRUB boot has no
 # such loader, so the kernel reads the same options as whole words on the
 # multiboot2 cmdline tag: `multiboot2 /boot/harland.elf boot-test`.
+# `storage-format` (AGAST #4883) lets kfs format a disk with foreign data.
 #
 # Pure: reads only the info block it is handed, so test/test_boot_options.ritz
 # runs it on the host.
 
-import boot_abi.handoff { HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_BOOT_FLAG_KLOG_DUMP }
+import ritzlib.strview { StrView, strview_from_ptr }
+import boot_abi.handoff { HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_BOOT_FLAG_KLOG_DUMP, HARLAND_BOOT_FLAG_STORAGE_FORMAT }
 
 # Multiboot2 tag types (multiboot2 spec §3.6); mm/pmm.ritz has the full list.
 const MB2_TAG_END: u32 = 0
@@ -21,22 +23,29 @@ const MB2_INFO_HEADER_SIZE: u64 = 8
 fn is_space(c: u8) -> bool
     return c == 32 or c == 9
 
-# True if NUL-terminated `cmdline` holds `word` as a whole space-separated word.
-pub fn cmdline_has_word(cmdline: *u8, word: *u8) -> bool
+# True if `cmdline` holds `word` as a whole space-separated word.
+pub fn cmdline_has_word(cmdline: StrView, word: StrView) -> bool
+    if word.len == 0
+        return false
     var i: i64 = 0
-    while *(cmdline + i) != 0
-        while is_space(*(cmdline + i))
+    while i < cmdline.len
+        while i < cmdline.len and is_space(cmdline.get(i))
             i = i + 1
-        var k: i64 = 0
-        while *(word + k) != 0 and *(cmdline + i + k) == *(word + k)
-            k = k + 1
-        let end: u8 = *(cmdline + i + k)
-        if *(word + k) == 0 and k > 0 and (end == 0 or is_space(end))
+        var end: i64 = i
+        while end < cmdline.len and not is_space(cmdline.get(end))
+            end = end + 1
+        if end > i and cmdline.slice(i, end).eq(word)
             return true
-        # Skip the rest of this word
-        while *(cmdline + i) != 0 and not is_space(*(cmdline + i))
-            i = i + 1
+        i = end
     return false
+
+# The multiboot2 cmdline tag's string as a view: the bytes before its NUL
+# terminator, never past the tag's `max` bytes.
+fn cmdline_view(cmdline: *u8, max: i64) -> StrView
+    var n: i64 = 0
+    while n < max and *(cmdline + n) != 0
+        n = n + 1
+    strview_from_ptr(cmdline, n)
 
 # The HARLAND_BOOT_FLAG_* bits the multiboot2 info block at mb_info_addr asks
 # for on its cmdline; 0 when there is no block or no cmdline tag.
@@ -52,12 +61,14 @@ pub fn mb2_cmdline_flags(mb_info_addr: u64) -> u32
         if tag_type == MB2_TAG_END or (tag_size as u64) < MB2_TAG_HEADER_SIZE
             return 0
         if tag_type == MB2_TAG_CMDLINE and (tag_size as u64) > MB2_TAG_HEADER_SIZE
-            let cmdline: *u8 = (tag_ptr + MB2_TAG_HEADER_SIZE) as *u8
+            let cmdline: StrView = cmdline_view((tag_ptr + MB2_TAG_HEADER_SIZE) as *u8, (tag_size as u64 - MB2_TAG_HEADER_SIZE) as i64)
             var flags: u32 = 0
-            if cmdline_has_word(cmdline, c"boot-test")
+            if cmdline_has_word(cmdline, "boot-test")
                 flags = flags | HARLAND_BOOT_FLAG_BOOT_TEST
-            if cmdline_has_word(cmdline, c"klog-dump")
+            if cmdline_has_word(cmdline, "klog-dump")
                 flags = flags | HARLAND_BOOT_FLAG_KLOG_DUMP
+            if cmdline_has_word(cmdline, "storage-format")
+                flags = flags | HARLAND_BOOT_FLAG_STORAGE_FORMAT
             return flags
         tag_ptr = (tag_ptr + tag_size as u64 + 7) & ~7
     return 0

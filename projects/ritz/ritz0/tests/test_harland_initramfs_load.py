@@ -155,7 +155,7 @@ STUBS = {
     "drivers/virtio/blk.ritz": BLK_STUB,
     "arch/x86_64/tsc.ritz": TSC_STUB,
 }
-REAL = ["fs/kfs.ritz", "fs/tar.ritz", "fs/initramfs.ritz", "syscall/errno.ritz"]
+REAL = ["fs/kfs.ritz", "fs/storage_claim.ritz", "fs/tar.ritz", "fs/initramfs.ritz", "syscall/errno.ritz"]
 
 
 def _run(tmp_path, src):
@@ -266,7 +266,7 @@ fn main() -> i32
     blk_stub_set(@g_image[0], len as u64)
 
     # No storage device: an empty namespace
-    if kfs_init(0 as *VirtioBlkDevice) != 0
+    if kfs_init(0 as *VirtioBlkDevice, false) != 0
         return 91
     if initramfs_load() != 0
         return 1

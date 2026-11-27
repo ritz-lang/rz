@@ -1,0 +1,168 @@
+# Harland - the storage-claim rule (AGAST #4883, docs/AHCI.md "Storage
+# safety on real hardware")
+#
+# kfs writes its goliath image to block device 1. On real hardware that can
+# be a disk with someone's data on it, so kfs claims the device only if it
+# already holds a goliath image or its first 64 sectors (the slot-header
+# area) are all zero. Any other disk is foreign and left alone, unless the
+# storage-format boot option says to format it.
+
+import ritzlib.span { Span, span_from_strview }
+import ritzlib.strview { StrView }
+import ritzlib.gvec { Vec, vec_zeroed }
+import goliath.hosted { memory_store_new }
+import goliath.blob_store { MemoryBlobStore, memory_store_free }
+import goliath.namespace { Namespace, namespace_new, namespace_write, namespace_read }
+import goliath.block_store { BlockDevice, block_store_save }
+import goliath.error { ErrorCode }
+import fs.storage_claim { StorageClaim, storage_claim, storage_claimed }
+
+# A RAM disk of 512-byte sectors; a read that reaches sector fail_from fails.
+struct RamDisk
+    data: Vec<u8>
+    sectors: u64
+    fail_from: u64
+
+fn ram_read(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
+    let d: *RamDisk = dev as *RamDisk
+    if lba + count as u64 > (*d).fail_from or lba + count as u64 > (*d).sectors
+        return -5
+    let disk: [u8] = (*d).data[(lba * 512) as i64..((lba + count as u64) * 512) as i64]
+    var i: i64 = 0
+    while i < disk.len
+        *(buf + i) = disk[i]
+        i = i + 1
+    0
+
+fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
+    let d: *RamDisk = dev as *RamDisk
+    if lba + count as u64 > (*d).sectors
+        return -5
+    let disk: [u8] = (*d).data[(lba * 512) as i64..((lba + count as u64) * 512) as i64]
+    var i: i64 = 0
+    while i < disk.len
+        disk[i] = *(buf + i)
+        i = i + 1
+    0
+
+fn ram_new(sectors: u64) -> RamDisk
+    RamDisk { data: vec_zeroed<u8>((sectors * 512) as i64), sectors: sectors, fail_from: sectors }
+
+fn ram_device(d: *RamDisk) -> BlockDevice
+    BlockDevice { dev: d as *u8, sectors: (*d).sectors, read: ram_read, write: ram_write }
+
+# One non-zero byte at `offset` of sector `lba`: someone's data.
+fn ram_poke(d: *RamDisk, lba: u64, offset: i64)
+    (*d).data[(lba * 512) as i64 + offset] = 0x5A
+
+fn ram_byte(d: *RamDisk, lba: u64, offset: i64) -> u8
+    (*d).data[(lba * 512) as i64 + offset]
+
+fn claim(d: *RamDisk, format: bool) -> StorageClaim
+    var dev: BlockDevice = ram_device(d)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace
+    let c: StorageClaim = storage_claim(@dev, @store, @ns, format)
+    memory_store_free(@store)
+    c
+
+# A disk holding a goliath image is claimed and its tree loads, with or
+# without storage-format (the option never wipes an image).
+[[test]]
+fn test_image_is_claimed_and_loaded() -> i32
+    var disk: RamDisk = ram_new(256)
+    var dev: BlockDevice = ram_device(@disk)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    let text: Span<u8> = span_from_strview("2")
+    assert namespace_write(@ns, "/boots", @text) == ErrorCode.Ok
+    assert block_store_save(@dev, @ns) == ErrorCode.Ok
+    memory_store_free(@store)
+
+    var store2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace
+    assert storage_claim(@dev, @store2, @ns2, false) == StorageClaim.Image
+    let got: Span<u8> = namespace_read(@ns2, "/boots")
+    assert got.ptr != null and got.as_strview().eq("2")
+    memory_store_free(@store2)
+    assert claim(@disk, true) == StorageClaim.Image
+    disk.data.deinit()
+    0
+
+# A disk whose first 64 sectors are zero is blank: claimed, to be formatted
+# by the first save. Data past the slot-header area doesn't make it foreign.
+[[test]]
+fn test_blank_disk_is_claimed() -> i32
+    var disk: RamDisk = ram_new(256)
+    ram_poke(@disk, 64, 0)
+    assert claim(@disk, false) == StorageClaim.Blank
+    assert storage_claimed(StorageClaim.Blank)
+    disk.data.deinit()
+    0
+
+# A disk smaller than the slot-header area is blank if all of it is zero.
+[[test]]
+fn test_small_blank_disk_is_claimed() -> i32
+    var disk: RamDisk = ram_new(16)
+    assert claim(@disk, false) == StorageClaim.Blank
+    disk.data.deinit()
+    0
+
+# One non-zero byte anywhere in the first 64 sectors, and no goliath
+# header: foreign, not claimed, and nothing is written to it.
+[[test]]
+fn test_foreign_disk_is_not_claimed() -> i32
+    var first: RamDisk = ram_new(256)
+    ram_poke(@first, 0, 0)
+    assert claim(@first, false) == StorageClaim.Foreign
+    assert not storage_claimed(StorageClaim.Foreign)
+    assert ram_byte(@first, 0, 0) == 0x5A
+    first.data.deinit()
+
+    var last: RamDisk = ram_new(256)
+    ram_poke(@last, 63, 511)
+    assert claim(@last, false) == StorageClaim.Foreign
+    last.data.deinit()
+    0
+
+# storage-format claims a foreign disk: the first save formats it.
+[[test]]
+fn test_foreign_disk_with_storage_format_is_claimed() -> i32
+    var disk: RamDisk = ram_new(256)
+    ram_poke(@disk, 3, 100)
+    assert claim(@disk, true) == StorageClaim.Format
+    assert storage_claimed(StorageClaim.Format)
+    disk.data.deinit()
+    0
+
+# A disk that can't be read is never claimed, even with storage-format:
+# not when its slot headers can't be read, nor when the blank check can't
+# read the rest of the slot-header area.
+[[test]]
+fn test_unreadable_disk_is_not_claimed() -> i32
+    var disk: RamDisk = ram_new(256)
+    disk.fail_from = 0
+    assert claim(@disk, false) == StorageClaim.Unreadable
+    assert claim(@disk, true) == StorageClaim.Unreadable
+    assert not storage_claimed(StorageClaim.Unreadable)
+    disk.fail_from = 10
+    assert claim(@disk, false) == StorageClaim.Unreadable
+    assert claim(@disk, true) == StorageClaim.Unreadable
+    disk.data.deinit()
+    0
+
+# A slot header with goliath's magic and a bad checksum is a damaged image:
+# never claimed, so a save can't replace what may still be recoverable, and
+# storage-format doesn't override that.
+[[test]]
+fn test_damaged_image_is_not_claimed() -> i32
+    var disk: RamDisk = ram_new(256)
+    let magic: StrView = "GOLIATHB"
+    var i: i64 = 0
+    while i < magic.len
+        disk.data[i] = magic.get(i)
+        i = i + 1
+    assert claim(@disk, false) == StorageClaim.Unreadable
+    assert claim(@disk, true) == StorageClaim.Unreadable
+    disk.data.deinit()
+    0

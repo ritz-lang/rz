@@ -14,7 +14,7 @@
 # One global namespace (kfs_get). Calls take the *Namespace so callers read
 # like the goliath API they wrap.
 
-import klog { klog, klog_dec }
+import klog { klog }
 import serial { StrView }
 import arch.x86_64.tsc { time_ns }
 import mm.heap { kalloc, kfree }
@@ -25,7 +25,8 @@ import ritzlib.fmt.digits { fmt_u64_into }
 import ritzlib.memory { Allocator }
 import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_count }
 import goliath.namespace { Namespace, namespace_new, namespace_exists, namespace_read, namespace_write, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_list, namespace_max_modified }
-import goliath.block_store { BlockDevice, block_store_save, block_store_load }
+import goliath.block_store { BlockDevice, block_store_save }
+import fs.storage_claim { StorageClaim, storage_claim, storage_claimed }
 import goliath.dir_entry { NsEntry }
 import goliath.error { ErrorCode }
 
@@ -91,6 +92,8 @@ var g_kfs_pstore: MemoryBlobStore
 var g_kfs_pns: Namespace
 var g_kfs_dev: BlockDevice
 var g_kfs_has_dev: bool = false
+# kfs_init's verdict on the storage device (fs/storage_claim.ritz)
+var g_kfs_claim: StorageClaim = StorageClaim.Unreadable
 var g_kfs_initialized: bool = false
 # When kfs_save last ran (time_ns; 0 = never) and whether a debounced save
 # was skipped since (fs_sync/power-off clear it).
@@ -106,8 +109,9 @@ var g_kfs_clock_last: u64 = 0
 # the image holds what was written, not the initramfs. 0, or -1 if the root
 # directory can't be allocated. A device whose image is damaged or unreadable
 # is logged and not used, so a save can't replace what may still be
-# recoverable.
-pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
+# recoverable; so is a device holding data that is not a goliath image,
+# unless `format` (the storage-format boot option) is set (AGAST #4883).
+pub fn kfs_init(storage: *VirtioBlkDevice, format: bool) -> i32
     if g_kfs_initialized
         return 0
     g_kfs_store = memory_store_new_in(kfs_allocator())
@@ -116,15 +120,15 @@ pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
     g_kfs_pns = namespace_new(@g_kfs_pstore)
     if storage != 0 as *VirtioBlkDevice
         g_kfs_dev = BlockDevice { dev: storage as *u8, sectors: (*storage).capacity, read: kfs_dev_read, write: kfs_dev_write }
-        let rc: ErrorCode = block_store_load(@g_kfs_dev, @g_kfs_pstore, @g_kfs_pns)
-        if rc == ErrorCode.Ok
-            g_kfs_has_dev = true
-        else if rc == ErrorCode.NotFound
-            g_kfs_has_dev = true
-        else
-            klog("kfs: storage image unreadable (goliath error " as StrView)
-            klog_dec(rc as i64)
-            klog("); not using it\n" as StrView)
+        g_kfs_claim = storage_claim(@g_kfs_dev, @g_kfs_pstore, @g_kfs_pns, format)
+        g_kfs_has_dev = storage_claimed(g_kfs_claim)
+        if g_kfs_claim == StorageClaim.Foreign
+            klog("kfs: block device 1 holds data that is not a goliath image; not using it\n" as StrView)
+        else if g_kfs_claim == StorageClaim.Format
+            klog("kfs: block device 1 holds data that is not a goliath image; storage-format set, formatting it\n" as StrView)
+        else if g_kfs_claim == StorageClaim.Unreadable
+            klog("kfs: storage image unreadable; not using it\n" as StrView)
+        if g_kfs_claim != StorageClaim.Image
             # A failed load may have stored part of the image
             g_kfs_pstore = memory_store_new_in(kfs_allocator())
             g_kfs_pns = namespace_new(@g_kfs_pstore)
@@ -148,6 +152,13 @@ pub fn kfs_persist_get() -> *Namespace
     if not g_kfs_initialized
         return 0 as *Namespace
     @g_kfs_pns
+
+# The boot's "Persistent storage" line for a storage device kfs_init did
+# not claim: why it is not used.
+pub fn kfs_storage_refusal() -> StrView
+    if g_kfs_claim == StorageClaim.Foreign
+        return "\r  [!!] Persistent storage (disk holds other data; boot option storage-format formats it)\n"
+    "\r  [!!] Persistent storage (image unreadable)\n"
 
 # Whether the namespace has a storage device to save to
 pub fn kfs_has_storage() -> bool

@@ -48,8 +48,12 @@ REPO = ci_local.REPO_ROOT
 NVME_SCRIPT = "projects/harland/tools/test_nvme_boot.sh"
 MSIX_SCRIPT = "projects/harland/tools/test_msix_boot.sh"
 
-# The QEMU stub writes $FAKE_SERIAL to the `-serial file:PATH` it was given;
-# with FAKE_PERSIST=1 it also writes a goliath block-store header (sector 0:
+# The QEMU stub models the kernel's storage guard (AGAST #4883): an ESP
+# without \harland\storage-format is the guard boot, which gets
+# $FAKE_GUARD_SERIAL (default: kfs refusing harland-data) and writes nothing
+# to the data drive unless FAKE_GUARD_WRITE=1. Otherwise it writes
+# $FAKE_SERIAL to the `-serial file:PATH` it was given; with FAKE_PERSIST=1
+# it also writes a goliath block-store header (sector 0:
 # "GOLIATHB", version 2, 512-byte sectors, image at sector 2, 100 bytes) and
 # the image magic ("GOLIATHS", sector 2) into the drive with id=data, as the
 # kernel's NVMe writes would, and
@@ -57,10 +61,19 @@ MSIX_SCRIPT = "projects/harland/tools/test_msix_boot.sh"
 # Then it idles until killed. Every argv goes to $STUB_LOG.
 QEMU_STUB = r"""#!/usr/bin/env bash
 echo "$@" >> "$STUB_LOG"
+serial="$FAKE_SERIAL" persist="${FAKE_PERSIST:-0}" prev=""
+for a in "$@"; do
+    case "$prev $a" in "-drive format=raw,file=fat:rw:"*)
+        if [ ! -e "${a#format=raw,file=fat:rw:}/harland/storage-format" ]; then
+            serial="${FAKE_GUARD_SERIAL-$GUARD_SERIAL}" persist="${FAKE_GUARD_WRITE:-0}"
+        fi ;;
+    esac
+    prev="$a"
+done
 prev=""
 for a in "$@"; do
-    if [ "$prev" = "-serial" ]; then printf '%b' "$FAKE_SERIAL" > "${a#file:}"; fi
-    if [ "$prev" = "-drive" ] && [ "${FAKE_PERSIST:-0}" = 1 ]; then
+    if [ "$prev" = "-serial" ]; then printf '%b' "$serial" > "${a#file:}"; fi
+    if [ "$prev" = "-drive" ] && [ "$persist" = 1 ]; then
         case "$a" in *id=data*)
             f="${a#file=}"; f="${f%%,*}"
             printf 'GOLIATHB' | dd of="$f" conv=notrunc status=none
@@ -109,6 +122,9 @@ PERSIST = r"  [OK] Persistent storage (goliath image: boot 1, 3 blobs)\n"
 NET_SKIPPED = r"[net] Network self-tests skipped: boot option off\n"
 SUITE_PASSED = r"  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
 PASSED = NET_SKIPPED + nvme_line() + INITRAMFS + PERSIST + SUITE_PASSED
+# The guard boot (no \harland\storage-format): kfs leaves harland-data alone.
+GUARD_SERIAL = (r"kfs: block device 1 holds data that is not a goliath image; not using it\n"
+                r"  [!!] Persistent storage (disk holds other data; boot option storage-format formats it)\n")
 
 
 # --------------------------------------------------------------------------
@@ -216,6 +232,7 @@ def _run(tree, serial: str = "", *, persist=True, qemu=True,
         "STUB_LOG": str(tree["tmp"] / "stub.log"),
         "FAKE_SERIAL": serial,
         "FAKE_PERSIST": "1" if persist else "0",
+        "GUARD_SERIAL": GUARD_SERIAL,
         **(env_extra or {}),
     }
     return subprocess.run(["/bin/bash", str(tree["script"])], env=env,
@@ -243,6 +260,33 @@ def test_all_checks_pass_on_two_nvme_disks_and_no_virtio_blk(tree):
     # harland-root must come first: it is block device 0, the initramfs.
     assert argv.index("harland-root") < argv.index("harland-data")
     assert "virtio-blk" not in argv
+    # Two boots: the guard boot, then the one with storage-format.
+    assert len(argv.splitlines()) == 2
+    assert "PASS (guard): kfs refused harland-data" in r.stdout
+    assert "PASS (guard): harland-data still holds the pattern" in r.stdout
+    assert "not using it" in (keep / "nvme-guard.log").read_text()
+
+
+# --------------------------------------------------------------------------
+# AGAST #4883: without storage-format, kfs must not touch harland-data
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_guard_boot_without_the_refusal_line_fails(tree):
+    """The mutation that drops the storage-claim guard: kfs treats the
+    patterned disk as blank and says nothing."""
+    r = _run(tree, PASSED, env_extra={"FAKE_GUARD_SERIAL": PERSIST})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (guard): kfs did not log" in r.stdout
+
+
+@pytest.mark.integration
+def test_guard_boot_that_writes_the_data_disk_fails(tree):
+    """kfs logs the refusal but a save still reaches the disk."""
+    r = _run(tree, PASSED, env_extra={"FAKE_GUARD_WRITE": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (guard): the boot without storage-format wrote" in r.stdout
 
 
 @pytest.mark.integration

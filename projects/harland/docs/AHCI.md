@@ -280,9 +280,13 @@ go, are all zero). Any other disk is logged
 (`kfs: block device 1 holds data that is not a goliath image; not using it`)
 and the namespace runs without persistent storage. A `storage-format` boot
 option (an ESP marker file, like `net-selftest`, and a GRUB cmdline word)
-overrides that. The CI boot scripts whose data disks carry a sector pattern
-(`test_nvme_boot.sh`, the AHCI boot test) set the option. The guard is
-generic: it protects the Acer's and the ThinkPad's NVMe disks too.
+overrides that (`HARLAND_BOOT_FLAG_STORAGE_FORMAT`; the rule is
+`kernel/src/fs/storage_claim.ritz`, #4883). The CI boot scripts whose data
+disks carry a sector pattern (`test_nvme_boot.sh`, `test_ahci_boot.sh`,
+`test_msix_boot.sh`, `test_nvme_ap_boot.sh`) set the option;
+`test_nvme_boot.sh` first boots without it and checks that kfs logs the line
+and leaves every sector of the pattern intact. The guard is generic: it
+protects the Acer's and the ThinkPad's NVMe disks too.
 
 ## Tests
 

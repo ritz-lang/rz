@@ -21,7 +21,15 @@
 # cannot pass on a QEMU that ignored the option. It also sets mdts=2 (16 KiB
 # per command), so long transfers split at the controller's limit.
 #
+# It boots twice. The guard boot (AGAST #4883) has no \harland\storage-format
+# option and stops once persistent storage reports: harland-data holds data
+# that is not a goliath image, so kfs must log
+#   kfs: block device 1 holds data that is not a goliath image; not using it
+# and write nothing; every sector must still hold the pattern. The main boot
+# sets storage-format, so kfs formats harland-data.
+#
 # Passes only if:
+#   - the guard boot logged that line and left harland-data unchanged;
 #   - harland-data reports 8192 sectors, the FNV-1a of LBAs 1-200 this
 #     script wrote (read path: identify, LBA addressing, multi-page reads)
 #     and NVME_LBA_SIZE as its LBA size;
@@ -43,8 +51,8 @@
 #
 # Usage: tools/test_nvme_boot.sh
 #        SKIP_BUILD=1   use the existing build/debug outputs
-#        BOOT_TIMEOUT=N seconds for the boot (default 120)
-#        KEEP_WORK=DIR  copy the serial log (nvme.log) into DIR
+#        BOOT_TIMEOUT=N seconds for each boot (default 120)
+#        KEEP_WORK=DIR  copy the serial logs (nvme.log, nvme-guard.log) into DIR
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
 #        NVME_LBA_SIZE  512 (default) or 4096: the NVMe logical block size
 #
@@ -64,8 +72,8 @@ USER_PKGS="indium rzsh prism"
 DATA_SECTORS=8192
 LBA_SIZE="${NVME_LBA_SIZE:-512}"
 case "$LBA_SIZE" in
-    512) NVME_OPTS=""; LOG_NAME=nvme.log ;;
-    4096) NVME_OPTS=",logical_block_size=4096,physical_block_size=4096,mdts=2"; LOG_NAME=nvme-4k.log ;;
+    512) NVME_OPTS=""; LOG_NAME=nvme.log; GUARD_LOG=nvme-guard.log ;;
+    4096) NVME_OPTS=",logical_block_size=4096,physical_block_size=4096,mdts=2"; LOG_NAME=nvme-4k.log; GUARD_LOG=nvme-4k-guard.log ;;
     *) echo "FAIL: NVME_LBA_SIZE must be 512 or 4096, not '$LBA_SIZE'"; exit 1 ;;
 esac
 
@@ -137,34 +145,60 @@ if [ -n "$OVMF_VARS" ]; then
     cp "$OVMF_VARS" "$WORK/vars.fd"
     vars=(-drive "if=pflash,format=raw,file=$WORK/vars.fd")
 fi
+# boot <serial log> <stop regex>: boot both disks until the log matches the
+# regex, QEMU exits or TIMEOUT passes; timed_out=1 on the last.
+boot() {
+    : > "$1"
+    timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m 2G \
+        -display none -no-reboot -monitor none \
+        -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
+        -drive "format=raw,file=fat:rw:$WORK/esp" \
+        -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=root" \
+        -device "nvme,serial=harland-root,drive=root$NVME_OPTS" \
+        -drive "file=$WORK/data.img,format=raw,if=none,id=data" \
+        -device "nvme,serial=harland-data,drive=data$NVME_OPTS" \
+        -serial "file:$1" >/dev/null 2>&1 &
+    local pid=$!
+    timed_out=1
+    for _ in $(seq 1 "$TIMEOUT"); do
+        sleep 1
+        grep -aqE "$2" "$1" && { sleep 1; timed_out=0; break; }
+        kill -0 "$pid" 2>/dev/null || { timed_out=0; break; }
+    done
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+}
+
+rc=0
+# The guard boot: no storage-format, so kfs must not touch harland-data.
+want_sha=$(sha256sum < "$WORK/data.img")
+GUARD="$WORK/$GUARD_LOG"
+boot "$GUARD" "Persistent storage \(|KERNEL PANIC"
+if grep -aqF "kfs: block device 1 holds data that is not a goliath image; not using it" "$GUARD"; then
+    echo "PASS (guard): kfs refused harland-data without storage-format"
+else
+    grep -aE "kfs:|Persistent storage" "$GUARD" | head -5
+    echo "FAIL (guard): kfs did not log that harland-data holds foreign data"
+    rc=1
+fi
+if [ "$(sha256sum < "$WORK/data.img")" = "$want_sha" ]; then
+    echo "PASS (guard): harland-data still holds the pattern"
+else
+    echo "FAIL (guard): the boot without storage-format wrote to harland-data"
+    rc=1
+fi
+
+# The main boot formats harland-data.
+: > "$WORK/esp/harland/storage-format"
 SERIAL="$WORK/$LOG_NAME"
-: > "$SERIAL"
-timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m 2G \
-    -display none -no-reboot -monitor none \
-    -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
-    -drive "format=raw,file=fat:rw:$WORK/esp" \
-    -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=root" \
-    -device "nvme,serial=harland-root,drive=root$NVME_OPTS" \
-    -drive "file=$WORK/data.img,format=raw,if=none,id=data" \
-    -device "nvme,serial=harland-data,drive=data$NVME_OPTS" \
-    -serial "file:$SERIAL" >/dev/null 2>&1 &
-pid=$!
-timed_out=1
-for _ in $(seq 1 "$TIMEOUT"); do
-    sleep 1
-    grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$SERIAL" && { sleep 1; timed_out=0; break; }
-    kill -0 "$pid" 2>/dev/null || { timed_out=0; break; }
-done
-kill "$pid" 2>/dev/null
-wait "$pid" 2>/dev/null
+boot "$SERIAL" "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC"
 
 echo "----- nvme boot ($LBA_SIZE-byte LBAs): NVMe lines -----"
 grep -aE "\[nvme\]|\[initramfs\] Loaded|Persistent storage" "$SERIAL" | head -20
 echo "---------------------------------"
 
-rc=0
-if grep -aqE "EXCEPTION|KERNEL PANIC" "$SERIAL"; then
-    sed -n '/EXCEPTION/,/CR2/p' "$SERIAL" | head -20
+if grep -aqE "EXCEPTION|KERNEL PANIC" "$GUARD" "$SERIAL"; then
+    sed -n '/EXCEPTION/,/CR2/p' "$GUARD" "$SERIAL" | head -20
     echo "FAIL: kernel exception during boot"
     rc=1
 fi

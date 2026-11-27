@@ -88,6 +88,9 @@ python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 cp "$LOADER_EFI" "$WORK/esp/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$WORK/esp/harland/kernel.elf"
+# The NVMe disk is block device 1 and holds a pattern: kfs formats it only
+# with storage-format (AGAST #4883).
+: > "$WORK/esp/harland/storage-format"
 
 # The NVMe disk (16 MiB, 32768 sectors): sector N holds the pattern
 # test_nvme_boot.sh uses. Prints the FNV-1a (32-bit) of sectors 32568-32767,

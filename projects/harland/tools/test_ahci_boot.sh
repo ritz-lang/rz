@@ -16,9 +16,9 @@
 # and a second boot of the same disks reports 2, and the sectors around
 # goliath's image still hold the pattern. A later save can leave an older
 # image past the two live ones; the pattern must resume and hold through
-# sector 15, which a 4 KiB DMA of a 512-byte write would wipe. storage-format
-# is not set: kfs still treats a disk with no goliath header as blank
-# (#4883 owns the guard).
+# sector 15, which a 4 KiB DMA of a 512-byte write would wipe. The ESP sets
+# \harland\storage-format: the patterned disk is not blank, and without it
+# kfs would leave it alone (AGAST #4883).
 #
 # Usage: tools/test_ahci_boot.sh
 #        AHCI_EMPTY=1   empty controller
@@ -93,6 +93,7 @@ trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm 
 mkdir -p "$WORK/bin" "$WORK/esp/EFI/BOOT" "$WORK/esp/harland"
 cp "$LOADER_EFI" "$WORK/esp/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$WORK/esp/harland/kernel.elf"
+: > "$WORK/esp/harland/storage-format"
 
 ROOT_SECTORS=0
 want_fnv=""

@@ -6,7 +6,8 @@
 # only counts whole: "boot-tests" or "xboot-test" set nothing.
 
 import boot_options { mb2_cmdline_flags, cmdline_has_word }
-import boot_abi.handoff { HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_BOOT_FLAG_KLOG_DUMP }
+import ritzlib.strview { StrView }
+import boot_abi.handoff { HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_BOOT_FLAG_KLOG_DUMP, HARLAND_BOOT_FLAG_STORAGE_FORMAT }
 
 # A multiboot2 info block: 8-byte header, then tags, each 8-byte aligned
 var g_mbi: [32]u64
@@ -15,22 +16,21 @@ fn put_u32(off: u64, v: u32)
     let p: *u32 = (@g_mbi as u64 + off) as *u32
     *p = v
 
-# Lay out [header][cmdline tag holding `cmdline`][end tag]; returns the address.
-fn build_mbi(cmdline: *u8) -> u64
+# Lay out [header][cmdline tag holding `cmdline`, NUL-terminated][end tag];
+# returns the address.
+fn build_mbi(cmdline: StrView) -> u64
     var i: i32 = 0
     while i < 32
         g_mbi[i] = 0
         i = i + 1
-    var n: u64 = 0
-    while *(cmdline + n as i64) != 0
-        n = n + 1
+    let n: u64 = cmdline.len as u64
     let tag_size: u64 = 8 + n + 1
     put_u32(8, 1)
     put_u32(12, tag_size as u32)
     var k: u64 = 0
-    while k <= n
+    while k < n
         let dst: *u8 = (@g_mbi as u64 + 16 + k) as *u8
-        *dst = *(cmdline + k as i64)
+        *dst = cmdline.get(k as i64)
         k = k + 1
     let end_off: u64 = (8 + tag_size + 7) & ~7
     put_u32(end_off, 0)
@@ -40,24 +40,33 @@ fn build_mbi(cmdline: *u8) -> u64
 
 [[test]]
 fn test_boot_test_word_sets_the_flag() -> i32
-    if mb2_cmdline_flags(build_mbi(c"boot-test")) != HARLAND_BOOT_FLAG_BOOT_TEST
+    if mb2_cmdline_flags(build_mbi("boot-test")) != HARLAND_BOOT_FLAG_BOOT_TEST
         return 1
-    if mb2_cmdline_flags(build_mbi(c"/boot/harland.elf boot-test")) != HARLAND_BOOT_FLAG_BOOT_TEST
+    if mb2_cmdline_flags(build_mbi("/boot/harland.elf boot-test")) != HARLAND_BOOT_FLAG_BOOT_TEST
         return 2
     return 0
 
 [[test]]
 fn test_both_words_set_both_flags() -> i32
     let want: u32 = HARLAND_BOOT_FLAG_BOOT_TEST | HARLAND_BOOT_FLAG_KLOG_DUMP
-    if mb2_cmdline_flags(build_mbi(c"klog-dump  boot-test")) != want
+    if mb2_cmdline_flags(build_mbi("klog-dump  boot-test")) != want
         return 1
+    return 0
+
+# AGAST #4883: `storage-format` lets kfs format a disk with foreign data.
+[[test]]
+fn test_storage_format_word_sets_the_flag() -> i32
+    if mb2_cmdline_flags(build_mbi("/boot/harland.elf storage-format")) != HARLAND_BOOT_FLAG_STORAGE_FORMAT
+        return 1
+    if mb2_cmdline_flags(build_mbi("storage-formats storage")) != 0
+        return 2
     return 0
 
 [[test]]
 fn test_partial_words_set_nothing() -> i32
-    if mb2_cmdline_flags(build_mbi(c"boot-tests xboot-test boot")) != 0
+    if mb2_cmdline_flags(build_mbi("boot-tests xboot-test boot")) != 0
         return 1
-    if mb2_cmdline_flags(build_mbi(c"")) != 0
+    if mb2_cmdline_flags(build_mbi("")) != 0
         return 2
     return 0
 
@@ -69,10 +78,14 @@ fn test_no_info_block_sets_nothing() -> i32
 
 [[test]]
 fn test_cmdline_has_word() -> i32
-    if not cmdline_has_word(c"a boot-test b", c"boot-test")
+    if not cmdline_has_word("a boot-test b", "boot-test")
         return 1
-    if cmdline_has_word(c"a boot-tes", c"boot-test")
+    if cmdline_has_word("a boot-tes", "boot-test")
         return 2
-    if cmdline_has_word(c"boot-test-x", c"boot-test")
+    if cmdline_has_word("boot-test-x", "boot-test")
         return 3
+    if not cmdline_has_word("boot-test", "boot-test")
+        return 4
+    if cmdline_has_word("  ", "")
+        return 5
     return 0

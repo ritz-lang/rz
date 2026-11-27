@@ -1,0 +1,78 @@
+# Harland - which storage device kfs may write (AGAST #4883)
+#
+# kfs saves its goliath image to block device 1 and, on a device without
+# one, formats it with the first save. On real hardware block device 1 can be
+# a disk with someone's data on it (the X99's second SATA disk in AHCI mode,
+# an Acer's or a ThinkPad's NVMe disk), so kfs claims the device only if it
+# already holds a goliath image, or is blank: its first STORAGE_CLAIM_SECTORS
+# sectors, where goliath puts its slot headers, are all zero. Any other disk
+# is foreign and left alone unless the storage-format boot option
+# (\harland\storage-format, or the GRUB cmdline word) says to format it.
+# docs/AHCI.md, "Storage safety on real hardware".
+#
+# Pure: reads only the BlockDevice it is handed, so
+# test/test_storage_claim.ritz runs it on the host.
+
+import goliath.blob_store { MemoryBlobStore }
+import goliath.namespace { Namespace }
+import goliath.block_store { BlockDevice, block_store_load, BLOCK_SECTOR_SIZE }
+import goliath.error { ErrorCode }
+
+# The sectors that must be zero for a disk without an image to count as
+# blank: the slot-header area.
+pub const STORAGE_CLAIM_SECTORS: u64 = 64
+
+pub enum StorageClaim
+    Image         # holds a goliath image, loaded into the namespace
+    Blank         # no image, slot-header area all zero: the first save formats it
+    Format        # foreign, and storage-format asked to format it anyway
+    Foreign       # holds data that is not a goliath image: not used
+    Unreadable    # the image is damaged or the disk can't be read: not used
+
+# Whether kfs may save to a device with this verdict.
+pub fn storage_claimed(c: StorageClaim) -> bool
+    c == StorageClaim.Image or c == StorageClaim.Blank or c == StorageClaim.Format
+
+# What the device's first STORAGE_CLAIM_SECTORS sectors (or all of it, if
+# smaller) hold.
+enum HeaderArea
+    Zero          # every byte is zero
+    Data          # some byte is not
+    ReadFailed    # a read failed
+
+fn header_area(dev: *BlockDevice) -> HeaderArea
+    var sector: [512]u8
+    var end: u64 = STORAGE_CLAIM_SECTORS
+    if (*dev).sectors < end
+        end = (*dev).sectors
+    let read: fn(*u8, u64, u32, *u8) -> i32 = (*dev).read
+    var lba: u64 = 0
+    while lba < end
+        if read((*dev).dev, lba, 1, @sector[0]) != 0
+            return HeaderArea.ReadFailed
+        var i: i64 = 0
+        while i < BLOCK_SECTOR_SIZE
+            if sector[i] != 0
+                return HeaderArea.Data
+            i = i + 1
+        lba = lba + 1
+    HeaderArea.Zero
+
+# Decide whether kfs claims `dev`, loading its image into `store` / `ns_out`
+# when it holds one. `format` is the storage-format boot option: it claims a
+# foreign disk, never a damaged image or a disk that can't be read. On any
+# verdict but Image, `store` may hold part of a failed load.
+pub fn storage_claim(dev: *BlockDevice, store: *MemoryBlobStore, ns_out: *Namespace, format: bool) -> StorageClaim
+    let rc: ErrorCode = block_store_load(dev, store, ns_out)
+    if rc == ErrorCode.Ok
+        return StorageClaim.Image
+    if rc != ErrorCode.NotFound
+        return StorageClaim.Unreadable
+    let area: HeaderArea = header_area(dev)
+    if area == HeaderArea.ReadFailed
+        return StorageClaim.Unreadable
+    if area == HeaderArea.Zero
+        return StorageClaim.Blank
+    if format
+        return StorageClaim.Format
+    StorageClaim.Foreign
