@@ -226,6 +226,15 @@ impl IrParser
             return Err(unsupported_at(line, named("type", self.span_from(start))))
         Ok(self.m.add_type(Type { kind: kind, width: n, elem: elem, first: 0, count: 0, packed: false, name: "" }))
 
+    # The `<N x i1>` type, found among what is already parsed or added:
+    # icmp on a vector has no type word of its own to read it from.
+    fn vector_i1_type(self: @&IrParser, n: i64) -> i64
+        for i in 0..self.m.types.len
+            let t: Type = self.m.types.get(i)
+            if t.kind == TypeKind.Vector and t.elem == TY_I1 and t.width == n
+                return i
+        self.m.add_type(Type { kind: TypeKind.Vector, width: n, elem: TY_I1, first: 0, count: 0, packed: false, name: "" })
+
     # { T, T } with the cursor on the brace.
     fn parse_struct_type(self: @&IrParser, packed: bool) -> Result<i64, Fail>
         self.pos += 1
@@ -862,12 +871,21 @@ impl IrParser
                 return Err(unsupported_at(line, named("cmpxchg", self.cur_text())))
             ops.push(self.parse_typed_value()?)
             self.expect_punct(",")?
-            ops.push(self.parse_typed_value()?)
+            let cmp_vid: i64 = self.parse_typed_value()?
+            ops.push(cmp_vid)
             self.expect_punct(",")?
             ops.push(self.parse_typed_value()?)
             self.ordering()?
             self.ordering()?
             inst.align = self.opt_align()?
+            # cmpxchg's result is the anonymous struct `{ T, i1 }` LLVM gives
+            # it (T the compared value's type): no type word in the text to
+            # read, so build it from the operand just parsed.
+            let vty: i64 = self.m.values.get(cmp_vid).ty
+            let first: i64 = self.m.type_lists.len
+            self.m.type_lists.push(vty)
+            self.m.type_lists.push(TY_I1)
+            inst.ty = self.m.add_type(Type { kind: TypeKind.Struct, width: 0, elem: -1, first: first, count: 2, packed: false, name: "" })
         else if w.eq("atomicrmw")
             inst.op = Opcode.AtomicRmw
             let opt: Token = self.tok()
@@ -895,7 +913,18 @@ impl IrParser
                 return Err(self.fail_here("expected a comparison predicate"))
             self.pos += 1
             inst.pred = pw
-            self.binary_operands(@&ops)?
+            # icmp/fcmp write no result type of their own: i1, or on a
+            # vector compare <N x i1> (DESIGN.md "LLVM IR subset"), found
+            # or added from the compared operands' own vector type.
+            let cty: i64 = self.parse_type()?
+            ops.push(self.parse_value(cty)?)
+            self.expect_punct(",")?
+            ops.push(self.parse_value(cty)?)
+            let ct: Type = self.m.types.get(self.m.resolve(cty))
+            if ct.kind == TypeKind.Vector
+                inst.ty = self.vector_i1_type(ct.width)
+            else
+                inst.ty = TY_I1
         else if w.eq("fneg")
             inst.op = Opcode.FNeg
             self.reject_flags()?

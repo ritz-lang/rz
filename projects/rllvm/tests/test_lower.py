@@ -510,6 +510,273 @@ entry:
 """
 
 
+# Float, SSE2 vector and atomic lowering (DESIGN "LLVM IR subset",
+# Instructions: Float, the vector types, atomics; AGAST #4805). Defined
+# values only, no poison: every operand is picked so the result does not
+# depend on anything DESIGN leaves unspecified (an undef byte, a division
+# whose divisor could be zero).
+FLOAT_VECTOR_ATOMIC_IR = r"""
+declare void @rt_hex(...)
+
+define i32 @main() {
+entry:
+  %a = fadd double 0.0, 3.5
+  %b = fadd double 0.0, -3.5
+  %nan = fdiv double 0.0, 0.0
+
+  %p1 = fcmp oeq double %a, %a
+  %p2 = fcmp one double %a, %b
+  %p3 = fcmp olt double %b, %a
+  %p4 = fcmp ogt double %a, %b
+  %p5 = fcmp ole double %a, %a
+  %p6 = fcmp oge double %a, %a
+  %p7 = fcmp ueq double %a, %nan
+  %p8 = fcmp une double %a, %nan
+  %p9 = fcmp uno double %a, %nan
+  %p10 = fcmp ord double %a, %a
+  %p11 = fcmp ult double %nan, %a
+  %p12 = fcmp ule double %nan, %a
+  %p13 = fcmp ugt double %nan, %a
+  %p14 = fcmp uge double %nan, %a
+  %p15 = fcmp false double %a, %a
+  %p16 = fcmp true double %a, %a
+
+  %z1 = zext i1 %p1 to i64
+  %z2 = zext i1 %p2 to i64
+  %z3 = zext i1 %p3 to i64
+  %z4 = zext i1 %p4 to i64
+  %z5 = zext i1 %p5 to i64
+  %z6 = zext i1 %p6 to i64
+  %z7 = zext i1 %p7 to i64
+  %z8 = zext i1 %p8 to i64
+  %z9 = zext i1 %p9 to i64
+  %z10 = zext i1 %p10 to i64
+  %z11 = zext i1 %p11 to i64
+  %z12 = zext i1 %p12 to i64
+  %z13 = zext i1 %p13 to i64
+  %z14 = zext i1 %p14 to i64
+  %z15 = zext i1 %p15 to i64
+  %z16 = zext i1 %p16 to i64
+
+  %s1 = shl i64 %z1, 15
+  %s2 = shl i64 %z2, 14
+  %s3 = shl i64 %z3, 13
+  %s4 = shl i64 %z4, 12
+  %s5 = shl i64 %z5, 11
+  %s6 = shl i64 %z6, 10
+  %s7 = shl i64 %z7, 9
+  %s8 = shl i64 %z8, 8
+  %s9 = shl i64 %z9, 7
+  %s10 = shl i64 %z10, 6
+  %s11 = shl i64 %z11, 5
+  %s12 = shl i64 %z12, 4
+  %s13 = shl i64 %z13, 3
+  %s14 = shl i64 %z14, 2
+  %s15 = shl i64 %z15, 1
+  %o1 = or i64 %s1, %s2
+  %o2 = or i64 %o1, %s3
+  %o3 = or i64 %o2, %s4
+  %o4 = or i64 %o3, %s5
+  %o5 = or i64 %o4, %s6
+  %o6 = or i64 %o5, %s7
+  %o7 = or i64 %o6, %s8
+  %o8 = or i64 %o7, %s9
+  %o9 = or i64 %o8, %s10
+  %o10 = or i64 %o9, %s11
+  %o11 = or i64 %o10, %s12
+  %o12 = or i64 %o11, %s13
+  %o13 = or i64 %o12, %s14
+  %o14 = or i64 %o13, %s15
+  %o15 = or i64 %o14, %z16
+  call void (...) @rt_hex(i64 %o15)
+
+  %f32 = fptrunc double %a to float
+  %back = fpext float %f32 to double
+  %bits32 = bitcast float %f32 to i32
+  %bits32x = zext i32 %bits32 to i64
+  call void (...) @rt_hex(i64 %bits32x)
+
+  %i = sitofp i32 -7 to double
+  %ibits = bitcast double %i to i64
+  call void (...) @rt_hex(i64 %ibits)
+  %u = uitofp i32 300 to double
+  %ubits = bitcast double %u to i64
+  call void (...) @rt_hex(i64 %ubits)
+  %t = fptosi double %back to i64
+  call void (...) @rt_hex(i64 %t)
+
+  %pa = alloca <4 x i32>
+  %pb = alloca <4 x i32>
+  store <4 x i32> <i32 10, i32 -20, i32 30, i32 -40>, ptr %pa
+  store <4 x i32> <i32 1, i32 2, i32 3, i32 4>, ptr %pb
+  %va = load <4 x i32>, ptr %pa
+  %vb = load <4 x i32>, ptr %pb
+
+  %add = add <4 x i32> %va, %vb
+  %sub = sub <4 x i32> %va, %vb
+  %mul = mul <4 x i32> %va, %vb
+  %and = and <4 x i32> %va, %vb
+  %or = or <4 x i32> %va, %vb
+  %xor = xor <4 x i32> %va, %vb
+  %shl = shl <4 x i32> %va, <i32 1, i32 2, i32 3, i32 4>
+  %lshr = lshr <4 x i32> %va, <i32 1, i32 1, i32 1, i32 1>
+  %ashr = ashr <4 x i32> %va, <i32 1, i32 1, i32 1, i32 1>
+  %sdiv = sdiv <4 x i32> %va, <i32 3, i32 3, i32 3, i32 3>
+  %udiv = udiv <4 x i32> %va, <i32 3, i32 3, i32 3, i32 3>
+  %srem = srem <4 x i32> %va, <i32 3, i32 3, i32 3, i32 3>
+
+  %e0 = extractelement <4 x i32> %add, i32 0
+  %e1 = extractelement <4 x i32> %sub, i32 1
+  %e2 = extractelement <4 x i32> %mul, i32 2
+  %e3 = extractelement <4 x i32> %and, i32 3
+  %e4 = extractelement <4 x i32> %or, i32 0
+  %e5 = extractelement <4 x i32> %xor, i32 1
+  %e6 = extractelement <4 x i32> %shl, i32 0
+  %e7 = extractelement <4 x i32> %shl, i32 3
+  %e8 = extractelement <4 x i32> %lshr, i32 1
+  %e9 = extractelement <4 x i32> %ashr, i32 1
+  %e10 = extractelement <4 x i32> %sdiv, i32 1
+  %e11 = extractelement <4 x i32> %udiv, i32 1
+  %e12 = extractelement <4 x i32> %srem, i32 1
+
+  %x0 = sext i32 %e0 to i64
+  %x1 = sext i32 %e1 to i64
+  %x2 = sext i32 %e2 to i64
+  %x3 = sext i32 %e3 to i64
+  %x4 = sext i32 %e4 to i64
+  %x5 = sext i32 %e5 to i64
+  %x6 = sext i32 %e6 to i64
+  %x7 = sext i32 %e7 to i64
+  %x8 = sext i32 %e8 to i64
+  %x9 = sext i32 %e9 to i64
+  %x10 = sext i32 %e10 to i64
+  %x11 = sext i32 %e11 to i64
+  %x12 = sext i32 %e12 to i64
+
+  call void (...) @rt_hex(i64 %x0)
+  call void (...) @rt_hex(i64 %x1)
+  call void (...) @rt_hex(i64 %x2)
+  call void (...) @rt_hex(i64 %x3)
+  call void (...) @rt_hex(i64 %x4)
+  call void (...) @rt_hex(i64 %x5)
+  call void (...) @rt_hex(i64 %x6)
+  call void (...) @rt_hex(i64 %x7)
+  call void (...) @rt_hex(i64 %x8)
+  call void (...) @rt_hex(i64 %x9)
+  call void (...) @rt_hex(i64 %x10)
+  call void (...) @rt_hex(i64 %x11)
+  call void (...) @rt_hex(i64 %x12)
+
+  ; icmp on vectors, insertelement, shufflevector.
+  %eq = icmp eq <4 x i32> %va, <i32 10, i32 0, i32 30, i32 0>
+  %gt = icmp sgt <4 x i32> %va, %vb
+  %eq0 = extractelement <4 x i1> %eq, i32 0
+  %eq1 = extractelement <4 x i1> %eq, i32 1
+  %gt0 = extractelement <4 x i1> %gt, i32 0
+  %eq0x = zext i1 %eq0 to i64
+  %eq1x = zext i1 %eq1 to i64
+  %gt0x = zext i1 %gt0 to i64
+  call void (...) @rt_hex(i64 %eq0x)
+  call void (...) @rt_hex(i64 %eq1x)
+  call void (...) @rt_hex(i64 %gt0x)
+
+  %ins = insertelement <4 x i32> %va, i32 999, i32 2
+  %insx = extractelement <4 x i32> %ins, i32 2
+  %insxx = sext i32 %insx to i64
+  call void (...) @rt_hex(i64 %insxx)
+
+  %shuf = shufflevector <4 x i32> %va, <4 x i32> %vb, <4 x i32> <i32 0, i32 4, i32 1, i32 5>
+  %sh0 = extractelement <4 x i32> %shuf, i32 1
+  %sh0x = sext i32 %sh0 to i64
+  call void (...) @rt_hex(i64 %sh0x)
+
+  ; <2 x i64>, including the compare SSE2 lacks.
+  %pc = alloca <2 x i64>
+  %pd = alloca <2 x i64>
+  store <2 x i64> <i64 100, i64 -200>, ptr %pc
+  store <2 x i64> <i64 100, i64 300>, ptr %pd
+  %vc = load <2 x i64>, ptr %pc
+  %vd = load <2 x i64>, ptr %pd
+  %cadd = add <2 x i64> %vc, %vd
+  %ceq = icmp eq <2 x i64> %vc, %vd
+  %ceq0 = extractelement <2 x i1> %ceq, i32 0
+  %ceq1 = extractelement <2 x i1> %ceq, i32 1
+  %ceq0x = zext i1 %ceq0 to i64
+  %ceq1x = zext i1 %ceq1 to i64
+  %ca0 = extractelement <2 x i64> %cadd, i32 0
+  call void (...) @rt_hex(i64 %ceq0x)
+  call void (...) @rt_hex(i64 %ceq1x)
+  call void (...) @rt_hex(i64 %ca0)
+
+  ; seq_cst load/store, cmpxchg (success and failure), the six atomicrmw
+  ; ops, and fence.
+  %p = alloca i64
+  store i64 42, ptr %p
+
+  %ld = load atomic i64, ptr %p seq_cst, align 8
+  call void (...) @rt_hex(i64 %ld)
+
+  store atomic i64 100, ptr %p seq_cst, align 8
+  %ld2 = load i64, ptr %p
+  call void (...) @rt_hex(i64 %ld2)
+
+  %cx1 = cmpxchg ptr %p, i64 100, i64 200 seq_cst seq_cst, align 8
+  %cx1v = extractvalue { i64, i1 } %cx1, 0
+  %cx1b = extractvalue { i64, i1 } %cx1, 1
+  %cx1bx = zext i1 %cx1b to i64
+  call void (...) @rt_hex(i64 %cx1v)
+  call void (...) @rt_hex(i64 %cx1bx)
+
+  %cx2 = cmpxchg ptr %p, i64 999, i64 300 seq_cst seq_cst, align 8
+  %cx2v = extractvalue { i64, i1 } %cx2, 0
+  %cx2b = extractvalue { i64, i1 } %cx2, 1
+  %cx2bx = zext i1 %cx2b to i64
+  call void (...) @rt_hex(i64 %cx2v)
+  call void (...) @rt_hex(i64 %cx2bx)
+  %ld3 = load i64, ptr %p
+  call void (...) @rt_hex(i64 %ld3)
+
+  %old_xchg = atomicrmw xchg ptr %p, i64 55 seq_cst
+  call void (...) @rt_hex(i64 %old_xchg)
+  %old_add = atomicrmw add ptr %p, i64 10 seq_cst
+  call void (...) @rt_hex(i64 %old_add)
+  %old_sub = atomicrmw sub ptr %p, i64 5 seq_cst
+  call void (...) @rt_hex(i64 %old_sub)
+  %old_and = atomicrmw and ptr %p, i64 15 seq_cst
+  call void (...) @rt_hex(i64 %old_and)
+  %old_or = atomicrmw or ptr %p, i64 128 seq_cst
+  call void (...) @rt_hex(i64 %old_or)
+  %old_xor = atomicrmw xor ptr %p, i64 255 seq_cst
+  call void (...) @rt_hex(i64 %old_xor)
+  %final = load i64, ptr %p
+  call void (...) @rt_hex(i64 %final)
+
+  fence seq_cst
+  ret i32 0
+}
+"""
+
+
+def test_float_vector_atomic_match_clang(rllvm_bin, tmp_path):
+    src = tmp_path / "fva.ll"
+    src.write_text(HEAD + FLOAT_VECTOR_ATOMIC_IR)
+    shim = c.clang_compile(c.entry("hosted/shim.ll"), tmp_path / "shim.o")
+    extra = c.assemble("hosted", tmp_path / "extra.o")
+    results = []
+    for tool in (["clang"], [rllvm_bin]):
+        obj = tmp_path / f"fva.{Path(tool[0]).name}.o"
+        p = run([*tool, *c.PROFILE_FLAGS["hosted"], str(src), "-o", str(obj)])
+        assert p.returncode == 0, p.stderr
+        assert c.check_relocations(obj, "hosted") == []
+        exe = tmp_path / f"fva.{Path(tool[0]).name}"
+        link = c.link_hosted([shim, obj, extra], exe)
+        assert link.returncode == 0, link.stderr
+        results.append(c.run(exe))
+    oracle, ours = results
+    assert oracle.status == 0 and oracle.stdout.count(b"\n") == 40
+    assert ours == oracle
+
+
 def test_core_instructions_match_clang(rllvm_bin, tmp_path):
     src = tmp_path / "core.ll"
     src.write_text(HEAD + CORE_IR)

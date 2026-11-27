@@ -45,6 +45,13 @@ pub const ARG_REGS: [6]i64 = [7, 6, 2, 1, 8, 9]
 # The integer return registers, in order.
 pub const RET_REGS: [3]i64 = [0, 2, 1]
 
+# %xmm scratch registers: nothing lives in one across instructions, same as
+# the GPR scratch set, so a handful of numbers is plenty.
+pub const XMM0: i64 = 0
+pub const XMM1: i64 = 1
+pub const XMM2: i64 = 2
+pub const XMM3: i64 = 3
+
 pub fn fail_unsupported(line: i64, what: StrView) -> Fail
     var s = string_from(what)
     s.push_str(" (not lowered yet)")
@@ -87,6 +94,18 @@ pub fn r64(num: i64) -> Operand
 
 pub fn r32(num: i64) -> Operand
     reg_op(num, OpSize.Long)
+
+# An %xmm register, encoder-only (razm.insn "RegClass.Xmm"). Named `xmm_reg`,
+# not `xmm`, because Ritz's function names are global across modules and
+# abi.ritz already has a public `xmm` (an `Operand`-returning equivalent
+# scoped to that module).
+pub fn xmm_reg(num: i64) -> Reg
+    Reg { class: RegClass.Xmm, num: num as u8 }
+
+# This one backs xmm_load/xmm_store/xmm_from_gpr below plus lower_fv.ritz's
+# scalar/vector float lowering.
+pub fn xmm_op(num: i64) -> Operand
+    Operand.Register(xmm_reg(num))
 
 fn section_flags(write: bool, exec: bool) -> SectionFlags
     SectionFlags { alloc: true, write: write, exec: exec }
@@ -272,6 +291,14 @@ impl Gen
         i.push(c)
         self.put_insn(i, false)
 
+    # `lock` ahead of a two-operand instruction on memory: cmpxchg and xadd,
+    # the atomics the GPR ALU and CAS forms need (DESIGN.md "Atomics").
+    pub fn op2_locked(self: @&Gen, name: StrView, size: OpSize, src: Operand, dst: Operand) -> Result<(), Fail>
+        var i = insn_new(Prefix.Lock, name, size)
+        i.push(src)
+        i.push(dst)
+        self.put_insn(i, false)
+
     # -------------------------------------------------------------- labels
 
     pub fn new_label(self: @&Gen) -> i64
@@ -387,6 +414,33 @@ impl Gen
             off += w
         Ok(())
 
+    # A scalar float (`bytes` 4) or double (8) at disp(%base) into %xmm `x`.
+    pub fn fload(self: @&Gen, x: i64, base: i64, disp: i64, bytes: i64) -> Result<(), Fail>
+        let name: StrView = if bytes == 4 then "movss" else "movsd"
+        let m: Operand = self.mem(base, disp)
+        self.op2(name, OpSize.Unsized, m, xmm_op(x))
+
+    # %xmm `x`'s low `bytes` (4 or 8) to disp(%base).
+    pub fn fstore(self: @&Gen, x: i64, base: i64, disp: i64, bytes: i64) -> Result<(), Fail>
+        let name: StrView = if bytes == 4 then "movss" else "movsd"
+        let m: Operand = self.mem(base, disp)
+        self.op2(name, OpSize.Unsized, xmm_op(x), m)
+
+    # 128 bits at disp(%base) into %xmm `x`, unaligned: a stack slot's
+    # alignment past 8 bytes is not guaranteed at -O0.
+    pub fn vload(self: @&Gen, x: i64, base: i64, disp: i64) -> Result<(), Fail>
+        let m: Operand = self.mem(base, disp)
+        self.op2("movdqu", OpSize.Unsized, m, xmm_op(x))
+
+    # %xmm `x`'s 128 bits to disp(%base), unaligned.
+    pub fn vstore(self: @&Gen, x: i64, base: i64, disp: i64) -> Result<(), Fail>
+        let m: Operand = self.mem(base, disp)
+        self.op2("movdqu", OpSize.Unsized, xmm_op(x), m)
+
+    # %xmm `x` to all-zero bits, touching no other register.
+    pub fn vzero(self: @&Gen, x: i64) -> Result<(), Fail>
+        self.op2("pxor", OpSize.Unsized, xmm_op(x), xmm_op(x))
+
     # Sign-extend the low `bits` of `r` to 64 bits.
     pub fn sign_extend(self: @&Gen, r: i64, bits: i64) -> Result<(), Fail>
         if bits == 1
@@ -419,10 +473,6 @@ impl Gen
         if bytes == 4
             return self.op2("movd", OpSize.Unsized, r32(r), xmm_op(x))
         self.op2("movq", OpSize.Unsized, r64(r), xmm_op(x))
-
-# %xmm`n` (abi.ritz's `xmm`, which imports this module).
-fn xmm_op(n: i64) -> Operand
-    Operand.Register(Reg { class: RegClass.Xmm, num: n as u8 })
 
 # The move between an %xmm register and memory for a value `bytes` wide.
 fn xmm_move(bytes: i64) -> StrView

@@ -1,0 +1,187 @@
+# lower_fv: instruction selection for float, SSE2 vector and atomic
+# lowering (DESIGN.md "LLVM IR subset", Instructions: Float, the vector
+# types, atomics; "Library", the SSE/SSE2 encoder set). Kept out of
+# lower.ritz (#4804's call ABI and #4806's intrinsics/asm also extend that
+# file) as the mnemonic and sequence choices for the opcodes this slice
+# owns: fneg/fadd/fsub/fmul/fdiv/fcmp/fptrunc/fpext/sitofp/uitofp/fptosi,
+# the integer vector ops, and cmpxchg/atomicrmw/fence. lower.ritz's
+# FnLower keeps the slot and value plumbing and calls into these.
+import ritzlib.result { Result }
+import ritzlib.strview { StrView }
+import razm.insn { OpSize }
+import rllvm.ir { Opcode }
+import rllvm.gen { Gen, xmm_op }
+import rllvm.parse { Fail }
+
+# fadd/fsub/fmul/fdiv's mnemonic at this width.
+pub fn float_binary_mnemonic(op: Opcode, is_double: bool) -> StrView
+    match op
+        Opcode.FAdd => if is_double then "addsd" else "addss"
+        Opcode.FSub => if is_double then "subsd" else "subss"
+        Opcode.FMul => if is_double then "mulsd" else "mulss"
+        _ => if is_double then "divsd" else "divss"
+
+# padd/psub's mnemonic at this element width (1, 2, 4 or 8 bytes); `add`
+# false selects psub. SSE2 has no padd/psubq-width-independent form: pand,
+# por and pxor (bitwise, width-independent) are named directly at the call
+# site instead of through this table.
+pub fn vector_add_sub_mnemonic(add: bool, elem_bytes: i64) -> StrView
+    if add
+        if elem_bytes == 1
+            return "paddb"
+        if elem_bytes == 2
+            return "paddw"
+        if elem_bytes == 4
+            return "paddd"
+        return "paddq"
+    if elem_bytes == 1
+        return "psubb"
+    if elem_bytes == 2
+        return "psubw"
+    if elem_bytes == 4
+        return "psubd"
+    "psubq"
+
+# A plain `cmp<suffix><ss|sd>` predicate, or a combination of two of them
+# (DESIGN's 8 SSE compare predicates: eq, lt, le, unord, neq, nlt, nle,
+# ord). `swap1`/`swap2` compare the operands in the opposite order, which
+# with those 8 gives every ordered and unordered fcmp predicate but `one`
+# and `ueq`, which need the AND or OR of two compares (ordered-and-equal
+# is neither "equal" nor its negation alone once NaN is in play, and
+# likewise for unordered-or-equal).
+pub struct FCmpPlan
+    is_const: bool      # `false`/`true`: no comparison at all
+    const_val: i64
+    suffix1: StrView
+    swap1: bool
+    combine: bool        # a second compare, ANDed (`op_and`) or ORed in
+    op_and: bool
+    suffix2: StrView
+    swap2: bool
+
+fn plan_one(suffix: StrView, swap: bool) -> FCmpPlan
+    FCmpPlan { is_const: false, const_val: 0, suffix1: suffix, swap1: swap, combine: false, op_and: false, suffix2: "", swap2: false }
+
+fn plan_const(v: i64) -> FCmpPlan
+    FCmpPlan { is_const: true, const_val: v, suffix1: "", swap1: false, combine: false, op_and: false, suffix2: "", swap2: false }
+
+pub fn fcmp_plan(pred: StrView) -> FCmpPlan
+    if pred.eq("false")
+        return plan_const(0)
+    if pred.eq("true")
+        return plan_const(1)
+    if pred.eq("oeq")
+        return plan_one("eq", false)
+    if pred.eq("olt")
+        return plan_one("lt", false)
+    if pred.eq("ole")
+        return plan_one("le", false)
+    if pred.eq("ogt")
+        return plan_one("lt", true)
+    if pred.eq("oge")
+        return plan_one("le", true)
+    if pred.eq("uno")
+        return plan_one("unord", false)
+    if pred.eq("une")
+        return plan_one("neq", false)
+    if pred.eq("uge")
+        return plan_one("nlt", false)
+    if pred.eq("ugt")
+        return plan_one("nle", false)
+    if pred.eq("ult")
+        return plan_one("nle", true)
+    if pred.eq("ule")
+        return plan_one("nlt", true)
+    if pred.eq("ord")
+        return plan_one("ord", false)
+    if pred.eq("one")
+        return FCmpPlan { is_const: false, const_val: 0, suffix1: "ord", swap1: false, combine: true, op_and: true, suffix2: "neq", swap2: false }
+    # ueq: unordered-or-equal = ordered-and-equal OR unordered.
+    FCmpPlan { is_const: false, const_val: 0, suffix1: "eq", swap1: false, combine: true, op_and: false, suffix2: "unord", swap2: false }
+
+# A decimal LLVM IR float literal ("1.5", "-3.25e+01"): no hex form, since
+# every literal this slice writes is exact in binary (a power-of-two
+# fraction), so plain scaling by ten is exact too (IEEE division of an
+# exactly representable quotient is exact).
+pub fn parse_decimal_f64(text: StrView) -> f64
+    var i: i64 = 0
+    var neg: bool = false
+    if i < text.len and text.get(i) == '-'
+        neg = true
+        i += 1
+    var mantissa: f64 = 0.0
+    while i < text.len and text.get(i) >= '0' and text.get(i) <= '9'
+        mantissa = mantissa * 10.0 + (text.get(i) - '0') as f64
+        i += 1
+    var frac_digits: i64 = 0
+    if i < text.len and text.get(i) == '.'
+        i += 1
+        while i < text.len and text.get(i) >= '0' and text.get(i) <= '9'
+            mantissa = mantissa * 10.0 + (text.get(i) - '0') as f64
+            frac_digits += 1
+            i += 1
+    var exp: i64 = 0 - frac_digits
+    if i < text.len and (text.get(i) == 'e' or text.get(i) == 'E')
+        i += 1
+        var eneg: bool = false
+        if i < text.len and (text.get(i) == '+' or text.get(i) == '-')
+            eneg = text.get(i) == '-'
+            i += 1
+        var e: i64 = 0
+        while i < text.len and text.get(i) >= '0' and text.get(i) <= '9'
+            e = e * 10 + (text.get(i) - '0') as i64
+            i += 1
+        if eneg
+            exp -= e
+        else
+            exp += e
+    var result: f64 = mantissa
+    if exp > 0
+        for _k in 0..exp
+            result = result * 10.0
+    else if exp < 0
+        for _k in 0..(0 - exp)
+            result = result / 10.0
+    if neg
+        return 0.0 - result
+    result
+
+# The double's 64 raw bits, as a GPR immediate.
+pub fn f64_bits(v: f64) -> i64
+    var x: f64 = v
+    let p: *i64 = @&x as *i64
+    *p
+
+# The f32 nearest `v`'s 32 raw bits, zero-extended into an i64 (gen.ritz's
+# `constant` masks to the width it is given, so the sign doesn't matter).
+pub fn f32_bits(v: f64) -> i64
+    var f: f32 = v as f32
+    let p: *i32 = @&f as *i32
+    (*p) as i64
+
+# A <4 x i32> multiply: SSE2 has no `pmulld`, so this is the standard
+# `pmuludq`-based sequence (two unsigned 32x32->64 multiplies, one for the
+# even lanes and one for the odd, each truncated back to its low 32 bits
+# and reassembled in lane order). `a` and `b` are left intact; the product
+# lands in `dst`. Nothing lives across IR instructions at -O0, so this
+# claims %xmm4..%xmm7 as its own scratch, distinct from `a`, `b` and `dst`
+# (XMM0..XMM3, gen.ritz's named scratch set).
+pub fn emit_vector_mul_i32x4(g: @&Gen, a: i64, b: i64, dst: i64) -> Result<(), Fail>
+    let sa: i64 = 4   # a shifted right one dword: lanes (a1, a2, a3, 0)
+    let sb: i64 = 5   # b shifted the same way
+    let evens: i64 = 6   # (a0*b0, _, a2*b2, _) as two 64-bit products
+    let odds: i64 = 7    # (a1*b1, _, a3*b3, _)
+    g.op2("movdqa", OpSize.Unsized, xmm_op(a), xmm_op(sa))?
+    g.op2("psrldq", OpSize.Unsized, g.imm(4), xmm_op(sa))?
+    g.op2("movdqa", OpSize.Unsized, xmm_op(b), xmm_op(sb))?
+    g.op2("psrldq", OpSize.Unsized, g.imm(4), xmm_op(sb))?
+    g.op2("movdqa", OpSize.Unsized, xmm_op(a), xmm_op(evens))?
+    g.op2("pmuludq", OpSize.Unsized, xmm_op(b), xmm_op(evens))?
+    g.op2("movdqa", OpSize.Unsized, xmm_op(sa), xmm_op(odds))?
+    g.op2("pmuludq", OpSize.Unsized, xmm_op(sb), xmm_op(odds))?
+    # Select each 64-bit product's low dword into lanes 0 and 1.
+    g.op3("pshufd", OpSize.Unsized, g.imm(8), xmm_op(evens), xmm_op(evens))?
+    g.op3("pshufd", OpSize.Unsized, g.imm(8), xmm_op(odds), xmm_op(odds))?
+    # evens := (evens[0], odds[0], evens[1], odds[1]) = (a0b0, a1b1, a2b2, a3b3).
+    g.op2("punpckldq", OpSize.Unsized, xmm_op(odds), xmm_op(evens))?
+    g.op2("movdqa", OpSize.Unsized, xmm_op(evens), xmm_op(dst))

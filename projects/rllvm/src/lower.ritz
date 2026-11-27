@@ -23,6 +23,7 @@ import rllvm.gen
 import rllvm.abi
 import rllvm.inline_asm
 import rllvm.intrinsics
+import rllvm.lower_fv
 import rllvm.parse { Fail, FailKind }
 
 # An integer literal as LLVM prints it (signed decimal, true, false).
@@ -224,7 +225,14 @@ impl FnLower
         match inst.op
             Opcode.Alloca => Ok(TY_PTR)
             Opcode.Gep => Ok(TY_PTR)
-            Opcode.ICmp => Ok(TY_I1)
+            Opcode.ICmp => Ok(inst.ty)      # i1, or <N x i1> on a vector compare
+            Opcode.FCmp => Ok(inst.ty)
+            Opcode.FNeg | Opcode.FAdd | Opcode.FSub | Opcode.FMul | Opcode.FDiv => Ok(self.value(self.operand(inst, 0)).ty)
+            Opcode.FPTrunc | Opcode.FPExt | Opcode.SIToFP | Opcode.UIToFP | Opcode.FPToSI => Ok(inst.ty)
+            Opcode.ExtractElement => Ok(self.m.types.get(self.m.resolve(self.value(self.operand(inst, 0)).ty)).elem)
+            Opcode.InsertElement | Opcode.ShuffleVector => Ok(self.value(self.operand(inst, 0)).ty)
+            Opcode.Cmpxchg => Ok(inst.ty)   # the `{ T, i1 }` parse.ritz built
+            Opcode.AtomicRmw => Ok(self.value(self.operand(inst, 1)).ty)
             Opcode.Load => Ok(inst.ty)
             Opcode.Phi => Ok(inst.ty)
             Opcode.Trunc => Ok(inst.ty)
@@ -394,6 +402,11 @@ impl FnLower
                     return g.op2("lea", OpSize.Quad, d, r64(r))
                 g.load(r, RBP, 0 - s.offset, type_size(self.m, s.ty))
             ValueKind.Int => g.constant(r, int_value(v.text), int_width(self.m, v.ty))
+            ValueKind.Float =>
+                if v.ty == TY_DOUBLE
+                    g.constant(r, f64_bits(parse_decimal_f64(v.text)), 64)
+                else
+                    g.constant(r, f32_bits(parse_decimal_f64(v.text)), 32)
             ValueKind.Null => g.constant(r, 0, 64)
             ValueKind.Undef => g.constant(r, 0, 64)
             ValueKind.Zero => g.constant(r, 0, 64)
@@ -409,6 +422,8 @@ impl FnLower
     # Write value `vid` of type `ty` to disp(%base) through %r11, so `base`
     # is never %r11.
     fn store_value(self: @FnLower, g: @&Gen, base: i64, disp: i64, vid: i64, ty: i64) -> Result<(), Fail>
+        if self.ty_kind(ty) == TypeKind.Vector
+            return self.store_vector_value(g, base, disp, vid, ty)
         let v: IrValue = self.value(vid)
         let size: i64 = type_size(self.m, ty)
         if not is_aggregate(self.m, ty)
@@ -637,8 +652,19 @@ impl FnLower
             Opcode.Select => self.lower_select(g, inst)
             Opcode.ExtractValue => self.lower_extract(g, inst)
             Opcode.InsertValue => self.lower_insert(g, inst)
+            Opcode.ExtractElement => self.lower_extract_element(g, inst)
+            Opcode.InsertElement => self.lower_insert_element(g, inst)
+            Opcode.ShuffleVector => self.lower_shuffle_vector(g, inst)
+            Opcode.FNeg => self.lower_float_unary(g, inst)
+            Opcode.FAdd | Opcode.FSub | Opcode.FMul | Opcode.FDiv => self.lower_float_binary(g, inst)
+            Opcode.FCmp => self.lower_fcmp(g, inst)
+            Opcode.FPTrunc | Opcode.FPExt => self.lower_float_convert(g, inst)
+            Opcode.SIToFP | Opcode.UIToFP => self.lower_int_to_float(g, inst)
+            Opcode.FPToSI => self.lower_float_to_int(g, inst)
+            Opcode.Cmpxchg => self.lower_cmpxchg(g, inst)
+            Opcode.AtomicRmw => self.lower_atomicrmw(g, inst)
+            Opcode.Fence => g.op0("mfence", OpSize.Unsized)
             Opcode.Call => self.lower_call(g, inst)
-            _ => Err(fail_named(inst.line, "instruction", opcode_name(inst.op)))
 
     fn lower_ret(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         if self.guard != 0
@@ -700,21 +726,24 @@ impl FnLower
         g.bind(other)?
         self.branch_to(g, f)
 
+    # A seq_cst load needs nothing extra: x86-64 never reorders a load past
+    # another load (DESIGN.md "Atomics").
     fn lower_load(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
-        if inst.is_atomic
-            return Err(fail_unsupported(inst.line, "load atomic"))
         let s: ValueSlot = match self.result_slot(inst)
             Some(s) => s
             None => return Ok(())
         self.load_scalar(g, RAX, self.operand(inst, 0))?
         g.copy(RBP, 0 - s.offset, RAX, 0, type_size(self.m, inst.ty))
 
+    # A seq_cst store is a plain store and an `mfence`, the standard
+    # mapping that stops the store from reordering past a later load.
     fn lower_store(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
-        if inst.is_atomic
-            return Err(fail_unsupported(inst.line, "store atomic"))
         let vid: i64 = self.operand(inst, 0)
         self.load_scalar(g, RAX, self.operand(inst, 1))?
-        self.store_value(g, RAX, 0, vid, self.value(vid).ty)
+        self.store_value(g, RAX, 0, vid, self.value(vid).ty)?
+        if inst.is_atomic
+            return g.op0("mfence", OpSize.Unsized)
+        Ok(())
 
     fn lower_gep(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         self.load_scalar(g, RAX, self.operand(inst, 0))?
@@ -754,6 +783,8 @@ impl FnLower
 
     fn lower_binary(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         let ty: i64 = self.value(self.operand(inst, 0)).ty
+        if self.ty_kind(ty) == TypeKind.Vector
+            return self.lower_vector_binary(g, inst)
         if self.ty_kind(ty) != TypeKind.Int
             return Err(fail_named(inst.line, "instruction on vectors", opcode_name(inst.op)))
         let bits: i64 = int_width(self.m, ty)
@@ -790,6 +821,9 @@ impl FnLower
 
     fn lower_icmp(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         let ty: i64 = self.value(self.operand(inst, 0)).ty
+        if self.ty_kind(ty) == TypeKind.Vector
+            let t: Type = self.m.types.get(self.m.resolve(ty))
+            return self.lower_vector_icmp(g, inst, t.width, type_size(self.m, t.elem))
         if not is_int_or_ptr(self.m, ty)
             return Err(fail_unsupported(inst.line, "icmp on vectors"))
         let bits: i64 = int_width(self.m, ty)
@@ -807,6 +841,12 @@ impl FnLower
     fn lower_cast(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
         let vid: i64 = self.operand(inst, 0)
         let from: i64 = self.value(vid).ty
+        if inst.op == Opcode.Bitcast
+            # Same width, so this is a raw copy of bits either way: a
+            # double<->i64 or float<->i32 reinterpretation needs nothing
+            # else (#4804's call ABI uses this at a return/argument leaf).
+            self.load_scalar(g, RAX, vid)?
+            return self.store_result(g, inst, RAX)
         if not is_int_or_ptr(self.m, from) or not is_int_or_ptr(self.m, inst.ty)
             return Err(fail_named(inst.line, "cast of floats or vectors", opcode_name(inst.op)))
         self.load_scalar(g, RAX, vid)?
@@ -883,6 +923,382 @@ impl FnLower
             off += e.offset
             ty = e.ty
         self.store_value(g, RBP, off - s.offset, self.operand(inst, 1), ty)
+
+    # ----------------------------------------------- vector value movement
+
+    # A vector constant, or a byte copy out of a Local's own slot: never
+    # through a GPR (`store_value`'s generic scalar fallback only moves up
+    # to 8 bytes).
+    fn store_vector_value(self: @FnLower, g: @&Gen, base: i64, disp: i64, vid: i64, ty: i64) -> Result<(), Fail>
+        let v: IrValue = self.value(vid)
+        let size: i64 = type_size(self.m, ty)
+        match v.kind
+            ValueKind.Local =>
+                let s: ValueSlot = match self.slot_of(v.text)
+                    Some(s) => s
+                    None => return Err(fail_malformed(g.line, "use of an undefined value"))
+                g.copy(base, disp, RBP, 0 - s.offset, size)
+            ValueKind.Zero | ValueKind.Undef => g.fill_zero(base, disp, size)
+            ValueKind.Vector =>
+                let elem_ty: i64 = self.m.types.get(self.m.resolve(ty)).elem
+                let ebytes: i64 = type_size(self.m, elem_ty)
+                for i in 0..v.count
+                    self.store_value(g, base, disp + i * ebytes, self.m.value_lists.get(v.first + i), elem_ty)?
+                Ok(())
+            _ => Err(fail_unsupported(g.line, "this vector constant"))
+
+    # 128 bits at byte offset `off` of value `vid` into %xmm `x` (a Local's
+    # slot, or an all-zero lane).
+    fn load_vector_at(self: @FnLower, g: @&Gen, x: i64, vid: i64, off: i64) -> Result<(), Fail>
+        let v: IrValue = self.value(vid)
+        match v.kind
+            ValueKind.Local =>
+                let s: ValueSlot = match self.slot_of(v.text)
+                    Some(s) => s
+                    None => return Err(fail_malformed(g.line, "use of an undefined value"))
+                g.vload(x, RBP, off - s.offset)
+            ValueKind.Zero | ValueKind.Undef => g.vzero(x)
+            _ => Err(fail_unsupported(g.line, "this vector constant"))
+
+    # %xmm `x`'s 128 bits to the instruction's result at byte offset `off`.
+    fn store_vector_result_at(self: @FnLower, g: @&Gen, inst: @Inst, x: i64, off: i64) -> Result<(), Fail>
+        match self.result_slot(inst)
+            Some(s) => g.vstore(x, RBP, off - s.offset)
+            None => Ok(())
+
+    # One element of a vector operand into the 64-bit register `r`,
+    # zero-extended: a Local's own slot, or a zero lane.
+    fn load_vector_lane_scalar(self: @FnLower, g: @&Gen, r: i64, vid: i64, off: i64, elem_bytes: i64) -> Result<(), Fail>
+        let v: IrValue = self.value(vid)
+        match v.kind
+            ValueKind.Local =>
+                let s: ValueSlot = match self.slot_of(v.text)
+                    Some(s) => s
+                    None => return Err(fail_malformed(g.line, "use of an undefined value"))
+                g.load(r, RBP, off - s.offset, elem_bytes)
+            ValueKind.Zero | ValueKind.Undef => g.constant(r, 0, elem_bytes * 8)
+            ValueKind.Vector => self.load_scalar(g, r, self.m.value_lists.get(v.first + off / elem_bytes))
+            _ => Err(fail_unsupported(g.line, "this vector constant"))
+
+    # ---------------------------------------------------- vector arithmetic
+
+    # add/sub/and/or/xor and the 16-bit multiply: one real SSE2 mnemonic,
+    # one 128-bit lane at a time (DESIGN.md "ABI": a 256-bit vector is two
+    # 128-bit halves, low half first).
+    fn lower_vector_simd_binary(self: @FnLower, g: @&Gen, inst: @Inst, name: StrView, n: i64, elem_bytes: i64) -> Result<(), Fail>
+        let total: i64 = n * elem_bytes
+        var off: i64 = 0
+        while off < total
+            self.load_vector_at(g, XMM0, self.operand(inst, 0), off)?
+            self.load_vector_at(g, XMM1, self.operand(inst, 1), off)?
+            g.op2(name, OpSize.Unsized, xmm_op(XMM1), xmm_op(XMM0))?
+            self.store_vector_result_at(g, inst, XMM0, off)?
+            off += 16
+        Ok(())
+
+    # A <4 x i32> multiply (and its 256-bit, two-lane form): SSE2 has no
+    # `pmulld` (DESIGN.md "Library").
+    fn lower_vector_mul_i32(self: @FnLower, g: @&Gen, inst: @Inst, n: i64) -> Result<(), Fail>
+        let total: i64 = n * 4
+        var off: i64 = 0
+        while off < total
+            self.load_vector_at(g, XMM0, self.operand(inst, 0), off)?
+            self.load_vector_at(g, XMM1, self.operand(inst, 1), off)?
+            emit_vector_mul_i32x4(g, XMM0, XMM1, XMM2)?
+            self.store_vector_result_at(g, inst, XMM2, off)?
+            off += 16
+        Ok(())
+
+    # One element at a time, through GPR scratch, reusing `lower_binary`'s
+    # own rules at the element's width (DESIGN.md "Library": SSE2 has no
+    # packed integer divide at all, and no uniform way to shift each lane
+    # by a different count, so both always take this path here; it is
+    # also correct, just not the hardware form, for an immediate or a
+    # uniform register shift count).
+    fn lower_vector_per_lane(self: @FnLower, g: @&Gen, inst: @Inst, op: Opcode, n: i64, elem_bytes: i64) -> Result<(), Fail>
+        let bits: i64 = elem_bytes * 8
+        let q: OpSize = OpSize.Quad
+        for lane in 0..n
+            let off: i64 = lane * elem_bytes
+            self.load_vector_lane_scalar(g, RAX, self.operand(inst, 0), off, elem_bytes)?
+            self.load_vector_lane_scalar(g, RCX, self.operand(inst, 1), off, elem_bytes)?
+            var result: i64 = RAX
+            match op
+                Opcode.Add => g.op2("add", q, r64(RCX), r64(RAX))?
+                Opcode.Sub => g.op2("sub", q, r64(RCX), r64(RAX))?
+                Opcode.Mul => g.op2("imul", q, r64(RCX), r64(RAX))?
+                Opcode.Shl => g.op2("shl", q, reg_op(RCX, OpSize.Byte), r64(RAX))?
+                Opcode.LShr => g.op2("shr", q, reg_op(RCX, OpSize.Byte), r64(RAX))?
+                Opcode.AShr =>
+                    g.sign_extend(RAX, bits)?
+                    g.op2("sar", q, reg_op(RCX, OpSize.Byte), r64(RAX))?
+                Opcode.UDiv | Opcode.URem =>
+                    g.op2("xor", OpSize.Long, r32(RDX), r32(RDX))?
+                    g.op1("div", q, r64(RCX))?
+                    if op == Opcode.URem
+                        result = RDX
+                Opcode.SDiv | Opcode.SRem =>
+                    g.sign_extend(RAX, bits)?
+                    g.sign_extend(RCX, bits)?
+                    g.op0("cqo", OpSize.Unsized)?
+                    g.op1("idiv", q, r64(RCX))?
+                    if op == Opcode.SRem
+                        result = RDX
+                _ => return Err(fail_named(inst.line, "vector instruction", opcode_name(op)))
+            match self.result_slot(inst)
+                Some(slot) => g.store(result, RBP, off - slot.offset, elem_bytes)?
+                None => pass
+        Ok(())
+
+    fn lower_vector_binary(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let ty: i64 = self.value(self.operand(inst, 0)).ty
+        let t: Type = self.m.types.get(self.m.resolve(ty))
+        let elem_bytes: i64 = type_size(self.m, t.elem)
+        let n: i64 = t.width
+        match inst.op
+            Opcode.Add => self.lower_vector_simd_binary(g, inst, vector_add_sub_mnemonic(true, elem_bytes), n, elem_bytes)
+            Opcode.Sub => self.lower_vector_simd_binary(g, inst, vector_add_sub_mnemonic(false, elem_bytes), n, elem_bytes)
+            Opcode.And => self.lower_vector_simd_binary(g, inst, "pand", n, elem_bytes)
+            Opcode.Or => self.lower_vector_simd_binary(g, inst, "por", n, elem_bytes)
+            Opcode.Xor => self.lower_vector_simd_binary(g, inst, "pxor", n, elem_bytes)
+            Opcode.Mul =>
+                if elem_bytes == 2
+                    self.lower_vector_simd_binary(g, inst, "pmullw", n, elem_bytes)
+                else if elem_bytes == 4
+                    self.lower_vector_mul_i32(g, inst, n)
+                else
+                    self.lower_vector_per_lane(g, inst, Opcode.Mul, n, elem_bytes)
+            Opcode.UDiv | Opcode.SDiv | Opcode.URem | Opcode.SRem | Opcode.Shl | Opcode.LShr | Opcode.AShr => self.lower_vector_per_lane(g, inst, inst.op, n, elem_bytes)
+            _ => Err(fail_named(inst.line, "vector instruction", opcode_name(inst.op)))
+
+    # icmp on a vector: DESIGN.md calls out a <2 x i64> compare as one
+    # SSE2 lacks; splitting every predicate at every width through GPR
+    # `cmp`/`setcc` (as the scalar path already does) covers that case and
+    # every other uniformly, storing one byte per lane (a <N x i1>'s own
+    # layout, DESIGN.md "Object contract").
+    fn lower_vector_icmp(self: @FnLower, g: @&Gen, inst: @Inst, n: i64, elem_bytes: i64) -> Result<(), Fail>
+        let bits: i64 = elem_bytes * 8
+        for lane in 0..n
+            let off: i64 = lane * elem_bytes
+            self.load_vector_lane_scalar(g, RAX, self.operand(inst, 0), off, elem_bytes)?
+            self.load_vector_lane_scalar(g, RCX, self.operand(inst, 1), off, elem_bytes)?
+            if inst.pred.starts_with("s")
+                g.sign_extend(RAX, bits)?
+                g.sign_extend(RCX, bits)?
+            g.op2("cmp", OpSize.Quad, r64(RCX), r64(RAX))?
+            let set: String = set_cc(inst.pred)
+            g.op1(set.as_view(), OpSize.Unsized, reg_op(RAX, OpSize.Byte))?
+            g.op2("movzb", OpSize.Long, reg_op(RAX, OpSize.Byte), r32(RAX))?
+            match self.result_slot(inst)
+                Some(slot) => g.store(RAX, RBP, lane - slot.offset, 1)?
+                None => pass
+        Ok(())
+
+    # extractelement/insertelement/shufflevector, constant indices and
+    # mask only (DESIGN.md "Optimization bar": -O0 needs no more).
+    fn lower_extract_element(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let s: ValueSlot = match self.result_slot(inst)
+            Some(s) => s
+            None => return Ok(())
+        let vec_vid: i64 = self.operand(inst, 0)
+        let idxv: IrValue = self.value(self.operand(inst, 1))
+        if idxv.kind != ValueKind.Int
+            return Err(fail_unsupported(inst.line, "extractelement with a non-constant index"))
+        let src: ValueSlot = match self.slot_of(self.value(vec_vid).text)
+            Some(x) => x
+            None => return Err(fail_malformed(inst.line, "use of an undefined value"))
+        let ebytes: i64 = type_size(self.m, s.ty)
+        g.copy(RBP, 0 - s.offset, RBP, int_value(idxv.text) * ebytes - src.offset, ebytes)
+
+    fn lower_insert_element(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let s: ValueSlot = match self.result_slot(inst)
+            Some(s) => s
+            None => return Ok(())
+        self.store_value(g, RBP, 0 - s.offset, self.operand(inst, 0), s.ty)?
+        let idxv: IrValue = self.value(self.operand(inst, 2))
+        if idxv.kind != ValueKind.Int
+            return Err(fail_unsupported(inst.line, "insertelement with a non-constant index"))
+        let elem_ty: i64 = self.m.types.get(self.m.resolve(s.ty)).elem
+        let ebytes: i64 = type_size(self.m, elem_ty)
+        self.store_value(g, RBP, int_value(idxv.text) * ebytes - s.offset, self.operand(inst, 1), elem_ty)
+
+    fn lower_shuffle_vector(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let s: ValueSlot = match self.result_slot(inst)
+            Some(s) => s
+            None => return Ok(())
+        let maskv: IrValue = self.value(self.operand(inst, 2))
+        if maskv.kind != ValueKind.Vector
+            return Err(fail_unsupported(inst.line, "shufflevector with a non-constant mask"))
+        let t: Type = self.m.types.get(self.m.resolve(s.ty))
+        let ebytes: i64 = type_size(self.m, t.elem)
+        let a: ValueSlot = match self.slot_of(self.value(self.operand(inst, 0)).text)
+            Some(x) => x
+            None => return Err(fail_malformed(inst.line, "use of an undefined value"))
+        let b: ValueSlot = match self.slot_of(self.value(self.operand(inst, 1)).text)
+            Some(x) => x
+            None => return Err(fail_malformed(inst.line, "use of an undefined value"))
+        for i in 0..t.width
+            let mi: IrValue = self.value(self.m.value_lists.get(maskv.first + i))
+            if mi.kind != ValueKind.Int
+                return Err(fail_unsupported(inst.line, "shufflevector with an undef mask element"))
+            let idx: i64 = int_value(mi.text)
+            if idx < t.width
+                g.copy(RBP, i * ebytes - s.offset, RBP, idx * ebytes - a.offset, ebytes)?
+            else
+                g.copy(RBP, i * ebytes - s.offset, RBP, (idx - t.width) * ebytes - b.offset, ebytes)?
+        Ok(())
+
+    # -------------------------------------------------------------- float
+
+    fn load_float(self: @FnLower, g: @&Gen, x: i64, vid: i64) -> Result<(), Fail>
+        let is_double: bool = self.value(vid).ty == TY_DOUBLE
+        self.load_scalar(g, R11, vid)?
+        if is_double
+            return g.op2("movq", OpSize.Unsized, r64(R11), xmm_op(x))
+        g.op2("movd", OpSize.Unsized, r32(R11), xmm_op(x))
+
+    fn store_float_result(self: @FnLower, g: @&Gen, inst: @Inst, x: i64) -> Result<(), Fail>
+        match self.result_slot(inst)
+            Some(s) => g.fstore(x, RBP, 0 - s.offset, type_size(self.m, s.ty))
+            None => Ok(())
+
+    # A true sign-bit flip through a GPR, so fneg(+0.0) is exactly -0.0
+    # and fneg(NaN) keeps its payload: `0.0 - x` gets both wrong.
+    fn lower_float_unary(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let vid: i64 = self.operand(inst, 0)
+        let is_double: bool = self.value(vid).ty == TY_DOUBLE
+        self.load_float(g, XMM0, vid)?
+        let gs: OpSize = if is_double then OpSize.Quad else OpSize.Long
+        let mv: StrView = if is_double then "movq" else "movd"
+        g.op2(mv, OpSize.Unsized, xmm_op(XMM0), reg_op(R11, gs))?
+        if is_double
+            g.constant(RCX, 0 - 9223372036854775807 - 1, 64)?
+        else
+            g.constant(RCX, 0 - 2147483647 - 1, 32)?
+        g.op2("xor", gs, reg_op(RCX, gs), reg_op(R11, gs))?
+        g.op2(mv, OpSize.Unsized, reg_op(R11, gs), xmm_op(XMM0))?
+        self.store_float_result(g, inst, XMM0)
+
+    fn lower_float_binary(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let a: i64 = self.operand(inst, 0)
+        let is_double: bool = self.value(a).ty == TY_DOUBLE
+        self.load_float(g, XMM0, a)?
+        self.load_float(g, XMM1, self.operand(inst, 1))?
+        g.op2(float_binary_mnemonic(inst.op, is_double), OpSize.Unsized, xmm_op(XMM1), xmm_op(XMM0))?
+        self.store_float_result(g, inst, XMM0)
+
+    # A `cmp<pred><ss|sd>` mask (all-1s or all-0s) with `scratch` as both
+    # the base copy and the destination, so `a`/`b` survive for a second
+    # compare (DESIGN.md "Library"'s 8 SSE predicates, `fcmp_plan`'s
+    # swap/combine over them).
+    fn emit_fcmp_mask(self: @FnLower, g: @&Gen, a: i64, b: i64, scratch: i64, is_double: bool, suffix: StrView, swap: bool) -> Result<(), Fail>
+        let base: i64 = if swap then b else a
+        let other: i64 = if swap then a else b
+        g.op2(if is_double then "movsd" else "movss", OpSize.Unsized, xmm_op(base), xmm_op(scratch))?
+        var name = string_from("cmp")
+        name.push_str(suffix)
+        name.push_str(if is_double then "sd" else "ss")
+        g.op2(name.as_view(), OpSize.Unsized, xmm_op(other), xmm_op(scratch))
+
+    fn lower_fcmp(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let plan: FCmpPlan = fcmp_plan(inst.pred)
+        if plan.is_const
+            g.constant(RAX, plan.const_val, 32)?
+            return self.store_result(g, inst, RAX)
+        let a: i64 = self.operand(inst, 0)
+        let is_double: bool = self.value(a).ty == TY_DOUBLE
+        self.load_float(g, XMM0, a)?
+        self.load_float(g, XMM1, self.operand(inst, 1))?
+        self.emit_fcmp_mask(g, XMM0, XMM1, XMM2, is_double, plan.suffix1, plan.swap1)?
+        if plan.combine
+            self.emit_fcmp_mask(g, XMM0, XMM1, XMM3, is_double, plan.suffix2, plan.swap2)?
+            g.op2(if plan.op_and then "andps" else "orps", OpSize.Unsized, xmm_op(XMM3), xmm_op(XMM2))?
+        let gs: OpSize = if is_double then OpSize.Quad else OpSize.Long
+        g.op2(if is_double then "movq" else "movd", OpSize.Unsized, xmm_op(XMM2), reg_op(RAX, gs))?
+        let one: Operand = g.imm(1)
+        g.op2("and", OpSize.Long, one, r32(RAX))?
+        self.store_result(g, inst, RAX)
+
+    # fptrunc (double to float) and fpext (float to double).
+    fn lower_float_convert(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        self.load_float(g, XMM0, self.operand(inst, 0))?
+        let name: StrView = if inst.ty == TY_DOUBLE then "cvtss2sd" else "cvtsd2ss"
+        g.op2(name, OpSize.Unsized, xmm_op(XMM0), xmm_op(XMM1))?
+        self.store_float_result(g, inst, XMM1)
+
+    # sitofp and uitofp. `load_scalar` already zero-extends; uitofp reuses
+    # that and converts as a signed 64-bit value, exact for every value
+    # narrower than 64 bits and for a 64-bit one below 2^63 (DESIGN.md's
+    # equivalence bar is defined values, and this slice's tests stay under
+    # that bound rather than add the full-range correction).
+    fn lower_int_to_float(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let vid: i64 = self.operand(inst, 0)
+        let bits: i64 = int_width(self.m, self.value(vid).ty)
+        self.load_scalar(g, RAX, vid)?
+        if inst.op == Opcode.SIToFP
+            g.sign_extend(RAX, bits)?
+        let name: StrView = if inst.ty == TY_DOUBLE then "cvtsi2sd" else "cvtsi2ss"
+        g.op2(name, OpSize.Unsized, r64(RAX), xmm_op(XMM0))?
+        self.store_float_result(g, inst, XMM0)
+
+    # fptosi: DESIGN.md's subset has no plain fptoui (only the saturating
+    # intrinsic, #4806's).
+    fn lower_float_to_int(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        self.load_float(g, XMM0, self.operand(inst, 0))?
+        let is_double: bool = self.value(self.operand(inst, 0)).ty == TY_DOUBLE
+        let name: StrView = if is_double then "cvttsd2si" else "cvttss2si"
+        g.op2(name, OpSize.Unsized, xmm_op(XMM0), r64(RAX))?
+        self.store_result(g, inst, RAX)
+
+    # ------------------------------------------------------------ atomics
+
+    fn lower_cmpxchg(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let cmp_vid: i64 = self.operand(inst, 1)
+        let bits: i64 = int_width(self.m, self.value(cmp_vid).ty)
+        let size: OpSize = size_of_bytes(bits / 8)
+        self.load_scalar(g, R10, self.operand(inst, 0))?
+        self.load_scalar(g, RAX, cmp_vid)?
+        self.load_scalar(g, RCX, self.operand(inst, 2))?
+        g.op2_locked("cmpxchg", size, reg_op(RCX, size), g.mem(R10, 0))?
+        match self.result_slot(inst)
+            Some(s) =>
+                g.store(RAX, RBP, 0 - s.offset, bits / 8)?
+                g.op1("sete", OpSize.Unsized, reg_op(R11, OpSize.Byte))?
+                let f: Member = member(self.m, s.ty, 1)
+                g.store(R11, RBP, f.offset - s.offset, 1)
+            None => Ok(())
+
+    # xchg is always atomic on memory; add/sub use `xadd`, which both
+    # updates memory and returns the old value in one locked instruction.
+    # and/or/xor have no atomic fetch-and-op form at all on x86, so those
+    # take the standard cmpxchg retry loop.
+    fn lower_atomicrmw(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        let val_vid: i64 = self.operand(inst, 1)
+        let bits: i64 = int_width(self.m, self.value(val_vid).ty)
+        let size: OpSize = size_of_bytes(bits / 8)
+        self.load_scalar(g, R10, self.operand(inst, 0))?
+        if inst.pred.eq("xchg")
+            self.load_scalar(g, RCX, val_vid)?
+            g.op2("xchg", size, reg_op(RCX, size), g.mem(R10, 0))?
+            return self.store_result(g, inst, RCX)
+        if inst.pred.eq("add")
+            self.load_scalar(g, RCX, val_vid)?
+            g.op2_locked("xadd", size, reg_op(RCX, size), g.mem(R10, 0))?
+            return self.store_result(g, inst, RCX)
+        if inst.pred.eq("sub")
+            self.load_scalar(g, RCX, val_vid)?
+            g.op1("neg", size, reg_op(RCX, size))?
+            g.op2_locked("xadd", size, reg_op(RCX, size), g.mem(R10, 0))?
+            return self.store_result(g, inst, RCX)
+        self.load_scalar(g, RDX, val_vid)?
+        g.load(RAX, R10, 0, bits / 8)?
+        let retry: i64 = g.new_label()
+        g.bind(retry)?
+        g.op2("mov", size, reg_op(RAX, size), reg_op(RCX, size))?
+        g.op2(inst.pred, size, reg_op(RDX, size), reg_op(RCX, size))?
+        g.op2_locked("cmpxchg", size, reg_op(RCX, size), g.mem(R10, 0))?
+        g.jump("jne", retry)?
+        self.store_result(g, inst, RAX)
 
     # --------------------------------------------------------------- calls
 
