@@ -56,7 +56,7 @@ pub const TX_BUFFERS: u32 = 32
 pub const VNET_BUF_SIZE: u64 = 2112
 
 # Bytes of one pool of `count` buffers: what netd asks DrvDmaAlloc for.
-pub fn pool_bytes(count: u32) -> u64
+pub fn virtio_pool_bytes(count: u32) -> u64
     (count as u64) * VNET_BUF_SIZE
 
 # Bytes of one queue's rings at the largest size this driver programs:
@@ -65,7 +65,7 @@ pub fn ring_run_bytes() -> u64
     virtq_ring_bytes(VIRTQ_MAX_SIZE)
 
 # The four runs netd allocates for the NIC: each queue's rings
-# (ring_run_bytes) and each pool (pool_bytes of RX_BUFFERS, TX_BUFFERS).
+# (ring_run_bytes) and each pool (virtio_pool_bytes of RX_BUFFERS, TX_BUFFERS).
 pub struct VirtioDma
     rx_ring: DmaRun
     tx_ring: DmaRun
@@ -243,7 +243,7 @@ const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1
 # 4.1.4.3.2). It cannot yield: until its first DrvIrqWait netd is the only
 # runnable process besides pid 1, which must not run mid-init
 # (RING1_DRIVER.md section 9 step 3).
-const RESET_POLLS: u32 = 10000000
+const VIRTIO_RESET_POLLS: u32 = 10000000
 
 # Where netd mapped the device's register blocks (each window's first byte
 # of its block), with the notify window's length and multiplier.
@@ -290,7 +290,7 @@ fn add_status(r: VirtioRegs, bits: u8)
     wr8(r.common + COMMON_DEVICE_STATUS, status(r) | bits)
 
 # Why VirtioNic.up stopped. netd exits with a status naming it.
-pub enum UpError
+pub enum VirtioUpError
     Reset                            # device_status never read 0
     Features                         # no VERSION_1, ACCESS_PLATFORM or MAC
     FeaturesOk                       # the device refused the features
@@ -403,7 +403,7 @@ impl VirtioNic
     # both queues laid over their runs and programmed, each signalling its
     # MSI-X index; DRIVER_OK. Every RX buffer is posted; the first tx_kick
     # notifies the RX queue.
-    pub fn up(self: @&VirtioNic, r: VirtioRegs, dma: VirtioDma, msix: VirtioMsix) -> Result<VirtioUp, UpError>
+    pub fn up(self: @&VirtioNic, r: VirtioRegs, dma: VirtioDma, msix: VirtioMsix) -> Result<VirtioUp, VirtioUpError>
         self.regs = r
         self.features = negotiate(r)?
         for i in 0..6
@@ -413,7 +413,7 @@ impl VirtioNic
             self.mtu = Some(rd16(r.device + NET_CFG_MTU))
         wr16(r.common + COMMON_MSIX_CONFIG, msix.config)
         if rd16(r.common + COMMON_MSIX_CONFIG) == MSI_NO_VECTOR
-            return Err(UpError.Vector)
+            return Err(VirtioUpError.Vector)
         let rx_max: u16 = queue_max(r, RX_QUEUE)?
         let tx_max: u16 = queue_max(r, TX_QUEUE)?
         let rx_num: u16 = capped(rx_max)
@@ -424,7 +424,7 @@ impl VirtioNic
         self.tx_doorbell = program_queue(r, @self.q.tx, TX_QUEUE, msix.tx)?
         add_status(r, STATUS_DRIVER_OK)
         if (status(r) & STATUS_NEEDS_RESET) != 0
-            return Err(UpError.NeedsReset)
+            return Err(VirtioUpError.NeedsReset)
         Ok(VirtioUp { rx_num: rx_num, rx_max: rx_max, tx_num: tx_num, tx_max: tx_max })
 
     # Give RX buffer `b` to the device on descriptor `d`.
@@ -572,13 +572,13 @@ impl Nic for VirtioNic
 # ============================================================================
 
 # Reset, then negotiate. Returns the accepted features.
-fn negotiate(r: VirtioRegs) -> Result<u64, UpError>
+fn negotiate(r: VirtioRegs) -> Result<u64, VirtioUpError>
     wr8(r.common + COMMON_DEVICE_STATUS, 0)
     var polls: u32 = 0
     while status(r) != 0
         polls = polls + 1
-        if polls >= RESET_POLLS
-            return Err(UpError.Reset)
+        if polls >= VIRTIO_RESET_POLLS
+            return Err(VirtioUpError.Reset)
     add_status(r, STATUS_ACKNOWLEDGE)
     add_status(r, STATUS_DRIVER)
     wr32(r.common + COMMON_DEVICE_FEATURE_SELECT, 0)
@@ -590,7 +590,7 @@ fn negotiate(r: VirtioRegs) -> Result<u64, UpError>
     let required: u64 = VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM | VIRTIO_NET_F_MAC
     if (accepted & required) != required
         add_status(r, STATUS_FAILED)
-        return Err(UpError.Features)
+        return Err(VirtioUpError.Features)
     wr32(r.common + COMMON_DRIVER_FEATURE_SELECT, 0)
     wr32(r.common + COMMON_DRIVER_FEATURE, virtio_features_lo(accepted))
     wr32(r.common + COMMON_DRIVER_FEATURE_SELECT, 1)
@@ -598,15 +598,15 @@ fn negotiate(r: VirtioRegs) -> Result<u64, UpError>
     add_status(r, STATUS_FEATURES_OK)
     if (status(r) & STATUS_FEATURES_OK) == 0
         add_status(r, STATUS_FAILED)
-        return Err(UpError.FeaturesOk)
+        return Err(VirtioUpError.FeaturesOk)
     Ok(accepted)
 
 # Queue `idx`'s maximum size; Queue when the device has no such queue.
-fn queue_max(r: VirtioRegs, idx: u16) -> Result<u16, UpError>
+fn queue_max(r: VirtioRegs, idx: u16) -> Result<u16, VirtioUpError>
     wr16(r.common + COMMON_QUEUE_SELECT, idx)
     let max: u16 = rd16(r.common + COMMON_QUEUE_SIZE)
     if max == 0
-        return Err(UpError.Queue)
+        return Err(VirtioUpError.Queue)
     Ok(max)
 
 fn capped(max: u16) -> u16
@@ -616,15 +616,15 @@ fn capped(max: u16) -> u16
 
 # Tell the device where queue `idx` (laid out in `vq`) is and that it
 # signals MSI-X table index `vector`; enable it. Returns its doorbell.
-fn program_queue(r: VirtioRegs, vq: *Virtqueue, idx: u16, vector: u16) -> Result<u64, UpError>
+fn program_queue(r: VirtioRegs, vq: *Virtqueue, idx: u16, vector: u16) -> Result<u64, VirtioUpError>
     wr16(r.common + COMMON_QUEUE_SELECT, idx)
     wr16(r.common + COMMON_QUEUE_SIZE, vq.num)
     wr16(r.common + COMMON_QUEUE_MSIX_VECTOR, vector)
     if rd16(r.common + COMMON_QUEUE_MSIX_VECTOR) == MSI_NO_VECTOR
-        return Err(UpError.Vector)
+        return Err(VirtioUpError.Vector)
     let off: u64 = (rd16(r.common + COMMON_QUEUE_NOTIFY_OFF) as u64) * (r.notify_mult as u64)
     if off + 2 > r.notify_len as u64
-        return Err(UpError.Queue)
+        return Err(VirtioUpError.Queue)
     wr64(r.common + COMMON_QUEUE_DESC, virtq_desc_phys(vq))
     wr64(r.common + COMMON_QUEUE_DRIVER, virtq_avail_phys(vq))
     wr64(r.common + COMMON_QUEUE_DEVICE, virtq_used_phys(vq))

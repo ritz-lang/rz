@@ -33,6 +33,7 @@ RITZ_ROOT = RITZ0_DIR.parent
 KERNEL_SRC = RITZ_ROOT.parent / "harland" / "kernel" / "src"
 WINDOW = KERNEL_SRC / "drivers" / "virtio" / "window.ritz"
 COMMON = KERNEL_SRC / "drivers" / "virtio" / "common.ritz"
+MSIX = KERNEL_SRC / "drivers" / "msix.ritz"
 DRIVER = KERNEL_SRC / "syscall" / "runtime" / "driver.ritz"
 
 
@@ -184,7 +185,11 @@ def test_probe_records_every_window():
     src = COMMON.read_text()
     assert "vio_note_window(" in _body(src, "vio_find_mmio_caps")
     note = _body(src, "vio_note_window")
-    assert "vio_window_add(" in note and "PCI_CAP_MSIX" in note
+    assert "vio_window_add(" in note and "msix_ranges(pci_dev)" in note
+    # AGAST #4893: the table and PBA ranges are msix.ritz's, which the
+    # e1000e probe's BAR0 window shares.
+    msix = _body(MSIX.read_text(), "msix_ranges")
+    assert "PCI_CAP_MSIX" in msix and "MSIX_CAP_TABLE" in msix and "MSIX_CAP_PBA" in msix
     # AGAST #4724: with the queue-address registers and the requester
     assert "vio_common_range(pci_dev)" in note and "pci_dev_sid(pci_dev)" in note
     assert "VIRTIO_PCI_CAP_COMMON_CFG" in _body(src, "vio_common_range")

@@ -1,0 +1,229 @@
+# drivers/e1000e.ritz - the kernel's side of an Intel e1000e (AGAST #4893;
+# docs/E1000E.md "Kernel side", "Where the 82574L and the I218-V differ")
+#
+# Harland has no in-kernel e1000e driver, and this adds none: the NIC's
+# driver is nic/src/e1000e.ritz, a library in /bin/netd (D9). A boot that
+# does not translate DMA spawns no netd, so it has no network on an e1000e.
+# On a translating boot with no virtio-net (drivers/nic.ritz: one NIC a
+# boot, virtio-net first) the kernel keeps what this file does:
+#
+#   e1000e_ring1_probe: 8086:10d3 (the 82574L, QEMU's -device e1000e) or
+#     8086:15a1 (the I218-V). Bus master off, BAR0 mapped for the kernel,
+#     the NIC's private DMA domain and only then bus master
+#     (nic_private_domain), the fault probe (a TX descriptor naming an IOVA
+#     nothing maps must fault with the NIC's source ID), a reset, MSI-X
+#     table entries 0-2 on one vector at the BSP (nic_msix_bsp; the 82574L's
+#     table is in BAR3), and BAR0 recorded as one CAP_TYPE_MMIO window
+#     (drivers/virtio/window.ritz, the queue-address registers inside it,
+#     so DrvMmioMap grants it only to an isolated device). BAR3 is never a
+#     window. The I218-V has MSI, not MSI-X: its probe is refused here until
+#     the kernel programs MSI (#4895).
+#   e1000e_reset: the quiesce on netd's death (syscall/runtime/driver.ritz
+#     quiesce_device): every cause masked, GIO master disabled and
+#     STATUS.GIO_MASTER_EN read clear (no DMA in flight), CTRL.RST set and
+#     read self-cleared. Only both waits make the reset complete.
+
+import klog { klog, klog_dec, klog_hex, klog_hex_width }
+import io { memory_barrier, cpu_pause }
+import ritzlib.option
+import serial { StrView }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import mm.vmm { vmm_map_mmio, phys_to_virt }
+import mm.dma { dma_alloc_zeroed, dma_free_pages, dma_quarantine }
+import drivers.pci { PciDevice, pci_find_e1000e, pci_disable_bus_master, pci_enable_memory, pci_dev_sid }
+import drivers.msix { MsixInfo, MsixRanges, msix_ranges }
+import drivers.virtio.window { phys_range, vio_window_add, vio_window_find, vio_window_guarded }
+import drivers.iommu.vtd { VtdEnter }
+import drivers.iommu.ir { dma_translation_on, dma_domain_enter, dma_domain_leave, dma_domain_hole }
+import drivers.nic { NicGrant, NicReset, NIC_PROBE_LEN, klog_bdf, nic_ring1_refused, nic_private_domain, nic_ring1_allowed, nic_msix_bsp, nic_faults_drain, nic_fault_seen }
+import driver_abi.boot { NIC_KIND_E1000E, E1000E_WINDOW_BAR0, E1000E_BAR0_LEN }
+
+# The registers the kernel touches (82574 datasheet section 10, the same
+# offsets on the I218-V; nic/src/e1000e.ritz is the driver's full set).
+const E1K_REG_CTRL: u64 = 0x0000
+const E1K_REG_STATUS: u64 = 0x0008
+const E1K_REG_IMC: u64 = 0x00D8
+const E1K_REG_TCTL: u64 = 0x0400
+const E1K_REG_TDBAL: u64 = 0x3800
+const E1K_REG_TDBAH: u64 = 0x3804
+const E1K_REG_TDLEN: u64 = 0x3808
+const E1K_REG_TDH: u64 = 0x3810
+const E1K_REG_TDT: u64 = 0x3818
+
+const E1K_CTRL_GIO_MASTER_DISABLE: u32 = 1 << 2
+const E1K_CTRL_RST: u32 = 1 << 26
+const E1K_STATUS_GIO_MASTER_EN: u32 = 1 << 19
+const E1K_TCTL_EN: u32 = 1 << 1
+const E1K_TCTL_PSP: u32 = 1 << 3
+const E1K_IMC_ALL: u32 = 0xFFFFFFFF
+
+# How long each wait of the reset may take: 80 ms for GIO_MASTER_EN (Linux
+# e1000e MASTER_DISABLE_TIMEOUT, 800 x 100 us), 100 ms for CTRL.RST.
+const E1K_MASTER_US: u64 = 80000
+const E1K_RESET_US: u64 = 100000
+
+# The fault probe's TX ring: one page, 8 legacy descriptors (TDLEN is a
+# multiple of 128 bytes), the first naming the hole.
+const E1K_PROBE_RING_LEN: u32 = 128
+const E1K_TXD_CMD_EOP: u8 = 1 << 0
+const E1K_TXD_CMD_IFCS: u8 = 1 << 1
+const E1K_TXD_CMD_RS: u8 = 1 << 3
+
+struct ProbeTxDesc
+    addr: u64
+    length: u16
+    cso: u8
+    cmd: u8
+    status: u8
+    css: u8
+    special: u16
+
+var e1000e_msix: MsixInfo
+
+fn rd(regs: u64, off: u64) -> u32
+    volatile_load((regs + off) as *u32)
+
+fn wr(regs: u64, off: u64, v: u32)
+    volatile_store((regs + off) as *u32, v)
+
+# `bit` of register `off` read clear within `us` microseconds.
+fn wait_clear(regs: u64, off: u64, bit: u32, us: u64) -> bool
+    let deadline: u64 = deadline_after_us(us)
+    while (rd(regs, off) & bit) != 0
+        if deadline_passed(deadline)
+            return false
+        cpu_pause()
+    true
+
+# How e1000e_reset ended. Not a Result: VtdDma, in this module's import
+# closure, declares `Ok` too (net/ring1.ritz).
+pub enum E1000eReset
+    Done                             # both waits succeeded
+    MasterStuck                      # STATUS.GIO_MASTER_EN never cleared: DMA may be in flight
+    ResetStuck                       # CTRL.RST never self-cleared
+
+pub fn e1000e_reset_name(r: E1000eReset) -> StrView
+    match r
+        E1000eReset.Done => "reset"
+        E1000eReset.MasterStuck => "GIO master enable never cleared"
+        E1000eReset.ResetStuck => "CTRL.RST never cleared"
+
+# Reset the MAC whose BAR0 the kernel maps at `regs` (Linux
+# e1000_reset_hw_82571): mask every cause, stop bus mastering and wait for
+# no DMA in flight, then CTRL.RST and wait for it to self-clear, and mask
+# again (the reset unmasks nothing, but a cause latched before it is
+# cleared with it). Done only when both waits succeeded.
+pub fn e1000e_reset(regs: u64) -> E1000eReset
+    wr(regs, E1K_REG_IMC, E1K_IMC_ALL)
+    wr(regs, E1K_REG_CTRL, rd(regs, E1K_REG_CTRL) | E1K_CTRL_GIO_MASTER_DISABLE)
+    if not wait_clear(regs, E1K_REG_STATUS, E1K_STATUS_GIO_MASTER_EN, E1K_MASTER_US)
+        return E1000eReset.MasterStuck
+    wr(regs, E1K_REG_CTRL, rd(regs, E1K_REG_CTRL) | E1K_CTRL_RST)
+    if not wait_clear(regs, E1K_REG_CTRL, E1K_CTRL_RST, E1K_RESET_US)
+        return E1000eReset.ResetStuck
+    wr(regs, E1K_REG_IMC, E1K_IMC_ALL)
+    E1000eReset.Done
+
+# The fault probe (AGAST #4724, as virtio_net_fault_probe): a one-page TX
+# ring in the NIC's domain `dom` whose first descriptor names an IOVA
+# nothing maps, and TDT past it. The NIC reads the descriptor from the
+# granted page, then faults on the buffer: the unit's record must name the
+# NIC's source ID `sid` and that IOVA. The ring leaves the domain after the
+# reset that follows. True if that record was found.
+fn e1000e_fault_probe(regs: u64, dom: u32, sid: u32) -> bool
+    let hole: u64 = match dma_domain_hole(dom)
+        Some(iova) => iova
+        None => return false
+    let phys: u64 = match dma_alloc_zeroed(1)
+        Some(p) => p
+        None => return false
+    let ring: u64 = match dma_domain_enter(dom, phys, 1)
+        VtdEnter.Entered(iova) => iova
+        VtdEnter.Refused =>
+            dma_free_pages(phys, 1)
+            return false
+        VtdEnter.Stuck =>
+            dma_quarantine(phys, 1)
+            return false
+    *(phys_to_virt(phys) as *ProbeTxDesc) = ProbeTxDesc { addr: hole, length: NIC_PROBE_LEN as u16, cso: 0, cmd: E1K_TXD_CMD_EOP | E1K_TXD_CMD_IFCS | E1K_TXD_CMD_RS, status: 0, css: 0, special: 0 }
+    wr(regs, E1K_REG_TDBAL, (ring & 0xFFFFFFFF) as u32)
+    wr(regs, E1K_REG_TDBAH, (ring >> 32) as u32)
+    wr(regs, E1K_REG_TDLEN, E1K_PROBE_RING_LEN)
+    wr(regs, E1K_REG_TDH, 0)
+    wr(regs, E1K_REG_TDT, 0)
+    wr(regs, E1K_REG_TCTL, E1K_TCTL_EN | E1K_TCTL_PSP)
+    nic_faults_drain()
+    memory_barrier()
+    wr(regs, E1K_REG_TDT, 1)
+    let found: bool = nic_fault_seen(sid, hole)
+    let reset: bool = match e1000e_reset(regs)
+        E1000eReset.Done => true
+        _ => false
+    # Only a NIC that reset no longer names the ring: else its page stays
+    # out of the PMM until reboot.
+    if reset and dma_domain_leave(dom, ring, 1)
+        dma_free_pages(phys, 1)
+    else
+        dma_quarantine(phys, 1)
+    found and reset
+
+# The probe (the header): the NIC's grant, or None when there is no e1000e,
+# DMA is not translated, or the NIC is refused.
+pub fn e1000e_ring1_probe() -> Option<NicGrant>
+    let dev: *PciDevice = match pci_find_e1000e()
+        Some(d) => d
+        None => return None
+    if not dma_translation_on()
+        return None
+    klog("\n[e1000e] Probing 8086:")
+    klog_hex_width((*dev).device_id as u64, 4)
+    klog(" at ")
+    klog_bdf(dev)
+    klog(" for the ring-1 driver\n")
+    pci_disable_bus_master(dev)
+    let bar0: u64 = (*dev).bar[0]
+    if (*dev).bar_is_io[0] != 0 or bar0 == 0 or (*dev).bar_size[0] < E1000E_BAR0_LEN as u64
+        return nic_ring1_refused("BAR0 is not 128 KiB of memory")
+    pci_enable_memory(dev)
+    let regs: u64 = vmm_map_mmio(bar0, E1000E_BAR0_LEN as u64)
+    if regs == 0
+        return nic_ring1_refused("BAR0 did not map")
+    # Quiet from the start: no cause raises anything until netd arms one.
+    wr(regs, E1K_REG_IMC, E1K_IMC_ALL)
+    let dom: u32 = match nic_private_domain(dev)
+        Some(d) => d
+        None => return nic_ring1_refused("the NIC is not isolated")
+    let sid: u32 = pci_dev_sid(dev)
+    if not e1000e_fault_probe(regs, dom, sid)
+        # A NIC that faulted elsewhere or did not reset is not handed out.
+        match e1000e_reset(regs)
+            E1000eReset.Done => pass
+            r =>
+                klog("[e1000e] reset: ")
+                klog(e1000e_reset_name(r))
+                klog("\n")
+                return nic_ring1_refused("the NIC did not reset")
+    if not nic_ring1_allowed(dev, dom)
+        return nic_ring1_refused("translation, remapping or blocked compatibility format is off")
+    let vector: u8 = match nic_msix_bsp(dev, @e1000e_msix, "e1000e", "rx, tx and other")
+        Some(v) => v
+        None => return nic_ring1_refused("MSI-X is not on at the BSP")
+    let guard: MsixRanges = msix_ranges(dev)
+    let window: u64 = match vio_window_add(bar0, E1000E_BAR0_LEN as u64, 0, guard.table, guard.pba, phys_range(bar0, E1000E_BAR0_LEN as u64), sid)
+        Some(id) => id
+        None => return nic_ring1_refused("BAR0 could not be recorded as a window")
+    match vio_window_find(window)
+        Some(w) =>
+            if vio_window_guarded(w)
+                return nic_ring1_refused("BAR0 holds the MSI-X table or PBA")
+        None => return nic_ring1_refused("BAR0 could not be recorded as a window")
+    klog("[e1000e] BAR0 0x")
+    klog_hex(bar0)
+    klog(" granted as one window of ")
+    klog_dec((E1000E_BAR0_LEN / 1024) as i64)
+    klog(" KiB; the MSI-X table stays the kernel's\n")
+    klog("[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), NIC isolated; the owner is /bin/netd\n")
+    var grant: NicGrant = NicGrant { kind: NIC_KIND_E1000E, vector: vector, sid: sid, dom: dom, reset: NicReset.E1000e(regs), msix_table_va: e1000e_msix.table_virt, window_count: 1, window_ids: [0, 0, 0, 0, 0, 0, 0, 0], window_types: [0, 0, 0, 0, 0, 0, 0, 0] }
+    grant.window_ids[0] = window
+    grant.window_types[0] = E1000E_WINDOW_BAR0
+    Some(grant)

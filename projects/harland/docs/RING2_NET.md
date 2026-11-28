@@ -100,7 +100,7 @@ The `SYS_*` numbers for these calls (`NetInfo` 224, `NetAddr` 225, `ShmMap` 227,
 
 ### Boot switch
 
-Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. Under D9 it spawns `/bin/netd` alone, in `/bin/virtio-net`'s place. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` keeps the EC2 peer-ping window on ENA. On any other NIC it opens the latency window on each owner, and after netd's a UDP window with `/bin/udp-echo` ("Rollout"). Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling. The gate ran on 2026-11-27 ("Rollout"), and D9 takes the first lever.
+Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. Under D9 it spawns `/bin/netd` alone, in `/bin/virtio-net`'s place. A boot with an Intel e1000e and no virtio-net spawns the same `/bin/netd` on it (`E1000E.md`, #4893). No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` keeps the EC2 peer-ping window on ENA. On any other NIC it opens the latency window on each owner, and after netd's a UDP window with `/bin/udp-echo` ("Rollout"). Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling. The gate ran on 2026-11-27 ("Rollout"), and D9 takes the first lever.
 
 ### Drivers inside netd (D9)
 
@@ -731,9 +731,35 @@ Round 3's in-kernel and netd-udp rows and round 5's ring rows were taken while t
 - **A long run slows every owner.** The dense run's medians climb from about the 300th echo on, on every guest owner: in-kernel from 716 µs to 7.4 ms, kernel-ring from 0.6 to 1.0 ms, netd from 1.2 to 3.5 ms. The floor stays flat at 184–253 µs. The ICMP entry's 600-echo run shows the same for netd. Because the in-kernel stack shows it too, it is not D9's. The cause is not found. The 220-echo windows above stay clear of it.
 - **What is left.** The gap that remains is netd's own path: the stack in CPL 3 and two `DrvIrqWait` returns per echo. Batching (#4876) and polling on a dedicated core (#4877) are next. The app's switches on the UDP path stay as long as the app is a separate process, which is the design.
 
+### 2026-11-28: e1000e against virtio-net (AGAST #4893)
+
+**Setup.** `net_latency.sh` with its new `NIC` parameter, on skronk-5 (48 CPUs, KVM), three rounds per NIC, alternating, 2026-11-28T06:31Z to 06:37Z. The host was busy with other rooms: load average 53–57. Both NICs are on the same machine: q35 with the split irqchip, `-cpu Haswell-v1 -smp 4 -m 2G`, `intel-iommu` on the ring boot, the same hub, slirp and wire. `NIC=virtio` is the modern virtio-net (`rx_queue_size=1024`, `iommu_platform=on`). `NIC=e1000e` is QEMU's 82574L (`-device e1000e`), driven by netd's `E1000eNic` (#4892) on the kernel's e1000e grant (#4893): legacy descriptors, 32-entry rings, no interrupt coalescing (`ITR`, `RDTR`, `RADV` 0), MSI-X RXQ0, TXQ0 and Other on one vector. Harland has no in-kernel e1000e driver, so the e1000e pc boot measures the wire floor alone and there is no in-kernel row. The wire sends 20 warm-up and 200 timed echoes, 10 ms apart. The counts are raw per round trip, with each window's idle backstop wakes still in them.
+
+**Results.** Three rounds, in µs. "Slow" counts round trips over 10 ms out of 200. Every echo and every datagram came back in every round.
+
+| NIC | owner | min | median | p99 | slow | switches/rt | CR3 loads/rt | syscalls/rt |
+|---|---|---|---|---|---|---|---|---|
+| virtio-net | wire-floor | 38 / 28 / 36 | 196 / 165 / 102 | 2212 / 2294 / 2321 | 0 / 0 / 0 | – | – | – |
+| virtio-net | in-kernel | 158 / 140 / 142 | 339 / 290 / 243 | 9864 / 13444 / 7128 | 2 / 3 / 1 | 0.00 | 0.00 | 0.00 |
+| virtio-net | kernel-ring | 118 / 131 / 147 | 372 / 350 / 329 | 9558 / 5681 / 13684 | 1 / 1 / 3 | 5.05–5.17 | 4.01 | 5.33–5.35 |
+| virtio-net | netd | 189 / 179 / 209 | 371 / 417 / 347 | 960 / 833 / 663 | 0 / 0 / 0 | 2.25–2.33 | 0.01 | 2.33–2.35 |
+| virtio-net | netd-udp | 231 / 472 / 316 | 828 / 907 / 512 | 1145 / 1267 / 4873 | 0 / 0 / 0 | 5.30–5.34 | 4.07 | 7.35–7.38 |
+| e1000e | wire-floor | 17 / 34 / 35 | 189 / 202 / 87 | 1701 / 2650 / 2037 | 0 / 0 / 0 | – | – | – |
+| e1000e | kernel-ring | 239 / 216 / 246 | 616 / 541 / 506 | 6298 / 5684 / 17802 | 0 / 1 / 3 | 4.33–4.36 | 4.00 | 6.75–7.17 |
+| e1000e | netd | 147 / 167 / 194 | 304 / 385 / 348 | 750 / 660 / 490 | 0 / 0 / 0 | 1.33 | 0.01 | 3.30–3.33 |
+| e1000e | netd-udp | 329 / 296 / 315 | 841 / 703 / 640 | 1143 / 1016 / 827 | 0 / 0 / 0 | 4.43–4.59 | 4.07 | 9.05–9.25 |
+
+**Reading.**
+
+- **netd is as fast on either NIC.** netd's medians are 304–385 µs on the e1000e and 347–417 µs on virtio-net, and its p99s are 490–750 µs against 663–960 µs. On this loaded host the difference is inside the round-to-round spread. The e1000e's legacy descriptors and one MMIO doorbell per pass cost nothing visible against virtio's rings.
+- **One more `DrvIrqWait` return per echo on the e1000e.** netd makes 3.3 syscalls per echo on the e1000e against 2.3 on virtio-net, and netd-udp 9.1–9.3 against 7.4. The e1000e raises one interrupt per cause, with no coalescing: RXQ0 for the echo request, TXQ0 for the reply's write-back (`IVAR` bit 31 asks for one on every write-back), and an Other on some passes. Each lands as its own wake. Interrupt moderation (`ITR`) is the lever, and it belongs to batching (#4876), as `E1000E.md` "No interrupt coalescing at first" says.
+- **Fewer switches.** The netd window logs 1.33 switches per echo on the e1000e against 2.3 on virtio-net. Both are raw: with one process in the path an echo costs no switch (the D9 entry), so what is counted is the window's other wakes, and they differ by NIC. Which wakes these are was not traced.
+- **kernel-ring is slower on the e1000e.** Its medians are 506–616 µs against 329–372 µs. On that path netd is the seat's driver and pid 1's stack runs the echo, so each frame crosses the frame ring both ways. Each extra e1000e interrupt there is a wake of netd and a switch back to the seat. This is the self-test window only, before the handoff, and no production path uses it.
+- **The gate holds.** Every echo came back on every owner of both NICs, with no slow round trip on netd or netd-udp in any round.
+
 ## Open questions
 
-One netd for every NIC, linking each NIC's library, or one netd per device. D9 puts the driver inside netd but does not choose. ENA is not a `Nic` implementation yet.
+One netd for every NIC, linking each NIC's library, or one netd per device. D9 puts the driver inside netd but does not choose. `E1000E.md` "One netd, chosen at boot" (#4893) took the smallest answer for now: one `/bin/netd` links both `Nic` implementations, the kernel hands it one NIC a boot, and `DriverBoot.nic` picks the loop's instance. Whether a boot with two NICs gets two netds is still open. ENA is not a `Nic` implementation yet.
 
 ARP lifetime, the pending-send cap, the ping deadline, DHCP retransmission, and the lease timers are decided above. TCP retransmission and congestion numbers are not open on this cutover. They belong to the TCP milestone, which is not part of it.
 

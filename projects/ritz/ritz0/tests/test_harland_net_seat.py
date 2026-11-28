@@ -40,7 +40,7 @@ def _code(path):
 
 
 def _fn_body(src, name):
-    m = re.search(rf"^(?:pub )?fn {name}\(.*?(?=^\S)", src + "\nEND", re.M | re.S)
+    m = re.search(rf"^(?:pub )?fn {name}(?:<[^>]*>)?\(.*?(?=^\S)", src + "\nEND", re.M | re.S)
     assert m, f"no fn {name}"
     return m.group(0)
 
@@ -136,6 +136,7 @@ def test_netpublish_holds_only_the_armed_service_until_the_switch():
 @pytest.mark.unit
 def test_netd_drains_the_seat_after_its_ready_publish():
     body = _fn_body(_code(NETD), "take_over")
-    _in_order(body, "g_svc.ready(", "net_publish(g_addr)", "service_boot_at(g_addr_va)",
-              "seat_hand_over<VirtioNic>(@&g_seat, @&g_svc, at.seat_rx_read", "cap_revoke(g_seat.handle)",
-              "g_svc.set_link(")
+    # Generic over the NIC (AGAST #4893): `svc` is the run's NetSvc<N>.
+    _in_order(body, "svc.ready(", "net_publish(g_addr)", "service_boot_at(g_addr_va)",
+              "seat_hand_over<N>(@&g_seat, svc, at.seat_rx_read", "cap_revoke(g_seat.handle)",
+              "svc.set_link(")

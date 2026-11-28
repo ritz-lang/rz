@@ -535,9 +535,18 @@ pub fn inl(port: u16) -> u32
 # drivers/msix.ritz: the device's table lives in the io stand-in.
 MSIX_STUB = """\
 import drivers.pci { PciDevice }
+import drivers.virtio.window { PhysRange, phys_range_none }
 import io { fake_msix_is_present, fake_msix_enable, fake_msix_set_entry, fake_msix_count }
 
 pub const PCI_CAP_MSIX: u8 = 0x11
+
+# A window's guard ranges (AGAST #4893): the double's table is in no BAR.
+pub struct MsixRanges
+    table: PhysRange
+    pba: PhysRange
+
+pub fn msix_ranges(dev: *PciDevice) -> MsixRanges
+    MsixRanges { table: phys_range_none(), pba: phys_range_none() }
 
 pub struct MsixInfo
     dev: *PciDevice

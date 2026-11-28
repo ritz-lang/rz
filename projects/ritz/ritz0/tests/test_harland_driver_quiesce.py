@@ -71,9 +71,16 @@ def test_quiesce_masks_resets_invalidates_then_unpublishes():
     src = DRIVER.read_text()
     dev = _fn_body(src, "quiesce_device")
     mask = dev.index("msix_mask_entries(")
-    reset = dev.index("vio_status_reset(")
+    reset = dev.index("device_reset(dev.reset)")
     leave = dev.index("run_left_domain(")
     assert mask < reset < leave
+    assert re.search(r"let reset_ok: bool = match reset\n\s+DeviceReset\.Done => true\n\s+_ => false", dev), dev
+    assert 'DeviceReset.Done => klog("0")' in dev
+    # The reset is the device's kind's (AGAST #4893): virtio's status
+    # readback, or the e1000e's two waits, 0 only when both succeeded.
+    kinds = _fn_body(src, "device_reset")
+    assert "if status == 0 then DeviceReset.Done else DeviceReset.Status(status)" in kinds
+    assert re.search(r"NicReset\.E1000e\(regs\) =>\n\s+let end: E1000eReset = e1000e_reset\(regs\)\n\s+match end\n\s+E1000eReset\.Done => DeviceReset\.Done\n\s+_ => DeviceReset\.Stuck\(", kinds), kinds
     assert re.search(r"if reset_ok and left\b", dev), dev
     assert "quarantine_leaves(" in dev and "dma_quarantine_iova(" in dev
     assert "dma_free_pages" not in dev

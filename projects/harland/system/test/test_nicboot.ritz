@@ -1,0 +1,133 @@
+# Host tests of netd's one match on the NIC kind (AGAST #4893; harland
+# docs/E1000E.md "One netd, chosen at boot")
+#
+# src/nicboot.ritz reads the private copy of DriverBoot once: a virtio-net
+# record gives its windows (nic.virtio boot_windows), an e1000e record its
+# one BAR0 window, and anything else is refused before netd maps a page.
+
+import driver_abi.boot { DriverBoot, DRIVER_BOOT_MAGIC, NIC_KIND_VIRTIO, NIC_KIND_E1000E, E1000E_WINDOW_BAR0, E1000E_BAR0_LEN, VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_NOTIFY, VIRTIO_WINDOW_DEVICE }
+import nic.virtio { BootBad }
+import system.nicboot { NicChoice, BootRefused, nic_choice }
+
+fn virtio_record() -> DriverBoot
+    var b: DriverBoot
+    b.magic = DRIVER_BOOT_MAGIC
+    b.nic = NIC_KIND_VIRTIO
+    b.window_count = 3
+    let kinds: [3]u8 = [VIRTIO_WINDOW_COMMON, VIRTIO_WINDOW_NOTIFY, VIRTIO_WINDOW_DEVICE]
+    for i in 0..3
+        b.windows[i].handle = 0x100000000 + i as u64
+        b.windows[i].offset = 0x100 * i as u32
+        b.windows[i].length = 0x40
+        b.windows[i].notify_multiplier = 0
+        b.windows[i].cfg_type = kinds[i]
+    b
+
+fn e1000e_record() -> DriverBoot
+    var b: DriverBoot
+    b.magic = DRIVER_BOOT_MAGIC
+    b.nic = NIC_KIND_E1000E
+    b.window_count = 1
+    b.windows[0].handle = 0x200000005
+    b.windows[0].offset = 0
+    b.windows[0].length = E1000E_BAR0_LEN
+    b.windows[0].notify_multiplier = 0
+    b.windows[0].cfg_type = E1000E_WINDOW_BAR0
+    b
+
+fn refused(r: Result<NicChoice, BootRefused>) -> Option<BootRefused>
+    match r
+        Ok(_) => None
+        Err(why) => Some(why)
+
+fn refused_kind(r: Result<NicChoice, BootRefused>) -> bool
+    match refused(r)
+        Some(why) =>
+            match why
+                BootRefused.Kind => true
+                _ => false
+        None => false
+
+fn refused_magic(r: Result<NicChoice, BootRefused>) -> bool
+    match refused(r)
+        Some(why) =>
+            match why
+                BootRefused.Magic => true
+                _ => false
+        None => false
+
+fn refused_window(r: Result<NicChoice, BootRefused>) -> bool
+    match refused(r)
+        Some(why) =>
+            match why
+                BootRefused.Window => true
+                _ => false
+        None => false
+
+[[test]]
+fn test_a_virtio_record_runs_the_virtio_nic_on_its_windows() -> i32
+    match nic_choice(virtio_record())
+        Ok(c) =>
+            match c
+                NicChoice.Virtio(w) =>
+                    assert w.common == 0 and w.notify == 1 and w.device.unwrap_or(9) == 2
+                NicChoice.E1000e(_) => return 2
+        Err(_) => return 1
+    0
+
+[[test]]
+fn test_an_e1000e_record_runs_the_e1000e_nic_on_bar0() -> i32
+    match nic_choice(e1000e_record())
+        Ok(c) =>
+            match c
+                NicChoice.E1000e(w) =>
+                    assert w.handle == 0x200000005 and w.length == E1000E_BAR0_LEN
+                NicChoice.Virtio(_) => return 2
+        Err(_) => return 1
+    0
+
+[[test]]
+fn test_a_record_with_no_kind_is_refused() -> i32
+    var b: DriverBoot = virtio_record()
+    b.nic = 0
+    assert refused_kind(nic_choice(b))
+    b.nic = 3
+    assert refused_kind(nic_choice(b))
+    0
+
+[[test]]
+fn test_a_virtio_record_is_checked_as_before() -> i32
+    var b: DriverBoot = virtio_record()
+    b.windows[1].offset = 4096
+    match refused(nic_choice(b))
+        Some(why) =>
+            match why
+                BootRefused.Virtio(bad) =>
+                    assert bad == BootBad.Window
+                _ => return 2
+        None => return 1
+    0
+
+[[test]]
+fn test_an_e1000e_record_is_one_whole_bar0() -> i32
+    var b: DriverBoot = e1000e_record()
+    b.magic = 0
+    assert refused_magic(nic_choice(b))
+    b = e1000e_record()
+    b.window_count = 2
+    assert refused_window(nic_choice(b))
+    b = e1000e_record()
+    b.window_count = 0
+    assert refused_window(nic_choice(b))
+    # A virtio window, BAR0 from past its first byte, or short of the
+    # registers the driver reaches
+    b = e1000e_record()
+    b.windows[0].cfg_type = VIRTIO_WINDOW_COMMON
+    assert refused_window(nic_choice(b))
+    b = e1000e_record()
+    b.windows[0].offset = 0x100
+    assert refused_window(nic_choice(b))
+    b = e1000e_record()
+    b.windows[0].length = E1000E_BAR0_LEN - 4
+    assert refused_window(nic_choice(b))
+    0

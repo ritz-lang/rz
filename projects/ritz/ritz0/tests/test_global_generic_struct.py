@@ -59,11 +59,20 @@ PROGRAMS = {
                         "    if ga[1].ptr.k != 4\n        return 1\n    return 0\n"),
     # Two instances of a user generic struct, each sized by its own T: an i64
     # value that does not fit an i32 shows a shared or wrong layout.
-    "two_instances": (_P + "var gi: P<i32>\nvar gl: P<i64>\n\n" + _MAIN
+    # AGAST #4893: with them, a global whose type nests one instance in
+    # another, as netd's `NetSvc<E1000eNic<MmioRegs>>`.  ritz0 left a
+    # global's type as written, so its spelling missed the instance
+    # `O$P_M` registered for it and the global fell back to `i8` ("Cannot
+    # access field on type: i8*").  Checks 4 and 5.
+    "two_instances": (_P + "struct O<N>\n    pad: i64\n    nic: N\n\nstruct M\n    base: u64\n\n"
+                      "var gi: P<i32>\nvar gl: P<i64>\nvar gn: O<P<M>>\n\n" + _MAIN
                       + "    gi.v = 7\n    gl.v = 1099511627776\n    gi.pad = 3\n"
+                      "    gn.nic.v.base = 1099511627776\n    gn.pad = 3\n    gn.nic.pad = 4\n"
                       "    if gi.v != 7\n        return 1\n"
                       "    if gl.v != 1099511627776\n        return 2\n"
-                      "    if gi.pad + gi.v != 10\n        return 3\n    return 0\n"),
+                      "    if gi.pad + gi.v != 10\n        return 3\n"
+                      "    if gn.nic.v.base != 1099511627776\n        return 4\n"
+                      "    if gn.pad + gn.nic.pad != 7\n        return 5\n    return 0\n"),
     # An array of a generic struct, global.
     "array": (_P + "var ga: [2]P<i64>\n\n" + _MAIN
               + "    ga[1].v = 1099511627776\n    ga[0].v = 5\n"

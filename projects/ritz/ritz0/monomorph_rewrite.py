@@ -1,6 +1,7 @@
 """The Monomorphizer's last step: rewrite the module to name specialized
 items, dropping the generic ones.  Split out of monomorph.py (AGAST #3522)."""
 
+import copy
 from typing import List
 
 import ritz_ast as rast
@@ -39,6 +40,17 @@ class MonoRewriteMixin:
             elif isinstance(item, rast.ImplBlock):
                 # Rewrite non-generic impl block methods
                 new_items.append(self._rewrite_impl(item))
+            elif isinstance(item, rast.VarDef) and item.type is not None:
+                # A global's type names its instance as a local's does: left
+                # as written, `var g: Out<In<M>>` asked the emitter for
+                # `Out<In$M>`-spelled lookups that missed `Out$In_M`, and the
+                # global fell back to `i8` (AGAST #4893).
+                # A copy, not dataclasses.replace: the attributes a VarDef
+                # gains after parsing (the file that declares it, which says
+                # whether this module defines it) are not fields.
+                rewritten = copy.copy(item)
+                rewritten.type = self._rewrite_type(item.type)
+                new_items.append(rewritten)
             else:
                 new_items.append(item)
 

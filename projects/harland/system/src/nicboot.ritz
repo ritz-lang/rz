@@ -1,0 +1,44 @@
+# netd's one match on the NIC kind (AGAST #4893; harland docs/E1000E.md
+# "One netd, chosen at boot", docs/RING2_NET.md "Drivers inside netd (D9)")
+#
+# One /bin/netd links both Nic implementations. The kernel names the kind
+# of the NIC it granted in DriverBoot.nic; netd reads its private copy of
+# the record here, once, and runs its generic loop on VirtioNic or
+# E1000eNic. The record is advisory: DrvMmioMap maps only what the kernel
+# recorded, so this check is what keeps netd from driving one kind's
+# registers as the other's.
+
+import driver_abi.boot { DriverBoot, DriverWindow, DRIVER_BOOT_MAGIC, NIC_KIND_VIRTIO, NIC_KIND_E1000E, E1000E_WINDOW_BAR0, E1000E_BAR0_LEN }
+import nic.virtio { BootWindows, BootBad, boot_windows }
+
+# The NIC netd runs, and the windows its driver maps.
+pub enum NicChoice
+    Virtio(BootWindows)              # indexes of the virtio register blocks in DriverBoot.windows
+    E1000e(DriverWindow)             # BAR0, whole
+
+# Why netd will not drive what the record describes. It exits.
+pub enum BootRefused
+    Kind                             # DriverBoot.nic is no NIC_KIND_*
+    Virtio(BootBad)                  # a virtio-net record nic.virtio refuses
+    Magic                            # an e1000e record the kernel did not write
+    Window                           # an e1000e record that is not one E1000E_WINDOW_BAR0 window from BAR0's first byte, E1000E_BAR0_LEN long
+
+# What the record asks netd to run.
+pub fn nic_choice(b: DriverBoot) -> Result<NicChoice, BootRefused>
+    match b.nic
+        NIC_KIND_VIRTIO =>
+            match boot_windows(b)
+                Ok(w) => Ok(NicChoice.Virtio(w))
+                Err(why) => Err(BootRefused.Virtio(why))
+        NIC_KIND_E1000E => e1000e_window(b)
+        _ => Err(BootRefused.Kind)
+
+fn e1000e_window(b: DriverBoot) -> Result<NicChoice, BootRefused>
+    if b.magic != DRIVER_BOOT_MAGIC
+        return Err(BootRefused.Magic)
+    if b.window_count != 1
+        return Err(BootRefused.Window)
+    let w: DriverWindow = b.windows[0]
+    if w.cfg_type != E1000E_WINDOW_BAR0 or w.offset != 0 or w.length < E1000E_BAR0_LEN
+        return Err(BootRefused.Window)
+    Ok(NicChoice.E1000e(w))

@@ -14,9 +14,9 @@ import io { inb, outb, inw, outw, inl, outl }
 import mm.pmm { pmm_alloc_contig, PAGE_SIZE }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_map_mmio, phys_to_virt }
-import drivers.pci { PciDevice, pci_enable_bus_master, pci_disable_bus_master, pci_enable_memory, pci_enable_io, pci_find_capability, pci_find_capability_nth, pci_dev_read_config8, pci_dev_read_config16, pci_dev_read_config32, pci_dev_sid, PCI_CAP_VENDOR }
+import drivers.pci { PciDevice, pci_enable_bus_master, pci_disable_bus_master, pci_enable_memory, pci_enable_io, pci_find_capability_nth, pci_dev_read_config8, pci_dev_read_config32, pci_dev_sid, PCI_CAP_VENDOR }
 import ritzlib.option
-import drivers.msix { PCI_CAP_MSIX }
+import drivers.msix { MsixRanges, msix_ranges }
 import drivers.virtio.window { PhysRange, phys_range, phys_range_none, vio_window_add }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 # The transport-independent virtqueue and feature negotiation (AGAST #4732):
@@ -541,23 +541,6 @@ fn vio_init(pci_dev: *PciDevice, bus_master: bool) -> *VirtioDevice
 
     return dev
 
-# The MSI-X capability's table and PBA registers (PCI 3.0 §6.8.2): each a
-# BIR in bits 0-2 and an offset in the rest; the table size is in bits 0-10
-# of Message Control.
-const MSIX_CAP_CONTROL: u8 = 2
-const MSIX_CAP_TABLE: u8 = 4
-const MSIX_CAP_PBA: u8 = 8
-const MSIX_ENTRY_BYTES: u64 = 16
-
-# The physical bytes the MSI-X register at `reg` (table or PBA) names, `len`
-# long, or no range when its BIR is not a memory BAR.
-fn msix_register_range(pci_dev: *PciDevice, reg: u8, len: u64) -> PhysRange
-    let loc: u32 = pci_dev_read_config32(pci_dev, reg)
-    let bir: i32 = (loc & 0x7) as i32
-    if bir > 5 or (*pci_dev).bar_is_io[bir] != 0 or (*pci_dev).bar[bir] == 0
-        return phys_range_none()
-    phys_range((*pci_dev).bar[bir] + ((loc & 0xFFFFFFF8) as u64), len)
-
 # The physical bytes of the device's common configuration (its queue-
 # address registers), or no range.
 fn vio_common_range(pci_dev: *PciDevice) -> PhysRange
@@ -586,14 +569,8 @@ fn vio_note_window(dev: *VirtioDevice, pci_dev: *PciDevice, cap_ptr: u8, cap_typ
     var notify: u32 = 0
     if cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG
         notify = pci_dev_read_config32(pci_dev, cap_ptr + VIRTIO_PCI_CAP_NOTIFY_MULT)
-    var table: PhysRange = phys_range_none()
-    var pba: PhysRange = phys_range_none()
-    let msix: u8 = pci_find_capability(pci_dev, PCI_CAP_MSIX)
-    if msix != 0
-        let entries: u64 = ((pci_dev_read_config16(pci_dev, msix + MSIX_CAP_CONTROL) & 0x7FF) as u64) + 1
-        table = msix_register_range(pci_dev, msix + MSIX_CAP_TABLE, entries * MSIX_ENTRY_BYTES)
-        pba = msix_register_range(pci_dev, msix + MSIX_CAP_PBA, (entries + 63) / 64 * 8)
-    match vio_window_add(phys, length, notify, table, pba, vio_common_range(pci_dev), pci_dev_sid(pci_dev))
+    let guard: MsixRanges = msix_ranges(pci_dev)
+    match vio_window_add(phys, length, notify, guard.table, guard.pba, vio_common_range(pci_dev), pci_dev_sid(pci_dev))
         Some(id) =>
             let n: u32 = (*dev).window_count
             if n < VIO_WINDOW_NOTES

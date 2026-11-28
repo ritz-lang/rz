@@ -30,6 +30,7 @@ RING1 = KERNEL_SRC / "net" / "ring1.ritz"
 STACK = KERNEL_SRC / "net" / "stack.ritz"
 NETDEV = KERNEL_SRC / "drivers" / "netdev.ritz"
 VNET = KERNEL_SRC / "drivers" / "virtio" / "net.ritz"
+NIC = KERNEL_SRC / "drivers" / "nic.ritz"
 PROCESS = KERNEL_SRC / "syscall" / "runtime" / "process.ritz"
 POSTINIT = KERNEL_SRC / "postinit.ritz"
 NVME = KERNEL_SRC / "drivers" / "nvme" / "nvme.ritz"
@@ -86,16 +87,15 @@ def test_the_probe_arms_nothing_the_driver_owns():
     for forbidden in ("vio_device_ready(", "virtio_net_start_queue(", "virtq_add_buf(", "nic_pool_new("):
         assert forbidden not in probe, forbidden
     iso = probe.index("virtio_net_isolate(")
-    assert iso < probe.index("net_ring1_allowed()") < probe.index("virtio_net_ring1_msix(")
+    assert iso < probe.index("net_ring1_allowed()") < probe.index("nic_msix_bsp(pci_dev, @virtio_net_msix,")
     # legacy-only devices are not claimed
     assert probe.index("VIO_TRANSPORT_MMIO") < iso
 
-
-@pytest.mark.unit
-def test_msix_is_refused_unless_every_entry_is_routed_to_the_bsp():
-    msix = _fn_body(_code(VNET), "virtio_net_ring1_msix")
+    # MSI-X is refused unless every entry is routed to the BSP:
+    # drivers/nic.ritz, every ring NIC's (AGAST #4893).
+    msix = _fn_body(_code(NIC), "nic_msix_bsp")
     assert "let bsp: u32 = lapic_id()" in msix
-    assert "msix_set_entry_to(@virtio_net_msix, e, vector, bsp) != 0 or msix_entry_dest(@virtio_net_msix, e) != bsp" in msix
+    assert "msix_set_entry_to(info, e, vector, bsp) != 0 or msix_entry_dest(info, e) != bsp" in msix
     assert "return None" in msix and "return 0" not in msix
 
 
@@ -155,13 +155,18 @@ def test_spawn_grants_before_netd_runs_and_starts_the_scheduler_once():
     in one process, with the device grants and the frame object."""
     body = _fn_body(_code(RING1), "net_ring1_spawn")
     assert "sched_is_running()" in body.split("\n", 2)[1]     # a second call does nothing
-    obj = body.index("ring1_device_object(g)")
-    spawn = body.index('process_spawn_program("/bin/netd")')
-    detach = body.index("proc_detach(pid)")
-    grant = body.index("ring1_grant_to(pid, obj, g, true)")
-    yields = body.index("sched_yield()\n        yields = yields + 1")
-    start = body.index("sched_start(proc_current_slot())")
-    assert obj < spawn < detach < grant < yields < start
+    netd = _fn_body(_code(RING1), "ring1_spawn_netd")
+    obj = netd.index("ring1_device_object(g)")
+    spawn = netd.index('process_spawn_program("/bin/netd")')
+    detach = netd.index("proc_detach(pid)")
+    grant = netd.index("ring1_grant_to(pid, obj, g, true)")
+    yields = netd.index("sched_yield()\n        yields = yields + 1")
+    assert obj < spawn < detach < grant < yields
+    assert "sched_start(" not in netd
+    # Step 4 once, after steps 2-3 whatever they did: pid 1 exists, so
+    # run_init starts no scheduler of its own (AGAST #4893: a boot with no
+    # /bin/netd ran init with no tick).
+    assert body.index("ring1_spawn_netd()") < body.index("sched_start(proc_current_slot())") < body.index("None => return")
     assert body.count("sched_start(") == 1
     assert "/bin/netd pid " in body and "parked: generation 2 published" in body
 
@@ -222,7 +227,7 @@ def test_d9_wait_deadline_and_handoff_rows():
 def test_the_device_object_is_bound_to_the_domain_and_recorded_for_quiesce():
     body = _fn_body(_code(RING1), "ring1_device_object")
     assert body.index("irq_object_register(obj, g.vector)") < body.index("irq_object_bind_domain(obj, g.dom)")
-    assert "drv_device_bind(obj, g.status_va, g.msix_table_va, MSIX_ENTRIES)" in body
+    assert "drv_device_bind(obj, g.reset, g.msix_table_va, MSIX_ENTRIES)" in body
 
 
 @pytest.mark.unit
@@ -251,7 +256,9 @@ def test_the_ring_owner_logs_its_parks_not_rx_halts():
     body = _fn_body(_code(POSTINIT), "network_dhcp_ping")
     ring = body.index("if net_on_ring()")
     assert ring < body.index("drv_irq_wait_park_count()") < body.index("else if virtio_net_msix_enabled()")
-    assert "match virtio_net_ring1_vector()\n                Some(v) => klog_dec(msix_vector_count(v))" in body
+    assert "match net_ring1_vector()\n                Some(v) => klog_dec(msix_vector_count(v))" in body
+    # The line names the NIC's kind (AGAST #4893).
+    assert body.count("klog(net_ring1_nic_name())") == 2
 
 
 @pytest.mark.unit

@@ -44,7 +44,7 @@ def _code(path):
 
 
 def _fn_body(src, name):
-    m = re.search(rf"^(?:pub )?fn {name}\(.*?(?=^\S)", src + "\nEND", re.M | re.S)
+    m = re.search(rf"^(?:pub )?fn {name}(?:<[^>]*>)?\(.*?(?=^\S)", src + "\nEND", re.M | re.S)
     assert m, f"no fn {name}"
     return m.group(0)
 
@@ -108,7 +108,7 @@ def test_the_restart_waits_out_its_backoff_then_respawns():
 def test_kernel_spawned_netd_leaves_no_zombie():
     """Nobody waits for netd: its exit frees its slot (MAX_PROCS is 8, and
     four deaths a boot would otherwise hold four)."""
-    assert "proc_detach(" in _fn_body(_code(RING1), "net_ring1_spawn")
+    assert "proc_detach(" in _fn_body(_code(RING1), "ring1_spawn_netd")
     assert "proc_detach(" in _fn_body(_code(RING1), "net_netd_respawn")
     body = _fn_body(_code(PROC_TABLE), "proc_detach")
     assert "detached = 1" in body and "parent = -1" in body
@@ -142,7 +142,7 @@ NETD = HARLAND / "system" / "src" / "netd.ritz"
 @pytest.mark.unit
 def test_netd_logs_its_lease_after_the_publish_and_before_it_parks():
     loop = _fn_body(_code(NETD), "serve").split("while true", 1)[1]
-    _in_order(loop, "net_publish(g_addr)", "log_address()", "wait_once(")
+    _in_order(loop, "net_publish(g_addr)", "log_address(svc)", "wait_once(")
 
 
 
@@ -203,7 +203,7 @@ D9_RESTART_ROWS = (
      ("process_spawn_program",)),
     ("the handoff is the frame object's last use: netd drains it through its stack and drops it",
      HARLAND / "system" / "src" / "netd.ritz", "take_over",
-     ("net_publish(g_addr)", "seat_hand_over<VirtioNic>(", "cap_revoke(g_seat.handle)", "g_svc.set_link("), ()),
+     ("net_publish(g_addr)", "seat_hand_over<N>(", "cap_revoke(g_seat.handle)", "svc.set_link("), ()),
 )
 
 

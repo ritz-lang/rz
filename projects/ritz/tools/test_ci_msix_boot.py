@@ -63,9 +63,12 @@ QEMU_STUB = r"""#!/usr/bin/env bash
 echo "$@" >> "$STUB_LOG"
 # The vtd-shell boot (AGAST #4752): shell_session.py puts the serial port
 # on its unix socket, and NET_GUEST plays rzsh there.
+# The e1000e boots (AGAST #4893) have their own log and banner.
+case " $* " in *" e1000e,netdev="*) FAKE_SHELL_BANNER="$FAKE_SHELL_BANNER_E1000E" ;; esac
 case " $* " in *" socket,id=con,"*) exec python3 "$(dirname "$0")/net_guest.py" "$@" ;; esac
 log="$FAKE_SERIAL"
 case " $* " in *" intel-iommu,"*) log="$FAKE_SERIAL_VTD" ;; esac
+case " $* " in *" e1000e,netdev="*) log="$FAKE_SERIAL_E1000E" ;; esac
 prev=""
 for a in "$@"; do
     if [ "$prev" = "-serial" ]; then printf '%b' "$log" > "${a#file:}"; fi
@@ -325,6 +328,33 @@ VTD_OK = (NVME_TABLE.replace(PCI_PORT_IO, "") + IR_ON + TE_ON + NET_MODERN + NIC
           + driver_parks(41) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SEAT_OK + RESTART_OK + SUITE_PASSED)
 
 
+# The e1000e boot (AGAST #4893): the same machine as vtd with QEMU's 82574L
+# in the virtio-net's place. The kernel probes it (no virtio-net probe: one
+# NIC a boot), grants BAR0 as one window, and netd's e1000e library brings
+# it up; MSI-X, the domain, the fault probe, DHCP, the TX burst, the seat
+# and the restarts are the virtio boot's lines. No first-DMA line: E1000eNic
+# keeps no record of its first frame.
+E1000E_PROBE = r"[e1000e] Probing 8086:10D3 at 0:4.0 for the ring-1 driver\n"
+E1000E_BAR0 = r"[e1000e] BAR0 0x81020000 granted as one window of 128 KiB; the MSI-X table stays the kernel's\n"
+E1000E_ON = r"[msix] e1000e: MSI-X on, vector 66 for rx, tx and other (entries 0-2), routed to the BSP\n"
+E1000E_UP = r"[e1000e] up: MAC published, 31 RX buffers posted\n"
+E1000E_DMA_OK = NIC_DOMAIN + NIC_FAULT_RECORD + NIC_FAULT + NIC_ALLOWED + DMA_RUN_RING + DMA_RUN_POOL
+
+
+def e1000e_interrupts(n: int) -> str:
+    return rf"[msix] e1000e interrupts: {n}\n"
+
+
+def e1000e_parks(p: int) -> str:
+    return rf"[msix] e1000e driver parks: {p}\n"
+
+
+E1000E_OK = (NVME_TABLE.replace(PCI_PORT_IO, "") + IR_ON + TE_ON + E1000E_PROBE + E1000E_DMA_OK + E1000E_ON
+             + E1000E_BAR0 + RING1_PARKED + E1000E_UP + DHCP_OK + TX_BURST_OK + e1000e_interrupts(9)
+             + e1000e_parks(24) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SEAT_OK + RESTART_OK + SUITE_PASSED)
+SHELL_E1000E_OK = (RING1_PARKED + E1000E_UP + SEAT_OK).replace(r"\n", "\r\n")
+
+
 # --------------------------------------------------------------------------
 # Wiring: main.yml
 # --------------------------------------------------------------------------
@@ -426,7 +456,9 @@ def _run(tree, serial: str = "", *, qemu=True, qemu_img=True, full_path=True,
         "STUB_LOG": str(tree["tmp"] / "stub.log"),
         "FAKE_SERIAL": serial,
         "FAKE_SERIAL_VTD": VTD_OK,
+        "FAKE_SERIAL_E1000E": E1000E_OK,
         "FAKE_SHELL_BANNER": SHELL_OK,
+        "FAKE_SHELL_BANNER_E1000E": SHELL_E1000E_OK,
         # shell_session.py's pacing is for a real guest's UART and netd
         "SHELL_TYPE_DELAY": "0",
         "SHELL_NET_SETTLE": "0",
@@ -579,7 +611,7 @@ def test_boots_pc_then_q35_with_the_nic_behind_intel_iommu(tree):
     with iommu_platform=on. The first stays pc with no IOMMU."""
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
-    pc, vtd, _shell = (tree["tmp"] / "stub.log").read_text().splitlines()
+    pc, vtd, _shell, _e1k, _e1k_shell = (tree["tmp"] / "stub.log").read_text().splitlines()
     assert "-machine pc " in pc and "iommu" not in pc
     assert "-machine q35,kernel-irqchip=split " in vtd
     assert "-device intel-iommu,intremap=on,eim=on " in vtd
@@ -833,7 +865,7 @@ def test_ring1_owner_passes_on_the_translating_boot(tree):
     vtd = r.stdout.split("===== msix boot (vtd) =====")[1]
     assert "PASS: the kernel spawned /bin/netd (pid 2) and it parked with generation 2 published" in vtd
     assert "PASS: no /bin/virtio-net: the driver is netd's library" in vtd
-    assert "PASS: netd's NIC library brought the NIC up" in vtd
+    assert "PASS: netd's virtio-net library brought the NIC up" in vtd
     assert "PASS: virtio_net_init did not run: netd is the NIC's only owner" in vtd
     assert "PASS: netd parked 41 times in DrvIrqWait" in vtd
     # the in-kernel owner's RX-wait check is the pc run's alone
@@ -1011,7 +1043,7 @@ def test_the_boot_images_carry_the_driver():
 def test_vtd_shell_boots_init_interactive_with_a_udp_hostfwd(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
-    _pc, vtd, shell = (tree["tmp"] / "stub.log").read_text().splitlines()
+    _pc, vtd, shell, _e1k, _e1k_shell = (tree["tmp"] / "stub.log").read_text().splitlines()
     assert "-device intel-iommu,intremap=on,eim=on " in shell
     assert "initramfs-shell.qcow2" in shell and "initramfs-shell" not in vtd
     assert "esp-shell" in shell
@@ -1024,7 +1056,7 @@ def test_vtd_shell_boots_init_interactive_with_a_udp_hostfwd(tree):
 def test_vtd_shell_net_session_passes(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
-    shell = r.stdout.split("===== msix boot (vtd-shell): ring-3 networking =====")[1]
+    shell = r.stdout.split("===== msix boot (vtd-shell): ring-3 networking =====")[1].split("=====")[0]
     assert "PASS: `ping 10.0.2.2`: one echo through netd" in shell
     assert "PASS: the host listener on" in shell and "got one datagram `hello`" in shell
     assert "a second bind of live port" in shell and "FAIL" not in shell
@@ -1050,5 +1082,107 @@ def test_vtd_shell_net_session_passes(tree):
 def test_vtd_shell_check_fails(tree, env, want):
     r = _run(tree, PASSED, env_extra=env)
     assert r.returncode == 1, r.stdout + r.stderr
-    shell = r.stdout.split("===== msix boot (vtd-shell): ring-3 networking =====")[1]
+    shell = r.stdout.split("===== msix boot (vtd-shell): ring-3 networking =====")[1].split("=====")[0]
     assert want in shell, shell
+
+
+# --------------------------------------------------------------------------
+# The e1000e boots (AGAST #4893, docs/E1000E.md "Tests")
+# --------------------------------------------------------------------------
+
+
+def _e1000e_section(out: str) -> str:
+    return out.split("===== msix boot (e1000e) =====")[1].split("===== msix boot (e1000e-shell)")[0]
+
+
+@pytest.mark.integration
+def test_e1000e_boots_qemus_82574l_behind_the_iommu(tree):
+    """The fourth and fifth boots are vtd's machine with -device e1000e in
+    the virtio-net's place, no option ROM, and no iommu_platform (QEMU's
+    e1000e always DMAs through the IOMMU); the fifth is the shell boot."""
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    _pc, vtd, _shell, e1k, e1k_shell = (tree["tmp"] / "stub.log").read_text().splitlines()
+    for line in (e1k, e1k_shell):
+        assert "-machine q35,kernel-irqchip=split " in line
+        assert "-device intel-iommu,intremap=on,eim=on " in line
+        assert "-device e1000e,netdev=net0,romfile= " in line
+        assert "virtio-net-pci" not in line and "iommu_platform" not in line
+    assert "initramfs-shell.qcow2" in e1k_shell and "hostfwd=udp:127.0.0.1:" in e1k_shell
+    assert "initramfs-shell" not in e1k
+    assert "-device e1000e" not in vtd
+
+
+@pytest.mark.integration
+def test_e1000e_boot_passes(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    e1k = _e1000e_section(r.stdout)
+    for want in ("PASS: the kernel probed the 82574L (8086:10d3) for netd",
+                 "PASS: BAR0 is netd's one 128 KiB window; the MSI-X table (BAR3) is not granted",
+                 "PASS: netd's e1000e library posted the ring's 31 RX buffers",
+                 "PASS: DHCP got a lease over the e1000e NIC",
+                 "PASS: TX burst sent 300/300 frames",
+                 "PASS: e1000e is in MSI-X mode",
+                 "PASS: e1000e delivered 9 MSI-X interrupts",
+                 "PASS: the NIC's DMA to unmapped IOVA 0x1000006000 faulted with its source ID",
+                 "PASS: netd's e1000e library brought the NIC up",
+                 "PASS: netd parked 24 times in DrvIrqWait",
+                 "PASS: the restart budget was spent and NetAddr stayed NoDev"):
+        assert want in e1k, want
+    # virtio-net's own lines are not asked of an e1000e
+    assert "FAIL" not in e1k and "virtio-net is driven" not in e1k and "ACCESS_PLATFORM" not in e1k.split("-----")[-1]
+    shell = r.stdout.split("===== msix boot (e1000e-shell): ring-3 networking =====")[1]
+    assert "PASS: `ping 10.0.2.2`: one echo through netd" in shell
+    assert shell.count("from a new process rebinds the port") == 6
+    assert "PASS: e1000e-shell: netd's e1000e library drove the NIC" in shell
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "drop, want",
+    [
+        (E1000E_PROBE, "FAIL: the kernel did not probe the e1000e for the ring-1 driver"),
+        (E1000E_BAR0, "FAIL: the e1000e's BAR0 was not granted as one 128 KiB window"),
+        (E1000E_UP, "FAIL: netd's e1000e did not come up with 31 RX buffers posted"),
+        (E1000E_ON, "FAIL: e1000e did not come up in MSI-X mode"),
+        (e1000e_interrupts(9), "FAIL: e1000e MSI-X interrupt counter is missing"),
+        (e1000e_parks(24), "FAIL: no NIC owner park count logged ([msix] e1000e driver parks: P)"),
+        (DHCP_OK, "FAIL: DHCP got no lease over the e1000e NIC"),
+        (NIC_FAULT, "FAIL: no fault record with the NIC's source ID"),
+        (nic_reset(3), "FAIL: netd pid 3's death (kill 2) did not quiesce the NIC"),
+    ],
+    ids=["no-probe", "no-bar0-grant", "no-up", "no-msix", "no-interrupts", "no-parks",
+         "no-lease", "no-fault-probe", "no-reset-before-restart"],
+)
+def test_e1000e_boot_check_fails(tree, drop, want):
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_E1000E": E1000E_OK.replace(drop, "", 1)})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in _e1000e_section(r.stdout), r.stdout
+
+
+@pytest.mark.integration
+def test_e1000e_boot_probing_a_virtio_net_too_fails(tree):
+    """One NIC a boot: the e1000e boot has no virtio-net to probe."""
+    serial = E1000E_OK.replace(E1000E_PROBE, E1000E_PROBE + r"[virtio-net] Probing device at 0:3.0 for the ring-1 driver\n")
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_E1000E": serial})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: the e1000e boot probed a virtio-net too: one NIC a boot" in r.stdout
+
+
+@pytest.mark.integration
+def test_e1000e_shell_without_its_driver_fails(tree):
+    banner = SHELL_E1000E_OK.replace("[e1000e] up: MAC published, 31 RX buffers posted\r\n", "")
+    r = _run(tree, PASSED, env_extra={"FAKE_SHELL_BANNER_E1000E": banner})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: e1000e-shell: no \"[e1000e] up: MAC published\" from netd" in r.stdout
+
+
+@pytest.mark.integration
+def test_boots_runs_only_the_boots_it_names(tree):
+    r = _run(tree, PASSED, env_extra={"BOOTS": "e1000e"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = (tree["tmp"] / "stub.log").read_text().splitlines()
+    assert len(argv) == 1 and "e1000e,netdev=net0" in argv[0]
+    r = _run(tree, PASSED, env_extra={"BOOTS": "vtd nope"})
+    assert r.returncode == 1 and 'FAIL: BOOTS names no boot "nope"' in r.stdout

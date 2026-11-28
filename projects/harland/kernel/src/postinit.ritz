@@ -19,7 +19,7 @@ import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send,
 import syscall.errno { Errno }
 import drivers.pci { pci_print_all_devices }
 import drivers.msix { msix_print_all, msix_vector_alloc, msix_vector_count }
-import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_ring1_vector, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
+import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
 import drivers.ahci.ahci { ahci_enable_msi, ahci_msi_read_check, ahci_irq_count, ahci_irq_wait_count, ahci_irq_missed_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop, rdtsc }
@@ -72,6 +72,8 @@ import proc.waitset { waitset_inbox_len, shm_latch_post }
 import driver_abi.wait { DEVICE_WAIT_MS, EVENT_DRIVER_GONE, SHM_DETACH_TIMEOUT_MS }
 import drivers.virtio.window { phys_range, phys_range_none, vio_window_add, vio_window_remove }
 import syscall.runtime.driver { drv_device_bind, drv_device_unbind }
+import drivers.nic { NicReset }
+import net.ring1 { net_ring1_vector, net_ring1_nic_name }
 import drivers.virtio.common { VIRTIO_RESET_TIMEOUT_US, vio_reset_force_stuck }
 import driver_abi.link { link_publish }
 
@@ -2089,7 +2091,7 @@ fn drv_quiesce_self_test() -> bool
         klog("  IRQ object not registered\n")
         pmm_free_page(page)
         return false
-    let bound: bool = drv_device_bind(QUIESCE_TEST_IRQ, phys_to_virt(page + QUIESCE_STATUS_OFF), phys_to_virt(page + QUIESCE_TABLE_OFF), QUIESCE_MSIX_ENTRIES)
+    let bound: bool = drv_device_bind(QUIESCE_TEST_IRQ, NicReset.Virtio(phys_to_virt(page + QUIESCE_STATUS_OFF)), phys_to_virt(page + QUIESCE_TABLE_OFF), QUIESCE_MSIX_ENTRIES)
     sched_start(proc_current_slot())
     var clean: bool = false
     var stuck: bool = false
@@ -2315,12 +2317,17 @@ fn network_dhcp_ping(run_net_responder: bool)
             # The ring-1 owner's interrupts, counted by msix_dispatch on the
             # vector the kernel aimed entries 0-2 at, and the driver's parks
             # in DrvIrqWait: a park is not a hlt, so it is no RX-wait halt.
-            klog("[msix] virtio-net interrupts: ")
-            match virtio_net_ring1_vector()
+            # The kind's name: "virtio-net" or "e1000e" (AGAST #4893).
+            klog("[msix] ")
+            klog(net_ring1_nic_name())
+            klog(" interrupts: ")
+            match net_ring1_vector()
                 Some(v) => klog_dec(msix_vector_count(v))
                 None => klog_dec(0)
             klog("\n")
-            klog("[msix] virtio-net driver parks: ")
+            klog("[msix] ")
+            klog(net_ring1_nic_name())
+            klog(" driver parks: ")
             klog_dec(drv_irq_wait_park_count())
             klog("\n")
         else if virtio_net_msix_enabled()

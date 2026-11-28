@@ -6,19 +6,24 @@
 # translated DMA domain (kernel net/ring1.ritz). It holds the NIC's
 # CAP_TYPE_MMIO windows and CAP_TYPE_IRQ (the domain is bound to that IRQ
 # object), the link page, and the frame object while the kernel holds the
-# seat. The virtio-net driver is a library here (nic.virtio), behind
-# `trait Nic`; the kernel keeps PCI, bus mastering, the MSI-X table and the
-# IDT.
+# seat. The NIC's driver is a library here, behind `trait Nic`: nic.virtio
+# for a virtio-net, nic.e1000e for an e1000e (AGAST #4893, docs/E1000E.md
+# "One netd, chosen at boot"). The kernel keeps PCI, bus mastering, the
+# MSI-X table and the IDT.
 #
 #   1. Copy the boot record (driver_abi.boot DriverBoot) out of the link
-#      page the kernel mapped at DRV_RING_BASE, and check it.
+#      page the kernel mapped at DRV_RING_BASE, and check it: its NIC kind
+#      picks the driver, once (system/src/nicboot.ritz).
 #   2. ShmMap the link page (it must be the page at DRV_RING_BASE) and the
 #      frame object, if the record names one (a restart's names none).
-#   3. DrvMmioMap the common, notify and device-config windows and
-#      DrvDmaAlloc the NIC's rings and buffer pools; VirtioNic.up resets,
-#      negotiates (VIRTIO_F_ACCESS_PLATFORM: DMA through the domain) and sets
-#      DRIVER_OK. Publish NetInfo on the link page (link_seq 2) and
-#      NetPublish it.
+#   3. DrvMmioMap the NIC's windows and DrvDmaAlloc its rings and buffer
+#      pools, and bring it up: VirtioNic.up resets, negotiates
+#      (VIRTIO_F_ACCESS_PLATFORM: DMA through the domain) and sets
+#      DRIVER_OK; E1000eNic.up resets the MAC, reads its address, lays the
+#      rings and starts the link. Publish NetInfo on the link page
+#      (link_seq 2) and NetPublish it. Steps 4-6 are one loop, generic over
+#      the kind (run<N: Nic>): compiled once for each, with no per-frame
+#      dispatch.
 #   4. Until the handoff, be the kernel seat's producer and consumer
 #      (system/src/seat.ritz): RX frames onto the RX ring, DATA to the
 #      kernel; TX slots to the device; Yield on a full RX ring; park in
@@ -56,7 +61,9 @@ import driver_abi.dma { DmaAlloc }
 import driver_abi.link { NetInfo, link_publish }
 import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_ATTACH, WAIT_OUT_CAP, DEVICE_WAIT_MS }
 import nic.nic { Nic, DmaRun }
-import nic.virtio { VirtioNic, VirtioRegs, VirtioDma, VirtioMsix, VirtioUp, BootWindows, BootBad, UpError, RX_BUFFERS, TX_BUFFERS, COMMON_LEN, NOTIFY_LEN, NET_CFG_LEN, ring_run_bytes, pool_bytes, boot_windows }
+import nic.virtio { VirtioNic, VirtioRegs, VirtioDma, VirtioMsix, VirtioUp, BootWindows, VirtioUpError, RX_BUFFERS, TX_BUFFERS, COMMON_LEN, NOTIFY_LEN, NET_CFG_LEN, ring_run_bytes, virtio_pool_bytes }
+import nic.e1000e { E1000eNic, MmioRegs, Regs, E1000eDma, UpError, E1000E_RING_USABLE, ring_bytes, pool_bytes, e1000e_msix, up_error_name }
+import system.nicboot { NicChoice, BootRefused, nic_choice }
 import system.netsvc { NetSvc }
 import system.seat { FrameSeat, SeatPass, SeatDrain, seat_pump, seat_hand_over }
 
@@ -160,7 +167,9 @@ fn now_ms() -> u64
 
 var g_boot: DriverBoot
 var g_service: ServiceBoot
-var g_svc: NetSvc<VirtioNic>
+# The service on its NIC: one of the two runs, chosen at bring-up.
+var g_virtio: NetSvc<VirtioNic>
+var g_e1000e: NetSvc<E1000eNic<MmioRegs>>
 var g_seat: FrameSeat
 var g_link_va: u64
 # The link_up of the last NetInfo the kernel took.
@@ -179,13 +188,14 @@ var g_dma_logged: bool = false
 # Why netd exits before it ever waits. The status is 10 + the position, so
 # a boot log names the step.
 enum InitError
-    Boot(BootBad)                    # 10: no DriverBoot, or an unusable one
+    Boot(BootRefused)                # 10: no DriverBoot, or an unusable one
     Link(Errno)                      # 11: the link page is not the page at DRV_RING_BASE, or would not publish
     Frame(Errno)                     # 12: the frame object would not map
     Map(Errno)                       # 13: a window would not map
     Window                           # 14: a register block is shorter than its registers
     Dma(Errno)                       # 15: a ring or pool run would not allocate
-    Up(UpError)                      # 16: the device would not come up
+    Up(VirtioUpError)                # 16: the virtio-net would not come up
+    E1000eUp(UpError)                # 17: the e1000e would not come up
 
 fn init_status(e: InitError) -> i32
     match e
@@ -196,6 +206,7 @@ fn init_status(e: InitError) -> i32
         InitError.Window => 14
         InitError.Dma(_) => 15
         InitError.Up(_) => 16
+        InitError.E1000eUp(_) => 17
 
 # ============================================================================
 # Bring-up: the NIC
@@ -230,30 +241,40 @@ fn dma(size: u64) -> Result<DmaRun, InitError>
 fn dma_runs() -> Result<VirtioDma, InitError>
     let rx_ring: DmaRun = dma(ring_run_bytes())?
     let tx_ring: DmaRun = dma(ring_run_bytes())?
-    let rx_pool: DmaRun = dma(pool_bytes(RX_BUFFERS))?
-    let tx_pool: DmaRun = dma(pool_bytes(TX_BUFFERS))?
+    let rx_pool: DmaRun = dma(virtio_pool_bytes(RX_BUFFERS))?
+    let tx_pool: DmaRun = dma(virtio_pool_bytes(TX_BUFFERS))?
     Ok(VirtioDma { rx_ring: rx_ring, tx_ring: tx_ring, rx_pool: rx_pool, tx_pool: tx_pool })
 
 # NetInfo on the link page (generation 2 on a fresh page), then NetPublish:
 # the kernel's snapshot is what makes netd the NIC. g_link_up follows only
 # a publish the kernel took, so a refused one is tried again on the next
 # pass.
-fn publish_link() -> Result<NetInfo, Errno>
-    let info: NetInfo = g_svc.nic.link()
+fn publish_link<N: Nic>(svc: @&NetSvc<N>) -> Result<NetInfo, Errno>
+    let info: NetInfo = svc.nic.link()
     link_publish(g_link_va, @info)
     net_publish(g_boot.link)?
     g_link_up = info.link_up != 0
     Ok(info)
 
+# The first NetPublish, then the RX buffers' first doorbell.
+fn publish_up<N: Nic>(svc: @&NetSvc<N>) -> Result<(), InitError>
+    match publish_link(svc)
+        Ok(_) => pass
+        Err(e) => return Err(InitError.Link(e))
+    svc.nic.tx_kick()
+    Ok(())
+
 fn log_queue(idx: u32, num: u16, max: u16)
     print("[virtio-net] Queue {idx}: size={num} (device max {max})\n")
 
-fn bring_up() -> Result<(), InitError>
+# Steps 1 and 2, whatever the NIC: the record, the link page and the frame
+# object. The NIC the record names.
+fn bring_up() -> Result<NicChoice, InitError>
     # 1. The record, copied once before anything is published (the page is
     # this process's, but the copy is what is checked and used).
     g_boot = *driver_boot_at(DRV_RING_BASE)
-    let w: BootWindows = match boot_windows(g_boot)
-        Ok(x) => x
+    let choice: NicChoice = match nic_choice(g_boot)
+        Ok(c) => c
         Err(why) => return Err(InitError.Boot(why))
     # 2. The link page is the record's page; the frame object, while the
     # kernel holds the seat.
@@ -268,44 +289,88 @@ fn bring_up() -> Result<(), InitError>
         match shm_map(g_boot.frame)
             Ok(va) => g_seat.open(g_boot.frame, va)
             Err(e) => return Err(InitError.Frame(e))
-    # 3. The device.
+    Ok(choice)
+
+# Step 3 on a virtio-net: the common, notify and device-config windows, the
+# rings and pools, VirtioNic.up, the first publish.
+fn virtio_up(w: BootWindows) -> Result<(), InitError>
     let regs: VirtioRegs = map_regs(w)?
     let runs: VirtioDma = dma_runs()?
     let msix = VirtioMsix { config: g_boot.msix_config, rx: g_boot.msix_rx, tx: g_boot.msix_tx }
-    let up: VirtioUp = match g_svc.nic.up(regs, runs, msix)
+    let up: VirtioUp = match g_virtio.nic.up(regs, runs, msix)
         Ok(u) => u
         Err(e) => return Err(InitError.Up(e))
     print("[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated: DMA through the IOMMU\n")
     log_queue(0, up.rx_num, up.rx_max)
     log_queue(1, up.tx_num, up.tx_max)
-    match publish_link()
+    publish_up<VirtioNic>(@&g_virtio)?
+    print("[virtio-net] up: MAC published, 32 RX buffers posted\n")
+    Ok(())
+
+# Step 3 on an e1000e: BAR0, whole (nicboot checked its length), the rings
+# and pools, E1000eNic.up with the record's MSI-X entries, the first
+# publish. A refused bring-up logs why (the X99 bring-up reads this line).
+fn e1000e_up(w: DriverWindow) -> Result<(), InitError>
+    let bar0: u64 = match drv_mmio_map(w.handle)
+        Ok(va) => va
+        Err(e) => return Err(InitError.Map(e))
+    let runs = E1000eDma { rx_ring: dma(ring_bytes())?, tx_ring: dma(ring_bytes())?, rx_pool: dma(pool_bytes())?, tx_pool: dma(pool_bytes())? }
+    match g_e1000e.nic.up(MmioRegs { base: bar0 }, runs, e1000e_msix(g_boot))
         Ok(_) => pass
-        Err(e) => return Err(InitError.Link(e))
-    # The RX buffers' first doorbell.
-    g_svc.nic.tx_kick()
+        Err(e) =>
+            let why: StrView = up_error_name(e)
+            print("[e1000e] up refused: {why}\n")
+            return Err(InitError.E1000eUp(e))
+    publish_up<E1000eNic<MmioRegs>>(@&g_e1000e)?
+    let posted: u32 = E1000E_RING_USABLE
+    print("[e1000e] up: MAC published, {posted} RX buffers posted\n")
     Ok(())
 
 # ============================================================================
 # Shared: events, the link, the log
 # ============================================================================
 
-fn log_first_dma()
-    if g_dma_logged or g_svc.nic.first_rx_len == 0
+# The first frame a NIC received: its length and the IOVA the device wrote.
+struct FirstRx
+    len: u32
+    iova: u64
+
+# What netd's loop asks of its Nic beyond trait Nic. A Nic that keeps no
+# record of its first frame answers None: VirtioNic keeps one, E1000eNic
+# does not (its ring's first slot is rewritten by the refill).
+trait FirstDma
+    fn first_dma(self: @Self) -> Option<FirstRx>
+
+impl FirstDma for VirtioNic
+    fn first_dma(self: @VirtioNic) -> Option<FirstRx>
+        if self.first_rx_len == 0
+            return None
+        Some(FirstRx { len: self.first_rx_len, iova: self.first_rx_iova })
+
+impl<R: Regs> FirstDma for E1000eNic<R>
+    fn first_dma(self: @E1000eNic<R>) -> Option<FirstRx>
+        None
+
+fn log_first_dma<N: Nic + FirstDma>(svc: @NetSvc<N>)
+    if g_dma_logged
         return
+    let first: FirstRx = match svc.nic.first_dma()
+        Some(f) => f
+        None => return
     # The device wrote it through the NIC's domain into a DrvDmaAlloc run:
     # the kernel logged that run's IOVAs, so the boot test can place this
     # one in it (AGAST #4735).
     g_dma_logged = true
-    let n: u32 = g_svc.nic.first_rx_len
-    let iova: u64 = g_svc.nic.first_rx_iova
+    let n: u32 = first.len
+    let iova: u64 = first.iova
     print("[virtio-net] device DMA: {n} bytes received into granted IOVA {iova}\n")
 
 # A config interrupt may mean the link changed: publish the new state.
 # Some(info) when it changed and the kernel took it.
-fn link_changed() -> Option<NetInfo>
-    if (g_svc.nic.link().link_up != 0) == g_link_up
+fn link_changed<N: Nic>(svc: @&NetSvc<N>) -> Option<NetInfo>
+    if (svc.nic.link().link_up != 0) == g_link_up
         return None
-    match publish_link()
+    match publish_link(svc)
         Ok(info) => Some(info)
         Err(_) =>
             print("[netd] NetPublish refused the link change\n")
@@ -364,9 +429,9 @@ fn seat_detach()
 
 # One pass and, unless the RX ring is full, one wait. Returns when the
 # address page has come.
-fn seat_loop() -> Result<(), Errno>
+fn seat_loop<N: Nic + FirstDma>(svc: @&NetSvc<N>) -> Result<(), Errno>
     while g_addr == 0
-        let pass: SeatPass = seat_pump<VirtioNic>(@&g_seat, @&g_svc.nic)
+        let pass: SeatPass = seat_pump<N>(@&g_seat, @&svc.nic)
         if pass.published > 0
             shm_notify(g_seat.handle, EVENT_DATA)
         if pass.sent + pass.rejected > 0
@@ -374,8 +439,8 @@ fn seat_loop() -> Result<(), Errno>
         if pass.closed.is_some()
             print("[netd] frame ring closed: impossible kernel index\n")
             seat_detach()
-        log_first_dma()
-        link_changed()
+        log_first_dma(svc)
+        link_changed(svc)
         # A full RX ring: TX was drained in this pass; let the seat run.
         if pass.full and g_seat.attached
             yield_cpu()
@@ -408,12 +473,12 @@ fn seat_loop() -> Result<(), Errno>
 # the seat is netd's. Then the seat's drain, its CapRevoke, and DHCP.
 # False when the kernel refused the ready publish: netd drops the page and
 # stays the seat's driver.
-fn take_over() -> bool
+fn take_over<N: Nic>(svc: @&NetSvc<N>) -> bool
     g_tsc_per_ms = g_service.tsc_hz / 1000
-    g_svc.init(g_addr_va, (rdtsc() & 0xFFFFFFFF) as u32)
-    let link: NetInfo = g_svc.nic.link()
-    g_svc.ready(link)
-    g_svc.take_publish_due()
+    svc.init(g_addr_va, (rdtsc() & 0xFFFFFFFF) as u32)
+    let link: NetInfo = svc.nic.link()
+    svc.ready(link)
+    svc.take_publish_due()
     match net_publish(g_addr)
         Ok(_) => pass
         Err(_) =>
@@ -426,15 +491,15 @@ fn take_over() -> bool
     # read them there, not from the copy.
     if g_seat.attached
         let at: *ServiceBoot = service_boot_at(g_addr_va)
-        let drain: SeatDrain = seat_hand_over<VirtioNic>(@&g_seat, @&g_svc, at.seat_rx_read, now_ms())
+        let drain: SeatDrain = seat_hand_over<N>(@&g_seat, svc, at.seat_rx_read, now_ms())
         cap_revoke(g_seat.handle)
         let tx: u32 = drain.tx_sent
         let rx: u32 = drain.rx_frames
         print("[netd] seat taken: {tx} TX and {rx} RX frames from the kernel\n")
-    g_svc.set_link(link, now_ms())
-    g_svc.nic.tx_kick()
+    svc.set_link(link, now_ms())
+    svc.nic.tx_kick()
     for i in 0..g_early_count
-        attach(g_early[i])
+        attach(svc, g_early[i])
     g_early_count = 0
     true
 
@@ -443,10 +508,10 @@ fn take_over() -> bool
 # ============================================================================
 
 # An ATTACH record's exchange: map it and serve it, or drop it.
-fn attach(h: u64)
+fn attach<N: Nic>(svc: @&NetSvc<N>, h: u64)
     match shm_map(h)
         Ok(va) =>
-            if not g_svc.attach(h, va)
+            if not svc.attach(h, va)
                 cap_revoke(h)
         Err(_) => cap_revoke(h)
 
@@ -454,8 +519,8 @@ fn attach(h: u64)
 # 0 for none: 0.0.0.0 is never a lease's address.
 var g_logged: u32 = 0
 
-fn log_address()
-    let now: u32 = g_svc.address().unwrap_or(0)
+fn log_address<N: Nic>(svc: @NetSvc<N>)
+    let now: u32 = svc.address().unwrap_or(0)
     if now == g_logged
         return
     g_logged = now
@@ -467,38 +532,38 @@ fn log_address()
     let b3 = now & 0xFF
     print("[netd] configured {b0}.{b1}.{b2}.{b3}\n")
 
-fn serve() -> i32
+fn serve<N: Nic + FirstDma>(svc: @&NetSvc<N>) -> i32
     while true
         let now = now_ms()
-        g_svc.service(now)
-        log_first_dma()
+        svc.service(now)
+        log_first_dma(svc)
         while true
-            match g_svc.take_notify()
+            match svc.take_notify()
                 Some(n) => shm_notify(n.handle, n.bits)
                 None => break
         while true
-            match g_svc.take_revoke()
+            match svc.take_revoke()
                 Some(h) => cap_revoke(h)
                 None => break
-        if g_svc.take_publish_due()
+        if svc.take_publish_due()
             match net_publish(g_addr)
-                Ok(_) => log_address()
-                Err(_) => g_svc.publish_failed()
-        match link_changed()
+                Ok(_) => log_address(svc)
+                Err(_) => svc.publish_failed()
+        match link_changed(svc)
             Some(info) =>
                 # Link up sends DHCP's discover: its doorbell now, not after
                 # the wait.
-                g_svc.set_link(info, now_ms())
-                g_svc.nic.tx_kick()
+                svc.set_link(info, now_ms())
+                svc.nic.tx_kick()
             None => pass
         let sources: [WaitSource] = @g_sources
-        let apps = g_svc.app_sources(sources)
-        match wait_once(apps, g_svc.deadline(now))
+        let apps = svc.app_sources(sources)
+        match wait_once(apps, svc.deadline(now))
             Ok(events) =>
-                g_svc.app_wake(events)
+                svc.app_wake(events)
                 for i in 0..events.len
                     if (events[i].bits & EVENT_ATTACH) != 0
-                        attach(events[i].handle)
+                        attach(svc, events[i].handle)
             Err(e) =>
                 match e
                     Errno.Again => yield_cpu()
@@ -506,21 +571,37 @@ fn serve() -> i32
                         print("[netd] DrvIrqWait failed: exiting\n")
                         return 1
 
-pub fn main(args: Span<StrView>) -> i32
-    match bring_up()
-        Ok(_) => pass
-        Err(e) =>
-            let code: i32 = init_status(e)
-            print("[netd] bring-up failed: exit {code}\n")
-            return code
-    print("[virtio-net] up: MAC published, 32 RX buffers posted\n")
+# Steps 4-6 on the NIC brought up in `svc`: the kernel seat's driver until
+# the handoff, then the service.
+fn run<N: Nic + FirstDma>(svc: @&NetSvc<N>) -> i32
     while true
-        match seat_loop()
+        match seat_loop(svc)
             Ok(_) => pass
             Err(_) =>
                 print("[netd] DrvIrqWait failed: exiting\n")
                 return 1
-        if take_over()
+        if take_over(svc)
             break
     print("[netd] ready: generation 2 published\n")
-    serve()
+    serve(svc)
+
+fn init_failed(e: InitError) -> i32
+    let code: i32 = init_status(e)
+    print("[netd] bring-up failed: exit {code}\n")
+    code
+
+pub fn main(args: Span<StrView>) -> i32
+    let choice: NicChoice = match bring_up()
+        Ok(c) => c
+        Err(e) => return init_failed(e)
+    # The one match on the kind (DriverBoot.nic): each arm brings its NIC up
+    # and runs the loop compiled for it.
+    match choice
+        NicChoice.Virtio(w) =>
+            match virtio_up(w)
+                Ok(_) => run<VirtioNic>(@&g_virtio)
+                Err(e) => init_failed(e)
+        NicChoice.E1000e(w) =>
+            match e1000e_up(w)
+                Ok(_) => run<E1000eNic<MmioRegs>>(@&g_e1000e)
+                Err(e) => init_failed(e)

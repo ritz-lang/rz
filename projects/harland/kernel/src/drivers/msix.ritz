@@ -34,6 +34,7 @@
 
 import klog { klog, klog_dec, klog_hex, klog_hex_width }
 import mm.vmm { vmm_map_mmio }
+import drivers.virtio.window { PhysRange, phys_range, phys_range_none }
 import drivers.pci { PciDevice, pci_find_capability, pci_dev_read_config16, pci_dev_read_config32, pci_dev_write_config16, pci_dev_write_config32, pci_dev_sid, pci_enable_memory, pci_get_device_count, pci_get_device }
 import drivers.msi_cap { MsiLayout, msi_layout, msi_ctrl_one, msi_ctrl_off, PCI_CAP_MSI, MSI_CAP_CONTROL, MSI_CAP_ADDR_LO, MSI_CAP_ADDR_HI }
 import arch.x86_64.irq_dest { msi_addr_lo, msi_addr_dest, IRQ_DEST_NONE }
@@ -56,6 +57,7 @@ pub const PCI_CAP_MSIX: u8 = 0x11
 # Capability layout (offsets from the capability pointer)
 const MSIX_CAP_CONTROL: u8 = 2      # 16-bit Message Control
 const MSIX_CAP_TABLE: u8 = 4        # 32-bit Table Offset / BIR
+const MSIX_CAP_PBA: u8 = 8          # 32-bit PBA Offset / BIR
 
 # Message Control bits
 const MSIX_CTRL_TABLE_SIZE: u16 = 0x07FF    # table size - 1
@@ -129,6 +131,31 @@ pub fn msix_probe(dev: *PciDevice, out: *MsixInfo) -> i32
     if bar > 5 or (*dev).bar_is_io[bar] != 0 or (*dev).bar[bar] == 0
         return -1
     return 0
+
+# The physical bytes of a function's MSI-X table and pending-bit array:
+# what a CAP_TYPE_MMIO window must never cover (drivers/virtio/window.ritz
+# vio_window_guarded), whichever driver records the window.
+pub struct MsixRanges
+    table: PhysRange
+    pba: PhysRange
+
+# The physical bytes the MSI-X register at `reg` (table or PBA, PCI 3.0
+# section 6.8.2: a BIR in bits 0-2 and an offset in the rest) names, `len`
+# long, or no range when its BIR is not a memory BAR.
+fn msix_register_range(dev: *PciDevice, reg: u8, len: u64) -> PhysRange
+    let loc: u32 = pci_dev_read_config32(dev, reg)
+    let bir: i32 = (loc & 0x7) as i32
+    if bir > 5 or (*dev).bar_is_io[bir] != 0 or (*dev).bar[bir] == 0
+        return phys_range_none()
+    phys_range((*dev).bar[bir] + ((loc & 0xFFFFFFF8) as u64), len)
+
+# dev's MSI-X table and PBA, or no ranges when it has no MSI-X capability.
+pub fn msix_ranges(dev: *PciDevice) -> MsixRanges
+    let cap: u8 = pci_find_capability(dev, PCI_CAP_MSIX)
+    if cap == 0
+        return MsixRanges { table: phys_range_none(), pba: phys_range_none() }
+    let entries: u64 = ((pci_dev_read_config16(dev, cap + MSIX_CAP_CONTROL) & MSIX_CTRL_TABLE_SIZE) as u64) + 1
+    MsixRanges { table: msix_register_range(dev, cap + MSIX_CAP_TABLE, entries * MSIX_ENTRY_SIZE), pba: msix_register_range(dev, cap + MSIX_CAP_PBA, (entries + 63) / 64 * 8) }
 
 # ============================================================================
 # Enabling

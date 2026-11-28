@@ -45,6 +45,8 @@ MSIX = KERNEL_SRC / "drivers" / "msix.ritz"
 IR = KERNEL_SRC / "drivers" / "iommu" / "ir.ritz"
 VIRTIO_COMMON = KERNEL_SRC / "drivers" / "virtio" / "common.ritz"
 VIRTIO_NET = KERNEL_SRC / "drivers" / "virtio" / "net.ritz"
+NIC = KERNEL_SRC / "drivers" / "nic.ritz"
+E1000E = KERNEL_SRC / "drivers" / "e1000e.ritz"
 
 PROGRAM = """\
 import drivers.iommu.dmar
@@ -1223,14 +1225,19 @@ def test_nic_bus_master_waits_for_its_private_domain():
                      r"if isolate\s+vdev = vio_init_device_isolated\(pci_dev\)", init), init
     assert init.index("virtio_net_isolate(pci_dev, vdev)") < init.index("virtio_net_setup_msix")
     iso = _body(net, "virtio_net_isolate")
-    named = iso.index("if not req.named")
-    dom = iso.index("dma_private_domain(span_from_ptr<u32>(@req.sids[0], req.count as i64))")
-    bm = iso.index("pci_enable_bus_master(pci_dev)")
-    probe = iso.index("virtio_net_fault_probe(vdev, sid)")
-    assert named < dom < bm < probe, iso
-    assert iso[named:dom].count("return false") == 1 and iso[dom:bm].count("return false") == 1
-    # bus master is set nowhere else in the NIC driver
-    assert net.count("pci_enable_bus_master(") == 1
+    assert iso.index("nic_private_domain(pci_dev)") < iso.index("virtio_net_fault_probe(vdev, pci_dev_sid(pci_dev))")
+    assert "None => return false" in iso
+    # The domain before bus master is every ring NIC's (drivers/nic.ritz,
+    # AGAST #4893).
+    nicd = _body(_code(NIC), "nic_private_domain")
+    named = nicd.index("if not req.named")
+    dom = nicd.index("dma_private_domain(span_from_ptr<u32>(@req.sids[0], req.count as i64))")
+    bm = nicd.index("pci_enable_bus_master(dev)")
+    assert named < dom < bm, nicd
+    assert nicd[named:dom].count("return None") == 1 and nicd[dom:bm].count("return None") == 1
+    # bus master is set nowhere else in either NIC's kernel code
+    assert "pci_enable_bus_master(" not in net
+    assert "pci_enable_bus_master(" not in _code(E1000E)
 
 
 @pytest.mark.unit
@@ -1249,10 +1256,13 @@ def test_nic_dma_goes_through_its_domain():
     poll = _body(net, "virtio_net_poll")
     assert "virtio_rx_pool.virt + (rx_addr - virtio_rx_pool.dev)" in poll and "phys_to_virt(rx_addr)" not in poll
     probe = _body(net, "virtio_net_fault_probe")
-    assert "dma_domain_hole(virtio_net_dom)" in probe and "f.sid == sid and f.iova == hole" in probe
-    assert probe.index("virtq_kick(txq)") < probe.index("match dma_fault_next()")
+    assert "dma_domain_hole(virtio_net_dom)" in probe
+    assert probe.index("nic_faults_drain()") < probe.index("virtq_kick(txq)") < probe.index("nic_fault_seen(sid, hole)")
     assert "virtio_net_reset_done(vdev)" in probe
-    allowed = _body(net, "net_ring1_allowed")
+    seen = _body(_code(NIC), "nic_fault_seen")
+    assert "match dma_fault_next()" in seen and "f.sid == sid and f.iova == hole" in seen
+    assert "nic_ring1_allowed(virtio_net.pci_dev, virtio_net_dom)" in _body(net, "net_ring1_allowed")
+    allowed = _body(_code(NIC), "nic_ring1_allowed")
     assert "dma_isolation_live()" in allowed and "dma_requester_isolated(" in allowed
 
 

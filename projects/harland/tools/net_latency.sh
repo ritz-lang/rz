@@ -5,6 +5,7 @@
 #
 #   bash projects/harland/tools/net_latency.sh            # build, then measure
 #   SKIP_BUILD=1 bash projects/harland/tools/net_latency.sh
+#   NIC=e1000e bash projects/harland/tools/net_latency.sh # QEMU's 82574L
 #
 # Measures ICMP echo RTT, host -> guest -> host, on each owner of the guest's
 # network stack, and a UDP round trip on the ring path:
@@ -20,9 +21,14 @@
 #                /bin/udp-echo (port 7), and the wire sends UDP datagrams
 #                to it and times each until its bytes come back: netd and
 #                an app, the whole ring path.
-# Both boots are q35 with the split irqchip, the same CPU, memory and NIC
-# (modern virtio-net, rx_queue_size=1024); the translating one adds the
-# IOMMU and VIRTIO_F_ACCESS_PLATFORM, which a ring-1 driver needs.
+# Both boots are q35 with the split irqchip, the same CPU, memory and NIC;
+# the translating one adds the IOMMU, which a ring-1 driver needs. NIC picks
+# it (AGAST #4893, docs/E1000E.md "Tests"):
+#   virtio   (the default) a modern virtio-net, rx_queue_size=1024, with
+#            VIRTIO_F_ACCESS_PLATFORM on the translating boot;
+#   e1000e   QEMU's 82574L. Harland has no in-kernel e1000e driver, so the
+#            untranslated boot measures the wire floor alone and there is
+#            no in-kernel row; netd's e1000e library is the ring owner.
 #
 # The ESP carries \harland\net-selftest and \harland\net-responder, so the
 # kernel opens a fixed-length latency window on each owner
@@ -42,9 +48,9 @@
 # the same hub with no guest in the path, first on the pc boot: subtract it
 # from an owner's numbers for the guest's share, and rerun on a loaded host.
 #
-# Env: COUNT (200), WARMUP (20), INTERVAL_MS (10), ACCEL (kvm if /dev/kvm is
-# usable, else tcg), BOOT_TIMEOUT (300 s per boot), KEEP_WORK=DIR (keep the
-# serial logs there).
+# Env: NIC (virtio or e1000e, above), COUNT (200), WARMUP (20), INTERVAL_MS
+# (10), ACCEL (kvm if /dev/kvm is usable, else tcg), BOOT_TIMEOUT (300 s per
+# boot), KEEP_WORK=DIR (keep the serial logs there).
 # Exit: 0 = every owner measured; 1 = a boot or a window failed; 3 = a
 # required tool is missing.
 
@@ -61,10 +67,12 @@ INTERVAL_MS="${INTERVAL_MS:-10}"
 GUEST_MAC="52:54:00:12:34:56"
 SLIRP_MAC="52:55:0a:00:02:02"   # slirp's gateway, 10.0.2.2
 WIRE="$SCRIPT_DIR/net_latency_wire.py"
+NIC="${NIC:-virtio}"
 
 setup_error() { echo "SETUP ERROR: $*" >&2; exit 3; }
 command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not found"
 command -v python3 >/dev/null || setup_error "python3 not found"
+case "$NIC" in virtio|e1000e) ;; *) echo "FAIL: NIC=$NIC: want virtio or e1000e"; exit 1 ;; esac
 if [ -z "${OVMF_CODE:-}" ]; then
     for p in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd; do
         if [ -f "$p" ]; then OVMF_CODE="$p"; break; fi
@@ -124,11 +132,14 @@ RESULTS="$WORK/results.jsonl"
 # run the wire against each owner's window in turn.
 measure() {
     local name="$1"; shift
-    local serial="$WORK/$name.log" iommu=() platform="" vars=()
+    local serial="$WORK/$name.log" iommu=() platform="" vars=() nic_dev
     if [ "$name" = vtd ]; then
         iommu=(-device intel-iommu,intremap=on,eim=on)
         platform=",iommu_platform=on"
     fi
+    nic_dev="virtio-net-pci,netdev=nic0,mac=$GUEST_MAC,romfile=,disable-legacy=on,rx_queue_size=1024$platform"
+    # The e1000e's DMA always goes through the IOMMU: no iommu_platform.
+    [ "$NIC" = e1000e ] && nic_dev="e1000e,netdev=nic0,mac=$GUEST_MAC,romfile="
     if [ -n "$OVMF_VARS" ]; then
         cp "$OVMF_VARS" "$WORK/vars-$name.fd"
         vars=(-drive "if=pflash,format=raw,file=$WORK/vars-$name.fd")
@@ -142,7 +153,7 @@ measure() {
         -device virtio-blk-pci,drive=initramfs,disable-legacy=on \
         -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
         -netdev hubport,id=nic0,hubid=0 \
-        -device "virtio-net-pci,netdev=nic0,mac=$GUEST_MAC,romfile=,disable-legacy=on,rx_queue_size=1024$platform" \
+        -device "$nic_dev" \
         -netdev user,id=slirp0 -netdev hubport,id=hp1,hubid=0,netdev=slirp0 \
         -netdev "dgram,id=wire0,local.type=inet,local.host=127.0.0.1,local.port=$QEMU_PORT,remote.type=inet,remote.host=127.0.0.1,remote.port=$WIRE_PORT" \
         -netdev hubport,id=hp2,hubid=0,netdev=wire0 \
@@ -182,10 +193,16 @@ measure() {
     if [ -s "$WORK/qemu-$name.err" ]; then cat "$WORK/qemu-$name.err"; fi
 }
 
-echo "=== net latency: accel=$ACCEL count=$COUNT warmup=$WARMUP interval=${INTERVAL_MS}ms ($(date -u +%Y-%m-%dT%H:%MZ), $(uname -n))"
+echo "=== net latency: nic=$NIC accel=$ACCEL count=$COUNT warmup=$WARMUP interval=${INTERVAL_MS}ms ($(date -u +%Y-%m-%dT%H:%MZ), $(uname -n))"
 [ "$ACCEL" = kvm ] || echo "NOTE: TCG, not KVM: the numbers are the emulator's as much as the guest's"
-echo "--- pc: the wire floor, then in-kernel"
-measure pc wire-floor in-kernel
+if [ "$NIC" = e1000e ]; then
+    # No in-kernel e1000e: the untranslated boot has no network owner.
+    echo "--- pc: the wire floor (no in-kernel e1000e driver)"
+    measure pc wire-floor
+else
+    echo "--- pc: the wire floor, then in-kernel"
+    measure pc wire-floor in-kernel
+fi
 echo "--- vtd: kernel-ring, then netd, then netd-udp"
 measure vtd kernel-ring netd netd-udp
 

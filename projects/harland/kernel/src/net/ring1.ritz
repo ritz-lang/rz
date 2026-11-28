@@ -1,18 +1,22 @@
-# net/ring1.ritz - the virtio-net cutover (AGAST #4735, #4875;
+# net/ring1.ritz - the NIC cutover (AGAST #4735, #4875, #4893;
 # docs/RING1_DRIVER.md sections 8-9 and PR 8, docs/RING2_NET.md "Drivers
-# inside netd (D9)", ring plan T29)
+# inside netd (D9)", docs/E1000E.md "Kernel side", ring plan T29)
 #
-# On every boot with a virtio-net and a translated DMA domain the NIC's
+# On every boot with a ring NIC and a translated DMA domain the NIC's
 # queues belong to /bin/netd, a CPL-3 process the kernel spawns that runs
-# the virtio-net driver as a library beside the network stack (D9), and
+# the NIC's driver as a library beside the network stack (D9), and
 # virtio_net_init never runs (D7: the boot picks the owner, not a marker
-# file). An untranslated boot keeps virtio_net_init and spawns nothing.
+# file). The ring NIC is one per boot: a virtio-net, else an e1000e
+# (drivers/nic.ritz), and DriverBoot names its kind so netd runs that
+# driver. An untranslated boot keeps virtio_net_init and spawns nothing
+# (it has no e1000e driver at all).
 # kernel_main runs steps 1-4 before postinit_diagnostics and run_init,
 # whether or not \harland\net-selftest is set:
 #
-#   1. net_ring1_prepare: the probe (virtio_net_ring1_probe: the NIC
-#      isolated in its private domain, MSI-X entries 0-2 on one vector at
-#      the BSP, its windows recorded), then process_create_init. Pid 1
+#   1. net_ring1_prepare: the probe (virtio_net_ring1_probe, else
+#      e1000e_ring1_probe: the NIC isolated in its private domain, MSI-X
+#      entries 0-2 on one vector at the BSP, its windows recorded), then
+#      process_create_init. Pid 1
 #      exists, at CPL 0, with the scheduler stopped. kernel_main moves onto
 #      pid 1's kernel stack (the boot stack is not in a child's page table)
 #      and calls net_ring1_spawn there.
@@ -24,7 +28,7 @@
 #      (ring_seat_open: mapped into netd, and into pid 1, the kernel seat);
 #      the IRQ; one MMIO handle per window.
 #   3. Pid 1 yields while the scheduler is stopped: nothing preempts netd,
-#      which resets the device, sets DRIVER_OK, publishes generation 2
+#      which resets the device, brings it up, publishes generation 2
 #      (NetPublish), posts its RX buffers and parks in DrvIrqWait; that
 #      park is the switch back.
 #   4. sched_start, once: run_init does not call it again.
@@ -58,8 +62,8 @@
 #
 # Step 7 (AGAST #4745, #4875, ring plan T39) is netd's death and restart,
 # armed once step d has run: sys_exit_impl quiesces the NIC first
-# (driver_quiesce: MSI-X masked, virtio status 0 read back, its DMA out of
-# the domain, NetInfo NoDev), invalidates NetAddr, retires netd's exchanges
+# (driver_quiesce: MSI-X masked, its reset read back, its DMA out of the
+# domain, NetInfo NoDev), invalidates NetAddr, retires netd's exchanges
 # and restarts /bin/netd at most NETD_RESTARTS times a boot
 # (net_netd_respawn), only while every quiesce left the NIC fit, each with
 # the device grants and new link and address pages, and no frame object.
@@ -95,14 +99,16 @@ import syscall.runtime.net { net_link_register, ring_driver_published, net_addr_
 import syscall.runtime.net { ServicePage, NETD_RESTARTS, net_service_page, net_service_boot, net_service_attach_page, net_restart_arm, net_restart_armed, net_service_pid, net_addr_configured_by, net_addr_snapshot, pml4_of }
 import syscall.runtime.driver { drv_device_bind, drv_device_fit, drv_device_unmask }
 import syscall.runtime.process { process_create_init, process_spawn_program, process_mark_exit }
-import drivers.virtio.net { NicGrant, virtio_net_ring1_probe }
+import drivers.nic { NicGrant }
+import drivers.virtio.net { virtio_net_ring1_probe }
+import drivers.e1000e { e1000e_ring1_probe }
 import drivers.virtio.window { VioWindow, vio_window_find }
 import syscall.stack { kstack_top }
-import driver_abi.boot { DriverBoot, DriverWindow, DRV_RING_BASE, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, driver_boot_at }
+import driver_abi.boot { DriverBoot, DriverWindow, DRV_RING_BASE, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, NIC_KIND_E1000E, driver_boot_at }
 import driver_abi.boot { ServiceBoot, service_boot_at }
 
-# The driver's MSI-X table indexes: config changes, the RX and TX queues
-# (virtio_net_ring1_probe aims all three at the grant's vector).
+# The driver's MSI-X table indexes: config changes (the 82574L's Other), the
+# RX and TX queues (each probe aims all three at the grant's vector).
 const MSIX_CONFIG: u16 = 0
 const MSIX_RX: u16 = 1
 const MSIX_TX: u16 = 2
@@ -141,7 +147,10 @@ pub fn net_ring1_boot(tail: fn())
 # Step 1. True when the NIC was handed to the ring-1 driver: pid 1 exists
 # (process_create_init).
 fn net_ring1_prepare() -> bool
-    match virtio_net_ring1_probe()
+    let probed: Option<NicGrant> = match virtio_net_ring1_probe()
+        Some(g) => Some(g)
+        None => e1000e_ring1_probe()
+    match probed
         Some(g) =>
             ring1_grant = g
             ring1_probed = true
@@ -152,6 +161,18 @@ fn net_ring1_prepare() -> bool
 # The pid of the first netd (step 2), 0 before or without one.
 pub fn net_ring1_pid() -> u64
     ring1_pid
+
+# The ring NIC's vector, None when no NIC was handed over (step 1).
+pub fn net_ring1_vector() -> Option<u8>
+    if not ring1_probed
+        return None
+    Some(ring1_grant.vector)
+
+# The ring NIC's kind as the boot log names it: "virtio-net" or "e1000e".
+pub fn net_ring1_nic_name() -> StrView
+    if ring1_grant.kind == NIC_KIND_E1000E
+        return "e1000e"
+    "virtio-net"
 
 fn packed(h: CapHandle) -> u64
     let index: u32 = h.index
@@ -169,15 +190,15 @@ fn ring1_fail(why: StrView) -> bool
     false
 
 # The device as an IRQ object: latched by the grant's vector, its runs
-# mapped in its private domain, and recorded for driver_quiesce (its
-# device_status and MSI-X table through the kernel's own mappings).
+# mapped in its private domain, and recorded for driver_quiesce (its reset
+# and MSI-X table through the kernel's own mappings).
 fn ring1_device_object(g: NicGrant) -> Option<u64>
     let obj: u64 = NIC_IRQ_OBJECT_BASE | g.sid as u64
     if not irq_object_register(obj, g.vector)
         return None
     if not irq_object_bind_domain(obj, g.dom)
         return None
-    if not drv_device_bind(obj, g.status_va, g.msix_table_va, MSIX_ENTRIES)
+    if not drv_device_bind(obj, g.reset, g.msix_table_va, MSIX_ENTRIES)
         return None
     Some(obj)
 
@@ -222,7 +243,7 @@ fn ring1_grant_to(pid: u64, obj: u64, g: NicGrant, with_seat: bool) -> bool
     boot.msix_config = MSIX_CONFIG
     boot.msix_rx = MSIX_RX
     boot.msix_tx = MSIX_TX
-    boot._pad = 0
+    boot.nic = g.kind
     var i: u32 = 0
     while i < g.window_count and i < DRIVER_BOOT_WINDOWS
         let w: VioWindow = match vio_window_find(g.window_ids[i])
@@ -249,16 +270,38 @@ fn ring1_parked(pid: u64) -> bool
 
 # Steps 2-4, as pid 1 on its own kernel stack (kstack_call), the scheduler
 # stopped. Logs "[net-ring1] /bin/netd pid P parked: generation 2
-# published" when netd is the NIC's owner.
+# published" when netd is the NIC's owner. Step 4 runs whether or not netd
+# did: step 1 made pid 1, so run_init starts no scheduler of its own, and a
+# boot whose netd never ran (no /bin/netd in its initramfs, say: a q35
+# boot test's default e1000e, AGAST #4893) would otherwise run init with no
+# tick.
 pub fn net_ring1_spawn()
     if not ring1_probed or ring1_pid != 0 or sched_is_running()
         return
+    let netd: Option<u64> = ring1_spawn_netd()
+    # Step 4: the tick from now on; run_init does not start it again.
+    sched_start(proc_current_slot())
+    let spawned: u64 = match netd
+        Some(p) => p
+        None => return
+    if ring1_parked(spawned) and ring_driver_published()
+        klog("[net-ring1] /bin/netd pid ")
+        klog_dec(spawned as i64)
+        klog(" parked: generation 2 published\n")
+    else
+        klog("[net-ring1] /bin/netd pid ")
+        klog_dec(spawned as i64)
+        klog(" did not park with its link published: the NIC has no owner on this boot\n")
+
+# Steps 2 and 3: the device object, netd's spawn and grants, and netd's run
+# to its first park. Its pid, or None when there is no netd (logged).
+fn ring1_spawn_netd() -> Option<u64>
     let g: NicGrant = ring1_grant
     let obj: u64 = match ring1_device_object(g)
         Some(id) => id
         None =>
             ring1_fail("the device's IRQ object was not made")
-            return
+            return None
     ring1_obj = obj
     let pid: u64 = match process_spawn_program("/bin/netd")
         Result.Ok(p) => p
@@ -266,7 +309,7 @@ pub fn net_ring1_spawn()
             klog("[net-ring1] /bin/netd was not spawned (errno ")
             klog_dec(e as i64)
             klog("): the NIC has no owner on this boot\n")
-            return
+            return None
     # Nobody waits for netd: its exit leaves no zombie (#4745).
     proc_detach(pid)
     if not ring1_grant_to(pid, obj, g, true)
@@ -274,23 +317,14 @@ pub fn net_ring1_spawn()
         # every grant go with it.
         process_mark_exit(pid)
         sched_yield()
-        return
+        return None
     ring1_pid = pid
     # Step 3: netd runs, uninterrupted, until its first park.
     var yields: i32 = 0
     while not ring1_parked(pid) and yields < FIRST_PARK_YIELDS
         sched_yield()
         yields = yields + 1
-    # Step 4: the tick from now on; run_init does not start it again.
-    sched_start(proc_current_slot())
-    if ring1_parked(pid) and ring_driver_published()
-        klog("[net-ring1] /bin/netd pid ")
-        klog_dec(pid as i64)
-        klog(" parked: generation 2 published\n")
-    else
-        klog("[net-ring1] /bin/netd pid ")
-        klog_dec(pid as i64)
-        klog(" did not park with its link published: the NIC has no owner on this boot\n")
+    Some(pid)
 
 # ============================================================================
 # Step 6: the frame-seat handoff to /bin/netd (AGAST #4744)
@@ -420,7 +454,7 @@ pub enum Respawn
 
 # A replacement netd, in the dead one's sys_exit_impl after its backoff
 # (syscall/runtime/process.ritz netd_restart): only onto a NIC whose
-# quiesces all read status 0 back and quarantined nothing, with what the
+# quiesces all confirmed the reset and quarantined nothing, with what the
 # first netd got but the seat: a new IRQ-owner record on the same IRQ
 # object with its MSI-X entries unmasked, one MMIO handle per window, a new
 # link page (DriverBoot names no frame object) and a new address page as

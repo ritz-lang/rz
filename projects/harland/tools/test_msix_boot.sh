@@ -1,7 +1,7 @@
 #!/bin/bash
-# Boot Harland under OVMF with a virtio-net NIC and an NVMe controller and
-# check that PCI devices interrupt the kernel through MSI-X (AGAST #1852,
-# NVMe: #3630).
+# Boot Harland under OVMF with a virtio-net NIC (and, on two more boots, an
+# e1000e: AGAST #4893) and an NVMe controller and check that PCI devices
+# interrupt the kernel through MSI-X (AGAST #1852, NVMe: #3630).
 #
 # The kernel walks every PCI device's capability list at boot and logs each
 # MSI-X table it finds ("[msix] BB:DD.F VVVV:DDDD: N vectors ..."). The
@@ -142,6 +142,21 @@
 # datagram. The log also shows the seat handoff and netd's own lease
 # (seat_checks).
 #
+# Then the e1000e (AGAST #4893, docs/E1000E.md "Tests"): two more boots,
+# "e1000e" and "e1000e-shell", are the vtd and vtd-shell machines with QEMU's
+# 82574L (-device e1000e,netdev=net0,romfile=) in the virtio-net's place.
+# One NIC a boot: the kernel probes the e1000e and no virtio-net, grants
+# BAR0 as one 128 KiB window (never BAR3, the MSI-X table), and netd's
+# e1000e library brings it up ("[e1000e] up: MAC published, 31 RX buffers
+# posted"). Every NIC-neutral check above holds on it: MSI-X ("[msix]
+# e1000e: MSI-X on", its interrupts and netd's parks), the private domain
+# and the fault probe, DHCP, the TX burst, the seat handoff, and netd's
+# death and restart, each death resetting the NIC ("[quiesce] pid P status
+# 0": GIO_MASTER_EN and CTRL.RST both read clear). The e1000e-shell boot
+# runs the same rzsh session (ping and the UDP tools). There is no first-DMA
+# line: E1000eNic keeps no record of its first frame, and the lease is the
+# proof that its DMA lands in the domain. The virtio boots are unchanged.
+#
 # The NIC uses QEMU's user-mode network (slirp): its built-in DHCP server
 # answers inside QEMU, so this needs no root and no host network.
 #
@@ -155,7 +170,10 @@
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for the boot (default 120)
 #        KEEP_WORK=DIR  copy the serial logs (msix.log, msix-vtd.log,
-#                       msix-vtd-shell.log) into DIR
+#                       msix-vtd-shell.log, msix-e1000e.log,
+#                       msix-e1000e-shell.log) into DIR
+#        BOOTS="..."    the boots to run, in order (default: pc vtd
+#                       vtd-shell e1000e e1000e-shell); a pass needs them all
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
 #
 # Exit: 0 = pass; 1 = the boot or a check failed; 3 = a required tool is
@@ -169,6 +187,7 @@ HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECTS_DIR="$(dirname "$HARLAND_DIR")"
 ROOT_DIR="$(dirname "$PROJECTS_DIR")"
 TIMEOUT="${BOOT_TIMEOUT:-120}"
+BOOTS="${BOOTS:-pc vtd vtd-shell e1000e e1000e-shell}"
 
 EXIT_SETUP=3
 setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
@@ -258,13 +277,14 @@ print(h)
 EOF
 ) || { echo "FAIL: could not write the NVMe disk"; exit 1; }
 
-# qemu_cmd NAME ESP INITRAMFS NETDEV: set qemu=(...) to the machine with
-# that ESP directory and initramfs, the NIC's netdev options NETDEV after
-# "user,id=net0"; the serial port is the caller's. NAME "vtd" (and
-# "vtd-shell") is q35 with intel-iommu and the NIC behind it, "pc" has no
-# IOMMU.
+# qemu_cmd NAME ESP INITRAMFS NETDEV [NIC]: set qemu=(...) to the machine
+# with that ESP directory and initramfs, the NIC's netdev options NETDEV
+# after "user,id=net0"; the serial port is the caller's. NAME "pc" has no
+# IOMMU; every other is q35 with intel-iommu and the NIC behind it. NIC is
+# virtio (the default: a modern-only virtio-net) or e1000e (QEMU's 82574L,
+# AGAST #4893), on the same netdev.
 qemu_cmd() {
-    local name="$1" esp="$2" initramfs="$3" netdev="$4" machine=(-machine pc) iommu=() platform="" vars=()
+    local name="$1" esp="$2" initramfs="$3" netdev="$4" nic="${5:-virtio}" machine=(-machine pc) iommu=() platform="" vars=() nic_dev
     if [ "$name" != pc ]; then
         # intremap=on wants the split irqchip; eim=on because the kernel
         # runs the LAPIC in x2APIC mode (32-bit IRTE destinations). The
@@ -280,7 +300,10 @@ qemu_cmd() {
     # romfile= drops the NIC's iPXE option ROM, so OVMF never tries a network
     # boot before the ESP. The legacy virtio-net path is covered by
     # tools/test_tier1_boot.sh's grub boot, whose NIC is QEMU's transitional
-    # default.
+    # default. The e1000e's DMA always goes through the IOMMU (pci_dma_*):
+    # it has no iommu_platform to ask for.
+    nic_dev="virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024$platform"
+    [ "$nic" = e1000e ] && nic_dev="e1000e,netdev=net0,romfile="
     qemu=(qemu-system-x86_64 "${machine[@]}" -cpu Haswell-v1 -smp 4 -m 2G
         "${iommu[@]}"
         -display none -no-reboot -monitor none
@@ -289,17 +312,17 @@ qemu_cmd() {
         -device virtio-blk-pci,drive=initramfs,disable-legacy=on
         -device virtio-keyboard-pci
         -drive "file=$initramfs,format=qcow2,if=none,id=initramfs"
-        -device "virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024$platform"
+        -device "$nic_dev"
         -netdev "user,id=net0$netdev"
         -device nvme,serial=harland-msix,drive=nvme0
         -drive "file=$WORK/nvme.img,format=raw,if=none,id=nvme0")
 }
 
-# boot NAME SERIAL: boot the Tier-1 suite on the machine NAME (qemu_cmd),
-# its serial port written to SERIAL.
+# boot NAME SERIAL [NIC]: boot the Tier-1 suite on the machine NAME with NIC
+# (qemu_cmd), its serial port written to SERIAL.
 boot() {
-    local name="$1" serial="$2"
-    qemu_cmd "$name" "$WORK/esp" "$WORK/initramfs.qcow2" ""
+    local name="$1" serial="$2" nic="${3:-virtio}"
+    qemu_cmd "$name" "$WORK/esp" "$WORK/initramfs.qcow2" "" "$nic"
     : > "$serial"
     timeout "$TIMEOUT" "${qemu[@]}" -serial "file:$serial" >/dev/null 2>&1 &
     local pid=$!
@@ -316,7 +339,7 @@ boot() {
 # nic_dma_checks SERIAL: the NIC's private DMA domain on the translating
 # boot (AGAST #4724); sets rc=1 on any failure.
 nic_dma_checks() {
-    local SERIAL="$1" line sid dom hole dma iova ddom
+    local SERIAL="$1" nic="${2:-virtio-net}" line sid dom hole dma iova ddom
     line=$(grep -aoE "\[nic-dma\] private domain [0-9]+ for [0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7] and [0-9]+ alias\(es\), never in the identity map; bus master on" "$SERIAL" | head -1)
     dom=$(echo "$line" | sed -nE 's/.*private domain ([0-9]+) for.*/\1/p')
     sid=$(echo "$line" | sed -nE 's/.* for ([0-9a-f:.]+) and .*/\1/p')
@@ -345,10 +368,16 @@ nic_dma_checks() {
         echo "PASS: the NIC's DMA to unmapped IOVA 0x$hole faulted with its source ID $sid"
     fi
     # The frame the driver received (decimal IOVA) inside a run DrvDmaAlloc
-    # mapped in the NIC's domain for it (hex IOVA, pages).
-    dma=$(grep -aoE "\[virtio-net\] device DMA: [0-9]+ bytes received into granted IOVA [0-9]+" "$SERIAL" | head -1)
+    # mapped in the NIC's domain for it (hex IOVA, pages). VirtioNic records
+    # its first frame; E1000eNic does not, and its DHCP lease is the proof
+    # that its frames landed in the domain's runs: the NIC's requester has
+    # no other mapping.
+    dma=""
+    [ "$nic" = virtio-net ] && dma=$(grep -aoE "\[virtio-net\] device DMA: [0-9]+ bytes received into granted IOVA [0-9]+" "$SERIAL" | head -1)
     iova=$(echo "$dma" | sed -nE 's/.*granted IOVA ([0-9]+)$/\1/p')
-    if [ -z "$dma" ]; then
+    if [ "$nic" != virtio-net ]; then
+        :
+    elif [ -z "$dma" ]; then
         grep -a "device DMA" "$SERIAL" | head -3
         echo "FAIL: no device DMA into a granted page of the NIC's domain"
         rc=1
@@ -390,7 +419,7 @@ nic_dma_checks() {
 # runs (AGAST #4735, #4875); sets rc=1 on any failure and ring1_pid to
 # netd's pid.
 ring1_checks() {
-    local SERIAL="$1" parks line
+    local SERIAL="$1" nic="${2:-virtio-net}" parks line
     ring1_pid=""
     line=$(grep -aoE "\[net-ring1\] /bin/netd pid [0-9]+ parked: generation 2 published" "$SERIAL" | head -1)
     if [ -n "$line" ]; then
@@ -408,11 +437,11 @@ ring1_checks() {
     else
         echo "PASS: no /bin/virtio-net: the driver is netd's library"
     fi
-    if grep -aqF "[virtio-net] up: MAC published" "$SERIAL"; then
-        echo "PASS: netd's NIC library brought the NIC up"
+    if grep -aqF "[$nic] up: MAC published" "$SERIAL"; then
+        echo "PASS: netd's $nic library brought the NIC up"
     else
-        grep -a "\[virtio-net\]" "$SERIAL" | head -3
-        echo "FAIL: no \"[virtio-net] up: MAC published\" from netd's NIC library"
+        grep -a "\[$nic\]" "$SERIAL" | head -3
+        echo "FAIL: no \"[$nic] up: MAC published\" from netd's NIC library"
         rc=1
     fi
     if grep -aqE "\[netdev\] Registered VirtIO-net device|\[virtio-net\] Initialization complete!" "$SERIAL"; then
@@ -421,9 +450,9 @@ ring1_checks() {
     else
         echo "PASS: virtio_net_init did not run: netd is the NIC's only owner"
     fi
-    parks=$(grep -aoE "\[msix\] virtio-net driver parks: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*parks: ([0-9]+)$/\1/p')
+    parks=$(grep -aoE "\[msix\] $nic driver parks: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*parks: ([0-9]+)$/\1/p')
     if [ -z "$parks" ]; then
-        echo "FAIL: no NIC owner park count logged ([msix] virtio-net driver parks: P)"
+        echo "FAIL: no NIC owner park count logged ([msix] $nic driver parks: P)"
         rc=1
     elif [ "$parks" -eq 0 ]; then
         echo "FAIL: netd never parked in DrvIrqWait: it spins"
@@ -566,9 +595,51 @@ restart_checks() {
     fi
 }
 
+# e1000e_checks SERIAL: the e1000e boot's own lines (AGAST #4893,
+# docs/E1000E.md "Kernel side"): the kernel probed QEMU's 82574L, not a
+# virtio-net (one NIC a boot), granted BAR0 as one 128 KiB window and kept
+# the MSI-X table; netd's e1000e library came up with the ring's 31 RX
+# buffers. Sets rc=1 on any failure.
+e1000e_checks() {
+    local SERIAL="$1"
+    if grep -aqE "\[e1000e\] Probing 8086:10D3 at [0-9]+:[0-9]+\.[0-7] for the ring-1 driver" "$SERIAL"; then
+        echo "PASS: the kernel probed the 82574L (8086:10d3) for netd"
+    else
+        grep -a "\[e1000e\]" "$SERIAL" | head -3
+        echo "FAIL: the kernel did not probe the e1000e for the ring-1 driver"
+        rc=1
+    fi
+    if grep -aqF "[virtio-net] Probing" "$SERIAL"; then
+        echo "FAIL: the e1000e boot probed a virtio-net too: one NIC a boot"
+        rc=1
+    fi
+    if grep -aqE "\[e1000e\] BAR0 0x[0-9A-Fa-f]+ granted as one window of 128 KiB; the MSI-X table stays the kernel's" "$SERIAL"; then
+        echo "PASS: BAR0 is netd's one 128 KiB window; the MSI-X table (BAR3) is not granted"
+    else
+        echo "FAIL: the e1000e's BAR0 was not granted as one 128 KiB window"
+        rc=1
+    fi
+    if grep -aqF "[e1000e] up: MAC published, 31 RX buffers posted" "$SERIAL"; then
+        echo "PASS: netd's e1000e library posted the ring's 31 RX buffers"
+    else
+        grep -a "\[e1000e\] up\|\[netd\] bring-up" "$SERIAL" | head -3
+        echo "FAIL: netd's e1000e did not come up with 31 RX buffers posted"
+        rc=1
+    fi
+}
+
+# nic_of NAME: the NIC kind boot NAME attaches (qemu_cmd's NIC argument).
+nic_of() {
+    case "$1" in e1000e*) echo e1000e ;; *) echo virtio-net ;; esac
+}
+
 # check NAME SERIAL: the verdicts for one boot; sets rc=1 on any failure.
+# The NIC's own lines are its kind's: virtio-net's transport and queue cap,
+# or the e1000e probe's BAR0 grant (AGAST #4893); every NIC-neutral check
+# (DHCP, the TX burst, MSI-X, the domain, netd, its restarts) holds on both.
 check() {
-    local name="$1" SERIAL="$2"
+    local name="$1" SERIAL="$2" nic
+    nic=$(nic_of "$name")
     echo "===== msix boot ($name) ====="
     echo "----- msix boot ($name): MSI-X and IOMMU lines -----"
     grep -aE "\[msix\]|Interrupt remapping|\[vtd\]|ACCESS_PLATFORM|\[nic-dma\]" "$SERIAL" | head -42
@@ -587,24 +658,28 @@ check() {
         echo "FAIL: no MSI-X table found on the NVMe controller (1b36:0010)"
         rc=1
     fi
-    if grep -aq "\[virtio-net\] Transport: modern (MMIO)" "$SERIAL"; then
-        echo "PASS: virtio-net is driven over the modern (MMIO) transport"
+    if [ "$nic" = e1000e ]; then
+        e1000e_checks "$SERIAL"
     else
-        grep -a "\[virtio-net\]" "$SERIAL" | head -5
-        echo "FAIL: virtio-net was not driven over the modern (MMIO) transport"
-        rc=1
-    fi
-    if grep -aqF "[virtio-net] Queue 0: size=256 (device max 1024)" "$SERIAL"; then
-        echo "PASS: virtio-net's 1024-entry RX queue was capped to 256"
-    else
-        echo "FAIL: virtio-net's RX queue was not capped from 1024 to 256"
-        rc=1
+        if grep -aq "\[virtio-net\] Transport: modern (MMIO)" "$SERIAL"; then
+            echo "PASS: virtio-net is driven over the modern (MMIO) transport"
+        else
+            grep -a "\[virtio-net\]" "$SERIAL" | head -5
+            echo "FAIL: virtio-net was not driven over the modern (MMIO) transport"
+            rc=1
+        fi
+        if grep -aqF "[virtio-net] Queue 0: size=256 (device max 1024)" "$SERIAL"; then
+            echo "PASS: virtio-net's 1024-entry RX queue was capped to 256"
+        else
+            echo "FAIL: virtio-net's RX queue was not capped from 1024 to 256"
+            rc=1
+        fi
     fi
     if grep -aqF "[dhcp] Configured!" "$SERIAL"; then
-        echo "PASS: DHCP got a lease over the modern virtio-net"
+        echo "PASS: DHCP got a lease over the $nic NIC"
     else
         grep -a "\[dhcp\]\|DHCP" "$SERIAL" | head -5
-        echo "FAIL: DHCP got no lease over the modern virtio-net"
+        echo "FAIL: DHCP got no lease over the $nic NIC"
         rc=1
     fi
     burst=$(grep -aoE "\[net\] TX burst: sent=[0-9]+/[0-9]+ replies=[0-9]+" "$SERIAL" | tail -1)
@@ -624,17 +699,17 @@ check() {
     else
         echo "PASS: TX burst sent $b_sent/$b_total frames, $b_replies distinct replies"
     fi
-    if grep -aq "\[msix\] virtio-net: MSI-X on" "$SERIAL"; then
-        echo "PASS: virtio-net is in MSI-X mode"
+    if grep -aq "\[msix\] $nic: MSI-X on" "$SERIAL"; then
+        echo "PASS: $nic is in MSI-X mode"
     else
-        echo "FAIL: virtio-net did not come up in MSI-X mode"
+        echo "FAIL: $nic did not come up in MSI-X mode"
         rc=1
     fi
-    count=$(grep -aoE "\[msix\] virtio-net interrupts: [0-9]+" "$SERIAL" | tail -1 | grep -oE "[0-9]+$")
+    count=$(grep -aoE "\[msix\] $nic interrupts: [0-9]+" "$SERIAL" | tail -1 | grep -oE "[0-9]+$")
     if [ -n "$count" ] && [ "$count" -gt 0 ]; then
-        echo "PASS: virtio-net delivered $count MSI-X interrupts"
+        echo "PASS: $nic delivered $count MSI-X interrupts"
     else
-        echo "FAIL: virtio-net MSI-X interrupt counter is ${count:-missing}, want > 0"
+        echo "FAIL: $nic MSI-X interrupt counter is ${count:-missing}, want > 0"
         rc=1
     fi
     if grep -aqE "\[msix\] nvme [^ ]+: MSI-X on" "$SERIAL"; then
@@ -796,14 +871,17 @@ check() {
             echo "FAIL: no \"[vtd] translation on\": DMA was not translated"
             rc=1
         fi
-        if grep -aqF "[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated" "$SERIAL"; then
+        # QEMU's e1000e always DMAs through the IOMMU: no bit to negotiate.
+        if [ "$nic" = e1000e ]; then
+            :
+        elif grep -aqF "[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated" "$SERIAL"; then
             echo "PASS: virtio-net negotiated VIRTIO_F_ACCESS_PLATFORM: its DMA goes through the IOMMU"
         else
             echo "FAIL: virtio-net did not negotiate VIRTIO_F_ACCESS_PLATFORM (bit 33) on the translating boot"
             rc=1
         fi
-        nic_dma_checks "$SERIAL"
-        ring1_checks "$SERIAL"
+        nic_dma_checks "$SERIAL" "$nic"
+        ring1_checks "$SERIAL" "$nic"
         seat_checks "$SERIAL"
         restart_checks "$SERIAL"
     fi
@@ -820,16 +898,17 @@ check() {
 # udp-send and udp-recv against /bin/netd (shell_session.py --net, which
 # prints each check). Sets rc=1 on any failure.
 net_shell_boot() {
-    local log="$WORK/msix-vtd-shell.log" port src
-    echo "===== msix boot (vtd-shell): ring-3 networking ====="
+    local name="$1" nic="${2:-virtio}" log port src
+    log="$WORK/msix-$name.log"
+    echo "===== msix boot ($name): ring-3 networking ====="
     # A free host UDP port for the hostfwd. The guest binds the same number.
     port=$(python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    qemu_cmd vtd-shell "$WORK/esp-shell" "$WORK/initramfs-shell.qcow2" ",hostfwd=udp:127.0.0.1:$port-:$port"
+    qemu_cmd "$name" "$WORK/esp-shell" "$WORK/initramfs-shell.qcow2" ",hostfwd=udp:127.0.0.1:$port-:$port" "$nic"
     python3 "$SCRIPT_DIR/shell_session.py" --net "$port" "$log" "$TIMEOUT" -- "${qemu[@]}"
     src=$?
-    [ "$src" -eq "$EXIT_SETUP" ] && setup_error "QEMU could not be started (vtd-shell)"
+    [ "$src" -eq "$EXIT_SETUP" ] && setup_error "QEMU could not be started ($name)"
     if [ "$src" -ne 0 ]; then
-        echo "----- vtd-shell serial tail -----"
+        echo "----- $name serial tail -----"
         tail -c 1500 "$log" 2>/dev/null | tr -d '\r'
         echo
         echo "---------------------------------"
@@ -837,19 +916,33 @@ net_shell_boot() {
     fi
     if grep -aqE "KERNEL PANIC|!!! EXCEPTION !!!" "$log" 2>/dev/null; then
         sed -n '/EXCEPTION/,/CR2/p' "$log" | head -20
-        echo "FAIL: kernel exception or panic on the vtd-shell boot"
+        echo "FAIL: kernel exception or panic on the $name boot"
         rc=1
     fi
     pml4_free_check "$log"
+    # The e1000e boot's netd ran its e1000e library (AGAST #4893).
+    if [ "$nic" = e1000e ]; then
+        if grep -aqF "[e1000e] up: MAC published" "$log"; then
+            echo "PASS: $name: netd's e1000e library drove the NIC"
+        else
+            echo "FAIL: $name: no \"[e1000e] up: MAC published\" from netd"
+            rc=1
+        fi
+    fi
     # This boot's own netd: the vtd boot's pid is not this one's.
     ring1_pid=$(grep -aoE "\[net-ring1\] /bin/netd pid [0-9]+ parked" "$log" | head -1 | sed -nE 's/.*pid ([0-9]+) parked.*/\1/p')
     seat_checks "$log"
 }
 
 rc=0
-boot pc "$WORK/msix.log"
-check pc "$WORK/msix.log"
-boot vtd "$WORK/msix-vtd.log"
-check vtd "$WORK/msix-vtd.log"
-net_shell_boot
+for b in $BOOTS; do
+    case "$b" in
+        pc) boot pc "$WORK/msix.log"; check pc "$WORK/msix.log" ;;
+        vtd) boot vtd "$WORK/msix-vtd.log"; check vtd "$WORK/msix-vtd.log" ;;
+        vtd-shell) net_shell_boot vtd-shell ;;
+        e1000e) boot e1000e "$WORK/msix-e1000e.log" e1000e; check e1000e "$WORK/msix-e1000e.log" ;;
+        e1000e-shell) net_shell_boot e1000e-shell e1000e ;;
+        *) echo "FAIL: BOOTS names no boot \"$b\""; rc=1 ;;
+    esac
+done
 exit $rc

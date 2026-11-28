@@ -81,6 +81,9 @@ import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
 import klog { klog, klog_dec, klog_hex }
 import drivers.msix { msix_mask_entries, msix_unmask_entries }
 import drivers.virtio.common { vio_status_reset }
+import drivers.nic { NicReset }
+import drivers.e1000e { E1000eReset, e1000e_reset, e1000e_reset_name }
+import serial { StrView }
 import syscall.runtime.net { net_driver_quiesced, pml4_of }
 import net.ring { ring_seat_driver_is, ring_driver_gone }
 
@@ -520,21 +523,22 @@ pub fn drv_dma_process_end(pid: u32, pml4: u64)
 # driver_quiesce (#4733, RING1_DRIVER.md "Driver death")
 # ============================================================================
 #
-# What the kernel needs to stop a ring-1 driver's device without it: the
-# kernel VAs (its own mappings, which outlive the process) of the device's
-# virtio device_status byte and of its MSI-X table, recorded against the
-# device's IRQ object when the kernel hands the device out. The process is
-# never given the MSI-X table.
+# What the kernel needs to stop a ring-1 driver's device without it: how to
+# reset it (drivers/nic.ritz NicReset: a virtio device_status byte, or an
+# e1000e's BAR0, AGAST #4893) and its MSI-X table, both through the kernel's
+# own mappings, which outlive the process, recorded against the device's
+# IRQ object when the kernel hands the device out. The process is never
+# given the MSI-X table.
 
 const DRV_DEVICE_MAX: i32 = 16      # one per IRQ object (waitset IRQ_OBJECT_MAX)
 
 pub struct DrvDevice
     object_id: u64          # the CAP_TYPE_IRQ object: the device
-    status_va: u64          # kernel VA of the virtio device_status byte
+    reset: NicReset         # the device's kind, and the kernel VA its reset writes
     msix_table_va: u64      # kernel VA of MSI-X entry 0, 0 for none
     msix_entries: u32
     in_use: bool
-    # Every quiesce so far read status 0 back and left no run on
+    # Every quiesce so far confirmed its reset and left no run on
     # dma_quarantine: the device may go to a new owner (D9, #4875: netd's
     # restart). Sticky once false: networking stays down until reboot.
     fit: bool
@@ -552,13 +556,13 @@ fn drv_device_slot(object_id: u64) -> i32
 
 # The kernel records how to quiesce the device behind IRQ object
 # `object_id`. False if it is already recorded or the table is full.
-pub fn drv_device_bind(object_id: u64, status_va: u64, msix_table_va: u64, msix_entries: u32) -> bool
+pub fn drv_device_bind(object_id: u64, reset: NicReset, msix_table_va: u64, msix_entries: u32) -> bool
     if object_id == 0 or drv_device_slot(object_id) >= 0
         return false
     var i: i32 = 0
     while i < DRV_DEVICE_MAX
         if not drv_devices[i].in_use
-            drv_devices[i] = DrvDevice { object_id: object_id, status_va: status_va, msix_table_va: msix_table_va, msix_entries: msix_entries, in_use: true, fit: true, _pad: [0, 0] }
+            drv_devices[i] = DrvDevice { object_id: object_id, reset: reset, msix_table_va: msix_table_va, msix_entries: msix_entries, in_use: true, fit: true, _pad: [0, 0] }
             return true
         i = i + 1
     false
@@ -586,21 +590,44 @@ pub fn drv_device_unbind(object_id: u64)
     if slot >= 0
         drv_devices[slot].in_use = false
 
+# How a device's reset read back.
+enum DeviceReset
+    Done                    # the reset completed
+    Status(u8)              # virtio: device_status never read 0; the last value read
+    Stuck(StrView)          # e1000e: which wait ran out (e1000e_reset_name)
+
+# Reset the device by its kind and read the reset back: a virtio device's
+# device_status must read 0 (VIRTIO_RESET_TIMEOUT_US); an e1000e's
+# GIO_MASTER_EN and then CTRL.RST must read clear (e1000e_reset).
+fn device_reset(reset: NicReset) -> DeviceReset
+    match reset
+        NicReset.Virtio(status_va) =>
+            let status: u8 = vio_status_reset(status_va)
+            if status == 0 then DeviceReset.Done else DeviceReset.Status(status)
+        NicReset.E1000e(regs) =>
+            let end: E1000eReset = e1000e_reset(regs)
+            match end
+                E1000eReset.Done => DeviceReset.Done
+                _ => DeviceReset.Stuck(e1000e_reset_name(end))
+
 # Stop device `dev`, whose IRQ owner `pid` (page table `pml4`, 0 for none)
 # is dying or has let go of it: mask its MSI-X entries, reset it and read
-# the reset back, then take each of `pid`'s DMA runs of the device out of
-# its domain and wait for the IOTLB. A run is left for vmm_free_pml4 to
-# free (once) only when both the reset and its invalidation completed;
-# otherwise its leaves get PTE_DEVICE (the free walk skips them) and its
-# frames and IOVA go on dma_quarantine until reboot. Never dma_free_pages:
-# the PML4's teardown is the one free. Logs "[quiesce] pid P status S"
-# (S is the last status read: 0 once the reset completed). True when the
-# reset read back 0 and no run was quarantined: the device is fit for a new
-# owner (D9, #4875: netd's restart).
+# the reset back (device_reset), then take each of `pid`'s DMA runs of the
+# device out of its domain and wait for the IOTLB. A run is left for
+# vmm_free_pml4 to free (once) only when both the reset and its
+# invalidation completed; otherwise its leaves get PTE_DEVICE (the free
+# walk skips them) and its frames and IOVA go on dma_quarantine until
+# reboot. Never dma_free_pages: the PML4's teardown is the one free. Logs
+# "[quiesce] pid P status 0" once the reset completed, else "status S" (the
+# virtio status last read) or "status stuck: W" (the e1000e wait that ran
+# out). True when the reset completed and no run was quarantined: the
+# device is fit for a new owner (D9, #4875: netd's restart).
 fn quiesce_device(pid: u32, pml4: u64, dev: DrvDevice) -> bool
     msix_mask_entries(dev.msix_table_va, dev.msix_entries)
-    let status: u8 = vio_status_reset(dev.status_va)
-    let reset_ok: bool = status == 0
+    let reset: DeviceReset = device_reset(dev.reset)
+    let reset_ok: bool = match reset
+        DeviceReset.Done => true
+        _ => false
     var quarantined: u64 = 0
     while true
         let run: DmaRun = match dma_run_take_device(pid, dev.object_id)
@@ -616,7 +643,12 @@ fn quiesce_device(pid: u32, pml4: u64, dev: DrvDevice) -> bool
     klog("[quiesce] pid ")
     klog_dec(pid as i64)
     klog(" status ")
-    klog_dec(status as i64)
+    match reset
+        DeviceReset.Done => klog("0")
+        DeviceReset.Status(status) => klog_dec(status as i64)
+        DeviceReset.Stuck(why) =>
+            klog("stuck: ")
+            klog(why)
     klog("\n")
     if quarantined != 0
         klog("[quiesce] pid ")
