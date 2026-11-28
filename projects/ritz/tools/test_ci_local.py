@@ -621,7 +621,9 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     test_ci_ahci_boot.py), the xHCI keyboard boot (#4887;
     test_ci_usb_boot.py), typing into rzsh on that keyboard (#4888;
     test_ci_usb_boot.py) and on its plain-MSI and polled fallbacks (#4891;
-    test_ci_usb_boot.py). So does resolving the builder image the boots
+    test_ci_usb_boot.py), and Buddhafinger on harland's serial console
+    (#4833, a step of its own since #4920; tools/test_harland_console.sh
+    exits 3 only for a missing tool). So does resolving the builder image the boots
     stage Buddhafinger with (#4834; projects/builder/resolve_image.sh: 3
     only for a missing docker). A new step here must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
@@ -671,6 +673,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/harland/tools/test_usb_boot.sh keyboard-msi",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" SKIP_BUILD=1 '
         "bash projects/harland/tools/test_usb_boot.sh keyboard-poll",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs/buddhafinger" '
+        "bash projects/buddhafinger/tools/test_harland_console.sh",
     ]
 
 

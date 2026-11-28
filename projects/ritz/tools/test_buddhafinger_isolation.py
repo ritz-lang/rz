@@ -91,6 +91,25 @@ class TestSweepExcludesBuddhafinger:
         # #4825), which runs it inside the published builder image.
         assert "buddhafinger" in builder_matrix.list_packages(rz=rz)
 
+    def test_harland_boot_is_a_build_all_step_after_qemu(self):
+        # AGAST #4920: the Harland acceptance boot (#4833) is its own step in
+        # the job that installs QEMU, which GitHub and ci-local (the train
+        # gate) both run; not part of the suite the bootstrap job's tools/
+        # pytest runs on a runner without QEMU.
+        import yaml
+        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["build-all"]["steps"]
+        runs = [s.get("run", "") for s in steps]
+        # The script the Makefile's harland-test runs, called directly so its
+        # exit 3 (a missing tool) reaches ci-local as SETUP ERROR.
+        script = "tools/test_harland_console.sh"
+        assert any(script in c for c in _recipe_commands())
+        boot = [i for i, r in enumerate(runs) if f"bash {PKG_REL}/{script}" in r]
+        qemu = [i for i, s in enumerate(steps) if "QEMU" in s.get("name", "")
+                and s.get("name", "").startswith("Install test tools")]
+        image = [i for i, r in enumerate(runs) if "builder/resolve_image.sh" in r]
+        assert len(boot) == 1 and qemu and image, (boot, qemu, image)
+        assert boot[0] > max(qemu[0], image[0])
+
 
 @pytest.mark.unit
 class TestEntryPassesTheCompilerExplicitly:
@@ -106,6 +125,16 @@ class TestEntryPassesTheCompilerExplicitly:
     def test_entry_builds_the_compiler_first(self):
         assert any("ritz1-bootstrap" in c for c in _recipe_commands())
 
+    def test_test_is_the_suite_then_the_harland_boot(self):
+        # AGAST #4920: `suite` is the QEMU-free half the integration case
+        # below runs; `test` (the smoke plan's entry:) still boots Harland.
+        text = (PKG / "Makefile").read_text()
+        rule = lambda t: re.search(rf"^{t}:(.*)\n((?:\t.*\n)*)", text, re.MULTILINE)
+        suite, test = rule("suite"), rule("test")
+        assert suite and test
+        assert "rz) test buddhafinger" in suite[2] or "RZ) test buddhafinger" in suite[2]
+        assert "suite" in test[1] and "harland-test" in test[2]
+
 
 @pytest.mark.unit
 def test_core_does_not_import_platform_adapters():
@@ -120,7 +149,8 @@ def test_core_does_not_import_platform_adapters():
 
 @pytest.mark.integration
 def test_dedicated_entry_runs_the_suite_under_ritz1_selfhosted():
-    r = subprocess.run(["make", "-C", str(PKG), "test"], cwd=WORKSPACE,
+    # `suite`, not `test`: the Harland boot needs QEMU (AGAST #4920).
+    r = subprocess.run(["make", "-C", str(PKG), "suite"], cwd=WORKSPACE,
                        capture_output=True, text=True, timeout=900)
     out = r.stdout + r.stderr
     assert r.returncode == 0, out

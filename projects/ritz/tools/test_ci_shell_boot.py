@@ -341,8 +341,12 @@ def _run(tree, *, replies=None, tty_replies=None, qemu=True,
         "FAKE_EXIT": EXIT,
         **(env_extra or {}),
     }
+    # A session that fails early waits out BOOT_TIMEOUT (5 s) at every later
+    # prompt: test_ctrl_c_ignored_fails took 90.9 s against a 90 s cap once
+    # #4831's paste steps landed (AGAST #4920), so it went red or green by
+    # noise. 180 s holds every step timing out, with room for load.
     return subprocess.run(["/bin/bash", str(tree["script"])], env=env,
-                          capture_output=True, text=True, timeout=90)
+                          capture_output=True, text=True, timeout=180)
 
 
 @pytest.mark.integration

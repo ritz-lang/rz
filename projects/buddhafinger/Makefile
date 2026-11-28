@@ -14,7 +14,7 @@
 COMPILER := ritz1_selfhosted
 RZ := ../../rz
 
-.PHONY: all build test harland-test bench-build bench bench-check
+.PHONY: suite all build test harland-test bench-build bench bench-check
 all: build
 
 # ritz1-bootstrap builds ritz1 + ritz1_selfhosted; a no-op when both are
@@ -26,9 +26,15 @@ build:
 
 # The ritzunit suites, then the Harland acceptance test (AGAST #4833): the
 # editor on Harland's serial console under QEMU, KVM where it works.
-test: build
-	$(RZ) test buddhafinger --compiler $(COMPILER)
+test: suite
 	$(MAKE) harland-test
+
+# The ritzunit suites alone: no QEMU. tools/test_buddhafinger_isolation.py
+# runs this on hosts without it (GitHub's bootstrap runner, AGAST #4920);
+# main.yml's build-all job runs harland-test as its own step after
+# installing QEMU, and ci-local runs that step on every train gate.
+suite: build
+	$(RZ) test buddhafinger --compiler $(COMPILER)
 
 # tools/test_harland_console.sh boots the packaged Indium image (AGAST
 # #4834): it builds the kernel, then indium's initramfs.pkgs through
