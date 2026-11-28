@@ -41,9 +41,9 @@ import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
 import syscall.runtime.net { NETD_RESTARTS, net_service_exited, net_service_death, net_restart_backoff_ms }
 import net.ring1 { Respawn, net_netd_respawn }
 import syscall.runtime.argv { ArgvStatus, ArgvCapture, argv_capture, argv_buf, argv_offsets }
-import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait, proc_mark_exit, proc_runnable_count, MarkError }
+import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait, proc_mark_exit, proc_runnable_on, proc_set_home, PROC_BSP_CPU, MarkError }
 import ritzlib.result { Result }
-import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report }
+import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report, sched_forward }
 import cap.table { CapTable, cap_process_has, cap_table_alloc, cap_table_free_pid, cap_inherit_ambient, cap_retire_held_shm }
 import cap.types { CAP_TYPE_POWER, CAP_TYPE_NAMESPACE, CAP_RIGHT_EXECUTE, CAP_RIGHT_READ, CAP_RIGHT_CREATE }
 import syscall.runtime.driver { drv_dma_process_end, driver_quiesce }
@@ -225,7 +225,7 @@ fn spawn_child_begin(parent_pid: u64, inherit_caps: bool) -> i64
 #
 # ISOLATION: each child gets its own page table (CR3); it cannot read or
 # write the parent's user memory.
-fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: bool) -> i64
+fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: bool, home: i32) -> i64
     # Read file from namespace (using kernel's page table). A path under
     # /var comes from the persistent subtree (fs/kfs.ritz, #4321).
     let ns: *Namespace = kfs_ns_for(path_view)
@@ -285,6 +285,7 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: b
     if argc > 0
         arg0 = argc as u64
     sched_prepare_user(slot, load_result.entry_point, user_rsp, arg0, child_argv)
+    proc_set_home(slot, home)
     proc_start(slot)
     return child_pid as i64
 
@@ -297,7 +298,17 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: b
 pub fn process_spawn_program(path: StrView) -> Result<u64, Errno>
     if proc_current() == 0 as *Proc
         return Err(Errno.Srch)
-    errno_result(spawn_process(path, 0, 0, false))
+    errno_result(spawn_process(path, 0, 0, false, PROC_BSP_CPU))
+
+# process_spawn_program, homed on CPU `cpu` (SMP_USER.md §5): kernel-only
+# placement, the spawn on the BSP, which owns the process table. The child
+# first runs on its home when proc_start's kick reaches it, and its user
+# code only ever runs there. `cpu` is the caller's choice through
+# place_pinned (arch/x86_64/cpu_map.ritz): a started AP, or the BSP.
+pub fn process_spawn_program_on(path: StrView, cpu: i32) -> Result<u64, Errno>
+    if proc_current() == 0 as *Proc
+        return Err(Errno.Srch)
+    errno_result(spawn_process(path, 0, 0, false, cpu))
 
 # The most pages process_spawn_image maps for an image (AGAST #4731): the
 # boot-test stub grew past one page when the frame-ring modes landed beside
@@ -314,6 +325,16 @@ pub const SPAWN_IMAGE_MAX_PAGES: u64 = 4
 # The child is runnable when this returns: its pid, or a negative errno with
 # nothing changed.
 pub fn process_spawn_image(image: Span<u8>, arg0: u64, arg1: u64) -> i64
+    spawn_image(image, arg0, arg1, PROC_BSP_CPU)
+
+# process_spawn_image, homed on CPU `cpu`, as process_spawn_program_on
+# places one (the smp-user boot test, AGAST #4881): the child's pid, or the
+# errno with nothing changed.
+pub fn process_spawn_image_on(image: Span<u8>, arg0: u64, arg1: u64, cpu: i32) -> Result<u64, Errno>
+    errno_result(spawn_image(image, arg0, arg1, cpu))
+
+# Both spawns of an image: the pid, or a negative errno.
+fn spawn_image(image: Span<u8>, arg0: u64, arg1: u64, cpu: i32) -> i64
     if image.is_empty() or image.len() as u64 > SPAWN_IMAGE_MAX_PAGES * PAGE_SIZE
         return Errno.Inval as i64
     let parent: *Proc = proc_current()
@@ -343,6 +364,7 @@ pub fn process_spawn_image(image: Span<u8>, arg0: u64, arg1: u64) -> i64
         return Errno.NoMem as i64
 
     sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1)
+    proc_set_home(slot, cpu)
     proc_start(slot)
     return child_pid as i64
 
@@ -384,7 +406,7 @@ fn wait_for_child(pid: u64, code: *i64) -> i32
 # sys_wait to collect the status; a negative exit code fails the spawn with
 # -1 instead, and the child is reaped here since no wait will come.
 fn spawn_and_block(path: StrView, argc: i32, argv_bytes: i64) -> i64
-    let pid: i64 = spawn_process(path, argc, argv_bytes, true)
+    let pid: i64 = spawn_process(path, argc, argv_bytes, true, PROC_BSP_CPU)
     if pid <= 0
         return pid
     var code: i64 = 0
@@ -409,6 +431,10 @@ fn sys_spawn_args_impl(path: StrView, argc: i32, argv_bytes: i64) -> i64
 # parent blocked on it runs again); then the CPU goes to whoever runs next.
 # init exiting powers off.
 fn sys_exit_impl(code: i32) -> i64
+    # A process exits on the BSP, which owns its slot and frees its space
+    # and kernel stack (SMP_USER.md §2 "Exit and kills"). The Exit syscall
+    # is forwarded already; a fault or a reap on an AP is carried here.
+    sched_forward()
     let me: *Proc = proc_current()
     if me != 0 as *Proc and not proc_is_init(me)
         let my_pml4: u64 = me.pml4
@@ -544,7 +570,7 @@ fn netd_backoff(ms: u64)
     enable_interrupts()
     while not deadline_passed(deadline)
         sched_yield()
-        if proc_runnable_count() < 2
+        if proc_runnable_on(PROC_BSP_CPU) < 2
             sti_hlt()
 
 fn netd_not_restarted(why: StrView)
@@ -700,7 +726,7 @@ pub fn sys_spawn_bg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         argv_bytes = spawn_capture_argv(rsi as **u8, argc)
         if argv_bytes < 0
             return argv_bytes
-    return spawn_process(strview_from_ptr(rdi as *u8, path_result), argc, argv_bytes, true)
+    return spawn_process(strview_from_ptr(rdi as *u8, path_result), argc, argv_bytes, true, PROC_BSP_CPU)
 
 # wait(pid)
 pub fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

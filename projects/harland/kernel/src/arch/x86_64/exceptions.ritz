@@ -14,7 +14,7 @@ import drivers.msix { msix_dispatch }
 import drivers.usb.usb { usb_irq, usb_tick }
 import syscall.runtime.process { process_kill_current, current_pid }
 import syscall.stack { syscall_stack_guard_hit }
-import proc.sched { sched_tick }
+import proc.sched { sched_tick, sched_user_safe_point }
 import proc.waitq { waitq_wake_irq }
 import sync.mbox { mbox_kick_irq }
 import arch.x86_64.sysret_catch { sysret_selftest_catch }
@@ -451,9 +451,14 @@ pub fn irq_handler(frame: *InterruptFrame)
     if irq_num == 208
         # Vector 240: the mailbox kick (sync/mbox.ritz KICK_VECTOR). It
         # sends EOI and marks the kick pending; the mailbox is drained at
-        # this CPU's next safe point (the idle loop), never in the IRQ, so
-        # an AP call runs with no ISR in service.
+        # this CPU's next safe point, with no ISR in service. A kick that
+        # interrupted CPL 3 is one (AGAST #4881): no kernel code is half
+        # done, and the stub runs on the process's kernel stack (no IST),
+        # so the drain may switch to a process it brought here. A pinned
+        # process spinning in user mode still answers an UNMAP.
         mbox_kick_irq()
+        if ((*frame).cs & 3) != 0
+            sched_user_safe_point()
         return
 
     # MSI-X vectors (64-79 and the CPU-local 80-95): count the interrupt

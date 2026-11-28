@@ -23,9 +23,9 @@
 # step's comment names its step in that model ("post.reserve", ...).
 #
 # The kick (KICK_VECTOR) only marks this CPU's `pc_kick_pending`. Messages
-# are handled at a safe point, never in the IRQ: today the idle loops
-# (cpu_smp.ritz smp_ap_idle, the BSP scheduler's), later return to user and
-# a block (#4881). A message mutates owner state that the interrupted kernel
+# are handled at a safe point, never in the IRQ: the idle loop
+# (proc/sched.ritz sched_idle_main, every CPU's) and return to user
+# (sched_user_safe_point: a syscall's end, a kick that interrupted CPL 3). A message mutates owner state that the interrupted kernel
 # code may be halfway through changing, so handling it in the IRQ would
 # break "only the owner writes" against the owner's own interrupts.
 #
@@ -68,8 +68,15 @@ pub const MBOX_UNMAP_DONE: u32 = 6       # arg[0] the request id, arg[1] leaves 
 # KERNEL_INVLPG_DONE.
 pub const MBOX_KERNEL_INVLPG: u32 = 7
 pub const MBOX_KERNEL_INVLPG_DONE: u32 = 8   # arg[0] the request id
-# Reserved for #4881 (SMP_USER.md §2), not handled yet: FORWARD, RETURN,
-# CAP_INSERT.
+# A process moved onto the receiver (SMP_USER.md §2, AGAST #4881): FORWARD
+# to the BSP for a syscall it does not run locally, RETURN back to its home
+# once it is done. The sender has already published the move (the slot's
+# `on`, proc/table.ritz) after leaving the process's stack and space, so the
+# receiver's pick finds it; the message is the wake. pid names the process.
+# No reply.
+pub const MBOX_FORWARD: u32 = 9
+pub const MBOX_RETURN: u32 = 10
+# Reserved for #4881's grants into a table on another CPU: CAP_INSERT.
 
 # A message body: 56 bytes, so with `seq` a slot is one 64-byte line.
 pub struct MboxMsg
@@ -99,6 +106,8 @@ var pc_kick_pending: [64]u32
 var mbox_draining: [64]bool
 # Replies nobody waited for (a late answer after a timeout): the owner's count.
 var mbox_strays: [64]u64
+# FORWARD and RETURN messages each CPU took (the owner's count).
+var mbox_moves_in: [64]u64
 
 # A message of `kind` from this CPU, arguments zero.
 pub fn mbox_msg(kind: u32) -> MboxMsg
@@ -120,6 +129,7 @@ pub fn mbox_init()
         pc_kick_pending[cpu] = 0
         mbox_draining[cpu] = false
         mbox_strays[cpu] = 0
+        mbox_moves_in[cpu] = 0
         var i: u64 = 0
         while i < MBOX_SLOTS
             (*slot_of(cpu, i)).seq = i
@@ -229,6 +239,13 @@ pub fn mbox_stray_count(cpu: i32) -> u64
         return 0
     mbox_strays[cpu]
 
+# FORWARD and RETURN messages CPU `cpu` has taken: on the BSP, the
+# forwarded syscalls it served.
+pub fn mbox_moves_in_count(cpu: i32) -> u64
+    if not valid_cpu(cpu)
+        return 0
+    mbox_moves_in[cpu]
+
 # Handle one message on its owner. Short and never blocking.
 fn mbox_handle(msg: MboxMsg)
     if msg.kind == MBOX_CALL
@@ -251,6 +268,10 @@ fn mbox_handle(msg: MboxMsg)
         done.arg[0] = msg.arg[0]
         done.arg[1] = tlb_serve(msg.kind, msg.arg[1], msg.arg[2], msg.arg[3], msg.arg[4])
         mbox_post(msg.from as i32, done)
+    else if msg.kind == MBOX_FORWARD or msg.kind == MBOX_RETURN
+        # The move is published already: this CPU's next pick runs it.
+        let me: i32 = cpu_index()
+        mbox_moves_in[me] = mbox_moves_in[me] + 1
     else
         # CALL_DONE, PONG, UNMAP_DONE and KERNEL_INVLPG_DONE are taken by
         # their waiter (apcall.ritz, mm/tlb.ritz); one that reaches the

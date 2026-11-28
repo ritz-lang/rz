@@ -1,0 +1,229 @@
+# Harland smp-user boot test: user processes pinned to APs (AGAST #4881,
+# docs/SMP_USER.md §6)
+#
+# Run in boot-test mode with \harland\smp-user (GRUB: `smp-user`), as pid 1,
+# from postinit.ritz driver_process_tests. The user code is the stub in
+# kernel/smp_user_stub.s, spawned with process_spawn_image_on; it calls two
+# test syscalls, answered only while this test runs:
+#
+#   SmpUser (253)       not SYS_LOCAL: from an AP it is forwarded, and runs
+#                       on the BSP (syscall/runtime/entry.ritz)
+#   SmpUserLocal (252)  SYS_LOCAL: runs on the caller's own CPU
+#
+# Each takes an op in RDI. BUMP on SmpUser adds one to smp_shared, a
+# BSP-owned counter, with a plain load and store a few pauses apart: only
+# forwarding keeps two CPUs from bumping it at once, so a missed forward
+# loses counts (the mutation: mark SmpUser SYS_LOCAL). BUMP on SmpUserLocal
+# adds one to the caller's CPU's own counter and records when that CPU's
+# bumps began and ended, so the test can see the two processes' windows
+# overlap. WHERE answers the CPU the call ran on.
+#
+# The verdicts tools/test_tier1_boot.sh greps:
+#   [smp-user] concurrent syscalls OK: cpu0 N cpuK M, forwarded F
+#     a process on the BSP and one pinned to the last AP (place_pinned) each
+#     make SMP_USER_CALLS forwarded and SMP_USER_CALLS local bumps; every
+#     count exact, the local windows overlap, and the AP process's local
+#     WHERE said cpu K while its forwarded WHERE said cpu 0. F is the
+#     FORWARDs the AP sent: one per forwarded call, its exit included.
+#   [smp-user] single CPU: pinned spawn ran on the BSP
+#     no AP started: place_pinned falls back to the BSP, and the spawn runs
+#     there (SMP_USER.md §5).
+
+import klog { klog, klog_dec }
+import io { cpu_pause, rdtsc }
+import ritzlib.span { Span, span_from_ptr }
+import syscall.errno { Errno }
+import ritzlib.strview { StrView }
+import arch.x86_64.percpu { cpu_index }
+import arch.x86_64.cpu_map { MAX_CPUS, place_pinned }
+import proc.table { PROC_BSP_CPU, proc_current_slot }
+import proc.sched { sched_start, sched_stop, sched_moves_out_count }
+import ritzlib.result { Result }
+import syscall.runtime.process { process_spawn_image_on, process_spawn_program_on, process_wait }
+
+extern fn smp_user_stub_start()
+extern fn smp_user_stub_end()
+
+# The ops (RDI), as kernel/smp_user_stub.s spells them.
+const OP_ARRIVE: u64 = 1     # local: count this process in
+const OP_GO: u64 = 2         # local: 1 once both processes arrived
+const OP_BUMP: u64 = 3       # local: this CPU's counter; forwarded: smp_shared
+const OP_WHERE: u64 = 4      # the CPU the call runs on
+
+# The stub's modes (RDI at entry) and what it exits with: its local WHERE,
+# and its forwarded WHERE shifted left 8.
+const MODE_COUNT: u64 = 1    # RSI bumps of each kind, after both arrived
+const MODE_WHERE: u64 = 2    # only the two WHEREs
+
+# Calls of each kind per process (SMP_USER.md §6: 100k).
+const SMP_USER_CALLS: u64 = 100000
+# Pauses between the forwarded BUMP's load and its store: a window two CPUs
+# running it at once would hit, losing counts.
+const RACE_PAUSES: i32 = 16
+const PROCESSES: u32 = 2
+
+var smp_active: bool = false
+# BSP-owned: written only by forwarded SmpUser calls, never atomically.
+var smp_shared: u64 = 0
+var smp_arrived: u32 = 0
+# Each CPU's own: its local bumps, and the TSC at its first and last one.
+var smp_local: [64]u64
+var smp_first: [64]u64
+var smp_last: [64]u64
+
+fn reset()
+    smp_shared = 0
+    atomic_store(@smp_arrived, 0)
+    var c: i32 = 0
+    while c < MAX_CPUS
+        smp_local[c] = 0
+        smp_first[c] = 0
+        smp_last[c] = 0
+        c = c + 1
+
+# SmpUser: forwarded from an AP, so it always runs on the BSP.
+pub fn sys_smp_user_handler(op: u64, a2: u64, a3: u64, a4: u64) -> i64
+    if not smp_active
+        return Errno.NoSys as i64
+    if op == OP_BUMP
+        let seen: u64 = volatile_load(@smp_shared)
+        var i: i32 = 0
+        while i < RACE_PAUSES
+            cpu_pause()
+            i = i + 1
+        volatile_store(@smp_shared, seen + 1)
+        return 0
+    if op == OP_WHERE
+        return cpu_index() as i64
+    Errno.Inval as i64
+
+# SmpUserLocal: SYS_LOCAL, on the caller's CPU.
+pub fn sys_smp_user_local_handler(op: u64, a2: u64, a3: u64, a4: u64) -> i64
+    if not smp_active
+        return Errno.NoSys as i64
+    let cpu: i32 = cpu_index()
+    if op == OP_ARRIVE
+        atomic_fetch_add(@smp_arrived, 1)
+        return 0
+    if op == OP_GO
+        if atomic_load(@smp_arrived) >= PROCESSES
+            return 1
+        return 0
+    if op == OP_BUMP
+        let now: u64 = rdtsc()
+        if smp_local[cpu] == 0
+            smp_first[cpu] = now
+        smp_last[cpu] = now
+        smp_local[cpu] = smp_local[cpu] + 1
+        return 0
+    if op == OP_WHERE
+        return cpu as i64
+    Errno.Inval as i64
+
+fn is_no_ent(e: Errno) -> bool
+    match e
+        NoEnt => true
+        _ => false
+
+fn stub() -> Span<u8>
+    let start: u64 = smp_user_stub_start as u64
+    span_from_ptr<u8>(start as *u8, (smp_user_stub_end as u64 - start) as i64)
+
+fn fail(why: StrView) -> bool
+    klog("[smp-user] FAIL: ")
+    klog(why)
+    klog("\n")
+    false
+
+# The stub's exit status for a process whose local calls ran on `local` and
+# whose forwarded ones on the BSP.
+fn where_status(local: i32) -> i64
+    (local as i64) | ((PROC_BSP_CPU as i64) << 8)
+
+# One CPU: the pinned spawn falls back to the BSP and runs there.
+fn single_cpu() -> bool
+    let pid: u64 = match process_spawn_image_on(stub(), MODE_WHERE, 0, place_pinned(-1))
+        Ok(p) => p
+        Err(_) => return fail("the pinned spawn failed")
+    if process_wait(pid as i32) != where_status(PROC_BSP_CPU)
+        return fail("the pinned spawn did not run on the BSP")
+    klog("[smp-user] single CPU: pinned spawn ran on the BSP\n")
+    true
+
+# Two processes, one on the BSP and one on AP `ap`, bump at once.
+fn concurrent(ap: i32) -> bool
+    let forwards_before: u64 = sched_moves_out_count(ap)
+    sched_start(proc_current_slot())
+    let ap_spawn: Result<u64, Errno> = process_spawn_image_on(stub(), MODE_COUNT, SMP_USER_CALLS, ap)
+    let bsp_spawn: Result<u64, Errno> = process_spawn_image_on(stub(), MODE_COUNT, SMP_USER_CALLS, PROC_BSP_CPU)
+    let spawned: bool = ap_spawn.is_ok() and bsp_spawn.is_ok()
+    var ap_status: i64 = -1
+    var bsp_status: i64 = -1
+    match ap_spawn
+        Ok(pid) => ap_status = process_wait(pid as i32)
+        Err(_) => pass
+    match bsp_spawn
+        Ok(pid) => bsp_status = process_wait(pid as i32)
+        Err(_) => pass
+    sched_stop()
+    let forwarded: u64 = sched_moves_out_count(ap) - forwards_before
+    klog("[smp-user] shared ")
+    klog_dec(smp_shared as i64)
+    klog(", cpu0 ")
+    klog_dec(smp_local[PROC_BSP_CPU] as i64)
+    klog(", cpu")
+    klog_dec(ap as i64)
+    klog(" ")
+    klog_dec(smp_local[ap] as i64)
+    klog(", statuses ")
+    klog_dec(bsp_status)
+    klog(" ")
+    klog_dec(ap_status)
+    klog("\n")
+    if not spawned
+        return fail("a spawn failed")
+    if smp_shared != 2 * SMP_USER_CALLS
+        return fail("forwarded bumps were lost: two CPUs ran a BSP-owned row at once")
+    if ap_status != where_status(ap)
+        return fail("the pinned process did not run on its AP with its forwarded calls on the BSP")
+    if bsp_status != where_status(PROC_BSP_CPU)
+        return fail("the BSP process did not run on the BSP")
+    if smp_local[PROC_BSP_CPU] != SMP_USER_CALLS or smp_local[ap] != SMP_USER_CALLS
+        return fail("a CPU's local bumps are not exact")
+    if smp_first[PROC_BSP_CPU] >= smp_last[ap] or smp_first[ap] >= smp_last[PROC_BSP_CPU]
+        return fail("the two processes' windows did not overlap")
+    # Its two WHEREs' forwarded one, its bumps and its exit.
+    if forwarded != SMP_USER_CALLS + 2
+        return fail("the AP did not forward each forwarded call once")
+    klog("[smp-user] concurrent syscalls OK: cpu0 ")
+    klog_dec(smp_local[PROC_BSP_CPU] as i64)
+    klog(" cpu")
+    klog_dec(ap as i64)
+    klog(" ")
+    klog_dec(smp_local[ap] as i64)
+    klog(", forwarded ")
+    klog_dec(forwarded as i64)
+    klog("\n")
+    true
+
+# The smp-user boot test, as pid 1 on its own kernel stack.
+pub fn smp_user_selftest() -> bool
+    klog("\nTesting user processes on APs...\n")
+    reset()
+    smp_active = true
+    let ap: i32 = place_pinned(-1)
+    # The path spawn places as the image spawn does: a missing program is
+    # NoEnt on any CPU, and nothing is left behind.
+    let missing: bool = match process_spawn_program_on("/bin/no-such-smp-user", ap)
+        Err(e) => is_no_ent(e)
+        Ok(_) => false
+    if not missing
+        smp_active = false
+        return fail("a pinned spawn of a missing program was not NoEnt")
+    var ok: bool = false
+    if ap == PROC_BSP_CPU
+        ok = single_cpu()
+    else
+        ok = concurrent(ap)
+    smp_active = false
+    ok

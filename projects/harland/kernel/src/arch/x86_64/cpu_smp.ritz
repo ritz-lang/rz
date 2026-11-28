@@ -24,9 +24,7 @@
 # made step 3 impossible: the two CPUs overwrote each other's frame.
 
 import klog { klog, klog_dec, klog_hex }
-import io { memory_barrier, cpu_pause, rdmsr, interrupts_enabled, enable_interrupts, disable_interrupts }
-import sync.idle { cpu_idle_begin, cpu_idle_cancel, cpu_idle_sleep }
-import sync.mbox { mbox_has_work, mbox_drain }
+import io { memory_barrier, cpu_pause, rdmsr, interrupts_enabled, enable_interrupts }
 import arch.x86_64.gdt { gdt_get_sysret_base, gdt_set_kernel_stack_cpu, gdt_user_segments_ok }
 import arch.x86_64.sysret_catch { sysret_catch_arm, sysret_catch_disarm, sysret_catch_caught, sysret_catch_vector, sysret_catch_rip, sysret_catch_cs, sysret_ring0_selftest }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page }
@@ -43,6 +41,8 @@ extern fn smp_test_resume_bsp() -> u64
 extern fn jump_to_userspace(entry: u64, stack: u64)
 extern fn kstack_set_current(top: u64)
 extern fn syscall_iret_exit_count() -> u64
+# proc/sched.ritz: this AP's idle context, for good.
+extern fn sched_ap_enter()
 
 # The stub and its stacks, below the kernel half and clear of the user ELF
 # (4 GiB) and user stack (top of the lower half). PML4 index 128.
@@ -251,16 +251,13 @@ pub fn smp_syscall_selftest(bsp_cpu: i32) -> i32
 # sti;hlt. A kick that lands between the re-check and the hlt is held
 # pending while IF=0 and wakes the hlt, so no message waits for the next
 # interrupt. The drain runs AP calls with IF=1 (apcall.ritz ap_call_run).
+#
+# Since AGAST #4881 that loop is the scheduler's (proc/sched.ritz
+# sched_idle_main), on this AP's own idle context: the same handshake, with
+# the processes homed on this AP in its re-check. Declared, not imported:
+# proc/sched.ritz reaches this module through apic.ritz.
 pub fn smp_ap_idle()
-    let me: i32 = cpu_index()
-    while true
-        disable_interrupts()
-        cpu_idle_begin()
-        if mbox_has_work(me)
-            cpu_idle_cancel()
-            mbox_drain()
-        else
-            cpu_idle_sleep()
+    sched_ap_enter()
 
 # An AP's side: wait for the BSP to start the test, then enter the stub on
 # this CPU's own user stack. Returns with an error if the test never starts.

@@ -38,6 +38,7 @@ ISR_S = KERNEL / "isr_stubs.s"
 GDT = SRC / "arch" / "x86_64" / "gdt.ritz"
 PERCPU = SRC / "arch" / "x86_64" / "percpu.ritz"
 CPU_SMP = SRC / "arch" / "x86_64" / "cpu_smp.ritz"
+SCHED = SRC / "proc" / "sched.ritz"
 APIC = SRC / "arch" / "x86_64" / "apic.ritz"
 STACK = SRC / "syscall" / "stack.ritz"
 MAIN = SRC / "main.ritz"
@@ -173,12 +174,18 @@ def test_finished_aps_stay_alive_for_the_ap_call_ipi():
     smp = CPU_SMP.read_text()
     assert "halt_loop" not in smp, "an AP that halts cannot answer an AP call"
     # The idle loop is the handshake (sync/idle.ritz, #4879): announce with
-    # IF=0, re-check the mailbox, then drain it or sleep in sti;hlt.
-    idle = _body(smp, "smp_ap_idle")
+    # IF=0, re-check for a process and the mailbox, then run it, drain it
+    # or sleep in sti;hlt. Since #4881 an AP runs it on its idle context,
+    # the scheduler's (proc/sched.ritz), with its homed processes.
+    assert "sched_ap_enter()" in _body(smp, "smp_ap_idle")
+    sched = SCHED.read_text()
+    enter = _body(sched, "sched_ap_enter")
+    assert enter.index("disable_interrupts()") < enter.index("sched_make_idle(cpu)") < enter.index("sched_switch(")
+    idle = _body(sched, "sched_idle_main")
     assert "while true" in idle
-    order = [idle.index(s) for s in ("disable_interrupts()", "cpu_idle_begin()",
-                                     "mbox_has_work(me)", "cpu_idle_cancel()",
-                                     "mbox_drain()", "cpu_idle_sleep()")]
+    order = [idle.index(s) for s in ("cpu_idle_begin()", "proc_pick_next()",
+                                     "cpu_idle_cancel()", "sched_switch_to(next)",
+                                     "mbox_has_work(cpu)", "mbox_drain()", "cpu_idle_sleep()")]
     assert order == sorted(order), idle
     run = _body(smp, "smp_ap_run")
     assert "kstack_set_current(cpu_stack_top(cpu_idx, CPU_IST1))" in run

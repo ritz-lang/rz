@@ -729,7 +729,10 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
         < undo.index("fs_process_select(parent_pid)")
     # the kernel's spawn (#4713) shares the first half and inherits no
     # ambient capabilities: the kernel grants what it holds
-    image = _fn(PROCESS, "process_spawn_image")
+    # (both image spawns share spawn_image; the pinned one names a home,
+    # #4881)
+    assert "spawn_image(image, arg0, arg1, PROC_BSP_CPU)" in _fn(PROCESS, "process_spawn_image")
+    image = _fn(PROCESS, "spawn_image")
     assert "spawn_child_begin(parent_pid, false)" in image
     assert begin.index("if inherit_caps") < begin.index("cap_inherit_ambient(")
     # every failure after the child exists gives its slot back

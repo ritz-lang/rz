@@ -426,7 +426,7 @@ PY
 # boot_self_tests and boot_process_tests). channel-close and
 # channel-debug-print were skipped as page faults until AGAST #1887; the
 # gate now requires both.
-BOOT_TESTS="vmm higher-half heap ipc channel-close channel-debug-print munmap mmap-failure pmm-above-4g mmap-overlap mmap-cursor mmap-driver-window elf-loader sysret nmi-gs ist-nest nmi-nest cap-device shm-map virtio-blk-read proc-create-init driver-enter driver-fault driver-preempt driver-reap drv-irq-wait drv-mmio-map drv-dma-alloc drv-dma-free console-poll shm-wait net-attach net-info shm-retire net-addr frame-ring spawn-pages drv-quiesce"
+BOOT_TESTS="vmm higher-half heap ipc channel-close channel-debug-print munmap mmap-failure pmm-above-4g mmap-overlap mmap-cursor mmap-driver-window elf-loader sysret nmi-gs ist-nest nmi-nest cap-device shm-map virtio-blk-read proc-create-init driver-enter driver-fault driver-preempt driver-reap drv-irq-wait drv-mmio-map drv-dma-alloc drv-dma-free console-poll shm-wait net-attach net-info shm-retire net-addr frame-ring spawn-pages drv-quiesce smp-user"
 
 # boot_tests_passed NAME: pass only if the kernel's boot-test summary is in
 # the log (before any ring dump, which repeats it) with 0 failed, no test logged FAIL, and every BOOT_TESTS name
@@ -851,6 +851,38 @@ tlb_owner_unmap() {
     return 1
 }
 
+# smp_user NAME: pass only if user processes ran pinned to an AP (AGAST
+# #4881, docs/SMP_USER.md §6; the boot carries \harland\smp-user or the
+# `smp-user` word). With APs, one on the BSP and one on the last AP (index
+# NCPUS - 1) each made 100000 forwarded and 100000 local test syscalls at
+# once, every count exact: "[smp-user] concurrent syscalls OK: cpu0 100000
+# cpuK 100000, forwarded F". At one CPU the pinned spawn must have fallen
+# back to the BSP: "[smp-user] single CPU: pinned spawn ran on the BSP".
+smp_user() {
+    local last=$((SMP_NCPUS - 1)) line
+    if grep -aq '\[smp-user\] FAIL' "$WORK/$1.log"; then
+        grep -a '\[smp-user\]' "$WORK/$1.log" | head -5
+        echo "FAIL ($1): the smp-user boot test failed"
+        return 1
+    fi
+    if [ "$last" -le 0 ]; then
+        if grep -aq '\[smp-user\] single CPU: pinned spawn ran on the BSP' "$WORK/$1.log"; then
+            echo "PASS ($1): one CPU, the pinned spawn ran on the BSP"
+            return 0
+        fi
+        echo "FAIL ($1): one CPU, but no \"[smp-user] single CPU\" line"
+        return 1
+    fi
+    line="$(grep -aoE '\[smp-user\] concurrent syscalls OK: cpu0 100000 cpu[0-9]+ 100000, forwarded [0-9]+' "$WORK/$1.log" | head -1)"
+    if printf '%s\n' "$line" | grep -q " cpu$last 100000,"; then
+        echo "PASS ($1): $line"
+        return 0
+    fi
+    grep -a '\[smp-user\]' "$WORK/$1.log" | head -5
+    echo "FAIL ($1): no concurrent-syscalls verdict for a process on cpu $last (got: ${line:-none})"
+    return 1
+}
+
 # sysret_ring0 NAME: pass only if the "sysret" self-test's non-canonical
 # return RIP faulted in ring 0 at syscall_exit_iret (CS 8), the path #4610's
 # fixup covers and TCG never takes (AGAST #4612).
@@ -875,6 +907,7 @@ if [ "$MODE" != grub ]; then
     cp "$KERNEL_ELF" "$WORK/esp-native/harland/kernel.elf"
     : > "$WORK/esp-native/harland/klog-dump"
     : > "$WORK/esp-native/harland/boot-test"
+    : > "$WORK/esp-native/harland/smp-user"
 fi
 
 if [ "$MODE" = kvm ]; then
@@ -885,6 +918,7 @@ if [ "$MODE" = kvm ]; then
         -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
         -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
     boot_tests_passed kvm || rc=1
+    smp_user kvm || rc=1
     sysret_ring0 kvm || rc=1
     no_exception kvm || rc=1
     exit $rc
@@ -902,6 +936,7 @@ if [ "$MODE" != grub ]; then
     smp_stacks native || rc=1
     mbox_round_trip native || rc=1
     tlb_owner_unmap native || rc=1
+    smp_user native || rc=1
     ring_holds_boot native || rc=1
     blk_transport native modern || rc=1
     slow_disk native || rc=1
@@ -918,7 +953,7 @@ if [ "$MODE" != native ]; then
     cat > "$WORK/grub.cfg" <<'EOF'
 set timeout=0
 insmod all_video
-menuentry "Harland" { multiboot2 /boot/harland.elf boot-test; boot; }
+menuentry "Harland" { multiboot2 /boot/harland.elf boot-test smp-user; boot; }
 EOF
     grub-mkstandalone -O x86_64-efi -o "$WORK/esp-grub/EFI/BOOT/BOOTX64.EFI" \
         "boot/grub/grub.cfg=$WORK/grub.cfg" "boot/harland.elf=$KERNEL_ELF" \
@@ -944,6 +979,7 @@ EOF
     smp_stacks grub || rc=1
     mbox_round_trip grub || rc=1
     tlb_owner_unmap grub || rc=1
+    smp_user grub || rc=1
     blk_transport grub legacy || rc=1
     key_received grub || rc=1
     preempted grub || rc=1
@@ -958,6 +994,7 @@ EOF
     smp_stacks grub-reboot || rc=1
     mbox_round_trip grub-reboot || rc=1
     tlb_owner_unmap grub-reboot || rc=1
+    smp_user grub-reboot || rc=1
     persisted grub-reboot 2 || rc=1
     saved_subtree grub-reboot || rc=1
 fi

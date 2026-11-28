@@ -95,6 +95,8 @@ AREAS = {
             "net_addr_register", "net_addr_snapshot", "net_service_exited"],
     # Poll (7): the console's timed read (#4829).
     "poll": ["sys_poll_handler"],
+    # SmpUser (253) and SmpUserLocal (252): the smp-user boot test (#4881).
+    "smp_user": ["sys_smp_user_handler", "sys_smp_user_local_handler"],
 }
 
 VARS = {
@@ -244,8 +246,9 @@ def test_table_registers_handlers_imported_from_their_area():
     # 45 with Stat and Fstat (4, 5, #4832); 47 with DrvMmioMap and
     # DrvDmaAlloc (221, 222, #4720); 49 with ShmWait and ShmNotify
     # (229, 230, #4727); 50 with NetPublish (226, #4730); 51 with DrvDmaFree
-    # (223, #4725).
-    assert len(regs) == 51, regs
+    # (223, #4725); 53 with the smp-user test's SmpUser and SmpUserLocal
+    # (253, 252, #4881).
+    assert len(regs) == 53, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

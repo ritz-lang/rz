@@ -95,6 +95,7 @@ The dispatch table gets a per-syscall flag, `SYS_LOCAL`. On the BSP every syscal
 | Mmap, Munmap | its own PML4, and frames from its CPU's cache. Only the CPU the process is on loads that PML4 (§3) |
 | DebugPrint | `klog_lock` |
 | Smp (254) | the #4192 self-test barrier. Every CPU is spinning in that handler, the BSP included, so a forwarded call would never be served (the survey's point 1) |
+| SmpUserLocal (252) | the smp-user boot test's local half (§6): it bumps only its CPU's own counter. Its forwarded twin, SmpUser (253), bumps a BSP-owned one |
 
 Everything else is forwarded: Exit, the fs and tty syscalls, Spawn/SpawnArgs/SpawnBg/Wait, IPC and channels, CapGrant/CapRevoke, Input, Fb, Drv{MmioMap,DmaAlloc,DmaFree}, the Net seat (NetInfo, NetAddr, NetPublish, NetAttach), ShmMap, Sync, AcpiPoweroff. None is on netd's echo path (#4877).
 
@@ -291,5 +292,7 @@ Each step lands green at -smp 1, 2 and 4.
    - The BSP gates dropped.
    - `process_spawn_program_on`/`place_pinned`.
    - The `\harland\smp-user` boot tests.
+
+   Landed in slices. The first: `Proc.home` and `Proc.on` with the per-CPU pick (`proc/table.ritz`), the AP idle loop on the scheduler (`proc/sched.ritz sched_ap_enter`), the AP tick, forwarding (`sched_forward`/`sched_return_home`, finished on the idle context by `sched_finish_move`; Exit and kills forward in `sys_exit_impl`), the mailbox drain at return to user (`sched_user_safe_point`), `process_spawn_program_on`/`place_pinned`, and boot tests (a) and (c) (`syscall/runtime/smp_user.ritz`, `kernel/smp_user_stub.s`). Then the BSP gates, `CAP_INSERT` and boot test (b).
 
 Then #4877 (netd on its own AP) depends on all three, and on #4876's batched wait.

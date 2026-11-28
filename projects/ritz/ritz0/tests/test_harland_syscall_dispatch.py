@@ -124,6 +124,8 @@ ABI = {
     # (#4727, RING1_DRIVER.md "Wait and notify").
     "ShmWait": 229, "ShmNotify": 230,
     "Smp": 254,
+    # The smp-user boot test (AGAST #4881): one forwarded, one SYS_LOCAL.
+    "SmpUser": 253, "SmpUserLocal": 252,
     "DebugPrint": 255,
 }
 
@@ -140,7 +142,7 @@ DISPATCHED = {
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
     "Sync", "Smp", "ShmMap", "DrvIrqWait", "DrvMmioMap", "DrvDmaAlloc", "DrvDmaFree", "NetInfo", "NetAddr", "NetAttach", "Poll",
     "ShmWait", "ShmNotify", "NetPublish",
-    "Stat", "Fstat",
+    "Stat", "Fstat", "SmpUser", "SmpUserLocal",
 }
 
 
@@ -420,6 +422,7 @@ def test_every_declared_syscall_is_dispatched():
 SYS_LOCAL_ALLOWLIST = {
     "Getpid", "Yield", "ShmWait", "ShmNotify", "DrvIrqWait",
     "CapInfo", "CapCheck", "CapDerive", "Mmap", "Munmap", "DebugPrint", "Smp",
+    "SmpUserLocal",
 }
 
 

@@ -56,8 +56,15 @@
 # idle context) and its own round-robin position. The CPU index comes from
 # `extern fn cpu_index` (arch/x86_64/percpu.ritz in the kernel; a host test
 # supplies a stub), declared rather than imported so this module stays pure.
-# Until #4881 every process's home is the BSP (PROC_HOME_CPU): another
-# CPU's pick finds nothing.
+#
+# Pinning (AGAST #4881, SMP_USER.md §1, §5): every process has a home, the
+# CPU its user code runs on, and `on`, the CPU it is on right now: its home,
+# or the BSP while a forwarded syscall runs there (§2). A CPU picks only the
+# processes on it. Every process is homed on the BSP (PROC_BSP_CPU), its
+# children included, unless the kernel placed it elsewhere at spawn
+# (proc_set_home, before proc_start). `on` is an atomic word: the CPU a
+# process leaves publishes the move with it, after it is off the process's
+# stack and out of its address space (proc/sched.ritz sched_move).
 
 import syscall.errno { Errno }
 import ritzlib.strview { StrView }
@@ -74,8 +81,9 @@ extern fn cpu_kick_if_idle(cpu: i32)
 # take five before the ring-1 driver, netd or anything else.
 pub const MAX_PROCS: i32 = 32
 
-# The CPU every process runs on until #4881 gives a process its own home.
-pub const PROC_HOME_CPU: i32 = 0
+# The BSP's CPU index: every process's home unless the kernel placed it
+# elsewhere, and the CPU a forwarded syscall runs on.
+pub const PROC_BSP_CPU: i32 = 0
 
 # MAX_CPUS (arch/x86_64/cpu_map.ritz): the per-CPU arrays' literal length.
 const PROC_MAX_CPUS: i32 = 64
@@ -125,6 +133,8 @@ pub struct Proc
     ksp: u64                # kernel RSP saved by sched_switch while it isn't running
     wait_pid: u64           # BLOCK_CHILD: the child it waits for
     exit_code: i64          # valid in PROC_ZOMBIE
+    home: i32               # the CPU its user code runs on (fixed once started)
+    on: u32                 # the CPU it is on now (atomic only): home, or the BSP for a forwarded call
     cwd: Cwd
 
 var procs: [MAX_PROCS]Proc
@@ -173,7 +183,7 @@ fn wake_word(i: i32, w: u64) -> bool
         return false
     if atomic_cmpxchg(@procs[i].word, w, word_make(word_gen(w), PROC_RUNNING)) != w
         return false
-    cpu_kick_if_idle(PROC_HOME_CPU)
+    cpu_kick_if_idle(proc_on(i))
     true
 
 # Slot `i`'s state word as a waker reads it before its CAS.
@@ -188,6 +198,8 @@ pub fn proc_wake_seen(i: i32, w: u64) -> bool
 
 fn proc_free(i: i32)
     set_state(i, PROC_FREE)
+    procs[i].home = PROC_BSP_CPU
+    atomic_store(@procs[i].on, PROC_BSP_CPU as u32)
     procs[i].pid = 0
     procs[i].parent = -1
     procs[i].block = BLOCK_NONE
@@ -246,15 +258,50 @@ pub fn proc_live_count() -> i32
         i = i + 1
     n
 
-# Processes that can run now (PROC_RUNNING), the current one included.
-pub fn proc_runnable_count() -> i32
+# Processes that can run now on CPU `cpu` (RUNNING and on it), its current
+# one included: what that CPU's tick and its waits compare against.
+pub fn proc_runnable_on(cpu: i32) -> i32
     var n: i32 = 0
     var i: i32 = 0
     while i < MAX_PROCS
-        if proc_state(i) == PROC_RUNNING
+        if proc_state(i) == PROC_RUNNING and proc_on(i) == cpu
             n = n + 1
         i = i + 1
     n
+
+# Live processes (new, running or blocked: not free, not zombie) homed on
+# CPU `cpu`. An AP's tick runs only while it has two or more (§4).
+pub fn proc_homed_count(cpu: i32) -> i32
+    var n: i32 = 0
+    var i: i32 = 0
+    while i < MAX_PROCS
+        let st: u8 = proc_state(i)
+        if st != PROC_FREE and st != PROC_ZOMBIE and procs[i].home == cpu
+            n = n + 1
+        i = i + 1
+    n
+
+# Slot `slot`'s home CPU.
+pub fn proc_home(slot: i32) -> i32
+    procs[slot].home
+
+# The CPU slot `slot` is on now (an atomic read: another CPU publishes it).
+pub fn proc_on(slot: i32) -> i32
+    atomic_load(@procs[slot].on) as i32
+
+# Slot `slot` is on CPU `cpu` from now on: the CPU it left publishes the
+# move (proc/sched.ritz sched_move), once it is off its stack and space.
+pub fn proc_set_on(slot: i32, cpu: i32)
+    atomic_store(@procs[slot].on, cpu as u32)
+
+# Place NEW slot `slot` on CPU `cpu`, before proc_start: the kernel's
+# placement (SMP_USER.md §5, syscall/runtime/process.ritz
+# process_spawn_program_on). A started process never changes home: refused.
+pub fn proc_set_home(slot: i32, cpu: i32)
+    if proc_state(slot) != PROC_NEW
+        return
+    procs[slot].home = cpu
+    atomic_store(@procs[slot].on, cpu as u32)
 
 fn proc_free_slot() -> i32
     var i: i32 = 0
@@ -280,6 +327,8 @@ pub fn proc_enter_init(pml4: u64) -> i32
     (*p).ksp = 0
     (*p).wait_pid = 0
     (*p).exit_code = 0
+    (*p).home = PROC_BSP_CPU
+    atomic_store(@(*p).on, PROC_BSP_CPU as u32)
     (*p).cwd.bytes[0] = 47  # '/'
     (*p).cwd.bytes[1] = 0
     (*p).cwd.len = 1
@@ -315,6 +364,10 @@ pub fn proc_new_child() -> i32
     (*c).ksp = 0
     (*c).wait_pid = 0
     (*c).exit_code = 0
+    # The BSP, whatever the parent's home: only the kernel places a process
+    # elsewhere (proc_set_home).
+    (*c).home = PROC_BSP_CPU
+    atomic_store(@(*c).on, PROC_BSP_CPU as u32)
     (*c).cwd = (*parent).cwd
     slot
 
@@ -322,9 +375,10 @@ pub fn proc_new_child() -> i32
 pub fn proc_start(slot: i32)
     if proc_state(slot) == PROC_NEW
         # Every field is written: the store publishes them (TSO keeps them
-        # before it), then its CPU is kicked if it idles.
+        # before it), then its home is kicked if it idles. Its rows pass from
+        # the BSP to its home here (SMP_USER.md §5).
         set_state(slot, PROC_RUNNING)
-        cpu_kick_if_idle(PROC_HOME_CPU)
+        cpu_kick_if_idle(proc_on(slot))
 
 # Undo proc_new_child for a child that never ran (a failed load): its slot is
 # freed, and nobody can wait for it.
@@ -504,24 +558,26 @@ pub fn proc_wait(pid: u64) -> i64
 
 # The CPU process `pid` is on: the one that owns its per-process rows and is
 # the only CPU that may load its PML4 (SMP_USER.md §2, §3). An unmap from
-# its space is a request to that CPU (mm/tlb.ritz tlb_unmap_on). Every
-# process is on PROC_HOME_CPU until #4881 gives a slot its own `on`.
+# its space is a request to that CPU (mm/tlb.ritz tlb_unmap_on). The BSP
+# for no live process of that pid.
 pub fn proc_on_cpu(pid: u64) -> i32
-    PROC_HOME_CPU
+    var i: i32 = 0
+    while i < MAX_PROCS
+        if pid != 0 and procs[i].pid == pid and proc_state(i) != PROC_FREE
+            return proc_on(i)
+        i = i + 1
+    PROC_BSP_CPU
 
-# Round robin on this CPU: the first runnable slot after the one it last
-# switched to, wrapping, that one last (so it keeps running when nothing
-# else can). -1 if no process is runnable here: on every CPU but
-# PROC_HOME_CPU until #4881.
+# Round robin on this CPU: the first runnable slot on it after the one it
+# last switched to, wrapping, that one last (so it keeps running when
+# nothing else can). -1 if no process is runnable here.
 pub fn proc_pick_next() -> i32
     let cpu: i32 = cpu_index()
-    if cpu != PROC_HOME_CPU
-        return -1
     let start: i32 = proc_last_by_cpu[cpu]
     var n: i32 = 0
     while n < MAX_PROCS
         let i: i32 = (start + n) % MAX_PROCS
-        if proc_state(i) == PROC_RUNNING
+        if proc_state(i) == PROC_RUNNING and proc_on(i) == cpu
             return i
         n = n + 1
     -1

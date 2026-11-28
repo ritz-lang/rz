@@ -566,7 +566,9 @@ def test_msix_dispatch_latches_the_vectors_object():
 
 
 def test_sched_tick_expires_wait_set_deadlines():
-    body = _fn_body(SCHED.read_text(), "sched_tick")
+    # The BSP's tick, for every slot (#4881: an AP's tick only preempts).
+    assert "if cpu == PROC_BSP_CPU\n        sched_tick_global(from_user)" in _fn_body(SCHED.read_text(), "sched_tick")
+    body = _fn_body(SCHED.read_text(), "sched_tick_global")
     assert "waitset_tick(" in body, body
 
 
@@ -595,7 +597,7 @@ def test_sched_tick_runs_the_detach_timeout_only_over_user_code():
     """#4729: SHM_DETACH_TIMEOUT_MS unmaps a peer from the tick, but only a
     tick that interrupted CPL 3: the PMM and vmm_unmap_page_in are not
     reentrant, so a tick over kernel code only wakes the parked holders."""
-    body = _fn_body(SCHED.read_text(), "sched_tick")
+    body = _fn_body(SCHED.read_text(), "sched_tick_global")
     assert "if from_user\n        shm_detach_expired()" in body, body
     assert "shm_detach_wake_due()" in body, body
 

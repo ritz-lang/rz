@@ -530,11 +530,11 @@ fn main() -> i32
     g_kicks = 0
     proc_start(a)
     # A start publishes RUNNING and kicks the process's CPU (the BSP).
-    if proc_state(a) != PROC_RUNNING or g_kicks != 1 or g_kicked != PROC_HOME_CPU
+    if proc_state(a) != PROC_RUNNING or g_kicks != 1 or g_kicked != PROC_BSP_CPU
         return 1
 
     # Per CPU: CPU 1 has no current process and its pick finds nothing
-    # (every process's home is the BSP until #4881); CPU 0's is untouched.
+    # (no process is homed there); CPU 0's is untouched.
     g_cpu = 1
     if proc_current_slot() != -1 or proc_current() != 0 as *Proc or proc_pick_next() != -1
         return 2
@@ -612,6 +612,103 @@ SMP_STATE_CLAIMS = {
 def test_state_word_cas_generation_and_per_cpu_current(tmp_path):
     rc = _run(tmp_path, SMP_STATE)
     assert rc == 0, SMP_STATE_CLAIMS.get(rc, f"exit {rc}")
+
+# Pinning (AGAST #4881, docs/SMP_USER.md §1, §2, §5): a process's home is
+# where its user code runs, `on` where it is right now (its home, or the
+# BSP during a forwarded syscall). A CPU picks only what is on it; a start
+# and a wake kick the CPU the process is on.
+PINNING = """\
+import syscall.errno { Errno }
+import proc.table
+
+fn main() -> i32
+    proc_table_reset()
+    proc_enter_init(0)
+    let init: i32 = proc_current_slot()
+    if proc_home(init) != PROC_BSP_CPU or proc_on(init) != PROC_BSP_CPU
+        return 1
+    let a: i32 = proc_new_child()
+    if proc_home(a) != PROC_BSP_CPU
+        return 2
+    proc_set_home(a, 3)
+    g_kicks = 0
+    proc_start(a)
+    if g_kicks != 1 or g_kicked != 3 or proc_on(a) != 3 or proc_on_cpu(proc_at(a).pid) != 3
+        return 3
+    # CPU 3 picks it, the BSP never does.
+    g_cpu = 3
+    if proc_pick_next() != a
+        return 4
+    g_cpu = 0
+    if proc_pick_next() != init
+        return 5
+    # Live processes homed on CPU 3, and runnable ones on each CPU.
+    if proc_homed_count(3) != 1 or proc_homed_count(0) != 1 or proc_runnable_on(3) != 1 or proc_runnable_on(0) != 1
+        return 6
+    # A child of a process homed on an AP is homed on the BSP.
+    g_cpu = 3
+    proc_set_current(a)
+    let c: i32 = proc_new_child()
+    if proc_home(c) != PROC_BSP_CPU
+        return 7
+    proc_abort_child(c)
+    # A forwarded syscall: `a` is on the BSP, still homed on 3.
+    proc_set_current(-1)
+    proc_set_on(a, PROC_BSP_CPU)
+    if proc_pick_next() != -1 or proc_home(a) != 3 or proc_on_cpu(proc_at(a).pid) != PROC_BSP_CPU
+        return 8
+    g_cpu = 0
+    if proc_runnable_on(0) != 2
+        return 9
+    # It blocks on the BSP; a wake kicks the BSP, where it is.
+    proc_set_current(a)
+    proc_block(BLOCK_WAIT, 0)
+    proc_set_current(init)
+    g_kicks = 0
+    if not proc_wake_pid(proc_at(a).pid, BLOCK_WAIT) or g_kicked != PROC_BSP_CPU
+        return 10
+    # Back home: it blocks there, and a wake kicks CPU 3.
+    proc_set_on(a, 3)
+    g_cpu = 3
+    proc_set_current(a)
+    proc_block(BLOCK_WAIT, 0)
+    g_cpu = 0
+    if not proc_wake_pid(proc_at(a).pid, BLOCK_WAIT) or g_kicked != 3
+        return 11
+    # A zombie is not a live homed process; a home set after the start is
+    # refused (only spawn places).
+    proc_set_home(a, 1)
+    if proc_home(a) != 3
+        return 12
+    g_cpu = 3
+    proc_set_current(a)
+    proc_exit_current(0)
+    if proc_homed_count(3) != 0
+        return 13
+    0
+"""
+
+PINNING_CLAIMS = {
+    1: "init is homed on and on the BSP",
+    2: "a new child is homed on the BSP",
+    3: "a start on an AP kicks that AP once and puts the process on it",
+    4: "the home CPU picks it",
+    5: "the BSP does not pick a process on an AP",
+    6: "homed and runnable counts are per CPU",
+    7: "a child of an AP-homed process is homed on the BSP",
+    8: "on the BSP for a forwarded call: the home picks nothing, the home stays",
+    9: "the BSP counts the forwarded process as runnable there",
+    10: "a wake of a process on the BSP kicks the BSP",
+    11: "a wake of a process back home kicks its home",
+    12: "the home of a started process does not change",
+    13: "an exited process is not homed anywhere",
+}
+
+
+@pytest.mark.integration
+def test_pinned_home_on_pick_and_kicks(tmp_path):
+    rc = _run(tmp_path, PINNING)
+    assert rc == 0, PINNING_CLAIMS.get(rc, f"exit {rc}")
 
 # --- source-level acceptance -------------------------------------------------------
 

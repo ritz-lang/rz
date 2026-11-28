@@ -38,21 +38,34 @@
 # place as before.
 #
 # Per CPU: the counters and `running` are each CPU's own (SMP_USER.md §2
-# inventory), summed for the reports. Processes still run on the BSP only
-# (proc/table.ritz PROC_HOME_CPU, until #4881); an AP's pick finds nothing.
+# inventory), summed for the reports. Each CPU runs the processes on it
+# (proc/table.ritz proc_pick_next: `on == cpu`).
+#
+# APs (AGAST #4881, SMP_USER.md §1, §2): an AP leaves its boot idle loop for
+# its idle context here (sched_ap_enter) and from then on runs the
+# processes homed on it. Its tick runs only while it has two or more live
+# homed processes (sched_ap_tick_update); the global duties (the NVMe
+# watchdog, wait-set deadlines, shm detach timeouts) stay on the BSP's.
+#
+# A move (sched_move): a syscall an AP may not run locally carries its
+# process to the BSP and back (FORWARD, then RETURN), as do Exit and a kill
+# (sys_exit_impl). The process switches onto its CPU's idle context, which
+# finishes the move: it drops the process's address space (the kernel's
+# PML4 loaded), publishes `on` and posts the message. Only then can the
+# other CPU pick it, so only one CPU holds its stack and space at a time.
 
 import klog { klog, klog_dec }
 import io { sti_hlt, disable_interrupts, enable_interrupts, interrupts_enabled, rdtsc }
-import mm.vmm { vmm_switch_pml4, vmm_get_current_pml4 }
+import mm.vmm { vmm_switch_pml4, vmm_get_current_pml4, vmm_load_kernel_pml4 }
 import arch.x86_64.gdt { gdt_set_kernel_stack_cpu }
 import arch.x86_64.percpu { cpu_index, cpu_stack_top, CPU_IDLE }
 import arch.x86_64.cpu_map { MAX_CPUS }
 import sync.idle { cpu_idle_begin, cpu_idle_cancel, cpu_idle_sleep }
-import sync.mbox { mbox_has_work, mbox_drain }
-import arch.x86_64.apic { lapic_timer_start, lapic_timer_stop,lapic_tick_advance, lapic_watchdog_expired }
+import sync.mbox { MboxMsg, MBOX_FORWARD, MBOX_RETURN, mbox_msg, mbox_post, mbox_has_work, mbox_drain }
+import arch.x86_64.apic { lapic_timer_start, lapic_timer_stop, lapic_tick_advance, lapic_watchdog_expired, lapic_local_tick_start, lapic_local_tick_stop }
 import fs.syscall { fs_process_select }
 import syscall.stack { kstack_top }
-import proc.table { Proc, PROC_RUNNING, BLOCK_IRQ, proc_at, proc_state, proc_current_slot, proc_pick_next, proc_set_current, proc_wake, proc_runnable_count }
+import proc.table { Proc, PROC_RUNNING, PROC_BSP_CPU, BLOCK_IRQ, proc_at, proc_state, proc_current_slot, proc_pick_next, proc_set_current, proc_wake, proc_runnable_on, proc_homed_count, proc_home, proc_set_on }
 import proc.waitset { waitset_tick }
 import mm.shm { shm_detach_expired, shm_detach_wake_due }
 
@@ -111,6 +124,12 @@ var sched_running: [64]bool
 # sched_start has made it.
 var sched_idle_ksp: [64]u64
 var sched_idle_made: [64]bool
+# A move this CPU's idle context finishes (sched_move): the slot plus one
+# (0: none), and the CPU it goes to.
+var sched_move_slot: [64]i32
+var sched_move_to: [64]i32
+# The moves each CPU sent: FORWARDs from an AP, RETURNs from the BSP.
+var sched_moves_out: [64]u64
 
 # Every CPU's counters, summed (a racy sum: each is its CPU's own).
 fn sched_totals() -> SchedCounts
@@ -168,6 +187,9 @@ fn sched_switch_to(next: i32)
 fn sched_idle_main()
     let cpu: i32 = cpu_index()
     while true
+        # The process that just left this CPU for another (sched_move).
+        sched_finish_move(cpu)
+        sched_ap_tick_update(cpu)
         # idle.announce: a locked xchg of this CPU's idle flag to 1.
         cpu_idle_begin()
         # idle.recheck: a runnable process, or a mailbox message, after the
@@ -184,6 +206,108 @@ fn sched_idle_main()
             # idle.sleep: sti;hlt. A kick held pending since the announce
             # ends the hlt at once.
             cpu_idle_sleep()
+
+# On the idle context, after the process in sched_move_slot left this CPU
+# for sched_move_to: this CPU drops its address space, then publishes the
+# move and posts it (SMP_USER.md §2 steps 1 and 3). The other CPU can pick
+# it from the publish on; the post is its wake (posts always kick).
+fn sched_finish_move(cpu: i32)
+    let held: i32 = sched_move_slot[cpu]
+    if held == 0
+        return
+    sched_move_slot[cpu] = 0
+    let slot: i32 = held - 1
+    let to: i32 = sched_move_to[cpu]
+    let p: *Proc = proc_at(slot)
+    # Its space leaves this CPU: only the CPU a process is on loads it (§3).
+    if vmm_get_current_pml4() == p.pml4
+        vmm_load_kernel_pml4()
+    proc_set_on(slot, to)
+    var kind: u32 = MBOX_RETURN
+    if to == PROC_BSP_CPU
+        kind = MBOX_FORWARD
+    var msg: MboxMsg = mbox_msg(kind)
+    msg.pid = p.pid
+    sched_moves_out[cpu] = sched_moves_out[cpu] + 1
+    mbox_post(to, msg)
+
+# Carry the running process to CPU `to`: it switches onto this CPU's idle
+# context, which publishes the move (sched_finish_move), and resumes here
+# once `to` picks it. A no-op on `to` itself, with no process, or on a CPU
+# with no idle context (nothing can finish the move: the process stays).
+# Keeps IF as it was.
+fn sched_move(to: i32)
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
+    let cpu: i32 = cpu_index()
+    let me: i32 = proc_current_slot()
+    if to != cpu and me >= 0 and sched_idle_made[cpu]
+        sched_move_slot[cpu] = me + 1
+        sched_move_to[cpu] = to
+        sched_switch_to(-1)
+    if was
+        enable_interrupts()
+
+# FORWARD: an AP's process goes to the BSP for a syscall that is not
+# SYS_LOCAL, or to exit (SMP_USER.md §2). Returns on the BSP. A no-op there.
+pub fn sched_forward()
+    sched_move(PROC_BSP_CPU)
+
+# RETURN: a forwarded syscall is done on the BSP, and its process goes back
+# to its home. Returns on the home. A no-op for a process homed on the BSP.
+pub fn sched_return_home()
+    let me: i32 = proc_current_slot()
+    if me >= 0
+        sched_move(proc_home(me))
+
+# The moves CPU `cpu` sent (FORWARDs from an AP, RETURNs from the BSP).
+pub fn sched_moves_out_count(cpu: i32) -> u64
+    if cpu < 0 or cpu >= MAX_CPUS
+        return 0
+    sched_moves_out[cpu]
+
+# An AP leaves its boot idle loop (arch/x86_64/cpu_smp.ritz smp_ap_idle) for
+# its idle context, and runs the processes homed on it from then on. The
+# stack it left (IST1, or its bootstrap stack) is never returned to.
+pub fn sched_ap_enter()
+    disable_interrupts()
+    let cpu: i32 = cpu_index()
+    sched_make_idle(cpu)
+    var left: u64 = 0
+    sched_switch(@left, sched_idle_ksp[cpu])
+
+# An AP's tick runs only while two or more live processes are homed on it,
+# to preempt between them; a lone pinned process sees no timer interrupt
+# (SMP_USER.md §4). The BSP's tick is sched_start's.
+fn sched_ap_tick_update(cpu: i32)
+    if cpu == PROC_BSP_CPU
+        return
+    let want: bool = proc_homed_count(cpu) >= 2
+    if want and not sched_running[cpu]
+        if lapic_local_tick_start()
+            sched_running[cpu] = true
+    else if not want and sched_running[cpu]
+        lapic_local_tick_stop()
+        sched_running[cpu] = false
+
+# A safe point on the way back to user (the end of a syscall, a kick that
+# interrupted CPL 3): the mailbox is drained, since no kernel code is half
+# done here (SMP_USER.md §2 "Safe points"). A drain may have brought a
+# process onto this CPU (a FORWARD or RETURN): it runs now, not at the next
+# tick. On an AP the tick follows its homed count.
+pub fn sched_user_safe_point()
+    let cpu: i32 = cpu_index()
+    if not mbox_has_work(cpu)
+        return
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
+    mbox_drain()
+    sched_ap_tick_update(cpu)
+    let next: i32 = proc_pick_next()
+    if next >= 0 and next != proc_current_slot()
+        sched_switch_to(next)
+    if was
+        enable_interrupts()
 
 # Make this CPU's idle context: a sched_switch frame at the top of its idle
 # stack that "returns" into sched_idle_main with IF=0, as
@@ -287,8 +411,21 @@ pub fn sched_exit()
 pub fn sched_tick(from_user: bool)
     let cpu: i32 = cpu_index()
     sched_counts[cpu].ticks = sched_counts[cpu].ticks + 1
-    if sched_running[cpu] and proc_runnable_count() >= 2
+    if sched_running[cpu] and proc_runnable_on(cpu) >= 2
         sched_counts[cpu].contended = sched_counts[cpu].contended + 1
+    # The global duties are the BSP's, for every slot (SMP_USER.md §4); an
+    # AP's tick only preempts between its homed processes.
+    if cpu == PROC_BSP_CPU
+        sched_tick_global(from_user)
+    if not from_user or not sched_running[cpu]
+        return
+    let next: i32 = proc_pick_next()
+    if next >= 0 and next != proc_current_slot()
+        sched_counts[cpu].preemptions = sched_counts[cpu].preemptions + 1
+        sched_switch_to(next)
+
+# The BSP tick's duties for the whole machine.
+fn sched_tick_global(from_user: bool)
     # The NVMe watchdog rides this tick instead of reprogramming the timer
     # (#4220): count the tick, and wake a parked driver wait when it expires.
     lapic_tick_advance()
@@ -306,12 +443,6 @@ pub fn sched_tick(from_user: bool)
         shm_detach_expired()
     else
         shm_detach_wake_due()
-    if not from_user or not sched_running[cpu]
-        return
-    let next: i32 = proc_pick_next()
-    if next >= 0 and next != proc_current_slot()
-        sched_counts[cpu].preemptions = sched_counts[cpu].preemptions + 1
-        sched_switch_to(next)
 
 # Build a new process's first frames on slot's kernel stack: its user frame
 # (ring 3 at `entry`, RSP `user_rsp`, RDI/RSI = arg0/arg1, every other

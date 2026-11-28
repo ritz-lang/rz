@@ -246,14 +246,15 @@ def test_kernel_main_keeps_the_boot_order():
     on pid 1's kernel stack when the cutover made pid 1."""
     body = _body(_code(MAIN), "kernel_main") + _body(_code(MAIN), "kernel_tail")
     assert re.search(r"^    if boot_test\n        boot_self_tests\(\)$", body, re.M), body
-    assert re.search(r"^    if boot_test\n        boot_process_tests\(\)$", body, re.M), body
+    # \harland\smp-user (#4881) chooses one of the process tests.
+    assert re.search(r"^    if boot_test\n        boot_process_tests\(boot_option\(HARLAND_BOOT_FLAG_SMP_USER\)\)$", body, re.M), body
     # \b: fs_syscall_init() runs earlier and must not match syscall_init().
     steps = [
         r"\bboot_self_tests\(\)",
         re.escape(r'klog("\nKernel initialized successfully.\n")'),
         r"\bsyscall_init\(\)",
         # #4712: the boot-test process phase needs SYSCALL set up.
-        r"\bboot_process_tests\(\)",
+        r"\bboot_process_tests\(",
         # #4735: the probe and pid 1, then the spawn on pid 1's stack
         r"\bnet_ring1_boot\(kernel_tail\)",
         r"\bnet_ring1_spawn\(\)",

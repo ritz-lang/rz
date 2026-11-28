@@ -45,7 +45,7 @@ FAKE_QEMU = textwrap.dedent("""\
     # the kernel's banner and boot-test self-tests (\\harland\\boot-test,
     # #1887), then its ring dump repeating both (\\harland\\klog-dump, #1885)
     names = ("vmm higher-half heap ipc channel-close channel-debug-print munmap "
-             "mmap-failure pmm-above-4g mmap-overlap mmap-cursor mmap-driver-window elf-loader sysret nmi-gs ist-nest nmi-nest cap-device shm-map virtio-blk-read proc-create-init driver-enter driver-fault driver-preempt driver-reap drv-irq-wait drv-mmio-map drv-dma-alloc drv-dma-free console-poll shm-wait net-attach net-info shm-retire net-addr frame-ring spawn-pages drv-quiesce").split()
+             "mmap-failure pmm-above-4g mmap-overlap mmap-cursor mmap-driver-window elf-loader sysret nmi-gs ist-nest nmi-nest cap-device shm-map virtio-blk-read proc-create-init driver-enter driver-fault driver-preempt driver-reap drv-irq-wait drv-mmio-map drv-dma-alloc drv-dma-free console-poll shm-wait net-attach net-info shm-retire net-addr frame-ring spawn-pages drv-quiesce smp-user").split()
     log = ("\\n========================================\\n    Hello from Harland!\\n========================================\\n"
            + "".join(f"[boot-test] PASS {n}\\n" for n in names)
            + f"[boot-test] {len(names)} passed, 0 failed\\n")
@@ -84,6 +84,7 @@ FAKE_QEMU = textwrap.dedent("""\
                 "[tlb] owner unmap OK: cpu 1 saw the unmap\\n[tlb] kernel invlpg OK: cpu 1 saw the unmap\\n"
                 "[tlb] owner unmap OK: cpu 2 saw the unmap\\n[tlb] kernel invlpg OK: cpu 2 saw the unmap\\n"
                 "[tlb] owner unmap OK: cpu 3 saw the unmap\\n[tlb] kernel invlpg OK: cpu 3 saw the unmap\\n"
+                "[smp-user] concurrent syscalls OK: cpu0 100000 cpu3 100000, forwarded 100002\\n"
                 "[test] ping nodev ... ping: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"
                 "[test] udp-send nodev ... udp-send: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"
                 "[test] udp-recv nodev ... udp-recv: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"

@@ -222,7 +222,12 @@ MBOX_OK = "".join(f"[mbox] round trip OK: cpu {k} answered 64 pings\n" for k in 
 TLB_OK = "".join(f"[tlb] owner unmap OK: cpu {k} saw the unmap\n[tlb] kernel invlpg OK: cpu {k} saw the unmap\n"
                  for k in (1, 2, 3))
 TLB_NONE = "[tlb] no APs for the owner unmap\n"
-SMP_OK = SMP_OK + MBOX_OK + TLB_OK
+# A process on the BSP and one pinned to the last AP (cpu 3) made forwarded
+# and local syscalls at once, every count exact (AGAST #4881, SMP_USER.md
+# §6); at one CPU the pinned spawn fell back to the BSP.
+SMP_USER_OK = "[smp-user] concurrent syscalls OK: cpu0 100000 cpu3 100000, forwarded 100002\n"
+SMP_USER_NONE = "[smp-user] single CPU: pinned spawn ran on the BSP\n"
+SMP_OK = SMP_OK + MBOX_OK + TLB_OK + SMP_USER_OK
 PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
 # The native ESP carries \\harland\\klog-dump, so the kernel dumps its crash
 # ring before init: the dump must be exactly the kernel's serial output up to
@@ -237,7 +242,7 @@ BOOT_TESTS = (
     "munmap", "mmap-failure", "pmm-above-4g", "mmap-overlap", "mmap-cursor",
     "mmap-driver-window",
     "elf-loader", "sysret", "nmi-gs", "ist-nest", "nmi-nest", "cap-device", "shm-map", "virtio-blk-read",
-    "proc-create-init", "driver-enter", "driver-fault", "driver-preempt", "driver-reap", "drv-irq-wait", "drv-mmio-map", "drv-dma-alloc", "drv-dma-free", "console-poll", "shm-wait", "net-attach", "net-info", "shm-retire", "net-addr", "frame-ring", "spawn-pages", "drv-quiesce",
+    "proc-create-init", "driver-enter", "driver-fault", "driver-preempt", "driver-reap", "drv-irq-wait", "drv-mmio-map", "drv-dma-alloc", "drv-dma-free", "console-poll", "shm-wait", "net-attach", "net-info", "shm-retire", "net-addr", "frame-ring", "spawn-pages", "drv-quiesce", "smp-user",
 )
 BOOT_TEST_OK = "".join(f"[boot-test] PASS {t}\n" for t in BOOT_TESTS) + (
     f"[boot-test] {len(BOOT_TESTS)} passed, 0 failed\n"
@@ -643,8 +648,10 @@ def test_every_ap_must_see_the_unmap(tree, tlb, verdict):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("line, rc", [("[mbox] no APs to ping\n" + TLB_NONE, 0), ("[mbox] no APs to ping\n", 1), ("", 1)],
-                         ids=["said", "tlb-silent", "silent"])
+@pytest.mark.parametrize("line, rc", [("[mbox] no APs to ping\n" + TLB_NONE + SMP_USER_NONE, 0),
+                                      ("[mbox] no APs to ping\n" + SMP_USER_NONE, 1),
+                                      ("[mbox] no APs to ping\n" + TLB_NONE, 1), ("", 1)],
+                         ids=["said", "tlb-silent", "smp-user-silent", "silent"])
 def test_one_cpu_must_say_it_has_no_ap_to_ping(tree, line, rc):
     """At -smp 1 there is no AP: the kernel says so, and silence fails. Nor
     does it run the SMP syscall-stack self-test (init_smp needs an AP)."""
@@ -654,6 +661,28 @@ def test_one_cpu_must_say_it_has_no_ap_to_ping(tree, line, rc):
     if rc == 0:
         assert "PASS (native): one CPU, no AP to ping over the mailbox" in r.stdout
         assert "PASS (native): one CPU, no AP for the owner unmap" in r.stdout
+        assert "PASS (native): one CPU, the pinned spawn ran on the BSP" in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "line, verdict",
+    [
+        ("", "no concurrent-syscalls verdict for a process on cpu 3 (got: none)"),
+        (SMP_USER_OK.replace("cpu3", "cpu2"), "no concurrent-syscalls verdict for a process on cpu 3"),
+        (SMP_USER_OK.replace("cpu0 100000", "cpu0 99999"), "no concurrent-syscalls verdict for a process on cpu 3"),
+        (SMP_USER_OK + "[smp-user] FAIL: forwarded bumps were lost: two CPUs ran a BSP-owned row at once\n",
+         "the smp-user boot test failed"),
+    ],
+    ids=["silent", "not-the-last-ap", "inexact", "failed"],
+)
+def test_a_process_pinned_to_the_last_ap_must_make_its_syscalls(tree, line, verdict):
+    """The smp-user boot test (AGAST #4881): a process pinned to the last AP
+    and one on the BSP each made 100000 forwarded and 100000 local syscalls
+    at once, every count exact, and no FAIL line."""
+    r = _run(tree, PASSED.replace(SMP_USER_OK, line))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert verdict in r.stdout
 
 
 @pytest.mark.integration
@@ -1066,6 +1095,8 @@ def test_native_esp_carries_the_boot_test_marker(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "ESP ./harland/boot-test" in (tree["tmp"] / "stub.log").read_text()
+    # ...and \\harland\\smp-user, the boot test of processes on APs (#4881).
+    assert "ESP ./harland/smp-user" in (tree["tmp"] / "stub.log").read_text()
     assert f"PASS (native): {len(BOOT_TESTS)} kernel boot self-tests passed" in r.stdout
 
 
@@ -1073,7 +1104,7 @@ def test_grub_boots_pass_boot_test_on_the_cmdline():
     """GRUB has no ESP marker for the kernel to see: the multiboot2 cmdline
     carries the same option."""
     text = (REPO / BOOT_SCRIPT).read_text()
-    assert "multiboot2 /boot/harland.elf boot-test;" in text
+    assert "multiboot2 /boot/harland.elf boot-test smp-user;" in text
 
 
 @pytest.mark.integration

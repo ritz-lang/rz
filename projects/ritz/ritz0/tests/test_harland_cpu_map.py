@@ -178,6 +178,26 @@ fn main() -> i32
     cpu_map_add(256)
     if cpu_map_boot_claim(256) != -1
         return 32
+    # place_pinned (AGAST #4881, SMP_USER.md §5): a started AP as asked, else
+    # the last started AP, else the BSP. The BSP (index 0) is never "an AP".
+    cpu_map_reset()
+    cpu_map_add(0)
+    if place_pinned(1) != 0 or place_pinned(-1) != 0
+        return 33
+    cpu_map_add(2)
+    cpu_map_add(4)
+    cpu_map_add(6)
+    cpu_map_mark_started(2)
+    cpu_map_mark_started(4)
+    if place_pinned(1) != 1
+        return 34
+    if place_pinned(3) != 2 or place_pinned(-1) != 2 or place_pinned(64) != 2
+        return 35
+    if place_pinned(0) != 2
+        return 36
+    cpu_map_mark_started(0)
+    if place_pinned(0) != 2
+        return 37
     0
 """
 
@@ -194,7 +214,10 @@ CLAIMS = {1: "MAX_CPUS is 64", 2: "reset empties the table", 3: "add returns CPU
           26: "an AP whose boot was never opened can't claim it", 27: "opened boot -> claim returns the index",
           28: "a boot is claimed once", 29: "abandon after the AP claimed -> false (it runs)",
           30: "abandoned boot -> the late AP's claim fails", 31: "unknown APIC ID / bad index refused",
-          32: "reset closes open boots"}
+          32: "reset closes open boots", 33: "no started AP: the BSP",
+          34: "a started AP as asked", 35: "else the last started AP",
+          36: "the BSP asked for is no AP: the last started AP",
+          37: "the BSP is never a placement target even if flagged"}
 
 
 @pytest.mark.integration
