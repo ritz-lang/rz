@@ -7,6 +7,10 @@
 # waits as long as it takes, 0 does not wait.
 #
 #   fd < 0          skipped: revents 0
+#   a pipe's read   POLLIN once read would return: bytes, or no writer left
+#   end             (end of file); fd 0-2 too, when a spawn redirected them
+#   a pipe's write  POLLOUT once write would return: room, or no reader left
+#   end             (#4955)
 #   a file          POLLIN | POLLOUT, as asked: a file never blocks
 #   fd 0, the       POLLIN once read(0) would return (a line, or a raw byte,
 #   console         or an end of input: tty_console_readable); POLLOUT
@@ -24,14 +28,21 @@
 #
 # The wait is tty_console_wait's: parked on the caller's wait set with a TSC
 # deadline (monotonic, no wall clock) and a console watch, so COM1 input or
-# the deadline (sched_tick, 100 Hz) ends it.
+# the deadline (sched_tick, 100 Hz) ends it. A set with a pipe fd also
+# watches pipes (proc/waitset.ritz waitset_watch_pipes) from before its first
+# check: a pipe change ends the wait too, and the set is checked again, until
+# something is ready or the deadline passes.
 
 import ritzlib.option
 import mm.uptr { uptr_check_write }
 import syscall.errno { Errno }
-import fs.syscall { is_fs_fd }
+import fs.syscall { is_fs_fd, fs_pipe_end }
+import fs.pipe { PipeEnd, PipeSide, pipe_readable, pipe_writable }
 import tty.console { tty_console_readable, tty_console_wait }
-import arch.x86_64.tsc { deadline_after_us }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import proc.table { proc_current, proc_current_slot, proc_reap_pending }
+import proc.waitq { waitq_can_park }
+import proc.waitset { waitset_watch_pipes, waitset_disarm }
 
 # ritzlib.sys's PollFd.
 struct PollFd
@@ -52,6 +63,9 @@ const US_PER_MS: u64 = 1000
 fn poll_revents(fd: i32, events: i16, console_readable: bool) -> i16
     if fd < 0
         return 0
+    match fs_pipe_end(fd)
+        Some(end) => return pipe_revents(end, events)
+        None => pass
     if is_fs_fd(fd)
         return events & (POLLIN | POLLOUT)
     if fd == 0
@@ -62,6 +76,28 @@ fn poll_revents(fd: i32, events: i16, console_readable: bool) -> i16
     if fd <= 2
         return events & POLLOUT
     POLLNVAL
+
+# What a pipe end reports: POLLIN on a readable read end, POLLOUT on a
+# writable write end.
+fn pipe_revents(end: PipeEnd, events: i16) -> i16
+    match end.side
+        PipeSide.Read =>
+            if pipe_readable(end.pipe)
+                return events & POLLIN
+        PipeSide.Write =>
+            if pipe_writable(end.pipe)
+                return events & POLLOUT
+    0
+
+# Whether an entry is a pipe fd: the wait then watches pipes.
+fn poll_has_pipe(fds: *PollFd, nfds: u64) -> bool
+    var i: u64 = 0
+    while i < nfds
+        match fs_pipe_end((fds + i).fd)
+            Some(_) => return true
+            None => pass
+        i = i + 1
+    false
 
 # Write every entry's revents; how many are non-zero.
 fn poll_fill(fds: *PollFd, nfds: u64, console_readable: bool) -> i64
@@ -82,9 +118,18 @@ fn poll_wants_console(fds: *PollFd, nfds: u64) -> bool
     while i < nfds
         let e: *PollFd = fds + i
         if e.fd == 0 and (e.events & POLLIN) != 0 and not is_fs_fd(0)
-            return true
+            match fs_pipe_end(0)
+                Some(_) => pass
+                None => return true
         i = i + 1
     false
+
+# poll's answer `count`, with the caller's pipe watch (if any) disarmed: a
+# stale `fired` would end a later wait early.
+fn poll_done(slot: i32, count: i64) -> i64
+    if slot >= 0
+        waitset_disarm(slot)
+    count
 
 # poll(fds, nfds, timeout_ms): the caller's page table is loaded.
 pub fn sys_poll_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -96,12 +141,28 @@ pub fn sys_poll_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         return Errno.Inval as i64
     if nfds > 0 and uptr_check_write(fds as *u8, nfds * sizeof(PollFd) as u64) != 0
         return Errno.Fault as i64
-    let count: i64 = poll_fill(fds, nfds, tty_console_readable())
+    # Watch pipes before every check, so a change after it is not lost.
+    let watch: bool = poll_has_pipe(fds, nfds)
+    let slot: i32 = proc_current_slot()
+    if watch
+        waitset_watch_pipes(slot)
+    var count: i64 = poll_fill(fds, nfds, tty_console_readable())
     if count > 0 or timeout_ms == 0
-        return count
-    # Nothing ready: only console input or the deadline can change that.
+        return poll_done(slot, count)
+    # Nothing ready: console input, a pipe change or the deadline can change
+    # that.
     var deadline: Option<u64> = None
     if timeout_ms > 0
         deadline = Some(deadline_after_us(timeout_ms as u64 * US_PER_MS))
-    let readable: bool = tty_console_wait(poll_wants_console(fds, nfds), deadline)
-    poll_fill(fds, nfds, readable)
+    while true
+        let readable: bool = tty_console_wait(poll_wants_console(fds, nfds), deadline)
+        if watch
+            waitset_watch_pipes(slot)
+        count = poll_fill(fds, nfds, readable)
+        if count > 0 or not watch or not waitq_can_park() or proc_reap_pending(proc_current())
+            return poll_done(slot, count)
+        match deadline
+            Some(t) =>
+                if deadline_passed(t)
+                    return poll_done(slot, count)
+            None => pass

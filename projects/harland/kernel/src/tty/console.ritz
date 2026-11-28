@@ -47,7 +47,7 @@ import ritzlib.option
 import ritzlib.result { Result }
 import syscall.errno { Errno }
 import proc.table { BLOCK_TTY, BLOCK_WAIT, proc_block, proc_wake, proc_current, proc_current_slot, proc_reap_pending }
-import proc.waitset { waitset_arm, waitset_disarm, waitset_watch_console, waitset_console_ready }
+import proc.waitset { waitset_arm, waitset_disarm, waitset_watch_console, waitset_console_ready, waitset_pipe_fired }
 import proc.waitq { waitq_can_park }
 import arch.x86_64.tsc { deadline_passed }
 import proc.sched { sched_block }
@@ -186,8 +186,9 @@ pub fn tty_console_readable() -> bool
 # A timed poll's wait (#4829): sleep on the caller's wait set until TSC
 # `deadline` passes (None: no deadline), or, with `for_input`, until read(0)
 # would return. Console input wakes it either way, so a Ctrl-C for the
-# foreground still kills it. Returns tty_console_readable's answer as the
-# wait ended. A process marked to exit stops waiting (its return to user
+# foreground still kills it. A pipe change ends it too, when the caller
+# watches pipes (proc/waitset.ritz waitset_watch_pipes, #4955). Returns
+# tty_console_readable's answer as the wait ended. A process marked to exit stops waiting (its return to user
 # exits), and a CPU that cannot park (not the BSP, no process) does not wait.
 pub fn tty_console_wait(for_input: bool, deadline: Option<u64>) -> bool
     disable_interrupts()
@@ -201,6 +202,9 @@ pub fn tty_console_wait(for_input: bool, deadline: Option<u64>) -> bool
             tty_console_kill_foreground()
         ready = ldisc_readable()
         if (for_input and ready) or not waitq_can_park() or proc_reap_pending(proc_current())
+            break
+        # A poll watching pipes (#4955) re-checks its set after a change.
+        if waitset_pipe_fired(slot)
             break
         match deadline
             Some(t) =>

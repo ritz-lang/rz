@@ -267,7 +267,9 @@ def test_spawn_bg_yield_and_wait_are_real():
     entry = _code(ENTRY)
     assert "syscall_register(Syscall.SpawnBg, sys_spawn_bg_handler)" in entry
     process = _code(PROCESS)
-    bg = _body(process, "sys_spawn_bg_handler")
+    # spawn_bg and spawn_io (#4955) share spawn_bg_from_user, which never waits
+    assert "spawn_bg_from_user(" in _body(process, "sys_spawn_bg_handler")
+    bg = _body(process, "spawn_bg_from_user")
     assert "return spawn_process(" in bg and "wait_for_child" not in bg
     assert "spawn_process(" in _body(process, "spawn_and_block") and \
         "wait_for_child(" in _body(process, "spawn_and_block")

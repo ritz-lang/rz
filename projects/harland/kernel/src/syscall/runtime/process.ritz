@@ -31,7 +31,8 @@ import fs.vfs { O_CREAT }
 import goliath.namespace { Namespace }
 import ritzlib.strview { strview_from_ptr }
 import ritzlib.span { Span, span_from_ptr }
-import fs.syscall { sys_open, fs_process_end, fs_process_start, fs_process_select }
+import fs.syscall { SpawnStdio, sys_open, fs_process_end, fs_process_start, fs_process_select, fs_process_give_stdio, spawn_stdio_inherit }
+import syscall.runtime.pipe { pipe_changed }
 import syscall.stack { syscall_stack_check, syscall_stack_used }
 import drivers.acpi.tables { acpi_poweroff }
 import loader.image { ElfStatus }
@@ -114,6 +115,7 @@ fn spawn_undo(slot: i32, parent_pid: u64)
     fs_process_select(c.pid)
     fs_process_end()
     fs_process_select(parent_pid)
+    pipe_changed()
     if c.pml4 != 0
         vmm_free_pml4(c.pml4)
     proc_abort_child(slot)
@@ -139,11 +141,12 @@ fn spawn_capture_argv(argv: **u8, argc: i32) -> i64
 
 # The first half of every spawn, in the parent's address space: a child
 # slot of the running process `parent_pid`, its capability table (the
-# parent's ambient capabilities when `inherit_caps`), its own fd table, and
-# an isolated page table (kernel mappings, empty user space) in its Proc.
+# parent's ambient capabilities when `inherit_caps`), its own fd table with
+# fds 0-2 from the parent's under `stdio` (#4955), and an isolated page table
+# (kernel mappings, empty user space) in its Proc.
 # The parent's fd table is current again on return. The child's slot, or a
 # negative errno with nothing left behind.
-fn spawn_child_begin(parent_pid: u64, inherit_caps: bool) -> i64
+fn spawn_child_begin(parent_pid: u64, inherit_caps: bool, stdio: SpawnStdio) -> i64
     let slot: i32 = proc_new_child()
     if slot < 0
         klog("[spawn_args] No child process slot\n")
@@ -174,6 +177,14 @@ fn spawn_child_begin(parent_pid: u64, inherit_caps: bool) -> i64
         proc_abort_child(slot)
         return fs_result as i64
 
+    # Its stdin, stdout and stderr: the parent's own, or the parent fds
+    # spawn_io named; a pipe end is shared, so its EOF waits for both.
+    match fs_process_give_stdio(child_pid, stdio)
+        Ok(_) => pass
+        Err(e) =>
+            spawn_undo(slot, parent_pid)
+            return e as i64
+
     # An isolated address space: kernel mappings, empty user space.
     let child_pml4: u64 = vmm_create_user_pml4()
     if child_pml4 == 0
@@ -190,7 +201,7 @@ fn spawn_child_begin(parent_pid: u64, inherit_caps: bool) -> i64
 #
 # ISOLATION: each child gets its own page table (CR3); it cannot read or
 # write the parent's user memory.
-fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: bool, home: i32) -> i64
+fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: bool, home: i32, stdio: SpawnStdio) -> i64
     # Read file from namespace (using kernel's page table). A path under
     # /var comes from the persistent subtree (fs/kfs.ritz, #4321).
     let ns: *Namespace = kfs_ns_for(path_view)
@@ -215,7 +226,7 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: b
     let parent_pid: u64 = parent.pid
     let parent_pml4: u64 = vmm_get_current_pml4()
     (*parent).pml4 = parent_pml4
-    let begun: i64 = spawn_child_begin(parent_pid, inherit_caps)
+    let begun: i64 = spawn_child_begin(parent_pid, inherit_caps, stdio)
     if begun < 0
         return begun
     let slot: i32 = begun as i32
@@ -259,7 +270,7 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: b
 pub fn process_spawn_program(path: StrView) -> Result<u64, Errno>
     if proc_current() == 0 as *Proc
         return Err(Errno.Srch)
-    errno_result(spawn_process(path, 0, 0, false, PROC_BSP_CPU))
+    errno_result(spawn_process(path, 0, 0, false, PROC_BSP_CPU, spawn_stdio_inherit()))
 
 # process_spawn_program, homed on CPU `cpu` (SMP_USER.md §5): kernel-only
 # placement, the spawn on the BSP, which owns the process table. The child
@@ -269,7 +280,7 @@ pub fn process_spawn_program(path: StrView) -> Result<u64, Errno>
 pub fn process_spawn_program_on(path: StrView, cpu: i32) -> Result<u64, Errno>
     if proc_current() == 0 as *Proc
         return Err(Errno.Srch)
-    errno_result(spawn_process(path, 0, 0, false, cpu))
+    errno_result(spawn_process(path, 0, 0, false, cpu, spawn_stdio_inherit()))
 
 # The most pages process_spawn_image maps for an image (AGAST #4731): the
 # boot-test stub grew past one page when the frame-ring modes landed beside
@@ -305,7 +316,7 @@ fn spawn_image(image: Span<u8>, arg0: u64, arg1: u64, cpu: i32) -> i64
     let parent_pml4: u64 = vmm_get_current_pml4()
     (*parent).pml4 = parent_pml4
 
-    let begun: i64 = spawn_child_begin(parent_pid, false)
+    let begun: i64 = spawn_child_begin(parent_pid, false, spawn_stdio_inherit())
     if begun < 0
         return begun
     let slot: i32 = begun as i32
@@ -367,7 +378,7 @@ fn wait_for_child(pid: u64, code: *i64) -> i32
 # sys_wait to collect the status; a negative exit code fails the spawn with
 # -1 instead, and the child is reaped here since no wait will come.
 fn spawn_and_block(path: StrView, argc: i32, argv_bytes: i64) -> i64
-    let pid: i64 = spawn_process(path, argc, argv_bytes, true, PROC_BSP_CPU)
+    let pid: i64 = spawn_process(path, argc, argv_bytes, true, PROC_BSP_CPU, spawn_stdio_inherit())
     if pid <= 0
         return pid
     var code: i64 = 0
@@ -425,8 +436,10 @@ fn sys_exit_impl(code: i32) -> i64
         driver_quiesce(me.pid as u32, my_pml4)
 
         # Close the fds it left open (flushing their writes) and free its
-        # fd table, so none outlive it (#2753).
+        # fd table, so none outlive it (#2753). Its pipe ends go with it: the
+        # other sides may be waiting for that (EOF, Pipe; #4955).
         fs_process_end()
+        pipe_changed()
         # Each shm object it held is retired (#4729): the other holders'
         # latches get PEER_CLOSE (DRIVER_GONE when it owned a device IRQ),
         # and the pages stay the object's until their mappings detach or
@@ -687,6 +700,11 @@ pub fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # the child's pid comes back at once, both run (#3629), and wait(pid)
 # collects its exit code.
 pub fn sys_spawn_bg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return spawn_bg_from_user(rdi, rsi, rdx, spawn_stdio_inherit())
+
+# spawn_bg's and spawn_io's body: path `rdi`, argv `rsi`, argc `rdx` from
+# the caller, the child's fds 0-2 under `stdio` (already copied in).
+fn spawn_bg_from_user(rdi: u64, rsi: u64, rdx: u64, stdio: SpawnStdio) -> i64
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
         return Errno.Fault as i64
@@ -699,7 +717,19 @@ pub fn sys_spawn_bg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         argv_bytes = spawn_capture_argv(rsi as **u8, argc)
         if argv_bytes < 0
             return argv_bytes
-    return spawn_process(strview_from_ptr(rdi as *u8, path_result), argc, argv_bytes, true, PROC_BSP_CPU)
+    return spawn_process(strview_from_ptr(rdi as *u8, path_result), argc, argv_bytes, true, PROC_BSP_CPU, stdio)
+
+# spawn_io(path, argv, argc, stdio): spawn_bg, with the child's fds 0-2 from
+# the caller's fds the SpawnStdio record names ({ 0, 1, 2 }: the caller's own,
+# #4955). A pipe end or a console fd; anything else
+# (a file, an unopened fd) is Errno.BadF with nothing started.
+pub fn sys_spawn_io_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: the map is copied out of the caller's memory here, before
+    # spawn_process switches page tables.
+    if uptr_check_read(r10 as *u8, sizeof(SpawnStdio) as u64) != 0
+        return Errno.Fault as i64
+    let stdio: SpawnStdio = *(r10 as *SpawnStdio)
+    return spawn_bg_from_user(rdi, rsi, rdx, stdio)
 
 # wait(pid)
 pub fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

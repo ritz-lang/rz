@@ -18,6 +18,8 @@
 #     to waitset_tick, which wakes the parked set whose deadline has passed
 #     and no other. The shared LAPIC watchdog is not used, so two device
 #     waits cannot clear each other's timeouts.
+#   * Pipes, per process slot (#4955): a poll with a pipe fd watches them,
+#     and every pipe change (waitset_pipes_changed) fires and wakes it.
 #   * The console, per process slot (#4829): a timed poll on fd 0
 #     (syscall/runtime/poll.ritz) parks here with a deadline and a console
 #     watch, and COM1's receive interrupt (tty/console.ritz tty_console_irq)
@@ -90,6 +92,8 @@ struct IrqObject
 var irq_objects: [16]IrqObject      # IRQ_OBJECT_MAX
 var waitset_deadline: [MAX_PROCS]u64    # by process slot; NO_DEADLINE = unarmed
 var waitset_console: [MAX_PROCS]bool    # by process slot: watching the console
+var waitset_pipes: [MAX_PROCS]bool      # by process slot: watching pipes (#4955)
+var waitset_pipe_hit: [MAX_PROCS]bool # by process slot: a pipe changed since the watch
 
 # The slot holding `object_id`, or -1.
 fn irq_object_slot(object_id: u64) -> i32
@@ -209,6 +213,32 @@ pub fn waitset_watch_console(slot: i32)
 pub fn waitset_disarm(slot: i32)
     waitset_deadline[slot] = NO_DEADLINE
     waitset_console[slot] = false
+    waitset_pipes[slot] = false
+    waitset_pipe_hit[slot] = false
+
+# A poll with a pipe fd in its set (#4955) watches pipes from before its
+# first check, so a change between that check and the park is not lost: it
+# sets the slot's `fired`, which the wait (tty_console_wait) reads before it
+# parks.
+pub fn waitset_watch_pipes(slot: i32)
+    if slot < 0
+        return
+    waitset_pipes[slot] = true
+    waitset_pipe_hit[slot] = false
+
+# Whether a pipe changed since the slot's waitset_watch_pipes.
+pub fn waitset_pipe_fired(slot: i32) -> bool
+    slot >= 0 and waitset_pipe_hit[slot]
+
+# A pipe took or gave bytes, or lost an end (syscall/runtime/pipe.ritz,
+# IF=0): every pipe watcher is fired and, if parked on its wait set, woken.
+pub fn waitset_pipes_changed()
+    var slot: i32 = 0
+    while slot < MAX_PROCS
+        if waitset_pipes[slot]
+            waitset_pipe_hit[slot] = true
+            proc_wake_pid(proc_at(slot).pid, BLOCK_WAIT)
+        slot = slot + 1
 
 # Console input arrived (tty_console_irq, IF=0): wake each process watching
 # the console that is parked on its wait set. One blocked for anything

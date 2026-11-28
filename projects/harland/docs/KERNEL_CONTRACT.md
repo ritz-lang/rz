@@ -79,7 +79,40 @@ fn sys_spawn_bg(path: *u8, argv: **u8, argc: i32) -> i64
   exits and returns its exit code. A child whose parent exits first is
   detached: nobody can wait for it, and its exit frees its slot.
 - **Returns**: the child's pid, or a negative errno (ENOENT, ENOEXEC,
-  ENOMEM, EAGAIN with 8 processes live, E2BIG, EFAULT)
+  ENOMEM, EAGAIN with 32 processes live, E2BIG, EFAULT)
+- The child's fds 0-2 are the caller's: a pipe end there is shared with it
+  (AGAST #4955). It gets no other fd of the caller's.
+
+#### SYS_PIPE (29)
+
+```ritz
+# A pipe (AGAST #4955): Linux's number and ABI
+fn sys_pipe(fds: *[2]i32) -> i32
+```
+
+- `fds[0]` reads what `fds[1]` writes, the lowest free fds. A pipe holds
+  4096 bytes. `read` returns as soon as any bytes are there, 0 (end of file)
+  once every write end is closed, and sleeps while the pipe is empty;
+  `write` returns once all its bytes are in, sleeping while the pipe is
+  full, and is EPIPE once every read end is closed. `poll` reports POLLIN
+  on a readable read end and POLLOUT on a writable write end. `fstat` says
+  S_IFIFO. A pipe needs no capability. 64 pipes can be open at once.
+- **Returns**: 0, or ENFILE (no pipe or fd free), EFAULT
+
+#### SYS_SPAWN_IO (90)
+
+```ritz
+# Start a program with its fds 0-2 taken from the caller's (AGAST #4955)
+fn sys_spawn_io(path: *u8, argv: **u8, argc: i32, stdio: *SpawnStdio) -> i64
+```
+
+- Like SYS_SPAWN_BG (28). `stdio` is `{ stdin: i32, stdout: i32, stderr:
+  i32 }`: each the caller's fd that the child's fd 0, 1 or 2 shares;
+  `{ 0, 1, 2 }` is the caller's own stdio. Each must be a pipe end or a
+  console fd. A child closing a redirected fd 0-2 gets the console back
+  there. `ritzlib.command`'s `Command` is the portable API.
+- **Returns**: as SYS_SPAWN_BG, and EBADF (nothing started) for a stdio fd
+  that is not open or is a file
 
 #### SYS_GETPID (23)
 
