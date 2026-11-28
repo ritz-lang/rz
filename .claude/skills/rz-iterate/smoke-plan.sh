@@ -39,7 +39,7 @@
 #     except projects/ritz/**.md         doc-examples
 #     and docs/LANGUAGE_SPEC.md          doc-examples build-all-ritz1
 #   projects/ritz/ritz0/**, grammars/**,
-#     runtime/**                         unit ritz1-bootstrap matrix (the
+#     runtime/**                         ritz1-bootstrap unit matrix (the
 #                                        compiler set rz briefs, 2026-11-23)
 #                                        build-all-ritz1
 #   projects/ritz/ritz1/test/**          the compiler set, ritz1-unit
@@ -261,8 +261,18 @@ targets_of() {
     esac
 }
 
-# The fixed order targets run and are quoted in: cheap and broad first.
-ORDER=(smoke doc-examples tools-unit tools-ratchets harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1 builder)
+# The fixed order targets run and are quoted in: the ritz0-only targets,
+# cheap and broad first, then ritz1-bootstrap, then every target that runs
+# ritz1 or ritz1_selfhosted (AGAST #5000: with unit ahead of the bootstrap, a
+# fresh worktree failed ~6k ritz1_selfhosted rows on missing binaries and a
+# reused one ran them on stale ones).  Ahead of the bootstrap: smoke builds
+# the ritz1 it uses itself, check-doc-examples, ritzlib, ritz-tests and
+# examples default to ritz0, harness-selftest stubs its binaries in a scratch
+# root, and tools-ratchets runs --no-ritz1-build.  After it: tools-unit (its
+# tests run the built ritz1), unit, ritz1-unit, matrix and the package
+# sweeps.  A target that runs ritz1 goes after ritz1-bootstrap.  `check`
+# compares sets, so a quote in the old order still passes.
+ORDER=(smoke doc-examples tools-ratchets harness-selftest ritzlib ritz-tests examples ritz1-bootstrap tools-unit unit ritz1-unit matrix build-all build-all-ritz1 builder)
 
 # plan_targets <range...>: every target for the diff, smoke first, in ORDER,
 # then ci:/entry:/pkg:/skill: targets sorted.

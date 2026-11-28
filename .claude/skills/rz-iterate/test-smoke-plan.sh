@@ -26,16 +26,16 @@ targets() { bash "$SP" plan "$@" | cut -f1 | paste -sd' '; }
 # 1. The path -> targets mapping, one rule at a time.
 change docs/a.md >/dev/null;                    eq "$(targets)" "smoke tools-ratchets" "a doc-only diff is smoke and the ratchets"
 change projects/ritz/README.md >/dev/null;      eq "$(targets)" "smoke doc-examples tools-ratchets" "a ritz doc checks its examples"
-change projects/ritz/ritz0/x.py >/dev/null;     eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix build-all-ritz1" "ritz0 runs the full unit suite, ritz1-bootstrap, the matrix and every package under ritz1"
-change projects/ritz/runtime/r.c >/dev/null;    eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix build-all-ritz1" "the runtime runs the compiler set (every package links it)"
+change projects/ritz/ritz0/x.py >/dev/null;     eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit matrix build-all-ritz1" "ritz0 runs the full unit suite, ritz1-bootstrap, the matrix and every package under ritz1"
+change projects/ritz/runtime/r.c >/dev/null;    eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit matrix build-all-ritz1" "the runtime runs the compiler set (every package links it)"
 change projects/ritz/ritz1/src/m.ritz >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap ritz1-unit matrix build-all-ritz1" "ritz1/src runs the compiler set, its unit suites and every package under ritz1"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit ritz1-unit matrix build-all-ritz1" "ritz1/src runs the compiler set, its unit suites and every package under ritz1"
 change projects/ritz/grammars/g.grammar >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix build-all-ritz1" "the grammar runs the compiler set (regen-check is in the matrix)"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit matrix build-all-ritz1" "the grammar runs the compiler set (regen-check is in the matrix)"
 change projects/ritz/ritzlib/v.ritz >/dev/null; eq "$(targets)" "smoke tools-ratchets ritzlib matrix build-all-ritz1" "ritzlib runs its tests, the matrix and every package under ritz1"
 change projects/ritz/test/t.ritz >/dev/null;    eq "$(targets)" "smoke tools-ratchets ritz-tests matrix" "ritz/test runs the language tests and the matrix"
 change projects/ritz/examples/e.ritz >/dev/null; eq "$(targets)" "smoke tools-ratchets examples" "examples run the examples"
-change projects/ritz/tools/t.py >/dev/null;     eq "$(targets)" "smoke tools-unit tools-ratchets" "tools run tools-unit (and the ratchets: no unit for ritz0's half)"
+change projects/ritz/tools/t.py >/dev/null;     eq "$(targets)" "smoke tools-ratchets tools-unit" "tools run tools-unit (and the ratchets: no unit for ritz0's half)"
 change projects/ritz/scripts/s.sh >/dev/null;   eq "$(targets)" "smoke tools-ratchets harness-selftest" "scripts run the harness self-tests"
 change projects/ritz/build.py >/dev/null;       eq "$(targets)" "smoke tools-unit unit" "other ritz files run unit and tools-unit"
 change projects/nexus/src/n.ritz >/dev/null;    eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap pkg:nexus" "a package builds the compilers, then its own build and tests"
@@ -45,13 +45,13 @@ change projects/nexus/src/n.ritz >/dev/null;    eq "$(targets)" "smoke tools-rat
 change projects/builder/Dockerfile >/dev/null;  eq "$(targets)" "smoke tools-ratchets builder" "the builder image runs its own image test, not a package build"
 has "$(bash "$SP" plan)" "^builder	bash projects/builder/test.sh$" "the builder target runs projects/builder/test.sh"
 change .claude/skills/rz-iterate/train.sh >/dev/null
-eq "$(targets)" "smoke tools-unit tools-ratchets skill:rz-iterate" "a skill runs its own tests and tools-unit"
+eq "$(targets)" "smoke tools-ratchets tools-unit skill:rz-iterate" "a skill runs its own tests and tools-unit"
 # AGAST #4580 bounce: tools/test_provision_room.py and test_smoke.py assert
 # SKILL.md's text, so a .claude/ change (markdown included) runs tools-unit.
 change .claude/skills/rz-iterate/SKILL.md >/dev/null
-eq "$(targets)" "smoke tools-unit tools-ratchets skill:rz-iterate" "a skill's SKILL.md runs tools-unit and the skill's tests"
-change .claude/settings.json >/dev/null;        eq "$(targets)" "smoke tools-unit tools-ratchets" "any other .claude/ file runs tools-unit"
-change .claude/host-env.sh >/dev/null;          eq "$(targets)" "smoke tools-unit tools-ratchets skill:rz-iterate" "host-env.sh runs tools-unit and rz-iterate's tests"
+eq "$(targets)" "smoke tools-ratchets tools-unit skill:rz-iterate" "a skill's SKILL.md runs tools-unit and the skill's tests"
+change .claude/settings.json >/dev/null;        eq "$(targets)" "smoke tools-ratchets tools-unit" "any other .claude/ file runs tools-unit"
+change .claude/host-env.sh >/dev/null;          eq "$(targets)" "smoke tools-ratchets tools-unit skill:rz-iterate" "host-env.sh runs tools-unit and rz-iterate's tests"
 toml="$(change rz.toml)";                       eq "$(targets)" "smoke tools-ratchets build-all" "the workspace manifest builds everything"
 change .github/workflows/main.yml >/dev/null;   eq "$(targets)" "smoke tools-ratchets" "CI config is smoke and the ratchets (the train gate covers the rest)"
 # AGAST #4587: train 814a64f4 went red on tools/test_ritz1_kind_match.py, a
@@ -61,9 +61,9 @@ has "$(bash "$SP" plan)" "^tools-ratchets	make -C projects/ritz tools-ratchets$"
 # tools-unit runs all of tools/ and unit all of ritz0, so a diff that needs
 # both runs them instead (#4587, #4622).
 change projects/ritz/ritz1/src/k.ritz projects/ritz/tools/k.py >/dev/null
-eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap ritz1-unit matrix build-all-ritz1" "tools-unit subsumes tools-ratchets"
+eq "$(targets)" "smoke ritz1-bootstrap tools-unit unit ritz1-unit matrix build-all-ritz1" "tools-unit subsumes tools-ratchets"
 change projects/ritz/ritz1/src/k.ritz .claude/settings.json >/dev/null
-eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap ritz1-unit matrix build-all-ritz1" "and so does a .claude/ change's tools-unit"
+eq "$(targets)" "smoke ritz1-bootstrap tools-unit unit ritz1-unit matrix build-all-ritz1" "and so does a .claude/ change's tools-unit"
 
 # AGAST #4672: every car runs the ratchets (~15 s), not only a compiler
 # change: #4653 and #4654 both broke a pin their smoke never ran.  Only
@@ -92,7 +92,7 @@ git reset -q --hard "$mark"   # keep later ranges ($toml^..HEAD) as they were
 # ritz1/src and broke ritz1/test (ritz1-unit, which nothing planned); #4739
 # changed a package that only ritz1 could not build (pkg: built with ritz0).
 change projects/ritz/ritz1/test/test_v.ritz >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap ritz1-unit matrix" "ritz1/test runs ritz1's unit suites (no package sweep: no compiler change)"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit ritz1-unit matrix" "ritz1/test runs ritz1's unit suites (no package sweep: no compiler change)"
 has "$(bash "$SP" plan)" "^ritz1-unit	make -C projects/ritz ritz1-unit$" "ritz1-unit runs the Makefile's ritz1 unit suites"
 change projects/ritz/ritz1/src/n.ritz >/dev/null
 has "$(bash "$SP" plan)" "^build-all-ritz1	make -C projects/ritz build-all-ritz1$" "build-all-ritz1 builds every package under ritz1 and ritz1_selfhosted"
@@ -145,13 +145,13 @@ done
 printf '[workspace.exclude]\n"projects/harland/boot" = "harland builds it"\n' > rz.toml
 change projects/harland/ritz.toml projects/harland/netstack/ritz.toml projects/harland/boot/ritz.toml >/dev/null
 change projects/harland/netstack/src/arp.ritz >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland pkg:harland/netstack" "a nested package's change builds it and its enclosing package"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit pkg:harland pkg:harland/netstack" "a nested package's change builds it and its enclosing package"
 change projects/harland/boot/src/b.ritz >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland" "an excluded nested dir is its enclosing package's"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit pkg:harland" "an excluded nested dir is its enclosing package's"
 change projects/harland/kernel/src/k.ritz >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland" "the enclosing package's own files build it alone"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit pkg:harland" "the enclosing package's own files build it alone"
 nest="$(git rev-parse HEAD~2)"; git mv -k projects/harland/netstack/ritz.toml projects/harland/netstack/x.toml; git commit -qm unnest
-eq "$(targets "$nest^!")" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland pkg:harland/netstack" "the planned commit's tree decides, not the work tree"
+eq "$(targets "$nest^!")" "smoke tools-ratchets ritz1-bootstrap unit pkg:harland pkg:harland/netstack" "the planned commit's tree decides, not the work tree"
 git reset -q --hard HEAD~1
 # AGAST #4813: a top-level package rz.toml excludes (buddhafinger: built with
 # ritz1_selfhosted only) runs its dedicated entry, never pkg:'s
@@ -185,15 +185,15 @@ printf 'SCRIPT = "projects/harland/tools/test_msix_boot.sh"\nS = "projects/harla
 printf 'S = REPO / "projects/harland/tools/shell_session.py"\n' > projects/ritz/tools/test_ci_shell_boot.py
 git add -A; git commit -qm pins
 change projects/harland/tools/test_msix_boot.sh >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap ci:test_ci_msix_boot.py pkg:harland" "a CI boot script runs the test_ci_*.py that names it"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit ci:test_ci_msix_boot.py pkg:harland" "a CI boot script runs the test_ci_*.py that names it"
 has "$(bash "$SP" plan)" "^ci:test_ci_msix_boot.py	cd projects/ritz && python3 -m pytest -q -n 8 --dist loadgroup tools/test_ci_msix_boot.py$" \
     "ci: runs that one file under xdist, as tools-unit does"
 change projects/harland/tools/shell_session.py >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap ci:test_ci_msix_boot.py ci:test_ci_shell_boot.py pkg:harland" "a file two pins name runs both"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit ci:test_ci_msix_boot.py ci:test_ci_shell_boot.py pkg:harland" "a file two pins name runs both"
 change projects/harland/tools/other.sh >/dev/null
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland" "a path no pin names runs none"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit pkg:harland" "a path no pin names runs none"
 change projects/ritz/tools/test_ci_msix_boot.py >/dev/null
-eq "$(targets)" "smoke tools-unit tools-ratchets" "a pin itself is tools-unit's (which runs it)"
+eq "$(targets)" "smoke tools-ratchets tools-unit" "a pin itself is tools-unit's (which runs it)"
 git reset -q --hard "$mark"
 
 # AGAST #4898: train 0000283f79b4 went red in [ritz0 unit tests] after #4882
@@ -203,7 +203,7 @@ git reset -q --hard "$mark"
 # names.  So any non-doc harland path runs unit; a harland doc does not.
 mark="$(git rev-parse HEAD)"
 blk="$(change projects/harland/kernel/src/drivers/virtio/blk.ritz)"
-eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap pkg:harland" "a harland kernel source runs ritz0's unit suite (it compiles them)"
+eq "$(targets)" "smoke tools-ratchets ritz1-bootstrap unit pkg:harland" "a harland kernel source runs ritz0's unit suite (it compiles them)"
 eq "$(bash "$SP" check "$blk" "smoke ${blk:0:12} [smoke tools-ratchets ritz1-bootstrap pkg:harland] EXIT=0" >/dev/null 2>&1; echo $?)" 1 \
     "check refuses a harland quote without unit (#4882's)"
 change projects/harland/virtio_abi/src/v.ritz >/dev/null
@@ -217,18 +217,37 @@ git reset -q --hard "$mark"
 # 2. A mixed diff: each target once, in the fixed order, packages last.
 s="$(change projects/ritz/ritz0/y.py projects/ritz/tools/u.py projects/ritz/ritz0/z.py \
     projects/spire/lib/a.ritz projects/angelo/src/b.ritz docs/c.md)"
-eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire" "a mixed diff: each target once, in order"
-eq "$(targets "$s^!")" "smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire" "<sha>^! plans one commit"
-eq "$(targets "$toml^..HEAD")" "smoke doc-examples tools-unit unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1 entry:editor pkg:angelo pkg:harland pkg:harland/netstack pkg:spire" \
+eq "$(targets)" "smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire" "a mixed diff: each target once, in order"
+eq "$(targets "$s^!")" "smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire" "<sha>^! plans one commit"
+eq "$(targets "$toml^..HEAD")" "smoke doc-examples ritz1-bootstrap tools-unit unit ritz1-unit matrix build-all build-all-ritz1 entry:editor pkg:angelo pkg:harland pkg:harland/netstack pkg:spire" \
     "a range plans every commit in it"
 has "$(bash "$SP" plan)" "^unit	make -C projects/ritz unit$" "plan prints each target's command, tab-separated"
+
+# AGAST #5000: ritz1-bootstrap runs before every target that runs ritz1 or
+# ritz1_selfhosted (unit's ritz1_selfhosted rows, tools-unit's ritz1 tests,
+# ritz1-unit, the matrix, the package sweeps).  Planned after them, a fresh
+# worktree failed ~6k unit rows on missing binaries and a reused one ran them
+# on stale ones.  The ritz0-only targets stay ahead of it (cheap and broad
+# first): smoke builds the ritz1 it uses itself, harness-selftest stubs its
+# binaries in a scratch root, tools-ratchets runs --no-ritz1-build.
+all="$(change projects/ritz/ritz0/w.py projects/ritz/ritzlib/w.ritz projects/ritz/test/w.ritz \
+    projects/ritz/examples/w.ritz projects/ritz/scripts/w.sh projects/ritz/README.md \
+    projects/builder/w.sh rz.toml)"
+eq "$(targets "$all^!")" "smoke doc-examples tools-ratchets harness-selftest ritzlib ritz-tests examples ritz1-bootstrap unit matrix build-all build-all-ritz1 builder" \
+    "every ritz0-only target first, then ritz1-bootstrap, then everything that runs ritz1"
+eq "$(bash "$SP" plan "$all^!" | cut -f1 | grep -xE 'ritz1-bootstrap|unit' | paste -sd' ')" "ritz1-bootstrap unit" \
+    "a diff that plans unit and ritz1-bootstrap lists ritz1-bootstrap first"
+git reset -q --hard "$s"
+change projects/ritz/ritz0/v.py projects/ritz/tools/v.py >/dev/null
+eq "$(targets)" "smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1" "tools-unit (its tests run ritz1) follows ritz1-bootstrap too"
+git reset -q --hard "$s"
 has "$(bash "$SP" plan)" "^pkg:spire	rc=0; for c in ritz0 ritz1 ritz1_selfhosted; .*\./rz test spire [|][|] rc=1; .*\./rz test spire --compiler ritz1 [|][|] rc=1; fi; exit .rc$" "a package's command builds it under each compiler, then tests it under ritz0 and ritz1"
 
 # AGAST #4777: the plan is the floor.  A room adds targets by judgment
 # (`+<target>`) and its quote names them, after the plan's, each once.
-eq "$(targets +ritzlib-ritz1 +pkg:nexus +smoke)" "smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire ritzlib-ritz1 pkg:nexus" \
+eq "$(targets +ritzlib-ritz1 +pkg:nexus +smoke)" "smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire ritzlib-ritz1 pkg:nexus" \
     "plan +<target> adds extras after the floor, each once"
-eq "$(targets "$s^!" +build-all)" "smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire build-all" "extras combine with a range"
+eq "$(targets "$s^!" +build-all)" "smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire build-all" "extras combine with a range"
 has "$(bash "$SP" plan +ritzlib-ritz1)" "^ritzlib-ritz1	make -C projects/ritz ritzlib-tests-ritz1$" "ritzlib-ritz1 runs ritzlib's tests under ritz1 and ritz1_selfhosted"
 out="$(bash "$SP" plan +no-such 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && has "$out" "unknown target no-such" "an unknown extra is refused" || bad "an unknown extra is refused (rc=$rc)"
@@ -244,17 +263,17 @@ export RZ_SMOKE_RUNNER="$T/runner" RZ_TEST_RAN="$T/ran"
 h12="$(git rev-parse --short=12 HEAD)"
 : > "$T/ran"; out="$(bash "$SP" run 2>/dev/null)"; rc=$?
 eq "$rc" 0 "run exits 0 when every target passes"
-eq "$(tail -1 <<<"$out")" "smoke $h12 [smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=0" \
+eq "$(tail -1 <<<"$out")" "smoke $h12 [smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=0" \
     "run's last line is the REAP quote"
 : > "$T/ran"; out="$(RZ_TEST_FAIL="tools-unit" bash "$SP" run 2>"$T/err")"; rc=$?
 eq "$rc" 1 "run exits non-zero when a target fails"
-eq "$(paste -sd' ' "$T/ran")" "smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire" \
+eq "$(paste -sd' ' "$T/ran")" "smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire" \
     "a failing target does not stop the rest (every subsystem runs in full)"
-eq "$(tail -1 <<<"$out")" "smoke $h12 [smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=1" \
+eq "$(tail -1 <<<"$out")" "smoke $h12 [smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=1" \
     "the quote carries the failure"
 has "$(cat "$T/err")" "^FAILED: tools-unit$" "run names the failed targets"
 : > "$T/ran"; out="$(bash "$SP" run +ritzlib-ritz1 2>/dev/null)"; rc=$?
-eq "$(tail -1 <<<"$out")" "smoke $h12 [smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire ritzlib-ritz1] EXIT=0" \
+eq "$(tail -1 <<<"$out")" "smoke $h12 [smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire ritzlib-ritz1] EXIT=0" \
     "run +<target> runs the extra and quotes it"
 eq "$(tail -1 "$T/ran")" "ritzlib-ritz1" "the extra ran, last"
 out="$(bash "$SP" check "$(git rev-parse HEAD)" "$(tail -1 <<<"$out")")"; rc=$?
@@ -276,18 +295,18 @@ unset RZ_SMOKE_RUNNER
 
 # 4. check: rz's REAP check of the quote.
 full="$(git rev-parse HEAD)"
-q="smoke $h12 [smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=0"
+q="smoke $h12 [smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=0"
 out="$(bash "$SP" check "$full" "$q")"; rc=$?
 eq "$rc" 0 "check accepts the quote run printed"; has "$out" "^OK smoke $h12" "and says OK"
-out="$(bash "$SP" check "$full" "smoke $h12 [smoke unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire build-all] EXIT=0")"; rc=$?
+out="$(bash "$SP" check "$full" "smoke $h12 [smoke ritz1-bootstrap unit matrix build-all-ritz1 pkg:angelo pkg:spire build-all] EXIT=0")"; rc=$?
 [[ $rc -ne 0 ]] && has "$out" "misses tools-unit" "check refuses a quote missing a planned target" \
     || bad "check refuses a quote missing a planned target"
-out="$(bash "$SP" check "$full" "smoke $h12 [smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire build-all] EXIT=0")"
+out="$(bash "$SP" check "$full" "smoke $h12 [smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire build-all] EXIT=0")"
 has "$out" "^OK" "check allows extra targets"
-out="$(bash "$SP" check "$full" "smoke $h12 [smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=1")"; rc=$?
+out="$(bash "$SP" check "$full" "smoke $h12 [smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=1")"; rc=$?
 [[ $rc -ne 0 ]] && has "$out" "EXIT=1" "check refuses a failed run" || bad "check refuses a failed run"
 other="$(git rev-parse --short=12 HEAD~1)"
-out="$(bash "$SP" check "$full" "smoke $other [smoke tools-unit unit ritz1-bootstrap matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=0")"; rc=$?
+out="$(bash "$SP" check "$full" "smoke $other [smoke ritz1-bootstrap tools-unit unit matrix build-all-ritz1 pkg:angelo pkg:spire] EXIT=0")"; rc=$?
 [[ $rc -ne 0 ]] && has "$out" "not $h12" "check refuses a quote for another SHA" || bad "check refuses a quote for another SHA"
 out="$(bash "$SP" check "$full" "gate skipped (train-gated)")"; rc=$?
 [[ $rc -ne 0 ]] && has "$out" "not a smoke quote" "check refuses a bare no-check marker" || bad "check refuses a bare no-check marker"
