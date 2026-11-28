@@ -592,6 +592,32 @@ check("stub: -I puts the document's directory on the import path",
       "-I" in first and str(docdir) in first[first.index("-I") + 1].split(":")[0], repr(first))
 check("stub: nothing written next to the document", sorted(os.listdir(docdir)) == [], repr(os.listdir(docdir)))
 
+# Where the scratch copy goes without $XDG_RUNTIME_DIR: ritzlib.fs temp_dir
+# (AGAST #4957), so $TMPDIR when it is a directory by an absolute path, else
+# /tmp; an unusable $TMPDIR no longer loses the compile.
+def scratch_input(tmpdir):
+    env = {k: v for k, v in STUB.items() if k != "XDG_RUNTIME_DIR"}
+    env["TMPDIR"] = tmpdir
+    before = len(log.read_text().splitlines()) if log.exists() else 0
+    rc, out = stepwise([did_open(duri, "fn main() -> i32\n    0\n", 1)], env=env)
+    lines = log.read_text().splitlines()[before:] if log.exists() else []
+    d = diags(out)
+    return (json.loads(lines[-1])["argv"][0] if lines else ""), d
+tmpd = scratch / "tmpd"
+tmpd.mkdir()
+uid_dir = f"ritz-lsp-{os.getuid()}"
+got, _ = scratch_input(str(tmpd))
+check("scratch: under $TMPDIR when it is a directory",
+      got.startswith(str(tmpd / uid_dir) + "/"), repr(got))
+# An unusable $TMPDIR (relative) still compiles, in temp_dir's fallback: an
+# absolute <temp>/ritz-lsp-<uid>/. Which directory that is (/tmp) is pinned
+# by ritzlib's test_temp_dir_from_falls_back_to_tmp; naming the host's here
+# would share it (AGAST #3178).
+got, d = scratch_input("relative/not-a-dir")
+check("scratch: an unusable $TMPDIR falls back to temp_dir's default",
+      os.path.isabs(got) and f"/{uid_dir}/" in got and not got.startswith("relative")
+      and d[-1:] and d[-1].get("diagnostics") == [], repr((got, d)))
+
 # ritz1 reports byte columns; the diagnostic's are UTF-16 units (#3885).
 # Line 2 below has é€😀 before `nope` (9 bytes, 4 units); the stub reports
 # the byte column, computed here rather than hand-counted.

@@ -1,0 +1,141 @@
+# tmp_test: Harland's /tmp, a scratch directory only RAM holds (AGAST #4957)
+#
+# The kernel makes /tmp at boot, mode 01777, in the runtime tree: no save
+# writes it to the storage device, so it is empty at every boot. Every
+# process gets TMPDIR=/tmp from the kernel (its envp in RDX), so ritzlib.fs
+# temp_dir, which ritz-lsp's scratch files go under, names it.
+#
+# Steps, each exit code naming the one that failed:
+#   1-2   TMPDIR is /tmp, and temp_dir agrees
+#   3     /tmp is a directory, mode 01777
+#   4     after a reboot: the file the last boot left in /tmp is gone
+#   5-9   write, read back, list, unlink and miss a file under /tmp
+#   10-13 rmdir: NotEmpty, NotDir, IsDir for unlink, then the empty one goes
+#   14    leave a file in /tmp, and mark it in /var, for the next boot's step 4
+#
+# The last boot's file is marked in /var/tmp_test.mark (the persistent
+# subtree): when the mark is there, the boot before this one left
+# /tmp/tmp_test.left, so finding it missing is the reboot's doing. The PASS
+# line then says "after a reboot", which tools/test_tier1_boot.sh requires of
+# a second boot of the same storage disk.
+
+import ritzlib.fs { stat, read_file, write_file, unlink, rmdir, mkdir, sync, temp_dir, list_dir, path_exists, mode_is_dir }
+import ritzlib.os.env { env_get }
+import ritzlib.errno { Errno }
+import ritzlib.option
+import ritzlib.result
+import ritzlib.string { String, string_new }
+import ritzlib.strview { StrView }
+
+const MODE_1777: i32 = 1023
+const PERM_MASK: i32 = 4095
+const DIR_MODE: i32 = 493
+
+const FILE: StrView = "/tmp/tmp_test.file"
+const DIR: StrView = "/tmp/tmp_test.dir"
+const INNER: StrView = "/tmp/tmp_test.dir/inner"
+const LEFT: StrView = "/tmp/tmp_test.left"
+const MARK: StrView = "/var/tmp_test.mark"
+
+fn fail(step: i32, what: StrView) -> i32
+    print("[tmp_test] FAIL step {step}: {what}\n")
+    step
+
+fn reads_back(path: StrView, want: StrView) -> bool
+    match read_file(path)
+        Ok(s) => s.eq(want)
+        Err(_) => false
+
+# Whether `r` failed with `want`.
+fn fails_with(r: Result<i32, Errno>, want: Errno) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e.code() == want.code()
+
+# Whether listing /tmp names `name`.
+fn tmp_lists(name: StrView) -> bool
+    match list_dir("/tmp")
+        Ok(names) =>
+            for i in 0..names.len()
+                if names[i].eq(name)
+                    return true
+            false
+        Err(_) => false
+
+pub fn main() -> i32
+    # 1-2. The kernel's environment names /tmp, and temp_dir takes it.
+    match env_get("TMPDIR")
+        Some(v) =>
+            if not v.eq("/tmp")
+                return fail(1, "TMPDIR is not /tmp")
+        None => return fail(1, "no TMPDIR in the environment")
+    match temp_dir()
+        Ok(d) =>
+            if not d.eq("/tmp")
+                return fail(2, "temp_dir is not /tmp")
+        Err(_) => return fail(2, "temp_dir failed")
+
+    # 3. A directory, 01777.
+    match stat("/tmp")
+        Ok(st) =>
+            if not mode_is_dir(st.st_mode)
+                return fail(3, "/tmp is not a directory")
+            if (st.st_mode & PERM_MASK) != MODE_1777
+                return fail(3, "/tmp is not mode 01777")
+        Err(_) => return fail(3, "stat /tmp failed")
+
+    # 4. The file the last boot left is gone with its RAM.
+    let rebooted: bool = path_exists(MARK)
+    if rebooted and path_exists(LEFT)
+        return fail(4, "the last boot's /tmp file survived the reboot")
+    if path_exists(FILE) or path_exists(DIR)
+        return fail(4, "/tmp holds this test's files at its start")
+
+    # 5-9. Write, read, list, unlink.
+    match write_file(FILE, "scratch")
+        Ok(_) => pass
+        Err(_) => return fail(5, "write_file under /tmp failed")
+    if not reads_back(FILE, "scratch")
+        return fail(6, "the /tmp file did not read back")
+    if not tmp_lists("tmp_test.file")
+        return fail(7, "readdir /tmp does not list the file")
+    if unlink(FILE).is_err()
+        return fail(8, "unlink of the /tmp file failed")
+    if path_exists(FILE) or tmp_lists("tmp_test.file")
+        return fail(9, "the unlinked file is still there")
+    if not fails_with(unlink(FILE), Errno.NoEnt)
+        return fail(9, "a second unlink is not NoEnt")
+
+    # 10-13. rmdir takes only an empty directory, unlink only a file.
+    if mkdir(DIR, DIR_MODE).is_err()
+        return fail(10, "mkdir under /tmp failed")
+    match write_file(INNER, "x")
+        Ok(_) => pass
+        Err(_) => return fail(10, "write_file in the new directory failed")
+    if not fails_with(rmdir(DIR), Errno.NotEmpty)
+        return fail(11, "rmdir of a non-empty directory is not NotEmpty")
+    if not fails_with(rmdir(INNER), Errno.NotDir)
+        return fail(12, "rmdir of a file is not NotDir")
+    if not fails_with(unlink(DIR), Errno.IsDir)
+        return fail(12, "unlink of a directory is not IsDir")
+    if unlink(INNER).is_err() or rmdir(DIR).is_err()
+        return fail(13, "removing the file and then its directory failed")
+    if path_exists(DIR) or tmp_lists("tmp_test.dir")
+        return fail(13, "the removed directory is still there")
+
+    # 14. Leave a file for the next boot to miss. The mark is durable: sync.
+    match write_file(LEFT, "left by the last boot")
+        Ok(_) => pass
+        Err(_) => return fail(14, "write_file of the left file failed")
+    if path_exists("/var/boots")
+        match write_file(MARK, "1")
+            Ok(_) => pass
+            Err(_) => return fail(14, "write_file of the /var mark failed")
+        if sync().is_err()
+            return fail(14, "sync of the /var mark failed")
+
+    if rebooted
+        print("[tmp_test] PASS: /tmp write, read, list, remove; empty after a reboot\n")
+    else
+        print("[tmp_test] PASS: /tmp write, read, list, remove\n")
+    0

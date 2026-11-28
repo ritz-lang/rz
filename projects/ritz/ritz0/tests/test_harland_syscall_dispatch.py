@@ -91,7 +91,9 @@ ABI = {
     "IpcSend": 30, "IpcRecv": 31, "IpcClose": 33,
     "CapGrant": 40, "CapRevoke": 41, "CapDerive": 42, "CapInfo": 43, "CapCheck": 44,
     "InputPoll": 50, "InputRead": 51,
-    "Mkdir": 83,
+    # Rmdir (84) and Unlink (87): Linux's numbers, the path as (bytes, len)
+    # like Mkdir's (AGAST #4957).
+    "Mkdir": 83, "Rmdir": 84, "Unlink": 87,
     "ChannelCreate": 100,
     "Sync": 162,
     "AcpiPoweroff": 200,
@@ -146,6 +148,7 @@ DISPATCHED = {
     "Sync", "Smp", "ShmMap", "DrvIrqWait", "DrvMmioMap", "DrvDmaAlloc", "DrvDmaFree", "NetInfo", "NetAddr", "NetAttach", "Poll",
     "ShmWait", "ShmNotify", "NetPublish",
     "Stat", "Fstat", "SmpUser", "SmpUserLocal", "Getdents64",
+    "Rmdir", "Unlink",
 }
 
 

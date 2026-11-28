@@ -59,7 +59,8 @@ AREAS = {
     "file": [
         "sys_readdir_impl",
         "sys_close_handler", "sys_stat_handler", "sys_fstat_handler",
-        "sys_lseek_handler", "sys_mkdir_handler", "sys_write_handler",
+        "sys_lseek_handler", "sys_mkdir_handler", "sys_unlink_handler",
+        "sys_rmdir_handler", "sys_write_handler",
         "sys_read_handler", "sys_readdir_handler", "tty_fd_ok",
         "sys_tty_getattr_handler", "sys_tty_setattr_handler", "sys_tty_setfg_handler",
         "sys_sync_handler",
@@ -248,8 +249,9 @@ def test_table_registers_handlers_imported_from_their_area():
     # DrvDmaAlloc (221, 222, #4720); 49 with ShmWait and ShmNotify
     # (229, 230, #4727); 50 with NetPublish (226, #4730); 51 with DrvDmaFree
     # (223, #4725); 53 with the smp-user test's SmpUser and SmpUserLocal
-    # (253, 252, #4881); 54 with Getdents64 (217, #4947).
-    assert len(regs) == 54, regs
+    # (253, 252, #4881); 54 with Getdents64 (217, #4947); 56 with Rmdir and
+    # Unlink (84, 87, #4957).
+    assert len(regs) == 56, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

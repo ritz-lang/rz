@@ -24,8 +24,11 @@
 # ritz1's messages name the document's file, nothing lands next to the
 # document, and ritz1's per-source cache gets one entry per document rather
 # than one per keystroke.  <scratch> is $XDG_RUNTIME_DIR/ritz-lsp, else
-# ${TMPDIR:-/tmp}/ritz-lsp-<uid>.  The copy, its output and the directory
-# are removed after each compile.
+# <temp>/ritz-lsp-<uid>, where <temp> is ritzlib.fs temp_dir: $TMPDIR if it
+# is a directory, else /tmp (on Harland, the kernel's RAM-only /tmp; AGAST
+# #4957).  With neither, the document gets one warning instead of its
+# diagnostics.  The copy, its output and the directory are removed after
+# each compile.
 #
 # Imports:  `-I` lists the document's directory and its ancestors (ritz1
 # looks for a relative import there, as it would beside the real file), then
@@ -97,8 +100,9 @@ fn push_hash_hex(out: @&String, s: StrView)
             out.push(('a' as u64 + d - 10) as u8)
         k -= 4
 
-# The private directory compiles happen under (created, mode 0700).
-fn scratch_root() -> String
+# The private directory compiles happen under (created, mode 0700), or
+# temp_dir's Err when there is no scratch directory to put it in.
+fn scratch_root() -> Result<String, Errno>
     var out: String = string_new()
     match env_get("XDG_RUNTIME_DIR")
         Some(v) =>
@@ -107,11 +111,11 @@ fn scratch_root() -> String
                 out.push_str("/ritz-lsp")
         None => pass
     if out.len() == 0
-        out.push_str(env_get_or("TMPDIR", "/tmp"))
+        out.push_str(temp_dir()?)
         out.push_str("/ritz-lsp-")
         out.push_i64(user_id() as i64)
     mkdir(out.as_view(), 448)
-    out
+    Ok(out)
 
 # =============================================================================
 # Diagnostics JSON
@@ -248,7 +252,14 @@ fn compile(dl: *DiagList, uri: StrView, text: StrView)
     if base.len() == 0
         base.push_str("buffer.ritz")
 
-    var dir: String = scratch_root()
+    var dir: String = match scratch_root()
+        Ok(root) => root
+        Err(e) =>
+            var m: String = string_from("ritz-lsp: no scratch directory ($TMPDIR and /tmp are not directories, errno ")
+            m.push_i64(e.code() as i64)
+            m.push_str("); no compiler diagnostics")
+            add_message(dl, SEV_WARNING, @&m)
+            return
     dir.push('/')
     push_hash_hex(@&dir, uri)
     mkdir(dir.as_view(), 448)

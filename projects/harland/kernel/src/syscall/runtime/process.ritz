@@ -40,7 +40,7 @@ import syscall.errno { Errno, errno_result }
 import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
 import syscall.runtime.net { NETD_RESTARTS, net_service_exited, net_service_death, net_restart_backoff_ms }
 import net.ring1 { Respawn, net_netd_respawn }
-import syscall.runtime.argv { ArgvStatus, ArgvCapture, argv_capture, argv_buf, argv_offsets }
+import syscall.runtime.argv { ArgvStatus, ArgvCapture, ArgsLayout, argv_capture, args_layout }
 import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait, proc_mark_exit, proc_runnable_on, proc_set_home, PROC_BSP_CPU, MarkError }
 import ritzlib.result { Result }
 import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report, sched_forward }
@@ -55,10 +55,6 @@ extern fn syscall_stack_size() -> u64
 # spawn
 # ============================================================================
 
-# The child's argv addresses on its stack, filled by spawn_push_argv.
-# The strings themselves live in argv.ritz's capture buffer: argv is read
-# from user memory exactly once, in the handler (AGAST #1888).
-var g_spawn_child_argv: [64]u64
 
 # init's page table: the kernel's own, mapped for as long as the kernel
 # runs. An exiting process leaves its own for this one before freeing it.
@@ -141,39 +137,6 @@ fn spawn_capture_argv(argv: **u8, argc: i32) -> i64
         return argv_status_errno(cap.status)
     return cap.bytes
 
-# Lay out argv on the child's user stack (the child's page table is
-# current): the strings at the top, below them the argv array and its NULL,
-# 16-aligned. The child's RSP; *child_argv gets argv's address.
-fn spawn_push_argv(argc: i32, total_string_bytes: i64, child_argv: *u64) -> u64
-    # Stack top is USER_STACK_TOP + PAGE_SIZE (first unmapped address)
-    var stack_ptr: u64 = USER_STACK_TOP + PAGE_SIZE
-    stack_ptr = stack_ptr - (total_string_bytes as u64)
-    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
-    let strings_base: u64 = stack_ptr
-    var i: i32 = 0
-    var dst_offset: i64 = 0
-    while i < argc
-        g_spawn_child_argv[i] = strings_base + (dst_offset as u64)
-        let src_offset: i64 = argv_offsets[i]
-        var j: i64 = 0
-        while argv_buf[(src_offset + j) as i32] != 0
-            *((strings_base + dst_offset as u64 + j as u64) as *u8) = argv_buf[(src_offset + j) as i32]
-            j = j + 1
-        *((strings_base + dst_offset as u64 + j as u64) as *u8) = 0
-        dst_offset = dst_offset + j + 1
-        i = i + 1
-    let argv_array_size: u64 = ((argc + 1) as u64) * 8  # pointers + NULL
-    stack_ptr = stack_ptr - argv_array_size
-    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
-    let argv_addr: u64 = stack_ptr
-    i = 0
-    while i < argc
-        *((argv_addr + (i as u64) * 8) as *u64) = g_spawn_child_argv[i]
-        i = i + 1
-    *((argv_addr + (argc as u64) * 8) as *u64) = 0
-    *child_argv = argv_addr
-    return stack_ptr & 0xFFFFFFFFFFFFFFF0
-
 # The first half of every spawn, in the parent's address space: a child
 # slot of the running process `parent_pid`, its capability table (the
 # parent's ambient capabilities when `inherit_caps`), its own fd table, and
@@ -220,7 +183,8 @@ fn spawn_child_begin(parent_pid: u64, inherit_caps: bool) -> i64
     slot as i64
 
 # Start `path` as a child of the running process, with argc/argv (argc 0:
-# none) in main's RDI/RSI. The child is runnable when this returns: its pid,
+# an empty argv) and the kernel's environment (argv.ritz ENVIRON) in
+# _start's RDI/RSI/RDX. The child is runnable when this returns: its pid,
 # or a negative errno with nothing changed. A sys_spawn child inherits the
 # parent's ambient capabilities (`inherit_caps`); a kernel spawn does not.
 #
@@ -275,17 +239,13 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: b
         spawn_undo(slot, parent_pid)
         return Errno.NoMem as i64
 
-    var user_rsp: u64 = child_stack_top
-    var child_argv: u64 = 0
-    if argc > 0
-        user_rsp = spawn_push_argv(argc, total_string_bytes, @child_argv)
+    # argv and the environment (ENVIRON, AGAST #4957) at the stack's top
+    let args: ArgsLayout = args_layout(USER_STACK_TOP + PAGE_SIZE, argc, total_string_bytes)
     vmm_switch_pml4(parent_pml4)
 
-    # main(argc, argv) in RDI/RSI; the first switch to the slot enters it.
-    var arg0: u64 = 0
-    if argc > 0
-        arg0 = argc as u64
-    sched_prepare_user(slot, load_result.entry_point, user_rsp, arg0, child_argv)
+    # _start(argc, argv, envp) in RDI/RSI/RDX; the first switch to the slot
+    # enters it.
+    sched_prepare_user(slot, load_result.entry_point, args.rsp, argc as u64, args.argv, args.envp)
     proc_set_home(slot, home)
     proc_start(slot)
     return child_pid as i64
@@ -364,7 +324,7 @@ fn spawn_image(image: Span<u8>, arg0: u64, arg1: u64, cpu: i32) -> i64
         spawn_undo(slot, parent_pid)
         return Errno.NoMem as i64
 
-    sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1)
+    sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1, 0)
     proc_set_home(slot, cpu)
     proc_start(slot)
     return child_pid as i64

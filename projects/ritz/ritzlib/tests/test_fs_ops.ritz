@@ -12,6 +12,7 @@ import ritzlib.errno
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.result
+import ritzlib.gvec
 import ritzlib.testlib
 
 # errno code of `r`'s Err, 0 when it is Ok.
@@ -311,4 +312,91 @@ fn test_dir_open_view() -> i32
 [[test]]
 fn test_sync_is_ok_on_linux() -> i32
     assert sync().is_ok()
+    0
+
+# ============================================================================
+# temp_dir / temp_dir_from -> Result<StrView, Errno> (AGAST #4957)
+# ============================================================================
+
+# Whether `r` is Ok(`want`).
+fn dir_is(r: Result<StrView, Errno>, want: StrView) -> bool
+    match r
+        Ok(d) => d.eq(want)
+        Err(_) => false
+
+# An unusable $TMPDIR (unset, empty, relative, missing, a file) is /tmp.
+[[test]]
+fn test_temp_dir_from_falls_back_to_tmp() -> i32
+    assert dir_is(temp_dir_from(None), "/tmp")
+    assert dir_is(temp_dir_from(Some("")), "/tmp")
+    assert dir_is(temp_dir_from(Some("tmp")), "/tmp")
+    assert dir_is(temp_dir_from(Some("/nonexistent/tmpdir")), "/tmp")
+    let file: String = sandbox_path("fs_ops", "tmpdir_file.tmp")
+    assert write_file(file.as_view(), "x").is_ok()
+    assert dir_is(temp_dir_from(Some(file.as_view())), "/tmp")
+    unlink(file.as_view())
+    0
+
+# A $TMPDIR naming a directory by an absolute path is used as it is.
+[[test]]
+fn test_temp_dir_from_takes_a_tmpdir_directory() -> i32
+    let dir: String = sandbox_path("fs_ops", "tmpdir")
+    rmdir(dir.as_view())
+    assert mkdir(dir.as_view(), 448).is_ok()
+    let got: bool = dir_is(temp_dir_from(Some(dir.as_view())), dir.as_view())
+    rmdir(dir.as_view())
+    assert got
+    0
+
+# temp_dir is the rule applied to this process's $TMPDIR: some directory.
+[[test]]
+fn test_temp_dir_is_a_directory() -> i32
+    match temp_dir()
+        Ok(d) =>
+            assert is_dir(d)
+        Err(_) => return 1
+    0
+
+# ============================================================================
+# list_dir -> Result<Vec<String>, Errno> (AGAST #4957)
+# ============================================================================
+
+fn lists(names: @Vec<String>, want: StrView) -> bool
+    for i in 0..names.len()
+        if names[i].eq(want)
+            return true
+    false
+
+# A directory's names, without "." and ".."; a file is NotDir, a missing
+# path NoEnt.
+[[test]]
+fn test_list_dir_names_the_entries() -> i32
+    let dir: String = sandbox_path("fs_ops", "listdir")
+    remove_dir_all(dir.as_view())
+    assert mkdir(dir.as_view(), 493).is_ok()
+    let a: String = path_join(dir.as_view(), "a")
+    let sub: String = path_join(dir.as_view(), "sub")
+    assert write_file(a.as_view(), "x").is_ok()
+    assert mkdir(sub.as_view(), 493).is_ok()
+    var ok: bool = false
+    match list_dir(dir.as_view())
+        Ok(names) =>
+            ok = names.len() == 2 and lists(@names, "a") and lists(@names, "sub")
+        Err(_) => pass
+    var not_dir: bool = false
+    match list_dir(a.as_view())
+        Ok(_) => pass
+        Err(e) => match e
+            NotDir => not_dir = true
+            _ => pass
+    remove_dir_all(dir.as_view())
+    var missing: bool = false
+    match list_dir(dir.as_view())
+        Ok(_) => pass
+        Err(e) => match e
+            NoEnt => missing = true
+            _ => pass
+    assert ok
+    assert not_dir
+    assert missing
     0

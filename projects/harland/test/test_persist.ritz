@@ -10,19 +10,21 @@
 
 import ritzlib.span { Span, span_from_strview }
 import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from }
 import ritzlib.gvec { Vec, vec_zeroed }
 import ritzlib.result
 import ritzlib.option
 import goliath.hosted { memory_store_new }
 import goliath.blob_id { blob_id_zero }
 import goliath.blob_store { MemoryBlobStore, memory_store_free }
-import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_exists, namespace_stat, NsStat }
+import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_exists, namespace_stat, namespace_write, namespace_mkdir, namespace_mkdir_mode, NsStat }
 import goliath.block_store { BlockDevice, block_store_load }
 import goliath.error { ErrorCode }
 import syscall.errno { Errno }
 import fs.vfs { O_WRONLY, O_CREAT, O_TRUNC, O_EXCL, O_SYNC }
 import fs.open_plan { WriteMode, OpenPlan, open_plan }
-import fs.persist { Persist, SaveGate, FileCommit, persist_new, persist_save, persist_flush_pending, persist_commit, persist_commit_durable, persist_mkdir }
+import fs.persist { Persist, SaveGate, FileCommit, RemoveKind, persist_new, persist_save, persist_flush_pending, persist_commit, persist_commit_durable, persist_mkdir, persist_remove, remove_entry }
+import fs.route { Route, Tree, route, route_is_var, TMP_DIR, TMP_MODE }
 
 # ============================================================================
 # A RAM disk, and a gate whose park plays the holder
@@ -473,4 +475,139 @@ fn test_open_plan() -> i32
     assert plan_is(open_plan(false, sync_create, false), OpenPlan.CreateNow)
     # A read-only fd commits nothing at its close: it creates now
     assert plan_is(open_plan(false, O_CREAT | O_SYNC, true), OpenPlan.CreateNow)
+    0
+
+# ============================================================================
+# Removing a file or directory: unlink and rmdir (AGAST #4957)
+# ============================================================================
+
+fn errno_is(r: Result<(), Errno>, want: Errno) -> bool
+    errno_of(r) == want as i32
+
+# remove_entry is what unlink and rmdir check in either tree: a file for
+# unlink, an empty directory for rmdir, never the root.
+[[test]]
+fn test_remove_entry_unlink_and_rmdir_rules() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    let bytes: Span<u8> = span_from_strview("x")
+    assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
+    assert namespace_write(@ns, "/d/f", @bytes) == ErrorCode.Ok
+    assert errno_is(remove_entry(@ns, "/d", RemoveKind.File), Errno.IsDir)
+    assert errno_is(remove_entry(@ns, "/d/f", RemoveKind.Dir), Errno.NotDir)
+    assert errno_is(remove_entry(@ns, "/d", RemoveKind.Dir), Errno.NotEmpty)
+    assert errno_is(remove_entry(@ns, "/gone", RemoveKind.File), Errno.NoEnt)
+    assert errno_is(remove_entry(@ns, "/d/f/below", RemoveKind.File), Errno.NotDir)
+    assert errno_is(remove_entry(@ns, "/", RemoveKind.Dir), Errno.Perm)
+    assert namespace_exists(@ns, "/d/f")
+    assert remove_entry(@ns, "/d/f", RemoveKind.File).is_ok()
+    assert not namespace_exists(@ns, "/d/f")
+    assert remove_entry(@ns, "/d", RemoveKind.Dir).is_ok()
+    assert not namespace_exists(@ns, "/d")
+    memory_store_free(@store)
+    0
+
+# A remove in the subtree is a plain commit: gone at once, the save owed,
+# and the next image lacks it.
+[[test]]
+fn test_persist_remove_is_owed_a_save() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert plain(@p, "/f", "data").is_ok()
+    assert persist_save(@p).is_ok()
+    assert image_reads(@(*r).dev, "/f", "data")
+    assert persist_remove(@p, "/f", RemoveKind.File).is_ok()
+    assert not namespace_exists(@(*r).ns, "/f")
+    assert p.pending
+    assert image_reads(@(*r).dev, "/f", "data")
+    assert persist_flush_pending(@p).is_ok()
+    assert not p.pending
+    assert image_reads(@(*r).dev, "/f", "")
+    # A refused remove changes nothing and owes nothing
+    assert errno_is(persist_remove(@p, "/f", RemoveKind.File), Errno.NoEnt)
+    assert not p.pending
+    rig_end(r)
+    0
+
+# Under fault-persist a remove fails EIO like every other commit, and the
+# file stays.
+[[test]]
+fn test_persist_remove_under_fault_persist_changes_nothing() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert plain(@p, "/f", "data").is_ok()
+    assert persist_save(@p).is_ok()
+    p.fault_persist = true
+    assert errno_is(persist_remove(@p, "/f", RemoveKind.File), Errno.Io)
+    assert reads(@(*r).ns, "/f", "data")
+    assert not p.pending
+    rig_end(r)
+    0
+
+# ============================================================================
+# /tmp: the runtime tree's scratch directory, never saved (AGAST #4957)
+# ============================================================================
+
+# `name` in TMP_DIR ("/tmp/<name>"): the kernel's scratch path, built from
+# the constant so no test names a fixed host /tmp path (these are paths in a
+# RAM namespace, never on the host).
+fn in_tmp(name: StrView) -> String
+    var s: String = string_from(TMP_DIR)
+    s.push('/')
+    s.push_str(name)
+    s
+
+fn route_is(path: StrView, mounted: bool, tree: Tree, local: StrView) -> bool
+    let got: Route = route(path, mounted)
+    got.tree == tree and got.local.eq(local)
+
+[[test]]
+fn test_route_tmp_is_runtime_and_var_is_the_subtree() -> i32
+    assert route_is("/tmp", true, Tree.Runtime, "/tmp")
+    let lsp: String = in_tmp("ritz-lsp-0/f")
+    assert route_is(lsp.as_view(), true, Tree.Runtime, lsp.as_view())
+    assert route_is("/var", true, Tree.Persist, "/")
+    assert route_is("/var/x", true, Tree.Persist, "/x")
+    assert route_is("/var/run/x", true, Tree.Persist, "/run/x")
+    assert route_is("/variable", true, Tree.Runtime, "/variable")
+    assert route_is("/va", true, Tree.Runtime, "/va")
+    # Without storage nothing is the subtree: /var is a missing path
+    assert route_is("/var/x", false, Tree.Runtime, "/var/x")
+    assert route_is_var("/var/x") and not route_is_var("/tmp")
+    assert TMP_DIR.eq("/tmp")
+    assert TMP_MODE == 1023
+    0
+
+# Write `text` at `path` where the kernel would: the tree route() names.
+fn write_routed(runtime: *Namespace, subtree: *Namespace, path: StrView, text: StrView) -> bool
+    let bytes: Span<u8> = span_from_strview(text)
+    let at: Route = route(path, true)
+    var ns: *Namespace = runtime
+    if at.tree == Tree.Persist
+        ns = subtree
+    namespace_write(ns, at.local, @bytes) == ErrorCode.Ok
+
+# A save carries the subtree and nothing of /tmp: after a reboot the
+# /var file is back and the /tmp file, the directory included, is not.
+[[test]]
+fn test_save_excludes_tmp() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    var rstore: MemoryBlobStore = memory_store_new()
+    var runtime: Namespace = namespace_new(@rstore)
+    assert namespace_mkdir_mode(@runtime, TMP_DIR, TMP_MODE) == ErrorCode.Ok
+    let scratch: String = in_tmp("scratch")
+    assert write_routed(@runtime, @(*r).ns, scratch.as_view(), "scratch")
+    assert write_routed(@runtime, @(*r).ns, "/var/keep", "keep")
+    assert reads(@runtime, scratch.as_view(), "scratch")
+    assert persist_save(@p).is_ok()
+    assert image_reads(@(*r).dev, "/keep", "keep")
+    assert image_reads(@(*r).dev, scratch.as_view(), "")
+    assert image_reads(@(*r).dev, "/scratch", "")
+    assert image_reads(@(*r).dev, "/tmp", "")
+    memory_store_free(@rstore)
+    rig_end(r)
     0

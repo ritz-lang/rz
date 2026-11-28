@@ -13,7 +13,10 @@
 #
 # The kernel's handler calls it with uptr_check_read as the checker; the
 # child is built from argv_buf/argv_offsets and the user array is never
-# touched again.
+# touched again: args_layout writes them, with the environment, onto the
+# child's stack.
+
+import ritzlib.strview { StrView }
 
 # Where each arg's bytes start in argv_buf.
 pub var argv_buf: [4096]u8
@@ -87,3 +90,66 @@ pub fn argv_capture(argv: **u8, argc: i32, check: fn(*u8, u64) -> i64) -> ArgvCa
     argv_count = argc
     out.bytes = total
     return out
+
+# ============================================================================
+# The child's stack: argv and the environment (AGAST #4957)
+# ============================================================================
+
+# Every process's environment, fixed by the kernel. TMPDIR names the
+# RAM-only scratch directory (fs/route.ritz TMP_DIR), so a program's
+# scratch files never reach the storage device. Harland has no setenv and
+# no spawn with an environment, so a child's is its parent's because both
+# are this one.
+pub const ENVIRON: [1]StrView = ["TMPDIR=/tmp"]
+
+# Where args_layout put things, as user addresses: the child's RSP and the
+# argv and envp vectors its _start gets in RSI and RDX.
+pub struct ArgsLayout
+    rsp: u64
+    argv: u64
+    envp: u64
+
+# Copy `s` and a NUL to `at`: the address past the NUL.
+fn put_cstr(at: u64, s: StrView) -> u64
+    var j: i64 = 0
+    while j < s.len()
+        *((at + j as u64) as *u8) = s.get(j)
+        j = j + 1
+    *((at + j as u64) as *u8) = 0
+    at + j as u64 + 1
+
+fn put_word(at: u64, i: i64, v: u64)
+    *((at + (i as u64) * 8) as *u64) = v
+
+# Lay out the last capture (`argc` strings, `string_bytes` of them with their
+# NULs) and ENVIRON below `top`, the first address past the child's stack,
+# in the address space that is current: the strings at the top, below them
+# envp and argv, each NULL-terminated, 16-aligned. At most ARGV_BYTES_MAX
+# plus ENVIRON and the two vectors (under 5 KiB) below `top`.
+pub fn args_layout(top: u64, argc: i32, string_bytes: i64) -> ArgsLayout
+    var env_bytes: i64 = 0
+    var envc: i64 = 0
+    for e in ENVIRON
+        env_bytes = env_bytes + e.len() + 1
+        envc = envc + 1
+    let strings: u64 = (top - (string_bytes + env_bytes) as u64) & 0xFFFFFFFFFFFFFFF0
+    let envp: u64 = (strings - ((envc + 1) * 8) as u64) & 0xFFFFFFFFFFFFFFF0
+    let argv: u64 = (envp - ((argc as i64 + 1) * 8) as u64) & 0xFFFFFFFFFFFFFFF0
+
+    var at: u64 = strings
+    var i: i32 = 0
+    while i < argc
+        put_word(argv, i as i64, at)
+        var len: i64 = 0
+        while argv_buf[(argv_offsets[i] + len) as i32] != 0
+            len = len + 1
+        at = put_cstr(at, StrView { ptr: @argv_buf[argv_offsets[i] as i32], len: len })
+        i = i + 1
+    put_word(argv, argc as i64, 0)
+    var k: i64 = 0
+    for e in ENVIRON
+        put_word(envp, k, at)
+        at = put_cstr(at, e)
+        k = k + 1
+    put_word(envp, envc, 0)
+    ArgsLayout { rsp: argv, envp: envp, argv: argv }

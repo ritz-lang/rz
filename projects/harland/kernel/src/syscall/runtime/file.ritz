@@ -1,6 +1,6 @@
 # Harland Syscall Runtime - File (AGAST #2751, from main.ritz)
 #
-# read/write/close/stat/fstat/lseek/mkdir/readdir: filesystem fds go to fs/syscall.ritz,
+# read/write/close/stat/fstat/lseek/mkdir/unlink/rmdir/readdir: filesystem fds go to fs/syscall.ritz,
 # fds 0-2 to the serial console. (open lives in process.ritz: see there.)
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
@@ -13,17 +13,17 @@ import mm.uptr { uptr_validate_string, uptr_check_read, uptr_check_write }
 import fs.kfs { kfs_ns_for, kfs_local, kfs_list, kfs_errno }
 import goliath.namespace { Namespace }
 import goliath.dir_entry { NsEntry }
-import goliath.path { GOLIATH_PATH_MAX, PATH_SEP }
 import ritzlib.strview { strview_from_ptr }
 import ritzlib.span { span_from_ptr }
-import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_fstat, sys_lseek, sys_mkdir, sys_getdents64, is_fs_fd, fs_sync }
+import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_fstat, sys_lseek, sys_mkdir, sys_unlink, sys_rmdir, sys_getdents64, is_fs_fd, fs_sync }
 import fs.stat { Stat, stat_at }
 import ritzlib.result
 import ritzlib.option
-import syscall.errno { Errno }
+import syscall.errno { Errno, errno_rc }
+import syscall.runtime.upath { user_path }
 import syscall.runtime.process { current_pid }
 import cap.table { cap_process_has, cap_process_has_any }
-import cap.types { CAP_TYPE_NAMESPACE, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_CREATE, CAP_RIGHT_LIST }
+import cap.types { CAP_TYPE_NAMESPACE, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_CREATE, CAP_RIGHT_DELETE, CAP_RIGHT_LIST }
 import mm.heap { kalloc, kfree }
 
 # Most entries one readdir returns.
@@ -109,19 +109,12 @@ pub fn sys_stat_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         klog("[syscall] stat denied (no namespace capability)\n")
         return Errno.Perm as i64
     # SECURITY: Validate the path (same contract as mkdir) and the record
-    if rsi == 0
-        return Errno.Inval as i64
-    if rsi > GOLIATH_PATH_MAX as u64
-        return Errno.NameTooLong as i64
-    if uptr_check_read(rdi as *u8, rsi as u64) != 0
-        return Errno.Fault as i64
+    let path: StrView = match user_path(rdi, rsi)
+        Ok(p) => p
+        Err(e) => return e as i64
     if uptr_check_write(rdx as *u8, sizeof(Stat) as u64) != 0
         return Errno.Fault as i64
-    # Absolute paths only: userspace resolves a relative one (AGAST #4776)
-    if *(rdi as *u8) != PATH_SEP
-        return Errno.Inval as i64
     # /var and below are the persistent subtree's, as for open (fs/kfs.ritz)
-    let path: StrView = StrView { ptr: rdi as *u8, len: rsi as i64 }
     let ns: *Namespace = kfs_ns_for(path)
     if ns == 0 as *Namespace
         return Errno.NoDev as i64
@@ -165,20 +158,28 @@ pub fn sys_mkdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_CREATE)
         klog("[syscall] mkdir denied (no namespace capability)\n")
         return Errno.Perm as i64
-    # SECURITY: Validate path buffer (same contract as open)
-    if rsi == 0
-        return Errno.Inval as i64
-    if rsi > GOLIATH_PATH_MAX as u64
-        return Errno.NameTooLong as i64
-    let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
-    if path_result != 0
-        return Errno.Fault as i64
-    # The kernel takes absolute paths only: userspace resolves a relative
-    # one, `.` and `..` against its cwd first (ritzlib.path, AGAST #4776).
-    let path: *u8 = rdi as *u8
-    if *path != PATH_SEP
-        return Errno.Inval as i64
-    sys_mkdir(path, rsi)
+    match user_path(rdi, rsi)
+        Ok(path) => sys_mkdir(path)
+        Err(e) => e as i64
+
+# unlink(path, len) and rmdir(path, len): Linux's numbers, the path as bytes
+# and length like mkdir's. Removing an entry needs CAP_RIGHT_DELETE in the
+# namespace (AGAST #4957).
+pub fn sys_unlink_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_DELETE)
+        klog("[syscall] unlink denied (no namespace capability)\n")
+        return Errno.Perm as i64
+    match user_path(rdi, rsi)
+        Ok(path) => errno_rc(sys_unlink(path))
+        Err(e) => e as i64
+
+pub fn sys_rmdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_DELETE)
+        klog("[syscall] rmdir denied (no namespace capability)\n")
+        return Errno.Perm as i64
+    match user_path(rdi, rsi)
+        Ok(path) => errno_rc(sys_rmdir(path))
+        Err(e) => e as i64
 
 # write(fd, buf, count), also debug_print: Linux/POSIX write convention.
 pub fn sys_write_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

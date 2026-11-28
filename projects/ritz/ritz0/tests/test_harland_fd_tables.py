@@ -324,6 +324,12 @@ pub fn kfs_persist_create(path: StrView, mode: u32) -> i32
     var empty: u8 = 0
     ns_stub_write(path, @empty, 0)
 
+pub fn kfs_unlink(path: StrView) -> Result<(), Errno>
+    Err(Errno.NoEnt)
+
+pub fn kfs_rmdir(path: StrView) -> Result<(), Errno>
+    Err(Errno.NoEnt)
+
 pub fn kfs_persist_mkdir(path: StrView) -> i32
     0
 
@@ -837,7 +843,7 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
     assert begin.index("if inherit_caps") < begin.index("cap_inherit_ambient(")
     # every failure after the child exists gives its slot back
     assert image.count("spawn_undo(slot, parent_pid)") == 2, image
-    assert image.index("proc_start(slot)") > image.index("sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1)")
+    assert image.index("proc_start(slot)") > image.index("sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1, 0)")
     # both spawn syscalls, and spawn_bg, go through it
     for spawn in ("spawn_and_block", "sys_spawn_bg_handler"):
         assert "spawn_process(" in _fn(PROCESS, spawn), spawn

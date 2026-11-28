@@ -90,6 +90,14 @@ goliath's copy-on-write root swap (`commit`), which no reader can observe
 half done. This removes the first row of the table, and `/var` costs half
 the RAM.
 
+Which tree a path is in is `fs/route.ritz`'s (`route`), and everything
+outside `/var` is the runtime tree: RAM, never saved. `/tmp` is its scratch
+directory (AGAST #4957): `kfs_init` makes it, mode 01777, every process gets
+`TMPDIR=/tmp` in the environment the kernel passes in RDX, and a save never
+carries it, so it is empty at every boot. `unlink` (87) and `rmdir` (84)
+remove from whichever tree the path routes to; under `/var` a remove is a
+plain commit (`persist_remove`), owed a save like a close's.
+
 ### 2. The save gate: one writer of the persistent subtree
 
 A kernel flag, `g_kfs_gate`. It is held across every persistent-subtree

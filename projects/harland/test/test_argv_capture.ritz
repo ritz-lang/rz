@@ -11,7 +11,8 @@
 # tests run it against ordinary memory (the checker is injectable) and prove
 # a mutation after a check is what gets copied, never a stale snapshot.
 
-import syscall.runtime.argv { ArgvStatus, ArgvCapture, ARGV_BYTES_MAX, ARGV_COUNT_MAX, argv_capture, argv_buf, argv_offsets, argv_count }
+import syscall.runtime.argv { ArgvStatus, ArgvCapture, ArgsLayout, ARGV_BYTES_MAX, ARGV_COUNT_MAX, ENVIRON, argv_capture, args_layout, argv_buf, argv_offsets, argv_count }
+import ritzlib.strview { StrView }
 
 fn ok_check(ptr: *u8, len: u64) -> i64
     return 0
@@ -159,3 +160,66 @@ fn test_byte_budget_is_4096() -> i32
     if ARGV_BYTES_MAX != 4096
         return 1
     return 0
+
+# ============================================================================
+# The child's stack: argv and the environment (AGAST #4957)
+# ============================================================================
+#
+# args_layout writes the last capture's strings, ENVIRON's, and the two
+# NULL-terminated pointer arrays below `top`. Here `top` is the end of an
+# ordinary buffer, so the pointers it writes can be followed.
+
+var g_stack: [8192]u8
+
+fn stack_top() -> u64
+    (@g_stack[0]) as u64 + 8192
+
+# Whether entry `i` of the NULL-terminated vector at `addr` is the C string
+# `want`: its bytes, then the NUL.
+fn vec_entry_is(addr: u64, i: i64, want: StrView) -> bool
+    let p: *u8 = *((addr + (i as u64) * 8) as *u64) as *u8
+    if p == null
+        return false
+    let got: StrView = StrView { ptr: p, len: want.len() }
+    got.eq(want) and *(p + want.len()) == 0
+
+fn vec_is_null(addr: u64, i: i64) -> bool
+    *((addr + (i as u64) * 8) as *u64) == 0
+
+fn in_stack(addr: u64) -> bool
+    addr >= (@g_stack[0]) as u64 and addr < stack_top()
+
+[[test]]
+fn test_layout_passes_argv_and_the_environment() -> i32
+    # argv_capture reads spawn_args' argv: the kernel's C ABI, an array of
+    # NUL-terminated strings, which is what these literals are.
+    var arr: [2]*u8
+    arr[0] = c"prog"
+    arr[1] = c"arg one"
+    let cap: ArgvCapture = argv_capture(@arr as **u8, 2, ok_check)
+    assert cap.status == ArgvStatus.Ok
+    let l: ArgsLayout = args_layout(stack_top(), 2, cap.bytes)
+    assert l.rsp % 16 == 0
+    assert in_stack(l.rsp) and in_stack(l.argv) and in_stack(l.envp)
+    assert l.rsp <= l.argv and l.rsp <= l.envp
+    assert vec_entry_is(l.argv, 0, "prog")
+    assert vec_entry_is(l.argv, 1, "arg one")
+    assert vec_is_null(l.argv, 2)
+    assert vec_entry_is(l.envp, 0, "TMPDIR=/tmp")
+    assert vec_is_null(l.envp, 1)
+    0
+
+# A spawn without arguments still gets the environment, and an empty argv
+# rather than none.
+[[test]]
+fn test_layout_without_argv_still_has_the_environment() -> i32
+    var none: [1]*u8
+    let cap: ArgvCapture = argv_capture(@none as **u8, 0, ok_check)
+    assert cap.status == ArgvStatus.Ok
+    let l: ArgsLayout = args_layout(stack_top(), 0, cap.bytes)
+    assert l.rsp % 16 == 0
+    assert in_stack(l.argv) and in_stack(l.envp)
+    assert vec_is_null(l.argv, 0)
+    assert vec_entry_is(l.envp, 0, "TMPDIR=/tmp")
+    assert vec_is_null(l.envp, 1)
+    0

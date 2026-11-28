@@ -194,6 +194,11 @@ WRITE_EMPTY_OK = r"[test] write_empty_test ... [write_empty_test] PASS: /tmp and
 STAT_OK = r"[test] stat_test ... [stat_test] PASS: /tmp and /var\nPASS (exit=0)\n"
 # indium's dir_test listed /var as well as /tmp (AGAST #4947).
 DIR_OK = r"[test] dir_test ... [dir_test] PASS: /tmp and /var\nPASS (exit=0)\n"
+# indium's tmp_test: TMPDIR, the 01777 RAM-only /tmp, write/read/list/remove
+# there (AGAST #4957). A first boot of its disk; a reboot adds "empty after
+# a reboot", which tools/test_tier1_boot.sh requires of grub-reboot and
+# kvm-reboot.
+TMP_OK = r"[test] tmp_test ... [tmp_test] PASS: /tmp write, read, list, remove\nPASS (exit=0)\n"
 # The native boot's virtio-blk is modern-only and offers 1024-entry queues;
 # the driver must take the MMIO transport and cap the queue (AGAST #3576).
 BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
@@ -259,7 +264,7 @@ RING_DUMP_END = r"\n=== END RING BUFFER ===\n"
 # dump repeating it.
 RING_OK = (KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_START
            + KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_END)
-PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK + DIR_OK + SUITE_PASSED + INIT_EXIT
+PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK + DIR_OK + TMP_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -524,7 +529,7 @@ def test_busy_children_coarsely_paired_by_load_pass(tree):
     serial = (RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
               + BUSY_PAIRED_9
               + SCHED_OK
-              + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK + DIR_OK
+              + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK + DIR_OK + TMP_OK
               + SUITE_PASSED + INIT_EXIT)
     r = _run(tree, serial)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -795,6 +800,16 @@ def test_dir_on_tmp_alone_fails(tree):
     r = _run(tree, PASSED.replace(DIR_OK, tmp_only))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL (native): dir_test did not pass on both /tmp and /var" in r.stdout
+
+
+@pytest.mark.integration
+def test_no_tmp_test_pass_fails(tree):
+    """A boot whose tmp_test didn't pass fails on it by name, not just by the
+    suite's count (AGAST #4957)."""
+    failed = r"[test] tmp_test ... [tmp_test] FAIL step 1: no TMPDIR in the environment\nFAIL (expected 0, got 1)\n"
+    r = _run(tree, PASSED.replace(TMP_OK, failed))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): no '[tmp_test] PASS: /tmp write, read, list, remove'" in r.stdout
 
 
 @pytest.mark.integration

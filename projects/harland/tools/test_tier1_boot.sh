@@ -45,6 +45,9 @@
 # goliath, restored from that disk's goliath image at boot, and each boot
 # counts itself in /var/boots and saves the image. The first boot must log
 # "boot 1" and the reboot "boot 2": what one boot saved, the next one loaded.
+# indium's tmp_test (AGAST #4957) writes, reads, lists and removes files in
+# the kernel's RAM-only /tmp on every boot, and leaves one there; the reboot
+# must find it gone ("empty after a reboot").
 #
 # A boot fails as a hang when its serial log stops growing for BOOT_STALL
 # seconds, not after a fixed time: on a host at load ~100 a TCG boot ran 10x
@@ -60,7 +63,10 @@
 #             requires the "sysret" self-test's non-canonical return RIP to
 #             fault in ring 0 ("... CS 8"): only an IRETQ that checks the RIP
 #             (KVM, hardware) takes #4610's syscall_exit_iret fixup, and TCG
-#             never does (AGAST #4612). Skipped (exit 0, "SKIP (kvm): <why>")
+#             never does (AGAST #4612). Two boots of one blank qcow2 storage
+#             disk, kvm and kvm-reboot: boot 1 and boot 2 of its image, and
+#             the second must find /tmp empty of what the first left (AGAST
+#             #4957). Skipped (exit 0, "SKIP (kvm): <why>")
 #             where /dev/kvm is absent, can't be opened read-write, or QEMU's
 #             KVM accelerator fails to start; never part of `all`.
 #        SKIP_BUILD=1   use the existing build/debug outputs
@@ -743,6 +749,23 @@ dir_ok() {
     return 1
 }
 
+# tmp_ok NAME [rebooted]: pass only if indium's tmp_test passed (AGAST #4957):
+# TMPDIR=/tmp, /tmp a 01777 directory, and a file written, read, listed and
+# removed there. With `rebooted` (a second boot of the same storage disk), it
+# must also have found the file the boot before left in /tmp gone: /tmp is
+# RAM, and no save carries it. Its exit code already fails the suite.
+tmp_ok() {
+    local want="[tmp_test] PASS: /tmp write, read, list, remove"
+    [ "${2:-}" = rebooted ] && want="$want; empty after a reboot"
+    if grep -aqF "$want" "$WORK/$1.log"; then
+        echo "PASS ($1): $want"
+        return 0
+    fi
+    grep -a "\[tmp_test\]" "$WORK/$1.log" | head -3
+    echo "FAIL ($1): no '$want'"
+    return 1
+}
+
 # net_nodev NAME: pass only if init ran indium's ping, udp-send and
 # udp-recv and each exited 19 (-Errno.NoDev): a Tier-1 boot runs no ring-2
 # service, so NetAttach answers NoDev and each tool ends before it publishes
@@ -937,14 +960,30 @@ fi
 if [ "$MODE" = kvm ]; then
     # The native ESP under KVM (AGAST #4612): the boot self-tests, with the
     # non-canonical return RIP's fault taken in ring 0 at syscall_exit_iret.
+    # A real storage disk booted twice (AGAST #4957): what boot 1 left in
+    # /tmp must be gone in boot 2, while its /var survives.
+    # -o size=, so the image is the last argument, as the boot tests' qemu-img
+    # stubs (projects/ritz/tools/test_ci_*_boot.py) expect: a trailing 64M
+    # made a file named 64M in their working directory.
+    qemu-img create -q -f qcow2 -o size=64M "$WORK/kvm-storage.qcow2" \
+        || { echo "FAIL: qemu-img create failed"; exit 1; }
+    KVM_STORAGE=(-drive "file=$WORK/kvm-storage.qcow2,format=qcow2,if=none,id=persist"
+                 -device "virtio-blk-pci,drive=persist,disable-legacy=on")
     QEMU_CPU=host boot kvm "$WORK/esp-native" ",disable-legacy=on,queue-size=1024" \
-        -accel kvm \
-        -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
-        -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
+        -accel kvm "${KVM_STORAGE[@]}" || rc=1
     boot_tests_passed kvm || rc=1
     smp_user kvm || rc=1
     sysret_ring0 kvm || rc=1
     no_exception kvm || rc=1
+    all_passed kvm || rc=1
+    persisted kvm 1 || rc=1
+    tmp_ok kvm || rc=1
+    QEMU_CPU=host boot kvm-reboot "$WORK/esp-native" ",disable-legacy=on,queue-size=1024" \
+        -accel kvm "${KVM_STORAGE[@]}" || rc=1
+    all_passed kvm-reboot || rc=1
+    no_exception kvm-reboot || rc=1
+    persisted kvm-reboot 2 || rc=1
+    tmp_ok kvm-reboot rebooted || rc=1
     exit $rc
 fi
 
@@ -957,6 +996,7 @@ if [ "$MODE" != grub ]; then
     write_empty native || rc=1
     stat_ok native || rc=1
     dir_ok native || rc=1
+    tmp_ok native || rc=1
     boot_tests_passed native || rc=1
     smp_stacks native || rc=1
     mbox_round_trip native || rc=1
@@ -983,7 +1023,7 @@ EOF
     grub-mkstandalone -O x86_64-efi -o "$WORK/esp-grub/EFI/BOOT/BOOTX64.EFI" \
         "boot/grub/grub.cfg=$WORK/grub.cfg" "boot/harland.elf=$KERNEL_ELF" \
         || setup_error "grub-mkstandalone failed"
-    qemu-img create -q -f qcow2 "$WORK/storage.qcow2" 64M \
+    qemu-img create -q -f qcow2 -o size=64M "$WORK/storage.qcow2" \
         || { echo "FAIL: qemu-img create failed"; exit 1; }
     STORAGE=(-drive "file=$WORK/storage.qcow2,format=qcow2,if=none,id=storage"
              -device "virtio-blk-pci,drive=storage")
@@ -1001,6 +1041,7 @@ EOF
     write_empty grub || rc=1
     stat_ok grub || rc=1
     dir_ok grub || rc=1
+    tmp_ok grub || rc=1
     boot_tests_passed grub || rc=1
     smp_stacks grub || rc=1
     mbox_round_trip grub || rc=1
@@ -1022,6 +1063,7 @@ EOF
     tlb_owner_unmap grub-reboot || rc=1
     smp_user grub-reboot || rc=1
     persisted grub-reboot 2 || rc=1
+    tmp_ok grub-reboot rebooted || rc=1
     saved_subtree grub-reboot || rc=1
 fi
 

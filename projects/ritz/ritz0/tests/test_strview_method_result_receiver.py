@@ -11,6 +11,14 @@ calls it. ritz0's type checker gave a built-in receiver's source method
 literal receiver (a StrView local it did), nor a match's payload bound from
 a method call's result.
 
+A const receiver too (AGAST #4957): `const HEX: StrView = ".."` then
+`HEX.get(1)` wanted `get` on every instance, and with a `Vec<String>` in
+the program (ritzlib.fs list_dir's) ritz1 instantiated `Vec<String>.get`,
+which moves a String out of `@Vec`. ritz1's monomorph typed a struct global
+receiver (#4774) but not a const. Nor did its bool check: `if
+HEX.eq("..")` took `HEX`, neither local nor global, for a static call's
+type name, so `eq`'s bool was unknown and an `if` or `assert` on it refused.
+
 Every row runs on ritz0, ritz1 and ritz1_selfhosted.
 """
 
@@ -41,6 +49,17 @@ ROWS = {
         "    match s.split_once('\\t')\n"
         "        Some(f) => f.before.parse_i64().unwrap_or(-1) as i32\n"
         "        None => 9\n"),
+    "const_receiver": (
+        "import ritzlib.gvec\nimport ritzlib.string\nimport ritzlib.strview\n"
+        "const HEX: StrView = \"0123\"\n"
+        "fn names() -> Vec<String>\n    var v: Vec<String> = vec_new<String>()\n"
+        "    v.push(string_from(\"a\"))\n    v\n"
+        "pub fn main() -> i32\n    let v: Vec<String> = names()\n"
+        "    (HEX.get(1) as i32) + (v.len() as i32)\n"),
+    "const_receiver_bool": (
+        "import ritzlib.strview\nconst HEX: StrView = \"0123\"\n"
+        "pub fn main() -> i32\n    if HEX.eq(\"0123\") and not HEX.eq(\"x\")\n"
+        "        return 0\n    1\n"),
 }
 
 

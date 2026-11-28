@@ -175,7 +175,7 @@ STUBS = {
     "drivers/virtio/blk.ritz": BLK_STUB,
     "arch/x86_64/tsc.ritz": TSC_STUB,
 }
-REAL = ["fs/kfs.ritz", "fs/persist.ritz", "fs/open_plan.ritz", "fs/vfs.ritz", "fs/storage_claim.ritz", "fs/tar.ritz", "fs/initramfs.ritz", "syscall/errno.ritz"]
+REAL = ["fs/kfs.ritz", "fs/persist.ritz", "fs/route.ritz", "fs/open_plan.ritz", "fs/vfs.ritz", "fs/storage_claim.ritz", "fs/tar.ritz", "fs/initramfs.ritz", "syscall/errno.ritz"]
 
 
 def _run(tmp_path, src):

@@ -11,6 +11,7 @@
 #     parks (SaveGate.park) until the holder releases it.
 #   * plain commits: a file or directory is published at once and the save
 #     is owed (`pending`) until one succeeds (kfs debounces it).
+#   * removes (unlink, rmdir): a plain commit of the entry's absence.
 #   * durable commits, an O_SYNC fd's last close: prepare (fork the tree and
 #     commit the file into the fork), persist (save the fork), publish
 #     (adopt the fork). A failure before the publish drops the fork: the
@@ -29,7 +30,7 @@ import ritzlib.result
 import ritzlib.option
 import syscall.errno { Errno }
 import fs.open_plan { WriteMode }
-import goliath.namespace { Namespace, namespace_exists, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_fork, namespace_adopt, namespace_drop }
+import goliath.namespace { Namespace, NsStat, namespace_exists, namespace_stat, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_delete, namespace_fork, namespace_adopt, namespace_drop }
 import goliath.block_store { BlockDevice, block_store_save }
 import goliath.error { ErrorCode }
 
@@ -178,6 +179,35 @@ pub fn persist_mkdir(p: *Persist, path: StrView) -> Result<(), Errno>
             r = persist_checked(code)
         if r.is_ok()
             (*p).pending = true
+    gate_leave(@(*p).gate)
+    r
+
+# What a remove may take (AGAST #4957)
+pub enum RemoveKind
+    File        # unlink: a file; IsDir for a directory
+    Dir         # rmdir: an empty directory; NotDir for a file
+
+# Remove `path` from `ns`, either tree: the checks unlink and rmdir make
+# (IsDir, NotDir, NotEmpty, NoEnt; Perm for the root), then the delete.
+pub fn remove_entry(ns: *Namespace, path: StrView, kind: RemoveKind) -> Result<(), Errno>
+    let st: NsStat = match namespace_stat(ns, path)
+        Ok(found) => found
+        Err(code) => return persist_checked(code)
+    if st.is_dir and kind == RemoveKind.File
+        return Err(Errno.IsDir)
+    if not st.is_dir and kind == RemoveKind.Dir
+        return Err(Errno.NotDir)
+    persist_checked(namespace_delete(ns, path))
+
+# Remove `path` from the subtree, gone now and owed a save. Nothing is owed
+# when the remove is refused.
+pub fn persist_remove(p: *Persist, path: StrView, kind: RemoveKind) -> Result<(), Errno>
+    gate_enter(@(*p).gate)?
+    var r: Result<(), Errno> = Err(Errno.Io)
+    if not (*p).fault_persist
+        r = remove_entry((*p).ns, path, kind)
+    if r.is_ok()
+        (*p).pending = true
     gate_leave(@(*p).gate)
     r
 

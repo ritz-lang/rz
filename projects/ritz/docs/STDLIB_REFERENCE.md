@@ -2011,6 +2011,13 @@ extension.
 | `mkdir` | `fn(path: StrView, mode: i32) -> Result<i32, Errno>` | Create directory (`Ok(0)`; `Err(Exist)` if it exists) |
 | `unlink` | `fn(path: StrView) -> Result<i32, Errno>` | Remove a non-directory (`Ok(0)`) |
 | `rmdir` | `fn(path: StrView) -> Result<i32, Errno>` | Remove an empty directory (`Ok(0)`) |
+| `list_dir` | `fn(path: StrView) -> Result<Vec<String>, Errno>` | A directory's names, without `.` and `..`; `Err(NotDir)` for a file |
+| `temp_dir` | `fn() -> Result<StrView, Errno>` | The scratch directory: `$TMPDIR` if it is a directory by an absolute path, else `/tmp`; `Err(NoEnt)` if neither is |
+| `temp_dir_from` | `fn(tmpdir: Option<StrView>) -> Result<StrView, Errno>` | `temp_dir`'s rule for a given `$TMPDIR` (`None`: unset) |
+
+`mkdir`, `unlink`, `rmdir`, `list_dir` and `temp_dir` work on Linux and Harland. Harland's
+kernel gives every process `TMPDIR=/tmp`, a directory only RAM holds, so
+`temp_dir` there names a scratch directory that is empty at every boot.
 
 ```ritz
 import ritzlib.fs

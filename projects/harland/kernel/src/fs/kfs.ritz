@@ -13,6 +13,8 @@
 #   * /var:   the persistent subtree's commits and saves are fs/persist.ritz
 #             (the save gate, plain and durable commits; AGAST #4835), bound
 #             here to the device, the file clock and the wait queue
+#   * /tmp:   the runtime tree's scratch directory, made here at boot, mode
+#             01777; RAM only, so no save carries it (fs/route.ritz, #4957)
 #
 # One global namespace (kfs_get). Calls take the *Namespace so callers read
 # like the goliath API they wrap.
@@ -28,13 +30,14 @@ import ritzlib.span { Span, span_from_ptr }
 import ritzlib.fmt.digits { fmt_u64_into }
 import ritzlib.memory { Allocator }
 import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_count }
-import goliath.namespace { Namespace, namespace_new, namespace_exists, namespace_read, namespace_write, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_list, namespace_max_modified }
+import goliath.namespace { Namespace, namespace_new, namespace_exists, namespace_read, namespace_write, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_mkdir_mode, namespace_list, namespace_max_modified }
 import goliath.block_store { BlockDevice }
 import ritzlib.result
 import ritzlib.option
 pub import fs.persist { kfs_errno }
 import fs.open_plan { WriteMode }
-import fs.persist { persist_checked, Persist, SaveGate, FileCommit, persist_new, persist_save, persist_flush_pending, persist_commit, persist_commit_durable, persist_mkdir }
+import fs.persist { persist_checked, Persist, SaveGate, FileCommit, RemoveKind, persist_new, persist_save, persist_flush_pending, persist_commit, persist_commit_durable, persist_mkdir, persist_remove, remove_entry }
+import fs.route { Tree, route, route_is_var, TMP_DIR, TMP_MODE }
 import fs.storage_claim { StorageClaim, storage_claim, storage_claimed }
 import goliath.dir_entry { NsEntry }
 
@@ -164,6 +167,10 @@ pub fn kfs_init(storage: *VirtioBlkDevice, format: bool) -> i32
     # none, and a /var path is a missing runtime-tree path.
     if g_kfs_has_dev and kfs_mkdir(@g_kfs_ns, "/var") != KFS_OK
         return -1
+    # /tmp, every process's TMPDIR: in the runtime tree, so it starts empty
+    # each boot. The initramfs may list it too; its mkdir then finds it.
+    if kfs_errno(namespace_mkdir_mode(@g_kfs_ns, TMP_DIR, TMP_MODE)) != KFS_OK
+        return -1
     0
 
 # The kernel namespace (null before kfs_init): the runtime tree the initramfs
@@ -284,26 +291,18 @@ pub fn kfs_clock() -> u64
 # The persistent subtree (/var)
 # ============================================================================
 
-# Length of the "/var" prefix `path` starts with (0 if it doesn't): 4 for
-# "/var" exactly and for "/var/...".
-fn kfs_persist_prefix(path: StrView) -> i64
-    if path.len < 4
-        return 0
-    if *(path.ptr) != 47 or *(path.ptr + 1) != 118 or *(path.ptr + 2) != 97 or *(path.ptr + 3) != 114
-        return 0
-    if path.len == 4 or *(path.ptr + 4) == 47
-        return 4
-    0
+# Which tree a path is in is fs/route.ritz's: /var and below are the
+# subtree only while it is mounted (on a storage device).
 
 # Whether `path` is part of the persistent subtree (at or below /var)
 pub fn kfs_is_persist(path: StrView) -> bool
-    kfs_persist_prefix(path) != 0
+    route_is_var(path)
 
 # Whether `path` is in the persistent subtree and the subtree is on a
 # storage device: /var is mounted. Without storage the runtime tree has no
 # /var, so a /var path is simply missing there.
 pub fn kfs_is_durable(path: StrView) -> bool
-    kfs_is_persist(path) and kfs_has_storage()
+    route(path, kfs_has_storage()).tree == Tree.Persist
 
 # The namespace a path lives in: the persistent /var subtree for /var and
 # below when it is mounted, else the runtime tree.
@@ -314,14 +313,7 @@ pub fn kfs_ns_for(path: StrView) -> *Namespace
 
 # `path` within kfs_ns_for's namespace: "/var/x" is "/x" in the subtree.
 pub fn kfs_local(path: StrView) -> StrView
-    if not kfs_is_durable(path)
-        return path
-    let n: i64 = kfs_persist_prefix(path)
-    if n == 0
-        return path
-    if path.len == n
-        return "/"
-    StrView { ptr: path.ptr + n, len: path.len - n }
+    route(path, kfs_has_storage()).local
 
 # ============================================================================
 # Namespace calls with kernel-shaped results
@@ -408,6 +400,23 @@ pub fn kfs_persist_mkdir(path: StrView) -> i32
     if local.len == 1
         return KFS_OK
     kfs_rc(persist_mkdir(@g_kfs_persist, local))
+
+# Remove `path` as the running system sees it (unlink: a file, rmdir: an
+# empty directory): under /var from the persistent subtree, owed a save
+# (kfs_save_later), else from the runtime tree. "/var" itself is the
+# subtree's root and is never removed (Perm).
+fn kfs_remove(path: StrView, kind: RemoveKind) -> Result<(), Errno>
+    if not kfs_is_durable(path)
+        return remove_entry(kfs_get(), path, kind)
+    persist_remove(@g_kfs_persist, kfs_local(path), kind)
+
+# unlink: the file at `path` (IsDir for a directory)
+pub fn kfs_unlink(path: StrView) -> Result<(), Errno>
+    kfs_remove(path, RemoveKind.File)
+
+# rmdir: the empty directory at `path` (NotDir for a file, NotEmpty)
+pub fn kfs_rmdir(path: StrView) -> Result<(), Errno>
+    kfs_remove(path, RemoveKind.Dir)
 
 # ============================================================================
 # Boot record

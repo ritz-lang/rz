@@ -92,6 +92,7 @@ FAKE_QEMU = textwrap.dedent("""\
                 "[test] write_empty_test ... [write_empty_test] PASS: /tmp and /var\\nPASS (exit=0)\\n"
                 "[test] stat_test ... [stat_test] PASS: /tmp and /var\\nPASS (exit=0)\\n"
                 "[test] dir_test ... [dir_test] PASS: /tmp and /var\\nPASS (exit=0)\\n"
+                "[test] tmp_test ... [tmp_test] PASS: /tmp write, read, list, remove\\nPASS (exit=0)\\n"
                 "ALL TESTS PASSED\\n"
                 "[exit] init exited with code 0\\n")
     """)

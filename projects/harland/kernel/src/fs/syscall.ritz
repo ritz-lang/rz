@@ -1,8 +1,9 @@
 # Filesystem Syscalls
 #
-# Implements sys_open, sys_close, sys_read, sys_write and sys_fstat for files
-# (stat by path is fs/stat.ritz stat_at), and sys_getdents64 for directory
-# fds (open with O_DIRECTORY; the records are fs/dirent.ritz's, AGAST #4947).
+# Implements sys_open, sys_close, sys_read, sys_write, sys_fstat, mkdir,
+# unlink and rmdir for files (stat by path is fs/stat.ritz stat_at), and
+# sys_getdents64 for directory fds (open with O_DIRECTORY; the records are
+# fs/dirent.ritz's, AGAST #4947).
 # Integrates with the kernel namespace (fs/kfs.ritz) and the per-process fd tables (fs/fd.ritz).
 
 import klog { klog }
@@ -10,7 +11,7 @@ import serial { StrView }
 import fs.vfs { O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_SYNC, O_DIRECTORY }
 import fs.fd { FdTable, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_dup, fd_owner, fd_refs, fd_heir }
 import syscall.errno { Errno }
-import fs.kfs { KFS_OK, kfs_get, kfs_ns_for, kfs_local, kfs_is_persist, kfs_is_durable, kfs_persist_write, kfs_persist_create, kfs_persist_mkdir, kfs_commit_durable, kfs_save, kfs_save_later }
+import fs.kfs { KFS_OK, kfs_get, kfs_ns_for, kfs_local, kfs_is_persist, kfs_is_durable, kfs_persist_write, kfs_persist_create, kfs_persist_mkdir, kfs_unlink, kfs_rmdir, kfs_commit_durable, kfs_save, kfs_save_later }
 import fs.open_plan { WriteMode, OpenPlan, open_plan }
 import fs.stat { Stat, stat_of_entry, stat_console }
 import fs.dirent { dirent_fill }
@@ -737,14 +738,40 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64
 # sys_mkdir - Create a directory
 # ============================================================================
 
-pub fn sys_mkdir(path_ptr: *u8, path_len: u64) -> i64
+pub fn sys_mkdir(path: StrView) -> i64
     if kfs_get() == 0 as *Namespace
         return Errno.Inval as i64
-    let path: StrView = StrView { ptr: path_ptr, len: path_len as i64 }
     let result: i32 = kfs_persist_mkdir(path)
     if result == KFS_OK and kfs_is_persist(path)
         kfs_save_later()
     result as i64
+
+# ============================================================================
+# sys_unlink / sys_rmdir - Remove a file or an empty directory (AGAST #4957)
+# ============================================================================
+#
+# Under /var the remove is a commit like a close's, saved later
+# (kfs_save_later); anywhere else (/tmp) it only changes RAM. An fd open on
+# the file keeps reading what it opened: it holds the blob.
+
+# A remove's result, with the save it owes under /var scheduled.
+fn fs_removed(path: StrView, r: Result<(), Errno>) -> Result<(), Errno>
+    if r.is_ok() and kfs_is_persist(path)
+        kfs_save_later()
+    r
+
+# Remove the file at `path`: IsDir for a directory, NoEnt if it is missing.
+pub fn sys_unlink(path: StrView) -> Result<(), Errno>
+    if kfs_get() == 0 as *Namespace
+        return Err(Errno.Inval)
+    fs_removed(path, kfs_unlink(path))
+
+# Remove the empty directory at `path`: NotDir for a file, NotEmpty if it
+# holds anything.
+pub fn sys_rmdir(path: StrView) -> Result<(), Errno>
+    if kfs_get() == 0 as *Namespace
+        return Err(Errno.Inval)
+    fs_removed(path, kfs_rmdir(path))
 
 # ============================================================================
 # fs_sync - Flush the persistent subtree to the storage device

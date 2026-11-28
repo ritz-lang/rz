@@ -10,7 +10,9 @@
 #   whole files  read_file -> Result<String, Errno>, write_file -> Result<i64, Errno>
 #   mutation     mkdir / unlink / rmdir -> Result<i32, Errno> (Ok(0)), copy_file
 #   storage      sync -> Result<(), Errno>
-#   directories  dir_open -> Result<DirIter, Errno>; dir_next -> bool;
+#   scratch      temp_dir / temp_dir_from -> Result<StrView, Errno>
+#   directories  list_dir -> Result<Vec<String>, Errno>;
+#                dir_open -> Result<DirIter, Errno>; dir_next -> bool;
 #                dir_entry_type -> Option<u8>; dir_entry / dir_next_entry
 #   paths        path_join -> String; path_basename / dirname / extension / stem
 #                -> StrView, a view into the input (no allocation)
@@ -19,15 +21,16 @@
 # without a variant), never a -1 / null sentinel or a bare number (AGAST
 # #4248). A path of FS_PATH_MAX bytes or more fails with NameTooLong.
 #
-# Targets (AGAST #4830, #4832, #4833): read_file, write_file, copy_file,
-# stat / lstat, sync, the predicates, file_size, the path utilities, the
-# mode_is_* helpers and directory iteration (dir_open, DirIter: AGAST #4947)
-# compile for Linux and Harland. The rest (mkdir/unlink/rmdir, access ..
-# set_times, remove_dir_all) is [[target_os = "linux"]]: it rests on
-# syscalls Harland does not have. Harland has no symlinks, so there lstat is
-# stat and is_symlink is false. Harland's kernel takes absolute paths only,
-# so there a relative path is resolved against the working directory first
-# (ritzlib.path path_absolute): "." and "src/x" mean what they do on Linux.
+# Targets (AGAST #4830, #4832, #4833, #4957): read_file, write_file,
+# copy_file, stat / lstat, sync, mkdir / unlink / rmdir, temp_dir, the
+# predicates, file_size, the path utilities, the mode_is_* helpers and
+# directory iteration (dir_open, DirIter: AGAST #4947; list_dir) compile for
+# Linux and Harland. The rest (access .. set_times, remove_dir_all) is
+# [[target_os = "linux"]]: it rests on syscalls Harland does not have.
+# Harland has no symlinks, so there lstat is stat and is_symlink is false.
+# Harland's kernel takes absolute paths only, so there a relative path is
+# resolved against the working directory first (ritzlib.path path_absolute):
+# "." and "src/x" mean what they do on Linux.
 #
 # Note: Stat struct and STAT_SIZE are defined in ritzlib/sys.ritz
 
@@ -38,8 +41,9 @@ import ritzlib.string
 import ritzlib.strview
 import ritzlib.result
 import ritzlib.option
-import ritzlib.gvec    # Vec<u8>: DirIter's getdents buffer
+import ritzlib.gvec    # Vec<u8>: DirIter's getdents buffer; list_dir's Vec<String>
 import ritzlib.path { path_absolute }
+import ritzlib.os.env  # temp_dir reads $TMPDIR
 # Errno is part of this API (every Err), so importers of fs get it too.
 pub import ritzlib.errno
 
@@ -443,6 +447,66 @@ pub fn rmdir(path: StrView) -> Result<i32, Errno>
         return Err(errno_from_raw(perr))
     fs_unit(sys_rmdir(@cpath[0]))
 
+# Harland's mkdir, unlink and rmdir take the path's bytes and length, as its
+# open does (AGAST #4957); as there, a relative path is resolved against the
+# working directory first. A directory there is always 0755: `mode` is not
+# passed.
+[[target_os = "harland"]]
+fn fs_path_call(nr: i64, path: StrView) -> Result<i32, Errno>
+    if not path.starts_with("/")
+        return match path_absolute(path)
+            Ok(abs) => fs_path_call(nr, abs.as_view())
+            Err(e) => Err(e)
+    if path.len >= FS_PATH_MAX
+        return Err(errno_from_raw(FS_ENAMETOOLONG))
+    fs_unit(syscall2(nr, path.ptr as i64, path.len) as i32)
+
+[[target_os = "harland"]]
+pub fn mkdir(path: StrView, mode: i32) -> Result<i32, Errno>
+    fs_path_call(SYS_MKDIR, path)
+
+[[target_os = "harland"]]
+pub fn unlink(path: StrView) -> Result<i32, Errno>
+    fs_path_call(SYS_UNLINK, path)
+
+[[target_os = "harland"]]
+pub fn rmdir(path: StrView) -> Result<i32, Errno>
+    fs_path_call(SYS_RMDIR, path)
+
+# ============================================================================
+# The temporary directory (AGAST #4957)
+# ============================================================================
+#
+# Where a program puts its scratch files: $TMPDIR when it names a directory
+# by an absolute path, else /tmp when that is a directory. The same rule on
+# Linux and Harland, whose kernel gives every process TMPDIR=/tmp: a
+# directory only RAM holds, empty at every boot. The view borrows the
+# process's environment (which lives as long as the process) or a literal.
+
+const TEMP_DIR_DEFAULT: StrView = "/tmp"
+
+# Whether `path` is a directory, following a symlink (a $TMPDIR may be one).
+fn fs_is_dir_at(path: StrView) -> bool
+    match stat(path)
+        Ok(st) => mode_is_dir(st.st_mode)
+        Err(_) => false
+
+# The scratch directory: temp_dir_from this process's $TMPDIR.
+pub fn temp_dir() -> Result<StrView, Errno>
+    temp_dir_from(env_get("TMPDIR"))
+
+# temp_dir's rule for a given $TMPDIR (None: unset). Err(NoEnt) when neither
+# it nor /tmp is a directory.
+pub fn temp_dir_from(tmpdir: Option<StrView>) -> Result<StrView, Errno>
+    match tmpdir
+        Some(dir) =>
+            if dir.starts_with("/") and fs_is_dir_at(dir)
+                return Ok(dir)
+        None => pass
+    if fs_is_dir_at(TEMP_DIR_DEFAULT)
+        return Ok(TEMP_DIR_DEFAULT)
+    Err(Errno.NoEnt)
+
 # ============================================================================
 # Paths, permissions, cwd -> Result<_, Errno> (AGAST #4637)
 # ============================================================================
@@ -787,3 +851,24 @@ pub fn remove_dir_all(path: StrView) -> Result<(), Errno>
     match rmdir(path)
         Ok(_) => Ok(())
         Err(err) => Err(err)
+
+# ============================================================================
+# list_dir -> Result<Vec<String>, Errno> (AGAST #4957)
+# ============================================================================
+
+# The names in directory `path`, without "." and "..", in the order the
+# kernel gives them. Err(NotDir) for a file, Err(NoEnt) for a missing path.
+# One DirIter on Linux and Harland (AGAST #4947).
+pub fn list_dir(path: StrView) -> Result<Vec<String>, Errno>
+    var dir: DirIter = match dir_open(path)
+        Ok(d) => d
+        Err(e) => return Err(e)
+    var names: Vec<String> = vec_new<String>()
+    loop
+        match dir.next_entry()
+            Some(e) =>
+                if not e.name.eq(".") and not e.name.eq("..")
+                    names.push(string_from(e.name))
+            None => break
+    dir.close()
+    Ok(names)

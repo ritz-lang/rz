@@ -1,0 +1,51 @@
+# Which tree a path lives in: RAM or the storage device (AGAST #4835, #4957)
+#
+# Userspace sees one tree, but kfs keeps two namespaces:
+#
+#   * the runtime tree: the initramfs root and everything outside /var,
+#     /tmp among it. RAM only: no save ever writes it, so all of it is gone
+#     at the next boot.
+#   * the persistent subtree: /var and below, when a storage device holds
+#     it. It is what a save writes and what the next boot loads.
+#
+# /tmp is the runtime tree's scratch directory (TMP_DIR, mode TMP_MODE):
+# the kernel makes it at boot and every process gets TMPDIR=/tmp in its
+# environment (syscall/runtime/environ.ritz), so a program's scratch files
+# never reach the disk and never outlive the boot.
+#
+# Pure (StrView only), so test/test_persist.ritz routes paths and saves the
+# subtree on the host; fs/kfs.ritz binds it to the kernel's namespaces.
+
+import serial { StrView }
+
+# The runtime tree's scratch directory and its mode, 01777: anyone may
+# create in it (Harland has one user today; the bits are what stat shows).
+pub const TMP_DIR: StrView = "/tmp"
+pub const TMP_MODE: u32 = 1023
+
+pub enum Tree
+    Runtime     # RAM: never saved, gone at reboot
+    Persist     # the /var subtree on the storage device
+
+# Where `path` lives: the tree, and the path within that tree's namespace
+# ("/var/x" is "/x" in the subtree, "/var" its root "/").
+pub struct Route
+    tree: Tree
+    local: StrView
+
+const VAR_DIR: StrView = "/var"
+
+# Whether `path` is at or below /var: "/var" exactly or "/var/...", not
+# "/variable".
+pub fn route_is_var(path: StrView) -> bool
+    path.starts_with(VAR_DIR) and (path.len() == VAR_DIR.len() or path.get(VAR_DIR.len()) == '/')
+
+# Where `path` lives. `var_mounted`: the persistent subtree is on a storage
+# device. Without one the runtime tree has no /var, and a /var path is
+# simply a runtime-tree path (a missing one).
+pub fn route(path: StrView, var_mounted: bool) -> Route
+    if not var_mounted or not route_is_var(path)
+        return Route { tree: Tree.Runtime, local: path }
+    if path.len() == VAR_DIR.len()
+        return Route { tree: Tree.Persist, local: "/" }
+    Route { tree: Tree.Persist, local: path.skip(VAR_DIR.len()) }
