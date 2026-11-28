@@ -1,0 +1,659 @@
+# Harland USB hub class driver (AGAST #4890, docs/USB.md "Hubs")
+#
+# A configured device whose configuration has a hub interface (class 9)
+# with an interrupt IN endpoint is handed here by drivers/usb/usb.ritz, and
+# every later event for it comes here too: USB 2.0 hubs (USB 2.0 chapter
+# 11), and USB 3 hubs on their SuperSpeed side (USB 3.2 chapter 10; such a
+# hub's USB 2 side is a USB 2 hub of its own on a USB 2 port). Bring-up,
+# each step on its completion event: GET_DESCRIPTOR(hub), SET_HUB_DEPTH (a
+# SuperSpeed hub), Configure Endpoint (the slot becomes a hub: its port
+# count and TT think time, and the status change endpoint), SET_FEATURE
+# (PORT_POWER) on each port, then bPwrOn2PwrGood on the BSP tick, and one
+# Normal TRB on the status change endpoint, requeued as each bitmap lands.
+#
+# Ports, one EP0 request at a time: a port the bitmap (or the tick) names
+# gets GET_STATUS, each change bit it reports is cleared (CLEAR_FEATURE)
+# and its status read again, until none is left; then its stage moves on
+# (PortStage). A connection stable for 100 ms (debounce, USB 2.0 7.1.7.3)
+# is reset (SET_FEATURE(PORT_RESET), whose end is a C_PORT_RESET change),
+# given 10 ms of reset recovery, and handed to usb.ritz as Attached at the
+# speed its status says; usb.ritz enumerates it as it does a root port's
+# device, with the route string and TT fields of SlotPlace.below. A
+# SuperSpeed port that is enabled already needs no reset. A disconnect, a
+# connect change or a disabled port tells usb.ritz the device is Gone.
+#
+# Default address: a device just reset answers at address 0 until Address
+# Device gives it one, so on each controller only one hub port at a time
+# is between its reset and its Address Device (`hc_lock`); usb.ritz says
+# when that device is addressed, failed or gone (hub_child_settled) and
+# the next waiting port is reset.
+#
+# Detach (docs/USB.md "Hot-plug"): a hub that goes takes every device
+# below it with it; usb.ritz detaches them, then the hub (hub_detach), and
+# frees its pages once its slot is disabled (hub_free).
+#
+# Ownership: BSP-owned with no lock, as the rest of drivers/usb (usb.ritz's
+# header): xhci_irq's events and the BSP tick, both with interrupts off.
+
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span { span_from_ptr }
+import klog { klog, klog_dec, klog_hex_width }
+import mm.vmm { phys_to_virt }
+import drivers.usb.xhci { xhci_ctx64, xhci_doorbell, xhci_command, xhci_alloc_page, xhci_free_page }
+import usb_abi.regs { UsbSpeed, EpKind, ep_interval, speed_name }
+import usb_abi.trb { Completion, completion_ok, TransferEvent, trb_configure_endpoint, trb_setup_stage, trb_data_stage, trb_status_stage, trb_normal }
+import usb_abi.ring { TrbPage, TrbRing, RingError, RING_TRBS }
+import usb_abi.context { SlotPlace, InputContext, EpType, ADD_SLOT, input_control, slot_ctx, slot_ctx_hub, ep_ctx, add_flag, dci_of }
+import usb_abi.desc { SetupPacket }
+import usb_abi.hub { HubDesc, HubIface, PortStatus, PortFeature, parse_hub_descriptor, port_status, find_hub_iface, changed_ports, setup_get_hub_descriptor, setup_set_hub_depth, setup_get_port_status, setup_set_port_feature, setup_clear_port_feature, setup_clear_hub_feature, HUB_PORTS_MAX, HUB_DESC_MAX }
+
+# Hubs driven at once.
+const HUBS_MAX: u32 = 8
+const DCI_EP0: u8 = 1
+# The buffer page: the status change bitmap at its start (up to
+# BITMAP_MAX bytes), GET_STATUS's 4 bytes at STATUS_OFFSET and the hub
+# descriptor at DESC_OFFSET.
+const BITMAP_MAX: u16 = 32
+const STATUS_OFFSET: u64 = 64
+const DESC_OFFSET: u64 = 128
+# BSP ticks (10 ms each): a connection's debounce, and reset recovery.
+const DEBOUNCE_TICKS: u64 = 10
+const RECOVERY_TICKS: u64 = 1
+
+enum HubState
+    Free
+    ReadingDescriptor       # GET_DESCRIPTOR(hub) on EP0
+    SettingDepth            # SET_HUB_DEPTH (SuperSpeed) on EP0
+    ConfiguringEndpoint     # Configure Endpoint queued
+    PoweringPorts           # SET_FEATURE(PORT_POWER), port `op_port`
+    WaitingPower            # bPwrOn2PwrGood, on the tick
+    Running                 # a Normal TRB is always queued on the status change endpoint
+    Failed                  # stopped; waits for a disconnect
+    Detached                # gone; pages wait for hub_free
+
+# What the hub's EP0 is doing for its ports.
+enum PortOp
+    Idle
+    GetStatus               # GET_STATUS of `op_port` (0: the hub)
+    ClearChange             # CLEAR_FEATURE of one change bit
+    SetReset                # SET_FEATURE(PORT_RESET)
+
+# Where a hub port is.
+enum PortStage
+    Empty                   # nothing connected
+    Debouncing              # connected; stable for DEBOUNCE_TICKS before its reset
+    WaitingTurn             # debounced; waits for the controller's default address
+    Resetting               # PORT_RESET sent; C_PORT_RESET ends it
+    Recovering              # reset done; RECOVERY_TICKS before Address Device
+    Child                   # usb.ritz's device
+
+# What usb.ritz hands over with a configured device.
+pub struct HubAttach
+    hc: u8                  # its controller
+    slot: u8
+    dev: u8                 # usb.ritz's device entry, the owner of its commands
+    speed: UsbSpeed
+    place: SlotPlace
+    in_ctx: u64             # the device's input context page (phys)
+    ep0: *TrbRing           # its EP0 transfer ring, usb.ritz's
+
+# A hub port's device, as hub_transfer reports it.
+pub struct HubPort
+    port: u8
+    speed: UsbSpeed
+
+# What a hub event tells usb.ritz.
+pub enum HubNews
+    Quiet
+    Attached(HubPort)       # enumerate the device on this port
+    Gone(u8)                # the device on this port is gone
+
+struct Hub
+    state: HubState
+    hc: u8
+    slot: u8
+    dev: u8
+    speed: UsbSpeed
+    place: SlotPlace
+    usb3: bool              # its SuperSpeed side
+    in_ctx: u64
+    ep0: *TrbRing
+    ep_addr: u8
+    dci: u8
+    mps: u16
+    interval: u8
+    ring_page: u64          # the status change endpoint's transfer ring (phys)
+    ring: TrbRing
+    buf: u64                # bitmap, port status and descriptor (phys)
+    ep_on: bool             # its status change endpoint is configured
+    ports: u8               # ports driven: bNbrPorts, at most HUB_PORTS_MAX
+    think_time: u8
+    power_ticks: u64        # bPwrOn2PwrGood in ticks, rounded up, plus the tick in flight
+    due: u64                # WaitingPower: the tick power is good
+    op: PortOp
+    op_port: u8
+    pending: u32            # ports to GET_STATUS (bit N: port N, bit 0: the hub)
+    seen: u32               # ports whose connect change was cleared since their last decision
+    stage: [16]PortStage
+    port_due: [16]u64       # Debouncing, Recovering: the tick it ends
+    status: PortStatus      # op_port's last GET_STATUS
+
+var hubs: [8]Hub
+# BSP ticks since boot (hub_tick).
+var hub_now: u64 = 0
+
+# The hub port of each controller (xhci.ritz's XHCS_MAX) between its reset
+# and its device's Address Device: the hub's device entry (0: none) and
+# its port.
+struct DefaultAddress
+    dev: u8
+    port: u8
+
+var hc_lock: [4]DefaultAddress
+
+fn bit(port: u8) -> u32
+    1 << (port as u32)
+
+fn log_hub(h: *Hub)
+    klog("[usb] hc")
+    klog_dec(h.hc as i64)
+    klog(" slot ")
+    klog_dec(h.slot as i64)
+    klog(": hub")
+
+fn log_hub_port(h: *Hub, port: u8)
+    log_hub(h)
+    klog(" port ")
+    klog_dec(port as i64)
+
+fn fail(h: *Hub, what: StrView)
+    log_hub(h)
+    klog(" ")
+    klog(what)
+    klog("; hub stopped\n")
+    release_lock(h)
+    h.state = HubState.Failed
+
+fn zero_page(phys: u64)
+    let w: *u64 = phys_to_virt(phys) as *u64
+    for i in 0..512
+        *(w + i) = 0
+
+# The hub on usb.ritz's device entry `dev` of controller `hc`, detached or
+# not.
+fn hub_of_dev(hc: u8, dev: u8) -> Option<*Hub>
+    for i in 0..HUBS_MAX
+        let h: *Hub = @hubs[i]
+        if h.state != HubState.Free and h.hc == hc and h.dev == dev
+            return Some(h)
+    None
+
+# A free entry with its two pages from controller `hc`; hub_free gives
+# them back.
+fn hub_entry(hc: u8) -> Option<*Hub>
+    for i in 0..HUBS_MAX
+        let h: *Hub = @hubs[i]
+        if h.state == HubState.Free
+            let ring: u64 = match xhci_alloc_page(hc)
+                Ok(p) => p
+                Err(_) => return None
+            match xhci_alloc_page(hc)
+                Ok(p) => h.buf = p
+                Err(_) =>
+                    xhci_free_page(ring)
+                    return None
+            h.ring_page = ring
+            return Some(h)
+    None
+
+# ============================================================================
+# EP0
+# ============================================================================
+
+# A class request on EP0: Setup, a Data stage of `s.length` bytes at
+# `offset` in the buffer (IN or OUT as the request says) if it has one,
+# and Status (the interrupt). The Status TRB's address, or Full with
+# nothing queued.
+fn control(h: *Hub, s: SetupPacket, offset: u64) -> Result<u64, RingError>
+    let need: u32 = if s.length == 0 then 2 else 3
+    if h.ep0.free() < need
+        return Err(RingError.Full)
+    let dir_in: bool = (s.request_type & 0x80) != 0
+    if s.length != 0
+        let b: *u8 = (phys_to_virt(h.buf) + offset) as *u8
+        for i in 0..s.length as u64
+            *(b + i) = 0
+    h.ep0.push(trb_setup_stage(s))
+    if s.length != 0
+        h.ep0.push(trb_data_stage(h.buf + offset, s.length as u32, dir_in))
+    # The status stage runs opposite the data, and IN with none.
+    let status: Result<u64, RingError> = h.ep0.push(trb_status_stage(s.length == 0 or not dir_in))
+    xhci_doorbell(h.hc, h.slot, DCI_EP0)
+    status
+
+fn request(h: *Hub, s: SetupPacket, offset: u64)
+    if control(h, s, offset).is_err()
+        fail(h, "EP0 ring full")
+
+fn bytes_at(h: *Hub, offset: u64, n: i64) -> [u8]
+    span_from_ptr<u8>((phys_to_virt(h.buf) + offset) as *u8, n)
+
+# ============================================================================
+# Bring-up
+# ============================================================================
+
+# The hub descriptor: how many ports, how long their power takes, and the
+# TT think time; then SET_HUB_DEPTH (SuperSpeed) or Configure Endpoint.
+fn got_descriptor(h: *Hub)
+    let d: HubDesc = match parse_hub_descriptor(bytes_at(h, DESC_OFFSET, HUB_DESC_MAX as i64), h.usb3)
+        Ok(d) => d
+        Err(_) =>
+            fail(h, "descriptor malformed")
+            return
+    h.ports = if d.ports > HUB_PORTS_MAX then HUB_PORTS_MAX else d.ports
+    h.think_time = d.think_time
+    h.power_ticks = ((d.power_good_ms as u64) + 9) / 10 + 1
+    log_hub(h)
+    klog(": ")
+    klog_dec(d.ports as i64)
+    klog(" ports, USB ")
+    klog_dec(if h.usb3 then 3 else 2)
+    klog(", power good ")
+    klog_dec(d.power_good_ms as i64)
+    klog(" ms")
+    if d.ports > HUB_PORTS_MAX
+        klog(" (ports past ")
+        klog_dec(HUB_PORTS_MAX as i64)
+        klog(" have no route string field: not driven)")
+    klog("\n")
+    if h.usb3
+        h.state = HubState.SettingDepth
+        request(h, setup_set_hub_depth(h.place.depth), 0)
+    else
+        configure_endpoint(h)
+
+# The slot becomes a hub (its port count and TT think time), and gets its
+# status change endpoint.
+fn configure_endpoint(h: *Hub)
+    zero_page(h.in_ctx)
+    zero_page(h.ring_page)
+    h.ring = TrbRing.new(phys_to_virt(h.ring_page) as *TrbPage, h.ring_page, RING_TRBS)
+    let ic: InputContext = InputContext.over(phys_to_virt(h.in_ctx), xhci_ctx64(h.hc))
+    *ic.control() = input_control(0, ADD_SLOT | add_flag(h.dci))
+    *ic.slot() = slot_ctx_hub(slot_ctx(h.speed, h.place, h.dci), h.ports, h.think_time)
+    *ic.ep(h.dci) = ep_ctx(EpType.InterruptIn, h.mps, h.interval, h.ring.dequeue_ptr())
+    match xhci_command(h.hc, trb_configure_endpoint(h.in_ctx, h.slot), h.dev)
+        Ok(_) => h.state = HubState.ConfiguringEndpoint
+        Err(_) => fail(h, "command ring full")
+
+# Power port `port`, the next one in turn.
+fn power_port(h: *Hub, port: u8)
+    h.op_port = port
+    request(h, setup_set_port_feature(port, PortFeature.Power), 0)
+
+# Every port is powered and its power good: watch the status change
+# endpoint, and look at every port once.
+fn start(h: *Hub)
+    h.state = HubState.Running
+    h.op = PortOp.Idle
+    h.seen = 0
+    for p in 0..16
+        h.stage[p] = PortStage.Empty
+    # Ports 1 ..= ports (at most HUB_PORTS_MAX, so bit 16 fits).
+    h.pending = (bit(h.ports + 1) - 1) & ~bit(0)
+    if queue_bitmap(h).is_err()
+        fail(h, "status ring full")
+        return
+    log_hub(h)
+    klog(" ready (")
+    klog_dec(h.ports as i64)
+    klog(" ports, endpoint 0x")
+    klog_hex_width(h.ep_addr as u64, 2)
+    klog(", interval ")
+    klog_dec(h.interval as i64)
+    klog(")\n")
+    next_op(h)
+
+# One Normal TRB for the next status change bitmap.
+fn queue_bitmap(h: *Hub) -> Result<u64, RingError>
+    let len: u16 = if h.mps > BITMAP_MAX then BITMAP_MAX else h.mps
+    let r: Result<u64, RingError> = h.ring.push(trb_normal(h.buf, len as u32))
+    if r.is_ok()
+        xhci_doorbell(h.hc, h.slot, h.dci)
+    r
+
+# ============================================================================
+# Ports
+# ============================================================================
+
+fn release_lock(h: *Hub)
+    let l: *DefaultAddress = @hc_lock[h.hc]
+    if l.dev == h.dev and l.dev != 0
+        l.dev = 0
+        l.port = 0
+        kick_waiting(h.hc)
+
+# The default address is free: every hub on controller `hc` with a port
+# waiting for it looks at that port again.
+fn kick_waiting(hc: u8)
+    for i in 0..HUBS_MAX
+        let h: *Hub = @hubs[i]
+        if h.state == HubState.Running and h.hc == hc
+            for p in 1..=h.ports
+                if h.stage[p] == PortStage.WaitingTurn
+                    h.pending = h.pending | bit(p)
+            next_op(h)
+
+# The next request on EP0, if it is free: the lowest port waiting for a
+# look.
+fn next_op(h: *Hub)
+    if h.state != HubState.Running or h.op != PortOp.Idle or h.pending == 0
+        return
+    var p: u8 = 0
+    while (h.pending & bit(p)) == 0
+        p += 1
+    h.pending = h.pending & ~bit(p)
+    h.op = PortOp.GetStatus
+    h.op_port = p
+    request(h, setup_get_port_status(p), STATUS_OFFSET)
+
+# Reset port `port` if the controller's default address is free.
+fn try_reset(h: *Hub, port: u8)
+    let l: *DefaultAddress = @hc_lock[h.hc]
+    if l.dev != 0 and not (l.dev == h.dev and l.port == port)
+        h.stage[port] = PortStage.WaitingTurn
+        return
+    l.dev = h.dev
+    l.port = port
+    h.stage[port] = PortStage.Resetting
+    log_hub_port(h, port)
+    klog(": resetting\n")
+    h.op = PortOp.SetReset
+    request(h, setup_set_port_feature(port, PortFeature.Reset), 0)
+
+# The port's status with no change left to clear: move its stage on.
+# `seen`: a connect change was cleared on the way here.
+fn decide(h: *Hub, port: u8, st: PortStatus, seen: bool) -> HubNews
+    let stage: PortStage = h.stage[port]
+    if not st.connected()
+        return unplugged(h, port, stage)
+    match stage
+        Child =>
+            # Replugged (a connect change), or disabled: the device is gone.
+            if seen or not st.enabled()
+                h.stage[port] = PortStage.Empty
+                # Its replacement is looked at once the old device is gone.
+                h.pending = h.pending | bit(port)
+                return HubNews.Gone(port)
+        Empty =>
+            log_hub_port(h, port)
+            klog(": connected\n")
+            debounce(h, port)
+        Debouncing =>
+            if seen
+                debounce(h, port)
+            else if hub_now >= h.port_due[port]
+                if h.usb3 and st.enabled()
+                    # A SuperSpeed link trains by itself.
+                    return attached(h, port, st)
+                try_reset(h, port)
+        WaitingTurn => try_reset(h, port)
+        Resetting =>
+            if st.enabled() and not st.resetting()
+                h.stage[port] = PortStage.Recovering
+                h.port_due[port] = hub_now + RECOVERY_TICKS
+        Recovering =>
+            if hub_now >= h.port_due[port]
+                if st.enabled()
+                    return attached(h, port, st)
+                log_hub_port(h, port)
+                klog(": not enabled after its reset\n")
+                release_lock(h)
+                h.stage[port] = PortStage.Empty
+    HubNews.Quiet
+
+# Nothing is connected to the port now.
+fn unplugged(h: *Hub, port: u8, stage: PortStage) -> HubNews
+    h.stage[port] = PortStage.Empty
+    match stage
+        Child => HubNews.Gone(port)
+        Resetting | Recovering =>
+            release_lock(h)
+            HubNews.Quiet
+        Empty | Debouncing | WaitingTurn => HubNews.Quiet
+
+fn debounce(h: *Hub, port: u8)
+    h.stage[port] = PortStage.Debouncing
+    h.port_due[port] = hub_now + DEBOUNCE_TICKS
+
+fn attached(h: *Hub, port: u8, st: PortStatus) -> HubNews
+    h.stage[port] = PortStage.Child
+    let s: UsbSpeed = st.speed(h.usb3)
+    log_hub_port(h, port)
+    klog(": enabled, ")
+    klog(speed_name(s))
+    klog(" speed\n")
+    HubNews.Attached(HubPort { port: port, speed: s })
+
+# GET_STATUS of `op_port` done: clear its next change, or decide.
+fn got_status(h: *Hub) -> HubNews
+    let port: u8 = h.op_port
+    let st: PortStatus = match port_status(bytes_at(h, STATUS_OFFSET, 4))
+        Some(s) => s
+        None => PortStatus { status: 0, change: 0 }
+    h.status = st
+    if port == 0
+        match st.next_hub_change()
+            Some(f) =>
+                h.op = PortOp.ClearChange
+                request(h, setup_clear_hub_feature(f), 0)
+            None =>
+                h.op = PortOp.Idle
+                next_op(h)
+        return HubNews.Quiet
+    match st.next_change(h.usb3)
+        Some(f) =>
+            if f == PortFeature.CConnection
+                h.seen = h.seen | bit(port)
+            h.op = PortOp.ClearChange
+            request(h, setup_clear_port_feature(port, f), 0)
+            return HubNews.Quiet
+        None => pass
+    let seen: bool = (h.seen & bit(port)) != 0
+    h.seen = h.seen & ~bit(port)
+    h.op = PortOp.Idle
+    let news: HubNews = decide(h, port, st, seen)
+    next_op(h)
+    news
+
+# ============================================================================
+# What usb.ritz calls
+# ============================================================================
+
+# A hub there is no entry or DMA page for: logged and left to usb.ritz.
+# False, hub_attach's answer.
+fn not_driven(a: HubAttach) -> bool
+    klog("[usb] hc")
+    klog_dec(a.hc as i64)
+    klog(" slot ")
+    klog_dec(a.slot as i64)
+    klog(": hub not driven (no free hub or DMA page)\n")
+    false
+
+# A configured device: take it if its configuration (`config`) has a hub
+# interface, and start the hub's bring-up. False leaves the device to
+# usb.ritz.
+pub fn hub_attach(a: HubAttach, config: [u8]) -> bool
+    let f: HubIface = match find_hub_iface(config)
+        Some(f) => f
+        None => return false
+    let h: *Hub = match hub_entry(a.hc)
+        Some(h) => h
+        None => return not_driven(a)
+    h.hc = a.hc
+    h.slot = a.slot
+    h.dev = a.dev
+    h.speed = a.speed
+    h.place = a.place
+    h.usb3 = a.speed == UsbSpeed.Super or a.speed == UsbSpeed.SuperPlus
+    h.in_ctx = a.in_ctx
+    h.ep0 = a.ep0
+    h.ep_addr = f.ep_addr
+    h.dci = dci_of(f.ep_addr)
+    h.mps = f.mps
+    h.interval = ep_interval(a.speed, EpKind.Interrupt, f.binterval)
+    h.ep_on = false
+    h.ports = 0
+    h.op = PortOp.Idle
+    h.pending = 0
+    log_hub(h)
+    klog(" on interface ")
+    klog_dec(f.number as i64)
+    klog(", endpoint 0x")
+    klog_hex_width(f.ep_addr as u64, 2)
+    klog("\n")
+    h.state = HubState.ReadingDescriptor
+    request(h, setup_get_hub_descriptor(h.usb3), DESC_OFFSET)
+    true
+
+# A command completed for the hub on device entry `dev`: its Configure
+# Endpoint. Then its ports are powered, one by one.
+pub fn hub_command(hc: u8, dev: u8, code: Completion)
+    let h: *Hub = match hub_of_dev(hc, dev)
+        Some(h) => h
+        None => return
+    if h.state != HubState.ConfiguringEndpoint
+        return
+    if not completion_ok(code)
+        fail(h, "Configure Endpoint failed")
+        return
+    h.ep_on = true
+    h.state = HubState.PoweringPorts
+    power_port(h, 1)
+
+# A transfer completed on one of the hub's endpoints: what it means for
+# the devices on its ports.
+pub fn hub_transfer(hc: u8, dev: u8, x: TransferEvent) -> HubNews
+    let h: *Hub = match hub_of_dev(hc, dev)
+        Some(h) => h
+        None => return HubNews.Quiet
+    if x.dci == DCI_EP0
+        return on_ep0(h, x)
+    if x.dci != h.dci or h.state != HubState.Running
+        return HubNews.Quiet
+    let _ = h.ring.retire(x.trb)
+    if not completion_ok(x.code)
+        fail(h, "status change transfer failed")
+        return HubNews.Quiet
+    let len: u16 = if h.mps > BITMAP_MAX then BITMAP_MAX else h.mps
+    var n: i64 = len as i64
+    if x.residual as i64 <= n
+        n = n - x.residual as i64
+    h.pending = h.pending | changed_ports(bytes_at(h, 0, n), h.ports)
+    if queue_bitmap(h).is_err()
+        fail(h, "status ring full")
+        return HubNews.Quiet
+    next_op(h)
+    HubNews.Quiet
+
+fn on_ep0(h: *Hub, x: TransferEvent) -> HubNews
+    let _ = h.ep0.retire(x.trb)
+    if not completion_ok(x.code)
+        match h.state
+            Running =>
+                # A port request the hub refused: that port is looked at
+                # again on its next change.
+                log_hub_port(h, h.op_port)
+                klog(": request failed\n")
+                h.op = PortOp.Idle
+                next_op(h)
+            Detached | Failed | Free => pass
+            ReadingDescriptor | SettingDepth | ConfiguringEndpoint | PoweringPorts | WaitingPower => fail(h, "bring-up request failed")
+        return HubNews.Quiet
+    match h.state
+        ReadingDescriptor => got_descriptor(h)
+        SettingDepth => configure_endpoint(h)
+        PoweringPorts =>
+            if h.op_port < h.ports
+                power_port(h, h.op_port + 1)
+            else
+                h.state = HubState.WaitingPower
+                h.due = hub_now + h.power_ticks
+        Running =>
+            match h.op
+                GetStatus => return got_status(h)
+                ClearChange =>
+                    h.op = PortOp.GetStatus
+                    request(h, setup_get_port_status(h.op_port), STATUS_OFFSET)
+                SetReset =>
+                    h.op = PortOp.Idle
+                    next_op(h)
+                Idle => pass
+        _ => pass
+    HubNews.Quiet
+
+# The device on port `port` of the hub on entry `dev` is addressed, failed
+# or gone: the controller's default address is free again.
+pub fn hub_child_settled(hc: u8, dev: u8, port: u8)
+    let l: *DefaultAddress = @hc_lock[hc]
+    if l.dev == dev and l.port == port
+        l.dev = 0
+        l.port = 0
+        kick_waiting(hc)
+
+# The device on port `port` of the hub on entry `dev` is freed: look at
+# the port again (a device connected since enumerates).
+pub fn hub_port_free(hc: u8, dev: u8, port: u8)
+    match hub_of_dev(hc, dev)
+        Some(h) =>
+            if h.state == HubState.Running and port >= 1 and port <= h.ports
+                h.pending = h.pending | bit(port)
+                next_op(h)
+        None => pass
+
+# The hub on entry `dev` went away, or its controller failed: stop driving
+# it. The DCI of its status change endpoint if it was configured (the
+# endpoint the detach stops), else 0. usb.ritz detaches the devices below
+# it; its pages stay until hub_free.
+pub fn hub_detach(hc: u8, dev: u8) -> u8
+    let h: *Hub = match hub_of_dev(hc, dev)
+        Some(h) => h
+        None => return 0
+    if h.state == HubState.Detached
+        return 0
+    release_lock(h)
+    h.state = HubState.Detached
+    log_hub(h)
+    klog(" gone\n")
+    if h.ep_on then h.dci else 0
+
+# The hub's slot is disabled or its controller reset: nothing can reach
+# its pages, so they are freed and its entry is free again.
+pub fn hub_free(hc: u8, dev: u8)
+    let h: *Hub = match hub_of_dev(hc, dev)
+        Some(h) => h
+        None => return
+    release_lock(h)
+    xhci_free_page(h.ring_page)
+    xhci_free_page(h.buf)
+    h.ring_page = 0
+    h.buf = 0
+    h.ep_on = false
+    h.state = HubState.Free
+
+# The periodic tick, on the BSP (usb_tick): a hub whose power is good
+# starts, and a port whose debounce or reset recovery is over is looked
+# at again.
+pub fn hub_tick()
+    hub_now += 1
+    for i in 0..HUBS_MAX
+        let h: *Hub = @hubs[i]
+        if h.state == HubState.WaitingPower and hub_now >= h.due
+            start(h)
+        else if h.state == HubState.Running
+            for p in 1..=h.ports
+                let s: PortStage = h.stage[p]
+                if (s == PortStage.Debouncing or s == PortStage.Recovering) and hub_now >= h.port_due[p]
+                    h.pending = h.pending | bit(p)
+            next_op(h)

@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all build clean test test-smp test-tier1 test-usb test-usb-kbd test-usb-msi test-usb-poll kernel iso help inventory-img test-inventory
+.PHONY: all build clean test test-smp test-tier1 test-usb test-usb-kbd test-usb-msi test-usb-poll test-usb-hub kernel iso help inventory-img test-inventory
 
 all: kernel
 
@@ -100,6 +100,12 @@ test-usb-msi:
 test-usb-poll:
 	./tools/test_usb_boot.sh keyboard-poll
 
+# The hub (#4890): the keyboard boot with the keyboard behind QEMU's usb-hub.
+# Typing and Ctrl-C work through it; the hub is unplugged with the keyboard
+# on it and both are plugged back before typing again.
+test-usb-hub:
+	./tools/test_usb_boot.sh keyboard-hub
+
 # Hardware-inventory USB stick (AGAST #3406): HWINV.EFI on a GPT + FAT32
 # image for `dd` or Etcher. See inventory/README.md.
 INVENTORY_IMG ?= $(BUILD_DIR)/hwinv.img
@@ -137,6 +143,7 @@ help:
 	@echo "  test-tier1   - Boot with indium under OVMF, check init Tier-1 suite"
 	@echo "  test-usb     - Boot with qemu-xhci + usb-kbd, check enumeration (#4887)"
 	@echo "  test-usb-kbd - Type into rzsh on a usb-kbd, no COM1 (#4888)"
+	@echo "  test-usb-hub - Type into rzsh on a usb-kbd behind a usb-hub (#4890)"
 	@echo "  inventory-img  - Build the hardware-inventory USB stick image (build/hwinv.img)"
 	@echo "  test-inventory - Boot the inventory stick in QEMU and check its dump"
 	@echo "  clean        - Remove build artifacts"

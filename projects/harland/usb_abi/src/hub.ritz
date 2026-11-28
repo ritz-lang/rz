@@ -1,0 +1,257 @@
+# Harland USB hub class protocol (AGAST #4890, docs/USB.md "Hubs")
+#
+# What the kernel's hub class driver (kernel/src/drivers/usb/hub.ritz)
+# sends and decodes, for USB 2.0 hubs (USB 2.0 chapter 11) and USB 3 hubs
+# on their SuperSpeed side (USB 3.2 chapter 10): the class requests' SETUP
+# packets, the hub descriptor, a port's wPortStatus and wPortChange and the
+# change bit to clear next, the interrupt endpoint's status change bitmap,
+# and the hub interface a configuration offers. Every byte comes from a
+# device, so every length is checked against the bytes there.
+
+import usb_abi.regs { UsbSpeed, EpKind }
+import usb_abi.desc { SetupPacket, DescWalk, DescError }
+
+pub const DESC_HUB: u8 = 0x29              # USB 2.0 hub descriptor
+pub const DESC_SS_HUB: u8 = 0x2A           # SuperSpeed hub descriptor
+# The longest USB 2 hub descriptor: 7 bytes, then DeviceRemovable and
+# PortPwrCtrlMask of up to 32 bytes each (255 ports).
+pub const HUB_DESC_MAX: u16 = 71
+pub const SS_HUB_DESC_LEN: u16 = 12
+const HUB_DESC_MIN: u8 = 7
+
+# Ports a hub is driven on: the route string has four bits a tier
+# (context.ROUTE_PORT_MAX), so a port past 15 cannot be addressed.
+pub const HUB_PORTS_MAX: u8 = 15
+
+const HUB_CLASS: u8 = 9
+
+# bmRequestType: class requests to the hub (device) or to a port (other).
+const RT_HUB_IN: u8 = 0xA0
+const RT_HUB_OUT: u8 = 0x20
+const RT_PORT_IN: u8 = 0xA3
+const RT_PORT_OUT: u8 = 0x23
+
+const REQ_GET_STATUS: u8 = 0
+const REQ_CLEAR_FEATURE: u8 = 1
+const REQ_SET_FEATURE: u8 = 3
+const REQ_GET_DESCRIPTOR: u8 = 6
+const REQ_SET_HUB_DEPTH: u8 = 12
+
+# Port feature selectors (USB 2.0 table 11-17, USB 3.2 table 10-9).
+pub enum PortFeature: u16
+    Reset = 4
+    Power = 8
+    CConnection = 16
+    CEnable = 17
+    CSuspend = 18
+    COverCurrent = 19
+    CReset = 20
+    CLinkState = 25
+    CConfigError = 26
+    CBhReset = 29
+
+# Hub feature selectors: the hub's own two changes.
+pub enum HubFeature: u16
+    CLocalPower = 0
+    COverCurrent = 1
+
+# ============================================================================
+# Requests
+# ============================================================================
+
+# GET_DESCRIPTOR of the hub descriptor: a USB 2 hub's (its longest
+# possible) or a SuperSpeed hub's.
+pub fn setup_get_hub_descriptor(usb3: bool) -> SetupPacket
+    let dtype: u8 = if usb3 then DESC_SS_HUB else DESC_HUB
+    SetupPacket {
+        request_type: RT_HUB_IN,
+        request: REQ_GET_DESCRIPTOR,
+        value: (dtype as u16) << 8,
+        index: 0,
+        length: if usb3 then SS_HUB_DESC_LEN else HUB_DESC_MAX
+    }
+
+# SET_HUB_DEPTH (SuperSpeed hubs only): hubs between it and the root
+# port, 0 for one on a root port. It picks the hub's route string field.
+pub fn setup_set_hub_depth(depth: u8) -> SetupPacket
+    SetupPacket { request_type: RT_HUB_OUT, request: REQ_SET_HUB_DEPTH, value: depth as u16, index: 0, length: 0 }
+
+# GET_STATUS of port `port`, or of the hub itself for port 0: 4 bytes,
+# the status word then the change word.
+pub fn setup_get_port_status(port: u8) -> SetupPacket
+    SetupPacket {
+        request_type: if port == 0 then RT_HUB_IN else RT_PORT_IN,
+        request: REQ_GET_STATUS,
+        value: 0,
+        index: port as u16,
+        length: 4
+    }
+
+pub fn setup_set_port_feature(port: u8, f: PortFeature) -> SetupPacket
+    SetupPacket { request_type: RT_PORT_OUT, request: REQ_SET_FEATURE, value: f as u16, index: port as u16, length: 0 }
+
+pub fn setup_clear_port_feature(port: u8, f: PortFeature) -> SetupPacket
+    SetupPacket { request_type: RT_PORT_OUT, request: REQ_CLEAR_FEATURE, value: f as u16, index: port as u16, length: 0 }
+
+pub fn setup_clear_hub_feature(f: HubFeature) -> SetupPacket
+    SetupPacket { request_type: RT_HUB_OUT, request: REQ_CLEAR_FEATURE, value: f as u16, index: 0, length: 0 }
+
+# ============================================================================
+# The hub descriptor
+# ============================================================================
+
+pub struct HubDesc
+    ports: u8               # bNbrPorts
+    characteristics: u16    # wHubCharacteristics
+    power_good_ms: u16      # bPwrOn2PwrGood: from port power on to power good
+    think_time: u8          # TT Think Time (bits 6:5), for the slot context; 0 on SuperSpeed
+
+# A hub descriptor, USB 2's (`usb3` false) or SuperSpeed's.
+pub fn parse_hub_descriptor(b: [u8], usb3: bool) -> Result<HubDesc, DescError>
+    let min: u8 = if usb3 then SS_HUB_DESC_LEN as u8 else HUB_DESC_MIN
+    if b.len < 2
+        return Err(DescError.Truncated)
+    if b[1] != (if usb3 then DESC_SS_HUB else DESC_HUB)
+        return Err(DescError.WrongType)
+    if b.len < min as i64
+        return Err(DescError.Truncated)
+    if b[0] < min
+        return Err(DescError.BadLength)
+    if (b[0] as i64) > b.len
+        return Err(DescError.Truncated)
+    if b[2] == 0
+        return Err(DescError.BadLength)
+    let ch: u16 = (b[3] as u16) | ((b[4] as u16) << 8)
+    Ok(HubDesc {
+        ports: b[2],
+        characteristics: ch,
+        power_good_ms: (b[5] as u16) * 2,
+        think_time: if usb3 then 0 else ((ch >> 5) & 3) as u8
+    })
+
+# ============================================================================
+# Port status
+# ============================================================================
+
+const PS_CONNECTION: u16 = 1 << 0
+const PS_ENABLE: u16 = 1 << 1
+const PS_RESET: u16 = 1 << 4
+const PS_LOW_SPEED: u16 = 1 << 9            # USB 2 only
+const PS_HIGH_SPEED: u16 = 1 << 10          # USB 2 only
+
+# A port's (or the hub's) GET_STATUS answer.
+pub struct PortStatus
+    status: u16             # wPortStatus (wHubStatus for the hub)
+    change: u16             # wPortChange (wHubChange)
+
+# The 4 bytes GET_STATUS returned, None if fewer came.
+pub fn port_status(b: [u8]) -> Option<PortStatus>
+    if b.len < 4
+        return None
+    Some(PortStatus {
+        status: (b[0] as u16) | ((b[1] as u16) << 8),
+        change: (b[2] as u16) | ((b[3] as u16) << 8)
+    })
+
+impl PortStatus
+    pub fn connected(self: @PortStatus) -> bool
+        (self.status & PS_CONNECTION) != 0
+
+    pub fn enabled(self: @PortStatus) -> bool
+        (self.status & PS_ENABLE) != 0
+
+    pub fn resetting(self: @PortStatus) -> bool
+        (self.status & PS_RESET) != 0
+
+    pub fn connect_changed(self: @PortStatus) -> bool
+        (self.change & 1) != 0
+
+    # The attached device's speed. A SuperSpeed hub's ports are all
+    # SuperSpeed (a USB 3 hub's USB 2 side is a separate USB 2 hub).
+    pub fn speed(self: @PortStatus, usb3: bool) -> UsbSpeed
+        if usb3
+            return UsbSpeed.Super
+        if (self.status & PS_LOW_SPEED) != 0
+            return UsbSpeed.Low
+        if (self.status & PS_HIGH_SPEED) != 0
+            return UsbSpeed.High
+        UsbSpeed.Full
+
+    # The lowest change bit set, as the feature that clears it. Bits the
+    # port's kind does not define are not cleared.
+    pub fn next_change(self: @PortStatus, usb3: bool) -> Option<PortFeature>
+        let c: u16 = self.change
+        if (c & 0x01) != 0
+            return Some(PortFeature.CConnection)
+        if not usb3 and (c & 0x02) != 0
+            return Some(PortFeature.CEnable)
+        if not usb3 and (c & 0x04) != 0
+            return Some(PortFeature.CSuspend)
+        if (c & 0x08) != 0
+            return Some(PortFeature.COverCurrent)
+        if (c & 0x10) != 0
+            return Some(PortFeature.CReset)
+        if usb3 and (c & 0x20) != 0
+            return Some(PortFeature.CBhReset)
+        if usb3 and (c & 0x40) != 0
+            return Some(PortFeature.CLinkState)
+        if usb3 and (c & 0x80) != 0
+            return Some(PortFeature.CConfigError)
+        None
+
+    # The hub's own lowest change bit, as the feature that clears it.
+    pub fn next_hub_change(self: @PortStatus) -> Option<HubFeature>
+        if (self.change & 0x01) != 0
+            return Some(HubFeature.CLocalPower)
+        if (self.change & 0x02) != 0
+            return Some(HubFeature.COverCurrent)
+        None
+
+# ============================================================================
+# The status change bitmap
+# ============================================================================
+
+# The interrupt endpoint's report: bit 0 the hub, bit N port N. Bits past
+# the hub's `ports` (and past HUB_PORTS_MAX) are dropped.
+pub fn changed_ports(b: [u8], ports: u8) -> u32
+    let n: u32 = if ports > HUB_PORTS_MAX then HUB_PORTS_MAX as u32 else ports as u32
+    var bits: u32 = 0
+    for i in 0..b.len
+        if i < 4
+            bits = bits | ((b[i] as u32) << (8 * i as u32))
+    let mask: u32 = (1 << (n + 1)) - 1
+    bits & mask
+
+# ============================================================================
+# The hub interface
+# ============================================================================
+
+# A configuration's hub interface: its number, and its status change
+# endpoint's address, size and bInterval.
+pub struct HubIface
+    number: u8
+    ep_addr: u8
+    mps: u16
+    binterval: u8
+
+# The first hub interface (class 9, alternate setting 0) with an
+# interrupt IN endpoint, in the configuration `config`.
+pub fn find_hub_iface(config: [u8]) -> Option<HubIface>
+    var w = match DescWalk.new(config)
+        Ok(w) => w
+        Err(_) => return None
+    var in_hub: bool = false
+    var number: u8 = 0
+    while true
+        match w.next()
+            Ok(item) =>
+                match item
+                    Interface(i) =>
+                        in_hub = i.alternate == 0 and i.class == HUB_CLASS
+                        number = i.number
+                    Endpoint(e) =>
+                        if in_hub and e.is_in() and e.kind() == EpKind.Interrupt
+                            return Some(HubIface { number: number, ep_addr: e.address, mps: e.max_packet(), binterval: e.interval })
+                    Other(_) => pass
+                    End => return None
+            Err(_) => return None

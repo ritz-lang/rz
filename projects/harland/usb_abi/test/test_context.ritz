@@ -3,10 +3,11 @@
 # Input and device context layout at both context sizes (HCCPARAMS1.CSZ:
 # 32 or 64 bytes), the endpoint's device context index, and the words of
 # the input control, slot and endpoint contexts the driver writes for
-# Address Device, Evaluate Context and Configure Endpoint. The contexts lie
+# Address Device, Evaluate Context and Configure Endpoint, and where a
+# device behind hubs is (route string, TT hub slot and port, AGAST #4890). The contexts lie
 # over a host global, as the driver's lie over a DMA page.
 
-import usb_abi.context { CtxWords, InputContext, DeviceContext, SlotState, EpType, ctx_bytes, input_ctx_bytes, device_ctx_bytes, dci_of, input_control, slot_ctx, ep_ctx, slot_state, slot_address, ADD_SLOT, ADD_EP0, add_flag }
+import usb_abi.context { CtxWords, InputContext, DeviceContext, SlotState, EpType, ctx_bytes, input_ctx_bytes, device_ctx_bytes, dci_of, input_control, slot_ctx, slot_ctx_hub, SlotPlace, ep_ctx, slot_state, slot_address, ADD_SLOT, ADD_EP0, add_flag }
 import usb_abi.regs { UsbSpeed }
 
 # Room for an input context at 64-byte contexts: 33 * 64 bytes.
@@ -84,12 +85,12 @@ fn test_input_control_words() -> i32
 [[test]]
 fn test_slot_context_words() -> i32
     # A full-speed device on root port 3, contexts up to EP0.
-    let w: CtxWords = slot_ctx(UsbSpeed.Full, 3, 1)
+    let w: CtxWords = slot_ctx(UsbSpeed.Full, SlotPlace.root(3), 1)
     assert w.dw[0] == ((1 << 20) | (1 << 27))
     assert w.dw[1] == 3 << 16
     assert w.dw[2] == 0                # interrupter 0, no TT
     assert w.dw[3] == 0
-    let s: CtxWords = slot_ctx(UsbSpeed.Super, 5, 3)
+    let s: CtxWords = slot_ctx(UsbSpeed.Super, SlotPlace.root(5), 3)
     assert s.dw[0] == ((4 << 20) | (3 << 27))
     assert s.dw[1] == 5 << 16
     0
@@ -122,7 +123,7 @@ fn test_context_written_through_view() -> i32
     let base: u64 = ctx_base()
     let ic = InputContext.over(base, true)
     *ic.control() = input_control(0, ADD_SLOT | ADD_EP0)
-    *ic.slot() = slot_ctx(UsbSpeed.High, 2, 1)
+    *ic.slot() = slot_ctx(UsbSpeed.High, SlotPlace.root(2), 1)
     *ic.ep(1) = ep_ctx(EpType.Control, 64, 0, 0x9000 | 1)
     # Raw dwords at the 64-byte offsets: control, slot, EP0.
     assert g_ctx[0] == 3 << 32
@@ -133,7 +134,7 @@ fn test_context_written_through_view() -> i32
 
 [[test]]
 fn test_slot_state_and_address() -> i32
-    var w: CtxWords = slot_ctx(UsbSpeed.Full, 1, 1)
+    var w: CtxWords = slot_ctx(UsbSpeed.Full, SlotPlace.root(1), 1)
     assert slot_state(w) == SlotState.DisabledOrEnabled
     w.dw[3] = (2 << 27) | 5
     assert slot_state(w) == SlotState.Addressed
@@ -144,4 +145,74 @@ fn test_slot_state_and_address() -> i32
     assert slot_state(w) == SlotState.Default
     w.dw[3] = 7 << 27
     assert slot_state(w) == SlotState.Reserved
+    0
+
+# ---------------------------------------------------------------------------
+# Devices behind hubs (AGAST #4890, docs/USB.md "Hubs")
+# ---------------------------------------------------------------------------
+
+fn place_of(o: Option<SlotPlace>) -> SlotPlace
+    match o
+        Some(p) => p
+        None => SlotPlace { root_port: 0xFF, route: 0xFFFFFFFF, depth: 0xFF, tt_slot: 0xFF, tt_port: 0xFF }
+
+[[test]]
+fn test_route_string_per_tier() -> i32
+    let r: SlotPlace = SlotPlace.root(2)
+    assert r.route == 0 and r.depth == 0 and r.root_port == 2
+    # A device on port 3 of a hub on root port 2: tier 1 is bits 3:0.
+    let a: SlotPlace = place_of(r.below(3, 1, UsbSpeed.High, UsbSpeed.High))
+    assert a.root_port == 2 and a.route == 3 and a.depth == 1
+    # Port 5 of a hub on that port: tier 2 is bits 7:4.
+    let b: SlotPlace = place_of(a.below(5, 2, UsbSpeed.High, UsbSpeed.High))
+    assert b.route == 0x53 and b.depth == 2
+    # Five tiers fill the 20-bit route string; a sixth has no field.
+    let c: SlotPlace = place_of(b.below(1, 3, UsbSpeed.High, UsbSpeed.High))
+    let d: SlotPlace = place_of(c.below(2, 4, UsbSpeed.High, UsbSpeed.High))
+    let e: SlotPlace = place_of(d.below(15, 5, UsbSpeed.High, UsbSpeed.High))
+    assert e.route == 0xF2153 and e.depth == 5
+    assert e.below(1, 6, UsbSpeed.High, UsbSpeed.High).is_none()
+    # A route string field is four bits: port 0 and ports past 15 have none.
+    assert r.below(0, 1, UsbSpeed.High, UsbSpeed.High).is_none()
+    assert r.below(16, 1, UsbSpeed.High, UsbSpeed.High).is_none()
+    0
+
+[[test]]
+fn test_transaction_translator_fields() -> i32
+    let r: SlotPlace = SlotPlace.root(1)
+    # A high-speed device needs no TT, nor anything on a root port.
+    let hs: SlotPlace = place_of(r.below(2, 4, UsbSpeed.High, UsbSpeed.High))
+    assert hs.tt_slot == 0 and hs.tt_port == 0
+    assert r.tt_slot == 0
+    # A full- or low-speed device behind a high-speed hub: that hub's TT.
+    let fs: SlotPlace = place_of(r.below(2, 4, UsbSpeed.High, UsbSpeed.Full))
+    assert fs.tt_slot == 4 and fs.tt_port == 2
+    let ls: SlotPlace = place_of(hs.below(3, 7, UsbSpeed.High, UsbSpeed.Low))
+    assert ls.tt_slot == 7 and ls.tt_port == 3
+    # Behind a full-speed hub, the TT is the nearest high-speed hub's.
+    let fhub: SlotPlace = place_of(r.below(2, 4, UsbSpeed.High, UsbSpeed.Full))
+    let kbd: SlotPlace = place_of(fhub.below(1, 9, UsbSpeed.Full, UsbSpeed.Low))
+    assert kbd.tt_slot == 4 and kbd.tt_port == 2
+    # A full-speed hub on a root port: the root port needs no TT.
+    let qhub: SlotPlace = place_of(r.below(1, 1, UsbSpeed.Full, UsbSpeed.Full))
+    assert qhub.tt_slot == 0 and qhub.tt_port == 0
+    0
+
+[[test]]
+fn test_slot_context_behind_hubs() -> i32
+    let p = SlotPlace { root_port: 2, route: 0x53, depth: 2, tt_slot: 4, tt_port: 3 }
+    let w: CtxWords = slot_ctx(UsbSpeed.Low, p, 1)
+    assert w.dw[0] == (0x53 | (2 << 20) | (1 << 27))
+    assert w.dw[1] == 2 << 16
+    assert w.dw[2] == (4 | (3 << 8))
+    0
+
+[[test]]
+fn test_hub_slot_fields() -> i32
+    # Hub (dword 0 bit 26), Number of Ports (dword 1 bits 31:24) and TT
+    # Think Time (dword 2 bits 17:16) over the slot context.
+    let w: CtxWords = slot_ctx_hub(slot_ctx(UsbSpeed.High, SlotPlace.root(1), 3), 4, 1)
+    assert w.dw[0] == ((3 << 20) | (3 << 27) | (1 << 26))
+    assert w.dw[1] == ((1 << 16) | (4 << 24))
+    assert w.dw[2] == 1 << 16
     0

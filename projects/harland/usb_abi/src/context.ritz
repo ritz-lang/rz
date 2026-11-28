@@ -93,13 +93,70 @@ pub fn input_control(drop: u32, add: u32) -> CtxWords
 # Slot context
 # ============================================================================
 
-# A root-hub device's slot context: its speed, its root port (1-based), and
-# the last valid endpoint DCI (`entries`). Route string 0, interrupter 0.
-pub fn slot_ctx(speed: UsbSpeed, root_port: u8, entries: u8) -> CtxWords
+# Hub tiers a route string has room for (xHCI 1.2 section 8.9).
+pub const ROUTE_TIERS: u8 = 5
+# A route string field is four bits: hub ports 1..=15.
+pub const ROUTE_PORT_MAX: u8 = 15
+
+# Where a device is (xHCI 1.2 section 6.2.2, AGAST #4890): its root port,
+# the route string through the hubs between (tier 1, the hub on the root
+# port, in bits 3:0), how many hubs that is, and for a full- or low-speed
+# device behind a high-speed hub, the slot and port of that hub's
+# transaction translator (0, 0: none).
+pub struct SlotPlace
+    root_port: u8
+    route: u32
+    depth: u8
+    tt_slot: u8
+    tt_port: u8
+
+impl SlotPlace
+    # A device on root port `port` (1-based).
+    pub fn root(port: u8) -> SlotPlace
+        SlotPlace { root_port: port, route: 0, depth: 0, tt_slot: 0, tt_port: 0 }
+
+    # A device of speed `speed` on port `port` of the hub at this place,
+    # which is slot `hub_slot` at speed `hub_speed`. None past the route
+    # string's five tiers, or for a port it has no field for.
+    pub fn below(self: @SlotPlace, port: u8, hub_slot: u8, hub_speed: UsbSpeed, speed: UsbSpeed) -> Option<SlotPlace>
+        if self.depth >= ROUTE_TIERS or port == 0 or port > ROUTE_PORT_MAX
+            return None
+        let slow: bool = speed == UsbSpeed.Low or speed == UsbSpeed.Full
+        var tt_slot: u8 = 0
+        var tt_port: u8 = 0
+        if slow and hub_speed == UsbSpeed.High
+            tt_slot = hub_slot
+            tt_port = port
+        else if slow
+            # Behind a full-speed hub: the nearest high-speed hub's TT.
+            tt_slot = self.tt_slot
+            tt_port = self.tt_port
+        Some(SlotPlace {
+            root_port: self.root_port,
+            route: self.route | ((port as u32) << (4 * self.depth as u32)),
+            depth: self.depth + 1,
+            tt_slot: tt_slot,
+            tt_port: tt_port
+        })
+
+# A device's slot context: its speed, where it is, and the last valid
+# endpoint DCI (`entries`). Interrupter 0.
+pub fn slot_ctx(speed: UsbSpeed, place: SlotPlace, entries: u8) -> CtxWords
     var w = CtxWords { dw: [0, 0, 0, 0, 0, 0, 0, 0] }
-    w.dw[0] = (speed_psiv(speed) << 20) | (((entries as u32) & 0x1F) << 27)
-    w.dw[1] = (root_port as u32) << 16
+    w.dw[0] = (place.route & 0xFFFFF) | (speed_psiv(speed) << 20) | (((entries as u32) & 0x1F) << 27)
+    w.dw[1] = (place.root_port as u32) << 16
+    w.dw[2] = (place.tt_slot as u32) | ((place.tt_port as u32) << 8)
     w
+
+# A hub's slot context: `w` with the Hub flag, its Number of Ports, and its
+# TT Think Time (wHubCharacteristics bits 6:5; 0 for a SuperSpeed hub).
+# Single-TT (MTT 0): the driver never selects a multi-TT alternate setting.
+pub fn slot_ctx_hub(w: CtxWords, ports: u8, think_time: u8) -> CtxWords
+    var h: CtxWords = w
+    h.dw[0] = h.dw[0] | (1 << 26)
+    h.dw[1] = h.dw[1] | ((ports as u32) << 24)
+    h.dw[2] = h.dw[2] | (((think_time as u32) & 3) << 16)
+    h
 
 # The Slot State the controller keeps in dword 3.
 pub enum SlotState

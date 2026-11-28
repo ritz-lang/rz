@@ -673,6 +673,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/harland/tools/test_usb_boot.sh keyboard-msi",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" SKIP_BUILD=1 '
         "bash projects/harland/tools/test_usb_boot.sh keyboard-poll",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs" SKIP_BUILD=1 '
+        "bash projects/harland/tools/test_usb_boot.sh keyboard-hub",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs/buddhafinger" '
         "bash projects/buddhafinger/tools/test_harland_console.sh",
     ]

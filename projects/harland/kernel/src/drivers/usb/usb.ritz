@@ -9,16 +9,24 @@
 # configuration (its 9-byte header, then wTotalLength) and
 # SET_CONFIGURATION. Every step is a command or a control transfer whose
 # completion event moves the port's state on; none waits. A configured HID
-# boot keyboard is handed to drivers/usb/hid_kbd.ritz (#4888), which
-# configures its endpoint and gets every later event for it; hubs are
-# #4890's.
+# boot keyboard is handed to drivers/usb/hid_kbd.ritz (#4888), and a hub
+# to drivers/usb/hub.ritz (#4890); each configures its endpoint and gets
+# every later event for it.
+#
+# Hubs (docs/USB.md "Hubs", #4890): a device on a hub's port is one more
+# device entry here, past the root ports'. The hub says when one is
+# Attached (its port reset and enabled, at a speed) and when it is Gone;
+# it enumerates as a root port's does, from Enable Slot, with its route
+# string, root port and TT hub slot and port in its slot context
+# (SlotPlace.below). Its log names it by root port and route
+# ("hc1 port 1.3"). A hub that goes takes everything below it with it.
 #
 # Hot-plug (docs/USB.md "Hot-plug", #4889): a Port Status Change with no
-# device connected detaches the port's device. Its keys are released at
+# device connected (or a hub's Gone) detaches the port's device. Its keys are released at
 # once (no repeat outlives it), then Stop Endpoint for each endpoint and
 # Disable Slot are queued; when the last of the port's commands completes
 # its pages are freed and, if a device is connected again by then, it
-# enumerates from the start. A controller that fails (xhci_tick) loses its
+# enumerates from the start (a hub looks at its port again). A controller that fails (xhci_tick) loses its
 # devices the same way at once, and when its reset is done their pages are
 # freed and its ports enumerate again; the other controllers' devices are
 # not touched.
@@ -38,18 +46,24 @@ import klog { klog, klog_dec, klog_hex, klog_hex_width }
 import io { interrupts_enabled, disable_interrupts, enable_interrupts }
 import arch.x86_64.apic { lapic_is_bsp }
 import mm.vmm { phys_to_virt }
-import drivers.usb.xhci { XhciError, EVENTS_PER_IRQ, xhci_init, xhci_error_name, xhci_count, xhci_running, xhci_polled, xhci_ctx64, xhci_max_ports, xhci_port_protocol, xhci_portsc, xhci_portsc_write, xhci_set_device_context, xhci_doorbell, xhci_command, xhci_command_done, xhci_port_commands, xhci_irq_ack, xhci_next_event, xhci_events_done, xhci_alloc_page, xhci_free_page, xhci_of_vector, xhci_tick, xhci_inject_fault }
+import drivers.usb.xhci { XhciError, EVENTS_PER_IRQ, xhci_init, xhci_error_name, xhci_count, xhci_running, xhci_polled, xhci_ctx64, xhci_max_ports, xhci_port_protocol, xhci_portsc, xhci_portsc_write, xhci_set_device_context, xhci_doorbell, xhci_command, xhci_command_done, xhci_dev_commands, xhci_irq_ack, xhci_next_event, xhci_events_done, xhci_alloc_page, xhci_free_page, xhci_of_vector, xhci_tick, xhci_inject_fault }
 import usb_abi.regs { UsbSpeed, PORTSC_CCS, PORTSC_PED, PORTSC_CHANGE, portsc_ack, portsc_start_reset, portsc_speed, speed_from_psiv, speed_name, ep0_max_packet, ep_interval }
 import usb_abi.trb { Trb, Completion, completion_ok, Event, CommandEvent, TransferEvent, trb_enable_slot, trb_disable_slot, trb_stop_endpoint, trb_address_device, trb_evaluate_context, trb_setup_stage, trb_data_stage, trb_status_stage }
 import usb_abi.ring { TrbPage, TrbRing, RING_TRBS }
-import usb_abi.context { InputContext, DeviceContext, EpType, ADD_SLOT, ADD_EP0, input_control, slot_ctx, ep_ctx, slot_address }
+import usb_abi.context { SlotPlace, InputContext, DeviceContext, EpType, ADD_SLOT, ADD_EP0, input_control, slot_ctx, ep_ctx, slot_address }
 import drivers.usb.irq_mode { UsbIrqMode }
 import drivers.usb.hid_kbd { HidAttach, hid_kbd_attach, hid_kbd_command, hid_kbd_transfer, hid_kbd_detach, hid_kbd_free, hid_kbd_tick }
+import drivers.usb.hub { HubAttach, HubPort, hub_attach, hub_command, hub_transfer, hub_child_settled, hub_port_free, hub_detach, hub_free, hub_tick }
 import usb_abi.desc { SetupPacket, DeviceDesc, ConfigHeader, DescWalk, DescError, setup_get_descriptor, setup_set_configuration, parse_device, device_max_packet0, parse_config_header, DESC_DEVICE, DESC_CONFIG, DEVICE_DESC_LEN, CONFIG_DESC_LEN }
 
-# Root ports per controller with a device entry of their own here. A
-# controller with more logs the ports it skips (chungus's have 2 to 8 each).
+# Root ports per controller with a device entry of their own here (entry
+# `port`). A controller with more logs the ports it skips (chungus's have 2
+# to 8 each).
 const PORTS_MAX: u8 = 32
+# Device entries per controller: the root ports', then PORTS_MAX more for
+# devices behind hubs (#4890). An entry's number (1-based) is the owner of
+# its commands (xhci_command).
+const DEVS_MAX: u8 = 64
 # Controllers with device entries here: xhci.ritz's XHCS_MAX.
 const HCS_MAX: u8 = 4
 # The descriptor buffer is one page: a configuration longer than that is
@@ -71,17 +85,22 @@ enum DevState
     ReadingConfig           # the whole configuration
     SettingConfig           # SET_CONFIGURATION
     Configured
-    Bound                   # a class driver's (drivers/usb/hid_kbd.ritz)
+    Bound                   # the keyboard driver's (drivers/usb/hid_kbd.ritz)
+    Hub                     # the hub driver's (drivers/usb/hub.ritz)
     Failed                  # stopped; the port waits for a disconnect
     Detaching               # disconnected: its endpoints stopping, slot disabling
     Lost                    # its controller is resetting
 
-# One root port's device. Its four DMA pages are allocated when it is
-# addressed and freed when it detaches (or its controller resets).
+# One device, on a root port or behind a hub. Its four DMA pages are
+# allocated when it is addressed and freed when it detaches (or its
+# controller resets).
 struct UsbDevice
     state: DevState
     hc: u8
-    port: u8
+    id: u8                  # its entry, 1 ..= DEVS_MAX: the root port for a root port's device
+    place: SlotPlace        # its root port, route string and TT
+    parent: u8              # the entry of the hub it is on, 0 on a root port
+    hub_port: u8            # its port on that hub
     speed: UsbSpeed
     slot: u8
     slot_type: u8
@@ -97,8 +116,8 @@ struct UsbDevice
     disable_trb: u64        # detaching: its Disable Slot command TRB, 0 if none
     slot_off: bool          # detaching: that command completed successfully
 
-# HCS_MAX controllers' PORTS_MAX root ports each.
-var usb_devs: [128]UsbDevice
+# HCS_MAX controllers' DEVS_MAX entries each.
+var usb_devs: [256]UsbDevice
 
 # The fault-usb boot option (AGAST #4889): once a keyboard on the last
 # controller is ready, the next tick fails that controller, once.
@@ -106,23 +125,39 @@ var usb_fault_armed: bool = false
 var usb_fault_due: bool = false
 var usb_fault_hc: u8 = 0
 
-# Root port `port` (1 ..= PORTS_MAX) of controller `hc`.
+# Device entry `id` (1 ..= DEVS_MAX) of controller `hc`.
+fn dev_of_id(hc: u8, id: u8) -> *UsbDevice
+    @usb_devs[(hc as u32) * (DEVS_MAX as u32) + (id as u32) - 1]
+
+# Root port `port` (1 ..= PORTS_MAX) of controller `hc`: its device's
+# entry, which knows where it is.
 fn dev_of_port(hc: u8, port: u8) -> *UsbDevice
-    @usb_devs[(hc as u32) * (PORTS_MAX as u32) + (port as u32) - 1]
+    let d: *UsbDevice = dev_of_id(hc, port)
+    d.hc = hc
+    d.id = port
+    d.place = SlotPlace.root(port)
+    d.parent = 0
+    d.hub_port = 0
+    d
 
 fn dev_of_slot(hc: u8, slot: u8) -> Option<*UsbDevice>
     if slot == 0
         return None
-    for port in 1..=PORTS_MAX
-        let d: *UsbDevice = dev_of_port(hc, port)
+    for id in 1..=DEVS_MAX
+        let d: *UsbDevice = dev_of_id(hc, id)
         if d.slot == slot and d.state != DevState.Empty
             return Some(d)
     None
 
-# The root ports of controller `hc` that have device entries.
-fn tracked_ports(hc: u8) -> u8
-    let n: u8 = xhci_max_ports(hc)
-    if n > PORTS_MAX then PORTS_MAX else n
+# A free entry for a device behind a hub.
+fn free_entry(hc: u8) -> Option<*UsbDevice>
+    for id in PORTS_MAX + 1..=DEVS_MAX
+        let d: *UsbDevice = dev_of_id(hc, id)
+        if d.state == DevState.Empty
+            d.hc = hc
+            d.id = id
+            return Some(d)
+    None
 
 fn log_hc_port(hc: u8, port: u8)
     klog("[usb] hc")
@@ -130,8 +165,17 @@ fn log_hc_port(hc: u8, port: u8)
     klog(" port ")
     klog_dec(port as i64)
 
+# "[usb] hc1 port 2", or behind hubs the root port then each hub's port
+# ("hc1 port 2.3.1"), as QEMU names a port.
 fn log_port(d: *UsbDevice)
-    log_hc_port(d.hc, d.port)
+    log_hc_port(d.hc, d.place.root_port)
+    log_route(d.place)
+
+# Each hub port on the way to the device, after its root port.
+fn log_route(p: SlotPlace)
+    for t in 0..p.depth
+        klog(".")
+        klog_dec(((p.route >> (4 * t as u32)) & 0xF) as i64)
 
 fn log_slot(d: *UsbDevice)
     klog("[usb] hc")
@@ -174,6 +218,7 @@ fn fail(d: *UsbDevice, what: StrView)
     klog(what)
     klog("; device left unconfigured\n")
     d.state = DevState.Failed
+    settled(d)
 
 fn fail_code(d: *UsbDevice, what: StrView, c: Completion)
     log_port(d)
@@ -189,13 +234,20 @@ fn fail_code(d: *UsbDevice, what: StrView, c: Completion)
         None => pass
     klog("; device left unconfigured\n")
     d.state = DevState.Failed
+    settled(d)
+
+# A device behind a hub is addressed, failed or gone: it no longer answers
+# at the default address, so the hubs may reset the next port.
+fn settled(d: *UsbDevice)
+    if d.parent != 0
+        hub_child_settled(d.hc, d.parent, d.hub_port)
 
 # ============================================================================
 # Commands and control transfers
 # ============================================================================
 
 fn command(d: *UsbDevice, t: Trb, next: DevState)
-    match xhci_command(d.hc, t, d.port)
+    match xhci_command(d.hc, t, d.id)
         Ok(_) =>
             d.state = next
         Err(_) => fail(d, "command ring full")
@@ -231,7 +283,8 @@ fn release_pages(d: *UsbDevice)
     d.dev_ctx = 0
     d.ep0_page = 0
     d.buf = 0
-    hid_kbd_free(d.hc, d.port)
+    hid_kbd_free(d.hc, d.id)
+    hub_free(d.hc, d.id)
 
 # Forget the device's pages without freeing them: its slot could not be
 # disabled, so the controller may still write them. Leaked, never reused.
@@ -290,7 +343,7 @@ fn received(d: *UsbDevice, residual: u32) -> [u8]
 # Ports
 # ============================================================================
 
-# The port is enabled at a known speed: ask for a slot.
+# The root port is enabled at a known speed: ask for a slot.
 fn enable_slot(d: *UsbDevice, portsc: u32)
     match speed_from_psiv(portsc_speed(portsc))
         Some(s) => d.speed = s
@@ -302,6 +355,48 @@ fn enable_slot(d: *UsbDevice, portsc: u32)
     klog(speed_name(d.speed))
     klog(" speed\n")
     command(d, trb_enable_slot(d.slot_type), DevState.EnablingSlot)
+
+# Hub `h`'s port `p.port` has a device, reset and enabled at `p.speed`:
+# it takes an entry and asks for a slot.
+fn attach_below(h: *UsbDevice, p: HubPort)
+    let place: SlotPlace = match h.place.below(p.port, h.slot, h.speed, p.speed)
+        Some(x) => x
+        None =>
+            log_port(h)
+            klog(": hub port ")
+            klog_dec(p.port as i64)
+            klog(": past the route string's tiers; ignored\n")
+            hub_child_settled(h.hc, h.id, p.port)
+            return
+    match free_entry(h.hc)
+        Some(d) => enumerate_below(h, d, place, p)
+        None =>
+            log_port(h)
+            klog(": hub port ")
+            klog_dec(p.port as i64)
+            klog(": no free device entry; ignored\n")
+            hub_child_settled(h.hc, h.id, p.port)
+
+# Entry `d` is the device on hub `h`'s port `p.port`, at `place`.
+fn enumerate_below(h: *UsbDevice, d: *UsbDevice, place: SlotPlace, p: HubPort)
+    d.place = place
+    d.parent = h.id
+    d.hub_port = p.port
+    d.speed = p.speed
+    d.slot_type = h.slot_type
+    d.slot = 0
+    log_port(d)
+    klog(": connected, ")
+    klog(speed_name(d.speed))
+    klog(" speed\n")
+    command(d, trb_enable_slot(d.slot_type), DevState.EnablingSlot)
+
+# Hub `h`'s port `port` lost its device.
+fn gone_below(h: *UsbDevice, port: u8)
+    for id in PORTS_MAX + 1..=DEVS_MAX
+        let d: *UsbDevice = dev_of_id(h.hc, id)
+        if d.parent == h.id and d.hub_port == port and live(d)
+            detach(d)
 
 # A Port Status Change (or a first look at a port, at boot or after its
 # controller's reset): acknowledge its changes and move its device on.
@@ -318,12 +413,9 @@ fn port_changed(hc: u8, port: u8)
     if (v & PORTSC_CHANGE) != 0
         xhci_portsc_write(hc, port, portsc_ack(v))
     let d: *UsbDevice = dev_of_port(hc, port)
-    d.hc = hc
-    d.port = port
     if (v & PORTSC_CCS) == 0
-        match d.state
-            Empty | Detaching | Lost => pass
-            Resetting | EnablingSlot | Addressing | ReadingMps | FixingMps | ReadingDevice | ReadingConfigHead | ReadingConfig | SettingConfig | Configured | Bound | Failed => detach(d)
+        if live(d)
+            detach(d)
         return
     let usb3: bool = match xhci_port_protocol(hc, port)
         Some(p) =>
@@ -353,46 +445,65 @@ fn port_changed(hc: u8, port: u8)
 # Detach (docs/USB.md "Hot-plug")
 # ============================================================================
 
+# A device that is there to detach: not Empty, and not already detaching
+# or lost with its controller.
+fn live(d: *UsbDevice) -> bool
+    match d.state
+        Empty | Detaching | Lost => false
+        Resetting | EnablingSlot | Addressing | ReadingMps | FixingMps | ReadingDevice | ReadingConfigHead | ReadingConfig | SettingConfig | Configured | Bound | Hub | Failed => true
+
 # Queue the commands that take slot `d.slot` down: Stop Endpoint for the
-# keyboard's interrupt endpoint `dci` (0: none) and for EP0, then Disable
+# class driver's interrupt endpoint `dci` (0: none) and for EP0, then Disable
 # Slot, whose TRB is kept to know its completion. They run in order; a
 # stop the endpoint's state refuses is still a completion. False if
 # Disable Slot could not be queued.
 fn take_slot_down(d: *UsbDevice, dci: u8) -> bool
     if dci != 0
-        let _ = xhci_command(d.hc, trb_stop_endpoint(d.slot, dci), d.port)
-    let _ = xhci_command(d.hc, trb_stop_endpoint(d.slot, DCI_EP0), d.port)
-    match xhci_command(d.hc, trb_disable_slot(d.slot), d.port)
+        let _ = xhci_command(d.hc, trb_stop_endpoint(d.slot, dci), d.id)
+    let _ = xhci_command(d.hc, trb_stop_endpoint(d.slot, DCI_EP0), d.id)
+    match xhci_command(d.hc, trb_disable_slot(d.slot), d.id)
         Ok(p) =>
             d.disable_trb = p
             true
         Err(_) => false
 
 # The port's device went away: its keys are released now, and its slot is
-# taken down. finish_detach frees it once every command for the port is
-# done.
+# taken down; a hub's devices go first, their slots before its own.
+# finish_detach frees it once every command for it is done.
 fn detach(d: *UsbDevice)
     log_port(d)
     klog(": disconnected\n")
     var dci: u8 = 0
     if d.state == DevState.Bound
-        dci = hid_kbd_detach(d.hc, d.port)
+        dci = hid_kbd_detach(d.hc, d.id)
+    else if d.state == DevState.Hub
+        dci = hub_detach(d.hc, d.id)
+        detach_below(d)
     d.state = DevState.Detaching
+    settled(d)
     d.disable_trb = 0
     d.slot_off = false
     if d.slot != 0 and not take_slot_down(d, dci)
         log_slot(d)
         klog(": command ring full: slot left enabled, its pages leaked\n")
-        hid_kbd_free(d.hc, d.port)
+        hid_kbd_free(d.hc, d.id)
+        hub_free(d.hc, d.id)
         leak_pages(d)
         d.slot = 0
     finish_detach(d)
+
+# Every device on hub `h`'s ports, and below them, detaches with it.
+fn detach_below(h: *UsbDevice)
+    for id in PORTS_MAX + 1..=DEVS_MAX
+        let d: *UsbDevice = dev_of_id(h.hc, id)
+        if d.parent == h.id and live(d)
+            detach(d)
 
 # The detaching device's last command completed: its slot is disabled (or
 # was never granted), so the controller no longer reaches its pages. Free
 # them, and enumerate a device connected since.
 fn finish_detach(d: *UsbDevice)
-    if xhci_port_commands(d.hc, d.port) != 0
+    if xhci_dev_commands(d.hc, d.id) != 0
         return
     log_port(d)
     klog(": detached")
@@ -405,8 +516,15 @@ fn finish_detach(d: *UsbDevice)
     release_pages(d)
     d.state = DevState.Empty
     d.slot = 0
-    if (xhci_portsc(d.hc, d.port) & PORTSC_CCS) != 0
-        port_changed(d.hc, d.port)
+    if d.parent != 0
+        # Its hub looks at the port again, if the hub is still there.
+        let hub: u8 = d.parent
+        let port: u8 = d.hub_port
+        d.parent = 0
+        d.hub_port = 0
+        hub_port_free(d.hc, hub, port)
+    else if (xhci_portsc(d.hc, d.place.root_port) & PORTSC_CCS) != 0
+        port_changed(d.hc, d.place.root_port)
 
 # A command for the detaching device completed. An Enable Slot queued
 # before the disconnect (the only command a device with no slot can have
@@ -430,22 +548,26 @@ fn detaching_command(d: *UsbDevice, c: CommandEvent)
 # Controller `hc` failed and is being reset: every device on it is gone.
 # Keyboards release their keys now; the pages wait for the reset.
 fn controller_died(hc: u8)
-    for port in 1..=tracked_ports(hc)
-        let d: *UsbDevice = dev_of_port(hc, port)
+    for id in 1..=DEVS_MAX
+        let d: *UsbDevice = dev_of_id(hc, id)
         if d.state == DevState.Bound
-            let _ = hid_kbd_detach(hc, port)
+            let _ = hid_kbd_detach(hc, id)
+        else if d.state == DevState.Hub
+            let _ = hub_detach(hc, id)
         if d.state != DevState.Empty
             d.state = DevState.Lost
 
 # Controller `hc` was reset and runs again, with no slots: free what its
 # devices held and look at every port, as at boot.
 fn controller_restarted(hc: u8)
-    for port in 1..=tracked_ports(hc)
-        let d: *UsbDevice = dev_of_port(hc, port)
+    for id in 1..=DEVS_MAX
+        let d: *UsbDevice = dev_of_id(hc, id)
         if d.state != DevState.Empty
             release_pages(d)
             d.state = DevState.Empty
             d.slot = 0
+            d.parent = 0
+            d.hub_port = 0
     scan_ports(hc)
 
 # A device already connected to one of `hc`'s ports starts enumerating.
@@ -472,7 +594,7 @@ fn address_device(d: *UsbDevice, slot: u8)
     xhci_set_device_context(d.hc, slot, d.dev_ctx)
     let ic: InputContext = input(d)
     *ic.control() = input_control(0, ADD_SLOT | ADD_EP0)
-    *ic.slot() = slot_ctx(d.speed, d.port, DCI_EP0)
+    *ic.slot() = slot_ctx(d.speed, d.place, DCI_EP0)
     *ic.ep(DCI_EP0) = ep_ctx(EpType.Control, d.mps0, 0, d.ep0.dequeue_ptr())
     command(d, trb_address_device(d.in_ctx, slot, false), DevState.Addressing)
 
@@ -480,10 +602,12 @@ fn read_device_descriptor(d: *UsbDevice)
     control_in(d, setup_get_descriptor(DESC_DEVICE, 0, DEVICE_DESC_LEN as u16), DevState.ReadingDevice)
 
 fn addressed(d: *UsbDevice)
+    settled(d)
     let dc: DeviceContext = DeviceContext.over(phys_to_virt(d.dev_ctx), xhci_ctx64(d.hc))
     log_slot(d)
     klog(" addressed: port ")
-    klog_dec(d.port as i64)
+    klog_dec(d.place.root_port as i64)
+    log_route(d.place)
     klog(", address ")
     klog_dec(slot_address(*dc.slot()) as i64)
     klog(", EP0 ")
@@ -612,35 +736,43 @@ fn got_config(d: *UsbDevice, b: [u8])
     control_nodata(d, setup_set_configuration(d.config_value), DevState.SettingConfig)
 
 # SET_CONFIGURATION done. The configuration read is still in the buffer:
-# a HID boot keyboard in it takes the device.
+# a HID boot keyboard or a hub in it takes the device.
 fn configured(d: *UsbDevice)
     d.state = DevState.Configured
     log_slot(d)
     klog(": configured (configuration ")
     klog_dec(d.config_value as i64)
     klog(")\n")
-    let a = HidAttach { hc: d.hc, slot: d.slot, port: d.port, speed: d.speed, in_ctx: d.in_ctx, ep0: @d.ep0 }
-    if hid_kbd_attach(a, span_from_ptr<u8>(phys_to_virt(d.buf) as *u8, d.config_len as i64))
+    let config: [u8] = span_from_ptr<u8>(phys_to_virt(d.buf) as *u8, d.config_len as i64)
+    let a = HidAttach { hc: d.hc, slot: d.slot, dev: d.id, speed: d.speed, place: d.place, in_ctx: d.in_ctx, ep0: @d.ep0 }
+    if hid_kbd_attach(a, config)
         d.state = DevState.Bound
+        return
+    let h = HubAttach { hc: d.hc, slot: d.slot, dev: d.id, speed: d.speed, place: d.place, in_ctx: d.in_ctx, ep0: @d.ep0 }
+    if hub_attach(h, config)
+        d.state = DevState.Hub
 
 # ============================================================================
 # Events
 # ============================================================================
 
 fn on_command(hc: u8, c: CommandEvent)
-    let port: u8 = match xhci_command_done(hc, c.trb)
+    let id: u8 = match xhci_command_done(hc, c.trb)
         Some(p) => p
         None => return
-    if port == 0 or port > PORTS_MAX
+    if id == 0 or id > DEVS_MAX
         return
-    let d: *UsbDevice = dev_of_port(hc, port)
+    let d: *UsbDevice = dev_of_id(hc, id)
     match d.state
         Detaching =>
             detaching_command(d, c)
             return
         Lost => return
+        Hub =>
+            hub_command(hc, id, c.code)
+            return
         Bound =>
-            if hid_kbd_command(hc, port, c.code) and usb_fault_armed and hc + 1 == xhci_count()
+            if hid_kbd_command(hc, id, c.code) and usb_fault_armed and hc + 1 == xhci_count()
                 usb_fault_armed = false
                 usb_fault_due = true
                 usb_fault_hc = hc
@@ -666,6 +798,12 @@ fn on_transfer(hc: u8, x: TransferEvent, from_user: bool) -> bool
         return false
     if d.state == DevState.Bound
         return hid_kbd_transfer(hc, x, from_user)
+    if d.state == DevState.Hub
+        match hub_transfer(hc, d.id, x)
+            Attached(p) => attach_below(d, p)
+            Gone(port) => gone_below(d, port)
+            Quiet => pass
+        return false
     if x.dci != DCI_EP0
         return false
     # Err means x.trb is not on this ring (a stale or foreign event): there
@@ -749,6 +887,7 @@ pub fn usb_tick(from_user: bool) -> bool
     for hc in 0..xhci_count()
         if xhci_polled(hc) and xhci_irq(hc, from_user)
             kill = true
+    hub_tick()
     if hid_kbd_tick(from_user)
         kill = true
     kill

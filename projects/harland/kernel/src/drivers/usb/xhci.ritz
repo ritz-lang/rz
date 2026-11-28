@@ -127,8 +127,8 @@ struct Xhci
     scratch: u64            # the scratchpad buffer array (phys), 0 if none
     cmd_page: u64           # the command ring (phys)
     cmd: TrbRing
-    cmd_owner: [256]u8      # the root port each outstanding command is for
-    port_cmds: [256]u8      # commands outstanding per root port
+    cmd_owner: [256]u8      # the device entry (usb.ritz's) each outstanding command is for
+    dev_cmds: [256]u8       # commands outstanding per device entry
     ev_page: u64            # event ring segment 0 (phys)
     events: EventRing
     erst: u64               # the event ring segment table (phys)
@@ -340,7 +340,7 @@ fn program_memory(h: *Xhci)
     h.cmd = TrbRing.new(phys_to_virt(h.cmd_page) as *TrbPage, h.cmd_page, RING_TRBS)
     for i in 0..256
         h.cmd_owner[i] = 0
-        h.port_cmds[i] = 0
+        h.dev_cmds[i] = 0
     zero_page(h.ev_page)
     h.events = EventRing.new(phys_to_virt(h.ev_page) as *TrbPage, h.ev_page, RING_TRBS)
     *(phys_to_virt(h.erst) as *ErstEntry) = erst_entry(h.ev_page, RING_TRBS)
@@ -708,36 +708,37 @@ pub fn xhci_doorbell(hc: u8, slot: u8, dci: u8)
     fence()
     wr32(hc_of(hc).db + (slot as u64) * 4, dci as u32)
 
-# Queue command `t` on behalf of root port `port` and ring the host
-# doorbell. Its Command Completion Event names the TRB; xhci_command_done
-# gives `port` back.
-pub fn xhci_command(hc: u8, t: Trb, port: u8) -> Result<u64, RingError>
+# Queue command `t` on behalf of usb.ritz's device entry `dev` (a root
+# port's device, or one behind a hub) and ring the host doorbell. Its
+# Command Completion Event names the TRB; xhci_command_done gives `dev`
+# back.
+pub fn xhci_command(hc: u8, t: Trb, dev: u8) -> Result<u64, RingError>
     let h: *Xhci = hc_of(hc)
     let p: u64 = h.cmd.push(t)?
     match h.cmd.index_of(p)
         Some(i) =>
-            h.cmd_owner[i] = port
-            h.port_cmds[port] += 1
+            h.cmd_owner[i] = dev
+            h.dev_cmds[dev] += 1
         None => pass
     xhci_doorbell(hc, 0, DB_HOST as u8)
     Ok(p)
 
-# The command TRB at `trb` completed: retire it and return the root port
+# The command TRB at `trb` completed: retire it and return the device entry
 # it was queued for.
 pub fn xhci_command_done(hc: u8, trb: u64) -> Option<u8>
     let h: *Xhci = hc_of(hc)
     match h.cmd.retire(trb)
         Ok(i) =>
-            let port: u8 = h.cmd_owner[i]
-            if h.port_cmds[port] > 0
-                h.port_cmds[port] -= 1
-            Some(port)
+            let dev: u8 = h.cmd_owner[i]
+            if h.dev_cmds[dev] > 0
+                h.dev_cmds[dev] -= 1
+            Some(dev)
         Err(_) => None
 
-# Commands queued for root port `port` whose completion has not arrived:
+# Commands queued for device entry `dev` whose completion has not arrived:
 # a detach waits for them before it frees the device's pages.
-pub fn xhci_port_commands(hc: u8, port: u8) -> u8
-    hc_of(hc).port_cmds[port]
+pub fn xhci_dev_commands(hc: u8, dev: u8) -> u8
+    hc_of(hc).dev_cmds[dev]
 
 # The interrupter's pending bit and the controller's event bit, cleared
 # before the event ring is drained so a later event raises a new interrupt.

@@ -16,7 +16,8 @@
 # newest held key: 500 ms, then every 3 ticks.
 #
 # Keyboards on every controller (#4889) are told apart by controller and
-# slot, or controller and root port. A detach, or its controller failing,
+# slot, or controller and usb.ritz's device entry (a root port's, or one
+# behind a hub: #4890). A detach, or its controller failing,
 # releases the keyboard's held keys at once (hid_kbd_detach: no repeat
 # outlives the device); its pages are freed (hid_kbd_free) only once its
 # slot is disabled or its controller reset, when nothing can DMA to them.
@@ -36,7 +37,7 @@ import usb_abi.regs { UsbSpeed, EpKind, ep_interval }
 import usb_abi.trb { Completion, completion_ok, TransferEvent, trb_configure_endpoint, trb_setup_stage, trb_data_stage, trb_status_stage, trb_normal }
 import ritzlib.result
 import usb_abi.ring { TrbPage, TrbRing, RingError, RING_TRBS }
-import usb_abi.context { InputContext, EpType, ADD_SLOT, input_control, slot_ctx, ep_ctx, add_flag, dci_of }
+import usb_abi.context { SlotPlace, InputContext, EpType, ADD_SLOT, input_control, slot_ctx, ep_ctx, add_flag, dci_of }
 import usb_abi.desc { SetupPacket, DescWalk }
 import usb_abi.hid { HidKbd, KeyOut, BOOT_REPORT_LEN, setup_set_protocol, setup_set_idle, setup_set_report_leds }
 
@@ -63,8 +64,9 @@ enum KbdState
 pub struct HidAttach
     hc: u8                  # its controller
     slot: u8
-    port: u8
+    dev: u8                 # usb.ritz's device entry, the owner of its commands
     speed: UsbSpeed
+    place: SlotPlace        # where it is: root port, route string, TT
     in_ctx: u64             # the device's input context page (phys)
     ep0: *TrbRing           # its EP0 transfer ring, usb.ritz's
 
@@ -72,8 +74,9 @@ struct Kbd
     state: KbdState
     hc: u8
     slot: u8
-    port: u8
+    dev: u8
     speed: UsbSpeed
+    place: SlotPlace
     iface: u8
     ep_addr: u8
     dci: u8
@@ -151,12 +154,12 @@ fn kbd_of_slot(hc: u8, slot: u8) -> Option<*Kbd>
             return Some(k)
     None
 
-# The keyboard entry on root port `port` of controller `hc`, detached or
-# not.
-fn kbd_of_port(hc: u8, port: u8) -> Option<*Kbd>
+# The keyboard on usb.ritz's device entry `dev` of controller `hc`,
+# detached or not.
+fn kbd_of_dev(hc: u8, dev: u8) -> Option<*Kbd>
     for i in 0..KBDS_MAX
         let k: *Kbd = @kbds[i]
-        if k.state != KbdState.Free and k.hc == hc and k.port == port
+        if k.state != KbdState.Free and k.hc == hc and k.dev == dev
             return Some(k)
     None
 
@@ -218,9 +221,9 @@ fn configure_endpoint(k: *Kbd)
     k.ring = TrbRing.new(phys_to_virt(k.ring_page) as *TrbPage, k.ring_page, RING_TRBS)
     let ic: InputContext = InputContext.over(phys_to_virt(k.in_ctx), xhci_ctx64(k.hc))
     *ic.control() = input_control(0, ADD_SLOT | add_flag(k.dci))
-    *ic.slot() = slot_ctx(k.speed, k.port, k.dci)
+    *ic.slot() = slot_ctx(k.speed, k.place, k.dci)
     *ic.ep(k.dci) = ep_ctx(EpType.InterruptIn, k.mps, k.interval, k.ring.dequeue_ptr())
-    match xhci_command(k.hc, trb_configure_endpoint(k.in_ctx, k.slot), k.port)
+    match xhci_command(k.hc, trb_configure_endpoint(k.in_ctx, k.slot), k.dev)
         Ok(_) => k.state = KbdState.ConfiguringEndpoint
         Err(_) => fail(k, "command ring full")
 
@@ -258,8 +261,9 @@ pub fn hid_kbd_attach(a: HidAttach, config: [u8]) -> bool
         None => return not_driven(a)
     k.hc = a.hc
     k.slot = a.slot
-    k.port = a.port
+    k.dev = a.dev
     k.speed = a.speed
+    k.place = a.place
     k.in_ctx = a.in_ctx
     k.ep0 = a.ep0
     k.iface = f.number
@@ -281,10 +285,10 @@ pub fn hid_kbd_attach(a: HidAttach, config: [u8]) -> bool
         fail(k, "EP0 ring full")
     true
 
-# A command completed for the keyboard on root port `port` of controller
-# `hc`. True when it made the keyboard ready.
-pub fn hid_kbd_command(hc: u8, port: u8, code: Completion) -> bool
-    let k: *Kbd = match kbd_of_port(hc, port)
+# A command completed for the keyboard on device entry `dev` of
+# controller `hc`. True when it made the keyboard ready.
+pub fn hid_kbd_command(hc: u8, dev: u8, code: Completion) -> bool
+    let k: *Kbd = match kbd_of_dev(hc, dev)
         Some(k) => k
         None => return false
     if k.state != KbdState.ConfiguringEndpoint
@@ -361,13 +365,13 @@ fn on_ep0(k: *Kbd, x: TransferEvent)
                 send_leds(k)
         _ => pass
 
-# The keyboard on root port `port` of controller `hc` went away, or its
+# The keyboard on device entry `dev` of controller `hc` went away, or its
 # controller failed: release its held keys now, so no repeat outlives it,
 # and stop driving it. The DCI of its interrupt IN endpoint if it was
 # configured (the endpoint the detach stops), else 0. Its pages stay until
 # hid_kbd_free.
-pub fn hid_kbd_detach(hc: u8, port: u8) -> u8
-    let k: *Kbd = match kbd_of_port(hc, port)
+pub fn hid_kbd_detach(hc: u8, dev: u8) -> u8
+    let k: *Kbd = match kbd_of_dev(hc, dev)
         Some(k) => k
         None => return 0
     if k.state == KbdState.Detached
@@ -382,8 +386,8 @@ pub fn hid_kbd_detach(hc: u8, port: u8) -> u8
 
 # The keyboard's slot is disabled or its controller reset: nothing can
 # reach its pages, so they are freed and its entry is free again.
-pub fn hid_kbd_free(hc: u8, port: u8)
-    let k: *Kbd = match kbd_of_port(hc, port)
+pub fn hid_kbd_free(hc: u8, dev: u8)
+    let k: *Kbd = match kbd_of_dev(hc, dev)
         Some(k) => k
         None => return
     if k.state == KbdState.Running

@@ -32,6 +32,11 @@ controller alone and enumerates its keyboard again. These pin:
     `test-usb-poll`; against the stub, each puts its boot option on the ESP
     (usb-no-msix, usb-poll), waits for hc1 running that way on screen, and
     types `echo hi` and Ctrl-C.
+  * the hub boot (`keyboard-hub`, #4890): its own CI step after the
+    fallback boots, and `make test-usb-hub`; against the stub, the keyboard
+    is behind QEMU's usb-hub on the second controller, types `echo hi` and
+    Ctrl-C through it, and the hub is unplugged (taking the keyboard with
+    it) and both are plugged back before `echo back` types.
 
 Run with:
     python3 -m pytest projects/ritz/tools/test_ci_usb_boot.py -q
@@ -590,3 +595,61 @@ def test_a_keyboard_ready_off_msix_fails(tree):
     r = _run(tree, log(lines))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "hc0 was disturbed" in r.stdout
+
+
+# --------------------------------------------------------------------------
+# The hub (#4890): the keyboard behind QEMU's usb-hub
+# --------------------------------------------------------------------------
+
+
+def test_hub_boot_is_its_own_gate_after_the_fallback_boots():
+    steps = _build_all()
+    [hub] = _indices(steps, USB_SCRIPT, "keyboard-hub")
+    [poll] = _indices(steps, USB_SCRIPT, "keyboard-poll")
+    uploads = [
+        i for i, s in enumerate(steps) if "upload-artifact" in str(s.get("uses", ""))
+    ]
+    assert poll < hub < min(uploads)
+    step = steps[hub]
+    assert "continue-on-error" not in step
+    assert "|| true" not in step["run"]
+    assert step.get("timeout-minutes")
+    assert "boot-logs" in step["run"]
+    text = (REPO / "projects/harland/Makefile").read_text()
+    assert "\ntest-usb-hub:\n\t./tools/test_usb_boot.sh keyboard-hub\n" in text
+    assert "test-usb-hub" in text.split("\n.PHONY:", 1)[1].split("\n", 1)[0]
+
+
+@pytest.mark.integration
+def test_hub_boot_types_through_the_hub_and_replugs_it(tree):
+    r, argv = _keyboard_run(tree, mode="keyboard-hub")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: typed into rzsh on a USB keyboard behind a hub" in r.stdout
+    qemu = argv[argv.index("--") + 1 :]
+    # The hub on the second controller's bus port 1, the keyboard on its
+    # port 1, and no keyboard on a root port.
+    assert qemu.count("usb-hub,id=hub,bus=xhci1.0,port=1") == 1
+    assert qemu.count("usb-kbd,id=kbd,bus=xhci1.0,port=1.1") == 1
+    assert "usb-kbd,id=kbd,bus=xhci1.0" not in qemu
+    esp = (tree["tmp"] / "fbcon.argv.esp").read_text().split("\n")
+    assert not {"usb-no-msix", "usb-poll", "fault-usb"} & set(esp), esp
+    assert _steps(argv) == [
+        "e c h o spc h i ret",
+        "s p i n ret",
+        "ctrl-c",
+        "e c h o spc shift-4 shift-slash ret",
+        # Unplug the hub with the keyboard on it; plug both back.
+        "device_del id=hub",
+        "device_add driver=usb-hub id=hub bus=xhci1.0 port=1",
+        "device_add driver=usb-kbd id=kbd bus=xhci1.0 port=1.1",
+        "e c h o spc b a c k ret",
+    ]
+    expects = [argv[i + 1] for i, a in enumerate(argv) if a == "--expect"]
+    assert any("hub ready" in e for e in expects), "the hub must be driven"
+    assert any("hc1 slot 2: keyboard ready" in e and e.endswith(", MSI-X\\)") for e in expects)
+    # The keyboard is enumerated by its route string, behind the hub.
+    assert any("hc1 slot 2 addressed: port [0-9]+\\.1" in e for e in expects), expects
+    assert any("keyboard gone" in e for e in expects), "the hub's unplug must take the keyboard"
+    assert any("hub gone" in e for e in expects)
+    assert any("130" in e for e in expects)
+    assert any("back" in e for e in expects), "typing must work after the replug"

@@ -84,11 +84,11 @@ the kernel keeps `virtio_net_init` for boots without an IOMMU.
 
 | Path | Contents |
 |---|---|
-| `projects/harland/usb_abi/` | New leaf package on the `virtio_abi` pattern, with no kernel imports and its own host unit tests. It holds the xHCI register and TRB layouts, the TRB ring (enqueue, cycle bit, link TRB, event dequeue), the context layouts (32- and 64-byte, `HCCPARAMS1.CSZ`), the USB descriptor parser, the endpoint-interval conversion, and the HID boot report decoder (report diff, US keymap, modifiers, escape sequences). |
+| `projects/harland/usb_abi/` | New leaf package on the `virtio_abi` pattern, with no kernel imports and its own host unit tests. It holds the xHCI register and TRB layouts, the TRB ring (enqueue, cycle bit, link TRB, event dequeue), the context layouts (32- and 64-byte, `HCCPARAMS1.CSZ`) and where a device is (`SlotPlace`: root port, route string, TT hub slot and port), the USB descriptor parser, the hub class protocol (`hub.ritz`: requests, hub descriptor, port status and changes, the status change bitmap), the endpoint-interval conversion, and the HID boot report decoder (report diff, US keymap, modifiers, escape sequences). |
 | `kernel/src/drivers/usb/xhci.ritz` | The controllers, each with its own state: PCI probe, BIOS handoff, reset, DCBAA, scratchpad, command and event rings, interrupter 0 (`setup_vector`, the one place a controller's interrupt source is chosen), port handling, and the tick-driven recovery reset (`xhci_tick`). |
 | `kernel/src/drivers/usb/usb.ritz` | Device enumeration per controller and root port: slots, Address Device, control transfers, descriptors, Set Configuration; a configured device a class driver takes is `Bound` and its events go there. Detach and re-attach, a failed controller's devices, and the entry points `usb_irq` (a vector) and `usb_tick` (the BSP tick). |
 | `kernel/src/drivers/usb/hid_kbd.ritz` | The HID boot keyboard: Set Protocol (boot), Set Idle, Configure Endpoint for the interrupt-IN endpoint, a Normal TRB always queued, report to bytes into the console, the Caps Lock LED, typematic repeat on the BSP tick. |
-| `kernel/src/drivers/usb/hub.ritz` | The hub class driver (USB 2.0 hubs, and USB 3 hubs on their SuperSpeed side). |
+| `kernel/src/drivers/usb/hub.ritz` | The hub class driver (USB 2.0 hubs, and USB 3 hubs on their SuperSpeed side): bring-up, port power, debounce, reset and status changes on the hub's interrupt endpoint, and the controller's one default address (see "Hubs"). |
 
 ## Concurrency under SMP_USER.md
 
@@ -203,6 +203,47 @@ key press -> device -> interrupt-IN transfer event (event ring, MSI-X to BSP)
    descriptor; 64 for high speed; 512 for SuperSpeed), then GET_DESCRIPTOR
    (device, configuration), SET_CONFIGURATION, Configure Endpoint.
 
+## Hubs
+
+How it is built (#4890). `usb.ritz` keeps one device entry per root port and
+as many again for devices behind hubs; an entry's number owns its commands
+(`xhci_command`), so a detach waits for exactly its own. A configured
+device whose configuration has a hub interface (class 9) is handed to
+`hub.ritz`, after the keyboard driver declines it.
+
+- **Bring-up.** GET_DESCRIPTOR of the hub descriptor (type 29h; a
+  SuperSpeed hub's is 2Ah, and it then gets SET_HUB_DEPTH), then Configure
+  Endpoint: the slot context gets Hub, Number of Ports and TT Think Time
+  (single TT: MTT is never selected), and the status change endpoint is
+  added. Each port gets SET_FEATURE(PORT_POWER), and after bPwrOn2PwrGood
+  (on the BSP tick, no spin) every port is looked at once and a Normal TRB
+  waits on the status change endpoint, requeued as each bitmap arrives.
+  Ports past 15 have no route string field and are not driven.
+- **Ports.** The hub's EP0 runs one request at a time. A port the bitmap
+  (or the tick) names gets GET_STATUS; each change bit is cleared
+  (CLEAR_FEATURE, lowest first) and the status read again until none is
+  left; then the port's stage moves on. A new connection is debounced for
+  100 ms, reset (SET_FEATURE(PORT_RESET), whose end is a C_PORT_RESET
+  change), given 10 ms of reset recovery, and handed to `usb.ritz` as
+  attached at the speed its status gives. A SuperSpeed port that is
+  enabled already needs no reset.
+- **The device below.** It enumerates as a root port's device does, from
+  Enable Slot, with its slot context's Route String (tier 1, the hub on the
+  root port, in bits 3:0), the root port, and for a low- or full-speed
+  device behind a high-speed hub that hub's slot and port as its TT (behind
+  a full-speed hub, the nearest high-speed hub's). Its log names it by root
+  port and hub ports, as QEMU does: `hc1 port 5.1`.
+- **One default address.** A device just reset answers at address 0 until
+  Address Device gives it one, so each controller has at most one hub port
+  between its reset and its Address Device. The next waiting port is reset
+  when that device is addressed, fails, or goes.
+- **Detach.** A disconnect, a connect change or a disabled port is the
+  device gone, and it detaches as in "Hot-plug". A hub that goes takes
+  everything below it with it: its devices detach first (their commands
+  queue before its own), then the hub's endpoint is stopped and its slot
+  disabled. When a device below a hub is freed, the hub looks at that port
+  again.
+
 ## Hot-plug
 
 Port Status Change events drive attach and detach for every port, root or
@@ -247,7 +288,8 @@ How it is built (#4889):
 | xHCI bring-up boot | `tools/test_usb_boot.sh` (`make test-usb`), two QEMU `qemu-xhci`: two `usb-kbd` on the first, one at full speed (`usb_version=1`), and one on the second, with `\harland\fault-usb` | the log shows each controller running on its own MSI-X vector, each port of the first connected once, its slots 1 and 2 addressed (the full-speed one's EP0 size read from its first 8 bytes), each configuration read and set. The second controller's forced error resets it alone and its keyboard is ready again; the first is never reset |
 | Keyboard into rzsh | `tools/test_usb_boot.sh keyboard` (`make test-usb-kbd`): q35 with `i8042=off`, `-serial none`, one `usb-kbd`; `fbcon_screen.py --send` types over QMP | `send-key` types `echo hi` and Enter, and the screen shows `hi` at rzsh's prompt. Ctrl-C kills a foreground `spin` (ring 3, no syscalls, so the kill is the xHCI interrupt's) and `echo $?` shows 130. Caps Lock types `echo ABc` as typed; a key held 1.2 s repeats |
 | Hot-plug | the keyboard boot (`fbcon_screen.py --qmp-do`) | QMP `device_del` of `usb-kbd`: its port is detached and its slot disabled. `device_add`: it is ready again and `echo back` types |
-| Hub | the same script, `-device usb-hub` with `usb-kbd` behind it | typing works through the hub |
+| `usb_abi` hub tests | host, `usb_abi/test/test_hub.ritz`, and `test_context.ritz` | hub class requests, the hub descriptor (USB 2 and SuperSpeed, malformed), port status and the change cleared next, the status change bitmap, the hub interface; route string per tier, TT hub slot and port, the hub's slot context fields |
+| Hub | `tools/test_usb_boot.sh keyboard-hub` (`make test-usb-hub`): the keyboard boot with QEMU's `usb-hub` on hc1 and `usb-kbd` on its port 1 | the hub is ready and the keyboard behind it addressed by route (`port 5.1`) and ready; `echo hi` types and Ctrl-C kills `spin`. QMP `device_del` of the hub detaches both (each slot disabled, keys released); `device_add` of both and `echo back` types |
 | Several controllers | the keyboard boot: two `qemu-xhci` devices, the keyboard on the second | the keyboard on any controller works, as on chungus |
 | MSI-only and polled | `tools/test_usb_boot.sh keyboard-msi` (`make test-usb-msi`) and `keyboard-poll` (`make test-usb-poll`): the keyboard boot with `\harland\usb-no-msix` (and `qemu-xhci,msi=on`: QEMU offers MSI only when asked) or `\harland\usb-poll` | hc1's keyboard-ready line on screen names its source (`MSI`, or `polled`; MSI-X boots say `MSI-X`) and no controller runs any other way; `echo hi` types and Ctrl-C kills `spin` (`$?` = 130) |
 | Dead-vector watch | host, `test/test_usb_irq_mode.ritz` | which sources each boot option allows; a pending interrupt across two health checks with none delivered is a stall, one look or a delivered interrupt is not |

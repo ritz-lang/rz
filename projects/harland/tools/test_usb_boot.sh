@@ -64,7 +64,23 @@
 # controller is seen running any other way, `echo hi` types, and Ctrl-C
 # kills `spin` ($? = 130: on the poll, the kill is the tick's).
 #
-# Usage: tools/test_usb_boot.sh [enumerate|keyboard|keyboard-msi|keyboard-poll]
+# keyboard-hub (AGAST #4890, docs/USB.md "Hubs"): the keyboard boot with
+# the keyboard behind a hub, QEMU's usb-hub (a full-speed hub, 8 ports) on
+# the second controller's root port 1 and usb-kbd on its port 1. Passes
+# only if:
+#   - the hub is driven (hub descriptor, Configure Endpoint as a hub, its
+#     ports powered) and the keyboard behind it is enumerated by route
+#     string ("hc1 port 5.1": QEMU's bus port 1 is the controller's first
+#     USB 2 root port, after its four USB 3 ones) and ready: "hc1 slot 2: keyboard ready";
+#   - `echo hi` + Enter at rzsh's prompt shows `hi` under it, and Ctrl-C
+#     kills `spin` (`echo $?` shows 130);
+#   - after QMP device_del of the hub, both it and the keyboard below it
+#     are detached (each slot disabled) and the keyboard's keys released;
+#   - after device_add of the hub and of the keyboard on its port 1, the
+#     keyboard is ready again and `echo back` types;
+#   - no panic or exception on screen.
+#
+# Usage: tools/test_usb_boot.sh [enumerate|keyboard|keyboard-msi|keyboard-poll|keyboard-hub]
 #                                                       (default enumerate)
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for the boot (default 120)
@@ -80,11 +96,12 @@ set -u
 
 MODE="${1:-enumerate}"
 case "$MODE" in
-    enumerate|keyboard|keyboard-msi|keyboard-poll) ;;
-    *) echo "usage: $0 [enumerate|keyboard|keyboard-msi|keyboard-poll]" >&2; exit 2 ;;
+    enumerate|keyboard|keyboard-msi|keyboard-poll|keyboard-hub) ;;
+    *) echo "usage: $0 [enumerate|keyboard|keyboard-msi|keyboard-poll|keyboard-hub]" >&2; exit 2 ;;
 esac
 # Every keyboard boot types into rzsh on the screen; keyboard-msi and
-# keyboard-poll differ only in the boot option and what they type.
+# keyboard-poll differ only in the boot option and what they type, and
+# keyboard-hub in where the keyboard is.
 KBD=0
 case "$MODE" in keyboard*) KBD=1 ;; esac
 
@@ -179,12 +196,15 @@ if [ "$KBD" = 1 ]; then
     XHCI_OPT=""
     [ "$MODE" = keyboard-msi ] && XHCI_OPT=",msi=on"
     case "$MODE" in
-        keyboard) VIA=MSI-X ;;
+        keyboard|keyboard-hub) VIA=MSI-X ;;
         keyboard-msi) VIA=MSI ;;
         keyboard-poll) VIA=polled ;;
     esac
+    # The keyboard's slot: behind the hub it is the second device.
+    KSLOT=1
+    [ "$MODE" = keyboard-hub ] && KSLOT=2
     common=(
-        --expect "\\[usb\\] hc1 slot 1: keyboard ready \\(endpoint 0x81, interval [0-9]+, $VIA\\)"
+        --expect "\\[usb\\] hc1 slot $KSLOT: keyboard ready \\(endpoint 0x81, interval [0-9]+, $VIA\\)"
         --send '(?m)^rzsh>$' 'e c h o spc h i ret'
         --expect '(?m)^rzsh> echo hi\nhi$'
         --send '(?m)^hi\nrzsh>$' 's p i n ret'
@@ -213,7 +233,26 @@ if [ "$KBD" = 1 ]; then
     keyboard-poll)
         steps=("${common[@]}" --absent '\[xhci\] hc[01] running: MSI(-X)? vector')
         how="a USB keyboard polled from the BSP tick (no vector)" ;;
+    keyboard-hub)
+        # The hub is unplugged with the keyboard on it, then both come
+        # back: the hub on bus port 1, the keyboard on the hub's port 1.
+        steps=(
+            --expect '(?s)\[usb\] hc1 slot 1: hub ready \(8 ports, endpoint 0x81, interval [0-9]+\).*\[usb\] hc1 port [0-9]+\.1: connected, full speed'
+            --expect '\[usb\] hc1 slot 2 addressed: port [0-9]+\.1, address [1-9][0-9]*, EP0 8 bytes'
+            "${common[@]}"
+            --qmp-do '(?m)^130\nrzsh>$' 'device_del id=hub'
+            --expect '\[usb\] hc1 slot 2: keyboard gone, keys released'
+            --expect '\[usb\] hc1 slot 1: hub gone'
+            --qmp-do '(?s)hc1 port [0-9]+\.1: detached \(slot 2 disabled\).*hc1 port [0-9]+: detached \(slot 1 disabled\)' 'device_add driver=usb-hub id=hub bus=xhci1.0 port=1'
+            --qmp-do '(?s)hc1 port [0-9]+: detached \(slot 1 disabled\)' 'device_add driver=usb-kbd id=kbd bus=xhci1.0 port=1.1'
+            --send '(?s)hc1 port [0-9]+: detached \(slot 1 disabled\).*\[usb\] hc1 port [0-9]+\.1: connected, full speed.*\[usb\] hc1 slot [0-9]+: keyboard ready[^\n]*\n' 'e c h o spc b a c k ret'
+            --expect '(?m)^echo back\nback$'
+        )
+        how="a USB keyboard behind a hub" ;;
     esac
+    # Where the keyboard is: on hc1's root port, or behind a hub there.
+    kbd_dev=(-device usb-kbd,id=kbd,bus=xhci1.0)
+    [ "$MODE" = keyboard-hub ] && kbd_dev=(-device usb-hub,id=hub,bus=xhci1.0,port=1 -device usb-kbd,id=kbd,bus=xhci1.0,port=1.1)
     python3 "$SCRIPT_DIR/fbcon_screen.py" watch --qmp "$WORK/qmp.sock" --shots "$WORK/kbd" \
         --timeout "$TIMEOUT" "${steps[@]}" \
         --absent 'KERNEL PANIC|!!! EXCEPTION !!!' -- \
@@ -221,7 +260,7 @@ if [ "$KBD" = 1 ]; then
         -machine q35,i8042=off -serial none -display none -vga std -no-reboot -monitor none \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$ESP" \
-        -device "qemu-xhci,id=xhci0$XHCI_OPT" -device "qemu-xhci,id=xhci1$XHCI_OPT" -device usb-kbd,id=kbd,bus=xhci1.0
+        -device "qemu-xhci,id=xhci0$XHCI_OPT" -device "qemu-xhci,id=xhci1$XHCI_OPT" "${kbd_dev[@]}"
     rc=$?
     [ "$rc" -eq "$EXIT_SETUP" ] && setup_error "QEMU could not be started"
     if [ "$rc" -ne 0 ]; then

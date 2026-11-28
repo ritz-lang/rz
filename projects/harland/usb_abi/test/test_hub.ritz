@@ -1,0 +1,226 @@
+# Harland usb_abi hub tests (AGAST #4890, docs/USB.md "Hubs")
+#
+# What the hub class driver sends and decodes (USB 2.0 chapter 11, USB 3.2
+# chapter 10): the class requests' SETUP packets, the hub descriptor (USB 2
+# and SuperSpeed, good and truncated), wPortStatus / wPortChange and the
+# change each GET_STATUS leaves to clear, the interrupt endpoint's status
+# change bitmap, and the hub interface a configuration offers.
+
+import usb_abi.regs { UsbSpeed }
+import usb_abi.desc { SetupPacket, DescError }
+import usb_abi.hub { HubDesc, HubIface, PortStatus, PortFeature, HubFeature, parse_hub_descriptor, port_status, find_hub_iface, changed_ports, setup_get_hub_descriptor, setup_set_hub_depth, setup_get_port_status, setup_set_port_feature, setup_clear_port_feature, setup_clear_hub_feature, DESC_HUB, DESC_SS_HUB, HUB_PORTS_MAX }
+
+# A 4-port USB 2 hub's descriptor: per-port power switching and
+# over-current (0x0009), TT think time 16 FS bit times (bits 6:5 = 1),
+# 100 ms (50 * 2) to power good, then DeviceRemovable and
+# PortPwrCtrlMask.
+var g_hub: [9]u8 = [9, 0x29, 4, 0x29, 0x00, 50, 100, 0x00, 0xFF]
+
+# A 7-port SuperSpeed hub's descriptor (12 bytes): 2 ms to power good.
+var g_ss_hub: [12]u8 = [12, 0x2A, 7, 0x09, 0x00, 1, 0, 0, 0, 0, 0, 0]
+
+# QEMU's usb-hub: config (9), interface 0 class 9/0/0 with one endpoint
+# (9), endpoint 0x81 interrupt IN, MPS 2, bInterval 255 (7). wTotalLength 25.
+var g_hub_cfg: [25]u8 = [9, 2, 25, 0, 1, 1, 0, 0xE0, 0, 9, 4, 0, 0, 1, 9, 0, 0, 0, 7, 5, 0x81, 3, 2, 0, 0xFF]
+
+# A keyboard's configuration: no hub interface in it.
+var g_kbd_cfg: [34]u8 = [9, 2, 34, 0, 1, 1, 6, 0xA0, 50, 9, 4, 0, 0, 1, 3, 1, 1, 7, 9, 0x21, 0x11, 0x01, 0, 1, 0x22, 0x3F, 0, 7, 5, 0x81, 3, 8, 0, 10]
+
+fn setup_is(s: SetupPacket, rt: u8, req: u8, value: u16, index: u16, len: u16) -> bool
+    s.request_type == rt and s.request == req and s.value == value and s.index == index and s.length == len
+
+fn hub_err(r: Result<HubDesc, DescError>, want: DescError) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e == want
+
+fn ps(status: u16, change: u16) -> PortStatus
+    var b: [4]u8 = [(status & 0xFF) as u8, (status >> 8) as u8, (change & 0xFF) as u8, (change >> 8) as u8]
+    let s: [u8] = @b
+    match port_status(s)
+        Some(p) => p
+        None => PortStatus { status: 0xFFFF, change: 0xFFFF }
+
+# ---------------------------------------------------------------------------
+# Requests
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_hub_class_requests() -> i32
+    # GET_DESCRIPTOR(hub), class device IN: the longest USB 2 descriptor
+    # (7 + 2 * 32 bytes), or the SuperSpeed hub's 12.
+    assert DESC_HUB == 0x29 and DESC_SS_HUB == 0x2A
+    assert setup_is(setup_get_hub_descriptor(false), 0xA0, 6, 0x2900, 0, 71)
+    assert setup_is(setup_get_hub_descriptor(true), 0xA0, 6, 0x2A00, 0, 12)
+    # SET_HUB_DEPTH (USB 3 only), class device OUT.
+    assert setup_is(setup_set_hub_depth(2), 0x20, 12, 2, 0, 0)
+    # GET_STATUS: of port 3 (class other IN), of the hub itself (port 0).
+    assert setup_is(setup_get_port_status(3), 0xA3, 0, 0, 3, 4)
+    assert setup_is(setup_get_port_status(0), 0xA0, 0, 0, 0, 4)
+    # SET_FEATURE / CLEAR_FEATURE on a port, CLEAR_FEATURE on the hub.
+    assert setup_is(setup_set_port_feature(2, PortFeature.Power), 0x23, 3, 8, 2, 0)
+    assert setup_is(setup_set_port_feature(1, PortFeature.Reset), 0x23, 3, 4, 1, 0)
+    assert setup_is(setup_clear_port_feature(4, PortFeature.CConnection), 0x23, 1, 16, 4, 0)
+    assert setup_is(setup_clear_hub_feature(HubFeature.COverCurrent), 0x20, 1, 1, 0, 0)
+    0
+
+# ---------------------------------------------------------------------------
+# Hub descriptor
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_usb2_hub_descriptor() -> i32
+    let b: [u8] = @g_hub
+    match parse_hub_descriptor(b, false)
+        Ok(h) =>
+            assert h.ports == 4
+            assert h.characteristics == 0x0029
+            assert h.power_good_ms == 100
+            assert h.think_time == 1
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_superspeed_hub_descriptor() -> i32
+    let b: [u8] = @g_ss_hub
+    match parse_hub_descriptor(b, true)
+        Ok(h) =>
+            assert h.ports == 7
+            assert h.power_good_ms == 2
+            # A SuperSpeed hub has no transaction translator.
+            assert h.think_time == 0
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_hub_descriptor_malformed() -> i32
+    let b: [u8] = @g_hub
+    assert hub_err(parse_hub_descriptor(b[0..6], false), DescError.Truncated)
+    # bLength past the bytes read.
+    g_hub[0] = 20
+    assert hub_err(parse_hub_descriptor(b, false), DescError.Truncated)
+    g_hub[0] = 5
+    assert hub_err(parse_hub_descriptor(b, false), DescError.BadLength)
+    g_hub[0] = 9
+    # A USB 2 descriptor where a SuperSpeed one was asked for, and back.
+    assert hub_err(parse_hub_descriptor(b, true), DescError.WrongType)
+    let s: [u8] = @g_ss_hub
+    assert hub_err(parse_hub_descriptor(s, false), DescError.WrongType)
+    # A hub with no ports drives nothing.
+    g_hub[2] = 0
+    assert hub_err(parse_hub_descriptor(b, false), DescError.BadLength)
+    g_hub[2] = 4
+    0
+
+# ---------------------------------------------------------------------------
+# Port status
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_port_status_bits() -> i32
+    # Connected, enabled, powered, high speed; connect change.
+    let p: PortStatus = ps(0x0503, 0x0001)
+    assert p.connected()
+    assert p.enabled()
+    assert not p.resetting()
+    assert p.connect_changed()
+    assert p.speed(false) == UsbSpeed.High
+    assert ps(0x0303, 0).speed(false) == UsbSpeed.Low
+    assert ps(0x0103, 0).speed(false) == UsbSpeed.Full
+    # On a SuperSpeed hub every device is SuperSpeed.
+    assert ps(0x0203, 0).speed(true) == UsbSpeed.Super
+    # In reset, not yet enabled, nothing connected.
+    let r: PortStatus = ps(0x0111, 0)
+    assert r.resetting() and not r.enabled()
+    assert not ps(0x0100, 0).connected()
+    0
+
+[[test]]
+fn test_port_status_too_short() -> i32
+    var b: [4]u8 = [1, 1, 1, 0]
+    let s: [u8] = @b
+    assert port_status(s[0..3]).is_none()
+    assert port_status(s).is_some()
+    0
+
+fn change_is(p: PortStatus, usb3: bool, want: PortFeature) -> bool
+    match p.next_change(usb3)
+        Some(f) => f == want
+        None => false
+
+[[test]]
+fn test_port_changes_cleared_lowest_first() -> i32
+    # Connect and reset change: connect first, then reset.
+    assert change_is(ps(0x0103, 0x0011), false, PortFeature.CConnection)
+    assert change_is(ps(0x0103, 0x0010), false, PortFeature.CReset)
+    assert change_is(ps(0x0103, 0x0002), false, PortFeature.CEnable)
+    assert change_is(ps(0x0103, 0x0004), false, PortFeature.CSuspend)
+    assert change_is(ps(0x0103, 0x0008), false, PortFeature.COverCurrent)
+    assert ps(0x0103, 0).next_change(false).is_none()
+    # A change bit USB 2 does not define is not one to clear.
+    assert ps(0x0103, 0x0040).next_change(false).is_none()
+    0
+
+[[test]]
+fn test_superspeed_port_changes() -> i32
+    assert change_is(ps(0x0203, 0x0020), true, PortFeature.CBhReset)
+    assert change_is(ps(0x0203, 0x0040), true, PortFeature.CLinkState)
+    assert change_is(ps(0x0203, 0x0080), true, PortFeature.CConfigError)
+    assert change_is(ps(0x0203, 0x0010), true, PortFeature.CReset)
+    # SuperSpeed has no enable or suspend change.
+    assert ps(0x0203, 0x0006).next_change(true).is_none()
+    0
+
+fn hub_change_is(p: PortStatus, want: HubFeature) -> bool
+    match p.next_hub_change()
+        Some(f) => f == want
+        None => false
+
+[[test]]
+fn test_hub_status_changes() -> i32
+    assert hub_change_is(ps(0, 0x0001), HubFeature.CLocalPower)
+    assert hub_change_is(ps(0, 0x0002), HubFeature.COverCurrent)
+    assert ps(0, 0).next_hub_change().is_none()
+    0
+
+# ---------------------------------------------------------------------------
+# Status change bitmap
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_status_change_bitmap() -> i32
+    # Bit 0 is the hub; bit N port N.
+    var b: [2]u8 = [0x06, 0x01]
+    let s: [u8] = @b
+    assert changed_ports(s, 8) == 0x106
+    # Bits past the hub's ports are noise.
+    assert changed_ports(s, 2) == 0x06
+    assert changed_ports(s[0..1], 8) == 0x06
+    var none: [1]u8 = [0]
+    let n: [u8] = @none
+    assert changed_ports(n, 4) == 0
+    assert HUB_PORTS_MAX == 15
+    0
+
+# ---------------------------------------------------------------------------
+# The hub interface
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_find_hub_interface() -> i32
+    let b: [u8] = @g_hub_cfg
+    match find_hub_iface(b)
+        Some(h) =>
+            assert h.number == 0
+            assert h.ep_addr == 0x81
+            assert h.mps == 2
+            assert h.binterval == 255
+        None =>
+            assert false
+    let k: [u8] = @g_kbd_cfg
+    assert find_hub_iface(k).is_none()
+    # A truncated configuration offers nothing.
+    assert find_hub_iface(b[0..20]).is_none()
+    0
