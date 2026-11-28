@@ -8,6 +8,9 @@ struct payload, and so did the untyped-let typing (emitter_stmt.ritz), so
 #2100 fixed the same gap on the match-bind side; the try path must load the
 payload as the enum aggregate too.
 
+`match lookup(k)?` (AGAST #4835) is an `Option<Pair>` payload as a match
+scrutinee.
+
 Every program exits 42 under ritz0 (the oracle) and must under ritz1.
 """
 
@@ -123,15 +126,32 @@ fn g(k: i32) -> Result<i32, i64>
     let o = mk(k)?
     return Ok(pick(o))
 
+# AGAST #4835: the `?` itself the scrutinee, an `Option<Pair>` matched
+# without a let.  ritz1 left `p` untyped (Sema typed only a struct
+# payload: "cannot emit: unhandled EXPR_MEMBER" at `p.a`).
+struct Pair
+    a: i32
+    b: i32
+
+fn lookup(k: i32) -> Result<Option<Pair>, i64>
+    if k == 2
+        return Err(10)
+    return Ok(Some(Pair { a: 29, b: 1 }))
+
+fn h(k: i32) -> Result<i32, i64>
+    match lookup(k)?
+        Some(p) => Ok(p.a + p.b)
+        None => Ok(100)
+
 pub fn main() -> i32
     var total: i32 = 0
     match g(0)
         Ok(n) => total = total + n
         Err(e) => total = total + 100
-    match g(1)
+    match h(1)
         Ok(n) => total = total + n
         Err(e) => total = total + 100
-    match g(2)
+    match h(2)
         Ok(n) => total = total + 100
         Err(e) => total = total + e as i32
     return total

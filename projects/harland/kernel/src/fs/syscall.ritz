@@ -6,14 +6,16 @@
 
 import klog { klog }
 import serial { StrView }
-import fs.vfs { O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND }
+import fs.vfs { O_WRONLY, O_RDWR, O_EXCL, O_TRUNC, O_APPEND, O_SYNC }
 import fs.fd { FdTable, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_dup, fd_owner, fd_refs, fd_heir }
 import syscall.errno { Errno }
-import fs.kfs { KFS_OK, kfs_get, kfs_ns_for, kfs_local, kfs_is_persist, kfs_persist_write, kfs_persist_create, kfs_persist_mkdir, kfs_save, kfs_save_later }
+import fs.kfs { KFS_OK, kfs_get, kfs_ns_for, kfs_local, kfs_is_persist, kfs_is_durable, kfs_persist_write, kfs_persist_create, kfs_persist_mkdir, kfs_commit_durable, kfs_save, kfs_save_later }
+import fs.open_plan { WriteMode, OpenPlan, open_plan }
 import fs.stat { Stat, stat_of_entry, stat_console }
 import goliath.namespace { Namespace, NsStat, namespace_resolve, namespace_store, namespace_hold, namespace_unhold, namespace_stat }
 import ritzlib.result
 import ritzlib.option
+import ritzlib.span { Span, span_from_ptr }
 import goliath.blob_id { BlobId, blob_id_is_zero, blob_id_copy }
 import goliath.blob_store { MemoryBlobStore, memory_store_get, memory_store_get_size }
 import mm.heap { kalloc, kfree }
@@ -54,6 +56,7 @@ struct FsFile
     path: *u8               # Heap copy of the path, for writable fds (null if none)
     path_len: u64
     meta: NsStat            # The entry as it was at open: what fstat reports
+    create: WriteMode       # Set(mode): the open deferred its create to the close
 
 struct FsProc
     pid: u64
@@ -226,13 +229,16 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
         return Errno.Inval as i64
     let local: StrView = kfs_local(path)
 
-    # Resolve the path to a blob ID
+    # Resolve the path to a blob ID, and decide what O_CREAT / O_EXCL do
+    # about it (fs/persist.ritz open_plan): an O_SYNC create on /var is
+    # deferred to the close's durable commit, any other create happens now.
     var blob_id: BlobId = namespace_resolve(ns, local)
-
-    # Check if file exists
-    if blob_id_is_zero(@blob_id)
-        # File doesn't exist
-        if (flags & O_CREAT) != 0
+    let plan: OpenPlan = match open_plan(not blob_id_is_zero(@blob_id), flags, kfs_is_durable(path))
+        Ok(pl) => pl
+        Err(e) => return e as i64
+    var create: WriteMode = WriteMode.Keep
+    match plan
+        CreateNow =>
             # Create the file with empty content and the caller's mode
             let create_result: i32 = kfs_persist_create(path, mode)
             if create_result != 0
@@ -241,8 +247,9 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
             blob_id = namespace_resolve(ns, local)
             if blob_id_is_zero(@blob_id)
                 return Errno.NoEnt as i64
-        else
-            return Errno.NoEnt as i64
+        CreateAtClose => create = WriteMode.Set(mode)
+        Existing => pass
+    let deferred: bool = plan == OpenPlan.CreateAtClose
 
     # Allocate a file descriptor
     let fd: i32 = fd_alloc(@(*p).table)
@@ -251,12 +258,16 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
 
     # Hold the blob while the fd is open: a rewrite or delete of the path
     # then can't free the bytes data_ptr points at (fs_close_file unholds).
-    if not namespace_hold(ns, @blob_id)
-        fd_free(@(*p).table, fd)
-        return Errno.NoEnt as i64
-    let store: *MemoryBlobStore = namespace_store(ns)
-    let data_ptr: *u8 = memory_store_get(store, @blob_id)
-    let size: u64 = memory_store_get_size(store, @blob_id)
+    # A deferred create has no blob yet: it reads as empty.
+    var data_ptr: *u8 = 0 as *u8
+    var size: u64 = 0
+    if not deferred
+        if not namespace_hold(ns, @blob_id)
+            fd_free(@(*p).table, fd)
+            return Errno.NoEnt as i64
+        let store: *MemoryBlobStore = namespace_store(ns)
+        data_ptr = memory_store_get(store, @blob_id)
+        size = memory_store_get_size(store, @blob_id)
 
     # Set up file state
     let f: *FsFile = @(*p).files[fd]
@@ -271,7 +282,12 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
     (*f).wbuf_cap = 0
     (*f).path = 0 as *u8
     (*f).path_len = 0
-    (*f).meta = fs_open_meta(ns, local)
+    (*f).create = create
+    if deferred
+        # What the close will create: an empty regular file of this mode
+        (*f).meta = NsStat { is_dir: false, size: 0, modified: 0, mode: mode }
+    else
+        (*f).meta = fs_open_meta(ns, local)
 
     # O_TRUNC on a writable fd: the fd reads the file as empty from here, and
     # close commits its write buffer even if it is empty (fs_close_commits).
@@ -287,7 +303,8 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
     if (flags & O_WRONLY) != 0 or (flags & O_RDWR) != 0
         let copy: *u8 = kalloc(path_len + 1)
         if copy == 0 as *u8
-            namespace_unhold(ns, @blob_id)
+            if not deferred
+                namespace_unhold(ns, @blob_id)
             fd_free(@(*p).table, fd)
             return Errno.NoMem as i64
         var i: u64 = 0
@@ -378,19 +395,22 @@ fn fs_close_file(p: *FsProc, fd: i32, by: CloseBy) -> i32
     # so owes the storage device a (debounced) save.
     let wrote: bool = fs_close_commits(f, by)
     let persist: bool = (*f).path != 0 as *u8 and kfs_is_persist(StrView { ptr: (*f).path, len: (*f).path_len as i64 })
+    # An O_SYNC fd's commit saved itself (fs_flush_write_buffer)
+    let durable: bool = fs_is_sync((*f).flags)
     let flush_result: i32 = fs_flush_write_buffer(f, by)
     if (*f).path != 0 as *u8
         kfree((*f).path)
         (*f).path = 0 as *u8
         (*f).path_len = 0
     let ns: *Namespace = (*f).ns
-    if ns != 0 as *Namespace
+    if ns != 0 as *Namespace and not blob_id_is_zero(@(*f).blob_id)
         namespace_unhold(ns, @(*f).blob_id)
     (*f).ns = 0 as *Namespace
     (*f).data_ptr = 0 as *u8
     (*f).position = 0
+    (*f).create = WriteMode.Keep
     fd_free(@(*p).table, fd)
-    if wrote and persist and flush_result == KFS_OK
+    if wrote and persist and not durable and flush_result == KFS_OK
         kfs_save_later()
     flush_result
 
@@ -408,6 +428,7 @@ fn fs_file_move(src: *FsFile, dst: *FsFile)
     (*dst).path = (*src).path
     (*dst).path_len = (*src).path_len
     (*dst).meta = (*src).meta
+    (*dst).create = (*src).create
 
 # ============================================================================
 # sys_read - Read from a file
@@ -536,6 +557,10 @@ pub fn sys_fs_write(fd: i32, buf: *u8, count: u64) -> i64
 #     process closed it with close(2): then an empty buffer commits an empty
 #     file.
 #
+# - the open deferred an O_SYNC create to the close (fs/persist.ritz
+#   open_plan) and the process closed it with close(2): the close creates
+#   the file, empty if nothing was written.
+#
 # Otherwise close leaves the file as it was: an fd opened for writing
 # without O_TRUNC that writes nothing (or only zero-byte writes) does not
 # truncate it, and neither does an O_TRUNC fd that wrote nothing and is
@@ -543,18 +568,34 @@ pub fn sys_fs_write(fd: i32, buf: *u8, count: u64) -> i64
 # open, zero-byte write and close empties the file, while a save killed (or
 # exiting) between its open and its first write leaves the old file: old or
 # new, never a prefix, the empty one included (BUDDHAFINGER_PROPOSAL.md
-# §Harland).
+# §Harland). A deferred create the process exits from without a write
+# leaves no file, the "old" state of a path that had none.
+#
+# On an O_SYNC fd under /var with storage the commit is durable
+# (kfs_commit_durable, fs/REPLACEMENT.md): it is on the storage device
+# before anyone reads it, and if close returns an Errno the file is old in
+# RAM and on the device.
 
 # Whether open flags truncate: O_TRUNC on a writable open.
 fn fs_truncates(flags: i32) -> bool
     (flags & O_TRUNC) != 0 and ((flags & O_WRONLY) != 0 or (flags & O_RDWR) != 0)
+
+# Whether open flags ask for durable commits: all of O_SYNC's bits.
+fn fs_is_sync(flags: i32) -> bool
+    (flags & O_SYNC) == O_SYNC
+
+# Whether the open deferred its create to the close
+fn fs_deferred(f: *FsFile) -> bool
+    match (*f).create
+        Keep => false
+        Set(_) => true
 
 # Whether closing f's last fd, by `by`, replaces the file (the rule above).
 fn fs_close_commits(f: *FsFile, by: CloseBy) -> bool
     if (*f).wbuf != 0 as *u8 and (*f).wbuf_size > 0
         return true
     match by
-        CloseBy.Close => fs_truncates((*f).flags)
+        CloseBy.Close => fs_truncates((*f).flags) or fs_deferred(f)
         CloseBy.Exit => false
 
 # Commit f's write buffer to the namespace if fs_close_commits says so, and
@@ -580,7 +621,13 @@ fn fs_flush_write_buffer(f: *FsFile, by: CloseBy) -> i32
         var bytes: *u8 = @empty
         if wsize > 0
             bytes = wbuf
-        result = kfs_persist_write(path, bytes, wsize)
+        if fs_is_sync((*f).flags)
+            let data: Span<u8> = span_from_ptr<u8>(bytes, wsize as i64)
+            result = match kfs_commit_durable(path, data, (*f).create, ((*f).flags & O_EXCL) != 0)
+                Ok(_) => 0
+                Err(e) => e as i32
+        else
+            result = kfs_persist_write(path, bytes, wsize)
     if wbuf != 0 as *u8
         kfree(wbuf)
     result

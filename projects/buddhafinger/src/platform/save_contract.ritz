@@ -1,0 +1,361 @@
+# platform/save_contract.ritz - the save contract every FileStore keeps (AGAST #4835).
+#
+# harland/kernel/src/fs/REPLACEMENT.md, "Editor and contract suite": the
+# target-neutral cases of the Linux save suite (#4820), run against a
+# FileStore on a real disk. Linux runs them under ritzunit
+# (test/test_save.ritz, LinuxFiles over /tmp); Harland runs them from the
+# bf-save-contract binary (main_save_contract.ritz, HarlandFiles over /var)
+# in the QEMU acceptance test (tools/test_harland_console.sh).
+#
+# A case is a free generic fn over the disk fixture (ContractDisk) and the
+# store, and returns Ok or what broke. It loads, edits and saves as the
+# editor does: the buffer is marked saved on Ok only. The store must be
+# fresh (nothing loaded yet); the disk gives each file its path.
+#
+# The cases (ContractCase): round trips (line endings, untouched bytes, no
+# final newline), a kept final newline, a file bigger than one 4096-byte
+# read, a missing file opened and then created, a second save checked
+# against the first, permissions kept (0750 and 0600), and three files
+# changed underneath and refused: other bytes, the same size with a new
+# mtime, a new file where there was none. A file deleted underneath stays
+# Linux-only (test_save.ritz): Harland has no unlink.
+#
+# A failing storage is its own case, in three steps, because on Harland the
+# failure is a boot option (fault-persist, fault-sync) under which no
+# fixture can be written: contract_fault_prepare writes the old file (a
+# plain boot), contract_failing_save tries a save through the failing store
+# (the fault boot), contract_fault_check finds the old file still there (a
+# later plain boot). Linux runs all three in one test, the failing store a
+# FileStore over a budgeted ENOSPC SaveIo.
+#
+# Linux-only cases (temp-file naming, the fsync/rename order, short writes
+# through SaveIo, the directory fsync, `:w!`) stay in test_save.ritz.
+# No I/O here: the disk and the store do it.
+
+import ritzlib.errno { Errno }
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result { Result }
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview { StrView }
+
+import core.buffer { Buffer, buffer_from_bytes, buffer_new, pos }
+import core.files { FileStore, LoadError, SaveError }
+
+# ============================================================================
+# The disk fixture
+# ============================================================================
+
+# What a case does to the disk besides the store's load and save: make its
+# files, play another program changing them, and read back what is there.
+pub trait ContractDisk
+    # The path of the case's file `name`.
+    fn path(self: @&Self, name: StrView) -> String
+    # Create the missing `path` holding `text`, with permission bits `mode`.
+    fn make(self: @&Self, path: StrView, text: StrView, mode: i32) -> Result<(), Errno>
+    # Another program writes `text` over the existing `path` (its mode kept).
+    fn replace(self: @&Self, path: StrView, text: StrView) -> Result<(), Errno>
+    # Another program gives `path` a new mtime, its size and bytes the same.
+    fn touch(self: @&Self, path: StrView) -> Result<(), Errno>
+    # The bytes at `path`.
+    fn read(self: @&Self, path: StrView) -> Result<Vec<u8>, Errno>
+    # The permission bits of `path` (st_mode & 07777).
+    fn mode(self: @&Self, path: StrView) -> Result<i32, Errno>
+
+# ============================================================================
+# The cases
+# ============================================================================
+
+pub enum ContractCase: u8
+    RoundTrips
+    FinalNewline
+    LargeFile
+    CreateMissing
+    SecondSave
+    Permissions
+    ChangedUnderneath
+    SameSizeNewMtime
+    CreatedUnderneath
+
+impl ContractCase
+    # The case's name, in PASS/FAIL lines and the files' names.
+    pub fn name(self: ContractCase) -> StrView
+        match self
+            RoundTrips => "round-trips"
+            FinalNewline => "final-newline"
+            LargeFile => "large-file"
+            CreateMissing => "create-missing"
+            SecondSave => "second-save"
+            Permissions => "permissions"
+            ChangedUnderneath => "changed-underneath"
+            SameSizeNewMtime => "same-size-new-mtime"
+            CreatedUnderneath => "created-underneath"
+
+# Every case, in order.
+pub fn contract_cases() -> Vec<ContractCase>
+    var all: Vec<ContractCase> = vec_new<ContractCase>()
+    var i: u8 = 0
+    loop
+        match ContractCase.from(i)
+            Some(c) => all.push(c)
+            None => break
+        i += 1
+    all
+
+# Run `case` on `disk` with the fresh `store`.
+pub fn contract_run<D: ContractDisk, S: FileStore>(case: ContractCase, disk: @&D, store: @&S) -> Result<(), String>
+    match case
+        RoundTrips => contract_round_trips(disk, store)
+        FinalNewline => contract_final_newline(disk, store)
+        LargeFile => contract_large_file(disk, store)
+        CreateMissing => contract_create_missing(disk, store)
+        SecondSave => contract_second_save(disk, store)
+        Permissions => contract_permissions(disk, store)
+        ChangedUnderneath => contract_changed_underneath(disk, store)
+        SameSizeNewMtime => contract_same_size_new_mtime(disk, store)
+        CreatedUnderneath => contract_created_underneath(disk, store)
+
+# LF, CRLF, a lone CR, a NUL and no final newline come back as they were,
+# with the edit.
+pub fn contract_round_trips<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = disk.path("round-trips")
+    contract_fixture(disk.make(p.as_view(), "one\ntwo\r\nthree\rfo\x00ur", 420), "make")?
+    var buf = contract_open(store, p.as_view())?
+    contract_expect(not buf.is_dirty(), "the buffer is dirty straight after the load")?
+    contract_edit(@&buf, "X")
+    contract_expect(buf.is_dirty(), "the edit left the buffer clean")?
+    contract_saved(store, p.as_view(), @&buf)?
+    contract_holds(disk, p.as_view(), "Xone\ntwo\r\nthree\rfo\x00ur")
+
+pub fn contract_final_newline<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = disk.path("final-newline")
+    contract_fixture(disk.make(p.as_view(), "a\r\nb\r\n", 420), "make")?
+    var buf = contract_open(store, p.as_view())?
+    contract_edit(@&buf, "z")
+    contract_saved(store, p.as_view(), @&buf)?
+    contract_holds(disk, p.as_view(), "za\r\nb\r\n")
+
+# Far bigger than one 4096-byte read (and Linux's 64 KiB write stage).
+pub fn contract_large_file<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = disk.path("large-file")
+    var want: String = string_new()
+    for i in 0..20000
+        want.push_str("line ")
+        want.push_i64(i)
+        want.push('\n')
+    contract_fixture(disk.make(p.as_view(), want.as_view(), 420), "make")?
+    var buf = contract_open(store, p.as_view())?
+    contract_edit(@&buf, "#")
+    contract_saved(store, p.as_view(), @&buf)?
+    var full: String = string_from("#")
+    full.push_str(want.as_view())
+    contract_holds(disk, p.as_view(), full.as_view())
+
+# `:e` of a missing file is an empty buffer, and `:w` creates the file.
+pub fn contract_create_missing<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = disk.path("create-missing")
+    var buf = contract_open(store, p.as_view())?
+    contract_expect(buf.byte_len() == 0, "the missing file loaded as a non-empty buffer")?
+    contract_edit(@&buf, "hello\n")
+    contract_saved(store, p.as_view(), @&buf)?
+    contract_holds(disk, p.as_view(), "hello\n")
+
+# The save records the new size and mtime, so saving again is not mistaken
+# for an external change.
+pub fn contract_second_save<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = disk.path("second-save")
+    contract_fixture(disk.make(p.as_view(), "a\n", 420), "make")?
+    var buf = contract_open(store, p.as_view())?
+    contract_edit(@&buf, "b")
+    contract_saved(store, p.as_view(), @&buf)?
+    contract_edit(@&buf, "cc")
+    contract_saved(store, p.as_view(), @&buf)?
+    contract_holds(disk, p.as_view(), "ccba\n")
+
+pub fn contract_permissions<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    contract_keeps_mode(disk, store, "permissions-0750", 488)?
+    contract_keeps_mode(disk, store, "permissions-0600", 384)
+
+# Another program rewrote the file: the save is refused and the file kept.
+pub fn contract_changed_underneath<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = disk.path("changed-underneath")
+    contract_fixture(disk.make(p.as_view(), "mine\n", 420), "make")?
+    var buf = contract_open(store, p.as_view())?
+    contract_edit(@&buf, "+")
+    contract_fixture(disk.replace(p.as_view(), "theirs, longer\n"), "replace")?
+    contract_refused(disk, store, p.as_view(), @&buf, "theirs, longer\n")
+
+# The same size, a new mtime: still a change.
+pub fn contract_same_size_new_mtime<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = disk.path("same-size-new-mtime")
+    contract_fixture(disk.make(p.as_view(), "abc\n", 420), "make")?
+    var buf = contract_open(store, p.as_view())?
+    contract_edit(@&buf, "+")
+    contract_fixture(disk.touch(p.as_view()), "touch")?
+    contract_refused(disk, store, p.as_view(), @&buf, "abc\n")
+
+# Opened as a new file, but another program made one there since.
+pub fn contract_created_underneath<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = disk.path("created-underneath")
+    var buf = contract_open(store, p.as_view())?
+    contract_edit(@&buf, "mine\n")
+    contract_fixture(disk.make(p.as_view(), "theirs\n", 420), "make")?
+    contract_refused(disk, store, p.as_view(), @&buf, "theirs\n")
+
+# ============================================================================
+# A failing storage
+# ============================================================================
+
+# What the failing-storage case's file holds before, and after, the save.
+pub const FAULT_OLD_TEXT: StrView = "old contents\n"
+
+# The file the failing-storage case saves to.
+pub fn contract_fault_path<D: ContractDisk>(disk: @&D) -> String
+    disk.path("fault")
+
+# Step 1, on a working disk: the old file.
+pub fn contract_fault_prepare<D: ContractDisk>(disk: @&D) -> Result<(), String>
+    let p = contract_fault_path(disk)
+    contract_fixture(disk.make(p.as_view(), FAULT_OLD_TEXT, 420), "make")?
+    contract_holds(disk, p.as_view(), FAULT_OLD_TEXT)
+
+# Step 2: `store` fails to save (its storage fails, not a change check). The
+# buffer stays dirty and the old bytes still read back.
+pub fn contract_failing_save<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S) -> Result<(), String>
+    let p = contract_fault_path(disk)
+    contract_holds(disk, p.as_view(), FAULT_OLD_TEXT)?
+    var buf = contract_open(store, p.as_view())?
+    contract_edit(@&buf, "new ")
+    match contract_save(store, p.as_view(), @&buf)
+        Ok(_) => return contract_fail("the save through the failing storage succeeded")
+        Err(e) =>
+            match e
+                Changed => return contract_fail("the save was refused as a change, not failed by the storage")
+                Failed(_) => pass
+                Unpersisted(_) => pass
+    contract_expect(buf.is_dirty(), "the failed save left the buffer clean")?
+    contract_holds(disk, p.as_view(), FAULT_OLD_TEXT)
+
+# Step 3, later (on Harland, after a reboot): still the old file.
+pub fn contract_fault_check<D: ContractDisk>(disk: @&D) -> Result<(), String>
+    let p = contract_fault_path(disk)
+    contract_holds(disk, p.as_view(), FAULT_OLD_TEXT)
+
+# ============================================================================
+# Steps the cases share
+# ============================================================================
+
+fn contract_fail(why: StrView) -> Result<(), String>
+    Err(string_from(why))
+
+fn contract_expect(ok: bool, why: StrView) -> Result<(), String>
+    if ok
+        return Ok(())
+    contract_fail(why)
+
+# "<what>: <errno's message>".
+fn contract_errno_text(what: StrView, e: Errno) -> String
+    var s: String = string_from(what)
+    s.push_str(": ")
+    s.push_str(e.message())
+    s.push_str(" (errno ")
+    s.push_i64(e.code() as i64)
+    s.push(')')
+    s
+
+# A fixture step: its Errno as the case's failure.
+fn contract_fixture(r: Result<(), Errno>, what: StrView) -> Result<(), String>
+    match r
+        Ok(_) => Ok(())
+        Err(e) => Err(contract_errno_text(what, e))
+
+fn contract_edit(buf: @&Buffer, text: StrView)
+    let at = buf.insert(pos(0, 0), span_from_strview(text))
+
+# `:e path`, as the editor does it: a missing file is an empty buffer.
+fn contract_open<S: FileStore>(store: @&S, path: StrView) -> Result<Buffer, String>
+    match store.load(path)
+        Ok(bytes) => Ok(buffer_from_bytes(span_from_vec<u8>(@bytes)))
+        Err(e) =>
+            match e
+                NotFound => Ok(buffer_new())
+                Failed(n) => Err(contract_errno_text("load", n))
+
+# `:w`, as the editor does it: the buffer is marked saved on Ok only.
+fn contract_save<S: FileStore>(store: @&S, path: StrView, buf: @&Buffer) -> Result<(), SaveError>
+    let r = store.save(path, buf)
+    if r.is_ok()
+        buf.mark_saved()
+    r
+
+# "<what>: <the SaveError>", for a failure line.
+fn contract_save_text(what: StrView, e: SaveError) -> String
+    match e
+        Changed =>
+            var s: String = string_from(what)
+            s.push_str(": the file changed on disk")
+            s
+        Failed(n) => contract_errno_text(what, n)
+        Unpersisted(n) => contract_errno_text(what, n)
+
+# A save that must succeed and leave the buffer clean.
+fn contract_saved<S: FileStore>(store: @&S, path: StrView, buf: @&Buffer) -> Result<(), String>
+    match contract_save(store, path, buf)
+        Ok(_) => pass
+        Err(e) => return Err(contract_save_text("the save failed", e))
+    contract_expect(not buf.is_dirty(), "the saved buffer is still dirty")
+
+# A save that must be refused as a change, leaving `want` on disk and the
+# buffer dirty.
+fn contract_refused<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S, path: StrView, buf: @&Buffer, want: StrView) -> Result<(), String>
+    match contract_save(store, path, buf)
+        Ok(_) => return contract_fail("the save over a changed file went ahead")
+        Err(e) =>
+            match e
+                Changed => pass
+                Failed(n) => return Err(contract_errno_text("the save over a changed file failed instead of being refused", n))
+                Unpersisted(n) => return Err(contract_errno_text("the save over a changed file failed instead of being refused", n))
+    contract_expect(buf.is_dirty(), "the refused save left the buffer clean")?
+    contract_holds(disk, path, want)
+
+# The file at `path` holds exactly `want`.
+fn contract_holds<D: ContractDisk>(disk: @&D, path: StrView, want: StrView) -> Result<(), String>
+    let bytes: Vec<u8> = match disk.read(path)
+        Ok(b) => b
+        Err(e) => return Err(contract_errno_text("read back", e))
+    let got = bytes.as_view()
+    if got.eq(want)
+        return Ok(())
+    var why: String = string_from("the file holds ")
+    why.push_i64(got.len)
+    why.push_str(" bytes, not the ")
+    why.push_i64(want.len)
+    why.push_str(" expected")
+    if got.len <= 64 and want.len <= 64
+        why.push_str(": \"")
+        why.push_str(got)
+        why.push_str("\", not \"")
+        why.push_str(want)
+        why.push_str("\"")
+    Err(why)
+
+# The file `name`, made with `mode`, edited and saved, still has `mode`.
+fn contract_keeps_mode<D: ContractDisk, S: FileStore>(disk: @&D, store: @&S, name: StrView, mode: i32) -> Result<(), String>
+    let p = disk.path(name)
+    contract_fixture(disk.make(p.as_view(), "echo hi\n", mode), "make")?
+    var buf = contract_open(store, p.as_view())?
+    contract_edit(@&buf, "#")
+    contract_saved(store, p.as_view(), @&buf)?
+    contract_holds(disk, p.as_view(), "#echo hi\n")?
+    let now = match disk.mode(p.as_view())
+        Ok(m) => m
+        Err(e) => return Err(contract_errno_text("stat", e))
+    if now == mode
+        return Ok(())
+    var why: String = string_from(name)
+    why.push_str(": mode ")
+    why.push_i64(now as i64)
+    why.push_str(" after the save, not ")
+    why.push_i64(mode as i64)
+    Err(why)

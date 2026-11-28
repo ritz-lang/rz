@@ -181,7 +181,7 @@ and Buddhafinger's console acceptance test all stage through it (AGAST
 An entry may name the compiler and the ELFs. Buddhafinger builds with
 `ritz1_selfhosted` only, so its entry is
 
-    buddhafinger  compiler=ritz1_selfhosted  bin=buddhafinger.harland:buddhafinger
+    buddhafinger  compiler=ritz1_selfhosted  bin=buddhafinger.harland:buddhafinger  bin=bf-save-contract.harland:bf-save-contract
 
 `compiler=ritz1_selfhosted` builds the package in the builder image
 (`projects/builder`) with that image's compiler, through
@@ -190,8 +190,9 @@ An entry may name the compiler and the ELFs. Buddhafinger builds with
 `projects/buddhafinger/build/builder/`. Staging never bootstraps a compiler:
 `projects/builder/resolve_image.sh` finds `rz-builder:src-<key>` (the
 compiler-source key, #4903) locally, pulls it from ghcr, or builds the image.
-The staged ELF's manifest must name `ritz1_selfhosted`. `bin=` stages only
-the Harland ELF, as `/bin/buddhafinger`, not the Linux editor or bench.
+The staged ELFs' manifests must name `ritz1_selfhosted`. `bin=` stages only
+the Harland ELFs, the editor as `/bin/buddhafinger` and its save contract
+(#4835) as `/bin/bf-save-contract`, not the Linux editor or bench.
 Staging therefore needs docker; `RZ_BUILDER_IMAGE` names an image to use
 instead.
 

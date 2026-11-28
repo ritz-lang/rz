@@ -3,7 +3,7 @@
 # The kernel's persistent filesystem: the same image goliath.file_store keeps
 # in a host file (goliath.image), behind two one-sector slot headers, on any
 # device that reads and writes 512-byte sectors. The device is a BlockDevice
-# (an opaque handle and two functions), so the kernel passes its virtio-blk
+# (an opaque handle and three functions), so the kernel passes its virtio-blk
 # driver and a test passes a RAM disk.
 #
 # Layout (integers little-endian):
@@ -26,6 +26,13 @@
 # until that last one-sector write lands the disk still loads the previous
 # tree; a header cut mid-sector fails its checksum and is skipped. The image
 # needs room for itself beside the one in use.
+#
+# Write-back caches (AGAST #4835): a disk that acknowledges a write before
+# it reaches the media (NVMe, AHCI with its write cache on) may make the
+# header durable before the image it names. So a save is image, flush,
+# header, flush: the header is written only once the image is on the media,
+# and the save returns Ok only once the header is too. A failed flush fails
+# the save before the header is written.
 #
 # Free space needs no map: the store is in memory and the image holds only
 # live blobs, so a deleted file's blobs are gone from the next save.
@@ -50,11 +57,17 @@ const BLOCK_IO_SECTORS: u32 = 8
 
 # A device of `sectors` 512-byte sectors. read / write(dev, lba, count, buf)
 # move `count` sectors at `lba` to / from `buf` and return 0 on success.
+# flush(dev) returns 0 once every write it acknowledged is on the media (a
+# write-through device has nothing to do). All three return an i32 status:
+# they are the drivers' C-shaped entry points (a fn pointer per device,
+# shared with the kernel's driver table), and block_store turns them into
+# bools at once (dev_read, dev_write, dev_flush).
 pub struct BlockDevice
     dev: *u8
     sectors: u64
     read: fn(*u8, u64, u32, *u8) -> i32
     write: fn(*u8, u64, u32, *u8) -> i32
+    flush: fn(*u8) -> i32
 
 fn dev_read(d: *BlockDevice, lba: u64, count: u32, buf: *u8) -> bool
     let f: fn(*u8, u64, u32, *u8) -> i32 = (*d).read
@@ -63,6 +76,10 @@ fn dev_read(d: *BlockDevice, lba: u64, count: u32, buf: *u8) -> bool
 fn dev_write(d: *BlockDevice, lba: u64, count: u32, buf: *u8) -> bool
     let f: fn(*u8, u64, u32, *u8) -> i32 = (*d).write
     f((*d).dev, lba, count, buf) == 0
+
+fn dev_flush(d: *BlockDevice) -> bool
+    let f: fn(*u8) -> i32 = (*d).flush
+    f((*d).dev) == 0
 
 fn block_magic_byte(i: i64) -> u8
     "GOLIATHB".get(i)
@@ -230,8 +247,11 @@ pub fn block_store_save(dev: *BlockDevice, ns: *Namespace) -> ErrorCode
     var sink: ImageSink = ImageSink { ctx: @w as *u8, write: writer_write }
     if not image_write(ns, @sink) or not writer_flush(@w)
         return ErrorCode.IoError
-    # The flip: one sector, last
-    if not header_write(dev, idx, gen, lba, len)
+    # The image on the media before the header that names it
+    if not dev_flush(dev)
+        return ErrorCode.IoError
+    # The flip: one sector, last, and on the media before Ok
+    if not header_write(dev, idx, gen, lba, len) or not dev_flush(dev)
         return ErrorCode.IoError
     ErrorCode.Ok
 

@@ -1,0 +1,476 @@
+# Harland - the persistent subtree's commits and saves (AGAST #4835,
+# kernel/src/fs/REPLACEMENT.md)
+#
+# fs/persist.ritz is the part of kfs that decides what /var holds and when
+# it reaches the storage device: the save gate (one writer at a time), plain
+# commits (published at once, saved later) and durable commits (O_SYNC:
+# fork, change, save, adopt); fs/open_plan.ritz is when an O_CREAT creates.
+# Both are pure, so these tests drive it with a RAM disk that can fail on demand and
+# a gate whose park plays the caller that holds it.
+
+import ritzlib.span { Span, span_from_strview }
+import ritzlib.strview { StrView }
+import ritzlib.gvec { Vec, vec_zeroed }
+import ritzlib.result
+import ritzlib.option
+import goliath.hosted { memory_store_new }
+import goliath.blob_id { blob_id_zero }
+import goliath.blob_store { MemoryBlobStore, memory_store_free }
+import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_exists, namespace_stat, NsStat }
+import goliath.block_store { BlockDevice, block_store_load }
+import goliath.error { ErrorCode }
+import syscall.errno { Errno }
+import fs.vfs { O_WRONLY, O_CREAT, O_TRUNC, O_EXCL, O_SYNC }
+import fs.open_plan { WriteMode, OpenPlan, open_plan }
+import fs.persist { Persist, SaveGate, FileCommit, persist_new, persist_save, persist_flush_pending, persist_commit, persist_commit_durable, persist_mkdir }
+
+# ============================================================================
+# A RAM disk, and a gate whose park plays the holder
+# ============================================================================
+
+struct RamDisk
+    data: Vec<u8>
+    sectors: u64
+    fail_write: bool
+    writes: i64
+
+fn ram_read(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
+    let d: *RamDisk = dev as *RamDisk
+    if lba + count as u64 > (*d).sectors
+        return -5
+    let disk: [u8] = (*d).data[(lba * 512) as i64..((lba + count as u64) * 512) as i64]
+    var i: i64 = 0
+    while i < disk.len
+        *(buf + i) = disk[i]
+        i = i + 1
+    0
+
+fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
+    let d: *RamDisk = dev as *RamDisk
+    if (*d).fail_write or lba + count as u64 > (*d).sectors
+        return -5
+    (*d).writes = (*d).writes + 1
+    let disk: [u8] = (*d).data[(lba * 512) as i64..((lba + count as u64) * 512) as i64]
+    var i: i64 = 0
+    while i < disk.len
+        disk[i] = *(buf + i)
+        i = i + 1
+    0
+
+fn ram_flush(dev: *u8) -> i32
+    0
+
+fn ram_new(sectors: u64) -> RamDisk
+    RamDisk { data: vec_zeroed<u8>((sectors * 512) as i64), sectors: sectors, fail_write: false, writes: 0 }
+
+fn ram_device(d: *RamDisk) -> BlockDevice
+    BlockDevice { dev: d as *u8, sectors: (*d).sectors, read: ram_read, write: ram_write, flush: ram_flush }
+
+# What the parked holder does when the waiter parks: it finishes its own
+# work (g_holder_work) and releases the gate. g_park_writes records the
+# device writes when the waiter parked, so a test can see the waiter wrote
+# nothing before the holder was done.
+var g_park_calls: i32 = 0
+var g_park_writes: i64 = -1
+var g_holder: *Persist = null
+var g_disk: *RamDisk = null
+var g_holder_work: i32 = 0
+var g_can_park: bool = true
+
+const HOLDER_SAVES: i32 = 1        # the holder's save was in flight
+const HOLDER_COMMITS: i32 = 2      # the holder was committing /late
+
+fn test_park() -> bool
+    g_park_calls = g_park_calls + 1
+    if not g_can_park
+        return false
+    g_park_writes = (*g_disk).writes
+    # The holder's own section, run as it would after its wake: it owns the
+    # gate until it clears `held`.
+    if g_holder_work == HOLDER_SAVES
+        let r = persist_save_held(g_holder)
+    else if g_holder_work == HOLDER_COMMITS
+        let r = commit_held(g_holder, "/late", "late")
+    (*g_holder).gate.held = false
+    true
+
+fn test_wake()
+    pass
+
+# The holder's work, done while it holds the gate: the unlocked steps are
+# what persist_save and persist_commit run inside it.
+fn persist_save_held(p: *Persist) -> Result<(), Errno>
+    (*p).gate.held = false
+    let r = persist_save(p)
+    (*p).gate.held = true
+    r
+
+fn commit_held(p: *Persist, path: StrView, text: StrView) -> Result<(), Errno>
+    (*p).gate.held = false
+    let r = plain(p, path, text)
+    (*p).gate.held = true
+    r
+
+fn test_gate() -> SaveGate
+    SaveGate { held: false, waits: 0, park: test_park, wake: test_wake }
+
+# A persistent subtree on `disk`, empty, nothing saved yet.
+struct Rig
+    store: MemoryBlobStore
+    ns: Namespace
+    dev: BlockDevice
+    disk: RamDisk
+
+# A rig, wired: its device and namespace point into it, so it is made in
+# place (rig_new, then rig_wire on the local) and stays put.
+fn rig_new() -> Rig
+    var disk: RamDisk = ram_new(256)
+    let dev: BlockDevice = BlockDevice { dev: null, sectors: 0, read: ram_read, write: ram_write, flush: ram_flush }
+    var store: MemoryBlobStore = memory_store_new()
+    Rig { store: store, ns: Namespace { store: null, root: blob_id_zero() }, dev: dev, disk: disk }
+
+fn rig_wire(r: *Rig) -> *Rig
+    (*r).dev = ram_device(@(*r).disk)
+    (*r).ns = namespace_new(@(*r).store)
+    g_park_calls = 0
+    g_park_writes = -1
+    g_holder_work = 0
+    g_can_park = true
+    g_disk = @(*r).disk
+    r
+
+fn rig_persist(r: *Rig) -> Persist
+    persist_new(@(*r).ns, Some(@(*r).dev), test_gate())
+
+fn rig_end(r: *Rig)
+    memory_store_free(@(*r).store)
+    (*r).disk.data.deinit()
+
+fn commit_of(path: StrView, text: StrView, mode: WriteMode) -> FileCommit
+    FileCommit { path: path, data: span_from_strview(text), mode: mode, mtime: 7, excl: false }
+
+fn plain(p: *Persist, path: StrView, text: StrView) -> Result<(), Errno>
+    let c: FileCommit = commit_of(path, text, WriteMode.Keep)
+    persist_commit(p, @c)
+
+fn durable(p: *Persist, path: StrView, text: StrView) -> Result<(), Errno>
+    let c: FileCommit = commit_of(path, text, WriteMode.Keep)
+    persist_commit_durable(p, @c)
+
+fn errno_of(r: Result<(), Errno>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e as i32
+
+fn reads(ns: *Namespace, path: StrView, want: StrView) -> bool
+    let got: Span<u8> = namespace_read(ns, path)
+    got.ptr != null and got.as_strview().eq(want)
+
+# Whether the image on `dev` (a reboot) holds `path` = `want`; "" for no file.
+fn image_reads(dev: *BlockDevice, path: StrView, want: StrView) -> bool
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace
+    var ok: bool = false
+    if block_store_load(dev, @store, @ns) == ErrorCode.Ok
+        if want.len == 0
+            ok = not namespace_exists(@ns, path)
+        else
+            ok = reads(@ns, path, want)
+    memory_store_free(@store)
+    ok
+
+# ============================================================================
+# Durable commits: old everywhere or new everywhere
+# ============================================================================
+
+# A durable commit whose save fails: the running system and the image both
+# still hold the old bytes, and close's error is EIO.
+[[test]]
+fn test_durable_commit_failed_save_is_old_everywhere() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert durable(@p, "/f", "old").is_ok()
+    (*r).disk.fail_write = true
+    assert errno_of(durable(@p, "/f", "new")) == Errno.Io as i32
+    assert reads(@(*r).ns, "/f", "old")
+    (*r).disk.fail_write = false
+    assert image_reads(@(*r).dev, "/f", "old")
+    rig_end(r)
+    0
+
+# fault-sync fails every save the same way, without touching the disk.
+[[test]]
+fn test_durable_commit_under_fault_sync_is_old_everywhere() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert durable(@p, "/f", "old").is_ok()
+    p.fault_sync = true
+    let before: i64 = (*r).disk.writes
+    assert errno_of(durable(@p, "/f", "new")) == Errno.Io as i32
+    assert (*r).disk.writes == before
+    assert reads(@(*r).ns, "/f", "old")
+    assert image_reads(@(*r).dev, "/f", "old")
+    p.fault_sync = false
+    p.fault_persist = true
+    assert errno_of(durable(@p, "/f", "new")) == Errno.Io as i32
+    assert reads(@(*r).ns, "/f", "old")
+    rig_end(r)
+    0
+
+# A durable commit that saves: new bytes live and in the image, and a plain
+# commit pending before it went out with it.
+[[test]]
+fn test_durable_commit_saves_and_clears_pending() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert plain(@p, "/a", "plain").is_ok()
+    assert p.pending
+    assert durable(@p, "/b", "durable").is_ok()
+    assert not p.pending
+    assert reads(@(*r).ns, "/b", "durable")
+    assert image_reads(@(*r).dev, "/b", "durable")
+    assert image_reads(@(*r).dev, "/a", "plain")
+    rig_end(r)
+    0
+
+# A deferred create (O_SYNC | O_CREAT of a missing path) whose save fails
+# leaves no file, not an empty one; one that saves has the open's mode.
+[[test]]
+fn test_deferred_create_failed_save_leaves_no_file() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert persist_save(@p).is_ok()
+    (*r).disk.fail_write = true
+    let c: FileCommit = commit_of("/n", "fresh", WriteMode.Set(384))
+    assert errno_of(persist_commit_durable(@p, @c)) == Errno.Io as i32
+    assert not namespace_exists(@(*r).ns, "/n")
+    (*r).disk.fail_write = false
+    assert image_reads(@(*r).dev, "/n", "")
+    assert persist_commit_durable(@p, @c).is_ok()
+    var mode: u32 = 0
+    match namespace_stat(@(*r).ns, "/n")
+        Ok(st) => mode = st.mode
+        Err(_) => return 1
+    assert mode == 384
+    assert image_reads(@(*r).dev, "/n", "fresh")
+    rig_end(r)
+    0
+
+# O_EXCL holds at the close too: a deferred exclusive create of a path
+# created since its open fails EEXIST and writes nothing.
+[[test]]
+fn test_deferred_exclusive_create_fails_if_the_path_appeared() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert plain(@p, "/x", "theirs").is_ok()
+    let before: i64 = (*r).disk.writes
+    var c: FileCommit = commit_of("/x", "mine", WriteMode.Set(420))
+    c.excl = true
+    assert errno_of(persist_commit_durable(@p, @c)) == Errno.Exist as i32
+    assert (*r).disk.writes == before
+    assert reads(@(*r).ns, "/x", "theirs")
+    rig_end(r)
+    0
+
+# Two deferred creates of one missing path (neither O_EXCL): the last close
+# wins, and the first's file is what it replaced.
+[[test]]
+fn test_two_deferred_creates_last_close_wins() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    let first: FileCommit = commit_of("/n", "first", WriteMode.Set(420))
+    let second: FileCommit = commit_of("/n", "second", WriteMode.Set(420))
+    assert persist_commit_durable(@p, @first).is_ok()
+    assert persist_commit_durable(@p, @second).is_ok()
+    assert reads(@(*r).ns, "/n", "second")
+    assert image_reads(@(*r).dev, "/n", "second")
+    rig_end(r)
+    0
+
+# ============================================================================
+# Plain commits and saves
+# ============================================================================
+
+# A plain commit whose save fails: new in RAM, old after a reboot, still
+# pending; the next good save makes them agree.
+[[test]]
+fn test_plain_commit_failed_save_stays_pending() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert plain(@p, "/f", "old").is_ok()
+    assert persist_save(@p).is_ok()
+    assert plain(@p, "/f", "new").is_ok()
+    (*r).disk.fail_write = true
+    assert errno_of(persist_save(@p)) == Errno.Io as i32
+    assert reads(@(*r).ns, "/f", "new")
+    assert p.pending
+    (*r).disk.fail_write = false
+    assert image_reads(@(*r).dev, "/f", "old")
+    assert persist_save(@p).is_ok()
+    assert not p.pending
+    assert image_reads(@(*r).dev, "/f", "new")
+    rig_end(r)
+    0
+
+# fault-persist fails a plain commit before it changes anything; mkdir is a
+# commit too, and Exist is fine for it.
+[[test]]
+fn test_plain_commit_under_fault_persist_changes_nothing() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert persist_mkdir(@p, "/d").is_ok()
+    assert persist_mkdir(@p, "/d").is_ok()
+    assert plain(@p, "/d/f", "old").is_ok()
+    p.fault_persist = true
+    assert errno_of(plain(@p, "/d/f", "new")) == Errno.Io as i32
+    assert errno_of(persist_mkdir(@p, "/e")) == Errno.Io as i32
+    assert reads(@(*r).ns, "/d/f", "old")
+    assert not namespace_exists(@(*r).ns, "/e")
+    rig_end(r)
+    0
+
+# Without a storage device a save is NoDev, and a durable commit is a plain
+# one: there is nothing to make it durable on.
+[[test]]
+fn test_no_device_saves_are_nodev() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    var p: Persist = persist_new(@ns, None, test_gate())
+    assert errno_of(persist_save(@p)) == Errno.NoDev as i32
+    assert durable(@p, "/f", "ram").is_ok()
+    assert reads(@ns, "/f", "ram")
+    memory_store_free(@store)
+    0
+
+# ============================================================================
+# The save gate
+# ============================================================================
+
+# A save that finds the gate held parks until the holder (mid-save) is done,
+# then writes its own: the two never write the same slot at once, and the
+# image is whole afterwards. A commit waits the same way.
+[[test]]
+fn test_contended_gate_second_save_waits() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    g_holder = @p
+    assert plain(@p, "/f", "one").is_ok()
+    p.gate.held = true
+    g_holder_work = HOLDER_SAVES
+    let before: i64 = (*r).disk.writes
+    assert persist_save(@p).is_ok()
+    assert g_park_calls == 1
+    assert p.gate.waits == 1
+    # It parked before writing anything of its own, then saved after
+    assert g_park_writes == before
+    assert (*r).disk.writes > before
+    assert not p.gate.held
+    assert image_reads(@(*r).dev, "/f", "one")
+    p.gate.held = true
+    assert plain(@p, "/f", "two").is_ok()
+    assert g_park_calls == 2
+    assert reads(@(*r).ns, "/f", "two")
+    rig_end(r)
+    0
+
+# The power-off save (persist_flush_pending) that finds the gate held by a
+# parked save waits for it: it neither skips its save nor writes beside it.
+# Here the holder's save carried the pending change, so nothing is left.
+[[test]]
+fn test_power_off_waits_for_a_parked_save() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    g_holder = @p
+    assert plain(@p, "/f", "unsaved").is_ok()
+    assert p.pending
+    p.gate.held = true
+    g_holder_work = HOLDER_SAVES
+    let before: i64 = (*r).disk.writes
+    assert persist_flush_pending(@p).is_ok()
+    assert g_park_calls == 1
+    assert g_park_writes == before
+    assert not p.pending
+    assert not p.gate.held
+    assert image_reads(@(*r).dev, "/f", "unsaved")
+    rig_end(r)
+    0
+
+# ... and when the parked holder was committing, the change it made is
+# pending once it releases: the power-off save writes it.
+[[test]]
+fn test_power_off_saves_what_a_parked_commit_left() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    g_holder = @p
+    assert persist_save(@p).is_ok()
+    assert not p.pending
+    p.gate.held = true
+    g_holder_work = HOLDER_COMMITS
+    assert persist_flush_pending(@p).is_ok()
+    assert g_park_calls == 1
+    assert not p.pending
+    assert image_reads(@(*r).dev, "/late", "late")
+    rig_end(r)
+    0
+
+# A caller that can't park (boot, an AP) and finds the gate held gets
+# EAGAIN and writes nothing; the gate stays the holder's.
+[[test]]
+fn test_gate_held_and_cannot_park_is_eagain() -> i32
+    var rig: Rig = rig_new()
+    let r: *Rig = rig_wire(@rig)
+    var p: Persist = rig_persist(r)
+    assert plain(@p, "/f", "x").is_ok()
+    p.gate.held = true
+    g_can_park = false
+    let before: i64 = (*r).disk.writes
+    assert errno_of(persist_flush_pending(@p)) == Errno.Again as i32
+    assert (*r).disk.writes == before
+    assert p.gate.held
+    assert p.pending
+    rig_end(r)
+    0
+
+# ============================================================================
+# The open plan: when O_CREAT creates
+# ============================================================================
+
+fn plan_is(r: Result<OpenPlan, Errno>, want: OpenPlan) -> bool
+    match r
+        Ok(p) => p == want
+        Err(_) => false
+
+fn plan_errno(r: Result<OpenPlan, Errno>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e as i32
+
+[[test]]
+fn test_open_plan() -> i32
+    let create: i32 = O_WRONLY | O_CREAT | O_TRUNC
+    let sync_create: i32 = create | O_SYNC
+    # An existing file is opened; O_EXCL refuses it at open, O_SYNC or not.
+    assert plan_is(open_plan(true, create, true), OpenPlan.Existing)
+    assert plan_errno(open_plan(true, create | O_EXCL, false)) == Errno.Exist as i32
+    assert plan_errno(open_plan(true, sync_create | O_EXCL, true)) == Errno.Exist as i32
+    # A missing one: NoEnt without O_CREAT; created at open, or for O_SYNC
+    # on a durable path (/var with storage) at the close.
+    assert plan_errno(open_plan(false, O_WRONLY | O_SYNC, true)) == Errno.NoEnt as i32
+    assert plan_is(open_plan(false, create, true), OpenPlan.CreateNow)
+    assert plan_is(open_plan(false, sync_create, true), OpenPlan.CreateAtClose)
+    assert plan_is(open_plan(false, sync_create | O_EXCL, true), OpenPlan.CreateAtClose)
+    assert plan_is(open_plan(false, sync_create, false), OpenPlan.CreateNow)
+    # A read-only fd commits nothing at its close: it creates now
+    assert plan_is(open_plan(false, O_CREAT | O_SYNC, true), OpenPlan.CreateNow)
+    0

@@ -184,6 +184,39 @@ pub fn namespace_hold(ns: *Namespace, id: *BlobId) -> bool
 pub fn namespace_unhold(ns: *Namespace, id: *BlobId)
     release(ns, id)
 
+# ============================================================================
+# Forks: a candidate tree beside the live one (AGAST #4835)
+# ============================================================================
+#
+# A fork is a second Namespace on the same store whose root is the live
+# root, held once more. Changing the fork rewrites only its own path to the
+# root (copy-on-write), so the live tree is untouched; it can be saved like
+# any namespace, then adopted (its root becomes the live one) or dropped.
+# The kernel's durable commit is exactly that: fork, change, save, adopt.
+# A change to the live namespace while a fork exists leaves the fork as it
+# was. Adopt or drop every fork before the store is freed.
+
+# A fork of `ns`: its tree as it is now, changeable on its own.
+pub fn namespace_fork(ns: *Namespace) -> Namespace
+    let root: BlobId = blob_id_copy(@(*ns).root)
+    memory_store_retain((*ns).store, @root)
+    Namespace { store: (*ns).store, root: root }
+
+# Make `fork`'s tree the live tree of `ns`, releasing the one it replaces.
+# `fork` is left empty (a zero root). Can't fail: no blob is written.
+pub fn namespace_adopt(ns: *Namespace, fork: *Namespace)
+    var old_root: BlobId = blob_id_copy(@(*ns).root)
+    (*ns).root = blob_id_copy(@(*fork).root)
+    (*fork).root = blob_id_zero()
+    release(ns, @old_root)
+
+# Drop `fork`: what only it reached is freed. `fork` is left empty.
+pub fn namespace_drop(fork: *Namespace)
+    var root: BlobId = blob_id_copy(@(*fork).root)
+    (*fork).root = blob_id_zero()
+    if not blob_id_is_zero(@root)
+        release(fork, @root)
+
 # A copy of directory `dir` with entry `name` set to `child` with metadata
 # `meta` (or removed, when `child` is null), stored, with one reference for
 # the caller. Zero and *err set on failure.

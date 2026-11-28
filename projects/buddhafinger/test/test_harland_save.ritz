@@ -3,9 +3,10 @@
 # platform/harland_save.ritz's save, step by step, on Linux: Kernel stands
 # in for Harland's file system through the OneWriteIo seam. It keeps the
 # file the running system sees (`live`), logs each call, and fails the step
-# a test names. Its close commits before it fails, as Harland's close does
-# when the persistent subtree's update fails after the runtime tree's.
-# `Ed` checks the dirty flag and the message through the real editor.
+# a test names. Its close is all or nothing, as Harland's O_SYNC close is
+# (harland/kernel/src/fs/REPLACEMENT.md, #4835): a failed one leaves the old
+# file, or no file, everywhere. `Ed` checks the dirty flag and the message
+# through the real editor.
 
 import ritzlib.errno
 import ritzlib.gvec
@@ -19,7 +20,7 @@ import ritzlib.termsession { Key }
 import core.buffer { Buffer, buffer_from_bytes, pos }
 import core.editor { Editor, editor_open, handle_key }
 import core.files { FileStore, LoadError, SaveError }
-import platform.harland_save { FileStamp, HarlandFiles, Loaded, OneWriteError, OneWriteIo, SavePause, harland_files, harland_load_with, harland_save_with, is_persistent }
+import platform.harland_save { FileStamp, HarlandFiles, Loaded, OPEN_REPLACE, OneWriteError, OneWriteIo, SavePause, harland_files, harland_load_with, harland_save_with }
 
 # ============================================================================
 # Kernel: Harland's file calls, scripted
@@ -31,19 +32,24 @@ const FAIL_STAT: i32 = 1
 const FAIL_CREATE: i32 = 2
 const FAIL_WRITE: i32 = 3
 const FAIL_SHORT: i32 = 4       # the write takes one byte less
-const FAIL_CLOSE: i32 = 5       # commits, then fails (the persistent update)
-const FAIL_SYNC: i32 = 6
+const FAIL_CLOSE: i32 = 5       # the commit fails: nothing changes
+
+# open(2)'s O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, Linux's numbers spelled
+# out: 1 | 64 | 512 | 04010000.
+const WANT_FLAGS: i32 = 1053249
 
 struct Kernel
     exists: bool
     live: Vec<u8>           # what the running system reads
     stamp: FileStamp
     pending: Vec<u8>        # the open fd's write buffer
+    pending_mode: i32       # the mode the open fd's file gets
+    flags: i32              # the last create's open flags
     fail: i32
-    log: String             # S stat, C create, W write, X close, A abandon, Y sync
+    log: String             # S stat, C create, W write, X close, A abandon
 
 fn kernel_with(text: StrView, mode: i32) -> Kernel
-    var k = Kernel { exists: true, live: vec_new<u8>(), stamp: FileStamp { size: text.len, mtime: 0, mtime_ns: 100, mode: mode }, pending: vec_new<u8>(), fail: FAIL_NONE, log: string_new() }
+    var k = Kernel { exists: true, live: vec_new<u8>(), stamp: FileStamp { size: text.len, mtime: 0, mtime_ns: 100, mode: mode }, pending: vec_new<u8>(), pending_mode: mode, flags: 0, fail: FAIL_NONE, log: string_new() }
     k.live.push_view(text)
     k
 
@@ -81,12 +87,14 @@ impl OneWriteIo for Kernel
             return Ok(None)
         Ok(Some(self.stamp))
 
-    fn create(self: @&Kernel, path: StrView, mode: i32) -> Result<(), Errno>
+    # A missing file's create waits for the close (O_SYNC | O_CREAT): the
+    # mode is applied when it commits.
+    fn create(self: @&Kernel, path: StrView, flags: i32, mode: i32) -> Result<(), Errno>
         let w = self.log.push('C')
+        self.flags = flags
         if self.fail == FAIL_CREATE
             return Err(Errno.NoSpc)
-        if not self.exists
-            self.stamp.mode = mode
+        self.pending_mode = if self.exists then self.stamp.mode else mode
         self.pending.clear()
         Ok(())
 
@@ -100,25 +108,21 @@ impl OneWriteIo for Kernel
         self.pending.push_span(data[0..n])
         Ok(n)
 
+    # The transaction: all of the new file, or (FAIL_CLOSE) none of it.
     fn close(self: @&Kernel) -> Result<(), Errno>
         let w = self.log.push('X')
+        if self.fail == FAIL_CLOSE
+            return Err(Errno.Io)
         self.live.clear()
         self.live.push_span(span_from_vec<u8>(@self.pending))
         self.exists = true
         self.stamp.size = self.live.len()
+        self.stamp.mode = self.pending_mode
         self.stamp.mtime_ns += 1
-        if self.fail == FAIL_CLOSE
-            return Err(Errno.Io)
         Ok(())
 
     fn abandon(self: @&Kernel)
         let w = self.log.push('A')
-
-    fn sync(self: @&Kernel) -> Result<(), Errno>
-        let w = self.log.push('Y')
-        if self.fail == FAIL_SYNC
-            return Err(Errno.Other(19))      # ENODEV: no storage device
-        Ok(())
 
 # ============================================================================
 # Ed: the editor on a Kernel
@@ -184,17 +188,27 @@ fn step_of(r: Result<(), OneWriteError>) -> StrView
 # ============================================================================
 
 [[test]]
-fn test_var_save_is_one_write_then_close_then_sync() -> i32
+fn test_var_save_is_one_write_then_the_close() -> i32
+    # No sync after the close: the O_SYNC close is the durable commit.
     var o = open_on("/var/notes.txt", kernel_with("one\ntwo\r\n", 384))
     o.keys("iX\x1b:w\r")
-    assert o.s.k.log.as_view().eq("SCWXYS")
+    assert o.s.k.log.as_view().eq("SCWXS")
     assert o.s.k.holds("Xone\ntwo\r\n")
     assert not o.dirty()
     assert o.says("written")
     0
 
 [[test]]
-fn test_ram_only_save_does_not_sync() -> i32
+fn test_the_save_opens_o_sync() -> i32
+    assert OPEN_REPLACE == WANT_FLAGS
+    var files = harland_files(SavePause.Never)
+    var k = kernel_empty()
+    assert step_of(save_text(@&files, @&k, "/var/f", "f\n")).eq("ok")
+    assert k.flags == WANT_FLAGS
+    0
+
+[[test]]
+fn test_ram_only_save_takes_the_same_steps() -> i32
     var o = open_on("/home/notes.txt", kernel_with("a\n", 420))
     o.keys("ib\x1b:w\r")
     assert o.s.k.log.as_view().eq("SCWXS")
@@ -206,7 +220,7 @@ fn test_ram_only_save_does_not_sync() -> i32
 fn test_empty_save_closes_without_a_write() -> i32
     var o = open_on("/var/e.txt", kernel_with("x", 420))
     o.keys("x:w\r")
-    assert o.s.k.log.as_view().eq("SCXYS")
+    assert o.s.k.log.as_view().eq("SCXS")
     assert o.s.k.holds("")
     assert not o.dirty()
     0
@@ -228,26 +242,48 @@ fn test_a_new_file_is_created_0644_and_an_old_one_keeps_its_mode() -> i32
 # ============================================================================
 
 [[test]]
-fn test_failed_persistent_update_keeps_the_buffer_dirty_and_says_so() -> i32
+fn test_failed_var_close_keeps_the_old_file_and_the_buffer_dirty() -> i32
+    # fault-persist or fault-sync: the O_SYNC close fails, the file is the
+    # old one everywhere. A plain failure, not "may already have changed".
     var o = open_on("/var/p.txt", kernel_with("old\n", 420))
     o.s.k.fail = FAIL_CLOSE
     o.keys("inew \x1b:w\r")
     assert o.dirty()
-    assert o.says("not saved to storage")
-    assert o.says("the live file may already have changed")
-    # The runtime tree took the bytes: what the running system now reads.
-    assert o.s.k.holds("new old\n")
+    assert o.says("not written: Input/output error")
+    assert not o.says("may already have changed")
+    assert o.s.k.holds("old\n")
     assert o.s.k.log.as_view().eq("SCWX")
+    # The record is untouched: once storage works the save is not refused
+    # as a change.
+    o.s.k.fail = FAIL_NONE
+    o.keys(":w\r")
+    assert not o.dirty()
+    assert o.s.k.holds("new old\n")
     0
 
 [[test]]
-fn test_failed_sync_keeps_the_buffer_dirty_and_says_so() -> i32
-    var o = open_on("/var/s.txt", kernel_with("old\n", 420))
-    o.s.k.fail = FAIL_SYNC
-    o.keys("inew \x1b:w\r")
-    assert o.dirty()
-    assert o.says("the live file may already have changed")
-    assert o.s.k.log.as_view().eq("SCWXY")
+fn test_failed_close_of_a_new_file_leaves_no_file() -> i32
+    var files = harland_files(SavePause.Never)
+    var k = kernel_empty()
+    let loaded = harland_load_with(@&files, "/var/n", @&k)
+    k.fail = FAIL_CLOSE
+    assert step_of(save_text(@&files, @&k, "/var/n", "n\n")).eq("close")
+    assert not k.exists
+    k.fail = FAIL_NONE
+    assert step_of(save_text(@&files, @&k, "/var/n", "n\n")).eq("ok")
+    assert k.holds("n\n")
+    assert k.stamp.mode == 420
+    0
+
+[[test]]
+fn test_a_failed_close_is_a_plain_failure() -> i32
+    let e: OneWriteError = OneWriteError.Close(Errno.Io)
+    var failed = false
+    match e.save_error()
+        Failed(n) => failed = n.name().eq("EIO")
+        Changed => pass
+        Unpersisted(_) => pass
+    assert failed
     0
 
 [[test]]
@@ -333,13 +369,4 @@ fn test_a_new_file_that_appeared_meanwhile_is_not_overwritten() -> i32
     o.keys("ix\x1b:w\r")
     assert o.dirty()
     assert o.says("changed on disk")
-    0
-
-[[test]]
-fn test_persistent_paths_are_var_and_below() -> i32
-    assert is_persistent("/var")
-    assert is_persistent("/var/a/b")
-    assert not is_persistent("/variable")
-    assert not is_persistent("/home/var/x")
-    assert not is_persistent("/")
     0

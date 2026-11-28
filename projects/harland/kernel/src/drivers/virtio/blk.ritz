@@ -25,7 +25,7 @@ import drivers.irq_wait { irq_wait_vector }
 import drivers.virtio.vmsix { VIO_MSIX_ENTRY, vio_msix_setup }
 import drivers.virtio.common { VirtioDevice, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, vio_setup_queue_vec, VIO_TRANSPORT_MMIO, vio_read_config64, vq_notify }
 import virtio_abi.virtq { Virtqueue, VringDesc, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_has_used, vq_get_used, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE }
-import drivers.nvme.nvme { NvmeNamespace, nvme_probe, nvme_get_namespace, nvme_ns_sectors, nvme_ns_read, nvme_ns_write }
+import drivers.nvme.nvme { NvmeNamespace, nvme_probe, nvme_get_namespace, nvme_ns_sectors, nvme_ns_read, nvme_ns_write, nvme_ns_flush }
 import drivers.ahci.ahci { AhciDisk, ahci_probe, ahci_get_disk, ahci_disk_rw }
 import drivers.ahci.fis { AhciDir, AHCI_SECTOR_BYTES }
 import mm.heap { kalloc, kfree }
@@ -572,6 +572,23 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
 # Write sectors to the block device (see virtio_blk_rw)
 pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
     return virtio_blk_rw(dev, sector, count, buf, true)
+
+# Make every write this device returned 0 for durable (goliath's
+# BlockDevice.flush, AGAST #4835): 0, or negative on error, the status
+# virtio_blk_read / virtio_blk_write return (that interface's i32).
+#   * virtio-blk: VIRTIO_BLK_F_FLUSH is never negotiated, and a device
+#     without it runs write-through (virtio 1.x §5.2.6.2), so a completed
+#     write is already on the media.
+#   * AHCI: ahci_disk_rw follows every write with FLUSH CACHE EXT when
+#     IDENTIFY says the write cache is on (#4884), so the same holds.
+#   * NVMe: a volatile write cache acknowledges writes early; the Flush
+#     command (nvme_ns_flush) waits for them.
+pub fn virtio_blk_flush(dev: *VirtioBlkDevice) -> i32
+    if dev == 0 as *VirtioBlkDevice
+        return -1
+    if (*dev).nvme != 0 as *NvmeNamespace
+        return nvme_ns_flush((*dev).nvme)
+    return 0
 
 # ============================================================================
 # Utility Functions

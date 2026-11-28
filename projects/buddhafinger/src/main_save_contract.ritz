@@ -1,0 +1,146 @@
+# main_save_contract - bf-save-contract, the save contract on Harland (AGAST #4835).
+#
+#   bf-save-contract run TAG       every case of platform/save_contract.ritz
+#   bf-save-contract prepare TAG   write the failing-storage case's old file
+#   bf-save-contract fault TAG     a save that must fail (a fault-* boot)
+#   bf-save-contract check TAG     the old file is still there (after a reboot)
+#
+# Each case runs through HarlandFiles, the editor's store, on its own files
+# /var/contract-TAG-<name> (flat: no mkdir); a tag names one run, so its
+# files start missing. One line per case, `PASS: <case>` or
+# `FAIL: <case>: <why>`; the exit status is 0 only when every case passed.
+# tools/test_harland_console.sh runs `run` and `prepare` in a plain boot,
+# `fault` under \harland\fault-persist and \harland\fault-sync, and `check`
+# in the plain boot after them. Linux runs the same cases under ritzunit
+# (test/test_save.ritz).
+
+import ritzlib.errno { Errno }
+import ritzlib.gvec
+import ritzlib.io { eprints, prints }
+import ritzlib.option
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_from_strview }
+import ritzlib.string
+import ritzlib.strview { StrView }
+
+import platform.harland_save { FileStamp, HarlandDisk, OPEN_REPLACE, OneWriteIo, SavePause, harland_disk, harland_files }
+import platform.save_contract { ContractCase, ContractDisk, contract_cases, contract_failing_save, contract_fault_check, contract_fault_prepare, contract_run }
+
+const USAGE: StrView = "usage: bf-save-contract run|prepare|fault|check TAG\n"
+const EXIT_PASS: i32 = 0
+const EXIT_FAIL: i32 = 1
+const EXIT_USAGE: i32 = 2
+
+# The contract's disk on Harland: /var/contract-<tag>-<name>, read and
+# written with the calls the save makes (HarlandDisk).
+struct VarDisk
+    prefix: String
+
+fn var_disk(tag: StrView) -> VarDisk
+    var prefix: String = string_from("/var/contract-")
+    prefix.push_str(tag)
+    prefix.push('-')
+    VarDisk { prefix: prefix }
+
+# Write `text` to `path` in one write, as the save does: open (O_SYNC: the
+# file is on the storage device when the close returns), write, close.
+fn var_write(path: StrView, text: StrView, mode: i32) -> Result<(), Errno>
+    var io: HarlandDisk = harland_disk(SavePause.Never, None)
+    io.create(path, OPEN_REPLACE, mode)?
+    if text.len > 0
+        let n = match io.write(span_from_strview(text))
+            Ok(taken) => taken
+            Err(e) =>
+                io.abandon()
+                return Err(e)
+        if n != text.len
+            io.abandon()
+            return Err(Errno.Io)
+    io.close()
+
+fn var_stamp(path: StrView) -> Result<FileStamp, Errno>
+    var io: HarlandDisk = harland_disk(SavePause.Never, None)
+    # Matched as a Result, not `match io.stat(path)?`: the builder image's
+    # ritz1_selfhosted predates #4835's fix for that form.
+    match io.stat(path)
+        Ok(found) =>
+            match found
+                Some(s) => Ok(s)
+                None => Err(Errno.NoEnt)
+        Err(e) => Err(e)
+
+impl ContractDisk for VarDisk
+    fn path(self: @&VarDisk, name: StrView) -> String
+        var p: String = string_from(self.prefix.as_view())
+        p.push_str(name)
+        p
+
+    fn make(self: @&VarDisk, path: StrView, text: StrView, mode: i32) -> Result<(), Errno>
+        var_write(path, text, mode)
+
+    # An existing file keeps its mode across the rewrite.
+    fn replace(self: @&VarDisk, path: StrView, text: StrView) -> Result<(), Errno>
+        let st = var_stamp(path)?
+        var_write(path, text, st.mode)
+
+    # Harland has no utimes: rewrite the same bytes. Every commit takes a new
+    # mtime, strictly later than the last.
+    fn touch(self: @&VarDisk, path: StrView) -> Result<(), Errno>
+        let bytes = self.read(path)?
+        let st = var_stamp(path)?
+        var_write(path, bytes.as_view(), st.mode)
+
+    fn read(self: @&VarDisk, path: StrView) -> Result<Vec<u8>, Errno>
+        var io: HarlandDisk = harland_disk(SavePause.Never, None)
+        let got = io.read(path)?
+        Ok(got.bytes)
+
+    fn mode(self: @&VarDisk, path: StrView) -> Result<i32, Errno>
+        let st = var_stamp(path)?
+        Ok(st.mode)
+
+# One case's line; true when it passed.
+fn report(name: StrView, r: Result<(), String>) -> bool
+    match r
+        Ok(_) =>
+            prints("PASS: ")
+            prints(name)
+            prints("\n")
+            true
+        Err(why) =>
+            prints("FAIL: ")
+            prints(name)
+            prints(": ")
+            prints(why.as_view())
+            prints("\n")
+            false
+
+fn exit_for(passed: bool) -> i32
+    if passed then EXIT_PASS else EXIT_FAIL
+
+# Every case, each with a fresh store.
+fn run_all(disk: @&VarDisk) -> bool
+    let all = contract_cases()
+    var passed = true
+    for i in 0..all.len()
+        let case: ContractCase = all[i]
+        var files = harland_files(SavePause.Never)
+        if not report(case.name(), contract_run(case, disk, @&files))
+            passed = false
+    passed
+
+pub fn main(args: Span<StrView>) -> i32
+    if args.len != 3
+        eprints(USAGE)
+        return EXIT_USAGE
+    var disk = var_disk(args[2])
+    match args[1]
+        "run" => exit_for(run_all(@&disk))
+        "prepare" => exit_for(report("fault-prepare", contract_fault_prepare(@&disk)))
+        "fault" =>
+            var files = harland_files(SavePause.Never)
+            exit_for(report("fault-save", contract_failing_save(@&disk, @&files)))
+        "check" => exit_for(report("fault-check", contract_fault_check(@&disk)))
+        _ =>
+            eprints(USAGE)
+            EXIT_USAGE

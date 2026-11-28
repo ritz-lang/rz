@@ -3,9 +3,9 @@
 import ritzlib.strview { StrView, strview_empty }
 import ritzlib.span { Span, span_from_strview }
 import goliath.blob_id { BlobId, blob_id_eq, blob_id_is_zero }
-import goliath.blob_store { MemoryBlobStore, memory_store_free }
+import goliath.blob_store { MemoryBlobStore, memory_store_free, memory_store_count, memory_store_refs }
 import goliath.hosted { memory_store_new }
-import goliath.namespace { Namespace, namespace_new, namespace_root, namespace_exists, namespace_read, namespace_write, namespace_mkdir, namespace_list, namespace_file_size }
+import goliath.namespace { Namespace, namespace_new, namespace_root, namespace_exists, namespace_read, namespace_write, namespace_mkdir, namespace_list, namespace_file_size, namespace_fork, namespace_adopt, namespace_drop }
 import goliath.dir_entry { NsEntry, dir_entry_is_file, dir_entry_is_dir }
 import goliath.error { ErrorCode }
 
@@ -240,5 +240,93 @@ fn test_namespace_write_root_rejected() -> i32
         memory_store_free(@store)
         return 1
 
+    memory_store_free(@store)
+    0
+
+# ============================================================================
+# Forks: a candidate tree beside the live one (AGAST #4835)
+# ============================================================================
+
+fn put_text(ns: *Namespace, path: StrView, text: StrView) -> ErrorCode
+    let data: Span<u8> = span_from_strview(text)
+    namespace_write(ns, path, @data)
+
+fn reads(ns: *Namespace, path: StrView, want: StrView) -> bool
+    let got: Span<u8> = namespace_read(ns, path)
+    got.ptr != null and got.as_strview().eq(want)
+
+# A fork changed and dropped leaves the live tree, its root's references and
+# the store's blobs as they were.
+[[test]]
+fn test_namespace_fork_drop_leaves_live_tree() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
+    assert put_text(@ns, "/d/f", "old") == ErrorCode.Ok
+    let root: BlobId = namespace_root(@ns)
+    let blobs: i32 = memory_store_count(@store)
+    let refs: i32 = memory_store_refs(@store, @root)
+
+    var cand: Namespace = namespace_fork(@ns)
+    assert memory_store_refs(@store, @root) == refs + 1
+    assert put_text(@cand, "/d/f", "new") == ErrorCode.Ok
+    assert put_text(@cand, "/g", "added") == ErrorCode.Ok
+    assert reads(@cand, "/d/f", "new")
+    # The live tree doesn't see the fork's changes
+    assert reads(@ns, "/d/f", "old")
+    assert not namespace_exists(@ns, "/g")
+
+    namespace_drop(@cand)
+    assert blob_id_is_zero(@cand.root)
+    assert reads(@ns, "/d/f", "old")
+    assert memory_store_refs(@store, @root) == refs
+    assert memory_store_count(@store) == blobs
+    memory_store_free(@store)
+    0
+
+# A fork changed and adopted is the tree a direct change gives: same root
+# blob, and the old tree's blobs are freed.
+[[test]]
+fn test_namespace_fork_adopt_matches_direct_change() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
+    assert put_text(@ns, "/d/f", "old") == ErrorCode.Ok
+
+    var direct_store: MemoryBlobStore = memory_store_new()
+    var direct: Namespace = namespace_new(@direct_store)
+    assert namespace_mkdir(@direct, "/d") == ErrorCode.Ok
+    assert put_text(@direct, "/d/f", "old") == ErrorCode.Ok
+    assert put_text(@direct, "/d/f", "new") == ErrorCode.Ok
+
+    var cand: Namespace = namespace_fork(@ns)
+    assert put_text(@cand, "/d/f", "new") == ErrorCode.Ok
+    namespace_adopt(@ns, @cand)
+    assert blob_id_is_zero(@cand.root)
+    assert reads(@ns, "/d/f", "new")
+    let a: BlobId = namespace_root(@ns)
+    let b: BlobId = namespace_root(@direct)
+    assert blob_id_eq(@a, @b)
+    assert memory_store_count(@store) == memory_store_count(@direct_store)
+    assert memory_store_refs(@store, @a) == 1
+    memory_store_free(@direct_store)
+    memory_store_free(@store)
+    0
+
+# A change to the live tree while a fork exists leaves the fork as it was.
+[[test]]
+fn test_namespace_live_change_leaves_fork_intact() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert put_text(@ns, "/f", "one") == ErrorCode.Ok
+    var cand: Namespace = namespace_fork(@ns)
+    assert put_text(@ns, "/f", "two") == ErrorCode.Ok
+    assert put_text(@ns, "/h", "live") == ErrorCode.Ok
+    assert reads(@cand, "/f", "one")
+    assert not namespace_exists(@cand, "/h")
+    assert reads(@ns, "/f", "two")
+    namespace_drop(@cand)
+    assert reads(@ns, "/f", "two")
+    assert reads(@ns, "/h", "live")
     memory_store_free(@store)
     0

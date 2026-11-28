@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive Buddhafinger on Harland's serial console under QEMU (AGAST #4833).
+"""Drive Buddhafinger on Harland's serial console under QEMU (AGAST #4833, #4835).
 
     harland_console.py SESSION LOG TIMEOUT -- QEMU_ARGV...
 
@@ -27,16 +27,27 @@ Sessions (docs/BUDDHAFINGER_PROPOSAL.md, "Harland acceptance"):
                  new contents, never a prefix; a new .ritz file, coloured,
                  `ipub<Esc>:wq` with no process fault (AGAST #4921)
   reboot         the same disk: every file of `first` persisted as it was
-  fault-persist  booted with \\harland\\fault-persist: `:w` keeps the buffer
-                 dirty and says the live file may already have changed; a
-                 read still gets the old bytes (/var reads are served from
-                 the persistent subtree, whose update failed)
-  fault-sync     booted with \\harland\\fault-sync: the same for a failed sync,
-                 after which the running system reads the new bytes; first,
-                 the file reads as before fault-persist's save
-  after-faults   no faults: the file reads as it was before both failed saves
+  contract       the save contract (platform/save_contract.ritz) through the
+                 editor's store: `bf-save-contract run plain` prints a PASS
+                 line for every case and exits 0; `bf-save-contract prepare
+                 persist` and `prepare sync` write the old files the fault
+                 boots try to replace
+  fault-persist  booted with \\harland\\fault-persist: `:w` fails with the plain
+                 "not written" message, the buffer stays dirty, and the
+                 running system still reads the old bytes; `bf-save-contract
+                 fault persist` passes (its save fails, the old file stays)
+  fault-sync     booted with \\harland\\fault-sync: the same for a failed save
+                 to storage (`fault sync`); first, the file reads as before
+                 fault-persist's save
+  after-faults   no faults: the file reads as it was before both failed
+                 saves, and `bf-save-contract check persist` / `check sync`
+                 find both old files
   ram-only       no storage device: a /tmp save is clean; a /var save stays
                  dirty (without storage kfs makes no /var: the open fails)
+
+A /var save's close is a durable transaction (O_SYNC, harland/kernel/src/fs/
+REPLACEMENT.md): a failed one leaves the old file everywhere, for the running
+system and the next boot alike.
 """
 
 from __future__ import annotations
@@ -54,9 +65,14 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "harland", "tools"))
 from shell_session import EXIT_MARKERS, PROMPT, Console, _in_order, _lines, _ok  # noqa: E402
 
 EDITOR = "buddhafinger"
+CONTRACT = "bf-save-contract"
+# platform/save_contract.ritz's ContractCase names, in order.
+CONTRACT_CASES = [
+    "round-trips", "final-newline", "large-file", "create-missing", "second-save",
+    "permissions", "changed-underneath", "same-size-new-mtime", "created-underneath",
+]
 NOTES = "/var/notes.txt"
 NOTES_TEXT = "hello world"              # one line, then LF: 12 bytes
-CHANGED_TEXT = "draft hello world"      # what a failed save tried to write
 # Seconds with nothing from the guest that count as the editor having
 # painted. A paint is one write; the serial link drains it in well under this.
 QUIET = float(os.environ.get("BF_QUIET", "0.8"))
@@ -304,11 +320,30 @@ def ritz_file(con: Console, timeout: float) -> int:
     return fails
 
 
-def failed_save(con: Console, fault: str, live: str, timeout: float) -> int:
-    """`:w` with the persistent update or the sync failing: dirty, the
-    message, and `live`, what the running system then reads. The editor
-    runs in a 30 x 120 viewport (--rows, --cols: Harland reports no size),
-    wide enough for the whole message."""
+# One contract verdict: "PASS: <case>" or "FAIL: <case>: <why>", to the end
+# of the line (a verdict is the program's last write on its line).
+VERDICT = re.compile(r"(?:PASS|FAIL): .*")
+
+
+def contract(con: Console, args: str, want: list[str], timeout: float, what: str) -> int:
+    """`bf-save-contract ARGS`: exactly the verdicts `want`, then $? = 0.
+    The kernel logs on the same serial console (a heap grow, an munmap), so
+    a verdict can land mid-line after one of its lines: each `PASS: ` /
+    `FAIL: ` is read from where it starts, the kernel's text dropped."""
+    lines = [m.group(0) for line in shell(con, f"{CONTRACT} {args}", timeout)
+             for m in VERDICT.finditer(line)]
+    fails = _ok(lines == want, f"{what}: `{CONTRACT} {args}` prints {len(want)} PASS line(s)",
+                repr(lines).encode())
+    rc = shell(con, "echo $?", timeout)
+    fails += _ok(rc == ["0"], f"{what}: `{CONTRACT} {args}` exits 0", repr(rc).encode())
+    return fails
+
+
+def failed_save(con: Console, fault: str, timeout: float) -> int:
+    """`:w` with the O_SYNC close failing: dirty, the plain "not written"
+    message, and the old file still what the running system reads. The
+    editor runs in a 30 x 120 viewport (--rows, --cols: Harland reports no
+    size), wide enough for the whole message."""
     fails = 0
     ed = Editor(con, timeout, 30, 120)
     fails += _ok(ed.start(f"--rows 30 --cols 120 {NOTES}") and "NORMAL" in ed.scr.row(28),
@@ -316,11 +351,12 @@ def failed_save(con: Console, fault: str, live: str, timeout: float) -> int:
     ed.keys(b"idraft \x1b:w\r")
     msg = ed.scr.message()
     fails += _ok(ed.dirty(), f"{fault}: the buffer stays dirty ([+])", ed.scr.status().encode())
-    fails += _ok("not saved to storage" in msg and "live file may already have changed" in msg,
-                 f"{fault}: the message says the live file may already have changed", msg.encode())
+    fails += _ok(f'"{NOTES}" not written: ' in msg and "may already have changed" not in msg,
+                 f"{fault}: the message says the file was not written", msg.encode())
     out = ed.quit(b":q!\r")
     fails += _ok(out is not None, f"{fault}: :q! leaves the editor", out)
-    fails += file_is(con, NOTES, live + "\n", len(live) + 1, timeout, f"{fault}: the running system's read")
+    fails += file_is(con, NOTES, NOTES_TEXT + "\n", len(NOTES_TEXT) + 1, timeout,
+                     f"{fault}: the running system still reads the old file")
     return fails
 
 
@@ -378,24 +414,37 @@ def reboot(con: Console, timeout: float) -> int:
     return fails
 
 
-# The runtime tree took the new bytes, but a read of a /var path is served
-# from the persistent subtree (kfs_ns_for), whose update failed: the running
-# system still reads the old file.
+# The contract, then the old files the fault boots try to replace: they
+# can't be written there (fault-persist fails every /var commit, and under
+# fault-sync nothing reaches the storage device).
+def contract_session(con: Console, timeout: float) -> int:
+    fails = contract(con, "run plain", [f"PASS: {c}" for c in CONTRACT_CASES], timeout, "contract")
+    for tag in ("persist", "sync"):
+        fails += contract(con, f"prepare {tag}", ["PASS: fault-prepare"], timeout, "contract")
+    return fails
+
+
+# The persistent subtree's commit fails: the close fails, nothing changed.
 def fault_persist(con: Console, timeout: float) -> int:
-    return failed_save(con, "fault-persist", NOTES_TEXT, timeout)
+    fails = failed_save(con, "fault-persist", timeout)
+    return fails + contract(con, "fault persist", ["PASS: fault-save"], timeout, "fault-persist")
 
 
 def fault_sync(con: Console, timeout: float) -> int:
     # fault-persist's save never reached the image.
     fails = file_is(con, NOTES, NOTES_TEXT + "\n", len(NOTES_TEXT) + 1, timeout,
                     "rebooted after the failed persistent update")
-    # Both trees took the new bytes; only the storage device did not.
-    return fails + failed_save(con, "fault-sync", CHANGED_TEXT, timeout)
+    # The save to storage fails, so the close publishes nothing either.
+    fails += failed_save(con, "fault-sync", timeout)
+    return fails + contract(con, "fault sync", ["PASS: fault-save"], timeout, "fault-sync")
 
 
 def after_faults(con: Console, timeout: float) -> int:
-    return file_is(con, NOTES, NOTES_TEXT + "\n", len(NOTES_TEXT) + 1, timeout,
-                   "rebooted after the failed sync")
+    fails = file_is(con, NOTES, NOTES_TEXT + "\n", len(NOTES_TEXT) + 1, timeout,
+                    "rebooted after the failed saves")
+    for tag in ("persist", "sync"):
+        fails += contract(con, f"check {tag}", ["PASS: fault-check"], timeout, "after-faults")
+    return fails
 
 
 def ram_only(con: Console, timeout: float) -> int:
@@ -421,6 +470,7 @@ def ram_only(con: Console, timeout: float) -> int:
 SESSIONS = {
     "first": first,
     "reboot": reboot,
+    "contract": contract_session,
     "fault-persist": fault_persist,
     "fault-sync": fault_sync,
     "after-faults": after_faults,

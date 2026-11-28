@@ -121,6 +121,9 @@ const NVME_CSTS_CFS: u32 = 0x2
 const NVME_ADMIN_CREATE_SQ: u32 = 0x01
 const NVME_ADMIN_CREATE_CQ: u32 = 0x05
 const NVME_ADMIN_IDENTIFY: u32 = 0x06
+# Flush (NVMe base spec, I/O command 00h): every write the controller has
+# completed is on non-volatile media when it completes (AGAST #4835).
+const NVME_CMD_FLUSH: u32 = 0x00
 const NVME_CMD_WRITE: u32 = 0x01
 const NVME_CMD_READ: u32 = 0x02
 
@@ -711,7 +714,12 @@ fn nvme_announce(ns: *NvmeNamespace)
             return
     klog(", ")
     klog_dec(1 << ((*ns).lba_shift as u64))
-    klog("-byte LBAs\n")
+    klog("-byte LBAs")
+    # The block store's flush (nvme_ns_flush), exercised once per namespace
+    if nvme_ns_flush(ns) == 0
+        klog(", flush ok\n")
+    else
+        klog(", flush failed\n")
 
 fn nvme_scan_namespaces(c: *NvmeController)
     var nsid: u32 = 1
@@ -875,6 +883,26 @@ pub fn nvme_ns_read(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i3
 
 pub fn nvme_ns_write(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i32
     return nvme_ns_rw(ns, sector, count, buf, true)
+
+# Flush `ns`'s volatile write cache: when it returns 0, every write
+# nvme_ns_write returned 0 for is on the media. A controller without a
+# volatile write cache completes it at once. The block store calls it
+# between the image and its slot header, and after the header (goliath
+# BlockDevice.flush). Takes the CPU's queue lock like a transfer. Returns 0,
+# or a negative error: the i32 of nvme_ns_read / nvme_ns_write, the block
+# interface's status (goliath BlockDevice), not a new convention.
+pub fn nvme_ns_flush(ns: *NvmeNamespace) -> i32
+    if ns == 0 as *NvmeNamespace
+        return -1
+    let c: *NvmeController = (*ns).ctrl
+    let qi: i32 = nvme_ioq_for_current(c)
+    let q: *NvmeIoQueue = @(*c).ioq[qi]
+    nvme_q_lock(q)
+    var rc: i32 = 0
+    if nvme_io_cmd(c, qi, NVME_CMD_FLUSH, (*ns).nsid, 0, 0, 0, 0, 0) != 0
+        rc = -5
+    nvme_q_unlock(q)
+    return rc
 
 # ============================================================================
 # MSI-X (AGAST #3630, per-CPU queues #4220)

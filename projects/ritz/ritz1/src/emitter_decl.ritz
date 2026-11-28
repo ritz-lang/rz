@@ -1573,39 +1573,43 @@ fn decl_infer_member(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: Ty
 # struct so the alloca matches the load width — without this, the
 # slot is i64-sized and the call's struct arg coerces from a
 # truncated 8-byte register.
+# The Result / Option a `?` unwraps, `inner` being its operand: a fn's
+# return-type name, or (AGAST #3238) a method's, or (#2267) a field's
+# declared type; no_name() when none is known.  decl_infer_try types `let x =
+# f()?` from it, and resolve_scrutinee_enum `match f()?` (AGAST #4835).
+pub fn try_operand_carrier(s: *EmitterState, inner: *Expr) -> StrView
+    if inner == null
+        return no_name()
+    match inner.kind
+        ExprKind.Call =>
+            let fdr: *FnDef = find_call_fn(s, inner)
+            if fdr != null and fdr.return_type == TypeKind.Struct
+                return fdr.return_type_name
+        ExprKind.Method =>
+            return try_method_carrier(s, inner)
+        # AGAST #2267: a field, `let x = h.r?` of `r: Result<T, E>`,
+        # from the field's declared type.  The slot stayed i64, so the
+        # unwrapped `%T` was stored as `i64` (invalid IR).
+        ExprKind.Member =>
+            let cf: *StructField = resolve_member_chain_field(s, inner)
+            if cf != null and cf.field_type == TypeKind.Struct and cf.field_type_name.len > 0
+                if is_tagged_enum_type(cf.field_type_name) == 1
+                    return cf.field_type_name
+        _ => pass
+    no_name()
+
 fn decl_infer_try(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: TypeKind) -> TypeKind
     var var_type: TypeKind = var_type_in
-    var inner_call: *Expr = stmt.var_init.left
-    if inner_call != null
-        # Resolve inner Result/Option's payload type from the
-        # callee's FnDef: a fn's return-type-name, or (AGAST #3238)
-        # a method's, `let p = r.mk()?`.
-        var carrier: StrView = no_name()
-        match inner_call.kind
-            ExprKind.Call =>
-                let fdr: *FnDef = find_call_fn(s, inner_call)
-                if fdr != null and fdr.return_type == TypeKind.Struct
-                    carrier = fdr.return_type_name
-            ExprKind.Method =>
-                carrier = try_method_carrier(s, inner_call)
-            # AGAST #2267: a field, `let x = h.r?` of `r: Result<T, E>`,
-            # from the field's declared type.  The slot stayed i64, so the
-            # unwrapped `%T` was stored as `i64` (invalid IR).
-            ExprKind.Member =>
-                let cf: *StructField = resolve_member_chain_field(s, inner_call)
-                if cf != null and cf.field_type == TypeKind.Struct and cf.field_type_name.len > 0
-                    if is_tagged_enum_type(cf.field_type_name) == 1
-                        carrier = cf.field_type_name
-            _ => pass
-        if carrier.ptr != null and carrier.len > 0
-            # The Ok payload's struct or user-enum type (AGAST
-            # #2105: an enum local is TypeKind.Struct + its name, as
-            # for `let o = Holds(1)` above).
-            let pay: StrView = tagged_enum_payload_named(s, carrier, 1)
-            if pay.ptr != null
-                var_type = TypeKind.Struct
-                dt.var_type = TypeKind.Struct
-                dt.var_type_name = pay
+    let carrier: StrView = try_operand_carrier(s, stmt.var_init.left)
+    if carrier.ptr != null and carrier.len > 0
+        # The Ok payload's struct or user-enum type (AGAST
+        # #2105: an enum local is TypeKind.Struct + its name, as
+        # for `let o = Holds(1)` above).
+        let pay: StrView = tagged_enum_payload_named(s, carrier, 1)
+        if pay.ptr != null
+            var_type = TypeKind.Struct
+            dt.var_type = TypeKind.Struct
+            dt.var_type_name = pay
     var_type
 
 # AGAST #175: address-of expression. `let task = @pool.tasks[i]` used

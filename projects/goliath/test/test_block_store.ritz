@@ -6,7 +6,7 @@ import ritzlib.memory { Allocator }
 import ritzlib.strview { StrView }
 import ritzlib.span { Span, Bytes, span_from_strview }
 import ritzlib.gvec { Vec, vec_zeroed }
-import ritzlib.string { String, string_from_bytes }
+import ritzlib.string { String, string_new, string_from_bytes }
 import goliath.alloc { allocator_alloc, allocator_free }
 import goliath.blob_id { BlobId }
 import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_free, memory_store_count, memory_store_get_span }
@@ -31,6 +31,10 @@ struct RamDisk
     written: i64
     write_budget: i64
     torn: bool
+    # The device calls in order: D per image write, H per slot-header write
+    # (sectors 0 and 1), F per flush. fail_flush makes every flush fail.
+    log: String
+    fail_flush: bool
 
 fn ram_read(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
     let d: *RamDisk = dev as *RamDisk
@@ -48,6 +52,10 @@ fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
     let d: *RamDisk = dev as *RamDisk
     if (*d).fail_io or lba + count as u64 > (*d).sectors
         return -5
+    if lba < 2
+        (*d).log.push('H')
+    else
+        (*d).log.push('D')
     let base: i64 = (lba * 512) as i64
     let disk: [u8] = (*d).data[base..base + count as i64 * 512]
     var s: i64 = 0
@@ -67,15 +75,24 @@ fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
         s = s + 1
     0
 
+# The RAM disk has no write cache, so a flush only records itself.
+fn ram_flush(dev: *u8) -> i32
+    let d: *RamDisk = dev as *RamDisk
+    (*d).log.push('F')
+    if (*d).fail_io or (*d).fail_flush
+        return -5
+    0
+
 # A zeroed (blank) disk of `sectors` sectors
 fn ram_new(sectors: u64) -> RamDisk
-    RamDisk { data: vec_zeroed<u8>((sectors * 512) as i64), sectors: sectors, fail_io: false, written: 0, write_budget: -1, torn: false }
+    RamDisk { data: vec_zeroed<u8>((sectors * 512) as i64), sectors: sectors, fail_io: false, written: 0, write_budget: -1, torn: false, log: string_new(), fail_flush: false }
 
 fn ram_device(d: *RamDisk) -> BlockDevice
-    BlockDevice { dev: d as *u8, sectors: (*d).sectors, read: ram_read, write: ram_write }
+    BlockDevice { dev: d as *u8, sectors: (*d).sectors, read: ram_read, write: ram_write, flush: ram_flush }
 
 fn ram_free(d: *RamDisk)
     (*d).data.deinit()
+    (*d).log.deinit()
 
 fn write_text(ns: *Namespace, path: StrView, text: StrView) -> ErrorCode
     let data: Span<u8> = span_from_strview(text)
@@ -336,6 +353,71 @@ fn test_block_store_out_of_space_keeps_previous() -> i32
     assert crash_tree(@ns, 6, 9000) == ErrorCode.Ok
     assert block_store_save(@dev, @ns) == ErrorCode.OutOfSpace
     assert loaded_gen(@dev) == 5
+    memory_store_free(@store)
+    ram_free(@disk)
+    0
+
+# ---------------------------------------------------------------------------
+# Write-back caches (AGAST #4835)
+# ---------------------------------------------------------------------------
+
+# Whether `log` is one save in durable order: image writes, a flush, the
+# one slot-header write, a flush. On a disk with a write-back cache (NVMe,
+# AHCI with the cache on) only that order keeps a header from reaching the
+# media before the image it names.
+fn durable_order(log: StrView) -> bool
+    let n: i64 = log.len
+    if n < 4 or not log.ends_with("DFHF")
+        return false
+    # Everything before the final flush-header-flush is image
+    let image: StrView = log.take(n - 3)
+    image.find_byte('F') == image.len and log.find_byte('H') == n - 2
+
+# block_store_save orders image -> flush -> header -> flush, on a first save
+# and on one that goes beside a live image.
+[[test]]
+fn test_block_store_save_flushes_image_then_header() -> i32
+    var disk: RamDisk = ram_new(256)
+    var dev: BlockDevice = ram_device(@disk)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert write_text(@ns, "/f", "first") == ErrorCode.Ok
+    assert block_store_save(@dev, @ns) == ErrorCode.Ok
+    assert durable_order(disk.log.as_view())
+    disk.log.clear()
+    assert write_text(@ns, "/f", "second") == ErrorCode.Ok
+    assert block_store_save(@dev, @ns) == ErrorCode.Ok
+    assert durable_order(disk.log.as_view())
+    var store2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace
+    assert block_store_load(@dev, @store2, @ns2) == ErrorCode.Ok
+    assert reads_back(@ns2, "/f", "second")
+    memory_store_free(@store2)
+    memory_store_free(@store)
+    ram_free(@disk)
+    0
+
+# A flush that fails fails the save: the header after it is never written,
+# so the disk still loads the previous generation.
+[[test]]
+fn test_block_store_failed_flush_keeps_previous() -> i32
+    var disk: RamDisk = ram_new(256)
+    var dev: BlockDevice = ram_device(@disk)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert write_text(@ns, "/f", "old") == ErrorCode.Ok
+    assert block_store_save(@dev, @ns) == ErrorCode.Ok
+    disk.log.clear()
+    disk.fail_flush = true
+    assert write_text(@ns, "/f", "new") == ErrorCode.Ok
+    assert block_store_save(@dev, @ns) == ErrorCode.IoError
+    assert not disk.log.as_view().contains("H")
+    disk.fail_flush = false
+    var store2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace
+    assert block_store_load(@dev, @store2, @ns2) == ErrorCode.Ok
+    assert reads_back(@ns2, "/f", "old")
+    memory_store_free(@store2)
     memory_store_free(@store)
     ram_free(@disk)
     0

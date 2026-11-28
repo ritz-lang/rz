@@ -10,6 +10,9 @@
 #             is restored from it at boot and saved with kfs_save, in
 #             goliath's one on-disk image format (goliath.block_store)
 #   * errors: goliath's ErrorCodes become Errno values for the syscall layer
+#   * /var:   the persistent subtree's commits and saves are fs/persist.ritz
+#             (the save gate, plain and durable commits; AGAST #4835), bound
+#             here to the device, the file clock and the wait queue
 #
 # One global namespace (kfs_get). Calls take the *Namespace so callers read
 # like the goliath API they wrap.
@@ -18,17 +21,22 @@ import klog { klog }
 import serial { StrView }
 import arch.x86_64.tsc { time_ns }
 import mm.heap { kalloc, kfree }
-import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_read, virtio_blk_write }
+import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_read, virtio_blk_write, virtio_blk_flush }
+import io { disable_interrupts, enable_interrupts }
 import syscall.errno { Errno }
 import ritzlib.span { Span, span_from_ptr }
 import ritzlib.fmt.digits { fmt_u64_into }
 import ritzlib.memory { Allocator }
 import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_count }
 import goliath.namespace { Namespace, namespace_new, namespace_exists, namespace_read, namespace_write, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_list, namespace_max_modified }
-import goliath.block_store { BlockDevice, block_store_save }
+import goliath.block_store { BlockDevice }
+import ritzlib.result
+import ritzlib.option
+pub import fs.persist { kfs_errno }
+import fs.open_plan { WriteMode }
+import fs.persist { persist_checked, Persist, SaveGate, FileCommit, persist_new, persist_save, persist_flush_pending, persist_commit, persist_commit_durable, persist_mkdir }
 import fs.storage_claim { StorageClaim, storage_claim, storage_claimed }
 import goliath.dir_entry { NsEntry }
-import goliath.error { ErrorCode }
 
 pub const KFS_OK: i32 = 0
 
@@ -51,33 +59,42 @@ fn kfs_dev_read(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
 fn kfs_dev_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
     virtio_blk_write(dev as *VirtioBlkDevice, lba, count, buf)
 
-# ============================================================================
-# Errors
-# ============================================================================
+fn kfs_dev_flush(dev: *u8) -> i32
+    virtio_blk_flush(dev as *VirtioBlkDevice)
 
-# A goliath ErrorCode as the Errno a syscall returns (`as i32`; 0 for Ok)
-pub fn kfs_errno(code: ErrorCode) -> i32
-    if code == ErrorCode.Ok
-        return KFS_OK
-    if code == ErrorCode.NotFound
-        return Errno.NoEnt as i32
-    if code == ErrorCode.AlreadyExists
-        return Errno.Exist as i32
-    if code == ErrorCode.InvalidPath
-        return Errno.Inval as i32
-    if code == ErrorCode.OutOfSpace
-        return Errno.NoSpc as i32
-    if code == ErrorCode.NotADirectory
-        return Errno.NotDir as i32
-    if code == ErrorCode.NotAFile
-        return Errno.IsDir as i32
-    if code == ErrorCode.DirectoryNotEmpty
-        return Errno.NotEmpty as i32
-    if code == ErrorCode.PermissionDenied
-        return Errno.Perm as i32
-    if code == ErrorCode.PathTooLong
-        return Errno.NameTooLong as i32
-    Errno.Io as i32
+# ============================================================================
+# The save gate's wait: the kernel's interrupt wait queue
+# ============================================================================
+#
+# A caller that finds the gate held parks like a driver waiting for its
+# device (proc/waitq.ritz): the holder is a process parked in a storage
+# driver, and its wake (an interrupt) or the gate's release wakes every
+# parked process, each of which re-checks. Declared, not imported:
+# proc/sched imports fs/syscall, which imports this module (the cycle
+# drivers/irq_wait.ritz avoids the same way).
+extern fn waitq_can_park() -> bool
+extern fn waitq_park() -> i32
+extern fn waitq_wake_irq()
+
+fn kfs_gate_park() -> bool
+    if not waitq_can_park()
+        return false
+    disable_interrupts()
+    waitq_park()
+    enable_interrupts()
+    true
+
+fn kfs_gate_wake()
+    waitq_wake_irq()
+
+fn kfs_gate() -> SaveGate
+    SaveGate { held: false, waits: 0, park: kfs_gate_park, wake: kfs_gate_wake }
+
+# Result<(), Errno> as the i32 the syscalls return
+fn kfs_rc(r: Result<(), Errno>) -> i32
+    match r
+        Ok(_) => KFS_OK
+        Err(e) => e as i32
 
 # ============================================================================
 # The global namespace
@@ -85,20 +102,21 @@ pub fn kfs_errno(code: ErrorCode) -> i32
 
 var g_kfs_store: MemoryBlobStore
 var g_kfs_ns: Namespace
-# The persistent subtree. What userspace writes at or below /var lives here
+# The persistent subtree. What userspace writes at or below /var lives here,
+# and only here (the runtime tree's /var is an empty mount point, #4835),
 # and is what kfs_save writes to the storage device; the initramfs root above
 # it never is, so the image can't grow by the initramfs (AGAST #4321).
 var g_kfs_pstore: MemoryBlobStore
 var g_kfs_pns: Namespace
 var g_kfs_dev: BlockDevice
 var g_kfs_has_dev: bool = false
+# Its commits and saves: the gate, `pending`, the faults (fs/persist.ritz)
+var g_kfs_persist: Persist
 # kfs_init's verdict on the storage device (fs/storage_claim.ritz)
 var g_kfs_claim: StorageClaim = StorageClaim.Unreadable
 var g_kfs_initialized: bool = false
-# When kfs_save last ran (time_ns; 0 = never) and whether a debounced save
-# was skipped since (fs_sync/power-off clear it).
+# When kfs_save last ran (time_ns; 0 = never), for kfs_save_later's debounce
 var g_kfs_last_save_ns: u64 = 0
-var g_kfs_save_pending: bool = false
 # The file clock (kfs_clock): this boot's offset, and the last time it gave.
 var g_kfs_clock_base: u64 = 0
 var g_kfs_clock_last: u64 = 0
@@ -119,7 +137,7 @@ pub fn kfs_init(storage: *VirtioBlkDevice, format: bool) -> i32
     g_kfs_ns = namespace_new(@g_kfs_store)
     g_kfs_pns = namespace_new(@g_kfs_pstore)
     if storage != 0 as *VirtioBlkDevice
-        g_kfs_dev = BlockDevice { dev: storage as *u8, sectors: (*storage).capacity, read: kfs_dev_read, write: kfs_dev_write }
+        g_kfs_dev = BlockDevice { dev: storage as *u8, sectors: (*storage).capacity, read: kfs_dev_read, write: kfs_dev_write, flush: kfs_dev_flush }
         g_kfs_claim = storage_claim(@g_kfs_dev, @g_kfs_pstore, @g_kfs_pns, format)
         g_kfs_has_dev = storage_claimed(g_kfs_claim)
         if g_kfs_claim == StorageClaim.Foreign
@@ -132,11 +150,19 @@ pub fn kfs_init(storage: *VirtioBlkDevice, format: bool) -> i32
             # A failed load may have stored part of the image
             g_kfs_pstore = memory_store_new_in(kfs_allocator())
             g_kfs_pns = namespace_new(@g_kfs_pstore)
+    var dev: Option<*BlockDevice> = None
+    if g_kfs_has_dev
+        dev = Some(@g_kfs_dev)
+    g_kfs_persist = persist_new(@g_kfs_pns, dev, kfs_gate())
     # This boot's file clock starts past every time the image holds
     g_kfs_clock_base = namespace_max_modified(@g_kfs_pns)
     g_kfs_clock_last = g_kfs_clock_base
     g_kfs_initialized = true
     if namespace_exists(@g_kfs_ns, "/") == false
+        return -1
+    # /var's mount point, so readdir of / lists it. Without storage there is
+    # none, and a /var path is a missing runtime-tree path.
+    if g_kfs_has_dev and kfs_mkdir(@g_kfs_ns, "/var") != KFS_OK
         return -1
     0
 
@@ -169,19 +195,32 @@ pub fn kfs_blob_count() -> i32
     memory_store_count(@g_kfs_store)
 
 # Save the persistent subtree to the storage device: 0, or an Errno (NoDev
-# without one). A save cut short leaves the previous image loadable.
+# without one). A save cut short leaves the previous image loadable. It
+# waits for the save gate (fs/persist.ritz) like every /var change.
 pub fn kfs_save() -> i32
     if not kfs_has_storage()
         return Errno.NoDev as i32
-    if g_kfs_fault_sync
-        return Errno.Io as i32
-    let rc: i32 = kfs_errno(block_store_save(@g_kfs_dev, @g_kfs_pns))
+    let rc: i32 = kfs_rc(persist_save(@g_kfs_persist))
     # A failing disk is not retried harder either: the next save is still a
     # debounce interval away.
     g_kfs_last_save_ns = time_ns()
-    if rc == KFS_OK
-        g_kfs_save_pending = false
     rc
+
+# Save the persistent subtree if a commit is owed a save: process exit,
+# init's exit and the ACPI power-off. If a parked process holds the save
+# gate, this waits for it rather than skip the save or write beside it
+# (fs/persist.ritz persist_flush_pending). Its callers can't hand an error
+# to anyone (the process is gone, or the machine is going down), so a
+# failed save is logged here; the change stays pending for a later save.
+pub fn kfs_flush_pending()
+    if not kfs_has_storage()
+        return
+    match persist_flush_pending(@g_kfs_persist)
+        Ok(_) => pass
+        Err(e) =>
+            klog("kfs: owed save failed: errno ")
+            klog_dec(0 - e as i64)
+            klog("\n")
 
 # How long a save on close is deferred after the last one: a burst of
 # writes then costs one disk image, not one per file.
@@ -197,32 +236,26 @@ pub fn kfs_save_later() -> i32
     if not kfs_has_storage()
         return Errno.NoDev as i32
     let now: u64 = time_ns()
+    # The commit left `pending` set; a save past the window clears it.
     if g_kfs_last_save_ns != 0 and now - g_kfs_last_save_ns < SAVE_DEBOUNCE_NS
-        g_kfs_save_pending = true
         return KFS_OK
     kfs_save()
 
-# Fault injection (AGAST #4833; the fault-persist and fault-sync boot
-# options): when set, a /var write fails with EIO after the runtime tree took
-# it (kfs_commit), and every save to the storage device fails with EIO
-# (kfs_save). The editor's acceptance test checks what a save reports then,
+# Fault injection (AGAST #4833, redefined by #4835; the fault-persist and
+# fault-sync boot options): with fault-persist every /var commit (a plain
+# close, an O_SYNC close's prepare, a mkdir) fails with EIO before it
+# changes anything; with fault-sync every save to the storage device fails
+# with EIO. The editor's acceptance test checks what a save reports then,
 # and what the running system and the next boot read.
-var g_kfs_fault_persist: bool = false
-var g_kfs_fault_sync: bool = false
-
-# Arm the faults above; main.ritz calls this after kfs_boot, so the boot's
-# own /var write and save are not failed.
+# main.ritz calls this after kfs_boot, so the boot's own /var write and
+# save are not failed.
 pub fn kfs_inject_faults(persist: bool, sync: bool)
-    g_kfs_fault_persist = persist
-    g_kfs_fault_sync = sync
+    g_kfs_persist.fault_persist = persist
+    g_kfs_persist.fault_sync = sync
     if persist
-        klog("kfs: fault-persist set: /var writes fail after the runtime tree\n" as StrView)
+        klog("kfs: fault-persist set: /var commits fail\n" as StrView)
     if sync
         klog("kfs: fault-sync set: saves to the storage device fail\n" as StrView)
-
-# Whether a debounced save is owed to the storage device
-pub fn kfs_save_pending() -> bool
-    g_kfs_save_pending
 
 # ============================================================================
 # The file clock: what a file's modified time is (AGAST #4832)
@@ -266,20 +299,28 @@ fn kfs_persist_prefix(path: StrView) -> i64
 pub fn kfs_is_persist(path: StrView) -> bool
     kfs_persist_prefix(path) != 0
 
+# Whether `path` is in the persistent subtree and the subtree is on a
+# storage device: /var is mounted. Without storage the runtime tree has no
+# /var, so a /var path is simply missing there.
+pub fn kfs_is_durable(path: StrView) -> bool
+    kfs_is_persist(path) and kfs_has_storage()
+
 # The namespace a path lives in: the persistent /var subtree for /var and
-# below, else the runtime tree.
+# below when it is mounted, else the runtime tree.
 pub fn kfs_ns_for(path: StrView) -> *Namespace
-    if kfs_is_persist(path) and g_kfs_initialized
+    if kfs_is_durable(path)
         return @g_kfs_pns
     kfs_get()
 
 # `path` within kfs_ns_for's namespace: "/var/x" is "/x" in the subtree.
 pub fn kfs_local(path: StrView) -> StrView
+    if not kfs_is_durable(path)
+        return path
     let n: i64 = kfs_persist_prefix(path)
     if n == 0
         return path
     if path.len == n
-        return StrView { ptr: c"/", len: 1 }
+        return "/"
     StrView { ptr: path.ptr + n, len: path.len - n }
 
 # ============================================================================
@@ -313,61 +354,60 @@ pub fn kfs_list(ns: *Namespace, path: StrView, entries: *NsEntry, max_entries: i
     Errno.NoEnt as i32
 
 # ============================================================================
-# User writes: the runtime tree and, under /var, the persistent subtree
+# User writes: the runtime tree, or under /var the persistent subtree
 # ============================================================================
 #
 # Userspace sees one tree: the initramfs root with /var on the storage device.
-# A write below /var goes to both -- the runtime copy serves readdir of "/",
-# the persistent copy is what the next boot loads -- and anywhere else only to
-# the runtime tree, which is RAM and gone at reboot.
+# A write below /var goes only to the persistent subtree (what readdir, stat
+# and open of /var read, and what the next boot loads); anywhere else only to
+# the runtime tree, which is RAM and gone at reboot. One copy, so a reader
+# and a reboot can't disagree about which one won (AGAST #4835).
 
-# Write `path` as the running system sees it: the runtime tree, plus the
-# persistent subtree for /var and below. Both copies get one new file-clock
-# reading as their modified time and keep the file's mode (0644 if it is
-# new). 0 or an Errno.
+# Write `path` as the running system sees it, with one new file-clock
+# reading as its modified time, keeping its mode (0644 if it is new). Under
+# /var the save is owed (kfs_save_later). 0 or an Errno.
 pub fn kfs_persist_write(path: StrView, data: *u8, size: u64) -> i32
-    kfs_commit(path, data, size, KfsMode.Keep, 0)
+    kfs_rc(kfs_commit(path, span_from_ptr<u8>(data, size as i64), WriteMode.Keep, false))
 
 # Create (or replace) `path` as an empty file with permission bits `mode`,
 # where kfs_persist_write would write: what open(O_CREAT, mode) does when the
 # path is missing. 0 or an Errno.
 pub fn kfs_persist_create(path: StrView, mode: u32) -> i32
     var empty: u8 = 0
-    kfs_commit(path, @empty, 0, KfsMode.Set, mode)
+    kfs_rc(kfs_commit(path, span_from_ptr<u8>(@empty, 0), WriteMode.Set(mode), false))
 
-# Whether a commit keeps the file's mode or sets it
-enum KfsMode
-    Keep
-    Set
+# The durable commit, an O_SYNC fd's last close: under /var with storage the
+# file is saved to the device before anyone sees it, and on an Errno it is
+# old in RAM and on the device (fs/persist.ritz persist_commit_durable).
+# `mode` is Set for a create the open deferred to here, `excl` its O_EXCL.
+# Anywhere else there is nothing to make durable: a plain write.
+pub fn kfs_commit_durable(path: StrView, data: Span<u8>, mode: WriteMode, excl: bool) -> Result<(), Errno>
+    if not kfs_is_durable(path)
+        return kfs_commit(path, data, mode, excl)
+    let c: FileCommit = FileCommit { path: kfs_local(path), data: data, mode: mode, mtime: kfs_clock(), excl: excl }
+    persist_commit_durable(@g_kfs_persist, @c)
 
-fn kfs_commit(path: StrView, data: *u8, size: u64, how: KfsMode, mode: u32) -> i32
-    let mtime: u64 = kfs_clock()
-    let rc: i32 = kfs_write_meta(kfs_get(), path, data, size, how, mode, mtime)
-    if rc != KFS_OK or not kfs_is_persist(path)
-        return rc
-    if g_kfs_fault_persist
-        return Errno.Io as i32
-    kfs_write_meta(@g_kfs_pns, kfs_local(path), data, size, how, mode, mtime)
+# A plain commit: published now; under /var the save is owed.
+fn kfs_commit(path: StrView, data: Span<u8>, mode: WriteMode, excl: bool) -> Result<(), Errno>
+    let c: FileCommit = FileCommit { path: kfs_local(path), data: data, mode: mode, mtime: kfs_clock(), excl: excl }
+    if kfs_is_durable(path)
+        return persist_commit(@g_kfs_persist, @c)
+    if excl and namespace_exists(kfs_get(), path)
+        return Err(Errno.Exist)
+    match mode
+        Keep => persist_checked(namespace_write_at(kfs_get(), path, @c.data, c.mtime))
+        Set(m) => persist_checked(namespace_write_mode(kfs_get(), path, @c.data, m, c.mtime))
 
-fn kfs_write_meta(ns: *Namespace, path: StrView, data: *u8, size: u64, how: KfsMode, mode: u32, mtime: u64) -> i32
-    let bytes: Span<u8> = span_from_ptr<u8>(data, size as i64)
-    match how
-        Keep => kfs_errno(namespace_write_at(ns, path, @bytes, mtime))
-        Set => kfs_errno(namespace_write_mode(ns, path, @bytes, mode, mtime))
-
-# mkdir `path` as the running system sees it: the runtime tree, plus the
-# persistent subtree for /var and below (Exist is fine in either). 0 or an
-# Errno.
+# mkdir `path` as the running system sees it: the persistent subtree for
+# /var and below (where "/var" itself is the subtree's root, always there),
+# else the runtime tree. Exist is fine under /var. 0 or an Errno.
 pub fn kfs_persist_mkdir(path: StrView) -> i32
-    let rc: i32 = kfs_mkdir(kfs_get(), path)
-    if rc != KFS_OK and rc != Errno.Exist as i32
-        return rc
-    if not kfs_is_persist(path)
+    if not kfs_is_durable(path)
+        return kfs_mkdir(kfs_get(), path)
+    let local: StrView = kfs_local(path)
+    if local.len == 1
         return KFS_OK
-    let prc: i32 = kfs_mkdir(@g_kfs_pns, kfs_local(path))
-    if prc == Errno.Exist as i32
-        return KFS_OK
-    prc
+    kfs_rc(persist_mkdir(@g_kfs_persist, local))
 
 # ============================================================================
 # Boot record
@@ -381,15 +421,11 @@ pub fn kfs_record_boot() -> i64
     let ns: *Namespace = kfs_get()
     if ns == 0 as *Namespace
         return Errno.NoDev as i64
+    # The count is the persistent subtree's (/var's): the initramfs has not
+    # loaded yet, and it never holds /var.
     let pns: *Namespace = kfs_persist_get()
-    let rc: i32 = kfs_persist_mkdir(StrView { ptr: c"/var", len: 4 })
-    if rc != KFS_OK
-        return rc as i64
-    # The count is the persistent subtree's, not the runtime tree's: the
-    # initramfs has not loaded yet, so the runtime tree is empty here and
-    # reading it would restart at 1 every boot.
     var size: u64 = 0
-    let old: *u8 = kfs_read(pns, StrView { ptr: c"/boots", len: 6 }, @size)
+    let old: *u8 = kfs_read(pns, "/boots", @size)
     var boots: u64 = 0
     var i: u64 = 0
     while i < size and old != 0 as *u8
@@ -403,8 +439,7 @@ pub fn kfs_record_boot() -> i64
     # Decimal digits, most significant first (ritzlib.fmt.digits, #1885)
     var buf: [20]u8
     let digits: StrView = fmt_u64_into(@buf, boots)
-    let boot_path: StrView = StrView { ptr: c"/var/boots", len: 10 }
-    let wrc: i32 = kfs_persist_write(boot_path, digits.ptr, digits.len as u64)
+    let wrc: i32 = kfs_persist_write("/var/boots", digits.ptr, digits.len as u64)
     if wrc != KFS_OK
         return wrc as i64
     let src: i32 = kfs_save()

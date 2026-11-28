@@ -224,6 +224,14 @@ else
     echo "FAIL: harland-data: want '$want', got '${got:-nothing}'"
     rc=1
 fi
+# The NVMe Flush command the block store orders its image and slot header
+# with (AGAST #4835): every namespace's announce issues one.
+if grep -aqE "\[nvme\] harland-data nsid [0-9]+: .*-byte LBAs, flush ok" "$SERIAL"; then
+    echo "PASS: harland-data completed an NVMe Flush"
+else
+    echo "FAIL: harland-data: no '[nvme] ... flush ok' (the Flush command failed or never ran)"
+    rc=1
+fi
 if grep -aqE "\[initramfs\] Loaded [1-9]" "$SERIAL"; then
     echo "PASS: initramfs loaded from harland-root"
 else

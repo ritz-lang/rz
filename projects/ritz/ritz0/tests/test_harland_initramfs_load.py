@@ -72,6 +72,23 @@ pub fn klog_hex_prefix(n: u64) -> i32
 IO_STUB = """\
 pub fn halt_loop() -> i32
     return 0
+
+pub fn disable_interrupts()
+    return
+
+pub fn enable_interrupts()
+    return
+
+# kfs.ritz's save gate parks on proc/waitq.ritz (#4835), declared extern
+# there; one thread here, so the gate is never held.
+pub fn waitq_can_park() -> bool
+    false
+
+pub fn waitq_park() -> i32
+    -1
+
+pub fn waitq_wake_irq()
+    return
 """
 
 # A 32 MB bump arena (frees are dropped): each write stores a copy of every
@@ -138,6 +155,9 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
 
 pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
     -5
+
+pub fn virtio_blk_flush(dev: *VirtioBlkDevice) -> i32
+    0
 """
 
 # kfs.ritz debounces a save on close with time_ns (#4321); this harness never
@@ -155,7 +175,7 @@ STUBS = {
     "drivers/virtio/blk.ritz": BLK_STUB,
     "arch/x86_64/tsc.ritz": TSC_STUB,
 }
-REAL = ["fs/kfs.ritz", "fs/storage_claim.ritz", "fs/tar.ritz", "fs/initramfs.ritz", "syscall/errno.ritz"]
+REAL = ["fs/kfs.ritz", "fs/persist.ritz", "fs/open_plan.ritz", "fs/vfs.ritz", "fs/storage_claim.ritz", "fs/tar.ritz", "fs/initramfs.ritz", "syscall/errno.ritz"]
 
 
 def _run(tmp_path, src):

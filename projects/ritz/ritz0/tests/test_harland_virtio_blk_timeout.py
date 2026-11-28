@@ -170,6 +170,9 @@ pub fn nvme_ns_read(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i3
 
 pub fn nvme_ns_write(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i32
     -1
+
+pub fn nvme_ns_flush(ns: *NvmeNamespace) -> i32
+    -1
 """
 
 # blk.ritz probes AHCI and ignores the count (AGAST #4882), then looks up and

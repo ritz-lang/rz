@@ -1,5 +1,5 @@
 #!/bin/bash
-# Buddhafinger's Harland acceptance test (AGAST #4833; docs/
+# Buddhafinger's Harland acceptance test (AGAST #4833, #4835; docs/
 # BUDDHAFINGER_PROPOSAL.md, "Harland acceptance"): the editor, built by
 # ritz1_selfhosted, run from rzsh on the serial console under QEMU.
 #
@@ -8,7 +8,8 @@
 # as indium's Makefile stages them, with init_interactive as /bin/init (the
 # interactive shell's, tools/test_shell_boot.sh in harland). The editor is
 # initramfs.pkgs' buddhafinger entry: the builder image's ritz1_selfhosted
-# builds it, and its Harland ELF is /bin/buddhafinger. tools/harland_console.py plays
+# builds it, and its Harland ELFs are /bin/buddhafinger and /bin/bf-save-contract
+# (the save contract, platform/save_contract.ritz). tools/harland_console.py plays
 # one session per boot; the storage disk (the second virtio-blk: /var's
 # goliath image) is the same qcow2 throughout, so each boot is a reboot of
 # the one before:
@@ -16,10 +17,20 @@
 #   first          edit, bare Escape, :w, :q, the shell's terminal state,
 #                  reopen, an empty save, kills before and after the write
 #   reboot         every file persisted
-#   fault-persist  \harland\fault-persist: the persistent update fails
-#   fault-sync     \harland\fault-sync: the sync fails
-#   after-faults   the file is what it was before both failed saves
+#   contract       `bf-save-contract run plain`: every contract case PASSes,
+#                  exit 0; `prepare persist` / `prepare sync`: the old files
+#   fault-persist  \harland\fault-persist: the persistent update fails; `:w`
+#                  says "not written", the buffer stays dirty and the old
+#                  file is what the running system reads; `bf-save-contract
+#                  fault persist` likewise
+#   fault-sync     \harland\fault-sync: the save to storage fails; the same,
+#                  and `fault sync`
+#   after-faults   the files are what they were before the failed saves
+#                  (`bf-save-contract check persist`, `check sync`)
 #   ram-only       no storage disk: RAM-only and /var saves
+#
+# A /var save's O_SYNC close is all or nothing (harland/kernel/src/fs/
+# REPLACEMENT.md): after a failed one, old everywhere.
 #
 # Boots use KVM where /dev/kvm opens and QEMU's KVM accelerator starts
 # (the probe is test_tier1_boot.sh's), else TCG, said once up front.
@@ -94,14 +105,17 @@ trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm 
 # --no-build: the packages were built above (or, SKIP_BUILD, before).
 bash "$STAGE" --no-build "$WORK/bin" || { echo "FAIL: staging the initramfs packages failed"; exit 1; }
 EDITOR_ELF="$WORK/bin/buddhafinger.elf"
-for f in "$EDITOR_ELF" "$WORK/bin/rzsh.elf" "$WORK/bin/init_interactive.elf"; do
+CONTRACT_ELF="$WORK/bin/bf-save-contract.elf"
+for f in "$EDITOR_ELF" "$CONTRACT_ELF" "$WORK/bin/rzsh.elf" "$WORK/bin/init_interactive.elf"; do
     [ -f "$f" ] || { echo "FAIL: not in the packaged image: /bin/$(basename "$f" .elf)"; exit 1; }
 done
 # The stager already refuses a compiler= entry built by anything else; this
 # says so in the log, and fails if initramfs.pkgs ever drops the pin.
-grep -q '"compiler": *"ritz1_selfhosted"' "$EDITOR_ELF.manifest.json" \
-    || { echo "FAIL: the packaged /bin/buddhafinger was not built by ritz1_selfhosted"; exit 1; }
-echo "packaged: /bin/buddhafinger built by ritz1_selfhosted"
+for f in "$EDITOR_ELF" "$CONTRACT_ELF"; do
+    grep -q '"compiler": *"ritz1_selfhosted"' "$f.manifest.json" \
+        || { echo "FAIL: the packaged /bin/$(basename "$f" .elf) was not built by ritz1_selfhosted"; exit 1; }
+done
+echo "packaged: /bin/buddhafinger and /bin/bf-save-contract built by ritz1_selfhosted"
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" --init init_interactive \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 qemu-img create -q -f qcow2 "$WORK/storage.qcow2" 64M || { echo "FAIL: qemu-img create failed"; exit 1; }
@@ -163,6 +177,7 @@ boot() {
 
 boot first "" yes
 boot reboot "" yes
+boot contract "" yes
 boot fault-persist fault-persist yes
 boot fault-sync fault-sync yes
 boot after-faults "" yes

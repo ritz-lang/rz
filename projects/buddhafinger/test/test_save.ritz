@@ -1,5 +1,12 @@
 # test/test_save.ritz - the Linux save's ritzunit suite (AGAST #4820).
 #
+# The target-neutral cases are platform/save_contract.ritz's (#4835), which
+# Harland runs too; the "Contract" section below runs each through
+# LinuxDisk, a ContractDisk over a /tmp fixture directory. The rest are
+# Linux-only: the temp file, the fsync/rename order, short writes and
+# faults through SaveIo, the directory fsync, `:w!`, and a file deleted
+# underneath (Harland has no unlink).
+#
 # LinuxFiles.load_disk records the file's size and mtime; save writes a temp file in
 # the same directory, fsyncs it, gives it the target's permissions, renames
 # it over the target and fsyncs the directory
@@ -16,6 +23,7 @@ import ritzlib.errno
 import ritzlib.fd
 import ritzlib.fs
 import ritzlib.gvec
+import ritzlib.io { eprints }
 import ritzlib.option
 import ritzlib.process { process_id }
 import ritzlib.result
@@ -26,6 +34,7 @@ import ritzlib.strview
 import core.buffer { Buffer, buffer_new, buffer_from_bytes, pos }
 import core.files { FileStore, LoadError, SaveError }
 import platform.save { DiskCheck, DiskError, DiskLoadError, LinuxFiles, SaveIo, disk_temp_path, linux_files, linux_save_with }
+import platform.save_contract { ContractCase, ContractDisk, contract_cases, contract_fault_check, contract_fault_path, contract_fault_prepare, contract_failing_save, contract_run }
 
 # ============================================================================
 # Fixtures
@@ -190,115 +199,178 @@ impl SaveIo for FaultIo
         rename(from, to)
 
 # ============================================================================
-# Round trips
+# The contract (platform/save_contract.ritz)
+# ============================================================================
+
+# The contract's disk: files in one fixture directory.
+struct LinuxDisk
+    dir: String
+
+impl ContractDisk for LinuxDisk
+    fn path(self: @&LinuxDisk, name: StrView) -> String
+        path_join(self.dir.as_view(), name)
+
+    fn make(self: @&LinuxDisk, path: StrView, text: StrView, mode: i32) -> Result<(), Errno>
+        let n = write_file(path, text)?
+        chmod(path, mode)
+
+    fn replace(self: @&LinuxDisk, path: StrView, text: StrView) -> Result<(), Errno>
+        let n = write_file(path, text)?
+        Ok(())
+
+    # An mtime the save's record can't hold: 2001-09-09.
+    fn touch(self: @&LinuxDisk, path: StrView) -> Result<(), Errno>
+        set_times(path, FileTime.Now, FileTime.At(1000000000))
+
+    fn read(self: @&LinuxDisk, path: StrView) -> Result<Vec<u8>, Errno>
+        let text = read_file(path)?
+        var bytes: Vec<u8> = vec_new<u8>()
+        bytes.push_view(text.as_view())
+        Ok(bytes)
+
+    fn mode(self: @&LinuxDisk, path: StrView) -> Result<i32, Errno>
+        let st = stat(path)?
+        Ok(st.st_mode & 4095)
+
+# A LinuxFiles whose saves write through a FaultIo with `budget` bytes
+# before ENOSPC: the failing storage of the contract's fault case.
+struct FullDisk
+    files: LinuxFiles
+    budget: i64
+
+impl FileStore for FullDisk
+    fn load(self: @&FullDisk, path: StrView) -> Result<Vec<u8>, LoadError>
+        self.files.load(path)
+
+    fn save(self: @&FullDisk, path: StrView, buf: @Buffer) -> Result<(), SaveError>
+        var io = fault_io()
+        io.budget = self.budget
+        match linux_save_with(@&self.files, path, buf, DiskCheck.Checked, @&io)
+            Ok(_) => Ok(())
+            Err(e) => Err(e.save_error())
+
+# Whether `dir` can be listed and holds no temp file (".bf~").
+fn no_temps(dir: @String) -> bool
+    match dir_open(dir.as_view())
+        Ok(it) =>
+            var d = it
+            var clean = true
+            loop
+                match d.next_entry()
+                    Some(e) =>
+                        if e.name.ends_with(".bf~")
+                            clean = false
+                    None => break
+            d.close()
+            clean
+        Err(_) => false
+
+# Run `case` with a fresh LinuxFiles in its own fixture directory; the save
+# leaves no temp file behind. Prints why on a failure.
+[[test_helper]]
+fn contract_ok(case: ContractCase) -> bool
+    var disk = LinuxDisk { dir: fixture_dir(case.name()) }
+    var files = linux_files()
+    let r = contract_run(case, @&disk, @&files)
+    let clean = no_temps(@disk.dir)
+    let gone = remove_dir_all(disk.dir.as_view())
+    match r
+        Ok(_) => clean
+        Err(why) =>
+            eprints("contract case ")
+            eprints(case.name())
+            eprints(": ")
+            eprints(why.as_view())
+            eprints("\n")
+            false
+
+[[test]]
+fn test_contract_round_trips_endings_and_untouched_bytes() -> i32
+    assert contract_ok(ContractCase.RoundTrips)
+    0
+
+[[test]]
+fn test_contract_keeps_the_final_newline() -> i32
+    assert contract_ok(ContractCase.FinalNewline)
+    0
+
+[[test]]
+fn test_contract_saves_a_file_bigger_than_one_chunk() -> i32
+    assert contract_ok(ContractCase.LargeFile)
+    0
+
+[[test]]
+fn test_contract_open_missing_file_then_save_creates_it() -> i32
+    assert contract_ok(ContractCase.CreateMissing)
+    0
+
+[[test]]
+fn test_contract_second_save_checks_against_the_first() -> i32
+    assert contract_ok(ContractCase.SecondSave)
+    0
+
+[[test]]
+fn test_contract_save_preserves_permissions() -> i32
+    assert contract_ok(ContractCase.Permissions)
+    0
+
+[[test]]
+fn test_contract_save_refuses_a_file_changed_underneath() -> i32
+    assert contract_ok(ContractCase.ChangedUnderneath)
+    0
+
+[[test]]
+fn test_contract_save_refuses_a_same_size_file_with_a_new_mtime() -> i32
+    assert contract_ok(ContractCase.SameSizeNewMtime)
+    0
+
+[[test]]
+fn test_contract_save_refuses_a_new_file_created_underneath() -> i32
+    assert contract_ok(ContractCase.CreatedUnderneath)
+    0
+
+[[test]]
+fn test_contract_lists_every_case_once() -> i32
+    # bf-save-contract runs contract_cases(); the tests above name each.
+    let all = contract_cases()
+    assert all.len() == 9
+    for i in 0..all.len()
+        let a: ContractCase = all[i]
+        for j in 0..i
+            let b: ContractCase = all[j]
+            assert not a.name().eq(b.name())
+    let first: ContractCase = all[0]
+    let last: ContractCase = all[8]
+    assert first.name().eq("round-trips")
+    assert last.name().eq("created-underneath")
+    0
+
+[[test]]
+fn test_contract_failing_storage_keeps_the_old_file_and_the_buffer_dirty() -> i32
+    var disk = LinuxDisk { dir: fixture_dir("contractfault") }
+    assert contract_fault_prepare(@&disk).is_ok()
+    var full = FullDisk { files: linux_files(), budget: 5 }
+    let r = contract_failing_save(@&disk, @&full)
+    assert r.is_ok()
+    assert contract_fault_check(@&disk).is_ok()
+    assert no_temps(@disk.dir)
+    # The record is untouched: the same store on a working disk saves,
+    # checked against the load the failed save made.
+    let p = contract_fault_path(@&disk)
+    let buf = buffer_from_bytes(span_from_strview("new old contents\n"))
+    assert full.files.save_disk(p.as_view(), @buf).is_ok()
+    assert holds(@p, "new old contents\n")
+    # And the check would catch a file that changed.
+    assert contract_fault_check(@&disk).is_err()
+    let gone = remove_dir_all(disk.dir.as_view())
+    0
+
+# ============================================================================
+# Changed underneath: the Linux-only parts
 # ============================================================================
 
 [[test]]
-fn test_save_round_trips_endings_and_untouched_bytes() -> i32
-    let d = fixture_dir("roundtrip")
-    let p = in_dir(@d, "f.txt")
-    # LF, CRLF, a lone CR, a NUL and no final newline.
-    put(@p, "one\ntwo\r\nthree\rfo\x00ur", 420)
-    var o = open_ok(@p)
-    assert not o.buffer.is_dirty()
-    edit(@&o, "X")
-    assert o.buffer.is_dirty()
-    assert step_of(o.write()).eq("ok")
-    assert holds(@p, "Xone\ntwo\r\nthree\rfo\x00ur")
-    assert not o.buffer.is_dirty()
-    assert entries(@d) == 1
-    let gone = remove_dir_all(d.as_view())
-    0
-
-[[test]]
-fn test_save_keeps_the_final_newline() -> i32
-    let d = fixture_dir("finalnl")
-    let p = in_dir(@d, "f.txt")
-    put(@p, "a\r\nb\r\n", 420)
-    var o = open_ok(@p)
-    edit(@&o, "z")
-    assert step_of(o.write()).eq("ok")
-    assert holds(@p, "za\r\nb\r\n")
-    let gone = remove_dir_all(d.as_view())
-    0
-
-[[test]]
-fn test_save_streams_a_file_bigger_than_one_chunk() -> i32
-    let d = fixture_dir("big")
-    let p = in_dir(@d, "f.txt")
-    var want: String = string_new()
-    for i in 0..20000
-        want.push_str("line ")
-        want.push_i64(i)
-        want.push('\n')
-    put(@p, want.as_view(), 420)
-    var o = open_ok(@p)
-    edit(@&o, "#")
-    assert step_of(o.write()).eq("ok")
-    var full: String = string_from("#")
-    full.push_str(want.as_view())
-    assert holds(@p, full.as_view())
-    let gone = remove_dir_all(d.as_view())
-    0
-
-[[test]]
-fn test_open_missing_file_then_save_creates_it() -> i32
-    let d = fixture_dir("newfile")
-    let p = in_dir(@d, "new.txt")
-    var o = open_ok(@p)
-    assert o.buffer.byte_len() == 0
-    edit(@&o, "hello\n")
-    assert step_of(o.write()).eq("ok")
-    assert holds(@p, "hello\n")
-    assert not o.buffer.is_dirty()
-    assert entries(@d) == 1
-    let gone = remove_dir_all(d.as_view())
-    0
-
-[[test]]
-fn test_second_save_checks_against_the_first() -> i32
-    # The save records the new size and mtime, so saving again is not
-    # mistaken for an external change.
-    let d = fixture_dir("twice")
-    let p = in_dir(@d, "f.txt")
-    put(@p, "a\n", 420)
-    var o = open_ok(@p)
-    edit(@&o, "b")
-    assert step_of(o.write()).eq("ok")
-    edit(@&o, "cc")
-    assert step_of(o.write()).eq("ok")
-    assert holds(@p, "ccba\n")
-    let gone = remove_dir_all(d.as_view())
-    0
-
-# ============================================================================
-# Permissions
-# ============================================================================
-
-[[test]]
-fn test_save_preserves_permissions() -> i32
-    let d = fixture_dir("perms")
-    let p = in_dir(@d, "run.sh")
-    put(@p, "echo hi\n", 488)                 # 0750
-    var o = open_ok(@p)
-    edit(@&o, "#")
-    assert step_of(o.write()).eq("ok")
-    assert mode_of(@p) == 488
-    let q = in_dir(@d, "secret")
-    put(@q, "k\n", 384)                       # 0600
-    var s = open_ok(@q)
-    edit(@&s, "#")
-    assert step_of(s.write()).eq("ok")
-    assert mode_of(@q) == 384
-    let gone = remove_dir_all(d.as_view())
-    0
-
-# ============================================================================
-# Changed underneath
-# ============================================================================
-
-[[test]]
-fn test_save_refuses_a_file_changed_underneath() -> i32
+fn test_w_bang_overwrites_a_file_changed_underneath() -> i32
     let d = fixture_dir("changed")
     let p = in_dir(@d, "f.txt")
     put(@p, "mine\n", 420)
@@ -314,33 +386,6 @@ fn test_save_refuses_a_file_changed_underneath() -> i32
     assert step_of(o.write_over()).eq("ok")
     assert holds(@p, "+mine\n")
     assert not o.buffer.is_dirty()
-    let gone = remove_dir_all(d.as_view())
-    0
-
-[[test]]
-fn test_save_refuses_a_same_size_file_with_a_new_mtime() -> i32
-    let d = fixture_dir("mtime")
-    let p = in_dir(@d, "f.txt")
-    put(@p, "abc\n", 420)
-    var o = open_ok(@p)
-    edit(@&o, "+")
-    let t = set_times(p.as_view(), FileTime.Now, FileTime.At(1000000000))
-    assert step_of(o.write()).eq("changed")
-    assert holds(@p, "abc\n")
-    assert o.buffer.is_dirty()
-    let gone = remove_dir_all(d.as_view())
-    0
-
-[[test]]
-fn test_save_refuses_a_new_file_created_underneath() -> i32
-    let d = fixture_dir("appeared")
-    let p = in_dir(@d, "f.txt")
-    var o = open_ok(@p)
-    edit(@&o, "mine\n")
-    put(@p, "theirs\n", 420)
-    assert step_of(o.write()).eq("changed")
-    assert holds(@p, "theirs\n")
-    assert o.buffer.is_dirty()
     let gone = remove_dir_all(d.as_view())
     0
 
@@ -539,6 +584,23 @@ fn test_describe_names_the_step_and_the_error() -> i32
     let c: DiskError = DiskError.Changed
     let changed: String = c.describe()
     assert changed.as_view().eq("file changed on disk since it was read (:w! overwrites)")
+    0
+
+# "changed", "failed" or "unpersisted": the SaveError a DiskError becomes.
+fn editor_kind(e: DiskError) -> StrView
+    match e.save_error()
+        Changed => "changed"
+        Failed(_) => "failed"
+        Unpersisted(_) => "unpersisted"
+
+[[test]]
+fn test_a_failed_directory_fsync_is_unpersisted_to_the_editor() -> i32
+    # The rename already replaced the file: "the live file may already have
+    # changed". Every step before it left the file as it was: Failed.
+    assert editor_kind(DiskError.SyncDir(Errno.Io)).eq("unpersisted")
+    assert editor_kind(DiskError.Rename(Errno.Acces)).eq("failed")
+    assert editor_kind(DiskError.Write(Errno.NoSpc)).eq("failed")
+    assert editor_kind(DiskError.Changed).eq("changed")
     0
 
 # ============================================================================

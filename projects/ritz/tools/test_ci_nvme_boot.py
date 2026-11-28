@@ -111,8 +111,9 @@ def _pattern_fnv() -> int:
 
 def nvme_line(sectors: int = 8192, fnv: int | None = None, lba: int = 512) -> str:
     fnv = _pattern_fnv() if fnv is None else fnv
+    # ", flush ok": the namespace's boot-time NVMe Flush (AGAST #4835)
     return (rf"[nvme] harland-data nsid 1: {sectors} sectors, LBA 1-200 fnv1a={fnv}"
-            rf", {lba}-byte LBAs\n")
+            rf", {lba}-byte LBAs, flush ok\n")
 
 
 INITRAMFS = r"[initramfs] Loaded 42 entries\n"

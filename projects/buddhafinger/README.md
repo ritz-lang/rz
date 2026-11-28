@@ -61,11 +61,17 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   `harland` (the console session: termsession's raw mode, a `--rows` x
   `--cols` viewport since Harland reports no window size, KeyReader's timed
   console read for the Escape timeout, input overruns reported) and
-  `harland_save` (`HarlandFiles`: the whole file in one write, the close
-  checked, and for `/var` a `sync` too; a failure keeps the buffer dirty).
+  `harland_save` (`HarlandFiles`: the whole file in one write, opened
+  `O_SYNC` so that for `/var` the checked close is the durable commit, all
+  or nothing; a failure keeps the buffer dirty and the old file), and
+  `save_contract` (the cases every `FileStore` passes, generic over a disk
+  fixture: Linux runs them in `test_save.ritz`, Harland in
+  `bf-save-contract`).
 - `src/main.ritz`: the `buddhafinger` binary, `platform/linux`'s `run_editor`
   on stdin. `src/main_harland.ritz`: the Harland one
   (`build/debug/buddhafinger.harland.elf`), `platform/harland` only.
+  `src/main_save_contract.ritz`: `bf-save-contract`, the save contract on
+  Harland (`run`, `prepare`, `fault`, `check` TAG, on `/var/contract-TAG-*`).
 - `src/bench/`: `buddhafinger-bench`, the performance workloads (a million
   short lines, one 8 MiB line, ordinary Ritz sources). `bench/` holds their
   regression limits and the recorded results; `bench/README.md` says how to
@@ -82,15 +88,17 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   `test_terminal.ritz` runs the editor on a pty: open, edit, save and exit,
   a bare Escape, Ctrl-Z and SIGTSTP then SIGCONT, SIGTERM/SIGINT/SIGHUP and
   a resize, comparing the terminal's attributes before and after each.
+  `test_save.ritz` runs the save contract and the Linux-only cases;
   `test_harland_save.ritz` runs the Harland save's every step and failure
   against a scripted kernel.
 - `tools/test_harland_console.sh`: the Harland acceptance test. It boots the
-  shell image with the editor under QEMU (KVM where it works) six times on
+  shell image with the editor under QEMU (KVM where it works) seven times on
   one storage disk and drives it over the serial console
   (`tools/harland_console.py`): edit, bare Escape, save, reopen, the shell's
   terminal state, an empty save, kills before and after the save's write,
-  reboots, the `fault-persist` and `fault-sync` boot options, and a boot
-  with no storage device.
+  reboots, the save contract (`bf-save-contract`), the `fault-persist` and
+  `fault-sync` boot options (the save fails, the old file stays, after a
+  reboot too), and a boot with no storage device.
 
 ## Build and test
 

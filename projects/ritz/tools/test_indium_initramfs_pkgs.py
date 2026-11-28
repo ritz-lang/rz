@@ -161,13 +161,16 @@ def test_the_stager_is_the_one_reader():
 
 def test_buddhafinger_is_built_by_ritz1_selfhosted_and_stages_its_harland_elf():
     """AGAST #4834: the editor builds with ritz1_selfhosted only (#4813), and
-    only its Harland ELF belongs in the image, as /bin/buddhafinger."""
+    only its Harland ELFs belong in the image: the editor as /bin/buddhafinger
+    and the save contract (#4835) as /bin/bf-save-contract."""
     assert "buddhafinger" in read_pkgs()
     fields = entry_fields("buddhafinger")
     assert fields.get("compiler") == ["ritz1_selfhosted"], fields
-    assert fields.get("bin") == ["buddhafinger.harland:buddhafinger"], fields
-    (harland,) = [b for b in manifest_bins("buddhafinger") if b["name"] == "buddhafinger.harland"]
-    assert harland.get("target_os") == "harland", harland
+    assert fields.get("bin") == ["buddhafinger.harland:buddhafinger",
+                                 "bf-save-contract.harland:bf-save-contract"], fields
+    for name in ("buddhafinger.harland", "bf-save-contract.harland"):
+        (harland,) = [b for b in manifest_bins("buddhafinger") if b["name"] == name]
+        assert harland.get("target_os") == "harland", harland
     # The Linux editor and bench exist, and are exactly what bin= keeps out.
     linux = {b["name"] for b in manifest_bins("buddhafinger") if b.get("target_os") == "linux"}
     assert {"buddhafinger", "buddhafinger-bench"} <= linux, linux

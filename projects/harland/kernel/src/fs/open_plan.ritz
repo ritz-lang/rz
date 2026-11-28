@@ -1,0 +1,41 @@
+# What an open decides about the file at its path (AGAST #4835,
+# fs/REPLACEMENT.md): whether O_CREAT creates now or at the close (a
+# writable O_SYNC create on /var, which the close's durable commit creates),
+# O_EXCL, and the mode a commit gives the file. Pure (flags and Errno only):
+# fs/syscall.ritz's open and fs/persist.ritz's commits share it, and
+# test/test_persist.ritz runs it.
+
+import ritzlib.result
+import syscall.errno { Errno }
+import fs.vfs { O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_SYNC }
+
+# Whether a commit keeps the file's mode (0644 for a new file) or sets it:
+# Set(mode) is what an O_CREAT that creates the file gives it.
+pub enum WriteMode
+    Keep
+    Set(u32)
+
+# What an open does about the file at its path.
+pub enum OpenPlan
+    Existing                    # it is there: open it
+    CreateNow                   # O_CREAT of a missing path: create it now
+    CreateAtClose               # a writable O_SYNC | O_CREAT on a durable
+                                # path: the close's durable commit creates it
+
+# The plan for an open with `flags` of a path that `exists` or not.
+# `durable`: the path is in the persistent subtree and there is storage to
+# make it durable on. O_CREAT | O_EXCL of an existing path is EEXIST, here
+# at the open, O_SYNC or not; a deferred create checks it again at the
+# close (FileCommit.excl). Without O_CREAT a missing path is ENOENT.
+pub fn open_plan(exists: bool, flags: i32, durable: bool) -> Result<OpenPlan, Errno>
+    let creat: bool = (flags & O_CREAT) != 0
+    if exists
+        if creat and (flags & O_EXCL) != 0
+            return Err(Errno.Exist)
+        return Ok(OpenPlan.Existing)
+    if not creat
+        return Err(Errno.NoEnt)
+    let writable: bool = (flags & (O_WRONLY | O_RDWR)) != 0
+    if durable and writable and (flags & O_SYNC) == O_SYNC
+        return Ok(OpenPlan.CreateAtClose)
+    Ok(OpenPlan.CreateNow)

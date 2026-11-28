@@ -64,10 +64,10 @@ COMPILERS = ["ritz0"]
 
 # The real serial.ritz drives the UART through port I/O (and doesn't parse on
 # ritz1); only its StrView is needed here.
+# serial.ritz's StrView is ritzlib's, re-exported, as the real module does:
+# fs/syscall.ritz also imports ritzlib.span, whose StrView must be the same.
 SERIAL_STUB = """\
-pub struct StrView
-    ptr: *u8
-    len: i64
+pub import ritzlib.strview { StrView }
 """
 
 # The kernel logs through klog (AGAST #1885); these have its signatures and
@@ -289,6 +289,10 @@ pub fn stub_holds(path: *u8, plen: i64, want: *u8, wlen: u64) -> bool
 
 KFS_STUB = """\
 import serial { StrView }
+import ritzlib.span { Span }
+import ritzlib.result
+import syscall.errno { Errno }
+import fs.open_plan { WriteMode }
 import goliath.namespace { Namespace, ns_stub_get, ns_stub_write }
 
 pub const KFS_OK: i32 = 0
@@ -326,6 +330,14 @@ pub fn kfs_save() -> i32
 
 pub fn kfs_save_later() -> i32
     0
+
+# No /var with storage here: every path is the stub namespace (#4835)
+pub fn kfs_is_durable(path: StrView) -> bool
+    false
+
+pub fn kfs_commit_durable(path: StrView, data: Span<u8>, mode: WriteMode, excl: bool) -> Result<(), Errno>
+    ns_stub_write(path, data.ptr, data.len as u64)
+    Ok(())
 """
 
 # goliath's error enum, as far as the stubs use it.
@@ -345,7 +357,7 @@ STUBS = {
     "fs/kfs.ritz": KFS_STUB,
     "goliath/error.ritz": ERROR_STUB,
 }
-REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "syscall/errno.ritz"]
+REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open_plan.ritz", "syscall/errno.ritz"]
 
 
 def _compile(compiler, tmp_path, path, name, extra=()):
@@ -392,7 +404,7 @@ def _run(compiler, tmp_path, src, modules):
 FD_MODULES = ["fs/fd.ritz", "syscall/errno.ritz"]
 FS_MODULES = ["serial.ritz", "klog.ritz", "mm/heap.ritz", "goliath/blob_id.ritz", "goliath/blob_store.ritz",
               "goliath/error.ritz", "goliath/namespace.ritz", "fs/kfs.ritz", "fs/fd.ritz",
-              "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "syscall/errno.ritz"]
+              "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open_plan.ritz", "syscall/errno.ritz"]
 
 # --- FdTable (fs/fd.ritz) ---------------------------------------------------------
 

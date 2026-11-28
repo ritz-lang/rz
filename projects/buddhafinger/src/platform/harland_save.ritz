@@ -10,14 +10,15 @@
 #      record from load or the last save (stat, #4832): a file that changed
 #      since is not written;
 #   2. builds the whole file in one buffer (Buffer.serialize);
-#   3. opens the target O_WRONLY | O_CREAT | O_TRUNC, with the target's mode
-#      (a new file gets 0644);
+#   3. opens the target O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, with the
+#      target's mode (a new file gets 0644);
 #   4. writes it in ONE write that must take every byte: a kill between two
 #      writes would commit the prefix written so far, a kill before the
 #      write leaves the old file;
-#   5. closes it and checks the close: that is where the kernel commits;
-#   6. for /var (the persistent subtree), syncs (syscall 162) and requires
-#      that to succeed too.
+#   5. closes it and checks the close: that is where the kernel commits. For
+#      /var (the persistent subtree) the O_SYNC close is the durable commit
+#      (harland/kernel/src/fs/REPLACEMENT.md, #4835): the file is saved to
+#      the storage device and only then made visible, so no sync follows.
 #
 # An empty buffer skips the write: the O_TRUNC fd commits the empty file on
 # the explicit close (#4830).
@@ -29,13 +30,10 @@
 #                        of an O_TRUNC fd would commit what the kernel holds
 #                        (nothing, or a prefix), while process exit commits an
 #                        empty buffer never. One fd stays open until exit.
-#   Close                a RAM-only path: the commit failed.
-#   Unpersisted          /var: the close (the persistent subtree's update)
-#                        or the sync failed. The running system may already
-#                        see the new bytes while the next boot loads the old
-#                        file, so the message says the live file may already
-#                        have changed. Transactional replacement across the
-#                        two trees is the save-parity track (#4792).
+#   Close                the commit failed (on /var: the persistent subtree's
+#                        update or the save to storage): the file is the old
+#                        one everywhere, for the running system and the next
+#                        boot alike, and a file that was missing still is.
 #
 # The store never marks the buffer saved: the editor does, on Ok only, so
 # every failure leaves it dirty.
@@ -47,13 +45,13 @@
 # every step and failure on Linux with a scripted fake; HarlandDisk is the
 # real one. HarlandDisk can also stop a save before or after its write
 # (SavePause, `--pause-save`) so the QEMU acceptance test can kill the editor
-# at exactly that point. The sync is ritzlib.fs's sync (162 on both
-# targets; on Linux, where only the tests and the library build this
-# module, it flushes everything and is Ok).
+# at exactly that point. platform/save_contract.ritz holds the cases this
+# store and Linux's both pass, run on Harland by bf-save-contract
+# (main_save_contract.ritz).
 
 import ritzlib.errno
 import ritzlib.fd
-import ritzlib.fs { stat, sync }
+import ritzlib.fs { stat }
 import ritzlib.gvec
 import ritzlib.io { prints }
 import ritzlib.option
@@ -62,15 +60,15 @@ import ritzlib.result
 import ritzlib.span
 import ritzlib.string
 import ritzlib.strview
-import ritzlib.sys { Stat }
+import ritzlib.sys { O_CREAT, O_RDONLY, O_SYNC, O_TRUNC, O_WRONLY, Stat }
 import ritzlib.termsession { TermState }
 
 import core.buffer { Buffer }
 import core.files { FileStore, LoadError, SaveError }
 
-# open(2) flags, Linux's numbers, which Harland's open takes too.
-const OPEN_READ: i32 = 0            # O_RDONLY
-const OPEN_REPLACE: i32 = 577       # O_WRONLY | O_CREAT | O_TRUNC (1 | 64 | 512)
+# open(2) flags (Linux's numbers, which Harland's open takes too). A save's
+# open: the close of an O_SYNC fd is the durable commit.
+pub const OPEN_REPLACE: i32 = O_WRONLY | O_CREAT | O_TRUNC | O_SYNC
 # A new file's permission bits: rw-r--r--.
 const MODE_NEW: i32 = 420
 # Permission bits of st_mode (07777).
@@ -86,11 +84,10 @@ pub enum OneWriteError
     Stat(Errno)             # stat of the target
     Open(Errno)             # the O_TRUNC open
     Write(Errno)            # the write failed or was short (Io)
-    Close(Errno)            # the close of a RAM-only path
-    Unpersisted(Errno)      # /var: the close or the sync failed
+    Close(Errno)            # the close: the commit failed, the file is unchanged
 
 impl OneWriteError
-    # "changed", "stat", "open", "write", "close" or "unpersisted".
+    # "changed", "stat", "open", "write" or "close".
     pub fn step_name(self: OneWriteError) -> StrView
         match self
             Changed => "changed"
@@ -98,7 +95,6 @@ impl OneWriteError
             Open(_) => "open"
             Write(_) => "write"
             Close(_) => "close"
-            Unpersisted(_) => "unpersisted"
 
     # The editor's SaveError for it.
     pub fn save_error(self: OneWriteError) -> SaveError
@@ -108,7 +104,6 @@ impl OneWriteError
             Open(e) => SaveError.Failed(e)
             Write(e) => SaveError.Failed(e)
             Close(e) => SaveError.Failed(e)
-            Unpersisted(e) => SaveError.Unpersisted(e)
 
 # ============================================================================
 # The disk seam
@@ -139,16 +134,14 @@ pub trait OneWriteIo
     fn read(self: @&Self, path: StrView) -> Result<Loaded, Errno>
     # The file's stamp now; None when there is no file.
     fn stat(self: @&Self, path: StrView) -> Result<Option<FileStamp>, Errno>
-    # open(path, O_WRONLY | O_CREAT | O_TRUNC, mode).
-    fn create(self: @&Self, path: StrView, mode: i32) -> Result<(), Errno>
+    # open(path, flags, mode): a save passes OPEN_REPLACE.
+    fn create(self: @&Self, path: StrView, flags: i32, mode: i32) -> Result<(), Errno>
     # One write(2) of `data`: Ok(bytes taken).
     fn write(self: @&Self, data: [u8]) -> Result<i64, Errno>
-    # close(2): the commit.
+    # close(2): the commit (for /var, the durable one).
     fn close(self: @&Self) -> Result<(), Errno>
     # Forget the open file without closing it (Write, above).
     fn abandon(self: @&Self)
-    # sync(2): the persistent subtree to the storage device.
-    fn sync(self: @&Self) -> Result<(), Errno>
 
 # Where HarlandDisk stops a save for the acceptance test to kill the editor.
 pub enum SavePause
@@ -167,7 +160,7 @@ pub fn harland_disk(pause: SavePause, console: Option<TermState>) -> HarlandDisk
 
 impl OneWriteIo for HarlandDisk
     fn read(self: @&HarlandDisk, path: StrView) -> Result<Loaded, Errno>
-        var f: Fd = fd_open(path, OPEN_READ, 0)?
+        var f: Fd = fd_open(path, O_RDONLY, 0)?
         let got = read_all(@f)
         let closed = f.close()
         got
@@ -180,8 +173,8 @@ impl OneWriteIo for HarlandDisk
                     NoEnt => Ok(None)
                     _ => Err(e)
 
-    fn create(self: @&HarlandDisk, path: StrView, mode: i32) -> Result<(), Errno>
-        self.file = fd_open(path, OPEN_REPLACE, mode)?
+    fn create(self: @&HarlandDisk, path: StrView, flags: i32, mode: i32) -> Result<(), Errno>
+        self.file = fd_open(path, flags, mode)?
         if self.pause == SavePause.BeforeWrite
             hold_console("before write", self.console)
         Ok(())
@@ -197,9 +190,6 @@ impl OneWriteIo for HarlandDisk
 
     fn abandon(self: @&HarlandDisk)
         self.file = fd_adopt(-1)
-
-    fn sync(self: @&HarlandDisk) -> Result<(), Errno>
-        sync()
 
 fn read_all(f: @Fd) -> Result<Loaded, Errno>
     let st = f.stat()?
@@ -243,10 +233,6 @@ pub struct HarlandFiles
 
 pub fn harland_files(pause: SavePause) -> HarlandFiles
     HarlandFiles { path: string_new(), stamp: None, pause: pause, console: None }
-
-# Whether `path` (absolute) is in the persistent subtree: /var and below.
-pub fn is_persistent(path: StrView) -> bool
-    path.eq("/var") or path.starts_with("/var/")
 
 # The record for `path`: Some(stamp) for a file seen there, None for none
 # seen (a new file, or a path never loaded or saved).
@@ -297,7 +283,7 @@ pub fn harland_save_with<T: OneWriteIo>(files: @&HarlandFiles, path: StrView, bu
         None => MODE_NEW
     # 2-4. One buffer, one open, one write.
     let bytes = buf.serialize()
-    match io.create(path, mode)
+    match io.create(path, OPEN_REPLACE, mode)
         Ok(_) => pass
         Err(e) => return Err(OneWriteError.Open(e))
     if bytes.len() > 0
@@ -309,18 +295,10 @@ pub fn harland_save_with<T: OneWriteIo>(files: @&HarlandFiles, path: StrView, bu
             Err(e) =>
                 io.abandon()
                 return Err(OneWriteError.Write(e))
-    # 5. The close commits; 6. sync for /var.
-    let persistent = is_persistent(path)
+    # 5. The close commits: on /var, durably, or not at all.
     match io.close()
         Ok(_) => pass
-        Err(e) =>
-            if persistent
-                return Err(OneWriteError.Unpersisted(e))
-            return Err(OneWriteError.Close(e))
-    if persistent
-        match io.sync()
-            Ok(_) => pass
-            Err(e) => return Err(OneWriteError.Unpersisted(e))
+        Err(e) => return Err(OneWriteError.Close(e))
     # The bytes are saved. A stat that fails now leaves no record, so the
     # next save reports the file changed rather than guess.
     match io.stat(path)

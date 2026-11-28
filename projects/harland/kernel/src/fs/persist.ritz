@@ -1,0 +1,206 @@
+# The persistent subtree: one writer, plain and durable commits (AGAST #4835)
+#
+# fs/REPLACEMENT.md is the design. /var lives only in the persistent
+# subtree's namespace (kfs's g_kfs_pns), and this module is everything that
+# changes it or writes it to the storage device:
+#
+#   * the save gate: one caller at a time changes the subtree or saves it.
+#     A storage driver that parks its caller mid-request lets another
+#     process run, and that one must not write the slot being written or
+#     change the tree being serialized. A caller that finds the gate held
+#     parks (SaveGate.park) until the holder releases it.
+#   * plain commits: a file or directory is published at once and the save
+#     is owed (`pending`) until one succeeds (kfs debounces it).
+#   * durable commits, an O_SYNC fd's last close: prepare (fork the tree and
+#     commit the file into the fork), persist (save the fork), publish
+#     (adopt the fork). A failure before the publish drops the fork: the
+#     file is old in RAM and on disk. After it, new in both.
+#
+# What an open decides (when O_CREAT creates, the mode a deferred create
+# gives) is fs/open_plan.ritz.
+#
+# Pure (goliath and Errno only), so test/test_persist.ritz runs it against
+# a RAM disk; fs/kfs.ritz binds it to the kernel's device, clock and wait
+# queue.
+
+import serial { StrView }
+import ritzlib.span { Span }
+import ritzlib.result
+import ritzlib.option
+import syscall.errno { Errno }
+import fs.open_plan { WriteMode }
+import goliath.namespace { Namespace, namespace_exists, namespace_write_at, namespace_write_mode, namespace_mkdir, namespace_fork, namespace_adopt, namespace_drop }
+import goliath.block_store { BlockDevice, block_store_save }
+import goliath.error { ErrorCode }
+
+# The ErrorCode as a Result (kfs's runtime-tree writes use it too)
+pub fn persist_checked(code: ErrorCode) -> Result<(), Errno>
+    match code
+        Ok => Ok(())
+        NotFound => Err(Errno.NoEnt)
+        AlreadyExists => Err(Errno.Exist)
+        InvalidPath => Err(Errno.Inval)
+        OutOfSpace => Err(Errno.NoSpc)
+        NotADirectory => Err(Errno.NotDir)
+        NotAFile => Err(Errno.IsDir)
+        DirectoryNotEmpty => Err(Errno.NotEmpty)
+        PermissionDenied => Err(Errno.Perm)
+        PathTooLong => Err(Errno.NameTooLong)
+        _ => Err(Errno.Io)
+
+# A goliath ErrorCode as the Errno a syscall returns (`as i32`; 0 for Ok)
+pub fn kfs_errno(code: ErrorCode) -> i32
+    match persist_checked(code)
+        Ok(_) => 0
+        Err(e) => e as i32
+
+# ============================================================================
+# The save gate
+# ============================================================================
+#
+# The kernel is not preemptible and only the BSP runs processes
+# (SMP_USER.md §2), so `held` needs no atomic: between a caller's check and
+# its park nothing else runs. park() sleeps until a release may have
+# happened (the caller re-checks) and returns false when this caller can't
+# sleep at all (boot, an AP): it then gets EAGAIN rather than spin on a
+# holder that can't run. wake() is the release's: it makes parked callers
+# runnable. Whoever holds the gate when a power-off save comes waits for,
+# never beside, the power-off save (persist_flush_pending).
+
+pub struct SaveGate
+    held: bool
+    waits: u64                  # times a caller found it held
+    park: fn() -> bool
+    wake: fn()
+
+fn gate_enter(g: *SaveGate) -> Result<(), Errno>
+    while (*g).held
+        (*g).waits = (*g).waits + 1
+        let park: fn() -> bool = (*g).park
+        if not park()
+            return Err(Errno.Again)
+    (*g).held = true
+    Ok(())
+
+fn gate_leave(g: *SaveGate)
+    (*g).held = false
+    let wake: fn() = (*g).wake
+    wake()
+
+# ============================================================================
+# The subtree
+# ============================================================================
+
+pub struct Persist
+    ns: *Namespace              # the persistent subtree: its root is /var
+    dev: Option<*BlockDevice>   # the storage device, if there is one
+    gate: SaveGate
+    pending: bool               # a commit is published but not yet saved
+    # Fault injection (the fault-persist and fault-sync boot options, #4833):
+    # every commit, plain or durable, fails EIO before it changes anything;
+    # every save fails EIO before it writes.
+    fault_persist: bool
+    fault_sync: bool
+
+pub fn persist_new(ns: *Namespace, dev: Option<*BlockDevice>, gate: SaveGate) -> Persist
+    Persist { ns: ns, dev: dev, gate: gate, pending: false, fault_persist: false, fault_sync: false }
+
+# One file's new contents: what a written fd's close commits. `path` is in
+# the subtree ("/x" for /var/x). `excl`: the commit creates the file and
+# fails EEXIST if it is there (a deferred O_CREAT | O_EXCL).
+pub struct FileCommit
+    path: StrView
+    data: Span<u8>
+    mode: WriteMode
+    mtime: u64
+    excl: bool
+
+fn write_file(ns: *Namespace, c: @FileCommit) -> Result<(), Errno>
+    if c.excl and namespace_exists(ns, c.path)
+        return Err(Errno.Exist)
+    match c.mode
+        Keep => persist_checked(namespace_write_at(ns, c.path, @c.data, c.mtime))
+        Set(mode) => persist_checked(namespace_write_mode(ns, c.path, @c.data, mode, c.mtime))
+
+# Save `ns` (the live tree or a fork of it), under the gate.
+fn save_held(p: *Persist, ns: *Namespace) -> Result<(), Errno>
+    match (*p).dev
+        Some(dev) =>
+            if (*p).fault_sync
+                return Err(Errno.Io)
+            persist_checked(block_store_save(dev, ns))
+        None => Err(Errno.NoDev)
+
+# Save the subtree. A failed save leaves `pending` as it was: every later
+# save writes what this one didn't.
+pub fn persist_save(p: *Persist) -> Result<(), Errno>
+    gate_enter(@(*p).gate)?
+    let r = save_held(p, (*p).ns)
+    if r.is_ok()
+        (*p).pending = false
+    gate_leave(@(*p).gate)
+    r
+
+# Save the subtree if a commit is owed one: the power-off and process-exit
+# save. It takes the gate like any save, so if a parked caller holds it,
+# this waits for that caller to finish (whose save may carry the change)
+# and then decides; it never skips a pending change and never writes beside
+# another save.
+pub fn persist_flush_pending(p: *Persist) -> Result<(), Errno>
+    gate_enter(@(*p).gate)?
+    var r: Result<(), Errno> = Ok(())
+    if (*p).pending
+        r = save_held(p, (*p).ns)
+        if r.is_ok()
+            (*p).pending = false
+    gate_leave(@(*p).gate)
+    r
+
+# Publish `c` now; the save is owed (pending) until one succeeds.
+pub fn persist_commit(p: *Persist, c: @FileCommit) -> Result<(), Errno>
+    gate_enter(@(*p).gate)?
+    var r: Result<(), Errno> = Err(Errno.Io)
+    if not (*p).fault_persist
+        r = write_file((*p).ns, c)
+    if r.is_ok()
+        (*p).pending = true
+    gate_leave(@(*p).gate)
+    r
+
+# mkdir `path` in the subtree, published now and owed a save. Exist is fine.
+pub fn persist_mkdir(p: *Persist, path: StrView) -> Result<(), Errno>
+    gate_enter(@(*p).gate)?
+    var r: Result<(), Errno> = Err(Errno.Io)
+    if not (*p).fault_persist
+        let code: ErrorCode = namespace_mkdir((*p).ns, path)
+        r = Ok(())
+        if code != ErrorCode.AlreadyExists
+            r = persist_checked(code)
+        if r.is_ok()
+            (*p).pending = true
+    gate_leave(@(*p).gate)
+    r
+
+# The durable commit (an O_SYNC fd's last close): prepare, persist,
+# publish, all under the gate so the fork is the live tree plus exactly
+# this file. On Err nothing changed, in RAM or on the device. On Ok the
+# file is live and saved, along with every plain commit that was pending.
+# Without a storage device there is nothing to make it durable on: a plain
+# commit.
+pub fn persist_commit_durable(p: *Persist, c: @FileCommit) -> Result<(), Errno>
+    if (*p).dev.is_none()
+        return persist_commit(p, c)
+    gate_enter(@(*p).gate)?
+    var r: Result<(), Errno> = Err(Errno.Io)
+    if not (*p).fault_persist
+        var cand: Namespace = namespace_fork((*p).ns)
+        r = write_file(@cand, c)
+        if r.is_ok()
+            r = save_held(p, @cand)
+        if r.is_ok()
+            namespace_adopt((*p).ns, @cand)
+            (*p).pending = false
+        else
+            namespace_drop(@cand)
+    gate_leave(@(*p).gate)
+    r

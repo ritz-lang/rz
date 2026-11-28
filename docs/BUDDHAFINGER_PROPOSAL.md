@@ -248,19 +248,16 @@ committing a prefix of an existing file. It requires a contiguous snapshot in
 the editor and a kernel write buffer. An empty save goes through the same
 path: its `O_TRUNC` open commits the empty file on the explicit close.
 
-For RAM-only paths, a successful close completes the save. For `/var`,
-require both a successful close and a successful `sync` before marking the
-buffer clean. Close updates the runtime tree before updating the persistent
-subtree. If the second update fails, the new bytes may be visible in the
-running system while a reboot still loads the old file. A failed sync can
-also leave the on-disk version behind. Keep the buffer dirty in either case
-and report that the live file may already have changed. (The acceptance
-test, #4833, found that a read of a `/var` path is served from the
-persistent subtree, so after a failed persistent update `read` still
-returns the old bytes and only the runtime tree holds the new ones; after a
-failed sync both trees hold them.) Keep transactional
-replacement across the two trees and storage failure recovery on the Harland
-save-parity track.
+For RAM-only paths, a successful close completes the save. For `/var`, the
+save opens with `O_SYNC`, whose last close is a durable transaction
+(`projects/harland/kernel/src/fs/REPLACEMENT.md`, #4835): the file is saved
+to the storage device and only then made visible. A failed close leaves the
+old file everywhere, for the running system and the next boot alike, so it
+is a plain failure; the buffer stays dirty, and no `sync` follows. (Until
+#4835 the save also required a `sync`, and a failed persistent update or
+sync could leave the running system and the next boot disagreeing.) The
+contract cases both stores pass are `platform/save_contract.ritz`, which
+Harland runs as `bf-save-contract` in the acceptance test.
 
 With `stat` (#4832) the Harland save detects external changes as Linux's
 does, and preserves the mode: an existing file keeps its mode across the

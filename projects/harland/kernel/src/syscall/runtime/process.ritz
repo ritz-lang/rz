@@ -26,7 +26,7 @@ import serial { StrView }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
 import mm.vmm { PTE_USER, phys_to_virt, vmm_map_page, vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4, vmm_load_kernel_pml4 }
 import mm.uptr { uptr_validate_string, uptr_check_read }
-import fs.kfs { kfs_ns_for, kfs_local, kfs_read, kfs_save, kfs_save_pending }
+import fs.kfs { kfs_ns_for, kfs_local, kfs_read, kfs_flush_pending }
 import fs.vfs { O_CREAT }
 import goliath.namespace { Namespace }
 import ritzlib.strview { strview_from_ptr }
@@ -443,9 +443,9 @@ fn sys_exit_impl(code: i32) -> i64
 
         # Save-on-close is debounced (#4321): a write it deferred is not lost
         # when the process that made it goes away. Only then is a save owed,
-        # so a boot full of children costs no disk writes.
-        if kfs_save_pending()
-            kfs_save()
+        # so a boot full of children costs no disk writes. A save another
+        # process is parked in is waited for, not written beside (#4835).
+        kfs_flush_pending()
 
         # Free its page table and all its user-space pages. A ring-1
         # driver's DMA runs leave their device's domain first (#4725): a
@@ -484,9 +484,9 @@ fn sys_exit_impl(code: i32) -> i64
     # through ACPI S5 (#2755): under QEMU the VM exits instead of hanging.
     fs_process_end()
     # Its closes may have deferred a save (#4321); the machine is about to
-    # lose RAM, so write the persistent subtree out now.
-    if kfs_save_pending()
-        kfs_save()
+    # lose RAM, so write the persistent subtree out now, after any save a
+    # parked process is in the middle of (#4835).
+    kfs_flush_pending()
     # init's exit doesn't return through syscall_handler either: panic, not
     # power off as if fine, if a syscall ran off its stack (#2761), and
     # report how deep any went.
@@ -725,9 +725,9 @@ pub fn sys_acpi_poweroff_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         return Errno.Perm as i64
     klog("[syscall] ACPI poweroff requested\n")
     # Whatever save-on-close deferred (#4321) goes to the disk before the
-    # machine goes down.
-    if kfs_save_pending()
-        kfs_save()
+    # machine goes down, after any save a parked process is in the middle of
+    # (#4835): it waits for the save gate, never skips or writes beside it.
+    kfs_flush_pending()
     let result: i32 = acpi_poweroff()
     # If we get here, poweroff failed
     return result as i64
