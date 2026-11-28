@@ -1102,7 +1102,6 @@ pub fn decl_infer_array_src(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type
         # AGAST #3191: so is `let c = *p` of a `*[N]T` (local, field, global,
         # `p + k`): the `[N]T` local `let c: [N]T = *p` declares, copied.
         else if stmt.var_init.kind == ExprKind.Unary and stmt.var_init.op == OpKind.Deref
-            var dsh: ArraySrc
             let dnd: *ArrayShape = deref_nd_shape(s, stmt.var_init.operand)
             if dnd != null and dnd.leaf_type == TypeKind.Struct and dnd.leaf_name.len > 0 and own_type_is_move_only(s, dnd.leaf_name)
                 # A move-only leaf isn't copied out from behind a pointer, as
@@ -1119,26 +1118,29 @@ pub fn decl_infer_array_src(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type
                 dt.var_array_elem_pointee = TypeKind.Void
                 dt.var_array_shape = dnd
                 dt.var_type_name = strview_empty()
-            else if array_ptr_shape(s, stmt.var_init.operand, @dsh) == 1
-                var_type = TypeKind.Array
-                dt.var_type = TypeKind.Array
-                dt.var_array_size = dsh.size
-                dt.var_array_elem_type = dsh.elem
-                dt.var_type_name = dsh.name
+            else
+                match array_ptr_shape(s, stmt.var_init.operand)
+                    Some(dsh) =>
+                        var_type = TypeKind.Array
+                        dt.var_type = TypeKind.Array
+                        dt.var_array_size = dsh.size
+                        dt.var_array_elem_type = dsh.elem
+                        dt.var_type_name = dsh.name
+                    None => pass
         # AGAST #2305: and `let r = if c then f() else g()`: an arm's array.
         # AGAST #3276: and `let r = match c` + arms of arrays.
         else
             match stmt.var_init.kind
                 ExprKind.If | ExprKind.Match =>
-                    var ish: ArraySrc
-                    var ipt: TypeKind = dt.var_array_elem_pointee
-                    if if_array_shape(s, stmt.var_init, @ish, @ipt) == 1
-                        var_type = TypeKind.Array
-                        dt.var_type = TypeKind.Array
-                        dt.var_array_size = ish.size
-                        dt.var_array_elem_type = ish.elem
-                        dt.var_array_elem_pointee = ipt
-                        dt.var_type_name = ish.name
+                    match if_array_shape(s, stmt.var_init, dt.var_array_elem_pointee)
+                        Some(arm) =>
+                            var_type = TypeKind.Array
+                            dt.var_type = TypeKind.Array
+                            dt.var_array_size = arm.src.size
+                            dt.var_array_elem_type = arm.src.elem
+                            dt.var_array_elem_pointee = arm.pointee
+                            dt.var_type_name = arm.src.name
+                        None => pass
                 # AGAST #3017: and `let arr = h.a` of an `a: [N]T` field (any root
                 # resolve_member_chain_field types, a Box's Deref included): the `[N]T`
                 # local `let arr: [N]T = h.a` declares, copied.  The slot was i64, so
@@ -2172,30 +2174,41 @@ fn const_struct_named(s: *EmitterState, e: *Expr) -> *ConstEntry
         return null
     return ce
 
+# The whole `[N]T` an `if` / `match` arm gives (if_array_shape): its shape,
+# and its element's pointee.
+struct ArmArray
+    src: ArraySrc
+    pointee: TypeKind
+
 # AGAST #2305: N and T of the whole `[N]T` an `if` value's first telling arm
-# gives: a `-> [N]T` call (its element pointee to `*pointee`), a 1-D array
-# place, an inline field, or a nested `if`.  1 if one does.  Each arm is still
-# held to that shape when emit_array_if_into stores it.  Emits nothing.
+# gives: a `-> [N]T` call (its element pointee its own), a 1-D array place,
+# an inline field, or a nested `if`, whose element pointee is `pointee`, the
+# one the caller had.  None if no arm tells.  Each arm is still held to that
+# shape when emit_array_if_into stores it.  Emits nothing.
 # AGAST #3276: a `match` value's arms too (its `args` are MatchArms as an
 # `if`'s are), and a nested `match`.  An arm reading its own pattern binding
 # can't tell here (the binding isn't in scope); a later arm may.
-fn if_array_shape(s: *EmitterState, e: *Expr, out: *ArraySrc, pointee: *TypeKind) -> i32
+fn if_array_shape(s: *EmitterState, e: *Expr, pointee: TypeKind) -> Option<ArmArray>
     var arm: *MatchArm = e.args as *MatchArm
     while arm != null
         let v: *Expr = arm.body
         if arm.is_pass == 0 and v != null
             if v.kind == ExprKind.If or v.kind == ExprKind.Match
-                if if_array_shape(s, v, out, pointee) == 1
-                    return 1
+                match if_array_shape(s, v, pointee)
+                    Some(nested) =>
+                        return Some(nested)
+                    None => pass
             else
                 let cra: *Param = call_ret_array(s, v)
                 if cra != null
-                    *pointee = cra.param_array_elem_pointee
-                    return array_src_set(out, cra.param_array_size, cra.param_array_elem_type, cra.param_type_name)
-                if arm.body_stmts == null and arg_array_shape(s, v, out) == 1
-                    return 1
+                    return Some(ArmArray { src: array_src(cra.param_array_size, cra.param_array_elem_type, cra.param_type_name), pointee: cra.param_array_elem_pointee })
+                if arm.body_stmts == null
+                    match arg_array_shape(s, v)
+                        Some(src) =>
+                            return Some(ArmArray { src: src, pointee: pointee })
+                        None => pass
         arm = arm.next
-    0
+    None
 
 # True when `e` is a StrView value that ritz1 lowers to a `%Span$u8`: a `"..."`,
 # a `... as StrView` (whose register is its operand's, #2131), or a local

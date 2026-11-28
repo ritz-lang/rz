@@ -448,9 +448,7 @@ fn emit_nd_sub_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
         if vsh.dims[vsh.rank - 1] != m or vsh.leaf_pointee != sh.leaf_pointee or array_elem_types_match(vsh.leaf_type, vsh.leaf_name, sh.leaf_type, leaf_sv) == 0
             emit_ir_error_sv(s, v.span, "this row's type is not the multi-dimensional array's row type")
             return
-        var src: NdIndexPtr
-        emit_nd_index_ptr(s, v, @src)
-        emit_local_array_copy(s, m, sh.leaf_type, leaf_sv, src.reg, dst.reg)
+        emit_local_array_copy(s, m, sh.leaf_type, leaf_sv, emit_nd_index_reg(s, v), dst.reg)
         return
     emit_array_local_whole_assign(s, dst.reg, m, sh.leaf_type, leaf_sv, v)
 
@@ -458,10 +456,11 @@ fn emit_nd_sub_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
 # index chain `place` (built by the caller) names: one index short of a 2-D
 # array's leaf, so a row store.
 fn emit_nd_stmt_row_store(s: *EmitterState, stmt: *Stmt, place: *Expr)
-    var dst: NdIndexPtr
-    if emit_nd_index_ptr(s, place, @dst) == 0
-        emit_nd_error_sv(s, stmt.span.line, stmt.span.col, "assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
-        return
+    let dst: NdIndexPtr = match emit_nd_index_ptr(s, place)
+        Some(found) => found
+        None =>
+            emit_nd_error_sv(s, stmt.span.line, stmt.span.col, "assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
+            return
     emit_nd_elem_store(s, stmt, @dst)
 
 # AGAST #1509: store stmt.assign_value into the N-D element `dst` points
@@ -874,10 +873,11 @@ fn assign_to_deref(s: *EmitterState, stmt: *Stmt, target_expr: *Expr) -> i32
         if plane != null
             emit_nd_plane_store(s, emit_array_ptr_value(s, target_expr.operand), plane, stmt.assign_value)
             return 1
-        var arr_dst: ArraySrc
-        if array_ptr_shape(s, target_expr.operand, @arr_dst) == 1
-            emit_array_local_whole_assign(s, emit_array_ptr_value(s, target_expr.operand), arr_dst.size, arr_dst.elem, arr_dst.name, stmt.assign_value)
-            return 1
+        match array_ptr_shape(s, target_expr.operand)
+            Some(arr_dst) =>
+                emit_array_local_whole_assign(s, emit_array_ptr_value(s, target_expr.operand), arr_dst.size, arr_dst.elem, arr_dst.name, stmt.assign_value)
+                return 1
+            None => pass
         if stmt.assign_value.kind == ExprKind.ArrayLit or stmt.assign_value.kind == ExprKind.ArrayFill
             emit_ir_error_sv(s, stmt.span, "whole-array store through this pointer is not supported by ritz1 (only a `*[N]T` local, param, field or global, or `p + k` over one)")
             return 1
@@ -1129,10 +1129,11 @@ fn emit_assign_to_expr(s: *EmitterState, stmt: *Stmt)
     # to the generic path below, which evaluated `g[i][j]` as a VALUE
     # (over a flattened [N x i64]) and stored through it.
     if target_expr.kind == ExprKind.Index
-        var nd_dst: NdIndexPtr
-        if emit_nd_index_ptr(s, target_expr, @nd_dst) == 1
-            emit_nd_elem_store(s, stmt, @nd_dst)
-            return
+        match emit_nd_index_ptr(s, target_expr)
+            Some(nd_dst) =>
+                emit_nd_elem_store(s, stmt, @nd_dst)
+                return
+            None => pass
 
     if assign_to_member(s, stmt, target_expr, orig_target, orig_reach) == 1
         return
@@ -1303,51 +1304,52 @@ fn ret_struct_value(s: *EmitterState, ret_name: StrView, reg: i32)
     emit_llvm_type_struct(s, TypeKind.Struct, ret_name)
     format_into(s, " %.{reg}\n")
 
+# A header a `for` walks in place: a pointer to it, and its struct.
+struct ForHeader
+    reg: i32
+    st: *StructDef
+
 # A bare name holding a header, or a reference to one.  A local hides a global of
 # its name.
-fn emit_for_ident_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
+fn emit_for_ident_header(s: *EmitterState, e: *Expr) -> Option<ForHeader>
     let loc: *LocalVar = find_local_struct_name(s, e.ident)
     if loc != null
         let st: *StructDef = for_header_struct(s, lv_name(loc))
         if st == null
-            return 0
+            return None
         if lv_var_type(loc) == TypeKind.Struct
-            *out = st
-            return loc.reg
+            return Some(ForHeader { reg: loc.reg, st: st })
         if local_struct_levels(loc) == 1 and lv_pointee_type(loc) == TypeKind.Struct
-            *out = st
-            return emit_load_ptr(s, loc.reg)
-        return 0
+            return Some(ForHeader { reg: emit_load_ptr(s, loc.reg), st: st })
+        return None
     let glob: *GlobalVarDef = find_global(s, e.ident)
     if glob != null
         if glob.var_type == TypeKind.Struct
             let gst: *StructDef = for_header_struct(s, glob.type_name)
             if gst != null
-                *out = gst
-                return emit_lvalue_ptr(s, e)
+                return Some(ForHeader { reg: emit_lvalue_ptr(s, e), st: gst })
         else if glob.var_type == TypeKind.Ptr and glob.pointee_type == TypeKind.Struct
             let pst: *StructDef = for_header_struct(s, glob.pointee_type_name)
             if pst != null
-                var unused: *StructDef = null
-                var levels: i32 = 0
-                *out = pst
-                return emit_deref_operand_ptr(s, e, @unused, @levels)
-        return 0
+                # A `*S` global S names resolves: pst being found means gp loads.
+                match emit_deref_operand_ptr(s, e)
+                    Some(gp) => return Some(ForHeader { reg: gp.reg, st: pst })
+                    None => return None
+        return None
     let ce: *ConstEntry = find_const_entry(s, e.ident)
     if ce != null and ce.const_type == TypeKind.Struct
         let cst: *StructDef = for_header_struct(s, ce.type_name)
         if cst != null
-            *out = cst
-            return emit_for_header_spill(s, cst, emit_expr(s, e))
-    0
+            return Some(ForHeader { reg: emit_for_header_spill(s, cst, emit_expr(s, e)), st: cst })
+    None
 
 # `@v` / `@&v` / `@h.v`.  `@v` of a pointer or a reference isn't here: ritz0
 # refuses `v: *Vec<T>` and `v: @Vec<T>`.  `mr` is `h.v`, which emit_for_iterable
 # has already reached (AGAST #2533): reaching it again would emit it twice.
-fn emit_for_addr_header(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, out: **StructDef) -> i32
+fn emit_for_addr_header(s: *EmitterState, e: *Expr, mr: *MemberPtrResult) -> Option<ForHeader>
     let op: *Expr = e.operand
     if op == null
-        return 0
+        return None
     if op.kind == ExprKind.Ident
         # AGAST #2314: `v:& Vec<T>`'s slot holds the borrow's pointer, and `@v` is
         # that pointer (#2286), not the slot's address.
@@ -1355,152 +1357,138 @@ fn emit_for_addr_header(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, out: *
         if lent != null
             let lst: *StructDef = for_header_struct(s, lv_name(lent))
             if lst == null
-                return 0
-            *out = lst
-            return emit_load_ptr(s, lent.reg)
+                return None
+            return Some(ForHeader { reg: emit_load_ptr(s, lent.reg), st: lst })
         let loc: *LocalVar = find_local_struct_name(s, op.ident)
         if loc != null
             if lv_var_type(loc) != TypeKind.Struct
-                return 0
+                return None
             let st: *StructDef = for_header_struct(s, lv_name(loc))
             if st != null
-                *out = st
-                return loc.reg
-            return 0
+                return Some(ForHeader { reg: loc.reg, st: st })
+            return None
         let glob: *GlobalVarDef = find_global(s, op.ident)
         if glob != null and glob.var_type == TypeKind.Struct
             let gst: *StructDef = for_header_struct(s, glob.type_name)
             if gst != null
-                *out = gst
-                return emit_lvalue_ptr(s, op)
-        return 0
+                return Some(ForHeader { reg: emit_lvalue_ptr(s, op), st: gst })
+        return None
     if op.kind == ExprKind.Member
         if mr.success == 1 and mr.field.field_type == TypeKind.Struct
             let fst: *StructDef = for_header_struct(s, mr.field.field_type_name)
             if fst != null
-                *out = fst
-                return mr.reg
+                return Some(ForHeader { reg: mr.reg, st: fst })
     if op.kind == ExprKind.Index
-        return emit_for_element_header(s, op, out)   # AGAST #2410: `@vs[i]` is `vs[i]`
-    0
+        return emit_for_element_header(s, op)   # AGAST #2410: `@vs[i]` is `vs[i]`
+    None
 
 # AGAST #2410: `*p`, with `p` a pointer to a header: the header it points at.
-fn emit_for_deref_header(s: *EmitterState, op: *Expr, out: **StructDef) -> i32
-    var dst: *StructDef = null
-    var levels: i32 = 0
-    let reg: i32 = emit_deref_operand_ptr(s, op, @dst, @levels)
-    if dst == null or levels != 1
-        return 0
-    let st: *StructDef = for_header_struct(s, dst.name)
+fn emit_for_deref_header(s: *EmitterState, op: *Expr) -> Option<ForHeader>
+    let d: DerefPtr = emit_deref_operand_ptr(s, op)?
+    if d.levels != 1
+        return None
+    let st: *StructDef = for_header_struct(s, d.st.name)
     if st == null
-        return 0
-    *out = st
-    reg
+        return None
+    Some(ForHeader { reg: d.reg, st: st })
 
 # AGAST #2426: `vv[i]`, a header that is an element of the Vec `vv` names, where
 # it is in `vv`'s buffer: `&data[i]`, with `vv` and `i` evaluated once, before
 # the loop.  `vv` is any place emit_for_header walks in place; a call's result
-# isn't one.  0, emitting nothing, for anything else.
-fn emit_for_vec_elem_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
+# isn't one.  None, emitting nothing, for anything else.
+fn emit_for_vec_elem_header(s: *EmitterState, e: *Expr) -> Option<ForHeader>
     let base: *Expr = e.left
     if base == null or e.right == null or e.right.kind == ExprKind.Range
-        return 0
+        return None
     if base.kind == ExprKind.Call or base.kind == ExprKind.Method or base.kind == ExprKind.ArrayLit or base.kind == ExprKind.StringLit
-        return 0
+        return None
     let b: RefTy = match ref_ty_of(s, base)
         Some(found) => found
-        None => return 0
+        None => return None
     let el: RefTy = match ref_vec_elem(s, b)
         Some(found) => found
-        None => return 0
+        None => return None
     if el.kind != TypeKind.Struct
-        return 0
+        return None
     let est: *StructDef = for_header_struct(s, el.name)
     if est == null
-        return 0
+        return None
     var mr: MemberPtrResult
     mr.reg = 0
     mr.field = null
     mr.success = 0
     if base.kind == ExprKind.Member
         emit_member_ptr(s, base, @mr)
-    var vst: *StructDef = null
-    let hdr: i32 = emit_for_header(s, base, @mr, @vst)
-    if vst == null
-        return 0
-    let di: i32 = find_field_index(vst, "data")
+    let vh: ForHeader = emit_for_header(s, base, @mr)?
+    let di: i32 = find_field_index(vh.st, "data")
     if di < 0
-        return 0
+        return None
     let dpp: i32 = next_reg(s)
-    gep_struct_open(s, dpp, vst.name)
-    format_into(s, ", ptr %.{hdr}, i32 0, i32 {di}\n")
+    gep_struct_open(s, dpp, vh.st.name)
+    format_into(s, ", ptr %.{vh.reg}, i32 0, i32 {di}\n")
     let dp: i32 = emit_load_ptr(s, dpp)
     let idx: i32 = emit_expr(s, e.right)
     let ep: i32 = next_reg(s)
     gep_struct_open(s, ep, est.name)
     format_into(s, ", ptr %.{dp}, i64 %.{idx}\n")
-    *out = est
-    ep
+    Some(ForHeader { reg: ep, st: est })
 
 # AGAST #2410: `vs[i]`, an element that is a header, at its own address.  The
 # index is evaluated once, before the loop.
-fn emit_for_element_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
+fn emit_for_element_header(s: *EmitterState, e: *Expr) -> Option<ForHeader>
     let t: RefTy = match ref_ty_of(s, e)
         Some(found) => found
-        None => return emit_for_vec_elem_header(s, e, out)   # AGAST #2426
+        None => return emit_for_vec_elem_header(s, e)   # AGAST #2426
 
     if t.kind != TypeKind.Struct
-        return 0
+        return None
     let st: *StructDef = for_header_struct(s, t.name)
     if st == null
-        return 0
+        return None
     let reg: i32 = emit_lvalue_ptr(s, e)
     if reg < 0
-        return 0
-    *out = st
-    reg
+        return None
+    Some(ForHeader { reg: reg, st: st })
 
-# AGAST #2388: a pointer to the header `iter` names, with its struct in *out, or
-# 0 with *out null.  The loop walks that header in place, reading `len` and `data`
-# on every pass, because it sees what the body writes (#2387).  That's also what
-# makes a `push` that moves the buffer safe: nothing from before it is kept, and
-# the binding is a copy of its element, taken before the body runs.
+# AGAST #2388: a pointer to the header `iter` names, and its struct, or None.
+# The loop walks that header in place, reading `len` and `data` on every pass,
+# because it sees what the body writes (#2387).  That's also what makes a
+# `push` that moves the buffer safe: nothing from before it is kept, and the
+# binding is a copy of its element, taken before the body runs.
 #
 # `iter` is evaluated once.  `mr` is its field when it's an ExprKind.Member, or `@` /
 # `@&` of one: reaching that again would run whatever it's reached through twice.
-fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **StructDef) -> i32
+fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult) -> Option<ForHeader>
     match iter.kind
         ExprKind.Ident =>
-            return emit_for_ident_header(s, iter, out)
+            return emit_for_ident_header(s, iter)
         ExprKind.Member =>
             if mr.success != 1
-                return 0
+                return None
             let f: *StructField = mr.field
             let st: *StructDef = for_header_struct(s, f.field_type_name)
             if st == null
-                return 0
+                return None
             match f.field_type
                 TypeKind.Struct =>
-                    *out = st
-                    return mr.reg
+                    return Some(ForHeader { reg: mr.reg, st: st })
                 TypeKind.Ptr =>
-                    *out = st
-                    return emit_load_ptr(s, mr.reg)
+                    return Some(ForHeader { reg: emit_load_ptr(s, mr.reg), st: st })
                 _ => pass
-            return 0
+            return None
         _ => pass
     var name: StrView = no_name()
     match iter.kind
         ExprKind.Unary =>
             match iter.op
                 OpKind.Addr | OpKind.AddrMut =>
-                    return emit_for_addr_header(s, iter, mr, out)
+                    return emit_for_addr_header(s, iter, mr)
                 # AGAST #2410: `*p` and `vs[i]` are places: walked where they are.
                 OpKind.Deref =>
-                    return emit_for_deref_header(s, iter.operand, out)
+                    return emit_for_deref_header(s, iter.operand)
                 _ => pass
         ExprKind.Index =>
-            return emit_for_element_header(s, iter, out)
+            return emit_for_element_header(s, iter)
         ExprKind.Call | ExprKind.Method =>
             name = for_call_struct_name(s, iter)
         ExprKind.StringLit =>
@@ -1508,9 +1496,8 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
         _ => pass
     let vst: *StructDef = for_header_struct(s, name)
     if vst == null
-        return 0
-    *out = vst
-    emit_for_header_spill(s, vst, emit_expr(s, iter))
+        return None
+    Some(ForHeader { reg: emit_for_header_spill(s, vst, emit_expr(s, iter)), st: vst })
 
 # AGAST #2410: the literal `e` in a slot of its own, a static alloca written
 # into the entry-block buffer, out of any enclosing loop; its element type,
@@ -1639,11 +1626,12 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
                             # AGAST #2426 / #2517: `mkp().m[i]` too, a row of what a call points at.
                             let sh: *ArrayShape = nd_index_shape(s, iter, @nd_depth)
                             if sh != null and nd_depth < sh.rank and (iter.right == null or iter.right.kind != ExprKind.Range)
-                                var ndp: NdIndexPtr
-                                if emit_nd_index_ptr(s, iter, @ndp) == 1
-                                    nd_shape = sh
-                                    src.iter_kind = ForIterKind.ArrayReg
-                                    src.data_reg = ndp.reg
+                                match emit_nd_index_ptr(s, iter)
+                                    Some(ndp) =>
+                                        nd_shape = sh
+                                        src.iter_kind = ForIterKind.ArrayReg
+                                        src.data_reg = ndp.reg
+                                    None => pass
                         ExprKind.ArrayLit =>
                             # AGAST #2410: a literal is an rvalue: a slot of its own.
                             src.data_reg = emit_for_literal(s, iter, src)
@@ -1676,23 +1664,21 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
         src.bind_pointee = elem_recorded_pointee(s, src.elem_type, nd_shape.leaf_pointee, src.elem_name, @src.bind_name)
 
     if src.iter_kind == ForIterKind.Unsupported and iter != null
-        var hdr: *StructDef = null
-        src.data_reg = emit_for_header(s, iter, @mr, @hdr)
-        if hdr != null
-            var fe: ForElem
-            fe.elem = TypeKind.Void
-            fe.name = strview_empty()
-            fe.pointee = TypeKind.Void
-            fe.pointee_name = strview_empty()
-            if not for_header_elem(s, hdr, @fe)
-                emit_nd_error_sv(s, iter.span.line, iter.span.col, "this `for` element type is not supported in ritz1 (index the Vec, or use a struct element)")
-                return 0
-            src.iter_kind = ForIterKind.HeaderReg
-            src.type_name = hdr.name
-            src.elem_type = fe.elem
-            src.elem_name = fe.name
-            src.bind_pointee = fe.pointee
-            src.bind_name = fe.pointee_name
+        match emit_for_header(s, iter, @mr)
+            Some(hdr) =>
+                src.data_reg = hdr.reg
+                let fe: ForElem = match for_header_elem(s, hdr.st)
+                    Some(found) => found
+                    None =>
+                        emit_nd_error_sv(s, iter.span.line, iter.span.col, "this `for` element type is not supported in ritz1 (index the Vec, or use a struct element)")
+                        return 0
+                src.iter_kind = ForIterKind.HeaderReg
+                src.type_name = hdr.st.name
+                src.elem_type = fe.elem
+                src.elem_name = fe.name
+                src.bind_pointee = fe.pointee
+                src.bind_name = fe.pointee_name
+            None => src.data_reg = 0
 
     if src.iter_kind == ForIterKind.Unsupported
         emit_nd_error_sv(s, iter.span.line, iter.span.col, "this `for` iterable is not supported in ritz1 (it takes an array, an array field, a Vec, a Span or a StrView)")

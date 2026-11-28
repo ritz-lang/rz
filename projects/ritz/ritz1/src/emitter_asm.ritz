@@ -196,18 +196,11 @@ fn asm_llvm_type(t: TypeKind) -> StrView
         TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef => "ptr"
         _ => no_name()
 
-# Find what `o` names and fill `out`; true if it can be the operand it is,
-# else false with the error reported.
-fn asm_resolve(s: *EmitterState, o: *AsmOperand, out: *AsmOp) -> bool
+# What `o` names, when it can be the operand it is; else None with the error
+# reported.  Its output / input numbers are -1 until emit_asm_block numbers it.
+fn asm_resolve(s: *EmitterState, o: *AsmOperand) -> Option<AsmOp>
     let name: StrView = asm_operand_name(o)
-    out.op = o
-    out.addr = 0 - 1
-    out.glob = null
-    out.is_const = false
-    out.const_value = 0
-    out.out_idx = 0 - 1
-    out.in_idx = 0 - 1
-    out.val = 0
+    var op: AsmOp = AsmOp { op: o, ty: no_name(), addr: 0 - 1, glob: null, is_const: false, const_value: 0, out_idx: 0 - 1, in_idx: 0 - 1, val: 0 }
     var t: TypeKind = TypeKind.Void
     var is_let: bool = false
     let idx: i32 = find_local_idx(s, name)
@@ -216,42 +209,42 @@ fn asm_resolve(s: *EmitterState, o: *AsmOperand, out: *AsmOp) -> bool
         t = lv_var_type(loc)
         if loc.is_bool == 1
             t = TypeKind.Bool   # an i64 slot that holds a bool (AGAST #1521)
-        out.addr = loc.reg
+        op.addr = loc.reg
         is_let = loc.is_let == 1
     else
         let g: *GlobalVarDef = find_global(s, name)
         if g != null
             t = g.var_type
-            out.glob = g
+            op.glob = g
         else
             let ce: *ConstEntry = find_const_entry(s, name)
             if ce == null
                 var msg: String = string_new()
                 format_into(@&msg, "asm operand '{name}' is not a local, a parameter or a global")
                 asm_error(s, o.span, msg.as_view())
-                return false
+                return None
             t = ce.const_type
-            out.is_const = true
-            out.const_value = ce.value
-    out.ty = asm_llvm_type(t)
-    if unnamed(out.ty)
+            op.is_const = true
+            op.const_value = ce.value
+    op.ty = asm_llvm_type(t)
+    if unnamed(op.ty)
         var msg: String = string_new()
         format_into(@&msg, "asm operand '{name}' must be an integer or a pointer")
         asm_error(s, o.span, msg.as_view())
-        return false
+        return None
     if o.dir == ASM_OUT or o.dir == ASM_INOUT
         let dir: StrView = if o.dir == ASM_INOUT then "inout" else "out"
         if is_let
             var msg: String = string_new()
             format_into(@&msg, "asm '{dir}' operand '{name}' is a `let` binding, not an assignable place: declare it `var`")
             asm_error(s, o.span, msg.as_view())
-            return false
-        if out.is_const
+            return None
+        if op.is_const
             var msg: String = string_new()
             format_into(@&msg, "asm '{dir}' operand '{name}' is a const, not an assignable place")
             asm_error(s, o.span, msg.as_view())
-            return false
-    true
+            return None
+    Some(op)
 
 # The place `op` is: `%.N` (a local's slot) or `@name` (a global).
 fn asm_emit_place(s: *EmitterState, op: *AsmOp)
@@ -413,8 +406,11 @@ pub fn emit_asm_block(s: *EmitterState, stmt: *Stmt)
     o = b.operands
     var i: i32 = 0
     while o != null
-        if not asm_resolve(s, o, ops + i)
-            ok = false
+        match asm_resolve(s, o)
+            Some(op) =>
+                *(ops + i) = op
+            None =>
+                ok = false
         i = i + 1
         o = o.next
     if not ok

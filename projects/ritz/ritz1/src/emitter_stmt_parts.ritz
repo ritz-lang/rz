@@ -182,11 +182,12 @@ pub fn for_header_struct(s: *EmitterState, name: StrView) -> *StructDef
 
 # What a header's elements are, read off its `data` field as the monomorph left
 # it: a struct T by name, a primitive T in array_elem_type, and `*T` as a `**`
-# field.  True if that names the element; a type this can't name is refused
-# rather than walked at a guessed stride, which `Vec<S>` was at 8 bytes.
-pub fn for_header_elem(s: *EmitterState, st: *StructDef, out: *ForElem) -> bool
+# field.  None for a type this can't name: it is refused rather than walked
+# at a guessed stride, which `Vec<S>` was at 8 bytes.
+pub fn for_header_elem(s: *EmitterState, st: *StructDef) -> Option<ForElem>
     let data: *StructField = st.fields
     let data_name: StrView = data.field_type_name
+    let none: StrView = strview_empty()
     if data.field_type == TypeKind.Ptr
         if data_name.len > 0
             # AGAST #2411: a non-generic user enum is a `%C` the loop walks at
@@ -194,27 +195,20 @@ pub fn for_header_elem(s: *EmitterState, st: *StructDef, out: *ForElem) -> bool
             # and an Option / Result instance (`%Option$i64`), at the layout
             # tagged_enum_layout gives it, as ptr_pointee_size strides it (#1578).
             if find_struct(s, data_name) == null and user_enum_index(s.sym.mono.pctx, data_name) < 0 and is_tagged_enum_type(data_name) == 0
-                return false
-            out.elem = TypeKind.Struct
-            out.name = data.field_type_name
-            return true
+                return None
+            return Some(ForElem { elem: TypeKind.Struct, name: data.field_type_name, pointee: TypeKind.Void, pointee_name: none })
         if primitive_name_len(data.array_elem_type) == 0
-            return false
-        out.elem = data.array_elem_type
-        return true
+            return None
+        return Some(ForElem { elem: data.array_elem_type, name: none, pointee: TypeKind.Void, pointee_name: none })
     # `Vec$ptr_Node` names Node, and `Vec$ptr_u8` nothing: its pointee is only
     # in the suffix.  `Vec$ptr_ptr_u8` names no struct there is, and is refused.
-    out.elem = TypeKind.Ptr
     if data_name.len > 0
         if find_struct(s, data_name) == null
-            return false
-        out.pointee = TypeKind.Struct
-        out.pointee_name = data.field_type_name
-        return true
+            return None
+        return Some(ForElem { elem: TypeKind.Ptr, name: none, pointee: TypeKind.Struct, pointee_name: data.field_type_name })
     let st_name: StrView = st.name
     let after: i64 = st_name.find_byte('$') + 5   # past `$ptr_`
-    out.pointee = primitive_type_from_name(st_name.slice(after, st_name.len))
-    true
+    Some(ForElem { elem: TypeKind.Ptr, name: none, pointee: primitive_type_from_name(st_name.slice(after, st_name.len)), pointee_name: none })
 
 # The LLVM type of one element of a `for` iterable: `%S` for a struct element.
 # emit_llvm_type spells that i64, which is neither its size nor its stride.
@@ -453,21 +447,20 @@ pub fn emit_array_ptr_base(s: *EmitterState, loc: *LocalVar) -> i32
 
 # True when `*e` is a whole `[N]T` (array_ptr_shape), which isn't a value on its own.
 pub fn deref_names_array(s: *EmitterState, e: *Expr) -> bool
-    var sh: ArraySrc
-    array_ptr_shape(s, e, @sh) == 1
+    array_ptr_shape(s, e).is_some()
 
-# AGAST #2517: fill `out` when `value` is a 1-D row of an N-D array (nd_row_shape:
-# `g[i]` of `[N][M]T`, `c[i][j]` of `[N][M][K]T`).  The base is any
-# nd_index_shape knows: a local, a global, a field, or a field of a call's
-# result, by value or through `*S`.  Emits nothing; emit_nd_index_ptr finds it.
-pub fn nd_row_src(s: *EmitterState, value: *Expr, out: *ArraySrc) -> bool
+# AGAST #2517: the row's shape when `value` is a 1-D row of an N-D array
+# (nd_row_shape: `g[i]` of `[N][M]T`, `c[i][j]` of `[N][M][K]T`), else None.
+# The base is any nd_index_shape knows: a local, a global, a field, or a field
+# of a call's result, by value or through `*S`.  Emits nothing;
+# emit_nd_index_ptr finds it.
+pub fn nd_row_src(s: *EmitterState, value: *Expr) -> Option<ArraySrc>
     if value.kind != ExprKind.Index or value.right == null or value.right.kind == ExprKind.Range
-        return false
+        return None
     let sh: *ArrayShape = nd_row_shape(s, value)
     if sh == null
-        return false
-    array_src_set(out, sh.dims[sh.rank - 1], sh.leaf_type, sh.leaf_name)
-    true
+        return None
+    Some(array_src(sh.dims[sh.rank - 1], sh.leaf_type, sh.leaf_name))
 
 # The address of global array `g`, in a register.
 pub fn emit_global_array_ptr(s: *EmitterState, g: *GlobalVarDef) -> i32

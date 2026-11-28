@@ -109,50 +109,51 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
     var src_size: i32 = -1
     var src_et: TypeKind = TypeKind.Void
     var src_name: StrView = no_name()
-    var place: ArraySrc
-    if array_place_shape(s, value, @place) == 1
-        src_ptr = emit_array_place_ptr(s, value)
-        src_size = place.size
-        src_et = place.elem
-        src_name = place.name
-    else if value.kind == ExprKind.Member
-        var mr: MemberPtrResult
-        emit_member_ptr(s, value, @mr)
-        if mr.success == 1 and mr.field != null and mr.field.field_type == TypeKind.Array
-            src_ptr = mr.reg
-            src_size = mr.field.array_size
-            src_et = mr.field.array_elem_type
-            src_name = mr.field.array_elem_type_name
-    else if call_ret_array(s, value) != null
-        # AGAST #2302: a call's `[N x T]`, through a temporary.
-        let cra: *Param = call_ret_array(s, value)
-        src_ptr = emit_call_array_temp(s, value, cra)
-        src_size = cra.param_array_size
-        src_et = cra.param_array_elem_type
-        src_name = cra.param_type_name
-    else if value.kind == ExprKind.If or value.kind == ExprKind.Match
-        # AGAST #4918: an array-valued `if` / `match`, its arms held to the
-        # field's N and T, built in a temporary (an arm may read the field).
-        src_ptr = next_reg(s)
-        entry_alloca_reg_begin(s, src_ptr)
-        emit_local_array_llvm_type(s, field.array_size, field.array_elem_type, field.array_elem_type_name)
-        format_into(s, "  ; #4918 array arm value\n")
-        entry_alloca_reg_end(s)
-        emit_array_local_whole_assign_impl(s, src_ptr, field.array_size, field.array_elem_type, field.array_elem_type_name, value)
-        src_size = field.array_size
-        src_et = field.array_elem_type
-        src_name = field.array_elem_type_name
-    else
-        match try_array_payload(s, value)
-            Some(tap) =>
-                # AGAST #4918: `x?`'s array payload, read from the carrier's spill.
-                src_ptr = match emit_try_array_ptr(s, value)
-                    Some(p) => p
-                    None => return   # refused, located
-                src_size = tap.size
-                src_et = tap.elem
-                src_name = tap.name
-            None => pass
+    match array_place_shape(s, value)
+        Some(place) =>
+            src_ptr = emit_array_place_ptr(s, value)
+            src_size = place.size
+            src_et = place.elem
+            src_name = place.name
+        None =>
+            if value.kind == ExprKind.Member
+                var mr: MemberPtrResult
+                emit_member_ptr(s, value, @mr)
+                if mr.success == 1 and mr.field != null and mr.field.field_type == TypeKind.Array
+                    src_ptr = mr.reg
+                    src_size = mr.field.array_size
+                    src_et = mr.field.array_elem_type
+                    src_name = mr.field.array_elem_type_name
+            else if call_ret_array(s, value) != null
+                # AGAST #2302: a call's `[N x T]`, through a temporary.
+                let cra: *Param = call_ret_array(s, value)
+                src_ptr = emit_call_array_temp(s, value, cra)
+                src_size = cra.param_array_size
+                src_et = cra.param_array_elem_type
+                src_name = cra.param_type_name
+            else if value.kind == ExprKind.If or value.kind == ExprKind.Match
+                # AGAST #4918: an array-valued `if` / `match`, its arms held to the
+                # field's N and T, built in a temporary (an arm may read the field).
+                src_ptr = next_reg(s)
+                entry_alloca_reg_begin(s, src_ptr)
+                emit_local_array_llvm_type(s, field.array_size, field.array_elem_type, field.array_elem_type_name)
+                format_into(s, "  ; #4918 array arm value\n")
+                entry_alloca_reg_end(s)
+                emit_array_local_whole_assign_impl(s, src_ptr, field.array_size, field.array_elem_type, field.array_elem_type_name, value)
+                src_size = field.array_size
+                src_et = field.array_elem_type
+                src_name = field.array_elem_type_name
+            else
+                match try_array_payload(s, value)
+                    Some(tap) =>
+                        # AGAST #4918: `x?`'s array payload, read from the carrier's spill.
+                        src_ptr = match emit_try_array_ptr(s, value)
+                            Some(p) => p
+                            None => return   # refused, located
+                        src_size = tap.size
+                        src_et = tap.elem
+                        src_name = tap.name
+                    None => pass
     if src_ptr < 0
         emit_ir_error_sv(s, value.span, "whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
         return
@@ -235,9 +236,7 @@ pub fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, 
     var src_ptr: i32 = -1
     match value.kind
         ExprKind.Index =>
-            var pp: NdIndexPtr
-            emit_nd_index_ptr(s, value, @pp)
-            src_ptr = pp.reg
+            src_ptr = emit_nd_index_reg(s, value)
         ExprKind.Member =>
             var mr: MemberPtrResult
             emit_member_ptr(s, value, @mr)
@@ -378,20 +377,21 @@ fn emit_array_place_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: 
             emit_try_array_into(s, dst_ptr, dst_size, dst_et, dst_name, value, tap)
             return
         None => pass
-    var place: ArraySrc
-    if nd_row_src(s, value, @place)
-        # AGAST #2517: a row `g[i]`, `x.m[i]`, `mk().m[i]` or `mkp().m[i]`.
-        if not array_len_matches(s, value, place.size, dst_size, "array length does not match the local array's length")
+    match nd_row_src(s, value)
+        Some(row) =>
+            # AGAST #2517: a row `g[i]`, `x.m[i]`, `mk().m[i]` or `mkp().m[i]`.
+            if not array_len_matches(s, value, row.size, dst_size, "array length does not match the local array's length")
+                return
+            if not array_store_fits(s, value, row.elem, row.name, dst_et, dst_name)
+                return
+            emit_local_array_copy(s, dst_size, dst_et, dst_name, emit_nd_index_reg(s, value), dst_ptr)
             return
-        if not array_store_fits(s, value, place.elem, place.name, dst_et, dst_name)
+        None => pass
+    let place: ArraySrc = match array_place_shape(s, value)
+        Some(a) => a
+        None =>
+            emit_ir_error_sv(s, value.span, "whole-array assignment to a local array from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
             return
-        var ndp: NdIndexPtr
-        emit_nd_index_ptr(s, value, @ndp)
-        emit_local_array_copy(s, dst_size, dst_et, dst_name, ndp.reg, dst_ptr)
-        return
-    if array_place_shape(s, value, @place) == 0
-        emit_ir_error_sv(s, value.span, "whole-array assignment to a local array from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
-        return
     if not array_len_matches(s, value, place.size, dst_size, "array length does not match the local array's length")
         return
     if not array_store_fits(s, value, place.elem, place.name, dst_et, dst_name)

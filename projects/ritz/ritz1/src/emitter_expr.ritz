@@ -108,11 +108,29 @@ fn emit_vec_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult
     emit_member_gep_from_ptr(s, result, elem_ptr, elem_st, field_idx, field)
     return 1
 
+# A struct S and the pointer levels from a value to it: 1 = `*S`, 2 = `**S`.
+pub struct StructLevels
+    st: *StructDef
+    levels: i32
+
+# A loaded pointer to a struct: the register holding it, the struct, and the
+# pointer levels from it to the struct.
+pub struct DerefPtr
+    reg: i32
+    st: *StructDef
+    levels: i32
+
+# `reg` as a DerefPtr to `st` through `levels`; None for register 0, which is
+# what an emit_expr that failed returns (registers start at 1).
+fn deref_ptr_at(reg: i32, st: *StructDef, levels: i32) -> Option<DerefPtr>
+    if reg == 0
+        return None
+    Some(DerefPtr { reg: reg, st: st, levels: levels })
+
 # AGAST #1510: the VALUE of `x`, where x is a pointer to a struct through
-# one or more levels of indirection.  Sets *out_st to that struct and
-# *out_levels to the number of pointer levels: 1 = `*St`, 2 = `**St`.
-# Returns the register holding the loaded pointer, or 0 if the shape or
-# static type isn't recognised.
+# one or more levels of indirection: the register holding the loaded
+# pointer, that struct, and the number of pointer levels (1 = `*St`,
+# 2 = `**St`).  None if the shape or static type isn't recognised.
 #
 # Recursive over the shapes a deref operand takes in practice:
 #   IDENT          local `*St` / `@St` / `@&St` (1), or `**St` / `@*St` (2)
@@ -123,11 +141,9 @@ fn emit_vec_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult
 # The IDENT arm checks the struct before emitting anything.  The member arm
 # may leave dead loads behind when it gives up; the caller reports the
 # error, so they are never reached.
-pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, out_levels: *i32) -> i32
-    *out_st = null
-    *out_levels = 0
+pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr) -> Option<DerefPtr>
     if x == null
-        return 0
+        return None
     match x.kind
         ExprKind.Ident =>
             let loc: *LocalVar = find_local_struct_name(s, x.ident)
@@ -137,51 +153,45 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
             if loc == null
                 let glob: *GlobalVarDef = find_global(s, x.ident)
                 if glob == null or glob.var_type != TypeKind.Ptr or glob.pointee_type != TypeKind.Struct or glob.pointee_type_name.len <= 0
-                    return 0
+                    return None
                 let gst: *StructDef = find_struct(s, glob.pointee_type_name)
                 if gst == null
-                    return 0
+                    return None
                 let gp: i32 = next_reg(s)
                 let g_ir: String = ir_name(glob.name)
                 format_into(s, "  %.{gp} = load ptr, ptr @{g_ir.as_view()}\n")
-                *out_st = gst
-                *out_levels = 1
-                return gp
+                return deref_ptr_at(gp, gst, 1)
             if lv_type_name_len(loc) <= 0
-                return 0
+                return None
             let levels: i32 = local_struct_levels(loc)
             if levels == 0
-                return 0
+                return None
             let st: *StructDef = find_struct(s, lv_name(loc))
             if st == null
-                return 0
-            *out_st = st
-            *out_levels = levels
-            return emit_load_ptr(s, loc.reg)
+                return None
+            return deref_ptr_at(emit_load_ptr(s, loc.reg), st, levels)
         ExprKind.Method =>
             # AGAST #1635: `(*m.index(k)).f`, which a struct's `m[k].f` becomes.
             # The method returns an `@S`, `@&S` or `*S`: an address, in an i64.
             let fd: *FnDef = method_call_def(s, x)
             if fd == null or fd.return_type_name.len <= 0
-                return 0
+                return None
             if fd.return_type != TypeKind.Ref and fd.return_type != TypeKind.MutRef and fd.return_type != TypeKind.Ptr
-                return 0
+                return None
             let mst: *StructDef = find_struct(s, fd.return_type_name)
             if mst == null
-                return 0
+                return None
             let addr: i32 = emit_expr(s, x)
             let mp: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, addr)
-            *out_st = mst
-            *out_levels = 1
-            return mp
+            return deref_ptr_at(mp, mst, 1)
         ExprKind.Member =>
             var inner: MemberPtrResult
             emit_member_ptr(s, x, @inner)
             if inner.success != 1
-                return 0
+                return None
             let f: *StructField = inner.field
             if f.field_type_name.len <= 0
-                return 0
+                return None
             var flevels: i32 = 0
             match f.field_type
                 TypeKind.Ptr =>
@@ -190,23 +200,19 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
                     flevels = ptr_ptr_ident_levels(f.inner_pointee_type)
                 _ => pass
             if flevels == 0
-                return 0
+                return None
             let fst: *StructDef = find_struct(s, f.field_type_name)
             if fst == null
-                return 0
-            *out_st = fst
-            *out_levels = flevels
-            return emit_load_ptr(s, inner.reg)
+                return None
+            return deref_ptr_at(emit_load_ptr(s, inner.reg), fst, flevels)
         _ => pass
     if x.kind == ExprKind.Unary and x.op == OpKind.Deref
-        var sub_st: *StructDef = null
-        var sub_levels: i32 = 0
-        let sub_reg: i32 = emit_deref_operand_ptr(s, x.operand, @sub_st, @sub_levels)
-        if sub_reg == 0 or sub_levels < 2
-            return 0
-        *out_st = sub_st
-        *out_levels = sub_levels - 1
-        return emit_load_ptr(s, sub_reg)
+        let sub: DerefPtr = match emit_deref_operand_ptr(s, x.operand)
+            Some(found) => found
+            None => return None
+        if sub.levels < 2
+            return None
+        return deref_ptr_at(emit_load_ptr(s, sub.reg), sub.st, sub.levels - 1)
     # AGAST #2376: `b[i]` with `b: [N]**S`, or `@a[i]` with `a: [N]*S`: a `**S`,
     # so `(**b[i]).f` reaches S.
     if elem_rooted(x) == 1
@@ -214,29 +220,25 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
         if pl.levels >= 2 and pl.inner == TypeKind.Struct and pl.name.len > 0
             let pl_st: *StructDef = find_struct(s, pl.name)
             if pl_st == null
-                return 0
+                return None
             var pl_ptr: i32 = emit_expr(s, x)
             if deref_operand_is_ptr(s, x) == 0
                 let pl_val: i32 = pl_ptr
                 pl_ptr = next_reg(s)
                 format_into(s, "  %.{pl_ptr} = inttoptr i64 %.{pl_val} to ptr\n")
-            *out_st = pl_st
-            *out_levels = pl.levels
-            return pl_ptr
+            return deref_ptr_at(pl_ptr, pl_st, pl.levels)
     # AGAST #2805: `y + k` / `y - k` where y is a `**S` (`qq + 1`, or a call
     # returning one, `vec_as_ptr<*S>(@w) + 1`), or such a call bare: emit_expr
     # strides it by 8, and `(*(qq + 1)).f` loads the `*S` and GEPs into S.  It
     # fell through to the `*S` arm below, which names no S for it, and was an
     # unlocated "unhandled EXPR_MEMBER".
     if x.kind == ExprKind.Call or (x.kind == ExprKind.Binary and (x.op == OpKind.Add or x.op == OpKind.Sub))
-        var pp_st: *StructDef = null
-        let pp_levels: i32 = ptr_ptr_struct_operand(s, x, @pp_st)
-        if pp_levels >= 2
-            let pp_val: i32 = emit_expr(s, x)
-            let pp_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, pp_val)
-            *out_st = pp_st
-            *out_levels = pp_levels
-            return pp_ptr
+        match ptr_ptr_struct_operand(s, x)
+            Some(pp) =>
+                let pp_val: i32 = emit_expr(s, x)
+                let pp_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, pp_val)
+                return deref_ptr_at(pp_ptr, pp.st, pp.levels)
+            None => pass
     # AGAST #1924: `y + k` / `y - k` where y is a `*S` (`*(pp + i) + k`):
     # emit_expr strides it by sizeof(S) (deref_pointee_struct_name names S
     # for the left operand), so `(*(*(pp + i) + k)).f` GEPs into the right
@@ -246,42 +248,37 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
     if x.kind == ExprKind.Index or x.kind == ExprKind.Call or x.kind == ExprKind.Cast or (x.kind == ExprKind.Binary and (x.op == OpKind.Add or x.op == OpKind.Sub))
         let b_name: StrView = deref_pointee_struct_name(s, x)
         if b_name.len <= 0
-            return 0
+            return None
         let b_st: *StructDef = find_struct(s, b_name)
         if b_st == null
-            return 0
+            return None
         let b_val: i32 = emit_expr(s, x)
         # AGAST #3443: `x as @&S` is already the `ptr` an `@&T` lowers as
         # (#1754); `as *S` / `as @S` are i64 addresses.
         if x.kind == ExprKind.Cast and x.type_kind == TypeKind.MutRef
-            *out_st = b_st
-            *out_levels = 1
-            return b_val
+            return deref_ptr_at(b_val, b_st, 1)
         let b_ptr: i32 = ir_inttoptr_ptr(s.ir.out, @s.fcx.reg_counter, b_val)
-        *out_st = b_st
-        *out_levels = 1
-        return b_ptr
-    return 0
+        return deref_ptr_at(b_ptr, b_st, 1)
+    None
 
-# AGAST #2805: the pointer levels (>= 2) of `x` when it is a pointer to
-# pointer to a struct S, writing S to *out_st: pointer arithmetic down the left
-# spine rooted in anything ptr_levels_of resolves (a `**S` local, param, global
-# or field), or in a call returning `**S` (written, or `vec_as_ptr<*S>`, which
-# monomorph records as TypeKind.PtrPtr named S, a `ptr_` per extra level, #2791).
-# 0 for any other shape.
-fn ptr_ptr_struct_operand(s: *EmitterState, x: *Expr, out_st: **StructDef) -> i32
-    *out_st = null
+# AGAST #2805: the struct S and the pointer levels (>= 2) of `x` when it is a
+# pointer to pointer to S: pointer arithmetic down the left spine rooted in
+# anything ptr_levels_of resolves (a `**S` local, param, global or field), or
+# in a call returning `**S` (written, or `vec_as_ptr<*S>`, which monomorph
+# records as TypeKind.PtrPtr named S, a `ptr_` per extra level, #2791).
+# None for any other shape.
+fn ptr_ptr_struct_operand(s: *EmitterState, x: *Expr) -> Option<StructLevels>
     var root: *Expr = x
     while root != null and root.kind == ExprKind.Binary and (root.op == OpKind.Add or root.op == OpKind.Sub)
         root = root.left
     if root == null
-        return 0
+        return None
     var name: StrView = no_name()
     var levels: i32 = 0
     if root.kind == ExprKind.Call
         let fd: *FnDef = find_call_fn(s, root)
         if fd == null or fd.return_type != TypeKind.PtrPtr or fd.return_type_name.ptr == null
-            return 0
+            return None
         name = fd.return_type_name
         levels = 2
         while name.len > 4 and name.starts_with("ptr_")
@@ -290,44 +287,41 @@ fn ptr_ptr_struct_operand(s: *EmitterState, x: *Expr, out_st: **StructDef) -> i3
     else
         let pl: PtrLevels = ptr_levels_of(s, x)
         if pl.inner != TypeKind.Struct
-            return 0
+            return None
         levels = pl.levels
         name = pl.name
     if levels < 2 or unnamed(name) or name.len <= 0
-        return 0
+        return None
     let st: *StructDef = find_struct(s, name)
     if st == null
-        return 0
-    *out_st = st
-    levels
+        return None
+    Some(StructLevels { st: st, levels: levels })
 
-# AGAST #2399: levels between what the call `e` returns and the struct `.` names,
-# when there are two or more (`-> **S`, `-> @*S`, `-> @&**S`), with the struct in
-# `out_st`.  0 for any other result.
-pub fn call_result_struct_levels(s: *EmitterState, e: *Expr, out_st: **StructDef) -> i32
-    *out_st = null
+# AGAST #2399: the struct `.` names through what the call `e` returns, and the
+# levels (two or more) between them: `-> **S`, `-> @*S`, `-> @&**S`.  None for
+# any other result.
+pub fn call_result_struct_levels(s: *EmitterState, e: *Expr) -> Option<StructLevels>
     let fd: *FnDef = call_callee_def(s, e)
     if fd == null
-        return 0
+        return None
     if fd.return_type == TypeKind.PtrPtr and e.kind == ExprKind.Call
-        return ptr_ptr_struct_operand(s, e, out_st)
+        return ptr_ptr_struct_operand(s, e)
     if fd.return_type != TypeKind.Ref and fd.return_type != TypeKind.MutRef
-        return 0
+        return None
     let r: *Param = fd.ret_ref
     if r == null or r.param_type_name.len <= 0
-        return 0
+        return None
     var levels: i32 = 0
     if r.param_pointee_type == TypeKind.Ptr
         levels = 2
     else if r.param_pointee_type == TypeKind.PtrPtr and ptr_ptr_slot_inner(r.param_inner_pointee_type) == TypeKind.Struct
         levels = 1 + ptr_ptr_ident_levels(r.param_inner_pointee_type)
     else
-        return 0
+        return None
     let st: *StructDef = find_struct(s, r.param_type_name)
     if st == null
-        return 0
-    *out_st = st
-    levels
+        return None
+    Some(StructLevels { st: st, levels: levels })
 
 # The struct pointer the call `e` returns `levels` levels from it, loaded down
 # to the struct's address.  The call is emitted once.
@@ -440,13 +434,13 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
         # does (#2526): emit_deref_operand_ptr resolves an `as *S` to S's address.
         # It fell to "unhandled EXPR_MEMBER in assignment", so the store failed.
         ExprKind.Cast =>
-            var c_st: *StructDef = null
-            var c_levels: i32 = 0
-            let c_base: i32 = emit_deref_operand_ptr(s, e.left, @c_st, @c_levels)
-            if c_base != 0 and c_levels == 1
-                let c_idx: i32 = find_field_index(c_st, e.ident)
-                if c_idx >= 0
-                    emit_member_gep_from_ptr(s, result, c_base, c_st, c_idx, get_field_type(c_st, c_idx))
+            match emit_deref_operand_ptr(s, e.left)
+                Some(c) =>
+                    if c.levels == 1
+                        let c_idx: i32 = find_field_index(c.st, e.ident)
+                        if c_idx >= 0
+                            emit_member_gep_from_ptr(s, result, c.reg, c.st, c_idx, get_field_type(c.st, c_idx))
+                None => pass
 
         ExprKind.Binary =>
             member_ptr_of_binary(s, e, result)
@@ -588,14 +582,14 @@ fn member_ptr_of_call(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                 return
     # AGAST #2399: `h(x).f` with `h` returning `**S` or `@*S`: through
     # every level, as for a local of that type.
-    var cl_st: *StructDef = null
-    let cl_levels: i32 = call_result_struct_levels(s, e.left, @cl_st)
-    if cl_levels >= 2
-        let cl_idx: i32 = find_field_index(cl_st, e.ident)
-        if cl_idx >= 0
-            let cl_ptr: i32 = emit_call_result_struct_ptr(s, e.left, cl_levels)
-            emit_member_gep_from_ptr(s, result, cl_ptr, cl_st, cl_idx, get_field_type(cl_st, cl_idx))
-            return
+    match call_result_struct_levels(s, e.left)
+        Some(cl) =>
+            let cl_idx: i32 = find_field_index(cl.st, e.ident)
+            if cl_idx >= 0
+                let cl_ptr: i32 = emit_call_result_struct_ptr(s, e.left, cl.levels)
+                emit_member_gep_from_ptr(s, result, cl_ptr, cl.st, cl_idx, get_field_type(cl.st, cl_idx))
+                return
+        None => pass
     # AGAST #2879: a `*S` result is the struct's address, so its field is
     # a place: `sp(@s).x = 3`, `s.me().arr[2] = 5`.  GEP through the
     # pointer the call returns.  The call is emitted once here; `x op= v`
@@ -659,21 +653,19 @@ fn member_ptr_of_deref(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     # pointee struct recursively, then GEP on it.
     # AGAST #1940: a `**S` ident (`(*pp).n`) falls through to here
     # too; the `*S` ident arm above only takes one level.
-    var d_st: *StructDef = null
-    var d_levels: i32 = 0
-    var d_base: i32 = emit_deref_operand_ptr(s, d_op, @d_st, @d_levels)
-    if d_base == 0
-        return
+    let d: DerefPtr = match emit_deref_operand_ptr(s, d_op)
+        Some(found) => found
+        None => return
+    var d_base: i32 = d.reg
     # AGAST #1940: `(*pp).n` with pp a `**S`: `*pp` is still a `*S`,
     # and `.n` auto-derefs it (ritz0 does the same).  Load once more.
     # AGAST #2372: as many times as it takes.
-    if d_levels >= 2
-        d_base = emit_load_levels(s, d_base, d_levels - 1)
-        d_levels = 1
-    if d_levels == 1
-        let d_idx: i32 = find_field_index(d_st, e.ident)
+    if d.levels >= 2
+        d_base = emit_load_levels(s, d_base, d.levels - 1)
+    if d.levels >= 1
+        let d_idx: i32 = find_field_index(d.st, e.ident)
         if d_idx >= 0
-            emit_member_gep_from_ptr(s, result, d_base, d_st, d_idx, get_field_type(d_st, d_idx))
+            emit_member_gep_from_ptr(s, result, d_base, d.st, d_idx, get_field_type(d.st, d_idx))
 
 # `(@x).f`: e.left is an address-of.
 fn member_ptr_of_addr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
@@ -822,11 +814,10 @@ fn member_ptr_of_nd_index(s: *EmitterState, e: *Expr, result: *MemberPtrResult, 
     let nd_fidx: i32 = find_field_index(nd_st, e.ident)
     if nd_fidx < 0
         return
-    var nd_el: NdIndexPtr
-    emit_nd_index_ptr(s, e.left, @nd_el)
+    let nd_el: i32 = emit_nd_index_reg(s, e.left)
     let nd_fp: i32 = next_reg(s)
     gep_struct_open(s, nd_fp, nd_st.name)
-    format_into(s, ", ptr %.{nd_el.reg}, i32 0, i32 {nd_fidx}\n")
+    format_into(s, ", ptr %.{nd_el}, i32 0, i32 {nd_fidx}\n")
     result.reg = nd_fp
     result.field = get_field_type(nd_st, nd_fidx)
     result.success = 1
@@ -1157,8 +1148,7 @@ fn int_as_enum_refused(s: *EmitterState, e: *Expr) -> bool
         return false
     if ty_int_bits(expr_slot_ty(e.left)) == 0
         return false
-    var en_sv: StrView = StrView { ptr: null, len: 0 }
-    if resolve_scrutinee_enum(s, e.left, @en_sv) != 0
+    if resolve_scrutinee_enum(s, e.left).is_some()
         return false
     var line: i32 = e.bracket.line
     var col: i32 = e.bracket.col
@@ -1312,13 +1302,14 @@ pub fn emit_cast_expr(s: *EmitterState, e: *Expr) -> i32
     # type: the int → int path below wraps it to the target.
     if enum_identity_cast(s, e) == 1
         return cast_raw
-    var enum_src_ty: TypeKind = TypeKind.Void
-    let enum_disc: i32 = emit_enum_to_int(s, e, cast_raw, @enum_src_ty)
-    let from_enum: bool = enum_disc != 0 - 1
-    if from_enum
-        cast_src = enum_disc
-        src_ty = enum_src_ty
-        src_name = no_name()
+    var from_enum: bool = false
+    match emit_enum_to_int(s, e, cast_raw)
+        Some(disc) =>
+            from_enum = true
+            cast_src = disc.reg
+            src_ty = disc.src_ty
+            src_name = no_name()
+        None => pass
     let src_is_float: bool = is_float_type(src_ty, src_name) == 1
     let dst_is_float: bool = is_float_type(target_ty, no_name()) == 1
     if src_is_float and not dst_is_float
@@ -1384,8 +1375,8 @@ fn emit_cast_int_wrap(s: *EmitterState, cast_src: i32, src_ty: TypeKind, target_
     format_into(s, "  %.{wide} = {ext} i{w} %.{narrow} to i64\n")
     wide
 
-# A `"..."` literal (a %Span$u8 / %StrView value): 1 (result in *out) when lowered.
-pub fn emit_string_lit_expr(s: *EmitterState, e: *Expr, out: *i32) -> i32
+# A `"..."` literal: the register holding its %Span$u8 / %StrView value.
+pub fn emit_string_lit_expr(s: *EmitterState, e: *Expr) -> i32
     # Bare "..." lowers to a %Span$u8 aggregate { ptr: *u8, len: i64 } —
     # the StrView-shaped view (AGAST #98). Zero allocation: the payload
     # is an @.str global and length is known at compile time. %Span$u8 is
@@ -1404,8 +1395,7 @@ pub fn emit_string_lit_expr(s: *EmitterState, e: *Expr, out: *i32) -> i32
     format_into(s, "  %.{sv1} = insertvalue %{lit_ty.as_view()} undef, ptr %.{gep_reg}, 0\n")
     let sv2: i32 = next_reg(s)
     format_into(s, "  %.{sv2} = insertvalue %{lit_ty.as_view()} %.{sv1}, i64 {str_len}, 1\n")
-    *out = sv2
-    return 1
+    sv2
 
 
 # The words for an array literal or fill that has no `[N]T` slot.  ritz0's
@@ -1465,17 +1455,21 @@ pub fn float_ret_value(s: *EmitterState, val_reg: i32, ret_type: TypeKind, value
 # Statement Emission
 # =============================================================================
 
-# The address of the struct `e`, an index through, is or points at, as a `ptr`
-# register, and its name in `out_name`; 0 if `e` isn't one or its element isn't
-# a struct.  An element that's a pointer holds the struct's address; otherwise
-# the sum is it.
-pub fn emit_through_elem_ptr(s: *EmitterState, e: *Expr, out_name: *StrView) -> i32
+# A struct's address in a `ptr` register, and the struct's name.
+pub struct NamedPtr
+    reg: i32
+    name: StrView
+
+# The address of the struct `e`, an index through, is or points at, and its
+# name; None if `e` isn't one or its element isn't a struct.  An element that's
+# a pointer holds the struct's address; otherwise the sum is it.
+pub fn emit_through_elem_ptr(s: *EmitterState, e: *Expr) -> Option<NamedPtr>
     let loc: *LocalVar = index_through(s, e)
     if loc == null
-        return 0
+        return None
     let held: NamedKind = through_elem_struct(s, loc)
     if unnamed(held.name)
-        return 0
+        return None
     var t: ThroughIndex
     index_through_fill(s, e, through_spill(s, loc), @t)
     var val: i32 = 0
@@ -1485,8 +1479,7 @@ pub fn emit_through_elem_ptr(s: *EmitterState, e: *Expr, out_name: *StrView) -> 
         val = emit_expr(s, @t.sum)
     let elem_ptr: i32 = next_reg(s)
     format_into(s, "  %.{elem_ptr} = inttoptr i64 %.{val} to ptr\n")
-    *out_name = held.name
-    elem_ptr
+    Some(NamedPtr { reg: elem_ptr, name: held.name })
 
 # `p[i].f`'s address, for `e` = the ExprKind.Member.  Returns 1 when it took `e`.
 pub fn emit_through_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult) -> i32
@@ -1497,8 +1490,10 @@ pub fn emit_through_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrRes
     let field_idx: i32 = find_field_index(st, e.ident)
     if field_idx < 0
         return 0
-    var elem_name: StrView = no_name()
-    let elem_ptr: i32 = emit_through_elem_ptr(s, e.left, @elem_name)
+    var elem_ptr: i32 = 0
+    match emit_through_elem_ptr(s, e.left)
+        Some(ep) => elem_ptr = ep.reg
+        None => pass
     emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, get_field_type(st, field_idx))
     1
 

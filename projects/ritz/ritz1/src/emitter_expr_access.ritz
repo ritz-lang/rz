@@ -102,22 +102,22 @@ fn emit_struct_load(s: *EmitterState, name: StrView, ptr: i32) -> i32
 # Check if ident name is "None" (4 chars: N o n e).
 # AGAST #2434: true when a bare `None` is a user enum's unit variant here, as
 # users_variant_wins decides for a call `Some(5)`: a user enum declares the
-# unit `None` (or two do: bare_unit_variant_enum's -2, reported by the bare
+# unit `None` (or two do: BareUnit.Ambiguous, reported by the bare
 # unit-variant path) and no Option slot gives the builtin an enum.  A slot
 # that is the user's enum (`let x: E = None`, a param of E) is the user's
 # whatever the fn returns.
 pub fn users_none_wins(s: *EmitterState, e: *Expr) -> bool
     if e == null or e.kind != ExprKind.Ident or is_ident_none(ident_text(e)) == 0
         return false
-    var vi: i32 = 0
-    var other: i32 = 0
-    let ei: i32 = bare_unit_variant_enum(s, e, @vi, @other)
-    if ei == 0 - 1
-        return false
-    if ei >= 0 and s.fcx.ctx_enum_name.ptr != null
-        let ctx: StrView = s.fcx.ctx_enum_name
-        if ctx.eq(enum_name_at(s.sym.mono.pctx, ei))
-            return true
+    match bare_unit_variant_enum(s, e)
+        BareUnit.NoVariant =>
+            return false
+        BareUnit.Unit(at) =>
+            if s.fcx.ctx_enum_name.ptr != null
+                let ctx: StrView = s.fcx.ctx_enum_name
+                if ctx.eq(enum_name_at(s.sym.mono.pctx, at.enum_idx))
+                    return true
+        BareUnit.Ambiguous(_) => pass
     unnamed(resolve_enum_ctx(s))
 
 # A const, local or global named `name` hides the builtin `None`.
@@ -271,21 +271,21 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
         return emit_fn_address(s, fn_def)
 
     # AGAST #2422: `Empty` where the slot is a `Slot<i32>`.
-    var ivi: i32 = 0
-    let iei: i32 = slot_instance_variant(s, name, @ivi)
-    if iei >= 0 and enum_variant_kind(s.sym.mono.pctx, iei, ivi) == ENUM_VARIANT_UNIT
-        return emit_unit_variant_value(s, enum_name_at(s.sym.mono.pctx, iei), ivi)
+    match slot_instance_variant(s, name)
+        Some(inst) =>
+            if enum_variant_kind(s.sym.mono.pctx, inst.enum_idx, inst.variant) == ENUM_VARIANT_UNIT
+                return emit_unit_variant_value(s, enum_name_at(s.sym.mono.pctx, inst.enum_idx), inst.variant)
+        None => pass
 
     # AGAST #1600 / #1610: a bare unit variant `B` of a user enum, as the
     # qualified `S.B` builds it.  Checked last, so a const / local / global /
     # fn of the same name still wins (bare_unit_variant_enum also checks).
-    var vi: i32 = 0
-    var other_ei: i32 = 0
-    let var_ei: i32 = bare_unit_variant_enum(s, e, @vi, @other_ei)
-    if var_ei >= 0
-        return emit_unit_variant_value(s, enum_name_at(s.sym.mono.pctx, var_ei), vi)
-    if var_ei == 0 - 2
-        return emit_ambiguous_variant_error(s, name, e.span, vi, other_ei)
+    match bare_unit_variant_enum(s, e)
+        BareUnit.Unit(at) =>
+            return emit_unit_variant_value(s, enum_name_at(s.sym.mono.pctx, at.enum_idx), at.variant)
+        BareUnit.Ambiguous(c) =>
+            return emit_ambiguous_variant_error(s, name, e.span, c.first, c.second)
+        BareUnit.NoVariant => pass
     # AGAST #3021: `Empty` where the slot names no `Slot` instance.
     let no_inst: i32 = emit_no_instance_error(s, name, e.span)
     if no_inst != 0
@@ -653,9 +653,9 @@ fn try_emit_index_early(s: *EmitterState, e: *Expr) -> Option<i32>
             emit_nd_error_sv(s, e.span.line, e.span.col, unsliceable_message(TypeKind.Array))
             return Some(0)
     # AGAST #1509: `g[i][j]` over a multi-dimensional array (one GEP chain).
-    var nd_val: i32 = 0
-    if emit_nd_index_value(s, e, @nd_val) == 1
-        return Some(nd_val)
+    match emit_nd_index_value(s, e)
+        Some(nd_val) => return Some(nd_val)
+        None => pass
     match emit_array_ptr_index(s, e)
         Some(v) => return Some(v)
         None => pass
@@ -1048,18 +1048,17 @@ pub fn is_enum_instance(ctx: *ParseCtx, name: StrView) -> i32
 # `Full(5)` is a `Slot<i32>` only because its slot says so, as in ritz0.  The
 # slot is the typed let's, the parameter's or field's (ctx_enum_name), else the
 # enclosing fn's return type outside a call argument.  When that is an instance
-# declaring variant `name`, its tracker index (*out_vi the tag); else -1.
-pub fn slot_instance_variant(s: *EmitterState, name: StrView, out_vi: *i32) -> i32
+# declaring variant `name`, that variant of it (its tracker index); else None.
+pub fn slot_instance_variant(s: *EmitterState, name: StrView) -> Option<VariantAt>
     var en: StrView = s.fcx.ctx_enum_name
     if en.ptr == null and s.fcx.ctx_enum_arg == 0
         en = s.fcx.ret_type_name
     if is_enum_instance(s.sym.mono.pctx, en) == 0
-        return 0 - 1
+        return None
     let vi: i32 = enum_variant_index(s.sym.mono.pctx, en, name)
     if vi < 0
-        return 0 - 1
-    *out_vi = vi
-    enum_find(s.sym.mono.pctx, en)
+        return None
+    Some(VariantAt { enum_idx: enum_find(s.sym.mono.pctx, en), variant: vi })
 
 # AGAST #3021: a generic enum's bare constructor (`Full(6)`, `Empty`) whose
 # slot names no instance of it, refused at the constructor:
@@ -1372,32 +1371,29 @@ struct NdIndexPtr
 # AGAST #2570: `q[i][j][k]` with more indices than q's plane has dimensions.
 # index_through leaves a plane pointer to the N-D path, which can't take it,
 # and the rest read past q (it crashed): refused, located, as ritz0 refuses it.
-# Returns 1 with a full-depth *out over %0 when it refused (the error fails the
-# build; callers then don't report again), 0 when `e` isn't such a chain.
-fn nd_plane_overindex(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
+# A full-depth NdIndexPtr over %0 when it refused (the error fails the build;
+# callers then don't report again), None when `e` isn't such a chain.
+fn nd_plane_overindex(s: *EmitterState, e: *Expr) -> Option<NdIndexPtr>
     if e == null or e.kind != ExprKind.Index
-        return 0
+        return None
     var chain: i32 = 0
     let base: *Expr = nd_chain_base(s, e, @chain)   # AGAST #4122: `a[k]` a base
     if chain == 0   # `a[k]` itself: the plane pointer, not an index into it
-        return 0
+        return None
     let sh: *ArrayShape = plane_ptr_shape(s, base)
     if sh == null
-        return 0
+        return None
     emit_nd_error_sv(s, e.span.line, e.span.col, "this indexes more dimensions than the plane of the multi-dimensional array it points at has")
-    out.reg = 0
-    out.depth = sh.rank
-    out.shape = sh
-    return 1
+    Some(NdIndexPtr { reg: 0, depth: sh.rank, shape: sh })
 
-# Emit the GEP for an N-D index chain `e` into *out.  Returns 0 (emitting
-# nothing) when nd_index_shape does not recognise `e`.  The indices are
-# evaluated in source order, outermost dimension first.
-pub fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
+# Emit the GEP for an N-D index chain `e`: the element / sub-array pointer.
+# None (emitting nothing) when nd_index_shape does not recognise `e`.  The
+# indices are evaluated in source order, outermost dimension first.
+pub fn emit_nd_index_ptr(s: *EmitterState, e: *Expr) -> Option<NdIndexPtr>
     var depth: i32 = 0
     let sh: *ArrayShape = nd_index_shape(s, e, @depth)
     if sh == null
-        return nd_plane_overindex(s, e, out)
+        return nd_plane_overindex(s, e)
     var chain: i32 = 0
     let base: *Expr = nd_chain_base(s, e, @chain)   # AGAST #4122: `a[k]` a base
     # AGAST #2097: a field base `s.m` / `p.m` / `a.b.m` is addressed before
@@ -1450,15 +1446,19 @@ pub fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
         format_into(s, ", i64 %.{regs[j]}")
         j = j + 1
     format_into(s, "\n")
-    out.reg = r
-    out.depth = depth
-    out.shape = sh
-    return 1
+    Some(NdIndexPtr { reg: r, depth: depth, shape: sh })
 
-# The value of `e` = `g[i]..[k]` over an N-D array, in *out_reg.  Returns 0
-# when `e` is not an N-D index chain.  Only a full-depth chain to a leaf is a
-# value; a row (`g[i]` of `[N][M]T`) is a located error rather than a guess
-# at an aggregate load.  AGAST #3322: a row bound to an `[M]T` local
+# The register emit_nd_index_ptr gives for `e`, for a caller that has already
+# matched its N-D shape; 0, emitting nothing, if `e` is no N-D index chain.
+pub fn emit_nd_index_reg(s: *EmitterState, e: *Expr) -> i32
+    match emit_nd_index_ptr(s, e)
+        Some(p) => return p.reg
+        None => return 0
+
+# The value of `e` = `g[i]..[k]` over an N-D array (register 0 after a
+# located error).  None when `e` is not an N-D index chain.  Only a full-depth
+# chain to a leaf is a value; a row (`g[i]` of `[N][M]T`) is a located error
+# rather than a guess at an aggregate load.  AGAST #3322: a row bound to an `[M]T` local
 # (`let r = g[i]`, annotated or not) or passed to an `[M]T` parameter is
 # copied by the whole-array paths and never reaches here.
 #
@@ -1467,28 +1467,24 @@ pub fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
 # `g[0][0] = g[2][1]`, `f(g[i][j])`), as a 1-D `[N]S` element is (#2330).
 # A leaf naming no struct (a generic clone that kept `T`, #3141) stays the
 # located error: `load %T` would be invalid IR.
-fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
-    var ndp: NdIndexPtr
-    if emit_nd_index_ptr(s, e, @ndp) == 0
-        return 0
+fn emit_nd_index_value(s: *EmitterState, e: *Expr) -> Option<i32>
+    let ndp: NdIndexPtr = match emit_nd_index_ptr(s, e)
+        Some(found) => found
+        None => return None
     let sh: *ArrayShape = ndp.shape
     var leaf_st: *StructDef = null
     if sh.leaf_type == TypeKind.Struct and sh.leaf_name.len > 0
         leaf_st = find_struct(s, sh.leaf_name)
     if ndp.depth < sh.rank or (sh.leaf_type == TypeKind.Struct and leaf_st == null)
         emit_nd_error_sv(s, e.span.line, e.span.col, "a row or a struct element of a multi-dimensional array is not a value in ritz1 (index every dimension, use .field, or take its address with @)")
-        *out_reg = 0
-        return 1
+        return Some(0)
     if sh.leaf_type == TypeKind.Struct
-        *out_reg = 0
         if whole_struct_elem_refused(s, e)
-            return 1
+            return Some(0)
         let sv: i32 = next_reg(s)
         emit_struct_load_or_defer(s, TypeKind.Struct, sv, sh.leaf_name, ndp.reg, no_name())
-        *out_reg = sv
-        return 1
+        return Some(sv)
     let ty: StrView = elem_mem_llvm(sh.leaf_type)
     let v: i32 = next_reg(s)
     format_into(s, "  %.{v} = load {ty}, ptr %.{ndp.reg}\n")
-    *out_reg = emit_array_elem_widen(s, v, sh.leaf_type, elem_mem_llvm(sh.leaf_type))
-    return 1
+    Some(emit_array_elem_widen(s, v, sh.leaf_type, elem_mem_llvm(sh.leaf_type)))

@@ -303,13 +303,13 @@ fn emit_span_of_addr_place(s: *EmitterState, e: *Expr, name: StrView) -> i32
             let first: i32 = next_reg(s)
             format_into(s, "  %.{first} = getelementptr i8, ptr @{g.as_view()}, i64 0\n")
             return emit_span_value(s, first, ce.array_size, name)
-    var src: ArraySrc
-    if arg_array_shape(s, x, @src) == 0
-        return 0
+    let src: ArraySrc = match arg_array_shape(s, x)
+        Some(a) => a
+        None => return 0
     if src.elem != TypeKind.Ptr and src.elem != TypeKind.PtrPtr
         span_elem_fits(s, e, src.elem, src.name, name)
     var ptr: i32 = 0
-    if array_place_shape(s, x, @src) == 1
+    if array_place_shape(s, x).is_some()
         ptr = emit_array_place_ptr(s, x)
     else
         var mr: MemberPtrResult
@@ -320,19 +320,23 @@ fn emit_span_of_addr_place(s: *EmitterState, e: *Expr, name: StrView) -> i32
 # `StrView { &x[0], N }` of strview_array_src's array `x`, or `{ x, N }` when
 # `x` points at it.
 fn emit_strview_of_array(s: *EmitterState, x: *Expr) -> i32
-    var src: ArraySrc
+    # strview_array_src saw the shape each arm reads (None never gets here).
     if strview_array_ptr(s, x)
-        array_ptr_shape(s, x, @src)
-        return emit_span_value(s, emit_array_ptr_value(s, x), src.size, "StrView")
-    arg_array_shape(s, x, @src)
+        let pn: i32 = match array_ptr_shape(s, x)
+            Some(a) => a.size
+            None => 0
+        return emit_span_value(s, emit_array_ptr_value(s, x), pn, "StrView")
+    let n: i32 = match arg_array_shape(s, x)
+        Some(a) => a.size
+        None => 0
     var ptr: i32 = 0
-    if array_place_shape(s, x, @src) == 1
+    if array_place_shape(s, x).is_some()
         ptr = emit_array_place_ptr(s, x)
     else
         var mr: MemberPtrResult
         emit_member_ptr(s, x, @mr)
         ptr = mr.reg
-    emit_span_value(s, ptr, src.size, "StrView")
+    emit_span_value(s, ptr, n, "StrView")
 
 # AGAST #2287: the `[N x T]` value of `arg` for by-value array param `p`.  As in
 # ritz0, `g(p)` and `g(@a)` read through the pointer.  Each value is copied into
@@ -372,7 +376,6 @@ fn emit_array_arg_addr(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     if param_takes_array_ref(p) == 0
         return 0
     var ptr: i32 = 0
-    var place: ArraySrc
     # AGAST #2290: a reborrow.  An `@[N]T` slot is an i64; the `ptr` slots
     # (`:&`, `@&[N]T`) take the pointer itself.  AGAST #2322: this is the only
     # place a bare `a:& [N]T` is its pointer; emit_expr_ident refuses it.
@@ -383,7 +386,7 @@ fn emit_array_arg_addr(s: *EmitterState, arg: *Expr, p: *Param) -> i32
         if p.param_type != TypeKind.Ref
             return lent.reg
         ptr = lent.reg
-    else if array_place_shape(s, arg, @place) == 1
+    else if array_place_shape(s, arg).is_some()
         ptr = emit_array_place_ptr(s, arg)
     else if arg.kind == ExprKind.Member and arg_field_is_array(s, arg)
         var mr: MemberPtrResult
@@ -499,15 +502,15 @@ fn emit_variant_struct(s: *EmitterState, tag: i32, ctor: *Expr) -> i32
 # not the last-declared enum's ctor.
 fn try_emit_user_variant_ctor(s: *EmitterState, e: *Expr) -> i32
     # AGAST #2422: `Full(5)` in a `Slot<i32>` slot builds that instance.
-    var ivi: i32 = 0
-    let iei: i32 = slot_instance_variant(s, e.func_name, @ivi)
-    if iei >= 0
-        let ikind: i32 = enum_variant_kind(s.sym.mono.pctx, iei, ivi)
-        # AGAST #1295: a payload variant takes its fields' values (counted
-        # by emit_variant_build).
-        if (ikind == ENUM_VARIANT_UNIT and e.args == null) or ((ikind == ENUM_VARIANT_TUPLE or ikind == ENUM_VARIANT_STRUCT) and e.args != null)
-            let in_name: StrView = enum_name_at(s.sym.mono.pctx, iei)
-            return emit_variant_build(s, in_name, ivi, e.args)
+    match slot_instance_variant(s, e.func_name)
+        Some(inst) =>
+            let ikind: i32 = enum_variant_kind(s.sym.mono.pctx, inst.enum_idx, inst.variant)
+            # AGAST #1295: a payload variant takes its fields' values (counted
+            # by emit_variant_build).
+            if (ikind == ENUM_VARIANT_UNIT and e.args == null) or ((ikind == ENUM_VARIANT_TUPLE or ikind == ENUM_VARIANT_STRUCT) and e.args != null)
+                let in_name: StrView = enum_name_at(s.sym.mono.pctx, inst.enum_idx)
+                return emit_variant_build(s, in_name, inst.variant, e.args)
+        None => pass
     match user_variant_ctor_ambiguous(s.sym.mono.pctx, e)
         Some(c) =>
             return emit_ambiguous_variant_error(s, e.func_name, e.span, c.first, c.second)
@@ -622,15 +625,17 @@ fn eval_variant_payload(s: *EmitterState, enum_name: StrView, sel: i32, e: *Expr
     pv.have = PayloadHave.Nothing
     pv.reg = 0
     # AGAST #3029: an array literal payload is written in place, below.
-    let arr_payload: i32 = variant_array_payload(s, enum_name, sel, e, @pv.arr)
-    # AGAST #2272: `Ok(())` carries a zero-byte payload: nothing to store.
-    if arr_payload == 1
-        pv.have = PayloadHave.InPlace
-    else if e != null and is_unit_expr(e) == 0
-        pv.reg = emit_lent_payload(s, enum_name, sel, e)
-        if pv.reg == 0
-            pv.reg = emit_payload_into_slot(s, enum_name, sel, e)
-        pv.have = PayloadHave.Value
+    match variant_array_payload(s, enum_name, sel, e)
+        Some(arr) =>
+            pv.arr = arr
+            pv.have = PayloadHave.InPlace
+        None =>
+            # AGAST #2272: `Ok(())` carries a zero-byte payload: nothing to store.
+            if e != null and is_unit_expr(e) == 0
+                pv.reg = emit_lent_payload(s, enum_name, sel, e)
+                if pv.reg == 0
+                    pv.reg = emit_payload_into_slot(s, enum_name, sel, e)
+                pv.have = PayloadHave.Value
 
 # Store the evaluated payload field `sel` (eval_variant_payload, from `e`)
 # into the enum at `slot`, at the field's offset and type.
@@ -2535,7 +2540,11 @@ fn method_recv_call(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
     var call_lv_st: *StructDef = null
     var call_levels: i32 = 0
     if r.type_name.len == 0 and call_ptr_st == null
-        call_levels = call_result_struct_levels(s, recv, @call_lv_st)
+        match call_result_struct_levels(s, recv)
+            Some(lv) =>
+                call_lv_st = lv.st
+                call_levels = lv.levels
+            None => pass
     r.recv_value_reg = emit_expr(s, recv)
     var call_slot: i32 = 0
     if call_levels >= 2
@@ -2642,42 +2651,40 @@ fn method_recv_deref(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
         # emit_deref_operand_ptr turns the cast's value into S's address, as
         # it does for `(p as @&S).f`.  So the method runs on the pointee, as
         # with `(*p).m()`.
-        var cr_st: *StructDef = null
-        var cr_levels: i32 = 0
-        let cr_reg: i32 = emit_deref_operand_ptr(s, recv, @cr_st, @cr_levels)
-        if cr_reg != 0 and cr_levels == 1
-            r.type_name = cr_st.name
-            r.receiver_reg = cr_reg
-            r.recv_is_ptr_of_ptr = false
-            r.recv_levels = 0
+        match emit_deref_operand_ptr(s, recv)
+            Some(cr) =>
+                if cr.levels == 1
+                    r.type_name = cr.st.name
+                    r.receiver_reg = cr.reg
+                    r.recv_is_ptr_of_ptr = false
+                    r.recv_levels = 0
+            None => pass
     else if recv.kind == ExprKind.Unary and recv.op == OpKind.Deref
         # AGAST #2145: `(*pp).m()` with pp a `**S` (param, local, field):
         # `*pp` is a `*S` value, so dispatch like a `*S` local -- the
         # loaded pp points at the slot holding the `*S` (ptr-of-ptr).
         # emit_deref_operand_ptr resolves pp the way emit_member_ptr's
         # `(*pp).w` arm (#1940) does.
-        var dr_st: *StructDef = null
-        var dr_levels: i32 = 0
-        let dr_reg: i32 = emit_deref_operand_ptr(s, recv.operand, @dr_st, @dr_levels)
-        if dr_reg == 0
-            return
-        if dr_levels == 1
+        let dr: DerefPtr = match emit_deref_operand_ptr(s, recv.operand)
+            Some(found) => found
+            None => return
+        if dr.levels == 1
             # AGAST #3109: a deref that leaves the struct itself, `(*(q + k)).m()`,
             # `(*q).m()`, `(**pp).m()`.  LARB R9 (#2175): `*p` is a place, so the
             # method runs on the pointee -- the loaded operand IS its address,
             # as a struct local's slot is.  The operand is emitted once, above.
-            r.type_name = dr_st.name
-            r.receiver_reg = dr_reg
+            r.type_name = dr.st.name
+            r.receiver_reg = dr.reg
             r.recv_is_ptr_of_ptr = false
             r.recv_levels = 0
         # AGAST #2404: through a `***S` or deeper `*p` is a `**S`, and the
         # loaded p is that many loads from the slot holding the `*S`.
-        else if dr_levels >= 2
-            r.type_name = dr_st.name
-            r.receiver_reg = emit_load_levels(s, dr_reg, dr_levels - 2)
+        else if dr.levels >= 2
+            r.type_name = dr.st.name
+            r.receiver_reg = emit_load_levels(s, dr.reg, dr.levels - 2)
             r.recv_is_ptr_of_ptr = true
-            r.recv_levels = dr_levels - 1
-            r.recv_base = dr_reg
+            r.recv_levels = dr.levels - 1
+            r.recv_base = dr.reg
 
 # A `**S` or deeper receiver no arm above names (AGAST #2404).
 fn method_recv_ptr_ptr(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
@@ -2765,9 +2772,14 @@ fn method_recv_index(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
         # AGAST #2443: `p[i].m()` through a `*`, `@` or `@&` Vec, Span or String
         # (R9), and `v[i].m()` on one: the element's address is the receiver, so
         # a mutating method writes the element in place.
-        var elem_sv: StrView = StrView { ptr: (elem_name), len: (elem_len) as i64 }
-        r.receiver_reg = emit_through_elem_ptr(s, recv, @elem_sv)
-        r.type_name = elem_sv
+        # None leaves no receiver, under the name index_through_struct gave.
+        r.receiver_reg = 0
+        r.type_name = StrView { ptr: (elem_name), len: (elem_len) as i64 }
+        match emit_through_elem_ptr(s, recv)
+            Some(ep) =>
+                r.receiver_reg = ep.reg
+                r.type_name = ep.name
+            None => pass
         r.recv_is_ptr_of_ptr = false
         r.recv_levels = 0
     else if nd_struct_leaf(s, recv) != null
@@ -2775,9 +2787,7 @@ fn method_recv_index(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
         # field, plane pointer): the element's address is the receiver, as
         # for `arr[i].m()` (#1981), so a mutating method writes it in place.
         let nd_st: *StructDef = nd_struct_leaf(s, recv)
-        var nd_recv: NdIndexPtr
-        emit_nd_index_ptr(s, recv, @nd_recv)
-        r.receiver_reg = nd_recv.reg
+        r.receiver_reg = emit_nd_index_reg(s, recv)
         r.type_name = nd_st.name
         r.recv_is_ptr_of_ptr = false
         r.recv_levels = 0
@@ -3019,8 +3029,11 @@ fn emit_impl_method_call(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv
     # AGAST #3071: a `self` two levels or more from its struct is the pointer
     # at those levels: the place of a receiver one short (lent, §5.4), or what
     # one with the levels holds.  Not the `*S` the dispatch below loads.
-    if pass_self_at_its_levels(s, recv, mfn, r.recv_levels, r.recv_base, @r.receiver_reg) == 1
-        r.recv_is_ptr_of_ptr = false
+    match pass_self_at_its_levels(s, recv, mfn, r.recv_levels, r.recv_base)
+        Some(reg) =>
+            r.receiver_reg = reg
+            r.recv_is_ptr_of_ptr = false
+        None => pass
 
     # A pointer-typed receiver (local, param or field `*T`) sits in a slot
     # that holds the pointer: load it and pass that, not the slot (AGAST #1692).
@@ -3172,10 +3185,10 @@ pub fn emit_expr_method_impl(s: *EmitterState, e: *Expr) -> i32
     # not a method call.  Before the impl lookup: in ritz0 a variant wins
     # over an impl method of the same name (a local named `Opt` still
     # shadows the enum; qualified_variant checks that).
-    var qvi: i32 = 0
-    let qei: i32 = qualified_variant(s, e, @qvi)
-    if qei >= 0
-        return emit_qualified_variant_ctor(s, e, qei, qvi)
+    match qualified_variant(s, e)
+        Some(q) =>
+            return emit_qualified_variant_ctor(s, e, q.enum_idx, q.variant)
+        None => pass
 
     # `E.from(v)` for an enum with no generated `from` (LANGUAGE_SPEC §10.4).
     let from_reg: i32 = try_emit_enum_from(s, e)
