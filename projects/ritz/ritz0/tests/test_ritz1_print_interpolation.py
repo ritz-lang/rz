@@ -170,11 +170,11 @@ pub fn main() -> i32
 
 # print with no placeholder keeps working, and its return value is still the
 # write(2) byte count.
+# A print's value is a Result<(), Errno> only with ritzlib.errno in scope
+# (AGAST #4962, test_print_result.py); here each one is a statement.
 PLAIN = """\
 pub fn main() -> i32
-    let n: i64 = print("hello\\n")
-    if n != 6
-        return 1
+    print("hello\\n")
     print(c"cstr plain\\n")
     return 0
 """

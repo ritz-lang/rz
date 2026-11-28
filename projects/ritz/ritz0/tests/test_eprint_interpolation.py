@@ -35,10 +35,8 @@ import re
 import subprocess
 from pathlib import Path
 
-import pytest
-
 import fast_link
-
+import pytest
 from ritz0_inproc import run_ritz0
 from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, RITZ_START
 
@@ -59,7 +57,13 @@ def _compile(compiler: str, tmp_path: Path, name: str, program: str):
     else:
         cmd = [str(RITZ1_BIN), str(src), "-o", str(ll)]
         proc = subprocess.run(
-            cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
+            cmd,
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
         )
     return proc, ll
 
@@ -79,7 +83,7 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str):
     assert link.returncode == 0, (
         f"{compiler} emitted IR that would not link for {name}:\n{link.stderr[-2000:]}"
     )
-    run = subprocess.run([str(exe)], capture_output=True, timeout=60)
+    run = subprocess.run([str(exe)], capture_output=True, timeout=60, check=False)
     assert run.returncode == 0, (
         f"{compiler} binary for {name} exited {run.returncode}; "
         f"stderr={run.stderr[-500:]!r}"
@@ -116,16 +120,6 @@ pub fn main() -> i32
 """
 
 
-def test_eprint_scalars_go_to_stderr_only(tmp_path):
-    _assert_parity(
-        tmp_path,
-        "eprint_scalars",
-        EPRINT_SCALARS,
-        b"",
-        b"x=-21 b=7 t=true cmp=false call=-42 s=cs\nplain\n",
-    )
-
-
 INTERLEAVED = """\
 pub fn main() -> i32
     let n: i64 = 3
@@ -137,24 +131,14 @@ pub fn main() -> i32
 """
 
 
-def test_print_and_eprint_keep_their_streams(tmp_path):
-    _assert_parity(
-        tmp_path, "interleaved", INTERLEAVED, b"out 3\nout2\n", b"err 3\nerr2 {n}\n"
-    )
-
-
-EPRINT_RETURN = """\
+# eprint's value, a Result<(), Errno>, needs ritzlib.errno (AGAST #4962;
+# test_print_result.py pins it); here each call is a statement.
+EPRINT_PLAIN = """\
 pub fn main() -> i32
-    let n: i64 = eprint("abcd\\n")
-    if n != 5
-        return 1
+    eprint("abcd\\n")
     eprint(c"cstr ok\\n")
     return 0
 """
-
-
-def test_eprint_plain_returns_byte_count_and_accepts_cstring(tmp_path):
-    _assert_parity(tmp_path, "eprint_ret", EPRINT_RETURN, b"", b"abcd\ncstr ok\n")
 
 
 # ---------------------------------------------------------------------------
@@ -195,15 +179,39 @@ pub fn main() -> i32
 """
 
 
-def test_strview_placeholders_print_len_bytes(tmp_path):
-    _assert_parity(
-        tmp_path,
-        "strview",
+# One test runs every row (AGAST #4962 folded the four to keep the suite
+# under its cap); each row is still checked, and named, on its own.
+#   eprint_scalars: eprint writes stderr only
+#   interleaved:    print and eprint keep their streams
+#   eprint_plain:   a plain eprint takes a c"..." too
+#   strview:        a StrView placeholder prints len bytes, not to a NUL
+PARITY = {
+    "eprint_scalars": (
+        EPRINT_SCALARS,
+        b"",
+        b"x=-21 b=7 t=true cmp=false call=-42 s=cs\nplain\n",
+    ),
+    "interleaved": (INTERLEAVED, b"out 3\nout2\n", b"err 3\nerr2 {n}\n"),
+    "eprint_plain": (EPRINT_PLAIN, b"", b"abcd\ncstr ok\n"),
+    "strview": (
         STRVIEW,
-        b"local=[view] part=[he] empty=[]\ncall=[yes],[no] field=[opt]\n"
-        b"param=[view]\nref=[view]\n",
+        (
+            b"local=[view] part=[he] empty=[]\ncall=[yes],[no] field=[opt]\n"
+            b"param=[view]\nref=[view]\n"
+        ),
         b"option 'view' needs a value (he)\n",
-    )
+    ),
+}
+
+
+def test_every_parity_row(tmp_path):
+    failed = []
+    for name, (program, out, err) in PARITY.items():
+        try:
+            _assert_parity(tmp_path, name, program, out, err)
+        except AssertionError as e:
+            failed.append(f"{name}: {e}")
+    assert not failed, "\n\n".join(failed)
 
 
 # String (string_as_view) is covered by the matrix file
@@ -223,8 +231,7 @@ REJECT = {
 }
 
 
-@pytest.mark.parametrize("case", sorted(REJECT))
-def test_eprint_rejects_what_print_rejects(tmp_path, case):
+def _check_reject(tmp_path, case: str) -> None:
     body, marker = REJECT[case]
     program = "pub fn main() -> i32\n    " + body + "\n    return 0\n"
     for compiler in COMPILERS:
@@ -236,11 +243,23 @@ def test_eprint_rejects_what_print_rejects(tmp_path, case):
             line = next(
                 i for i, text in enumerate(program.splitlines(), 1) if marker in text
             )
-            assert re.search(rf"\.ritz:{line}:\d+: error: ", comp.stderr), comp.stderr   # AGAST #3621
+            assert re.search(rf"\.ritz:{line}:\d+: error: ", comp.stderr), (
+                comp.stderr
+            )  # AGAST #3621
+        if case == "eprint_cstring":
+            # The c-string refusal names the fix, not just the failure.
+            assert "do not interpolate" in comp.stdout + comp.stderr, (
+                compiler,
+                comp.stderr,
+            )
 
 
-def test_eprint_cstring_rejection_names_the_fix(tmp_path):
-    program = 'pub fn main() -> i32\n    let x: i64 = 1\n    eprint(c"c={x}\\n")\n    return 0\n'
-    for compiler in COMPILERS:
-        comp, _ = _compile(compiler, tmp_path, "reject_msg", program)
-        assert "do not interpolate" in comp.stdout + comp.stderr, (compiler, comp.stderr)
+def test_eprint_rejects_what_print_rejects(tmp_path):
+    """Every REJECT row, by name, in one test (AGAST #4962, the suite cap)."""
+    failed = []
+    for case in sorted(REJECT):
+        try:
+            _check_reject(tmp_path, case)
+        except AssertionError as e:
+            failed.append(f"{case}: {e}")
+    assert not failed, "\n\n".join(failed)

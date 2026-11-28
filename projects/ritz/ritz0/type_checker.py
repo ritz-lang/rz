@@ -865,6 +865,18 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
         return operand_type
 
+    def _print_value_type(self, span) -> rast.Type:
+        """`Result<(), Errno>`, a print builtin's value (AGAST #4962).
+
+        It is ritzlib.errno's `errno_check`'s return, which the lowering
+        calls. A self-contained program without it has no Errno to build, so
+        there the call is a procedure (the emitter's `_resolved_to_procedure`).
+        """
+        sig = self.functions.get('errno_check')
+        if sig is not None and sig.ret_type is not None:
+            return sig.ret_type
+        return rast.NamedType(span, 'void', [])
+
     def _check_call(self, expr: rast.Call) -> rast.Type:
         """Type check function call."""
         # Get function name
@@ -919,19 +931,17 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                     return ptr_ty.inner
                 return rast.NamedType(expr.span, 'unknown', [])
 
-            # print(str) / eprint(str) -> void (eprint: AGAST #1641);
-            # format_into(sink, str) -> void (AGAST #1824)
-            # println / eprintln interpolate too (AGAST #202), but keep their
-            # ordinary signature when the argument is not an InterpString.
+            # The print builtins: print(str) / eprint(str) (AGAST #1641), and
+            # println / eprintln / write / writeln when the literal holds a
+            # placeholder (AGAST #202; otherwise they keep their ordinary
+            # signature). The lowering (_emit_interp_string_print) is the call
+            # whatever fn of the name is in scope, and its value is
+            # Result<(), Errno>: the first failing piece's errno, or Ok
+            # (LANGUAGE_SPEC §2.6, AGAST #4962). format_into(sink, str)
+            # appends and has no value (AGAST #1824).
             interp_line = (fn_name in ('println', 'eprintln')
                            and any(isinstance(a, rast.InterpString)
                                    for a in expr.args))
-            # write/writeln interpolate through their Writer, and the lowering
-            # (_emit_interp_string_print) is the call whatever fn of the name
-            # is in scope, so its value is the i64 byte total a Display body
-            # returns.  ritzlib.fmt's own write/writeln return
-            # Result<(), Errno> since AGAST #4930; typing the builtin by them
-            # refused `show`'s `write(w, "({self.x})")` tail (AGAST #4962).
             interp_writer = (fn_name in ('write', 'writeln')
                              and len(expr.args) == 2
                              and isinstance(expr.args[1], rast.InterpString))
@@ -939,9 +949,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                     or interp_line or interp_writer):
                 for arg in expr.args:
                     self._infer_type(arg)
-                if interp_writer:
-                    return rast.NamedType(expr.span, 'i64', [])
-                return rast.NamedType(expr.span, 'void', [])
+                if fn_name == 'format_into':
+                    return rast.NamedType(expr.span, 'void', [])
+                return self._print_value_type(expr.span)
 
             # Instructions the emitter lowers by name
             if fn_name in INTRINSICS or fn_name in (

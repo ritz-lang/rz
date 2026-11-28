@@ -1254,7 +1254,7 @@ byte accepted. A Writer is a `format_into` sink: it has `push_bytes`.
 | `string_writer` | `fn(s: @&String) -> Writer` | Appends to `*s` |
 | `span_writer` | `fn(buf: Span<u8>) -> Writer` | Fills `buf`; a write that doesn't fit is `Err(NoSpc)` and writes nothing |
 | `null_writer` | `fn() -> Writer` | Discards; `w.len` measures |
-| `write` / `writeln` | `fn(w: @&Writer, s: StrView) -> Result<(), Errno>` | `s` (and a newline) to `w`; stops at the first error |
+| `write` / `writeln` | `fn(w: @&Writer, s: StrView) -> Result<(), Errno>` | `s` (and a newline) to `w`; stops at the first error. With a placeholder in the literal it is the builtin, with the same Result (LANGUAGE_SPEC §2.6) |
 | `format` | `fn(s: StrView) -> String` | `s` copied into a new String |
 
 **Methods** (`impl Writer`, AGAST #4445):
@@ -1823,6 +1823,7 @@ pub enum Errno
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `errno_from_raw` | `fn(code: i32) -> Errno` | The Errno for `code`; either sign, so a raw `-errno` syscall return converts directly |
+| `errno_check` | `fn(raw: i64) -> Result<(), Errno>` | `Ok` when `raw` (a count or syscall return) is not negative, else the `Err` of its errno; the print builtins' value (LANGUAGE_SPEC §2.6) |
 | `errno_write` | `fn(fd: i32, e: Errno) -> i64` | Write the message to `fd`, no newline; `Other(n)` gives `"Unknown error <n>"` |
 
 **Methods** (`impl Errno`, AGAST #4445):

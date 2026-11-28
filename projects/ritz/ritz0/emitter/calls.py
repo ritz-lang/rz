@@ -212,6 +212,7 @@ class CallEmitter:
         # whatever `println` names in this file (ritzlib.io's, or a test's).
         printed = self._emit_print_call(call, fname)
         if printed is not None:
+            self._print_is_procedure(call, fname)
             return printed
 
         # write(w, "...{x}...") / writeln: Display through the Writer the
@@ -220,8 +221,10 @@ class CallEmitter:
         # StrView call. Checked before user fns, like print.
         if (fname in ('write', 'writeln') and len(call.args) == 2
                 and isinstance(call.args[1], rast.InterpString)):
-            return self._emit_interp_string_print(
+            written = self._emit_interp_string_print(
                 call.args[1], newline=(fname == 'writeln'), writer=call.args[0])
+            self._print_is_procedure(call, fname)
+            return written
 
         # format_into(sink, "...") -- print's literal, appended to a buffer
         # (AGAST #1824). Reserved like print: checked before user functions.
@@ -278,8 +281,13 @@ class CallEmitter:
                     # GEP to get i8* pointer to string data
                     ptr = self.builder.gep(str_const, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
                     length = len(s)
-                    # Call write(out_fd, ptr, length) via syscall
-                    return self._emit_write_syscall(ir.Constant(self.i64, out_fd), ptr, ir.Constant(self.i64, length))
+                    # write(out_fd, ptr, length) via syscall; its value is
+                    # the Result of that one write (AGAST #4962).
+                    got = self._emit_write_syscall(ir.Constant(self.i64, out_fd), ptr, ir.Constant(self.i64, length))
+                    zero = ir.Constant(self.i64, 0)
+                    status = self.builder.select(
+                        self.builder.icmp_signed('<', got, zero), got, zero)
+                    return self._print_result(status, getattr(call, "span", None))
                 elif isinstance(arg, rast.InterpString):
                     # Handle interpolated string - desugar to Display calls
                     return self._emit_interp_string_print(arg, out_fd,

@@ -408,9 +408,9 @@ pub fn main() -> i32
     a[1].x = 3
     return f(@&a)
 """,
+    # Linked alone, so no ritzlib import: with ritzlib.errno in scope the
+    # print would call errno_check for its value (AGAST #4962).
     "print_element": """
-import ritzlib.io
-
 fn f(a:& [2]i32) -> i32
     print("{a[1]}\\n")
     return a[1]

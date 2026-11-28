@@ -47,11 +47,14 @@ pytestmark = pytest.mark.integration
 # Result's Ok, Result's Err, and a user enum's tuple variant.  A row that
 # only repeated another's was left out (docs/TESTING.md, "What a ritz0 pytest
 # case costs").
+# Each program is linked alone (no ritzlib objects), so none imports
+# ritzlib.io: through it ritzlib.errno is in scope, and a print then calls
+# errno_check for its value (AGAST #4962).  print is a builtin; it needs no
+# import.
 RUNS = {
-    # The ticket's repro, verbatim.
+    # The ticket's repro, less its `import ritzlib.io` (above).
     "option_some_u8": (
         """\
-import ritzlib.io
 import ritzlib.option
 
 fn nm(i: i64) -> Option<*u8>
@@ -73,7 +76,6 @@ fn main() -> i32
     ),
     "result_ok_u8": (
         """\
-import ritzlib.io
 import ritzlib.result
 
 fn pick(i: i64) -> Result<*u8, i64>
@@ -94,7 +96,6 @@ fn main() -> i32
     ),
     "result_err_u8": (
         """\
-import ritzlib.io
 import ritzlib.result
 
 fn pick(i: i64) -> Result<i64, *u8>
@@ -115,8 +116,6 @@ fn main() -> i32
     ),
     "user_enum_ptr_u8": (
         """\
-import ritzlib.io
-
 enum Slot
     P(*u8)
     N
@@ -142,7 +141,6 @@ fn main() -> i32
 # The binding is a pointer, not just printed as one: `*n` reads a byte and
 # `n + 1` steps by one.  Exits 0 when both reads are right.
 DEREF = """\
-import ritzlib.io
 import ritzlib.option
 
 fn mk() -> Option<*u8>

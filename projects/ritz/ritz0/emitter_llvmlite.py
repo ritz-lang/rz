@@ -1428,6 +1428,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                     if isinstance(ptr_ty, (rast.PtrType, rast.RefType)):
                         return ptr_ty.inner
                     return None
+                fn_name = self._call_typed_by(expr, fn_name)
+                if fn_name is None:
+                    return None
                 if fn_name in self.functions:
                     _, fn_def = self.functions[fn_name]
                     return fn_def.ret_type
@@ -7190,26 +7193,103 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         `print`/`println` pass fd 1, `eprint`/`eprintln` fd 2 (AGAST #1641,
         #202). `write`/`writeln` pass the program's Writer expression.
-        Returns the bytes written.
+        Returns the call's Result<(), Errno> (`_print_result`): the first
+        piece that fails stops the call (AGAST #4962).
         """
         self._refuse_format_specs(expr)
         if writer is None:
             sink = {'kind': 'fd', 'fd': fd, 'arg': None}
         else:
             sink = self._fmt_explicit_sink(writer, expr)
-        total = ir.Constant(self.i64, 0)
+        self._fmt_begin_checks(sink)
         for i, part in enumerate(expr.parts):
             if part:
-                got = self._sink_write_const(sink, part)
-                total = self.builder.add(total, got)
+                self._sink_write_const(sink, part)
             if i < len(expr.exprs):
-                got = self._emit_display_value(expr.exprs[i], sink,
-                                               expr.specs[i] if i < len(expr.specs) else '')
-                total = self.builder.add(total, got)
+                self._emit_display_value(expr.exprs[i], sink,
+                                         expr.specs[i] if i < len(expr.specs) else '')
         if newline:
-            got = self._sink_write_const(sink, "\n")
-            total = self.builder.add(total, got)
-        return total
+            self._sink_write_const(sink, "\n")
+        return self._print_result(self._fmt_end_checks(sink),
+                                  getattr(expr, "span", None))
+
+    # ------------------------------------------------------------------
+    # A print builtin's value (AGAST #4962): every count a piece returns (a
+    # sink write's, or a Display/Debug method's) is checked as it comes
+    # back, and the first negative one -- the -errno -- branches to the end
+    # with it as the status. Nothing after it is written. The status is
+    # ritzlib.errno's `errno_check`'s argument, so the call is a
+    # Result<(), Errno>.
+    # ------------------------------------------------------------------
+
+    def _fmt_begin_checks(self, sink) -> None:
+        """Give `sink` the status slot and the block a failure jumps to."""
+        status = self.builder._entry_alloca(self.i64, "fmt.status")
+        self.builder.store(ir.Constant(self.i64, 0), status)
+        sink['status'] = status
+        sink['done'] = self.current_fn.append_basic_block("fmt.done")
+
+    def _fmt_check(self, sink, got: ir.Value) -> None:
+        """Stop the print at `got` if it is negative (an error)."""
+        if 'done' not in sink or got is None:
+            return
+        got = self._convert_type(got, self.i64)
+        self.builder.store(got, sink['status'])
+        failed = self.builder.icmp_signed('<', got, ir.Constant(self.i64, 0))
+        cont = self.current_fn.append_basic_block("fmt.ok")
+        self.builder.cbranch(failed, sink['done'], cont)
+        self.builder.position_at_end(cont)
+
+    def _fmt_end_checks(self, sink) -> ir.Value:
+        """Every piece was written: the status, 0, or the failure's -errno."""
+        self.builder.store(ir.Constant(self.i64, 0), sink['status'])
+        self.builder.branch(sink['done'])
+        self.builder.position_at_end(sink['done'])
+        return self.builder.load(sink['status'])
+
+    @staticmethod
+    def _call_typed_by(call: rast.Call, fname: str) -> str | None:
+        """The fn whose return types `call`, a call of `fname`.
+
+        A print builtin is lowered ahead of any fn of its name (emitter/
+        calls.py), so that fn says nothing about it: its value is
+        `errno_check`'s, and format_into has none (None). Any other call is
+        typed by `fname` itself.
+        """
+        args = call.args
+        if fname in ('print', 'eprint'):
+            return 'errno_check'
+        if (fname in ('println', 'eprintln') and len(args) == 1
+                and isinstance(args[0], rast.InterpString)):
+            return 'errno_check'
+        if (fname in ('write', 'writeln') and len(args) == 2
+                and isinstance(args[1], rast.InterpString)):
+            return 'errno_check'
+        if fname == 'format_into':
+            return None
+        return fname
+
+    def _print_is_procedure(self, call: rast.Call, fname: str) -> None:
+        """No ritzlib.errno: the print builtin `call` has no value to use."""
+        if 'errno_check' not in self.functions:
+            self._resolved_to_procedure(call, fname)
+
+    def _print_result(self, status: ir.Value, span) -> ir.Value:
+        """`errno_check(status)`, the call's Result<(), Errno>.
+
+        A self-contained program without ritzlib.errno has no Errno to build:
+        there the call is a procedure, and its callers (emitter/calls.py)
+        refuse a use of its value (`_print_is_procedure`).
+        """
+        if 'errno_check' not in self.functions:
+            return status
+        name = self._fmt_local_name("status")
+        slot = self.builder._entry_alloca(self.i64, "fmt.result")
+        self.builder.store(status, slot)
+        self.locals[name] = (slot, self.i64)
+        self.ritz_types[name] = rast.NamedType(span, 'i64', [])
+        return self._emit_expr(rast.Call(span, rast.Ident(span, 'errno_check'),
+                                         [rast.Ident(span, name)]))
 
     def _emit_display_value(self, expr: rast.Expr, sink, spec: str = ''):
         """Write one `{expr[:spec]}` to `sink` through the value's own impl.
@@ -7307,7 +7387,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             self.ritz_types[recv_name] = rty
         arg = self._display_writer_arg(sink, span)
         call = rast.MethodCall(span, rast.Ident(span, recv_name), method, [arg])
-        return self._emit_method_call(call)
+        got = self._emit_method_call(call)
+        self._fmt_check(sink, got)
+        return got
 
     # ------------------------------------------------------------------
     # Debug's auto-derive (#202): a struct with no `impl Debug` prints as
@@ -7348,22 +7430,19 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             return None
         stack.add(type_name)
         try:
-            total = self._sink_write_const(sink, spelling)
+            # Each write is checked as it is made (`_fmt_check`), so only
+            # the last one's count is returned.
+            got = self._sink_write_const(sink, spelling)
             if fields:
-                total = self.builder.add(
-                    total, self._sink_write_const(sink, " { "))
+                self._sink_write_const(sink, " { ")
                 for i, (fname, ftype) in enumerate(fields):
                     if i:
-                        total = self.builder.add(
-                            total, self._sink_write_const(sink, ", "))
-                    total = self.builder.add(
-                        total, self._sink_write_const(sink, f"{fname}: "))
-                    got = self._emit_debug_field(
+                        self._sink_write_const(sink, ", ")
+                    self._sink_write_const(sink, f"{fname}: ")
+                    self._emit_debug_field(
                         self.builder.extract_value(value, i), ftype, sink, span)
-                    total = self.builder.add(total, got)
-                total = self.builder.add(
-                    total, self._sink_write_const(sink, " }"))
-            return total
+                got = self._sink_write_const(sink, " }")
+            return got
         finally:
             stack.discard(type_name)
 
@@ -7523,16 +7602,20 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         return fn
 
     def _sink_write_ptr(self, sink, ptr: ir.Value, length: ir.Value):
+        """Write `length` bytes at `ptr`; returns the bytes accepted, after
+        stopping the print if that is an error (`_fmt_check`)."""
+        got = self._sink_write_raw(sink, ptr, length)
+        self._fmt_check(sink, got)
+        return got
+
+    def _sink_write_raw(self, sink, ptr: ir.Value, length: ir.Value):
         """Write `length` bytes at `ptr`; returns the bytes accepted."""
         if sink['kind'] == 'fd':
             return self._emit_write_syscall(
                 ir.Constant(self.i64, sink['fd']), ptr, length)
         wptr = sink['ptr']
-        imported = self.functions.get('writer_write')
-        if imported is not None:
-            return self.builder.call(imported[0], [wptr, ptr, length])
-        # No ritzlib to call: the Writer's own sink, and the `len` accounting
-        # `writer_write` would do (writer_view/writer_len read it).
+        # The Writer's own sink, and the `len` accounting `Writer.write`
+        # does (`w.len()` / `w.view()` read it), without needing the import.
         idx = {n: i for i, n in enumerate(
             name for name, _ in self.struct_fields['Writer'])}
         sink_ptr = self.builder.load(self.builder.gep(
@@ -7660,12 +7743,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                     break  # Block terminated (return/break/continue)
             # The body's trailing expression, as _emit_while's. It was
             # dropped, so `unsafe` + `if c` + `break` never ran (AGAST #2248).
-            tail = stmt.body.expr
-            if tail is not None and not self.builder.block.is_terminated:
-                if isinstance(tail, rast.If):
-                    self._emit_if(tail)
-                else:
-                    self._emit_expr(tail)
+            self._emit_discarded_tail(stmt.body.expr)
         finally:
             # Restore previous state
             self.in_unsafe = prev_unsafe
@@ -8095,12 +8173,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         return None
 
-    def _emit_loop_body_tail(self, tail: Optional[rast.Expr]) -> None:
-        """A `while` / `for` body's trailing expression, if the body reaches
-        it.  Its value is discarded (AGAST #3749) and, like a statement's,
-        its temporaries drop at its end, once per iteration (§13.6): left in
-        the loop statement's frame, each slot dropped once, after the loop,
-        and an arm's call leaked on every other iteration (AGAST #4592)."""
+    def _emit_discarded_tail(self, tail: rast.Expr | None) -> None:
+        """A `while` / `for` / `unsafe` body's trailing expression, if the
+        body reaches it.  Its value is discarded (AGAST #3749) and, like a
+        statement's, its temporaries drop at its end, once per iteration in
+        a loop (§13.6): left in the loop statement's frame, each slot dropped
+        once, after the loop, and an arm's call leaked on every other
+        iteration (AGAST #4592)."""
         if self.builder.block.is_terminated or tail is None:
             return
         self._temp_frames.append([])
@@ -8147,7 +8226,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if result is True:
                 break
 
-        self._emit_loop_body_tail(stmt.body.expr)
+        self._emit_discarded_tail(stmt.body.expr)
         self._leave_drop_scope()
 
         if not self.builder.block.is_terminated:
@@ -8274,7 +8353,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if result is True:
                 break
 
-        self._emit_loop_body_tail(stmt.body.expr)
+        self._emit_discarded_tail(stmt.body.expr)
         self._leave_drop_scope()
 
         # Jump to increment if not terminated
@@ -8472,7 +8551,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if result is True:
                 break
 
-        self._emit_loop_body_tail(stmt.body.expr)
+        self._emit_discarded_tail(stmt.body.expr)
         self._leave_drop_scope()
 
         if not self.builder.block.is_terminated:
@@ -14538,6 +14617,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 fn_name = expr.func.name
             elif isinstance(expr.func, str):
                 fn_name = expr.func
+            if fn_name:
+                fn_name = self._call_typed_by(expr, fn_name)
             if fn_name and fn_name in self.functions:
                 _, fn_def = self.functions[fn_name]
                 if fn_def and fn_def.ret_type:

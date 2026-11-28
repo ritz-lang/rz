@@ -2,7 +2,8 @@
 """AGAST #4070: a statement if/else's arms are not merged into a phi.
 
 ritz0 lowered an if/else whose value is discarded (an expression
-statement, or the tail of a procedure) as a value: `_emit_if` merged the
+statement, the tail of a procedure, a loop body or an `unsafe` block) as
+a value: `_emit_if` merged the
 arms' last expressions in a phi.  With one arm ending in a unit call (whose
 dummy value is an i32) and the other in a struct-returning call, the phi
 was typed i32 but fed the struct, and clang refused the IR:
@@ -121,6 +122,16 @@ fn run(flag: i32, out: @&i32)
             mk(out)
 """
 
+# The if/else is an `unsafe` block's tail (AGAST #2248 runs it).
+UNSAFE = """\
+fn run(flag: i32, out: @&i32)
+    unsafe
+        if flag == 1
+            side(out)
+        else
+            mk(out)
+"""
+
 MAIN = """
 pub fn main() -> i32
     var n: i32 = 0
@@ -137,6 +148,7 @@ BODIES = {
     "valued": (VALUED, 11),
     "loop": (LOOP, 11),
     "for": (FOR, 11),
+    "unsafe": (UNSAFE, 11),
 }
 
 # Each row exits 0: `main` subtracts what its arms should have added.

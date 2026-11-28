@@ -293,7 +293,9 @@ enum SinkKind
 # `arg` is the Writer argument the impl methods take, built once; for an Fd
 # sink the fd Writer is built only when an impl is actually called, so a
 # self-contained program that only prints ints still needs no Writer struct.
-# `isink` / `ilen` are the Writer's field indices.
+# `isink` / `ilen` are the Writer's field indices.  `status` is the slot
+# holding the call's status (0, or the first failing piece's -errno) and
+# `done` the label a failure jumps to (fmt_check; AGAST #4962).
 struct PrintSink
     kind: SinkKind
     fd: i64
@@ -301,6 +303,8 @@ struct PrintSink
     arg: *Expr
     isink: i32
     ilen: i32
+    status: i32
+    done: i32
 
 var g_fmt_seq: i32 = 0
 var g_fmt_writer_used: bool = false
@@ -735,11 +739,67 @@ fn fmt_writer_arg(s: *EmitterState, sink: *PrintSink, span: SrcSpan) -> *Expr
 # ---- Sink writes ---------------------------------------------------------
 
 # Write the `len` bytes (an i64 register) at the `ptr` register to the sink.
-# Returns the bytes accepted.
+# Returns the bytes accepted, after stopping the print if that is an error.
 fn fmt_sink_write_ptr(s: *EmitterState, sink: *PrintSink, ptr: i32, len: i32) -> i32
-    match sink.kind
+    let got: i32 = match sink.kind
         SinkKind.Fd => fd_write(s, sink.fd, ptr, len)
         SinkKind.Writer => writer_write(s, sink, ptr, len)
+    fmt_check(s, sink, got)
+    got
+
+# ---- A print's value (AGAST #4962) ---------------------------------------
+#
+# Every count a piece returns (a sink write's, or a Display / Debug method's)
+# is checked as it comes back, and the first negative one, the -errno,
+# branches to the end with it as the status: nothing after it is written.
+# The call's value is ritzlib.errno's errno_check of the status, a
+# Result<(), Errno> (interp_text.ritz's print_result_fn), as ritz0's
+# _fmt_check / _print_result.
+
+# The status slot, 0 until a piece fails, and the label a failure jumps to.
+fn fmt_begin_checks(s: *EmitterState, sink: *PrintSink)
+    let slot: i32 = next_reg(s)
+    alloca_at(s, slot, "i64", "print status")
+    format_into(s, "  store i64 0, ptr %.{slot}\n")
+    sink.status = slot
+    sink.done = next_label(s)
+
+# Stop the print at the count register `got` if it is negative.
+fn fmt_check(s: *EmitterState, sink: *PrintSink, got: i32)
+    if sink.status == 0 or got == 0
+        return
+    let slot: i32 = sink.status
+    let done: i32 = sink.done
+    let failed: i32 = next_reg(s)
+    format_into(s, "  store i64 %.{got}, ptr %.{slot}\n  %.{failed} = icmp slt i64 %.{got}, 0\n")
+    let ok: i32 = next_label(s)
+    format_into(s, "  br i1 %.{failed}, label %L{done}, label %L{ok}\n")
+    begin_block(s, ok)
+
+# Every piece was written (status 0), or one failed: the call's value.
+fn fmt_end_checks(s: *EmitterState, sink: *PrintSink, span: SrcSpan) -> i32
+    let slot: i32 = sink.status
+    let done: i32 = sink.done
+    format_into(s, "  store i64 0, ptr %.{slot}\n  br label %L{done}\n")
+    begin_block(s, done)
+    print_result(s, slot, span)
+
+# errno_check(<the status in `slot`>).  A self-contained program without
+# ritzlib.errno has no Errno to build: there the call is a procedure, whose
+# value emitter_expr_call.ritz's print_is_procedure refuses, so the status
+# stands in.
+fn print_result(s: *EmitterState, slot: i32, span: SrcSpan) -> i32
+    if find_fn(s, print_result_fn()) == null
+        let r: i32 = next_reg(s)
+        format_into(s, "  %.{r} = load i64, ptr %.{slot}\n")
+        return r
+    let name: StrView = fmt_name("status")
+    add_local(s, name, slot, TypeKind.I64)
+    let call: *Expr = fmt_expr_zero(ExprKind.Call, span)
+    call.func_name = print_result_fn()
+    call.args = fmt_ident_expr(name, span)
+    fmt_note_slots(s, call)
+    emit_expr(s, call)
 
 fn fd_write(s: *EmitterState, fd: i64, ptr: i32, len: i32) -> i32
     let pi: i32 = ir_ptrtoint_i64(s.ir.out, @s.fcx.reg_counter, ptr)
@@ -749,7 +809,7 @@ fn fd_write(s: *EmitterState, fd: i64, ptr: i32, len: i32) -> i32
     r
 
 # The program's Writer: its sink field, then the `len` accounting ritzlib's
-# writer_write would do (without needing the import). The pointer sits in the
+# Writer.write does (without needing the import). The pointer sits in the
 # hidden local write/writeln made for it.
 fn writer_write(s: *EmitterState, sink: *PrintSink, ptr: i32, len: i32) -> i32
     let wptr: i32 = sink.wptr
@@ -785,14 +845,6 @@ fn fmt_sink_write_const(s: *EmitterState, sink: *PrintSink, data: StrView) -> i3
     let len: i64 = data.len
     format_into(s, "  %.{n} = add i64 0, {len}\n")
     fmt_sink_write_ptr(s, sink, ptr, n)
-
-# The running byte count `total` (0: nothing yet) plus `got`.
-fn fmt_sink_add(s: *EmitterState, total: i32, got: i32) -> i32
-    if total == 0
-        return got
-    let r: i32 = next_reg(s)
-    format_into(s, "  %.{r} = add i64 %.{total}, %.{got}\n")
-    r
 
 # ---- Intrinsic forms -----------------------------------------------------
 
@@ -880,7 +932,9 @@ fn fmt_call_impl(s: *EmitterState, e: *Expr, ft: *FmtType, sink: *PrintSink, spa
     let w: *Expr = fmt_writer_arg(s, sink, span)
     if w == null
         return 0
-    emit_expr_method(s, fmt_method_expr(id, method, w, span))
+    let got: i32 = emit_expr_method(s, fmt_method_expr(id, method, w, span))
+    fmt_check(s, sink, got)
+    got
 
 # A value's Debug: its impl, a struct's auto-derived one, or a scalar's
 # intrinsic form; None when it has none.
@@ -897,32 +951,29 @@ fn fmt_debug_of(s: *EmitterState, e: *Expr, ft: *FmtType, sink: *PrintSink, span
 
 # A struct's auto-derived Debug: `Name { field: value, ... }`, each field
 # through its own Debug (a real impl, an auto-derived one, or a scalar's
-# intrinsic).
+# intrinsic).  Each write is checked as it is made (fmt_check), so this
+# returns only the last one's count.
 fn fmt_auto_debug(s: *EmitterState, e: *Expr, ft: *FmtType, st: *StructDef, sink: *PrintSink, span: SrcSpan) -> i32
     let spell: StrView = fmt_spelling(ft.name)
     let id: *Expr = fmt_materialize(s, e, ft, span)
-    var total: i32 = fmt_sink_write_const(s, sink, spell)
+    let named_only: i32 = fmt_sink_write_const(s, sink, spell)
     if st.fields == null
-        return total
-    total = fmt_sink_add(s, total, fmt_sink_write_const(s, sink, " { "))
+        return named_only
+    fmt_sink_write_const(s, sink, " { ")
     var f: *StructField = st.fields
     while f != null
         if f != st.fields
-            total = fmt_sink_add(s, total, fmt_sink_write_const(s, sink, ", "))
+            fmt_sink_write_const(s, sink, ", ")
         let fname: StrView = f.name
-        total = fmt_sink_add(s, total, fmt_sink_write_const(s, sink, fname))
-        total = fmt_sink_add(s, total, fmt_sink_write_const(s, sink, ": "))
+        fmt_sink_write_const(s, sink, fname)
+        fmt_sink_write_const(s, sink, ": ")
         let fe: *Expr = fmt_member_expr(id, fname, span)
         var fft: FmtType = fmt_field_type(f)
-        var got: i32 = 0
         match fmt_debug_of(s, fe, @fft, sink, span)
-            Some(r) => got = r
-            None =>
-                fmt_missing_impl(s, span, @fft, "Debug")
-                got = emit_print_zero(s)
-        total = fmt_sink_add(s, total, got)
+            Some(_) => pass
+            None => fmt_missing_impl(s, span, @fft, "Debug")
         f = f.next
-    fmt_sink_add(s, total, fmt_sink_write_const(s, sink, " }"))
+    fmt_sink_write_const(s, sink, " }")
 
 # A struct field's declared type, as the dispatcher needs it.
 fn fmt_field_type(f: *StructField) -> FmtType
@@ -985,14 +1036,13 @@ struct Pieces
     dest: PieceDest
     sink: *PrintSink   # Print's
     k: *FmtSink        # Format's
-    total: i32         # Print's bytes written so far (0: nothing yet)
     values: i32        # placeholders seen
 
 # Compile-time text.
 fn piece_text(s: *EmitterState, out: *Pieces, text: StrView)
     match out.dest
         PieceDest.Print =>
-            out.total = fmt_sink_add(s, out.total, fmt_sink_write_const(s, out.sink, text))
+            fmt_sink_write_const(s, out.sink, text)
         PieceDest.Format =>
             fmt_push_const(s, out.k, text)
 
@@ -1021,7 +1071,7 @@ fn piece_expr(s: *EmitterState, out: *Pieces, lit: *Expr, text: StrView, debug: 
 fn piece_lower(s: *EmitterState, out: *Pieces, lit: *Expr, e: *Expr, debug: bool)
     match out.dest
         PieceDest.Print =>
-            out.total = fmt_sink_add(s, out.total, fmt_print_value(s, out.sink, e, debug))
+            fmt_print_value(s, out.sink, e, debug)
         PieceDest.Format =>
             fmt_push_value(s, out.k, lit, e)
 
@@ -1087,43 +1137,38 @@ fn refuse_cstr_placeholder(s: *EmitterState, lit: *Expr, dest: PieceDest) -> boo
     true
 
 # Lower an interpolated print: literal parts, then each placeholder's
-# Display/Debug, then a newline for println/writeln. `want_total` returns
-# the bytes written (write/writeln's value); print's result keeps its old
-# shape (the write when there is no placeholder, else 0).
-fn emit_interp_print(s: *EmitterState, sink: *PrintSink, lit: *Expr, newline: bool, want_total: bool) -> i32
+# Display/Debug, then a newline for println/writeln.  Returns the call's
+# Result<(), Errno> (fmt_end_checks): the first piece that fails stops it.
+fn emit_interp_print(s: *EmitterState, sink: *PrintSink, lit: *Expr, newline: bool) -> i32
     if refuse_cstr_placeholder(s, lit, PieceDest.Print)
         return emit_print_zero(s)
+    fmt_begin_checks(s, sink)
     let body: StrView = raw_body(lit)
     if lit.kind == ExprKind.CstringLit or unnamed(body)
-        let r: i32 = fmt_sink_write_const(s, sink, cooked_text(lit))
+        fmt_sink_write_const(s, sink, cooked_text(lit))
         if newline and lit.kind == ExprKind.CstringLit
-            fmt_sink_add(s, r, fmt_sink_write_const(s, sink, "\n"))
-        return r
-    var out: Pieces = Pieces { dest: PieceDest.Print, sink: sink, k: null, total: 0, values: 0 }
+            fmt_sink_write_const(s, sink, "\n")
+        return fmt_end_checks(s, sink, lit.span)
+    var out: Pieces = Pieces { dest: PieceDest.Print, sink: sink, k: null, values: 0 }
     let tail: StrView = split_literal(s, @out, lit, body)
-    if out.values == 0 and not newline and not want_total
-        return fmt_sink_write_const(s, sink, tail)
     if tail.len > 0
         piece_text(s, @out, tail)
     if newline
         piece_text(s, @out, "\n")
-    if want_total
-        return out.total
-    emit_print_zero(s)
+    fmt_end_checks(s, sink, lit.span)
 
-# Lower print/println(<literal>) to fd. Returns the result register: the
-# write's byte count when the literal has no placeholder, else 0, as ritz0.
+# Lower print/println(<literal>) to fd: its Result<(), Errno>, as ritz0.
 pub fn emit_print_literal(s: *EmitterState, fd: i64, lit: *Expr, newline: bool) -> i32
-    var sink: PrintSink = PrintSink { kind: SinkKind.Fd, fd: fd, wptr: 0, arg: null, isink: -1, ilen: -1 }
-    emit_interp_print(s, @sink, lit, newline, false)
+    var sink: PrintSink = PrintSink { kind: SinkKind.Fd, fd: fd, wptr: 0, arg: null, isink: -1, ilen: -1, status: 0, done: 0 }
+    emit_interp_print(s, @sink, lit, newline)
 
 # Lower write/writeln(writer, <literal>): Display through the program's
-# Writer. Returns the bytes written.
+# Writer.  Its Result<(), Errno>, as print's.
 pub fn emit_write_literal(s: *EmitterState, lit: *Expr, writer_expr: *Expr, newline: bool) -> i32
-    var sink: PrintSink = PrintSink { kind: SinkKind.Writer, fd: 0, wptr: 0, arg: null, isink: -1, ilen: -1 }
+    var sink: PrintSink = PrintSink { kind: SinkKind.Writer, fd: 0, wptr: 0, arg: null, isink: -1, ilen: -1, status: 0, done: 0 }
     if not fmt_explicit_writer(s, writer_expr, @sink, lit.span)
         return emit_print_zero(s)
-    emit_interp_print(s, @sink, lit, newline, true)
+    emit_interp_print(s, @sink, lit, newline)
 
 # format_into's literal: each piece appended to the sink `k`.
 fn emit_format_literal(s: *EmitterState, k: *FmtSink, lit: *Expr) -> i32
@@ -1133,7 +1178,7 @@ fn emit_format_literal(s: *EmitterState, k: *FmtSink, lit: *Expr) -> i32
     if lit.kind == ExprKind.CstringLit or unnamed(body)
         fmt_push_const(s, k, cooked_text(lit))
         return emit_print_zero(s)
-    var out: Pieces = Pieces { dest: PieceDest.Format, sink: null, k: k, total: 0, values: 0 }
+    var out: Pieces = Pieces { dest: PieceDest.Format, sink: null, k: k, values: 0 }
     let tail: StrView = split_literal(s, @out, lit, body)
     if tail.len > 0
         piece_text(s, @out, tail)

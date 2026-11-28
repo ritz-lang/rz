@@ -468,6 +468,34 @@ fn main() -> i32
     return 0
 ```
 
+**A print's value** is `Result<(), Errno>`, as ritzlib's plain `write` /
+`writeln` are (AGAST #4930, #4962). That holds for `print` and `eprint` of any
+plain literal and for the interpolated `println`, `eprintln`, `write` and
+`writeln`. The pieces, literal text and each placeholder's `Display`, are
+written in order, and the first one that fails stops the call: nothing after
+it is written, and its errno is the `Err`. A `show` that returns a negative
+count fails the same way. `Ok(())` means every byte was accepted. The value is
+`ritzlib.errno`'s `errno_check` of that status, so `?` and `match` take it as
+they take any syscall wrapper's. A program without `ritzlib.errno` has no
+`Errno` to build, so there the call is a statement and using its value is an
+error. `format_into` (below) appends and has no value.
+
+```ritz
+import ritzlib.errno
+import ritzlib.fmt
+
+fn report(w: @&Writer, n: i64) -> Result<(), Errno>
+    writeln(w, "n = {n}")?
+    print("done\n")?
+    Ok(())
+
+fn main() -> i32
+    var w: Writer = stdout_writer()
+    match report(@&w, 42)
+        Ok(_) => 0
+        Err(e) => e.code()
+```
+
 Interpolation is a rule of these builtins (and of `format_into`, below), not
 of the string literal. The same `"{x}"` anywhere else, such as a `let`, an
 argument to any other function, a `return` or a struct field, is the three

@@ -218,14 +218,14 @@ def test_write_and_writeln_use_the_explicit_writer(tmp_path, compiler):
 pub fn main() -> i32
     var w: Writer = Writer { sink: buf_sink, state: @buf[0] as *u8, fd: -1, cap: 0, len: 0 }
     let p: Point = Point { x: 3, y: 4 }
-    let n: i64 = writeln(@&w, "p={p}")
-    let m: i64 = write(@&w, "!{p}")
+    writeln(@&w, "p={p}")
+    write(@&w, "!{p}")
     let v: StrView = StrView { ptr: @buf[0] as *u8, len: w.len }
-    print("[{v}] {n} {m}\\n")
+    print("[{v}] {w.len}\\n")
     0
 """
     out, err = _run(compiler, tmp_path, "display_writer", program)
-    assert out == b"[p=POINT\n!POINT] 8 6\n", f"{compiler}: {out!r}"
+    assert out == b"[p=POINT\n!POINT] 14\n", f"{compiler}: {out!r}"
     assert err == b"", f"{compiler}: {err!r}"
 
 
@@ -239,15 +239,20 @@ struct Point
 
 impl Display for Point
     fn show(self: @Point, w: @&Writer) -> i64
-        write(w, "({self.x}, {self.y})")
+        let start: i64 = w.len()
+        match write(w, "({self.x}, {self.y})")
+            Ok(_) => w.len() - start
+            Err(e) => -(e.code() as i64)
 
 pub fn main() -> i32
     var s: String = string_new()
     var w: Writer = string_writer(@&s)
     let p: Point = Point { x: 3, y: 4 }
-    let n: i64 = writeln(@&w, "p={p} x={p.x}")
+    match writeln(@&w, "p={p} x={p.x}")
+        Ok(_) => pass
+        Err(_) => return 1
     let v: StrView = s.as_view()
-    print("[{v}] {n}\\n")
+    print("[{v}] {w.len()}\\n")
     0
 """
 
