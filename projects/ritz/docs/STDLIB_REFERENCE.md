@@ -1069,6 +1069,8 @@ Slicing (no allocation):
 | `s.trim_start()` | `fn() -> StrView` | Drop leading space, `\t`, `\n`, `\r` |
 | `s.trim_end()` | `fn() -> StrView` | Drop trailing whitespace |
 | `s.trim()` | `fn() -> StrView` | Both ends |
+| `s.trim_start_byte(c)` | `fn(c: u8) -> StrView` | Drop the leading run of byte `c` (none: the whole view) |
+| `s.split_digits()` | `fn() -> SplitPair` | `before`: the leading ASCII decimal digits (maybe empty); `after`: the rest. Read the number with `p.before.parse_i64()` |
 | `s.split_once(delim)` | `fn(delim: u8) -> Option<SplitPair>` | Split at the first `delim`: `Some` of `{before, after}`, the delimiter in neither (either may be empty), or `None` when `delim` is absent |
 
 Search:

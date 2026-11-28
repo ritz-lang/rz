@@ -8,6 +8,12 @@ reported `expected Span<u8>, got @unknown` at a `Span<u8>` slot (angelo's
 shaper, four sites). Typed, `bytes` passes as itself, and `@bytes` is what
 LARB R1 refuses: an `@Span<u8>` is not a `Span<u8>`.
 
+The same branch must also read ritzlib's `impl StrView` methods (AGAST
+#4925): it typed `s.parse_i64()` as `unknown`, and an `unknown` receiver
+makes monomorph want a method on *every* instance, so `s.parse_i64().
+unwrap_or(0)` instantiated `Result<String, E>.unwrap_or` too and the
+compile failed in ritzlib/result.ritz at a line the program never called.
+
 No compiles: every case parses a few lines in-process.
 """
 
@@ -20,6 +26,20 @@ from parser import parse
 
 pytestmark = pytest.mark.unit
 
+# A stand-in for ritzlib's `impl StrView`: one plain return, one generic.
+IMPL = """\
+enum Opt<T>
+    Some(T)
+    None
+
+impl StrView
+    pub fn count(self: StrView) -> i64
+        self.len
+    pub fn number(self: StrView) -> Opt<i64>
+        Opt.None
+
+"""
+
 FIRST = "fn first(b: Span<u8>, i: usize) -> i32\n    b[i] as i32\n\n"
 
 
@@ -27,14 +47,14 @@ def _errors(source: str) -> list:
     return [str(e) for e in typed.type_module(parse(source)).errors]
 
 
-def _as_bytes_type(source: str) -> str:
-    """The type the pass gave the one `.as_bytes()` call in `source`."""
+def _method_type(source: str, method: str = "as_bytes") -> str:
+    """The type the pass gave the one `.method()` call in `source`."""
     module = parse(source)
     table = typed.type_module(module)
     calls = []
 
     def walk(node):
-        if isinstance(node, rast.MethodCall) and node.method == "as_bytes":
+        if isinstance(node, rast.MethodCall) and node.method == method:
             calls.append(node)
         if isinstance(node, list):
             for x in node:
@@ -51,11 +71,16 @@ def _as_bytes_type(source: str) -> str:
 
 
 @pytest.mark.parametrize("param", ["StrView", "@StrView"])
-def test_as_bytes_is_a_span_of_u8(param):
+def test_strview_methods_are_typed(param):
     # A by-value receiver and one read through a borrow: the emitter loads both.
     src = f"fn f(s: {param}) -> i64\n    let b = s.as_bytes()\n    b.len\n"
-    assert _as_bytes_type(src) == "Span<u8>"
+    assert _method_type(src) == "Span<u8>"
     assert _errors(src) == []
+    # An `impl StrView` method is its declared return type, generic or not.
+    for method, want in (("count", "i64"), ("number", "Opt<i64>")):
+        src = IMPL + f"fn f(s: {param}) -> i32\n    let n = s.{method}()\n    0\n"
+        assert _method_type(src, method) == want, method
+        assert _errors(src) == [], method
 
 
 def test_bound_bytes_fill_a_span_slot():
@@ -80,13 +105,13 @@ def test_borrowed_bytes_are_refused_at_a_by_value_span():
 def test_as_bytes_with_arguments_stays_untyped():
     # The emitter refuses `as_bytes(x)`; the pass doesn't claim a type for it.
     src = "fn f(s: StrView) -> i32\n    s.as_bytes(1)\n    0\n"
-    assert _as_bytes_type(src) != "Span<u8>"
+    assert _method_type(src) != "Span<u8>"
 
 
 def test_only_a_strview_receiver_gets_the_built_in():
     # The pass's built-in receivers share one branch; `as_bytes` is StrView's.
     src = "fn f(x: Span<u8>) -> i32\n    x.as_bytes()\n    0\n"
-    assert _as_bytes_type(src) != "Span<u8>"
+    assert _method_type(src) != "Span<u8>"
 
 
 def test_other_strview_built_ins_are_not_spans():

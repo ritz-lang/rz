@@ -1712,7 +1712,7 @@ pub fn char_token_value(tok: Token) -> i64
     if text.len >= 4
         # Escaped char: '\n', '\\', '\e', '\x1B' ...  The lexer already rejected
         # a bad escape (AGAST #1978, #1872), so the shared table always cooks.
-        return lexer_cook_escape_at(text.ptr + 2, text.len - 3, 1) as i64
+        return lexer_cook_escape_at(text.skip(2).take(text.len - 3), 1).unwrap_or(0) as i64
     0
 
 pub fn expr_char(p: *Parser, tok: Token) -> *Expr
@@ -2581,18 +2581,20 @@ pub fn lit_int_value(e: *Expr, out: *i64) -> i32
             return 1
     0
 
-# The base of a NUMBER token's digits (10, 16 or 2), and where they start.
-pub fn int_lit_base(start: StrView, digits: **u8) -> i64
-    *digits = start.ptr
-    if start.len >= 3 and start.get(0) == '0'  # '0'
-        let prefix: i32 = start.get(1) as i32
-        if prefix == 120 or prefix == 88  # 'x' or 'X'
-            *digits = start.ptr + 2
-            return 16
-        if prefix == 98 or prefix == 66   # 'b' or 'B'
-            *digits = start.ptr + 2
-            return 2
-    10
+# A NUMBER token's base and its digits: the text after a `0x` / `0b`
+# prefix, a type suffix (`42i32`) included.
+pub struct IntLitDigits
+    base: i64          # 10, 16 or 2
+    digits: StrView
+
+pub fn int_lit_base(start: StrView) -> IntLitDigits
+    if start.len >= 3 and start.get(0) == '0'
+        let prefix: u8 = start.get(1)
+        if prefix == 'x' or prefix == 'X'
+            return IntLitDigits { base: 16, digits: start.skip(2) }
+        if prefix == 'b' or prefix == 'B'
+            return IntLitDigits { base: 2, digits: start.skip(2) }
+    IntLitDigits { base: 10, digits: start }
 
 # The value of one digit of `base`, or -1 if `ch` isn't one (a suffix).
 pub fn int_lit_digit(ch: i32, base: i64) -> i64
@@ -2609,13 +2611,12 @@ pub fn int_lit_digit(ch: i32, base: i64) -> i64
 
 # 1 if the literal is 2^64 or more: past every integer type.
 pub fn parse_int_overflows(start: StrView) -> i32
-    var digits: *u8 = null
-    let base: i64 = int_lit_base(start, @digits)
-    let n: i32 = (start.len as i32) - (digits - start.ptr) as i32
+    let lit: IntLitDigits = int_lit_base(start)
+    let base: i64 = lit.base
     let max: u64 = 0xFFFFFFFFFFFFFFFF
     var val: u64 = 0
-    for i in 0..n
-        let d: i64 = int_lit_digit(*(digits + i) as i32, base)
+    for i in 0..lit.digits.len
+        let d: i64 = int_lit_digit(lit.digits.get(i) as i32, base)
         if d < 0
             return 0
         if val > (max - d as u64) / base as u64
