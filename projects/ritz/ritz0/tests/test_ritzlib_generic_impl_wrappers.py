@@ -146,6 +146,8 @@ def test_impl_vec_holds_each_method():
 MOVE_ONLY = """\
 import ritzlib.gvec
 import ritzlib.option
+import ritzlib.hashmap
+import ritzlib.memory
 
 struct Res
     h: i32
@@ -210,6 +212,7 @@ impl Box2
 
 var g_box: Box2 = Box2 { a: 0, b: 0 }
 var g_boxp: *Box2 = null
+var g_mapp: *HashMap<i64, i64> = null
 
 """
 
@@ -223,6 +226,17 @@ GLOBAL_SHAPES = {
     g_boxp = @local
     return (*g_boxp).first().unwrap_or(0) + 7
 """, 16),
+    # AGAST #4916: `(*gp).get(k).unwrap_or(..)` through a pointer to a
+    # 2-type-param generic (HashMap<K, V>) is a Method receiver whose type
+    # method_ret_at gave up on (tp.next != null), so unwrap_or specialised
+    # at every Option/Result instance an import names instead of just
+    # Option<i64>.
+    "deref_of_global_hashmap_pointer": ("""\
+    var local: HashMap<i64, i64> = hashmap_with_cap<i64, i64>(4)
+    local.insert(42, 99)
+    g_mapp = @local
+    return ((*g_mapp).get(42).unwrap_or(0) + 7) as i32
+""", 106),
 }
 
 

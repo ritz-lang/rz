@@ -1881,14 +1881,15 @@ pub fn call_result_type_name(m: *Module, call: *Expr) -> StrView
     strview_join2(f.return_type_name.take(d as i64), call.call_type_suffix)  # AGAST #4915
 
 # The type impl method `meth` of instance `tn` ("Vec$i32", or a plain "S")
-# returns, by name: a one-param generic impl's `T` / `Base$T` at tn's suffix,
-# or a concrete name as written.  null when unknown, or when the name still
-# holds a type param this can't substitute.
-pub fn method_result_type_name(m: *Module, tn_sv: StrView, meth_sv: StrView) -> StrView
+# returns, by name: a generic impl's `T` / `Base$T` at tn's suffix (any
+# number of type params, AGAST #4916), or a concrete name as written.  null
+# when unknown, or when the name still holds a type param this can't
+# substitute.
+pub fn method_result_type_name(ctx: *ParseCtx, m: *Module, tn_sv: StrView, meth_sv: StrView) -> StrView
     let ib: *ImplBlock = impl_with_method(m, tn_sv, meth_sv, false)
     if ib == null
         return strview_empty()
-    method_ret_at(ib, impl_method_named(ib, meth_sv), tn_sv, find_dollar_sign(tn_sv))
+    method_ret_at(ctx, m, ib, impl_method_named(ib, meth_sv), tn_sv, find_dollar_sign(tn_sv))
 
 # The impl block of instance `tn` ("Vec$i32", or a plain "S") that defines
 # `meth`: a generic impl of tn's base, or a concrete one of tn itself.
@@ -1918,25 +1919,44 @@ pub fn impl_method_named(ib: *ImplBlock, meth: StrView) -> *FnDef
         f = f.next
     null
 
-fn method_ret_at(ib: *ImplBlock, f: *FnDef, tn: StrView, d: i32) -> StrView
-    let tn_len: i32 = tn.len as i32
+# AGAST #4916: a 2+-param generic (`impl<K, V> HashMap<K, V>`'s
+# `get(..) -> Option<V>`) used to bail here (`tp.next != null`) the instant
+# an impl had more than one type param, so `.get(k)` on a `HashMap<K, V>`
+# through a pointer typed as unknown: the caller (receiver_instance) gave up
+# too, and the outer `.unwrap_or` wanted every Option/Result instance an
+# import names instead of just the one its receiver actually is.  Each
+# param now takes its own argument out of `tn`'s suffix, by position
+# (split_mangled_args / mangled_arg, as clone_struct_fields_multi already
+# does for a struct's own fields), not just the sole one a 1-param impl has.
+fn method_ret_at(ctx: *ParseCtx, m: *Module, ib: *ImplBlock, f: *FnDef, tn: StrView, d: i32) -> StrView
     let rn: StrView = f.return_type_name
     if rn.ptr == null or rn.len <= 0
         return strview_empty()
     if ib.type_params == null
         return rn
     let tp: *TypeParam = ib.type_params
-    if tp.next != null
-        return strview_empty()
-    if name_eq(rn, tp.name) == 1
-        # `-> T`: the instance's own argument.
-        return strview_from_ptr(tn.ptr + d + 1, (tn_len - d - 1) as i64)
+    let idx: i32 = type_param_index(tp, rn)
     let rd: i32 = find_dollar_sign(rn)
-    if rd < 0
-        return rn   # a concrete type
-    if name_eq(rn.skip(rd + 1), tp.name) == 0
-        return strview_empty()
-    strview_join2(rn.take(rd as i64), tn.skip(d as i64))  # AGAST #4915
+    if idx < 0 and rd < 0
+        return rn   # a concrete type, no param to substitute
+    let suffix: StrView = tn.skip(d as i64)
+    let cap: i32 = mangled_arg_capacity(suffix)
+    let starts: *i32 = malloc((cap as i64) * 4) as *i32
+    let lens: *i32 = malloc((cap as i64) * 4) as *i32
+    let got: i32 = split_mangled_args(ctx, m, suffix, starts, lens)
+    var result: StrView = strview_empty()
+    if got == count_type_params(tp)
+        if idx >= 0
+            # `-> T`: the instance's own argument at T's position.
+            result = mangled_arg(suffix, starts, lens, idx).skip(1)
+        else
+            let pidx: i32 = type_param_index(tp, rn.skip(rd + 1))
+            if pidx >= 0
+                # `-> Base$T`: Base at T's own argument.
+                result = strview_join2(rn.take(rd as i64), mangled_arg(suffix, starts, lens, pidx))   # AGAST #4915
+    free(starts as *u8)
+    free(lens as *u8)
+    result
 
 # AGAST #2318: an untyped receiver becomes the typed one it means: bare `self`
 # (param_self) is `self: T`, and bare `self:&` (param_self_lent) is `self:& T`,
