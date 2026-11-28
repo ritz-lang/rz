@@ -177,7 +177,7 @@ RITZ0 = Step(STEP)
 # Re-measured 2026-11-22 (AGAST #4541, #4552), same recipe: the reject-parity
 # self-test runs pytest on ritz0/tests/test_reject_parity.py, which loads
 # ritz0/conftest.py and the plugins it names (spawn_guard, cost_meter,
-# only_files, read_guard; read_guard imports tools/ritz0_scope.py), the two
+# only_files, read_guard; read_guard imports tools/ritz0_scope.py), the five
 # corpus tables the test imports, and lists ritz0/tests, ritz0/harness and
 # every top-level directory it walks looking for the test (adding a
 # pyvenv.cfg/conda-meta marker or an __init__.py changes what it collects or
@@ -207,7 +207,11 @@ HARNESS = Step(
            "projects/ritz/ritz0/harness/spawn_guard.py",
            "projects/ritz/ritz0/tests/test_reject_parity.py",
            "projects/ritz/ritz0/tests/test_if_expression_requires_else.py",
-           "projects/ritz/ritz0/tests/test_implicit_narrowing.py"),
+           "projects/ritz/ritz0/tests/test_implicit_narrowing.py",
+           # Loaded by test_reject_parity.py since #4932/#4933/#4936.
+           "projects/ritz/ritz0/tests/test_implicit_narrowing_slots.py",
+           "projects/ritz/ritz0/tests/test_ritz1_const_array_fold.py",
+           "projects/ritz/ritz0/tests/test_unannotated_mixed_float_arms.py"),
     lists=("projects/ritz", "projects/ritz/tools", "projects/ritz/ritz0",
            "projects/ritz/ritz0/tests", "projects/ritz/ritz0/harness",
            "projects/ritz/ritz0/emitter", "projects/ritz/ritz0/test",
