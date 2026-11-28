@@ -30,6 +30,31 @@ pub fn parser_alloc(p: *Parser, size: i64) -> *u8
     memzero(result, size)
     return result
 
+# `a` then `b`, as one fresh StrView in the parser's own arena (freed with
+# `p`, not the heap) — the arena counterpart of ritzlib's strview_join2 for
+# AST/mangled-name text that must outlive the parser_alloc call that made
+# the pieces (AGAST #4915 slice 2).
+pub fn parser_join2(p: *Parser, a: StrView, b: StrView) -> StrView
+    let n: i64 = a.len + b.len
+    let buf: *u8 = parser_alloc(p, n + 1)
+    memcpy(buf, a.ptr, a.len)
+    memcpy(buf + a.len, b.ptr, b.len)
+    *(buf + n) = 0
+    StrView { ptr: (buf), len: (n) }
+
+# `a` then `b` then `c`, as one fresh StrView in the parser's own arena.
+# Same ownership as parser_join2; three pieces in call order, with no
+# separator semantics of its own (pass one of the pieces as a literal
+# separator, as generic_tok_suffix below does).
+pub fn parser_join3(p: *Parser, a: StrView, b: StrView, c: StrView) -> StrView
+    let n: i64 = a.len + b.len + c.len
+    let buf: *u8 = parser_alloc(p, n + 1)
+    memcpy(buf, a.ptr, a.len)
+    memcpy(buf + a.len, b.ptr, b.len)
+    memcpy(buf + a.len + b.len, c.ptr, c.len)
+    *(buf + n) = 0
+    StrView { ptr: (buf), len: (n) }
+
 # =============================================================================
 # Module helpers
 # =============================================================================
@@ -1301,7 +1326,6 @@ pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, 
 # Anything else spells as the token text.  Reads the table without touching
 # parser state.
 pub fn generic_tok_suffix(p: *Parser, prefix: StrView, tok: Token) -> StrView
-    let prefix_len: i32 = prefix.len as i32
     var spell: *u8 = tok.text.ptr
     var spell_len: i32 = (tok.text.len as i32)
     # AGAST #3935 (LARB R53): `usize` / `isize` spell as `u64` / `i64`, as a
@@ -1333,15 +1357,7 @@ pub fn generic_tok_suffix(p: *Parser, prefix: StrView, tok: Token) -> StrView
                 spell_len = n
             else
                 spell = tok.text.ptr
-    let total: i32 = 1 + prefix_len + spell_len
-    let buf: *u8 = parser_alloc(p, (total + 1) as i64)
-    *buf = 36  # '$'
-    for i in 0..prefix_len
-        *(buf + 1 + i) = prefix.get(i)
-    for i in 0..spell_len
-        *(buf + 1 + prefix_len + i) = *(spell + i)
-    *(buf + total) = 0
-    return StrView { ptr: (buf), len: (total) as i64 }
+    return parser_join3(p, "$", prefix, StrView { ptr: (spell), len: (spell_len) as i64 })
 
 # Mangled spelling of one argument: the primitive's name, or the captured
 # struct/generic/pointer name.  The one speller for generic type annotations,
