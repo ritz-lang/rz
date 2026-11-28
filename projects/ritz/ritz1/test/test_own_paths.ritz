@@ -1,0 +1,121 @@
+# ritz1/test/test_own_paths.ritz - own_check's member paths, as values (AGAST #4926)
+#
+# own_check tracks a partly movable binding's fields as paths; oc_path_of
+# walks a member expression `x.f.g` down them and returns an OcPathOf (the
+# deepest path it reaches, and whether the expression ends on it), in place
+# of C's `int f(..., int *out_exact)`.  These hold where each walk lands.
+# OcBind.paths is a Vec<OwnPath>; oc_path_count and oc_path_depth read
+# it.  The other ported helpers (oc_value_struct, oc_buffer_value_struct,
+# oc_build_paths, and ownership's own_field_ptr / own_place_ptr /
+# own_build_paths) need a full Sema or EmitterState and are covered by the
+# compiler's own tests.  Run by
+# `make ritz1-unit` (tools/ritz1_unit.py).
+
+import ritzlib.gvec
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.strview
+import ast
+import ast_query
+import own_check
+
+# A field named `name`.
+fn field_named(name: StrView) -> *StructField
+    let f: *StructField = malloc(sizeof(StructField)) as *StructField
+    memset(f as *u8, 0, sizeof(StructField))
+    f.name = name
+    f
+
+# `x`, an identifier.
+fn ident_of(name: StrView) -> *Expr
+    let e: *Expr = malloc(sizeof(Expr)) as *Expr
+    memset(e as *u8, 0, sizeof(Expr))
+    e.kind = ExprKind.Ident
+    e.ident = name
+    e
+
+# `l.name`, a member.
+fn member_of(l: *Expr, name: StrView) -> *Expr
+    let e: *Expr = malloc(sizeof(Expr)) as *Expr
+    memset(e as *u8, 0, sizeof(Expr))
+    e.kind = ExprKind.Member
+    e.left = l
+    e.ident = name
+    e
+
+# A path along field `name` of path `parent` (-1: of the binding itself).
+fn path_of(parent: i32, name: StrView) -> OwnPath
+    OwnPath { parent: parent, fld: field_named(name) }
+
+# The paths `o.a` (0) and `o.a.x` (1).
+fn two_paths() -> Vec<OwnPath>
+    var paths: Vec<OwnPath> = vec_new<OwnPath>()
+    paths.push(path_of(0 - 1, "a"))
+    paths.push(path_of(0, "x"))
+    paths
+
+# A binding `o` with the paths `o.a` (0) and `o.a.x` (1).
+fn bind_with_paths() -> OcBind
+    OcBind { name: "o", paths: two_paths() }
+
+[[test]]
+fn test_a_name_is_the_binding_itself() -> i32
+    var b: OcBind = bind_with_paths()
+    let at: OcPathOf = oc_path_of(@b, ident_of("o"))
+    assert at.path == 0 - 1
+    assert at.exact
+    0
+
+[[test]]
+fn test_a_field_with_a_path_ends_on_it() -> i32
+    var b: OcBind = bind_with_paths()
+    let at: OcPathOf = oc_path_of(@b, member_of(ident_of("o"), "a"))
+    assert at.path == 0
+    assert at.exact
+    0
+
+[[test]]
+fn test_a_nested_field_ends_on_the_deepest_path() -> i32
+    var b: OcBind = bind_with_paths()
+    let at: OcPathOf = oc_path_of(@b, member_of(member_of(ident_of("o"), "a"), "x"))
+    assert at.path == 1
+    assert at.exact
+    0
+
+[[test]]
+fn test_a_field_with_no_path_stops_at_its_parent() -> i32
+    var b: OcBind = bind_with_paths()
+    let at: OcPathOf = oc_path_of(@b, member_of(member_of(ident_of("o"), "a"), "y"))
+    assert at.path == 0
+    assert not at.exact
+    0
+
+[[test]]
+fn test_a_walk_that_left_the_paths_stays_out() -> i32
+    var b: OcBind = bind_with_paths()
+    # `o.c.x`: `c` has no path, so `x` is not looked up under the binding.
+    let at: OcPathOf = oc_path_of(@b, member_of(member_of(ident_of("o"), "c"), "x"))
+    assert at.path == 0 - 1
+    assert not at.exact
+    0
+
+[[test]]
+fn test_a_binding_counts_its_paths() -> i32
+    var b: OcBind = bind_with_paths()
+    assert oc_path_count(@b) == 2
+    0
+
+[[test]]
+fn test_a_binding_with_no_paths_counts_none() -> i32
+    var b: OcBind = OcBind { name: "o" }
+    assert oc_path_count(@b) == 0
+    0
+
+[[test]]
+fn test_a_path_is_as_deep_as_its_parents() -> i32
+    var paths: Vec<OwnPath> = two_paths()
+    paths.push(path_of(1, "z"))
+    assert oc_path_depth(@paths, 0) == 0
+    assert oc_path_depth(@paths, 1) == 1
+    assert oc_path_depth(@paths, 2) == 2
+    0

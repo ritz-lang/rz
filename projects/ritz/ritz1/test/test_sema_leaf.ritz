@@ -1,0 +1,116 @@
+# ritz1/test/test_sema_leaf.ritz - Sema's leaf helpers, as Options (AGAST #4926)
+#
+# narrowing folds an operator over integer literals (narrow_fold_lit),
+# wrapping applies a constant operator the way the emitter wraps it
+# (ca_apply), enum_as_int names the enum a value is (eai_set) and
+# struct_index spells a monomorphised type name as the source does
+# (si_shown), each as an Option or a value in place of C's
+# `int f(..., T *out)`.  These hold what each answers, and when it answers
+# None.  Run by `make ritz1-unit` (tools/ritz1_unit.py).
+
+import ritzlib.option
+import ritzlib.strview
+import ast
+import narrowing
+import wrapping
+import enum_as_int
+import struct_index
+
+fn int_lit(v: i64) -> Expr
+    Expr { kind: ExprKind.IntLit, int_val: v }
+
+fn bin(op: OpKind, l: *Expr, r: *Expr) -> Expr
+    Expr { kind: ExprKind.Binary, op: op, left: l, right: r }
+
+# The folded value of `e`, or `miss` when it does not fold.
+fn fold_or(e: *Expr, miss: i64) -> i64
+    match narrow_fold_lit(e)
+        Some(v) => v
+        None => miss
+
+# `a op b` as ca_apply wraps it, or `miss` for an op it doesn't fold.
+fn apply_or(op: OpKind, a: i64, b: i64, miss: i64) -> i64
+    var e: Expr = Expr { kind: ExprKind.Binary, op: op }
+    match ca_apply(@e, a, b)
+        Some(v) => v
+        None => miss
+
+[[test]]
+fn test_fold_lit_folds_an_operator_over_literals() -> i32
+    var a: Expr = int_lit(1)
+    var b: Expr = int_lit(26)
+    var shl: Expr = bin(OpKind.Shl, @a, @b)
+    assert fold_or(@shl, -99) == 67108864
+    var z: Expr = int_lit(0)
+    var one: Expr = int_lit(1)
+    var sub: Expr = bin(OpKind.Sub, @z, @one)
+    assert fold_or(@sub, -99) == -1
+    var six: Expr = int_lit(63)
+    var inv: Expr = Expr { kind: ExprKind.Unary, op: OpKind.BitNot, operand: @six }
+    assert fold_or(@inv, -99) == -64
+    0
+
+[[test]]
+fn test_fold_lit_leaves_a_bare_literal_and_refuses_a_trap() -> i32
+    var five: Expr = int_lit(5)
+    let bare: Option<i64> = narrow_fold_lit(@five)
+    assert bare.is_none()
+    var neg: Expr = Expr { kind: ExprKind.Unary, op: OpKind.Neg, operand: @five }
+    let minus: Option<i64> = narrow_fold_lit(@neg)
+    assert minus.is_none()
+    var zero: Expr = int_lit(0)
+    var div: Expr = bin(OpKind.Div, @five, @zero)
+    let by_zero: Option<i64> = narrow_fold_lit(@div)
+    assert by_zero.is_none()
+    var big: Expr = int_lit(64)
+    var shl: Expr = bin(OpKind.Shl, @five, @big)
+    let wide: Option<i64> = narrow_fold_lit(@shl)
+    assert wide.is_none()
+    var name: Expr = Expr { kind: ExprKind.Ident }
+    var add: Expr = bin(OpKind.Add, @five, @name)
+    let named: Option<i64> = narrow_fold_lit(@add)
+    assert named.is_none()
+    0
+
+[[test]]
+fn test_ca_apply_wraps_as_the_emitter_does() -> i32
+    let max: i64 = 9223372036854775807
+    assert apply_or(OpKind.Add, max, 1, -99) == 0 - max - 1
+    assert apply_or(OpKind.Sub, 2, 3, -99) == -1
+    assert apply_or(OpKind.Mul, 6, 7, -99) == 42
+    assert apply_or(OpKind.Div, 7, -1, -99) == -7
+    assert apply_or(OpKind.Mod, 7, -1, -99) == 0
+    assert apply_or(OpKind.Shr, -8, 1, -99) == -4
+    assert apply_or(OpKind.BitXor, 6, 3, -99) == 5
+    0
+
+[[test]]
+fn test_ca_apply_refuses_an_op_it_does_not_fold() -> i32
+    var e: Expr = Expr { kind: ExprKind.Binary, op: OpKind.Lt }
+    let r: Option<i64> = ca_apply(@e, 1, 2)
+    assert r.is_none()
+    0
+
+[[test]]
+fn test_eai_set_is_the_name_or_none() -> i32
+    let named: Option<StrView> = eai_set("Color")
+    match named
+        Some(n) =>
+            assert n.eq("Color")
+        None => return 1
+    let none: Option<StrView> = eai_set(strview_empty())
+    assert none.is_none()
+    0
+
+[[test]]
+fn test_si_shown_spells_a_generic_instance() -> i32
+    var tp_b: TypeParam = TypeParam { name: "B" }
+    var tp_a: TypeParam = TypeParam { name: "A", next: @tp_b }
+    var pair: StructDef = StructDef { name: "Pair", type_params: @tp_a }
+    var m: Module = Module { structs: @pair }
+    assert si_shown(@m, "Pair$i64$i32").eq("Pair<i64, i32>")
+    assert si_shown(@m, "Pair$Pair$u8$i8$i64").eq("Pair<Pair<u8, i8>, i64>")
+    # Too few arguments for Pair's two: the name as written.
+    assert si_shown(@m, "Pair$i64").eq("Pair$i64")
+    assert si_shown(@m, "i64").eq("i64")
+    0

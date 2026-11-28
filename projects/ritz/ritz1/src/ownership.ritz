@@ -665,7 +665,7 @@ fn own_emit_binding_glue(s: *EmitterState, b: *OwnBinding, ptr: i32, mask: i32)
 # AGAST #2319: the run-time mask is an integer of whole 32-bit words, one
 # bit per path (an i32 up to 32 paths, an i64 up to 64, ...): its width.
 fn own_mask_width(b: *OwnBinding) -> i32
-    var words: i32 = (b.path_count + 31) / 32
+    var words: i32 = (own_path_count(b) + 31) / 32
     if words < 1
         words = 1
     words * 32
@@ -892,8 +892,7 @@ fn own_init_binding(o: *OwnState, b: *OwnBinding, slot: i32, flag: i32, ty: StrV
     b.type_name = ty
     b.moved = 0
     b.count = count
-    b.paths = null
-    b.path_count = 0
+    b.paths = vec_new<OwnPath>()
     b.fmask = 0
     b.aux = 0
     b.seq = own_next_seq(o)
@@ -1203,76 +1202,64 @@ fn own_partly_movable(s: *EmitterState, name: StrView) -> bool
 
 # AGAST #2242: path `i` of the binding.
 fn own_path_at(b: *OwnBinding, i: i32) -> *OwnPath
-    let base: *OwnPath = b.paths
-    return @base[i]
+    b.paths.get_ptr(i as i64)
 
-# Add a path for each move-only field of the struct `name`, the parts of
-# path `parent`, to the array *pp (room for *cap, grown as it fills).
-# Returns the new path count.
-fn own_add_paths(s: *EmitterState, pp: **OwnPath, cap: *i32, count: i32, parent: i32, name: StrView) -> i32
+# How many paths the binding has (0 for one that can't be partly moved).
+fn own_path_count(b: *OwnBinding) -> i32
+    b.paths.len() as i32
+
+# Add a path to `paths` for each move-only field of the struct `name`, the
+# parts of path `parent`; a path's index in `paths` is its bit.
+fn own_add_paths(s: *EmitterState, paths:& Vec<OwnPath>, parent: i32, name: StrView)
     let st: *StructDef = find_struct(s, name)
     if st == null
-        return count
-    var n: i32 = count
+        return
     var idx: i32 = 0
     var f: *StructField = st.fields
     while f != null
         if own_field_move_only(s, f, 0)
-            if n >= *cap
-                let nc: i32 = *cap * 2
-                *pp = realloc(*pp as *u8, (nc as i64) * sizeof(OwnPath)) as *OwnPath
-                *cap = nc
-            let paths: *OwnPath = *pp
+            let n: i32 = paths.len() as i32
             let bit: i32 = own_set_bit(n)
-            let p: *OwnPath = @paths[n]
-            p.parent = parent
-            p.idx = idx
-            p.fld = f
-            p.up = bit
-            p.down = bit
+            paths.push(OwnPath { parent: parent, idx: idx, fld: f, up: bit, down: bit })
+            let p: *OwnPath = paths.get_ptr(n as i64)
             var a: i32 = parent
             while a >= 0
-                let ap: *OwnPath = @paths[a]
+                let ap: *OwnPath = paths.get_ptr(a as i64)
                 p.up = own_set_or(p.up, own_set_bit(a))
                 ap.down = own_set_or(ap.down, bit)
                 a = ap.parent
-            n += 1
         idx += 1
         f = f.next
-    n
 
-# How many paths path `i` is a part of.
-fn own_path_depth(paths: *OwnPath, i: i32) -> i32
+# How many paths path `i` of `paths` is a part of.
+fn own_path_depth(paths: @Vec<OwnPath>, i: i32) -> i32
     var d: i32 = 0
-    var p: *OwnPath = @paths[i]
-    while p.parent >= 0
+    var parent: i32 = paths.get(i as i64).parent
+    while parent >= 0
         d += 1
-        p = @paths[p.parent]
+        parent = paths.get(parent as i64).parent
     d
 
-# The paths of a partly movable struct `name` (their count in *out_n),
-# shallowest first, so the fields nearest the binding get the paths a set
-# holds inline.  A field stops the walk where it can't be partly moved
-# itself: a type with its own drop, an enum, an array.  Every path is
-# tracked (AGAST #2319); only OWN_MAX_DEPTH bounds a malformed recursive type.
-fn own_build_paths(s: *EmitterState, name: StrView, out_n: *i32) -> *OwnPath
-    var cap: i32 = 32
-    var paths: *OwnPath = malloc((cap as i64) * sizeof(OwnPath)) as *OwnPath
-    var n: i32 = own_add_paths(s, @paths, @cap, 0, 0 - 1, name)
+# The paths of a partly movable struct `name`, shallowest first, so the
+# fields nearest the binding get the paths a set holds inline.  A field
+# stops the walk where it can't be partly moved itself: a type with its own
+# drop, an enum, an array.  Every path is tracked (AGAST #2319); only
+# OWN_MAX_DEPTH bounds a malformed recursive type.
+fn own_build_paths(s: *EmitterState, name: StrView) -> Vec<OwnPath>
+    var paths: Vec<OwnPath> = vec_with_cap<OwnPath>(32)
+    own_add_paths(s, paths, 0 - 1, name)
     var i: i32 = 0
-    while i < n
-        let p: *OwnPath = @paths[i]
-        let f: *StructField = p.fld
-        if f.field_type == TypeKind.Struct and own_path_depth(paths, i) < OWN_MAX_DEPTH and own_partly_movable(s, own_field_type(f))
-            n = own_add_paths(s, @paths, @cap, n, i, own_field_type(f))
+    while i < paths.len() as i32
+        let f: *StructField = paths.get(i as i64).fld
+        if f.field_type == TypeKind.Struct and own_path_depth(@paths, i) < OWN_MAX_DEPTH and own_partly_movable(s, own_field_type(f))
+            own_add_paths(s, paths, i, own_field_type(f))
         i += 1
-    *out_n = n
     paths
 
 # The path for field `idx` of path `parent`, or -1.
 fn own_child_path(b: *OwnBinding, parent: i32, idx: i32) -> i32
     var i: i32 = 0
-    while i < b.path_count
+    while i < own_path_count(b)
         let p: *OwnPath = own_path_at(b, i)
         if p.parent == parent and p.idx == idx
             return i
@@ -1282,7 +1269,7 @@ fn own_child_path(b: *OwnBinding, parent: i32, idx: i32) -> i32
 # The path for the field `name` of path `parent`, or -1.
 fn own_named_path(b: *OwnBinding, parent: i32, name: StrView) -> i32
     var i: i32 = 0
-    while i < b.path_count
+    while i < own_path_count(b)
         let p: *OwnPath = own_path_at(b, i)
         let fname: StrView = p.fld.name
         if p.parent == parent and fname.eq(name)
@@ -1347,12 +1334,11 @@ fn own_register(s: *EmitterState, idx: i32, owned: bool)
     let flag: i32 = own_entry_alloca(s, "i1", "drop flag")
     # AGAST #2168: a struct with no drop of its own can be partly moved.
     var fmask: i32 = 0
-    var paths: *OwnPath = null
-    var path_count: i32 = 0
+    var paths: Vec<OwnPath> = vec_new<OwnPath>()
     if count == 0 and own_partly_movable(s, name)
-        paths = own_build_paths(s, name, @path_count)
+        paths = own_build_paths(s, name)
         # One bit per path, in whole 32-bit words (own_mask_width).
-        let bits: i32 = (path_count + 31) / 32 * 32
+        let bits: i32 = (paths.len() as i32 + 31) / 32 * 32
         fmask = entry_alloca_begin(s)
         format_into(s, "i{bits}  ; moved fields\n")
         entry_alloca_end(s)
@@ -1362,7 +1348,6 @@ fn own_register(s: *EmitterState, idx: i32, owned: bool)
     b.name = loc.name
     b.local_idx = idx
     b.paths = paths
-    b.path_count = path_count
     b.fmask = fmask
     o.live_count = o.live_count + 1
     own_store_flag(s, b, owned)
@@ -1414,11 +1399,11 @@ pub fn own_decl(s: *EmitterState, stmt: *Stmt, before: i32)
 # until it is assigned.
 fn own_start_unwritten(s: *EmitterState, stmt: *Stmt)
     let b: *OwnBinding = own_lookup(s, stmt.var_name)
-    if b == null or b.count > 0 or b.path_count == 0
+    if b == null or b.count > 0 or own_path_count(b) == 0
         return
     var leaves: i32 = 0
     var i: i32 = 0
-    while i < b.path_count
+    while i < own_path_count(b)
         if not own_has_parts(b, i)
             leaves = own_set_or(leaves, own_set_bit(i))
         i += 1
@@ -2240,37 +2225,47 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
     h.old_field = null
     h
 
-# The field `fname` of the struct `tname` at `base`: a pointer to it (and
-# the field in *out_f), or 0.
-fn own_field_ptr(s: *EmitterState, base: i32, tname: StrView, fname: StrView, out_f: **StructField) -> i32
+# A struct field in memory: the register holding a pointer to it, and the field.
+struct OwnFieldAt
+    ptr: i32
+    fld: *StructField
+
+# A place `x.f...`: its field's pointer and field, and x's binding.
+struct OwnPlace
+    ptr: i32
+    fld: *StructField
+    b: *OwnBinding
+
+# The field `fname` of the struct `tname` at `base`: a pointer to it (its GEP
+# emitted) and the field, or None when `tname` has no such field.
+fn own_field_ptr(s: *EmitterState, base: i32, tname: StrView, fname: StrView) -> Option<OwnFieldAt>
     let st: *StructDef = find_struct(s, tname)
     if st == null
-        return 0
+        return None
     let idx: i32 = find_field_index(st, fname)
     if idx < 0
-        return 0
+        return None
     let f: *StructField = get_field_type(st, idx)
     let r: i32 = own_field_gep(s, base, st, idx)
-    *out_f = f
-    r
+    Some(OwnFieldAt { ptr: r, fld: f })
 
-# A member path `x.f...` rooted at a single-value binding x (*out_b): a
-# pointer to its field (*out_f), or 0.
-fn own_place_ptr(s: *EmitterState, e: *Expr, out_f: **StructField, out_b: **OwnBinding) -> i32
+# A member path `x.f...` rooted at a single-value binding x: a pointer to
+# its field, the field and x's binding, or None.
+fn own_place_ptr(s: *EmitterState, e: *Expr) -> Option<OwnPlace>
     if e == null or e.kind != ExprKind.Member or e.left == null
-        return 0
+        return None
     let l: *Expr = e.left
     if l.kind == ExprKind.Ident
         let b: *OwnBinding = own_lookup(s, own_ident(l))
         if b == null or b.count > 0
-            return 0
-        *out_b = b
-        return own_field_ptr(s, b.slot, own_binding_type(b), own_ident(e), out_f)
-    var pf: *StructField = null
-    let base: i32 = own_place_ptr(s, l, @pf, out_b)
-    if base == 0 or pf.field_type != TypeKind.Struct
-        return 0
-    own_field_ptr(s, base, own_field_type(pf), own_ident(e), out_f)
+            return None
+        let at: OwnFieldAt = own_field_ptr(s, b.slot, own_binding_type(b), own_ident(e))?
+        return Some(OwnPlace { ptr: at.ptr, fld: at.fld, b: b })
+    let up: OwnPlace = own_place_ptr(s, l)?
+    if up.fld.field_type != TypeKind.Struct
+        return None
+    let at: OwnFieldAt = own_field_ptr(s, up.ptr, own_field_type(up.fld), own_ident(e))?
+    Some(OwnPlace { ptr: at.ptr, fld: at.fld, b: up.b })
 
 # AGAST #2173: before the field store `x.f... = v` (own_stmt_moves found
 # x owns its old value on the i1 `cond`): copy the old value aside.  The
@@ -2285,9 +2280,18 @@ fn own_field_store_begin(s: *EmitterState, stmt: *Stmt, cond: i32, out_old: *i32
             if b == null or b.count > 0
                 return null
             let fname: StrView = stmt.assign_target
-            ptr = own_field_ptr(s, b.slot, own_binding_type(b), fname, @f)
+            match own_field_ptr(s, b.slot, own_binding_type(b), fname)
+                Some(at) =>
+                    ptr = at.ptr
+                    f = at.fld
+                None => pass
         StmtKind.Assign =>
-            ptr = own_place_ptr(s, stmt.if_cond as *Expr, @f, @b)
+            match own_place_ptr(s, stmt.if_cond as *Expr)
+                Some(place) =>
+                    ptr = place.ptr
+                    f = place.fld
+                    b = place.b
+                None => pass
         _ => pass   # own_stmt_moves sets fa_cond for these two only
     if ptr == 0 or f == null or b == null
         return null

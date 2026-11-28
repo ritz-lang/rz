@@ -75,9 +75,11 @@ fn eai_is_enum_name(ctx: *ParseCtx, name: StrView) -> i32
         return 1
     is_enum_type(ctx, name)
 
-fn eai_set(name_sv: StrView, out: *StrView) -> i32
-    *out = name_sv
-    1
+# The enum name `name_sv` as an answer: None for no name (a null view).
+pub fn eai_set(name_sv: StrView) -> Option<StrView>
+    if name_sv.ptr == null
+        return None
+    Some(name_sv)
 
 # 1 when `name` is a module or builtin const (emit_expr_ident's first stop).
 fn eai_is_const(sm: *Sema, name_sv: StrView) -> i32
@@ -90,22 +92,23 @@ fn eai_is_const(sm: *Sema, name_sv: StrView) -> i32
 
 # The (non-generic) enum a qualified variant `E.V(..)` / `E.V` builds, as
 # qualified_variant_enum: a local or global named `E` shadows the enum.
-fn eai_qualified(sm: *Sema, e: *Expr, out: *StrView) -> i32
+# Its name, or None.
+fn eai_qualified(sm: *Sema, e: *Expr) -> Option<StrView>
     let q: *Expr = e.left
     if q == null or q.kind != ExprKind.Ident
-        return 0
+        return None
     if sema_find_local(sm, q.ident) != null
-        return 0
+        return None
     if sbk_global(sm, q.ident) != null
-        return 0
+        return None
     let ei: i32 = enum_find(sm.pctx, q.ident)
     if ei < 0
-        return 0
+        return None
     if enum_variant_index(sm.pctx, q.ident, e.ident) < 0
-        return 0
+        return None
     if enum_is_generic(sm.pctx, ei) == 1
-        return 0
-    eai_set(enum_name_at(sm.pctx, ei), out)
+        return None
+    eai_set(enum_name_at(sm.pctx, ei))
 
 # The fn a named call `e` calls, as find_call_fn: a typed fn-pointer local
 # of the name, else sema_call_fn; a nameless one through its fn value.
@@ -114,59 +117,60 @@ fn eai_call_fn(sm: *Sema, e: *Expr) -> *FnDef
         return sbk_value_fn_sig(sm, e.left)
     narrow_sema_call_fn(sm, e)
 
-# resolve_scrutinee_enum's shapes, from Sema's scope.
-fn eai_resolve(sm: *Sema, e: *Expr, out: *StrView) -> i32
-    *out = strview_empty()
+# resolve_scrutinee_enum's shapes, from Sema's scope: the enum name `e`
+# is a value of, or None.
+fn eai_resolve(sm: *Sema, e: *Expr) -> Option<StrView>
     let k: ExprKind = e.kind
     match k
         ExprKind.Ident =>
             let v: *SemaVar = sema_find_local(sm, e.ident)
             if v == null
-                return 0
+                return None
             if g_eai_notes_ready == 1
                 let noted: StrView = (*g_eai_notes).get(v.name.ptr as i64).unwrap_or(strview_empty())
                 if noted.ptr != null
-                    return eai_set(noted, out)
+                    return eai_set(noted)
             # AGAST #2135: a pointer local is no enum value, whatever its
             # type_name says.
             if v.kind == TypeKind.Ptr or v.kind == TypeKind.PtrPtr
-                return 0
+                return None
             if eai_is_enum_name(sm.pctx, v.type_name) == 1
-                return eai_set(v.type_name, out)
-            return 0
+                return eai_set(v.type_name)
+            return None
         ExprKind.Method =>
-            return eai_qualified(sm, e, out)   # `Opt.Holds(40)`
+            return eai_qualified(sm, e)   # `Opt.Holds(40)`
         ExprKind.Call =>
-            # `Holds(40)`; *out is cleared when e builds no user enum.
-            eai_set(user_variant_ctor_enum(sm.pctx, e), out)
-            if out.ptr != null
-                return 1
+            # `Holds(40)`, else a fn returning a user enum.
+            let built: Option<StrView> = eai_set(user_variant_ctor_enum(sm.pctx, e))
+            if built.is_some()
+                return built
             let fd: *FnDef = eai_call_fn(sm, e)
             if fd != null and fd.return_type == TypeKind.Struct and eai_is_enum_name(sm.pctx, fd.return_type_name) == 1
-                return eai_set(fd.return_type_name, out)
-            return 0
+                return eai_set(fd.return_type_name)
+            return None
         ExprKind.Unary =>
             if e.op != OpKind.Deref
-                return 0
+                return None
             let opnd: *Expr = e.operand
             if opnd != null and opnd.kind == ExprKind.Ident
                 # `*p` of a `p: *E` local: E, from the pointee's name.
                 let pv: *SemaVar = sema_find_local(sm, opnd.ident)
                 if pv != null and pv.kind == TypeKind.Ptr and pv.pointee == TypeKind.Struct
                     if eai_is_enum_name(sm.pctx, pv.type_name) == 1
-                        return eai_set(pv.type_name, out)
-                    return 0
-            return eai_resolve(sm, e.operand, out)
+                        return eai_set(pv.type_name)
+                    return None
+            return eai_resolve(sm, e.operand)
         ExprKind.Member =>
-            if eai_qualified(sm, e, out) == 1   # `Opt.Vacant`
-                return 1
+            let qual: Option<StrView> = eai_qualified(sm, e)   # `Opt.Vacant`
+            if qual.is_some()
+                return qual
             # An enum-typed struct field, `h.d` (AGAST #1797).
             var t: SemaTy
             if sema_expr_ty(sm, e, @t) == TypeKind.Struct and eai_is_enum_name(sm.pctx, t.name) == 1
-                return eai_set(t.name, out)
-            return 0
+                return eai_set(t.name)
+            return None
         _ => pass
-    0
+    None
 
 # A bare `B`: a unit variant of exactly one enum, the name no const, local,
 # global or fn (bare_unit_variant_enum).  The enum index, or -1.
@@ -190,18 +194,25 @@ fn eai_bare_unit(sm: *Sema, e: *Expr) -> i32
         return 0 - 1
     ei
 
-# The user enum `e` evaluates to, if any: 1 and its name in *out.
-fn eai_enum_of(sm: *Sema, e: *Expr, out: *StrView) -> i32
+# The name of the (non-generic) user enum `e` evaluates to, or None.
+fn eai_enum_of(sm: *Sema, e: *Expr) -> Option<StrView>
     if e == null
-        return 0
+        return None
     var ei: i32 = 0 - 1
-    if eai_resolve(sm, e, out) == 1
-        ei = enum_find(sm.pctx, *out)
-    else
-        ei = eai_bare_unit(sm, e)
-        if ei >= 0
-            eai_set(enum_name_at(sm.pctx, ei), out)
-    (ei >= 0 and enum_is_generic(sm.pctx, ei) == 0) as i32
+    var name: StrView = strview_empty()
+    match eai_resolve(sm, e)
+        Some(n) =>
+            name = n
+            ei = enum_find(sm.pctx, n)
+        None =>
+            ei = eai_bare_unit(sm, e)
+            if ei >= 0
+                name = enum_name_at(sm.pctx, ei)
+    # A generic enum (1) and a monomorphised instance (ENUM_INSTANCE, 2) are
+    # both refused here: only a plain user enum (0) is.
+    if ei < 0 or enum_is_generic(sm.pctx, ei) != 0
+        return None
+    Some(name)
 
 # sema_walk, at the start of each fn: its notes are its own (a generic's
 # instances share their declarations).
@@ -214,8 +225,11 @@ pub fn eai_note_decl(sm: *Sema, st: *Stmt)
     if st.var_declared_type != TypeKind.Void or st.var_init == null or st.var_name.ptr == null
         return
     var en: StrView = strview_empty()
-    if eai_enum_of(sm, st.var_init, @en) == 0
-        return
+    match eai_enum_of(sm, st.var_init)
+        Some(n) =>
+            en = n
+        None =>
+            return
     if g_eai_notes_ready == 0
         g_eai_notes = malloc(sizeof(HashMap<i64, StrView>)) as *HashMap<i64, StrView>
         *g_eai_notes = hashmap_with_cap<i64, StrView>(256)
@@ -238,8 +252,11 @@ fn eai_check_arg(sm: *Sema, e: *Expr, want: TypeKind, line: i32, col: i32, fname
     if ty_bits(want) == 0
         return
     var en: StrView = strview_empty()
-    if eai_enum_of(sm, e, @en) == 0
-        return
+    match eai_enum_of(sm, e)
+        Some(n) =>
+            en = n
+        None =>
+            return
     diag_error_at(sm.file, diag_span(line, col))
     if fname != null
         eprint("argument {argno as i64} of `")

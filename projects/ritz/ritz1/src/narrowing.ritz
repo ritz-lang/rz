@@ -464,10 +464,12 @@ fn narrow_is_int_lit(e: *Expr) -> i32
 # shift's left literal in an `if` arm is an i64, as `1 << n` is there.
 fn narrow_folded_side(e: *Expr, other: *Expr, t: TypeKind, ot: TypeKind, arm_i64: i32) -> TypeKind
     var v: i64 = 0
-    if narrow_fold_lit(e, @v) == 0
-        return t
-    var ov: i64 = 0
-    if narrow_is_int_lit(other) == 1 or narrow_fold_lit(other, @ov) == 1
+    match narrow_fold_lit(e)
+        Some(folded) =>
+            v = folded
+        None =>
+            return t
+    if narrow_is_int_lit(other) == 1 or narrow_fold_lit(other).is_some()
         return t        # both literal: the operator itself folds
     if arm_i64 == 1
         return TypeKind.I64
@@ -476,92 +478,83 @@ fn narrow_folded_side(e: *Expr, other: *Expr, t: TypeKind, ot: TypeKind, arm_i64
     TypeKind.NarrowLit
 
 # ritz0's fold_literal_i64 (AGAST #4082): the i64 value of an operator over
-# untyped integer literals only, into *out; 1 if it folds.  A bare literal
-# (`5`, `-5`) is one already and gives 0, as do names and casts.  Unlike
+# untyped integer literals only, or None.  A bare literal (`5`, `-5`) is one
+# already and gives None, as do names and casts.  Unlike
 # narrow_const_value, which proves a slot's fit, it folds what the emitter
 # computes: `>>` is arithmetic and `/` `%` truncate on negative operands too.
-# Any step outside i64, a zero divisor or a count outside 0..63 gives 0.
-pub fn narrow_fold_lit(e: *Expr, out: *i64) -> i32
+# Any step outside i64, a zero divisor or a count outside 0..63 gives None.
+pub fn narrow_fold_lit(e: *Expr) -> Option<i64>
     if e == null or narrow_is_int_lit(e) == 1
-        return 0
+        return None
     if e.kind != ExprKind.Binary and e.kind != ExprKind.Unary
-        return 0
-    narrow_fold_lit_in(e, out)
+        return None
+    narrow_fold_lit_in(e)
 
-fn narrow_fold_lit_in(e: *Expr, out: *i64) -> i32
+# narrow_fold_lit's fold, a bare non-negative literal included.
+fn narrow_fold_lit_in(e: *Expr) -> Option<i64>
     if e == null
-        return 0
+        return None
     let min: i64 = 0 - I64_MAX - 1
-    if e.kind == ExprKind.IntLit
-        # A negative int_val is a literal only a u64 holds (int_operand_shape).
-        if e.lit_kind != LIT_PLAIN or e.int_val < 0
-            return 0
-        *out = e.int_val
-        return 1
-    var l: i64 = 0
-    if e.kind == ExprKind.Unary
-        if e.op != OpKind.Neg and e.op != OpKind.BitNot
-            return 0
-        if narrow_fold_lit_in(e.operand, @l) == 0
-            return 0
-        if e.op == OpKind.BitNot
-            *out = (0 - 1) - l
-            return 1
-        if l == min
-            return 0
-        *out = 0 - l
-        return 1
-    if e.kind != ExprKind.Binary or narrow_is_arith_op(e.op) == 0
-        return 0
-    var r: i64 = 0
-    if narrow_fold_lit_in(e.left, @l) == 0 or narrow_fold_lit_in(e.right, @r) == 0
-        return 0
+    match e.kind
+        ExprKind.IntLit =>
+            # A negative int_val is a literal only a u64 holds (int_operand_shape).
+            if e.lit_kind != LIT_PLAIN or e.int_val < 0
+                return None
+            return Some(e.int_val)
+        ExprKind.Unary =>
+            if e.op != OpKind.Neg and e.op != OpKind.BitNot
+                return None
+            let v: i64 = narrow_fold_lit_in(e.operand)?
+            if e.op == OpKind.BitNot
+                return Some((0 - 1) - v)
+            if v == min
+                return None
+            return Some(0 - v)
+        ExprKind.Binary => pass
+        _ =>
+            return None
+    if narrow_is_arith_op(e.op) == 0
+        return None
+    let l: i64 = narrow_fold_lit_in(e.left)?
+    let r: i64 = narrow_fold_lit_in(e.right)?
     let op: OpKind = e.op
     match op
         OpKind.Shl | OpKind.Shr =>
             if r < 0 or r >= 64
-                return 0
+                return None
             if op == OpKind.Shr
-                *out = l >> r
-                return 1
+                return Some(l >> r)
             if l >= 0 and l > (I64_MAX >> r)
-                return 0
+                return None
             if l < 0 and l < (min >> r)
-                return 0
-            *out = l << r
-            return 1
+                return None
+            return Some(l << r)
         OpKind.Div | OpKind.Mod =>
             if r == 0 or (l == min and r == 0 - 1)
-                return 0
+                return None
             if op == OpKind.Div
-                *out = l / r
-            else
-                *out = l % r
-            return 1
+                return Some(l / r)
+            return Some(l % r)
         OpKind.Add =>
             if narrow_add_ok(l, r) == 0
-                return 0
-            *out = l + r
-            return 1
+                return None
+            return Some(l + r)
         OpKind.Sub =>
             if narrow_sub_ok(l, r) == 0
-                return 0
-            *out = l - r
-            return 1
+                return None
+            return Some(l - r)
         OpKind.Mul =>
             if narrow_mul_ok(l, r) == 0
-                return 0
-            *out = l * r
-            return 1
+                return None
+            return Some(l * r)
         _ => pass
     match op
         OpKind.BitAnd =>
-            *out = l & r
+            return Some(l & r)
         OpKind.BitOr =>
-            *out = l | r
-        _ =>
-            *out = l ^ r
-    1
+            return Some(l | r)
+        _ => pass
+    Some(l ^ r)
 
 # Ritz type of an initialiser, TypeKind.NarrowLit, or TypeKind.NarrowUnknown (see header).
 pub fn narrow_src_type(s: *EmitterState, e: *Expr) -> TypeKind
@@ -743,129 +736,115 @@ fn narrow_mul_ok(a: i64, b: i64) -> i32
         return 0
     1
 
-# Exact value of a compile-time integer expression into *out; 1 if proven.
+# Exact value of a compile-time integer expression, or None if not proven.
 # A named constant narrower than 64 bits is trusted only as the WHOLE
 # initialiser: inside an expression it is computed at its own width and
 # could wrap before any widening.
-fn narrow_const_value(env: *NarrowEnv, e: *Expr, whole: i32, out: *i64) -> i32
+fn narrow_const_value(env: *NarrowEnv, e: *Expr, whole: i32) -> Option<i64>
     if e == null
-        return 0
+        return None
     match e.kind
         ExprKind.IntLit =>
-            *out = e.int_val
-            return 1
+            return Some(e.int_val)
         ExprKind.Ident =>
             let ce: *ConstEntry = narrow_env_const(env, e.ident)
             if ce == null or ce.fold_state != CONST_FOLD_DONE
-                return 0
+                return None
             let w: i32 = ty_bits(ce.const_type)
             if w < 8
-                return 0
+                return None
             if w < 64 and whole == 0
-                return 0
-            *out = ce.value
-            return 1
+                return None
+            return Some(ce.value)
         ExprKind.Unary =>
-            var v: i64 = 0
             if e.op != OpKind.Neg and e.op != OpKind.BitNot
-                return 0
-            if narrow_const_value(env, e.operand, 0, @v) == 0
-                return 0
+                return None
+            let v: i64 = narrow_const_value(env, e.operand, 0)?
             if e.op == OpKind.Neg
                 if v == 0 - I64_MAX - 1
-                    return 0
-                *out = 0 - v
-            else
-                *out = (0 - 1) - v    # ~v
-            return 1
+                    return None
+                return Some(0 - v)
+            return Some((0 - 1) - v)    # ~v
         _ => pass
     if e.kind != ExprKind.Binary
-        return 0
-    var l: i64 = 0
-    var r: i64 = 0
-    if narrow_const_value(env, e.left, 0, @l) == 0
-        return 0
-    if narrow_const_value(env, e.right, 0, @r) == 0
-        return 0
+        return None
+    let l: i64 = narrow_const_value(env, e.left, 0)?
+    let r: i64 = narrow_const_value(env, e.right, 0)?
     let op: OpKind = e.op
     match op
         OpKind.Shl =>
             # A shift of 64 or more is poison in LLVM, not 0.
             if r < 0 or r >= 64
-                return 0
+                return None
             if l >= 0 and l > (I64_MAX >> r)
-                return 0
+                return None
             if l < 0 and l < ((0 - I64_MAX - 1) >> r)
-                return 0
-            *out = l << r
-            return 1
+                return None
+            return Some(l << r)
         OpKind.Shr | OpKind.Div | OpKind.Mod =>
             # Signed and unsigned forms (ashr/lshr, sdiv/udiv) agree only for
             # non-negative operands; see ritz0's comment on `(1 << 62) * 4 >> 60`.
             if l < 0 or r < 0
-                return 0
+                return None
             if op == OpKind.Shr
                 if r >= 64
-                    return 0
-                *out = l >> r
-                return 1
+                    return None
+                return Some(l >> r)
             if r == 0
-                return 0
+                return None
             if op == OpKind.Div
-                *out = l / r
-            else
-                *out = l % r
-            return 1
+                return Some(l / r)
+            return Some(l % r)
         OpKind.Add =>
             if narrow_add_ok(l, r) == 0
-                return 0
-            *out = l + r
-            return 1
+                return None
+            return Some(l + r)
         OpKind.Sub =>
             if narrow_sub_ok(l, r) == 0
-                return 0
-            *out = l - r
-            return 1
+                return None
+            return Some(l - r)
         OpKind.Mul =>
             if narrow_mul_ok(l, r) == 0
-                return 0
-            *out = l * r
-            return 1
+                return None
+            return Some(l * r)
         OpKind.BitAnd =>
-            *out = l & r
-            return 1
+            return Some(l & r)
         OpKind.BitOr =>
-            *out = l | r
-            return 1
+            return Some(l | r)
         OpKind.BitXor =>
-            *out = l ^ r
-            return 1
+            return Some(l ^ r)
         _ => pass
-    0
+    None
 
 # [*lo, *hi] bounding every value of e; 1 if proven.  Port of ritz0's
 # _provable_int_range: constants, `e & K` masks, and match over those.  No
 # reasoning about comparisons, loop bounds or variables -- widening this is a
 # language decision, pinned by test_implicit_narrowing.py.
 fn narrow_provable_range(env: *NarrowEnv, e: *Expr, whole: i32, lo: *i64, hi: *i64) -> i32
-    var v: i64 = 0
-    if narrow_const_value(env, e, whole, @v) == 1
-        *lo = v
-        *hi = v
-        return 1
+    match narrow_const_value(env, e, whole)
+        Some(v) =>
+            *lo = v
+            *hi = v
+            return 1
+        None => pass
     if e == null
         return 0
     if e.kind == ExprKind.Binary and e.op == OpKind.BitAnd
         var found: i32 = 0
         var best: i64 = 0
-        var k: i64 = 0
-        if narrow_const_value(env, e.left, 0, @k) == 1 and k >= 0
-            best = k
-            found = 1
-        if narrow_const_value(env, e.right, 0, @k) == 1 and k >= 0
-            if found == 0 or k < best
-                best = k
-            found = 1
+        match narrow_const_value(env, e.left, 0)
+            Some(k) =>
+                if k >= 0
+                    best = k
+                    found = 1
+            None => pass
+        match narrow_const_value(env, e.right, 0)
+            Some(k) =>
+                if k >= 0
+                    if found == 0 or k < best
+                        best = k
+                    found = 1
+            None => pass
         if found == 0
             return 0
         *lo = 0
@@ -1080,15 +1059,15 @@ fn narrow_arms_fit(env: *NarrowEnv, e: *Expr, decl: TypeKind) -> i32
     while arm != null
         if arm.is_pass != 0 or arm.body == null
             return 0
-        var v: i64 = 0
-        if narrow_const_value(env, arm.body, 1, @v) == 1
-            if narrow_fits(v, decl) == 0
-                return 0
-        else
-            let at: TypeKind = narrow_src_type_in(env, arm.body, 1)
-            if at == TypeKind.NarrowUnknown or ty_bits(at) > dw
-                if narrow_arms_fit(env, arm.body, decl) == 0
+        match narrow_const_value(env, arm.body, 1)
+            Some(v) =>
+                if narrow_fits(v, decl) == 0
                     return 0
+            None =>
+                let at: TypeKind = narrow_src_type_in(env, arm.body, 1)
+                if at == TypeKind.NarrowUnknown or ty_bits(at) > dw
+                    if narrow_arms_fit(env, arm.body, decl) == 0
+                        return 0
         arm = arm.next
     1
 
@@ -1122,11 +1101,12 @@ fn narrow_congs_fit(env: *NarrowEnv, e: *Expr, decl: TypeKind) -> i32
         if l == 1 or r == 1
             return 1
         return 0
-    var v: i64 = 0
-    if narrow_const_value(env, e, 1, @v) == 1
-        if narrow_fits(v, decl) == 1
-            return 0
-        return -1
+    match narrow_const_value(env, e, 1)
+        Some(v) =>
+            if narrow_fits(v, decl) == 1
+                return 0
+            return -1
+        None => pass
     # AGAST #4584: unary `-` and `~` are congruent mod 2**width as well
     # (ritz0's _CONGRUENT_UNOPS), so `let x: i32 = -match c` with literal arms
     # is judged by its arms, as `6 + match c` is.  After the constant check, so

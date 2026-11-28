@@ -1224,20 +1224,20 @@ pub fn sema_note_elem_init(sm: *Sema, st: *Stmt)
     if init.kind == ExprKind.Index
         # `b[i][j]` with `b: [N]**T` is `*(b[i] + j)`, one level under b[i].
         if init.left != null and init.left.kind == ExprKind.Index
-            var inner: TypeKind = TypeKind.Void
-            var lname: StrView = strview_empty()
-            let levels: i32 = sx_ptr_levels_into(sm, init.left, @inner, @lname)
-            if levels >= 2 and inner != TypeKind.Void
-                sema_note_ptr_levels(lv, levels - 1, inner, lname, ref_kind)
-                sx_note_init_levels(init, levels - 1, inner, lname)
+            match sx_ptr_levels_into(sm, init.left)
+                Some(pl) =>
+                    if pl.levels >= 2 and pl.inner != TypeKind.Void
+                        sema_note_ptr_levels(lv, pl.levels - 1, pl.inner, pl.name, ref_kind)
+                        sx_note_init_levels(init, pl.levels - 1, pl.inner, pl.name)
+                        return
+                None => pass
+    match sx_ptr_levels_into(sm, init)
+        Some(pl) =>
+            if pl.inner == TypeKind.Void
                 return
-    var inner2: TypeKind = TypeKind.Void
-    var oname: StrView = strview_empty()
-    let levels2: i32 = sx_ptr_levels_into(sm, init, @inner2, @oname)
-    if levels2 == 0 or inner2 == TypeKind.Void
-        return
-    sema_note_ptr_levels(lv, levels2, inner2, oname, ref_kind)
-    sx_note_init_levels(init, levels2, inner2, oname)
+            sema_note_ptr_levels(lv, pl.levels, pl.inner, pl.name, ref_kind)
+            sx_note_init_levels(init, pl.levels, pl.inner, pl.name)
+        None => pass
 
 # ---- The slot type the emitter reads (AGAST #4410, rest of #4404) -----------
 #
@@ -2249,8 +2249,7 @@ fn sx_array_elem_pointee(sm: *Sema, x: *Expr, out: *StrView) -> TypeKind
     while b != null and b.kind == ExprKind.Binary and (b.op == OpKind.Add or b.op == OpKind.Sub)
         # `q - p` is a count, not an element (is_ptr_distance).
         if b.op == OpKind.Sub
-            var rinner: TypeKind = TypeKind.Void
-            if sx_ptr_levels_into(sm, b.right, @rinner, null) > 0
+            if sx_ptr_levels_into(sm, b.right).is_some()
                 return TypeKind.Void
             if sx_array_elem_pointee_kind(sm, b.right) != TypeKind.Void
                 return TypeKind.Void
@@ -2287,12 +2286,24 @@ fn sx_elem_rooted(x: *Expr) -> i32
         b = b.operand
     (b != null and b.kind == ExprKind.Index) as i32
 
+# A pointer's static type as Sema reads it (emitter_types' PtrLevels, on
+# Sema): `levels` (2 = `**T`, 3 = `***T`, 1 under a deref), the innermost
+# pointee `inner`, and its name when `inner` is a struct (else empty).
+pub struct SemaPtrLevels
+    levels: i32
+    inner: TypeKind
+    name: StrView
+
+# `levels` over `inner`, named `name_sv` only when it is a struct.
+fn sx_levels(levels: i32, inner: TypeKind, name_sv: StrView) -> SemaPtrLevels
+    var name: StrView = strview_empty()
+    if inner == TypeKind.Struct
+        name = name_sv
+    SemaPtrLevels { levels: levels, inner: inner, name: name }
+
 # `@a[i]` points at an element that is itself a pointer: a `**U` for
-# `a: [N]*U`, one level more than the element for `a: [N]**U` (0 otherwise).
-fn sx_addr_of_elem_levels(sm: *Sema, x: *Expr, out_inner: *TypeKind, out: *StrView) -> i32
-    *out_inner = TypeKind.Void
-    if out != null
-        *out = strview_empty()
+# `a: [N]*U`, one level more than the element for `a: [N]**U` (None otherwise).
+fn sx_addr_of_elem_levels(sm: *Sema, x: *Expr) -> Option<SemaPtrLevels>
     var elem: TypeKind = TypeKind.Void
     var pointee: i32 = (TypeKind.Void as i32)
     var name: StrView = strview_empty()
@@ -2300,50 +2311,34 @@ fn sx_addr_of_elem_levels(sm: *Sema, x: *Expr, out_inner: *TypeKind, out: *StrVi
     if elem == TypeKind.Ptr
         let u: TypeKind = sx_elem_recorded_pointee(elem, ptr_slot_flat(pointee))
         if u == TypeKind.Void
-            return 0
-        *out_inner = u
-        if u == TypeKind.Struct
-            if out != null
-                *out = name
-        return 2
+            return None
+        return Some(sx_levels(2, u, name))
     if elem != TypeKind.PtrPtr or ptr_ptr_slot_levels(pointee) < 2
-        return 0
-    *out_inner = ptr_ptr_slot_inner(pointee)
-    if *out_inner == TypeKind.Struct
-        if out != null
-            *out = name
-    ptr_ptr_slot_levels(pointee) + 1
+        return None
+    Some(sx_levels(ptr_ptr_slot_levels(pointee) + 1, ptr_ptr_slot_inner(pointee), name))
 
 # The static pointer levels of `x`, as emitter_core's ptr_levels_of reads
-# them, with the innermost pointee in *out_inner (a struct's name out too);
-# 0 for a plain `*T` base.
-fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out: *StrView) -> i32
-    *out_inner = TypeKind.Void
-    if out != null
-        *out = strview_empty()
+# them, with the innermost pointee (a struct's name too); None for a plain
+# `*T` base or no pointer.
+fn sx_ptr_levels_into(sm: *Sema, x: *Expr) -> Option<SemaPtrLevels>
     if x == null
-        return 0
+        return None
     match x.kind
         ExprKind.Binary =>
             if x.op == OpKind.Add or x.op == OpKind.Sub
-                return sx_ptr_levels_into(sm, x.left, out_inner, out)
-            return 0
+                return sx_ptr_levels_into(sm, x.left)
+            return None
         ExprKind.Unary =>
             # `@a[i]` / `@&a[i]`: the element's address (addr_of_elem_levels).
             if (x.op == OpKind.Addr or x.op == OpKind.AddrMut) and x.operand != null and x.operand.kind == ExprKind.Index
-                return sx_addr_of_elem_levels(sm, x.operand, out_inner, out)
+                return sx_addr_of_elem_levels(sm, x.operand)
             if x.op != OpKind.Deref or x.operand == null
-                return 0
-            var inner: TypeKind = TypeKind.Void
-            var in_name: StrView = strview_empty()
-            let sub: i32 = sx_ptr_levels_into(sm, x.operand, @inner, @in_name)
-            if sub < 2
-                *out_inner = TypeKind.Void
-                return 0
-            *out_inner = inner
-            if out != null
-                *out = in_name
-            return sub - 1
+                return None
+            var sub: SemaPtrLevels = sx_ptr_levels_into(sm, x.operand)?
+            if sub.levels < 2
+                return None
+            sub.levels = sub.levels - 1
+            return Some(sub)
         _ => pass
     var slot: i32 = (TypeKind.Void as i32)
     var name: StrView = strview_empty()
@@ -2358,18 +2353,18 @@ fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out: *StrView) 
                 else if (v.kind == TypeKind.Ptr or v.kind == TypeKind.Ref or v.kind == TypeKind.MutRef) and v.inner != (TypeKind.Void as i32) and ptr_ptr_slot_levels(v.inner) >= 2
                     slot = v.inner
                 else
-                    return 0
+                    return None
                 name = v.type_name
             else
                 let g: *GlobalVarDef = sx_find_global(sm, x.ident)
                 if g == null or g.var_type != TypeKind.PtrPtr
-                    return 0
+                    return None
                 slot = g.inner_pointee_type
                 name = g.pointee_type_name
         ExprKind.Member =>
             let f: *StructField = sx_member_field(sm, x)
             if f == null or f.field_type != TypeKind.PtrPtr
-                return 0
+                return None
             slot = f.inner_pointee_type
             name = f.field_type_name
         ExprKind.Index =>
@@ -2378,12 +2373,12 @@ fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out: *StrView) 
             var el_name: StrView = strview_empty()
             sx_array_elem_record(sm, x, @elem, @slot, @el_name)
             if elem != TypeKind.PtrPtr
-                return 0
+                return None
             name = el_name
         ExprKind.Cast =>
             # `x as **S`, whose slot cast_tail_new records (AGAST #2544).
             if x.type_kind != TypeKind.PtrPtr
-                return 0
+                return None
             slot = x.cast_ptr_kind
             name = x.ident
         ExprKind.Call =>
@@ -2391,37 +2386,33 @@ fn sx_ptr_levels_into(sm: *Sema, x: *Expr, out_inner: *TypeKind, out: *StrView) 
             # level past two (monomorph's spelling); only a struct answers.
             let fd: *FnDef = sx_call_fn(sm, x)
             if fd == null or fd.return_type != TypeKind.PtrPtr or fd.return_type_name.ptr == null
-                return 0
+                return None
             name = fd.return_type_name
             var extra: i32 = 0
             while name.len > 4 and name.starts_with("ptr_")
                 name = name.skip(4)
                 extra = extra + 1
             if sema_find_struct(sm, name) == null
-                return 0
+                return None
             slot = ptr_slot_deepen((TypeKind.Struct as i32), extra)
         _ =>
-            return 0
+            return None
     let levels: i32 = ptr_ptr_slot_levels(slot)
     if levels < 2
-        return 0
-    let inner: TypeKind = ptr_ptr_slot_inner(slot)
-    *out_inner = inner
-    if inner == TypeKind.Struct
-        if out != null
-            *out = name
-    levels
+        return None
+    Some(sx_levels(levels, ptr_ptr_slot_inner(slot), name))
 
 # The scalar T behind `*base` when `base` is a `*T` (a `**T` deref), or VOID.
 fn sx_deref_ptr_ptr_elem(sm: *Sema, base: *Expr) -> TypeKind
     if base == null or base.kind != ExprKind.Unary or base.op != OpKind.Deref
         return TypeKind.Void
-    var inner: TypeKind = TypeKind.Void
-    if sx_ptr_levels_into(sm, base, @inner, null) != 1
-        return TypeKind.Void
-    if inner == TypeKind.Struct or inner == TypeKind.Void
-        return TypeKind.Void
-    inner
+    match sx_ptr_levels_into(sm, base)
+        Some(pl) =>
+            if pl.levels != 1 or pl.inner == TypeKind.Struct or pl.inner == TypeKind.Void
+                return TypeKind.Void
+            return pl.inner
+        None => pass
+    TypeKind.Void
 
 # The scalar T that `(*r)[i]` reads when `*r` is a `*T` (deref_index_elem).
 fn sx_deref_index_elem(sm: *Sema, e: *Expr) -> TypeKind
@@ -2453,12 +2444,13 @@ fn sx_member_pointee(sm: *Sema, e: *Expr) -> TypeKind
 fn sx_ptr_ptr_index_scalar(sm: *Sema, x: *Expr) -> TypeKind
     if x == null
         return TypeKind.Void
-    var inner: TypeKind = TypeKind.Void
-    if sx_ptr_levels_into(sm, x, @inner, null) != 2
-        return TypeKind.Void
-    if inner == TypeKind.Struct or inner == TypeKind.Void
-        return TypeKind.Void
-    inner
+    match sx_ptr_levels_into(sm, x)
+        Some(pl) =>
+            if pl.levels != 2 or pl.inner == TypeKind.Struct or pl.inner == TypeKind.Void
+                return TypeKind.Void
+            return pl.inner
+        None => pass
+    TypeKind.Void
 
 # The local `name`'s recorded pointee, as find_local_pointee_type: i64 for
 # a miss, and i64 for a scalar `:&` borrow (bound as a plain T local).
@@ -2523,8 +2515,11 @@ pub fn sema_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
                 if ix != TypeKind.Void
                     return ix
             # `*(ppp + i)` with `ppp: ***T` is itself a `**T` (AGAST #1924).
-            var dl_inner: TypeKind = TypeKind.Void
-            let dl_levels: i32 = sx_ptr_levels_into(sm, e, @dl_inner, null)
+            var dl_levels: i32 = 0
+            match sx_ptr_levels_into(sm, e)
+                Some(pl) =>
+                    dl_levels = pl.levels
+                None => pass
             if dl_levels >= 2
                 return TypeKind.PtrPtr
             # AGAST #2376: `*a[i]` with `a: [N]**T` (or `*@a[i]` with

@@ -62,9 +62,9 @@ pub struct MonoCtx
     # Generic-typed locals of the fn being specialised ("Local Variable Type
     # Tracking" below).
     lv_names: *StrView
-    lv_prefix_kind: *i32    # 0 = plain struct, 1 = Vec, 2 = Span
+    lv_collection: *Option<CollectionKind>  # Vec / Span; None = plain struct
     lv_suffixes: *StrView       # the "$T" portion (with leading $)
-    lv_type_names: *StrView     # kind 0: the struct's name (e.g. "R")
+    lv_type_names: *StrView     # a plain struct's name (e.g. "R")
     lv_by_value: *i32       # 1: the local IS the struct, not *T / @T (AGAST #2451)
     lv_shared: *i32         # 1: an `@T` param or local, which refuses writes (§3.2)
     lv_count: i32
@@ -687,7 +687,7 @@ pub fn ensure_builtin_span_template(m: *Module)
 # receiver, register the corresponding `vec_<method>$<T>` / `span_<method>$<T>`
 # instantiation when a matching generic template exists.
 
-# Holds the Vec/Span locals AND the plain-struct locals (kind 0) that field
+# Holds the Vec/Span locals AND the plain-struct locals (no collection) that field
 # receivers resolve through (AGAST #1512).  Grows by doubling: entries past
 # the old fixed cap of 256 used to be dropped silently (AGAST #1813).
 const LOCAL_VARS_INIT_CAP: i32 = 256
@@ -699,7 +699,7 @@ pub fn init_local_var_tracker(mono: *MonoCtx)
         return
     mono.lv_cap = LOCAL_VARS_INIT_CAP
     mono.lv_names = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
-    mono.lv_prefix_kind = malloc((mono.lv_cap as i64) * 4) as *i32
+    mono.lv_collection = malloc((mono.lv_cap as i64) * sizeof(Option<CollectionKind>)) as *Option<CollectionKind>
     mono.lv_suffixes = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
     mono.lv_type_names = malloc((mono.lv_cap as i64) * sizeof(StrView)) as *StrView
     mono.lv_by_value = malloc((mono.lv_cap as i64) * 4) as *i32
@@ -739,18 +739,20 @@ pub fn array_local_elem(mono: *MonoCtx, name_sv: StrView) -> StrView
         i = i - 1
     strview_empty()
 
-pub fn add_local_var(mono: *MonoCtx, name_sv: StrView, prefix_kind: i32, suffix_sv: StrView)
+# Track local `name_sv`: a Vec or Span (`coll`) at `suffix_sv`, or, with
+# `coll` None, a plain struct whose name the caller sets in lv_type_names.
+pub fn add_local_var(mono: *MonoCtx, name_sv: StrView, coll: Option<CollectionKind>, suffix_sv: StrView)
     if mono.lv_count >= mono.lv_cap
         let cap: i64 = (mono.lv_cap as i64) * 2
         mono.lv_names = realloc(mono.lv_names as *u8, cap * sizeof(StrView)) as *StrView
-        mono.lv_prefix_kind = realloc(mono.lv_prefix_kind as *u8, cap * 4) as *i32
+        mono.lv_collection = realloc(mono.lv_collection as *u8, cap * sizeof(Option<CollectionKind>)) as *Option<CollectionKind>
         mono.lv_suffixes = realloc(mono.lv_suffixes as *u8, cap * sizeof(StrView)) as *StrView
         mono.lv_type_names = realloc(mono.lv_type_names as *u8, cap * sizeof(StrView)) as *StrView
         mono.lv_by_value = realloc(mono.lv_by_value as *u8, cap * 4) as *i32
         mono.lv_shared = realloc(mono.lv_shared as *u8, cap * 4) as *i32
         mono.lv_cap = cap as i32
     *(mono.lv_names + mono.lv_count) = name_sv
-    *(mono.lv_prefix_kind + mono.lv_count) = prefix_kind
+    *(mono.lv_collection + mono.lv_count) = coll
     *(mono.lv_suffixes + mono.lv_count) = suffix_sv
     *(mono.lv_type_names + mono.lv_count) = strview_empty()
     *(mono.lv_by_value + mono.lv_count) = 0
@@ -764,31 +766,31 @@ pub fn mark_last_local_by_value(mono: *MonoCtx)
 
 # Record a local/param whose type is a (non-collection) struct or a pointer
 # or reference to one, so a field receiver rooted at it — `r.raw.push(9)` —
-# can resolve the field's type (AGAST #1512).  Kind 0 never matches a UFCS
+# can resolve the field's type (AGAST #1512).  No collection never matches a UFCS
 # prefix, so the ident-receiver path ignores these entries.
 pub fn add_local_struct_var(mono: *MonoCtx, name_sv: StrView, type_name_sv: StrView)
     if type_name_sv.ptr == null or type_name_sv.len <= 0
         return
-    add_local_var(mono, name_sv, 0, strview_empty())
+    add_local_var(mono, name_sv, None, strview_empty())
     *(mono.lv_type_names + mono.lv_count - 1) = type_name_sv
 
 # Record a binding of type `type_kind`/`type_name`: Vec/Span by-value go to
-# the UFCS kinds; any other named struct (by value, *T, @T, @&T) is kind 0.
+# the UFCS kinds; any other named struct (by value, *T, @T, @&T) is a plain
+# struct (no collection).
 pub fn track_typed_local(mono: *MonoCtx, name_sv: StrView, type_kind: TypeKind, type_name: StrView)
     if type_name.ptr == null or type_name.len <= 0
         return
     if type_kind != TypeKind.Struct and type_kind != TypeKind.Ptr and type_kind != TypeKind.Ref and type_kind != TypeKind.MutRef
         return
-    var suf: StrView = strview_empty()
-    let kind: i32 = classify_collection_type(type_name, @suf)
-    if kind > 0
-        # By value or through *T / @T / @&T alike: the emitter's UFCS
-        # dispatch loads a pointer receiver itself, so `points:& Vec<P>`
-        # needs `vec_slice$P` registered just as a local Vec would
-        # (angelo's `points[:]`, AGAST #1794).
-        add_local_var(mono, name_sv, kind, suf)
-    else
-        add_local_struct_var(mono, name_sv, type_name)
+    match classify_collection_type(type_name)
+        Some(c) =>
+            # By value or through *T / @T / @&T alike: the emitter's UFCS
+            # dispatch loads a pointer receiver itself, so `points:& Vec<P>`
+            # needs `vec_slice$P` registered just as a local Vec would
+            # (angelo's `points[:]`, AGAST #1794).
+            add_local_var(mono, name_sv, Some(c.kind), c.suffix)
+        None =>
+            add_local_struct_var(mono, name_sv, type_name)
     if type_kind == TypeKind.Struct
         mark_last_local_by_value(mono)
 
@@ -813,7 +815,7 @@ pub fn track_address_of_local(mono: *MonoCtx, name_sv: StrView, of: *Expr)
     let idx: i32 = find_local_var_idx(mono, of.ident)
     if idx < 0 or *(mono.lv_by_value + idx) != 1
         return
-    add_local_var(mono, name_sv, *(mono.lv_prefix_kind + idx), *(mono.lv_suffixes + idx))
+    add_local_var(mono, name_sv, local_collection(mono, idx), *(mono.lv_suffixes + idx))
     *(mono.lv_type_names + mono.lv_count - 1) = *(mono.lv_type_names + idx)
     *(mono.lv_by_value + mono.lv_count - 1) = 2
 
@@ -821,27 +823,26 @@ pub fn track_address_of_local(mono: *MonoCtx, name_sv: StrView, of: *Expr)
 pub fn field_is_ref(f: *StructField) -> i32
     (f.field_type == TypeKind.Ref or f.field_type == TypeKind.MutRef) as i32
 
-# The method `meth` of the inherent generic impl of Vec (kind 1) or Span
-# (kind 2), and through out_ib that impl, or null.  Method syntax reaches only
-# impl methods (LARB R66); the vec_/span_ prefix table this replaced went with
-# AGAST #4303.
-fn collection_impl_method(m: *Module, kind: i32, meth_sv: StrView, out_ib: **ImplBlock) -> *FnDef
-    var base: StrView = "Vec"
-    if kind == 2
-        base = "Span"
-    else if kind != 1
-        return null
+# A method `f` found in impl block `ib`.
+struct ImplMethodAt
+    ib: *ImplBlock
+    f: *FnDef
+
+# The method `meth` of the inherent generic impl of Vec or Span (`kind`), with
+# that impl, or None.  Method syntax reaches only impl methods (LARB R66); the
+# vec_/span_ prefix table this replaced went with AGAST #4303.
+fn collection_impl_method(m: *Module, kind: CollectionKind, meth_sv: StrView) -> Option<ImplMethodAt>
+    let base: StrView = collection_base_name(kind)
     var ib: *ImplBlock = m.impls
     while ib != null
         if ib.type_params != null and (ib.trait_name.ptr == null or ib.trait_name.len == 0) and name_eq(ib.type_name, base) == 1
             var f: *FnDef = ib.methods
             while f != null
                 if name_eq(f.name, meth_sv) == 1
-                    *out_ib = ib
-                    return f
+                    return Some(ImplMethodAt { ib: ib, f: f })
                 f = f.next
         ib = ib.next
-    null
+    None
 
 # AGAST #1798: record an un-annotated local initialised by a method call on a
 # tracked ident receiver -- `var s = a.slice(0, n)`, `var s = a[:]` (which
@@ -857,22 +858,26 @@ pub fn track_method_init_local(mono: *MonoCtx, m: *Module, name_sv: StrView, ini
         # move-only L nothing calls), AGAST #4588.
         track_impl_method_local(mono, m, name_sv, init.left.ident, init)
         return
-    let kind: i32 = *(mono.lv_prefix_kind + idx)
-    if kind > 0
-        # Vec/Span receiver: an impl method returning its own collection
-        # over the impl's type parameter (`fn slice(..) -> Vec<T>`, "Vec$T")
-        # gives that collection at the receiver's suffix.
-        var cib: *ImplBlock = null
-        let tmpl: *FnDef = collection_impl_method(m, kind, init.ident, @cib)
-        if tmpl == null or tmpl.return_type != TypeKind.Struct
+    match local_collection(mono, idx)
+        Some(kind) =>
+            # Vec/Span receiver: an impl method returning its own collection
+            # over the impl's type parameter (`fn slice(..) -> Vec<T>`, "Vec$T")
+            # gives that collection at the receiver's suffix.
+            let at: ImplMethodAt = match collection_impl_method(m, kind, init.ident)
+                Some(found) => found
+                None => return
+            let tmpl: *FnDef = at.f
+            if tmpl.return_type != TypeKind.Struct
+                return
+            let tp: *TypeParam = at.ib.type_params
+            match classify_collection_type(tmpl.return_type_name)
+                Some(rc) =>
+                    if tp.name.eq(rc.suffix.skip(1))
+                        add_local_var(mono, name_sv, Some(rc.kind), *(mono.lv_suffixes + idx))
+                        mark_last_local_by_value(mono)
+                None => pass
             return
-        var rsuf: StrView = strview_empty()
-        let rkind: i32 = classify_collection_type(tmpl.return_type_name, @rsuf)
-        let tp: *TypeParam = cib.type_params
-        if rkind > 0 and tp.name.eq(rsuf.skip(1))
-            add_local_var(mono, name_sv, rkind, *(mono.lv_suffixes + idx))
-            mark_last_local_by_value(mono)
-        return
+        None => pass
     # Struct receiver (by value or pointer): its non-generic impl method's
     # return type, recorded like an annotation of that type.
     let tn: StrView = *(mono.lv_type_names + idx)
@@ -908,21 +913,45 @@ pub fn find_local_var_idx(mono: *MonoCtx, name_sv: StrView) -> i32
             return i
     return -1
 
-# If `type_name` is a Vec$T or Span$T mangled name, return the prefix kind
-# (1 = Vec, 2 = Span) and write the inner suffix (with leading $) to out.
-# Returns 0 if no match.
-pub fn classify_collection_type(type_name: StrView, out: *StrView) -> i32
+# The collection tracked local `idx` is, or None for a plain struct.
+pub fn local_collection(mono: *MonoCtx, idx: i32) -> Option<CollectionKind>
+    *(mono.lv_collection + idx)
+
+# Whether `k` is the collection `want` (Option of a payload enum has no `==`).
+pub fn collection_is(k: Option<CollectionKind>, want: CollectionKind) -> bool
+    match k
+        Some(c) => c == want
+        None => false
+
+# Which collection a Vec$T / Span$T mangled name is.
+pub enum CollectionKind
+    Vec
+    Span
+
+# A Vec$T or Span$T mangled name: its collection and inner suffix ("$T",
+# with the leading $).
+pub struct CollectionType
+    kind: CollectionKind
+    suffix: StrView
+
+# The type name `k`'s instances are mangled from: "Vec" or "Span".
+pub fn collection_base_name(k: CollectionKind) -> StrView
+    match k
+        CollectionKind.Vec => "Vec"
+        CollectionKind.Span => "Span"
+
+# The collection `type_name` names when it is a Vec$T or Span$T mangled
+# name, else None.
+pub fn classify_collection_type(type_name: StrView) -> Option<CollectionType>
     if type_name.ptr == null or type_name.len < 5
-        return 0
-    # "Vec$..." → kind 1, suffix starts at index 3
+        return None
+    # "Vec$...": the suffix starts at index 3
     if type_name.starts_with("Vec$")
-        *out = type_name.skip(3)
-        return 1
-    # "Span$..." → kind 2, suffix starts at index 4 (need 6+ bytes)
+        return Some(CollectionType { kind: CollectionKind.Vec, suffix: type_name.skip(3) })
+    # "Span$...": the suffix starts at index 4 (need 6+ bytes)
     if type_name.len >= 6 and type_name.starts_with("Span$")
-        *out = type_name.skip(4)
-        return 2
-    return 0
+        return Some(CollectionType { kind: CollectionKind.Span, suffix: type_name.skip(4) })
+    None
 
 # Walk module functions looking for any (generic or specialized) fn matching
 # the given name.  Used during collection to resolve a var-decl initializer
@@ -1065,18 +1094,25 @@ pub fn type_param_index(tp: *TypeParam, name_sv: StrView) -> i32
         cur = cur.next
     -1
 
+# The type parameter a `$`-component ends in after its `_`-pieces: its index
+# in the list, and the length of the pieces before it (`ptr_` is 4).
+pub struct PieceParam
+    index: i32
+    head: i32
+
 # AGAST #3748: the parameter a `$`-component ends in after its `_`-pieces
-# (`ptr_A`, `ptr_ptr_A`, `arr2_A`), its index, with the length of the pieces
-# before it in `out_head` (`ptr_` is 4).  -1 when the last piece is no
+# (`ptr_A`, `ptr_ptr_A`, `arr2_A`).  None when the last piece is no
 # parameter, or the component has no `_`: a whole-component parameter is
 # substitute_params_in_mangled's own case.  Only the last piece takes an
 # argument, as gi_match_pieces binds it (#3516).
-pub fn piece_param_index(tp: *TypeParam, c: StrView, out_head: *i32) -> i32
+pub fn piece_param_index(tp: *TypeParam, c: StrView) -> Option<PieceParam>
     let k: i32 = last_piece_start(c)
     if k == 0
-        return -1
-    *out_head = k
-    type_param_index(tp, c.skip(k))
+        return None
+    let idx: i32 = type_param_index(tp, c.skip(k))
+    if idx < 0
+        return None
+    Some(PieceParam { index: idx, head: k })
 
 # Where a `$`-component's last `_`-piece starts: 4 in `ptr_A`, 0 with no `_`
 # or when a piece before it is no type constructor the mangler writes (`ptr`,
@@ -1139,7 +1175,7 @@ pub fn scrutinee_type_name(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
         return strview_empty()
     if e.kind == ExprKind.Ident
         let idx: i32 = find_local_var_idx(mono, e.ident)
-        if idx < 0 or *(mono.lv_by_value + idx) != 1 or *(mono.lv_prefix_kind + idx) != 0
+        if idx < 0 or *(mono.lv_by_value + idx) != 1 or local_collection(mono, idx).is_some()
             return strview_empty()
         return *(mono.lv_type_names + idx)
     if e.kind == ExprKind.Call and e.call_type_suffix.len == 0
@@ -1514,8 +1550,7 @@ pub fn parse_type_from_suffix(suffix: StrView) -> TypeKind
         return prim
 
     # AGAST #2832: `$arr2_i8` is the array `[2]i8`.
-    var a: ArrayArg
-    if array_arg_decode(type_name, @a) == 1
+    if array_arg_decode(type_name).is_some()
         return TypeKind.Array
 
     # Could be a struct type
@@ -1532,22 +1567,26 @@ struct ArrayArg
     # TypeKind.Array and name null, as on an N-D local); null for a 1-D one.
     shape: *ArrayShape
 
-# 1 and *out filled when name[0..len] spells an array, else 0.
-pub fn array_arg_decode(name_sv: StrView, out: *ArrayArg) -> i32
-    out.shape = null
-    if array_arg_decode_1d(name_sv, out) == 0
-        return 0
+# The array `name_sv` spells, else None.
+pub fn array_arg_decode(name_sv: StrView) -> Option<ArrayArg>
+    let out: ArrayArg = array_arg_decode_1d(name_sv)?
     # AGAST #3634: an element that itself spells an array nests it.
     if out.elem != TypeKind.Struct or out.name.len < 6
-        return 1
-    var inner: ArrayArg
-    if array_arg_decode(out.name, @inner) == 0
-        return 1
+        return Some(out)
+    match array_arg_decode(out.name)
+        Some(inner) =>
+            return Some(array_arg_nest(out, inner))
+        None =>
+            return Some(out)
+
+# The 1-D array `out` whose struct element is the array `inner`, as one
+# array of `inner`'s leaf; `out` as it was past MAX_ARRAY_RANK.
+fn array_arg_nest(out: ArrayArg, inner: ArrayArg) -> ArrayArg
     var inner_rank: i32 = 1
     if inner.shape != null
         inner_rank = inner.shape.rank
     if inner_rank >= MAX_ARRAY_RANK
-        return 1
+        return out
     let sh: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
     sh.rank = inner_rank + 1
     sh.dims[0] = out.size
@@ -1562,28 +1601,23 @@ pub fn array_arg_decode(name_sv: StrView, out: *ArrayArg) -> i32
         sh.leaf_type = inner.shape.leaf_type
         sh.leaf_pointee = inner.shape.leaf_pointee
         sh.leaf_name = inner.shape.leaf_name
-    out.elem = TypeKind.Array
-    out.pointee = TypeKind.Void
-    out.name = strview_empty()
-    out.shape = sh
-    1
+    ArrayArg { size: out.size, elem: TypeKind.Array, pointee: TypeKind.Void, name: strview_empty(), shape: sh }
 
-# One `arrN_` level of array_arg_decode, its element read as written.
-fn array_arg_decode_1d(name: StrView, out: *ArrayArg) -> i32
+# One `arrN_` level of array_arg_decode, its element read as written (shape
+# null), else None.
+fn array_arg_decode_1d(name: StrView) -> Option<ArrayArg>
     if name.ptr == null or name.len < 6 or not name.starts_with("arr")
-        return 0
+        return None
     var pos: i32 = 3
     var size: i32 = 0
     while pos < name.len and name.get(pos) >= '0' and name.get(pos) <= '9'
         size = size * 10 + (name.get(pos) - 48) as i32
         pos = pos + 1
     if pos == 3 or pos + 1 >= name.len or name.get(pos) != '_'   # digits, '_', element
-        return 0
+        return None
     pos = pos + 1
     var elem: StrView = name.skip(pos)
-    out.size = size
-    out.elem = TypeKind.Struct
-    out.pointee = TypeKind.Void
+    var out: ArrayArg = ArrayArg { size: size, elem: TypeKind.Struct, pointee: TypeKind.Void, shape: null }
     if elem.len > 4 and elem.starts_with("ptr_")
         out.elem = TypeKind.Ptr
         elem = elem.skip(4)
@@ -1594,11 +1628,11 @@ fn array_arg_decode_1d(name: StrView, out: *ArrayArg) -> i32
             out.pointee = prim
         else
             out.elem = prim
-        return 1
+        return Some(out)
     out.name = elem
     if out.elem == TypeKind.Ptr
         out.pointee = TypeKind.Struct
-    1
+    Some(out)
 
 pub fn get_type_name_from_suffix(suffix_sv: StrView) -> StrView
     # Suffix format: "$typename" or (AGAST #186) "$ptr_<typename>".
@@ -1701,14 +1735,16 @@ pub fn subst_value_field(cloned: *StructField, subst_type: TypeKind, subst_name_
     cloned.field_type_name = subst_name_sv
     # AGAST #2832: `v: T` at T = `[4]i64` is the array field `v: [4]i64`,
     # recorded as field_new records a written one.
-    var a: ArrayArg
-    if subst_type == TypeKind.Array and array_arg_decode(subst_name_sv, @a) == 1
-        cloned.field_type_name = strview_empty()
-        cloned.array_size = a.size
-        cloned.array_elem_type = a.elem
-        cloned.array_elem_pointee = a.pointee
-        cloned.array_elem_type_name = a.name
-        cloned.array_shape = a.shape   # AGAST #3634: `[N][M]E`
+    if subst_type == TypeKind.Array
+        match array_arg_decode(subst_name_sv)
+            Some(a) =>
+                cloned.field_type_name = strview_empty()
+                cloned.array_size = a.size
+                cloned.array_elem_type = a.elem
+                cloned.array_elem_pointee = a.pointee
+                cloned.array_elem_type_name = a.name
+                cloned.array_shape = a.shape   # AGAST #3634: `[N][M]E`
+            None => pass
     # AGAST #4779: `v: T` at T = `*X` is the pointer field `v: *X`, its
     # pointee kind recorded as field_new records a written one (Sema types
     # the field by it).  A `$ptr_X` argument arrives as the name "X".
@@ -1862,12 +1898,9 @@ pub fn want_method(mono: *MonoCtx, m: *Module, tn: StrView, meth_sv: StrView)
         return
     want_at(mono, tn.take(d), tn.skip(d), meth_sv)
 
-# "Vec$i32" / "Span$u8" for a Vec / Span of the tracker's kind and suffix.
-pub fn collection_instance_name(kind: i32, suf: StrView) -> StrView
-    var base: StrView = "Vec"
-    if kind == 2
-        base = "Span"
-    strview_join2(base, suf)  # AGAST #4915
+# "Vec$i32" / "Span$u8" for a Vec / Span of `kind` and suffix `suf`.
+pub fn collection_instance_name(kind: CollectionKind, suf: StrView) -> StrView
+    strview_join2(collection_base_name(kind), suf)  # AGAST #4915
 
 # The type a call `f(..)` returns, by name: a plain fn's (or an impl method's
 # by its symbol, `String_from`), or a one-param generic fn's `Base$T` at the

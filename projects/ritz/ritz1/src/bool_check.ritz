@@ -755,25 +755,32 @@ fn sbk_pointee(sm: *Sema, e: *Expr) -> TypeKind
             return t.pointee
     TypeKind.Unknown
 
+# How deep a pointer is (sbk_ptr_depth): `levels` pointer levels, and the
+# root's inner-pointee slot, whose innermost pointee is the T.
+struct SbkPtrDepth
+    levels: i32
+    slot: i32
+
 # How many pointer levels `x` has (ptr_levels_of): a `**T` / `***T` local,
 # global or field, through `+ n` and `*`, down to 1 under a `*` (`*pp`, which
-# `*` reads a T from; AGAST #3768).  0 otherwise.  `*out_slot` is the root's
-# inner-pointee slot, whose innermost pointee is that T.
-fn sbk_ptr_depth(sm: *Sema, x: *Expr, out_slot: *i32) -> i32
+# `*` reads a T from; AGAST #3768), with the root's inner-pointee slot.  None
+# where it has none.
+fn sbk_ptr_depth(sm: *Sema, x: *Expr) -> Option<SbkPtrDepth>
     if x == null
-        return 0
+        return None
     match x.kind
         ExprKind.Binary =>
             if x.op == OpKind.Add or x.op == OpKind.Sub
-                return sbk_ptr_depth(sm, x.left, out_slot)
-            return 0
+                return sbk_ptr_depth(sm, x.left)
+            return None
         ExprKind.Unary =>
             if x.op != OpKind.Deref
-                return 0
-            let sub: i32 = sbk_ptr_depth(sm, x.operand, out_slot)
-            if sub < 2
-                return 0
-            return sub - 1
+                return None
+            var d: SbkPtrDepth = sbk_ptr_depth(sm, x.operand)?
+            if d.levels < 2
+                return None
+            d.levels = d.levels - 1
+            return Some(d)
         _ => pass
     var slot: i32 = (TypeKind.Void as i32)
     match x.kind
@@ -781,25 +788,24 @@ fn sbk_ptr_depth(sm: *Sema, x: *Expr, out_slot: *i32) -> i32
             let v: *SemaVar = sema_find_local(sm, x.ident)
             if v != null
                 if v.kind != TypeKind.PtrPtr
-                    return 0
+                    return None
                 slot = v.inner
             else
                 let g: *GlobalVarDef = sbk_global(sm, x.ident)
                 if g == null or g.var_type != TypeKind.PtrPtr
-                    return 0
+                    return None
                 slot = g.inner_pointee_type
         ExprKind.Member =>
             let f: *StructField = sbk_member_field(sm, x)
             if f == null or f.field_type != TypeKind.PtrPtr
-                return 0
+                return None
             slot = f.inner_pointee_type
         _ =>
-            return 0
+            return None
     let levels: i32 = ptr_ptr_slot_levels(slot)
     if levels < 2
-        return 0
-    *out_slot = slot
-    levels
+        return None
+    Some(SbkPtrDepth { levels: levels, slot: slot })
 
 # `*e`: its pointee's kind.  A pointee Sema can't type is unsure: the emitter's
 # get_expr_type may know it (a bool, a float), and an integer guess there
@@ -812,12 +818,13 @@ fn sbk_deref(sm: *Sema, e: *Expr) -> i32
         if v != null and v.kind == TypeKind.Unknown and (v.bk == BK_BOOL or v.bk == BK_INT)
             return v.bk
     # `*p` of a `**T` (or deeper) is a pointer; `*(*pp + k)` its T.
-    var slot: i32 = (TypeKind.Void as i32)
-    let depth: i32 = sbk_ptr_depth(sm, o, @slot)
-    if depth >= 2
-        return BK_PTR
-    if depth == 1 and ptr_ptr_slot_inner(slot) != TypeKind.Struct
-        return sbk_of_ty(ptr_ptr_slot_inner(slot), strview_empty())
+    match sbk_ptr_depth(sm, o)
+        Some(d) =>
+            if d.levels >= 2
+                return BK_PTR
+            if ptr_ptr_slot_inner(d.slot) != TypeKind.Struct
+                return sbk_of_ty(ptr_ptr_slot_inner(d.slot), strview_empty())
+        None => pass
     # `*r` of `let r = @x`, whose pointee Sema leaves untyped.
     if o.kind == ExprKind.Ident
         let rv: *SemaVar = sema_find_local(sm, o.ident)

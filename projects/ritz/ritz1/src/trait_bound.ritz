@@ -121,27 +121,32 @@ fn tb_split(ctx: *ParseCtx, m: *Module, n: i32, suffix_sv: StrView, starts: *i32
         return -1
     n
 
-# The first (param index, bound) of `tps` that the args of `suffix` miss, as
-# `*out_bound`; -1 when every bound is met or the suffix doesn't split.
-fn tb_unmet(ctx: *ParseCtx, m: *Module, tps: *TypeParam, suffix_sv: StrView, out_bound: **TraitBound) -> i32
+# A bound an instance misses: type parameter `param` (its index) and the
+# bound of it its argument doesn't implement.
+struct UnmetBound
+    param: i32
+    bound: *TraitBound
+
+# The first bound of `tps` that the args of `suffix` miss; None when every
+# bound is met or the suffix doesn't split.
+fn tb_unmet(ctx: *ParseCtx, m: *Module, tps: *TypeParam, suffix_sv: StrView) -> Option<UnmetBound>
     let n: i32 = count_type_params(tps)
     if n == 0 or tb_has_bounds(tps) == 0
-        return -1
+        return None
     let cap: i64 = 4 * (mangled_arg_capacity(suffix_sv) + 1) as i64
     let starts: *i32 = malloc(cap) as *i32
     let lens: *i32 = malloc(cap) as *i32
-    var miss: i32 = -1
+    var miss: Option<UnmetBound> = None
     if tb_split(ctx, m, n, suffix_sv, starts, lens) == n
         var tp: *TypeParam = tps
         var i: i32 = 0
-        while tp != null and miss < 0
+        while tp != null and miss.is_none()
             # Skip the `$` each argument's suffix starts with.
             let arg: StrView = mangled_arg(suffix_sv, starts, lens, i).skip(1)
             var b: *TraitBound = tp.bounds
-            while b != null and miss < 0
+            while b != null and miss.is_none()
                 if tb_implements(ctx, m, arg, b.name) == 0
-                    miss = i
-                    *out_bound = b
+                    miss = Some(UnmetBound { param: i, bound: b })
                 b = b.next
             tp = tp.next
             i = i + 1
@@ -161,8 +166,7 @@ fn tb_implements(ctx: *ParseCtx, m: *Module, arg: StrView, tname_sv: StrView) ->
             if k == arg.len and ib.type_params == null
                 return 1
             if k < arg.len and ib.type_params != null
-                var unused: *TraitBound = null
-                if tb_unmet(ctx, m, ib.type_params, arg.skip(k), @unused) < 0
+                if tb_unmet(ctx, m, ib.type_params, arg.skip(k)).is_none()
                     return 1
                 return 0
         ib = ib.next
@@ -251,10 +255,14 @@ fn tb_check_instance(sm: *Sema, owner_sv: StrView, is_impl: i32, tps: *TypeParam
     let m: *Module = sm.module
     if tb_has_bounds(tps) == 0 or tb_has_free_param(sm.pctx, m, suffix_sv) == 1
         return 0
+    var i: i32 = 0
     var bound: *TraitBound = null
-    let i: i32 = tb_unmet(sm.pctx, m, tps, suffix_sv, @bound)
-    if i < 0
-        return 0
+    match tb_unmet(sm.pctx, m, tps, suffix_sv)
+        Some(ub) =>
+            i = ub.param
+            bound = ub.bound
+        None =>
+            return 0
     var tp: *TypeParam = tps
     for k in 0..i
         tp = tp.next

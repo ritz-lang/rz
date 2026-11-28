@@ -1,0 +1,188 @@
+# ritz1/test/test_monomorph.ritz - monomorph's name decoders, as values (AGAST #4926)
+#
+# classify_collection_type reads a Vec$T / Span$T mangled name as an
+# Option<CollectionType>, array_arg_decode an `arrN_E` type argument as an
+# Option<ArrayArg>, and piece_param_index a `ptr_A` component as an
+# Option<PieceParam>, in place of C's `int f(..., T *out)`.  The local-var
+# tracker stores each local's Option<CollectionKind>.  interp_trim
+# (interp_text) gives the trimmed placeholder as a StrView.  Run by
+# `make ritz1-unit` (tools/ritz1_unit.py).
+
+import ritzlib.memory
+import ritzlib.option
+import ritzlib.str
+import ritzlib.strview
+import ast
+import monomorph
+import interp_text
+
+[[test]]
+fn test_a_vec_name_is_a_vec_with_its_suffix() -> i32
+    match classify_collection_type("Vec$u16")
+        Some(c) =>
+            assert c.kind == CollectionKind.Vec
+            assert c.suffix.eq("$u16")
+            assert collection_base_name(c.kind).eq("Vec")
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_a_span_name_is_a_span_with_its_suffix() -> i32
+    match classify_collection_type("Span$Pt")
+        Some(c) =>
+            assert c.kind == CollectionKind.Span
+            assert c.suffix.eq("$Pt")
+            assert collection_base_name(c.kind).eq("Span")
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_other_names_are_no_collection() -> i32
+    assert classify_collection_type("String").is_none()
+    assert classify_collection_type("Vec$").is_none()     # under 5 bytes
+    assert classify_collection_type("Span$").is_none()    # under 6 bytes
+    assert classify_collection_type("Vecs$u8").is_none()
+    assert classify_collection_type(strview_empty()).is_none()
+    0
+
+[[test]]
+fn test_collection_instance_names_join_base_and_suffix() -> i32
+    assert collection_instance_name(CollectionKind.Vec, "$i32").eq("Vec$i32")
+    assert collection_instance_name(CollectionKind.Span, "$u8").eq("Span$u8")
+    0
+
+[[test]]
+fn test_collection_is_matches_only_that_collection() -> i32
+    assert collection_is(Some(CollectionKind.Vec), CollectionKind.Vec)
+    assert not collection_is(Some(CollectionKind.Vec), CollectionKind.Span)
+    assert collection_is(Some(CollectionKind.Span), CollectionKind.Span)
+    assert not collection_is(None, CollectionKind.Vec)
+    0
+
+[[test]]
+fn test_the_local_tracker_keeps_each_locals_collection() -> i32
+    var mono: MonoCtx
+    memset(@mono as *u8, 0, sizeof(MonoCtx))
+    init_local_var_tracker(@mono)
+    add_local_var(@mono, "v", Some(CollectionKind.Vec), "$u16")
+    add_local_struct_var(@mono, "r", "R")
+    track_typed_local(@mono, "s", TypeKind.Struct, "Span$Pt")
+    let vi: i32 = find_local_var_idx(@mono, "v")
+    let ri: i32 = find_local_var_idx(@mono, "r")
+    let si: i32 = find_local_var_idx(@mono, "s")
+    assert collection_is(local_collection(@mono, vi), CollectionKind.Vec)
+    assert local_collection(@mono, ri).is_none()
+    assert collection_is(local_collection(@mono, si), CollectionKind.Span)
+    assert (*(mono.lv_suffixes + si)).eq("$Pt")
+    0
+
+[[test]]
+fn test_a_1d_primitive_array_decodes() -> i32
+    match array_arg_decode("arr4_i32")
+        Some(a) =>
+            assert a.size == 4
+            assert a.elem == TypeKind.I32
+            assert a.pointee == TypeKind.Void
+            assert a.name.len == 0
+            assert a.shape == null
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_an_array_of_pointers_decodes_its_pointee() -> i32
+    match array_arg_decode("arr12_ptr_u8")
+        Some(a) =>
+            assert a.size == 12
+            assert a.elem == TypeKind.Ptr
+            assert a.pointee == TypeKind.U8
+            assert a.name.len == 0
+        None =>
+            assert false
+    match array_arg_decode("arr2_ptr_Node")
+        Some(b) =>
+            assert b.elem == TypeKind.Ptr
+            assert b.pointee == TypeKind.Struct
+            assert b.name.eq("Node")
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_an_array_of_structs_names_its_element() -> i32
+    match array_arg_decode("arr3_Pt")
+        Some(a) =>
+            assert a.size == 3
+            assert a.elem == TypeKind.Struct
+            assert a.name.eq("Pt")
+            assert a.shape == null
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_a_nested_array_has_a_shape() -> i32
+    match array_arg_decode("arr2_arr3_u8")
+        Some(a) =>
+            assert a.size == 2
+            assert a.elem == TypeKind.Array
+            assert a.name.len == 0
+            assert a.shape != null
+            assert a.shape.rank == 2
+            assert a.shape.dims[0] == 2
+            assert a.shape.dims[1] == 3
+            assert a.shape.leaf_type == TypeKind.U8
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_non_arrays_do_not_decode() -> i32
+    assert array_arg_decode("i32").is_none()
+    assert array_arg_decode("arr_i32").is_none()     # no size
+    assert array_arg_decode("arr4i32x").is_none()    # no `_`
+    assert array_arg_decode("arr4_").is_none()       # no element
+    assert array_arg_decode(strview_empty()).is_none()
+    0
+
+[[test]]
+fn test_a_pieced_component_names_its_parameter() -> i32
+    var b: TypeParam
+    memset(@b as *u8, 0, sizeof(TypeParam))
+    b.name = "B"
+    var a: TypeParam
+    memset(@a as *u8, 0, sizeof(TypeParam))
+    a.name = "A"
+    a.next = @b
+    match piece_param_index(@a, "ptr_B")
+        Some(p) =>
+            assert p.index == 1
+            assert p.head == 4
+        None =>
+            assert false
+    match piece_param_index(@a, "ptr_ptr_A")
+        Some(q) =>
+            assert q.index == 0
+            assert q.head == 8
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_other_components_name_no_piece_parameter() -> i32
+    var a: TypeParam
+    memset(@a as *u8, 0, sizeof(TypeParam))
+    a.name = "A"
+    assert piece_param_index(@a, "A").is_none()        # whole-component
+    assert piece_param_index(@a, "ptr_C").is_none()    # C is no parameter
+    assert piece_param_index(@a, "My_A").is_none()     # a struct's name
+    0
+
+[[test]]
+fn test_interp_trim_drops_surrounding_space() -> i32
+    assert interp_trim("  x + 1 ").eq("x + 1")
+    assert interp_trim("y").eq("y")
+    assert interp_trim("   ").len == 0
+    0

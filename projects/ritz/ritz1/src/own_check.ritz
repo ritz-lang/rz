@@ -67,6 +67,7 @@
 # test_defer_all_compilers.py and test_ownership_free_count.py.
 
 import ritzlib.cstr
+import ritzlib.gvec     # OcBind.paths
 import ritzlib.strview
 import ritzlib.sys
 import ritzlib.io
@@ -124,7 +125,7 @@ const OC_BLOCK_BODY: i32 = 2
 const OC_BLOCK_UNSAFE: i32 = 3
 
 # A binding that owns a value of a move-only type.
-struct OcBind
+pub struct OcBind
     name: StrView
     vi: i32           # its SemaVar's index in Sema's scope; -1 for a match's scrutinee
     id: i32           # its identity, for the loop events and the field-move log
@@ -134,8 +135,7 @@ struct OcBind
     move_line: i32
     move_col: i32
     shadow: i32
-    paths: *OwnPath   # AGAST #2242: a partly movable struct's paths
-    path_count: i32
+    paths: Vec<OwnPath>   # AGAST #2242: a partly movable struct's paths (all-zero: none)
     fmoved: i32
     fshadow: i32
     # AGAST #4033, #4096: `var x: T` with no initialiser, T with drop glue
@@ -453,72 +453,61 @@ fn oc_partly_movable(sm: *Sema, name_sv: StrView) -> i32
 # --- Paths (AGAST #2242) ----------------------------------------------------------------
 
 fn oc_path_at(b: *OcBind, i: i32) -> *OwnPath
-    let base: *OwnPath = b.paths
-    return @base[i]
+    b.paths.get_ptr(i as i64)
 
-# Add a path for each move-only field of the struct `name`, the parts of
-# path `parent`, to the array *pp (room for *cap, grown as it fills).
-# Returns the new path count.
-fn oc_add_paths(sm: *Sema, pp: **OwnPath, cap: *i32, count: i32, parent: i32, name_sv: StrView) -> i32
+# How many paths the binding has (0 for one that can't be partly moved).
+pub fn oc_path_count(b: *OcBind) -> i32
+    b.paths.len() as i32
+
+# Add a path to `paths` for each move-only field of the struct `name`, the
+# parts of path `parent`; a path's index in `paths` is its bit.
+fn oc_add_paths(sm: *Sema, paths:& Vec<OwnPath>, parent: i32, name_sv: StrView)
     let st: *StructDef = oc_find_struct(sm, name_sv)
     if st == null
-        return count
-    var n: i32 = count
+        return
     var idx: i32 = 0
     var f: *StructField = st.fields
     while f != null
         if oc_field_move_only(sm, f) == 1
-            if n >= *cap
-                let nc: i32 = *cap * 2
-                *pp = realloc(*pp as *u8, (nc as i64) * sizeof(OwnPath)) as *OwnPath
-                *cap = nc
-            let paths: *OwnPath = *pp
+            let n: i32 = paths.len() as i32
             let bit: i32 = own_set_bit(n)
-            let p: *OwnPath = @paths[n]
-            p.parent = parent
-            p.idx = idx
-            p.fld = f
-            p.up = bit
-            p.down = bit
+            paths.push(OwnPath { parent: parent, idx: idx, fld: f, up: bit, down: bit })
+            let p: *OwnPath = paths.get_ptr(n as i64)
             var a: i32 = parent
             while a >= 0
-                let ap: *OwnPath = @paths[a]
+                let ap: *OwnPath = paths.get_ptr(a as i64)
                 p.up = own_set_or(p.up, own_set_bit(a))
                 ap.down = own_set_or(ap.down, bit)
                 a = ap.parent
-            n += 1
         idx += 1
         f = f.next
-    n
 
-fn oc_path_depth(paths: *OwnPath, i: i32) -> i32
+# How many paths path `i` of `paths` is a part of.
+pub fn oc_path_depth(paths: @Vec<OwnPath>, i: i32) -> i32
     var d: i32 = 0
-    var p: *OwnPath = @paths[i]
-    while p.parent >= 0
+    var parent: i32 = paths.get(i as i64).parent
+    while parent >= 0
         d += 1
-        p = @paths[p.parent]
+        parent = paths.get(parent as i64).parent
     d
 
 # The paths of a partly movable struct `name`, shallowest first; a field
 # stops the walk where it can't be partly moved itself.
-fn oc_build_paths(sm: *Sema, name_sv: StrView, out_n: *i32) -> *OwnPath
-    var cap: i32 = 32
-    var paths: *OwnPath = malloc((cap as i64) * sizeof(OwnPath)) as *OwnPath
-    var n: i32 = oc_add_paths(sm, @paths, @cap, 0, 0 - 1, name_sv)
+fn oc_build_paths(sm: *Sema, name_sv: StrView) -> Vec<OwnPath>
+    var paths: Vec<OwnPath> = vec_with_cap<OwnPath>(32)
+    oc_add_paths(sm, paths, 0 - 1, name_sv)
     var i: i32 = 0
-    while i < n
-        let p: *OwnPath = @paths[i]
-        let f: *StructField = p.fld
-        if f.field_type == TypeKind.Struct and oc_path_depth(paths, i) < OC_MAX_DEPTH and oc_partly_movable(sm, f.field_type_name) == 1
-            n = oc_add_paths(sm, @paths, @cap, n, i, f.field_type_name)
+    while i < paths.len() as i32
+        let f: *StructField = paths.get(i as i64).fld
+        if f.field_type == TypeKind.Struct and oc_path_depth(@paths, i) < OC_MAX_DEPTH and oc_partly_movable(sm, f.field_type_name) == 1
+            oc_add_paths(sm, paths, i, f.field_type_name)
         i += 1
-    *out_n = n
     paths
 
 # The path for the field `name` of path `parent`, or -1.
 fn oc_named_path(b: *OcBind, parent: i32, name_sv: StrView) -> i32
     var i: i32 = 0
-    while i < b.path_count
+    while i < oc_path_count(b)
         let p: *OwnPath = oc_path_at(b, i)
         if p.parent == parent and name_eq(p.fld.name, name_sv) == 1
             return i
@@ -710,7 +699,7 @@ fn oc_register_as(sm: *Sema, name_sv: StrView, tname_sv: StrView, count: i32) ->
     b.count = count
     # AGAST #2168: a struct with no drop of its own can be partly moved.
     if count == 0 and oc_partly_movable(sm, tname_sv) == 1
-        b.paths = oc_build_paths(sm, tname_sv, @b.path_count)
+        b.paths = oc_build_paths(sm, tname_sv)
     oc_annotate(sm, name)
     1
 
@@ -983,23 +972,24 @@ fn oc_member_path(sm: *Sema, e: *Expr, out_b: **OcBind, out: *StrView) -> *Struc
         *out = tname
     oc_struct_field(sm, tname, idx)
 
+# Where a member path `e` lands in a binding's paths: the deepest path along
+# it (-1 for the binding itself), and whether `e` ends on that path.
+pub struct OcPathOf
+    path: i32
+    exact: bool
+
 # The deepest path of `b` along the member path `e`, rooted at b (-1 for b
-# itself); *out_exact is 1 when `e` ends on it.
-fn oc_path_of(b: *OcBind, e: *Expr, out_exact: *i32) -> i32
+# itself); exact when `e` ends on it.
+pub fn oc_path_of(b: *OcBind, e: *Expr) -> OcPathOf
     if e.kind != ExprKind.Member or e.left == null
-        *out_exact = 1
-        return 0 - 1
-    var exact: i32 = 0
-    let parent: i32 = oc_path_of(b, e.left, @exact)
-    if exact == 0
-        *out_exact = 0
-        return parent
-    let path: i32 = oc_named_path(b, parent, e.ident)
+        return OcPathOf { path: 0 - 1, exact: true }
+    let up: OcPathOf = oc_path_of(b, e.left)
+    if not up.exact
+        return up
+    let path: i32 = oc_named_path(b, up.path, e.ident)
     if path < 0
-        *out_exact = 0
-        return parent
-    *out_exact = 1
-    path
+        return OcPathOf { path: up.path, exact: false }
+    OcPathOf { path: path, exact: true }
 
 # The fn a call `e` calls (a local fn value's signature, else the fn).
 fn oc_call_fn(sm: *Sema, e: *Expr) -> *FnDef
@@ -1037,18 +1027,24 @@ fn oc_temp_field_move_only(sm: *Sema, e: *Expr) -> i32
         return 0
     oc_field_move_only(sm, oc_struct_field(sm, name_sv, idx))
 
+# What a `p[i]` reads through, as oc_buffer_value_struct sees it.
+enum OcBufElem
+    NoBuffer         # no Vec, Span or String (nor a pointer to one)
+    Scalar           # a buffer of scalars or pointers
+    Struct(StrView)  # a buffer of this struct, by value
+
 # `p[i]` through a Vec, Span or String (or a pointer to one), as
 # index_through_value_struct reads it, typed by Sema's element typer
-# (sema_buffer_ty, AGAST #4259): 1 with the struct its element is by
-# value (a `*S` buffer's S), 0 for a scalar or pointer element, -1 when `e`
-# reads through no such buffer.
-fn oc_buffer_value_struct(sm: *Sema, e: *Expr, out: *StrView) -> i32
+# (sema_buffer_ty, AGAST #4259): Struct with the struct its element is by
+# value (a `*S` buffer's S), Scalar for a scalar or pointer element,
+# NoBuffer when `e` reads through no such buffer.
+fn oc_buffer_value_struct(sm: *Sema, e: *Expr) -> OcBufElem
     let l: *Expr = e.left
     if e.right == null or e.right.kind == ExprKind.Range or l == null
-        return 0 - 1
+        return OcBufElem.NoBuffer
     let call: i32 = (l.kind == ExprKind.Call or l.kind == ExprKind.Method) as i32
     if call == 0 and l.kind != ExprKind.Ident and l.kind != ExprKind.Member and (l.kind != ExprKind.Unary or l.op != OpKind.Deref)
-        return 0 - 1
+        return OcBufElem.NoBuffer
     var t: SemaTy
     if call == 1
         # `t.regions()[i]`, a call's `@Vec<T>`: its element, not the Vec
@@ -1057,14 +1053,13 @@ fn oc_buffer_value_struct(sm: *Sema, e: *Expr, out: *StrView) -> i32
     else
         match rs_ty(sm, l)
             Some(found) => t = found
-            None => return 0 - 1
+            None => return OcBufElem.NoBuffer
     var el: SemaTy
     if t.name.ptr == null or t.name.len <= 0 or sema_buffer_ty(sm, @t, @el) == TypeKind.Unknown
-        return 0 - 1
+        return OcBufElem.NoBuffer
     if el.kind != TypeKind.Struct or el.name.ptr == null or el.name.len <= 0
-        return 0
-    *out = el.name
-    1
+        return OcBufElem.Scalar
+    OcBufElem.Struct(el.name)
 
 # 1 when `e`, an index, indexes a call's or method call's result.
 fn oc_call_base(e: *Expr) -> i32
@@ -1072,32 +1067,38 @@ fn oc_call_base(e: *Expr) -> i32
         return 0
     (e.left.kind == ExprKind.Call or e.left.kind == ExprKind.Method) as i32
 
-# The struct `e` holds by value: 1 and its name, or 0.  `p[i]` through a Vec
-# or Span holds its element (AGAST #2444, R9).
-fn oc_value_struct(sm: *Sema, e: *Expr, out: *StrView) -> i32
+# The struct `e` holds by value, or None.  `p[i]` through a Vec or Span
+# holds its element (AGAST #2444, R9).
+fn oc_value_struct(sm: *Sema, e: *Expr) -> Option<StrView>
     if e.kind == ExprKind.Index and (rs_through_kind(sm, e) != TypeKind.Void or oc_call_base(e) == 1)
-        let r: i32 = oc_buffer_value_struct(sm, e, out)
-        if r >= 0
-            return r
+        match oc_buffer_value_struct(sm, e)
+            OcBufElem.Struct(name) => return Some(name)
+            OcBufElem.Scalar => return None
+            OcBufElem.NoBuffer => pass
     var env: RefEnv
     match ref_ty_in(ref_env_of(@env, null, sm), e)
         Some(t) =>
             if t.kind != TypeKind.Struct
-                return 0
+                return None
             if t.name.len > 0
-                *out = t.name
-                return 1
+                return Some(t.name)
         None => pass
     # A name or field ref_ty_in can't type: Sema's (a nameless tuple and its
     # fields, `p[i].f` through a Vec or Span, AGAST #2444).
     if e.kind != ExprKind.Ident and e.kind != ExprKind.Member
-        return 0
+        return None
     var st: SemaTy
     sema_expr_ty(sm, e, @st)
     if st.kind != TypeKind.Struct or st.name.ptr == null or st.name.len <= 0
-        return 0
-    *out = st.name
-    1
+        return None
+    Some(st.name)
+
+# The struct a member `e` (`p[i].f`) holds by value; None when `e` is null,
+# not a member, or holds no struct.
+fn oc_member_value_struct(sm: *Sema, e: *Expr) -> Option<StrView>
+    if e == null or e.kind != ExprKind.Member
+        return None
+    oc_value_struct(sm, e)
 
 # 1 when `e`, a payload copy a non-owning match lent, is named (AGAST #2178).
 fn oc_lent_payload(sm: *Sema, e: *Expr) -> i32
@@ -1172,9 +1173,9 @@ fn oc_by_value_buffer(sm: *Sema, e: *Expr) -> i32
 fn oc_moves_out(sm: *Sema, e: *Expr) -> i32
     if e.kind == ExprKind.Ident
         return 0
-    var name: StrView = strview_empty()
-    if oc_value_struct(sm, e, @name) == 0
-        return 0
+    let name: StrView = match oc_value_struct(sm, e)
+        Some(found) => found
+        None => return 0
     if oc_move_only(sm, name) == 0
         return 0
     oc_through(sm, e)
@@ -1241,9 +1242,9 @@ fn oc_moves_element(sm: *Sema, e: *Expr) -> i32
         return oc_move_only(sm, row_sh.leaf_name)
     if oc_element_root(sm, e) == null
         return 0
-    var name: StrView = strview_empty()
-    if oc_value_struct(sm, e, @name) == 0
-        return 0
+    let name: StrView = match oc_value_struct(sm, e)
+        Some(found) => found
+        None => return 0
     oc_move_only(sm, name)
 
 # LARB R34 (AGAST #3367, §13.2): the `G` of a by-value read of `e` (`G`,
@@ -1256,8 +1257,10 @@ fn oc_moves_global(sm: *Sema, e: *Expr) -> *Expr
         return null
     if sema_find_local(sm, r.ident) != null or sbk_global(sm, r.ident) == null
         return null
-    var name: StrView = strview_empty()
-    if oc_value_struct(sm, e, @name) == 0 or oc_move_only(sm, name) == 0
+    let name: StrView = match oc_value_struct(sm, e)
+        Some(found) => found
+        None => return null
+    if oc_move_only(sm, name) == 0
         return null
     r
 
@@ -1344,8 +1347,9 @@ fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
     var m: *FnDef = null
     if e.left != null and e.left.kind == ExprKind.Index and rs_through_kind(sm, e.left) != TypeKind.Void
         # `p[i].m()`: the element's method, on the element's type (AGAST #2444).
-        if oc_buffer_value_struct(sm, e.left, @name) != 1
-            return
+        match oc_buffer_value_struct(sm, e.left)
+            OcBufElem.Struct(elem) => name = elem
+            _ => return
         m = sema_method_fn(sm, name, e.ident)
     else
         var env: RefEnv
@@ -1357,18 +1361,21 @@ fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
             name = t.name
             is_ptr = ref_is_pointer(t.kind)
             m = rs_method_def(sm, e)
-        else if e.left != null and e.left.kind == ExprKind.Member and oc_value_struct(sm, e.left, @name) == 1
-            # `p[i].f.m()` through a Vec or Span: f's struct.
-            m = sema_method_fn(sm, name, e.ident)
         else
-            # `p.m()` with `p: **S` (or deeper): the method is S's and the
-            # receiver is behind a pointer (AGAST #2402).
-            let ppname: StrView = oc_ptr_ptr_struct(sm, e.left)
-            if ppname.ptr == null
-                return
-            name = ppname
-            is_ptr = 1
-            m = sema_method_fn(sm, name, e.ident)
+            match oc_member_value_struct(sm, e.left)
+                Some(fs) =>
+                    # `p[i].f.m()` through a Vec or Span: f's struct.
+                    name = fs
+                    m = sema_method_fn(sm, name, e.ident)
+                None =>
+                    # `p.m()` with `p: **S` (or deeper): the method is S's and the
+                    # receiver is behind a pointer (AGAST #2402).
+                    let ppname: StrView = oc_ptr_ptr_struct(sm, e.left)
+                    if ppname.ptr == null
+                        return
+                    name = ppname
+                    is_ptr = 1
+                    m = sema_method_fn(sm, name, e.ident)
     if m == null or m.params == null or oc_param_moves(m.params) == 0 or m.params.is_borrow == 1
         return
     if name_eq(m.params.name, "self") == 0
@@ -1596,9 +1603,9 @@ fn oc_walk_member(sm: *Sema, e: *Expr, mv: i32)
     if b.moved == 1
         oc_error_use_at(sm, line, col, b, b.move_line, b.move_col)
         return
-    var exact: i32 = 0
-    let path: i32 = oc_path_of(b, e, @exact)
-    let overlap: i32 = oc_overlap(b, path, exact)
+    let at: OcPathOf = oc_path_of(b, e)
+    let path: i32 = at.path
+    let overlap: i32 = oc_overlap(b, path, at.exact as i32)
     if own_set_and(b.fmoved, overlap) != 0
         oc_error_field_use_at(sm, line, col, b, own_set_and(b.fmoved, overlap))
         return
@@ -1872,10 +1879,9 @@ fn oc_check_stmt(sm: *Sema, stmt: *Stmt)
                 oc_walk(sm, t, 0)
             oc_walk(sm, stmt.assign_value, 1)
             if pf != null
-                var exact: i32 = 0
-                let path: i32 = oc_path_of(pb, t, @exact)
+                let at: OcPathOf = oc_path_of(pb, t)
                 let root: *Expr = oc_member_root(t)
-                oc_store_path(sm, pb, path, exact, root.span.line, root.span.col)
+                oc_store_path(sm, pb, at.path, at.exact as i32, root.span.line, root.span.col)
         StmtKind.IndexAssign | StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
             # `x[i] = v`, `x.f = v`, `x.f[i] = v`: x is used, not moved.
             var base: *OcBind = null
@@ -2031,9 +2037,9 @@ fn oc_stmt_end(sm: *Sema, stmt: *Stmt)
 fn oc_sema_struct(sm: *Sema, e: *Expr) -> StrView
     if e == null
         return strview_empty()
-    var n: StrView = strview_empty()
-    if oc_value_struct(sm, e, @n) == 1
-        return n
+    match oc_value_struct(sm, e)
+        Some(n) => return n
+        None => pass
     var t: SemaTy
     sema_expr_ty(sm, e, @t)
     if t.kind == TypeKind.Struct and t.name.ptr != null and t.name.len > 0
@@ -2117,7 +2123,7 @@ fn oc_loop_enter() -> i32
         b.shadow = 1 - b.moved
         b.fshadow = 0
         if b.moved == 0
-            b.fshadow = own_set_minus(own_set_range(b.path_count), b.fmoved)
+            b.fshadow = own_set_minus(own_set_range(oc_path_count(b)), b.fmoved)
         i += 1
     old
 
@@ -2311,7 +2317,7 @@ fn oc_start_unwritten(sm: *Sema, stmt: *Stmt)
     let b: *OcBind = oc_lookup(sm, stmt.var_name)
     if b == null or b.count > 0
         return
-    if b.path_count == 0 and oc_has_drop_impl(sm, b.type_name) == 0 and oc_find_struct(sm, b.type_name) != null
+    if oc_path_count(b) == 0 and oc_has_drop_impl(sm, b.type_name) == 0 and oc_find_struct(sm, b.type_name) != null
         # Move-only only through a type argument (`Vec<Res>`: a `*Res`
         # field): no part has drop glue, so nothing starts unwritten.
         return
@@ -2323,7 +2329,7 @@ fn oc_start_unwritten(sm: *Sema, stmt: *Stmt)
     b.uninit_line = line
     b.uninit_col = col
     b.uninit_told = 0
-    if b.path_count == 0
+    if oc_path_count(b) == 0
         b.moved = 1
         b.move_line = 0 - line
         b.move_col = col
@@ -2336,7 +2342,7 @@ fn oc_start_unwritten(sm: *Sema, stmt: *Stmt)
 fn oc_push_unwritten(o: *OcState, b: *OcBind, parent: i32, acc: i32) -> i32
     var out: i32 = acc
     var i: i32 = 0
-    while i < b.path_count
+    while i < oc_path_count(b)
         let p: *OwnPath = oc_path_at(b, i)
         if p.parent == parent
             if p.down != own_set_bit(i)
@@ -2353,7 +2359,7 @@ fn oc_unwritten_bits(o: *OcState, b: *OcBind) -> i32
     var bits: i32 = 0
     let base: *i32 = o.fm_loc
     var i: i32 = 0
-    while i < b.path_count
+    while i < oc_path_count(b)
         if own_set_has(b.fmoved, i) == 1
             let at: i32 = oc_fm_index(o, b.id, i)
             if at >= 0
@@ -2432,7 +2438,7 @@ fn oc_keep_unwritten(snap: *i32)
                 b.move_col = r[2]
             var back: i32 = 0
             var p: i32 = 0
-            while p < b.path_count
+            while p < oc_path_count(b)
                 if own_set_has(r[4], p) == 1 and own_set_has(b.fmoved, p) == 0
                     let at: i32 = oc_fm_latest_below(o, b.id, p, snap[1])
                     if at >= 0
