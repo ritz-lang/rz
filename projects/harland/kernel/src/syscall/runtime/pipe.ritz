@@ -1,0 +1,113 @@
+# Harland Syscall Runtime - pipes (AGAST #4955)
+#
+# pipe(fds) is syscall 29, Linux's ABI: two i32s, fds[0] the read end and
+# fds[1] the write end, the lowest free fds; 0, or Errno.NFile (the pipe
+# pool or the fd table is full) or Errno.Fault. Like the console, pipes need
+# no capability: they reach nothing outside the processes holding them.
+#
+# Reads and writes on a pipe fd come here from file.ritz's handlers (fds 0-2
+# included, when a spawn redirected them). fs/syscall.ritz's calls never
+# block; these do, as Linux's blocking pipes do:
+#
+#   read   returns as soon as any bytes are there (up to count), or 0 at end
+#          of file; an empty pipe with a writer left parks the caller.
+#   write  returns once every byte is in, parking while the pipe is full; the
+#          last reader gone is Errno.Pipe, or the count written before it.
+#
+# The check and the park are one step with interrupts off (BLOCK_PIPE, as
+# read(0) does with BLOCK_TTY): pipe, read, write, close, poll and the
+# spawns are not SYS_LOCAL, so a process on an AP has them forwarded to the
+# BSP (syscall/dispatch.ritz, docs/SMP_USER.md §2), and nothing changes a
+# pipe between them. pipe_changed after every change (bytes in or
+# out, an end closed, a process exited) wakes every BLOCK_PIPE waiter and
+# every poll watching pipes; each re-checks, so a wake meant for another
+# pipe costs one check. A process told to exit (PROC_REAP) stops waiting:
+# its return to user exits it.
+
+import io { disable_interrupts, enable_interrupts }
+import mm.uptr { uptr_check_write }
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span { Span }
+import syscall.errno { Errno }
+import fs.syscall { PipeFds, fs_pipe_open, fs_pipe_read, fs_pipe_write }
+import proc.table { BLOCK_PIPE, proc_block, proc_current, proc_reap_pending, proc_wake }
+import proc.sched { sched_block }
+import proc.waitq { waitq_can_park }
+import proc.waitset { waitset_pipes_changed }
+
+# A pipe changed: wake whoever waits on one (IF may be on or off).
+pub fn pipe_changed()
+    disable_interrupts()
+    proc_wake(BLOCK_PIPE)
+    waitset_pipes_changed()
+    enable_interrupts()
+
+# Whether the caller may park for a pipe: a process that can sleep and is
+# not on its way out.
+fn pipe_may_wait() -> bool
+    waitq_can_park() and not proc_reap_pending(proc_current())
+
+# read(fd, dst) on a pipe fd: Ok(the bytes read, 0 at end of file), or
+# Err(BadF: not a read end; Again: told to exit while waiting).
+pub fn pipe_read_wait(fd: i32, dst: Span<u8>) -> Result<i64, Errno>
+    # A count above i64's range came in as a negative one
+    if dst.len() < 0
+        return Err(Errno.Inval)
+    while true
+        disable_interrupts()
+        match fs_pipe_read(fd, dst)
+            Ok(n) =>
+                enable_interrupts()
+                if n > 0
+                    pipe_changed()
+                return Ok(n)
+            Err(e) =>
+                if e != Errno.Again or not pipe_may_wait()
+                    enable_interrupts()
+                    return Err(e)
+        # Until a writer, or the last writer's close, wakes it; IF=0 after.
+        proc_block(BLOCK_PIPE, 0)
+        sched_block()
+        enable_interrupts()
+
+# write(fd, src) on a pipe fd: Ok(src.len()) once all of it is in, else
+# Ok(what went in before the reader left, or the caller was told to exit),
+# or Err when nothing did (BadF: not a write end; Pipe: no reader).
+pub fn pipe_write_wait(fd: i32, src: Span<u8>) -> Result<i64, Errno>
+    if src.len() < 0
+        return Err(Errno.Inval)
+    var done: i64 = 0
+    while true
+        disable_interrupts()
+        match fs_pipe_write(fd, src.from(done))
+            Ok(n) =>
+                enable_interrupts()
+                done = done + n
+                if n > 0
+                    pipe_changed()
+                if done >= src.len()
+                    return Ok(done)
+                continue
+            Err(e) =>
+                if e != Errno.Again or not pipe_may_wait()
+                    enable_interrupts()
+                    if done > 0
+                        return Ok(done)
+                    return Err(e)
+        # Until a reader makes room, or the last reader's close; IF=0 after.
+        proc_block(BLOCK_PIPE, 0)
+        sched_block()
+        enable_interrupts()
+
+# pipe(fds)
+pub fn sys_pipe_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # SECURITY: the two i32s go to the caller's memory
+    if uptr_check_write(rdi as *u8, 8) != 0
+        return Errno.Fault as i64
+    match fs_pipe_open()
+        Ok(fds) =>
+            *(rdi as *i32) = fds.read
+            *((rdi + 4) as *i32) = fds.write
+            return 0
+        Err(e) => return e as i64

@@ -1,0 +1,136 @@
+# ritzlib.command (AGAST #4955): a program started with its stdin, stdout and
+# stderr taken from the caller's fds, the same API on Linux and Harland.
+#
+#   command(path, args) -> Command        the caller's own stdio
+#   cmd.stdin_from(@fd) / stdout_to(@fd) / stderr_to(@fd)
+#   cmd.spawn() -> Result<Child, Errno>
+#   child.wait() -> Result<i32, Errno>    exit code; 128 + n for signal n
+#
+# On Harland the same calls are proven by indium's pipe_test (a Tier-1 boot
+# program, projects/harland/tools/test_tier1_boot.sh).
+
+import ritzlib.sys
+import ritzlib.fd
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+import ritzlib.command
+
+# A pipe, or one whose ends are closed if pipe() failed (every use then fails).
+fn new_pipe() -> Pipe
+    match pipe()
+        Ok(p) => p
+        Err(_) => Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+
+# Everything left in `fd` until EOF.
+fn drain(fd: @Fd) -> String
+    var text: String = string_new()
+    match fd.read_to_end(@&text)
+        Ok(_) => pass
+        Err(_) => pass
+    text
+
+# wait()'s exit code, or -1000 - errno.
+fn exit_of(child: @&Child) -> i32
+    match child.wait()
+        Ok(code) => code
+        Err(e) => -1000 - e.code()
+
+# The spawn's Child, or a Child that no wait finds (pid -1).
+fn started(r: Result<Child, Errno>) -> Child
+    match r
+        Ok(c) => c
+        Err(_) => Child { pid: -1, waited: true }
+
+fn spawn_errno(r: Result<Child, Errno>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e.code()
+
+[[test]]
+fn test_stdout_to_a_pipe_comes_back() -> i32
+    var args: [3]StrView
+    args[0] = "echo"
+    args[1] = "piped"
+    args[2] = "out"
+    var out: Pipe = new_pipe()
+    var cmd: Command = command("/bin/echo", span_from_ptr<StrView>(@args[0], 3))
+    cmd.stdout_to(@out.write)
+    var child: Child = started(cmd.spawn())
+    assert child.pid() > 0
+    # our copy of the write end closed: the child's exit is the EOF
+    out.write.close()
+    var text: String = drain(@out.read)
+    assert text.eq("piped out\n")
+    assert exit_of(@&child) == 0
+    out.read.close()
+    0
+
+[[test]]
+fn test_stdin_from_a_pipe_sees_eof_once_we_close() -> i32
+    var args: [1]StrView
+    args[0] = "cat"
+    var inp: Pipe = new_pipe()
+    var out: Pipe = new_pipe()
+    var cmd: Command = command("/bin/cat", span_from_ptr<StrView>(@args[0], 1))
+    cmd.stdin_from(@inp.read)
+    cmd.stdout_to(@out.write)
+    var child: Child = started(cmd.spawn())
+    assert child.pid() > 0
+    inp.read.close()
+    out.write.close()
+    match inp.write.write_str("through cat\n")
+        Ok(_) => pass
+        Err(_) => return 1
+    # cat ends only if it holds no write end of its own stdin (close-on-exec)
+    inp.write.close()
+    var text: String = drain(@out.read)
+    assert text.eq("through cat\n")
+    assert exit_of(@&child) == 0
+    out.read.close()
+    0
+
+[[test]]
+fn test_stderr_to_and_the_exit_code() -> i32
+    var args: [3]StrView
+    args[0] = "sh"
+    args[1] = "-c"
+    args[2] = "echo oops >&2; exit 3"
+    var err: Pipe = new_pipe()
+    var cmd: Command = command("/bin/sh", span_from_ptr<StrView>(@args[0], 3))
+    cmd.stderr_to(@err.write)
+    var child: Child = started(cmd.spawn())
+    err.write.close()
+    var text: String = drain(@err.read)
+    assert text.eq("oops\n")
+    assert exit_of(@&child) == 3
+    # a second wait has nothing to collect
+    assert exit_of(@&child) == -1000 - 10
+    err.read.close()
+    0
+
+[[test]]
+fn test_a_signal_is_128_plus_n() -> i32
+    var args: [3]StrView
+    args[0] = "sh"
+    args[1] = "-c"
+    args[2] = "kill -9 $$"
+    var child: Child = started(command("/bin/sh", span_from_ptr<StrView>(@args[0], 3)).spawn())
+    assert exit_of(@&child) == 137
+    0
+
+[[test]]
+fn test_a_missing_program_or_closed_fd_starts_nothing() -> i32
+    var args: [1]StrView
+    args[0] = "nope"
+    let missing: Command = command("/nonexistent/ritz-nope", span_from_ptr<StrView>(@args[0], 1))
+    assert spawn_errno(missing.spawn()) == 2
+    var out: Pipe = new_pipe()
+    out.write.close()
+    var cmd: Command = command("/bin/echo", span_from_ptr<StrView>(@args[0], 1))
+    cmd.stdout_to(@out.write)
+    assert spawn_errno(cmd.spawn()) == 9
+    out.read.close()
+    0

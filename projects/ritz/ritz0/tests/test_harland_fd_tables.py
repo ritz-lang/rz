@@ -395,7 +395,7 @@ STUBS = {
     "goliath/error.ritz": ERROR_STUB,
     "fs/dirent.ritz": DIRENT_STUB,
 }
-REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open_plan.ritz", "syscall/errno.ritz"]
+REAL = ["fs/fd.ritz", "fs/pipe.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open_plan.ritz", "syscall/errno.ritz"]
 
 
 def _compile(compiler, tmp_path, path, name, extra=()):
@@ -436,7 +436,10 @@ def _run(compiler, tmp_path, src, modules):
 FD_MODULES = ["fs/fd.ritz", "syscall/errno.ritz"]
 FS_MODULES = ["serial.ritz", "klog.ritz", "mm/heap.ritz", "goliath/blob_id.ritz", "goliath/blob_store.ritz",
               "goliath/error.ritz", "goliath/namespace.ritz", "fs/kfs.ritz", "fs/dirent.ritz", "fs/fd.ritz",
-              "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open_plan.ritz", "syscall/errno.ritz"]
+              "fs/pipe.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open_plan.ritz",
+              "syscall/errno.ritz",
+              # fs/pipe.ritz's Span.copy_from calls memmove, ritzlib/str.ritz's (AGAST #4955)
+              str(RITZ_ROOT / "ritzlib" / "str.ritz")]
 
 # --- FdTable (fs/fd.ritz) ---------------------------------------------------------
 
@@ -818,7 +821,7 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
     assert start < begin.index("fs_process_select(parent_pid)") < begin.index("vmm_create_user_pml4()")
     # (a sys_spawn child inherits the parent's ambient capabilities; the
     # kernel's process_spawn_program passes false, #4735)
-    assert body.index("spawn_child_begin(parent_pid, inherit_caps)") < body.index("vmm_switch_pml4(child_pml4)")
+    assert body.index("spawn_child_begin(parent_pid, inherit_caps, stdio)") < body.index("vmm_switch_pml4(child_pml4)")
     # every later failure path gives it back: spawn_undo ends the child's table
     fails = re.findall(r"vmm_switch_pml4\(parent_pml4\)\n(\s+)(\S.*)\n", body)
     fail_lines = [line for _, line in fails]
@@ -832,13 +835,13 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
     # #4881)
     assert "spawn_image(image, arg0, arg1, PROC_BSP_CPU)" in _fn(PROCESS, "process_spawn_image")
     image = _fn(PROCESS, "spawn_image")
-    assert "spawn_child_begin(parent_pid, false)" in image
+    assert "spawn_child_begin(parent_pid, false, spawn_stdio_inherit())" in image
     assert begin.index("if inherit_caps") < begin.index("cap_inherit_ambient(")
     # every failure after the child exists gives its slot back
     assert image.count("spawn_undo(slot, parent_pid)") == 2, image
     assert image.index("proc_start(slot)") > image.index("sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1, 0)")
     # both spawn syscalls, and spawn_bg, go through it
-    for spawn in ("spawn_and_block", "sys_spawn_bg_handler"):
+    for spawn in ("spawn_and_block", "spawn_bg_from_user"):
         assert "spawn_process(" in _fn(PROCESS, spawn), spawn
     for spawn in ("sys_spawn_impl", "sys_spawn_args_impl"):
         assert "spawn_and_block(" in _fn(PROCESS, spawn), spawn

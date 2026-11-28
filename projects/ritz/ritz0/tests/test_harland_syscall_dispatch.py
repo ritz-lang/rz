@@ -88,6 +88,9 @@ ABI = {
     "Mmap": 9, "Munmap": 11, "TtySetfg": 16, "Readdir": 17, "TtyGetattr": 18, "TtySetattr": 19,
     "Exit": 20, "Spawn": 21, "Wait": 22, "Getpid": 23, "Yield": 24,
     "SpawnArgs": 25, "Getcwd": 26, "Chdir": 27, "SpawnBg": 28,
+    # Pipe (29, Linux's number for it on Harland since #4955) and SpawnIo
+    # (90): spawn_bg with the child's fds 0-2 taken from the caller's.
+    "Pipe": 29, "SpawnIo": 90,
     "IpcSend": 30, "IpcRecv": 31, "IpcClose": 33,
     "CapGrant": 40, "CapRevoke": 41, "CapDerive": 42, "CapInfo": 43, "CapCheck": 44,
     "InputPoll": 50, "InputRead": 51,
@@ -148,7 +151,7 @@ DISPATCHED = {
     "Sync", "Smp", "ShmMap", "DrvIrqWait", "DrvMmioMap", "DrvDmaAlloc", "DrvDmaFree", "NetInfo", "NetAddr", "NetAttach", "Poll",
     "ShmWait", "ShmNotify", "NetPublish",
     "Stat", "Fstat", "SmpUser", "SmpUserLocal", "Getdents64",
-    "Rmdir", "Unlink",
+    "Rmdir", "Unlink", "Pipe", "SpawnIo",
 }
 
 

@@ -36,10 +36,11 @@
 # never escapes these methods.
 #
 # Targets (AGAST #4832): the module compiles for Linux and Harland. On
-# Harland fd_open (with O_CREAT's mode), read, write, seek, stat and close
-# reach the kernel; dup, dup_to, truncate, fsync, chmod, lock, sendfile, the
-# nonblocking calls and pipe() are Err(Other(38)) (ENOSYS): Harland has no
-# such syscalls. poll is Linux-only (harland: ritzlib.timedread).
+# Harland fd_open (with O_CREAT's mode), read, write, seek, stat, close and
+# pipe() (29, AGAST #4955) reach the kernel; dup, dup_to, truncate, fsync,
+# chmod, lock, sendfile and the nonblocking calls are Err(Other(38))
+# (ENOSYS): Harland has no such syscalls. poll is Linux-only (harland:
+# ritzlib.timedread).
 #
 # Nonblocking I/O (AGAST #4815): set_nonblocking(true), then poll and
 # try_read / try_write, whose Ok tells "nothing yet" (WouldBlock) apart from
@@ -82,6 +83,7 @@ const FD_EAGAIN: i32 = 11
 const FD_F_GETFL: i32 = 3
 const FD_F_SETFL: i32 = 4
 const FD_ENOSYS: i32 = 38
+const FD_SYS_PIPE2: i64 = 293
 
 # What a nonblocking read got (Fd.try_read): `Data(n)` bytes, `Eof` (the
 # writer is gone and the pipe is drained), or `WouldBlock` (nothing there
@@ -179,10 +181,6 @@ fn sys_flock(fd: i32, operation: i32) -> i32
 fn sys_sendfile(out_fd: i32, in_fd: i32, offset: *i64, count: i64) -> i64
     -(FD_ENOSYS as i64)
 
-[[target_os = "harland"]]
-fn sys_pipe(pipefd: *i32) -> i32
-    -FD_ENOSYS
-
 # fstat(2) of `fd`: Fd.stat's body. Harland's fstat is Linux's number and
 # struct stat (AGAST #4832), with no ritzlib.sys wrapper of its own.
 [[target_os = "linux"]]
@@ -261,10 +259,27 @@ pub fn fd_stdout() -> Fd
 pub fn fd_stderr() -> Fd
     Fd { fd: 2 }
 
-# A new pipe(2): Ok(Pipe { read, write }), both ends owned by the caller.
+# A new pipe: Ok(Pipe { read, write }), both ends owned by the caller.
 pub fn pipe() -> Result<Pipe, Errno>
+    fd_pipe()
+
+# pipe2(2) with O_CLOEXEC (AGAST #4955): a program this process starts gets
+# only the ends ritzlib.command hands it (dup2 onto its 0-2 clears the flag),
+# so a child never holds the write end of its own stdin and its EOF arrives.
+[[target_os = "linux"]]
+fn fd_pipe() -> Result<Pipe, Errno>
     var ends: [2]i32
-    let rc: i32 = sys_pipe(@ends[0])
+    fd_pipe_result(syscall2(FD_SYS_PIPE2, @ends[0] as i64, O_CLOEXEC as i64) as i32, ends)
+
+# Harland's pipe (29): a spawned child gets only its fds 0-2, never the
+# parent's others, so there is no close-on-exec to ask for.
+[[target_os = "harland"]]
+fn fd_pipe() -> Result<Pipe, Errno>
+    var ends: [2]i32
+    fd_pipe_result(syscall1(SYS_PIPE, @ends[0] as i64) as i32, ends)
+
+# The Pipe the kernel's `ends` are, or the Errno of its `rc`.
+fn fd_pipe_result(rc: i32, ends: [2]i32) -> Result<Pipe, Errno>
     if rc < 0
         return Err(errno_from_raw(rc))
     Ok(Pipe { read: Fd { fd: ends[0] }, write: Fd { fd: ends[1] } })

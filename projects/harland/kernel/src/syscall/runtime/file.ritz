@@ -1,7 +1,9 @@
 # Harland Syscall Runtime - File (AGAST #2751, from main.ritz)
 #
-# read/write/close/stat/fstat/lseek/mkdir/unlink/rmdir/readdir: filesystem fds go to fs/syscall.ritz,
-# fds 0-2 to the serial console. (open lives in process.ritz: see there.)
+# read/write/close/stat/fstat/lseek/mkdir/unlink/rmdir/readdir: pipe fds go to
+# pipe.ritz (fds 0-2 too, when a spawn redirected them, #4955), filesystem fds
+# to fs/syscall.ritz, and the rest of 0-2 to the serial console. (open lives in
+# process.ritz: see there.)
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
@@ -14,8 +16,9 @@ import fs.kfs { kfs_ns_for, kfs_local, kfs_list, kfs_errno }
 import goliath.namespace { Namespace }
 import goliath.dir_entry { NsEntry }
 import ritzlib.strview { strview_from_ptr }
+import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_fstat, sys_lseek, sys_mkdir, sys_unlink, sys_rmdir, sys_getdents64, is_fs_fd, is_pipe_fd, fs_sync }
+import syscall.runtime.pipe { pipe_read_wait, pipe_write_wait, pipe_changed }
 import ritzlib.span { span_from_ptr }
-import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_fstat, sys_lseek, sys_mkdir, sys_unlink, sys_rmdir, sys_getdents64, is_fs_fd, fs_sync }
 import fs.stat { Stat, stat_at }
 import ritzlib.result
 import ritzlib.option
@@ -91,6 +94,11 @@ fn sys_readdir_impl(path_view: StrView, buf: *u8, buf_size: i64) -> i64
 # close(fd)
 pub fn sys_close_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     let fd: i32 = rdi as i32
+    # A pipe end: its other side may be waiting for this close (EOF, Pipe).
+    if is_pipe_fd(fd)
+        let r: i64 = sys_close(fd)
+        pipe_changed()
+        return r
     # Check if it's a filesystem fd
     if is_fs_fd(fd)
         # Closing a file mutates the namespace-backed fd table, so either
@@ -193,6 +201,10 @@ pub fn sys_write_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         if uptr_result != 0
             return Errno.Fault as i64
 
+    # A pipe end, whatever its number: blocks while the pipe is full
+    if is_pipe_fd(fd)
+        return rax_of(pipe_write_wait(fd, span_from_ptr<u8>(buf, len)))
+
     # Check if it's a filesystem fd
     if is_fs_fd(fd)
         # Writing a file needs WRITE in the namespace. The console fds stay
@@ -231,6 +243,10 @@ pub fn sys_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         if uptr_result != 0
             return Errno.Fault as i64
 
+    # A pipe end, whatever its number: blocks while the pipe is empty
+    if is_pipe_fd(fd)
+        return rax_of(pipe_read_wait(fd, span_from_ptr<u8>(buf, count)))
+
     # Check if it's a filesystem fd
     if is_fs_fd(fd)
         # Reading a file needs READ in the namespace; stdin stays ungated
@@ -246,6 +262,12 @@ pub fn sys_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
     # The console: sleeps until a line (or, raw, a byte) arrives (#4254).
     return tty_console_read(buf, count)
+
+# A count-or-Errno as the handler's rax: the count, or -errno.
+fn rax_of(r: Result<i64, Errno>) -> i64
+    match r
+        Ok(n) => n
+        Err(e) => e as i64
 
 # readdir(path, buf, size)
 pub fn sys_readdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -281,9 +303,9 @@ pub fn sys_getdents64_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # (#4254: tty/ldisc.ritz's TTY_ECHO, TTY_ICANON and TTY_ISIG) and the input
 # bytes dropped with the input queue full since boot (#4831). getattr writes
 # both; setattr reads only the flags. fds 0-2 are the console unless they
-# name a file; anything else is not a terminal.
+# name a file or a pipe end (#4955); anything else is not a terminal.
 fn tty_fd_ok(fd: i32) -> bool
-    fd >= 0 and fd <= 2 and not is_fs_fd(fd)
+    fd >= 0 and fd <= 2 and not is_fs_fd(fd) and not is_pipe_fd(fd)
 
 # tty_getattr(fd, attrs)
 pub fn sys_tty_getattr_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

@@ -1,0 +1,205 @@
+# pipe_test: Harland's pipes and spawn with stdio redirection (AGAST #4955,
+# Buddhafinger M7: ritz-lsp talks to its client over stdin/stdout and runs
+# ritz1 per compile).
+#
+# Through the portable APIs ritz-lsp will use, ritzlib.fd's pipe() and
+# ritzlib.command's Command, the same calls ritzlib/tests/test_command.ritz
+# makes on Linux:
+#
+#   1  a pipe carries bytes within one process; poll (ritzlib.timedread)
+#      says not readable when empty, readable once written
+#   2  /bin/echo's stdout is a pipe: its words come back, then EOF when it
+#      exits, and its exit code is 0
+#   3  /bin/cat between two pipes, with more bytes than a pipe holds: the
+#      writer blocks while the pipe is full and cat drains it, and cat's
+#      EOF comes once our write end is closed
+#   4  the last writer gone: a read is EOF; the last reader gone: a write
+#      is Err(Pipe)
+#   5  a closed fd as a stream starts nothing (Err(BadF))
+#
+# Exit 0 only if every claim held; each failure has its own code.
+
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new }
+import ritzlib.span { Span, span_from_ptr }
+import ritzlib.option
+import ritzlib.result
+import ritzlib.fd
+import ritzlib.command
+import ritzlib.timedread { wait_readable }
+
+# More than a pipe's 4096 bytes, so the write must wait for cat.
+const BIG: i64 = 6000
+
+fn fail(step: i32, what: StrView) -> i32
+    print("[pipe_test] FAIL: {what}\n")
+    step
+
+fn new_pipe() -> Option<Pipe>
+    match pipe()
+        Ok(p) => Some(p)
+        Err(e) =>
+            print("[pipe_test] pipe() failed: {e.code()}\n")
+            None
+
+# Everything left in `fd` until EOF, or None on a read error.
+fn drain(fd: @Fd) -> Option<String>
+    var text: String = string_new()
+    match fd.read_to_end(@&text)
+        Ok(_) => Some(text)
+        Err(_) => None
+
+fn readable(fd: @Fd) -> bool
+    match wait_readable(fd.raw(), 0)
+        Ok(r) => r
+        Err(_) => false
+
+fn exited_ok(child: @&Child) -> bool
+    match child.wait()
+        Ok(code) => code == 0
+        Err(_) => false
+
+# 1: bytes within one process, and poll on a pipe.
+fn same_process() -> i32
+    var p: Pipe = Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+    match new_pipe()
+        Some(q) => p = q
+        None => return 10
+    if readable(@p.read)
+        return fail(11, "an empty pipe polled readable")
+    match p.write.write_str("ping")
+        Ok(_) => pass
+        Err(_) => return fail(12, "write to a pipe")
+    if not readable(@p.read)
+        return fail(13, "a written pipe did not poll readable")
+    var buf: [8]u8
+    match p.read.read(span_from_ptr<u8>(@buf[0], 8))
+        Ok(n) =>
+            if n != 4 or buf[0] != 'p' or buf[3] != 'g'
+                return fail(14, "read back what was written")
+        Err(_) => return fail(14, "read back what was written")
+    p.close()
+    0
+
+# 2: a child's stdout comes back through a pipe.
+fn echo_stdout() -> i32
+    var args: [3]StrView
+    args[0] = "echo"
+    args[1] = "hello"
+    args[2] = "pipe"
+    var out: Pipe = Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+    match new_pipe()
+        Some(q) => out = q
+        None => return 20
+    var cmd: Command = command("/bin/echo", span_from_ptr<StrView>(@args[0], 3))
+    cmd.stdout_to(@out.write)
+    var child: Child = Child { pid: -1, waited: true }
+    match cmd.spawn()
+        Ok(c) => child = c
+        Err(e) =>
+            print("[pipe_test] spawn /bin/echo: {e.code()}\n")
+            return 21
+    out.write.close()
+    match drain(@out.read)
+        Some(text) =>
+            if not text.eq("hello pipe\n")
+                return fail(22, "echo's stdout through the pipe")
+        None => return fail(22, "echo's stdout through the pipe")
+    if not exited_ok(@&child)
+        return fail(23, "echo's exit code")
+    out.read.close()
+    0
+
+# 3: cat between two pipes, more bytes than one pipe holds.
+fn cat_through() -> i32
+    var args: [1]StrView
+    args[0] = "cat"
+    var inp: Pipe = Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+    var out: Pipe = Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+    match new_pipe()
+        Some(q) => inp = q
+        None => return 30
+    match new_pipe()
+        Some(q) => out = q
+        None => return 30
+    var cmd: Command = command("/bin/cat", span_from_ptr<StrView>(@args[0], 1))
+    cmd.stdin_from(@inp.read)
+    cmd.stdout_to(@out.write)
+    var child: Child = Child { pid: -1, waited: true }
+    match cmd.spawn()
+        Ok(c) => child = c
+        Err(e) =>
+            print("[pipe_test] spawn /bin/cat: {e.code()}\n")
+            return 31
+    inp.read.close()
+    out.write.close()
+    var big: [6000]u8
+    for i in 0..BIG
+        big[i] = ('a' as i64 + i % 26) as u8
+    match inp.write.write_all(span_from_ptr<u8>(@big[0], BIG))
+        Ok(_) => pass
+        Err(_) => return fail(32, "write more than a pipe holds")
+    inp.write.close()
+    match drain(@out.read)
+        Some(text) =>
+            if text.len() != BIG or text.get(0) != 'a' or text.get(BIG - 1) != ('a' as i64 + (BIG - 1) % 26) as u8
+                return fail(33, "cat's output is its input")
+        None => return fail(33, "cat's output is its input")
+    if not exited_ok(@&child)
+        return fail(34, "cat's exit code")
+    out.read.close()
+    0
+
+# 4: EOF without writers, Err(Pipe) without readers.
+fn ends_gone() -> i32
+    var p: Pipe = Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+    match new_pipe()
+        Some(q) => p = q
+        None => return 40
+    p.write.close()
+    var buf: [4]u8
+    match p.read.read(span_from_ptr<u8>(@buf[0], 4))
+        Ok(n) =>
+            if n != 0
+                return fail(41, "no writer: EOF")
+        Err(_) => return fail(41, "no writer: EOF")
+    p.read.close()
+    match new_pipe()
+        Some(q) => p = q
+        None => return 40
+    p.read.close()
+    match p.write.write_str("x")
+        Ok(_) => return fail(42, "no reader: Err(Pipe)")
+        # EPIPE
+        Err(e) =>
+            if e.code() != 32
+                return fail(42, "no reader: Err(Pipe)")
+    p.write.close()
+    0
+
+# 5: a closed fd as a stream starts nothing.
+fn closed_stream() -> i32
+    var args: [1]StrView
+    args[0] = "echo"
+    var cmd: Command = command("/bin/echo", span_from_ptr<StrView>(@args[0], 1))
+    let gone: Fd = fd_adopt(-1)
+    cmd.stdout_to(@gone)
+    match cmd.spawn()
+        Ok(_) => return fail(50, "a closed fd started a child")
+        # EBADF
+        Err(e) =>
+            if e.code() != 9
+                return fail(51, "a closed fd: Err(BadF)")
+    0
+
+pub fn main() -> i32
+    var rc: i32 = same_process()
+    if rc == 0
+        rc = echo_stdout()
+    if rc == 0
+        rc = cat_through()
+    if rc == 0
+        rc = ends_gone()
+    if rc == 0
+        rc = closed_stream()
+    rc

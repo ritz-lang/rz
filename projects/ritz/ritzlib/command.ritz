@@ -1,0 +1,219 @@
+# ritzlib/command.ritz - start a program with its stdin, stdout and stderr
+# taken from the caller's fds (AGAST #4955)
+#
+# The portable half of ritzlib.process: the same API and behaviour on Linux
+# and Harland, so a program like ritz-lsp that runs ritz1 per compile and
+# reads its output builds for both.
+#
+#     var args: [2]StrView
+#     args[0] = "/bin/echo"
+#     args[1] = "hi"
+#     match pipe()                                   # ritzlib.fd: Result<Pipe, Errno>
+#         Ok(p) =>
+#             var out: Pipe = p
+#             var cmd: Command = command("/bin/echo", span_from_ptr<StrView>(@args[0], 2))
+#             cmd.stdout_to(@out.write)
+#             match cmd.spawn()                      # Result<Child, Errno>
+#                 Ok(c) =>
+#                     var child: Child = c
+#                     out.write.close()              # else EOF never comes
+#                     var text: String = string_new()
+#                     out.read.read_to_end(@&text)   # "hi\n"
+#                     child.wait()                   # Result<i32, Errno>: Ok(0)
+#                 Err(e) => ...                      # NoEnt, BadF, ...
+#
+# `path` runs as given (no $PATH search: ritzlib.process's find_command does
+# that on Linux) with argv `args`, args[0] being argv[0]. A stream nobody set
+# is the caller's own. The Fds handed in are borrowed: the caller still owns
+# and closes them, and should close its copy of an end it gave the child, or
+# the child's EOF (or the caller's) never arrives.
+#
+# The child gets exactly fds 0-2 as set, and no other fd of the caller's: on
+# Harland a spawned child has only those; on Linux ritzlib.fd's pipe() makes
+# both ends close-on-exec and dup2 onto 0-2 clears the flag. A file fd works
+# as a stream on Linux; on Harland only a pipe end or the console does (a
+# file fd is Err(BadF)).
+#
+# Errors: Err(NoEnt) / Err(Acces) / Err(NoExec) for a program that can't run
+# (on Linux, checked before the fork, so they are not an exit 127), Err(BadF)
+# for a stream fd that is closed or not usable, Err(NoMem). wait() is the
+# exit code; a child killed by signal n is 128 + n, as a shell reports it.
+
+import ritzlib.sys
+import ritzlib.fd
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result
+pub import ritzlib.errno
+import ritzlib.os.env
+
+# Where the child's fds 0, 1 and 2 come from: each the caller's fd it gets.
+# Also Harland's spawn_io record (the kernel's fs/syscall.ritz SpawnStdio):
+# three i32s, { 0, 1, 2 } for the caller's own stdio.
+struct SpawnStdio
+    stdin: i32
+    stdout: i32
+    stderr: i32
+
+# A program to start: Command.spawn starts it, as often as asked.
+pub struct Command
+    path: StrView
+    args: Span<StrView>
+    stdio: SpawnStdio
+
+# A started program: wait() collects its exit code, once.
+pub struct Child
+    pid: i32
+    waited: bool
+
+# A Command for `path` with argv `args` (args[0] is argv[0]) and the
+# caller's own stdin, stdout and stderr.
+pub fn command(path: StrView, args: Span<StrView>) -> Command
+    Command { path: path, args: args, stdio: SpawnStdio { stdin: 0, stdout: 1, stderr: 2 } }
+
+# Methods (S-IMPL-1): a Command is the subject of its setup and its spawn.
+impl Command
+    # The child reads its stdin from `fd` (a pipe's read end, say).
+    pub fn stdin_from(self: @&Command, fd: @Fd)
+        self.stdio.stdin = fd.raw()
+
+    # The child writes its stdout to `fd` (a pipe's write end, say).
+    pub fn stdout_to(self: @&Command, fd: @Fd)
+        self.stdio.stdout = fd.raw()
+
+    # The child writes its stderr to `fd`.
+    pub fn stderr_to(self: @&Command, fd: @Fd)
+        self.stdio.stderr = fd.raw()
+
+    # Start the program; it runs alongside the caller. Ok(the Child), or the
+    # Errno it could not start with (see the module header).
+    pub fn spawn(self: @Command) -> Result<Child, Errno>
+        if self.stdio.stdin < 0 or self.stdio.stdout < 0 or self.stdio.stderr < 0
+            return Err(Errno.BadF)
+        var argv: CStrVec = cstr_vec(self.args)
+        if not argv.ok
+            return Err(Errno.NoMem)
+        var path: String = String.from(self.path)
+        let pathp: *u8 = path.as_ptr()
+        if pathp == null
+            return Err(Errno.NoMem)
+        command_start(pathp, @&argv, self.args.len, self.stdio)
+
+impl Child
+    # The child's process id.
+    pub fn pid(self: @Child) -> i32
+        self.pid
+
+    # Sleep until the child exits: Ok(its exit code; 128 + n if signal n
+    # killed it), Err(Child) once it has been waited for.
+    pub fn wait(self: @&Child) -> Result<i32, Errno>
+        if self.waited
+            return Err(Errno.Child)
+        let r: Result<i32, Errno> = child_wait(self.pid)
+        match r
+            Ok(_) => self.waited = true
+            Err(_) => pass
+        r
+
+# ============================================================================
+# argv and envp as C string vectors (the exec boundary)
+# ============================================================================
+
+# NUL-terminated copies of some views and a NULL-terminated pointer vector
+# into them: execve(2)'s argv/envp, Harland spawn's argv. `ok` is false if
+# an allocation failed. The pointers are taken once `buf` is complete, since
+# a growing String moves.
+struct CStrVec
+    buf: String
+    ptrs: Vec<*u8>
+    ok: bool
+
+fn cstr_vec(views: Span<StrView>) -> CStrVec
+    var v: CStrVec = CStrVec { buf: string_new(), ptrs: vec_new<*u8>(), ok: true }
+    var starts: Vec<i64> = vec_new<i64>()
+    for i in 0..views.len
+        if not starts.push(v.buf.len()) or not v.buf.push_str(views.get(i)) or not v.buf.push(0)
+            v.ok = false
+            return v
+    let base: *u8 = v.buf.as_ptr()
+    if base == null
+        v.ok = false
+        return v
+    for i in 0..starts.len()
+        if not v.ptrs.push(base + starts.get(i))
+            v.ok = false
+            return v
+    if not v.ptrs.push(null)
+        v.ok = false
+    v
+
+# ============================================================================
+# Linux: fork, dup2 onto 0-2, execve
+# ============================================================================
+
+# Start `path` with `argv` under `stdio`. The program is checked first, so a
+# missing one is Err(NoEnt) here rather than an exit 127 later.
+#
+# standard-exempt: raw-ptr-param, lib-exit: the fork/exec boundary: execve(2) takes C strings, and the forked child has no caller to return to (S-ERR-3)
+[[target_os = "linux"]]
+fn command_start(path: *u8, argv: @&CStrVec, argc: i64, stdio: SpawnStdio) -> Result<Child, Errno>
+    let acc: i32 = sys_access(path, X_OK)
+    if acc < 0
+        return Err(errno_from_raw(acc))
+    var envp: CStrVec = cstr_vec(env_iter())
+    if not envp.ok
+        return Err(Errno.NoMem)
+    let pid: i32 = sys_fork()
+    if pid < 0
+        return Err(errno_from_raw(pid))
+    if pid == 0
+        # The child: each stream onto its number. dup2 clears close-on-exec
+        # on the copy; the originals (ritzlib.fd pipes) close at exec.
+        if stdio.stdin != 0
+            sys_dup2(stdio.stdin, 0)
+        if stdio.stdout != 1
+            sys_dup2(stdio.stdout, 1)
+        if stdio.stderr != 2
+            sys_dup2(stdio.stderr, 2)
+        sys_execve(path, argv.ptrs.as_ptr(), envp.ptrs.as_ptr())
+        sys_exit(127)
+    Ok(Child { pid: pid, waited: false })
+
+# wait4(2) for `pid`: its exit code, or 128 + the signal that killed it.
+[[target_os = "linux"]]
+fn child_wait(pid: i32) -> Result<i32, Errno>
+    var status: i32 = 0
+    let rc: i32 = sys_wait4(pid, @status, 0, null)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    if (status & 127) == 0
+        return Ok((status >> 8) & 255)
+    Ok(128 + (status & 127))
+
+# ============================================================================
+# Harland: spawn_io (90)
+# ============================================================================
+
+# Harland's spawn_io(path, argv, argc, *SpawnStdio): the child's pid, its
+# fds 0-2 from ours under `stdio` (AGAST #4955).
+#
+# standard-exempt: raw-ptr-param: harland spawn_io(2) syscall ABI: the path is a NUL-terminated C string
+[[target_os = "harland"]]
+fn command_start(path: *u8, argv: @&CStrVec, argc: i64, stdio: SpawnStdio) -> Result<Child, Errno>
+    var rec: SpawnStdio = stdio
+    let rc: i64 = syscall4(SYS_SPAWN_IO, path as i64, argv.ptrs.as_ptr() as i64, argc, @rec as i64)
+    if rc < 0
+        return Err(errno_from_raw(rc as i32))
+    Ok(Child { pid: rc as i32, waited: false })
+
+# Harland's wait(pid): the exit code, which a fault or a kill already makes
+# 128 + n.
+[[target_os = "harland"]]
+fn child_wait(pid: i32) -> Result<i32, Errno>
+    let rc: i64 = sys_wait(pid)
+    if rc < 0
+        return Err(errno_from_raw(rc as i32))
+    Ok(rc as i32)

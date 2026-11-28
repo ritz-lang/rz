@@ -1,19 +1,22 @@
 # Filesystem Syscalls
 #
 # Implements sys_open, sys_close, sys_read, sys_write, sys_fstat, mkdir,
-# unlink and rmdir for files (stat by path is fs/stat.ritz stat_at), and
+# unlink and rmdir for files (stat by path is fs/stat.ritz stat_at),
 # sys_getdents64 for directory fds (open with O_DIRECTORY; the records are
-# fs/dirent.ritz's, AGAST #4947).
+# fs/dirent.ritz's, AGAST #4947), and binds pipe ends (fs/pipe.ritz,
+# AGAST #4955) to fds: pipe(2)'s two, and a spawned child's 0-2.
 # Integrates with the kernel namespace (fs/kfs.ritz) and the per-process fd tables (fs/fd.ritz).
 
 import klog { klog }
 import serial { StrView }
 import fs.vfs { O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_SYNC, O_DIRECTORY }
-import fs.fd { FdTable, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_dup, fd_owner, fd_refs, fd_heir }
+import fs.fd { FdTable, FileDescriptor, MAX_FDS, FD_KIND_PIPE, FD_KIND_STDIO, fd_table_init, fd_alloc, fd_free, fd_dup, fd_get, fd_owner, fd_refs, fd_heir }
+import fs.pipe { PipeEnd, PipeSide, pipe_create, pipe_reader, pipe_writer, pipe_hold, pipe_release, pipe_read, pipe_write }
+import ritzlib.span { Span }
 import syscall.errno { Errno }
 import fs.kfs { KFS_OK, kfs_get, kfs_ns_for, kfs_local, kfs_is_persist, kfs_is_durable, kfs_persist_write, kfs_persist_create, kfs_persist_mkdir, kfs_unlink, kfs_rmdir, kfs_commit_durable, kfs_save, kfs_save_later }
 import fs.open_plan { WriteMode, OpenPlan, open_plan }
-import fs.stat { Stat, stat_of_entry, stat_console }
+import fs.stat { Stat, stat_of_entry, stat_console, stat_pipe }
 import fs.dirent { dirent_fill }
 import goliath.namespace { Namespace, NsStat, namespace_resolve, namespace_store, namespace_hold, namespace_unhold, namespace_stat }
 import ritzlib.result
@@ -68,7 +71,8 @@ struct FsProc
     parent: i32             # fs_procs index of the spawning process; -1 for none
     mmap_next: u64          # next kernel-chosen mmap address; 0 = region start (#3530)
     table: FdTable
-    files: [256]FsFile      # indexed by fd; meaningful while the fd is open
+    files: [256]FsFile      # indexed by fd; meaningful while the fd is an open file
+    pipe_ends: [256]PipeEnd # indexed by fd; meaningful while the fd is FD_KIND_PIPE
 
 # Live processes at once: proc/table.ritz's MAX_PROCS.
 pub const FS_MAX_PROCS: i32 = 32
@@ -112,9 +116,41 @@ fn fs_file(p: *FsProc, fd: i32) -> *FsFile
     if p == 0 as *FsProc or fd < 3 or fd >= MAX_FDS
         return 0 as *FsFile
     let owner_fd: i32 = fd_owner(@(*p).table, fd)
-    if owner_fd < 0
+    if owner_fd < 0 or fs_is_pipe(p, fd)
         return 0 as *FsFile
     @(*p).files[owner_fd]
+
+# Whether fd is open in p and refers to a pipe end.
+fn fs_is_pipe(p: *FsProc, fd: i32) -> bool
+    let desc: *FileDescriptor = fd_get(@(*p).table, fd)
+    desc != 0 as *FileDescriptor and (*desc).kind == FD_KIND_PIPE
+
+# The pipe end p's fd refers to, or None if it is no pipe fd of p. Like an
+# FsFile, the end lives at the owner fd's index.
+fn fs_pipe_of(p: *FsProc, fd: i32) -> Option<PipeEnd>
+    if p == 0 as *FsProc or not fs_is_pipe(p, fd)
+        return None
+    Some(p.pipe_ends[fd_owner(@(*p).table, fd)])
+
+# Make p's open fd refer to `end` (its count is the caller's business).
+fn fs_bind_pipe(p: *FsProc, fd: i32, end: PipeEnd)
+    let desc: *FileDescriptor = fd_get(@(*p).table, fd)
+    (*desc).kind = FD_KIND_PIPE
+    (*p).pipe_ends[fd] = end
+
+# Close p's pipe fd: its end loses one fd. fds 0-2 are never freed (fs/fd.ritz):
+# a closed redirected stdio fd is the console again, as a child that was
+# given none has.
+fn fs_close_pipe(p: *FsProc, fd: i32)
+    match fs_pipe_of(p, fd)
+        Some(end) => pipe_release(end)
+        None => return
+    if fd < 3
+        (*fd_get(@(*p).table, fd)).kind = FD_KIND_STDIO
+        return
+    if fd_refs(@(*p).table, fd) > 1 and fd_owner(@(*p).table, fd) == fd
+        (*p).pipe_ends[fd_heir(@(*p).table, fd)] = p.pipe_ends[fd]
+    fd_free(@(*p).table, fd)
 
 # A process starts running: give it an empty fd table and make it current.
 # 0, Errno.Again (FS_MAX_PROCS live already) or Errno.NoMem.
@@ -137,17 +173,20 @@ pub fn fs_process_start(pid: u64) -> i32
 
 # The current process exits: close every fd it left open, flushing pending
 # writes as sys_close does except that an O_TRUNC fd that wrote nothing
-# leaves its file (see "What close commits"), free its FsProc and make its
-# parent's current. Returns how many fds it closed, or Errno.Srch if none is
+# leaves its file (see "What close commits") and releasing its pipe ends
+# (fds 0-2 included), free its FsProc and make its parent's current. Returns how many fds it closed, or Errno.Srch if none is
 # current.
 pub fn fs_process_end() -> i32
     let p: *FsProc = fs_current_proc()
     if p == 0 as *FsProc
         return Errno.Srch as i32
     var closed: i32 = 0
-    var fd: i32 = 3
+    var fd: i32 = 0
     while fd < MAX_FDS
-        if fs_file(p, fd) != 0 as *FsFile
+        if fs_is_pipe(p, fd)
+            fs_close_pipe(p, fd)
+            closed = closed + 1
+        else if fs_file(p, fd) != 0 as *FsFile
             fs_close_file(p, fd, CloseBy.Exit)
             closed = closed + 1
         fd = fd + 1
@@ -377,15 +416,18 @@ fn fs_open_meta(ns: *Namespace, local: StrView) -> NsStat
 # A file fd reports the file as it was when the fd opened it: its type, mode
 # and modified time then, and the size the fd reads (0 after O_TRUNC). A
 # write fd's bytes reach the file only on close (see "What close commits"),
-# so a stat of the path after that close is what shows them. fds 0-2 that
-# are not files are the console (S_IFCHR). The Stat, or None for a number
+# so a stat of the path after that close is what shows them. A pipe end is
+# S_IFIFO. fds 0-2 that are neither are the console (S_IFCHR). The Stat, or None for a number
 # that is neither (the handler's Errno.BadF); the handler writes it to the
 # caller's record.
 
 pub fn sys_fstat(fd: i32) -> Option<Stat>
-    let f: *FsFile = fs_file(fs_current_proc(), fd)
+    let p: *FsProc = fs_current_proc()
+    let f: *FsFile = fs_file(p, fd)
     if f != 0 as *FsFile
         return Some(stat_of_entry((*f).meta, (*f).size))
+    if p != 0 as *FsProc and fs_is_pipe(p, fd)
+        return Some(stat_pipe())
     if fd >= 0 and fd <= 2
         return Some(stat_console())
     None
@@ -413,6 +455,9 @@ pub fn sys_dup(fd: i32) -> i64
 
 pub fn sys_close(fd: i32) -> i64
     let p: *FsProc = fs_current_proc()
+    if p != 0 as *FsProc and fs_is_pipe(p, fd)
+        fs_close_pipe(p, fd)
+        return 0
     if fs_file(p, fd) == 0 as *FsFile
         return Errno.BadF as i64
     fs_close_file(p, fd, CloseBy.Close) as i64
@@ -790,3 +835,140 @@ pub fn fs_sync() -> i32
 # FDs 0, 1, 2 are stdin/stdout/stderr (serial), never filesystem fds.
 pub fn is_fs_fd(fd: i32) -> bool
     fs_file(fs_current_proc(), fd) != 0 as *FsFile
+
+# ============================================================================
+# Pipe fds (AGAST #4955)
+# ============================================================================
+#
+# An fd of FD_KIND_PIPE refers to one end of a pipe (fs/pipe.ritz), kept in
+# FsProc.pipe_ends at the fd's index. pipe(2) makes the two fds, a spawn
+# hands ends to a child's 0-2 (fs_process_give_stdio), and close or exit
+# releases them (fs_close_pipe). The calls here never block: an empty read
+# or a full write is Err(Again), and syscall/runtime/pipe.ritz parks the
+# caller and wakes it. A pipe fd is no file: is_fs_fd is false for it.
+
+# pipe(2)'s two fds: bytes written to `write` are read from `read`.
+pub struct PipeFds
+    read: i32
+    write: i32
+
+# A new pipe as two fds of the current process, the lowest free ones:
+# Err(Srch) with none current, Err(NFile) with the pipe pool or the fd table
+# full, and nothing left behind.
+pub fn fs_pipe_open() -> Result<PipeFds, Errno>
+    let p: *FsProc = fs_current_proc()
+    if p == 0 as *FsProc
+        return Err(Errno.Srch)
+    var pipe: i32 = 0
+    match pipe_create()
+        Ok(n) => pipe = n
+        Err(e) => return Err(e)
+    let rfd: i32 = fd_alloc(@(*p).table)
+    if rfd < 0
+        pipe_release(pipe_reader(pipe))
+        pipe_release(pipe_writer(pipe))
+        return Err(Errno.NFile)
+    let wfd: i32 = fd_alloc(@(*p).table)
+    if wfd < 0
+        fd_free(@(*p).table, rfd)
+        pipe_release(pipe_reader(pipe))
+        pipe_release(pipe_writer(pipe))
+        return Err(Errno.NFile)
+    fs_bind_pipe(p, rfd, pipe_reader(pipe))
+    fs_bind_pipe(p, wfd, pipe_writer(pipe))
+    Ok(PipeFds { read: rfd, write: wfd })
+
+# The pipe end the current process's fd refers to, or None if it is no pipe
+# fd (a file, the console, or not open).
+pub fn fs_pipe_end(fd: i32) -> Option<PipeEnd>
+    fs_pipe_of(fs_current_proc(), fd)
+
+# Whether the current process's fd is a pipe end.
+pub fn is_pipe_fd(fd: i32) -> bool
+    let p: *FsProc = fs_current_proc()
+    p != 0 as *FsProc and fs_is_pipe(p, fd)
+
+# Read from the current process's pipe fd without blocking: fs/pipe.ritz's
+# pipe_read, or Err(BadF) if fd is not a pipe's read end.
+pub fn fs_pipe_read(fd: i32, dst: Span<u8>) -> Result<i64, Errno>
+    match fs_pipe_end(fd)
+        Some(end) => match end.side
+            PipeSide.Read => pipe_read(end.pipe, dst)
+            PipeSide.Write => Err(Errno.BadF)
+        None => Err(Errno.BadF)
+
+# Write to the current process's pipe fd without blocking: fs/pipe.ritz's
+# pipe_write, or Err(BadF) if fd is not a pipe's write end.
+pub fn fs_pipe_write(fd: i32, src: Span<u8>) -> Result<i64, Errno>
+    match fs_pipe_end(fd)
+        Some(end) => match end.side
+            PipeSide.Write => pipe_write(end.pipe, src)
+            PipeSide.Read => Err(Errno.BadF)
+        None => Err(Errno.BadF)
+
+# Where a spawned child's fds 0, 1 and 2 come from: each the parent fd it
+# shares. The spawn_io syscall's record (three i32s, ritzlib.command's
+# SpawnStdio); { 0, 1, 2 } is the parent's own stdio.
+pub struct SpawnStdio
+    stdin: i32
+    stdout: i32
+    stderr: i32
+
+# The map every spawn but spawn_io uses: the child's 0-2 are the parent's.
+pub fn spawn_stdio_inherit() -> SpawnStdio
+    SpawnStdio { stdin: 0, stdout: 1, stderr: 2 }
+
+# The parent fd child fd `n` (0-2) takes under `map`.
+fn spawn_stdio_source(map: SpawnStdio, n: i32) -> i32
+    if n == 0
+        return map.stdin
+    if n == 1
+        return map.stdout
+    map.stderr
+
+# Whether the current process's fd can be a child's stdio: a pipe end, or a
+# console stdio fd. A file is not (its FsFile, position and write buffer
+# belong to one process).
+fn fs_stdio_source_ok(p: *FsProc, fd: i32) -> bool
+    if fs_is_pipe(p, fd)
+        return true
+    let desc: *FileDescriptor = fd_get(@(*p).table, fd)
+    desc != 0 as *FileDescriptor and (*desc).kind == FD_KIND_STDIO
+
+# Give process `child_pid` (just started by fs_process_start, nothing run
+# yet) its fds 0-2 from the current process under `map`: a pipe end is shared
+# (one more fd on it), a console fd leaves the child's console fd. Err(Srch)
+# without a current process or a child table; Err(BadF), and nothing given,
+# if any source is not open or is a file.
+pub fn fs_process_give_stdio(child_pid: u64, map: SpawnStdio) -> Result<(), Errno>
+    let p: *FsProc = fs_current_proc()
+    var c: *FsProc = 0 as *FsProc
+    match fs_proc_of(child_pid)
+        Some(found) => c = found
+        None => return Err(Errno.Srch)
+    if p == 0 as *FsProc
+        return Err(Errno.Srch)
+    var n: i32 = 0
+    while n < 3
+        if not fs_stdio_source_ok(p, spawn_stdio_source(map, n))
+            return Err(Errno.BadF)
+        n = n + 1
+    n = 0
+    while n < 3
+        match fs_pipe_of(p, spawn_stdio_source(map, n))
+            Some(end) =>
+                pipe_hold(end)
+                fs_bind_pipe(c, n, end)
+            None => pass
+        n = n + 1
+    Ok(())
+
+# Process `pid`'s FsProc, or None if it has none.
+fn fs_proc_of(pid: u64) -> Option<*FsProc>
+    var slot: i32 = 0
+    while slot < FS_MAX_PROCS
+        let p: *FsProc = fs_procs[slot]
+        if p != 0 as *FsProc and p.pid == pid
+            return Some(p)
+        slot = slot + 1
+    None
