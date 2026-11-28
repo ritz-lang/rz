@@ -235,12 +235,15 @@ fi
 read -r other_rc _ < <(cached_hello other \
     'cp /rz/projects/ritz/ritz1/build/ritz1_selfhosted /tmp/r1 && printf x >> /tmp/r1 && RITZ1=/tmp/r1 exec rz-builder /src/projects/hello')
 other=$(cas_field other '(s["cas"]["compiled"] > 0, s["test"]["passed"])')
-stores=$(find "$work/cas" -mindepth 1 -maxdepth 1 -name 'ritz1-*' | wc -l)
+# A store is a directory; each keeps a <store>.lock beside it (AGAST #4927),
+# and the old store's lock goes with it.
+stores=$(find "$work/cas" -mindepth 1 -maxdepth 1 -type d -name 'ritz1-*' | wc -l)
+locks=$(find "$work/cas" -mindepth 1 -maxdepth 1 -name 'ritz1-*.lock' | wc -l)
 hello_now=$(find "$work/hello" -type f -print0 | sort -z | xargs -0 sha256sum)
-if [[ $other_rc -eq 0 && $other == "(True, 1)" && $stores -eq 1 && $hello_now == "$hello_before" ]]; then
+if [[ $other_rc -eq 0 && $other == "(True, 1)" && $stores -eq 1 && $locks -eq 1 && $hello_now == "$hello_before" ]]; then
     ok "cache: a changed compiler misses, in a store of its own; the old store is gone"
 else
-    bad "cache: changed compiler rc=$other_rc $other (compiled any, tests), $stores store(s)"
+    bad "cache: changed compiler rc=$other_rc $other (compiled any, tests), $stores store(s), $locks lock(s)"
     sed 's/^/     | /' "$work/other.log" | tail -20
 fi
 # A cache it can't write (huburght's volume before the repo is trusted, or a

@@ -33,7 +33,7 @@
 # for the purpose (AGAST #4857). The store is then
 # $RZ_BUILDER_CACHE/<cache key>, so a run on the same compiler reuses the
 # objects of the last; any other `ritz1-*` store there (an older compiler)
-# is deleted, and after the run the store is trimmed to
+# is deleted unless a concurrent run is in it (AGAST #4927), and after the run the store is trimmed to
 # $RZ_BUILDER_CACHE_MAX_BYTES (default 1536MiB). A CAS key already covers
 # the compiler, clang, the flags and every source in a module's import
 # closure, so a stale object is never reused. Concurrent runs on one store
@@ -156,7 +156,7 @@ if ! mkdir -p "$OUT" || ! touch "$OUT/.write-test"; then
     exit 2
 fi
 rm -f "$OUT/.write-test"
-rm -rf "$OUT/bin" "$OUT/obj" "$OUT/build" "$OUT/summary.json" \
+rm -rf "${OUT:?}/bin" "$OUT/obj" "$OUT/build" "$OUT/summary.json" \
     "$OUT/build.log" "$OUT/test.log" "$OUT/cas-stats.jsonl"
 
 # One fixed path, not mktemp's (AGAST #4857): the workspace has no checkout
@@ -289,6 +289,47 @@ if [[ $(readlink -f "$RITZ1") != $(readlink -f "$chosen") ]]; then
     exit 2
 fi
 export RITZ1
+
+# Runs on one host share a mounted cache (room and train gates, AGAST #4927),
+# each in the store of its own compiler. A run holds <store>.lock shared for
+# its whole life (the fd is inherited by ./rz and everything it starts), and
+# a store is pruned only under that lock taken exclusively without waiting:
+# never while another run is in it.
+hold_store() {  # <store>
+    local lock=$1.lock
+    while :; do
+        exec {STORE_LOCK_FD}>>"$lock"
+        flock -s "$STORE_LOCK_FD"
+        # A pruner unlinks the lock it held. One opened before that guards
+        # nothing: open the path again.
+        [[ /proc/self/fd/$STORE_LOCK_FD -ef $lock ]] && return 0
+        exec {STORE_LOCK_FD}>&-
+    done
+}
+
+# Every other compiler's store (and a lock left without its store), unless a
+# run holds it. A failed removal warns: a stale store never fails a package.
+prune_stores() {  # <cache root> <own key>
+    local root=$1 own=$2 entry old fd
+    for entry in "$root"/ritz1-*; do
+        old=${entry%.lock}
+        [[ $old != "$root/$own" && -e $entry ]] || continue
+        # A store and its lock are one entry: handled at the store.
+        [[ $entry == "$old" || ! -e $old ]] || continue
+        exec {fd}>>"$old.lock"
+        if flock -n -x "$fd"; then
+            if [[ -e $old ]]; then
+                echo "rz-builder: removing $old, the store of another compiler"
+            fi
+            rm -rf "$old" && rm -f "$old.lock" \
+                || echo "rz-builder: could not remove $old; it stays" >&2
+        else
+            echo "rz-builder: keeping $old, the store of a run still in it"
+        fi
+        exec {fd}>&-
+    done
+}
+
 CACHE_ROOT=${RZ_BUILDER_CACHE:-}
 if [[ -n $CACHE_ROOT ]]; then
     if [[ $CACHE_ROOT != /* || ! -d $CACHE_ROOT || ! -w $CACHE_ROOT ]]; then
@@ -299,12 +340,8 @@ if [[ -n $CACHE_ROOT ]]; then
 fi
 if [[ -n $CACHE_ROOT ]]; then
     key=$(cache_key)
-    for old in "$CACHE_ROOT"/ritz1-*; do
-        if [[ -d $old && $old != "$CACHE_ROOT/$key" ]]; then
-            echo "rz-builder: removing $old, the store of another compiler"
-            rm -rf "$old"
-        fi
-    done
+    hold_store "$CACHE_ROOT/$key"
+    prune_stores "$CACHE_ROOT" "$key"
     export RITZ_CACHE_DIR=$CACHE_ROOT/$key
     echo "rz-builder: CAS $RITZ_CACHE_DIR ($(find "$RITZ_CACHE_DIR" -name '*.o' 2>/dev/null | wc -l) objects)"
 else

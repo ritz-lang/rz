@@ -86,7 +86,10 @@ docker run ... -v "$PWD/cas:/cache" -e RZ_BUILDER_CACHE=/cache rz-builder:<tag> 
 
 The store is `/cache/<key>`, where `rz-builder --cache-key` prints the key:
 `ritz1-<first 16 of the dev.ritz.ritz1-selfhosted.sha256 label>-clang-<version>`.
-A new compiler starts an empty store and deletes the other `ritz1-*` ones.
+A new compiler starts an empty store and deletes the other `ritz1-*` ones,
+except a store another run is still in: each run holds `<store>.lock`
+shared for its whole life, and a store is deleted only under that lock
+taken exclusively without waiting (AGAST #4927, gates sharing one host).
 After the run the store is trimmed to `RZ_BUILDER_CACHE_MAX_BYTES` (`cas.py
 gc`; default 1536MiB). Reuse is safe by construction: a CAS key covers the
 compiler, clang, the flags and every source in a module's import closure.

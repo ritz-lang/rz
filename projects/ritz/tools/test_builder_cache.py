@@ -65,13 +65,92 @@ def test_cache_key_names_the_compiler_sha256_and_clang_version(tmp_path):
     assert r.returncode == 0, r.stderr
     sha = hashlib.sha256(b"compiler one").hexdigest()
     assert r.stdout == f"ritz1-{sha[:16]}-clang-21.1.8\n", r.stdout
+    other = _cache_key(tmp_path, b"compiler two").stdout
+    assert other and other != r.stdout
+
+
+# --- concurrent runs on one cache (AGAST #4927) --------------------------------
+
+# The workspace's `./rz`. `build` puts an object in this run's store; with
+# $HOLD set it then waits for $HOLD/go (a neighbour's whole run happens
+# meanwhile) and fails if the object is gone.
+FAKE_RZ = """#!/usr/bin/env bash
+[[ $1 == build ]] || exit 0
+mkdir -p "$RITZ_CACHE_DIR/objects/ab"
+echo obj > "$RITZ_CACHE_DIR/objects/ab/ab.o"
+if [[ -n ${HOLD:-} ]]; then
+    touch "$HOLD/building"
+    for _ in $(seq 300); do [[ -e $HOLD/go ]] && break; sleep 0.1; done
+    [[ -f $RITZ_CACHE_DIR/objects/ab/ab.o ]] || { echo "fake rz: store deleted under me"; exit 1; }
+fi
+"""
+
+
+def _builder_workspace(tmp_path: Path) -> tuple[Path, Path]:
+    """A stand-in for the image's /rz: just enough for the entrypoint to
+    stage a package, find its compiler and run `./rz build`."""
+    root = tmp_path / "rz"
+    ritz = root / "projects" / "ritz"
+    ritz.mkdir(parents=True)
+    (ritz / "build_pipeline.py").write_text(
+        'RITZ1_SELFHOSTED_BIN = "projects/ritz/ritz1/build/ritz1_selfhosted"\n')
+    (ritz / "cas.py").write_text('print("gc: trimmed nothing")\n')
+    (root / "rz").write_text(FAKE_RZ)
+    (root / "rz").chmod(0o755)
+    (root / "rz.toml").write_text("")
+    (root / "projects" / "pkg").mkdir()
+    (root / "projects" / "pkg" / "ritz.toml").write_text('[package]\nname = "pkg"\n')
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "clang").write_text(CLANG_STUB)
+    (bin_dir / "clang").chmod(0o755)
+    return root, bin_dir
+
+
+def _entrypoint(tmp_path: Path, root: Path, bin_dir: Path, cache: Path, name: str,
+                ritz1_bytes: bytes, **env: str) -> subprocess.Popen:
+    run = tmp_path / name
+    (run / "tmp").mkdir(parents=True)
+    ritz1 = run / "ritz1_selfhosted"
+    ritz1.write_bytes(ritz1_bytes)
+    ritz1.chmod(0o755)
+    full_env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", RITZ1=str(ritz1),
+                    RZ_ROOT=str(root), RZ_OUT=str(run / "out"), TMPDIR=str(run / "tmp"),
+                    RZ_BUILDER_CACHE=str(cache), **env)
+    return subprocess.Popen(["bash", str(ENTRYPOINT), "--build-only", "projects/pkg"],
+                            env=full_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True)
 
 
 @pytest.mark.integration
-def test_cache_key_changes_with_the_compiler(tmp_path):
-    a = _cache_key(tmp_path, b"compiler one").stdout
-    b = _cache_key(tmp_path, b"compiler two").stdout
-    assert a and b and a != b
+def test_a_run_never_deletes_the_store_a_concurrent_run_is_using(tmp_path):
+    """Gates on one host share RZ_BUILDER_CACHE. A run on another compiler
+    prunes old stores, but not one a neighbour is building in: #4808's and
+    #4809's gates failed when it did. An idle store of another compiler is
+    still pruned, so the cache keeps one store per compiler in use."""
+    root, bin_dir = _builder_workspace(tmp_path)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "ritz1-0000000000000000-clang-21.1.8" / "objects").mkdir(parents=True)
+    hold = tmp_path / "hold"
+    hold.mkdir()
+    a = _entrypoint(tmp_path, root, bin_dir, cache, "a", b"compiler one", HOLD=str(hold))
+    try:
+        deadline = time.monotonic() + 60
+        while not (hold / "building").exists():
+            assert a.poll() is None, a.communicate()[0]
+            assert time.monotonic() < deadline, "run A never started building"
+            time.sleep(0.05)
+        b = _entrypoint(tmp_path, root, bin_dir, cache, "b", b"compiler two")
+        b_out = b.communicate(timeout=60)[0]
+    finally:
+        (hold / "go").touch()
+        a_out = a.communicate(timeout=60)[0]
+    assert b.returncode == 0, b_out
+    assert a.returncode == 0, a_out
+    stores = sorted(p.name for p in cache.iterdir() if p.is_dir())
+    assert len(stores) == 2 and "ritz1-0000000000000000-clang-21.1.8" not in stores, stores
+    assert sorted(p.name for p in cache.glob("*.lock")) == [f"{s}.lock" for s in stores]
 
 
 # --- summary.py over a shared store -------------------------------------------
