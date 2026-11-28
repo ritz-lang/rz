@@ -200,6 +200,7 @@ pub struct FnLower
     guard: i64          # the stack protector's copy; 0: none
     sret: i64           # the hidden return pointer's slot; 0: none
     scratch: i64        # float/vector constants and unnamed results; 0: none
+    sp_floor: i64       # %rsp after the latest run-time alloca; 0: none
     saved: Vec<i64>     # callee-saved registers an asm block uses
     saved_at: Vec<i64>  # and their slots
     first_label: i64    # block i's label is first_label + i
@@ -216,6 +217,7 @@ pub fn fn_lower(m: @Module, f: Function) -> FnLower
         guard: 0,
         sret: 0,
         scratch: 0,
+        sp_floor: 0,
         saved: vec_new<i64>(),
         saved_at: vec_new<i64>(),
         first_label: 0,
@@ -316,6 +318,36 @@ impl FnLower
                     self.saved.push(r)
                     self.saved_at.push(self.reserve(8, 8))
 
+    # A run-time alloca's block sits below the fixed frame, at most
+    # 16-aligned (the call ABI keeps %rsp there), counted by an integer.
+    fn check_dynamic_alloca(self: @FnLower, inst: @Inst) -> Result<(), Fail>
+        let count: IrValue = self.value(self.operand(inst, 0))
+        if self.m.types.get(self.m.resolve(count.ty)).kind != TypeKind.Int
+            return Err(fail_malformed(inst.line, "alloca count is not an integer"))
+        let sa: SizeAlign = size_align(self.m, inst.ty)
+        let align: i64 = if inst.align > sa.align then inst.align else sa.align
+        if align > 16
+            return Err(fail_unsupported(inst.line, "a run-time alloca aligned past 16"))
+        Ok(())
+
+    # %rsp -= round_up(count * size, 16); the result and the floor the
+    # calls restore are the new %rsp. The count is unsigned (zero-extended).
+    fn lower_dynamic_alloca(self: @FnLower, g: @&Gen, inst: @Inst) -> Result<(), Fail>
+        self.load_scalar(g, RAX, self.operand(inst, 0))?
+        let size: i64 = size_align(self.m, inst.ty).size
+        if size != 1
+            g.constant(RCX, size, 64)?
+            g.op2("imul", OpSize.Quad, r64(RCX), r64(RAX))?
+        let fifteen: Operand = g.imm(15)
+        g.op2("add", OpSize.Quad, fifteen, r64(RAX))?
+        let mask: Operand = g.imm(-16)
+        g.op2("and", OpSize.Quad, mask, r64(RAX))?
+        g.op2("sub", OpSize.Quad, r64(RAX), r64(RSP))?
+        g.store(RSP, RBP, 0 - self.sp_floor, 8)?
+        match self.result_slot(inst)
+            Some(s) => g.store(RSP, RBP, 0 - s.offset, 8)
+            None => Ok(())
+
     # A slot for every parameter and named result.
     fn lay_out(self: @&FnLower) -> Result<(), Fail>
         if self.has(FA_SSPSTRONG)
@@ -339,9 +371,13 @@ impl FnLower
                     let callee: IrValue = self.value(self.operand(@inst, 0))
                     if callee.kind == ValueKind.Asm
                         self.note_asm_registers(callee)
+                if inst.op == Opcode.Alloca and inst.count > 0
+                    self.check_dynamic_alloca(@inst)?
+                    if self.sp_floor == 0
+                        self.sp_floor = self.reserve(8, 8)
                 if inst.name.len == 0
                     continue
-                if inst.op == Opcode.Alloca
+                if inst.op == Opcode.Alloca and inst.count == 0
                     let sa: SizeAlign = size_align(self.m, inst.ty)
                     let align: i64 = if inst.align > sa.align then inst.align else sa.align
                     # %rbp is only 16-aligned: a larger alignment reserves
@@ -621,6 +657,8 @@ impl FnLower
             g.op2("sub", OpSize.Quad, n, r64(RSP))?
         for i in 0..self.saved.len
             g.store(self.saved.get(i), RBP, 0 - self.saved_at.get(i), 8)?
+        if self.sp_floor != 0
+            g.store(RSP, RBP, 0 - self.sp_floor, 8)?
         if self.guard != 0
             g.address(R11, "__stack_chk_guard", 0)?
             g.load(R11, R11, 0, 8)?
@@ -679,7 +717,10 @@ impl FnLower
             Opcode.Ret => self.lower_ret(g, inst)
             Opcode.Br => self.lower_br(g, inst)
             Opcode.Unreachable => g.op0("ud2", OpSize.Unsized)
-            Opcode.Alloca => Ok(())
+            Opcode.Alloca =>
+                if inst.count > 0
+                    return self.lower_dynamic_alloca(g, inst)
+                Ok(())
             Opcode.Phi =>
                 match self.result_slot(inst)
                     Some(s) => g.copy(RBP, 0 - s.offset, RBP, 0 - s.phi_in, type_size(self.m, s.ty))
@@ -1471,11 +1512,14 @@ impl FnLower
         else
             self.load_scalar(g, R11, cvid)?
             g.op1("call", OpSize.Unsized, Operand.Indirect(gpr(R11, OpSize.Quad)))?
-        # %rsp below the frame is always %rbp - frame, whatever the call
-        # did to align it.
+        # %rsp below the frame is %rbp - frame, whatever the call did to
+        # align it, or the latest run-time alloca's floor when there is one.
         if area > 0 or plan.align > 16
-            let f: Operand = g.mem(RBP, 0 - self.frame)
-            g.op2("lea", OpSize.Quad, f, r64(RSP))?
+            if self.sp_floor != 0
+                g.load(RSP, RBP, 0 - self.sp_floor, 8)?
+            else
+                let f: Operand = g.mem(RBP, 0 - self.frame)
+                g.op2("lea", OpSize.Quad, f, r64(RSP))?
         if rp.demoted
             return Ok(())
         # Pop st0 then st1 even for an unused result: the x87 stack is empty

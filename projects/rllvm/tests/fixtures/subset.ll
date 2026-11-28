@@ -148,6 +148,8 @@ entry:
   %slot = alloca i64
   %arr = alloca [4 x i32], align 16
   %rec = alloca %Nest, align 16
+  %dyn = alloca i32, i64 4
+  %dyn16 = alloca i8, i32 3, align 16
   store i64 1, ptr %slot
   store i64 2, ptr %slot, align 8
   %v = load i64, ptr %slot

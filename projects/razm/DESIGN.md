@@ -299,7 +299,7 @@ Typed pointers are the same 64-bit value as `ptr`. The shims spell them `i8*`, `
 
 Terminators: `ret`, `br`, `unreachable`.
 
-Memory: `alloca`, `load`, `store`, `getelementptr`, `load volatile`, `store volatile`, `load atomic` / `store atomic` with `seq_cst` and an explicit alignment, `cmpxchg` with `seq_cst seq_cst`, `atomicrmw` of `xchg`, `add`, `sub`, `and`, `or`, `xor` at `seq_cst`, `fence seq_cst`.
+Memory: `alloca` (an element count may be a run-time value; that block is at most 16-aligned and sits below the fixed frame, and calls after it keep `%rsp` at its floor), `load`, `store`, `getelementptr`, `load volatile`, `store volatile`, `load atomic` / `store atomic` with `seq_cst` and an explicit alignment, `cmpxchg` with `seq_cst seq_cst`, `atomicrmw` of `xchg`, `add`, `sub`, `and`, `or`, `xor` at `seq_cst`, `fence seq_cst`.
 
 Integer, on scalars and on the vector types: `add`, `sub`, `mul`, `udiv`, `sdiv`, `urem`, `srem`, `shl`, `lshr`, `ashr`, `and`, `or`, `xor`. `icmp` with any predicate. `trunc`, `zext`, `sext`.
 
