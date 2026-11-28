@@ -2,11 +2,28 @@
 #
 # Each process has its own capability table that maps handles to
 # kernel objects with associated rights.
+#
+# A table is owned by the CPU its process is on (AGAST #4881,
+# docs/SMP_USER.md §2: proc/table.ritz proc_on_cpu), and only that CPU
+# writes its entries. A grant into a table on another CPU is a CAP_INSERT
+# request (sync/mbox.ritz): the BSP posts it and waits for CAP_INSERT_DONE,
+# and the owner writes the entry at its next safe point (cap_insert_serve).
+# Only the BSP waits on another CPU; every grant into another process's
+# table runs there (CapGrant and the kernel's grants are not SYS_LOCAL), so
+# an AP inserts only into the tables of processes on it. The process cannot
+# move meanwhile: a move to the BSP has to be run there, and a move off it
+# is the BSP's own, and it is busy waiting.
 
 import klog { klog, klog_dec }
 import mm.shm { shm_unmap, shm_forget_pid, shm_retire }
 import driver_abi.wait { EVENT_PEER_CLOSE, EVENT_DRIVER_GONE }
-import proc.waitset { shm_latch_create, shm_latch_drop, waitset_forget_pid }
+import proc.waitset { shm_latch_create, shm_latch_drop, shm_latch_held, waitset_forget_pid }
+import proc.table { PROC_BSP_CPU, proc_on_cpu }
+import sync.mbox { MboxMsg, MBOX_CAP_INSERT, MBOX_CAP_INSERT_DONE, mbox_msg, mbox_post, mbox_wait_reply }
+import arch.x86_64.cpu_map { MAX_CPUS, cpu_map_started }
+# The kernel's is arch/x86_64/percpu.ritz cpu_index (SMP_USER.md §2 "The
+# cpu-index hook").
+extern fn cpu_index() -> i32
 # syscall/runtime/driver.ritz: quiesce the device when its IRQ owner drops
 # its last handle (#4733). Declared, not imported: driver.ritz imports this
 # module.
@@ -158,23 +175,29 @@ pub fn cap_table_get(pid: u32) -> *CapTable
 # Capability Operations
 # ============================================================================
 
-# Insert a new capability into the table
-# Returns a handle to the capability, or invalid handle on failure
-pub fn cap_table_insert(table: *CapTable, cap_type: u8, rights: u32, object_id: u64) -> CapHandle
+# The id of the last CAP_INSERT the BSP sent: a reply carrying another is a
+# late one.
+var cap_insert_id: u64 = 0
+# CAP_INSERTs each CPU has served (the owner's count).
+var cap_inserts_served: [64]u64
+
+# A handle as it travels in a message: index | generation << 32.
+fn handle_pack(h: CapHandle) -> u64
+    (h.index as u64) | ((h.generation as u64) << 32)
+
+fn handle_unpack(packed: u64) -> CapHandle
+    cap_handle_init((packed & 0xFFFFFFFF) as u32, (packed >> 32) as u32)
+
+fn is_invalid(h: CapHandle) -> bool
+    h.index == 0xFFFFFFFF
+
+# Write the entry into `table`'s first free slot, on the CPU that owns it.
+fn table_put(table: *CapTable, cap_type: u8, rights: u32, object_id: u64) -> CapHandle
     if table == 0 as *CapTable
         return cap_handle_invalid()
-
-    # A shm handle comes with its holder's latch for the object, made here
-    # so a notify reaches a peer that has not mapped it (#4727,
-    # RING1_DRIVER.md "Wait and notify"). No latch to be had: no handle.
-    if cap_type == CAP_TYPE_SHM and not shm_latch_create(object_id, (*table).pid as u64)
-        return cap_handle_invalid()
-
-    # Find a free slot
     var i: i32 = 0
     while i < 64
         if (*table).entries[i].cap_type == CAP_TYPE_NONE
-            # Found a free slot
             (*table).entries[i].cap_type = cap_type
             (*table).entries[i].rights = rights
             (*table).entries[i].object_id = object_id
@@ -187,12 +210,65 @@ pub fn cap_table_insert(table: *CapTable, cap_type: u8, rights: u32, object_id: 
 
             return cap_handle_init(i as u32, gen)
         i = i + 1
+    cap_handle_invalid()
 
-    # No free slots; a latch made for this handle goes unless an earlier
-    # handle for the object still holds it
-    if cap_type == CAP_TYPE_SHM and not cap_table_holds_object(table, cap_type, object_id)
-        shm_latch_drop(object_id, (*table).pid as u64)
-    return cap_handle_invalid()
+# CAP_INSERT to `cpu`, the CPU process `pid` is on, and its reply's handle.
+fn insert_remote(cpu: i32, pid: u32, cap_type: u8, rights: u32, object_id: u64) -> CapHandle
+    cap_insert_id = cap_insert_id + 1
+    var req: MboxMsg = mbox_msg(MBOX_CAP_INSERT)
+    req.pid = pid as u64
+    req.arg[0] = cap_insert_id
+    req.arg[1] = cap_type as u64
+    req.arg[2] = rights as u64
+    req.arg[3] = object_id
+    mbox_post(cpu, req)
+    handle_unpack(mbox_wait_reply(MBOX_CAP_INSERT_DONE, cpu, cap_insert_id).arg[1])
+
+# sync/mbox.ritz's handler for CAP_INSERT, on the CPU process `pid` is on
+# (its `extern` hook): the entry alone. The BSP made the shm latch before it
+# asked. The packed handle, index 0xFFFFFFFF when refused.
+pub fn cap_insert_serve(pid: u64, cap_type: u32, rights: u32, object_id: u64) -> u64
+    let me: i32 = cpu_index()
+    if me >= 0 and me < MAX_CPUS
+        cap_inserts_served[me] = cap_inserts_served[me] + 1
+    handle_pack(table_put(cap_table_get(pid as u32), cap_type as u8, rights, object_id))
+
+# CAP_INSERTs CPU `cpu` has served (the smp-user boot test).
+pub fn cap_inserts_served_count(cpu: i32) -> u64
+    if cpu < 0 or cpu >= MAX_CPUS
+        return 0
+    cap_inserts_served[cpu]
+
+# Insert a new capability into the table, on the CPU that owns it: here, or
+# a CAP_INSERT to the CPU its process is on. Returns a handle to the
+# capability, or invalid handle on failure (the table is full, or an AP
+# asked for a table on another CPU, which only the BSP may do).
+pub fn cap_table_insert(table: *CapTable, cap_type: u8, rights: u32, object_id: u64) -> CapHandle
+    if table == 0 as *CapTable
+        return cap_handle_invalid()
+    let pid: u32 = (*table).pid
+
+    # A shm handle comes with its holder's latch for the object, made here
+    # so a notify reaches a peer that has not mapped it (#4727,
+    # RING1_DRIVER.md "Wait and notify"). No latch to be had: no handle.
+    # The latch is the BSP's row, made before the owner writes the entry.
+    let had_latch: bool = cap_type == CAP_TYPE_SHM and shm_latch_held(object_id, pid as u64)
+    if cap_type == CAP_TYPE_SHM and not shm_latch_create(object_id, pid as u64)
+        return cap_handle_invalid()
+
+    let me: i32 = cpu_index()
+    let owner: i32 = proc_on_cpu(pid as u64)
+    var h: CapHandle = cap_handle_invalid()
+    if owner == me or cpu_map_started(owner) == 0
+        h = table_put(table, cap_type, rights, object_id)
+    else if me == PROC_BSP_CPU
+        h = insert_remote(owner, pid, cap_type, rights, object_id)
+
+    # Refused: a latch made for this handle goes, unless an earlier handle
+    # for the object holds it
+    if is_invalid(h) and cap_type == CAP_TYPE_SHM and not had_latch
+        shm_latch_drop(object_id, pid as u64)
+    h
 
 # Look up a capability by handle
 # Returns pointer to entry or null if invalid
@@ -509,17 +585,15 @@ pub fn cap_kernel_grant(pid: u32, cap_type: u8, rights: u32, object_id: u64) -> 
         return cap_handle_invalid()
     if cap_type == CAP_TYPE_IRQ
         if irq_owner_slot(object_id) < 0
-            # A new owner: claim only once the handle is in, so a full
-            # table leaves no owner behind
-            let h: CapHandle = cap_table_insert(table, cap_type, rights, object_id)
-            let idx: u32 = h.index
-            let gen: u32 = h.generation
-            if idx == 0xFFFFFFFF
-                return cap_handle_invalid()
+            # A new owner: claimed first, and released if the insert is
+            # refused, so a full table leaves no owner behind and nothing
+            # is ever removed from a table on another CPU
             if not irq_owner_claim(object_id, pid)
-                cap_table_remove(table, cap_handle_init(idx, gen))
                 return cap_handle_invalid()
-            return cap_handle_init(idx, gen)
+            let h: CapHandle = cap_table_insert(table, cap_type, rights, object_id)
+            if is_invalid(h)
+                irq_owner_release(object_id, pid)
+            return h
         if cap_irq_owner(object_id) != pid
             return cap_handle_invalid()
     return cap_table_insert(table, cap_type, rights, object_id)

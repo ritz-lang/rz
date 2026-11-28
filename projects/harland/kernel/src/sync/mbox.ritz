@@ -13,8 +13,8 @@
 # published it, `t + 16` once the owner took it (the next lap's free value).
 # Order is FIFO by ticket, so FIFO per producer.
 #
-# Never full, by construction: only the BSP sends requests, one at a time
-# to each CPU (the boot ping keeps at most PING_WINDOW in flight; a
+# Never full, by construction: only the BSP sends requests (CAP_INSERT
+# included), one at a time to each CPU (the boot ping keeps at most PING_WINDOW in flight; a
 # KERNEL_INVLPG goes to every CPU at once, one each), and each process will
 # have at most one FORWARD or RETURN in flight (#4881). A producer that finds
 # its slot taken logs `[mbox] full` and waits: an assertion, not a path.
@@ -49,6 +49,10 @@ extern fn ap_call_run(kind: u32) -> i32
 # mm/tlb.ritz: serve an UNMAP or KERNEL_INVLPG on this CPU (the owner);
 # the reply's arg[1].
 extern fn tlb_serve(kind: u32, pml4: u64, vaddr: u64, pages: u64, mode: u64) -> u64
+# cap/table.ritz: write a capability into process `pid`'s table, which this
+# CPU owns (the process is on it); the packed handle, index 0xFFFFFFFF when
+# refused.
+extern fn cap_insert_serve(pid: u64, cap_type: u32, rights: u32, object_id: u64) -> u64
 
 # The kick IPI's vector (kernel/isr_stubs.s IRQ_STUB 48, 240; idt.ritz).
 # #4220's AP-call IPI, generalised: every mailbox post sends it.
@@ -76,7 +80,12 @@ pub const MBOX_KERNEL_INVLPG_DONE: u32 = 8   # arg[0] the request id
 # No reply.
 pub const MBOX_FORWARD: u32 = 9
 pub const MBOX_RETURN: u32 = 10
-# Reserved for #4881's grants into a table on another CPU: CAP_INSERT.
+# A grant into the table of process `pid`, which is on the receiver
+# (SMP_USER.md §2, AGAST #4881: cap/table.ritz cap_table_insert): cap type
+# arg[1], rights arg[2], object id arg[3]. The receiver, the table's owner,
+# writes the entry; reply CAP_INSERT_DONE with the packed handle in arg[1].
+pub const MBOX_CAP_INSERT: u32 = 11
+pub const MBOX_CAP_INSERT_DONE: u32 = 12    # arg[0] the request id, arg[1] the handle
 
 # A message body: 56 bytes, so with `seq` a slot is one 64-byte line.
 pub struct MboxMsg
@@ -246,6 +255,51 @@ pub fn mbox_moves_in_count(cpu: i32) -> u64
         return 0
     mbox_moves_in[cpu]
 
+# A FORWARD or RETURN taken: the move is published already, so this CPU's
+# next pick runs the process. Counted on this CPU.
+fn count_move()
+    let me: i32 = cpu_index()
+    mbox_moves_in[me] = mbox_moves_in[me] + 1
+
+# A message a reply wait took that is not its reply: a FORWARD or RETURN is
+# the move it is (a process forwarded to this CPU while it waited), anything
+# else a stray.
+pub fn mbox_set_aside(msg: MboxMsg)
+    if msg.kind == MBOX_FORWARD or msg.kind == MBOX_RETURN
+        count_move()
+    else
+        mbox_drop_stray(msg)
+
+# Spins of mbox_wait_reply before its one log line (several seconds).
+const WAIT_SLOW_SPINS: u64 = 0x40000000
+
+# Wait on this CPU's mailbox for the `kind` reply from CPU `from` to request
+# `id`, as long as it takes: the BSP's wait for an owner that serves its
+# mailbox at every safe point (SMP_USER.md §2 "No deadlock"). Other
+# messages are set aside (mbox_set_aside); a `kind` reply to another
+# request is a late one, dropped. Logs once if the owner is slow.
+pub fn mbox_wait_reply(kind: u32, from: i32, id: u64) -> MboxMsg
+    let me: i32 = cpu_index()
+    var spins: u64 = 0
+    while true
+        match mbox_take(me)
+            Some(m) =>
+                if m.kind == kind and m.from as i32 == from and m.arg[0] == id
+                    return m
+                if m.kind == kind
+                    mbox_drop_stray(m)
+                else
+                    mbox_set_aside(m)
+            None =>
+                spins = spins + 1
+                if spins == WAIT_SLOW_SPINS
+                    klog("[mbox] still waiting for a reply: kind ")
+                    klog_dec(kind as i64)
+                    klog(" from cpu ")
+                    klog_dec(from as i64)
+                    klog("\n")
+                cpu_pause()
+
 # Handle one message on its owner. Short and never blocking.
 fn mbox_handle(msg: MboxMsg)
     if msg.kind == MBOX_CALL
@@ -268,10 +322,14 @@ fn mbox_handle(msg: MboxMsg)
         done.arg[0] = msg.arg[0]
         done.arg[1] = tlb_serve(msg.kind, msg.arg[1], msg.arg[2], msg.arg[3], msg.arg[4])
         mbox_post(msg.from as i32, done)
+    else if msg.kind == MBOX_CAP_INSERT
+        var done: MboxMsg = mbox_msg(MBOX_CAP_INSERT_DONE)
+        done.pid = msg.pid
+        done.arg[0] = msg.arg[0]
+        done.arg[1] = cap_insert_serve(msg.pid, msg.arg[1] as u32, msg.arg[2] as u32, msg.arg[3])
+        mbox_post(msg.from as i32, done)
     else if msg.kind == MBOX_FORWARD or msg.kind == MBOX_RETURN
-        # The move is published already: this CPU's next pick runs it.
-        let me: i32 = cpu_index()
-        mbox_moves_in[me] = mbox_moves_in[me] + 1
+        count_move()
     else
         # CALL_DONE, PONG, UNMAP_DONE and KERNEL_INVLPG_DONE are taken by
         # their waiter (apcall.ritz, mm/tlb.ritz); one that reaches the
