@@ -257,8 +257,18 @@ pub fn main() -> i32
 """, 39),
 }
 
-RUNS = {**LITERAL_MEMBER, **ROW_STORE, **USER_SPAN}
-assert len(RUNS) == len(LITERAL_MEMBER) + len(ROW_STORE) + len(USER_SPAN)
+# ---- a last line with no trailing newline (was #4932) ---------------------
+#
+# ritz1's lexer closed the open blocks at EOF straight after the last token,
+# with no NEWLINE first, so it refused this as "unexpected dedent".  The
+# batcher compiles a row with no final newline alone (merge re-ends it).
+
+EOF_NEWLINE = {
+    "no_trailing_newline": ("fn main() -> i32\n    let x: i32 = 1\n    x", 1),
+}
+
+RUNS = {**LITERAL_MEMBER, **ROW_STORE, **USER_SPAN, **EOF_NEWLINE}
+assert len(RUNS) == len(LITERAL_MEMBER) + len(ROW_STORE) + len(USER_SPAN) + len(EOF_NEWLINE)
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

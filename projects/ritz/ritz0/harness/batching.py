@@ -168,7 +168,11 @@ def _rename(text: str, names: dict) -> str:
 def merge(programs: list) -> Merged:
     """One program answering for every row of `programs` (see the module doc)."""
     rows = [_split(p) for p in programs]
-    ok = [sum(it.kind == "main" for it in items) == 1 for items in rows]
+    # A row whose last line has no newline is compiled alone: the merge
+    # re-ends every item with one, so a batch would test another program
+    # (AGAST #4932: ritz1 refused exactly such files).
+    ok = [sum(it.kind == "main" for it in items) == 1 and p.endswith("\n")
+          for items, p in zip(rows, programs)]
     rows = [items if good else [] for items, good in zip(rows, ok)]
 
     def defs(it):

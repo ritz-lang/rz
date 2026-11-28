@@ -156,6 +156,17 @@ for _label, _table in (("value", ELSE.VALUE_POSITIONS), ("operand", ELSE.OPERAND
         )
 
 
+# AGAST #4932: a source whose last line has no trailing newline.  ritz1's
+# lexer closed the open blocks at EOF with no NEWLINE first, so the statement
+# parser met a DEDENT where it wanted end-of-line and refused the file as an
+# "unexpected dedent" parse error, never reaching ritz0's rule.
+CORPUS["eof/no_trailing_newline"] = Row(
+    program="fn main()\n  a or\n  b",
+    message="Unknown identifier: a",
+    at=(2, 3),
+)
+
+
 def _first_diagnostic(output: str) -> tuple[int, int] | None:
     match = POSITION_RE.search(output)
     return (int(match.group(1)), int(match.group(2))) if match else None

@@ -98,11 +98,14 @@ def test_imports_are_hoisted_once():
 
 
 @pytest.mark.unit
-def test_a_row_with_no_plain_main_is_left_out():
-    rows = [_row("fn f() -> i32\n    3\n"), "pub fn main(args: Span<StrView>) -> i32\n    0\n"]
+def test_a_row_with_no_plain_main_or_no_final_newline_is_left_out():
+    # A row with no final newline is another program once merged (each item
+    # is re-ended with one), so it compiles alone (AGAST #4932).
+    rows = [_row("fn f() -> i32\n    3\n"), "pub fn main(args: Span<StrView>) -> i32\n    0\n",
+            _row("fn f() -> i32\n    3\n", entry="    f()")]
     m = batching.merge(rows)
-    assert m.ok == [True, False]
-    assert "__row1" not in m.text
+    assert m.ok == [True, False, False]
+    assert "__row1" not in m.text and "__row2" not in m.text
 
 
 @pytest.mark.unit
