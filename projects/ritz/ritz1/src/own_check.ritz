@@ -192,10 +192,7 @@ struct OcState
     saved_count: i32
     saved_cap: i32
     body_pending: i32    # the kind the next statement list is (OC_BLOCK_*), or 0
-    # The buffered diagnostics (own_check_flush) and how many.
-    out: *u8
-    out_len: i64
-    out_cap: i64
+    # How many diagnostics oc_out holds (own_check_flush).
     errors: i32
     # AGAST #4844: the instance whose instantiation notes the last error
     # still owes (oc_note_flush), or null.
@@ -351,39 +348,24 @@ fn oc_block_pop(o: *OcState) -> i32
 
 # --- Diagnostics (buffered) ----------------------------------------------------------
 
-fn oc_put(p: *u8, n: i64)
-    let o: *OcState = oc()
-    if n <= 0
-        return
-    if o.out_len + n > o.out_cap
-        var cap: i64 = o.out_cap * 2
-        if cap < 256
-            cap = 256
-        while cap < o.out_len + n
-            cap = cap * 2
-        o.out = realloc(o.out, cap)
-        o.out_cap = cap
-    memcpy(o.out + o.out_len, p, n)
-    o.out_len = o.out_len + n
+# The buffered diagnostics, printed by own_check_flush.  A String has Drop,
+# and a module-level value of a Drop type is refused (OcState is one), so it
+# lives behind a pointer, made once and kept for the compile.
+var g_oc_out: *String = null
+
+fn oc_out() -> *String
+    if g_oc_out == null
+        g_oc_out = heap string_new()
+    g_oc_out
 
 fn oc_puts(s: StrView)
-    oc_put(s.ptr, s.len)
-
-fn oc_put_bytes(p: *u8, n: i32)
-    oc_put(p, n as i64)
+    oc_out().push_str(s)
 
 fn oc_put_char(c: u8)
-    var b: u8 = c
-    oc_put(@b, 1)
+    oc_out().push(c)
 
 fn oc_put_int(n: i32)
-    if n < 0
-        oc_put_char('-')
-        oc_put_int(0 - n)
-        return
-    if n >= 10
-        oc_put_int(n / 10)
-    oc_put_char(('0' as i32 + n % 10) as u8)
+    oc_out().push_i64(n as i64)
 
 # `<file>:<line>:<col>` as diag_loc prints it: the file the fn is written in
 # (an instance of an imported generic has its lines in that module, AGAST
@@ -415,11 +397,8 @@ fn oc_note_flush()
     let o: *OcState = oc()
     if o.note_fn == null
         return
-    var m: String = string_new()
-    diag_inst_notes_into(@&m, o.note_fn)
+    diag_inst_notes_into(oc_out(), o.note_fn)
     o.note_fn = null
-    let v: StrView = m.as_view()
-    oc_put(v.ptr, v.len)
 
 # --- Move-only types ------------------------------------------------------------------
 
@@ -851,12 +830,11 @@ fn oc_put_path(e: *Expr)
         _ => pass
 
 fn oc_error_move_from_drop(sm: *Sema, line: i32, col: i32, e: *Expr, tname_sv: StrView)
-    var tname: *u8 = tname_sv.ptr
     oc_error_at(sm, line, col)
     oc_puts("cannot move out of `")
     oc_put_path(e)
     oc_puts("`: `")
-    oc_put_bytes(tname, own_base_len(tname_sv))
+    oc_puts(tname_sv.take(own_base_len(tname_sv) as i64))
     oc_puts("` implements Drop\n")
 
 # 1 the first time this place is reported: a deferred statement is checked at
@@ -3528,7 +3506,7 @@ pub fn own_check_flush(sm: *Sema)
     oc_note_flush()   # AGAST #4844
     let o: *OcState = oc()
     if sm.error_count == 0 and o.errors > 0
-        sys_write(STDERR, o.out, o.out_len)
+        eprints(oc_out().as_view())
         sm.error_count = sm.error_count + o.errors
-    o.out_len = 0
+    oc_out().clear()
     o.errors = 0

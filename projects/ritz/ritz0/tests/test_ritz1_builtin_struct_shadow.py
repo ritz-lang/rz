@@ -497,7 +497,9 @@ def test_ritz1_builds_no_hardcoded_struct_layouts():
     for path in sorted(RITZ1_SRC.rglob("*.ritz")):
         src = path.read_text()
         rel = path.relative_to(RITZ1_SRC).as_posix()
-        for m in re.finditer(r"sizeof\(StructDef\)", src):
+        # `sizeof(StructDef)`, or a typed allocator's `parser_new<StructDef>`
+        # / `al_new<StructDef>` (AGAST #4924).
+        for m in re.finditer(r"sizeof\(StructDef\)|\b(?:parser|al)_new(?:_n)?<StructDef>", src):
             fn = _enclosing_fn(src, m.start())
             assert fn is not None, f"{rel}: StructDef allocated outside a function"
             found[(rel, fn)] = found.get((rel, fn), 0) + 1

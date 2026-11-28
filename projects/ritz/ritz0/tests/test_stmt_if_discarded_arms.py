@@ -36,6 +36,10 @@ fn mk(out: @&i32) -> V
 fn side(out: @&i32)
     *out = *out + 1
 
+fn flip(out: @&i32) -> bool
+    *out = *out + 10
+    true
+
 """
 
 # The if/else is a procedure's tail.
@@ -57,7 +61,9 @@ fn run(flag: i32, out: @&i32)
     *out = *out + 100
 """
 
-# A nested else-if chain, struct arm first, as the tail.
+# A nested else-if chain, struct arm first, as the tail.  AGAST #4924: its
+# inner if/else ends in a bool-valued call (`s.push(c)` on a String) beside a
+# unit call's dummy i32, which ritz0 refused as "bool as an integer".
 NESTED = """\
 fn run(flag: i32, out: @&i32)
     if flag == 0
@@ -65,7 +71,7 @@ fn run(flag: i32, out: @&i32)
     else if flag == 1
         side(out)
     else
-        mk(out)
+        flip(out)
 """
 
 # AGAST #4450: the tail else ends in a statement match, which has no value.

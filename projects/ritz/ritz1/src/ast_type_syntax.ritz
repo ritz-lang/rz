@@ -15,6 +15,7 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.cstr
 import ritzlib.strview    # strview_eq (was the local buf_eq)
+import ritzlib.fmt.digits  # fmt_i64_into: tuple and array spellings (AGAST #4924)
 import ast_expr_syntax   # AGAST #1818: split out of this file
 
 pub fn gated_decl_log(ctx: *ParseCtx, name_sv: StrView)
@@ -95,7 +96,7 @@ pub fn module_add_struct(m: *Module, s: *StructDef)
         curr.next = s
 
 pub fn struct_def_new(p: *Parser, name_sv: StrView, fields: *StructField, line: i32, col: i32) -> *StructDef
-    let s: *StructDef = parser_alloc(p, sizeof(StructDef)) as *StructDef
+    let s: *StructDef = parser_new<StructDef>(p)
     s.name = name_sv
     s.fields = fields
     s.next = null
@@ -122,7 +123,7 @@ pub fn ref_field_ptr_ptr_slot(p: *Parser, tr: *TypeRef) -> i32
 pub fn field_new(p: *Parser, name: StrView, tr: *TypeRef, line: i32, col: i32) -> *StructField
     let facts: *TypeFacts = type_facts(p, tr)
     let ty: TypeKind = facts.kind
-    let f: *StructField = parser_alloc(p, sizeof(StructField)) as *StructField
+    let f: *StructField = parser_new<StructField>(p)
     f.field_mut_ref = 0
     f.field_shared_ref = 0
     # AGAST #2097: an N-D field keeps its shape.
@@ -236,7 +237,7 @@ pub fn tr_var_inner_pointee(tr: *TypeRef) -> i32
 pub fn tn_claim(p: *Parser, inner: *TypeParam, f: *FnDef)
     if p.ctx.tn_pending == null
         return
-    let s: *TnScope = parser_alloc(p, sizeof(TnScope)) as *TnScope
+    let s: *TnScope = parser_new<TnScope>(p)
     s.inner = inner
     s.outer = null
     s.notes = p.ctx.tn_pending
@@ -320,7 +321,7 @@ fn pop_var_latch(p: *Parser, line: i32, col: i32)
 # Its line / col are the type's `fn` token (AGAST #3690): a call through it
 # that can't be lowered is refused there.
 pub fn type_fn(p: *Parser, params: *Param, ret: *TypeRef, line: i32, col: i32) -> *TypeRef
-    let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    let f: *FnDef = parser_new<FnDef>(p)
     # AGAST #4324: the return side as capture_fn_return_type records it for a
     # named fn, from the same state (the return type_spec is the last thing
     # parsed).  Without these a slot `fn(..) -> *T` / `-> @T` / `-> [N]T` could
@@ -592,7 +593,7 @@ pub fn fn_async(p: *Parser, f: *FnDef, col: i32) -> *FnDef
 # Grammar action for `await e` (AGAST #1456): an ExprKind.Await node, which
 # async_lower.ritz lowers (AGAST #3814).
 pub fn expr_await(p: *Parser, operand: *Expr, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.Await
     e.span.line = line
     e.span.col = col
@@ -1221,7 +1222,7 @@ fn ref_as_pointer(p: *Parser, inner: *TypeRef) -> *TypeRef
 # Called from grammar rules first_generic_type_arg / first_generic_type_arg_shr
 # right after the argument's type_spec parses, while last_type_name is fresh.
 pub fn capture_first_generic_arg(p: *Parser, tr: *TypeRef) -> *GenericArg
-    let ga: *GenericArg = parser_alloc(p, sizeof(GenericArg)) as *GenericArg
+    let ga: *GenericArg = parser_new<GenericArg>(p)
     let ty: TypeKind = tr_kind(tr)
     let facts: *TypeFacts = type_facts(p, tr)
     ga.ty = ty
@@ -1389,32 +1390,16 @@ fn spell_last_array(p: *Parser, tr: *TypeRef) -> StrView
     var c: ParserChain = parser_chain_new(p, (elem_len + 14 * dims + 5) as i64)
     for d in 0..dims
         parser_chain_push(p, c, "arr")
-        parser_chain_ensure(p, c, 11)  # up to 10 digits + "_"
+        var digits: [20]u8
         if sh != null
-            c.len = c.len + write_dec_i32(c.buf + c.len, sh.dims[d])
+            parser_chain_push(p, c, fmt_i64_into(@digits, sh.dims[d] as i64))
         else
-            c.len = c.len + write_dec_i32(c.buf + c.len, facts.array_size)
+            parser_chain_push(p, c, fmt_i64_into(@digits, facts.array_size as i64))
         parser_chain_push_byte(p, c, 95)  # '_'
     if ptr == 1
         parser_chain_push(p, c, "ptr_")
     parser_chain_push(p, c, StrView { ptr: (elem), len: (elem_len) as i64 })
     return parser_chain_view(p, c)
-
-# The decimal digits of n >= 0 at buf; returns how many.
-pub fn write_dec_i32(buf: *u8, n: i32) -> i32
-    var digits: [10]u8
-    var count: i32 = 0
-    var v: i32 = n
-    if v <= 0
-        *buf = 48  # '0'
-        return 1
-    while v > 0
-        digits[count] = (48 + v % 10) as u8
-        v = v / 10
-        count = count + 1
-    for i in 0..count
-        *(buf + i) = digits[count - 1 - i]
-    return count
 
 # Prepend one captured argument to the (possibly null) list of those after it.
 pub fn link_generic_arg(first: *GenericArg, rest: *GenericArg) -> *GenericArg
@@ -1478,7 +1463,7 @@ pub fn type_slice(p: *Parser, elem: *GenericArg) -> *TypeRef
 # Called from grammar rule tuple_type_elem with the element's parsed
 # *TypeRef (AGAST #4035: the type is the chain, not parser side state).
 pub fn tuple_elem_new(p: *Parser, tr: *TypeRef) -> *TupleElem
-    let te: *TupleElem = parser_alloc(p, sizeof(TupleElem)) as *TupleElem
+    let te: *TupleElem = parser_new<TupleElem>(p)
     te.field = field_new(p, strview_empty(), tr, parse_pos_line(p), parse_pos_col(p))
     te.ga = capture_first_generic_arg(p, tr)
     te.next = null
@@ -1496,14 +1481,9 @@ pub fn tuple_regs_reset(ctx: *ParseCtx)
     ctx.tuple_regs = null
 
 # The decimal spelling of element index i ("0", "1", ...), arena-allocated.
-# sign + 10 digits of an i32 + NUL (AGAST #1820: no magic alloc sizes).
-const I32_DEC_BUF: i64 = 12
-
 fn tuple_index_name(p: *Parser, i: i32) -> StrView
-    let buf: *u8 = parser_alloc(p, I32_DEC_BUF)
-    let n: i32 = write_dec_i32(buf, i)
-    *(buf + n) = 0
-    return StrView { ptr: (buf), len: (n) as i64 }
+    var digits: [20]u8
+    parser_join2(p, fmt_i64_into(@digits, i as i64), "")
 
 # The registered tuple spelled (name, len), or null.
 pub fn tuple_reg_lookup(ctx: *ParseCtx, name_sv: StrView) -> *TupleReg
@@ -1547,7 +1527,7 @@ pub fn type_tuple(p: *Parser, elems: *TupleElem) -> *TypeRef
     while cur != null
         total = total + 1 + (generic_arg_spelling(cur.ga).len as i32)
         cur = cur.next
-    let name: *u8 = parser_alloc(p, (total + 1) as i64)
+    let name: *u8 = parser_new_n<u8>(p, (total + 1) as i64)
     let tuple_lit: StrView = "tuple"
     memcpy(name, tuple_lit.ptr, tuple_lit.len)
     var pos: i32 = 5
@@ -1580,7 +1560,7 @@ pub fn type_tuple(p: *Parser, elems: *TupleElem) -> *TypeRef
             cur = cur.next
         let st: *StructDef = struct_def_new(p, name_sv, fields, 0, 0)
         module_add_struct(p.module, st)
-        let r: *TupleReg = parser_alloc(p, sizeof(TupleReg)) as *TupleReg
+        let r: *TupleReg = parser_new<TupleReg>(p)
         r.def = st
         r.fresh = 1
         r.elems = elems
@@ -1611,7 +1591,7 @@ pub fn tuple_lit(p: *Parser, first: *Expr, rest: *Expr, line: i32, col: i32) -> 
         last = fi
         i = i + 1
         cur = nxt
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.StructLit
     e.span.line = line
     e.span.col = col
@@ -1802,9 +1782,6 @@ fn tuple_split_let(ctx: *ParseCtx, s: *Stmt, which: i32, init: *Expr) -> *Stmt
         d.name_span = t.span
     d
 
-# "$tk" + up to 10 digits of an i32 counter + NUL (AGAST #1820).
-const TUPLE_SPLIT_NAME_BUF: i64 = 16
-
 # Rewrite StmtKind.TupleDecl `s` in place into the `let`s above, when its init
 # is a tuple literal or a splittable if / match of them.
 fn tuple_split_decl(ctx: *ParseCtx, s: *Stmt)
@@ -1828,16 +1805,12 @@ fn tuple_split_decl(ctx: *ParseCtx, s: *Stmt)
             last = d
             j = j + 1
     else
-        let leaves: **Expr = parser_alloc(ctx.tuple_p, (n as i64) * 8) as **Expr
+        let leaves: **Expr = parser_new_n<*Expr>(ctx.tuple_p, n as i64)
         var idx: i32 = 0
         let tree: *Expr = tuple_split_index(ctx, init, leaves, @idx, names)
         # "$tk<N>": no source name can collide with it.
-        let k: *u8 = parser_alloc(ctx.tuple_p, TUPLE_SPLIT_NAME_BUF)
-        let tk_lit: StrView = "$tk"
-        memcpy(k, tk_lit.ptr, tk_lit.len)
-        let k_len: i32 = 3 + write_dec_i32(k + 3, ctx.tuple_split_n)
-        *(k + k_len) = 0
-        let k_sv: StrView = StrView { ptr: k, len: k_len as i64 }
+        var digits: [20]u8
+        let k_sv: StrView = parser_join2(ctx.tuple_p, "$tk", fmt_i64_into(@digits, ctx.tuple_split_n as i64))
         ctx.tuple_split_n = ctx.tuple_split_n + 1
         first = stmt_let_decl(ctx.tuple_p, k_sv, 0, tree, s.span.line, s.span.col)
         last = first
@@ -2016,7 +1989,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     let ty: TypeKind = tr_kind(tr)
     let facts: *TypeFacts = type_facts(p, tr)
     note_pass_binding(p.ctx, name_sv)   # AGAST #3320
-    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    let s: *Stmt = parser_new<Stmt>(p)
     s.kind = StmtKind.VarDecl
     s.var_is_let = 0
     s.name_span.line = 0   # AGAST #2407: stmt_named sets it

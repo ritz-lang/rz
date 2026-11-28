@@ -21,6 +21,7 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.memory
 import ritzlib.str
+import ritzlib.string  # si_shown builds the spelling in a String (AGAST #4924)
 
 import ast
 import diag          # the error prefix (AGAST #3445)
@@ -124,55 +125,48 @@ pub fn si_is_struct(m: *Module, name: StrView) -> i32
         st = st.next
     0
 
-# Copy the type at `*pos` of the mangled `name` into `out` (at `*at`) as the
-# source spells it.  0 when the arities can't account for the name.
-fn si_show_take(m: *Module, name: StrView, pos: *i32, out: *u8, at: *i32) -> i32
-    let start: i32 = *pos
+# Append the type at `pos` of the mangled `name` to `out` as the source
+# spells it.  False when the arities can't account for the name.
+fn si_show_take(m: *Module, name: StrView, pos:& i32, out:& String) -> bool
+    let start: i32 = pos
     var end: i32 = start
     while end < name.len and name.get(end) != '$'
         end += 1
     if end == start
-        return 0
-    memcpy(out + *at, name.ptr + start, (end - start) as i64)
-    *at = *at + end - start
-    *pos = end
-    let n: i32 = si_arity(m, name.skip(start).take(end - start))
+        return false
+    let head: StrView = name.skip(start).take(end - start)
+    out.push_str(head)
+    pos = end
+    let n: i32 = si_arity(m, head)
     if n == 0
-        return 1
-    *(out + *at) = '<'
-    *at = *at + 1
+        return true
+    out.push('<')
     var k: i32 = 0
     while k < n
-        if *pos >= name.len
-            return 0
-        *pos = *pos + 1   # the `$`
+        if pos >= name.len
+            return false
+        pos = pos + 1   # the `$`
         if k > 0
-            *(out + *at) = ','
-            *(out + *at + 1) = ' '
-            *at = *at + 2
-        if si_show_take(m, name, pos, out, at) == 0
-            return 0
+            out.push_str(", ")
+        if not si_show_take(m, name, pos, out)
+            return false
         k += 1
-    *(out + *at) = '>'
-    *at = *at + 1
-    1
+    out.push('>')
+    true
 
 # A monomorphised type name as the source spells it: `Pair$i64` is
 # `Pair<i64>`, `Pair$i64$i32` `Pair<i64, i32>` (ritz0: deref_rules.display,
-# AGAST #2847).  Any other name is itself.
+# AGAST #2847).  Any other name is itself.  A spelled one is a fresh,
+# NUL-terminated buffer kept for the compile.
 pub fn si_shown(m: *Module, name_sv: StrView) -> StrView
-    var len: i32 = name_sv.len as i32
+    let len: i32 = name_sv.len as i32
     if si_head_len(name_sv) == len
         return name_sv
-    # Each `$` becomes at most `, ` and the closing `>`: three bytes.
-    let out: *u8 = malloc((len * 3 + 1) as i64)
+    var out: String = string_new()
     var pos: i32 = 0
-    var at: i32 = 0
-    if si_show_take(m, name_sv, @pos, out, @at) == 0 or pos != len
-        free(out)
+    if not si_show_take(m, name_sv, pos, out) or pos != len
         return name_sv
-    *(out + at) = 0
-    StrView { ptr: (out), len: (at) as i64 }
+    out.into_view()
 
 # `Vec$T`, `Span$T` and `String` index as the language says (§7.8).
 pub fn si_built_in(name_sv: StrView) -> i32

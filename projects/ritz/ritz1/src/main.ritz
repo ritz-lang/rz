@@ -241,7 +241,6 @@ fn add_enum_from_fns(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
     let gen_len: i64 = text.len()
     if gen_len == 0
         return 0
-    let gen: *u8 = text.as_ptr()
     var tokens: Vec<Token> = vec_with_cap<Token>(1024)
     if tokenize(ctx, path, text.as_view(), @tokens) > 0
         err2("Lexer errors in the generated from() of: ", path)
@@ -250,9 +249,8 @@ fn add_enum_from_fns(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
     if gm == null
         err2("Parse error in the generated from() of: ", path)
         return -1
-    # The AST slices the text: steal the buffer, as add_main_adapter does.
-    keep_source_alive(gen)
-    text.data.data = null
+    # The AST slices the text: it lives as long as the compile.
+    keep_source_alive(text)
     # Not in the source: identical enums in two files each generate one
     # (AGAST #2148, fns_conflict).
     var gf: *FnDef = gm.functions
@@ -302,10 +300,9 @@ fn lower_main(ctx: *ParseCtx, m: *Module, path: StrView) -> i32
     if gm == null
         err2("Parse error in the generated main adapter of: ", path)
         return -1
-    # The AST slices the text: it lives as long as the compile. Steal the
-    # buffer from `text`, or its Drop (AGAST #2159) frees it at return.
-    keep_source_alive(gen.ptr)
-    text.data.data = null
+    # The AST slices the text: it lives as long as the compile, not until
+    # `text`'s Drop (AGAST #2159) at return.
+    keep_source_alive(text)
     main_abi_rename(f)
     merge_module_into(m, gm)
     0
@@ -327,18 +324,16 @@ fn processed_vec() -> *Vec<String>
         g_processed = p
     g_processed
 
-# Source buffers backing AST string slices.  We "leak" each by stealing
-# its `data` pointer from the local Vec<u8> in load_and_parse; the OS
-# reclaims at process exit.  The compiler runs once, so a per-import
-# malloc-leak is acceptable and saves us a Vec<*u8> global (which would
-# need ritz1 mangling support for pointer-typed type args).
-fn keep_source_alive(src_ptr: *u8)
-    # Intentionally a no-op — `src_ptr` is the malloced backing buffer,
-    # leaked-by-design until compiler exit.  Keeping the function (with
-    # a dummy use of src_ptr to satisfy the parser) so call sites stay
-    # readable and we have a single place to wire a real keep-alive when
-    # ritz1 ever gains pointer-typed generic type-arg mangling.
-    let _: *u8 = src_ptr
+# The texts the AST slices: every lexed source, interface text and generated
+# fn, held until the compiler exits (the OS reclaims them).  Behind a pointer
+# for the reason g_processed is.
+var g_kept_sources: *Vec<String> = null
+
+# Keep `text` for the rest of the compile: AST nodes point into its bytes.
+fn keep_source_alive(text:= String)
+    if g_kept_sources == null
+        g_kept_sources = heap vec_new<String>()
+    g_kept_sources.push(text)
 
 fn was_import_processed(path: @String) -> i32
     let g: *Vec<String> = processed_vec()
@@ -1114,8 +1109,8 @@ fn iface_fix_extern_decls(m: *Module, text: StrView, src: StrView)
 
 # Read / tokenize / parse a single import: its stored interface text if
 # there is one, else its source.  Returns a parsed Module, or null on any
-# failure (already reported to stderr).  Steals the buffers' data to keep
-# the AST-pointed-into bytes alive via keep_source_alive().
+# failure (already reported to stderr).  Hands the buffers the AST points
+# into to keep_source_alive().
 fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
     let file: StrView = path.as_view()
     var src: Vec<u8> = read_source_file(file)
@@ -1174,10 +1169,9 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
 
     dep_record_note(file, dep_text)
 
-    # Keep the lexed buffer alive: AST nodes point into it.
-    keep_source_alive(lex_text.ptr)
-    src.data = null  # Prevent Vec Drop from freeing.
-    text.data = null
+    # Keep the lexed buffers alive: AST nodes point into them.
+    keep_source_alive(String { data: src })
+    keep_source_alive(String { data: text })
 
     mod
 

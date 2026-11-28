@@ -16,27 +16,35 @@ import ritzlib.str
 import ritzlib.cstr
 import ritzlib.strview    # strview_eq (was the local buf_eq)
 
-pub fn parser_alloc(p: *Parser, size: i64) -> *u8
-    # Bump allocator using the parser's heap arena
-    # Align to 8-byte boundary for pointers
+# The parser's arena is a bump allocator: `size` zeroed bytes at the next
+# 8-byte boundary, as the offset of their start.  AGAST #3509: zeroed, so a
+# field a constructor doesn't set (Expr.deref_step) reads null, not the
+# arena's last contents.  Everything in it lives as long as the parser.
+fn parser_bump(p: *Parser, size: i64) -> i64
     let aligned_offset: i64 = (p.heap_offset + 7) & (0 - 8)
-    let result: *u8 = p.heap_base + aligned_offset
     p.heap_offset = aligned_offset + size
     if p.ctx.parser_arena_cap > 0 and p.heap_offset > p.ctx.parser_arena_cap
         eprints("error: ritz1 parser arena exhausted; refusing to overrun the heap\n")
         sys_exit(70)
-    # AGAST #3509: zeroed, so a field a constructor doesn't set (Expr.deref_step)
-    # reads null, not the arena's last contents.
-    memzero(result, size)
-    return result
+    memzero(p.heap_base + aligned_offset, size)
+    aligned_offset
+
+# One zeroed T in the parser's arena (AGAST #4924: typed, not a `*u8` cast).
+pub fn parser_new<T>(p: *Parser) -> *T
+    (p.heap_base + parser_bump(p, sizeof(T))) as *T
+
+# `n` zeroed, consecutive Ts in the parser's arena: an array of nodes, or
+# `parser_new_n<u8>` for text.
+pub fn parser_new_n<T>(p: *Parser, n: i64) -> *T
+    (p.heap_base + parser_bump(p, n * sizeof(T))) as *T
 
 # `a` then `b`, as one fresh StrView in the parser's own arena (freed with
 # `p`, not the heap) — the arena counterpart of ritzlib's strview_join2 for
-# AST/mangled-name text that must outlive the parser_alloc call that made
+# AST/mangled-name text that must outlive the parser_new call that made
 # the pieces (AGAST #4915 slice 2).
 pub fn parser_join2(p: *Parser, a: StrView, b: StrView) -> StrView
     let n: i64 = a.len + b.len
-    let buf: *u8 = parser_alloc(p, n + 1)
+    let buf: *u8 = parser_new_n<u8>(p, n + 1)
     memcpy(buf, a.ptr, a.len)
     memcpy(buf + a.len, b.ptr, b.len)
     *(buf + n) = 0
@@ -48,7 +56,7 @@ pub fn parser_join2(p: *Parser, a: StrView, b: StrView) -> StrView
 # separator, as generic_tok_suffix below does).
 pub fn parser_join3(p: *Parser, a: StrView, b: StrView, c: StrView) -> StrView
     let n: i64 = a.len + b.len + c.len
-    let buf: *u8 = parser_alloc(p, n + 1)
+    let buf: *u8 = parser_new_n<u8>(p, n + 1)
     memcpy(buf, a.ptr, a.len)
     memcpy(buf + a.len, b.ptr, b.len)
     memcpy(buf + a.len + b.len, c.ptr, c.len)
@@ -64,9 +72,9 @@ pub fn parser_join3(p: *Parser, a: StrView, b: StrView, c: StrView) -> StrView
 # list's N nodes, an array's N dimensions, a repeated "ptr_" prefix depth):
 # a chain. Each of those did its own two-pass size-then-fill by hand.
 # ParserChain is that loop, written once: push each piece (or byte) as you
-# go, into a parser_alloc'd buffer that grows by doubling. A grow abandons
+# go, into a parser_new'd buffer that grows by doubling. A grow abandons
 # the old chunk rather than freeing it — safe and cheap here because
-# parser_alloc never frees individual allocations; the whole arena goes
+# parser_new never frees individual allocations; the whole arena goes
 # with `p`.
 struct ParserChain
     buf: *u8
@@ -79,14 +87,12 @@ struct ParserChain
 pub fn parser_chain_new(p: *Parser, cap_hint: i64) -> ParserChain
     if cap_hint <= 0
         return ParserChain { buf: (null), len: 0, cap: 0 }
-    ParserChain { buf: (parser_alloc(p, cap_hint)), len: 0, cap: cap_hint }
+    ParserChain { buf: (parser_new_n<u8>(p, cap_hint)), len: 0, cap: cap_hint }
 
 # Grow `c` so it holds at least `c.len + extra` bytes, doubling (or jumping
 # straight to what's needed, if that's bigger) and copying the bytes
-# written so far into the new chunk. `pub`: a caller that writes digits or
-# other fixed-width text straight into `c.buf` (write_dec_i32, say) reserves
-# room with this first, then advances `c.len` itself (see spell_last_array).
-pub fn parser_chain_ensure(p: *Parser, c:& ParserChain, extra: i64)
+# written so far into the new chunk.
+fn parser_chain_ensure(p: *Parser, c:& ParserChain, extra: i64)
     let need: i64 = c.len + extra
     if need <= c.cap
         return
@@ -95,7 +101,7 @@ pub fn parser_chain_ensure(p: *Parser, c:& ParserChain, extra: i64)
         new_cap = need
     if new_cap < 8
         new_cap = 8
-    let new_buf: *u8 = parser_alloc(p, new_cap)
+    let new_buf: *u8 = parser_new_n<u8>(p, new_cap)
     if c.len > 0
         memcpy(new_buf, c.buf, c.len)
     c.buf = new_buf
@@ -141,7 +147,7 @@ pub fn parse_file_copy(p: *Parser) -> StrView
     let file: StrView = p.ctx.parse_file
     if file.len == 0
         return strview_empty()
-    let buf: *u8 = parser_alloc(p, file.len)
+    let buf: *u8 = parser_new_n<u8>(p, file.len)
     memcpy(buf, file.ptr, file.len)
     StrView { ptr: buf, len: file.len }
 
@@ -238,7 +244,7 @@ pub fn ptr_names_array_of_struct_ptrs(p: *Parser, tr: *TypeRef) -> i32
 # or return type is recorded this way too, so they all know the same things.
 pub fn param_of_type(p: *Parser, name: StrView, ty: *TypeRef) -> *Param
     let kind: TypeKind = tr_kind(ty)
-    let param: *Param = parser_alloc(p, sizeof(Param)) as *Param
+    let param: *Param = parser_new<Param>(p)
     param.name.ptr = name.ptr as *u8
     param.param_ty = ty   # AGAST #4528
     param.name_span.line = 0
@@ -731,7 +737,7 @@ pub fn word_type(name: StrView) -> TypeKind
 # =============================================================================
 
 pub fn typeref_new(p: *Parser, kind: TypeKind) -> *TypeRef
-    let t: *TypeRef = parser_alloc(p, sizeof(TypeRef)) as *TypeRef
+    let t: *TypeRef = parser_new<TypeRef>(p)
     t.kind = kind
     t.name = strview_empty()
     t.pointee = null
@@ -945,7 +951,7 @@ pub struct TypeFacts
     fn_sig: *FnDef
 
 pub fn type_facts(p: *Parser, tr: *TypeRef) -> *TypeFacts
-    let f: *TypeFacts = parser_alloc(p, sizeof(TypeFacts)) as *TypeFacts
+    let f: *TypeFacts = parser_new<TypeFacts>(p)
     let kind: TypeKind = tr_kind(tr)
     f.kind = kind
     let type_name_sv: StrView = tr_name(tr)
@@ -1011,7 +1017,7 @@ pub fn note_type_name_written(p: *Parser, name: StrView, line: i32, col: i32)
     match src_pos_of(p.ctx, name)
         Some(q) => pos = q
         None => return
-    let at: *TypeNameAt = parser_alloc(p, sizeof(TypeNameAt)) as *TypeNameAt
+    let at: *TypeNameAt = parser_new<TypeNameAt>(p)
     at.at = pos
     at.line = line
     at.col = col
@@ -1040,7 +1046,7 @@ pub fn note_type_name_written(p: *Parser, name: StrView, line: i32, col: i32)
 pub fn tn_note(p: *Parser, name: StrView)
     if p.skip_item != 0 or name.ptr == null or name.len <= 0
         return
-    let n: *TnNote = parser_alloc(p, sizeof(TnNote)) as *TnNote
+    let n: *TnNote = parser_new<TnNote>(p)
     n.name = name
     n.next = p.ctx.tn_pending
     p.ctx.tn_pending = n
@@ -1141,7 +1147,7 @@ fn array_len_report(ctx: *ParseCtx, line: i32, col: i32, why: StrView)
 pub fn array_elem_of_type(p: *Parser, tr: *TypeRef) -> *ArrayElem
     let a: *TypeRef = tr_array_node(tr)
     let e: *TypeRef = tr_array_node_elem(tr)
-    let ae: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
+    let ae: *ArrayElem = parser_new<ArrayElem>(p)
     ae.elem = tr_kind(e)
     ae.pointee = tr_elem_pointee(a)
     let ae_name_sv: StrView = tr_elem_name(a)
@@ -1154,7 +1160,7 @@ pub fn array_elem_of_type(p: *Parser, tr: *TypeRef) -> *ArrayElem
     if e != null and e.kind == TypeKind.Ptr
         if e.pointee != null and e.pointee.kind == TypeKind.Array
             if e.pointee.shape == null
-                let inner: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
+                let inner: *ArrayElem = parser_new<ArrayElem>(p)
                 inner.elem = tr_elem_kind(e.pointee)
                 inner.pointee = tr_elem_pointee(e.pointee)
                 let inner_name_sv: StrView = tr_elem_name(e.pointee)
@@ -1186,7 +1192,7 @@ pub fn type_array_sized(p: *Parser, size: i32, elem: *TypeRef) -> *TypeRef
 # inner shape.  null (and reported) past MAX_ARRAY_RANK.
 fn array_shape_prepend_type(p: *Parser, size: i32, elem: *TypeRef) -> *ArrayShape
     let inner: *ArrayShape = tr_shape(elem)
-    let sh: *ArrayShape = parser_alloc(p, sizeof(ArrayShape)) as *ArrayShape
+    let sh: *ArrayShape = parser_new<ArrayShape>(p)
     sh.dims[0] = size
     if inner == null
         sh.rank = 2
@@ -1556,7 +1562,7 @@ pub fn tok_index_back(p: *Parser, at: StrView) -> Option<i32>
     None
 
 pub fn stmt_expr(p: *Parser, e: *Expr, line: i32, col: i32) -> *Stmt
-    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    let s: *Stmt = parser_new<Stmt>(p)
     s.kind = StmtKind.Expr
     s.span.line = line
     s.span.col = col
@@ -1565,7 +1571,7 @@ pub fn stmt_expr(p: *Parser, e: *Expr, line: i32, col: i32) -> *Stmt
     return s
 
 pub fn expr_int(p: *Parser, val: i64, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.IntLit
     e.span.line = line
     e.span.col = col
@@ -1647,7 +1653,7 @@ pub fn is_unit_expr(e: *Expr) -> i32
 # type info at use-site; the literal itself just carries the digits.
 pub fn expr_float(p: *Parser, src: StrView, line: i32, col: i32) -> *Expr
     let len: i32 = src.len as i32
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.FloatLit
     e.span.line = line
     e.span.col = col
@@ -1686,7 +1692,7 @@ fn float_text_with_point(p: *Parser, e: *Expr)
         at = at + 1
     if at == src.len
         return
-    let out: *u8 = parser_alloc(p, src.len + 2) as *u8
+    let out: *u8 = parser_new_n<u8>(p, src.len + 2)
     var i: i32 = 0
     while i < at
         *(out + i) = src.get(i)
@@ -1699,7 +1705,7 @@ fn float_text_with_point(p: *Parser, e: *Expr)
     e.string_val = StrView { ptr: out, len: src.len + 2 }
 
 pub fn expr_string(p: *Parser, tok: Token) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     # Distinguish c"..." / "..." based on lexer token kind. Kept in separate
     # AST nodes so the emitter types each one correctly:
     #   c"..."  (TOK_CSTRING)  -> *u8  (null-terminated)
@@ -1736,7 +1742,7 @@ pub fn char_token_value(tok: Token) -> i64
     0
 
 pub fn expr_char(p: *Parser, tok: Token) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.CharLit
     e.span.line = tok.line
     e.span.col = tok.col
@@ -1745,7 +1751,7 @@ pub fn expr_char(p: *Parser, tok: Token) -> *Expr
     return e
 
 pub fn expr_nil(p: *Parser, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.NilLit
     e.span.line = line
     e.span.col = col
@@ -1754,7 +1760,7 @@ pub fn expr_nil(p: *Parser, line: i32, col: i32) -> *Expr
     return e
 
 pub fn expr_ident(p: *Parser, name_sv: StrView, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.Ident
     e.span.line = line
     e.span.col = col
@@ -1781,7 +1787,7 @@ pub fn binary_set_op(e: *Expr, op: OpKind)
             e.op = op
 
 pub fn expr_binary(p: *Parser, op: OpKind, left: *Expr, right: *Expr) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.Binary
     e.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
     # Inherit span from left operand
@@ -1794,7 +1800,7 @@ pub fn expr_binary(p: *Parser, op: OpKind, left: *Expr, right: *Expr) -> *Expr
     return e
 
 pub fn expr_unary(p: *Parser, op: OpKind, operand: *Expr, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.Unary
     e.span.line = line
     e.span.col = col
@@ -1804,7 +1810,7 @@ pub fn expr_unary(p: *Parser, op: OpKind, operand: *Expr, line: i32, col: i32) -
     return e
 
 pub fn expr_cast(p: *Parser, left: *Expr, target_type: TypeKind, cast_pointee: TypeKind) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.Cast
     e.span = left.span
     e.left = left
@@ -1824,7 +1830,7 @@ pub fn expr_cast(p: *Parser, left: *Expr, target_type: TypeKind, cast_pointee: T
 # ExprKind.TypeOperand (AGAST #2124): `count` values of leaf kind `t` (struct
 # `name` when t == TypeKind.Struct).
 pub fn expr_type_operand(p: *Parser, count: i64, t: TypeKind, name_sv: StrView, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.TypeOperand
     e.span.line = line
     e.span.col = col
@@ -1876,7 +1882,7 @@ pub fn sizeof_generic_type_call(p: *Parser, name_tok: Token, base_tok: Token, ga
     return expr_call(p, name_tok.text, arg, name_tok.line, name_tok.col)
 
 pub fn expr_call(p: *Parser, name_sv: StrView, args: *Expr, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.Call
     e.span.line = line
     e.span.col = col
@@ -1898,7 +1904,7 @@ pub fn expr_generic_call(p: *Parser, name: StrView, type_arg: *TypeRef, args: *E
     var suffix_cap: i32 = 3
     if ta == TypeKind.Struct
         suffix_cap = (tn.len as i32)
-    var mangled: *u8 = parser_alloc(p, ((name.len as i32) + 1 + suffix_cap + 1) as i64) as *u8
+    var mangled: *u8 = parser_new_n<u8>(p, ((name.len as i32) + 1 + suffix_cap + 1) as i64)
     var pos: i32 = 0
 
     # Copy function name
@@ -1944,7 +1950,7 @@ pub fn expr_generic_call(p: *Parser, name: StrView, type_arg: *TypeRef, args: *E
         _ => pass
 
     # Create call expression with mangled name
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.Call
     e.span.line = line
     e.span.col = col
@@ -1964,7 +1970,7 @@ pub fn expr_link(first: *Expr, rest: *Expr) -> *Expr
 # unknown-kind branch. For const arrays this is harmless because the emitter
 # inlines const values via find_const, never re-walking the original Expr.
 pub fn expr_array(p: *Parser, head: *Expr, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.ArrayLit
     e.span.line = line
     e.span.col = col
@@ -1978,7 +1984,7 @@ pub fn expr_array(p: *Parser, head: *Expr, line: i32, col: i32) -> *Expr
 # count token directly (the grammar matches NUMBER, not a generic expr, to
 # keep parity with ritz0 and avoid having to constant-fold here).
 pub fn expr_array_fill(p: *Parser, value: *Expr, count_start_sv: StrView, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.ArrayFill
     e.span.line = line
     e.span.col = col
@@ -1992,7 +1998,7 @@ pub fn expr_array_fill(p: *Parser, value: *Expr, count_start_sv: StrView, line: 
 # =============================================================================
 
 pub fn binary_op_new(p: *Parser, op: OpKind, right: *Expr, next: *BinaryOp) -> *BinaryOp
-    let b: *BinaryOp = parser_alloc(p, sizeof(BinaryOp)) as *BinaryOp
+    let b: *BinaryOp = parser_new<BinaryOp>(p)
     b.op = op
     b.right = right
     b.next = next
@@ -2015,7 +2021,7 @@ pub fn apply_binary_opt_p(p: *Parser, left: *Expr, chain: *BinaryOp) -> *Expr
 # =============================================================================
 
 pub fn cast_tail_new(p: *Parser, tr: *TypeRef, next: *CastTail, as_line: i32, as_col: i32) -> *CastTail
-    let ct: *CastTail = parser_alloc(p, sizeof(CastTail)) as *CastTail
+    let ct: *CastTail = parser_new<CastTail>(p)
     let ty: TypeKind = tr_kind(tr)
     let f: *TypeFacts = type_facts(p, tr)
     ct.cast_type = ty
@@ -2149,7 +2155,7 @@ pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
 # =============================================================================
 
 pub fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
-    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    let op: *PostfixOp = parser_new<PostfixOp>(p)
     op.kind = POSTFIX_CALL
     op.args = args
     # #4035: the parser never records a call type suffix (it was always null),
@@ -2164,7 +2170,7 @@ pub fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
 # A generic call's one-token type argument (`g<Nope>`, `g<*Nope>`) as a
 # GenericArg that only says where it is written (AGAST #3469).
 pub fn generic_tok_arg(p: *Parser, tok: Token) -> *GenericArg
-    let ga: *GenericArg = parser_alloc(p, sizeof(GenericArg)) as *GenericArg
+    let ga: *GenericArg = parser_new<GenericArg>(p)
     ga.ty = TypeKind.Void
     ga.name = strview_empty()
     ga.next = null
@@ -2173,7 +2179,7 @@ pub fn generic_tok_arg(p: *Parser, tok: Token) -> *GenericArg
     ga
 
 pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
-    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    let op: *PostfixOp = parser_new<PostfixOp>(p)
     op.kind = POSTFIX_CALL
     op.args = args
     # Type suffix: "$" + type_name (an alias spelled as its target, #2037).
@@ -2192,7 +2198,7 @@ pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *Postfi
 # `ret %Option$` kept the struct type — clang IR verifier then rejected the
 # i64-into-struct mismatch (mausoleum/concurrent_bench, btree_scan path).
 pub fn postfix_generic_call_ptr(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
-    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    let op: *PostfixOp = parser_new<PostfixOp>(p)
     op.kind = POSTFIX_CALL
     op.args = args
     # Type suffix: "$ptr_" + type_name (an alias spelled as its target, #2037).
@@ -2207,7 +2213,7 @@ pub fn postfix_generic_call_ptr(p: *Parser, type_tok: Token, args: *Expr) -> *Po
 # token — `vec_new<Vec<i64>>()` (AGAST #1300).  Suffix is "$" + the argument's
 # mangled name ("$Vec$i64"), or its primitive spelling for a primitive.
 pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *PostfixOp
-    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    let op: *PostfixOp = parser_new<PostfixOp>(p)
     op.kind = POSTFIX_CALL
     op.args = args
     tn_note_args(p, ga)   # AGAST #4171
@@ -2254,7 +2260,7 @@ pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *P
             return null
         cur = cur.next
     tn_note_args(p, ga)   # AGAST #4171: a call, not a comparison
-    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    let op: *PostfixOp = parser_new<PostfixOp>(p)
     op.kind = POSTFIX_CALL
     op.args = args
     let suffix_sv: StrView = mangle_generic_args(p, strview_empty(), ga)
@@ -2264,7 +2270,7 @@ pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *P
     return op
 
 pub fn postfix_index(p: *Parser, index: *Expr, line: i32, col: i32) -> *PostfixOp
-    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    let op: *PostfixOp = parser_new<PostfixOp>(p)
     op.kind = POSTFIX_INDEX
     op.index = index
     op.bracket.line = line
@@ -2273,7 +2279,7 @@ pub fn postfix_index(p: *Parser, index: *Expr, line: i32, col: i32) -> *PostfixO
     return op
 
 pub fn postfix_member(p: *Parser, name_sv: StrView) -> *PostfixOp
-    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    let op: *PostfixOp = parser_new<PostfixOp>(p)
     op.kind = POSTFIX_MEMBER
     op.member_name = name_sv
     op.bracket = tok_span_back(p, name_sv)   # AGAST #3015: the field name's place
@@ -2281,7 +2287,7 @@ pub fn postfix_member(p: *Parser, name_sv: StrView) -> *PostfixOp
     return op
 
 pub fn postfix_cast(p: *Parser, ty: TypeKind) -> *PostfixOp
-    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    let op: *PostfixOp = parser_new<PostfixOp>(p)
     op.kind = POSTFIX_CAST
     op.cast_type = ty
     op.next = null
@@ -2331,7 +2337,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
                     result = expr_nameless_call(p, result, op.args)
         else if op.kind == POSTFIX_INDEX
             # Create new index expression
-            let index_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+            let index_expr: *Expr = parser_new<Expr>(p)
             index_expr.kind = ExprKind.Index
             index_expr.span = result.span
             index_expr.bracket = op.bracket
@@ -2341,7 +2347,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
             result = index_expr
         else if op.kind == POSTFIX_MEMBER
             # Create new member expression
-            let member_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+            let member_expr: *Expr = parser_new<Expr>(p)
             member_expr.kind = ExprKind.Member
             member_expr.span = result.span
             member_expr.left = result
@@ -2351,7 +2357,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
             result = member_expr
         else if op.kind == POSTFIX_CAST
             # Create new cast expression
-            let cast_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+            let cast_expr: *Expr = parser_new<Expr>(p)
             cast_expr.kind = ExprKind.Cast
             cast_expr.fn_sig = null
             cast_expr.cast_array = null
@@ -2365,7 +2371,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
         else if op.kind == POSTFIX_TRY
             # Try operator `expr?` — wrap running result in ExprKind.Try.
             # emit_expr_try propagates Err/None via early return. (AGAST #134)
-            let try_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+            let try_expr: *Expr = parser_new<Expr>(p)
             try_expr.kind = ExprKind.Try
             try_expr.span = result.span
             try_expr.left = result
@@ -2377,7 +2383,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
 # A call through a callee expression (AGAST #1747): ExprKind.Call with no name
 # and the callee in `left`; emit_call evaluates it to the fn's address.
 fn expr_nameless_call(p: *Parser, callee: *Expr, args: *Expr) -> *Expr
-    let call_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let call_expr: *Expr = parser_new<Expr>(p)
     call_expr.kind = ExprKind.Call
     call_expr.span = callee.span
     call_expr.func_name = strview_empty()
@@ -2404,7 +2410,7 @@ pub fn apply_postfix_paren_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
 # =============================================================================
 
 pub fn field_init_new(p: *Parser, name_sv: StrView, val: *Expr) -> *FieldInit
-    let f: *FieldInit = parser_alloc(p, sizeof(FieldInit)) as *FieldInit
+    let f: *FieldInit = parser_new<FieldInit>(p)
     f.name = name_sv
     f.value = val
     f.next = null
@@ -2433,7 +2439,7 @@ fn struct_lit_expr(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
     # literal's fields have been parsed since its name.
     note_type_name_written(p, tok.text, tok.line, tok.col)
     tn_note(p, tok.text)
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.StructLit
     e.span.line = tok.line
     e.span.col = tok.col
@@ -2452,7 +2458,7 @@ fn struct_lit_expr(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
 # named_variants.ritz turns it into the method-call shape `E.V(1, 2)` parses
 # to (ExprKind.Method), whatever `V` is.  `V` names no type: not noted as one.
 pub fn qualified_struct_lit(p: *Parser, qual: Token, name: Token, lit: *FieldInit) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.StructLit
     e.span.line = qual.line
     e.span.col = qual.col
@@ -2487,7 +2493,7 @@ pub fn named_forms_reset(ctx: *ParseCtx)
 fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv: StrView)
     if p.skip_item != 0
         return
-    let f: *NamedForm = parser_alloc(p, sizeof(NamedForm)) as *NamedForm
+    let f: *NamedForm = parser_new<NamedForm>(p)
     f.arm = arm
     f.lit = lit
     if arm != null
@@ -2517,7 +2523,7 @@ pub fn pattern_variant_named(p: *Parser, head: Token, name: Token, binds: *Tuple
 # from the capture records: parsing the literal's fields clobbers
 # the last_type_name side channel.
 pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *FieldInit) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.StructLit
     e.span.line = tok.line
     e.span.col = tok.col
@@ -2701,7 +2707,7 @@ pub fn parse_binary(start: StrView) -> i64
 
 # Allocate a new MatchArm with int-literal pattern. Caller fills body + is_pass.
 pub fn match_arm_int(p: *Parser, val: i64) -> *MatchArm
-    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
+    let a: *MatchArm = parser_new<MatchArm>(p)
     a.pattern_kind = PAT_INT_LIT
     a.pattern_int = val
     a.pattern_name = strview_empty()
@@ -2723,7 +2729,7 @@ pub fn match_arm_int(p: *Parser, val: i64) -> *MatchArm
 
 # Allocate a new MatchArm with wildcard pattern (_). Caller fills body + is_pass.
 pub fn match_arm_wildcard(p: *Parser) -> *MatchArm
-    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
+    let a: *MatchArm = parser_new<MatchArm>(p)
     a.pattern_kind = PAT_WILDCARD
     a.pattern_int = 0
     a.pattern_name = strview_empty()
@@ -2745,7 +2751,7 @@ pub fn match_arm_wildcard(p: *Parser) -> *MatchArm
 
 # Allocate a new MatchArm with identifier binding OR unit-variant (e.g. x, None).
 pub fn match_arm_ident(p: *Parser, name_sv: StrView) -> *MatchArm
-    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
+    let a: *MatchArm = parser_new<MatchArm>(p)
     a.pattern_kind = PAT_IDENT
     a.pattern_int = 0
     a.pattern_name = name_sv
@@ -2769,7 +2775,7 @@ pub fn match_arm_ident(p: *Parser, name_sv: StrView) -> *MatchArm
 # Allocate a new MatchArm with variant pattern Name(inner).
 # inner_kind is PAT_WILDCARD or PAT_IDENT.
 pub fn match_arm_variant(p: *Parser, name_sv: StrView, inner_kind: i32, inner_name_sv: StrView) -> *MatchArm
-    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
+    let a: *MatchArm = parser_new<MatchArm>(p)
     a.pattern_kind = PAT_VARIANT
     a.pattern_int = 0
     a.pattern_name = name_sv
@@ -2850,7 +2856,7 @@ pub fn match_arm_link(first: *MatchArm, rest: *MatchArm) -> *MatchArm
 
 # Create StmtKind.Match: scrutinee stored in if_cond, arms stored in if_then (recast).
 pub fn stmt_match(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col: i32) -> *Stmt
-    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    let s: *Stmt = parser_new<Stmt>(p)
     s.kind = StmtKind.Match
     s.span.line = line
     s.span.col = col
@@ -2862,7 +2868,7 @@ pub fn stmt_match(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col:
 
 # Create ExprKind.Match: scrutinee stored in left, arms stored in args (recast).
 pub fn expr_match(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col: i32) -> *Expr
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.Match
     e.span.line = line
     e.span.col = col
@@ -2880,7 +2886,7 @@ pub fn expr_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line
     let then_arm: *MatchArm = if_arm_from_block(p, then_body)
     let else_arm: *MatchArm = if_arm_from_block(p, else_body)
     then_arm.next = else_arm
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.If
     e.span.line = line
     e.span.col = col
@@ -2905,7 +2911,7 @@ pub fn expr_if_open(p: *Parser, cond: *Expr, then_body: *Stmt, line: i32, col: i
     match_arm_set_body(else_arm, null, 1)
     else_arm.else_missing = 1
     then_arm.next = else_arm
-    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let e: *Expr = parser_new<Expr>(p)
     e.kind = ExprKind.If
     e.span.line = line
     e.span.col = col
@@ -3041,7 +3047,7 @@ fn postfix_index_of(p: *Parser, recv: *Expr, op: *PostfixOp) -> *Expr
     let ix: *Expr = op.index
     if ix == null or ix.kind != ExprKind.Range or ix.right != null
         return ix
-    let r: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let r: *Expr = parser_new<Expr>(p)
     r.kind = ExprKind.Range
     r.span = ix.span
     r.left = ix.left
@@ -3051,7 +3057,7 @@ fn postfix_index_of(p: *Parser, recv: *Expr, op: *PostfixOp) -> *Expr
 
 # The method call `recv.name(args)` (no generic suffix) as ExprKind.Method.
 pub fn method_call_expr(p: *Parser, recv: *Expr, name_sv: StrView, args: *Expr) -> *Expr
-    let m: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    let m: *Expr = parser_new<Expr>(p)
     m.kind = ExprKind.Method
     m.span = recv.span
     m.left = recv

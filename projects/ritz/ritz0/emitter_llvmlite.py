@@ -7984,8 +7984,16 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         valueless_arm = (has_no_value(then_value) or has_no_value(else_value)
                          or self._ends_in_procedure_call(if_expr.then_block)
                          or self._ends_in_procedure_call(if_expr.else_block))
+        # A discarded if whose arms are a bool and something else (a unit
+        # call's dummy i32 beside `s.push(c)`) merges nothing either: there
+        # is no slot for the bool to land in (AGAST #4924; ritz1 agrees).
+        bool_beside_other = (
+            discard and not valueless_arm
+            and then_value is not None and else_value is not None
+            and then_value.type != else_value.type
+            and self.i1 in (then_value.type, else_value.type))
         if (then_value is not None and else_value is not None
-                and not (discard and valueless_arm)):
+                and not (discard and valueless_arm) and not bool_beside_other):
             if then_value.type != else_value.type:
                 # A float-annotated initialiser fixes the merge type (#2027):
                 # by size alone, i64 vs f64 kept the THEN type and `if c then

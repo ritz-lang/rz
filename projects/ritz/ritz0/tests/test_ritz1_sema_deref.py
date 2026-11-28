@@ -72,15 +72,28 @@ fn main() -> i32
     var r: Ro<H>
     r.ptr = @h
     r.k = 11
+    var r2: Ro2<H, i32>
+    r2.ptr = @h
+    r2.k = 12
     var q: i32 = 3
     for x in q
         h.k = 2
     0
+
+struct Ro2<T, U>
+    ptr: *T
+    tag: U
+
+impl<T, U> Deref for Ro2<T, U>
+    fn deref(self: @Ro2<T, U>) -> @T
+        @*self.ptr
 """
 
 STOPS_WANTED = [
     ("11:6", "`Lone` implements `DerefMut` without `Deref`"),
     ("23:7", "`r.k = …` needs `DerefMut`, and `Ro<H>` implements only `Deref`"),
+    # AGAST #4924: two type arguments, `, `-separated.
+    ("26:8", "`r2.k = …` needs `DerefMut`, and `Ro2<H, i32>` implements only `Deref`"),
 ]
 
 

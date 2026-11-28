@@ -15,7 +15,7 @@ THE FIX
 
 parse_tokens sizes the arena from the token count (interp.ritz's existing
 bound: a few 128-byte nodes per token, 1 KB per token), keeping 4 MB as a
-floor.  parser_alloc now fails loudly, with a nonzero exit, if an allocation
+floor.  parser_bump (behind parser_new) now fails loudly, with a nonzero exit, if an allocation
 ever passes the arena's capacity, instead of corrupting the heap.
 """
 

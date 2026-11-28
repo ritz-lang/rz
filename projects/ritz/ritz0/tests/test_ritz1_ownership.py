@@ -1045,18 +1045,20 @@ pub fn main() -> i32
 """, "main.ritz:38:12: error: use of moved value: `h.t` (moved at main.ritz:37:17)"),
 
     # Moving a field out of a type with its own drop would leave that drop
-    # a half-moved value (as in Rust, E0509).
+    # a half-moved value (as in Rust, E0509).  A generic one is named
+    # without its type arguments: the instance `Pair$Tracked` is `Pair`
+    # (AGAST #4924).
     "field_move_from_drop_type": ("""\
-struct Pair
-    a: Tracked
+struct Pair<T>
+    a: T
     n: i32
 
-impl Drop for Pair
-    fn drop(self: @&Pair)
+impl<T> Drop for Pair<T>
+    fn drop(self: @&Pair<T>)
         ORDER = 9
 
 pub fn main() -> i32
-    var p = Pair { a: make(1), n: 0 }
+    var p = Pair<Tracked> { a: make(1), n: 0 }
     consume(p.a)
     return 0
 """, "main.ritz:42:13: error: cannot move out of `p.a`: `Pair` implements Drop"),

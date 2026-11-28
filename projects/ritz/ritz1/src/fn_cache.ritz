@@ -222,12 +222,11 @@ fn exe_memo_path(st: @&Stat) -> String
     s.push('/')
     push_compiler_namespace(@s)
     s.push_str("/exe-id/")
-    var hex: [16]u8
-    u64_to_hex16(st.st_dev as u64, @hex[0])
-    s.push_span(Span<u8> { ptr: (@hex[0]), len: 16 })
+    let dev: String = u64_to_hex16(st.st_dev as u64)
+    s.push_string(@dev)
     s.push('-')
-    u64_to_hex16(st.st_ino as u64, @hex[0])
-    s.push_span(Span<u8> { ptr: (@hex[0]), len: 16 })
+    let ino: String = u64_to_hex16(st.st_ino as u64)
+    s.push_string(@ino)
     s
 
 # The memo record for `st`, up to and including the space before the hash.
@@ -248,17 +247,15 @@ fn exe_memo_record(st: @&Stat) -> String
 # The hash the memo at `memo` records for exactly `record`, or 0 (a miss)
 # if the file is absent, for another stat, or malformed in any way.
 fn exe_memo_read(memo: @&String, record: @&String) -> u64
-    var sz: i64 = 0
-    let buf: *u8 = read_file_to_buf(memo.as_view(), @sz)
-    if buf == null
-        return 0
+    let bytes: Vec<u8> = match read_whole_file(memo.as_view())
+        Some(b) => b
+        None => return 0
+    let line: StrView = bytes.as_view()
     let rlen: i64 = record.len()
     var h: u64 = 0
-    if sz == rlen + 17
-        let line: StrView = StrView { ptr: (buf), len: (sz) }
+    if line.len == rlen + 17
         if line.slice(0, rlen).eq(record.as_view()) and line.get(rlen + 16) == '\n'
             h = hex16_strict(line.slice(rlen, rlen + 16))
-    free(buf)
     h
 
 # Write `record` + `h` to `memo`.  Best effort: a cache root that can't be
@@ -266,9 +263,8 @@ fn exe_memo_read(memo: @&String, record: @&String) -> u64
 fn exe_memo_write(memo: @&String, record: @&String, h: u64)
     var line: String = string_new()
     line.push_span(Span<u8> { ptr: (record.as_ptr()), len: (record.len()) as i64 })
-    var hex: [16]u8
-    u64_to_hex16(h, @hex[0])
-    line.push_span(Span<u8> { ptr: (@hex[0]), len: 16 })
+    let hex: String = u64_to_hex16(h)
+    line.push_string(@hex)
     line.push('\n')
     mkdir_parents(memo.as_view())
     write_file_atomic(memo.as_view(), line.as_view())
@@ -425,21 +421,19 @@ fn fnv1a_mix_u64(h: u64, v: u64) -> u64
         i = i + 1
     return acc
 
-# Format a u64 as exactly 16 lowercase hex chars.  Caller provides a
-# >= 16-byte buffer; we do NOT null-terminate (caller may extend).
-pub fn u64_to_hex16(h: u64, out: *u8)
-    var v: u64 = h
-    var i: i32 = 15
-    while i >= 0
-        let nib: u64 = v & 15
-        var c: u8 = 0
+# `h` as exactly 16 lowercase hex digits, zero-padded: the form
+# hex16_to_u64 and hex16_strict read back.
+pub fn u64_to_hex16(h: u64) -> String
+    var out: String = string_with_cap(16)
+    var shift: i32 = 60
+    while shift >= 0
+        let nib: u64 = (h >> (shift as u64)) & 15
         if nib < 10
-            c = (nib + 48) as u8       # '0' = 48
+            out.push((nib + 48) as u8)        # '0' = 48
         else
-            c = (nib - 10 + 97) as u8  # 'a' = 97
-        *(out + i) = c
-        v = v >> 4
-        i = i - 1
+            out.push((nib - 10 + 97) as u8)   # 'a' = 97
+        shift = shift - 4
+    out
 
 # Parse a 16-hex-char string back to u64.  Returns 0 on malformed input
 # (only `[0-9a-fA-F]` accepted).  Stops at the first non-hex byte or after 16.
@@ -817,28 +811,22 @@ pub fn sig_take_deps(sd: *SigData)
 # File helpers
 # ============================================================================
 
-# Read entire file into a malloced buffer.  Returns null on missing/empty.
-# Sets `*out_len` to the number of bytes read.
-fn read_file_to_buf(path: StrView, out_len: *i64) -> *u8
-    *out_len = 0
+# Every byte of the file at `path`, or None when it is missing or empty.
+fn read_whole_file(path: StrView) -> Option<Vec<u8>>
     var file: Fd = fd_open(path, O_RDONLY, 0).unwrap_or(fd_adopt(-1))
     if not file.valid()
-        return null
+        return None
     # The open file's size.  It is only an upper bound: the file can shrink
     # before we read it.
     var sz: i64 = 0
     match file.stat()
         Ok(st) => sz = st.st_size
         Err(e) => sz = 0
-    var bytes: Vec<u8> = read_fd_to_vec(@file, sz)
+    let bytes: Vec<u8> = read_fd_to_vec(@file, sz)
     file.close()
     if bytes.len == 0
-        return null
-    # Hand the buffer to the caller, who frees it.
-    *out_len = bytes.len
-    let buf: *u8 = bytes.data
-    bytes.data = null
-    buf
+        return None
+    Some(bytes)
 
 # Every byte of the open `file`, read to EOF, with a NUL past the last
 # one (in the capacity, not counted in `len`).  Capacity starts at
@@ -878,13 +866,10 @@ fn read_fd_to_vec(file: @Fd, size_hint: i64) -> Vec<u8>
 # Parse a sig file.  Returns null on missing/corrupt/structurally unexpected —
 # the caller treats null as "no cache, cold start".
 pub fn read_sig_file(sig_path: StrView) -> *SigData
-    var sz: i64 = 0
-    let buf: *u8 = read_file_to_buf(sig_path, @sz)
-    if buf == null or sz <= 0
-        return null
-
-    let parsed: Result<Json, JsonError> = json_parse(strview_from_ptr(buf, sz))
-    free(buf)
+    let bytes: Vec<u8> = match read_whole_file(sig_path)
+        Some(b) => b
+        None => return null
+    let parsed: Result<Json, JsonError> = json_parse(bytes.as_view())
     match parsed
         Ok(root) => return sig_read_root(@root)
         Err(e) => return null
@@ -997,10 +982,9 @@ fn emit_sig_string(buf: *Vec<u8>, s_sv: StrView)
 
 # `h` as a quoted 16-digit lowercase hex string, the form hex16_to_u64 reads.
 fn emit_hex16(buf: *Vec<u8>, h: u64)
-    var hex: [16]u8
-    u64_to_hex16(h, @hex[0])
+    let hex: String = u64_to_hex16(h)
     buf.push(34)        # '"'
-    buf.push_bytes(@hex[0], 16)
+    buf.push_view(hex.as_view())
     buf.push(34)
 
 fn emit_hex16_field(buf: *Vec<u8>, key: StrView, h: u64)
@@ -1091,19 +1075,17 @@ fn write_file_atomic(path: StrView, data: StrView) -> i32
 # not stored: ritz0 and load_and_parse store only a text whose source parses).
 fn dep_text_matches(src: StrView, want: u64) -> i32
     var path: String = iface_text_path(src)
-    var tsz: i64 = 0
-    var text: *u8 = null
+    var text: Option<Vec<u8>> = None
     if path.len() > 0
-        text = read_file_to_buf(path.as_view(), @tsz)
+        text = read_whole_file(path.as_view())
     var h: u64 = 0
-    if text != null
-        h = fnv1a_bytes(StrView { ptr: (text), len: (tsz) })
-        free(text)
-    else
-        var made: Vec<u8> = vec_new<u8>()
-        if iface_text_derive(src, @&made) < 0
-            return 0
-        h = fnv1a_bytes(made.as_view())
+    match text
+        Some(stored) => h = fnv1a_bytes(stored.as_view())
+        None =>
+            var made: Vec<u8> = vec_new<u8>()
+            if iface_text_derive(src, @&made) < 0
+                return 0
+            h = fnv1a_bytes(made.as_view())
     if h == want
         return 1
     0
@@ -1119,18 +1101,16 @@ fn sig_deps_unchanged(sd: *SigData) -> i32
         return 0
     var i: i32 = 0
     while i < sd.dep_count
-        var sz: i64 = 0
-        let buf: *u8 = read_file_to_buf(*(sd.dep_paths + i), @sz)
-        if buf == null
-            return 0
-        let src: StrView = StrView { ptr: buf, len: sz }
+        let bytes: Vec<u8> = match read_whole_file(*(sd.dep_paths + i))
+            Some(b) => b
+            None => return 0
+        let src: StrView = bytes.as_view()
         let want: u64 = *(sd.dep_hashes + i)
         var same: i32 = 0
         if fnv1a_bytes(src) == want
             same = 1
         else
             same = dep_text_matches(src, want)
-        free(buf)
         if same == 0
             return 0
         i = i + 1
@@ -1247,15 +1227,7 @@ fn ll_not_older(ll_path: StrView, src_path: StrView) -> bool
         Err(e) => return false
 
 # 1 when the file at `path` holds exactly `data[0..len)`, else 0.
-fn file_equals(path: StrView, data_sv: StrView) -> i32
-    var data: *u8 = data_sv.ptr
-    var len: i64 = data_sv.len
-    var sz: i64 = 0
-    let buf: *u8 = read_file_to_buf(path, @sz)
-    if buf == null
-        return 0
-    var same: i32 = 0
-    if sz == len and memcmp(buf, data, len) == 0
-        same = 1
-    free(buf)
-    return same
+fn file_equals(path: StrView, data: StrView) -> i32
+    match read_whole_file(path)
+        Some(bytes) => return if bytes.as_view().eq(data) then 1 else 0
+        None => return 0

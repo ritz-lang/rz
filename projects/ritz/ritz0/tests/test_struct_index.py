@@ -507,6 +507,12 @@ REFUSALS = {
         "impl<T> Index for Only<T>\n    fn index(self: @Only<T>, key: i64) -> @T\n        @self.a[key]\n\n",
         "    var m: Only<i64>\n    let v: i64 = m[0]\n    m^[0] = v\n    0\n",
         needs_writer("Only<i64>", ["Index"])),
+    # AGAST #4924: two type arguments are spelled `, `-separated.
+    "generic_two_params_index_only": (
+        "struct Two<A, B>\n    a: [2]A\n    b: B\n\n"
+        "impl<A, B> Index for Two<A, B>\n    fn index(self: @Two<A, B>, key: i64) -> @A\n        @self.a[key]\n\n",
+        "    var m: Two<i64, i32>\n    let v: i64 = m[0]\n    m^[0] = v\n    0\n",
+        needs_writer("Two<i64, i32>", ["Index"])),
     # R11a: `@t[1]` is a loan of `t[_]` once it's an `index` call, so a store
     # into another element of `t` overlaps it.
     "loan_then_store": (TALLY, "    var t: Tally\n    let p: @i64 = @t[1]\n    ^t[2] = 5\n"
