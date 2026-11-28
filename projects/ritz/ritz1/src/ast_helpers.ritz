@@ -2673,7 +2673,7 @@ fn enum_variant_count_node(e: *EnumDef) -> i32
     n
 
 # Allocate and append a new EnumDef to the module being parsed.
-fn enum_new(p: *Parser, name_sv: StrView, generic: i32, repr: TypeKind, line: i32) -> *EnumDef
+fn enum_new(p: *Parser, name_sv: StrView, generic: i32, repr: TypeKind, line: i32, params: *TypeParam) -> *EnumDef
     let e: *EnumDef = parser_alloc(p, sizeof(EnumDef)) as *EnumDef
     e.name = name_sv
     e.generic = generic
@@ -2683,29 +2683,30 @@ fn enum_new(p: *Parser, name_sv: StrView, generic: i32, repr: TypeKind, line: i3
     e.variants = null
     e.next = null
     e.def_file = parse_file_copy_shared(p)   # AGAST #3494 (R65)
+    e.type_params = params
     if p.module.enums == null
         p.module.enums = e
     else
         enum_list_append(p.module.enums, e)
     e
 
-fn enum_def_start_impl(p: *Parser, name_sv: StrView, generic: i32) -> i32
-    return enum_def_start_full(p, name_sv, generic, TypeKind.Void, 0)
+fn enum_def_start_impl(p: *Parser, name_sv: StrView, generic: i32, params: *TypeParam) -> i32
+    return enum_def_start_full(p, name_sv, generic, TypeKind.Void, 0, params)
 
-fn enum_def_start_full(p: *Parser, name_sv: StrView, generic: i32, repr: TypeKind, line: i32) -> i32
-    enum_new(p, name_sv, generic, repr, line)
+fn enum_def_start_full(p: *Parser, name_sv: StrView, generic: i32, repr: TypeKind, line: i32, params: *TypeParam) -> i32
+    enum_new(p, name_sv, generic, repr, line, params)
     if generic != ENUM_INSTANCE   # `Slot$i32` is declared by no file
         type_decl_log(p.ctx, name_sv)   # AGAST #3907
     return 0
 
 # Called from grammar rule enum_def_header: starts a new EnumDef.
 pub fn enum_def_start(p: *Parser, name_sv: StrView) -> i32
-    return enum_def_start_impl(p, name_sv, 0)
+    return enum_def_start_impl(p, name_sv, 0, null)
 
 # `enum Name<T>`: as enum_def_start, flagged generic (AGAST #1797).
 pub fn enum_def_start_generic(p: *Parser, name_sv: StrView, params: *TypeParam) -> i32
     p.ctx.tn_enum_params = params   # AGAST #4021: in scope in its payloads
-    return enum_def_start_impl(p, name_sv, 1)
+    return enum_def_start_impl(p, name_sv, 1, params)
 
 # `enum E: T` (LANGUAGE_SPEC §10.4): as enum_def_start, with representation
 # type T, which must be an integer type (a located error otherwise).
@@ -2720,7 +2721,7 @@ pub fn enum_def_start_repr(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32
             eprintln("' must be an integer type")
             p.ctx.attr_errors = p.ctx.attr_errors + 1
         r = TypeKind.I64
-    return enum_def_start_full(p, name_sv, 0, r, line)
+    return enum_def_start_full(p, name_sv, 0, r, line, null)
 
 # Called from grammar rule enum_variant: appends a unit variant to the most
 # recent enum's variant list.
@@ -3020,6 +3021,7 @@ pub fn enum_record_instance(ctx: *ParseCtx, base: i32, name_sv: StrView, fields:
     e.variants = null
     e.next = null
     e.def_file = strview_empty()   # AGAST #3494 (R65): an instance is declared by no file
+    e.type_params = null
     if ctx.program_enums == null
         ctx.program_enums = e
     else
@@ -3438,41 +3440,14 @@ pub fn primitive_type_from_name(name: StrView) -> TypeKind
         return word_type(name.ptr)
     TypeKind.Void
 
-# `enum Slot<A, B>`'s parameters, read off the source after its name: the
-# grammar's action records the enum as generic but drops the list
-# (enum_def_header).  null when no `<...>` follows the name.
+# `enum Slot<A, B>`'s parameters, as enum_def_header parsed them (AGAST
+# #4773: they were read back off the source after the name, which split
+# `<T: Weigh>` at the space).  null for a concrete enum and an instance.
 pub fn generic_enum_params(ctx: *ParseCtx, ei: i32) -> *TypeParam
     let e: *EnumDef = enum_node_at(ctx, ei)
     if e == null
         return null
-    let name: *u8 = e.name.ptr
-    var p: *u8 = name + (e.name.len as i32)
-    while *p == ' ' or *p == 9
-        p = p + 1
-    if *p != '<'   # '<'
-        return null
-    p = p + 1
-    var first: *TypeParam = null
-    var last: *TypeParam = null
-    while *p != '>' and *p != 0 and *p != 10   # '>', NUL, newline
-        if *p == ' ' or *p == 9 or *p == ','   # ' ', '\t', ','
-            p = p + 1
-        else
-            let start: *u8 = p
-            var n: i32 = 0
-            while *p != '>' and *p != 0 and *p != 10 and *p != ' ' and *p != 9 and *p != ','
-                p = p + 1
-                n = n + 1
-            let tp: *TypeParam = malloc(sizeof(TypeParam)) as *TypeParam
-            tp.name = StrView { ptr: start, len: n as i64 }
-            tp.next = null
-            tp.bounds = null
-            if last == null
-                first = tp
-            else
-                last.next = tp
-            last = tp
-    first
+    e.type_params
 
 # AGAST #3021: how many type parameters generic enum `ei` declares
 # (`enum Two<A, B>` 2), 0 for a concrete enum or an instance.
