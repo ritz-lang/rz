@@ -487,6 +487,24 @@ def test_blocking_pipe_io_parks_and_every_change_wakes():
     assert "sys_pipe_handler" in text
 
 
+def test_pipe_changed_keeps_the_callers_interrupt_state():
+    # A Ctrl-C (tty/console.ritz) or a ring-3 fault kills the running process
+    # from its IRQ or exception handler: sys_exit_impl runs on that stack
+    # (CPU 0's IST2 for the USB keyboard's MSI-X vector) with IF clear, and
+    # must keep it clear. An `sti` in pipe_changed, which exit calls, let the
+    # next IST2 interrupt start again at that stack's top, over the exit
+    # path's frames: a ret to garbage (CS 8, RSP in IST2) once in a few USB
+    # keyboard boots, at the `spin` Ctrl-C.
+    changed = _fn(PIPE_RT, "pipe_changed")
+    assert "interrupts_enabled()" in changed, "pipe_changed must save IF before its cli"
+    # the only sti is the conditional one restoring what the caller had
+    lines = [ln.strip() for ln in changed.splitlines()]
+    sti = [i for i, ln in enumerate(lines) if ln == "enable_interrupts()"]
+    assert sti, "pipe_changed never restores IF"
+    for i in sti:
+        assert lines[i - 1].startswith("if "), f"unconditional enable_interrupts() in pipe_changed: {lines[i - 1]!r}"
+
+
 def test_poll_reports_and_waits_for_pipe_fds():
     revents = _fn(POLL, "poll_revents")
     assert "pipe_revents(" in revents
