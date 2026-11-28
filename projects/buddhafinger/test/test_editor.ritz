@@ -15,7 +15,7 @@ import ritzlib.string
 import ritzlib.termsession { Key }
 
 import core.buffer { Buffer, pos }
-import core.editor { Editor, LangAsk, editor_new, editor_open, handle_key, jump_to, MSG_NO_JUMP, MSG_NOT_SAVED, MAX_JUMPS }
+import core.editor { Editor, LangAsk, editor_new, editor_open, handle_key, jump_to, MSG_NO_JUMP, MSG_NOT_SAVED, MSG_TOO_LONG, MAX_JUMPS }
 import core.files { FileStore, LoadError, SaveError }
 import core.modes { Mode, mode_label }
 import core.screen { LineSource, Size, render, screen_new, view_new }
@@ -138,6 +138,10 @@ fn holds(ed: @Editor, want: StrView) -> bool
 
 fn at(ed: @Editor, line: i64, col: i64) -> bool
     ed.cursor.line == line and ed.cursor.col == col
+
+# The unnamed register holds `want`, whole lines when `lines`.
+fn reg_is(ed: @Editor, want: StrView, lines: bool) -> bool
+    span_from_vec<u8>(@ed.reg).as_strview().eq(want) and ed.reg_lines == lines
 
 fn says(ed: @Editor, want: StrView) -> bool
     ed.message.as_view().eq(want)
@@ -425,8 +429,9 @@ fn test_dd_deletes_lines() -> i32
     assert holds(@run("a\nb", "Gdd"), "a")                      # no final newline
     assert holds(@run("a\n", "dd"), "")
     assert holds(@run("", "dd"), "")
-    # d then anything else is dropped.
-    assert holds(@run("ab", "dl"), "ab")
+    # d then a key that is no motion is dropped, and so is the d.
+    assert holds(@run("ab", "dz"), "ab")
+    assert holds(@run("ab", "dzx"), "b")
     0
 
 [[test]]
@@ -454,6 +459,185 @@ fn test_yank_keeps_the_buffer_clean() -> i32
     let ed = run("a\nb", "yy")
     assert not ed.buf.is_dirty()
     assert ed.reg_lines
+    0
+
+# ============================================================================
+# Counts and operators (AGAST #4909)
+# ============================================================================
+
+[[test]]
+fn test_a_count_repeats_a_motion() -> i32
+    assert at(@run("abcdef", "3l"), 0, 3)
+    assert at(@run("abc", "5l"), 0, 2)                      # as far as it goes
+    assert at(@run("abcdef", "$3h"), 0, 2)
+    assert at(@run("abcdefghijklm", "10l"), 0, 10)
+    assert at(@run("a\nb\nc\nd", "2j"), 2, 0)
+    assert at(@run("a\nb\nc\nd", "9j"), 3, 0)
+    assert at(@run("a\nb\nc\nd", "G2k"), 1, 0)
+    assert at(@run("a b c d", "2w"), 0, 4)
+    assert at(@run("ab cd ef", "2e"), 0, 4)
+    assert at(@run("ab cd ef", "$2b"), 0, 3)
+    assert at(@run("ab\ncd", "2$"), 1, 1)
+    assert at(@run("ab", "2$"), 0, 0)                       # no line below: no move
+    0
+
+[[test]]
+fn test_a_count_names_the_line_for_G_and_gg() -> i32
+    assert at(@run("a\nb\nc", "2G"), 1, 0)
+    assert at(@run("a\nb\nc", "9G"), 2, 0)
+    assert at(@run("a\n  b\nc", "G2gg"), 1, 2)
+    0
+
+[[test]]
+fn test_d_with_charwise_exclusive_motions() -> i32
+    let ed = run("foo bar", "dw")
+    assert holds(@ed, "bar") and at(@ed, 0, 0) and reg_is(@ed, "foo ", false)
+    assert holds(@run("a b c", "d2w"), "c")
+    assert holds(@run("a b c d e f g h", "2d3w"), "g h")
+    let back = run("foo bar", "$db")
+    assert holds(@back, "foo r") and at(@back, 0, 4)
+    assert holds(@run("foo bar", "wd0"), "bar")
+    let h = run("abc", "$dh")
+    assert holds(@h, "ac") and at(@h, 0, 1)
+    assert holds(@run("abc", "dh"), "abc")                   # nothing left of it
+    assert holds(@run("abc", "chx<esc>"), "xabc")             # c still inserts
+    assert holds(@run("abcdef", "3x"), "def")
+    let x = run("ab", "l5x")
+    assert holds(@x, "a") and at(@x, 0, 0)
+    assert holds(@run("ab", "dl"), "b")
+    0
+
+[[test]]
+fn test_dw_on_a_lines_last_word_keeps_the_line_break() -> i32
+    let ed = run("foo bar\nbaz", "wdw")
+    assert holds(@ed, "foo \nbaz") and at(@ed, 0, 3)
+    assert holds(@run("foo   \nbar", "dw"), "\nbar")
+    assert holds(@run("ab", "ldw"), "a")                    # the last line too
+    0
+
+[[test]]
+fn test_d_with_charwise_inclusive_motions() -> i32
+    assert holds(@run("foo bar", "de"), " bar")
+    assert holds(@run("foo bar baz", "d2e"), " baz")
+    let dollar = run("foo bar", "wd$")
+    assert holds(@dollar, "foo ") and at(@dollar, 0, 3)
+    assert holds(@run("foo bar", "wD"), "foo ")
+    assert holds(@run("ab\ncd\nef", "l2D"), "a\nef")
+    assert holds(@run("éa b", "de"), " b")                   # é is two bytes
+    0
+
+[[test]]
+fn test_d_with_linewise_motions() -> i32
+    let ed = run("a\nb\nc\n", "dj")
+    assert holds(@ed, "c\n") and at(@ed, 0, 0) and reg_is(@ed, "a\nb\n", true)
+    assert holds(@run("a\nb\nc\n", "jdk"), "c\n")
+    assert holds(@run("a\nb", "dk"), "a\nb")               # nothing above
+    assert holds(@run("a\nb", "jdj"), "a\nb")              # nothing below
+    assert holds(@run("a\nb\nc\n", "jdG"), "a\n")
+    assert holds(@run("a\nb\nc\n", "jdgg"), "c\n")
+    assert holds(@run("a\nb\nc\nd\n", "d2j"), "d\n")
+    assert holds(@run("a\nb\nc\nd", "2dG"), "c\nd")      # dG to line 2
+    0
+
+[[test]]
+fn test_a_count_before_dd() -> i32
+    let ed = run("a\nb\nc\nd\n", "3dd")
+    assert holds(@ed, "d\n") and reg_is(@ed, "a\nb\nc\n", true)
+    assert holds(@run("a\nb\nc\n", "j5dd"), "a\n")      # as many as there are
+    assert holds(@run("a\nb\n", "j2dd"), "a\nb\n")      # none below the last line
+    assert holds(@run("a\nb", "2dd"), "")
+    0
+
+[[test]]
+fn test_d_across_lines_from_the_indent_to_a_blank_end_takes_whole_lines() -> i32
+    # A charwise d spanning lines, blank before its start and after its
+    # end, deletes the lines whole.
+    let ed = run("a\nb\nc", "d2w")
+    assert holds(@ed, "c") and reg_is(@ed, "a\nb\n", true)
+    # An exclusive motion ending at a line start ends at the line above's
+    # end instead: from the indent, whole lines (dw on an empty line) ...
+    assert holds(@run("a\n\nb", "jdw"), "a\nb")
+    assert holds(@run("a\n\nb", "d2w"), "b")
+    # ... and otherwise up to that end.
+    let mid = run("x a\n\nb", "wd2w")
+    assert holds(@mid, "x \nb") and reg_is(@mid, "a\n", false)
+    0
+
+[[test]]
+fn test_y_yanks_without_changing_the_text() -> i32
+    let ed = run("foo bar", "yw")
+    assert holds(@ed, "foo bar") and at(@ed, 0, 0) and reg_is(@ed, "foo ", false)
+    assert not ed.buf.is_dirty()
+    assert holds(@run("foo bar", "ywP"), "foo foo bar")
+    assert at(@run("foo bar", "$yb"), 0, 4)                 # to the range's start
+    assert holds(@run("a\nb\nc", "yjGp"), "a\nb\nc\na\nb")
+    assert holds(@run("a\nb", "Yjp"), "a\nb\na")          # Y is yy
+    assert at(@run("ab\ncd\nef", "jlyk"), 0, 1)            # up a line, the column kept
+    assert at(@run("ab\ncd\nef", "lyj"), 0, 1)             # the cursor stays
+    0
+
+[[test]]
+fn test_cw_changes_to_the_words_end() -> i32
+    assert holds(@run("foo bar", "cwx<esc>"), "x bar")
+    assert holds(@run("foo bar", "llcwx<esc>"), "fox bar")  # on the word's last char
+    assert holds(@run("a b c", "c2wx<esc>"), "x c")
+    assert holds(@run("a  b", "lcwx<esc>"), "axb")           # on blanks: to the next word
+    let ed = run("foo bar", "cw")
+    assert ed.mode == Mode.Insert and at(@ed, 0, 0) and reg_is(@ed, "foo", false)
+    0
+
+[[test]]
+fn test_c_with_other_motions() -> i32
+    assert holds(@run("foo bar", "wCx<esc>"), "foo x")
+    assert holds(@run("foo bar", "c$x<esc>"), "x")
+    assert holds(@run("ab", "clx<esc>"), "xb")
+    assert holds(@run("\nb", "clx<esc>"), "x\nb")           # an empty range still inserts
+    0
+
+[[test]]
+fn test_cc_and_linewise_c_leave_one_line_to_type_on() -> i32
+    let ed = run("  a\nb", "ccx<esc>")
+    assert holds(@ed, "x\nb") and reg_is(@ed, "  a\n", true)
+    assert holds(@run("a\nb\nc", "cjx<esc>"), "x\nc")
+    assert holds(@run("a\nb\nc\n", "j2ccx<esc>"), "a\nx\n")
+    let none = run("a\nb\n", "j2cc")                         # no line below the last
+    assert none.mode == Mode.Normal and holds(@none, "a\nb\n")
+    let open = run("a\nb", "cc")
+    assert open.mode == Mode.Insert and at(@open, 0, 0) and holds(@open, "\nb")
+    0
+
+[[test]]
+fn test_c_and_its_insert_are_one_undo_step() -> i32
+    let ed = run("foo bar", "cwxy<esc>u")
+    assert holds(@ed, "foo bar") and not ed.buf.is_dirty()
+    assert holds(@run("a\nb", "ccxy<esc>u"), "a\nb")
+    assert holds(@run("foo bar", "cwxy<esc>u<C-r>"), "xy bar")
+    0
+
+[[test]]
+fn test_escape_or_an_unknown_key_cancels_a_count_or_operator() -> i32
+    assert holds(@run("abc", "d<esc>x"), "bc")
+    assert holds(@run("abc", "2<esc>x"), "bc")                 # the count is gone too
+    assert holds(@run("abc", "dclx"), "ac")                  # dc cancels; l then x
+    assert holds(@run("abc", "2dzx"), "bc")
+    0
+
+[[test]]
+fn test_a_count_repeats_p_u_and_n() -> i32
+    let ed = run("ab", "x3p")
+    assert holds(@ed, "baaa") and at(@ed, 0, 3)
+    let lines = run("a\nb", "yy2p")
+    assert holds(@lines, "a\na\na\nb") and at(@lines, 1, 0)
+    assert holds(@run("a\nb", "yy2pu"), "a\nb")           # one undo step
+    assert holds(@run("abc", "xxx2u"), "bc")
+    assert at(@run("ab ab ab ab", "/ab<cr>2n"), 0, 9)
+    assert at(@run("ab ab ab ab", "$2N"), 0, 10)              # no pattern: stays
+    0
+
+[[test]]
+fn test_a_put_too_long_is_refused() -> i32
+    let ed = run("ab", "x99999999p")
+    assert holds(@ed, "b") and says(@ed, MSG_TOO_LONG)
     0
 
 # ============================================================================

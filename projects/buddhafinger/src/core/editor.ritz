@@ -1,15 +1,21 @@
 # core/editor.ritz - the editor: modes and the first-release commands.
 #
 # The editor state is one buffer, the cursor, the viewport's top line and
-# page height, one unnamed register, the last search pattern and the
-# command line being typed. handle_key() applies one typed Key to it; the
-# commands are docs/BUDDHAFINGER_PROPOSAL.md's "First usable release" table
-# and nothing more (Vim behaviour throughout):
+# page height, one unnamed register, the last search pattern, the Normal-mode
+# keys typed so far (core/normal.ritz) and the command line being typed.
+# handle_key() applies one typed Key to it; the commands are
+# docs/BUDDHAFINGER_PROPOSAL.md's "First usable release" table, then
+# counts and operators from "Everyday code editing" (Vim behaviour
+# throughout):
 #
-#   Motion        h j k l, arrows, w b e, 0 $, gg G, Ctrl-F Ctrl-B
+#   Motion        h j k l, arrows, w b e, 0 $, gg G, gj gk, Ctrl-F Ctrl-B
 #   Insert        i a o O, Escape, Backspace, Enter, Tab
-#   Edit          x dd yy p P, one unnamed register
-#   Undo          u Ctrl-R; an Insert session is one undo step
+#   Operators     d c y with any motion, dd cc yy; x D C Y; p P;
+#                 one unnamed register
+#   Counts        before a motion, a command or an operator, and after an
+#                 operator (2d3w: six words); {count}G and {count}gg name a line
+#   Undo          u Ctrl-R; an Insert session (with the c that opened it)
+#                 is one undo step
 #   Search        / (a literal pattern), n N
 #   Command line  :w  :w <path>  :q  :q!  :wq  :e <path>  :<line>
 #   Language      K (hover), gd (go to definition), Ctrl-O / Ctrl-T (jump back)
@@ -39,10 +45,11 @@ import ritzlib.strview { StrView }
 import ritzlib.string
 import ritzlib.termsession { Key }
 
-import core.buffer { Buffer, Pos, Term, buffer_new, buffer_from_bytes, pos, term_text }
+import core.buffer { Buffer, Pos, Term, buffer_new, buffer_from_bytes, pos, pos_before, term_text }
 import core.commands { Command, parse_command }
 import core.files { FileStore, LoadError, SaveError }
 import core.modes { Mode }
+import core.normal { Action, Motion, NormalCommand, NormalKeys, Operator, Step, normal_keys_new }
 import core.screen { LineSource, Status }
 import core.utf8 { utf8_encode, utf8_next, utf8_prev }
 
@@ -50,6 +57,10 @@ pub const MSG_NOT_SAVED: StrView = "E37: No write since last change (add ! to ov
 pub const MSG_NO_NAME: StrView = "E32: No file name"
 pub const MSG_NO_PATTERN: StrView = "No previous search pattern"
 pub const MSG_NO_JUMP: StrView = "E73: Tag stack empty"
+pub const MSG_TOO_LONG: StrView = "E1240: Resulting text too long"
+
+# The most bytes one put (a count times the register) inserts.
+pub const MAX_PUT: i64 = 64 * 1024 * 1024
 
 # The most jumps kept for Ctrl-O / Ctrl-T; the oldest go first.
 pub const MAX_JUMPS: i64 = 100
@@ -79,7 +90,7 @@ pub struct Editor
     reg_lines: bool         # it holds whole lines, each with its terminator
     pattern: Vec<u8>        # the last search pattern
     cmdline: String         # the command line: its prompt (`:` or `/`), then the text
-    pending: u8             # the first key of gg, dd or yy; 0: none
+    keys: NormalKeys        # the Normal-mode keys of a command not yet complete
     message: String         # the message line
     quit: bool
     revisions: i64          # text revisions of the buffers before this one (text_revision)
@@ -95,7 +106,7 @@ pub fn editor_open(path: StrView, data: [u8]) -> Editor
     editor_with(string_from(path), buffer_from_bytes(data))
 
 fn editor_with(path: String, buf: Buffer) -> Editor
-    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), pending: 0, message: string_new(), quit: false, revisions: 0, ask: LangAsk.Nothing, jumps: vec_new<Jump>(), jump_paths: vec_new<u8>() }
+    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), keys: normal_keys_new(), message: string_new(), quit: false, revisions: 0, ask: LangAsk.Nothing, jumps: vec_new<Jump>(), jump_paths: vec_new<u8>() }
 
 # ============================================================================
 # Characters and columns
@@ -115,6 +126,23 @@ fn class_of(s: [u8], col: i64) -> CharClass
     if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 0x80
         return CharClass.Word
     CharClass.Punct
+
+# How an operator reaches a motion's target (Vim's exclusive, inclusive
+# and linewise motions).
+enum Reach
+    Exclusive       # up to the target, not including it (w b h l 0)
+    Inclusive       # the target's code point too (e $)
+    Linewise        # whole lines, the cursor's to the target's (j k gg G dd)
+
+# Where a motion takes the cursor, and how an operator reaches it.
+struct Target
+    at: Pos
+    reach: Reach
+
+# One step of w: keep going from a position, or end there.
+enum Stride
+    On(Pos)
+    Done(Pos)
 
 # The start of the code point holding byte `col`, kept on the last one: the
 # Normal-mode column for `col`. 0 on an empty line.
@@ -283,12 +311,6 @@ impl Editor
         let line = self.clamp_line(l)
         self.place(pos(line, first_non_blank(self.buf.line(line))))
 
-    # Line l (clamped), at the column `want` names; `want` stays.
-    fn place_vertical(self: @&Editor, l: i64)
-        let line = self.clamp_line(l)
-        let s = self.buf.line(line)
-        self.cursor = pos(line, normal_col(s, col_of_unit(s, self.want)))
-
     # One code point on within the shown text, crossing line ends: the end
     # of a line is a position of its own. None at the end of the last line.
     fn step(self: @Editor, p: Pos) -> Option<Pos>
@@ -311,79 +333,185 @@ impl Editor
         class_of(self.buf.line(p.line), p.col)
 
     # ------------------------------------------------------------------
-    # Motions
+    # Motions: where each takes the cursor, without moving it
     # ------------------------------------------------------------------
 
-    fn left(self: @&Editor)
-        if self.cursor.col > 0
-            self.place(pos(self.cursor.line, utf8_prev(self.buf.line(self.cursor.line), self.cursor.col)))
+    # True when the step from p to n left p's line or landed on its end.
+    fn breaks(self: @Editor, p: Pos, n: Pos) -> bool
+        n.line != p.line or n.col >= self.buf.line_len(n.line)
 
-    fn right(self: @&Editor)
-        let s = self.buf.line(self.cursor.line)
-        self.place(pos(self.cursor.line, utf8_next(s, self.cursor.col)))
+    # One step of w from p. With `stop_at_eol`, a step that leaves the line
+    # or lands on its end ends the motion there.
+    fn w_step(self: @Editor, p: Pos, stop_at_eol: bool) -> Stride
+        match self.step(p)
+            Some(n) => if stop_at_eol and self.breaks(p, n) then Stride.Done(n) else Stride.On(n)
+            None => Stride.Done(p)
 
-    # w: the next word's start. An empty line is a word; past the last
-    # word, the last character.
-    fn word_forward(self: @&Editor)
-        var p = self.cursor
-        let start = p.line
-        let c = self.class_at(p)
-        if c != CharClass.Blank
-            while true
-                match self.step(p)
-                    Some(q) =>
-                        p = q
-                        if q.line != start or self.class_at(q) != c
-                            break
-                    None => break
+    # w, `count` times (Vim's fwd_word). With `eol` (an operator waits for
+    # the motion) the last word stops at its line's end rather than crossing
+    # to the next line's first word: `dw` on a line's last word keeps the
+    # line break. An empty line is a word; past the last word, the end of
+    # the text.
+    fn word_forward_from(self: @Editor, from: Pos, count: i64, eol: bool) -> Pos
+        var p = from
+        for k in 0..count
+            let stop_at_eol = eol and k == count - 1
+            let cls = self.class_at(p)
+            # Off the code point under the cursor: on the last line, the
+            # line's end is as far as w goes.
+            match self.w_step(p, stop_at_eol or p.line >= self.last())
+                Stride.On(n) => p = n
+                Stride.Done(n) => return n
+            # To the end of its word, then over blanks to the next word.
+            if cls != CharClass.Blank
+                while self.class_at(p) == cls
+                    match self.w_step(p, stop_at_eol)
+                        Stride.On(n) => p = n
+                        Stride.Done(n) => return n
+            while self.class_at(p) == CharClass.Blank
+                if p.col == 0 and self.buf.line_len(p.line) == 0
+                    break
+                match self.w_step(p, stop_at_eol)
+                    Stride.On(n) => p = n
+                    Stride.Done(n) => return n
+        p
+
+    # b, once: the start of this word, or of the one before. An empty line
+    # is a word.
+    fn word_backward_from(self: @Editor, from: Pos) -> Pos
+        var p: Pos = match self.back(from)
+            Some(n) => n
+            None => return from
         while self.class_at(p) == CharClass.Blank
-            if p.line != start and self.buf.line_len(p.line) == 0
-                break
-            match self.step(p)
-                Some(q) => p = q
-                None => break
-        self.place(p)
-
-    # b: the start of this word, or of the one before. An empty line is a word.
-    fn word_backward(self: @&Editor)
-        var p = self.cursor
-        match self.back(p)
-            Some(q) => p = q
-            None => return
-        while self.class_at(p) == CharClass.Blank
-            if p.line != self.cursor.line and self.buf.line_len(p.line) == 0
+            if p.line != from.line and self.buf.line_len(p.line) == 0
                 break
             match self.back(p)
-                Some(q) => p = q
+                Some(n) => p = n
                 None => break
-        let c = self.class_at(p)
-        if c != CharClass.Blank
+        let cls = self.class_at(p)
+        if cls != CharClass.Blank
             while p.col > 0
                 let q = pos(p.line, utf8_prev(self.buf.line(p.line), p.col))
-                if self.class_at(q) != c
+                if self.class_at(q) != cls
                     break
                 p = q
-        self.place(p)
+        p
 
-    # e: the end of this word, or of the next. Empty lines don't stop it.
-    fn word_end(self: @&Editor)
-        var p = self.cursor
-        match self.step(p)
-            Some(q) => p = q
-            None => return
-        while self.class_at(p) == CharClass.Blank
+    # Past the run of `cls` code points at p. A word or punctuation run
+    # ends on its own line, at the latest at the line's end.
+    fn skip_class(self: @Editor, from: Pos, cls: CharClass) -> Pos
+        var p = from
+        while self.class_at(p) == cls
             match self.step(p)
-                Some(q) => p = q
-                None => return
-        let c = self.class_at(p)
-        while true
+                Some(n) => p = n
+                None => return p
+        p
+
+    # e, `count` times (Vim's end_word): the end of this word, or of the
+    # next; empty lines don't stop it. With `change` (cw on a word, which
+    # changes to the word's end): a cursor on a word's last code point is at
+    # its end already, and an empty line ends it. Past the last word, the
+    # end of the text.
+    fn word_end_from(self: @Editor, from: Pos, count: i64, change: bool) -> Pos
+        var p = from
+        for k in 0..count
+            let cls = self.class_at(p)
             match self.step(p)
-                Some(q) =>
-                    if q.line != p.line or self.class_at(q) != c
+                Some(n) => p = n
+                None => return p
+            if cls != CharClass.Blank and self.class_at(p) == cls
+                p = self.skip_class(p, cls)
+            else if cls == CharClass.Blank or not (change and k == 0)
+                var empty_line = false
+                while self.class_at(p) == CharClass.Blank and not empty_line
+                    if change and p.col == 0 and self.buf.line_len(p.line) == 0
+                        empty_line = true
+                    else
+                        match self.step(p)
+                            Some(n) => p = n
+                            None => return p
+                if empty_line
+                    continue
+                p = self.skip_class(p, self.class_at(p))
+            p = self.back(p).unwrap_or(p)
+        p
+
+    # Line l (clamped) at the column `want` names: where j and k go.
+    fn vertical(self: @Editor, l: i64) -> Pos
+        let line = self.clamp_line(l)
+        let s = self.buf.line(line)
+        pos(line, normal_col(s, col_of_unit(s, self.want)))
+
+    # Where motion `m` takes the cursor, with `count` as typed (0: none),
+    # and how an operator reaches it. `op`: an operator waits for the
+    # motion, which lets l reach a line's end and stops w there. None where
+    # a line motion can't go at all (k on the first line): no move, and an
+    # operator does nothing. h and l that can't move stay put, so an
+    # operator gets an empty range (ch at a line's start still inserts).
+    fn target(self: @Editor, m: Motion, count: i64, op: bool) -> Option<Target>
+        let n = if count > 0 then count else 1
+        let c = self.cursor
+        let s = self.buf.line(c.line)
+        match m
+            Motion.Left =>
+                var col = c.col
+                var k: i64 = 0
+                while k < n and col > 0
+                    col = utf8_prev(s, col)
+                    k += 1
+                Some(Target { at: pos(c.line, col), reach: Reach.Exclusive })
+            Motion.Right =>
+                # Normal mode stops on the last code point; an operator
+                # reaches past it, to the line's end.
+                var col = c.col
+                var k: i64 = 0
+                while k < n and col < s.len
+                    let next = utf8_next(s, col)
+                    if not op and next >= s.len
+                        break
+                    col = next
+                    k += 1
+                Some(Target { at: pos(c.line, col), reach: Reach.Exclusive })
+            Motion.Up =>
+                if c.line == 0 then None else Some(Target { at: self.vertical(c.line - n), reach: Reach.Linewise })
+            Motion.Down =>
+                if c.line >= self.last() then None else Some(Target { at: self.vertical(c.line + n), reach: Reach.Linewise })
+            Motion.WordForward => Some(Target { at: self.word_forward_from(c, n, op), reach: Reach.Exclusive })
+            Motion.WordBackward =>
+                var p = c
+                var k: i64 = 0
+                while k < n
+                    let q = self.word_backward_from(p)
+                    if not pos_before(q, p)
                         break
                     p = q
-                None => break
-        self.place(p)
+                    k += 1
+                Some(Target { at: p, reach: Reach.Exclusive })
+            Motion.WordEnd => Some(Target { at: self.word_end_from(c, n, false), reach: Reach.Inclusive })
+            Motion.LineStart => Some(Target { at: pos(c.line, 0), reach: Reach.Exclusive })
+            Motion.LineEnd =>
+                let l = c.line + n - 1
+                if l > self.last() then None else Some(Target { at: pos(l, self.buf.line_len(l)), reach: Reach.Inclusive })
+            Motion.FirstLine => Some(self.line_target(if count > 0 then count - 1 else 0))
+            Motion.LastLine => Some(self.line_target(if count > 0 then count - 1 else self.last()))
+            Motion.Lines =>
+                if n > 1 and c.line >= self.last() then None else Some(self.line_target(c.line + n - 1))
+
+    # Line l (clamped), at its first non-blank, reached linewise.
+    fn line_target(self: @Editor, l: i64) -> Target
+        let line = self.clamp_line(l)
+        Target { at: pos(line, first_non_blank(self.buf.line(line))), reach: Reach.Linewise }
+
+    # A motion without an operator: the cursor goes to its target. j and k
+    # keep the column they aim for.
+    fn move_by(self: @&Editor, m: Motion, count: i64)
+        match self.target(m, count, false)
+            Some(t) =>
+                if m == Motion.Up or m == Motion.Down
+                    self.cursor = t.at
+                else
+                    self.place(t.at)
+            None => pass
 
     # The lines a page turns over: Vim keeps two of the old page in view.
     fn page_step(self: @Editor) -> i64
@@ -412,6 +540,10 @@ impl Editor
     # Into Insert mode at `at`; the session's edits are one undo step.
     fn start_insert(self: @&Editor, at: Pos)
         self.buf.begin_group()
+        self.enter_insert(at)
+
+    # Into Insert mode at `at`, in the undo step already open (c's).
+    fn enter_insert(self: @&Editor, at: Pos)
         self.cursor = at
         self.mode = Mode.Insert
 
@@ -446,48 +578,138 @@ impl Editor
         self.reg.push_span(text)
         self.reg_lines = lines
 
-    # x: delete the code point under the cursor into the register.
-    fn delete_char(self: @&Editor)
-        let s = self.buf.line(self.cursor.line)
-        if s.len == 0
-            return
-        let end = pos(self.cursor.line, utf8_next(s, self.cursor.col))
-        let text = self.buf.text(self.cursor, end)
-        self.set_register(span_from_vec<u8>(@text), false)
-        let at = self.buf.delete(self.cursor, end)
-        self.place(at)
-
-    # Line l as the register holds it: its bytes and a terminator (the
-    # line's own; for the last line, which has none, the one above's or LF).
-    fn yank_line(self: @&Editor, l: i64)
-        var text: Vec<u8> = vec_new<u8>()
-        text.push_span(self.buf.line(l))
-        var t = self.buf.line_term(l)
+    # Lines a..=b as the register holds them: their bytes and terminators,
+    # the last line's own or, for the last line of the text, which has
+    # none, the one above's or LF.
+    fn yank_lines(self: @&Editor, a: i64, b: i64)
+        # The annotation works around AGAST #4914 (ritz1 types the local at
+        # another Vec instance of core.buffer); drop it with that fix.
+        var text: Vec<u8> = self.buf.text(pos(a, 0), pos(b, self.buf.line_len(b)))
+        var t = self.buf.line_term(b)
         if t == Term.NoEol
-            t = if l > 0 then self.buf.line_term(l - 1) else Term.Lf
+            t = if b > 0 then self.buf.line_term(b - 1) else Term.Lf
         text.push_view(term_text(t))
         self.set_register(span_from_vec<u8>(@text), true)
 
-    # dd: delete the cursor's line, terminator and all, into the register.
-    fn delete_line(self: @&Editor)
-        let l = self.cursor.line
-        self.yank_line(l)
-        if l + 1 < self.buf.line_count()
-            self.buf.delete(pos(l, 0), pos(l + 1, 0))
-        else if l > 0
-            # The last line: take the terminator before it.
-            self.buf.delete(pos(l - 1, self.buf.line_len(l - 1)), pos(l, self.buf.line_len(l)))
+    # Delete lines a..=b, terminators and all, into the register; the
+    # cursor on the line that takes their place.
+    fn delete_lines(self: @&Editor, a: i64, b: i64)
+        self.yank_lines(a, b)
+        if b + 1 < self.buf.line_count()
+            self.buf.delete(pos(a, 0), pos(b + 1, 0))
+        else if a > 0
+            # Through the last line: take the terminator before them.
+            self.buf.delete(pos(a - 1, self.buf.line_len(a - 1)), pos(b, self.buf.line_len(b)))
         else
-            self.buf.delete(pos(0, 0), pos(0, self.buf.line_len(0)))
-        self.place_line(l)
+            self.buf.delete(pos(0, 0), pos(b, self.buf.line_len(b)))
+        self.place_line(a)
 
-    # p (after) and P (before): put the register by the cursor, its lines
-    # by the cursor's line.
-    fn put(self: @&Editor, after: bool)
+    # True when only blanks come before p on its line (Vim's inindent).
+    fn in_indent(self: @Editor, p: Pos) -> bool
+        let s = self.buf.line(p.line)
+        for i in 0..p.col
+            if s[i] != ' ' and s[i] != '\t'
+                return false
+        true
+
+    # True when only blanks come from p to its line's end.
+    fn blank_after(self: @Editor, p: Pos) -> bool
+        let s = self.buf.line(p.line)
+        for i in p.col..s.len
+            if s[i] != ' ' and s[i] != '\t'
+                return false
+        true
+
+    # Where operator `op` reaches with motion `m`: the motion's target,
+    # except that cw on a word changes to the word's end (Vim's cw is ce).
+    fn operator_target(self: @Editor, op: Operator, m: Motion, count: i64) -> Option<Target>
+        let c = self.cursor
+        if op == Operator.Change and m == Motion.WordForward and self.class_at(c) != CharClass.Blank
+            let n = if count > 0 then count else 1
+            return Some(Target { at: self.word_end_from(c, n, true), reach: Reach.Inclusive })
+        self.target(m, count, true)
+
+    # d, c or y over motion `m`. The text goes to the register, its lines
+    # whole for a linewise motion. Vim's two adjustments to a charwise
+    # range apply: an exclusive one that ends at a later line's start ends
+    # at the line before's end instead (and is linewise when it starts in
+    # the indent), and a d that spans lines with only blanks before its
+    # start and after its end deletes the lines whole.
+    fn operate(self: @&Editor, op: Operator, m: Motion, count: i64)
+        let t: Target = match self.operator_target(op, m, count)
+            Some(found) => found
+            None => return
+        var a = self.cursor
+        var b = t.at
+        if pos_before(b, a)
+            a = t.at
+            b = self.cursor
+        if t.reach == Reach.Linewise
+            self.on_lines(op, a.line, b.line)
+            return
+        if t.reach == Reach.Inclusive and b.col < self.buf.line_len(b.line)
+            b = pos(b.line, utf8_next(self.buf.line(b.line), b.col))
+        if t.reach == Reach.Exclusive and b.col == 0 and b.line > a.line
+            if self.in_indent(a)
+                self.on_lines(op, a.line, b.line - 1)
+                return
+            b = pos(b.line - 1, self.buf.line_len(b.line - 1))
+        if op == Operator.Delete and b.line > a.line and self.in_indent(a) and self.blank_after(b)
+            self.on_lines(op, a.line, b.line)
+            return
+        self.on_chars(op, a, b)
+
+    # An operator over the text from a to b (a first, b excluded).
+    fn on_chars(self: @&Editor, op: Operator, a: Pos, b: Pos)
+        match op
+            Operator.Yank =>
+                self.take(a, b, false)
+                self.place(a)
+            Operator.Delete =>
+                self.take(a, b, true)
+                self.place(a)
+            Operator.Change =>
+                self.buf.begin_group()
+                self.take(a, b, true)
+                self.enter_insert(a)
+
+    # The text from a to b into the register, and out of the buffer when
+    # `cut`. An empty range leaves the register as it was.
+    fn take(self: @&Editor, a: Pos, b: Pos, cut: bool)
+        if not pos_before(a, b)
+            return
+        let text = self.buf.text(a, b)
+        self.set_register(span_from_vec<u8>(@text), false)
+        if cut
+            self.buf.delete(a, b)
+
+    # An operator over lines a..=b. c leaves one empty line to type on.
+    fn on_lines(self: @&Editor, op: Operator, a: i64, b: i64)
+        match op
+            Operator.Delete => self.delete_lines(a, b)
+            Operator.Yank =>
+                self.yank_lines(a, b)
+                if a != self.cursor.line
+                    self.cursor = self.vertical(a)
+            Operator.Change =>
+                self.buf.begin_group()
+                self.yank_lines(a, b)
+                self.buf.delete(pos(a, 0), pos(b, self.buf.line_len(b)))
+                self.enter_insert(pos(a, 0))
+
+    # p (after) and P (before): put the register `times` over by the
+    # cursor, its lines by the cursor's line. One undo step.
+    fn put(self: @&Editor, after: bool, times: i64)
         if self.reg.len() == 0
             return
+        if times > MAX_PUT / self.reg.len()
+            self.say(MSG_TOO_LONG)
+            return
         let l = self.cursor.line
-        let text = span_from_vec<u8>(@self.reg)
+        var repeated: Vec<u8> = vec_with_cap<u8>(self.reg.len() * times)
+        for k in 0..times
+            repeated.push_span(span_from_vec<u8>(@self.reg))
+        let text = span_from_vec<u8>(@repeated)
         if self.reg_lines
             if not after
                 self.buf.insert(pos(l, 0), text)
@@ -511,26 +733,37 @@ impl Editor
         let end = self.buf.insert(at, text)
         self.place(self.buf.prev_char(end))
 
-    fn undo(self: @&Editor)
+    # u, once; false when there was nothing to undo.
+    fn undo(self: @&Editor) -> bool
         match self.buf.undo()
-            Some(p) => self.place(p)
-            None => self.say("Already at oldest change")
+            Some(p) =>
+                self.place(p)
+                true
+            None =>
+                self.say("Already at oldest change")
+                false
 
-    fn redo(self: @&Editor)
+    # Ctrl-R, once; false when there was nothing to redo.
+    fn redo(self: @&Editor) -> bool
         match self.buf.redo()
-            Some(p) => self.place(p)
-            None => self.say("Already at newest change")
+            Some(p) =>
+                self.place(p)
+                true
+            None =>
+                self.say("Already at newest change")
+                false
 
     # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------
 
     # n (forward) and N: the next match of the last pattern, wrapping
-    # around the buffer once, the cursor's own match last.
-    fn search(self: @&Editor, forward: bool)
+    # around the buffer once, the cursor's own match last. False when there
+    # is none.
+    fn search(self: @&Editor, forward: bool) -> bool
         if self.pattern.len() == 0
             self.say(MSG_NO_PATTERN)
-            return
+            return false
         let pat = span_from_vec<u8>(@self.pattern)
         let n = self.shown()
         let cur = self.cursor
@@ -553,11 +786,12 @@ impl Editor
                         self.say("search hit BOTTOM, continuing at TOP")
                     else if not forward and cur.line - k < 0
                         self.say("search hit TOP, continuing at BOTTOM")
-                    return
+                    return true
                 None => pass
         var msg = string_from("Pattern not found: ")
         msg.push_span(pat)
         self.say(msg.as_view())
+        false
 
     # ------------------------------------------------------------------
     # The command line
@@ -599,94 +833,61 @@ pub fn handle_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
     ed.message.clear()
     match ed.mode
         Mode.Normal =>
-            if key.eq(Key.Ctrl('o')) or key.eq(Key.Ctrl('t'))
-                ed.pending = 0
-                jump_back<F>(ed, files)
-            else
-                normal_key(ed, key)
+            match ed.keys.feed(key)
+                Step.Run(cmd) => run_normal<F>(ed, files, cmd)
+                Step.Wait | Step.Cancel => pass
         Mode.Insert => ed.insert_key(key)
         Mode.CommandLine => command_line_key<F>(ed, files, key)
 
-fn normal_key(ed: @&Editor, key: Key)
-    let c = ascii_of(key)
-    # The second key of gg, dd or yy; any other drops the first and acts alone.
-    let first = ed.pending
-    ed.pending = 0
-    if first == 'g' and c == 'd'
-        ed.ask = LangAsk.Definition
-        return
-    if first != 0 and c == first
-        if c == 'g'
-            ed.place_line(0)
-        else if c == 'd'
-            ed.delete_line()
-        else
-            ed.yank_line(ed.cursor.line)
-        return
-    match key
-        Key.Left => ed.left()
-        Key.Right => ed.right()
-        Key.Up => ed.place_vertical(ed.cursor.line - 1)
-        Key.Down => ed.place_vertical(ed.cursor.line + 1)
-        Key.Ctrl(k) =>
-            if k == 'f'
-                ed.page_down()
-            else if k == 'b'
-                ed.page_up()
-            else if k == 'r'
-                ed.redo()
-        _ => normal_char(ed, c)
+# n or N `times` over, stopping at the first miss.
+fn repeat_search(ed: @&Editor, forward: bool, times: i64)
+    var k: i64 = 0
+    while k < times and ed.search(forward)
+        k += 1
 
-fn normal_char(ed: @&Editor, c: u8)
+# Run one Normal-mode command (core/normal.ritz decoded it). A count
+# repeats u, Ctrl-R, n, N, Ctrl-F, Ctrl-B and Ctrl-O until one fails; i, a,
+# o, O, :, /, K and gd take none.
+fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
+    let times = cmd.times()
     let l = ed.cursor.line
-    if c == 'h'
-        ed.left()
-    else if c == 'l'
-        ed.right()
-    else if c == 'j'
-        ed.place_vertical(l + 1)
-    else if c == 'k'
-        ed.place_vertical(l - 1)
-    else if c == 'w'
-        ed.word_forward()
-    else if c == 'b'
-        ed.word_backward()
-    else if c == 'e'
-        ed.word_end()
-    else if c == '0'
-        ed.place(pos(l, 0))
-    else if c == '$'
-        ed.place(pos(l, ed.buf.line_len(l)))
-    else if c == 'G'
-        ed.place_line(ed.last())
-    else if c == 'g' or c == 'd' or c == 'y'
-        ed.pending = c
-    else if c == 'i'
-        ed.start_insert(ed.cursor)
-    else if c == 'a'
-        ed.start_insert(pos(l, utf8_next(ed.buf.line(l), ed.cursor.col)))
-    else if c == 'o'
-        ed.start_insert(ed.cursor)
-        ed.cursor = ed.buf.split_line(pos(l, ed.buf.line_len(l)))
-    else if c == 'O'
-        ed.start_insert(pos(l, 0))
-        ed.buf.split_line(pos(l, 0))
-    else if c == 'x'
-        ed.delete_char()
-    else if c == 'p'
-        ed.put(true)
-    else if c == 'P'
-        ed.put(false)
-    else if c == 'u'
-        ed.undo()
-    else if c == 'n'
-        ed.search(true)
-    else if c == 'N'
-        ed.search(false)
-    else if c == ':' or c == '/'
-        ed.open_command_line(c)
-    else if c == 'K'
-        ed.ask = LangAsk.Hover
+    match cmd.action
+        Action.Move(m) => ed.move_by(m, cmd.count)
+        Action.Operate(op, m) => ed.operate(op, m, cmd.count)
+        Action.Insert => ed.start_insert(ed.cursor)
+        Action.Append => ed.start_insert(pos(l, utf8_next(ed.buf.line(l), ed.cursor.col)))
+        Action.OpenBelow =>
+            ed.start_insert(ed.cursor)
+            ed.cursor = ed.buf.split_line(pos(l, ed.buf.line_len(l)))
+        Action.OpenAbove =>
+            ed.start_insert(pos(l, 0))
+            ed.buf.split_line(pos(l, 0))
+        Action.PutAfter => ed.put(true, times)
+        Action.PutBefore => ed.put(false, times)
+        Action.Undo =>
+            var k: i64 = 0
+            while k < times and ed.undo()
+                k += 1
+        Action.Redo =>
+            var k: i64 = 0
+            while k < times and ed.redo()
+                k += 1
+        Action.SearchNext => repeat_search(ed, true, times)
+        Action.SearchPrev => repeat_search(ed, false, times)
+        Action.PageDown =>
+            for k in 0..(if times > ed.shown() then ed.shown() else times)
+                ed.page_down()
+        Action.PageUp =>
+            for k in 0..(if times > ed.shown() then ed.shown() else times)
+                ed.page_up()
+        Action.CommandLine => ed.open_command_line(':')
+        Action.Search => ed.open_command_line('/')
+        Action.Hover => ed.ask = LangAsk.Hover
+        Action.Definition => ed.ask = LangAsk.Definition
+        Action.JumpBack =>
+            var k: i64 = 0
+            while k < times and jump_back<F>(ed, files)
+                k += 1
 
 fn command_line_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
     match key
@@ -719,7 +920,7 @@ fn run_search(ed: @&Editor, text: StrView)
     if not text.is_empty()
         ed.pattern.clear()
         ed.pattern.push_view(text)
-    ed.search(true)
+    let found = ed.search(true)
 
 fn run_command<F: FileStore>(ed: @&Editor, files: @&F, text: StrView)
     match parse_command(text)
@@ -884,15 +1085,17 @@ pub fn jump_to<F: FileStore>(ed: @&Editor, files: @&F, path: StrView, at: Pos) -
     true
 
 # Ctrl-O / Ctrl-T: back to where the last jump_to left from. A file that
-# can't be reopened (pending edits) keeps the jump for another try.
-fn jump_back<F: FileStore>(ed: @&Editor, files: @&F)
+# can't be reopened (pending edits) keeps the jump for another try. True
+# when back.
+fn jump_back<F: FileStore>(ed: @&Editor, files: @&F) -> bool
     let j: JumpBack = match ed.pop_jump()
         Some(b) => b
         None =>
             ed.say(MSG_NO_JUMP)
-            return
+            return false
     if not ed.path.as_view().eq(j.path.as_view())
         if not edit<F>(ed, files, j.path.as_view())
             ed.restore_jump(@j)
-            return
+            return false
     ed.place(j.at)
+    true

@@ -1,0 +1,202 @@
+# core/normal.ritz - Normal-mode keys into commands.
+#
+# Vim's Normal-mode grammar: `[count] command`, or `[count] operator [count]
+# motion`, where an operator typed twice (dd cc yy) means the cursor's lines
+# and the two counts multiply (2d3w deletes six words). NormalKeys holds the
+# keys typed so far; feed() turns each key into a Step: wait for more, cancel
+# (the key completes nothing, so everything typed is dropped with no effect,
+# where Vim beeps), or run a NormalCommand. core/editor.ritz runs it.
+#
+# `0` is a motion unless it continues a count. `gj` and `gk` are j and k:
+# with no soft wrap a screen line is a buffer line.
+# Core module: no terminal or OS I/O (see src/platform/).
+
+import ritzlib.option { Option }
+import ritzlib.termsession { Key }
+
+# The largest count kept: more digits leave it there, as Vim does.
+pub const MAX_COUNT: i64 = 99_999_999
+
+pub enum Operator
+    Delete          # d
+    Change          # c
+    Yank            # y
+
+pub enum Motion
+    Left            # h, Left
+    Right           # l, Right
+    Up              # k, Up, gk
+    Down            # j, Down, gj
+    WordForward     # w
+    WordBackward    # b
+    WordEnd         # e
+    LineStart       # 0
+    LineEnd         # $; a count goes count - 1 lines down
+    FirstLine       # gg; a count names the line
+    LastLine        # G; a count names the line
+    Lines           # an operator typed twice: the cursor's line and count - 1 more
+
+pub enum Action
+    Move(Motion)
+    Operate(Operator, Motion)
+    Insert          # i
+    Append          # a
+    OpenBelow       # o
+    OpenAbove       # O
+    PutAfter        # p
+    PutBefore       # P
+    Undo            # u
+    Redo            # Ctrl-R
+    SearchNext      # n
+    SearchPrev      # N
+    PageDown        # Ctrl-F
+    PageUp          # Ctrl-B
+    CommandLine     # :
+    Search          # /
+    Hover           # K
+    Definition      # gd
+    JumpBack        # Ctrl-O, Ctrl-T
+
+pub struct NormalCommand
+    action: Action
+    count: i64      # the counts typed, multiplied; 0 when none was
+
+impl NormalCommand
+    # The count, or 1 when none was typed.
+    pub fn times(self: @NormalCommand) -> i64
+        if self.count > 0 then self.count else 1
+
+pub enum Step
+    Wait            # the key started or continued a command
+    Cancel          # the key completes nothing: what was typed is dropped
+    Run(NormalCommand)
+
+pub struct NormalKeys
+    count: i64              # the count being typed; 0: none
+    op: Option<Operator>    # the operator waiting for its motion
+    op_count: i64           # the count typed before the operator; 0: none
+    g: bool                 # a `g` waits for its second key
+
+pub fn normal_keys_new() -> NormalKeys
+    NormalKeys { count: 0, op: None, op_count: 0, g: false }
+
+# a * b for counts, 0 meaning none typed; never past MAX_COUNT.
+fn times_counts(a: i64, b: i64) -> i64
+    if a == 0
+        return b
+    if b == 0
+        return a
+    if a > MAX_COUNT / b then MAX_COUNT else a * b
+
+impl NormalKeys
+    # True when no key of a command is waiting.
+    pub fn is_idle(self: @NormalKeys) -> bool
+        self.count == 0 and self.op.is_none() and not self.g
+
+    # One more typed key.
+    pub fn feed(self: @&NormalKeys, key: Key) -> Step
+        let c: u8 = match key
+            Key.Char(ch) => if ch < 0x80 then ch as u8 else 0
+            _ => 0
+        if self.g
+            return self.after_g(c)
+        if (c >= '1' and c <= '9') or (c == '0' and self.count > 0)
+            let digit = (c - '0') as i64
+            self.count = if self.count > (MAX_COUNT - digit) / 10 then MAX_COUNT else self.count * 10 + digit
+            return Step.Wait
+        match key
+            Key.Left => self.motion(Motion.Left)
+            Key.Right => self.motion(Motion.Right)
+            Key.Up => self.motion(Motion.Up)
+            Key.Down => self.motion(Motion.Down)
+            Key.Ctrl(k) => self.ctrl(k)
+            Key.Char(_) => self.char(c)
+            _ => self.cancel()
+
+    # The second key of a g command.
+    fn after_g(self: @&NormalKeys, c: u8) -> Step
+        self.g = false
+        match c
+            'g' => self.motion(Motion.FirstLine)
+            'j' => self.motion(Motion.Down)
+            'k' => self.motion(Motion.Up)
+            'd' => self.action(Action.Definition)
+            _ => self.cancel()
+
+    fn ctrl(self: @&NormalKeys, k: u8) -> Step
+        match k
+            'f' => self.action(Action.PageDown)
+            'b' => self.action(Action.PageUp)
+            'r' => self.action(Action.Redo)
+            'o' | 't' => self.action(Action.JumpBack)
+            _ => self.cancel()
+
+    fn char(self: @&NormalKeys, c: u8) -> Step
+        match c
+            'h' => self.motion(Motion.Left)
+            'l' => self.motion(Motion.Right)
+            'j' => self.motion(Motion.Down)
+            'k' => self.motion(Motion.Up)
+            'w' => self.motion(Motion.WordForward)
+            'b' => self.motion(Motion.WordBackward)
+            'e' => self.motion(Motion.WordEnd)
+            '0' => self.motion(Motion.LineStart)
+            '$' => self.motion(Motion.LineEnd)
+            'G' => self.motion(Motion.LastLine)
+            'g' =>
+                self.g = true
+                Step.Wait
+            'd' => self.operator(Operator.Delete)
+            'c' => self.operator(Operator.Change)
+            'y' => self.operator(Operator.Yank)
+            'x' => self.action(Action.Operate(Operator.Delete, Motion.Right))
+            'D' => self.action(Action.Operate(Operator.Delete, Motion.LineEnd))
+            'C' => self.action(Action.Operate(Operator.Change, Motion.LineEnd))
+            'Y' => self.action(Action.Operate(Operator.Yank, Motion.Lines))
+            'i' => self.action(Action.Insert)
+            'a' => self.action(Action.Append)
+            'o' => self.action(Action.OpenBelow)
+            'O' => self.action(Action.OpenAbove)
+            'p' => self.action(Action.PutAfter)
+            'P' => self.action(Action.PutBefore)
+            'u' => self.action(Action.Undo)
+            'n' => self.action(Action.SearchNext)
+            'N' => self.action(Action.SearchPrev)
+            ':' => self.action(Action.CommandLine)
+            '/' => self.action(Action.Search)
+            'K' => self.action(Action.Hover)
+            _ => self.cancel()
+
+    # d, c or y: wait for the motion; the same operator again is its lines.
+    fn operator(self: @&NormalKeys, o: Operator) -> Step
+        match self.op
+            Some(waiting) =>
+                if waiting == o
+                    return self.motion(Motion.Lines)
+                self.cancel()
+            None =>
+                self.op = Some(o)
+                self.op_count = self.count
+                self.count = 0
+                Step.Wait
+
+    # A motion: the waiting operator's, else a cursor move.
+    fn motion(self: @&NormalKeys, m: Motion) -> Step
+        match self.op
+            Some(o) => self.run(Action.Operate(o, m))
+            None => self.run(Action.Move(m))
+
+    # A command that takes no motion: with an operator waiting, a cancel.
+    fn action(self: @&NormalKeys, a: Action) -> Step
+        if self.op.is_some()
+            return self.cancel()
+        self.run(a)
+
+    fn run(self: @&NormalKeys, a: Action) -> Step
+        let count = times_counts(self.op_count, self.count)
+        *self = normal_keys_new()
+        Step.Run(NormalCommand { action: a, count: count })
+
+    fn cancel(self: @&NormalKeys) -> Step
+        *self = normal_keys_new()
+        Step.Cancel

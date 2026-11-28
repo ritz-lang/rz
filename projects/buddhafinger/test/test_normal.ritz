@@ -1,0 +1,210 @@
+# test/test_normal.ritz - Normal-mode keys into commands (AGAST #4909).
+#
+# core/normal.ritz's decoder alone: counts before and after an operator, an
+# operator typed twice, the g prefix, the shorthands (x D C Y), and the keys
+# that cancel what was typed. test_editor.ritz runs the commands.
+
+import ritzlib.option
+import ritzlib.strview
+import ritzlib.termsession { Key }
+
+import core.normal { Action, Motion, NormalCommand, NormalKeys, Operator, Step, MAX_COUNT, normal_keys_new }
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# Feed `keys` to a fresh decoder; the Step of the last key. `<esc>` and
+# `<C-x>` name those keys.
+fn step_of(keys: StrView) -> Step
+    var nk = normal_keys_new()
+    step_after(@&nk, keys)
+
+fn step_after(nk: @&NormalKeys, keys: StrView) -> Step
+    var last = Step.Wait
+    var i: i64 = 0
+    while i < keys.len
+        if keys.get(i) == '<'
+            let close = keys.slice(i, keys.len).find_byte('>')
+            let name = keys.slice(i + 1, i + close)
+            if name.eq("esc")
+                last = nk.feed(Key.Escape)
+            else
+                last = nk.feed(Key.Ctrl(name.get(2)))
+            i += close + 1
+            continue
+        last = nk.feed(Key.Char(keys.get(i) as u32))
+        i += 1
+    last
+
+# The command `keys` complete, or None when they wait or cancel.
+fn command_of(keys: StrView) -> Option<NormalCommand>
+    match step_of(keys)
+        Step.Run(c) => Some(c)
+        Step.Wait | Step.Cancel => None
+
+fn moves(keys: StrView, m: Motion, count: i64) -> bool
+    match command_of(keys)
+        Some(c) => match c.action
+            Action.Move(got) => got == m and c.count == count
+            _ => false
+        None => false
+
+fn operates(keys: StrView, o: Operator, m: Motion, count: i64) -> bool
+    match command_of(keys)
+        Some(c) => match c.action
+            Action.Operate(got_o, got_m) => got_o == o and got_m == m and c.count == count
+            _ => false
+        None => false
+
+fn cancels(keys: StrView) -> bool
+    match step_of(keys)
+        Step.Cancel => true
+        _ => false
+
+fn waits(keys: StrView) -> bool
+    match step_of(keys)
+        Step.Wait => true
+        _ => false
+
+# ============================================================================
+# Counts
+# ============================================================================
+
+[[test]]
+fn test_a_count_goes_with_the_motion() -> i32
+    assert moves("l", Motion.Right, 0)
+    assert moves("3l", Motion.Right, 3)
+    assert moves("10j", Motion.Down, 10)              # 0 continues a count
+    assert moves("0", Motion.LineStart, 0)            # alone, 0 is a motion
+    assert moves("5G", Motion.LastLine, 5)
+    assert moves("12gg", Motion.FirstLine, 12)
+    0
+
+[[test]]
+fn test_counts_before_and_after_an_operator_multiply() -> i32
+    assert operates("dw", Operator.Delete, Motion.WordForward, 0)
+    assert operates("3dw", Operator.Delete, Motion.WordForward, 3)
+    assert operates("d3w", Operator.Delete, Motion.WordForward, 3)
+    assert operates("2d3w", Operator.Delete, Motion.WordForward, 6)
+    assert operates("2c10l", Operator.Change, Motion.Right, 20)
+    0
+
+[[test]]
+fn test_a_count_stops_at_max_count() -> i32
+    assert moves("999999999999l", Motion.Right, MAX_COUNT)
+    assert operates("99999d99999w", Operator.Delete, Motion.WordForward, MAX_COUNT)
+    0
+
+[[test]]
+fn test_a_count_and_digits_wait() -> i32
+    assert waits("2")
+    assert waits("2d")
+    assert waits("2d3")
+    assert waits("g")
+    assert waits("2g")
+    0
+
+# ============================================================================
+# Operators
+# ============================================================================
+
+[[test]]
+fn test_an_operator_typed_twice_is_its_lines() -> i32
+    assert operates("dd", Operator.Delete, Motion.Lines, 0)
+    assert operates("3cc", Operator.Change, Motion.Lines, 3)
+    assert operates("y2y", Operator.Yank, Motion.Lines, 2)
+    0
+
+[[test]]
+fn test_every_motion_follows_an_operator() -> i32
+    assert operates("dh", Operator.Delete, Motion.Left, 0)
+    assert operates("dk", Operator.Delete, Motion.Up, 0)
+    assert operates("db", Operator.Delete, Motion.WordBackward, 0)
+    assert operates("ce", Operator.Change, Motion.WordEnd, 0)
+    assert operates("y0", Operator.Yank, Motion.LineStart, 0)
+    assert operates("d$", Operator.Delete, Motion.LineEnd, 0)
+    assert operates("dgg", Operator.Delete, Motion.FirstLine, 0)
+    assert operates("dG", Operator.Delete, Motion.LastLine, 0)
+    assert operates("dgj", Operator.Delete, Motion.Down, 0)
+    0
+
+[[test]]
+fn test_x_D_C_and_Y_are_operator_shorthands() -> i32
+    assert operates("x", Operator.Delete, Motion.Right, 0)
+    assert operates("3x", Operator.Delete, Motion.Right, 3)
+    assert operates("D", Operator.Delete, Motion.LineEnd, 0)
+    assert operates("C", Operator.Change, Motion.LineEnd, 0)
+    assert operates("2Y", Operator.Yank, Motion.Lines, 2)
+    0
+
+# ============================================================================
+# Cancels
+# ============================================================================
+
+[[test]]
+fn test_a_key_that_completes_nothing_cancels() -> i32
+    assert cancels("dz")                    # no such motion
+    assert cancels("dc")                    # another operator
+    assert cancels("dx")                    # a command, not a motion
+    assert cancels("dp")
+    assert cancels("dgd")                   # gd is no motion
+    assert cancels("gz")
+    assert cancels("d<esc>")
+    assert cancels("3<esc>")
+    assert cancels("Z")
+    assert cancels("<C-x>")
+    assert cancels("y<C-x>")                # Ctrl-X is no motion
+    0
+
+[[test]]
+fn test_a_cancel_or_a_command_leaves_the_decoder_idle() -> i32
+    var nk = normal_keys_new()
+    assert nk.is_idle()
+    let w = step_after(@&nk, "2d")
+    assert not nk.is_idle()
+    let c = step_after(@&nk, "z")
+    assert nk.is_idle()
+    # Nothing typed before the cancel carries over.
+    match step_after(@&nk, "w")
+        Step.Run(cmd) => match cmd.action
+            Action.Move(m) =>
+                assert m == Motion.WordForward and cmd.count == 0
+            _ => return 1
+        Step.Wait | Step.Cancel => return 2
+    let g = step_after(@&nk, "g")
+    assert not nk.is_idle()
+    let run = step_after(@&nk, "g")
+    assert nk.is_idle()
+    0
+
+# ============================================================================
+# Commands without a motion
+# ============================================================================
+
+[[test]]
+fn test_commands_without_a_motion_keep_their_count() -> i32
+    match command_of("3p")
+        Some(c) => match c.action
+            Action.PutAfter =>
+                assert c.count == 3 and c.times() == 3
+            _ => return 1
+        None => return 2
+    match command_of("u")
+        Some(c) => match c.action
+            Action.Undo =>
+                assert c.count == 0 and c.times() == 1
+            _ => return 3
+        None => return 4
+    match command_of("gd")
+        Some(c) => match c.action
+            Action.Definition => pass
+            _ => return 5
+        None => return 6
+    match command_of("2<C-o>")
+        Some(c) => match c.action
+            Action.JumpBack =>
+                assert c.count == 2
+            _ => return 7
+        None => return 8
+    0
