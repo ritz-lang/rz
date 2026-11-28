@@ -3285,15 +3285,21 @@ def test_tempest_document_compiles(tmp_path):
 
 # A by-value slot only copies a referent of its own type: reading one as
 # another would be a silent reinterpretation, so neither compiler may produce
-# a program.  A `C` into a `D` slot is located (ANOTHER_STRUCT_SLOT, #3294),
-# and a `:&` of a pointer to pointer doesn't hold a `C` either.
-POINTER_REFERENT = TYPES + """
+# a program.  A `C` into a `D` slot is located (ANOTHER_STRUCT_SLOT, #3294).
+
+# AGAST #4935: nor does a `**C`, whether a `c:& **C` borrows it or `c: **C`
+# is one: refused at the slot on all three compilers, in ritz0's words
+# (REFUSAL_ROWS).  ritz1 bound the borrow untyped and named no `**C`, so it
+# compiled all three.  `^` marks where it's reported; ritz0 spells the store's
+# types as LLVM's, so that row pins its words up to them.
+POINTER_TO_POINTER_SLOT = {
+    "pointer_referent": (TYPES + """
 struct V
     c: C
 
 fn mk(c:& **C) -> V
     var v: V
-    v.c = c
+    ^v.c = c
     return v
 
 pub fn main() -> i32
@@ -3302,7 +3308,30 @@ pub fn main() -> i32
     var q: **C = @p
     var v: V = mk(@&q)
     return v.c.x
-"""
+""", "cannot assign to field `c`: cannot store "),
+    "pointer_referent_return": (TYPES + """
+fn f(c:& **C) -> C
+    ^return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var p: *C = @c
+    var q: **C = @p
+    var d: C = f(@&q)
+    return d.x
+""", "return type **C doesn't match expected C"),
+    "pointer_pointer_return": (TYPES + """
+fn f(c: **C) -> C
+    ^return c
+
+pub fn main() -> i32
+    var c: C = C { x: 3, y: 0 }
+    var p: *C = @c
+    var q: **C = @p
+    var d: C = f(q)
+    return d.x
+""", "return type **C doesn't match expected C"),
+}
 
 # An array of `C` names `C` as well: the slot must not get its first element.
 ARRAY_REFERENT = TYPES + """
@@ -3330,28 +3359,6 @@ struct D
 """
 
 REFUSED_READS = {
-    "pointer_referent_return": TYPES + """
-fn f(c:& **C) -> C
-    return c
-
-pub fn main() -> i32
-    var c: C = C { x: 3, y: 0 }
-    var p: *C = @c
-    var q: **C = @p
-    var d: C = f(@&q)
-    return d.x
-""",
-    "pointer_pointer_return": TYPES + """
-fn f(c: **C) -> C
-    return c
-
-pub fn main() -> i32
-    var c: C = C { x: 3, y: 0 }
-    var p: *C = @c
-    var q: **C = @p
-    var d: C = f(q)
-    return d.x
-""",
     "array_referent_return": TYPES + """
 fn mk(c:& [2]C) -> C
     return c
@@ -3521,7 +3528,6 @@ pub fn main() -> i32
 
 REFUSED = {
     "array_referent": ARRAY_REFERENT,
-    "pointer_referent": POINTER_REFERENT,
     **REFUSED_READS,
 }
 
@@ -4013,7 +4019,13 @@ REFUSAL_ROWS = _refusal_rows()
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_every_refusal(tmp_path, compiler):
     import test_table_rows as table_rows
-    table_rows.assert_refusals(compiler, tmp_path, REFUSAL_ROWS,
+    # The `**C` rows pin a prefix: ritz0 spells the store's types as LLVM's.
+    # Wrapped here: test_table_rows can't be imported as this module loads.
+    rows = dict(REFUSAL_ROWS)
+    for name in sorted(POINTER_TO_POINTER_SLOT):
+        program, message = POINTER_TO_POINTER_SLOT[name]
+        rows[f"by_value_slot_of_another_type_is_refused[{name}]"] = (program, table_rows.Prefix(message))
+    table_rows.assert_refusals(compiler, tmp_path, rows,
                                compile=_no_ll(ref_into_value._batch_compile))
 
 

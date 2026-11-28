@@ -309,44 +309,64 @@ fn cc_sure_int(sm: *Sema, a: *Expr) -> i32
 # The struct argument `a` statically points at, or an empty view (the
 # emitter's arg_pointee_struct, AGAST #1948): `@x` / `@&x` of a struct local,
 # a `:&` struct param or a struct field; `x` a local `*T` / `@T` / `@&T`, T a
-# struct.  Anything else is empty: it fails open on shapes it cannot type.
+# struct; a call or method whose declared return is one (#4935, Sema's
+# typer).  Anything else is empty: it fails open on shapes it cannot type.
 fn cc_pointee_struct(sm: *Sema, a: *Expr) -> StrView
     var name: StrView = strview_empty()
-    if a.kind == ExprKind.Unary and (a.op == OpKind.Addr or a.op == OpKind.AddrMut)
-        let x: *Expr = a.operand
-        if x == null
-            return strview_empty()
-        match x.kind
-            ExprKind.Ident =>
-                let v: *SemaVar = sema_find_local(sm, x.ident)
-                if v == null
-                    return strview_empty()
-                if v.kind == TypeKind.Struct
-                    name = v.type_name
-                else
-                    let lent: StrView = cc_lent_struct(sm, x)
-                    name = lent
-            ExprKind.Member =>
-                let f: *StructField = sbk_member_field(sm, x)
-                if f == null or f.field_type != TypeKind.Struct
-                    return strview_empty()
-                name = f.field_type_name
-            _ =>
+    match a.kind
+        ExprKind.Unary =>
+            if a.op != OpKind.Addr and a.op != OpKind.AddrMut
                 return strview_empty()
-    else if a.kind == ExprKind.Ident
-        let v: *SemaVar = sema_find_local(sm, a.ident)
-        if v == null or v.lent != null
+            let x: *Expr = a.operand
+            if x == null
+                return strview_empty()
+            match x.kind
+                ExprKind.Ident =>
+                    let v: *SemaVar = sema_find_local(sm, x.ident)
+                    if v == null
+                        return strview_empty()
+                    if v.kind == TypeKind.Struct
+                        name = v.type_name
+                    else
+                        let lent: StrView = cc_lent_struct(sm, x)
+                        name = lent
+                ExprKind.Member =>
+                    let f: *StructField = sbk_member_field(sm, x)
+                    if f == null or f.field_type != TypeKind.Struct
+                        return strview_empty()
+                    name = f.field_type_name
+                _ =>
+                    return strview_empty()
+        ExprKind.Ident =>
+            let v: *SemaVar = sema_find_local(sm, a.ident)
+            if v == null or v.lent != null
+                return strview_empty()
+            if v.kind != TypeKind.Ptr and v.kind != TypeKind.Ref and v.kind != TypeKind.MutRef
+                return strview_empty()
+            if v.pointee != TypeKind.Struct
+                return strview_empty()
+            name = v.type_name
+        ExprKind.Call | ExprKind.Method =>
+            var t: SemaTy
+            let k: TypeKind = sema_expr_ty(sm, a, @t)
+            if (k != TypeKind.Ptr and k != TypeKind.Ref and k != TypeKind.MutRef) or t.pointee != TypeKind.Struct
+                return strview_empty()
+            name = t.name
+        _ =>
             return strview_empty()
-        if v.kind != TypeKind.Ptr and v.kind != TypeKind.Ref and v.kind != TypeKind.MutRef
-            return strview_empty()
-        if v.pointee != TypeKind.Struct
-            return strview_empty()
-        name = v.type_name
-    else
-        return strview_empty()
     if name.ptr == null or name.len <= 0 or sema_find_struct(sm, name) == null
         return strview_empty()
     name
+
+# The struct S a `**S` value `a` points through, as Sema's typer has it (a
+# `**S` local or param, a `p:& **S` borrow: #4935); None for anything else.
+fn cc_ptr_ptr_struct(sm: *Sema, a: *Expr) -> Option<StrView>
+    var t: SemaTy
+    if sema_expr_ty(sm, a, @t) != TypeKind.PtrPtr or t.pointee != TypeKind.Ptr
+        return None
+    if t.name.len <= 0 or sema_find_struct(sm, t.name) == null
+        return None
+    Some(t.name)
 
 # What `a` is when it can't be the by-value struct `want`, in words; an empty
 # view when it can be, or Sema can't tell.
@@ -381,6 +401,8 @@ fn cc_not_a_struct(sm: *Sema, a: *Expr, want_sv: StrView) -> StrView
     if pointee.ptr != null
         if name_eq(pointee, want_sv) == 1
             return strview_empty()   # ref_check's "doesn't fit a by-value slot"
+        return "a pointer"
+    if cc_ptr_ptr_struct(sm, a).is_some()
         return "a pointer"
     # A local `*u8` / `*i32` ...: a pointer to no struct at all.  A `*[N]u8`
     # makes a StrView in ritz0, so a pointer to an array isn't judged.
@@ -512,6 +534,7 @@ pub struct SlotFit
     name: StrView
     slot_pointee: TypeKind   # a pointer slot's pointee, TypeKind.Struct for a known struct
     value_pointee: TypeKind  # a pointer value's pointee
+    value_depth: i32         # a pointer value's `*`s: 1 for `*T`, 2 for `**S` (#4935)
 
 fn skf_named(out: *SlotFit, class: i32, name: StrView) -> i32
     out.value_class = class
@@ -554,6 +577,12 @@ fn skf_value(sm: *Sema, a: *Expr, out: *SlotFit) -> i32
             return SKV_NONE
         return skf_named(out, SKV_INT, name)
     if bk == BK_PTR
+        match cc_ptr_ptr_struct(sm, a)
+            Some(pps) =>
+                out.value_pointee = TypeKind.Ptr
+                out.value_depth = 2
+                return skf_named(out, SKV_PTR, pps)
+            None => pass
         if k != TypeKind.Ptr
             return SKV_NONE
         out.value_pointee = t.pointee
@@ -660,6 +689,7 @@ pub fn slot_kind_fit(sm: *Sema, a: *Expr, t: TypeKind, name_sv: StrView, pointee
     out.name = strview_empty()
     out.slot_pointee = pointee
     out.value_pointee = TypeKind.Void
+    out.value_depth = 1
     if a == null or skf_bare_variant(sm, a, name_sv) == 1
         return SKF_FITS
     let sc: i32 = skf_slot(sm, t, name_sv, pointee, out)
@@ -733,7 +763,10 @@ pub fn sk_eprint_slot(t: TypeKind, name_sv: StrView, f: *SlotFit)
 # The value's type: a struct's name, a pointer's `*T`, a scalar's or `null`.
 pub fn sk_eprint_value(f: *SlotFit)
     if f.value_class == SKV_PTR
-        eprint_char('*')
+        var d: i32 = 0
+        while d < f.value_depth
+            eprint_char('*')
+            d += 1
     if f.name.ptr == null
         eprint_char('?')
     else
@@ -1539,42 +1572,48 @@ fn ca_param_struct(sm: *Sema, p: *Param) -> StrView
 
 # The struct `arg` surely points at, or an empty view (the emitter's
 # arg_pointee_struct): `@x` / `@&x` of a struct local, a `c:& C` param or a
-# struct field; `x` a local `*T` / `@T` / `@&T`.  Anything else fails open.
+# struct field; `x` a local `*T` / `@T` / `@&T`; a call's or method's result
+# (cc_pointee_struct's, #4935).  Anything else fails open.
 fn ca_arg_struct(sm: *Sema, arg: *Expr) -> StrView
     var name: StrView = strview_empty()
-    if arg.kind == ExprKind.Unary and (arg.op == OpKind.Addr or arg.op == OpKind.AddrMut)
-        let x: *Expr = arg.operand
-        if x == null
-            return strview_empty()
-        match x.kind
-            ExprKind.Ident =>
-                let loc: *LocalVar = ca_local(sm, x)
-                if loc == null
-                    return strview_empty()
-                let lent: i32 = (lv_holds_lent_ptr(loc) == 1 and lv_pointee_type(loc) == TypeKind.Struct) as i32
-                if lv_var_type(loc) != TypeKind.Struct and lent == 0
-                    return strview_empty()
-                if ca_names_differ(sm, x, loc) == 1
-                    return strview_empty()
-                name = lv_name(loc)
-            ExprKind.Member =>
-                let f: *StructField = rs_field(sm, x)
-                if f == null or f.field_type != TypeKind.Struct
-                    return strview_empty()
-                name = f.field_type_name
-            _ =>
+    match arg.kind
+        ExprKind.Unary =>
+            if arg.op != OpKind.Addr and arg.op != OpKind.AddrMut
                 return strview_empty()
-    else if arg.kind == ExprKind.Ident
-        let loc: *LocalVar = ca_local(sm, arg)
-        if loc == null
+            let x: *Expr = arg.operand
+            if x == null
+                return strview_empty()
+            match x.kind
+                ExprKind.Ident =>
+                    let loc: *LocalVar = ca_local(sm, x)
+                    if loc == null
+                        return strview_empty()
+                    let lent: i32 = (lv_holds_lent_ptr(loc) == 1 and lv_pointee_type(loc) == TypeKind.Struct) as i32
+                    if lv_var_type(loc) != TypeKind.Struct and lent == 0
+                        return strview_empty()
+                    if ca_names_differ(sm, x, loc) == 1
+                        return strview_empty()
+                    name = lv_name(loc)
+                ExprKind.Member =>
+                    let f: *StructField = rs_field(sm, x)
+                    if f == null or f.field_type != TypeKind.Struct
+                        return strview_empty()
+                    name = f.field_type_name
+                _ =>
+                    return strview_empty()
+        ExprKind.Ident =>
+            let loc: *LocalVar = ca_local(sm, arg)
+            if loc == null
+                return strview_empty()
+            if lv_var_type(loc) != TypeKind.Ptr and lv_var_type(loc) != TypeKind.Ref and lv_var_type(loc) != TypeKind.MutRef
+                return strview_empty()
+            if lv_pointee_type(loc) != TypeKind.Struct or ca_names_differ(sm, arg, loc) == 1
+                return strview_empty()
+            name = lv_name(loc)
+        ExprKind.Call | ExprKind.Method =>
+            return cc_pointee_struct(sm, arg)   # #4935: `f(give(@c))`
+        _ =>
             return strview_empty()
-        if lv_var_type(loc) != TypeKind.Ptr and lv_var_type(loc) != TypeKind.Ref and lv_var_type(loc) != TypeKind.MutRef
-            return strview_empty()
-        if lv_pointee_type(loc) != TypeKind.Struct or ca_names_differ(sm, arg, loc) == 1
-            return strview_empty()
-        name = lv_name(loc)
-    else
-        return strview_empty()
     if name.ptr == null or name.len <= 0 or sema_find_struct(sm, name) == null
         return strview_empty()
     name
@@ -1600,11 +1639,13 @@ fn ca_struct_ptr(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Ex
     # `Future`, by reference.
     if sema_future_ref_fits(want, got) == 1
         return
-    if ca_report(sm, call, call, fname_sv, argno) == 1
-        eprint_bytes(want)
-        eprints("* != ")
+    # ritz0's words, at the argument (#4935): `*C != *D`, the argument's first.
+    if ca_report(sm, call, arg, fname_sv, argno) == 1
+        eprint_char('*')
         eprint_bytes(got)
-        eprints("*\n")
+        eprints(" != *")
+        eprint_bytes(want)
+        eprint_char('\n')
 
 # --- Arrays ---
 

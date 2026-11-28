@@ -1032,7 +1032,7 @@ def test_ritz1_refuses_a_borrow_of_another_type(ritz1_bin, tmp_path):
     out = comp.stdout + comp.stderr
     slot = re.search(r"main\.ritz:(\d+):14: error: a reference to one type doesn't fit a reference "
                      r"to another: cast it with `as`", out)
-    call = re.search(r"main\.ritz:(\d+):\d+: error: argument 1 of `h` has the wrong type: D\* != C\*", out)
+    call = re.search(r"main\.ritz:(\d+):\d+: error: argument 1 of `h` has the wrong type: \*C != \*D", out)
     assert slot and call and slot[1] == call[1] and slot.start() < call.start(), out
 
 

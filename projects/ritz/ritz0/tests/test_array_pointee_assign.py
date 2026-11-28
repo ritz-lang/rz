@@ -174,10 +174,13 @@ CALL_ACCEPTED = {
 }
 
 
-@pytest.mark.parametrize("name", _ids(CALL_REFUSED))
-def test_a_call_argument_pointer_is_not_bitcast(tmp_path, name):
-    marked, message = CALL_REFUSED[name]
-    _assert_refused("ritz0", tmp_path, name, marked, message)
+# AGAST #4935: on all three compilers.  ritz1 typed no call's result, so
+# compiled every row; it types it as ritz0 does, by its declared return.
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_call_argument_pointer_is_not_bitcast(tmp_path, compiler):
+    for name in _ids(CALL_REFUSED):
+        marked, message = CALL_REFUSED[name]
+        _assert_refused(compiler, tmp_path, name, marked, message)
 
 
 @pytest.mark.parametrize("name", _ids(CALL_ACCEPTED))
