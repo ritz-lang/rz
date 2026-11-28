@@ -17,6 +17,7 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.cstr
 import ritzlib.memory
+import ritzlib.string  # strview_join2 (AGAST #4915)
 import monomorph
 
 # Resolve the type of the field named by an ExprKind.Member chain rooted at a
@@ -1994,16 +1995,8 @@ fn substitute_type(ty: TypeKind, type_param_sv: StrView, subst_type: TypeKind, s
     return ty
 
 fn mangle_struct_name(name: StrView, suffix: StrView) -> StrView
-    let name_len: i32 = name.len as i32
-    # Create mangled name like Vec$u8
-    let mangled_len: i32 = name_len + (suffix.len as i32)
-    let mangled: *u8 = malloc(mangled_len as i64 + 1) as *u8
-    for i in 0..name_len
-        *(mangled + i) = name.get(i)
-    for j in 0..(suffix.len as i32)
-        *(mangled + name_len + j) = suffix.get(j)
-    *(mangled + mangled_len) = 0
-    return strview_from_ptr(mangled, mangled_len as i64)
+    # Mangled name like Vec$u8 (AGAST #4915: was a hand-written malloc+copy loop)
+    return strview_join2(name, suffix)
 
 # The module being specialised, so substitute_type_param_in_name can ask
 # whether a bare name is a generic struct template (AGAST #1926).  Set by
@@ -2049,18 +2042,9 @@ pub fn substitute_type_param_in_name(mono: *MonoCtx, name: StrView, type_param: 
                     matches = 0
                     break
             if matches != 0
-                # Replace "$T" with new_suffix
+                # Replace "$T" with new_suffix (AGAST #4915)
                 let base_len: i32 = suffix_start  # "Vec" part
-                let new_len: i32 = base_len + new_suffix_len
-                let result: *u8 = malloc(new_len as i64 + 1) as *u8
-                # Copy base part
-                for j in 0..base_len
-                    *(result + j) = name.get(j)
-                # Copy new suffix
-                for k in 0..new_suffix_len
-                    *(result + base_len + k) = new_suffix.get(k)
-                *(result + new_len) = 0
-                return StrView { ptr: result, len: new_len as i64 }
+                return strview_join2(name.take(base_len as i64), new_suffix)
 
     # AGAST #2418: T as an inner component, `Result$T$i32` at T = i32 is
     # `Result$i32$i32` (one-parameter fn over `Result<T, i32>`).
@@ -2075,15 +2059,8 @@ pub fn substitute_type_param_in_name(mono: *MonoCtx, name: StrView, type_param: 
     # `Cell { .. }`) keeps its name, else `Cell` -> `Cell$i64`, which does not
     # exist (AGAST #1926).
     if new_suffix_len > 0 and names_generic_struct(mono, name) != 0
-        # Append the new suffix (e.g., "Vec" + "$u8" = "Vec$u8")
-        let new_len: i32 = name_len + new_suffix_len
-        let result: *u8 = malloc(new_len as i64 + 1) as *u8
-        for i in 0..name_len
-            *(result + i) = name.get(i)
-        for k in 0..new_suffix_len
-            *(result + name_len + k) = new_suffix.get(k)
-        *(result + new_len) = 0
-        return StrView { ptr: result, len: new_len as i64 }
+        # Append the new suffix (e.g., "Vec" + "$u8" = "Vec$u8", AGAST #4915)
+        return strview_join2(name, new_suffix)
     else
         # No substitution needed - just copy the name
         let copy: *u8 = malloc(name.len + 1) as *u8
@@ -2671,18 +2648,8 @@ fn check_and_substitute_suffix(mono: *MonoCtx, old_suffix: StrView, type_param: 
 # Clone a generic struct and substitute the type parameter
 
 fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef, suffix: StrView) -> *StructDef
-    # Create a new StructDef with mangled name
-    let mangled_name_len: i32 = (template.name.len as i32) + (suffix.len as i32)
-    let mangled_name: *u8 = malloc(mangled_name_len as i64 + 1) as *u8
-
-    # Copy base name
-    for i in 0..(template.name.len as i32)
-        *(mangled_name + i) = *(template.name.ptr + i)
-
-    # Copy suffix (including the $)
-    for j in 0..(suffix.len as i32)
-        *(mangled_name + (template.name.len as i32) + j) = suffix.get(j)
-    *(mangled_name + mangled_name_len) = 0
+    # Mangled name, e.g. "Vec" + "$u8" (AGAST #4915)
+    let mangled_name: StrView = strview_join2(template.name, suffix)
 
     # AGAST #1574: substitute EVERY parameter of a multi-parameter template.
     if count_type_params(template.type_params) >= 2
@@ -2692,7 +2659,7 @@ fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef,
         if split_mangled_args(mono.pctx, m, suffix, starts, lens) != count_type_params(template.type_params)
             return null
         let multi: *StructDef = malloc(sizeof(StructDef)) as *StructDef
-        multi.name = StrView { ptr: mangled_name, len: mangled_name_len as i64 }
+        multi.name = mangled_name
         multi.fields = clone_struct_fields_multi(mono, template.fields, template.type_params, suffix, starts, lens)
         multi.type_params = null
         multi.next = null
@@ -2711,7 +2678,7 @@ fn clone_and_specialize_struct(mono: *MonoCtx, m: *Module, template: *StructDef,
 
     # Clone the struct with specialized name
     let specialized: *StructDef = malloc(sizeof(StructDef)) as *StructDef
-    specialized.name = StrView { ptr: mangled_name, len: mangled_name_len as i64 }
+    specialized.name = mangled_name
     specialized.fields = clone_struct_fields(mono, template.fields, type_param_name, subst_type, subst_type_name, suffix)
     specialized.type_params = null  # Not generic anymore
     specialized.next = null
@@ -3129,11 +3096,7 @@ fn specialize_impl_method(mono: *MonoCtx, m: *Module, ib: *ImplBlock, method: *F
     let template: *FnDef = malloc(sizeof(FnDef)) as *FnDef
     memcpy(template as *u8, method as *u8, sizeof(FnDef))
     template.type_params = ib.type_params
-    let self_name: *u8 = malloc((type_name_len + suffix_len) as i64 + 1)
-    memcpy(self_name, type_name.ptr, type_name.len)
-    memcpy(self_name + type_name_len, suffix.ptr, suffix.len)
-    *(self_name + type_name_len + suffix_len) = 0
-    mono.impl_self_name = StrView { ptr: self_name, len: (type_name_len + suffix_len) as i64 }
+    mono.impl_self_name = strview_join2(type_name, suffix)  # AGAST #4915
     let specialized: *FnDef = clone_and_specialize_function(mono, m, template, suffix)
     mono.impl_self_name = strview_empty()
     free(template as *u8)
