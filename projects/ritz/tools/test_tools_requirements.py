@@ -43,6 +43,7 @@ REQUIREMENTS = [
 LOCAL_MODULES = {
     "ci_local",
     "manifest",  # projects/ritz/manifest.py, the ritz.toml schema (AGAST #1837)
+    "packages",  # projects/ritz/packages.py, rz pack / install (AGAST #4865)
     "cache",  # projects/ritz/cache.py, the closure store (AGAST #4775)
     "build_pipeline",  # projects/ritz/build_pipeline.py (AGAST #4775)
     "compiler_identity",  # projects/ritz/ritz0/, the compiler hash (AGAST #3915)

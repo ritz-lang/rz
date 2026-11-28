@@ -182,8 +182,8 @@ def test_author_chosen_keys_are_free_but_their_values_are_not():
     ok = manifest.loads(PKG + '[dependencies]\nany-name = "../x"\n'
                         'other = { path = "../o" }\n', Path("ritz.toml"))
     assert set(ok["dependencies"]) == {"any-name", "other"}
-    e = _error(PKG + '[dependencies.other]\npath = "../o"\nversion = "1"\n')
-    assert "unknown key 'version' in [dependencies.other]" in e.message
+    e = _error(PKG + '[dependencies.other]\npath = "../o"\nvers = "1"\n')
+    assert "unknown key 'vers' in [dependencies.other]" in e.message
 
 
 def test_only_the_two_selectable_profiles_are_accepted():

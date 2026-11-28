@@ -79,15 +79,21 @@ BOOTSTRAP_ROOTS = (
     "projects/ritz/Makefile",
 )
 
-# The builder's own build recipe. Not test.sh, accept.sh, README.md or
-# Dockerfile.dockerignore: a `git archive` build (what test.sh and
-# main.yml's builder-image job both use) never looks at any of those three,
-# and a .dockerignore only matters to a context built from a working tree.
+# The builder's own build recipe, and the two files its runtime stage COPYs
+# in beside /rz: entrypoint.sh (`rz-builder`) and summary.py. Without those
+# an entrypoint fix never reached an image whose key it left alone (AGAST
+# #4865: the cache-eviction fix ran the old entrypoint in three gates). Not
+# test.sh, accept.sh, README.md or Dockerfile.dockerignore: a `git archive`
+# build (what test.sh and main.yml's builder-image job both use) never looks
+# at any of those, and a .dockerignore only matters to a context built from
+# a working tree.
 BUILDER_ROOTS = (
     "projects/builder/Dockerfile",
     "projects/builder/stage_tree.py",
     "projects/builder/check_fixed_point.sh",
     "projects/builder/collect_toolchain.sh",
+    "projects/builder/entrypoint.sh",
+    "projects/builder/summary.py",
 )
 
 

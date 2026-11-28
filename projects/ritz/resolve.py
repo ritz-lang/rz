@@ -55,6 +55,12 @@ class DependencySpec:
     name: str           # Dependency name (used as import namespace)
     path: Path          # Path to dependency root (absolute)
     sources: list[str]  # Source directories within dependency (default: ["src"])
+    # The parsed ritz-package.toml when `path` holds one (an installed
+    # package, or a packed tree named by path): docs/PACKAGES.md §2.
+    package: "PackageInfo | None" = None  # packages.PackageInfo
+    # `prebuilt = false`: compile the package from source, never link its
+    # archive (the link swap, docs/PACKAGES.md §4, reads it).
+    prebuilt: bool = True
 
     def resolve_import(self, module_parts: list[str]) -> Path | None:
         """Resolve an import path within this dependency.
@@ -92,8 +98,16 @@ def parse_dependencies(config: dict, pkg_dir: Path, *, warn: bool = True) -> dic
     - Each dependency gets its own namespace for imports
     - Paths are resolved relative to the package directory
 
-    A dependency with no `path`, or whose path does not exist, is skipped,
-    with a warning on stderr unless `warn` is False.
+    `name = { version = "..." }` names an installed package (AGAST #4865,
+    docs/PACKAGES.md §2): its path is `$RITZ_PACKAGES/<name>/<version>/`.
+    A dependency whose directory holds `ritz-package.toml`, by either form,
+    gets its parsed manifest as `package`; `source_sha256` must then match
+    the one it records.
+
+    A dependency with neither `path` nor `version`, whose directory does
+    not exist, or whose package manifest is unreadable or not the pinned
+    `source_sha256`, is skipped, with a warning on stderr unless `warn` is
+    False.
 
     Returns:
         Dict mapping dependency name to DependencySpec
@@ -102,21 +116,51 @@ def parse_dependencies(config: dict, pkg_dir: Path, *, warn: bool = True) -> dic
         if warn:
             print(msg, file=sys.stderr)
 
+    # ritz-package.toml and $RITZ_PACKAGES (AGAST #4865). Imported here, not
+    # at the top: ritz0 imports this module for package_sources on every
+    # compile, and needs none of packages.py's tar and URL machinery.
+    import packages
+
     deps = {}
     deps_config = config.get("dependencies", {})
 
     for name, spec in deps_config.items():
         if isinstance(spec, dict):
-            # Full spec: { path = "...", sources = [...] }
+            # Full spec: { path = "...", sources = [...] } or { version = "..." }
+            version = spec.get("version")
             dep_path = spec.get("path")
-            if dep_path is None:
-                warning(f"  ⚠ Dependency '{name}' missing 'path'")
+            if version is not None:
+                try:
+                    dep_path = packages.install_dir(name, version)
+                except packages.PackageError as e:
+                    warning(f"  ⚠ Dependency '{name}': {e}")
+                    continue
+                if not (dep_path / packages.MARKER).is_file():
+                    warning(f"  ⚠ Dependency '{name}' {version} is not installed under "
+                            f"{packages.packages_root()}: `rz install` its package")
+                    continue
+            elif dep_path is None:
+                warning(f"  ⚠ Dependency '{name}' missing 'path' or 'version'")
                 continue
+            else:
+                # Resolve path relative to package directory
+                dep_path = (pkg_dir / dep_path).resolve()
+                if not dep_path.exists():
+                    warning(f"  ⚠ Dependency '{name}' path not found: {dep_path}")
+                    continue
 
-            # Resolve path relative to package directory
-            dep_path = (pkg_dir / dep_path).resolve()
-            if not dep_path.exists():
-                warning(f"  ⚠ Dependency '{name}' path not found: {dep_path}")
+            package = None
+            if (dep_path / packages.MARKER).is_file():
+                try:
+                    package = packages.read_package(dep_path)
+                except packages.PackageError as e:
+                    warning(f"  ⚠ Dependency '{name}': {e}")
+                    continue
+            pin = spec.get("source_sha256")
+            if pin is not None and (package is None or package.source_sha256 != pin):
+                got = package.source_sha256 if package else "no ritz-package.toml"
+                warning(f"  ⚠ Dependency '{name}' pins source_sha256 {pin}, but "
+                        f"{dep_path} has {got}")
                 continue
 
             # Get sources from dependency's ritz.toml if not specified
@@ -128,7 +172,9 @@ def parse_dependencies(config: dict, pkg_dir: Path, *, warn: bool = True) -> dic
             if isinstance(sources, str):
                 sources = [sources]
 
-            deps[name] = DependencySpec(name=name, path=dep_path, sources=sources)
+            deps[name] = DependencySpec(name=name, path=dep_path, sources=sources,
+                                        package=package,
+                                        prebuilt=spec.get("prebuilt", True))
         elif isinstance(spec, str):
             # Shorthand: just a path
             dep_path = (pkg_dir / spec).resolve()
@@ -173,7 +219,9 @@ def get_transitive_dependencies(
     """Get all dependencies including transitive ones.
 
     Walks the dependency tree and collects all dependencies.
-    Detects cycles and raises an error.
+    Detects cycles and raises an error, as it does for two versions of one
+    package in the tree (docs/PACKAGES.md §2: one version of a name per
+    build), naming both requirers.
 
     Args:
         pkg_dir: Package directory
@@ -196,6 +244,7 @@ def get_transitive_dependencies(
     # Get direct dependencies
     direct_deps = parse_dependencies(config, pkg_dir)
     all_deps.update(direct_deps)
+    required_by = {name: Path(pkg_dir) for name in direct_deps}
 
     # Get transitive dependencies
     for dep_name, dep_spec in direct_deps.items():
@@ -205,8 +254,16 @@ def get_transitive_dependencies(
 
             # Add transitive deps (but don't override direct deps)
             for trans_name, trans_spec in transitive.items():
-                if trans_name not in all_deps:
+                have = all_deps.get(trans_name)
+                if have is None:
                     all_deps[trans_name] = trans_spec
+                    required_by[trans_name] = dep_spec.path
+                elif (have.package and trans_spec.package
+                      and have.package.version != trans_spec.package.version):
+                    raise ValueError(
+                        f"Two versions of package '{trans_name}' in one build: "
+                        f"{have.package.version} (required by {required_by[trans_name]}) "
+                        f"and {trans_spec.package.version} (required by {dep_spec.path})")
 
     return all_deps
 

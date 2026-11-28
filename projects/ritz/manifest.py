@@ -69,6 +69,9 @@ class Table:
     # Root tables only: retired keys, as {table path: {key: where it went}}.
     # One is still an error, but one that says where the key goes now.
     moved_from: dict[tuple, dict[str, str]] = field(default_factory=dict)
+    # Exactly one of these keys must be present (a dependency's `path` or
+    # `version`, AGAST #4865).
+    one_of: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -171,14 +174,29 @@ PACKAGE_SCHEMA = Table(
             "Packages this one imports. Each is put on RITZ_PATH and its "
             "dependencies are followed transitively.",
             "dependency name (its import namespace)",
-            Table("One dependency.", {
+            Table("One dependency: a directory (`path`) or an installed "
+                  "package (`version`), exactly one. A `path` directory "
+                  "holding `ritz-package.toml` is a package too "
+                  "(docs/PACKAGES.md §2).", {
                 "path": Value(STRING, "Package directory, relative to this one.",
-                              (f"{RESOLVE}::parse_dependencies",), required=True),
+                              (f"{RESOLVE}::parse_dependencies",)),
+                "version": Value(STRING, "An installed package's exact version: "
+                                 "`$RITZ_PACKAGES/<name>/<version>/`, put there "
+                                 "by `rz install`.",
+                                 (f"{RESOLVE}::parse_dependencies",)),
+                "source_sha256": Value(STRING, "Pins the package's source tree: "
+                                       "its `ritz-package.toml` must record this "
+                                       "`source_sha256`.",
+                                       (f"{RESOLVE}::parse_dependencies",)),
+                "prebuilt": Value(BOOL, "`false`: compile the package from its "
+                                  "shipped source, never link its archive.",
+                                  (f"{RESOLVE}::parse_dependencies",),
+                                  default="true"),
                 "sources": Value(
                     STRING_OR_LIST, "The dependency's source roots. Defaults to "
                     "the `sources` its own ritz.toml declares.",
                     (f"{RESOLVE}::parse_dependencies",)),
-            }),
+            }, one_of=("path", "version")),
             (f"{RESOLVE}::parse_dependencies",),
             shorthand=Value(STRING, 'Shorthand for `{ path = "..." }` with '
                             '`sources = ["src"]`.',
@@ -459,6 +477,17 @@ def _dotted(path: tuple) -> str:
     return ".".join(p for p in path if not isinstance(p, int))
 
 
+def _presence_errors(table: Table, value: dict, path: tuple) -> list[str]:
+    """What `value` lacks: each required key, and exactly one `one_of` key."""
+    errors = [f"{_where(path)} is missing required key '{k}'"
+              for k, node in table.fields.items()
+              if getattr(node, "required", False) and k not in value]
+    if table.one_of and sum(k in value for k in table.one_of) != 1:
+        names = ", ".join(f"'{k}'" for k in table.one_of)
+        errors.append(f"{_where(path)} needs exactly one of {names}")
+    return errors
+
+
 def validate(data: dict, schema: Table, lines: dict[tuple, int] | None = None
              ) -> list[tuple[int, str]]:
     """Every (line, message) the schema has against `data`, in file order."""
@@ -511,9 +540,8 @@ def validate(data: dict, schema: Table, lines: dict[tuple, int] | None = None
                     allowed.append(f"{own_name or 'NAME'} (= name)")
                 err(path + (k,), f"unknown key '{k}' in {_where(path)} "
                                  f"(allowed: {', '.join(allowed)})")
-        for k, node in table.fields.items():
-            if getattr(node, "required", False) and k not in value:
-                err(path, f"{_where(path)} is missing required key '{k}'")
+        for msg in _presence_errors(table, value, path):
+            err(path, msg)
 
     moved = schema.moved_from
     check_table(schema, data, ())

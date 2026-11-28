@@ -242,6 +242,7 @@ REGRESSION = Step(
            "projects/ritz/bounded_run.py",
            "projects/ritz/cache.py",
            "projects/ritz/cas.py",
+           "projects/ritz/packages.py",
            "projects/ritz/resolve.py"),
     # Never opened (the trace): ritz0's tests (the compiler hash follows the
     # compiler's imports, which reach no test), ritzlib/tests, the Markdown.

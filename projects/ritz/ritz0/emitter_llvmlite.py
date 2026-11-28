@@ -661,6 +661,19 @@ def symbol_file_key(path: str) -> str:
     return module_interface.cas.file_anchor(os.path.realpath(path))[1]
 
 
+def debug_source_dir(path: str) -> str | None:
+    """DIFile's directory for a file in a package (docs/PACKAGES.md §3,
+    AGAST #4865): its anchor's `pkg/<name>/<dir>`, not the absolute one, so
+    the object `rz pack` compiles in its staging tree and the one a rebuild
+    compiles in any install are the same bytes (`rz install --verify`
+    compares them).  A debugger maps it with `set substitute-path
+    pkg/<name> <install dir>`.  None outside a package: the caller keeps
+    the absolute directory, as every in-repo build always has.
+    """
+    kind, key = module_interface.cas.file_anchor(os.path.realpath(path))
+    return os.path.dirname(key) if kind == "pkg" else None
+
+
 class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                   layout.LayoutEmitter, patterns.PatternEmitter):
     """

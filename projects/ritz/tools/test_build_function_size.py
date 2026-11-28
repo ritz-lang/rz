@@ -20,7 +20,7 @@ MAX_SLOC = 150
 MAX_CC = 30
 
 FILES = [PKG_DIR / f for f in ("build.py", "build_pipeline.py", "build_testrun.py",
-                               "build_cli.py", "manifest.py", "resolve.py",
+                               "build_cli.py", "manifest.py", "resolve.py", "packages.py",
                                "bounded_run.py")] + [REPO / "rz"]
 
 

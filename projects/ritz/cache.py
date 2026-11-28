@@ -53,7 +53,9 @@ LEGACY_ENTRIES = ("objects", "deps.json", "hashes.json")
 # every stale object. The rest were part of build.py until AGAST #1835 /
 # #3632: resolve.py decides the --deps every module is compiled with,
 # build_pipeline.py owns the flags and links, manifest.py what each [[bin]] is
-# built as. cas.py derives every artifact key (AGAST #4314). (build_testrun.py
+# built as. cas.py derives every artifact key (AGAST #4314). packages.py
+# turns a `{ version = … }` dependency into the directory resolve.py hands
+# the compiler (AGAST #4865). (build_testrun.py
 # and build_cli.py produce no artefact.) ritz0's own files, which include
 # cas.py, resolve.py and manifest.py again through its imports, come from
 # compiler_identity (AGAST #3915).
@@ -63,6 +65,7 @@ RITZ0_DRIVER_FILES = {
     "build_pipeline.py": b"build-driver-pipeline",
     "manifest.py": b"build-driver-manifest",
     "cas.py": b"build-driver-cas",
+    "packages.py": b"build-driver-packages",
 }
 
 

@@ -9,6 +9,10 @@ Usage:
     rz list                List all projects in workspace
     rz clean [PROJECT]     Clean build artifacts
     rz cache [gc|path]     Shared artifact store
+    rz pack PACKAGE        Pack a [[lib]] package: source + archive (docs/PACKAGES.md)
+    rz install TARBALL     Install a packed package (--sha256 H for a URL;
+                           --verify NAME VERSION rebuilds and compares)
+    rz uninstall NAME VERSION
 
 Compiler Selection:
     --compiler ritz0       Use Python bootstrap compiler (default)
@@ -33,6 +37,8 @@ from pathlib import Path
 WORKSPACE_ROOT = Path(__file__).parent.resolve()
 PROJECTS_DIR = WORKSPACE_ROOT / "projects"
 RITZ_BUILD = WORKSPACE_ROOT / "projects" / "ritz" / "build.py"
+# `rz pack` / `install` / `uninstall` (AGAST #4865): packages.py's CLI.
+PACKAGES_PY = WORKSPACE_ROOT / "projects" / "ritz" / "packages.py"
 
 # The dependency resolver build.py uses (AGAST #1835). Standard library only,
 # so importing it does not load the compiler.
@@ -953,6 +959,62 @@ def cmd_cache(args):
     return bounded_run.child([sys.executable, str(PROJECTS_DIR / "ritz" / "cas.py"), *argv]).returncode
 
 
+def resolve_package(arg):
+    """resolve_project, else the one workspace package whose [package] name
+    is `arg`: `rz pack ritzlib` names projects/ritz/ritzlib."""
+    project = resolve_project(arg)
+    if project is not None:
+        return project
+    named = []
+    for p in discover_projects():
+        config = get_project_config(p) or {}
+        if config.get("package", {}).get("name") == arg:
+            named.append(p)
+    if len(named) == 1:
+        return named[0]
+    if named:
+        print(f"Error: '{arg}' names {len(named)} packages ({', '.join(named)}): "
+              "give its path", file=sys.stderr)
+    else:
+        print(f"Error: Package '{arg}' not found (no ritz.toml there, and no "
+              "workspace package of that name)", file=sys.stderr)
+    return None
+
+
+def cmd_pack(args):
+    """Handle 'rz pack': packages.py pack, in the package's build environment."""
+    project = resolve_package(args.project)
+    if project is None:
+        return 1
+    argv = ["pack", str(PROJECTS_DIR / project), "--compiler", args.compiler]
+    for profile in args.profile or []:
+        argv += ["--profile", profile]
+    if args.version:
+        argv += ["--version", args.version]
+    if args.output:
+        argv += ["-o", str(Path(args.output).resolve())]
+    return bounded_run.child([sys.executable, str(PACKAGES_PY), *argv],
+                             env=child_env(project)).returncode
+
+
+def cmd_install(args):
+    """Handle 'rz install': a tarball or URL, or --verify NAME VERSION (which
+    compiles, so it runs in ritz's build environment)."""
+    argv = ["install", *args.args]
+    if args.sha256:
+        argv += ["--sha256", args.sha256]
+    if args.verify:
+        argv.append("--verify")
+    return bounded_run.child([sys.executable, str(PACKAGES_PY), *argv],
+                             env=child_env("ritz")).returncode
+
+
+def cmd_uninstall(args):
+    """Handle 'rz uninstall NAME VERSION'."""
+    return bounded_run.child([sys.executable, str(PACKAGES_PY), "uninstall",
+                              args.name, args.version]).returncode
+
+
 def _positive_int(text):
     try:
         n = int(text)
@@ -1030,6 +1092,27 @@ def build_parser():
                                "else 4 GiB)")
     cache_sub.add_parser("path", help="Print the store directory")
 
+    # pack / install / uninstall (docs/PACKAGES.md §2, AGAST #4865)
+    pack_parser = subparsers.add_parser("pack", help="Pack a package: source + archive")
+    pack_parser.add_argument("project", help="Package: a path, or a workspace package's name")
+    pack_parser.add_argument("--profile", action="append", choices=["hosted"],
+                             help="Object profile to archive (default: hosted)")
+    pack_parser.add_argument("--version",
+                             help="Default: ritz.toml's, plus +g<HEAD> in a checkout")
+    pack_parser.add_argument("-o", "--output", help="Default: ./<name>-<version>.tar.gz")
+    pack_parser.add_argument("--compiler", choices=["ritz0", "ritz1", "ritz1_selfhosted"],
+                             default="ritz0", help="Compiler to use (default: ritz0)")
+    install_parser = subparsers.add_parser(
+        "install", help="Install a packed package into $RITZ_PACKAGES")
+    install_parser.add_argument("args", nargs="+", metavar="TARBALL | NAME VERSION",
+                                help="A tarball or URL; with --verify, NAME VERSION")
+    install_parser.add_argument("--sha256", help="The tarball's sha256 (required for a URL)")
+    install_parser.add_argument("--verify", action="store_true",
+                                help="Rebuild an install's archives and compare")
+    uninstall_parser = subparsers.add_parser("uninstall", help="Remove an installed package")
+    uninstall_parser.add_argument("name")
+    uninstall_parser.add_argument("version")
+
     commands = {
         "build": cmd_build,
         "test": cmd_test,
@@ -1037,6 +1120,9 @@ def build_parser():
         "list": cmd_list,
         "clean": cmd_clean,
         "cache": cmd_cache,
+        "pack": cmd_pack,
+        "install": cmd_install,
+        "uninstall": cmd_uninstall,
     }
     for name, sub in subparsers.choices.items():
         sub.set_defaults(func=commands[name])

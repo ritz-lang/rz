@@ -1,8 +1,10 @@
 # Packages: source plus a prebuilt archive
 
-**Status:** Draft, awaiting Aaron's OK (AGAST #4859, epic #4858). Design
-only: nothing here is implemented yet. Implementation slices are filed after
-the OK (see "Slices").
+**Status:** Approved design (AGAST #4859, epic #4858), landing in slices
+(see "Slices"): 1 (identity, #4863), 2 (ritzlib's `ritz.toml`, #4864) and
+3 (`ritz-package.toml`, `rz pack`, `rz install`, the `{ version = … }`
+dependency kind, #4865: `projects/ritz/packages.py`) are in. No build links
+an archive yet: that is slice 4.
 
 **Amends** [`design/PACKAGING_RFC.md`](design/PACKAGING_RFC.md) §3.2
 ("Libraries are always source"). Source stays the artefact of record: a
@@ -104,10 +106,10 @@ target = "linux/x86_64/clang version 20.1.8 …"  # cas.target_id()
 triple = "x86_64-unknown-linux-gnu"
 object_flags = {}        # Target.key_flags; empty for hosted
 
-# Per module: its CAS key (the stamp) and its member's sha256 (for
-# `rz install --verify`, which rebuilds and compares).
+# Per module: its CAS key (the stamp), its object's sha256 and the archive
+# member holding it (for `rz install --verify`, which rebuilds and compares).
 [archive.modules]
-"fs.ritz" = { key = "…", object_sha256 = "…" }
+"fs.ritz" = { key = "…", object_sha256 = "…", member = "fs_1a2b3c4d.o" }
 ```
 
 `compiler_fp`, `target`, `triple` and `object_flags` are redundant with the
@@ -426,7 +428,20 @@ Each is one commit with its own tests; the order is the dependency order.
    `libritzlib.a`; dependents' `sources = ["."]` optional.
 3. **pack / install / dep kind.** `ritz-package.toml` schema, `rz pack`,
    `rz install` (file, URL + sha256, `--verify`), `{ version = … }` and
-   `prebuilt = false` in the schema and `parse_dependencies`.
+   `prebuilt = false` in the schema and `parse_dependencies`. Done (#4865):
+   `packages.py`, tested by `tools/test_packages.py`. As built: pack packs
+   the `hosted` profile only (a freestanding profile needs its `Target`
+   from a consumer, slice 5); each `[archive.modules]` entry also records
+   its `member` name, so `--verify` compares the archive's own bytes with
+   the rebuild; a tree with uncommitted changes packs as
+   `+g<sha>.dirty<8 hex of source_sha256>`; install refuses any tarball
+   member that is not a regular file or directory, and any file the
+   manifest does not list. Two things still named a module's directory in
+   its object, so a cold-store rebuild in an install differed from pack's
+   bytes: ritz0's DWARF `DIFile` directory (now `pkg/<name>/<dir>` in a
+   package, `debug_source_dir`) and the artefact name `compile_modules`
+   hashed from the absolute path, which clang records as the object's
+   `STT_FILE` and `ar` as the member name (now hashed from the identity).
 4. **Link swap.** Stamp check, archive link with fallback archive, in
    `compile_binary`, `test_runner`, `compile_freestanding_binary`;
    `binary_provenance` records archives. Tests: a matching stamp compiles

@@ -79,11 +79,14 @@ Each key is a dependency name (its import namespace); each value a table, descri
 
 ### `[dependencies.<dependency name (its import namespace)>]`
 
-One dependency.
+One dependency: a directory (`path`) or an installed package (`version`), exactly one. A `path` directory holding `ritz-package.toml` is a package too (docs/PACKAGES.md §2).
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `path` | string | **required** | `projects/ritz/resolve.py parse_dependencies` | Package directory, relative to this one. |
+| `path` | string |  | `projects/ritz/resolve.py parse_dependencies` | Package directory, relative to this one. |
+| `version` | string |  | `projects/ritz/resolve.py parse_dependencies` | An installed package's exact version: `$RITZ_PACKAGES/<name>/<version>/`, put there by `rz install`. |
+| `source_sha256` | string |  | `projects/ritz/resolve.py parse_dependencies` | Pins the package's source tree: its `ritz-package.toml` must record this `source_sha256`. |
+| `prebuilt` | bool | `true` | `projects/ritz/resolve.py parse_dependencies` | `false`: compile the package from its shipped source, never link its archive. |
 | `sources` | string or string list |  | `projects/ritz/resolve.py parse_dependencies` | The dependency's source roots. Defaults to the `sources` its own ritz.toml declares. |
 
 ### `[[lib]]`

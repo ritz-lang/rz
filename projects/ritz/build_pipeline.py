@@ -1326,8 +1326,16 @@ def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, us
     obj_failures: List[str] = []  # AGAST #1731
     for src in sources:
         # Use a unique name to avoid collisions (e.g., multiple sys.ritz)
-        # Hash the full path to get a unique identifier
-        path_hash = hashlib.md5(str(src).encode()).hexdigest()[:8]
+        # Hash the full path to get a unique identifier. A package's module
+        # hashes its identity (`pkg/<name>/<path>`) instead: clang records
+        # the .ll's name in the object (its STT_FILE symbol) and `ar` the
+        # member name, so a staged tree and any install of it must name it
+        # alike for their objects to be the same bytes (AGAST #4865). One
+        # build holds one version of a package, so identities can't collide.
+        name_key = cas.module_identity(src)
+        if not name_key.startswith("pkg/"):
+            name_key = str(src)
+        path_hash = hashlib.md5(name_key.encode()).hexdigest()[:8]
         src_name = f"{src.stem}_{path_hash}"
         ll_path = artifact_dir / f"{src_name}.ll"
         bc_path = artifact_dir / f"{src_name}.bc"
@@ -1651,7 +1659,8 @@ def find_llvm_tool(name: str) -> str:
 def compile_library(lib: LibraryConfig, out_dir: Path, *, keep_artifacts: bool = False,
                     use_cache: bool = True, dependencies: dict[str, DependencySpec] = None,
                     pkg_dir: Path = None, source_roots: list[str] = None,
-                    compiler: str = "ritz0", on_rebuild=None) -> Optional[Path]:
+                    compiler: str = "ritz0", on_rebuild=None,
+                    members: Optional[dict] = None) -> Optional[Path]:
     """Compile a [[lib]] into `out_dir/lib<name>.a`. None on failure.
 
     The archive holds this package's modules only. A module's imports are
@@ -1660,6 +1669,12 @@ def compile_library(lib: LibraryConfig, out_dir: Path, *, keep_artifacts: bool =
 
     `on_rebuild` is as for compile_binary (AGAST #1382): not invoked when the
     archive is proven up to date.
+
+    `members`, a dict, is filled with `{module: {"key", "object_sha256",
+    "member"}}`: its CAS key, its object's sha256 and that object's member
+    name in the archive (`rz pack`'s stamps, packages.py, AGAST #4865). It
+    needs every key, so the build fails when a module can't be keyed, and it
+    always compiles: the up-to-date shortcut has no objects to hash.
     """
     archive = out_dir / f"lib{lib.name}.a"
     cache = get_build_cache(compiler)
@@ -1685,7 +1700,7 @@ def compile_library(lib: LibraryConfig, out_dir: Path, *, keep_artifacts: bool =
                 "compiler_hash": cache._get_current_compiler_hash(),
                 "modules": [[str(m.resolve()), k] for m, k in zip(lib.modules, keys)],
             }
-    if (provenance is not None and not compiler_changed
+    if (members is None and provenance is not None and not compiler_changed
             and binary_is_up_to_date(archive, provenance)):
         return archive
 
@@ -1701,6 +1716,15 @@ def compile_library(lib: LibraryConfig, out_dir: Path, *, keep_artifacts: bool =
             pkg_dir=pkg_dir)
         if objects is None:
             return None
+        if members is not None:
+            if provenance is None:
+                why = (", ".join(str(m) for m, k in zip(lib.modules, keys) if k is None)
+                       if use_cache else "any module: the build cache is off")
+                print(f"  ✗ lib{lib.name}: no CAS key for {why}", file=sys.stderr)
+                return None
+            for module, (_, key), obj in zip(lib.modules, provenance["modules"], objects):
+                members[module] = {"key": key, "object_sha256": _sha256_file(obj),
+                                   "member": obj.name}
 
         archiver = shutil.which(find_llvm_tool("llvm-ar")) or shutil.which("ar")
         if archiver is None:

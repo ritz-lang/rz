@@ -26,7 +26,8 @@ bounded_run = importlib.import_module("bounded_run")
 
 # Every file whose children must be bounded.
 GUARDED = ["bounded_run.py", "build.py", "build_pipeline.py", "build_testrun.py", "build_cli.py",
-           "manifest.py", "resolve.py", "cache.py", "cas.py"]
+           "manifest.py", "resolve.py", "cache.py", "cas.py",
+           "packages.py"]
 SPAWNERS = {"run", "Popen", "call", "check_call", "check_output"}
 
 

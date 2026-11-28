@@ -26,7 +26,7 @@ from lexer import Lexer, LexerError
 from parser import Parser, ParseError
 from enum_from import rewrite_enum_from
 from named_variants import rewrite_named_variants
-from emitter_llvmlite import emit as emit_llvmlite, EmitError
+from emitter_llvmlite import emit as emit_llvmlite, EmitError, debug_source_dir
 from instantiate import check_instances, monomorphize_module, raise_instance_errors
 from import_resolver import ImportResolver, ImportError as RitzImportError
 from selective_import import check_selective_imports
@@ -504,7 +504,8 @@ def _emit(ctx: _Compile) -> bool:
     """
     fn_cache_data, fn_hashes, sig_hashes, old_sig_data = _fn_cache(ctx)
     source_path_obj = Path(ctx.source_path)
-    source_dir = str(source_path_obj.parent.resolve()) if source_path_obj.parent else "."
+    source_dir = (debug_source_dir(ctx.source_path)
+                  or (str(source_path_obj.parent.resolve()) if source_path_obj.parent else "."))
     emit_result = emit_llvmlite(
         ctx.module, no_runtime=ctx.no_runtime,
         source_file=source_path_obj.name, source_dir=source_dir,

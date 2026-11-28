@@ -118,6 +118,7 @@ def test_buddhafinger_only_diff_keeps_the_key(repo):
     ("projects/ritz/ritzlib/io.ritz", "// ritzlib v2\n"),
     ("projects/ritz/runtime/ritz_start.ll", "; shim v2\n"),
     ("projects/builder/Dockerfile", "FROM scratch\n# v2\n"),
+    ("projects/builder/entrypoint.sh", "# rz-builder v2\n"),
     ("projects/widget/src/lib.ritz", "// widget v2\n"),
 ])
 def test_an_input_diff_changes_the_key(repo, rel, content):

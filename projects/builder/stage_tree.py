@@ -45,6 +45,7 @@ PYTHON_FILES = [
     "projects/ritz/cache.py",
     "projects/ritz/cas.py",
     "projects/ritz/manifest.py",
+    "projects/ritz/packages.py",
     "projects/ritz/resolve.py",
     "projects/ritz/tools/known_failures.py",
     "projects/ritz/ritz0/compiler_identity.py",

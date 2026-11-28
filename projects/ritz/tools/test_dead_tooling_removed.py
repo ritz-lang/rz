@@ -23,7 +23,9 @@ BUILD_PY = PKG_DIR / "build.py"
 
 # The commands `rz` keeps: the gate uses build/test/cache, rzrz delegates
 # run/clean, and list is the workspace inventory.
-RZ_COMMANDS = {"build", "test", "run", "list", "clean", "cache"}
+RZ_COMMANDS = {"build", "test", "run", "list", "clean", "cache",
+               # docs/PACKAGES.md §2 (AGAST #4865)
+               "pack", "install", "uninstall"}
 
 DELETED_RZ_SYMBOLS = (
     "run_pipeline", "compile_with_ritz1", "compile_with_ritz0", "link_llvm_ir",
