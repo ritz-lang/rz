@@ -13,7 +13,7 @@ import ritz1_text_ratchet as rt
 
 pytestmark = pytest.mark.unit
 
-PORTED = ("emitter_expr_arith",)
+PORTED = ("emitter_expr_arith", "emitter_ir", "text_bridge")
 
 
 def test_counts_the_three_forms():
@@ -170,5 +170,39 @@ def test_no_c_path_in_ritz1():
         for p in sorted(rt.DEFAULT_SRC.glob("*.ritz"))
         if not p.name.startswith("emitter") and p.stem not in rt.GENERATED_MODULES
         for line in c_path_forms(p.read_text())
+    ]
+    assert found == []
+
+
+# AGAST #4922: ritz1's fixed type / attribute spelling tables hand out their
+# spellings as StrViews, and the IR helpers that print one take a StrView, so
+# no caller measures a C string back into a view (text_bridge.llvm_text).
+SPELLING_TABLES = {
+    "types": ("ty_mem_llvm", "ty_value_llvm", "tr_mem_llvm", "tr_value_llvm"),
+    "ast_expr_syntax": ("primitive_name_sv", "word_type"),
+    "ast_helpers": ("enum_tag_llvm", "fn_inline_attr", "fn_callconv_kw"),
+    "emitter_ir": ("ir_inttoptr_to", "ir_load", "ir_store", "ir_phi_start"),
+}
+
+
+def _signature(text: str, fn: str) -> str | None:
+    pat = re.compile(rf"^\s*(?:pub\s+)?fn\s+{fn}\s*\(")
+    return next((line for line in text.splitlines() if pat.match(line)), None)
+
+
+@pytest.mark.parametrize("module,fn", [(m, f) for m, fns in SPELLING_TABLES.items() for f in fns])
+def test_a_spelling_table_takes_and_returns_a_view(module, fn):
+    sig = _signature((rt.DEFAULT_SRC / f"{module}.ritz").read_text(), fn)
+    assert sig is not None, f"{module}.{fn} is gone"
+    assert "*u8" not in sig
+
+
+def test_no_c_string_is_measured_back_into_a_spelling():
+    gone = ("llvm_text", "primitive_name_from_type", "primitive_spelling")
+    found = [
+        f"{p.name}: {name}"
+        for p in sorted(rt.DEFAULT_SRC.glob("*.ritz"))
+        for name in gone
+        if re.search(rf"\b{name}\(", "\n".join(rt._code(line) for line in p.read_text().splitlines()))
     ]
     assert found == []

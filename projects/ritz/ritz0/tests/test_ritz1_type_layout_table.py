@@ -536,5 +536,5 @@ def test_types_ritz_table_is_complete():
     text = (RITZ1_SRC / TYPES_RITZ).read_text()
     for kind in ["I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64"]:
         assert f"TypeKind.{kind}" in text
-    for spelling in ['c"float"', 'c"double"', 'c"i1"', 'c"ptr"']:
+    for spelling in ['"float"', '"double"', '"i1"', '"ptr"']:
         assert spelling in text
