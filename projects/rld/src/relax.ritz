@@ -1,0 +1,102 @@
+# GOT-load relaxation, as ld.lld does it (../razm/DESIGN.md "Inputs"): a
+# R_X86_64_GOTPCRELX or R_X86_64_REX_GOTPCRELX load of a symbol defined in
+# the image is rewritten to reach the symbol directly, and needs no GOT
+# entry.
+#
+#   mov  foo@GOTPCREL(%rip), %r    ->  lea  foo(%rip), %r
+#   call *foo@GOTPCREL(%rip)       ->  addr32 call foo
+#   jmp  *foo@GOTPCREL(%rip)       ->  jmp  foo; nop
+#   test %r, foo@GOTPCREL(%rip)    ->  test $foo, %r          (REX, not PIC)
+#   op   foo@GOTPCREL(%rip), %r    ->  op   $foo, %r          (REX, not PIC)
+#
+# where op is adc, add, and, cmp, or, sbb, sub or xor.
+import ritzlib.gvec { Vec }
+import ritzlib.span { Span }
+import razm.elf
+
+const OP_MOV: i64 = 0x8b
+const OP_LEA: u8 = 0x8d
+const OP_GROUP5: i64 = 0xff         # call/jmp r/m
+const MODRM_CALL_RIP: i64 = 0x15
+const MODRM_JMP_RIP: i64 = 0x25
+const OP_TEST: i64 = 0x85
+const OP_TEST_IMM: u8 = 0xf7
+const OP_BINOP_IMM: u8 = 0x81
+const PREFIX_ADDR32: u8 = 0x67
+const OP_CALL_REL: u8 = 0xe8
+const OP_JMP_REL: u8 = 0xe9
+const OP_NOP: u8 = 0x90
+const REX_R: i64 = 0x4
+
+# How a GOT-load relocation is applied.
+pub enum Relax
+    Keep            # through a GOT entry
+    PcRelative      # rewritten to address the symbol: the field is S + A - P
+    Absolute        # rewritten to an immediate: the field is S
+
+# Whether `op` is the r, r/m form of adc, add, and, cmp, or, sbb, sub or xor.
+fn is_binop(op: i64) -> bool
+    (op & 0xc7) == 0x03
+
+# How ld.lld treats the relocation of `rtype` and `addend` whose field is at
+# `at` in `code`, in an output that is PIC or not.
+pub fn relax_kind(code: Span<u8>, at: i64, rtype: i64, addend: i64, pic: bool) -> Relax
+    if rtype != R_X86_64_GOTPCRELX and rtype != R_X86_64_REX_GOTPCRELX
+        return Relax.Keep
+    # Any other addend loads part of the entry, not all of it.
+    if addend != -4 or at < 2
+        return Relax.Keep
+    let op: i64 = code[at - 2] as i64
+    let modrm: i64 = code[at - 1] as i64
+    if op == OP_MOV
+        return Relax.PcRelative
+    if op == OP_GROUP5 and (modrm == MODRM_CALL_RIP or modrm == MODRM_JMP_RIP)
+        return Relax.PcRelative
+    # test and the binops need the REX byte the relocation type promises.
+    if rtype == R_X86_64_GOTPCRELX or pic or at < 3
+        return Relax.Keep
+    if op == OP_TEST or is_binop(op)
+        return Relax.Absolute
+    Relax.Keep
+
+# Whether the rewritten field holds `value`.
+pub fn relax_fits(kind: Relax, value: i64) -> bool
+    match kind
+        Keep => true
+        PcRelative => value >= -0x80000000 and value <= 0x7fffffff
+        Absolute => value >= -0x80000000 and value <= 0x7fffffff
+
+# Rewrite the instruction whose field is at `at` in `image` and store
+# `value` in it, as `relax_kind` chose.
+pub fn apply_relax(image: @&Vec<u8>, at: i64, kind: Relax, value: i64)
+    let op: i64 = image[at - 2] as i64
+    let modrm: i64 = image[at - 1] as i64
+    match kind
+        Keep => pass
+        PcRelative =>
+            if op == OP_MOV
+                image[at - 2] = OP_LEA
+                patch_le(image, at, value, 4)
+            else if modrm == MODRM_CALL_RIP
+                image[at - 2] = PREFIX_ADDR32
+                image[at - 1] = OP_CALL_REL
+                patch_le(image, at, value, 4)
+            else
+                # jmp rel32 is one byte shorter than jmp *disp32(%rip): it
+                # starts a byte earlier, and a nop fills the last byte.
+                image[at - 2] = OP_JMP_REL
+                patch_le(image, at - 1, value + 1, 4)
+                image[at + 3] = OP_NOP
+        Absolute =>
+            # The r/m operand becomes the register; REX.R moves to REX.B.
+            let rex: i64 = image[at - 3] as i64
+            let reg: i64 = (modrm & 0x38) >> 3
+            if op == OP_TEST
+                image[at - 1] = (0xc0 | reg) as u8
+                image[at - 2] = OP_TEST_IMM
+            else
+                # The binop's kind moves from the opcode to ModRM.reg.
+                image[at - 1] = (0xc0 | reg | (op & 0x38)) as u8
+                image[at - 2] = OP_BINOP_IMM
+            image[at - 3] = ((rex & ~REX_R) | ((rex & REX_R) >> 2)) as u8
+            patch_le(image, at, value, 4)

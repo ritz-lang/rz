@@ -1,0 +1,471 @@
+# The no-script executable (../razm/DESIGN.md "Outputs"): ET_EXEC at
+# 0x200000, the read-only, executable and writable output sections each
+# starting a new PT_LOAD on a new page, entry `_start`.
+#
+# Each allocated input section goes to the output section of its own name,
+# in command-line order. A GOT entry is made only for a GOT load that does
+# not relax, and holds the symbol's address.
+import ritzlib.fs { chmod, write_file }
+import ritzlib.gvec { Vec, vec_new, vec_zeroed }
+import ritzlib.hashmap { HashMap, HashMapI64, hashmap_new, hashmap_i64_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_from_vec }
+import ritzlib.strview { StrView }
+import razm.elf
+import rld.input
+import rld.relax { Relax, apply_relax, relax_fits, relax_kind }
+
+pub const BASE: i64 = 0x200000
+const PAGE: i64 = 0x1000
+const GOT_ENTRY: i64 = 8
+const ENTRY: StrView = "_start"
+const EXEC_MODE: i32 = 0x1ed      # rwxr-xr-x
+
+# The segments, in address order.
+const SEG_R: i64 = 0
+const SEG_RX: i64 = 1
+const SEG_RW: i64 = 2
+const SEGMENTS: i64 = 3
+
+pub struct OutSection
+    name: StrView
+    stype: i64
+    flags: i64
+    align: i64
+    size: i64
+    nobits: bool
+    addr: i64
+    offset: i64         # in the file; for NOBITS, where it would start
+
+struct Segment
+    flags: i64          # PF_* bits
+    offset: i64
+    addr: i64
+    filesz: i64
+    memsz: i64
+    used: bool
+
+pub struct Image
+    outs: Vec<OutSection>       # in address order
+    relax: Vec<Relax>           # per InReloc
+    got: HashMapI64             # defining InSymbol: its GOT slot
+    got_syms: Vec<i64>          # per slot, the defining InSymbol
+    got_out: i64                # the .got output section, or -1
+    placed: Vec<i64>            # per gathered output section, its index in outs
+    entry: i64
+
+fn align_up(v: i64, align: i64) -> i64
+    (v + align - 1) & ~(align - 1)
+
+fn segment_of(o: OutSection) -> i64
+    if (o.flags & SHF_WRITE) != 0
+        return SEG_RW
+    if (o.flags & SHF_EXECINSTR) != 0
+        return SEG_RX
+    SEG_R
+
+# Placement order within a segment: the GOT, then PROGBITS, then NOBITS
+# last, so a writable segment's file bytes end before its zero fill.
+fn rank(o: OutSection, is_got: bool) -> i64
+    let seg: i64 = segment_of(o) * 3
+    if is_got
+        return seg
+    if o.nobits then seg + 2 else seg + 1
+
+fn fits_signed32(v: i64) -> bool
+    v >= -0x80000000 and v <= 0x7fffffff
+
+fn fits_unsigned32(v: i64) -> bool
+    v >= 0 and v <= 0xffffffff
+
+fn fits_either(v: i64, width: i64) -> bool
+    let bits: i64 = width * 8
+    v >= 0 - (1 << (bits - 1)) and v < (1 << bits)
+
+fn fits_signed(v: i64, width: i64) -> bool
+    let bits: i64 = width * 8
+    v >= 0 - (1 << (bits - 1)) and v < (1 << (bits - 1))
+
+# The address of the symbol a relocation against `sym` reaches.
+fn address(l: @Linker, img: @Image, sym: i64) -> i64
+    let d: i64 = l.definition(sym)
+    let s: InSymbol = l.symbols[d]
+    if s.shndx == SHN_ABS or s.shndx == SHN_UNDEF
+        return s.value
+    let sec: InSection = l.sections[l.symbol_section(d)]
+    if sec.out < 0
+        return s.value
+    img.outs[img.placed[sec.out]].addr + sec.offset + s.value
+
+# Every relocation's symbol resolves: else the first one that does not.
+fn check_undefined(l: @Linker) -> Result<(), LinkError>
+    for r in 0..l.relocs.len
+        let rel: InReloc = l.relocs[r]
+        if rel.rtype == R_X86_64_NONE
+            continue
+        if l.definition(rel.symbol) == UNRESOLVED
+            return Err(LinkError.Undefined(l.symbols[rel.symbol].name))
+    Ok(())
+
+# Group the kept input sections into output sections by name, and give
+# each its offset in its output section.
+fn gather(l: @&Linker) -> Vec<OutSection>
+    var outs: Vec<OutSection> = vec_new<OutSection>()
+    var by_name: HashMap<StrView, i64> = hashmap_new<StrView, i64>()
+    for i in 0..l.sections.len
+        if not l.is_kept(i)
+            continue
+        var s: InSection = l.sections[i]
+        let nobits: bool = s.stype == SHT_NOBITS
+        let o: i64 = match by_name.get(s.name)
+            Some(o) => o
+            None =>
+                outs.push(OutSection { name: s.name, stype: s.stype, flags: 0, align: 1, size: 0, nobits: true, addr: 0, offset: 0 })
+                by_name.insert(s.name, outs.len - 1)
+                outs.len - 1
+        var out: OutSection = outs[o]
+        out.flags = out.flags | s.flags
+        if s.align > out.align
+            out.align = s.align
+        if not nobits
+            out.nobits = false
+            out.stype = s.stype
+        s.offset = align_up(out.size, s.align)
+        s.out = o
+        out.size = s.offset + s.size
+        outs[o] = out
+        l.sections[i] = s
+    # A NOBITS section only takes zero fill at the end of a writable
+    # segment; anywhere else it is laid out as zero bytes in the file.
+    for o in 0..outs.len
+        var out: OutSection = outs[o]
+        if out.nobits and (out.flags & SHF_WRITE) == 0
+            out.nobits = false
+            out.stype = SHT_PROGBITS
+            outs[o] = out
+    outs
+
+# Lay out a no-script executable: decide each GOT load, place the
+# sections, and redo both until every relaxed load reaches its symbol.
+pub fn layout(l: @&Linker) -> Result<Image, LinkError>
+    check_undefined(l)?
+    let gathered: Vec<OutSection> = gather(l)
+    var img: Image = Image {
+        outs: vec_new<OutSection>(),
+        relax: vec_new<Relax>(),
+        got: hashmap_i64_new(),
+        got_syms: vec_new<i64>(),
+        got_out: -1,
+        placed: vec_new<i64>(),
+        entry: 0
+    }
+    for r in 0..l.relocs.len
+        let rel: InReloc = l.relocs[r]
+        let code: Span<u8> = l.sections[rel.section].data
+        img.relax.push(relax_kind(code, rel.offset, rel.rtype, rel.addend, false))
+    loop
+        plan_got(l, @&img)
+        place(l, @&img, @gathered)
+        if not unrelax_out_of_range(l, @&img)
+            break
+    let start: i64 = l.lookup(ENTRY)
+    if start == UNRESOLVED
+        return Err(LinkError.NoEntry(ENTRY))
+    img.entry = address(l, @img, start)
+    Ok(img)
+
+# A GOT slot for each GOT load that is kept.
+fn plan_got(l: @Linker, img: @&Image)
+    for r in 0..l.relocs.len
+        let rel: InReloc = l.relocs[r]
+        let got_load: bool = rel.rtype == R_X86_64_GOTPCREL or rel.rtype == R_X86_64_GOTPCRELX or rel.rtype == R_X86_64_REX_GOTPCRELX
+        if not got_load or img.relax[r] != Relax.Keep
+            continue
+        let d: i64 = l.definition(rel.symbol)
+        if img.got.contains(d)
+            continue
+        img.got.insert(d, img.got_syms.len)
+        img.got_syms.push(d)
+
+# Any relaxed load whose symbol is now out of its reach goes back
+# through the GOT; whether there was one.
+fn unrelax_out_of_range(l: @Linker, img: @&Image) -> bool
+    var changed: bool = false
+    for r in 0..l.relocs.len
+        let kind: Relax = img.relax[r]
+        if kind == Relax.Keep
+            continue
+        let rel: InReloc = l.relocs[r]
+        let s: i64 = address(l, img, rel.symbol)
+        let value: i64 = if kind == Relax.Absolute then s else s + rel.addend - place_address(l, img, rel)
+        if not relax_fits(kind, value)
+            img.relax[r] = Relax.Keep
+            changed = true
+    changed
+
+fn place_address(l: @Linker, img: @Image, rel: InReloc) -> i64
+    let sec: InSection = l.sections[rel.section]
+    img.outs[img.placed[sec.out]].addr + sec.offset + rel.offset
+
+fn place_offset(l: @Linker, img: @Image, rel: InReloc) -> i64
+    let sec: InSection = l.sections[rel.section]
+    img.outs[img.placed[sec.out]].offset + sec.offset + rel.offset
+
+# Order the output sections, the GOT among them, by segment and rank,
+# and give each its address and file offset. The ELF and program
+# headers open the read-only segment.
+fn place(l: @Linker, img: @&Image, gathered: @Vec<OutSection>)
+    var all: Vec<OutSection> = gathered.clone()
+    var got_index: i64 = -1
+    if img.got_syms.len > 0
+        all.push(OutSection { name: ".got", stype: SHT_PROGBITS, flags: SHF_ALLOC | SHF_WRITE, align: GOT_ENTRY, size: img.got_syms.len * GOT_ENTRY, nobits: false, addr: 0, offset: 0 })
+        got_index = all.len - 1
+    # The order: every output section by rank, stably.
+    var order: Vec<i64> = vec_new<i64>()
+    for k in 0..(SEGMENTS * 3)
+        for o in 0..all.len
+            if rank(all[o], o == got_index) == k
+                order.push(o)
+    var used: [3]bool = [false, false, false]
+    used[SEG_R] = true
+    for o in 0..all.len
+        used[segment_of(all[o])] = true
+    var phnum: i64 = 1          # PT_GNU_STACK
+    for g in 0..SEGMENTS
+        if used[g]
+            phnum += 1
+
+    var off: i64 = EHDR_SIZE + phnum * PHDR_SIZE
+    var addr: i64 = BASE + off
+    var seg: i64 = SEG_R
+    var placed: Vec<OutSection> = vec_new<OutSection>()
+    var new_index: Vec<i64> = vec_zeroed<i64>(all.len)
+    for n in 0..order.len
+        var out: OutSection = all[order[n]]
+        let g: i64 = segment_of(out)
+        if g != seg
+            seg = g
+            off = align_up(off, PAGE)
+            addr = BASE + off
+        addr = align_up(addr, out.align)
+        if not out.nobits
+            off = addr - BASE
+        out.addr = addr
+        out.offset = off
+        addr += out.size
+        if not out.nobits
+            off += out.size
+        new_index[order[n]] = placed.len
+        placed.push(out)
+    img.outs = placed
+    img.got_out = if got_index >= 0 then new_index[got_index] else -1
+    img.placed = new_index
+
+# The segments the placed sections make.
+fn segments(l: @Linker, img: @Image) -> [3]Segment
+    var segs: [3]Segment = [
+        Segment { flags: PF_R, offset: 0, addr: BASE, filesz: 0, memsz: 0, used: true },
+        Segment { flags: PF_R | PF_X, offset: 0, addr: 0, filesz: 0, memsz: 0, used: false },
+        Segment { flags: PF_R | PF_W, offset: 0, addr: 0, filesz: 0, memsz: 0, used: false }
+    ]
+    for o in 0..img.outs.len
+        let out: OutSection = img.outs[o]
+        let g: i64 = segment_of(out)
+        var s: Segment = segs[g]
+        if not s.used
+            s.used = true
+            s.offset = out.offset
+            s.addr = out.addr
+        if not out.nobits
+            s.filesz = out.offset + out.size - s.offset
+        s.memsz = out.addr + out.size - s.addr
+        segs[g] = s
+    if segs[SEG_R].filesz == 0
+        var r: Segment = segs[SEG_R]
+        r.filesz = header_size(l, img)
+        r.memsz = r.filesz
+        segs[SEG_R] = r
+    segs
+
+fn header_size(l: @Linker, img: @Image) -> i64
+    EHDR_SIZE + phnum(l, img) * PHDR_SIZE
+
+fn phnum(l: @Linker, img: @Image) -> i64
+    var used: [3]bool = [true, false, false]
+    for o in 0..img.outs.len
+        used[segment_of(img.outs[o])] = true
+    var n: i64 = 1
+    for g in 0..SEGMENTS
+        if used[g]
+            n += 1
+    n
+
+# Apply one relocation to the image.
+fn apply(l: @Linker, img: @Image, bytes: @&Vec<u8>, r: i64) -> Result<(), LinkError>
+    let rel: InReloc = l.relocs[r]
+    if rel.rtype == R_X86_64_NONE
+        return Ok(())
+    let s: i64 = address(l, img, rel.symbol)
+    let p: i64 = place_address(l, img, rel)
+    let at: i64 = place_offset(l, img, rel)
+    let a: i64 = rel.addend
+    let name: StrView = l.symbols[rel.symbol].name
+    let overflow: LinkError = LinkError.Overflow(name, rel.rtype)
+    match rel.rtype
+        R_X86_64_64 => patch_le(bytes, at, s + a, 8)
+        R_X86_64_PC64 => patch_le(bytes, at, s + a - p, 8)
+        R_X86_64_PC32 | R_X86_64_PLT32 =>
+            if not fits_signed32(s + a - p)
+                return Err(overflow)
+            patch_le(bytes, at, s + a - p, 4)
+        R_X86_64_32 =>
+            if not fits_unsigned32(s + a)
+                return Err(overflow)
+            patch_le(bytes, at, s + a, 4)
+        R_X86_64_32S =>
+            if not fits_signed32(s + a)
+                return Err(overflow)
+            patch_le(bytes, at, s + a, 4)
+        R_X86_64_16 | R_X86_64_8 =>
+            let width: i64 = if rel.rtype == R_X86_64_16 then 2 else 1
+            if not fits_either(s + a, width)
+                return Err(overflow)
+            patch_le(bytes, at, s + a, width)
+        R_X86_64_PC16 | R_X86_64_PC8 =>
+            let width: i64 = if rel.rtype == R_X86_64_PC16 then 2 else 1
+            if not fits_signed(s + a - p, width)
+                return Err(overflow)
+            patch_le(bytes, at, s + a - p, width)
+        R_X86_64_GOTPCREL | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX =>
+            let kind: Relax = img.relax[r]
+            match kind
+                Keep =>
+                    let slot: i64 = match img.got.get(l.definition(rel.symbol))
+                        Some(n) => n
+                        None => return Err(overflow)
+                    let g: i64 = img.outs[img.got_out].addr + slot * GOT_ENTRY
+                    if not fits_signed32(g + a - p)
+                        return Err(overflow)
+                    patch_le(bytes, at, g + a - p, 4)
+                PcRelative => apply_relax(bytes, at, kind, s + a - p)
+                Absolute => apply_relax(bytes, at, kind, s)
+        _ => return Err(overflow)
+    Ok(())
+
+# The executable's bytes: headers, segments, then the section headers,
+# a symbol table of the global definitions, and the name tables.
+pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
+    let segs: [3]Segment = segments(l, img)
+    var end: i64 = header_size(l, img)
+    for o in 0..img.outs.len
+        let out: OutSection = img.outs[o]
+        if not out.nobits and out.offset + out.size > end
+            end = out.offset + out.size
+    var bytes: Vec<u8> = vec_zeroed<u8>(end)
+    for i in 0..l.sections.len
+        let s: InSection = l.sections[i]
+        if s.out < 0 or s.stype == SHT_NOBITS
+            continue
+        let at: i64 = img.outs[img.placed[s.out]].offset + s.offset
+        for b in 0..s.data.len
+            bytes[at + b] = s.data[b]
+    if img.got_out >= 0
+        let got: OutSection = img.outs[img.got_out]
+        for slot in 0..img.got_syms.len
+            patch_le(@&bytes, got.offset + slot * GOT_ENTRY, address(l, img, img.got_syms[slot]), 8)
+    for r in 0..l.relocs.len
+        apply(l, img, @&bytes, r)?
+
+    # The ELF header and the program headers.
+    let ident: [8]u8 = [0x7f, 'E', 'L', 'F', 2, 1, 1, 0]   # ELFCLASS64, ELFDATA2LSB, EV_CURRENT, SysV
+    for i in 0..8
+        bytes[i] = ident[i]
+    let phnum: i64 = phnum(l, img)
+    patch_le(@&bytes, 16, ELF_ET_EXEC as i64, 2)
+    patch_le(@&bytes, 18, ELF_EM_X86_64 as i64, 2)
+    patch_le(@&bytes, 20, 1, 4)                    # e_version
+    patch_le(@&bytes, 24, img.entry, 8)
+    patch_le(@&bytes, 32, EHDR_SIZE, 8)            # e_phoff
+    patch_le(@&bytes, 52, EHDR_SIZE, 2)
+    patch_le(@&bytes, 54, PHDR_SIZE, 2)
+    patch_le(@&bytes, 56, phnum, 2)
+    var ph: i64 = EHDR_SIZE
+    for g in 0..SEGMENTS
+        let s: Segment = segs[g]
+        if not s.used
+            continue
+        patch_phdr(@&bytes, ph, PT_LOAD, s.flags, s.offset, s.addr, s.filesz, s.memsz, PAGE)
+        ph += PHDR_SIZE
+    patch_phdr(@&bytes, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0)
+
+    # Section headers: null, each output section, .symtab, .strtab,
+    # .shstrtab.
+    var shstrtab: Vec<u8> = vec_new<u8>()
+    shstrtab.push(0)
+    var headers: Vec<SectionHeader> = vec_new<SectionHeader>()
+    headers.push(SectionHeader { name: 0, stype: SHT_NULL, flags: 0, addr: 0, offset: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 })
+    for o in 0..img.outs.len
+        let out: OutSection = img.outs[o]
+        let name: i64 = add_name(@&shstrtab, out.name)
+        let stype: i64 = if out.nobits then SHT_NOBITS else out.stype
+        headers.push(SectionHeader { name: name, stype: stype, flags: out.flags, addr: out.addr, offset: out.offset, size: out.size, link: 0, info: 0, align: out.align, entsize: 0 })
+
+    var strtab: Vec<u8> = vec_new<u8>()
+    strtab.push(0)
+    var symtab: Vec<u8> = vec_new<u8>()
+    push_sym(@&symtab, SymbolEntry { name: 0, bind: 0, stype: 0, shndx: 0, value: 0, size: 0 })
+    for i in 0..l.symbols.len
+        let s: InSymbol = l.symbols[i]
+        if s.bind == STB_LOCAL or l.definition(i) != i
+            continue
+        var shndx: i64 = SHN_ABS
+        if s.shndx != SHN_ABS
+            shndx = 1 + img.placed[l.sections[l.symbol_section(i)].out]
+        let name: i64 = add_name(@&strtab, s.name)
+        push_sym(@&symtab, SymbolEntry { name: name, bind: s.bind, stype: s.stype, shndx: shndx, value: address(l, img, i), size: s.size })
+    let symtab_index: i64 = headers.len
+    pad_to(@&bytes, 8)
+    let symtab_name: i64 = add_name(@&shstrtab, ".symtab")
+    headers.push(SectionHeader { name: symtab_name, stype: SHT_SYMTAB, flags: 0, addr: 0, offset: bytes.len, size: symtab.len, link: symtab_index + 1, info: 1, align: 8, entsize: SYM_SIZE })
+    bytes.push_span(span_from_vec<u8>(@symtab))
+    let strtab_name: i64 = add_name(@&shstrtab, ".strtab")
+    headers.push(SectionHeader { name: strtab_name, stype: SHT_STRTAB, flags: 0, addr: 0, offset: bytes.len, size: strtab.len, link: 0, info: 0, align: 1, entsize: 0 })
+    bytes.push_span(span_from_vec<u8>(@strtab))
+    let shstrtab_name: i64 = add_name(@&shstrtab, ".shstrtab")
+    headers.push(SectionHeader { name: shstrtab_name, stype: SHT_STRTAB, flags: 0, addr: 0, offset: bytes.len, size: shstrtab.len, link: 0, info: 0, align: 1, entsize: 0 })
+    bytes.push_span(span_from_vec<u8>(@shstrtab))
+
+    pad_to(@&bytes, 8)
+    let shoff: i64 = bytes.len
+    for h in 0..headers.len
+        push_shdr(@&bytes, headers[h])
+    patch_le(@&bytes, 40, shoff, 8)
+    patch_le(@&bytes, 58, SHDR_SIZE, 2)
+    patch_le(@&bytes, 60, headers.len, 2)
+    patch_le(@&bytes, 62, headers.len - 1, 2)
+    Ok(bytes)
+
+fn patch_phdr(out: @&Vec<u8>, at: i64, ptype: i64, flags: i64, offset: i64, addr: i64, filesz: i64, memsz: i64, align: i64)
+    patch_le(out, at, ptype, 4)
+    patch_le(out, at + 4, flags, 4)
+    patch_le(out, at + 8, offset, 8)
+    patch_le(out, at + 16, addr, 8)
+    patch_le(out, at + 24, addr, 8)     # p_paddr
+    patch_le(out, at + 32, filesz, 8)
+    patch_le(out, at + 40, memsz, 8)
+    patch_le(out, at + 48, align, 8)
+
+# Link the objects at `paths` into the no-script executable at `out`.
+pub fn link(l: @&Linker, paths: Span<StrView>, out: StrView) -> Result<(), LinkError>
+    for i in 0..paths.len
+        l.add_file(paths[i])?
+    l.resolve()?
+    let img: Image = layout(l)?
+    let bytes: Vec<u8> = write_image(l, @img)?
+    match write_file(out, span_from_vec<u8>(@bytes).as_strview())
+        Ok(_) => pass
+        Err(_) => return Err(LinkError.Unwritable(out))
+    match chmod(out, EXEC_MODE)
+        Ok(_) => Ok(())
+        Err(_) => Err(LinkError.Unwritable(out))

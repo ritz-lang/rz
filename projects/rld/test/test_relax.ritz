@@ -1,0 +1,144 @@
+# GOT-load relaxation, one case per ld.lld rule (relax.ritz). Each case is
+# the instruction as `as --64` encodes it, with the relocated field zero,
+# and the bytes ld.lld writes for it.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.span { Span, span_from_vec }
+import ritzlib.testlib
+import razm.elf
+import rld.relax
+
+const VALUE: i64 = 0x12345
+
+[[test_helper]]
+fn code(bytes: Span<u8>) -> Vec<u8>
+    var v: Vec<u8> = vec_new<u8>()
+    v.push_span(bytes)
+    v
+
+[[test_helper]]
+fn kind_of(bytes: Span<u8>, at: i64, rtype: i64, addend: i64, pic: bool) -> Relax
+    let v: Vec<u8> = code(bytes)
+    relax_kind(span_from_vec<u8>(@v), at, rtype, addend, pic)
+
+# Relax the field at `at` with `value` and compare with `want`.
+[[test_helper]]
+fn rewrites(bytes: Span<u8>, at: i64, rtype: i64, value: i64, want: Span<u8>) -> bool
+    var v: Vec<u8> = code(bytes)
+    let kind: Relax = relax_kind(span_from_vec<u8>(@v), at, rtype, -4, false)
+    apply_relax(@&v, at, kind, value)
+    if v.len != want.len
+        return false
+    for i in 0..want.len
+        if v[i] != want[i]
+            return false
+    true
+
+[[test]]
+fn test_rex_mov_becomes_lea() -> i32
+    let mov: [7]u8 = [0x48, 0x8b, 0x05, 0, 0, 0, 0]        # movq x@GOTPCREL(%rip), %rax
+    let lea: [7]u8 = [0x48, 0x8d, 0x05, 0x45, 0x23, 0x01, 0]
+    assert kind_of(@mov, 3, R_X86_64_REX_GOTPCRELX, -4, false) == Relax.PcRelative
+    assert rewrites(@mov, 3, R_X86_64_REX_GOTPCRELX, VALUE, @lea)
+    0
+
+[[test]]
+fn test_mov_without_rex_becomes_lea() -> i32
+    let mov: [6]u8 = [0x8b, 0x0d, 0, 0, 0, 0]               # movl x@GOTPCREL(%rip), %ecx
+    let lea: [6]u8 = [0x8d, 0x0d, 0x45, 0x23, 0x01, 0]
+    assert kind_of(@mov, 2, R_X86_64_GOTPCRELX, -4, false) == Relax.PcRelative
+    assert rewrites(@mov, 2, R_X86_64_GOTPCRELX, VALUE, @lea)
+    0
+
+[[test]]
+fn test_call_becomes_addr32_call() -> i32
+    let call: [6]u8 = [0xff, 0x15, 0, 0, 0, 0]              # call *x@GOTPCREL(%rip)
+    let direct: [6]u8 = [0x67, 0xe8, 0x45, 0x23, 0x01, 0]
+    assert kind_of(@call, 2, R_X86_64_GOTPCRELX, -4, false) == Relax.PcRelative
+    assert rewrites(@call, 2, R_X86_64_GOTPCRELX, VALUE, @direct)
+    0
+
+[[test]]
+fn test_jmp_becomes_jmp_and_nop() -> i32
+    let jmp: [6]u8 = [0xff, 0x25, 0, 0, 0, 0]               # jmp *x@GOTPCREL(%rip)
+    let direct: [6]u8 = [0xe9, 0x46, 0x23, 0x01, 0, 0x90]   # jmp x (one byte earlier); nop
+    assert kind_of(@jmp, 2, R_X86_64_GOTPCRELX, -4, false) == Relax.PcRelative
+    assert rewrites(@jmp, 2, R_X86_64_GOTPCRELX, VALUE, @direct)
+    0
+
+[[test]]
+fn test_rex_test_becomes_test_immediate() -> i32
+    let test: [7]u8 = [0x48, 0x85, 0x15, 0, 0, 0, 0]       # testq %rdx, x@GOTPCREL(%rip)
+    let imm: [7]u8 = [0x48, 0xf7, 0xc2, 0x45, 0x23, 0x01, 0]
+    assert kind_of(@test, 3, R_X86_64_REX_GOTPCRELX, -4, false) == Relax.Absolute
+    assert rewrites(@test, 3, R_X86_64_REX_GOTPCRELX, VALUE, @imm)
+    0
+
+[[test]]
+fn test_rex_r_moves_to_rex_b() -> i32
+    let add: [7]u8 = [0x4c, 0x03, 0x05, 0, 0, 0, 0]        # addq x@GOTPCREL(%rip), %r8
+    let add_imm: [7]u8 = [0x49, 0x81, 0xc0, 0x45, 0x23, 0x01, 0]
+    assert rewrites(@add, 3, R_X86_64_REX_GOTPCRELX, VALUE, @add_imm)
+    let cmp: [7]u8 = [0x4c, 0x3b, 0x1d, 0, 0, 0, 0]        # cmpq x@GOTPCREL(%rip), %r11
+    let cmp_imm: [7]u8 = [0x49, 0x81, 0xfb, 0x45, 0x23, 0x01, 0]
+    assert rewrites(@cmp, 3, R_X86_64_REX_GOTPCRELX, VALUE, @cmp_imm)
+    0
+
+[[test]]
+fn test_each_binop_keeps_its_kind_in_modrm() -> i32
+    # adc add and cmp or sbb sub xor, each on %rcx: ModRM.reg is the kind.
+    let ops: [8]u8 = [0x13, 0x03, 0x23, 0x3b, 0x0b, 0x1b, 0x2b, 0x33]
+    let regs: [8]u8 = [0xd1, 0xc1, 0xe1, 0xf9, 0xc9, 0xd9, 0xe9, 0xf1]
+    for i in 0..8
+        let insn: [7]u8 = [0x48, ops[i], 0x0d, 0, 0, 0, 0]
+        let want: [7]u8 = [0x48, 0x81, regs[i], 0x45, 0x23, 0x01, 0]
+        assert rewrites(@insn, 3, R_X86_64_REX_GOTPCRELX, VALUE, @want), "binop"
+    0
+
+[[test]]
+fn test_binop_without_rex_type_keeps_the_got() -> i32
+    # After another instruction's byte, so only the type keeps it.
+    let add: [7]u8 = [0xc0, 0x03, 0x05, 0, 0, 0, 0]         # ...; addl x@GOTPCREL(%rip), %eax
+    assert kind_of(@add, 3, R_X86_64_GOTPCRELX, -4, false) == Relax.Keep
+    let test: [7]u8 = [0xc0, 0x85, 0x05, 0, 0, 0, 0]        # ...; testl %eax, x@GOTPCREL(%rip)
+    assert kind_of(@test, 3, R_X86_64_GOTPCRELX, -4, false) == Relax.Keep
+    0
+
+[[test]]
+fn test_binop_in_pic_output_keeps_the_got() -> i32
+    let add: [7]u8 = [0x48, 0x03, 0x05, 0, 0, 0, 0]
+    assert kind_of(@add, 3, R_X86_64_REX_GOTPCRELX, -4, true) == Relax.Keep
+    let mov: [7]u8 = [0x48, 0x8b, 0x05, 0, 0, 0, 0]
+    assert kind_of(@mov, 3, R_X86_64_REX_GOTPCRELX, -4, true) == Relax.PcRelative
+    0
+
+[[test]]
+fn test_other_addend_keeps_the_got() -> i32
+    let mov: [6]u8 = [0x8b, 0x05, 0, 0, 0, 0]               # movl x@GOTPCREL+4(%rip), %eax
+    assert kind_of(@mov, 2, R_X86_64_GOTPCRELX, 0, false) == Relax.Keep
+    0
+
+[[test]]
+fn test_plain_gotpcrel_and_other_opcodes_keep_the_got() -> i32
+    let mov: [7]u8 = [0x48, 0x8b, 0x05, 0, 0, 0, 0]
+    assert kind_of(@mov, 3, R_X86_64_GOTPCREL, -4, false) == Relax.Keep
+    let push: [6]u8 = [0xff, 0x35, 0, 0, 0, 0]              # pushq x@GOTPCREL(%rip)
+    assert kind_of(@push, 2, R_X86_64_GOTPCRELX, -4, false) == Relax.Keep
+    let movb: [7]u8 = [0x48, 0x8a, 0x05, 0, 0, 0, 0]        # not a binop
+    assert kind_of(@movb, 3, R_X86_64_REX_GOTPCRELX, -4, false) == Relax.Keep
+    0
+
+[[test]]
+fn test_field_too_close_to_section_start_keeps_the_got() -> i32
+    let bytes: [5]u8 = [0x05, 0, 0, 0, 0]
+    assert kind_of(@bytes, 1, R_X86_64_GOTPCRELX, -4, false) == Relax.Keep
+    0
+
+[[test]]
+fn test_relaxed_fields_hold_32_bits_signed() -> i32
+    assert relax_fits(Relax.PcRelative, 0x7fffffff)
+    assert not relax_fits(Relax.PcRelative, 0x80000000)
+    assert relax_fits(Relax.PcRelative, -0x80000000)
+    assert not relax_fits(Relax.PcRelative, -0x80000001)
+    assert relax_fits(Relax.Absolute, 0x7fffffff)
+    assert not relax_fits(Relax.Absolute, 0x80000000)
+    0

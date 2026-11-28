@@ -15,51 +15,7 @@ import ritzlib.span { Bytes, Span, span_empty, span_from_vec }
 import ritzlib.string { String, string_from }
 import ritzlib.strview { StrView }
 import razm.fixup { Fixup, FixupKind }
-
-pub const ELF_ET_REL: u16 = 1
-pub const ELF_EM_X86_64: u16 = 62
-
-const EHDR_SIZE: i64 = 64
-const SHDR_SIZE: i64 = 64
-const SYM_SIZE: i64 = 24
-const RELA_SIZE: i64 = 24
-
-const SHT_PROGBITS: i64 = 1
-const SHT_SYMTAB: i64 = 2
-const SHT_STRTAB: i64 = 3
-const SHT_RELA: i64 = 4
-const SHT_NOBITS: i64 = 8
-const SHT_GROUP: i64 = 17
-
-const SHF_WRITE: i64 = 0x1
-const SHF_ALLOC: i64 = 0x2
-const SHF_EXECINSTR: i64 = 0x4
-const SHF_INFO_LINK: i64 = 0x40
-const SHF_GROUP: i64 = 0x200
-
-const SHN_ABS: i64 = 0xfff1
-const SHN_LORESERVE: i64 = 0xff00
-const GRP_COMDAT: i64 = 1
-
-const STB_LOCAL: i64 = 0
-const STB_GLOBAL: i64 = 1
-const STB_WEAK: i64 = 2
-const STT_NOTYPE: i64 = 0
-const STT_OBJECT: i64 = 1
-const STT_FUNC: i64 = 2
-const STT_SECTION: i64 = 3
-
-const R_X86_64_64: i64 = 1
-const R_X86_64_PC32: i64 = 2
-const R_X86_64_PLT32: i64 = 4
-const R_X86_64_32: i64 = 10
-const R_X86_64_32S: i64 = 11
-const R_X86_64_16: i64 = 12
-const R_X86_64_PC16: i64 = 13
-const R_X86_64_8: i64 = 14
-const R_X86_64_PC8: i64 = 15
-const R_X86_64_PC64: i64 = 24
-const R_X86_64_REX_GOTPCRELX: i64 = 42
+import razm.elf
 
 # Symbol.section for a symbol with no section.
 const UNDEFINED: i64 = -1
@@ -233,64 +189,12 @@ fn section_flag_bits(f: SectionFlags) -> i64
         bits = bits | SHF_EXECINSTR
     bits
 
-# Little-endian appends and patches.
-fn push_le(out: @&Vec<u8>, v: i64, width: i64)
-    for i in 0..width
-        out.push(((v >> (i * 8)) & 0xff) as u8)
-
-fn patch_le(out: @&Vec<u8>, at: i64, v: i64, width: i64)
-    for i in 0..width
-        out[at + i] = ((v >> (i * 8)) & 0xff) as u8
-
-fn pad_to(out: @&Vec<u8>, align: i64)
-    while out.len % align != 0
-        out.push(0)
-
-# Append `name` and its NUL to a string table; the name's offset in it.
-fn add_name(table: @&Vec<u8>, name: StrView) -> i64
-    let at: i64 = table.len
-    table.push_view(name)
-    table.push(0)
-    at
-
-fn push_shdr(out: @&Vec<u8>, h: Header)
-    push_le(out, h.name, 4)
-    push_le(out, h.stype, 4)
-    push_le(out, h.flags, 8)
-    push_le(out, 0, 8)          # sh_addr
-    push_le(out, h.offset, 8)
-    push_le(out, h.size, 8)
-    push_le(out, h.link, 4)
-    push_le(out, h.info, 4)
-    push_le(out, h.align, 8)
-    push_le(out, h.entsize, 8)
-
-fn push_sym(out: @&Vec<u8>, name: i64, bind: i64, stype: i64, shndx: i64, value: i64, size: i64)
-    push_le(out, name, 4)
-    out.push(((bind << 4) | stype) as u8)
-    out.push(0)                 # st_other: STV_DEFAULT
-    push_le(out, shndx, 2)
-    push_le(out, value, 8)
-    push_le(out, size, 8)
-
-# One section header, its body already in the file at `offset`.
-struct Header
-    name: i64       # offset in .shstrtab
-    stype: i64
-    flags: i64
-    link: i64
-    info: i64
-    align: i64
-    entsize: i64
-    offset: i64
-    size: i64
-
 # Append `body` to the file at `align`; the header of the section it is.
-fn header(out: @&Vec<u8>, name: i64, stype: i64, flags: i64, link: i64, info: i64, align: i64, entsize: i64, body: Span<u8>) -> Header
+fn header(out: @&Vec<u8>, name: i64, stype: i64, flags: i64, link: i64, info: i64, align: i64, entsize: i64, body: Span<u8>) -> SectionHeader
     pad_to(out, align)
     let offset: i64 = out.len
     out.push_span(body)
-    Header { name: name, stype: stype, flags: flags, link: link, info: info, align: align, entsize: entsize, offset: offset, size: body.len }
+    SectionHeader { name: name, stype: stype, flags: flags, addr: 0, offset: offset, size: body.len, link: link, info: info, align: align, entsize: entsize }
 
 impl Object
     # A new, empty section. Its alignment starts at 1.
@@ -549,9 +453,9 @@ impl Object
         var strtab: Vec<u8> = vec_new<u8>()
         strtab.push(0)
         var symtab: Vec<u8> = vec_new<u8>()
-        push_sym(@&symtab, 0, 0, 0, 0, 0, 0)
+        push_sym(@&symtab, SymbolEntry { name: 0, bind: 0, stype: 0, shndx: 0, value: 0, size: 0 })
         for i in 0..nsec
-            push_sym(@&symtab, 0, STB_LOCAL, STT_SECTION, shndx[i], 0, 0)
+            push_sym(@&symtab, SymbolEntry { name: 0, bind: STB_LOCAL, stype: STT_SECTION, shndx: shndx[i], value: 0, size: 0 })
         var sym_index: Vec<i64> = vec_new<i64>()
         for s in 0..self.symbols.len
             sym_index.push(-1)
@@ -574,7 +478,7 @@ impl Object
                     else
                         where = shndx[sym.section]
                     let name: i64 = add_name(@&strtab, sym.name.as_view())
-                    push_sym(@&symtab, name, bind, type_bits(sym.stype), where, sym.value, sym.size)
+                    push_sym(@&symtab, SymbolEntry { name: name, bind: bind, stype: type_bits(sym.stype), shndx: where, value: sym.value, size: sym.size })
                     sym_index[s] = count
                     count += 1
 
@@ -585,7 +489,7 @@ impl Object
             out.push(0)
         var shstrtab: Vec<u8> = vec_new<u8>()
         shstrtab.push(0)
-        var headers: Vec<Header> = vec_new<Header>()
+        var headers: Vec<SectionHeader> = vec_new<SectionHeader>()
         for g in 0..self.groups.len
             var body: Vec<u8> = vec_new<u8>()
             push_le(@&body, GRP_COMDAT, 4)
@@ -603,7 +507,7 @@ impl Object
             let flags: i64 = section_flag_bits(s.flags) | grouped
             let name: i64 = add_name(@&shstrtab, s.name.as_view())
             if s.kind == SectionKind.Nobits
-                var h: Header = header(@&out, name, SHT_NOBITS, flags, 0, 0, s.align, 0, span_empty<u8>())
+                var h: SectionHeader = header(@&out, name, SHT_NOBITS, flags, 0, 0, s.align, 0, span_empty<u8>())
                 h.size = s.size
                 headers.push(h)
             else
@@ -615,9 +519,7 @@ impl Object
                     let rel: @Relocation = @relocs[r]
                     if rel.section == i
                         let target: i64 = if rel.symbol < 0 then 1 + rel.via else sym_index[rel.symbol]
-                        push_le(@&rela, rel.at, 8)
-                        push_le(@&rela, (target << 32) | rel.rtype, 8)
-                        push_le(@&rela, rel.addend, 8)
+                        push_rela(@&rela, RelaEntry { offset: rel.at, rtype: rel.rtype, symbol: target, addend: rel.addend })
                 var rname: String = string_from(".rela")
                 rname.push_str(s.name.as_view())
                 let rn: i64 = add_name(@&shstrtab, rname.as_view())
@@ -631,7 +533,7 @@ impl Object
 
         pad_to(@&out, 8)
         let shoff: i64 = out.len
-        push_shdr(@&out, Header { name: 0, stype: 0, flags: 0, link: 0, info: 0, align: 0, entsize: 0, offset: 0, size: 0 })
+        push_shdr(@&out, SectionHeader { name: 0, stype: SHT_NULL, flags: 0, addr: 0, offset: 0, size: 0, link: 0, info: 0, align: 0, entsize: 0 })
         for h in 0..headers.len
             push_shdr(@&out, headers[h])
 

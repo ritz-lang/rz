@@ -1,0 +1,265 @@
+# The reader, the resolver and the no-script link, on objects razm's writer
+# makes: what one producer writes, the linker reads back.
+import ritzlib.fs { unlink, write_file }
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_empty }
+import ritzlib.string { String }
+import ritzlib.strview { StrView }
+import ritzlib.testlib
+import razm.fixup { Fixup, FixupKind }
+import razm.object
+import razm.elf
+import rld.input
+import rld.link
+import rld.relax { Relax }
+
+# _start: exit with the quad at `answer`, loaded through the GOT.
+#   movq answer@GOTPCREL(%rip), %rax; movq (%rax), %rdi
+#   movl $60, %eax; syscall
+const START: [15]u8 = [0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x48, 0x8b, 0x38, 0xb8, 0x3c, 0, 0, 0]
+const SYSCALL: [2]u8 = [0x0f, 0x05]
+const ANSWER: [8]u8 = [42, 0, 0, 0, 0, 0, 0, 0]
+const RET: [1]u8 = [0xc3]
+
+fn text_flags() -> SectionFlags
+    SectionFlags { alloc: true, write: false, exec: true }
+
+fn data_flags() -> SectionFlags
+    SectionFlags { alloc: true, write: true, exec: false }
+
+[[test_helper]]
+fn ok_section(r: Result<SectionId, ObjectError>) -> SectionId
+    match r
+        Ok(s) => s
+        Err(_) =>
+            assert false, "add_section"
+            SectionId { index: -1 }
+
+[[test_helper]]
+fn emit(obj: @&Object, sec: SectionId, bytes: Span<u8>)
+    assert obj.emit(sec, bytes).is_ok(), "emit"
+
+[[test_helper]]
+fn define(obj: @&Object, name: StrView, sec: SectionId, binding: Binding)
+    assert obj.define(name, sec, 0).is_ok(), "define"
+    obj.set_binding(name, binding)
+
+# Write `obj` to this test's scratch file `name`.
+[[test_helper]]
+fn save(obj: @Object, name: StrView) -> String
+    let path: String = sandbox_path("rld_link", name)
+    assert obj.write(path.as_view()).is_ok(), "write"
+    path
+
+# The program above: `_start` in .text, `answer` in .data.
+[[test_helper]]
+fn program() -> Object
+    var obj: Object = object_new()
+    let text: SectionId = ok_section(obj.add_section(".text", SectionKind.Progbits, text_flags()))
+    emit(@&obj, text, @START)
+    emit(@&obj, text, @SYSCALL)
+    define(@&obj, "_start", text, Binding.Global)
+    let f = Fixup { offset: 3, width: 4, kind: FixupKind.GotPcRelx, target: "answer", addend: -4 }
+    assert obj.add_fixup(text, 0, f).is_ok(), "add_fixup"
+    let data: SectionId = ok_section(obj.add_section(".data", SectionKind.Progbits, data_flags()))
+    emit(@&obj, data, @ANSWER)
+    define(@&obj, "answer", data, Binding.Global)
+    obj
+
+# An object defining `name` with `binding`, in the COMDAT group `group`
+# when that is not "".
+[[test_helper]]
+fn definer(name: StrView, binding: Binding, group: StrView) -> Object
+    var obj: Object = object_new()
+    let sec: SectionId = if group.len > 0 then ok_section(obj.add_group_section(".text.g", SectionKind.Progbits, text_flags(), group)) else ok_section(obj.add_section(".text", SectionKind.Progbits, text_flags()))
+    emit(@&obj, sec, @RET)
+    define(@&obj, name, sec, binding)
+    obj
+
+[[test_helper]]
+fn read(l: @&Linker, path: @String)
+    assert l.add_file(path.as_view()).is_ok(), "add_file"
+
+[[test]]
+fn test_reads_sections_symbols_and_relocations() -> i32
+    var path_obj: Object = program()
+    let path: String = save(@path_obj, "read.o")
+    var l: Linker = linker_new()
+    read(@&l, @path)
+    var names: i64 = 0
+    for i in 0..l.sections.len
+        if l.sections[i].name.eq(".text") or l.sections[i].name.eq(".data")
+            assert l.is_kept(i), "allocated sections are kept"
+            names += 1
+    assert names == 2
+    assert l.relocs.len == 1
+    assert l.relocs[0].rtype == R_X86_64_REX_GOTPCRELX
+    assert l.relocs[0].offset == 3 and l.relocs[0].addend == -4
+    assert l.symbols[l.relocs[0].symbol].name.eq("answer")
+    assert l.resolve().is_ok()
+    let answer: i64 = l.lookup("answer")
+    assert answer != UNRESOLVED and l.symbols[answer].bind == STB_GLOBAL
+    assert l.definition(l.relocs[0].symbol) == answer
+    assert l.sections[l.symbol_section(answer)].name.eq(".data")
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_second_comdat_group_is_discarded() -> i32
+    var a_obj: Object = definer("g", Binding.Weak, "g")
+    let a: String = save(@a_obj, "comdat_a.o")
+    var b_obj: Object = definer("g", Binding.Weak, "g")
+    let b: String = save(@b_obj, "comdat_b.o")
+    var l: Linker = linker_new()
+    read(@&l, @a)
+    read(@&l, @b)
+    assert l.resolve().is_ok()
+    var kept: i64 = 0
+    var discarded: i64 = 0
+    for i in 0..l.sections.len
+        if l.sections[i].name.eq(".text.g")
+            if l.sections[i].discarded
+                discarded += 1
+            else
+                kept += 1
+    assert kept == 1 and discarded == 1
+    assert l.symbols[l.lookup("g")].file == 0, "the first group is kept"
+    unlink(a.as_view())
+    unlink(b.as_view())
+    0
+
+[[test]]
+fn test_strong_definition_beats_weak() -> i32
+    var a_obj: Object = definer("f", Binding.Weak, "")
+    let a: String = save(@a_obj, "weak.o")
+    var b_obj: Object = definer("f", Binding.Global, "")
+    let b: String = save(@b_obj, "strong.o")
+    var l: Linker = linker_new()
+    read(@&l, @a)
+    read(@&l, @b)
+    assert l.resolve().is_ok()
+    assert l.symbols[l.lookup("f")].file == 1
+    unlink(a.as_view())
+    unlink(b.as_view())
+    0
+
+[[test]]
+fn test_first_weak_definition_stands() -> i32
+    var a_obj: Object = definer("f", Binding.Weak, "")
+    let a: String = save(@a_obj, "weak1.o")
+    var b_obj: Object = definer("f", Binding.Weak, "")
+    let b: String = save(@b_obj, "weak2.o")
+    var l: Linker = linker_new()
+    read(@&l, @a)
+    read(@&l, @b)
+    assert l.resolve().is_ok()
+    assert l.symbols[l.lookup("f")].file == 0
+    unlink(a.as_view())
+    unlink(b.as_view())
+    0
+
+[[test]]
+fn test_two_strong_definitions_are_an_error() -> i32
+    var a_obj: Object = definer("f", Binding.Global, "")
+    let a: String = save(@a_obj, "strong1.o")
+    var b_obj: Object = definer("f", Binding.Global, "")
+    let b: String = save(@b_obj, "strong2.o")
+    var l: Linker = linker_new()
+    read(@&l, @a)
+    read(@&l, @b)
+    match l.resolve()
+        Ok(_) =>
+            assert false, "duplicate accepted"
+        Err(e) =>
+            match e
+                Duplicate(name) =>
+                    assert name.eq("f")
+                _ =>
+                    assert false, "not Duplicate"
+    unlink(a.as_view())
+    unlink(b.as_view())
+    0
+
+[[test]]
+fn test_undefined_reference_is_an_error() -> i32
+    var obj: Object = object_new()
+    let text: SectionId = ok_section(obj.add_section(".text", SectionKind.Progbits, text_flags()))
+    emit(@&obj, text, @START)
+    define(@&obj, "_start", text, Binding.Global)
+    let f = Fixup { offset: 3, width: 4, kind: FixupKind.GotPcRelx, target: "missing", addend: -4 }
+    assert obj.add_fixup(text, 0, f).is_ok(), "add_fixup"
+    let path: String = save(@obj, "undefined.o")
+    var l: Linker = linker_new()
+    read(@&l, @path)
+    assert l.resolve().is_ok()
+    match layout(@&l)
+        Ok(_) =>
+            assert false, "undefined accepted"
+        Err(e) =>
+            match e
+                Undefined(name) =>
+                    assert name.eq("missing")
+                _ =>
+                    assert false, "not Undefined"
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_got_load_relaxes_with_no_got_entry() -> i32
+    var path_obj: Object = program()
+    let path: String = save(@path_obj, "relax.o")
+    var l: Linker = linker_new()
+    read(@&l, @path)
+    assert l.resolve().is_ok()
+    match layout(@&l)
+        Ok(img) =>
+            assert img.relax[0] == Relax.PcRelative
+            assert img.got_syms.len == 0 and img.got_out == -1
+            assert img.entry == BASE + 0x1000, "_start opens the executable segment"
+        Err(_) =>
+            assert false, "layout"
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_linked_program_runs() -> i32
+    var obj_path_obj: Object = program()
+    let obj_path: String = save(@obj_path_obj, "run.o")
+    let exe: String = sandbox_path("rld_link", "run.out")
+    let inputs: [1]StrView = [obj_path.as_view()]
+    var l: Linker = linker_new()
+    assert link(@&l, @inputs, exe.as_view()).is_ok(), "link"
+    match exec_capture(exe.as_view(), span_empty<StrView>(), span_empty<StrView>(), span_empty<u8>())
+        Ok(c) =>
+            assert c.status.exit_code == 42, "the GOT load reaches `answer`"
+        Err(_) =>
+            assert false, "spawn"
+    unlink(obj_path.as_view())
+    unlink(exe.as_view())
+    0
+
+[[test]]
+fn test_non_elf_input_is_malformed() -> i32
+    let path: String = sandbox_path("rld_link", "text.o")
+    assert write_file(path.as_view(), "not an object\n").is_ok()
+    var l: Linker = linker_new()
+    match l.add_file(path.as_view())
+        Ok(_) =>
+            assert false, "text accepted"
+        Err(e) =>
+            match e
+                Malformed(_, what) =>
+                    assert what.eq("not an ELF file")
+                _ =>
+                    assert false, "not Malformed"
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_supported_relocation_types() -> i32
+    assert reloc_supported(R_X86_64_PC32) and reloc_supported(R_X86_64_REX_GOTPCRELX)
+    assert reloc_supported(R_X86_64_64) and reloc_supported(R_X86_64_32S)
+    assert not reloc_supported(19), "R_X86_64_TLSGD"
+    assert not reloc_supported(37), "R_X86_64_IRELATIVE"
+    0

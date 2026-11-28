@@ -1,0 +1,189 @@
+# ELF64 x86-64 records and their little-endian encoding, shared by razm's
+# object writer and rld's reader and executable writer.
+import ritzlib.gvec { Vec }
+import ritzlib.span { Span }
+import ritzlib.strview { StrView }
+
+pub const ELF_ET_REL: u16 = 1
+pub const ELF_ET_EXEC: u16 = 2
+pub const ELF_EM_X86_64: u16 = 62
+
+pub const EHDR_SIZE: i64 = 64
+pub const PHDR_SIZE: i64 = 56
+pub const SHDR_SIZE: i64 = 64
+pub const SYM_SIZE: i64 = 24
+pub const RELA_SIZE: i64 = 24
+
+pub const SHT_NULL: i64 = 0
+pub const SHT_PROGBITS: i64 = 1
+pub const SHT_SYMTAB: i64 = 2
+pub const SHT_STRTAB: i64 = 3
+pub const SHT_RELA: i64 = 4
+pub const SHT_NOBITS: i64 = 8
+pub const SHT_REL: i64 = 9
+pub const SHT_GROUP: i64 = 17
+
+pub const SHF_WRITE: i64 = 0x1
+pub const SHF_ALLOC: i64 = 0x2
+pub const SHF_EXECINSTR: i64 = 0x4
+pub const SHF_INFO_LINK: i64 = 0x40
+pub const SHF_GROUP: i64 = 0x200
+
+pub const SHN_UNDEF: i64 = 0
+pub const SHN_LORESERVE: i64 = 0xff00
+pub const SHN_ABS: i64 = 0xfff1
+pub const SHN_COMMON: i64 = 0xfff2
+pub const SHN_XINDEX: i64 = 0xffff
+pub const GRP_COMDAT: i64 = 1
+
+pub const STB_LOCAL: i64 = 0
+pub const STB_GLOBAL: i64 = 1
+pub const STB_WEAK: i64 = 2
+pub const STT_NOTYPE: i64 = 0
+pub const STT_OBJECT: i64 = 1
+pub const STT_FUNC: i64 = 2
+pub const STT_SECTION: i64 = 3
+
+pub const PT_LOAD: i64 = 1
+pub const PT_GNU_STACK: i64 = 0x6474e551
+pub const PF_X: i64 = 1
+pub const PF_W: i64 = 2
+pub const PF_R: i64 = 4
+
+pub const R_X86_64_NONE: i64 = 0
+pub const R_X86_64_64: i64 = 1
+pub const R_X86_64_PC32: i64 = 2
+pub const R_X86_64_PLT32: i64 = 4
+pub const R_X86_64_GOTPCREL: i64 = 9
+pub const R_X86_64_32: i64 = 10
+pub const R_X86_64_32S: i64 = 11
+pub const R_X86_64_16: i64 = 12
+pub const R_X86_64_PC16: i64 = 13
+pub const R_X86_64_8: i64 = 14
+pub const R_X86_64_PC8: i64 = 15
+pub const R_X86_64_PC64: i64 = 24
+pub const R_X86_64_GOTPCRELX: i64 = 41
+pub const R_X86_64_REX_GOTPCRELX: i64 = 42
+
+# One section header.
+pub struct SectionHeader
+    name: i64       # offset in the section name table
+    stype: i64
+    flags: i64
+    addr: i64
+    offset: i64
+    size: i64
+    link: i64
+    info: i64
+    align: i64
+    entsize: i64
+
+# One symbol table entry.
+pub struct SymbolEntry
+    name: i64       # offset in the linked string table
+    bind: i64
+    stype: i64
+    shndx: i64
+    value: i64
+    size: i64
+
+# One RELA entry.
+pub struct RelaEntry
+    offset: i64
+    rtype: i64
+    symbol: i64
+    addend: i64
+
+pub fn push_le(out: @&Vec<u8>, v: i64, width: i64)
+    for i in 0..width
+        out.push(((v >> (i * 8)) & 0xff) as u8)
+
+pub fn patch_le(out: @&Vec<u8>, at: i64, v: i64, width: i64)
+    for i in 0..width
+        out[at + i] = ((v >> (i * 8)) & 0xff) as u8
+
+# The `width`-byte little-endian value at `at`, zero-extended; the caller
+# checks the bounds.
+pub fn read_le(bytes: Span<u8>, at: i64, width: i64) -> i64
+    var v: i64 = 0
+    for i in 0..width
+        v = v | ((bytes[at + i] as i64) << (i * 8))
+    v
+
+# The same, sign-extended from `width` bytes.
+pub fn read_le_signed(bytes: Span<u8>, at: i64, width: i64) -> i64
+    let v: i64 = read_le(bytes, at, width)
+    if width >= 8
+        return v
+    let shift: i64 = 64 - width * 8
+    (v << shift) >> shift
+
+pub fn pad_to(out: @&Vec<u8>, align: i64)
+    while out.len % align != 0
+        out.push(0)
+
+# Append `name` and its NUL to a string table; the name's offset in it.
+pub fn add_name(table: @&Vec<u8>, name: StrView) -> i64
+    let at: i64 = table.len
+    table.push_view(name)
+    table.push(0)
+    at
+
+pub fn push_shdr(out: @&Vec<u8>, h: SectionHeader)
+    push_le(out, h.name, 4)
+    push_le(out, h.stype, 4)
+    push_le(out, h.flags, 8)
+    push_le(out, h.addr, 8)
+    push_le(out, h.offset, 8)
+    push_le(out, h.size, 8)
+    push_le(out, h.link, 4)
+    push_le(out, h.info, 4)
+    push_le(out, h.align, 8)
+    push_le(out, h.entsize, 8)
+
+pub fn read_shdr(bytes: Span<u8>, at: i64) -> SectionHeader
+    SectionHeader {
+        name: read_le(bytes, at, 4),
+        stype: read_le(bytes, at + 4, 4),
+        flags: read_le(bytes, at + 8, 8),
+        addr: read_le(bytes, at + 16, 8),
+        offset: read_le(bytes, at + 24, 8),
+        size: read_le(bytes, at + 32, 8),
+        link: read_le(bytes, at + 40, 4),
+        info: read_le(bytes, at + 44, 4),
+        align: read_le(bytes, at + 48, 8),
+        entsize: read_le(bytes, at + 56, 8)
+    }
+
+pub fn push_sym(out: @&Vec<u8>, s: SymbolEntry)
+    push_le(out, s.name, 4)
+    out.push(((s.bind << 4) | s.stype) as u8)
+    out.push(0)                 # st_other: STV_DEFAULT
+    push_le(out, s.shndx, 2)
+    push_le(out, s.value, 8)
+    push_le(out, s.size, 8)
+
+pub fn read_sym(bytes: Span<u8>, at: i64) -> SymbolEntry
+    let info: i64 = read_le(bytes, at + 4, 1)
+    SymbolEntry {
+        name: read_le(bytes, at, 4),
+        bind: info >> 4,
+        stype: info & 0xf,
+        shndx: read_le(bytes, at + 6, 2),
+        value: read_le(bytes, at + 8, 8),
+        size: read_le(bytes, at + 16, 8)
+    }
+
+pub fn push_rela(out: @&Vec<u8>, r: RelaEntry)
+    push_le(out, r.offset, 8)
+    push_le(out, (r.symbol << 32) | r.rtype, 8)
+    push_le(out, r.addend, 8)
+
+pub fn read_rela(bytes: Span<u8>, at: i64) -> RelaEntry
+    let info: i64 = read_le(bytes, at + 8, 8)
+    RelaEntry {
+        offset: read_le(bytes, at, 8),
+        rtype: info & 0xffffffff,
+        symbol: (info >> 32) & 0xffffffff,
+        addend: read_le(bytes, at + 16, 8)
+    }

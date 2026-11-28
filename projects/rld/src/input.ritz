@@ -1,0 +1,355 @@
+# The link's inputs: relocatable ELF64 x86-64 objects read into one table of
+# sections, one of symbols and one of relocations, and the global symbols
+# resolved across them (../razm/DESIGN.md "rld", "Inputs").
+import ritzlib.fs { read_file }
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.hashmap { HashMap, hashmap_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_empty, span_from_strview }
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import razm.elf
+
+const ELF_MAGIC: StrView = "\x7fELF"
+const ELFCLASS64: i64 = 2
+const ELFDATA2LSB: i64 = 1
+
+# Global table value for a name only referenced so far.
+pub const UNRESOLVED: i64 = -1
+
+pub enum LinkError
+    Unreadable(StrView)                 # path
+    Malformed(StrView, StrView)         # path, what is wrong
+    UnsupportedReloc(StrView, i64)      # path, relocation type
+    Common(StrView)                     # symbol
+    Duplicate(StrView)                  # symbol
+    Undefined(StrView)                  # symbol
+    NoEntry(StrView)                    # entry symbol
+    Overflow(StrView, i64)              # symbol, relocation type
+    Unwritable(StrView)                 # output path
+
+# One input section, in file order.
+pub struct InSection
+    file: i64
+    name: StrView
+    stype: i64
+    flags: i64          # SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR bits only
+    align: i64
+    data: Span<u8>      # the bytes; empty for NOBITS
+    size: i64
+    discarded: bool     # a member of a COMDAT group another object kept
+    out: i64            # its output section, once laid out
+    offset: i64         # its offset in that output section
+
+# One input symbol table entry, index 0 included.
+pub struct InSymbol
+    file: i64
+    name: StrView
+    bind: i64
+    stype: i64
+    shndx: i64          # as the object wrote it
+    value: i64
+    size: i64
+
+# One relocation against a section the link keeps.
+pub struct InReloc
+    section: i64        # the InSection it patches
+    offset: i64
+    rtype: i64
+    symbol: i64         # an InSymbol
+    addend: i64
+
+pub struct Linker
+    files: Vec<String>              # each object's bytes: every view here is into one
+    paths: Vec<StrView>
+    first_section: Vec<i64>         # per file, its section 0 in `sections`
+    first_symbol: Vec<i64>          # per file, its symbol 0 in `symbols`
+    sections: Vec<InSection>
+    symbols: Vec<InSymbol>
+    relocs: Vec<InReloc>
+    globals: HashMap<StrView, i64>  # name: its defining InSymbol, or UNRESOLVED
+    comdats: HashMap<StrView, i64>  # group signature: the file that kept it
+
+# A Vec frees its buffer, not its elements: each file's bytes are dropped
+# here, as they are popped.
+impl Drop for Linker
+    fn drop(self: @&Linker)
+        while self.files.len > 0
+            self.files.pop()
+
+pub fn linker_new() -> Linker
+    Linker {
+        files: vec_new<String>(),
+        paths: vec_new<StrView>(),
+        first_section: vec_new<i64>(),
+        first_symbol: vec_new<i64>(),
+        sections: vec_new<InSection>(),
+        symbols: vec_new<InSymbol>(),
+        relocs: vec_new<InReloc>(),
+        globals: hashmap_new<StrView, i64>(),
+        comdats: hashmap_new<StrView, i64>()
+    }
+
+# The relocation types the link applies.
+pub fn reloc_supported(rtype: i64) -> bool
+    match rtype
+        R_X86_64_NONE | R_X86_64_64 | R_X86_64_PC32 | R_X86_64_PLT32 => true
+        R_X86_64_GOTPCREL | R_X86_64_32 | R_X86_64_32S => true
+        R_X86_64_16 | R_X86_64_PC16 | R_X86_64_8 | R_X86_64_PC8 => true
+        R_X86_64_PC64 | R_X86_64_GOTPCRELX | R_X86_64_REX_GOTPCRELX => true
+        _ => false
+
+# The name at `at` in an ELF string table: its bytes up to the NUL the format
+# ends each name with. None when `at` or the NUL is outside the table.
+fn table_name(table: StrView, at: i64) -> Option<StrView>
+    if at < 0 or at >= table.len
+        return None
+    let rest: StrView = table.skip(at)
+    let end: i64 = rest.find_byte(0)
+    if end < 0 then None else Some(rest.take(end))
+
+# Whether [at, at + n) lies inside a buffer of `len` bytes.
+fn inside(at: i64, n: i64, len: i64) -> bool
+    at >= 0 and n >= 0 and at <= len and n <= len - at
+
+fn malformed(path: StrView, what: StrView) -> LinkError
+    LinkError.Malformed(path, what)
+
+impl Linker
+    # Read the object at `path` and add its sections, symbols, COMDAT groups
+    # and relocations.
+    pub fn add_file(self: @&Linker, path: StrView) -> Result<(), LinkError>
+        let content: String = match read_file(path)
+            Ok(c) => c
+            Err(_) => return Err(LinkError.Unreadable(path))
+        let file: i64 = self.files.len
+        self.files.push(content)
+        self.paths.push(path)
+        let text: StrView = self.file_text(file)
+        let bytes: Span<u8> = span_from_strview(text)
+
+        if bytes.len < EHDR_SIZE or not text.starts_with(ELF_MAGIC)
+            return Err(malformed(path, "not an ELF file"))
+        if read_le(bytes, 4, 1) != ELFCLASS64 or read_le(bytes, 5, 1) != ELFDATA2LSB
+            return Err(malformed(path, "not ELF64 little-endian"))
+        if read_le(bytes, 16, 2) != ELF_ET_REL as i64
+            return Err(malformed(path, "not a relocatable object"))
+        if read_le(bytes, 18, 2) != ELF_EM_X86_64 as i64
+            return Err(malformed(path, "not x86-64"))
+        let shoff: i64 = read_le(bytes, 40, 8)
+        let shentsize: i64 = read_le(bytes, 58, 2)
+        let shnum: i64 = read_le(bytes, 60, 2)
+        let shstrndx: i64 = read_le(bytes, 62, 2)
+        if shnum == 0 or shstrndx == SHN_XINDEX
+            return Err(malformed(path, "extended section numbering"))
+        if shentsize != SHDR_SIZE or not inside(shoff, shnum * SHDR_SIZE, bytes.len) or shstrndx >= shnum
+            return Err(malformed(path, "bad section header table"))
+
+        var headers: Vec<SectionHeader> = vec_new<SectionHeader>()
+        var symtab: i64 = -1
+        for i in 0..shnum
+            let h: SectionHeader = read_shdr(bytes, shoff + i * SHDR_SIZE)
+            if h.stype != SHT_NOBITS and h.stype != SHT_NULL and not inside(h.offset, h.size, bytes.len)
+                return Err(malformed(path, "a section lies outside the file"))
+            if h.stype == SHT_SYMTAB
+                if symtab >= 0
+                    return Err(malformed(path, "more than one symbol table"))
+                symtab = i
+            if h.stype == SHT_REL
+                return Err(malformed(path, "SHT_REL relocations"))
+            headers.push(h)
+        let shstr: SectionHeader = headers[shstrndx]
+        let names: StrView = text.slice(shstr.offset, shstr.offset + shstr.size)
+
+        self.first_section.push(self.sections.len)
+        for i in 0..shnum
+            let h: SectionHeader = headers[i]
+            let name: StrView = match table_name(names, h.name)
+                Some(n) => n
+                None => return Err(malformed(path, "a section name is outside .shstrtab"))
+            var align: i64 = h.align
+            if align == 0
+                align = 1
+            if (align & (align - 1)) != 0
+                return Err(malformed(path, "a section alignment is not a power of two"))
+            let nobits: bool = h.stype == SHT_NOBITS
+            self.sections.push(InSection {
+                file: file,
+                name: name,
+                stype: h.stype,
+                flags: h.flags & (SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR),
+                align: align,
+                data: if nobits or h.stype == SHT_NULL then span_empty<u8>() else bytes.slice(h.offset, h.offset + h.size),
+                size: h.size,
+                discarded: false,
+                out: -1,
+                offset: 0
+            })
+
+        self.first_symbol.push(self.symbols.len)
+        if symtab >= 0
+            self.read_symbols(file, bytes, @headers, symtab)?
+        self.read_groups(file, bytes, @headers)?
+        self.read_relocs(file, bytes, @headers)?
+        Ok(())
+
+    # The bytes of input `file`, as a view.
+    fn file_text(self: @Linker, file: i64) -> StrView
+        let bytes: @String = @self.files[file]
+        bytes.as_view()
+
+    fn read_symbols(self: @&Linker, file: i64, bytes: Span<u8>, headers: @Vec<SectionHeader>, symtab: i64) -> Result<(), LinkError>
+        let path: StrView = self.paths[file]
+        let h: SectionHeader = headers[symtab]
+        if h.link >= headers.len or h.entsize != SYM_SIZE
+            return Err(malformed(path, "bad symbol table"))
+        let str: SectionHeader = headers[h.link]
+        let strings: StrView = table_at(bytes, str.offset, str.offset + str.size)
+        let count: i64 = h.size / SYM_SIZE
+        for i in 0..count
+            let e: SymbolEntry = read_sym(bytes, h.offset + i * SYM_SIZE)
+            let name: StrView = match table_name(strings, e.name)
+                Some(n) => n
+                None => return Err(malformed(path, "a symbol name is outside .strtab"))
+            if e.shndx == SHN_XINDEX
+                return Err(malformed(path, "extended section numbering"))
+            if e.shndx != SHN_UNDEF and e.shndx < SHN_LORESERVE and e.shndx >= headers.len
+                return Err(malformed(path, "a symbol's section does not exist"))
+            if e.shndx == SHN_COMMON
+                return Err(LinkError.Common(name))
+            self.symbols.push(InSymbol {
+                file: file,
+                name: name,
+                bind: e.bind,
+                stype: e.stype,
+                shndx: e.shndx,
+                value: e.value,
+                size: e.size
+            })
+        Ok(())
+
+    # Each COMDAT group: the first object to name a signature keeps its
+    # members, and every later group with that signature is discarded.
+    fn read_groups(self: @&Linker, file: i64, bytes: Span<u8>, headers: @Vec<SectionHeader>) -> Result<(), LinkError>
+        let path: StrView = self.paths[file]
+        for i in 0..headers.len
+            let h: SectionHeader = headers[i]
+            if h.stype != SHT_GROUP
+                continue
+            if h.size < 4 or h.size % 4 != 0
+                return Err(malformed(path, "bad section group"))
+            if (read_le(bytes, h.offset, 4) & GRP_COMDAT) == 0
+                continue
+            let sig: i64 = self.first_symbol[file] + h.info
+            if h.info == 0 or sig >= self.symbols.len
+                return Err(malformed(path, "a group signature does not exist"))
+            let signature: StrView = self.symbols[sig].name
+            let kept: bool = match self.comdats.get(signature)
+                Some(_) => false
+                None => true
+            if kept
+                self.comdats.insert(signature, file)
+                continue
+            for w in 1..(h.size / 4)
+                let member: i64 = read_le(bytes, h.offset + w * 4, 4)
+                if member >= headers.len
+                    return Err(malformed(path, "a group member does not exist"))
+                let at: i64 = self.first_section[file] + member
+                var s: InSection = self.sections[at]
+                s.discarded = true
+                self.sections[at] = s
+        Ok(())
+
+    fn read_relocs(self: @&Linker, file: i64, bytes: Span<u8>, headers: @Vec<SectionHeader>) -> Result<(), LinkError>
+        let path: StrView = self.paths[file]
+        let nsyms: i64 = self.symbols.len - self.first_symbol[file]
+        for i in 0..headers.len
+            let h: SectionHeader = headers[i]
+            if h.stype != SHT_RELA
+                continue
+            if h.info >= headers.len or h.entsize != RELA_SIZE
+                return Err(malformed(path, "bad relocation section"))
+            let target: i64 = self.first_section[file] + h.info
+            if not self.is_kept(target)
+                continue
+            let size: i64 = self.sections[target].size
+            for r in 0..(h.size / RELA_SIZE)
+                let e: RelaEntry = read_rela(bytes, h.offset + r * RELA_SIZE)
+                if not reloc_supported(e.rtype)
+                    return Err(LinkError.UnsupportedReloc(path, e.rtype))
+                if e.symbol >= nsyms
+                    return Err(malformed(path, "a relocation's symbol does not exist"))
+                if not inside(e.offset, 1, size)
+                    return Err(malformed(path, "a relocation lies outside its section"))
+                self.relocs.push(InReloc {
+                    section: target,
+                    offset: e.offset,
+                    rtype: e.rtype,
+                    symbol: self.first_symbol[file] + e.symbol,
+                    addend: e.addend
+                })
+        Ok(())
+
+    # Whether the link keeps the input section: allocated and not discarded.
+    pub fn is_kept(self: @Linker, section: i64) -> bool
+        let s: InSection = self.sections[section]
+        (s.flags & SHF_ALLOC) != 0 and not s.discarded
+
+    # The InSection a symbol's shndx names, or -1 when it names none.
+    pub fn symbol_section(self: @Linker, sym: i64) -> i64
+        let s: InSymbol = self.symbols[sym]
+        if s.shndx == SHN_UNDEF or s.shndx >= SHN_LORESERVE
+            return -1
+        self.first_section[s.file] + s.shndx
+
+    # Whether the symbol is a definition the link keeps.
+    fn defines(self: @Linker, sym: i64) -> bool
+        let s: InSymbol = self.symbols[sym]
+        if s.shndx == SHN_ABS
+            return true
+        let sec: i64 = self.symbol_section(sym)
+        sec >= 0 and not self.sections[sec].discarded
+
+    # Resolve every global and weak symbol: a strong definition over a weak
+    # one, the first of several weak ones, and two strong ones an error. A
+    # definition in a discarded COMDAT member is a reference to the kept one.
+    pub fn resolve(self: @&Linker) -> Result<(), LinkError>
+        for i in 0..self.symbols.len
+            let s: InSymbol = self.symbols[i]
+            if s.bind == STB_LOCAL
+                continue
+            let prior: i64 = match self.globals.get(s.name)
+                Some(d) => d
+                None => UNRESOLVED
+            if not self.defines(i)
+                if prior == UNRESOLVED
+                    self.globals.insert(s.name, UNRESOLVED)
+                continue
+            if prior == UNRESOLVED
+                self.globals.insert(s.name, i)
+            else if self.symbols[prior].bind == STB_WEAK and s.bind == STB_GLOBAL
+                self.globals.insert(s.name, i)
+            else if self.symbols[prior].bind == STB_GLOBAL and s.bind == STB_GLOBAL
+                return Err(LinkError.Duplicate(s.name))
+        Ok(())
+
+    # The symbol a reference to `sym` binds to: itself when local, else the
+    # global definition, or UNRESOLVED.
+    pub fn definition(self: @Linker, sym: i64) -> i64
+        let s: InSymbol = self.symbols[sym]
+        if s.bind == STB_LOCAL
+            return sym
+        match self.globals.get(s.name)
+            Some(d) => d
+            None => UNRESOLVED
+
+    # The global definition of `name`, or UNRESOLVED.
+    pub fn lookup(self: @Linker, name: StrView) -> i64
+        match self.globals.get(name)
+            Some(d) => d
+            None => UNRESOLVED
+
+# A view of bytes [start, end) of an object, as text for name lookups.
+fn table_at(bytes: Span<u8>, start: i64, end: i64) -> StrView
+    bytes.slice(start, end).as_strview()

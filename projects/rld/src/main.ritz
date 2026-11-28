@@ -1,0 +1,90 @@
+# rld [-o OUT] OBJ...: link relocatable ELF64 x86-64 objects into the
+# no-script executable OUT (a.out by default).
+#
+# Exit status: 0 linked (or --help/-h printed the usage), 1 failed (usage,
+# an unreadable or malformed object, a symbol undefined or defined twice, a
+# value that does not fit its field). stderr names the cause.
+import ritzlib.fmt
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.span { Span, span_from_vec }
+import ritzlib.string { String, string_from, string_from_i64 }
+import ritzlib.strview { StrView }
+import rld.input { LinkError, Linker, linker_new }
+import rld.link
+
+const EXIT_FAILED: i32 = 1
+const USAGE: StrView = "Usage: rld [-o OUT] OBJ..."
+const DEFAULT_OUT: StrView = "a.out"
+
+fn usage_error(msg: StrView) -> i32
+    eprint("rld: {msg}\n{USAGE}\n")
+    EXIT_FAILED
+
+fn link_error_message(e: LinkError) -> String
+    var m: String = string_from("")
+    match e
+        Unreadable(path) =>
+            m.push_str(path)
+            m.push_str(": cannot read file")
+        Malformed(path, what) =>
+            m.push_str(path)
+            m.push_str(": ")
+            m.push_str(what)
+        UnsupportedReloc(path, rtype) =>
+            m.push_str(path)
+            m.push_str(": unsupported relocation type ")
+            m.push_string(@string_from_i64(rtype))
+        Common(name) =>
+            m.push_str("common symbol ")
+            m.push_str(name)
+            m.push_str(": SHN_COMMON is not supported")
+        Duplicate(name) =>
+            m.push_str("duplicate symbol: ")
+            m.push_str(name)
+        Undefined(name) =>
+            m.push_str("undefined symbol: ")
+            m.push_str(name)
+        NoEntry(name) =>
+            m.push_str("entry symbol ")
+            m.push_str(name)
+            m.push_str(" is not defined")
+        Overflow(name, rtype) =>
+            m.push_str("relocation type ")
+            m.push_string(@string_from_i64(rtype))
+            m.push_str(" against ")
+            m.push_str(name)
+            m.push_str(" is out of range")
+        Unwritable(path) =>
+            m.push_str(path)
+            m.push_str(": cannot write the executable")
+    m
+
+pub fn main(args: Span<StrView>) -> i32
+    var out: StrView = DEFAULT_OUT
+    var inputs: Vec<StrView> = vec_new<StrView>()
+    var i: i64 = 1
+    while i < args.len
+        let arg: StrView = args[i]
+        if arg.eq("--help") or arg.eq("-h")
+            print("{USAGE}\n")
+            return 0
+        else if arg.eq("-o")
+            if i + 1 >= args.len
+                return usage_error("-o needs a path")
+            i += 1
+            out = args[i]
+        else if arg.starts_with("-")
+            return usage_error("unknown option")
+        else
+            inputs.push(arg)
+        i += 1
+    if inputs.len == 0
+        return usage_error("no input files")
+
+    var l: Linker = linker_new()
+    match link(@&l, span_from_vec<StrView>(@inputs), out)
+        Ok(_) => 0
+        Err(e) =>
+            let why: String = link_error_message(e)
+            eprint("rld: error: {why.as_view()}\n")
+            EXIT_FAILED

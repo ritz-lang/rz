@@ -2,7 +2,7 @@
 
 Two programs replace the host tools that turn this tree's code into relocatable ELF64. [razm](#razm) replaces `as --64`. [rllvm](#what-rllvm-replaces) replaces `clang -c` on the `.ll` this tree already emits. Both write objects today's linkers already accept: hosted `clang` or `gcc` (`link_hosted`), and freestanding `ld.lld` (`link_freestanding_elf`). Neither links.
 
-The native linker is [rld](#rld), a later project. This document specifies it. Nothing here is implemented yet.
+The native linker is [rld](#rld). This document specifies it. Its first slice, the no-script executable, is implemented.
 
 Pipeline facts below are from `projects/ritz/build_pipeline.py` (`compile_ll_to_obj`, `OBJ_CLANG_FLAGS`, `freestanding_target`, `link_hosted`, `link_freestanding_elf`, `assemble_objects`, `ensure_runtime_object`) and from `projects/ritz/runtime/ritz_start.x86_64.ll` and `ritz_start.harland.x86_64.ll`.
 
@@ -12,7 +12,7 @@ Pipeline facts below are from `projects/ritz/build_pipeline.py` (`compile_ll_to_
 |---|---|---|---|
 | razm | `projects/razm` | first implementation | AT&T text → relocatable ELF64, and the one ELF writer |
 | rllvm | `projects/rllvm` | after razm encodes | `.ll` → instructions, encoded by razm |
-| rld | `projects/rld` | after both objects link with today's linkers | ELF objects + linker scripts → Linux and Harland executables |
+| rld | `projects/rld` | no-script executable; scripts, PIE and hosted to come | ELF objects + linker scripts → Linux and Harland executables |
 
 razm is the assembler, as a library and a driver. Indium has no GNU `as`. The kernel's `.s` files (`assemble_objects` runs `as --64`) have to assemble on Indium, and that program has to be written in Ritz. razm is that program. It is the short one: it encodes instructions the text already chose. It does not select them, allocate registers, or parse LLVM IR.
 
@@ -484,7 +484,7 @@ Today those bins (`bootx64`, `hwinv`, target `x86_64-unknown-uefi`) compile with
 
 ## rld
 
-rld is `projects/rld`. It is implemented after rllvm's objects link and run under the existing linkers. It is not started in the rllvm implementation phase.
+rld is `projects/rld`. It reads ELF through razm's `razm.elf` records, the ones razm's writer uses. Its first slice is the no-script executable with the object reader, symbol resolution, relocations and GOT relaxation below; the linker scripts, the PIEs and the hosted mode come after it.
 
 ### Inputs
 

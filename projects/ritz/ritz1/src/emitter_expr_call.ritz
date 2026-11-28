@@ -291,6 +291,18 @@ fn emit_span_of_addr_place(s: *EmitterState, e: *Expr, name: StrView) -> i32
             if vmr.success != 1
                 return 0
             return emit_span_of_vec_ptr(s, vf.field_type_name, vmr.reg, name)
+    # AGAST #4809: `@T` of a module `const T: [N]X`, which
+    # emit_const_array_entry emits as `@T = internal constant [N x X]`: the
+    # global is the first element.  It passed as the address alone, an i64.
+    if x.kind == ExprKind.Ident
+        let ce: *ConstEntry = unshadowed_const(s, x.ident)
+        if const_array_global(ce) == 1
+            if ce.array_elem_type != TypeKind.Ptr and ce.array_elem_type != TypeKind.PtrPtr
+                span_elem_fits(s, e, ce.array_elem_type, ce.array_elem_type_name, name)
+            let g: String = ir_name(ce.name)
+            let first: i32 = next_reg(s)
+            format_into(s, "  %.{first} = getelementptr i8, ptr @{g.as_view()}, i64 0\n")
+            return emit_span_value(s, first, ce.array_size, name)
     var src: ArraySrc
     if arg_array_shape(s, x, @src) == 0
         return 0
@@ -1388,6 +1400,10 @@ fn try_emit_indirect_call(s: *EmitterState, e: *Expr, c: *CallCallee) -> Option<
     # whose type is unknown (e.g. inferred `let h = task.handler`).
     let name: StrView = call_func_name(e)
     c.icall_local = find_local(s, name)
+    # AGAST #4809: a binding is not in scope in its own initialiser.
+    if c.icall_local >= 0 and e.func_name.len > 0
+        if local_at(s, find_local_idx(s, name)).not_fn == NOT_FN_PENDING
+            c.icall_local = -1
     c.icall_sig = null
     c.callee_val = -1
     if c.icall_local >= 0 and e.call_type_suffix.len == 0
