@@ -86,5 +86,7 @@ def test_the_deleted_facts_live_on_sema():
             f"RsNote.{field} is missing; LocalVar.{name}'s fact has no Sema home"
     # ref_of_local types the image from LocalVar; the pointer pointee now rides
     # on the note at the ident, so the image no longer carries it.
-    assert "ref_ptr_pointee" not in ref.split("fn ref_of_local", 1)[1].split("\nfn ", 1)[0], \
+    # Its body ends at the next fn, `pub` or not (AGAST #4926).
+    body = re.split(r"\n(?:pub )?fn ", ref.split("fn ref_of_local", 1)[1], maxsplit=1)[0]
+    assert "ref_ptr_pointee" not in body, \
         "ref_of_local still reads LocalVar.ref_ptr_pointee"

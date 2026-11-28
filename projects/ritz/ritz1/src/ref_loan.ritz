@@ -149,15 +149,15 @@ fn rl_is_span_decl(stmt: *Stmt) -> i32
         return 0
     ((stmt.var_type_name).starts_with("Span$")) as i32
 
-# 1 when `t` is a Vec or String: a `v[a..b]` of one in a Span slot is a view of
-# v's storage rather than a copy (§7.8, LARB R57).  A Span's slice views what
-# that Span does, so it lends nothing here.
-fn rl_is_vec_or_string(t: *SemaTy) -> i32
+# Is `t` a Vec or String?  A `v[a..b]` of one in a Span slot is a view of v's
+# storage rather than a copy (§7.8, LARB R57).  A Span's slice views what that
+# Span does, so it lends nothing here.
+fn rl_is_vec_or_string(t: SemaTy) -> bool
     if t.kind != TypeKind.Struct or t.name.ptr == null
-        return 0
+        return false
     if t.name.len > 4 and t.name.starts_with("Vec$")
-        return 1
-    name_eq(t.name, "String")
+        return true
+    t.name.eq("String")
 
 # --- Places ----------------------------------------------------------------------
 
@@ -178,8 +178,10 @@ fn rl_root(sm: *Sema, e0: *Expr) -> i32
             continue
         if e.kind != ExprKind.Member and e.kind != ExprKind.Index
             return 0 - 1
-        var base: SemaTy
-        if rs_loan_ty(sm, e.left, @base) == 0 or ref_is_pointer(base.kind) == 1
+        let base: SemaTy = match rs_loan_ty(sm, e.left)
+            Some(t) => t
+            None => return 0 - 1
+        if ref_is_pointer(base.kind) == 1
             return 0 - 1
         if e.kind == ExprKind.Index
             if e.right == null or e.right.kind == ExprKind.Range
@@ -327,9 +329,11 @@ pub fn ref_loan_move_conflict(sm: *Sema, place: *Expr) -> i32
 fn rl_lends_place(sm: *Sema, a: *Expr, p: *Param) -> i32
     if a.kind != ExprKind.Ident and a.kind != ExprKind.Member and a.kind != ExprKind.Index
         return 0
-    var t: SemaTy
-    if rs_ty(sm, a, @t) == 1 and ref_is_pointer(t.kind) == 1 and p.param_pointee_type != TypeKind.Ptr
-        return 0
+    match rs_ty(sm, a)
+        Some(t) =>
+            if ref_is_pointer(t.kind) == 1 and p.param_pointee_type != TypeKind.Ptr
+                return 0
+        None => pass
     1
 
 # 1 when param `p`, the first of fn `f`, lends its argument as a `:&` one does.
@@ -379,8 +383,10 @@ fn rl_walk_list(sm: *Sema, a0: *Expr)
 fn rl_receiver(sm: *Sema, e: *Expr, p: *Param)
     if p == null or p.param_type != TypeKind.MutRef
         return
-    var t: SemaTy
-    if rs_ty(sm, e.left, @t) == 0 or ref_is_pointer(t.kind) == 1
+    let t: SemaTy = match rs_ty(sm, e.left)
+        Some(found) => found
+        None => return
+    if ref_is_pointer(t.kind) == 1
         return
     rl_use(sm, e.left.span.line, e.left.span.col, rl_root(sm, e.left), e.left, 1, 0)
 
@@ -494,9 +500,11 @@ fn rl_index_step(sm: *Sema, e: *Expr)
         # `m[k].f… = x` (AGAST #4160): a write of the place `m[k].f…` when
         # each field's owner is a struct held by value.  `root` is m[k]'s:
         # rl_root can't type the copied chain above it.
-        var b: SemaTy
-        if rl_store_ty(sm, st.place.left, e, @b) == 1 and b.kind == TypeKind.Struct
-            rl_use(sm, st.at.line, st.at.col, rl_root(sm, rl_store_index(st.place)), st.place, 1, 1)
+        match rl_store_ty(sm, st.place.left, e)
+            Some(b) =>
+                if b.kind == TypeKind.Struct
+                    rl_use(sm, st.at.line, st.at.col, rl_root(sm, rl_store_index(st.place)), st.place, 1, 1)
+            None => pass
 
 # The `m[k]` at the bottom of si_field_place's `m[k].f…` chain `p`.
 fn rl_store_index(p: *Expr) -> *Expr
@@ -505,27 +513,27 @@ fn rl_store_index(p: *Expr) -> *Expr
         e = e.left
     e
 
-# The type of `p`, a step of a `m[k].f…` chain whose `m[k]` is `*call`; 0 when
-# a field's owner isn't a struct held by value: a store through a pointer field
-# writes outside m, as ritz0's MoveChecker._write_place.
-fn rl_store_ty(sm: *Sema, p: *Expr, call: *Expr, out: *SemaTy) -> i32
+# The type of `p`, a step of a `m[k].f…` chain whose `m[k]` is `*call`; None
+# when a field's owner isn't a struct held by value: a store through a pointer
+# field writes outside m, as ritz0's MoveChecker._write_place.
+fn rl_store_ty(sm: *Sema, p: *Expr, call: *Expr) -> Option<SemaTy>
     if p.kind != ExprKind.Member
         var d: Expr
         memset(@d as *u8, 0, sizeof(Expr))
         d.kind = ExprKind.Unary
         d.op = OpKind.Deref
         d.operand = call
-        return rs_ty(sm, @d, out)
-    var b: SemaTy
-    if rl_store_ty(sm, p.left, call, @b) == 0 or b.kind != TypeKind.Struct
-        return 0
+        return rs_ty(sm, @d)
+    let b: SemaTy = rl_store_ty(sm, p.left, call)?
+    if b.kind != TypeKind.Struct
+        return None
     let st: *StructDef = sema_find_struct(sm, b.name)
     if st == null
-        return 0
+        return None
     let fi: i32 = find_field_index(st, p.ident)
     if fi < 0
-        return 0
-    rs_of_field(get_field_type(st, fi), out)
+        return None
+    rs_of_field(get_field_type(st, fi))
 
 pub fn rl_expr_ident(e: *Expr, name_sv: StrView)
     memset(e as *u8, 0, sizeof(Expr))
@@ -599,9 +607,11 @@ fn rl_for_hold(sm: *Sema, stmt: *Stmt)
     var base: *Expr = null
     while base == null and (e.kind == ExprKind.Member or e.kind == ExprKind.Index)
         if e.kind == ExprKind.Index
-            var t: SemaTy
-            if rs_loan_ty(sm, e.left, @t) == 1 and t.kind != TypeKind.Array
-                base = e.left
+            match rs_loan_ty(sm, e.left)
+                Some(t) =>
+                    if t.kind != TypeKind.Array
+                        base = e.left
+                None => pass
         e = e.left
     if base == null
         return
@@ -663,11 +673,14 @@ fn rl_hold(sm: *Sema, e: *Expr, span_slot: i32)
         # index for the emitter to refuse.
         let base: *Expr = span_view_base(e)
         if base != null
-            var t: SemaTy
-            if rs_loan_ty(sm, base, @t) == 1 and rl_is_vec_or_string(@t) == 1
-                let root: i32 = rl_root(sm, base)
-                if root >= 0
-                    rl_add(root, base, 0, RL_DEPTH)
+            match rs_loan_ty(sm, base)
+                Some(t) =>
+                    if rl_is_vec_or_string(t)
+                        let root: i32 = rl_root(sm, base)
+                        if root >= 0
+                            rl_add(root, base, 0, RL_DEPTH)
+                None => pass
+
 
 # --- The walk's hooks ---------------------------------------------------------------
 

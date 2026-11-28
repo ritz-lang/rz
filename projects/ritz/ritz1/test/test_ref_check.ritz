@@ -1,0 +1,96 @@
+# ritz1/test/test_ref_check.ritz - ref_check's RefTy builders, as values (AGAST #4926)
+#
+# ref_check types a place as a RefTy.  Its builders return one (ref_new,
+# ref_new_array, ref_of_array_field) or an Option of one where the tables
+# can't always say (ref_row, ref_of_param, ref_of_fn), in place of C's
+# `int f(..., RefTy *out)`.  These hold what each builds, and when it builds
+# nothing.  Run by `make ritz1-unit` (tools/ritz1_unit.py).
+
+import ritzlib.memory
+import ritzlib.option
+import ritzlib.str
+import ritzlib.strview
+import ast
+import ref_check
+
+# A `[d0][d1]..T` shape of i32s, `rank` deep.
+fn shape_of(rank: i32, d0: i32, d1: i32, d2: i32) -> ArrayShape
+    var sh: ArrayShape
+    memset(@sh as *u8, 0, sizeof(ArrayShape))
+    sh.rank = rank
+    sh.dims[0] = d0
+    sh.dims[1] = d1
+    sh.dims[2] = d2
+    sh.leaf_type = TypeKind.I32
+    sh.leaf_name = strview_empty()
+    sh.leaf_pointee = TypeKind.Void
+    sh
+
+fn param_of(kind: TypeKind, pointee: TypeKind) -> Param
+    var p: Param
+    memset(@p as *u8, 0, sizeof(Param))
+    p.param_type = kind
+    p.param_pointee_type = pointee
+    p.param_type_name = strview_empty()
+    p.param_ref_ptr_pointee = TypeKind.Void
+    p
+
+[[test]]
+fn test_ref_new_knows_only_what_it_is_given() -> i32
+    let t: RefTy = ref_new(TypeKind.Ptr, TypeKind.Struct, "Point")
+    assert t.kind == TypeKind.Ptr
+    assert t.pointee == TypeKind.Struct
+    assert t.name.eq("Point")
+    assert t.elem_pointee == TypeKind.Void
+    assert t.shape == null
+    assert t.ref_shape == null
+    assert t.ref_size == 0 and t.ref_elem == TypeKind.Void
+    assert t.returned == 0 and t.name_only == 0 and t.array_len == 0
+    assert t.ptr_pointee == TypeKind.Void
+    assert t.held_name.len == 0
+    0
+
+[[test]]
+fn test_an_array_is_as_long_as_its_shape_says() -> i32
+    let flat: RefTy = ref_new_array(TypeKind.I32, TypeKind.Void, strview_empty(), null, 5)
+    assert flat.kind == TypeKind.Array and flat.pointee == TypeKind.I32
+    assert flat.array_len == 5
+    var sh: ArrayShape = shape_of(2, 3, 4, 0)
+    let nd: RefTy = ref_new_array(TypeKind.Array, TypeKind.Void, strview_empty(), @sh, 0)
+    assert nd.array_len == 3   # d0, whatever N was given
+    assert nd.shape == @sh
+    0
+
+[[test]]
+fn test_a_row_is_one_dimension_fewer() -> i32
+    let flat: RefTy = ref_new_array(TypeKind.I32, TypeKind.Void, strview_empty(), null, 5)
+    assert ref_row(flat).is_none()   # a one-dimensional array has no row
+    var sh2: ArrayShape = shape_of(2, 3, 4, 0)
+    let row: RefTy = match ref_row(ref_new_array(TypeKind.Array, TypeKind.Void, strview_empty(), @sh2, 0))
+        Some(r) => r
+        None => return 1
+    assert row.kind == TypeKind.Array and row.pointee == TypeKind.I32
+    assert row.shape == null and row.array_len == 4   # `[3][4]i32`'s row is `[4]i32`
+    var sh3: ArrayShape = shape_of(3, 2, 3, 4)
+    let plane: RefTy = match ref_row(ref_new_array(TypeKind.Array, TypeKind.Void, strview_empty(), @sh3, 0))
+        Some(r) => r
+        None => return 2
+    assert plane.kind == TypeKind.Array and plane.pointee == TypeKind.Array
+    assert plane.shape != null and plane.array_len == 3   # `[2][3][4]i32`'s is `[3][4]i32`
+    0
+
+[[test]]
+fn test_a_param_is_its_slot_and_a_ptr_ptr_none() -> i32
+    var pp: Param = param_of(TypeKind.PtrPtr, TypeKind.Ptr)
+    assert ref_of_param(@pp).is_none()
+    var mr: Param = param_of(TypeKind.MutRef, TypeKind.I64)
+    let slot: RefTy = match ref_of_param(@mr)
+        Some(t) => t
+        None => return 1
+    assert slot.kind == TypeKind.MutRef and slot.pointee == TypeKind.I64
+    0
+
+[[test]]
+fn test_no_fn_returns_nothing() -> i32
+    assert ref_of_fn(null).is_none()
+    0
