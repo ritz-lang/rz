@@ -1,0 +1,588 @@
+# Host tests of the e1000e Nic on the PCH LPT (the X99's I218-V; AGAST
+# #4894, harland docs/E1000E.md "Where the 82574L and the I218-V differ")
+#
+# src/e1000e.ritz over a register model of the PCH LAN, the only test these
+# paths get before the X99 (QEMU has no PCH model). Beside what the
+# 82574L's model does (test_e1000e.ritz) it answers the PCH's handshakes:
+#
+# - EXTCNF_CTRL.SWFLAG sticks when set, unless firmware holds it (always
+#   set) or the set is refused (never reads back). CTRL.RST releases it.
+#   An MDIC operation, a MAC reset or a LANPHYPC toggle made without it is
+#   recorded as unlocked.
+# - The PHY is paged: register 31 at address 1 takes `page << 5`; page 0
+#   is at address 2 and page 769 at address 1. Any other address, or a
+#   register past 15 on a page register 31 didn't select, reads back with
+#   MDIC's error bit.
+# - A dead PHY reads all ones. The LANPHYPC toggle (override on with the
+#   value low, then override off) revives it when the test says so, and
+#   sets CTRL_EXT.LPCD.
+# - CTRL.PHY_RST with CTRL.RST sets STATUS.LAN_INIT_DONE and PHYRA, unless
+#   held stuck. ICR reads to clear.
+
+import driver_abi.boot { DriverBoot }
+import driver_abi.link { NetInfo, NETDEV_TYPE_E1000E }
+import nic.nic { Nic, RxFrame, TxFrame, DmaRun }
+import nic.e1000e
+import ritzlib.span
+import ritzlib.strview { StrView }
+
+# ---------------------------------------------------------------------------
+# The register model
+# ---------------------------------------------------------------------------
+
+var g_reg: [32768]u32
+# PHY page 0 (address 2) and page 769 (address 1).
+var g_phy0: [32]u16
+var g_phy769: [32]u16
+var g_page: u32
+var g_phy_dead: bool
+var g_revive_on_toggle: bool
+var g_lanphypc_low: bool
+var g_toggles: u32
+var g_smbus_at_toggle: bool
+# Handshakes held stuck.
+var g_swflag_held: bool
+var g_stuck_own: bool
+var g_stuck_lan_init: bool
+# What the driver did that it must not.
+var g_unlocked: bool
+var g_mdic_addr_bad: bool
+var g_icr_writes: u32
+# Resets, and the PHY resets among them.
+var g_resets: u32
+var g_phy_resets: u32
+var g_log_off: [8192]u32
+var g_log_val: [8192]u32
+var g_log_len: u32
+var g_reads: u64
+
+struct Model
+    unused: u32
+
+fn reg(off: u32) -> u32
+    g_reg[off / 4]
+
+fn set_reg(off: u32, v: u32)
+    g_reg[off / 4] = v
+
+fn swflag_held_by_driver() -> bool
+    (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) != 0
+
+impl Regs for Model
+    fn rd(self: @Model, off: u32) -> u32
+        g_reads = g_reads + 1
+        let v: u32 = reg(off)
+        if off == REG_ICR
+            set_reg(REG_ICR, 0)
+        v
+
+    fn wr(self: @&Model, off: u32, v: u32)
+        if g_log_len < 8192
+            g_log_off[g_log_len] = off
+            g_log_val[g_log_len] = v
+            g_log_len = g_log_len + 1
+        if off == REG_CTRL
+            model_ctrl(v)
+        else if off == REG_EXTCNF_CTRL
+            if g_swflag_held
+                set_reg(off, v | EXTCNF_SWFLAG)
+            else if g_stuck_own
+                set_reg(off, v & (0xFFFFFFFF ^ EXTCNF_SWFLAG))
+            else
+                set_reg(off, v)
+        else if off == REG_ICR
+            g_icr_writes = g_icr_writes + 1
+            set_reg(REG_ICR, reg(REG_ICR) & (0xFFFFFFFF ^ v))
+        else if off == REG_IMS
+            set_reg(REG_IMS, reg(REG_IMS) | v)
+        else if off == REG_IMC
+            set_reg(REG_IMS, reg(REG_IMS) & (0xFFFFFFFF ^ v))
+        else if off == REG_MDIC
+            set_reg(REG_MDIC, mdic_answer(v))
+        else
+            set_reg(off, v)
+
+# A CTRL write: master disable, the LANPHYPC toggle and the reset.
+fn model_ctrl(v: u32)
+    var c: u32 = v
+    if (c & CTRL_GIO_MASTER_DISABLE) != 0
+        set_reg(REG_STATUS, reg(REG_STATUS) & (0xFFFFFFFF ^ STATUS_GIO_MASTER_EN))
+    if (c & CTRL_LANPHYPC_OVERRIDE) != 0 and (c & CTRL_LANPHYPC_VALUE) == 0
+        g_lanphypc_low = true
+    else if g_lanphypc_low and (c & CTRL_LANPHYPC_OVERRIDE) == 0
+        g_lanphypc_low = false
+        g_toggles = g_toggles + 1
+        g_smbus_at_toggle = (reg(REG_CTRL_EXT) & CTRL_EXT_FORCE_SMBUS) != 0
+        if not swflag_held_by_driver()
+            g_unlocked = true
+        if g_revive_on_toggle
+            g_phy_dead = false
+            set_reg(REG_CTRL_EXT, reg(REG_CTRL_EXT) | CTRL_EXT_LPCD)
+    if (c & CTRL_RST) != 0
+        if not swflag_held_by_driver()
+            g_unlocked = true
+        g_resets = g_resets + 1
+        if (c & CTRL_PHY_RST) != 0
+            g_phy_resets = g_phy_resets + 1
+            if not g_stuck_lan_init
+                set_reg(REG_STATUS, reg(REG_STATUS) | STATUS_LAN_INIT_DONE | STATUS_PHYRA)
+        # The reset clears itself, GIO_MASTER_DISABLE and PHY_RST, bus
+        # mastering is back on, and the hardware lets go of SWFLAG.
+        c = c & (0xFFFFFFFF ^ (CTRL_RST | CTRL_PHY_RST | CTRL_GIO_MASTER_DISABLE))
+        set_reg(REG_STATUS, reg(REG_STATUS) | STATUS_GIO_MASTER_EN)
+        set_reg(REG_EXTCNF_CTRL, reg(REG_EXTCNF_CTRL) & (0xFFFFFFFF ^ EXTCNF_SWFLAG))
+    set_reg(REG_CTRL, c)
+
+fn mdic_bad(v: u32) -> u32
+    g_mdic_addr_bad = true
+    v | MDIC_READY | MDIC_ERROR
+
+# MDIC after the driver wrote `v`, at once ready.
+fn mdic_answer(v: u32) -> u32
+    if not swflag_held_by_driver()
+        g_unlocked = true
+    let addr: u32 = (v >> MDIC_PHY_SHIFT) & 0x1F
+    let r: u32 = (v >> MDIC_REG_SHIFT) & 0x1F
+    let write: bool = (v & MDIC_OP_WRITE) != 0
+    let data: u16 = (v & 0xFFFF) as u16
+    if addr == PHY_ADDR and r == PHY_PAGE_SELECT
+        if not write
+            return mdic_bad(v)
+        g_page = (data as u32) >> PHY_PAGE_SHIFT
+        return v | MDIC_READY
+    # Which register file the access lands in.
+    var page0: bool = false
+    if addr == PCH_PHY_ADDR
+        if r > MAX_PHY_MULTI_PAGE_REG and g_page != 0
+            return mdic_bad(v)
+        page0 = true
+    else if addr == PHY_ADDR
+        if r <= MAX_PHY_MULTI_PAGE_REG or g_page != 769
+            return mdic_bad(v)
+    else
+        return mdic_bad(v)
+    if g_phy_dead
+        if write
+            return v | MDIC_READY
+        return (v & 0xFFFF0000) | 0xFFFF | MDIC_READY
+    if write
+        if page0
+            g_phy0[r] = data
+        else
+            g_phy769[r] = data
+        return v | MDIC_READY
+    var got: u16 = g_phy769[r]
+    if page0
+        got = g_phy0[r]
+    (v & 0xFFFF0000) | (got as u32) | MDIC_READY
+
+const PHY_ID1: u16 = 0x0154
+const PHY_ID2: u16 = 0x1092
+# CV_SMB_CTRL as the ME left it: SMBus forced, and a bit that must stay.
+const CV_SMB_AT_BOOT: u16 = 0x0011
+
+# The I218-V as the X99 hands it over: bus mastering on, link up, the
+# address loaded with AV, the MAC and PHY both forced to SMBus, the ME
+# allowing a PHY reset but not running (FW_VALID clear), a pending LSC.
+fn model_reset()
+    for i in 0..32768
+        g_reg[i] = 0
+    for i in 0..32
+        g_phy0[i] = 0
+        g_phy769[i] = 0
+    g_phy0[MII_BMCR] = 0x1140
+    g_phy0[MII_PHYSID1] = PHY_ID1
+    g_phy0[MII_PHYSID2] = PHY_ID2
+    g_phy769[CV_SMB_CTRL_REG] = CV_SMB_AT_BOOT
+    g_page = 0
+    set_reg(REG_STATUS, STATUS_GIO_MASTER_EN | STATUS_LU | 1)
+    set_reg(REG_CTRL_EXT, CTRL_EXT_FORCE_SMBUS)
+    set_reg(REG_FWSM, FWSM_RSPCIPHY)
+    set_reg(REG_RAL0, 0x12005452)
+    set_reg(REG_RAH0, 0x5634 | RAH_AV)
+    set_reg(REG_ICR, ICR_LSC)
+    set_reg(REG_IMS, 0xFF)
+    for i in 0..MTA_WORDS
+        set_reg(REG_MTA + 4 * i, 0xFFFFFFFF)
+    g_phy_dead = false
+    g_revive_on_toggle = false
+    g_lanphypc_low = false
+    g_toggles = 0
+    g_smbus_at_toggle = false
+    g_swflag_held = false
+    g_stuck_own = false
+    g_stuck_lan_init = false
+    g_unlocked = false
+    g_mdic_addr_bad = false
+    g_icr_writes = 0
+    g_resets = 0
+    g_phy_resets = 0
+    g_log_len = 0
+    g_reads = 0
+
+fn find_write(off: u32, v: u32, from: u32) -> u32
+    var i: u32 = from
+    while i < g_log_len
+        if g_log_off[i] == off and g_log_val[i] == v
+            return i
+        i = i + 1
+    g_log_len
+
+fn find_bits(off: u32, bits: u32, from: u32) -> u32
+    var i: u32 = from
+    while i < g_log_len
+        if g_log_off[i] == off and (g_log_val[i] & bits) == bits
+            return i
+        i = i + 1
+    g_log_len
+
+# ---------------------------------------------------------------------------
+# Bring-up
+# ---------------------------------------------------------------------------
+
+var g_rx_ring: [32 * 16 / 8]u64
+var g_tx_ring: [32 * 16 / 8]u64
+var g_rx_pool: [32 * 2048 / 8]u64
+var g_tx_pool: [32 * 2048 / 8]u64
+var g_nic: E1000eNic<Model>
+
+fn dma() -> E1000eDma
+    E1000eDma { rx_ring: DmaRun { virt: @g_rx_ring as u64, iova: 0x1_1000_0000 }, tx_ring: DmaRun { virt: @g_tx_ring as u64, iova: 0x1_1001_0000 }, rx_pool: DmaRun { virt: @g_rx_pool as u64, iova: 0x2000_0000 }, tx_pool: DmaRun { virt: @g_tx_pool as u64, iova: 0x3000_0000 } }
+
+fn try_up() -> Result<NetInfo, UpError>
+    g_nic.up(Model { unused: 0 }, E1000ePart.PchLpt, dma())
+
+[[test_helper]]
+fn fresh() -> @&E1000eNic<Model>
+    model_reset()
+    match try_up()
+        Ok(_) => pass
+        Err(_) =>
+            assert false
+    @&g_nic
+
+fn up_error_kind(e: UpError) -> u32
+    match e
+        UpError.MasterDisable => 1
+        UpError.Reset => 2
+        UpError.NoMac => 3
+        UpError.Phy(_) => 4
+        UpError.LanInit => 5
+        UpError.PhyAccess => 6
+        UpError.PhyResetBlocked => 7
+
+fn is_up_error(r: Result<NetInfo, UpError>, want: UpError) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => up_error_kind(e) == up_error_kind(want)
+
+fn is_phy_error(r: Result<u16, PhyError>, want: PhyError) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e == want
+
+fn ms(n: u32) -> u64
+    (n as u64) * (READS_PER_MS as u64)
+
+# ---------------------------------------------------------------------------
+# The part
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_the_part_comes_from_the_device_id() -> i32
+    var b: DriverBoot
+    b.msix_config = 2
+    b.msix_rx = 0
+    b.msix_tx = 1
+    let qemu: E1000ePart = match e1000e_part(0x10D3, b)
+        Some(p) => p
+        None => return 1
+    match qemu
+        E1000ePart.I82574(m) =>
+            assert m.rx == 0 and m.tx == 1 and m.other == 2
+        E1000ePart.PchLpt => return 2
+    let x99: E1000ePart = match e1000e_part(0x15A1, b)
+        Some(p) => p
+        None => return 3
+    match x99
+        E1000ePart.PchLpt => pass
+        E1000ePart.I82574(_) => return 4
+    # Another I218 id is not claimed until harland has seen one.
+    assert e1000e_part(0x1559, b).is_none()
+    0
+
+# ---------------------------------------------------------------------------
+# Reset and bring-up
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_pch_reset_takes_swflag_and_resets_the_phy_with_the_mac() -> i32
+    let n = fresh()
+    assert n.is_pch()
+    assert not g_unlocked and not g_mdic_addr_bad
+    # One reset, the PHY's with it, made holding SWFLAG after master
+    # disable; the hardware let go of the flag and nothing holds it now.
+    assert g_resets == 1 and g_phy_resets == 1
+    let gio: u32 = find_bits(REG_CTRL, CTRL_GIO_MASTER_DISABLE, 0)
+    let rst: u32 = find_bits(REG_CTRL, CTRL_RST | CTRL_PHY_RST, gio)
+    let flag: u32 = find_bits(REG_EXTCNF_CTRL, EXTCNF_SWFLAG, gio)
+    assert gio < flag and flag < rst and rst < g_log_len
+    assert (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) == 0
+    # LAN_INIT_DONE and PHYRA were seen and cleared.
+    assert (reg(REG_STATUS) & (STATUS_LAN_INIT_DONE | STATUS_PHYRA)) == 0
+    # The PHY answered at once: no LANPHYPC toggle.
+    assert g_toggles == 0
+    # ICR read to clear, never written; every cause masked until irq_arm.
+    assert reg(REG_ICR) == 0 and g_icr_writes == 0 and reg(REG_IMS) == 0
+    # No IVAR on a part without MSI-X.
+    assert find_bits(REG_IVAR, 0, 0) == g_log_len
+    # The MAC, and the link from autonegotiation on page 0.
+    let info: NetInfo = n.link()
+    assert info.mac[0] == 0x52 and info.mac[5] == 0x56 and info.device_type == NETDEV_TYPE_E1000E
+    assert g_phy0[MII_BMCR] == (0x1140 | BMCR_ANENABLE | BMCR_ANRESTART)
+    assert reg(REG_RCTL) == RCTL_VALUE and reg(REG_TCTL) == TCTL_VALUE
+    0
+
+[[test]]
+fn test_pch_errata_bits_are_linuxs() -> i32
+    let n = fresh()
+    # initialize_hw_bits: BIT(22) and PHYPDEN; init_hw: RO_DIS. SMBus was
+    # unforced (no ME), and no LPCD without a toggle.
+    assert reg(REG_CTRL_EXT) == ((1 << 22) | CTRL_EXT_PHYPDEN | CTRL_EXT_RO_DIS)
+    # BIT(22), then GRAN with WTHRESH 1 and PTHRESH 31.
+    assert reg(REG_TXDCTL0) == 0x0141001F and reg(REG_TXDCTL1) == 0x0141001F
+    assert reg(REG_TARC0) == 0x0D800000
+    # TCTL.MULR clear: BIT(28), with BIT(24) | BIT(26) | BIT(30).
+    assert reg(REG_TARC1) == 0x55000000
+    assert reg(REG_RFCTL) == (RFCTL_NFSW_DIS | RFCTL_NFSR_DIS)
+    assert reg(REG_PBECCSTS) == PBECCSTS_ECC_ENABLE and (reg(REG_CTRL) & CTRL_MEHE) != 0
+    assert reg(REG_KABGTXD) == KABGTXD_BGSQLBIAS
+    # All of it before the rings start.
+    assert find_write(REG_TXDCTL1, 0x0141001F, 0) < find_write(REG_TCTL, TCTL_VALUE, 0)
+    assert find_write(REG_KABGTXD, KABGTXD_BGSQLBIAS, 0) < find_write(REG_RCTL, RCTL_VALUE, 0)
+    0
+
+[[test]]
+fn test_smbus_is_unforced_only_when_no_me_runs() -> i32
+    let n = fresh()
+    # CV_SMB_CTRL.FORCE_SMBUS cleared in the PHY (page 769), its other bit
+    # kept, and CTRL_EXT.FORCE_SMBUS in the MAC.
+    assert g_phy769[CV_SMB_CTRL_REG] == (CV_SMB_AT_BOOT & (0xFFFF ^ CV_SMB_CTRL_FORCE_SMBUS))
+    assert (reg(REG_CTRL_EXT) & CTRL_EXT_FORCE_SMBUS) == 0
+    # With the ME running (FWSM.FW_VALID), both are left to it.
+    model_reset()
+    set_reg(REG_FWSM, FWSM_RSPCIPHY | FWSM_FW_VALID)
+    match try_up()
+        Ok(_) => pass
+        Err(_) => return 1
+    assert g_phy769[CV_SMB_CTRL_REG] == CV_SMB_AT_BOOT
+    assert (reg(REG_CTRL_EXT) & CTRL_EXT_FORCE_SMBUS) != 0
+    0
+
+[[test]]
+fn test_rspciphy_clear_blocks_the_phy_reset() -> i32
+    model_reset()
+    set_reg(REG_FWSM, 0)
+    match try_up()
+        Ok(_) => pass
+        Err(_) => return 1
+    # The MAC is reset alone, and nothing waits for LAN_INIT_DONE (the
+    # model sets it only with a PHY reset, so a wait would have failed up).
+    assert g_resets == 1 and g_phy_resets == 0
+    assert find_bits(REG_CTRL, CTRL_RST, 0) < g_log_len
+    assert find_bits(REG_CTRL, CTRL_PHY_RST, 0) == g_log_len
+    # FWSM was asked 11 times, 10 ms apart, before the block was believed.
+    assert g_reads >= ms(10 * FWSM_RETRY_MS)
+    0
+
+[[test]]
+fn test_lan_init_done_never_set_refuses_the_nic() -> i32
+    model_reset()
+    g_stuck_lan_init = true
+    let r: Result<NetInfo, UpError> = try_up()
+    assert is_up_error(r, UpError.LanInit)
+    match r
+        Ok(_) => return 1
+        Err(e) =>
+            assert up_error_name(e).eq("STATUS.LAN_INIT_DONE never set")
+    # The 20 ms settle and the 150 ms wait, bounded; no rings programmed.
+    assert g_reads >= ms(RESET_SETTLE_MS + LAN_INIT_MS) and g_reads < ms(RESET_SETTLE_MS + LAN_INIT_MS) + 1000
+    assert find_write(REG_RCTL, RCTL_VALUE, 0) == g_log_len
+    0
+
+[[test]]
+fn test_pch_up_refuses_a_nic_without_av() -> i32
+    model_reset()
+    set_reg(REG_RAH0, 0x5634)
+    assert is_up_error(try_up(), UpError.NoMac)
+    0
+
+# ---------------------------------------------------------------------------
+# SWFLAG
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_swflag_waits_100_ms_for_its_holder() -> i32
+    let n = fresh()
+    g_swflag_held = true
+    set_reg(REG_EXTCNF_CTRL, EXTCNF_SWFLAG)
+    let at: u32 = g_log_len
+    g_reads = 0
+    assert is_phy_error(n.phy_read(MII_PHYSID1), PhyError.Busy)
+    assert g_reads >= ms(SWFLAG_FREE_MS) and g_reads < ms(SWFLAG_FREE_MS) + 100
+    # Nothing was written: not the flag, not MDIC.
+    assert g_log_len == at
+    # A bring-up against a held flag stops before the PHY and the reset.
+    model_reset()
+    g_swflag_held = true
+    set_reg(REG_EXTCNF_CTRL, EXTCNF_SWFLAG)
+    let r: Result<NetInfo, UpError> = try_up()
+    match r
+        Ok(_) => return 1
+        Err(e) =>
+            match e
+                UpError.Phy(p) =>
+                    assert p == PhyError.Busy
+                _ => return 2
+    assert g_resets == 0 and find_bits(REG_MDIC, 0, 0) == g_log_len
+    0
+
+[[test]]
+fn test_swflag_that_never_reads_back_times_out_in_1_s() -> i32
+    let n = fresh()
+    g_stuck_own = true
+    g_reads = 0
+    assert is_phy_error(n.phy_read(MII_PHYSID1), PhyError.Ownership)
+    assert g_reads >= ms(SWFLAG_MS) and g_reads < ms(SWFLAG_MS) + 100
+    assert (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) == 0
+    match n.phy_write(MII_BMCR, 0)
+        Ok(_) => return 1
+        Err(e) =>
+            assert e == PhyError.Ownership
+    assert not g_mdic_addr_bad
+    0
+
+[[test]]
+fn test_every_phy_access_holds_swflag_and_lets_it_go() -> i32
+    let n = fresh()
+    assert n.phy_read(MII_PHYSID2).unwrap_or(0) == PHY_ID2
+    assert (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) == 0
+    match n.phy_write_paged(CV_SMB_CTRL_PAGE, CV_SMB_CTRL_REG, 0x0040)
+        Ok(_) => pass
+        Err(_) => return 1
+    assert (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) == 0
+    # A refused page lets go of it too.
+    assert is_phy_error(n.phy_read_paged(5, 17), PhyError.Page)
+    assert (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) == 0
+    assert not g_unlocked
+    0
+
+# ---------------------------------------------------------------------------
+# PHY pages and addresses
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_pch_phy_pages_and_addresses() -> i32
+    let n = fresh()
+    # Page 0, an MII register: address 2, no page select.
+    var at: u32 = g_log_len
+    assert n.phy_read(MII_PHYSID1).unwrap_or(0) == PHY_ID1
+    assert find_write(REG_MDIC, MDIC_OP_READ | (MII_PHYSID1 << MDIC_REG_SHIFT) | (PCH_PHY_ADDR << MDIC_PHY_SHIFT), at) < g_log_len
+    assert find_bits(REG_MDIC, PHY_PAGE_SELECT << MDIC_REG_SHIFT, at) == g_log_len
+    # Page 0 past register 15: page 0 into register 31 at address 1 first.
+    g_phy0[17] = 0x0ABC
+    at = g_log_len
+    assert n.phy_read_paged(0, 17).unwrap_or(0) == 0x0ABC
+    let sel0: u32 = find_write(REG_MDIC, MDIC_OP_WRITE | (PHY_PAGE_SELECT << MDIC_REG_SHIFT) | (PHY_ADDR << MDIC_PHY_SHIFT), at)
+    let rd17: u32 = find_write(REG_MDIC, MDIC_OP_READ | (17 << MDIC_REG_SHIFT) | (PCH_PHY_ADDR << MDIC_PHY_SHIFT), at)
+    assert sel0 < rd17 and rd17 < g_log_len
+    # Page 769: 769 << 5 into register 31, then address 1.
+    at = g_log_len
+    match n.phy_write_paged(769, 23, 0x1234)
+        Ok(_) => pass
+        Err(_) => return 1
+    let sel: u32 = find_write(REG_MDIC, MDIC_OP_WRITE | (PHY_PAGE_SELECT << MDIC_REG_SHIFT) | (PHY_ADDR << MDIC_PHY_SHIFT) | (769 << PHY_PAGE_SHIFT), at)
+    let wr23: u32 = find_write(REG_MDIC, MDIC_OP_WRITE | (23 << MDIC_REG_SHIFT) | (PHY_ADDR << MDIC_PHY_SHIFT) | 0x1234, at)
+    assert sel < wr23 and wr23 < g_log_len
+    assert g_phy769[23] == 0x1234 and not g_mdic_addr_bad
+    # Pages Linux reaches another way are refused before any MDIC.
+    at = g_log_len
+    assert is_phy_error(n.phy_read_paged(1, 17), PhyError.Page)
+    assert is_phy_error(n.phy_read_paged(767, 17), PhyError.Page)
+    assert is_phy_error(n.phy_read_paged(BM_WUC_PAGE, 17), PhyError.Page)
+    assert find_bits(REG_MDIC, 0, at) == g_log_len
+    0
+
+# ---------------------------------------------------------------------------
+# The LANPHYPC recovery
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_lanphypc_toggle_recovers_a_phy_reading_all_ones() -> i32
+    model_reset()
+    g_phy_dead = true
+    g_revive_on_toggle = true
+    match try_up()
+        Ok(_) => pass
+        Err(_) => return 1
+    # One toggle, made holding SWFLAG with the MAC forced to SMBus, the PHY
+    # config counter at 50 ms.
+    assert g_toggles == 1 and g_smbus_at_toggle and not g_unlocked
+    assert (reg(REG_FEXTNVM3) & FEXTNVM3_PHY_CFG_COUNTER_MASK) == FEXTNVM3_PHY_CFG_COUNTER_50MSEC
+    # Before it, 50 ms with SMBus forced: the force is written, then the
+    # override, with at least that many reads between (counted in total).
+    let force: u32 = find_bits(REG_CTRL_EXT, CTRL_EXT_FORCE_SMBUS, 0)
+    let low: u32 = find_bits(REG_CTRL, CTRL_LANPHYPC_OVERRIDE, 0)
+    assert force < low and low < g_log_len
+    assert g_reads >= ms(SMBUS_SETTLE_MS + LANPHYPC_SETTLE_MS)
+    # Then up as usual: SMBus unforced in the MAC and the PHY, the reset
+    # with the PHY's, the flag let go.
+    assert (reg(REG_CTRL_EXT) & CTRL_EXT_FORCE_SMBUS) == 0
+    assert g_phy769[CV_SMB_CTRL_REG] == (CV_SMB_AT_BOOT & (0xFFFF ^ CV_SMB_CTRL_FORCE_SMBUS))
+    assert g_phy_resets == 1 and (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) == 0
+    assert (reg(REG_CTRL) & CTRL_LANPHYPC_OVERRIDE) == 0
+    0
+
+[[test]]
+fn test_a_phy_that_never_answers_is_refused() -> i32
+    model_reset()
+    g_phy_dead = true
+    let r: Result<NetInfo, UpError> = try_up()
+    assert is_up_error(r, UpError.PhyAccess)
+    match r
+        Ok(_) => return 1
+        Err(e) =>
+            assert up_error_name(e).eq("the PHY never answered, after the LANPHYPC toggle")
+    # The toggle was tried once, the MAC was taken off SMBus after it, and
+    # the NIC was never reset; the flag was let go.
+    assert g_toggles == 1
+    assert (reg(REG_CTRL_EXT) & CTRL_EXT_FORCE_SMBUS) == 0
+    assert g_resets == 0
+    assert (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) == 0
+    0
+
+[[test]]
+fn test_a_dead_phy_the_me_wont_let_reset_is_refused() -> i32
+    model_reset()
+    g_phy_dead = true
+    g_revive_on_toggle = true
+    set_reg(REG_FWSM, 0)
+    assert is_up_error(try_up(), UpError.PhyResetBlocked)
+    # No toggle against the ME's block.
+    assert g_toggles == 0 and g_resets == 0
+    assert (reg(REG_EXTCNF_CTRL) & EXTCNF_SWFLAG) == 0
+    0
+
+# ---------------------------------------------------------------------------
+# Interrupts
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_pch_irq_arm_reads_icr_and_enables_the_legacy_causes() -> i32
+    let n = fresh()
+    set_reg(REG_ICR, ICR_RXT0 | ICR_LSC)
+    n.irq_arm()
+    assert reg(REG_ICR) == 0 and g_icr_writes == 0
+    assert reg(REG_IMS) == (ICR_RXT0 | ICR_TXDW | ICR_LSC)
+    assert IMS_CAUSES_PCH == 0x85
+    0
