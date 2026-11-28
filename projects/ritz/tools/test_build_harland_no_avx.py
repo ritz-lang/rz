@@ -110,14 +110,29 @@ def test_a_large_copy_uses_no_ymm_with_the_harland_flags(buildpy, tmp_path):
     assert "%xmm" in asm                    # SSE still copies it
 
 
+def _avx10_flag(tmp_path):
+    # clang 20 spells AVX10.1 `-mavx10.1-512` and rejects a bare `-mavx10.1`
+    # ("unsupported option"); later clangs take the bare form. Ask the clang
+    # on PATH which one it accepts, so the test runs on every build host.
+    probe = tmp_path / "probe.ll"
+    probe.write_text("define void @f() {\n  ret void\n}\n")
+    for flag in ("-mavx10.1", "-mavx10.1-512"):
+        r = subprocess.run(["clang", "--target=x86_64-unknown-none", flag, "-c",
+                            str(probe), "-o", str(tmp_path / "probe.o")],
+                           capture_output=True, text=True, check=False)
+        if r.returncode == 0:
+            return flag
+    pytest.fail("clang accepts neither -mavx10.1 nor -mavx10.1-512")
+
+
 @pytest.mark.integration
 def test_mno_avx_alone_does_not_stop_an_avx10_host(tmp_path):
     # Why the baseline is fixed: #4912's `-march=native -mno-avx` on an
-    # AVX10 host, stood in for by an explicit -mavx10.1 (what -march=native
+    # AVX10 host, stood in for by an explicit -mavx10.1 (_avx10_flag: what -march=native
     # passes there as +avx10.1-512; -march=graniterapids alone does not
     # reproduce it) so this means the same on every build host. If clang
     # ever makes -mno-avx win here, this goes red and the docstring above is
     # stale, not the fix.
     asm = _copy_asm(tmp_path, ["--target=x86_64-unknown-none", "-march=x86-64-v2",
-                               "-mavx10.1", "-mno-avx"])
+                               _avx10_flag(tmp_path), "-mno-avx"])
     assert "%ymm" in asm or "%zmm" in asm
