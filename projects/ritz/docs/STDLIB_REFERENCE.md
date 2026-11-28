@@ -2330,7 +2330,7 @@ struct SpawnTask
 
 struct Runtime
     ring: IoUring
-    initialized: i32
+    initialized: bool
     next_user_data: i64
     waker_user_data: i64
     waker_io_result: i32
@@ -2358,22 +2358,22 @@ as `rt.block_on` does, when a poll reports Pending without suspending on the rin
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `get_runtime` | `fn() -> @&Runtime` | Get global runtime |
+| `get_runtime` | `fn() -> Result<@&Runtime, Errno>` | The global runtime, created on first use; `Err` if its ring can't be set up |
 | `cleanup_runtime` | `fn()` | Cleanup global runtime |
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `rt.init()` | `fn() -> i32` | Initialize runtime |
+| `Runtime.new()` | `fn() -> Result<Runtime, Errno>` | A runtime on a new 256-entry ring; `Err` from `IoUring.new` |
 | `rt.destroy()` | `fn()` | Destroy runtime |
 | `rt.read(fd, buf_sv, offset)` | `fn(fd: i32, buf_sv: Span<u8>, offset: i64) -> Result<i64, Errno>` | Read, waiting for the result |
 | `rt.write(fd, buf_sv, offset)` | `fn(fd: i32, buf_sv: Span<u8>, offset: i64) -> Result<i64, Errno>` | Write, waiting for the result |
 | `rt.close(fd)` | `fn(fd: i32) -> Result<(), Errno>` | Close, waiting for the result |
 | `rt.block_on(f)` | `fn(f: @&Future)` | Poll a future to completion; read the result with `await p` (LARB R79) |
 | `rt.spawn(f)` | `fn(f: @&Future)` | Queue a held future for `rt.run_spawned()`; the caller keeps it alive until the drain returns |
-| `rt.run_spawned()` | `fn() -> i32` | Poll every spawned future until finished, waiting on the ring; 0 once the queue is drained |
+| `rt.run_spawned()` | `fn() -> Result<(), Errno>` | Poll every spawned future until finished, waiting on the ring; `Ok(())` once the queue is drained |
 | `rt.poll_read(fd, buf_sv, offset)` | `fn(fd: i32, buf_sv: Span<u8>, offset: i64) -> Option<i32>` | Inside a poll function: submit a read; `None` while it is in flight, then `Some(result)` |
 | `rt.poll_write(fd, buf_sv, offset)` | `fn(fd: i32, buf_sv: Span<u8>, offset: i64) -> Option<i32>` | Inside a poll function: submit a write; `None` while it is in flight, then `Some(result)` |
-| `rt.wait_for_io()` | `fn() -> i32` | Wait for a completion and record it for the waker |
+| `rt.wait_for_io()` | `fn() -> Result<(), Errno>` | Wait for a completion and hand each one to its waker or spawn task |
 | `rt.waker_register(user_data)` | `fn(user_data: i64)` | Suspend on an operation submitted by hand |
 | `rt.waker_clear()` | `fn()` | Stop waiting for that operation |
 
@@ -2395,16 +2395,25 @@ Multi-task async executor with io_uring for concurrent servers.
 
 **Task States**: `TASK_IDLE`, `TASK_WAITING`, `TASK_READY`
 
+A task's handler is a `fn(@&Task) -> TaskStep`, run on the task's first poll and
+on each completion of the I/O it submitted. It returns `TaskStep.Pending` once
+it has submitted the I/O (or yield) that wakes it, or `TaskStep.Done` to finish
+the task: the pool closes its fd and frees its slot (AGAST #4929).
+
 ```ritz
 import ritzlib.uring
 import ritzlib.iovec
+
+pub enum TaskStep
+    Pending
+    Done
 
 struct Task
     id: i64
     state: i32
     fd: i32
     io_result: i32
-    handler: fn(*Task) -> i32
+    handler: fn(@&Task) -> TaskStep
     handler_state: i32
     read_buf: [8192]u8
     write_buf: [8192]u8
@@ -2428,7 +2437,7 @@ struct TaskServer
     ring: IoUring
     accept_user_data: i64
     running: i32
-    shutdown_hook: fn() -> i32
+    shutdown_hook: fn() -> bool
     idle_timeout: i32
     timeout_user_data: i64
     timeout_ts: KernelTimespec
@@ -2440,9 +2449,10 @@ struct TaskServer
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `pool.init(ring)` | `fn(ring: @&IoUring)` | Initialize pool |
-| `pool.spawn(fd, handler)` | `fn(fd: i32, handler: fn(*Task) -> i32) -> bool` | Spawn task |
+| `pool.spawn(fd, handler)` | `fn(fd:= Fd, handler: fn(@&Task) -> TaskStep) -> bool` | Spawn a task that owns `fd`; false (and `fd` closed) if the pool is full |
 | `pool.complete(task)` | `fn(task: @&Task)` | Complete task |
-| `pool.run()` | `fn() -> i32` | Run all tasks |
+| `pool.run()` | `fn() -> Result<(), Errno>` | Run all tasks until every one is Done |
+| `pool.poll_ready()` | `fn()` | Run the handler of every READY task once, completing each one that is Done |
 | `pool.alloc()` | `fn() -> Option<@&Task>` | A free task slot, or `None` if the pool is full |
 | `pool.find(task_id)` | `fn(task_id: i64) -> Option<@&Task>` | A live task by its ID (`user_data`), or `None` |
 | `pool.submit_recv(task)` | `fn(task: @&Task) -> bool` | Queue a recv into `task.read_buf`; false if no SQE was free |
@@ -2477,20 +2487,20 @@ struct TaskServer
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `srv.init(listen_fd)` | `fn(listen_fd: i32) -> i32` | Initialize server |
+| `TaskServer.new(listener)` | `fn(listener: @Socket) -> Result<@&TaskServer, Errno>` | A server on the heap (~5MB) serving `listener`; free it with `srv.free()`. The caller keeps and closes `listener` |
+| `srv.init(listener)` | `fn(listener: @Socket) -> Result<(), Errno>` | Initialize a server in place (one embedded in a larger struct) |
 | `srv.destroy()` | `fn()` | Destroy server |
-| `srv.run(handler)` | `fn(handler: fn(*Task) -> i32) -> i32` | Run server |
-| `srv.run_multishot(handler)` | `fn(handler: fn(*Task) -> i32) -> i32` | Run with multishot accept |
+| `srv.run(handler)` | `fn(handler: fn(@&Task) -> TaskStep) -> Result<(), Errno>` | Run server until stopped; `Err` from submitting or waiting |
+| `srv.run_multishot(handler)` | `fn(handler: fn(@&Task) -> TaskStep) -> Result<(), Errno>` | Run with multishot accept |
 | `srv.stop()` | `fn()` | Stop server |
-| `srv.set_shutdown_hook(hook)` | `fn(hook: fn() -> i32)` | Set shutdown hook |
+| `srv.set_shutdown_hook(hook)` | `fn(hook: fn() -> bool)` | Set a hook run once per loop iteration; `true` stops the server |
 | `srv.set_idle_timeout(timeout_secs)` | `fn(timeout_secs: i32)` | Set idle timeout |
 | `srv.set_max_connections(max_conns)` | `fn(max_conns: i32)` | Set max connections |
 | `srv.free()` | `fn()` | Free a heap-allocated TaskServer |
 | `srv.submit_accept()` | `fn() -> bool` | Queue an accept |
 | `srv.submit_accept_multishot()` | `fn() -> bool` | Queue one multishot accept (5.19+) that yields a CQE per connection |
-| `srv.submit_idle_timeout()` | `fn() -> i32` | Queue the periodic idle-check timeout (currently disabled: EINVAL on some kernels) |
 | `srv.poll_tasks()` | `fn()` | Run the handler of every READY task |
-| `srv.handle_accept(client_fd, handler)` | `fn(client_fd: i32, handler: fn(*Task) -> i32)` | Start a task for a new connection |
+| `srv.handle_accept(client, handler)` | `fn(client:= Socket, handler: fn(@&Task) -> TaskStep)` | Start a task for a new connection (closed if the server can't take it) |
 | `srv.wake_task(task_id, result)` | `fn(task_id: i64, result: i32)` | Wake a task with an I/O result |
 | `srv.check_idle()` | `fn() -> i32` | Close idle connections; returns how many |
 
@@ -2565,7 +2575,7 @@ struct IoUring
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `ring.init(entries)` | `fn(entries: i32) -> i32` | Initialize ring |
+| `IoUring.new(entries)` | `fn(entries: i32) -> Result<IoUring, Errno>` | A ring of `entries` SQEs; `Err` from io_uring_setup(2) or a mapping |
 | `ring.destroy()` | `fn()` | Destroy ring |
 | `ring.get_sqe()` | `fn() -> Option<@&IoUringSqe>` | Get SQE (None when the ring is full) |
 | `ring.sqe_submit()` | `fn()` | Advance SQ tail |
@@ -3415,16 +3425,17 @@ fn vec_demo() -> i32
 **Async server with io_uring**:
 ```ritz
 import ritzlib.async.tasks
+import ritzlib.net
+import ritzlib.result
 
-fn handle_connection(task: *Task) -> i32
-    0
+fn handle_connection(task: @&Task) -> TaskStep
+    TaskStep.Done                       # or Pending, once it has submitted I/O
 
-fn run_server(listen_fd: i32) -> i32
-    var srv: TaskServer
-    srv.init(listen_fd)
-    srv.run(handle_connection)
-    srv.destroy()
-    0
+fn run_server(listener: @Socket) -> Result<(), Errno>
+    let srv: @&TaskServer = TaskServer.new(listener)?
+    let ran: Result<(), Errno> = srv.run(handle_connection)
+    srv.free()
+    ran
 ```
 
 ---

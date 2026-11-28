@@ -102,6 +102,11 @@ fn drain(f: @Fd, out: *u8, cap: i32) -> i32
         total += n as i32
     total
 
+# Put `raw` in `task`'s read buffer, as a recv would.
+fn task_load_request(task: @&Task, raw: StrView)
+    let read_buf: Span<u8> = @task.read_buf
+    task.read_len = read_buf.copy_from(raw.as_bytes()) as i32
+
 # Serve `raw` as the `count`-th request on a connection through
 # valet_try_static; the response lands in out[0..cap).  Returns its length,
 # or negative on setup failure.
@@ -113,13 +118,13 @@ fn static_reply(raw: StrView, count: i32, out: *u8, cap: i32) -> i32
     set_g_app(@app)
 
     var task: Task
-    let read_buf: Span<u8> = @task.read_buf
-    read_buf.copy_from(raw.as_bytes())
-    task.read_len = raw.len as i32
+    task_load_request(@&task, raw)
 
+    # Parsed from `raw` itself, so `req` holds no view into the task that
+    # valet_try_static borrows mutably.
     var req: Request
     request_init(@req)
-    if request_parse(@req, read_buf.to(task.read_len as i64)) < 0
+    if request_parse(@req, raw.as_bytes()) < 0
         return -1
 
     # Exactly what valet's connection handler does before valet_try_static.
@@ -131,12 +136,12 @@ fn static_reply(raw: StrView, count: i32, out: *u8, cap: i32) -> i32
         Ok(pp) => pp
         Err(_) => return -2
     task.fd = p.write.raw()
-    let handled: i32 = valet_try_static(@app, @task, req.path)
+    let handled: bool = valet_try_static(@app, @&task, req.path)
     p.write.close()
     let n: i32 = drain(@p.read, out, cap)
     p.read.close()
     set_g_app(null)
-    if handled != 1
+    if not handled
         return -3
     n
 

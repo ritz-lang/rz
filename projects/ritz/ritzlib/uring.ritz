@@ -326,9 +326,10 @@ pub const SPLICE_F_GIFT: i32 = 8       # Gift pages to destination (internal)
 # ============================================================================
 
 impl IoUring
-    # Initialize an io_uring instance
-    # Returns 0 on success, negative error code on failure
-    pub fn init(self: @&IoUring, entries: i32) -> i32
+    # A new io_uring of `entries` SQEs, its rings mapped: Ok(ring), or
+    # Err(errno) from io_uring_setup(2) or a mapping.  Nothing is left open
+    # on Err.
+    pub fn new(entries: i32) -> Result<IoUring, Errno>
         # Zero-initialize params
         var params: IoUringParams
         var i: i64 = 0
@@ -340,38 +341,39 @@ impl IoUring
         # Call io_uring_setup
         let fd: i32 = sys_io_uring_setup(entries, @params)
         if fd < 0
-            return fd
+            return Err(errno_from_raw(fd))
 
-        self.ring_fd = fd
-        self.sq_entries = params.sq_entries
-        self.cq_entries = params.cq_entries
+        var ring: IoUring
+        ring.ring_fd = fd
+        ring.sq_entries = params.sq_entries
+        ring.cq_entries = params.cq_entries
 
         # Calculate mmap sizes
         let sq_ring_size: i64 = (params.sq_off.array as i64) + (params.sq_entries as i64) * 4
         let cq_ring_size: i64 = (params.cq_off.cqes as i64) + (params.cq_entries as i64) * CQE_SIZE
         let sqes_size: i64 = (params.sq_entries as i64) * SQE_SIZE
 
-        self.sq_ring_size = sq_ring_size
-        self.cq_ring_size = cq_ring_size
-        self.sqes_size = sqes_size
+        ring.sq_ring_size = sq_ring_size
+        ring.cq_ring_size = cq_ring_size
+        ring.sqes_size = sqes_size
 
         # mmap the SQ ring
         let sq_prot: i32 = PROT_READ | PROT_WRITE
         let sq_ptr: *u8 = sys_mmap(0, sq_ring_size, sq_prot, MAP_SHARED, fd, IORING_OFF_SQ_RING)
         if (sq_ptr as i64) < 0
             sys_close(fd)
-            return (sq_ptr as i64) as i32
+            return Err(errno_from_raw((sq_ptr as i64) as i32))
 
-        self.sq_ring_ptr = sq_ptr
+        ring.sq_ring_ptr = sq_ptr
 
         # mmap the CQ ring (may overlap with SQ ring)
         let cq_ptr: *u8 = sys_mmap(0, cq_ring_size, sq_prot, MAP_SHARED, fd, IORING_OFF_CQ_RING)
         if (cq_ptr as i64) < 0
             sys_munmap(sq_ptr, sq_ring_size)
             sys_close(fd)
-            return (cq_ptr as i64) as i32
+            return Err(errno_from_raw((cq_ptr as i64) as i32))
 
-        self.cq_ring_ptr = cq_ptr
+        ring.cq_ring_ptr = cq_ptr
 
         # mmap the SQEs array
         let sqes_ptr: *u8 = sys_mmap(0, sqes_size, sq_prot, MAP_SHARED, fd, IORING_OFF_SQES)
@@ -379,24 +381,24 @@ impl IoUring
             sys_munmap(cq_ptr, cq_ring_size)
             sys_munmap(sq_ptr, sq_ring_size)
             sys_close(fd)
-            return (sqes_ptr as i64) as i32
+            return Err(errno_from_raw((sqes_ptr as i64) as i32))
 
-        self.sqes_ptr = sqes_ptr
-        self.sqes = sqes_ptr as *IoUringSqe
+        ring.sqes_ptr = sqes_ptr
+        ring.sqes = sqes_ptr as *IoUringSqe
 
         # Set up SQ ring pointers
-        self.sq_head = (sq_ptr + params.sq_off.head as i64) as *i32
-        self.sq_tail = (sq_ptr + params.sq_off.tail as i64) as *i32
-        self.sq_mask = *((sq_ptr + params.sq_off.ring_mask as i64) as *i32)
-        self.sq_array = (sq_ptr + params.sq_off.array as i64) as *i32
+        ring.sq_head = (sq_ptr + params.sq_off.head as i64) as *i32
+        ring.sq_tail = (sq_ptr + params.sq_off.tail as i64) as *i32
+        ring.sq_mask = *((sq_ptr + params.sq_off.ring_mask as i64) as *i32)
+        ring.sq_array = (sq_ptr + params.sq_off.array as i64) as *i32
 
         # Set up CQ ring pointers
-        self.cq_head = (cq_ptr + params.cq_off.head as i64) as *i32
-        self.cq_tail = (cq_ptr + params.cq_off.tail as i64) as *i32
-        self.cq_mask = *((cq_ptr + params.cq_off.ring_mask as i64) as *i32)
-        self.cqes = (cq_ptr + params.cq_off.cqes as i64) as *IoUringCqe
+        ring.cq_head = (cq_ptr + params.cq_off.head as i64) as *i32
+        ring.cq_tail = (cq_ptr + params.cq_off.tail as i64) as *i32
+        ring.cq_mask = *((cq_ptr + params.cq_off.ring_mask as i64) as *i32)
+        ring.cqes = (cq_ptr + params.cq_off.cqes as i64) as *IoUringCqe
 
-        return 0
+        Ok(ring)
 
     # Clean up an io_uring instance
     pub fn destroy(self: @&IoUring)

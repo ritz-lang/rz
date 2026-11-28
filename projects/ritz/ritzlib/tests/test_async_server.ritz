@@ -10,88 +10,66 @@ import ritzlib.iovec
 import ritzlib.span
 import ritzlib.async.tasks
 import ritzlib.async.runtime
+import ritzlib.fd
+import ritzlib.net
+import ritzlib.option
+import ritzlib.result
 
+# A test whose Runtime could not be created fails with this.
+fn no_runtime() -> i32
+    prints("FAIL: Runtime.new failed\n")
+    1
+
+
+# A fresh 64-entry ring, or None where io_uring is unavailable.
+fn test_ring() -> Option<IoUring>
+    match IoUring.new(64)
+        Ok(r) => Some(r)
+        Err(_) => None
 
 # ============================================================================
 # Test 1: Task initialization and pool management
 # ============================================================================
 
 [[test]]
-fn test_task_pool_init() -> i32
-    var ring: IoUring
-    let ret = ring.init(64)
-    if ret < 0
-        prints("FAIL: uring_init failed\n")
-        return 1
-
+fn test_task_pool_init()
+    var ring: IoUring = match test_ring()
+        Some(r) => r
+        None => return
     var pool: TaskPool
     pool.init(@&ring)
 
-    # Verify initial state
-    if pool.active_count != 0
-        prints("FAIL: active_count should be 0\n")
-        ring.destroy()
-        return 1
-
-    if pool.next_id != 1
-        prints("FAIL: next_id should be 1\n")
-        ring.destroy()
-        return 1
-
+    assert pool.active_count == 0
+    assert pool.next_id == 1
     ring.destroy()
-    prints("OK: task_pool_init\n")
-    return 0
 
 
 # ============================================================================
 # Test 2: Task allocation
 # ============================================================================
 
-fn dummy_handler(task: *Task) -> i32
-    return 0
+fn dummy_handler(task: @&Task) -> TaskStep
+    TaskStep.Done
 
 [[test]]
-fn test_task_alloc() -> i32
-    var ring: IoUring
-    ring.init(64)
-
+fn test_task_alloc()
+    var ring: IoUring = match test_ring()
+        Some(r) => r
+        None => return
     var pool: TaskPool
     pool.init(@&ring)
 
-    # Spawn a task
-    let ret = pool.spawn(99, dummy_handler)
-    if not ret
-        prints("FAIL: spawn_task failed\n")
-        ring.destroy()
-        return 1
+    # The pool takes the descriptor; 99 is never opened, so closing it is a no-op.
+    assert pool.spawn(fd_adopt(99), dummy_handler)
+    assert pool.active_count == 1
 
-    if pool.active_count != 1
-        prints("FAIL: active_count should be 1\n")
-        ring.destroy()
-        return 1
-
-    # Find the task
-    var task: *Task = null
-    match pool.find(1)  # First task gets ID 1
-        Some(t) => task = t
-        None =>
-            prints("FAIL: task not found\n")
-            ring.destroy()
-            return 1
-
-    if task.fd != 99
-        prints("FAIL: task.fd should be 99\n")
-        ring.destroy()
-        return 1
-
-    if task.state != TASK_READY
-        prints("FAIL: task.state should be TASK_READY\n")
-        ring.destroy()
-        return 1
-
+    # First task gets ID 1
+    let task: @&Task = match pool.find(1)
+        Some(t) => t
+        None => return assert_never()
+    assert task.fd == 99
+    assert task.state == TASK_READY
     ring.destroy()
-    prints("OK: task_alloc\n")
-    return 0
 
 
 # ============================================================================
@@ -99,86 +77,122 @@ fn test_task_alloc() -> i32
 # ============================================================================
 
 [[test]]
-fn test_task_complete() -> i32
-    var ring: IoUring
-    ring.init(64)
-
+fn test_task_complete()
+    var ring: IoUring = match test_ring()
+        Some(r) => r
+        None => return
     var pool: TaskPool
     pool.init(@&ring)
 
-    # Spawn a task (use -1 for fd so sys_close doesn't fail)
-    pool.spawn(-1, dummy_handler)
+    # A closed Fd (-1), so completing the task closes nothing.
+    assert pool.spawn(fd_adopt(-1), dummy_handler)
+    assert pool.active_count == 1
 
-    if pool.active_count != 1
-        prints("FAIL: active_count should be 1 after spawn\n")
-        ring.destroy()
-        return 1
-
-    # Complete the task
-    var task: *Task = null
-    match pool.find(1)
-        Some(t) => task = t
-        None =>
-            prints("FAIL: task not found\n")
-            ring.destroy()
-            return 1
-    task.fd = -1  # Prevent close attempt
+    let task: @&Task = match pool.find(1)
+        Some(t) => t
+        None => return assert_never()
     pool.complete(task)
 
-    if pool.active_count != 0
-        prints("FAIL: active_count should be 0 after complete\n")
-        ring.destroy()
-        return 1
-
-    # Task should now be idle
-    if task.state != TASK_IDLE
-        prints("FAIL: task.state should be TASK_IDLE\n")
-        ring.destroy()
-        return 1
-
+    assert pool.active_count == 0
+    assert task.state == TASK_IDLE
     ring.destroy()
-    prints("OK: task_complete\n")
-    return 0
+
+# A full pool refuses the task and closes the descriptor it was handed: the
+# pool owns it from the call on (AGAST #4929).
+[[test]]
+fn test_spawn_on_a_full_pool_closes_the_fd()
+    var ring: IoUring = match test_ring()
+        Some(r) => r
+        None => return
+    var pool: TaskPool
+    pool.init(@&ring)
+    for i in 0..256
+        assert pool.spawn(fd_adopt(-1), dummy_handler)
+
+    var fds: [2]i32
+    assert sys_pipe(@fds[0]) == 0
+    assert not pool.spawn(fd_adopt(fds[0]), dummy_handler)
+    # The read end was closed: a second close of it is EBADF.
+    assert sys_close(fds[0]) < 0
+    sys_close(fds[1])
+    ring.destroy()
+
+# Reached only on a broken invariant: fails the test.
+[[test_helper]]
+fn assert_never()
+    assert false
 
 
 # ============================================================================
-# Test 4: run_tasks resumes a task after its I/O completes
+# Test 4: TaskPool.run resumes a task after its I/O completes
 # ============================================================================
 
 var g_yield_polls: i32 = 0
 
-fn yield_once_handler(task: *Task) -> i32
+fn yield_once_handler(task: @&Task) -> TaskStep
     g_yield_polls = g_yield_polls + 1
     if task.handler_state == 0
         task.handler_state = 1
         task.yield()
-        return -1
-    return 0
+        return TaskStep.Pending
+    TaskStep.Done
 
 [[test]]
-fn test_run_tasks_resumes_after_yield() -> i32
-    var ring: IoUring
-    ring.init(64)
-
+fn test_run_tasks_resumes_after_yield()
+    var ring: IoUring = match test_ring()
+        Some(r) => r
+        None => return
     var pool: TaskPool
     pool.init(@&ring)
 
     g_yield_polls = 0
-    pool.spawn(-1, yield_once_handler)
+    assert pool.spawn(fd_adopt(-1), yield_once_handler)
 
-    let ret = pool.run()
+    let ran: bool = match pool.run()
+        Ok(_) => true
+        Err(_) => false
     ring.destroy()
 
-    if ret != 0
-        prints("FAIL: run_tasks failed\n")
-        return 1
-    if g_yield_polls != 2
-        prints("FAIL: the handler should be polled twice\n")
-        return 1
-    if pool.active_count != 0
-        prints("FAIL: the task should have completed\n")
-        return 1
-    return 0
+    assert ran
+    # Pending kept the task for its NOP's completion; Done finished it.
+    assert g_yield_polls == 2
+    assert pool.active_count == 0
+
+
+# ============================================================================
+# Test 4b: TaskServer.new serves a listener until its shutdown hook says so
+# ============================================================================
+
+var g_hook_calls: i32 = 0
+
+fn stop_now() -> bool
+    g_hook_calls = g_hook_calls + 1
+    true
+
+fn close_listener(listener: @&Socket)
+    listener.close()
+
+[[test]]
+fn test_task_server_runs_until_the_shutdown_hook_is_true()
+    var listener: Socket = match socket_tcp()
+        Ok(s) => s
+        Err(_) => return
+    assert listener.bind("127.0.0.1", 0).is_ok()
+    assert listener.listen(8).is_ok()
+
+    let srv: @&TaskServer = match TaskServer.new(@listener)
+        Ok(s) => s
+        Err(_) => return close_listener(@&listener)
+    g_hook_calls = 0
+    srv.set_shutdown_hook(stop_now)
+    let ran: bool = match srv.run(dummy_handler)
+        Ok(_) => true
+        Err(_) => false
+    srv.free()
+    listener.close()
+
+    assert ran
+    assert g_hook_calls == 1
 
 
 # ============================================================================
@@ -220,10 +234,9 @@ fn test_block_on_read_suspends_then_returns_the_io_result() -> i32
         return 1
     sys_write(fds[1], c"hello", 5)
 
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var buf: [8]u8
     var op: PipeOp
@@ -266,10 +279,9 @@ fn test_block_on_write_reaches_the_fd() -> i32
         prints("FAIL: sys_pipe failed\n")
         return 1
 
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var op: PipeOp
     op.rt = @rt
@@ -315,10 +327,9 @@ fn test_block_on_read_at_eof_returns_zero() -> i32
         return 1
     sys_close(fds[1])   # closed and empty: the read completes with 0
 
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var buf: [8]u8
     var op: PipeOp
@@ -353,10 +364,9 @@ fn test_block_on_zero_length_write_returns_zero() -> i32
         prints("FAIL: sys_pipe failed\n")
         return 1
 
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var op: PipeOp
     op.rt = @rt
@@ -391,10 +401,9 @@ fn test_poll_source_eperm_result_is_not_pending() -> i32
         prints("FAIL: sys_pipe failed\n")
         return 1
 
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var buf: [4]u8
     var op: PipeOp
@@ -457,12 +466,13 @@ fn test_block_on_pending_without_a_waker_fails_loudly() -> i32
         sys_close(err_pipe[0])
         sys_close(err_pipe[1])
 
-        var rt: Runtime
-        if rt.init() < 0
-            sys_exit(2)
-        var p = never_ready()
-        rt.block_on(@&p)
-        sys_exit(0)   # reached only if the failure was not loud
+        match Runtime.new()
+            Ok(r) =>
+                var rt: Runtime = r
+                var p = never_ready()
+                rt.block_on(@&p)
+                sys_exit(0)   # reached only if the failure was not loud
+            Err(_) => sys_exit(2)
 
     sys_close(err_pipe[1])
     # Drain stderr to EOF before reaping (docs/TESTING.md gotcha 1). A single
@@ -505,19 +515,18 @@ fn submit_nop(rt: *Runtime, user_data: i64)
 
 [[test]]
 fn test_waker_ignores_another_operations_completion() -> i32
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     rt.waker_register(500)
 
     submit_nop(@rt, 600)
-    rt.wait_for_io()
+    assert rt.wait_for_io().is_ok()
     let after_stray: i32 = rt.waker_active
 
     submit_nop(@rt, 500)
-    rt.wait_for_io()
+    assert rt.wait_for_io().is_ok()
     let after_match: i32 = rt.waker_active
     rt.destroy()
 
@@ -536,16 +545,12 @@ fn test_waker_ignores_another_operations_completion() -> i32
 
 [[test]]
 fn test_uring_writev() -> i32
-    var ring: IoUring
-    ring.init(64)
-
-    var sqe: *IoUringSqe = null
-    match ring.get_sqe()
-        Some(p) => sqe = p
-        None =>
-            prints("FAIL: uring_get_sqe failed\n")
-            ring.destroy()
-            return 1
+    var ring: IoUring = match test_ring()
+        Some(r) => r
+        None => return 0
+    let sqe: @&IoUringSqe = match ring.get_sqe()
+        Some(p) => p
+        None => return no_sqe(@&ring)
 
     # Just verify the function compiles and can be called
     var vecs: [1]Iovec
@@ -564,3 +569,9 @@ fn test_uring_writev() -> i32
     ring.destroy()
     prints("OK: uring_writev\n")
     return 0
+
+# get_sqe found no free entry on a fresh ring: fail the test.
+fn no_sqe(ring: @&IoUring) -> i32
+    prints("FAIL: get_sqe failed\n")
+    ring.destroy()
+    1

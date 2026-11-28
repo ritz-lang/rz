@@ -18,6 +18,11 @@ import ritzlib.io
 import ritzlib.fmt
 import ritzlib.async.runtime
 
+# A test whose Runtime could not be created fails with this.
+fn no_runtime() -> i32
+    prints("FAIL: Runtime.new failed\n")
+    1
+
 # One byte from `fd`, suspending on the ring until it arrives.  Awaiting a
 # plain `Option<i32>`-returning call is the hand-written poll source form:
 # None while Pending, re-evaluated on each poll (AGAST #4558).
@@ -84,10 +89,9 @@ fn test_spawn_n_futures_all_complete() -> i32
     sys_close(p1[1])
     sys_close(p2[1])
 
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var b0: [1]u8
     var b1: [1]u8
@@ -99,7 +103,7 @@ fn test_spawn_n_futures_all_complete() -> i32
     rt.spawn(@&f0)
     rt.spawn(@&f1)
     rt.spawn(@&f2)
-    let drain_result: i32 = rt.run_spawned()
+    let drained: bool = rt.run_spawned().is_ok()
 
     let n0: i32 = await f0
     let n1: i32 = await f1
@@ -113,8 +117,8 @@ fn test_spawn_n_futures_all_complete() -> i32
     var status: i32 = 0
     sys_wait4(pid, @status, 0, null)
 
-    if drain_result != 0
-        prints("FAIL: run_spawned should return 0\n")
+    if not drained
+        prints("FAIL: run_spawned should return Ok\n")
         return 1
     if n0 != 1 or n1 != 1 or n2 != 1
         prints("FAIL: every spawned read should return 1 byte\n")
@@ -133,19 +137,18 @@ fn test_spawn_n_futures_all_complete() -> i32
 
 [[test]]
 fn test_spawn_immediate_future_completes() -> i32
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var p = constant()
     rt.spawn(@&p)
-    let drain_result: i32 = rt.run_spawned()
+    let drained: bool = rt.run_spawned().is_ok()
     let v: i32 = await p
     rt.destroy()
 
-    if drain_result != 0
-        prints("FAIL: run_spawned should return 0\n")
+    if not drained
+        prints("FAIL: run_spawned should return Ok\n")
         return 1
     if v != 1234
         print("FAIL: expected 1234 from the immediate future, got {v}\n")
@@ -164,22 +167,21 @@ fn test_spawn_suspends_on_real_io() -> i32
         return 1
     sys_write(fds[1], c"Z", 1)
 
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var buf: [1]u8
     var p = read_byte(@rt, fds[0], @buf[0])
     rt.spawn(@&p)
-    let drain_result: i32 = rt.run_spawned()
+    let drained: bool = rt.run_spawned().is_ok()
     let n: i32 = await p
     rt.destroy()
     sys_close(fds[0])
     sys_close(fds[1])
 
-    if drain_result != 0
-        prints("FAIL: run_spawned should return 0\n")
+    if not drained
+        prints("FAIL: run_spawned should return Ok\n")
         return 1
     if n != 1
         print("FAIL: the spawned read should return 1 byte, got {n}\n")
@@ -205,10 +207,9 @@ fn test_spawned_future_observes_genuine_minus_one() -> i32
         prints("FAIL: sys_pipe failed\n")
         return 1
 
-    var rt: Runtime
-    if rt.init() < 0
-        prints("FAIL: runtime_init failed\n")
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return no_runtime()
 
     var buf: [1]u8
     var p = read_byte(@rt, fds[0], @buf[0])
@@ -230,14 +231,14 @@ fn test_spawned_future_observes_genuine_minus_one() -> i32
     rt.spawn_tasks[0].io_ready = 1
     rt.spawn_tasks[0].state = 2       # SPAWN_READY
 
-    let drain_result: i32 = rt.run_spawned()
+    let drained: bool = rt.run_spawned().is_ok()
     let n: i32 = await p
     rt.destroy()
     sys_close(fds[0])
     sys_close(fds[1])
 
-    if drain_result != 0
-        prints("FAIL: run_spawned should return 0\n")
+    if not drained
+        prints("FAIL: run_spawned should return Ok\n")
         return 1
     if n != 0 - 1
         print("FAIL: the spawned future should observe -1, got {n}\n")
@@ -262,13 +263,16 @@ fn test_spawn_pending_without_a_waker_fails_loudly() -> i32
         sys_close(err_pipe[0])
         sys_close(err_pipe[1])
 
-        var rt: Runtime
-        if rt.init() < 0
-            sys_exit(2)
-        var p = spawn_never_ready()
-        rt.spawn(@&p)
-        rt.run_spawned()
-        sys_exit(0)   # reached only if the failure was not loud
+        match Runtime.new()
+            Ok(r) =>
+                var rt: Runtime = r
+                var p = spawn_never_ready()
+                rt.spawn(@&p)
+                match rt.run_spawned()
+                    Ok(_) => pass
+                    Err(_) => pass
+                sys_exit(0)   # reached only if the failure was not loud
+            Err(_) => sys_exit(2)
 
     sys_close(err_pipe[1])
     # Drain stderr to EOF before reaping (docs/TESTING.md gotcha 1). A single

@@ -56,11 +56,11 @@ def keys(text, path="lib/m.ritz"):
 CASES = {
     # S-BOOL-2: a predicate's name, an integer return.
     "bool-return hit": (
-        "pub fn str_is_empty(s: StrView) -> i32\n    0\n",
+        "pub fn str_is_empty(s: StrView) -> i32\n    1\n",
         [("bool-return", "str_is_empty")],
     ),
     "bool-return streq hit": (
-        "pub fn streq(a: StrView, b: StrView) -> i32\n    0\n",
+        "pub fn streq(a: StrView, b: StrView) -> i32\n    1\n",
         [("bool-return", "streq")],
     ),
     "bool-return miss: returns bool": (
@@ -68,12 +68,12 @@ CASES = {
         [],
     ),
     "bool-return miss: not a predicate name": (
-        "pub fn str_len(s: StrView) -> i64\n    0\n",
+        "pub fn str_len(s: StrView) -> i64\n    1\n",
         [],
     ),
     # #4636: the C ctype names have no `_` to split on.
     "bool-return hit: isdigit": (
-        "pub fn isdigit(c: u8) -> i32\n    0\n",
+        "pub fn isdigit(c: u8) -> i32\n    1\n",
         [("bool-return", "isdigit")],
     ),
     "bool-return miss: isdigit returns bool": (
@@ -81,7 +81,7 @@ CASES = {
         [],
     ),
     "bool-return miss: an is-prefixed name with a digit or _": (
-        "pub fn is2(c: u8) -> i32\n    0\npub fn isolate_x(c: u8) -> i32\n    0\n",
+        "pub fn is2(c: u8) -> i32\n    1\npub fn isolate_x(c: u8) -> i32\n    1\n",
         [],
     ),
     # S-RESULT-1: an integer return with a negative literal returned.
@@ -90,7 +90,7 @@ CASES = {
         [("sentinel-return", "find")],
     ),
     "sentinel-return miss: no negative return": (
-        "pub fn find(s: StrView, c: u8) -> i64\n    let d = 0 - 1\n    return 0\n",
+        "pub fn find(s: StrView, c: u8) -> i64\n    let d = 0 - 1\n    return 1\n",
         [],
     ),
     # S-RESULT-2 (#4636): a bare integer status: a named negative code, or a
@@ -129,6 +129,57 @@ CASES = {
         "fn close_it(fd: i32) -> i32\n    return syscall1(3, fd as i64) as i32\n",
         [],
     ),
+    # #4929: the status shapes the rule could not see.  A negative a callee
+    # returned, passed back up.
+    "status-return hit: a callee's negative passed back up": (
+        (
+            "struct S\n    n: i32\n\nimpl S\n    pub fn init(self: @&S) -> i32\n"
+            "        let ret = self.ring.init(256)\n        if ret < 0\n            return ret\n"
+            "        self.n = 1\n        return 0\n"
+        ),
+        [("status-return", "init")],
+    ),
+    "status-return hit: `Err(e) => return -e.code()`": (
+        (
+            "pub fn wait(fd: i32) -> i32\n    match enter(fd)\n        Ok(_) => pass\n"
+            "        Err(e) => return -e.code()\n    return 3\n"
+        ),
+        [("status-return", "wait")],
+    ),
+    "status-return hit: a trailing -1 arm": (
+        "pub fn ready(fd: i32) -> i32\n    match enter(fd)\n        Ok(n) => n\n        Err(_) => -1\n",
+        [("status-return", "ready")],
+    ),
+    "status-return hit: only ever returns 0": (
+        "pub fn tick(fd: i32) -> i32\n    if fd > 3\n        return 0\n    flush(fd)\n    0\n",
+        [("status-return", "tick")],
+    ),
+    "status-return miss: a negative tested but a count returned": (
+        "pub fn count(fd: i32) -> i32\n    let n = probe(fd)\n    if n < 0\n        return 0\n    n\n",
+        [],
+    ),
+    "status-return miss: returns a value besides 0": (
+        "pub fn closed(fd: i32) -> i32\n    var c: i32 = 0\n    if fd > 3\n        return 0\n    c\n",
+        [],
+    ),
+    "status-return miss: a 0 tail inside a branch": (
+        "pub fn pick(fd: i32) -> i32\n    if fd > 3\n        0\n    else\n        fd\n",
+        [],
+    ),
+    "status-return miss: an unrelated `x - 1` tail": (
+        "pub fn prev(n: i32) -> i32\n    n - 1\n",
+        [],
+    ),
+    # #4929: a raw `*T` inside a public callback type forces every callback
+    # to take a raw pointer.
+    "raw-ptr-param hit: a *T inside a fn-type parameter": (
+        "pub fn spawn(fd: i32, handler: fn(*Task) -> i32) -> bool\n    true\n",
+        [("raw-ptr-param", "spawn")],
+    ),
+    "raw-ptr-param miss: a reference inside a fn-type parameter": (
+        "pub fn spawn(fd: i32, handler: fn(@&Task) -> TaskStep, hook: fn() -> bool) -> bool\n    true\n",
+        [],
+    ),
     # S-RESULT-3 (#4636): a result written through a parameter.
     "out-param hit: :& StrView assigned": (
         (
@@ -141,7 +192,7 @@ CASES = {
     "out-param hit: @&i32 written through *": (
         (
             "pub fn getname(fd: i32, ip: @&i32, port: @&i32) -> i32\n"
-            "    *ip = 1\n    *port += 2\n    0\n"
+            "    *ip = 1\n    *port += 2\n    1\n"
         ),
         [("out-param", "getname"), ("out-param", "getname")],
     ),
@@ -174,7 +225,7 @@ CASES = {
         [("raw-ptr-param", "exec"), ("status-return", "exec")],
     ),
     "out-param miss: only another variable assigned": (
-        "pub fn f(out: @&i32) -> i32\n    let x = out\n    var y = 0\n    y = 1\n    0\n",
+        "pub fn f(out: @&i32) -> i32\n    let x = out\n    var y = 0\n    y = 1\n    1\n",
         [],
     ),
     # S-OPTION-1: a pointer or reference return with `return null`.
@@ -202,15 +253,15 @@ CASES = {
     # S-PTR-2: (*T, length) where a Span<T> or StrView belongs. Also a raw
     # pointer, so it counts under S-PTR-1 as well.
     "ptr-len-param hit": (
-        "pub fn sum(xs: *i32, len: i64) -> i64\n    0\n",
+        "pub fn sum(xs: *i32, len: i64) -> i64\n    1\n",
         [("ptr-len-param", "sum"), ("raw-ptr-param", "sum")],
     ),
     "ptr-len-param hit, multi-line signature": (
-        "pub fn write_all(\n    fd: i32,\n    buf: *u8,\n    n: i64\n) -> i64\n    0\n",
+        "pub fn write_all(\n    fd: i32,\n    buf: *u8,\n    n: i64\n) -> i64\n    1\n",
         [("ptr-len-param", "write_all"), ("raw-ptr-param", "write_all")],
     ),
     "ptr-len-param miss: Span": (
-        "pub fn sum(xs: Span<i32>) -> i64\n    0\n",
+        "pub fn sum(xs: Span<i32>) -> i64\n    1\n",
         [],
     ),
     # S-IMPL-1: a public free fn whose first parameter is a type this file
@@ -347,7 +398,7 @@ def test_fn_exemption_needs_key_and_reason():
     text = (
         "# Write to fd.\n"
         "# standard-exempt: raw-ptr-param, ptr-len-param: the write(2) ABI\n"
-        "pub fn sys_write(fd: i32, buf: *u8, n: i64) -> i64\n    0\n"
+        "pub fn sys_write(fd: i32, buf: *u8, n: i64) -> i64\n    1\n"
     )
     sites = scan_source(text, "lib/sys.ritz")
     assert {s.key for s in sites} == {"raw-ptr-param", "ptr-len-param"}
@@ -357,7 +408,7 @@ def test_fn_exemption_needs_key_and_reason():
 def test_exemption_covers_only_its_keys():
     text = (
         "# standard-exempt: raw-ptr-param: the write(2) ABI\n"
-        "pub fn sys_write(fd: i32, buf: *u8, n: i64) -> i64\n    0\n"
+        "pub fn sys_write(fd: i32, buf: *u8, n: i64) -> i64\n    1\n"
     )
     assert keys(text) == [("ptr-len-param", "sys_write")]
 

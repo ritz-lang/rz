@@ -2,7 +2,7 @@
 #
 # This test verifies:
 #   - Task state machine handling
-#   - Handler functions that return state codes
+#   - Handler functions that return a TaskStep
 #   - Basic echo protocol (copy recv data to send)
 #   - Task completion tracking
 
@@ -11,6 +11,9 @@ import ritzlib.io
 import ritzlib.uring
 import ritzlib.async.tasks
 import ritzlib.memory
+import ritzlib.fd
+import ritzlib.result
+import ritzlib.errno
 
 
 # ============================================================================
@@ -25,7 +28,7 @@ const TEST_STATE_DONE: i32 = 2
 
 # A simplified echo handler for testing
 # This doesn't actually do I/O - it just demonstrates the state machine pattern
-fn test_echo_handler(task: *Task) -> i32
+fn test_echo_handler(task: @&Task) -> TaskStep
     if task.handler_state == TEST_STATE_RECV
         # Simulate receiving some data
         task.read_len = 5
@@ -35,41 +38,41 @@ fn test_echo_handler(task: *Task) -> i32
         # Move to send state
         task.handler_state = TEST_STATE_SEND
         task.write_len = 5
-        return -1  # Pending (pretend we submitted I/O)
+        return TaskStep.Pending  # pretend we submitted I/O
 
     if task.handler_state == TEST_STATE_SEND
         # Simulate sending the echo
         task.write_pos = task.write_len
         task.handler_state = TEST_STATE_DONE
-        return -1  # Pending (pretend we submitted I/O)
+        return TaskStep.Pending  # pretend we submitted I/O
 
-    if task.handler_state == TEST_STATE_DONE
-        # Task is complete
-        return 0
+    # TEST_STATE_DONE (or anything unknown): the task is complete
+    TaskStep.Done
 
-    0
+
+# IoUring.new failed: say why; one test failed.
+fn no_ring(e: Errno) -> i32
+    print("FAIL: IoUring.new: {e.name()}\n")
+    1
 
 
 # ============================================================================
 # Test 1: Handler state machine
 # ============================================================================
 
-fn test_handler_state_machine(pool: *TaskPool) -> i32
-    var ring: IoUring
-    ring.init(64)
+fn test_handler_state_machine(pool: @&TaskPool) -> i32
+    var ring: IoUring = match IoUring.new(64)
+        Ok(r) => r
+        Err(e) => return no_ring(e)
 
     pool.init(@&ring)
 
     # Spawn a task with our echo handler
-    pool.spawn(-1, test_echo_handler)
+    pool.spawn(fd_adopt(-1), test_echo_handler)
 
-    var task: *Task = null
-    match pool.find(1)
-        Some(t) => task = t
-        None =>
-            prints("FAIL: Could not find spawned task\n")
-            ring.destroy()
-            return 1
+    let task: @&Task = match pool.find(1)
+        Some(t) => t
+        None => return no_task(@&ring)
 
     # Initial state should be RECV
     if task.handler_state != TEST_STATE_RECV
@@ -79,8 +82,8 @@ fn test_handler_state_machine(pool: *TaskPool) -> i32
 
     # First call to handler - should move to SEND state
     let result1 = test_echo_handler(task)
-    if result1 != -1
-        prints("FAIL: Handler should return -1 (pending) on first call\n")
+    if result1 != TaskStep.Pending
+        prints("FAIL: Handler should be Pending after the first call\n")
         ring.destroy()
         return 1
 
@@ -91,8 +94,8 @@ fn test_handler_state_machine(pool: *TaskPool) -> i32
 
     # Second call to handler - should move to DONE state
     let result2 = test_echo_handler(task)
-    if result2 != -1
-        prints("FAIL: Handler should return -1 (pending) on second call\n")
+    if result2 != TaskStep.Pending
+        prints("FAIL: Handler should be Pending after the second call\n")
         ring.destroy()
         return 1
 
@@ -103,8 +106,8 @@ fn test_handler_state_machine(pool: *TaskPool) -> i32
 
     # Third call to handler - task should complete
     let result3 = test_echo_handler(task)
-    if result3 != 0
-        prints("FAIL: Handler should return 0 (done) on third call\n")
+    if result3 != TaskStep.Done
+        prints("FAIL: Handler should be Done after the third call\n")
         ring.destroy()
         return 1
 
@@ -113,25 +116,29 @@ fn test_handler_state_machine(pool: *TaskPool) -> i32
     return 0
 
 
+# The spawned task was not in the pool: one test failed.
+fn no_task(ring: @&IoUring) -> i32
+    prints("FAIL: Could not find spawned task\n")
+    ring.destroy()
+    1
+
+
 # ============================================================================
 # Test 2: Task buffer handling
 # ============================================================================
 
-fn test_task_buffers(pool: *TaskPool) -> i32
-    var ring: IoUring
-    ring.init(64)
+fn test_task_buffers(pool: @&TaskPool) -> i32
+    var ring: IoUring = match IoUring.new(64)
+        Ok(r) => r
+        Err(e) => return no_ring(e)
 
     pool.init(@&ring)
 
-    pool.spawn(-1, test_echo_handler)
+    pool.spawn(fd_adopt(-1), test_echo_handler)
 
-    var task: *Task = null
-    match pool.find(1)
-        Some(t) => task = t
-        None =>
-            prints("FAIL: Could not find spawned task\n")
-            ring.destroy()
-            return 1
+    let task: @&Task = match pool.find(1)
+        Some(t) => t
+        None => return no_task(@&ring)
 
     # Call handler to populate read buffer
     test_echo_handler(task)
@@ -163,15 +170,16 @@ fn test_task_buffers(pool: *TaskPool) -> i32
 # Test 3: Multiple concurrent tasks
 # ============================================================================
 
-fn test_multiple_tasks(pool: *TaskPool) -> i32
-    var ring: IoUring
-    ring.init(64)
+fn test_multiple_tasks(pool: @&TaskPool) -> i32
+    var ring: IoUring = match IoUring.new(64)
+        Ok(r) => r
+        Err(e) => return no_ring(e)
 
     pool.init(@&ring)
 
     # Spawn 5 tasks
     for i in 0..5
-        let ret = pool.spawn((-(i + 1)) as i32, test_echo_handler)
+        let ret = pool.spawn(fd_adopt((-(i + 1)) as i32), test_echo_handler)
         if not ret
             print("FAIL: spawn_task {i} failed\n")
             ring.destroy()
@@ -184,13 +192,9 @@ fn test_multiple_tasks(pool: *TaskPool) -> i32
 
     # Verify all tasks exist and are in correct state
     for i in 0..5
-        var task: *Task = null
-        match pool.find((i + 1) as i64)
-            Some(t) => task = t
-            None =>
-                print("FAIL: task {i} not found\n")
-                ring.destroy()
-                return 1
+        let task: @&Task = match pool.find((i + 1) as i64)
+            Some(t) => t
+            None => return no_task(@&ring)
 
         if task.fd != -(i + 1)
             print("FAIL: task {i} fd should be {-(i + 1)}\n")
@@ -199,13 +203,9 @@ fn test_multiple_tasks(pool: *TaskPool) -> i32
 
     # Complete all tasks
     for i in 0..5
-        var task: *Task = null
-        match pool.find((i + 1) as i64)
-            Some(t) => task = t
-            None =>
-                print("FAIL: task {i} not found\n")
-                ring.destroy()
-                return 1
+        let task: @&Task = match pool.find((i + 1) as i64)
+            Some(t) => t
+            None => return no_task(@&ring)
         pool.complete(task)
 
     if pool.active_count != 0
@@ -222,21 +222,18 @@ fn test_multiple_tasks(pool: *TaskPool) -> i32
 # Test 4: Task request counter
 # ============================================================================
 
-fn test_request_counter(pool: *TaskPool) -> i32
-    var ring: IoUring
-    ring.init(64)
+fn test_request_counter(pool: @&TaskPool) -> i32
+    var ring: IoUring = match IoUring.new(64)
+        Ok(r) => r
+        Err(e) => return no_ring(e)
 
     pool.init(@&ring)
 
-    pool.spawn(-1, test_echo_handler)
+    pool.spawn(fd_adopt(-1), test_echo_handler)
 
-    var task: *Task = null
-    match pool.find(1)
-        Some(t) => task = t
-        None =>
-            prints("FAIL: Could not find spawned task\n")
-            ring.destroy()
-            return 1
+    let task: @&Task = match pool.find(1)
+        Some(t) => t
+        None => return no_task(@&ring)
 
     # Initial request count should be 0
     if task.request_count != 0

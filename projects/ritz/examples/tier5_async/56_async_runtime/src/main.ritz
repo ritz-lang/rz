@@ -14,6 +14,7 @@ import ritzlib.process { process_id }
 import ritzlib.io
 import ritzlib.async.runtime
 import ritzlib.result
+import ritzlib.errno { Errno }
 import ritzlib.str
 import ritzlib.os.env
 import ritzlib.fmt
@@ -47,6 +48,16 @@ fn create_test_file(path: @String) -> Result<Fd, Errno>
 fn open_test_file(path: @String) -> Result<Fd, Errno>
     fd_open(path.as_view(), O_RDONLY, 0)
 
+# Runtime.new failed: say why; the test fails.
+fn no_runtime(e: Errno) -> bool
+    print("FAIL: Runtime.new: {e.name()}\n")
+    false
+
+# Runtime.new failed with the test file `f` open: close it, and fail.
+fn no_runtime_closing(f: @&Fd, e: Errno) -> bool
+    f.close()
+    no_runtime(e)
+
 # ============================================================================
 # Test 1: Runtime initialization
 # ============================================================================
@@ -54,11 +65,9 @@ fn open_test_file(path: @String) -> Result<Fd, Errno>
 fn test_runtime_init() -> bool
     print("test_runtime_init... ")
 
-    var rt: Runtime
-    let ret: i32 = rt.init()
-    if ret < 0
-        print("FAIL: runtime_init returned {ret as i64}\n")
-        return false
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(e) => return no_runtime(e)
 
     rt.destroy()
     print("OK\n")
@@ -91,10 +100,9 @@ fn test_runtime_read() -> bool
         return false
 
     # Now read via runtime
-    var rt: Runtime
-    if rt.init() < 0
-        print("FAIL: runtime_init failed\n")
-        return false
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(e) => return no_runtime(e)
 
     var rf: Fd = match open_test_file(@test_file)
         Ok(opened) => opened
@@ -144,11 +152,9 @@ fn test_runtime_write() -> bool
             print("FAIL: could not create test file\n")
             return false
 
-    var rt: Runtime
-    if rt.init() < 0
-        print("FAIL: runtime_init failed\n")
-        f.close()
-        return false
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(e) => return no_runtime_closing(@&f, e)
 
     # Write via runtime
     let bytes_written: i64 = match rt.write(f.raw(), Span<u8> { ptr: (test_data.ptr), len: (test_len) as i64 }, 0)
@@ -200,10 +206,9 @@ fn test_runtime_roundtrip() -> bool
     let test_data: StrView = "Round trip test data 12345!"
     let test_len: i32 = 27
 
-    var rt: Runtime
-    if rt.init() < 0
-        print("FAIL: runtime_init failed\n")
-        return false
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(e) => return no_runtime(e)
 
     # Write
     var wf: Fd = match create_test_file(@test_file)
@@ -269,11 +274,9 @@ fn test_runtime_close() -> bool
             print("FAIL: could not create test file\n")
             return false
 
-    var rt: Runtime
-    if rt.init() < 0
-        print("FAIL: runtime_init failed\n")
-        f.close()
-        return false
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(e) => return no_runtime_closing(@&f, e)
 
     # Close via runtime
     let ret: i32 = match rt.close(f.raw())
@@ -301,21 +304,29 @@ fn test_runtime_close() -> bool
 fn test_global_runtime() -> bool
     print("test_global_runtime... ")
 
-    let rt: *Runtime = get_runtime()
-    if rt == (null)
-        print("FAIL: get_runtime returned null\n")
-        return false
+    let rt: @&Runtime = match get_runtime()
+        Ok(r) => r
+        Err(e) => return no_runtime(e)
+    rt.next_user_data = 4242
 
-    # Should be able to get it again
-    let rt2: *Runtime = get_runtime()
-    if rt != rt2
-        print("FAIL: get_runtime returned different pointer\n")
-        cleanup_runtime()
-        return false
-
+    # Should be the same runtime again: the mark made through the first
+    # reference is seen through the second.
+    let rt2: @&Runtime = match get_runtime()
+        Ok(r) => r
+        Err(e) => return no_global_runtime(e)
+    let same: bool = rt2.next_user_data == 4242
     cleanup_runtime()
+    if not same
+        print("FAIL: get_runtime returned a different runtime\n")
+        return false
+
     print("OK\n")
     return true
+
+# get_runtime failed after it had once succeeded: clean up, and fail.
+fn no_global_runtime(e: Errno) -> bool
+    cleanup_runtime()
+    no_runtime(e)
 
 # ============================================================================
 # Main

@@ -10,11 +10,14 @@
 #
 # Usage:
 #   var server: TomeServer
-#   tome_server_init(@server, 6379)
-#   tome_server_run(@server)
+#   tome_server_init(@&server, 6379)?
+#   tome_server_run(@&server)?
 
 import ritzlib.hashmap
 import ritzlib.option
+import ritzlib.result
+import ritzlib.errno
+import ritzlib.net
 import ritzlib.str
 import ritzlib.string
 import ritzlib.strview
@@ -103,8 +106,8 @@ var g_conns: *Conns = null
 # Connection Handler
 # ============================================================================
 # Called by TaskServer on a connection's first poll and on each of its I/O
-# completions.  Returns -1 while the connection lives (an SQE is in flight)
-# and 0 to finish it, after which TaskServer closes the fd.
+# completions.  Pending while the connection lives (an SQE is in flight);
+# Done to finish it, after which TaskServer closes the fd.
 #
 # AGAST #2457: this handler used to return task_recv()'s result, 0 on
 # success, so the task finished (and its socket closed, unread request and
@@ -112,36 +115,35 @@ var g_conns: *Conns = null
 # sentinel as a 1 GiB recv, and kept its auth state in task.user_data,
 # which spawn_task had already filled with the TaskPool.
 
-# Drop the connection's session (in `slot`); 0, to finish the task.
-fn conn_close(task: *Task, slot: i64) -> i32
+# Drop the connection's session (in `slot`): the task is Done.
+fn conn_close(task: @&Task, slot: i64) -> TaskStep
     g_conns.by_task.remove(task.id)
     g_conns.sessions.remove(slot, session_blank())
-    return 0
+    TaskStep.Done
 
 
 # Run what the session holds, then submit the next I/O: replies first,
 # then (when nothing is queued) the next recv.
-fn conn_pump(task: *Task, slot: i64) -> i32
-    let pool: *TaskPool = task.user_data as *TaskPool
+fn conn_pump(task: @&Task, slot: i64) -> TaskStep
     let s: @&Session = g_conns.sessions.at(slot)
     session_process(s)
 
     if session_pending_len(s) > 0
         task.handler_state = STATE_SEND
-        if not pool.submit_send_buf(task, session_pending_buf(s))
+        if not task.send_buf(session_pending_buf(s))
             return conn_close(task, slot)
-        return -1
+        return TaskStep.Pending
 
     if session_should_close(s) != 0
         return conn_close(task, slot)
 
     task.handler_state = STATE_RECV
-    if not pool.submit_recv_buf(task, session_recv_buf(s))
+    if not task.recv_buf(session_recv_buf(s))
         return conn_close(task, slot)
-    return -1
+    TaskStep.Pending
 
 
-fn handle_connection(task: *Task) -> i32
+fn handle_connection(task: @&Task) -> TaskStep
     if task.handler_state == STATE_INIT
         let fresh: i64 = g_conns.sessions.insert(session_new(g_store, server_password()))
         g_conns.by_task.insert(task.id, fresh)
@@ -149,7 +151,7 @@ fn handle_connection(task: *Task) -> i32
 
     let slot: i64 = match g_conns.by_task.get(task.id)
         Some(sl) => sl
-        None => return 0  # no session: nothing to serve
+        None => return TaskStep.Done  # no session: nothing to serve
     let s: @&Session = g_conns.sessions.at(slot)
     if task.handler_state == STATE_RECV
         if task.io_result <= 0
@@ -161,7 +163,7 @@ fn handle_connection(task: *Task) -> i32
         session_sent(s, task.io_result as i64)
     else
         return conn_close(task, slot)
-    return conn_pump(task, slot)
+    conn_pump(task, slot)
 
 
 # ============================================================================
@@ -171,97 +173,80 @@ fn handle_connection(task: *Task) -> i32
 struct TomeServer
     task_server: TaskServer
     port: i32
-    listen_fd: i32
+    listener: Socket
 
 
-# Create and configure a listening socket
-fn server_create_listen_socket(port: i32) -> i32
-    # Create TCP socket
-    var sock: Socket
-    match socket_tcp()
-        Ok(s) => sock = s
-        Err(e) => return -e.code()
+# Close `sock` after a failed setup step, passing that step's error on.
+fn close_on_err(sock: @&Socket, e: Errno) -> Result<Socket, Errno>
+    sock.close()
+    Err(e)
 
-    # Set socket options
+
+# A TCP socket listening on all interfaces at `port`, or the errno of the
+# step that failed (the socket is closed then).
+fn server_create_listen_socket(port: i32) -> Result<Socket, Errno>
+    var sock: Socket = socket_tcp()?
     sock.set_reuseaddr()
     sock.set_reuseport()
 
-    # Bind to all interfaces on the specified port
-    var err: i32 = 0
     match sock.bind("0.0.0.0", port)
-        Ok(_) => err = 0
-        Err(e) => err = e.code()
-    if err != 0
-        sock.close()
-        return -err
-
-    # Start listening with a backlog of 128
+        Ok(_) => pass
+        Err(e) => return close_on_err(@&sock, e)
     match sock.listen(128)
-        Ok(_) => err = 0
-        Err(e) => err = e.code()
-    if err != 0
-        sock.close()
-        return -err
-
-    return sock.raw()
+        Ok(_) => pass
+        Err(e) => return close_on_err(@&sock, e)
+    Ok(sock)
 
 
-pub fn tome_server_init(srv: *TomeServer, port: i32) -> i32
+# Serve a fresh listener on `port`: Ok(()), or the errno of the socket or
+# ring setup that failed (the listener is closed then).
+pub fn tome_server_init(srv: @&TomeServer, port: i32) -> Result<(), Errno>
+    let listener: Socket = server_create_listen_socket(port)?
+    match tome_server_init_with_socket(srv, port, listener)
+        Ok(_) => Ok(())
+        Err(e) => close_listener_on_err(srv, e)
+
+
+# A failed init's listener is the server's to close: pass the error on.
+fn close_listener_on_err(srv: @&TomeServer, e: Errno) -> Result<(), Errno>
+    srv.listener.close()
+    Err(e)
+
+
+# Initialize with an existing listen socket (for multi-process workers).
+# The caller keeps `listen_fd`.
+pub fn tome_server_init_with_fd(srv: @&TomeServer, port: i32, listen_fd: i32) -> Result<(), Errno>
+    tome_server_init_with_socket(srv, port, socket_from_raw(listen_fd))
+
+
+fn tome_server_init_with_socket(srv: @&TomeServer, port: i32, listener: Socket) -> Result<(), Errno>
     srv.port = port
-
-    # Create listening socket
-    let listen_fd: i32 = server_create_listen_socket(port)
-    if listen_fd < 0
-        return listen_fd
-    srv.listen_fd = listen_fd
-
-    # Initialize task server
-    let ret: i32 = srv.task_server.init(listen_fd)
-    if ret < 0
-        var listener: Fd = fd_adopt(listen_fd)
-        listener.close()
-        return ret
+    srv.listener = listener
+    srv.task_server.init(@srv.listener)?
 
     # Set idle timeout (close connections idle for 60 seconds)
     srv.task_server.set_idle_timeout(60)
-
-    return 0
-
-
-# Initialize with an existing listen socket (for multi-process workers)
-pub fn tome_server_init_with_fd(srv: *TomeServer, port: i32, listen_fd: i32) -> i32
-    srv.port = port
-    srv.listen_fd = listen_fd
-
-    # Initialize task server with inherited listen fd
-    let ret: i32 = srv.task_server.init(listen_fd)
-    if ret < 0
-        return ret
-
-    # Set idle timeout (close connections idle for 60 seconds)
-    srv.task_server.set_idle_timeout(60)
-
-    return 0
+    Ok(())
 
 
 # Run the server (blocking).  The store and the sessions live here, for as
 # long as the event loop does (each worker process has its own).
-pub fn tome_server_run(srv: *TomeServer) -> i32
+pub fn tome_server_run(srv: @&TomeServer) -> Result<(), Errno>
     var store: Store = store_new()
     var conns: Conns = Conns { sessions: pool_new<Session>(), by_task: hashmap_i64_new() }
     g_store = @&store
     g_conns = @&conns
-    let ret: i32 = srv.task_server.run_multishot(handle_connection)
+    let ret: Result<(), Errno> = srv.task_server.run_multishot(handle_connection)
     g_conns = null
     g_store = null
-    return ret
+    ret
 
 
 # Stop the server
-pub fn tome_server_stop(srv: *TomeServer)
+pub fn tome_server_stop(srv: @&TomeServer)
     srv.task_server.stop()
 
 
 # Cleanup
-pub fn tome_server_destroy(srv: *TomeServer)
+pub fn tome_server_destroy(srv: @&TomeServer)
     srv.task_server.destroy()

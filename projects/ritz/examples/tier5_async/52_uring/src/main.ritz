@@ -12,6 +12,7 @@ import ritzlib.fmt
 import ritzlib.uring
 import ritzlib.span
 import ritzlib.result
+import ritzlib.errno { Errno }
 import ritzlib.str
 import ritzlib.os.env
 import ritzlib.strview { StrView }
@@ -42,16 +43,28 @@ fn drop_scratch(f: @&Fd, path: @String)
     f.close()
     unlink(path.as_view())
 
+# IoUring.new failed: say why; the test fails.
+fn no_ring(e: Errno) -> bool
+    print("FAIL: IoUring.new: {e.name()}\n")
+    false
+
+# IoUring.new failed with the test file `f` open: close it, and fail.
+fn no_ring_closing(f: @&Fd, e: Errno) -> bool
+    f.close()
+    no_ring(e)
+
+# IoUring.new failed with the test file at `path` made: delete it, and fail.
+fn no_ring_dropping(f: @&Fd, path: @String, e: Errno) -> bool
+    drop_scratch(f, path)
+    no_ring(e)
+
 # Test 1: Initialize and destroy an io_uring instance
 fn test_uring_init() -> bool
     print("test_uring_init... ")
 
-    var ring: IoUring
-    let ret: i32 = ring.init(32)
-
-    if ret < 0
-        print("FAIL: uring_init returned {ret}\n")
-        return false
+    var ring: IoUring = match IoUring.new(32)
+        Ok(r) => r
+        Err(e) => return no_ring(e)
 
     # Verify we got a valid ring fd
     if ring.ring_fd < 0
@@ -80,11 +93,9 @@ fn test_uring_init() -> bool
 fn test_uring_nop() -> bool
     print("test_uring_nop... ")
 
-    var ring: IoUring
-    let ret: i32 = ring.init(32)
-    if ret < 0
-        print("FAIL: uring_init\n")
-        return false
+    var ring: IoUring = match IoUring.new(32)
+        Ok(r) => r
+        Err(e) => return no_ring(e)
 
     # Get an SQE
     var sqe: *IoUringSqe = null
@@ -163,12 +174,9 @@ fn test_uring_write() -> bool
             print("FAIL: couldn't create temp file\n")
             return false
 
-    var ring: IoUring
-    let ret: i32 = ring.init(32)
-    if ret < 0
-        print("FAIL: uring_init\n")
-        f.close()
-        return false
+    var ring: IoUring = match IoUring.new(32)
+        Ok(r) => r
+        Err(e) => return no_ring_closing(@&f, e)
 
     # Prepare write data
     var data: [16]u8
@@ -257,12 +265,9 @@ fn test_uring_read() -> bool
     f.seek(0, SEEK_SET)
 
     # Now read with io_uring
-    var ring: IoUring
-    let ret: i32 = ring.init(32)
-    if ret < 0
-        print("FAIL: uring_init\n")
-        drop_scratch(@&f, @path)
-        return false
+    var ring: IoUring = match IoUring.new(32)
+        Ok(r) => r
+        Err(e) => return no_ring_dropping(@&f, @path, e)
 
     var buf: [16]u8
     var i: i64 = 0

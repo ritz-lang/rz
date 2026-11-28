@@ -7459,9 +7459,9 @@ async fn ready() -> i32
     42
 
 fn main() -> i32
-    var rt: Runtime
-    if rt.init() < 0
-        return 1
+    var rt: Runtime = match Runtime.new()
+        Ok(r) => r
+        Err(_) => return 1
     var p = ready()
     rt.block_on(@&p)
     let v: i32 = await p
@@ -7475,8 +7475,8 @@ a held future instead, and `rt.run_spawned()` polls every queued future until
 all have finished; the caller keeps each future alive until then.  A poll that
 answers `false` must have suspended on an operation it will be woken by;
 otherwise the future can never finish, so `block_on` and `run_spawned` fail
-loudly rather than spin.  `rt.init()` still reports failure as a negative
-`i32` from io_uring setup, hence the `< 0` test above.
+loudly rather than spin.  `Runtime.new()` is a `Result<Runtime, Errno>`:
+`Err` carries the errno of a failed io_uring setup.
 
 **Not covered.**  A future stored by value in a struct field or an array needs
 a nameable type, which `Future` isn't; keep the future in a local and store an

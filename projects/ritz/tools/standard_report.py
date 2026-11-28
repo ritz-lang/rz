@@ -34,9 +34,13 @@ fns are never counted.
   sentinel-return  API fn with an integer return whose body has
                    ``return -<digit>``.
   status-return    API fn with an integer return whose body has
-                   ``return -IDENT`` (a named code such as ``-EINVAL``) or
-                   passes a syscall's raw result straight through:
-                   ``return syscallN(`` / ``return sys_*(``.
+                   ``return -IDENT`` (a named code such as ``-EINVAL``,
+                   or ``Err(e) => return -e.code()``), passes a syscall's
+                   raw result straight through (``return syscallN(`` /
+                   ``return sys_*(``), passes a callee's negative back up
+                   (``if r < 0`` / ``return r``), gives a negative literal
+                   as a tail or arm (``Err(_) => -1``), or only ever
+                   returns ``0`` (it should return ``()``) (#4929).
   out-param        each non-self parameter that carries a result back
                    through itself: a ``:&`` / ``@&`` / ``*`` parameter
                    whose pointee is a scalar, ``StrView``, ``String`` or
@@ -47,7 +51,10 @@ fns are never counted.
                    hands to a ``sys_*(`` / ``syscallN(`` call.
   null-return      API fn returning ``*T``/``@T``/``@&T`` whose body has
                    ``return null``.
-  raw-ptr-param    each ``*T`` parameter of an API fn.
+  raw-ptr-param    each ``*T`` parameter of an API fn, and each ``*T``
+                   parameter of a fn-type parameter (``handler: fn(*Task)
+                   -> i32``): a raw pointer in a callback type makes every
+                   callback take one (#4929).
   ptr-len-param    API fn with a ``*T`` parameter followed directly by an
                    integer parameter named in LENGTH_NAMES or ending in
                    ``_len``.
@@ -159,7 +166,13 @@ RAW_RET_RE = re.compile(r"(?:^|[<,])\s*\*")
 ALLOC_RE = re.compile(r"(?<![\w.])(" + "|".join(ALLOC_FNS) + r")\s*\(")
 EXIT_RE = re.compile(r"(?<![\w.])sys_exit\s*\(")
 NEG_RETURN_RE = re.compile(r"^\s*return\s+-\s*\d")
-NAMED_NEG_RETURN_RE = re.compile(r"^\s*return\s+-\s*[A-Za-z_]")
+# `return -EINVAL`, also as a match arm: `Err(e) => return -e.code()` (#4929).
+NAMED_NEG_RETURN_RE = re.compile(r"^\s*(?:.*=>\s*)?return\s+-\s*[A-Za-z_]")
+# A trailing negative literal with no `return`: a tail or an arm, `Err(_) => -1`.
+NEG_TAIL_RE = re.compile(r"^\s*(?:.*=>\s*)?-\s*\d+\s*$")
+# `if ret < 0`: a callee's result tested for a negative status.
+NEG_TEST_RE = re.compile(r"^\s*(?:if|elif)\s+(\w+)\s*<\s*0\s*$")
+RETURN_RE = re.compile(r"^\s*(?:.*=>\s*)?return\b\s*(.*?)\s*$")
 SYSCALL_CALL = r"(?<![\w.])(?:sys_\w+|syscall\d)\s*\("
 PASSTHROUGH_RE = re.compile(r"^\s*return\s+" + SYSCALL_CALL)
 SYSCALL_RE = re.compile(SYSCALL_CALL)
@@ -295,6 +308,52 @@ def hands_to_syscall(code: str, name: str) -> bool:
     return bool(m) and re.search(r"\b" + re.escape(name) + r"\b", code[m.end():]) is not None
 
 
+def passes_negative_up(body: list[tuple[int, str]]) -> bool:
+    """`body` tests a value for `< 0` and returns that value: `if r < 0` /
+    `return r`, a callee's negative status handed back to the caller."""
+    tested = {m.group(1) for _, c in body if (m := NEG_TEST_RE.match(c))}
+    return any((m := RETURN_RE.match(c)) and m.group(1) in tested for _, c in body)
+
+
+def only_returns_zero(body: list[tuple[int, str]]) -> bool:
+    """Every value `body` can give is `0`: each `return` is `return 0`, and the
+    tail (the last line at the body's own indent) is `0` or `return 0`.  Such
+    an integer return carries no information; the fn should return ()."""
+    if not body:
+        return False
+    base = min(len(c) - len(c.lstrip()) for _, c in body)
+    tail = body[-1][1]
+    if len(tail) - len(tail.lstrip()) != base or tail.strip() not in ("0", "return 0"):
+        return False
+    return all(m.group(1) == "0" for _, c in body if (m := RETURN_RE.match(c)))
+
+
+def is_status(body: list[tuple[int, str]]) -> bool:
+    """`body`'s integer return is a status code (S-RESULT-2)."""
+    return (any(NAMED_NEG_RETURN_RE.match(c) or PASSTHROUGH_RE.match(c) or NEG_TAIL_RE.match(c)
+                for _, c in body)
+            or passes_negative_up(body) or only_returns_zero(body))
+
+
+def fn_type_raw_params(ty: str) -> list[str]:
+    """The raw `*T` parameters of a fn type `fn(*Task, i32) -> i32` (#4929)."""
+    ty = ty.strip()
+    if not re.match(r"fn\s*\(", ty):
+        return []
+    # The parameter list ends at the `)` that balances the `fn(`.
+    inner = ty[ty.find("(") + 1:]
+    depth, end = 0, len(inner)
+    for k, ch in enumerate(inner):
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            if depth == 0:
+                end = k
+                break
+            depth -= 1
+    return [p for p in split_top(inner[:end]) if p.startswith("*")]
+
+
 def parse_exemption(spec: str) -> tuple[set[str], str | None]:
     """`key[, key]: reason` -> (keys, reason). reason None means malformed."""
     if ":" not in spec:
@@ -428,8 +487,7 @@ def _fn_sites(fn: Fn, types: set[str]) -> list[tuple[str, int, str]]:
             out.append(("bool-return", fn.line, f"-> {fn.ret}"))
         if ret_int and any(NEG_RETURN_RE.match(c) for _, c in fn.body):
             out.append(("sentinel-return", fn.line, f"-> {fn.ret}"))
-        if ret_int and any(NAMED_NEG_RETURN_RE.match(c) or PASSTHROUGH_RE.match(c)
-                           for _, c in fn.body):
+        if ret_int and is_status(fn.body):
             out.append(("status-return", fn.line, f"-> {fn.ret}"))
         for (name, ty), mode in zip(fn.params, fn.modes or [""] * len(fn.params)):
             pointee = out_pointee(ty, mode)
@@ -446,6 +504,9 @@ def _fn_sites(fn: Fn, types: set[str]) -> list[tuple[str, int, str]]:
         if RAW_RET_RE.search(fn.ret):
             out.append(("ptr-return", fn.line, f"-> {fn.ret}"))
         for k, (name, ty) in enumerate(fn.params):
+            # A callback type with a raw `*T` makes every callback take one.
+            for raw in fn_type_raw_params(ty):
+                out.append(("raw-ptr-param", fn.line, f"{name}: {ty} ({raw})"))
             if name == "self" or not ty.startswith("*"):
                 continue
             out.append(("raw-ptr-param", fn.line, f"{name}: {ty}"))

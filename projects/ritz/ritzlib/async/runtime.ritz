@@ -13,11 +13,11 @@
 #
 # Usage:
 #   fn main() -> i32
-#       var rt: Runtime
-#       if rt.init() < 0
-#           return 1
+#       var rt: Runtime = match Runtime.new()
+#           Ok(r) => r
+#           Err(_) => return 1
 #       var p = my_async_fn()
-#       block_on(@rt, @&p)
+#       rt.block_on(@&p)
 #       let result: i32 = await p
 #       rt.destroy()
 #       result
@@ -71,7 +71,7 @@ struct Runtime
     # The io_uring instance
     ring: IoUring
     # Is the runtime initialized?
-    initialized: i32
+    initialized: bool
     # Global user_data counter for tracking operations
     next_user_data: i64
     # The operation the current future is suspended on
@@ -196,60 +196,55 @@ fn spawn_fatal(msg: StrView)
 
 # Global runtime instance - initialized lazily
 var g_runtime: Runtime
-var g_runtime_initialized: i32 = 0
+var g_runtime_initialized: bool = false
 
-# Get or initialize the global runtime
-pub fn get_runtime() -> @&Runtime
-    if g_runtime_initialized == 0
-        let ret: i32 = g_runtime.init()
-        if ret >= 0
-            g_runtime_initialized = 1
-    return @&g_runtime
+# The global runtime, created on first use: Ok(it), or Err(errno) if its
+# ring can't be set up (the next call tries again).
+pub fn get_runtime() -> Result<@&Runtime, Errno>
+    if not g_runtime_initialized
+        g_runtime = Runtime.new()?
+        g_runtime_initialized = true
+    Ok(@&g_runtime)
 
 # Clean up the global runtime (call at program exit)
 pub fn cleanup_runtime()
-    if g_runtime_initialized != 0
+    if g_runtime_initialized
         g_runtime.destroy()
-        g_runtime_initialized = 0
+        g_runtime_initialized = false
 
 # ============================================================================
 # Methods (S-IMPL-1): a Runtime is the subject of every operation on it.
 # ============================================================================
 
 impl Runtime
-    # Initialize the runtime with an io_uring instance
-    # Returns 0 on success, negative error code on failure
-    pub fn init(self: @&Runtime) -> i32
-        self.initialized = 0
-        self.next_user_data = 1
-        self.waker_user_data = 0
-        self.waker_io_result = 0
-        self.waker_io_ready = 0
-        self.waker_active = 0
-        self.spawn_count = 0
-        self.current_task = 0 - 1
+    # A new runtime on a 256-entry io_uring: Ok(runtime), or Err(errno)
+    # from setting up the ring.
+    pub fn new() -> Result<Runtime, Errno>
+        var rt: Runtime
+        rt.ring = IoUring.new(256)?
+        rt.initialized = true
+        rt.next_user_data = 1
+        rt.waker_user_data = 0
+        rt.waker_io_result = 0
+        rt.waker_io_ready = 0
+        rt.waker_active = 0
+        rt.spawn_count = 0
+        rt.current_task = 0 - 1
 
         # Initialize the spawn queue slots
         for i in 0..SPAWN_MAX_TASKS
-            let t = @&self.spawn_tasks[i]
+            let t = @&rt.spawn_tasks[i]
             t.user_data = 0
             t.state = SPAWN_IDLE
             t.io_result = 0
             t.io_ready = 0
-
-        # Initialize io_uring with 256 entries (good default)
-        let ret: i32 = self.ring.init(256)
-        if ret < 0
-            return ret
-
-        self.initialized = 1
-        return 0
+        Ok(rt)
 
     # Destroy the runtime, cleaning up io_uring resources
     pub fn destroy(self: @&Runtime)
-        if self.initialized != 0
+        if self.initialized
             self.ring.destroy()
-            self.initialized = 0
+            self.initialized = false
 
     # Submit a read operation and wait for completion.
     # Ok(bytes read, 0 at EOF) or Err(errno) from submission or the completion.
@@ -381,12 +376,11 @@ impl Runtime
         sqe.prep_write(fd, buf_sv, offset, user_data)
         return runtime_suspend_on(self, user_data)
 
-    # Wait for at least one completion and record the one the waker is armed for
-    pub fn wait_for_io(self: @&Runtime) -> i32
+    # Wait for at least one completion and hand each one to its owner: Ok(()),
+    # or Err(errno) from submitting or waiting.
+    pub fn wait_for_io(self: @&Runtime) -> Result<(), Errno>
         # Submit any pending SQEs and wait for at least one CQE
-        match self.ring.submit_and_wait(1)
-            Ok(_) => pass
-            Err(e) => return -e.code()
+        self.ring.submit_and_wait(1)?
 
         # Process completions
         var processed: i32 = 0
@@ -403,7 +397,7 @@ impl Runtime
             self.ring.cqe_seen(@*cqe)
             processed += 1
 
-        return 0
+        Ok(())
 
     # Poll a future until it is Ready (LARB R79), waiting on io_uring whenever the
     # future's poll reports Pending.  Returns nothing; the caller reads the result
@@ -417,9 +411,9 @@ impl Runtime
         while !future_poll(f)
             if self.waker_active == 0
                 block_on_contract_violation()
-            let wait_result: i32 = self.wait_for_io()
-            if wait_result < 0
-                block_on_fatal("block_on: runtime_wait_for_io failed")
+            match self.wait_for_io()
+                Ok(_) => pass
+                Err(_) => block_on_fatal("block_on: wait_for_io failed")
 
     # Queue a held future for run_spawned.  The caller's future must outlive the
     # drain.  A full queue is a program error: there is no return value to report
@@ -439,9 +433,9 @@ impl Runtime
         spawn_fatal("spawn: future queue is full")
 
     # Poll every spawned future until it is finished, waiting on the ring while
-    # all unfinished tasks are suspended.  Returns 0 once the queue is drained, or
-    # the negative code from a failed wait.
-    pub fn run_spawned(self: @&Runtime) -> i32
+    # all unfinished tasks are suspended: Ok(()) once the queue is drained, or
+    # Err(errno) from a failed wait.
+    pub fn run_spawned(self: @&Runtime) -> Result<(), Errno>
         while self.spawn_count > 0
             # Poll each task that is due, routing its I/O to its own waker slot
             for i in 0..SPAWN_MAX_TASKS
@@ -464,8 +458,6 @@ impl Runtime
                 break
 
             # All unfinished tasks are suspended: wait for at least one completion
-            let wait_result: i32 = self.wait_for_io()
-            if wait_result < 0
-                return wait_result
+            self.wait_for_io()?
 
-        return 0
+        Ok(())

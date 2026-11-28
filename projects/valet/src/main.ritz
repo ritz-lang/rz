@@ -198,22 +198,22 @@ fn handle_echo_body(path: *u8, path_len: i32) -> i32
 var g_mirror_body: [256]Span<u8>
 
 fn handle_mirror(path: *u8, path_len: i32) -> i32
-    let c: *HandlerContext = ctx()
-    if c == null
-        return 1
-    let idx: i32 = valet_task_slot_idx(c.task)
+    let task: @&Task = match ctx_task()
+        Some(t) => t
+        None => return 1
+    let idx: i32 = valet_task_slot_idx(task)
     if idx < 0
         return ctx_text(503, "mirror: no task slot\n")
     g_mirror_body[idx] = ctx_body_bytes()
-    if valet_proxy_arm_yield(c.task, 0) < 0
+    if not valet_proxy_arm_yield(task, 0)
         return ctx_text(503, "mirror: failed to arm yield\n")
     return STATUS_PROXY_PENDING
 
 
-fn handle_mirror_continuation(task: *Task) -> i32
+fn handle_mirror_continuation(task: @&Task) -> TaskStep
     let idx: i32 = valet_task_slot_idx(task)
     if idx < 0
-        return 1
+        return TaskStep.Done
     let body: Span<u8> = g_mirror_body[idx]
     let body_len: i64 = body.len
     var hdr: [256]u8
@@ -222,7 +222,7 @@ fn handle_mirror_continuation(task: *Task) -> i32
     response_status(@hres, 200)
     response_header(@hres, "Content-Type", "application/octet-stream")
     response_content_length(@hres, body_len)
-    if valet_task_closing(task) != 0
+    if valet_task_closing(task)
         response_header(@hres, "Connection", "close")
     response_end_headers(@hres)
     let hdr_len: i64 = hres.len as i64
@@ -230,7 +230,7 @@ fn handle_mirror_continuation(task: *Task) -> i32
     # Size the reply first, as the zeus proxy does, then read the body.
     let out: Span<u8> = valet_response_buffer(task, hdr_len + body_len)
     if out.len == 0
-        return 1
+        return TaskStep.Done
     let hdr_bytes: Span<u8> = @hdr
     out.copy_from(hdr_bytes.to(hdr_len))
     out.from(hdr_len).copy_from(body)
@@ -430,9 +430,9 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     # continuation when the CQE fires.  This decouples valet's task
     # loop from any one worker's response time — pipelined requests
     # actually overlap.
-    let task: *Task = ctx_task()
-    if task == null
-        return ctx_text(503, "zeus: no task in ctx\n")
+    let task: @&Task = match ctx_task()
+        Some(t) => t
+        None => return ctx_text(503, "zeus: no task in ctx\n")
 
     let st: *ProxyState = valet_proxy_state(task)
     if st == null
@@ -445,8 +445,7 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     st.spin_count = 0
     st.deadline_sec = get_current_time() + PROXY_DEADLINE_SEC
 
-    let arm_rc: i32 = valet_proxy_arm_yield(task, 0)
-    if arm_rc < 0
+    if not valet_proxy_arm_yield(task, 0)
         g_proxy_arm_fail = g_proxy_arm_fail + 1
         valet_proxy_state_clear(task)
         return ctx_text(503, "zeus: failed to arm yield\n")
@@ -457,7 +456,7 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
 
 # Send a short plain-text error from the proxy continuation (status 5xx,
 # Connection: close) and move to CONN_STATE_SEND.
-fn proxy_send_error(task: *Task, status: i32, msg: StrView) -> i32
+fn proxy_send_error(task: @&Task, status: i32, msg: StrView) -> TaskStep
     var res: Response
     response_init(@res, @task.write_buf[0], 8192)
     response_status(@res, status)
@@ -516,17 +515,17 @@ pub fn proxy_dump_counters()
 # heads alone for their owners to claim).  On hit, builds the HTTP
 # reply into task.write_buf and transitions to CONN_STATE_SEND.  On
 # miss, re-arms the yield until the deadline elapses.
-fn handle_zeus_proxy_continuation(task: *Task) -> i32
+fn handle_zeus_proxy_continuation(task: @&Task) -> TaskStep
     g_proxy_total_continuations = g_proxy_total_continuations + 1
     let st: *ProxyState = valet_proxy_state(task)
     if st == null or st.in_use == 0
         g_proxy_state_lost = g_proxy_state_lost + 1
-        return 1
+        return TaskStep.Done
 
     let client: *ZeusClient = get_zeus_client()
     if client == null
         valet_proxy_state_clear(task)
-        return 1
+        return TaskStep.Done
 
     # Inline spin: most responses are in the ring within tens of µs.
     # Spinning avoids the NOP-yield round-trip when the worker has
@@ -556,7 +555,7 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
         if handle == null
             g_proxy_handle_null = g_proxy_handle_null + 1
             valet_proxy_state_clear(task)
-            return 1
+            return TaskStep.Done
 
         # Per-slot arena view to resolve the response header + body offsets.
         var arena: DataArena
@@ -613,12 +612,12 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
             out.from(out_hdr_len).copy_from(data_arena_bytes(@arena, resp.body_offset as i64, body_len))
         let out_len: i64 = out_hdr_len + body_len
 
-        let ret: i32 = valet_task_send_response(task, out.to(out_len))
-        if ret > 0
-            g_proxy_send_fail_continuation = g_proxy_send_fail_continuation + 1
-            return 1
-        g_proxy_total_completions = g_proxy_total_completions + 1
-        return -1
+        match valet_task_send_response(task, out.to(out_len))
+            TaskStep.Done =>
+                g_proxy_send_fail_continuation = g_proxy_send_fail_continuation + 1
+                return TaskStep.Done
+            TaskStep.Pending => g_proxy_total_completions = g_proxy_total_completions + 1
+        return TaskStep.Pending
 
     # Miss.  Deadline check.
     let now_sec: i64 = get_current_time()
@@ -630,12 +629,11 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
     # Re-arm the yield, backing off from NOPs to timers of up to 1 ms
     # (AGAST #183): NOP-only yields from many waiters starved the loop.
     st.spin_count = st.spin_count + 1
-    let arm_rc: i32 = valet_proxy_arm_yield(task, proxy_yield_delay_us(st.spin_count))
-    if arm_rc < 0
+    if not valet_proxy_arm_yield(task, proxy_yield_delay_us(st.spin_count))
         g_proxy_arm_fail = g_proxy_arm_fail + 1
         valet_proxy_state_clear(task)
-        return 1
-    return -1
+        return TaskStep.Done
+    return TaskStep.Pending
 
 
 # Register the proxy handler under every method as a catch-all.

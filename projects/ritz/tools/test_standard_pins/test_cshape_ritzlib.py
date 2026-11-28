@@ -22,7 +22,9 @@ pytestmark = pytest.mark.unit
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-PINS = {"out-param": (0, 13), "status-return": (0, 82)}
+# status-return's 19 violations are the shapes #4929 taught the rule to see,
+# not new code: test_status_return_4929.py pins each of them by name.
+PINS = {"out-param": (0, 13), "status-return": (19, 101)}
 
 
 def test_ritzlib_c_shapes_only_go_down():
