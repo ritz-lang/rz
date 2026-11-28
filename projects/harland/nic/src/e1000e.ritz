@@ -1,0 +1,618 @@
+# The e1000e Nic for the 82574L (AGAST #4892; harland docs/E1000E.md
+# "Shape", "What the two parts share", "The Nic calls on e1000e")
+#
+# The second implementation of trait Nic, linked into /bin/netd beside the
+# virtio-net one (D9). It makes no syscalls: netd maps BAR0 and allocates
+# the DMA runs, and E1000eNic.up resets the MAC, reads its address, brings
+# the PHY up over MDIC, lays both rings over the runs and routes the MSI-X
+# causes.
+#
+# The registers are behind `trait Regs`. Its MMIO implementation, MmioRegs,
+# is a volatile access to the granted window; test/test_e1000e.ritz has a
+# register model that self-clears CTRL.RST, answers MDIC and so on, because
+# bring-up is a sequence of polled handshakes that plain memory can't
+# answer. Traits are static (LANGUAGE_SPEC §12), so E1000eNic<MmioRegs> is
+# compiled for netd and E1000eNic<the model> for the tests, with no vtable.
+#
+# Both rings use legacy 16-byte descriptors, 32 of them, one 2 KiB buffer
+# each, and no offloads. The device owns an RX slot from the RDT write that
+# posts it until it sets DD, and a TX slot from the TDT write until DD: the
+# ownership rule that lets rx_poll hand out a frame in place, and the
+# AGAST #4073 rule for TX reclaim. A ring of N descriptors holds at most
+# N - 1 (RDT == RDH and TDT == TDH both mean empty), so 31 are the device's
+# at once in each direction.
+
+import driver_abi.boot { DriverBoot }
+import driver_abi.link { NetInfo, NETDEV_TYPE_E1000E, ETH_HEADER_LEN }
+import nic.nic { Nic, RxFrame, TxFrame, DmaRun }
+import ritzlib.span
+import ritzlib.strview { StrView }
+
+# ============================================================================
+# Registers (82574 datasheet section 10; the same offsets on the I218-V)
+# ============================================================================
+
+pub const REG_CTRL: u32 = 0x0000
+pub const REG_STATUS: u32 = 0x0008
+pub const REG_MDIC: u32 = 0x0020
+pub const REG_ICR: u32 = 0x00C0
+pub const REG_ITR: u32 = 0x00C4
+pub const REG_IMS: u32 = 0x00D0
+pub const REG_IMC: u32 = 0x00D8
+pub const REG_IVAR: u32 = 0x00E4
+pub const REG_RCTL: u32 = 0x0100
+pub const REG_TCTL: u32 = 0x0400
+pub const REG_TIPG: u32 = 0x0410
+pub const REG_EXTCNF_CTRL: u32 = 0x0F00
+pub const REG_RDBAL: u32 = 0x2800
+pub const REG_RDBAH: u32 = 0x2804
+pub const REG_RDLEN: u32 = 0x2808
+pub const REG_RDH: u32 = 0x2810
+pub const REG_RDT: u32 = 0x2818
+pub const REG_RDTR: u32 = 0x2820
+pub const REG_RADV: u32 = 0x282C
+pub const REG_TDBAL: u32 = 0x3800
+pub const REG_TDBAH: u32 = 0x3804
+pub const REG_TDLEN: u32 = 0x3808
+pub const REG_TDH: u32 = 0x3810
+pub const REG_TDT: u32 = 0x3818
+pub const REG_MTA: u32 = 0x5200
+pub const REG_RAL0: u32 = 0x5400
+pub const REG_RAH0: u32 = 0x5404
+
+# The multicast table: 128 words, cleared (E1000E.md "Filters").
+pub const MTA_WORDS: u32 = 128
+
+pub const CTRL_GIO_MASTER_DISABLE: u32 = 1 << 2
+pub const CTRL_SLU: u32 = 1 << 6
+pub const CTRL_FRCSPD: u32 = 1 << 11
+pub const CTRL_FRCDPLX: u32 = 1 << 12
+pub const CTRL_RST: u32 = 1 << 26
+
+pub const STATUS_LU: u32 = 1 << 1
+pub const STATUS_GIO_MASTER_EN: u32 = 1 << 19
+
+pub const MDIC_REG_SHIFT: u32 = 16
+pub const MDIC_PHY_SHIFT: u32 = 21
+pub const MDIC_OP_WRITE: u32 = 1 << 26
+pub const MDIC_OP_READ: u32 = 2 << 26
+pub const MDIC_READY: u32 = 1 << 28
+pub const MDIC_ERROR: u32 = 1 << 30
+
+# The 82574L's PHY is on the die at MDIC address 1; QEMU answers no other.
+pub const PHY_ADDR: u32 = 1
+
+pub const EXTCNF_MDIO_SW_OWNERSHIP: u32 = 1 << 5
+
+pub const RCTL_EN: u32 = 1 << 1
+pub const RCTL_BAM: u32 = 1 << 15
+pub const RCTL_SECRC: u32 = 1 << 26
+# RCTL.BSIZE (bits 17:16) 00 with BSEX clear is 2048-byte buffers, and LPE
+# clear keeps frames to 1522 bytes, so a frame is always one descriptor.
+pub const RCTL_VALUE: u32 = RCTL_EN | RCTL_BAM | RCTL_SECRC
+
+pub const TCTL_EN: u32 = 1 << 1
+pub const TCTL_PSP: u32 = 1 << 3
+pub const TCTL_VALUE: u32 = TCTL_EN | TCTL_PSP
+
+# IPGT 8, IPGR1 8, IPGR2 6: Linux e1000e's copper defaults.
+pub const TIPG_VALUE: u32 = 8 | (8 << 10) | (6 << 20)
+
+# ICR and IMS causes. In MSI-X mode the 82574L raises RXQ0, TXQ0 and OTHER
+# (E1000E.md section 1); OTHER fires for the causes IMS enables beside it,
+# here LSC.
+pub const ICR_LSC: u32 = 1 << 2
+pub const ICR_RXQ0: u32 = 1 << 20
+pub const ICR_TXQ0: u32 = 1 << 22
+pub const ICR_OTHER: u32 = 1 << 24
+pub const IMS_CAUSES: u32 = ICR_RXQ0 | ICR_TXQ0 | ICR_OTHER | ICR_LSC
+
+# IVAR: a 3-bit MSI-X entry and a valid bit per cause, RxQ0 at bits 3:0,
+# TxQ0 at 11:8, Other at 19:16; bit 31 asks for a TX interrupt on every
+# descriptor write-back (Linux e1000_configure_msix).
+pub const IVAR_VALID: u32 = 0x8
+pub const IVAR_TX_EVERY_WB: u32 = 1 << 31
+
+pub const RAH_AV: u32 = 1 << 31
+
+# MII registers on PHY page 0.
+pub const MII_BMCR: u32 = 0
+pub const BMCR_ANRESTART: u16 = 1 << 9
+pub const BMCR_ANENABLE: u16 = 1 << 12
+
+# Polls of each handshake. Until its first DrvIrqWait netd is the only
+# runnable process besides pid 1 and has no clock to sleep on (as virtio's
+# RESET_POLLS), so each wait is a bounded count of register reads. A
+# million uncached MMIO reads outlast the ~80 ms Linux allows GIO_MASTER_EN
+# (MASTER_DISABLE_TIMEOUT, 800 x 100 us).
+pub const MASTER_POLLS: u32 = 1000000
+pub const RESET_POLLS: u32 = 1000000
+pub const MDIC_POLLS: u32 = 100000
+pub const OWNERSHIP_POLLS: u32 = 100000
+
+# The register window: one 32-bit read and write at a byte offset. rd takes
+# @Self so a read never changes the driver's view; wr takes @&Self.
+pub trait Regs
+    fn rd(self: @Self, off: u32) -> u32
+    fn wr(self: @&Self, off: u32, v: u32)
+
+# BAR0 as netd mapped it (DrvMmioMap): 128 KiB of registers at `base`.
+pub struct MmioRegs
+    base: u64
+
+impl Regs for MmioRegs
+    fn rd(self: @MmioRegs, off: u32) -> u32
+        volatile_load((self.base + off as u64) as *u32)
+
+    fn wr(self: @&MmioRegs, off: u32, v: u32)
+        volatile_store((self.base + off as u64) as *u32, v)
+
+# ============================================================================
+# Descriptors and buffers
+# ============================================================================
+
+pub const E1000E_RING: u32 = 32
+pub const E1000E_DESC_BYTES: u64 = 16
+pub const E1000E_BUF_SIZE: u64 = 2048
+# The device's share of a ring: N - 1 slots (TDT == TDH is empty).
+pub const E1000E_RING_USABLE: u32 = E1000E_RING - 1
+
+# The legacy receive descriptor (82574 section 7.1.4).
+pub struct RxDesc
+    addr: u64
+    length: u16
+    csum: u16
+    status: u8
+    errors: u8
+    special: u16
+
+pub const RXD_STAT_DD: u8 = 1 << 0
+pub const RXD_STAT_EOP: u8 = 1 << 1
+# CE, SE, SEQ, CXE, RXE: the frame is bad. IPE and TCPE need the checksum
+# offload this driver leaves off.
+pub const RXD_ERR_FRAME: u8 = 0x97
+
+# The legacy transmit descriptor (82574 section 7.2.10.1).
+pub struct TxDesc
+    addr: u64
+    length: u16
+    cso: u8
+    cmd: u8
+    status: u8
+    css: u8
+    special: u16
+
+pub const TXD_CMD_EOP: u8 = 1 << 0
+pub const TXD_CMD_IFCS: u8 = 1 << 1
+pub const TXD_CMD_RS: u8 = 1 << 3
+pub const TXD_STAT_DD: u8 = 1 << 0
+
+# Bytes of one ring (a multiple of 128, as RDLEN and TDLEN must be) and of
+# one pool: what netd asks DrvDmaAlloc for.
+pub fn ring_bytes() -> u64
+    (E1000E_RING as u64) * E1000E_DESC_BYTES
+
+pub fn pool_bytes() -> u64
+    (E1000E_RING as u64) * E1000E_BUF_SIZE
+
+# The four runs netd allocates: each ring (ring_bytes) and each pool
+# (pool_bytes).
+pub struct E1000eDma
+    rx_ring: DmaRun
+    tx_ring: DmaRun
+    rx_pool: DmaRun
+    tx_pool: DmaRun
+
+fn buf_iova(run: DmaRun, b: u32) -> u64
+    run.iova + (b as u64) * E1000E_BUF_SIZE
+
+fn buf(run: DmaRun, b: u32) -> [u8]
+    span_from_ptr<u8>((run.virt + (b as u64) * E1000E_BUF_SIZE) as *u8, E1000E_BUF_SIZE as i64)
+
+# The buffers of one pool not on the ring and not out to netd: a stack of
+# buffer ids.
+pub struct FreeBufs
+    ids: [32]u32                     # E1000E_RING
+    count: u32
+
+impl FreeBufs
+    pub fn push(self: @&FreeBufs, b: u32)
+        self.ids[self.count] = b
+        self.count = self.count + 1
+
+    pub fn pop(self: @&FreeBufs) -> Option<u32>
+        if self.count == 0
+            return None
+        self.count = self.count - 1
+        Some(self.ids[self.count])
+
+# ============================================================================
+# Interrupts
+# ============================================================================
+
+# The MSI-X table entries the kernel aimed at netd's vector (DriverBoot):
+# RXQ0, TXQ0 and Other.
+pub struct E1000eMsix
+    rx: u16
+    tx: u16
+    other: u16
+
+# The entries from the boot record: its queue entries, and its config entry
+# for Other (link changes), as the virtio probe names them.
+pub fn e1000e_msix(b: DriverBoot) -> E1000eMsix
+    E1000eMsix { rx: b.msix_rx, tx: b.msix_tx, other: b.msix_config }
+
+# The IVAR value that routes each cause to its entry.
+pub fn ivar_value(m: E1000eMsix) -> u32
+    let rx: u32 = IVAR_VALID | ((m.rx as u32) & 0x7)
+    let tx: u32 = IVAR_VALID | ((m.tx as u32) & 0x7)
+    let other: u32 = IVAR_VALID | ((m.other as u32) & 0x7)
+    rx | (tx << 8) | (other << 16) | IVAR_TX_EVERY_WB
+
+# ============================================================================
+# Bring-up errors
+# ============================================================================
+
+# Why a PHY access failed.
+pub enum PhyError
+    Ownership                        # EXTCNF_CTRL.MDIO_SW_OWNERSHIP never read back set
+    Timeout                          # MDIC never read ready
+    Device                           # MDIC read ready with its error bit
+
+# Why E1000eNic.up stopped. netd exits with a status naming it and logs
+# up_error_name.
+pub enum UpError
+    MasterDisable                    # STATUS.GIO_MASTER_EN never cleared: DMA still in flight
+    Reset                            # CTRL.RST never self-cleared
+    NoMac                            # RAH0.AV clear: the NVM loaded no address
+    Phy(PhyError)                    # the autonegotiation restart failed
+
+pub fn phy_error_name(e: PhyError) -> StrView
+    match e
+        PhyError.Ownership => "the MDIO software ownership flag never set"
+        PhyError.Timeout => "MDIC never read ready"
+        PhyError.Device => "MDIC reported an error"
+
+# The text of netd's log line for a NIC up refused.
+pub fn up_error_name(e: UpError) -> StrView
+    match e
+        UpError.MasterDisable => "GIO master enable never cleared"
+        UpError.Reset => "CTRL.RST never cleared"
+        UpError.NoMac => "RAH0.AV clear: no MAC address"
+        UpError.Phy(p) => phy_error_name(p)
+
+# ============================================================================
+# The NIC
+# ============================================================================
+
+pub const E1000E_MTU: u32 = 1500
+
+pub struct E1000eNic<R: Regs>
+    regs: R
+    rx_desc: [RxDesc]
+    tx_desc: [TxDesc]
+    rx_pool: DmaRun
+    tx_pool: DmaRun
+    mac: [6]u8
+    # RX: the device owns slots rx_next.. up to rx_tail; rx_slot is the
+    # buffer posted at each. rx_out marks a buffer netd holds.
+    rx_slot: [32]u32                 # E1000E_RING
+    rx_next: u32
+    rx_tail: u32
+    rx_free: FreeBufs
+    rx_out: [32]bool
+    # TX: slots tx_clean.. up to tx_next are submitted and not reclaimed;
+    # tx_slot is the buffer at each. tx_held marks a buffer tx_buffer
+    # handed out and tx_submit has not taken.
+    tx_slot: [32]u32
+    tx_next: u32
+    tx_clean: u32
+    tx_free: FreeBufs
+    tx_held: [32]bool
+    tx_busy: u32                     # held + submitted, at most E1000E_RING_USABLE
+    # A buffer was posted or a frame submitted since the last tx_kick.
+    rx_due: bool
+    tx_due: bool
+    # Frames the device delivered with errors or split, and submits of a
+    # runt or overlong frame.
+    rx_dropped: u64
+    tx_refused: u64
+
+fn next_slot(s: u32) -> u32
+    (s + 1) % E1000E_RING
+
+impl<R: Regs> E1000eNic<R>
+    # Bring the 82574L up over the register window `regs`: reset, the MAC
+    # from RAL0/RAH0, both rings over `dma` with every RX slot it can hold
+    # posted, the MSI-X routing, then the link (SLU and an autonegotiation
+    # restart). The interrupt stays masked until the first irq_arm, and the
+    # first tx_kick writes RDT. Returns the link record.
+    pub fn up(self: @&E1000eNic<R>, regs: R, dma: E1000eDma, msix: E1000eMsix) -> Result<NetInfo, UpError>
+        self.regs = regs
+        self.reset()?
+        self.mac = match self.read_mac()
+            Some(m) => m
+            None => return Err(UpError.NoMac)
+        for i in 0..MTA_WORDS
+            self.regs.wr(REG_MTA + 4 * i, 0)
+        self.layout(dma)
+        self.regs.wr(REG_ITR, 0)
+        self.regs.wr(REG_IVAR, ivar_value(msix))
+        self.program_rx(dma.rx_ring)
+        self.program_tx(dma.tx_ring)
+        self.link_up_start()?
+        Ok(self.link())
+
+    # The 82574L reset (Linux e1000_reset_hw_82571): stop bus mastering and
+    # wait until no DMA is in flight, mask every cause, stop both units, set
+    # CTRL.RST and wait for it to self-clear, mask again and acknowledge
+    # whatever ICR holds.
+    pub fn reset(self: @&E1000eNic<R>) -> Result<(), UpError>
+        self.regs.wr(REG_CTRL, self.regs.rd(REG_CTRL) | CTRL_GIO_MASTER_DISABLE)
+        if not self.wait_clear(REG_STATUS, STATUS_GIO_MASTER_EN, MASTER_POLLS)
+            return Err(UpError.MasterDisable)
+        self.regs.wr(REG_IMC, 0xFFFFFFFF)
+        self.regs.wr(REG_RCTL, 0)
+        self.regs.wr(REG_TCTL, 0)
+        self.regs.wr(REG_CTRL, self.regs.rd(REG_CTRL) | CTRL_RST)
+        if not self.wait_clear(REG_CTRL, CTRL_RST, RESET_POLLS)
+            return Err(UpError.Reset)
+        self.regs.wr(REG_IMC, 0xFFFFFFFF)
+        self.ack_icr()
+        Ok(())
+
+    # The address the NVM loaded into RAL0/RAH0, or None when RAH0.AV is
+    # clear.
+    pub fn read_mac(self: @E1000eNic<R>) -> Option<[6]u8>
+        let lo: u32 = self.regs.rd(REG_RAL0)
+        let hi: u32 = self.regs.rd(REG_RAH0)
+        if (hi & RAH_AV) == 0
+            return None
+        var m: [6]u8
+        for i in 0..4
+            m[i] = ((lo >> (8 * i as u32)) & 0xFF) as u8
+        m[4] = (hi & 0xFF) as u8
+        m[5] = ((hi >> 8) & 0xFF) as u8
+        Some(m)
+
+    # Read PHY register `reg` (0..31) over MDIC, holding the MDIO software
+    # ownership flag.
+    pub fn phy_read(self: @&E1000eNic<R>, reg: u32) -> Result<u16, PhyError>
+        self.phy_own()?
+        let got: Result<u32, PhyError> = self.mdic(MDIC_OP_READ | (reg << MDIC_REG_SHIFT) | (PHY_ADDR << MDIC_PHY_SHIFT))
+        self.phy_release()
+        Ok((got? & 0xFFFF) as u16)
+
+    # Write `v` to PHY register `reg` over MDIC, holding the flag.
+    pub fn phy_write(self: @&E1000eNic<R>, reg: u32, v: u16) -> Result<(), PhyError>
+        self.phy_own()?
+        let got: Result<u32, PhyError> = self.mdic(MDIC_OP_WRITE | (reg << MDIC_REG_SHIFT) | (PHY_ADDR << MDIC_PHY_SHIFT) | (v as u32))
+        self.phy_release()
+        got?
+        Ok(())
+
+    # Whether `bit` of `off` read clear within `polls` reads.
+    fn wait_clear(self: @E1000eNic<R>, off: u32, bit: u32, polls: u32) -> bool
+        for i in 0..polls
+            if (self.regs.rd(off) & bit) == 0
+                return true
+        false
+
+    # ICR is write-1-to-clear on both parts; a read alone clears it only
+    # with IMS 0 or IAME set (QEMU e1000e_mac_icr_read), so the value read
+    # is written back.
+    fn ack_icr(self: @&E1000eNic<R>)
+        let icr: u32 = self.regs.rd(REG_ICR)
+        self.regs.wr(REG_ICR, icr)
+
+    # Take EXTCNF_CTRL.MDIO_SW_OWNERSHIP: set it and read it back (Linux
+    # e1000_get_hw_semaphore_82574). The 82574L has no firmware agent and
+    # QEMU ignores the flag; the I218-V shares the PHY with the ME through
+    # the same bit (SWFLAG), so one code path takes it.
+    fn phy_own(self: @&E1000eNic<R>) -> Result<(), PhyError>
+        for i in 0..OWNERSHIP_POLLS
+            self.regs.wr(REG_EXTCNF_CTRL, self.regs.rd(REG_EXTCNF_CTRL) | EXTCNF_MDIO_SW_OWNERSHIP)
+            if (self.regs.rd(REG_EXTCNF_CTRL) & EXTCNF_MDIO_SW_OWNERSHIP) != 0
+                return Ok(())
+        Err(PhyError.Ownership)
+
+    fn phy_release(self: @&E1000eNic<R>)
+        self.regs.wr(REG_EXTCNF_CTRL, self.regs.rd(REG_EXTCNF_CTRL) & (0xFFFFFFFF ^ EXTCNF_MDIO_SW_OWNERSHIP))
+
+    # One MDIC operation `cmd`: write it, wait for ready, check the error
+    # bit. Returns the MDIC value it completed with.
+    fn mdic(self: @&E1000eNic<R>, cmd: u32) -> Result<u32, PhyError>
+        self.regs.wr(REG_MDIC, cmd)
+        for i in 0..MDIC_POLLS
+            let v: u32 = self.regs.rd(REG_MDIC)
+            if (v & MDIC_READY) != 0
+                if (v & MDIC_ERROR) != 0
+                    return Err(PhyError.Device)
+                return Ok(v)
+        Err(PhyError.Timeout)
+
+    # The rings over the runs, every buffer free, then RX posted into every
+    # slot the ring holds. The runs are zeroed memory (a DrvDmaAlloc run is).
+    fn layout(self: @&E1000eNic<R>, dma: E1000eDma)
+        self.rx_desc = span_from_ptr<RxDesc>(dma.rx_ring.virt as *RxDesc, E1000E_RING as i64)
+        self.tx_desc = span_from_ptr<TxDesc>(dma.tx_ring.virt as *TxDesc, E1000E_RING as i64)
+        self.rx_pool = dma.rx_pool
+        self.tx_pool = dma.tx_pool
+        self.rx_next = 0
+        self.rx_tail = 0
+        self.tx_next = 0
+        self.tx_clean = 0
+        self.tx_busy = 0
+        self.rx_free.count = 0
+        self.tx_free.count = 0
+        self.rx_due = false
+        self.tx_due = false
+        self.rx_dropped = 0
+        self.tx_refused = 0
+        # Pushed high to low, so buffer 0 comes off first.
+        var b: u32 = E1000E_RING
+        while b > 0
+            b = b - 1
+            self.rx_out[b] = false
+            self.tx_held[b] = false
+            self.rx_free.push(b)
+            self.tx_free.push(b)
+        for s in 0..E1000E_RING
+            self.rx_desc[s as i64] = RxDesc { addr: 0, length: 0, csum: 0, status: 0, errors: 0, special: 0 }
+            self.tx_desc[s as i64] = TxDesc { addr: 0, length: 0, cso: 0, cmd: 0, status: 0, css: 0, special: 0 }
+        self.rx_refill()
+
+    fn program_rx(self: @&E1000eNic<R>, ring: DmaRun)
+        self.regs.wr(REG_RDBAL, (ring.iova & 0xFFFFFFFF) as u32)
+        self.regs.wr(REG_RDBAH, (ring.iova >> 32) as u32)
+        self.regs.wr(REG_RDLEN, ring_bytes() as u32)
+        self.regs.wr(REG_RDH, 0)
+        self.regs.wr(REG_RDT, 0)
+        self.regs.wr(REG_RDTR, 0)
+        self.regs.wr(REG_RADV, 0)
+        self.regs.wr(REG_RCTL, RCTL_VALUE)
+
+    fn program_tx(self: @&E1000eNic<R>, ring: DmaRun)
+        self.regs.wr(REG_TDBAL, (ring.iova & 0xFFFFFFFF) as u32)
+        self.regs.wr(REG_TDBAH, (ring.iova >> 32) as u32)
+        self.regs.wr(REG_TDLEN, ring_bytes() as u32)
+        self.regs.wr(REG_TDH, 0)
+        self.regs.wr(REG_TDT, 0)
+        self.regs.wr(REG_TIPG, TIPG_VALUE)
+        self.regs.wr(REG_TCTL, TCTL_VALUE)
+
+    # Set link up with speed and duplex from autonegotiation, then enable
+    # and restart autonegotiation in the PHY. The link comes up later and
+    # raises LSC (about 0.5 s in QEMU); up does not wait for it.
+    fn link_up_start(self: @&E1000eNic<R>) -> Result<(), UpError>
+        let ctrl: u32 = self.regs.rd(REG_CTRL)
+        self.regs.wr(REG_CTRL, (ctrl | CTRL_SLU) & (0xFFFFFFFF ^ (CTRL_FRCSPD | CTRL_FRCDPLX)))
+        let bmcr: u16 = match self.phy_read(MII_BMCR)
+            Ok(v) => v
+            Err(e) => return Err(UpError.Phy(e))
+        match self.phy_write(MII_BMCR, bmcr | BMCR_ANENABLE | BMCR_ANRESTART)
+            Ok(_) => Ok(())
+            Err(e) => Err(UpError.Phy(e))
+
+    # Post free buffers into the slots at rx_tail, in ring order, while the
+    # ring has room. Which buffer goes where is the free stack's order:
+    # tokens are buffer ids, so a release out of order still fills the next
+    # slot.
+    fn rx_refill(self: @&E1000eNic<R>)
+        while next_slot(self.rx_tail) != self.rx_next
+            let b: u32 = match self.rx_free.pop()
+                Some(x) => x
+                None => return
+            let s: u32 = self.rx_tail
+            self.rx_slot[s] = b
+            self.rx_desc[s as i64] = RxDesc { addr: buf_iova(self.rx_pool, b), length: 0, csum: 0, status: 0, errors: 0, special: 0 }
+            self.rx_tail = next_slot(s)
+            self.rx_due = true
+
+    # Return every buffer the device has sent (DD set, in ring order) to
+    # the free stack.
+    fn tx_reclaim(self: @&E1000eNic<R>)
+        while self.tx_clean != self.tx_next
+            let s: u32 = self.tx_clean
+            if (self.tx_desc[s as i64].status & TXD_STAT_DD) == 0
+                return
+            self.tx_desc[s as i64].status = 0
+            self.tx_free.push(self.tx_slot[s])
+            self.tx_busy = self.tx_busy - 1
+            self.tx_clean = next_slot(s)
+
+    fn link_is_up(self: @E1000eNic<R>) -> bool
+        (self.regs.rd(REG_STATUS) & STATUS_LU) != 0
+
+impl<R: Regs> Nic for E1000eNic<R>
+    # The frame in the slot at rx_next once the device has set DD: its
+    # bytes in place (no NIC header), its token the buffer id. A frame with
+    # errors or without EOP is counted and its buffer reposted.
+    fn rx_poll(self: @&E1000eNic<R>) -> Option<RxFrame>
+        # DD is read before the rest of the descriptor and the buffer.
+        fence()
+        while self.rx_next != self.rx_tail
+            let s: u32 = self.rx_next
+            let d: RxDesc = self.rx_desc[s as i64]
+            if (d.status & RXD_STAT_DD) == 0
+                return None
+            fence()
+            self.rx_next = next_slot(s)
+            let b: u32 = self.rx_slot[s]
+            let ok: bool = (d.status & RXD_STAT_EOP) != 0 and (d.errors & RXD_ERR_FRAME) == 0 and d.length != 0 and d.length as u64 <= E1000E_BUF_SIZE
+            if not ok
+                self.rx_dropped = self.rx_dropped + 1
+                self.rx_free.push(b)
+                self.rx_refill()
+                continue
+            self.rx_out[b] = true
+            let bytes: [u8] = buf(self.rx_pool, b)
+            return Some(RxFrame { bytes: bytes[0..d.length as i64], token: b })
+        None
+
+    # The buffer goes back to the free stack and the free stack into the
+    # slots at RDT; the next tx_kick tells the device. A token netd does
+    # not hold is ignored.
+    fn rx_release(self: @&E1000eNic<R>, f: RxFrame)
+        if f.token >= E1000E_RING or not self.rx_out[f.token]
+            return
+        self.rx_out[f.token] = false
+        self.rx_free.push(f.token)
+        self.rx_refill()
+
+    # Reclaim first, then a free buffer, or None with the ring's share of
+    # buffers held or in flight. The buffer is held until tx_submit.
+    fn tx_buffer(self: @&E1000eNic<R>) -> Option<TxFrame>
+        fence()
+        self.tx_reclaim()
+        if self.tx_busy >= E1000E_RING_USABLE
+            return None
+        let b: u32 = self.tx_free.pop()?
+        self.tx_held[b] = true
+        self.tx_busy = self.tx_busy + 1
+        Some(TxFrame { bytes: buf(self.tx_pool, b), token: b })
+
+    # The descriptor at tx_next: the buffer, `len`, EOP | IFCS | RS. There
+    # is no NIC header; TCTL.PSP pads a frame under 60 bytes. A runt or a
+    # frame past the buffer is not sent and the buffer goes back.
+    fn tx_submit(self: @&E1000eNic<R>, f: TxFrame, len: u32)
+        if f.token >= E1000E_RING or not self.tx_held[f.token]
+            return
+        let b: u32 = f.token
+        self.tx_held[b] = false
+        if len < ETH_HEADER_LEN or len as u64 > E1000E_BUF_SIZE
+            self.tx_refused = self.tx_refused + 1
+            self.tx_free.push(b)
+            self.tx_busy = self.tx_busy - 1
+            return
+        let s: u32 = self.tx_next
+        self.tx_slot[s] = b
+        self.tx_desc[s as i64] = TxDesc { addr: buf_iova(self.tx_pool, b), length: len as u16, cso: 0, cmd: TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS, status: 0, css: 0, special: 0 }
+        self.tx_next = next_slot(s)
+        self.tx_due = true
+
+    # One RDT write for the buffers posted and one TDT write for the frames
+    # submitted since the last kick. The descriptors are visible first.
+    fn tx_kick(self: @&E1000eNic<R>)
+        if not self.rx_due and not self.tx_due
+            return
+        fence()
+        if self.rx_due
+            self.rx_due = false
+            self.regs.wr(REG_RDT, self.rx_tail)
+        if self.tx_due
+            self.tx_due = false
+            self.regs.wr(REG_TDT, self.tx_next)
+
+    # Acknowledge what ICR holds, then enable RXQ0, TXQ0 and OTHER (with
+    # LSC behind it).
+    fn irq_arm(self: @&E1000eNic<R>)
+        self.ack_icr()
+        self.regs.wr(REG_IMS, IMS_CAUSES)
+
+    # The MAC up read, STATUS.LU now, MTU 1500, NETDEV_TYPE_E1000E.
+    fn link(self: @E1000eNic<R>) -> NetInfo
+        var up: u8 = 0
+        if self.link_is_up()
+            up = 1
+        NetInfo { mac: self.mac, link_up: up, device_type: NETDEV_TYPE_E1000E, mtu: E1000E_MTU }
