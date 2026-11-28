@@ -22,6 +22,7 @@
 # the console's whatever the table becomes (#3629). Pure Ritz (proc/table
 # and errno), so ritz0/test_harland_tty.py runs it on the host.
 
+import ritzlib.result { Result }
 import syscall.errno { Errno }
 import proc.table { proc_current_pid, proc_current_descends_from }
 
@@ -29,39 +30,52 @@ pub const TTY_FG_NONE: u64 = 0
 pub const TTY_FG_CHILDREN: u64 = 1
 pub const TTY_FG_PID: u64 = 2
 
-# The foreground's root pid, and whether the root itself is in it
-# (TTY_FG_CHILDREN leaves the caller out). g_fg_pid 0: TTY_FG_NONE.
-var g_fg_pid: u64 = 0
-var g_fg_root_in: bool = false
+# The foreground: its root pid (0: TTY_FG_NONE), and whether the root
+# itself is in it (TTY_FG_CHILDREN leaves the caller out). A value, so
+# tty/restore.ritz can save the one a process replaced and put it back when
+# that process dies (#4958).
+pub struct TtyFg
+    pid: u64
+    root_in: bool
+
+impl TtyFg
+    pub fn same(self, other: TtyFg) -> bool
+        self.pid == other.pid and self.root_in == other.root_in
+
+var g_fg: TtyFg
 
 pub fn tty_fg_reset()
-    g_fg_pid = 0
-    g_fg_root_in = false
+    g_fg = TtyFg { pid: 0, root_in: false }
 
-# Set the foreground for the running process (pid is TTY_FG_PID's). 0, or
+# The foreground as it stands, and putting a saved one back.
+pub fn tty_fg_get() -> TtyFg
+    g_fg
+
+pub fn tty_fg_put(fg: TtyFg)
+    g_fg = fg
+
+# Set the foreground for the running process (pid is TTY_FG_PID's).
 # Errno.Inval for an unknown mode or pid 0, which change nothing.
-pub fn tty_fg_set(mode: u64, pid: u64) -> i32
+pub fn tty_fg_set(mode: u64, pid: u64) -> Result<(), Errno>
     if mode == TTY_FG_NONE
         tty_fg_reset()
-        return 0
+        return Ok(())
     if mode == TTY_FG_CHILDREN
         let me: u64 = proc_current_pid()
         if me == 0
-            return Errno.Inval as i32
-        g_fg_pid = me
-        g_fg_root_in = false
-        return 0
+            return Err(Errno.Inval)
+        g_fg = TtyFg { pid: me, root_in: false }
+        return Ok(())
     if mode != TTY_FG_PID or pid == 0
-        return Errno.Inval as i32
-    g_fg_pid = pid
-    g_fg_root_in = true
-    0
+        return Err(Errno.Inval)
+    g_fg = TtyFg { pid: pid, root_in: true }
+    Ok(())
 
 # The running process is in the foreground: a Ctrl-C is its.
 pub fn tty_fg_is_current() -> bool
     let me: u64 = proc_current_pid()
     if me <= 1
         return false
-    if g_fg_pid == 0
+    if g_fg.pid == 0
         return true
-    proc_current_descends_from(g_fg_pid, g_fg_root_in)
+    proc_current_descends_from(g_fg.pid, g_fg.root_in)

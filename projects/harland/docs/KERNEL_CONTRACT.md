@@ -128,6 +128,16 @@ fn sys_tty_setfg(fd: i32, mode: u64, pid: u64) -> i32
 - **Returns**: 0, ENOTTY for any other fd, EINVAL for an unknown mode, for
   TTY_FG_PID with pid 0, or for TTY_FG_CHILDREN before init starts
 
+**A setter's death restores** (AGAST #4958, `tty/restore.ritz`). The kernel
+saves the flags each `tty_setattr` replaced and the foreground each
+`tty_setfg` replaced, newest writer on top. When a process exits by any
+path (exit, a Ctrl-C's kill, a fault, PROC_REAP), each setting it wrote last
+goes back to what it replaced: an editor killed in raw mode leaves its shell
+a cooked console and the shell's own foreground. Nested setters unwind
+newest first; a setting someone wrote after the dead process stands, and
+goes back to before both when that writer dies. A process that wrote back
+the value it replaced (restored itself) is not restored again.
+
 ---
 
 ### IPC Syscalls

@@ -1,0 +1,154 @@
+# The console's attributes and foreground outlive the process that set
+# them only while it lives (AGAST #4958)
+#
+# A Ctrl-C under TTY_ISIG, a fault or the kernel's PROC_REAP kills a
+# process outright: it never runs the code that would put the console back.
+# An editor killed in raw mode left the console raw for the shell after it,
+# and a program that named itself the foreground left it on a dead pid.
+#
+# So the kernel keeps, for each of the two settings, the value each writer
+# replaced: a LIFO of (pid, saved value) records, the newest write on top.
+# A write by pid P (tty_restore_set_attrs, tty_restore_set_fg):
+#   * P on top already: nothing to save, unless P wrote back the value it
+#     saved (the setter restored itself): its record goes, so its death
+#     restores nothing and no later writer is overwritten;
+#   * otherwise P's record, if any, is taken out (below) and a new one goes
+#     on top with the value P replaced. One record per pid, so a table of
+#     MAX_PROCS never fills.
+# P's death (tty_restore_exit, from sys_exit_impl: exit, Ctrl-C, a fault,
+# PROC_REAP alike) takes its record out:
+#   * on top: P made the last write, and the setting goes back to what P
+#     replaced;
+#   * below: someone wrote after P, and their write stands; the record
+#     above P's inherits P's saved value, so when that writer dies too the
+#     setting goes back to what it was before either of them.
+# Nested setters (rzsh, then an editor it runs) unwind in LIFO order. The
+# kernel's own writes (pid 0, no process) are not recorded. init's are, and
+# init never dies but by powering off.
+#
+# Pure Ritz over the line discipline, tty/fg.ritz and proc/table.ritz, so
+# ritz0/tests/test_harland_tty.py runs it on the host. tty/console.ritz
+# calls it with interrupts off.
+
+import ritzlib.option
+import ritzlib.result { Result }
+import syscall.errno { Errno }
+import proc.table { MAX_PROCS, proc_current_pid }
+import tty.ldisc { ldisc_get_flags, ldisc_set_flags }
+import tty.fg { TtyFg, tty_fg_get, tty_fg_put, tty_fg_set }
+
+# A writer's pid and the value its write replaced.
+struct Saved<T>
+    pid: u64
+    was: T
+
+# The writers of one setting, oldest first (MAX_PROCS of them).
+struct SaveStack<T>
+    recs: [8]Saved<T>
+    len: i32
+
+impl<T> SaveStack<T>
+    fn clear(self: @&SaveStack<T>)
+        self.len = 0
+
+    fn on_top(self: @SaveStack<T>, pid: u64) -> bool
+        self.len > 0 and self.recs[self.len - 1].pid == pid
+
+    # The value the top record saved: what its writer replaced.
+    fn top_was(self: @SaveStack<T>) -> Option<T>
+        if self.len == 0
+            return None
+        Some(self.recs[self.len - 1].was)
+
+    fn pop(self: @&SaveStack<T>)
+        if self.len > 0
+            self.len = self.len - 1
+
+    # Take pid's record out. On top: Some(the value it saved), for the
+    # caller to put back. Below: the record above inherits its saved value,
+    # and None. No record: None.
+    fn forget(self: @&SaveStack<T>, pid: u64) -> Option<T>
+        var k: i32 = 0
+        while k < self.len and self.recs[k].pid != pid
+            k = k + 1
+        if k == self.len
+            return None
+        let was: T = self.recs[k].was
+        if k == self.len - 1
+            self.len = k
+            return Some(was)
+        self.recs[k + 1].was = was
+        while k + 1 < self.len
+            self.recs[k] = self.recs[k + 1]
+            k = k + 1
+        self.len = self.len - 1
+        None
+
+    # A new top record. Full (more writers than processes: not reachable
+    # while each pid has one), the oldest record goes.
+    fn push(self: @&SaveStack<T>, pid: u64, was: T)
+        if self.len == MAX_PROCS
+            var k: i32 = 0
+            while k + 1 < self.len
+                self.recs[k] = self.recs[k + 1]
+                k = k + 1
+            self.len = self.len - 1
+        self.recs[self.len] = Saved<T> { pid: pid, was: was }
+        self.len = self.len + 1
+
+    # pid's write: `same_as_saved` says whether the value it wrote is the
+    # one its top record saved (it put the setting back itself), `changed`
+    # whether the write changed the setting at all. `same_as_saved` matters
+    # only when pid holds the top record.
+    fn note(self: @&SaveStack<T>, pid: u64, old: T, same_as_saved: bool, changed: bool)
+        if self.on_top(pid)
+            if same_as_saved
+                self.pop()
+            return
+        self.forget(pid)
+        if changed
+            self.push(pid, old)
+
+var g_attr_writers: SaveStack<u32>
+var g_fg_writers: SaveStack<TtyFg>
+
+# Nothing saved (boot; the host test).
+pub fn tty_restore_reset()
+    g_attr_writers.clear()
+    g_fg_writers.clear()
+
+# tty_setattr for the running process: the line discipline's flags.
+pub fn tty_restore_set_attrs(flags: u32)
+    let me: u64 = proc_current_pid()
+    let old: u32 = ldisc_get_flags()
+    ldisc_set_flags(flags)
+    if me == 0
+        return
+    let saved: u32 = g_attr_writers.top_was().unwrap_or(old)
+    g_attr_writers.note(me, old, saved == flags, old != flags)
+
+# tty_setfg for the running process (tty/fg.ritz). Errno.Inval changes and
+# saves nothing.
+pub fn tty_restore_set_fg(mode: u64, pid: u64) -> Result<(), Errno>
+    let me: u64 = proc_current_pid()
+    let old: TtyFg = tty_fg_get()
+    tty_fg_set(mode, pid)?
+    if me == 0
+        return Ok(())
+    let now: TtyFg = tty_fg_get()
+    let saved: TtyFg = g_fg_writers.top_was().unwrap_or(old)
+    g_fg_writers.note(me, old, saved.same(now), not old.same(now))
+    Ok(())
+
+# pid has died: each setting it made last goes back to what it replaced.
+pub fn tty_restore_exit(pid: u64)
+    match g_attr_writers.forget(pid)
+        Some(flags) => ldisc_set_flags(flags)
+        None => pass
+    match g_fg_writers.forget(pid)
+        Some(fg) => tty_fg_put(fg)
+        None => pass
+
+# Records held, for the host test: attrs writers, fg writers.
+pub fn tty_restore_depth() -> i32
+    g_attr_writers.len + g_fg_writers.len

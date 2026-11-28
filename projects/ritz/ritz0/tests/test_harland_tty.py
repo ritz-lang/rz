@@ -401,9 +401,21 @@ PROC_TABLE = KERNEL_SRC / "proc" / "table.ritz"
 ERRNO = KERNEL_SRC / "syscall" / "errno.ritz"
 
 FG_PROGRAM = """\
+import ritzlib.result { Result }
 import syscall.errno { Errno }
 import proc.table
 import tty.fg
+
+# tty_fg_set's answers (Result<(), Errno>).
+fn ok(r: Result<(), Errno>) -> bool
+    match r
+        Ok(_) => true
+        Err(_) => false
+
+fn inval(r: Result<(), Errno>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e == Errno.Inval
 
 # What spawn and the scheduler do (#3629): a new child runs; an exiting
 # process hands the CPU back to its parent's slot.
@@ -432,7 +444,7 @@ fn main() -> i32
         return 3
     # rzsh hands the console to its children: from here on a Ctrl-C while
     # rzsh runs (tty_setattr .. spawn) is not rzsh's.
-    if tty_fg_set(TTY_FG_CHILDREN, 0) != 0 or tty_fg_is_current()
+    if not ok(tty_fg_set(TTY_FG_CHILDREN, 0)) or tty_fg_is_current()
         return 4
     # the command, pid 3, and what it spawns, pid 4
     let cmd: i32 = spawn()
@@ -447,7 +459,7 @@ fn main() -> i32
         return 7
     # A pid: that process and its descendants, not its parent.
     let five: i32 = spawn()
-    if proc_current_pid() != 5 or tty_fg_set(TTY_FG_PID, 5) != 0 or not tty_fg_is_current()
+    if proc_current_pid() != 5 or not ok(tty_fg_set(TTY_FG_PID, 5)) or not tty_fg_is_current()
         return 8
     spawn()
     if not tty_fg_is_current()
@@ -457,20 +469,20 @@ fn main() -> i32
     if tty_fg_is_current()
         return 10
     # A pid that is not running matches nothing.
-    if tty_fg_set(TTY_FG_PID, 99) != 0 or tty_fg_is_current()
+    if not ok(tty_fg_set(TTY_FG_PID, 99)) or tty_fg_is_current()
         return 11
     # TTY_FG_NONE: the running process again; anything else is EINVAL.
-    if tty_fg_set(TTY_FG_NONE, 0) != 0 or not tty_fg_is_current()
+    if not ok(tty_fg_set(TTY_FG_NONE, 0)) or not tty_fg_is_current()
         return 12
-    if tty_fg_set(3, 0) != Errno.Inval as i32 or tty_fg_set(TTY_FG_PID, 0) != Errno.Inval as i32
+    if not inval(tty_fg_set(3, 0)) or not inval(tty_fg_set(TTY_FG_PID, 0))
         return 13
     if not tty_fg_is_current()
         return 13
     # init is never the foreground, not even by its pid.
     exit_to(0, init)
-    if proc_current_pid() != 1 or tty_fg_set(TTY_FG_PID, 1) != 0 or tty_fg_is_current()
+    if proc_current_pid() != 1 or not ok(tty_fg_set(TTY_FG_PID, 1)) or tty_fg_is_current()
         return 14
-    if tty_fg_set(TTY_FG_CHILDREN, 0) != 0 or tty_fg_is_current()
+    if not ok(tty_fg_set(TTY_FG_CHILDREN, 0)) or tty_fg_is_current()
         return 15
     0
 """
@@ -530,3 +542,216 @@ def test_tty_setfg_syscall():
     for code in (sys, _code(FG)):
         for name, n in (("NONE", 0), ("CHILDREN", 1), ("PID", 2)):
             assert re.search(rf"TTY_FG_{name}: u64 = {n}\b", code), name
+
+
+# AGAST #4958: a process killed by Ctrl-C (TTY_ISIG), a fault or PROC_REAP
+# never runs the code that puts the console back, so an editor killed in raw
+# mode used to leave the shell a raw console, and a program that named
+# itself the foreground left it on a dead pid. tty/restore.ritz saves, per
+# setting, the value each writer replaced, newest on top; sys_exit_impl
+# (every exit path) hands the dying pid to tty_restore_exit, which puts back
+# what it replaced if its write is the last, and passes its saved value up
+# if someone wrote after it. One host program walks set-then-exit,
+# set-then-reap, nested setters and a setter that restored itself.
+
+RESTORE = KERNEL_SRC / "tty" / "restore.ritz"
+PROCESS_RT = KERNEL_SRC / "syscall" / "runtime" / "process.ritz"
+
+RESTORE_PROGRAM = """\
+import ritzlib.result { Result }
+import syscall.errno { Errno }
+import proc.table
+import tty.ldisc
+import tty.fg
+import tty.restore
+
+# tty_fg_set's answers (Result<(), Errno>).
+fn ok(r: Result<(), Errno>) -> bool
+    match r
+        Ok(_) => true
+        Err(_) => false
+
+fn inval(r: Result<(), Errno>) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e == Errno.Inval
+
+fn spawn() -> i32
+    let slot: i32 = proc_new_child()
+    proc_start(slot)
+    proc_set_current(slot)
+    slot
+
+# sys_exit_impl's order: the console first, then the table; the CPU goes
+# back to the parent's slot.
+fn exit_to(code: i64, parent: i32)
+    tty_restore_exit(proc_current_pid())
+    proc_exit_current(code)
+    proc_set_current(parent)
+
+fn fg_is(pid: u64, root_in: bool) -> bool
+    tty_fg_get().same(TtyFg { pid: pid, root_in: root_in })
+
+fn main() -> i32
+    proc_table_reset()
+    ldisc_reset()
+    tty_fg_reset()
+    tty_restore_reset()
+    proc_enter_init(4096)
+    let rzsh: i32 = spawn()
+    # rzsh edits a line raw, then restores the cooked console itself before
+    # a command: its record goes (the setter restored itself).
+    tty_restore_set_attrs(0)
+    if ldisc_get_flags() != 0 or tty_restore_depth() != 1
+        return 1
+    tty_restore_set_attrs(TTY_FLAGS_DEFAULT)
+    if ldisc_get_flags() != TTY_FLAGS_DEFAULT or tty_restore_depth() != 0
+        return 2
+    if not ok(tty_restore_set_fg(TTY_FG_CHILDREN, 0)) or not fg_is(2, false)
+        return 3
+
+    # Set then exit (a Ctrl-C's kill): the editor, pid 3, goes raw and names
+    # itself the foreground; its death gives rzsh back the cooked console and
+    # rzsh's own foreground.
+    let ed: i32 = spawn()
+    tty_restore_set_attrs(0)
+    if not ok(tty_restore_set_fg(TTY_FG_PID, 3)) or not fg_is(3, true)
+        return 4
+    exit_to(130, rzsh)
+    if ldisc_get_flags() != TTY_FLAGS_DEFAULT
+        return 5
+    if not fg_is(2, false)
+        return 6
+
+    # A refused tty_setfg saves nothing.
+    spawn()
+    if not inval(tty_restore_set_fg(9, 0)) or tty_restore_depth() != 1
+        return 7
+
+    # Set then reap: pid 4 goes raw; the kernel marks it PROC_REAP and its
+    # next return to user exits through sys_exit_impl like any exit.
+    tty_restore_set_attrs(TTY_ECHO)
+    match proc_mark_exit(4)
+        Ok(_) => pass
+        Err(_) => return 8
+    if proc_reap_current() != 1
+        return 8
+    exit_to(137, rzsh)
+    if ldisc_get_flags() != TTY_FLAGS_DEFAULT or tty_restore_depth() != 1
+        return 9
+
+    # Nested setters unwind LIFO: pid 5 sets echo only, its child pid 6 goes
+    # raw; 6's death gives back echo only, then 5's the cooked console.
+    let outer: i32 = spawn()
+    tty_restore_set_attrs(TTY_ECHO)
+    spawn()
+    tty_restore_set_attrs(0)
+    exit_to(130, outer)
+    if ldisc_get_flags() != TTY_ECHO
+        return 10
+    exit_to(130, rzsh)
+    if ldisc_get_flags() != TTY_FLAGS_DEFAULT or tty_restore_depth() != 1
+        return 11
+
+    # Out of order: pid 7 sets echo only, pid 8 (its child) goes raw, and 7
+    # dies first. 8's write stands; 8's death goes back to before 7.
+    let seven: i32 = spawn()
+    tty_restore_set_attrs(TTY_ECHO)
+    let eight: i32 = spawn()
+    tty_restore_set_attrs(0)
+    proc_set_current(seven)
+    exit_to(130, eight)
+    if ldisc_get_flags() != 0
+        return 12
+    exit_to(130, rzsh)
+    if ldisc_get_flags() != TTY_FLAGS_DEFAULT or tty_restore_depth() != 1
+        return 13
+
+    # A setter that restored itself is not restored again: pid 9 goes raw
+    # and back, then rzsh goes raw (for its line editor); 9's death leaves
+    # rzsh's raw console alone.
+    let nine: i32 = spawn()
+    tty_restore_set_attrs(0)
+    tty_restore_set_attrs(TTY_FLAGS_DEFAULT)
+    if tty_restore_depth() != 1
+        return 14
+    proc_set_current(rzsh)
+    tty_restore_set_attrs(0)
+    proc_set_current(nine)
+    exit_to(0, rzsh)
+    if ldisc_get_flags() != 0
+        return 15
+
+    # A write that changes nothing saves nothing, and its writer's death
+    # changes nothing.
+    spawn()
+    let depth: i32 = tty_restore_depth()
+    tty_restore_set_attrs(0)
+    if tty_restore_depth() != depth
+        return 16
+    exit_to(0, rzsh)
+    if ldisc_get_flags() != 0 or not fg_is(2, false)
+        return 17
+    0
+"""
+
+RESTORE_CLAIMS = {1: "a write saves the value it replaced",
+                  2: "a setter that writes back what it replaced drops its record",
+                  3: "tty_restore_set_fg sets the foreground",
+                  4: "the editor names itself the foreground",
+                  5: "set then exit: the attrs come back",
+                  6: "set then exit: the foreground goes back to the parent's",
+                  7: "a refused tty_setfg saves nothing",
+                  8: "PROC_REAP marks the process", 9: "set then reap: the attrs come back",
+                  10: "nested: the inner setter's death restores the outer's attrs",
+                  11: "nested: the outer setter's death restores the shell's",
+                  12: "out of order: a later writer's attrs stand",
+                  13: "out of order: the last death goes back to before both",
+                  14: "a setter that restored itself holds no record",
+                  15: "no double restore over a later writer",
+                  16: "a write that changes nothing saves nothing",
+                  17: "... and its writer's death changes nothing"}
+
+
+@pytest.mark.integration
+def test_console_restored_when_its_setter_dies(tmp_path):
+    files = [(ERRNO, "syscall/errno.ritz"), (PROC_TABLE, "proc/table.ritz"), (LDISC, "tty/ldisc.ritz"),
+             (FG, "tty/fg.ritz"), (RESTORE, "tty/restore.ritz")]
+    tree = tmp_path / "tree"
+    for src, rel in files:
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tree / rel).write_text(src.read_text())
+    (tmp_path / "t.ritz").write_text(RESTORE_PROGRAM + CPU_HOOKS)
+    env = dict(os.environ, RITZ_PATH=f"{tree}:{RITZ_ROOT}:{tmp_path}")
+    objs = []
+    units = [(tmp_path / "t.ritz", "t", ())] + [(tree / rel, Path(rel).stem, ("--no-runtime",))
+                                               for _, rel in files]
+    for src, name, extra in units:
+        ll = tmp_path / f"{name}.ll"
+        proc = run_ritz0([str(src), "-o", str(ll), *extra], cwd=tmp_path, env=env, timeout=300)
+        assert proc.returncode == 0 and ll.exists(), f"ritz0 rejected {name}:\n{proc.stdout}{proc.stderr}"
+        objs.append(str(ll))
+    exe = tmp_path / "t"
+    link = subprocess.run(["clang", "-Wno-override-module", *objs, "-o", str(exe), "-nostdlib", "-no-pie"],
+                          capture_output=True, text=True)
+    assert link.returncode == 0, link.stderr[-3000:]
+    rc = subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
+    assert rc == 0, f"exit {rc}: {RESTORE_CLAIMS.get(rc, 'crash')}"
+
+
+def test_every_exit_path_restores_the_console():
+    """The host program calls tty_restore_exit itself; the kernel's one call
+    is in sys_exit_impl, which exit, a Ctrl-C's kill and PROC_REAP all reach,
+    and the tty syscalls write through tty/restore.ritz, never past it."""
+    process = _code(PROCESS_RT)
+    exit_body = _body(process, "sys_exit_impl")
+    assert "tty_restore_exit(me.pid)" in exit_body
+    assert exit_body.index("tty_restore_exit(") < exit_body.index("proc_exit_current("), \
+        "restored before the parent can run"
+    assert "sys_exit_impl(status)" in _body(process, "process_kill_current")
+    assert "sys_exit_impl(PROC_REAP_STATUS)" in _body(process, "process_reap_exit")
+    console = _code(CONSOLE)
+    assert "tty_restore_set_attrs(flags)" in _body(console, "tty_console_set_flags")
+    assert "tty_restore_set_fg(mode, pid)" in _body(console, "tty_console_set_fg")
+    assert "ldisc_set_flags" not in console and "tty_fg_set" not in console, \
+        "every console write is saved for its writer's death"
