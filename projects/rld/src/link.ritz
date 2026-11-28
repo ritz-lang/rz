@@ -13,6 +13,7 @@ import ritzlib.gvec { Vec, vec_new, vec_zeroed }
 import ritzlib.hashmap { HashMap, HashMapI64, hashmap_new, hashmap_i64_new }
 import ritzlib.option { Option }
 import ritzlib.result { Result }
+import ritzlib.sort { sort }
 import ritzlib.span { Span, span_from_vec }
 import ritzlib.strview { StrView }
 import razm.elf
@@ -70,6 +71,8 @@ pub struct Image
     data_relatives: i64         # R_X86_64_64 relocations a PIE loads as RELATIVE
     made: Vec<Made>             # the dynamic-linking sections (not the GOT)
     made_out: Vec<i64>          # per made section, its index in outs
+    made_offset: Vec<i64>       # per made section, its offset in that output section
+    load_headers: bool          # the ELF and program headers are in a PT_LOAD
 
 pub fn align_up(v: i64, align: i64) -> i64
     (v + align - 1) & ~(align - 1)
@@ -130,7 +133,7 @@ fn needs_relative(l: @Linker, rel: InReloc) -> Result<bool, LinkError>
 
 # The R_X86_64_64 relocations a PIE turns into RELATIVEs, or the first one
 # it cannot load.
-fn count_data_relatives(l: @Linker) -> Result<i64, LinkError>
+pub fn count_data_relatives(l: @Linker) -> Result<i64, LinkError>
     var n: i64 = 0
     for r in 0..l.relocs.len
         if needs_relative(l, l.relocs[r])?
@@ -138,7 +141,7 @@ fn count_data_relatives(l: @Linker) -> Result<i64, LinkError>
     Ok(n)
 
 # The RELATIVEs: the data relocations' and the kept GOT slots'.
-fn relative_count(l: @Linker, img: @Image) -> i64
+pub fn relative_count(l: @Linker, img: @Image) -> i64
     if not is_pic(img.output)
         return 0
     var n: i64 = img.data_relatives
@@ -242,7 +245,9 @@ pub fn image_new(l: @Linker, output: Output) -> Image
         output: output,
         data_relatives: 0,
         made: vec_new<Made>(),
-        made_out: vec_new<i64>()
+        made_out: vec_new<i64>(),
+        made_offset: vec_new<i64>(),
+        load_headers: true
     }
     for r in 0..l.relocs.len
         let rel: InReloc = l.relocs[r]
@@ -250,12 +255,14 @@ pub fn image_new(l: @Linker, output: Output) -> Image
         img.relax.push(relax_kind(code, rel.offset, rel.rtype, rel.addend, is_pic(output)))
     img
 
+pub fn is_got_load(rel: InReloc) -> bool
+    rel.rtype == R_X86_64_GOTPCREL or rel.rtype == R_X86_64_GOTPCRELX or rel.rtype == R_X86_64_REX_GOTPCRELX
+
 # A GOT slot for each GOT load that is kept.
 pub fn plan_got(l: @Linker, img: @&Image)
     for r in 0..l.relocs.len
         let rel: InReloc = l.relocs[r]
-        let got_load: bool = rel.rtype == R_X86_64_GOTPCREL or rel.rtype == R_X86_64_GOTPCRELX or rel.rtype == R_X86_64_REX_GOTPCRELX
-        if not got_load or img.relax[r] != Relax.Keep
+        if not is_got_load(rel) or img.relax[r] != Relax.Keep
             continue
         let d: i64 = l.definition(rel.symbol)
         if img.got.contains(d)
@@ -343,20 +350,31 @@ fn place(l: @Linker, img: @&Image, gathered: @Vec<OutSection>)
     for m in 0..made_index.len
         made_out.push(new_index[made_index[m]])
     img.made_out = made_out
+    img.made_offset = vec_zeroed<i64>(made_index.len)
     img.placed = new_index
 
 # Where the made section `m` was placed in outs, if the output has it.
 fn made_at(img: @Image, m: Made) -> Option<i64>
     if m == Made.Got
         return if img.got_out >= 0 then Some(img.got_out) else None
+    match made_index(img, m)
+        Some(i) => Some(img.made_out[i])
+        None => None
+
+# The made section `m`'s index in img.made, if the output has it (never the
+# GOT, which got_out places).
+pub fn made_index(img: @Image, m: Made) -> Option<i64>
     for i in 0..img.made.len
         if img.made[i] == m
-            return Some(img.made_out[i])
+            return Some(i)
     None
 
+# The address of the made section `m`, or 0 when the output has none.
 fn made_addr(img: @Image, m: Made) -> i64
-    match made_at(img, m)
-        Some(o) => img.outs[o].addr
+    if m == Made.Got
+        return if img.got_out >= 0 then img.outs[img.got_out].addr + img.got_at else 0
+    match made_index(img, m)
+        Some(i) => img.outs[img.made_out[i]].addr + img.made_offset[i]
         None => 0
 
 # The segments the placed sections make.
@@ -400,25 +418,26 @@ fn phnum_of(outs: @Vec<OutSection>, output: Output) -> i64
     var used: [3]bool = [true, false, false]
     for o in 0..outs.len
         used[segment_of(outs[o])] = true
-    var n: i64 = extra_phdrs(output)
+    var n: i64 = extra_phdrs(output, true)
     for g in 0..SEGMENTS
         if used[g]
             n += 1
     n
 
 # The program headers besides the PT_LOADs: PT_GNU_STACK, and in a PIE
-# PT_PHDR and PT_DYNAMIC, and in the hosted one PT_INTERP.
-pub fn extra_phdrs(output: Output) -> i64
+# PT_DYNAMIC, and PT_PHDR when the headers are loaded, and in the hosted
+# one PT_INTERP.
+pub fn extra_phdrs(output: Output, load_headers: bool) -> i64
     var n: i64 = 1
     if is_pic(output)
-        n += 2
+        n += if load_headers then 2 else 1
     if output == Output.Hosted
         n += 1
     n
 
 # Apply one relocation to the image: the RELATIVE a PIE needs for it, if
 # any.
-fn apply(l: @Linker, img: @Image, bytes: @&Vec<u8>, r: i64) -> Result<Option<RelaEntry>, LinkError>
+fn apply(l: @Linker, img: @Image, bytes: @&Vec<u8>, r: i64) -> Result<Option<Relative>, LinkError>
     let rel: InReloc = l.relocs[r]
     if rel.rtype == R_X86_64_NONE
         return Ok(None)
@@ -428,7 +447,7 @@ fn apply(l: @Linker, img: @Image, bytes: @&Vec<u8>, r: i64) -> Result<Option<Rel
     let a: i64 = rel.addend
     let name: StrView = l.symbols[rel.symbol].name
     let overflow: LinkError = LinkError.Overflow(name, rel.rtype)
-    let load: Option<RelaEntry> = if is_pic(img.output) and needs_relative(l, rel)? then Some(relative(p, s + a)) else None
+    let load: Option<Relative> = if is_pic(img.output) and needs_relative(l, rel)? then Some(relative(p, s + a)) else None
     match rel.rtype
         R_X86_64_64 => patch_le(bytes, at, s + a, 8)
         R_X86_64_PC64 => patch_le(bytes, at, s + a - p, 8)
@@ -474,7 +493,7 @@ fn apply(l: @Linker, img: @Image, bytes: @&Vec<u8>, r: i64) -> Result<Option<Rel
 # table of the global definitions, and the name tables. A RELATIVE's place
 # also holds the link-time address, which a loader that applies none keeps.
 pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
-    let phnum: i64 = img.segs.len + extra_phdrs(img.output)
+    let phnum: i64 = img.segs.len + extra_phdrs(img.output, img.load_headers)
     var end: i64 = EHDR_SIZE + phnum * PHDR_SIZE
     for o in 0..img.outs.len
         let out: OutSection = img.outs[o]
@@ -499,7 +518,7 @@ pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
             continue
         for b in 0..s.data.len
             bytes[at + b] = s.data[b]
-    var relatives: Vec<RelaEntry> = vec_new<RelaEntry>()
+    var relatives: Vec<Relative> = vec_new<Relative>()
     if img.got_out >= 0
         let got: OutSection = img.outs[img.got_out]
         for slot in 0..img.got_syms.len
@@ -512,6 +531,7 @@ pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
         match apply(l, img, @&bytes, r)?
             Some(e) => relatives.push(e)
             None => pass
+    sort<Relative>(@&relatives)
     write_made(img, @&bytes, @relatives)
 
     # The ELF header and the program headers.
@@ -530,7 +550,7 @@ pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
     # In ld.lld's order: PT_PHDR, PT_INTERP, the loads, PT_DYNAMIC,
     # PT_GNU_STACK.
     var ph: i64 = EHDR_SIZE
-    if is_pic(img.output)
+    if is_pic(img.output) and img.load_headers
         let base: i64 = base_of(img.output)
         patch_phdr(@&bytes, ph, PT_PHDR, PF_R, EHDR_SIZE, base + EHDR_SIZE, base + EHDR_SIZE, phnum * PHDR_SIZE, phnum * PHDR_SIZE, PHDR_ALIGN)
         ph += PHDR_SIZE
@@ -565,6 +585,7 @@ pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
         var h: SectionHeader = SectionHeader { name: name, stype: stype, flags: out.flags, addr: out.addr, offset: out.offset, size: out.size, link: 0, info: 0, align: out.align, entsize: 0 }
         match made_kind(img, o)
             Some(m) =>
+                h.stype = made_type(m)
                 h.entsize = made_entsize(m)
                 match made_link(m)
                     Some(to) =>
@@ -625,7 +646,7 @@ fn made_kind(img: @Image, o: i64) -> Option<Made>
     None
 
 # Fill the dynamic-linking sections, `relatives` among them.
-fn write_made(img: @Image, bytes: @&Vec<u8>, relatives: @Vec<RelaEntry>)
+fn write_made(img: @Image, bytes: @&Vec<u8>, relatives: @Vec<Relative>)
     let at: DynAddrs = DynAddrs {
         rela: made_addr(img, Made.RelaDyn),
         dynsym: made_addr(img, Made.Dynsym),
@@ -639,10 +660,11 @@ fn write_made(img: @Image, bytes: @&Vec<u8>, relatives: @Vec<RelaEntry>)
             Interp => interp_bytes()
             GnuHash => gnu_hash_bytes()
             Hash => hash_bytes()
-            RelaDyn => rela_bytes(span_from_vec<RelaEntry>(relatives))
+            RelaDyn => rela_bytes(span_from_vec<Relative>(relatives))
             Dynamic => dynamic_bytes(img.output, relatives.len, at)
+            GotPlt => gotplt_bytes(made_addr(img, Made.Dynamic))
             Dynsym | Dynstr | Got => vec_new<u8>()    # all zero
-        let offset: i64 = img.outs[img.made_out[i]].offset
+        let offset: i64 = img.outs[img.made_out[i]].offset + img.made_offset[i]
         for b in 0..content.len
             bytes[offset + b] = content[b]
 

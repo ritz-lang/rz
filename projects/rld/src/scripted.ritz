@@ -1,10 +1,11 @@
-# The scripted executable (../razm/DESIGN.md "Linker scripts", "Outputs"):
-# ET_EXEC at the script's addresses, entry from its ENTRY, laid out as
-# ld.lld lays out the same script.
+# The scripted executable and freestanding PIE (../razm/DESIGN.md "Linker
+# scripts", "Outputs"): ET_EXEC or ET_DYN at the script's addresses, entry
+# from its ENTRY, laid out as ld.lld lays out the same script. No script in
+# the tree loads the headers, so a scripted PIE has no PT_PHDR.
 #
 # Inputs are the kept object sections, then the sections the linker makes
-# (the GOT), which patterns match like any other, after them, as ld.lld's
-# synthetic sections. Placement is first match: output statements in script
+# (the GOT, .got.plt, and a PIE's dynamic-linking sections), which patterns
+# match like any other, after them, as ld.lld's synthetic sections. Placement is first match: output statements in script
 # order, each `*(pat ...)` claiming in input order every unclaimed input any
 # of its patterns matches. /DISCARD/ drops what it claims. An input nothing
 # claims is an orphan, placed by ld.lld's sort-rank proximity.
@@ -24,23 +25,25 @@ import ritzlib.span { Span }
 import ritzlib.string { String }
 import ritzlib.strview { StrView }
 import razm.elf
-import rld.dynamic { Output }
+import rld.dynamic
 import rld.input
 import rld.link
 import rld.script
 
-# The linker-made inputs, after the object sections: the GOT, whose size
-# the GOT plan sets, and .got.plt, which ld.lld makes (three reserved words,
-# zero in an executable with no _DYNAMIC) when an input references
-# _GLOBAL_OFFSET_TABLE_, as `as` does for every GOT relocation. The symbol
-# is .got.plt's address, and the GOT is kept then, empty or not.
-const SYNTH_GOT: i64 = 0
-const SYNTH_GOTPLT: i64 = 1
-const SYNTHETICS: i64 = 2
-const GOT_NAME: StrView = ".got"
-const GOTPLT_NAME: StrView = ".got.plt"
+# The linker-made inputs, after the object sections, in the order ld.lld
+# makes them (lld/ELF/Writer.cpp createSyntheticSections), which orphans of
+# one rank keep:
+# - a PIE's dynamic-linking sections (dynamic.ritz), each only in a PIE,
+#   and .rela.dyn only when it holds a relocation;
+# - the GOT, whose size the GOT plan sets;
+# - .got.plt, which ld.lld makes when an input references
+#   _GLOBAL_OFFSET_TABLE_, as `as` does for every GOT relocation. The symbol
+#   is .got.plt's address, and the GOT is kept then, empty or not.
+const SYNTHETICS: i64 = 8
+const SYNTH_KINDS: [8]Made = [Made.Dynsym, Made.GnuHash, Made.Hash, Made.Dynamic, Made.Dynstr, Made.RelaDyn, Made.Got, Made.GotPlt]
+const SYNTH_GOT: i64 = 6
+const SYNTH_GOTPLT: i64 = 7
 const GOT_TABLE: StrView = "_GLOBAL_OFFSET_TABLE_"
-const GOTPLT_SIZE: i64 = 3 * GOT_ENTRY
 
 # ld.lld's sort-rank bits (lld/ELF/Writer.cpp getSectionRank), the subset
 # an executable's sections reach. Orphans go beside the section whose rank
@@ -75,6 +78,8 @@ struct ScriptOut
     offset: i64
     seg: Option<i64>    # its PT_LOAD in `segs`, if one holds it
     index: i64          # in the image's outs, once placed
+    typed: Option<Made> # a linker-made member whose type is not PROGBITS
+    members: i64
 
 # A command of the script, or an orphan output section, in layout order.
 enum LayoutStep
@@ -102,6 +107,8 @@ struct ScriptLayout
     values: HashMap<StrView, i64>   # each script symbol evaluated so far
     addrs: HashMap<StrView, i64>    # each output section placed so far: its address
     got_table: Option<i64>      # the _GLOBAL_OFFSET_TABLE_ InSymbol, when an input wants it
+    got_loads: bool             # an input loads through the GOT, if only relaxed
+    output: Output
 
 fn script_error(path: StrView, what: StrView, token: StrView) -> LinkError
     LinkError.Script(path, 0, what, token)
@@ -135,7 +142,8 @@ fn rank_of(o: ScriptOut) -> i64
     let large: bool = (o.flags & SHF_X86_64_LARGE) != 0
     var rank: i64 = 0
     if not write and not exec
-        if not o.nobits
+        # PROGBITS only: .dynsym and the like go before .rodata.
+        if not o.nobits and o.typed.is_none()
             rank = rank | RF_RODATA
         # .lrodata goes before .rodata: further from .text.
         if not large
@@ -161,27 +169,33 @@ impl ScriptLayout
         synthetic_name(l, i)
 
     fn flags(self: @ScriptLayout, l: @Linker, i: i64) -> i64
-        if i < self.nsec then l.sections[i].flags else SHF_ALLOC | SHF_WRITE
+        if i < self.nsec then l.sections[i].flags else made_flags(SYNTH_KINDS[i - self.nsec])
 
     fn align(self: @ScriptLayout, l: @Linker, i: i64) -> i64
-        if i < self.nsec then l.sections[i].align else GOT_ENTRY
+        if i < self.nsec then l.sections[i].align else made_align(SYNTH_KINDS[i - self.nsec])
 
     fn size(self: @ScriptLayout, l: @Linker, img: @Image, i: i64) -> i64
         if i < self.nsec
             return l.sections[i].size
-        if i == self.nsec + SYNTH_GOT
+        if not self.needed(l, img, i)
+            return 0
+        let m: Made = SYNTH_KINDS[i - self.nsec]
+        if m == Made.Got
             return img.got_syms.len * GOT_ENTRY
-        if self.got_table.is_some() then GOTPLT_SIZE else 0
+        made_size(m, img.output, relative_count(l, img))
 
-    # Whether linker-made input `i` is in the image: the GOT when it has an
-    # entry or _GLOBAL_OFFSET_TABLE_ is referenced, .got.plt in that case.
-    # Object sections always are.
-    fn needed(self: @ScriptLayout, img: @Image, i: i64) -> bool
+    # Whether input `i` is in the image: an object section always; the GOT
+    # when it has an entry, _GLOBAL_OFFSET_TABLE_ is referenced, or a GOT
+    # load is, as ld.lld keeps it, empty when every load relaxed; .got.plt
+    # when the symbol is referenced; a dynamic-linking section when the PIE has it.
+    fn needed(self: @ScriptLayout, l: @Linker, img: @Image, i: i64) -> bool
         if i < self.nsec
             return true
-        if i == self.nsec + SYNTH_GOT and img.got_syms.len > 0
-            return true
-        self.got_table.is_some()
+        let m: Made = SYNTH_KINDS[i - self.nsec]
+        match m
+            Got => img.got_syms.len > 0 or self.got_table.is_some() or self.got_loads
+            GotPlt => self.got_table.is_some()
+            Interp | Dynsym | GnuHash | Hash | Dynstr | RelaDyn | Dynamic => made_in(m, img.output, relative_count(l, img))
 
     fn nobits(self: @ScriptLayout, l: @Linker, i: i64) -> bool
         i < self.nsec and l.sections[i].stype == SHT_NOBITS
@@ -192,10 +206,8 @@ impl ScriptLayout
     fn is_gotplt(self: @ScriptLayout, i: i64) -> bool
         i == self.nsec + SYNTH_GOTPLT
 
-    # Whether input `i` goes in the link at all: a kept object section, or
-    # a linker-made one.
     fn candidate(self: @ScriptLayout, l: @Linker, i: i64) -> bool
-        i >= self.nsec or l.is_kept(i)
+        is_candidate(l, self.nsec, self.output, i)
 
     # An expression's value, with `.` at `dot`. Addresses wrap at 64 bits.
     fn eval(self: @ScriptLayout, s: @Script, e: i64, dot: i64) -> Result<i64, LinkError>
@@ -238,14 +250,22 @@ impl ScriptLayout
 # Input `i`'s section name: an object section's, else a linker-made one's.
 fn synthetic_name(l: @Linker, i: i64) -> StrView
     let nsec: i64 = l.sections.len
+    if i < nsec then l.sections[i].name else made_name(SYNTH_KINDS[i - nsec])
+
+# Whether input `i` goes in an `output` link at all, for a script to claim:
+# a kept object section, or a section ld.lld makes for it. It makes the
+# GOT, .got.plt and .rela.dyn for every link, the dynamic symbol sections
+# for a PIE only.
+fn is_candidate(l: @Linker, nsec: i64, output: Output, i: i64) -> bool
     if i < nsec
-        return l.sections[i].name
-    if i == nsec + SYNTH_GOT then GOT_NAME else GOTPLT_NAME
+        return l.is_kept(i)
+    let m: Made = SYNTH_KINDS[i - nsec]
+    m == Made.Got or m == Made.GotPlt or m == Made.RelaDyn or output == Output.Pie
 
 # First match, once: each InputDesc in script order claims, in input order,
 # every unclaimed input one of its patterns matches. /DISCARD/'s claims are
 # dropped from the link.
-fn claim(l: @&Linker, s: @Script, nsec: i64) -> ScriptClaims
+fn claim(l: @&Linker, s: @Script, nsec: i64, output: Output) -> ScriptClaims
     var c: ScriptClaims = ScriptClaims {
         members: vec_new<i64>(),
         desc_first: vec_zeroed<i64>(s.descs.len),
@@ -260,7 +280,7 @@ fn claim(l: @&Linker, s: @Script, nsec: i64) -> ScriptClaims
                     let desc: InputDesc = s.descs[d]
                     c.desc_first[d] = c.members.len
                     for i in 0..(nsec + SYNTHETICS)
-                        if c.claimed[i] or not (i >= nsec or l.is_kept(i))
+                        if c.claimed[i] or not is_candidate(l, nsec, output, i)
                             continue
                         let name: StrView = synthetic_name(l, i)
                         var hit: bool = false
@@ -305,23 +325,31 @@ fn define_one(l: @&Linker, defined: @&HashMap<StrView, i64>, name: StrView, prov
         return
     defined.insert(name, l.define_script_symbol(name))
 
-# The scripted layout of the linked inputs. Prints a line for each orphan.
-pub fn script_layout(l: @&Linker, s: @Script, path: StrView) -> Result<Image, LinkError>
+# The scripted `output` layout of the linked inputs. Prints a line for each orphan.
+pub fn script_layout(l: @&Linker, s: @Script, path: StrView, output: Output) -> Result<Image, LinkError>
     let nsec: i64 = l.sections.len
     let got_table: Option<i64> = if l.wants(GOT_TABLE) then Some(l.define_script_symbol(GOT_TABLE)) else None
     var lay: ScriptLayout = ScriptLayout {
         path: path,
         nsec: nsec,
-        claims: claim(l, s, nsec),
+        claims: claim(l, s, nsec, output),
         symbols: define_symbols(l, s),
         values: hashmap_new<StrView, i64>(),
         addrs: hashmap_new<StrView, i64>(),
-        got_table: got_table
+        got_table: got_table,
+        got_loads: false,
+        output: output
     }
     l.drop_unkept_relocs()
+    for r in 0..l.relocs.len
+        if is_got_load(l.relocs[r])
+            lay.got_loads = true
     check_undefined(l)?
     check_discarded(l)?
-    var img: Image = image_new(l, Output.Executable)
+    var img: Image = image_new(l, output)
+    img.load_headers = false
+    if output == Output.Pie
+        img.data_relatives = count_data_relatives(l)?
     loop
         plan_got(l, @&img)
         place(l, s, @&lay, @&img)?
@@ -351,7 +379,7 @@ fn check_discarded(l: @Linker) -> Result<(), LinkError>
 # `made by the linker` for a linker-made one.
 fn report_orphans(l: @Linker, lay: @ScriptLayout, img: @Image)
     for i in 0..lay.input_count()
-        if lay.claims.claimed[i] or not lay.candidate(l, i) or not lay.needed(img, i)
+        if lay.claims.claimed[i] or not lay.candidate(l, i) or not lay.needed(l, img, i)
             continue
         let name: StrView = lay.name(l, i)
         if i < lay.nsec
@@ -414,7 +442,7 @@ fn orphan_pos(outs: @Vec<ScriptOut>, order: @Vec<LayoutStep>, s: @Script, o: i64
 
 # The ScriptOut a slot holds; one with no inputs for a slot that holds none.
 fn slot_out(outs: @Vec<ScriptOut>, order: @Vec<LayoutStep>, s: @Script, j: i64) -> ScriptOut
-    let none: ScriptOut = ScriptOut { name: "", stmt: None, flags: 0, nobits: false, align: 1, has_inputs: false, empty: true, kept: false, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0 }
+    let none: ScriptOut = ScriptOut { name: "", stmt: None, flags: 0, nobits: false, align: 1, has_inputs: false, empty: true, kept: false, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0, typed: None, members: 0 }
     match order[j]
         Orphan(o) => outs[o]
         Cmd(c) =>
@@ -448,12 +476,15 @@ fn proximity(outs: @Vec<ScriptOut>, order: @Vec<LayoutStep>, s: @Script, j: i64,
 fn place(l: @&Linker, s: @Script, lay: @&ScriptLayout, img: @&Image) -> Result<(), LinkError>
     img.got_out = -1
     img.got_at = 0
+    img.made = vec_new<Made>()
+    img.made_out = vec_new<i64>()
+    img.made_offset = vec_new<i64>()
     var outs: Vec<ScriptOut> = vec_new<ScriptOut>()
     for st in 0..s.outputs.len
         let stmt: OutputStmt = s.outputs[st]
         if stmt.is_discard()
             continue
-        outs.push(ScriptOut { name: stmt.name, stmt: Some(st), flags: 0, nobits: true, align: 1, has_inputs: false, empty: true, kept: false, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0 })
+        outs.push(ScriptOut { name: stmt.name, stmt: Some(st), flags: 0, nobits: true, align: 1, has_inputs: false, empty: true, kept: false, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0, typed: None, members: 0 })
 
     # Orphans: each by its own name, into the output of that name if there
     # is one, else a new output section.
@@ -462,14 +493,14 @@ fn place(l: @&Linker, s: @Script, lay: @&ScriptLayout, img: @&Image) -> Result<(
     for i in 0..lay.input_count()
         if lay.claims.claimed[i] or not lay.candidate(l, i)
             continue
-        if not lay.needed(img, i)
+        if not lay.needed(l, img, i)
             continue
         let name: StrView = lay.name(l, i)
         var target: i64 = 0
         while target < outs.len and not outs[target].name.eq(name)
             target += 1
         if target == outs.len
-            outs.push(ScriptOut { name: name, stmt: None, flags: 0, nobits: true, align: 1, has_inputs: true, empty: true, kept: true, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0 })
+            outs.push(ScriptOut { name: name, stmt: None, flags: 0, nobits: true, align: 1, has_inputs: true, empty: true, kept: true, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0, typed: None, members: 0 })
         extra_out.push(target)
         extra_in.push(i)
 
@@ -492,6 +523,13 @@ fn place(l: @&Linker, s: @Script, lay: @&ScriptLayout, img: @&Image) -> Result<(
         for x in 0..extra_out.len
             if extra_out[x] == o
                 out = with_member(lay, l, img, out, extra_in[x])
+        # ld.lld's commitSection: a section of its own type, as .dynsym or
+        # .dynamic, takes no members of another.
+        match out.typed
+            Some(m) =>
+                if out.members > 1
+                    return Err(script_error(lay.path, "section type mismatch for", made_name(m)))
+            None => pass
         if noload
             out.nobits = true
         else if out.empty
@@ -625,6 +663,8 @@ fn place(l: @&Linker, s: @Script, lay: @&ScriptLayout, img: @&Image) -> Result<(
             l.sections[i] = sec
     if img.got_out >= 0 and img.got_out < outs.len
         img.got_out = outs[img.got_out].index
+    for m in 0..img.made_out.len
+        img.made_out[m] = outs[img.made_out[m]].index
 
     segments(lay, s, @&outs, @placed, img)?
     Ok(())
@@ -633,12 +673,15 @@ fn place(l: @&Linker, s: @Script, lay: @&ScriptLayout, img: @&Image) -> Result<(
 fn with_member(lay: @ScriptLayout, l: @Linker, img: @Image, out: ScriptOut, i: i64) -> ScriptOut
     var o: ScriptOut = out
     o.has_inputs = true
+    o.members += 1
+    if i >= lay.nsec and made_type(SYNTH_KINDS[i - lay.nsec]) != SHT_PROGBITS
+        o.typed = Some(SYNTH_KINDS[i - lay.nsec])
     o.flags = o.flags | lay.flags(l, i)
     let align: i64 = lay.align(l, i)
     if align > o.align
         o.align = align
     # A linker-made section the image does not need takes no place.
-    if lay.needed(img, i)
+    if lay.needed(l, img, i)
         o.empty = false
         if not lay.nobits(l, i)
             o.nobits = false
@@ -651,13 +694,18 @@ fn put_member(lay: @ScriptLayout, l: @&Linker, img: @&Image, out: ScriptOut, o: 
     if lay.is_got(i)
         img.got_out = o
         img.got_at = at - out.addr
-    else if lay.is_gotplt(i)
-        match lay.got_table
-            Some(t) =>
-                var sym: InSymbol = l.symbols[t]
-                sym.value = at
-                l.symbols[t] = sym
-            None => pass
+    else if i >= lay.nsec
+        if lay.is_gotplt(i)
+            match lay.got_table
+                Some(t) =>
+                    var sym: InSymbol = l.symbols[t]
+                    sym.value = at
+                    l.symbols[t] = sym
+                None => pass
+        if lay.needed(l, img, i)
+            img.made.push(SYNTH_KINDS[i - lay.nsec])
+            img.made_out.push(o)
+            img.made_offset.push(at - out.addr)
     else
         var sec: InSection = l.sections[i]
         sec.out = o
@@ -769,7 +817,7 @@ fn segments(lay: @ScriptLayout, s: @Script, outs: @&Vec<ScriptOut>, placed: @Vec
                 outs[placed[k]] = o
             kept.push(ld)
 
-    let phnum: i64 = kept.len + 1
+    let phnum: i64 = kept.len + extra_phdrs(img.output, false)
     let headers: i64 = EHDR_SIZE + phnum * PHDR_SIZE
     if placed.len > 0 and (min & (PAGE - 1)) >= headers
         return Err(script_error(lay.path, "the first section leaves room for the ELF headers on its page; loading them is not supported", ""))
@@ -826,8 +874,8 @@ fn segments(lay: @ScriptLayout, s: @Script, outs: @&Vec<ScriptOut>, placed: @Vec
     Ok(())
 
 # Link the objects at `paths` through the script at `script_path` into the
-# executable at `out`. Prints a line for each orphan.
-pub fn link_script(l: @&Linker, paths: Span<StrView>, script_path: StrView, out: StrView) -> Result<(), LinkError>
+# `output` at `out`. Prints a line for each orphan.
+pub fn link_script(l: @&Linker, paths: Span<StrView>, script_path: StrView, out: StrView, output: Output) -> Result<(), LinkError>
     let text: String = match read_file(script_path)
         Ok(t) => t
         Err(_) => return Err(LinkError.Unreadable(script_path))
@@ -837,5 +885,5 @@ pub fn link_script(l: @&Linker, paths: Span<StrView>, script_path: StrView, out:
     for i in 0..paths.len
         l.add_file(paths[i])?
     l.resolve()?
-    let img: Image = script_layout(l, @s, script_path)?
+    let img: Image = script_layout(l, @s, script_path, output)?
     write_executable(l, @img, out)

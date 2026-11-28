@@ -7,6 +7,7 @@
 #
 # The linker makes these sections, as it makes `.got`; link.ritz places
 # them and asks here for their sizes and bytes.
+import ritzlib.cmp { Ord, Ordering, cmp_i64 }
 import ritzlib.gvec { Vec, vec_new }
 import ritzlib.option { Option }
 import ritzlib.span { Span }
@@ -42,6 +43,7 @@ pub const DYN_SIZE: i64 = 16            # one Elf64_Dyn
 const HASH_SIZE: i64 = 16               # nbucket, nchain, bucket[0], chain[0]
 const GNU_HASH_SIZE: i64 = 28           # header, one bloom word, one bucket
 const GNU_HASH_SHIFT: i64 = 26          # ld.lld's bloom shift
+const GOTPLT_SIZE: i64 = 24             # three reserved words
 pub const INTERP: StrView = "/lib64/ld-linux-x86-64.so.2"
 
 # What the link writes (DESIGN.md "CLI"). Of the PIEs, the hosted one has
@@ -54,7 +56,7 @@ pub enum Output
 
 # A section the linker makes, in the order the no-script layout places
 # them: the read-only ones open the read-only segment, the writable ones
-# open the writable segment.
+# open the writable segment. Only a script places `.got.plt`.
 pub enum Made
     Interp
     Dynsym
@@ -64,6 +66,7 @@ pub enum Made
     RelaDyn
     Dynamic
     Got
+    GotPlt
 
 pub fn made_name(m: Made) -> StrView
     match m
@@ -75,6 +78,7 @@ pub fn made_name(m: Made) -> StrView
         RelaDyn => ".rela.dyn"
         Dynamic => ".dynamic"
         Got => ".got"
+        GotPlt => ".got.plt"
 
 pub fn made_type(m: Made) -> i64
     match m
@@ -85,18 +89,18 @@ pub fn made_type(m: Made) -> i64
         Dynstr => SHT_STRTAB
         RelaDyn => SHT_RELA
         Dynamic => SHT_DYNAMIC
-        Got => SHT_PROGBITS
+        Got | GotPlt => SHT_PROGBITS
 
 pub fn made_flags(m: Made) -> i64
     match m
         Interp | Dynsym | GnuHash | Hash | Dynstr | RelaDyn => SHF_ALLOC
-        Dynamic | Got => SHF_ALLOC | SHF_WRITE
+        Dynamic | Got | GotPlt => SHF_ALLOC | SHF_WRITE
 
 pub fn made_align(m: Made) -> i64
     match m
         Interp | Dynstr => 1
         Hash => 4
-        Dynsym | GnuHash | RelaDyn | Dynamic | Got => 8
+        Dynsym | GnuHash | RelaDyn | Dynamic | Got | GotPlt => 8
 
 # The section whose index a made section's sh_link holds, if any.
 pub fn made_link(m: Made) -> Option<Made>
@@ -114,26 +118,29 @@ pub fn made_entsize(m: Made) -> i64
         Hash => 4
         RelaDyn => RELA_SIZE
         Dynamic => DYN_SIZE
-        Interp | GnuHash | Dynstr | Got => 0
+        Interp | GnuHash | Dynstr | Got | GotPlt => 0
 
 # The dynamic-linking sections of an output with `relatives` load-time
 # relocations, in placement order: none for the executable. An empty
 # `.rela.dyn` is left out, as ld.lld leaves it out.
 pub fn pie_sections(output: Output, relatives: i64) -> Vec<Made>
+    let order: [7]Made = [Made.Interp, Made.Dynsym, Made.GnuHash, Made.Hash, Made.Dynstr, Made.RelaDyn, Made.Dynamic]
     var out: Vec<Made> = vec_new<Made>()
-    if output == Output.Executable
-        return out
-    if output == Output.Hosted
-        out.push(Made.Interp)
-    out.push(Made.Dynsym)
-    out.push(Made.GnuHash)
-    if output == Output.Pie
-        out.push(Made.Hash)
-    out.push(Made.Dynstr)
-    if relatives > 0
-        out.push(Made.RelaDyn)
-    out.push(Made.Dynamic)
+    for k in 0..7
+        if made_in(order[k], output, relatives)
+            out.push(order[k])
     out
+
+# Whether an `output` with `relatives` load-time relocations has the
+# dynamic-linking section `m`. The GOT plan, not the output, decides on the
+# GOT and `.got.plt`.
+pub fn made_in(m: Made, output: Output, relatives: i64) -> bool
+    match m
+        Interp => output == Output.Hosted
+        Hash => output == Output.Pie
+        Dynsym | GnuHash | Dynstr | Dynamic => output != Output.Executable
+        RelaDyn => output != Output.Executable and relatives > 0
+        Got | GotPlt => false
 
 # The size of a dynamic-linking section (not the GOT, whose size is its
 # slots).
@@ -147,6 +154,7 @@ pub fn made_size(m: Made, output: Output, relatives: i64) -> i64
         RelaDyn => relatives * RELA_SIZE
         Dynamic => dynamic_tags(output, relatives) * DYN_SIZE
         Got => 0
+        GotPlt => GOTPLT_SIZE
 
 # The number of entries `.dynamic` holds, DT_NULL included.
 fn dynamic_tags(output: Output, relatives: i64) -> i64
@@ -211,16 +219,37 @@ pub fn hash_bytes() -> Vec<u8>
     push_le(@&out, 0, 4)
     out
 
-# `.rela.dyn`: each R_X86_64_RELATIVE as (where, the link-time address it
-# holds); the loader adds the load base to both.
-pub fn rela_bytes(relatives: Span<RelaEntry>) -> Vec<u8>
+# A load-time relocation: the loader adds the load base to `value` and
+# stores it at `at` plus the base. A PIE has no other kind.
+pub struct Relative
+    at: i64
+    value: i64
+
+pub fn relative(at: i64, value: i64) -> Relative
+    Relative { at: at, value: value }
+
+# ld.lld's `.rela.dyn` order (-z combreloc, its default): RELATIVEs first,
+# then by symbol, then by offset; for RELATIVEs alone, by offset.
+impl Ord for Relative
+    fn compare(self: @Relative, other: @Relative) -> Ordering
+        cmp_i64(self.at, other.at)
+
+# `.rela.dyn`: an R_X86_64_RELATIVE for each of `relatives`, in order.
+pub fn rela_bytes(relatives: Span<Relative>) -> Vec<u8>
     var out: Vec<u8> = vec_new<u8>()
     for i in 0..relatives.len
-        push_rela(@&out, relatives[i])
+        let r: Relative = relatives[i]
+        push_rela(@&out, RelaEntry { offset: r.at, rtype: R_X86_64_RELATIVE, symbol: 0, addend: r.value })
     out
 
-pub fn relative(offset: i64, addend: i64) -> RelaEntry
-    RelaEntry { offset: offset, rtype: R_X86_64_RELATIVE, symbol: 0, addend: addend }
+# `.got.plt`'s three reserved words, as ld.lld writes them: the first is
+# `.dynamic`'s address (0 with none), the two the loader fills are zero.
+pub fn gotplt_bytes(dynamic: i64) -> Vec<u8>
+    var out: Vec<u8> = vec_new<u8>()
+    push_le(@&out, dynamic, 8)
+    push_le(@&out, 0, 8)
+    push_le(@&out, 0, 8)
+    out
 
 # `.interp`: the hosted PIE's loader, NUL-terminated as PT_INTERP requires.
 pub fn interp_bytes() -> Vec<u8>

@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from oracle import (CORPUS, DF_1_PIE, DT_FLAGS_1, DT_NEEDED, ET_DYN, PF_R,
-                    PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD,
+                    PF_W, PF_X, PT_DYNAMIC, PT_INTERP, PT_LOAD, PT_PHDR,
                     R_X86_64_RELATIVE, RLLVM_CORPUS, RZRZ_FLAGS, SHIM_FLAGS,
                     assemble, compile_ll, link_clang_hosted, link_lld,
                     link_lld_pie, link_rld, mnemonics, read_dynamic,
@@ -337,6 +337,69 @@ def test_freestanding_pie_relocations_match_lld(rld, tmp_path, producer):
         assert set(read_dynamic(got).tags) == set(read_dynamic(want).tags)
         assert relocs_by_section(got) == relocs_by_section(want)
         assert read_dynamic(got).relocs, f"{name}: pointers in writable data"
+
+
+PIE_SCRIPT = PKG.parent / "indium" / "user" / "linker_pie.ld"
+
+
+def load_table(path: Path) -> list:
+    return [(s.vaddr, s.paddr, s.flags, s.filesz, s.memsz)
+            for s in read_executable(path).segments if s.ptype == PT_LOAD]
+
+
+def load_bytes(path: Path) -> list[bytes]:
+    """Each PT_LOAD's file bytes, with each RELATIVE's word zeroed: ld.lld
+    writes 0 there, rld the link-time address (DESIGN.md "Load-time
+    relocations")."""
+    data = bytearray(path.read_bytes())
+    loads = [s for s in read_executable(path).segments if s.ptype == PT_LOAD]
+    for offset, _, _ in read_dynamic(path).relocs:
+        for s in loads:
+            if s.vaddr <= offset < s.vaddr + s.filesz:
+                at = s.offset + offset - s.vaddr
+                data[at:at + 8] = bytes(8)
+    return [bytes(data[s.offset:s.offset + s.filesz]) for s in loads]
+
+
+@pytest.mark.parametrize("script", [PIE_SCRIPT, CORPUS / "pie_inside.ld"],
+                         ids=["linker_pie", "pie_inside"])
+@pytest.mark.parametrize("producer", PRODUCERS)
+def test_scripted_pie_matches_lld(rld, tmp_path, producer, script):
+    """A pic bin's link through user/linker_pie.ld, and through a script
+    that puts the GOT and .got.plt inside .data. The script fixes the
+    layout, so the PT_LOAD table, every tag's value, each relocation's
+    (offset, type, addend) and the loaded bytes must match ld.lld's."""
+    objs = pic_objects(producer, tmp_path)
+    for name, group in [("pic", objs[:3]), ("fixture", objs[3:])]:
+        d = tmp_path / name
+        d.mkdir()
+        want, got = link_pie_both(rld, group, d, script)
+        assert_pie_shape(got, hosted=False)
+        assert load_table(got) == load_table(want)
+        assert read_dynamic(got).tags == read_dynamic(want).tags
+        assert sorted(read_dynamic(got).relocs) == sorted(read_dynamic(want).relocs)
+        assert load_bytes(got) == load_bytes(want)
+        assert read_dynamic(got).relocs, f"{name}: pointers in writable data"
+        assert read_executable(got).entry == read_executable(want).entry
+        # The script loads no headers, so as in ld.lld's there is no PT_PHDR.
+        assert not any(s.ptype == PT_PHDR for s in read_executable(got).segments)
+
+
+@pytest.mark.parametrize("pie, script, section", [
+    (True, "pie_mismatch.ld", ".dynamic"),
+    (False, "rela_mismatch.ld", ".rela.dyn"),
+], ids=["pie", "executable"])
+def test_section_type_mismatch_exits_1(rld, tmp_path, pie, script, section):
+    """A linker-made section of its own type among .data's PROGBITS:
+    ld.lld refuses it, and so does rld."""
+    objs = fixture_objects(tmp_path)
+    flags = [*(PIE if pie else []), "-T", CORPUS / script]
+    lld = run_tool(["ld.lld", *flags, "-o", tmp_path / "lld.out", *objs])
+    assert f"section type mismatch for {section}" in lld.stderr
+    r = link_rld(rld, objs, tmp_path / "out", flags)
+    assert r.returncode == 1, r
+    assert f"section type mismatch for {section}" in r.stderr
+    assert not (tmp_path / "out").exists()
 
 
 @pytest.mark.parametrize("source, message", [

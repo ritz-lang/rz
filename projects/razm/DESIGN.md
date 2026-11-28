@@ -2,7 +2,7 @@
 
 Two programs replace the host tools that turn this tree's code into relocatable ELF64. [razm](#razm) replaces `as --64`. [rllvm](#what-rllvm-replaces) replaces `clang -c` on the `.ll` this tree already emits. Both write objects today's linkers already accept: hosted `clang` or `gcc` (`link_hosted`), and freestanding `ld.lld` (`link_freestanding_elf`). Neither links.
 
-The native linker is [rld](#rld). This document specifies it. The no-script executable, the scripted executable (`-T`) and the two no-script PIEs are implemented.
+The native linker is [rld](#rld). This document specifies it. All its outputs are implemented: the no-script executable, the two PIEs, and the scripted executable and freestanding PIE.
 
 Pipeline facts below are from `projects/ritz/build_pipeline.py` (`compile_ll_to_obj`, `OBJ_CLANG_FLAGS`, `freestanding_target`, `link_hosted`, `link_freestanding_elf`, `assemble_objects`, `ensure_runtime_object`) and from `projects/ritz/runtime/ritz_start.x86_64.ll` and `ritz_start.harland.x86_64.ll`.
 
@@ -12,7 +12,7 @@ Pipeline facts below are from `projects/ritz/build_pipeline.py` (`compile_ll_to_
 |---|---|---|---|
 | razm | `projects/razm` | first implementation | AT&T text → relocatable ELF64, and the one ELF writer |
 | rllvm | `projects/rllvm` | after razm encodes | `.ll` → instructions, encoded by razm |
-| rld | `projects/rld` | no-script and scripted executables, no-script PIEs; scripted PIE to come | ELF objects + linker scripts → Linux and Harland executables |
+| rld | `projects/rld` | executables and PIEs, with and without a linker script | ELF objects + linker scripts → Linux and Harland executables |
 
 razm is the assembler, as a library and a driver. Indium has no GNU `as`. The kernel's `.s` files (`assemble_objects` runs `as --64`) have to assemble on Indium, and that program has to be written in Ritz. razm is that program. It is the short one: it encodes instructions the text already chose. It does not select them, allocate registers, or parse LLVM IR.
 
@@ -489,7 +489,7 @@ Today those bins (`bootx64`, `hwinv`, target `x86_64-unknown-uefi`) compile with
 
 ## rld
 
-rld is `projects/rld`. It reads ELF through razm's `razm.elf` records, the ones razm's writer uses. The no-script executable, with the object reader, symbol resolution, relocations and GOT relaxation below, the scripted executable, and the hosted and freestanding PIEs with their load-time relocations are implemented.
+rld is `projects/rld`. It reads ELF through razm's `razm.elf` records, the ones razm's writer uses. It implements the no-script executable with the object reader, symbol resolution, relocations and GOT relaxation below, the hosted and freestanding PIEs with their load-time relocations, and the linker scripts, the freestanding PIE's among them.
 
 ### Inputs
 

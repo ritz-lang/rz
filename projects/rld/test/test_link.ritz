@@ -3,6 +3,7 @@
 import ritzlib.fs { unlink, write_file }
 import ritzlib.gvec { Vec, vec_new }
 import ritzlib.result { Result }
+import ritzlib.sort { sort }
 import ritzlib.span { Span, span_empty }
 import ritzlib.string { String }
 import ritzlib.strview { StrView }
@@ -284,7 +285,7 @@ fn test_script_layout_places_at_the_script_addresses() -> i32
             var l: Linker = linker_new()
             read(@&l, @path)
             assert l.resolve().is_ok()
-            match script_layout(@&l, @s, "at.ld")
+            match script_layout(@&l, @s, "at.ld", Output.Executable)
                 Ok(img) =>
                     assert img.entry == 0x400000, "_start opens .text"
                     assert img.segs.len == 2, "text, then data under its own AT"
@@ -311,7 +312,7 @@ fn test_reference_into_discarded_section_is_an_error() -> i32
             var l: Linker = linker_new()
             read(@&l, @path)
             assert l.resolve().is_ok()
-            match script_layout(@&l, @s, "discard.ld")
+            match script_layout(@&l, @s, "discard.ld", Output.Executable)
                 Ok(_) =>
                     assert false, "a reference into /DISCARD/ accepted"
                 Err(e) =>
@@ -441,9 +442,57 @@ fn test_made_bytes_fill_their_sections() -> i32
         let relatives: i64 = k
         assert dynamic_bytes(Output.Pie, relatives, at).len == made_size(Made.Dynamic, Output.Pie, relatives)
         assert dynamic_bytes(Output.Hosted, relatives, at).len == made_size(Made.Dynamic, Output.Hosted, relatives)
-    let entries: [2]RelaEntry = [relative(0x100, 0x200), relative(0x108, 0x208)]
+    let entries: [2]Relative = [relative(0x100, 0x200), relative(0x108, 0x208)]
     let rela: Vec<u8> = rela_bytes(@entries)
     assert rela.len == made_size(Made.RelaDyn, Output.Pie, 2)
     assert rela[8] == R_X86_64_RELATIVE as u8 and rela[16] == 0, "type 8, addend 0x200"
     assert rela[17] == 2
+    0
+
+[[test]]
+fn test_made_in_is_what_each_output_makes() -> i32
+    # The PIEs' tables, and .rela.dyn only with a relocation.
+    assert made_in(Made.Dynsym, Output.Pie, 0) and made_in(Made.Dynamic, Output.Hosted, 0)
+    assert made_in(Made.Hash, Output.Pie, 0) and not made_in(Made.Hash, Output.Hosted, 0)
+    assert made_in(Made.Interp, Output.Hosted, 0) and not made_in(Made.Interp, Output.Pie, 0)
+    assert not made_in(Made.RelaDyn, Output.Pie, 0) and made_in(Made.RelaDyn, Output.Pie, 1)
+    assert not made_in(Made.Dynsym, Output.Executable, 1)
+    assert not made_in(Made.Got, Output.Pie, 1), "the GOT plan decides on the GOT"
+    let made: Vec<Made> = pie_sections(Output.Pie, 1)
+    assert made.len == 6 and made[0] == Made.Dynsym and made[5] == Made.Dynamic
+    0
+
+[[test]]
+fn test_gotplt_header_holds_dynamic() -> i32
+    let words: Vec<u8> = gotplt_bytes(0x1234)
+    assert words.len == made_size(Made.GotPlt, Output.Pie, 0)
+    assert words[0] == 0x34 and words[1] == 0x12 and words[8] == 0 and words[16] == 0
+    0
+
+[[test]]
+fn test_extra_phdrs_count_phdr_only_when_loaded() -> i32
+    assert extra_phdrs(Output.Executable, true) == 1, "PT_GNU_STACK"
+    assert extra_phdrs(Output.Pie, true) == 3, "and PT_PHDR, PT_DYNAMIC"
+    assert extra_phdrs(Output.Pie, false) == 2, "a script loads no headers"
+    assert extra_phdrs(Output.Hosted, true) == 4, "and PT_INTERP"
+    0
+
+[[test]]
+fn test_relatives_sort_by_offset() -> i32
+    var r: Vec<Relative> = vec_new<Relative>()
+    r.push(relative(0x130, 1))
+    r.push(relative(0x118, 2))
+    r.push(relative(0x120, 3))
+    sort<Relative>(@&r)
+    assert r[0].at == 0x118 and r[1].at == 0x120 and r[2].at == 0x130
+    assert r[0].value == 2, "each keeps its value"
+    0
+
+[[test]]
+fn test_got_loads_are_the_three_gotpcrel_types() -> i32
+    let load: InReloc = InReloc { section: 0, offset: 0, rtype: R_X86_64_REX_GOTPCRELX, symbol: 0, addend: -4 }
+    assert is_got_load(load)
+    var pc: InReloc = load
+    pc.rtype = R_X86_64_PC32
+    assert not is_got_load(pc)
     0
