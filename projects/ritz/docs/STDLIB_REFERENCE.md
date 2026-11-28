@@ -724,6 +724,16 @@ Free conversion constructors:
 | `string_from_i64` | `fn(n: i64) -> String` | Integer to String |
 | `string_from_hex` | `fn(n: u64) -> String` | Integer to hex String |
 
+**StrView join** (AGAST #4915): join views into one fresh,
+NUL-terminated heap buffer, instead of a hand-written
+malloc-and-memcpy loop. The caller owns the result and frees it with
+`free(result.ptr)`.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `strview_join2` | `fn(a: StrView, b: StrView) -> StrView` | `a` then `b` |
+| `strview_join3` | `fn(a: StrView, sep: StrView, b: StrView) -> StrView` | `a`, `sep`, then `b` (e.g. `"Type_method"`) |
+
 ---
 
 ### hashmap
