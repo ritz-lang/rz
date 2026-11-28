@@ -1,0 +1,284 @@
+# core/picker.ritz - the picker overlay: a query, and the candidates it matches, ranked.
+#
+# `:Files` and `:Buffers` (AGAST #4913, docs/BUDDHAFINGER_PROPOSAL.md
+# "Everyday code editing") open a Picker over the workspace's files (the
+# FileStore's list) or the buffer list. Typing narrows it, Up/Down and
+# Ctrl-P/Ctrl-N move the selection, Enter opens the selected candidate and
+# Escape closes it (core/editor.ritz runs those keys; core/paint.ritz draws
+# the overlay).
+#
+# Matching is fuzzy: the query's code points in order anywhere in the
+# candidate (a subsequence; ASCII letters match either case). Of every
+# placing, the best scores: SCORE_MATCH a code point, more for one right
+# after the last (a run) and for one that starts a word (the candidate's
+# start or after `/`; after `_`, `-`, `.` or a blank; an upper-case letter
+# after a lower-case one), less for each code point skipped between two.
+# Hits rank by score, then the shorter candidate, then the first listed;
+# with no query every candidate is a hit, in list order.
+#
+# Typing a code point narrows the hits already found (a candidate that
+# misses "ab" misses "abc"), so each key scores fewer candidates; erasing
+# one scores them all again.
+# Core module: no terminal or OS I/O (see src/platform/).
+
+import ritzlib.cmp { Ord, Ordering, cmp_i64 }
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.sort { sort }
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview { StrView }
+
+import core.files { PathList, path_list_new }
+import core.utf8 { utf8_prev }
+
+pub const SCORE_MATCH: i64 = 16
+pub const BONUS_RUN: i64 = 8            # right after the code point before
+pub const BONUS_SEGMENT: i64 = 10       # at the start, or after `/`
+pub const BONUS_WORD: i64 = 8           # after `_`, `-`, `.` or a blank
+pub const BONUS_CAMEL: i64 = 6          # an upper-case letter after a lower-case one
+pub const PENALTY_GAP: i64 = 1          # each code point skipped between two matches
+
+# Below every real score: no placing.
+const NONE: i64 = -(1 << 40)
+
+pub enum PickerKind
+    Files
+    Buffers
+
+fn fold(c: u8) -> u8
+    if c >= 'A' and c <= 'Z' then c + 32 else c
+
+fn is_upper(c: u8) -> bool
+    c >= 'A' and c <= 'Z'
+
+fn is_lower(c: u8) -> bool
+    c >= 'a' and c <= 'z'
+
+# What a match at byte j of `cand` adds for where it is.
+fn bonus_at(cand: StrView, j: i64) -> i64
+    if j == 0
+        return BONUS_SEGMENT
+    let before = cand.get(j - 1)
+    if before == '/'
+        return BONUS_SEGMENT
+    if before == '_' or before == '-' or before == '.' or before == ' '
+        return BONUS_WORD
+    if is_lower(before) and is_upper(cand.get(j))
+        return BONUS_CAMEL
+    0
+
+fn larger(a: i64, b: i64) -> i64
+    if a > b then a else b
+
+# True when `query` is a subsequence of `cand`: what any placing needs.
+fn has_subsequence(query: StrView, cand: StrView) -> bool
+    var i: i64 = 0
+    for j in 0..cand.len()
+        if i < query.len() and fold(cand.get(j)) == fold(query.get(i))
+            i += 1
+    i == query.len()
+
+# The scorer, with its two rows of scratch kept from one candidate to the next.
+pub struct Matcher
+    prev: Vec<i64>
+    cur: Vec<i64>
+
+pub fn matcher_new() -> Matcher
+    Matcher { prev: vec_new<i64>(), cur: vec_new<i64>() }
+
+impl Matcher
+    # The best placing's score of `query` in `cand`, or None for no match.
+    #
+    # Over the query's bytes i and the candidate's j: cur[j] is the best
+    # score of query[0..=i] with byte i matched at j. It comes from byte i-1
+    # matched right before (a run), or anywhere before that (less the gap),
+    # which `gap` carries along as j moves on. Bytes, not code points: a
+    # multi-byte code point matches only as a run of its own bytes.
+    pub fn score(self: @&Matcher, query: StrView, cand: StrView) -> Option<i64>
+        if query.is_empty()
+            return Some(0)
+        if not has_subsequence(query, cand)
+            return None
+        let n = cand.len()
+        self.prev.clear()
+        self.cur.clear()
+        for j in 0..n
+            let first = if fold(cand.get(j)) == fold(query.get(0)) then SCORE_MATCH + bonus_at(cand, j) else NONE
+            self.prev.push(first)
+            self.cur.push(NONE)
+        for i in 1..query.len()
+            let q = fold(query.get(i))
+            var gap: i64 = NONE     # best prev[k] - PENALTY_GAP * (j - 1 - k), k <= j - 2
+            for j in 0..n
+                if j >= 2
+                    gap = larger(gap, self.prev.get(j - 2)) - PENALTY_GAP
+                var from: i64 = gap
+                if j >= 1 and self.prev.get(j - 1) > NONE / 2
+                    from = larger(from, self.prev.get(j - 1) + BONUS_RUN)
+                var here: i64 = NONE
+                if fold(cand.get(j)) == q and from > NONE / 2
+                    here = from + SCORE_MATCH + bonus_at(cand, j)
+                self.cur.set(j, here)
+            for j in 0..n
+                self.prev.set(j, self.cur.get(j))
+        var best: i64 = NONE
+        for j in 0..n
+            best = larger(best, self.prev.get(j))
+        if best > NONE / 2 then Some(best) else None
+
+# fuzzy_score with a Matcher of its own: one-off scoring.
+pub fn fuzzy_score(query: StrView, cand: StrView) -> Option<i64>
+    var m = matcher_new()
+    m.score(query, cand)
+
+# A candidate the query matches: which, and how well.
+struct Ranked
+    index: i64
+    score: i64
+    len: i64
+
+# Rank order: the higher score, then the shorter, then the first listed.
+impl Ord for Ranked
+    fn compare(self: @Ranked, other: @Ranked) -> Ordering
+        if self.score != other.score
+            return cmp_i64(other.score, self.score)
+        if self.len != other.len
+            return cmp_i64(self.len, other.len)
+        cmp_i64(self.index, other.index)
+
+pub struct Picker
+    kind: PickerKind
+    names: PathList         # each candidate's name, as shown and matched
+    numbers: Vec<i64>       # Buffers: each candidate's buffer number
+    dirty: Vec<bool>        # Buffers: each candidate's pending edits
+    query: String
+    hits: Vec<Ranked>          # the candidates the query matches, ranked
+    selected: i64           # the selected hit's rank
+    top: i64                # the first hit shown
+    matcher: Matcher
+
+pub fn picker_new() -> Picker
+    Picker { kind: PickerKind.Files, names: path_list_new(), numbers: vec_new<i64>(), dirty: vec_new<bool>(), query: string_new(), hits: vec_new<Ranked>(), selected: 0, top: 0, matcher: matcher_new() }
+
+impl Picker
+    # A file picker over `list`.
+    pub fn open_files(self: @&Picker, list: PathList)
+        self.close()
+        self.kind = PickerKind.Files
+        self.names = list
+        self.ready()
+
+    # A buffer picker, empty: add_buffer each, then ready().
+    pub fn open_buffers(self: @&Picker)
+        self.close()
+        self.kind = PickerKind.Buffers
+
+    pub fn add_buffer(self: @&Picker, name: StrView, number: i64, dirty: bool)
+        self.names.push(name)
+        self.numbers.push(number)
+        self.dirty.push(dirty)
+
+    # Every candidate in: the hits for the (empty) query.
+    pub fn ready(self: @&Picker)
+        self.refilter(false)
+
+    pub fn close(self: @&Picker)
+        self.names = path_list_new()
+        self.numbers.clear()
+        self.dirty.clear()
+        self.query.clear()
+        self.hits.clear()
+        self.selected = 0
+        self.top = 0
+
+    pub fn candidate_count(self: @Picker) -> i64
+        self.names.len()
+
+    pub fn hit_count(self: @Picker) -> i64
+        self.hits.len()
+
+    # Match k (by rank): its name, and for a buffer its pending edits.
+    pub fn hit_name(self: @Picker, k: i64) -> StrView
+        self.names.get(self.hits.get(k).index)
+
+    pub fn hit_dirty(self: @Picker, k: i64) -> bool
+        let c = self.hits.get(k).index
+        c < self.dirty.len() and self.dirty.get(c)
+
+    # The selected hit's candidate, or None when nothing matches.
+    pub fn chosen(self: @Picker) -> Option<i64>
+        if self.selected < self.hits.len() then Some(self.hits.get(self.selected).index) else None
+
+    pub fn name_of(self: @Picker, c: i64) -> StrView
+        self.names.get(c)
+
+    # Buffers: candidate c's buffer number.
+    pub fn number_of(self: @Picker, c: i64) -> i64
+        self.numbers.get(c)
+
+    # The query grows by `text`: the hits narrow, the best selected.
+    pub fn type_text(self: @&Picker, text: StrView)
+        self.query.push_str(text)
+        self.refilter(true)
+
+    # The query's last code point off: the hits widen. False when the
+    # query is already empty.
+    pub fn erase(self: @&Picker) -> bool
+        if self.query.len() == 0
+            return false
+        let s = span_from_strview(self.query.as_view())
+        let keep = utf8_prev(s, s.len)
+        while self.query.len() > keep
+            self.query.pop()
+        self.refilter(false)
+        true
+
+    # The selection `by` hits on (back when negative), kept on the list.
+    pub fn move_by(self: @&Picker, by: i64)
+        var at = self.selected + by
+        if at > self.hits.len() - 1
+            at = self.hits.len() - 1
+        if at < 0
+            at = 0
+        self.selected = at
+
+    # The first hit to show in `rows` rows: scrolled the least that keeps
+    # the selection on them.
+    pub fn scroll(self: @&Picker, rows: i64) -> i64
+        if rows <= 0
+            return self.selected
+        if self.selected < self.top
+            self.top = self.selected
+        if self.selected >= self.top + rows
+            self.top = self.selected - rows + 1
+        let most = if self.hits.len() > rows then self.hits.len() - rows else 0
+        if self.top > most
+            self.top = most
+        if self.top < 0
+            self.top = 0
+        self.top
+
+    # The hits again for the query: from the hits already found when
+    # `narrow` (the query only grew), else from every candidate.
+    fn refilter(self: @&Picker, narrow: bool)
+        let q = self.query.as_view()
+        var found: Vec<Ranked> = vec_new<Ranked>()
+        let count = if narrow then self.hits.len() else self.names.len()
+        for k in 0..count
+            let c = if narrow then self.hits.get(k).index else k
+            match self.hit_of(c, q)
+                Some(h) => found.push(h)
+                None => pass
+        if not q.is_empty()
+            sort<Ranked>(@&found)
+        self.hits = found
+        self.selected = 0
+        self.top = 0
+
+    # Candidate c as a hit for `q`, or None when it doesn't match.
+    fn hit_of(self: @&Picker, c: i64, q: StrView) -> Option<Ranked>
+        let name = self.names.get(c)
+        match self.matcher.score(q, name)
+            Some(s) => Some(Ranked { index: c, score: s, len: name.len() })
+            None => None

@@ -1,0 +1,74 @@
+# platform/walk.ritz - the workspace's files, for the file picker (AGAST #4913).
+#
+# walk_files(root, limit) lists the regular files under `root`, breadth
+# first, so a bound cuts off the deepest files and keeps the shallow ones.
+# A `.git` or `build` directory is not entered, nor is a symlink (a link
+# to a directory could loop). Paths are relative to `root`: "src/main.ritz",
+# not "./src/main.ritz". Bounded twice, so a large tree can't stall the
+# editor's loop: at most `limit` files, and at most MAX_WALK_DIRS
+# directories read; either bound marks the list truncated. A directory that
+# can't be read is skipped.
+#
+# Linux only: Harland has no directory reading yet (ritzlib.fs's dir_open is
+# [[target_os = "linux"]]; AGAST #4947).
+
+import ritzlib.fs
+import ritzlib.option
+import ritzlib.result
+import ritzlib.string
+import ritzlib.strview { StrView }
+import ritzlib.sys
+
+import core.files { PathList, path_list_new }
+
+# The most directories one walk reads.
+pub const MAX_WALK_DIRS: i64 = 4096
+
+# True for a directory the walk doesn't enter.
+fn skipped_dir(name: StrView) -> bool
+    name.eq(".git") or name.eq("build")
+
+# `dir` and `name` as the walk names it: no "./" in front for the root.
+fn child_path(root: StrView, dir: StrView, name: StrView) -> String
+    if dir.eq(root) and root.eq(".")
+        return string_from(name)
+    path_join(dir, name)
+
+pub fn walk_files(root: StrView, limit: i64) -> PathList
+    var files = path_list_new()
+    var dirs = path_list_new()      # the queue: read from `next` on
+    dirs.push(root)
+    var next: i64 = 0
+    while next < dirs.len()
+        if next >= MAX_WALK_DIRS
+            files.truncated = true
+            break
+        let dir = string_from(dirs.get(next))
+        next += 1
+        var it: DirIter = match dir_open(dir.as_view())
+            Ok(d) => d
+            Err(_) => continue
+        loop
+            let e: DirEntry = match it.next_entry()
+                Some(found) => found
+                None => break
+            if e.name.eq(".") or e.name.eq("..")
+                continue
+            let path = child_path(root, dir.as_view(), e.name)
+            var kind = e.kind
+            if kind == DT_UNKNOWN
+                # A filesystem that doesn't say: ask lstat (a link stays a link).
+                kind = match lstat(path.as_view())
+                    Ok(st) => if mode_is_dir(st.st_mode) then DT_DIR else if mode_is_file(st.st_mode) then DT_REG else DT_LNK
+                    Err(_) => DT_LNK
+            if kind == DT_DIR
+                if not skipped_dir(e.name)
+                    dirs.push(path.as_view())
+            else if kind == DT_REG
+                if files.len() >= limit
+                    files.truncated = true
+                    it.close()
+                    return files
+                files.push(path.as_view())
+        it.close()
+    files

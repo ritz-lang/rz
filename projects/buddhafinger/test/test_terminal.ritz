@@ -5,7 +5,8 @@
 # test types keys into the master and reads the frames back from it. The
 # cases are the proposal's "Screen and I/O tests": open, edit, save and
 # exit; a bare Escape leaving Insert with no key after it; Ctrl-Z (and
-# SIGTSTP) then SIGCONT; SIGTERM, SIGINT and SIGHUP; a resize. Every exit
+# SIGTSTP) then SIGCONT; SIGTERM, SIGINT and SIGHUP; a resize; then the
+# file picker over a real directory (AGAST #4913). Every exit
 # path must leave the terminal's attributes as they were before the editor
 # started, compared field by field (a pty master reads its slave's).
 #
@@ -46,6 +47,10 @@ struct Child
 # Start the editor on `path` ("" for none) in a `rows` x `cols` pty. None
 # where the system has no ptys or can't fork: the caller skips.
 fn spawn_editor(path: StrView, rows: u16, cols: u16) -> Option<Child>
+    spawn_editor_in("", path, rows, cols)
+
+# spawn_editor with the editor's working directory `dir` ("" for this one).
+fn spawn_editor_in(dir: StrView, path: StrView, rows: u16, cols: u16) -> Option<Child>
     var pty: Pty = match pty_open()
         Ok(p) => p
         Err(_) => return None
@@ -57,16 +62,20 @@ fn spawn_editor(path: StrView, rows: u16, cols: u16) -> Option<Child>
     match fork()
         Ok(f) => match f
             ForkResult.Child =>
-                sys_exit(editor_child(@&pty, path))
+                sys_exit(editor_child(@&pty, dir, path))
                 None
             ForkResult.Parent(pid) =>
                 Some(Child { pid: pid, pty: pty, before: before, seen: string_new(), mark: 0 })
         Err(_) => None
 
 # The child: a session of its own with the slave as its terminal, then the
-# editor. 120 and up: the terminal could not be set up.
-fn editor_child(pty: @&Pty, path: StrView) -> i32
+# editor. 120 and up: the terminal or directory could not be set up.
+fn editor_child(pty: @&Pty, dir: StrView, path: StrView) -> i32
     let closed = pty.master.close()
+    if not dir.is_empty()
+        match chdir(dir)
+            Ok(_) => pass
+            Err(_) => return 123
     match new_session()
         Ok(_) => pass
         Err(_) => return 120
@@ -378,4 +387,41 @@ fn test_resize_relayouts() -> i32
     assert c.exits_with(0)
     assert c.restored()
     c.close()
+    0
+
+# `:Files` in a real directory: the walk lists its files and not .git's or
+# build's, typing narrows, Enter opens the one selected.
+[[test]]
+fn test_file_picker_lists_and_opens() -> i32
+    let dir = fixture_dir("picker")
+    let sub = path_join(dir.as_view(), "src")
+    let made_sub = mkdir(sub.as_view(), 493)
+    let git = path_join(dir.as_view(), ".git")
+    let made_git = mkdir(git.as_view(), 493)
+    let build = path_join(dir.as_view(), "build")
+    let made_build = mkdir(build.as_view(), 493)
+    let a = write_file(path_join(dir.as_view(), "notes.txt").as_view(), "notes\n")
+    let b = write_file(path_join(sub.as_view(), "walked.ritz").as_view(), "fn walked\n")
+    let h = write_file(path_join(git.as_view(), "HEAD").as_view(), "ref\n")
+    let e = write_file(path_join(build.as_view(), "out.o").as_view(), "obj\n")
+    var c: Child = match spawn_editor_in(dir.as_view(), "notes.txt", 24, 80)
+        Some(k) => k
+        None => return 0     # no ptys here
+    assert c.expect("NORMAL")
+    assert c.send(":Files\r")
+    assert c.expect("Files  2/2"), "notes.txt and src/walked.ritz, nothing in .git or build"
+    assert c.expect("PICKER")
+    assert c.send("wal")
+    assert c.expect("1/2")
+    assert c.expect("> src/walked.ritz")
+    assert c.send("\r")
+    # Open, in Normal mode again: the status line's mode, then its name
+    # (the frame skips the unchanged blanks between them).
+    assert c.expect("NORMAL")
+    assert c.expect("src/walked.ritz")
+    assert c.send(":q\r")
+    assert c.exits_with(0)
+    assert c.restored()
+    c.close()
+    let gone = remove_dir_all(dir.as_view())
     0

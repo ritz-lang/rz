@@ -9,6 +9,15 @@ event loop, lexical colors and the ritz-lsp client are in: `buddhafinger
 On Harland, `buddhafinger [--rows N] [--cols N] [FILE]` edits it on the
 serial console (AGAST #4833).
 
+## Pickers
+
+`:Files` opens a picker over the working directory's files (`.git` and
+`build` left out, at most 20000), `:Buffers` one over the buffer list, a
+buffer with pending edits marked `[+]`. Type to narrow it: the letters in
+order anywhere in the name, runs and word starts ranked first. Up/Down or
+Ctrl-P/Ctrl-N move, Enter opens (as `:e` or `:b` would), Escape closes.
+Vim's lower-case `:files` and `:buffers` are still `:ls`.
+
 ## Language server
 
 A `.ritz` file starts ritz-lsp as a child process, with `RITZ1` pointing at
@@ -39,8 +48,9 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   which decodes Normal- and Visual-mode keys (counts, operators, motions
   and Ctrl-W window commands) into commands, `layout`, the windows' frame
   tree sized equally as Vim's, `editor`, which applies typed keys to the
-  buffer list and its windows, and `paint`, which composes one frame of
-  every window for the terminal). It does no terminal or OS
+  buffer list and its windows, `picker`, the `:Files` / `:Buffers` overlay
+  with its fuzzy matcher and ranking, and `paint`, which composes one frame
+  of every window, and the picker over them, for the terminal). It does no terminal or OS
   I/O, so it is tested without a terminal: files go through the
   `FileStore` seam in `files`, which the platform implements.
 - `src/syntax/`: lexical colors. `lexer` splits one line into tokens (no
@@ -60,6 +70,8 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   SIGTERM/SIGINT/SIGHUP exit, the terminal restored on every way out) and
   `save` (`LinuxFiles`, the Linux `core/files` `FileStore`: temp file, fsync,
   rename, directory fsync, permissions kept, external-change check),
+  `walk` (the file picker's list: the working directory's tree breadth
+  first, `.git` and `build` skipped, bounded in files and directories),
   `lsp` (ritz-lsp on nonblocking pipes in the same poll, a bounded amount of
   pipe work per loop turn, a bounded stderr log, EOF and EPIPE ending the
   session),
@@ -68,7 +80,8 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   console read for the Escape timeout, input overruns reported) and
   `harland_save` (`HarlandFiles`: the whole file in one write, opened
   `O_SYNC` so that for `/var` the checked close is the durable commit, all
-  or nothing; a failure keeps the buffer dirty and the old file), and
+  or nothing; a failure keeps the buffer dirty and the old file; no file
+  picker list yet, AGAST #4947), and
   `save_contract` (the cases every `FileStore` passes, generic over a disk
   fixture: Linux runs them in `test_save.ritz`, Harland in
   `bf-save-contract`).

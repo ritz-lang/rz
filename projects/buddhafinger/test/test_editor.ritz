@@ -1,5 +1,6 @@
 # test/test_editor.ritz - modes and the first-release command list (AGAST #4818),
-# then counts and operators (#4909) and Visual mode (#4910).
+# then counts and operators (#4909), Visual mode (#4910), buffers and
+# windows (#4912) and the pickers (#4913).
 #
 # Each command in docs/BUDDHAFINGER_PROPOSAL.md's "First usable release"
 # table, driven by key sequences, asserting the buffer, the cursor and the
@@ -16,9 +17,10 @@ import ritzlib.string
 import ritzlib.termsession { Key }
 
 import core.buffer { Buffer, pos }
-import core.editor { Editor, LangAsk, editor_new, editor_open, handle_key, jump_to, MSG_NO_JUMP, MSG_NOT_SAVED, MSG_TOO_LONG, MAX_JUMPS }
-import core.files { FileStore, LoadError, SaveError }
+import core.editor { Editor, LangAsk, editor_new, editor_open, handle_key, jump_to, MSG_NO_JUMP, MSG_NOT_SAVED, MSG_TOO_LONG, MAX_JUMPS, MAX_PICKER_FILES }
+import core.files { FileStore, LoadError, PathList, SaveError, path_list_new }
 import core.modes { Mode, mode_label }
+import core.picker { PickerKind }
 import core.screen { LineSource, Size, render, screen_new, view_new }
 import core.utf8 { utf8_encode }
 
@@ -84,6 +86,19 @@ impl FileStore for Disk
         self.saved.push_span(span_from_vec<u8>(@bytes))
         self.saves += 1
         Ok(())
+
+    # The file picker's list: the files load finds, the first first, at
+    # most `limit` (more: truncated).
+    fn list(self: @&Disk, limit: i64) -> PathList
+        var l = path_list_new()
+        if not self.disk_path.as_view().is_empty()
+            l.push(self.disk_path.as_view())
+        for i in 0..self.more.len()
+            if l.len() >= limit
+                l.truncated = true
+                return l
+            l.push(self.more[i].path.as_view())
+        l
 
 # ============================================================================
 # Helpers
@@ -1607,4 +1622,143 @@ fn test_window_and_buffer_queries() -> i32
     assert ed.find_buffer(2).unwrap_or(-1) == 1 and ed.find_buffer(9).is_none()
     assert ed.find_path("g.ritz").unwrap_or(-1) == 1 and ed.find_path("x").is_none()
     assert ed.find_window(t.wins.get(1).win).unwrap_or(-1) == bottom and ed.find_window(99).is_none()
+    0
+
+# ============================================================================
+# The pickers (AGAST #4913)
+# ============================================================================
+
+# The disk the picker tests list: f.txt (open), then three more.
+fn picker_disk() -> Disk
+    var d = disk_with("f.txt", "a\nb\nc\n")
+    d.add("src/core/editor.ritz", "fn e\n")
+    d.add("src/core/paint.ritz", "fn p\n")
+    d.add("README.md", "# r\n")
+    d
+
+[[test]]
+fn test_files_opens_the_picker_over_the_workspace() -> i32
+    var d = picker_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":Files<cr>")
+    assert ed.mode == Mode.Picker
+    assert mode_label(Mode.Picker).eq("PICKER")
+    let p = ed.picker()
+    assert p.kind == PickerKind.Files
+    assert p.candidate_count() == 4 and p.hit_count() == 4
+    assert p.hit_name(0).eq("f.txt")
+    0
+
+[[test]]
+fn test_picker_typing_narrows_and_enter_opens() -> i32
+    var d = picker_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":Files<cr>paint")
+    # Bound first: ritz1 can't type a chain on a method call's result
+    # (`ed.picker().query.as_view()`, AGAST #4942).
+    let p = ed.picker()
+    assert p.query.as_view().eq("paint")
+    assert p.hit_count() == 1
+    feed(@&ed, @&d, "<cr>")
+    assert ed.mode == Mode.Normal
+    assert ed.path().eq("src/core/paint.ritz")
+    assert holds(@ed, "fn p\n")
+    assert ed.buffer_count() == 2
+    assert ed.picker().candidate_count() == 0, "closing forgets the list"
+    0
+
+[[test]]
+fn test_picker_moves_with_arrows_and_ctrl_n_p() -> i32
+    var d = picker_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":Files<cr><down><C-n>")
+    assert ed.picker().selected == 2
+    feed(@&ed, @&d, "<C-p>")
+    assert ed.picker().selected == 1
+    feed(@&ed, @&d, "<up><up><up>")
+    assert ed.picker().selected == 0
+    feed(@&ed, @&d, "<C-n><C-n><C-n><C-n><C-n>")
+    assert ed.picker().selected == 3
+    feed(@&ed, @&d, "<cr>")
+    assert ed.path().eq("README.md")
+    0
+
+[[test]]
+fn test_picker_escape_closes_and_changes_nothing() -> i32
+    var d = picker_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, "j:Files<cr>edi<bs><esc>")
+    assert ed.mode == Mode.Normal
+    assert ed.path().eq("f.txt") and ed.cursor.line == 1
+    assert ed.buffer_count() == 1
+    feed(@&ed, @&d, "j")
+    assert ed.cursor.line == 2, "Normal-mode keys work again"
+    0
+
+[[test]]
+fn test_picker_backspace_erases_and_stays_open() -> i32
+    var d = picker_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":Files<cr>zz")
+    assert ed.picker().hit_count() == 0
+    feed(@&ed, @&d, "<bs><bs><bs>")
+    assert ed.mode == Mode.Picker, "Backspace on an empty query doesn't close it"
+    assert ed.picker().hit_count() == 4
+    0
+
+[[test]]
+fn test_picker_enter_with_no_hit_just_closes() -> i32
+    var d = picker_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":Files<cr>qqq<cr>")
+    assert ed.mode == Mode.Normal
+    assert ed.path().eq("f.txt") and ed.buffer_count() == 1
+    0
+
+[[test]]
+fn test_picker_opens_a_file_already_open_in_its_buffer() -> i32
+    var d = picker_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":e README.md<cr>:Files<cr>f.t<cr>")
+    assert ed.path().eq("f.txt")
+    assert ed.buffer_count() == 2 and ed.buffer_number() == 1
+    0
+
+[[test]]
+fn test_files_bounds_the_list() -> i32
+    var d = picker_disk()
+    for i in 0..(MAX_PICKER_FILES + 5)
+        d.add("x", "")
+    var ed = open("a\n")
+    feed(@&ed, @&d, ":Files<cr>")
+    assert ed.picker().candidate_count() == MAX_PICKER_FILES
+    assert ed.picker().names.truncated
+    0
+
+[[test]]
+fn test_buffers_picks_among_the_open_buffers() -> i32
+    var d = picker_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":e src/core/editor.ritz<cr>ix<esc>:e README.md<cr>:Buffers<cr>")
+    assert ed.mode == Mode.Picker
+    let p = ed.picker()
+    assert p.kind == PickerKind.Buffers
+    assert p.hit_count() == 3
+    assert p.hit_name(0).eq("f.txt") and p.hit_name(1).eq("src/core/editor.ritz")
+    assert p.hit_dirty(1) and not p.hit_dirty(0) and not p.hit_dirty(2)
+    feed(@&ed, @&d, "edit<cr>")
+    assert ed.mode == Mode.Normal
+    assert ed.path().eq("src/core/editor.ritz")
+    assert holds(@ed, "xfn e\n"), "the buffer as left, pending edits and all"
+    0
+
+[[test]]
+fn test_buffers_names_an_unnamed_buffer() -> i32
+    var d = disk_new()
+    var ed = editor_new()
+    feed(@&ed, @&d, ":Buffers<cr>")
+    assert ed.picker().hit_count() == 1
+    assert ed.picker().hit_name(0).eq("[No Name]")
+    feed(@&ed, @&d, "<cr>")
+    assert ed.mode == Mode.Normal and ed.buffer_count() == 1
     0

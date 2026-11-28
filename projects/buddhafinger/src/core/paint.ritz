@@ -5,7 +5,10 @@
 # buffer's styler with its lexical-color cache and diagnostic marks, with
 # the text revision they were built for) and compose() turns the Editor
 # into the bytes that update the terminal: every window of the editor's
-# tiling in its place, the separators, then the message line. The language
+# tiling in its place, the separators, then the message line, or in Picker
+# mode the picker's overlay (AGAST #4913): a title row, up to PICKER_ROWS of
+# its hits, best first, above the bottom status lines, and its query on
+# the last row. The language
 # server's part comes from the caller: it fills each buffer's marks
 # (styler_for, Session.build_marks) and passes the current window's status
 # tag and the cursor line's diagnostic. The platform's event loop flushes
@@ -18,14 +21,16 @@
 import ritzlib.gvec
 import ritzlib.option
 import ritzlib.strview { StrView }
-import ritzlib.termsession { TermOut }
+import ritzlib.string
+import ritzlib.termsession { TermOut, style_plain }
 
 import core.buffer { Buffer }
 import core.editor { Editor }
 import core.history { release_all }
 import core.layout { Rect, Tiling }
 import core.modes { Mode }
-import core.screen { LineSource, Screen, Size, View, begin_frame, draw_message, draw_separator, draw_window, screen_new, view_new }
+import core.picker { Picker, PickerKind }
+import core.screen { LineSource, Screen, Size, View, begin_frame, draw_message, draw_overlay_row, draw_prompt, draw_separator, draw_window, screen_new, style_picked, style_status_nc, view_new }
 import syntax.marks { Marked, marked_new }
 
 # A window's lines as the screen reads them: the buffer's, `count` of them
@@ -52,6 +57,9 @@ struct Styled
     styler: Marked
     drawn: Option<i64>      # the text revision its caches are for; None before the first frame
     marks: Option<i64>      # the revision its marks were built for; None: to build
+
+# The most hits the picker's overlay shows at once.
+pub const PICKER_ROWS: i64 = 10
 
 pub struct Painter
     screen: Screen
@@ -139,16 +147,64 @@ impl Painter
             self.keep_view(placed.win, view)
         for i in 0..t.seps.len()
             draw_separator(@&self.screen, t.seps.get(i))
+        if ed.mode == Mode.Picker
+            self.draw_picker(ed)
+        else
+            self.draw_message_line(ed, hint)
+        self.prune(ed, @t)
+        out.hide_cursor()
+        self.screen.emit(out)
+        out.show_cursor()
+
+    # The message line: the command line while one is typed, else the
+    # editor's message, else `hint`.
+    fn draw_message_line(self: @&Painter, ed: @Editor, hint: StrView)
         var message: StrView = match ed.mode
             Mode.CommandLine => ed.command_line()
             _ => ed.message.as_view()
         if message.is_empty() and ed.mode != Mode.CommandLine
             message = hint
         draw_message(@&self.screen, message)
-        self.prune(ed, @t)
-        out.hide_cursor()
-        self.screen.emit(out)
-        out.show_cursor()
+
+    # The picker's overlay, over the windows above the bottom status lines
+    # (the current window's names the mode, PICKER): its title (the
+    # kind, hits/candidates; `+` after a list cut short), its hits from the
+    # first scrolled to, the selected one marked and reversed, a buffer
+    # with pending edits marked `[+]`, then `> query` on the last row with
+    # the cursor after it.
+    fn draw_picker(self: @&Painter, ed: @&Editor)
+        let total = self.screen.size.rows as i64
+        var rows = ed.picker().hit_count()
+        if rows > PICKER_ROWS
+            rows = PICKER_ROWS
+        if rows > total - 3
+            rows = total - 3
+        if rows < 0
+            rows = 0
+        let top = ed.picker_top(rows)
+        let p = ed.picker()
+        let first = total - 3 - rows       # above the status lines' row
+        let kind: StrView = match p.kind
+            PickerKind.Files => " Files  "
+            PickerKind.Buffers => " Buffers  "
+        var title = string_from(kind)
+        title.push_i64(p.hit_count())
+        title.push('/')
+        title.push_i64(p.candidate_count())
+        if p.names.truncated
+            title.push('+')
+        draw_overlay_row(@&self.screen, first, title.as_view(), style_status_nc())
+        for i in 0..rows
+            let k = top + i
+            let picked = k == p.selected
+            var line = string_from(if picked then "> " else "  ")
+            line.push_str(p.hit_name(k))
+            if p.hit_dirty(k)
+                line.push_str(" [+]")
+            draw_overlay_row(@&self.screen, first + 1 + i, line.as_view(), if picked then style_picked() else style_plain())
+        var prompt = string_from("> ")
+        prompt.push_str(p.query.as_view())
+        draw_prompt(@&self.screen, prompt.as_view())
 
     # Window w of the editor in rectangle `at`; its View as scrolled.
     fn draw(self: @&Painter, ed: @Editor, w: i64, at: Rect, lang: StrView) -> View

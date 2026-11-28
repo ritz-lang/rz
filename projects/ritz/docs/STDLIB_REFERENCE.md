@@ -77,6 +77,7 @@ modules links without sys. A freestanding program defines all three itself.
    - [gvec](#gvec) - Generic dynamic array (`Vec<T>`)
    - [string](#string) - Owned UTF-8 strings
    - [hashmap](#hashmap) - Hash map for i64 keys
+   - [sort](#sort) - Stable in-place sort of a `Vec<T: Ord>`
    - [span](#span) - Non-owning memory views
 4. [String Utilities](#string-utilities)
    - [strview](#strview) - Borrowed string views (`StrView`)
@@ -868,6 +869,54 @@ fn main() -> i32
 
 ---
 
+### sort
+
+**Module**: `ritzlib.sort`
+
+`sort<T: Ord>(@&v)` sorts a `Vec<T>` in place, ascending by `T`'s `compare`
+(`ritzlib.cmp`'s `Ord`). Stable: elements that compare `Equal` keep their
+order. A bottom-up merge sort, O(n log n) compares with one scratch `Vec` of
+n elements; with no memory for it, an insertion sort (no allocation), so a
+sort never fails. Elements are copied in and out, so `T` is plain data: a
+move-only `T` is refused where `sort` is instantiated.
+
+```ritz
+import ritzlib.cmp
+import ritzlib.gvec
+import ritzlib.sort
+
+struct Hit
+    score: i64
+    index: i64
+
+# Best first.
+impl Ord for Hit
+    fn compare(self: @Hit, other: @Hit) -> Ordering
+        cmp_i64(other.score, self.score)
+
+[[test]]
+fn test_sort_example() -> i32
+    var hits: Vec<Hit> = vec_new<Hit>()
+    hits.push(Hit { score: 3, index: 0 })
+    hits.push(Hit { score: 9, index: 1 })
+    hits.push(Hit { score: 3, index: 2 })
+    sort<Hit>(@&hits)
+    assert hits.get(0).index == 1
+    assert hits.get(1).index == 0 and hits.get(2).index == 2   # stable
+    var ns: Vec<i64> = vec_new<i64>()
+    ns.push(2)
+    ns.push(-1)
+    sort<i64>(@&ns)
+    assert ns.get(0) == -1
+    0
+```
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `sort<T: Ord>` | `fn(v: @&Vec<T>)` | Stable ascending sort in place |
+
+---
+
 ### cmp
 
 **Module**: `ritzlib.cmp` (core, bare)
@@ -899,6 +948,7 @@ fn test_cmp_example() -> i32
 | `o.is_lt()`, `o.is_le()` | `fn() -> bool` | `Less` / not `Greater` |
 | `o.is_gt()`, `o.is_ge()` | `fn() -> bool` | `Greater` / not `Less` |
 | `o.reverse()` | `fn() -> Ordering` | `Less` and `Greater` swapped |
+| `Ord` | `trait { fn compare(self: @Self, other: @Self) -> Ordering }` | A total order, what `ritzlib.sort` needs; `i64` has one. `compare`, not `cmp`: `StrView` already has a `cmp` |
 | `cmp_i64` | `fn(a: i64, b: i64) -> Ordering` | Compare two integers |
 
 ---

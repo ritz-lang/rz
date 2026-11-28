@@ -3,7 +3,9 @@
 # The core does no I/O (docs/BUDDHAFINGER_PROPOSAL.md, "Ritz and platform
 # boundaries"): `:e` and `:w` call a FileStore the platform supplies. The
 # Linux one (temp file, fsync, rename, the size/mtime check) is AGAST #4820;
-# the Harland one (one write, an O_SYNC close) is #4833 and #4835.
+# the Harland one (one write, an O_SYNC close) is #4833 and #4835. The file
+# picker (`:Files`, AGAST #4913) asks it for the workspace's files: Linux
+# walks the working directory's tree, bounded (platform/walk.ritz).
 # platform/save_contract.ritz is the contract both pass. The tests drive the
 # editor with an in-memory FileStore.
 # Core module: no terminal or OS I/O (see src/platform/).
@@ -28,6 +30,29 @@ pub enum SaveError
     # stays dirty. (Harland's O_SYNC close is all or nothing: Failed.)
     Unpersisted(Errno)
 
+# Paths in the order added, back to back in one Vec<u8> (a Vec frees only its
+# own storage, so one Vec of bytes rather than a Vec of Strings).
+pub struct PathList
+    bytes: Vec<u8>
+    ends: Vec<i64>          # where each path ends in `bytes`
+    truncated: bool         # a bound stopped the listing: there are more
+
+pub fn path_list_new() -> PathList
+    PathList { bytes: vec_new<u8>(), ends: vec_new<i64>(), truncated: false }
+
+impl PathList
+    pub fn push(self: @&PathList, path: StrView)
+        self.bytes.push_view(path)
+        self.ends.push(self.bytes.len())
+
+    pub fn len(self: @PathList) -> i64
+        self.ends.len()
+
+    # Path k, a view into the list: valid until the next push.
+    pub fn get(self: @PathList, k: i64) -> StrView
+        let from = if k == 0 then 0 else self.ends.get(k - 1)
+        self.bytes.as_view().slice(from, self.ends.get(k))
+
 pub trait FileStore
     # The file's bytes, exactly as stored.
     fn load(self: @&Self, path: StrView) -> Result<Vec<u8>, LoadError>
@@ -36,3 +61,10 @@ pub trait FileStore
     # order) to `path`. Ok only when all of them are stored: the editor then
     # marks the buffer clean, and on Err it stays dirty.
     fn save(self: @&Self, path: StrView, buf: @Buffer) -> Result<(), SaveError>
+
+    # The workspace's files for the file picker: paths relative to the
+    # working directory, none inside a `.git` or `build` directory, at most
+    # `limit` of them (more: the list is marked truncated). Bounded so a
+    # large tree doesn't stall the editor; empty where the platform can't
+    # list directories.
+    fn list(self: @&Self, limit: i64) -> PathList

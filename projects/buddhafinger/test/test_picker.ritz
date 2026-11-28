@@ -1,0 +1,212 @@
+# test/test_picker.ritz - core/picker: the fuzzy matcher, its ranking, and the overlay's state (AGAST #4913).
+#
+# The matcher takes a query's code points in order anywhere in a candidate
+# (a subsequence, ASCII case folded) and scores the best placing: runs of
+# adjacent matches and matches at word starts (after `/`, `_`, `-`, `.`, a
+# blank, or a lower-to-upper case change) score higher, gaps lower. The
+# Picker ranks its candidates by that score, then the shorter, then the
+# first listed; with no query it keeps their order.
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.strview { StrView }
+
+import core.files { PathList, path_list_new }
+import core.picker { Matcher, Picker, PickerKind, fuzzy_score, matcher_new, picker_new }
+
+fn score(query: StrView, cand: StrView) -> i64
+    fuzzy_score(query, cand).unwrap_or(-1)
+
+fn ranks_above(query: StrView, better: StrView, worse: StrView) -> bool
+    score(query, better) > score(query, worse)
+
+fn paths(a: StrView, b: StrView, c: StrView, d: StrView) -> PathList
+    var l = path_list_new()
+    l.push(a)
+    l.push(b)
+    l.push(c)
+    l.push(d)
+    l
+
+fn files_picker(list: PathList) -> Picker
+    var p = picker_new()
+    p.open_files(list)
+    p
+
+# The name of the hit at rank k, or "" past the last.
+fn hit(p: @Picker, k: i64) -> StrView
+    if k >= p.hit_count()
+        return ""
+    p.hit_name(k)
+
+# ============================================================================
+# The matcher
+# ============================================================================
+
+[[test]]
+fn test_subsequence_matches_and_misses() -> i32
+    assert fuzzy_score("edr", "editor.ritz").is_some()
+    assert fuzzy_score("", "anything").is_some()
+    assert fuzzy_score("rde", "editor.ritz").is_none(), "out of order is no match"
+    assert fuzzy_score("editors", "editor").is_none(), "longer than the candidate"
+    assert fuzzy_score("x", "").is_none()
+    0
+
+[[test]]
+fn test_case_folds_ascii() -> i32
+    assert fuzzy_score("EDIT", "editor.ritz").is_some()
+    assert fuzzy_score("readme", "README.md").is_some()
+    assert score("edit", "editor.ritz") == score("EDIT", "editor.ritz")
+    0
+
+[[test]]
+fn test_a_run_beats_scattered_matches() -> i32
+    assert ranks_above("edit", "editor.ritz", "e_d_i_t.ritz")
+    assert ranks_above("buf", "buffer.ritz", "bun_ufo.ritz")
+    0
+
+[[test]]
+fn test_word_starts_beat_the_middle_of_a_word() -> i32
+    assert ranks_above("fb", "foo_bar", "fxbx")
+    assert ranks_above("fb", "fooBar", "foobar")
+    assert ranks_above("lay", "src/core/layout.ritz", "src/core/play.ritz")
+    0
+
+# The best placing, not the first: `ed` takes "editor"'s e, not "core"'s.
+[[test]]
+fn test_the_best_placing_wins() -> i32
+    assert ranks_above("ed", "src/core/editor.ritz", "src/core/needed.ritz")
+    assert score("ed", "core/editor") == score("ed", "editor")
+    0
+
+[[test]]
+fn test_a_reused_matcher_scores_the_same() -> i32
+    var m: Matcher = matcher_new()
+    let a = m.score("pk", "src/core/picker.ritz").unwrap_or(-1)
+    let long = m.score("pk", "a/much/longer/path/to/some/packed/file.ritz").unwrap_or(-1)
+    let b = m.score("pk", "src/core/picker.ritz").unwrap_or(-1)
+    assert a > 0 and long > 0
+    assert a == b
+    assert a == score("pk", "src/core/picker.ritz")
+    0
+
+# ============================================================================
+# The picker's list
+# ============================================================================
+
+[[test]]
+fn test_no_query_lists_every_candidate_in_order() -> i32
+    var p = files_picker(paths("zeta.ritz", "src/a.ritz", "b.txt", "README.md"))
+    assert p.kind == PickerKind.Files
+    assert p.candidate_count() == 4 and p.hit_count() == 4
+    assert hit(@p, 0).eq("zeta.ritz") and hit(@p, 3).eq("README.md")
+    assert p.selected == 0
+    0
+
+[[test]]
+fn test_typing_filters_and_ranks() -> i32
+    var p = files_picker(paths("src/core/needed.ritz", "docs/intro.md", "src/core/editor.ritz", "test/test_editor.ritz"))
+    p.type_text("ed")
+    assert p.query.as_view().eq("ed")
+    assert p.hit_count() == 3, "intro.md has no e then d"
+    # Equal scores: the shorter first.
+    assert hit(@p, 0).eq("src/core/editor.ritz")
+    assert hit(@p, 1).eq("test/test_editor.ritz")
+    assert hit(@p, 2).eq("src/core/needed.ritz")
+    p.type_text("itor")
+    assert p.hit_count() == 2
+    p.type_text("zzz")
+    assert p.hit_count() == 0
+    assert p.chosen().is_none()
+    0
+
+[[test]]
+fn test_equal_hits_keep_list_order() -> i32
+    var p = files_picker(paths("b/x.ritz", "a/x.ritz", "c/x.ritz", "x"))
+    p.type_text("x.r")
+    assert p.hit_count() == 3
+    assert hit(@p, 0).eq("b/x.ritz") and hit(@p, 1).eq("a/x.ritz") and hit(@p, 2).eq("c/x.ritz")
+    0
+
+[[test]]
+fn test_erase_widens_again() -> i32
+    var p = files_picker(paths("alpha", "beta", "gamma", "delta"))
+    p.type_text("lt")
+    assert p.hit_count() == 1 and hit(@p, 0).eq("delta")
+    assert p.erase()
+    assert p.query.as_view().eq("l")
+    assert p.hit_count() == 2
+    assert p.erase()
+    assert p.hit_count() == 4 and hit(@p, 0).eq("alpha")
+    assert not p.erase(), "nothing left to erase"
+    0
+
+[[test]]
+fn test_erase_takes_a_whole_code_point() -> i32
+    var p = files_picker(paths("café", "cafe", "x", "y"))
+    p.type_text("é")
+    assert p.hit_count() == 1
+    assert p.erase()
+    assert p.query.len() == 0
+    0
+
+[[test]]
+fn test_moving_clamps_and_typing_resets() -> i32
+    var p = files_picker(paths("a1", "a2", "a3", "b"))
+    p.move_by(1)
+    p.move_by(1)
+    assert p.selected == 2
+    p.move_by(5)
+    assert p.selected == 3, "stops at the last"
+    p.move_by(-9)
+    assert p.selected == 0, "stops at the first"
+    p.move_by(2)
+    p.type_text("a")
+    assert p.selected == 0, "a new query starts at the best"
+    assert p.chosen().unwrap_or(-1) == 0
+    p.move_by(1)
+    assert p.chosen().unwrap_or(-1) == 1
+    0
+
+[[test]]
+fn test_scroll_keeps_the_selection_shown() -> i32
+    var l = path_list_new()
+    for i in 0..30
+        l.push("f")
+    var p = files_picker(l)
+    assert p.scroll(10) == 0
+    p.move_by(9)
+    assert p.scroll(10) == 0
+    p.move_by(1)
+    assert p.scroll(10) == 1, "one row on when the selection passes the last"
+    p.move_by(-1)
+    assert p.scroll(10) == 1, "moving back inside the rows doesn't scroll"
+    p.move_by(-9)
+    assert p.scroll(10) == 0
+    0
+
+[[test]]
+fn test_buffer_candidates_carry_number_and_mark() -> i32
+    var p = picker_new()
+    p.open_buffers()
+    p.add_buffer("main.ritz", 1, false)
+    p.add_buffer("[No Name]", 3, true)
+    p.add_buffer("lib/util.ritz", 4, false)
+    p.ready()
+    assert p.kind == PickerKind.Buffers
+    assert p.hit_count() == 3
+    assert p.hit_dirty(1) and not p.hit_dirty(0)
+    p.type_text("ut")
+    assert p.hit_count() == 1
+    let c = p.chosen().unwrap_or(-1)
+    assert c == 2 and p.number_of(c) == 4
+    0
+
+[[test]]
+fn test_close_forgets_everything() -> i32
+    var p = files_picker(paths("a", "b", "c", "d"))
+    p.type_text("a")
+    p.close()
+    assert p.candidate_count() == 0 and p.hit_count() == 0
+    assert p.query.len() == 0 and p.selected == 0
+    0

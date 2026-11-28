@@ -1,0 +1,78 @@
+# ritzlib/sort.ritz - sorting a Vec in place (AGAST #4913)
+#
+#     sort<T: Ord>(@&v)     ascending by T's compare (ritzlib.cmp's Ord)
+#
+# Stable: elements that compare Equal keep their order, so a sort by one key
+# after another ranks by the last key first. A bottom-up merge sort: O(n log
+# n) compares and one scratch Vec of n elements. Without memory for that
+# Vec it sorts by insertion instead (O(n^2), no allocation), so a sort never
+# fails.
+#
+# Elements are copied in and out (Vec.get / Vec.set), so T is plain data: a
+# move-only T is refused where sort is instantiated. Sort its indices, or a
+# Vec of keys holding them, instead.
+#
+#     struct Hit
+#         score: i64
+#         index: i64
+#
+#     impl Ord for Hit
+#         fn compare(self: @Hit, other: @Hit) -> Ordering
+#             cmp_i64(other.score, self.score)      # best first
+#
+#     sort<Hit>(@&hits)
+
+import ritzlib.cmp
+import ritzlib.gvec
+
+pub fn sort<T: Ord>(v: @&Vec<T>)
+    let n = v.len()
+    if n < 2
+        return
+    var tmp: Vec<T> = vec_zeroed<T>(n)
+    if tmp.len() < n
+        sort_by_insertion<T>(v)
+        return
+    var width: i64 = 1
+    while width < n
+        # Each pair of runs [lo, mid) and [mid, hi) of v, merged into tmp.
+        var lo: i64 = 0
+        while lo < n
+            let mid = if lo + width < n then lo + width else n
+            let hi = if mid + width < n then mid + width else n
+            merge_runs<T>(v, @&tmp, lo, mid, hi)
+            lo = hi
+        for i in 0..n
+            v.set(i, tmp.get(i))
+        width = width * 2
+
+# v's sorted runs [lo, mid) and [mid, hi) merged into out[lo..hi). On a tie
+# the left run's element goes first: what keeps the sort stable.
+fn merge_runs<T: Ord>(v: @Vec<T>, out: @&Vec<T>, lo: i64, mid: i64, hi: i64)
+    var a = lo
+    var b = mid
+    for k in lo..hi
+        var left = a < mid
+        if left and b < hi
+            let x: T = v.get(a)
+            let y: T = v.get(b)
+            left = not y.compare(@x).is_lt()
+        if left
+            out.set(k, v.get(a))
+            a += 1
+        else
+            out.set(k, v.get(b))
+            b += 1
+
+# Stable too: an element moves left only past ones it is strictly before.
+fn sort_by_insertion<T: Ord>(v: @&Vec<T>)
+    for i in 1..v.len()
+        let x: T = v.get(i)
+        var j = i
+        while j > 0
+            let y: T = v.get(j - 1)
+            if not x.compare(@y).is_lt()
+                break
+            v.set(j, y)
+            j -= 1
+        v.set(j, x)

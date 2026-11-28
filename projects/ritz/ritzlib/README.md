@@ -101,6 +101,7 @@ pub fn main() -> i32
 | `ptr.ritz` | `ritzlib.ptr` | reads through a raw pointer that take ownership |
 | `regex.ritz` | `ritzlib.regex` | regular expressions that run in linear time. |
 | `result.ritz` | `ritzlib.result` | `Result<T, E>`, a success value or an error |
+| `sort.ritz` | `ritzlib.sort` | sorting a Vec in place (AGAST #4913) |
 | `span.ritz` | `ritzlib.span` | Non-owning views into contiguous memory |
 | `str.ritz` | `ritzlib.str` | byte predicates and the libc memory symbols |
 | `string.ritz` | `ritzlib.string` | Owned string type |
