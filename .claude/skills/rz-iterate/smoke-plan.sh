@@ -64,7 +64,8 @@
 #                                        ritz.toml, so every harland path)
 #   projects/<pkg>/**                    ritz1-bootstrap pkg:<pkg>  (./rz
 #                                        build under ritz0, ritz1 and
-#                                        ritz1_selfhosted, then ./rz test),
+#                                        ritz1_selfhosted, then ./rz test
+#                                        under ritz0 and ritz1, #4917),
 #                                        plus pkg:<pkg>/<sub> for a nested
 #                                        package (its own ritz.toml, not in
 #                                        rz.toml's [workspace.exclude])
@@ -163,14 +164,19 @@ cmd_of() {
         ci:*)             echo "cd projects/ritz && python3 -m pytest -q -n 8 --dist loadgroup tools/${1#ci:}" ;;
         # The package under every compiler the gate builds it with (#4777:
         # #4739's package built under ritz0 and only ritz1 refused it), all
-        # three in full, then its tests.  A compiler whose known-failures/
-        # `build` entries excuse the package is skipped, as `rz build --all`
-        # excuses it; the plan's ritz1-bootstrap built the compilers first.
+        # three in full, then its tests under ritz0 and under ritz1, the two
+        # sweeps the gate runs (#4917: #4892's harland/nic tests compiled
+        # e1000e.ritz, which only ritz1 could not emit, and the train went
+        # red at [Test every package with ritz1]).  A compiler whose
+        # known-failures/ `build` entries excuse the package is skipped, as
+        # `rz build --all` excuses it; the ritz1 tests are skipped on a ritz1
+        # `build` or `parity` entry, as `rz test --all --compiler ritz1`
+        # excuses them.  The plan's ritz1-bootstrap built the compilers first.
         # An excluded top-level package's own gate (#4813): pkg:'s
         # three-compiler build is the sweep its exclusion keeps it out of.
         entry:*)          echo "make -C projects/${1#entry:} test" ;;
         pkg:*)            local p="${1#pkg:}"
-                          echo "rc=0; for c in ritz0 ritz1 ritz1_selfhosted; do if python3 projects/ritz/tools/known_failures.py list --gate build --compiler \$c | cut -f1 | grep -qxF '$p'; then echo \"$p: build under \$c excused by known-failures/\"; else ./rz build $p --compiler \$c || rc=1; fi; done; ./rz test $p || rc=1; exit \$rc" ;;
+                          echo "rc=0; for c in ritz0 ritz1 ritz1_selfhosted; do if python3 projects/ritz/tools/known_failures.py list --gate build --compiler \$c | cut -f1 | grep -qxF '$p'; then echo \"$p: build under \$c excused by known-failures/\"; else ./rz build $p --compiler \$c || rc=1; fi; done; ./rz test $p || rc=1; if { python3 projects/ritz/tools/known_failures.py list --gate build --compiler ritz1; python3 projects/ritz/tools/known_failures.py list --gate parity --compiler ritz1; } | cut -f1 | grep -qxF '$p'; then echo \"$p: tests under ritz1 excused by known-failures/\"; else ./rz test $p --compiler ritz1 || rc=1; fi; exit \$rc" ;;
         skill:*)          local d=".claude/skills/${1#skill:}"
                           # A test that starts real units (test-*-systemd.sh)
                           # runs through room-unit.sh: rooms may not call

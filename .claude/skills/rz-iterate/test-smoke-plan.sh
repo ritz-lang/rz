@@ -113,10 +113,31 @@ printf '#!/usr/bin/env bash\necho "$*" >> rz.log\n[[ "$*" != "build harland --co
 chmod +x "$T/stub/rz"
 printf 'import sys\nif sys.argv[-1] == "ritz1_selfhosted":\n    print("harland\\tAGAST #1: stub")\n' > "$T/stub/projects/ritz/tools/known_failures.py"
 (cd "$T/stub" && bash -c "$(cut -f2 <<<"$pk")" >out.log 2>&1); rc=$?
-eq "$(paste -sd'|' "$T/stub/rz.log")" "build harland --compiler ritz0|build harland --compiler ritz1|test harland" \
-    "pkg: builds under each compiler in full, skips an excused one, then tests"
+eq "$(paste -sd'|' "$T/stub/rz.log")" "build harland --compiler ritz0|build harland --compiler ritz1|test harland|test harland --compiler ritz1" \
+    "pkg: builds under each compiler in full, skips an excused one, then tests under ritz0 and ritz1"
 eq "$rc" 1 "a failed build under ritz1 fails the target"
 has "$(cat "$T/stub/out.log")" "build under ritz1_selfhosted excused" "and says which build it skipped"
+# AGAST #4917: #4892's pkg:harland/nic passed smoke, then the train went red
+# at [Test every package with ritz1] (`./rz test --all --compiler ritz1`):
+# its tests compiled e1000e.ritz, which only ritz1 could not emit.  pkg: now
+# tests under ritz1 too, excused as that sweep excuses (rz
+# known_failing_from_config: `build` or `parity` entries naming ritz1).
+has "$pk" "\./rz test harland --compiler ritz1 [|][|] rc=1" "pkg: tests under ritz1, as the gate's package step does"
+printf '#!/usr/bin/env bash\necho "$*" >> rz.log\n[[ "$*" != "test harland --compiler ritz1" ]]\n' > "$T/stub/rz"
+printf 'print("")\n' > "$T/stub/projects/ritz/tools/known_failures.py"
+: > "$T/stub/rz.log"
+(cd "$T/stub" && bash -c "$(cut -f2 <<<"$pk")" >out.log 2>&1); rc=$?
+eq "$rc" 1 "tests failing only under ritz1 fail the target"
+eq "$(tail -1 "$T/stub/rz.log")" "test harland --compiler ritz1" "the ritz1 tests run last, after ritz0's"
+for g in build parity; do
+    printf 'import sys\nif sys.argv[-3:] == ["%s", "--compiler", "ritz1"]:\n    print("harland\\tAGAST #1: stub")\n' "$g" \
+        > "$T/stub/projects/ritz/tools/known_failures.py"
+    : > "$T/stub/rz.log"
+    (cd "$T/stub" && bash -c "$(cut -f2 <<<"$pk")" >out.log 2>&1); rc=$?
+    eq "$rc" 0 "a ritz1 \`$g\` entry excuses the ritz1 tests"
+    eq "$(grep -c -- '^test harland --compiler ritz1$' "$T/stub/rz.log")" 0 "and they do not run ($g)"
+    has "$(cat "$T/stub/out.log")" "tests under ritz1 excused" "and it says so ($g)"
+done
 # A nested package (its own ritz.toml) is built by itself too: #4739's
 # arp.ritz is in harland/netstack, which harland's own build never compiles.
 # The enclosing package stays (harland builds its nested *_abi deps).  An
@@ -201,7 +222,7 @@ eq "$(targets "$s^!")" "smoke tools-unit unit ritz1-bootstrap matrix build-all-r
 eq "$(targets "$toml^..HEAD")" "smoke doc-examples tools-unit unit ritz1-bootstrap ritz1-unit matrix build-all build-all-ritz1 entry:editor pkg:angelo pkg:harland pkg:harland/netstack pkg:spire" \
     "a range plans every commit in it"
 has "$(bash "$SP" plan)" "^unit	make -C projects/ritz unit$" "plan prints each target's command, tab-separated"
-has "$(bash "$SP" plan)" "^pkg:spire	rc=0; for c in ritz0 ritz1 ritz1_selfhosted; .*\./rz test spire [|][|] rc=1; exit .rc$" "a package's command builds it under each compiler, then tests it"
+has "$(bash "$SP" plan)" "^pkg:spire	rc=0; for c in ritz0 ritz1 ritz1_selfhosted; .*\./rz test spire [|][|] rc=1; .*\./rz test spire --compiler ritz1 [|][|] rc=1; fi; exit .rc$" "a package's command builds it under each compiler, then tests it under ritz0 and ritz1"
 
 # AGAST #4777: the plan is the floor.  A room adds targets by judgment
 # (`+<target>`) and its quote names them, after the plan's, each once.
