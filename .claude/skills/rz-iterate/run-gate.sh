@@ -12,6 +12,8 @@
 #                                                (default: clean ci-local)
 #   RZ_GATE_SLOTS  gates allowed at once         (default: host.env, else 1)
 #   RZ_TRAIN_SLOTS of those, train gates only    (default: host.env, else 0)
+#   RZ_GATE_JOBS   the gate's -j, every tool's   (default: host.env, else each
+#                                                 tool's own; AGAST #4971)
 #   RZ_HOST_ENV    per-host config file          (default: ~/.config/rz/host.env)
 #   RZ_GATE_DIR    where logs and slot locks go  (default: ~/dev/ritz-lang/gate-logs)
 #   RZ_GATE_POLL   seconds between slot polls    (default: 20; tests use less)
@@ -274,6 +276,36 @@ if [[ -n "$CPU_FACTOR" ]]; then
 else
     CPU_FACTOR_HDR="(measured)"
 fi
+# The gate's parallelism (AGAST #4971): RZ_GATE_JOBS in this script's
+# environment (one gate), else host.env's.  The unit gets it as RZ_GATE_JOBS,
+# which main.yml's `rz build/test -j` and the Makefile's tool -j read, and
+# under the name of each knob that already had one: RITZ1_JOBS (every ritz1
+# make -j: scripts/ritz1-jobs.sh, regression.sh, run_regression_matrix.py, the
+# builder image's bootstrap), PYTEST_J (the ritz0 and tools/ suites),
+# RATCHETS_J (the source ratchets) and REGRESSION_JOBS (regression.sh).
+# Unset, none of them is passed, not even empty: the Makefile's `PYTEST_J ?=
+# 8` keeps an empty environment value and would run `pytest -n` with no count.
+# Not MAKEFLAGS=-jN: the gate's top-level make runs `smoke` then `ci-local`,
+# whose steps must stay in order; every make that recurses into ritz1 already
+# passes its own -j$(RITZ1_J).
+if [[ -n "${RZ_GATE_JOBS+set}" ]]; then
+    GATE_JOBS="$RZ_GATE_JOBS" GATE_JOBS_FROM="environment"
+else
+    GATE_JOBS="${HOST_ENV[RZ_GATE_JOBS]:-}" GATE_JOBS_FROM="host.env"
+fi
+JOBS_ENV=()
+if [[ -n "${RZ_GATE_JOBS+set}" || -n "$GATE_JOBS" ]]; then
+    if [[ ! "$GATE_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "error: RZ_GATE_JOBS must be a whole number >= 1: '$GATE_JOBS'" >&2
+        exit 2
+    fi
+    for k in RZ_GATE_JOBS RITZ1_JOBS PYTEST_J RATCHETS_J REGRESSION_JOBS; do
+        JOBS_ENV+=("--setenv=$k=$GATE_JOBS")
+    done
+    GATE_JOBS_HDR="$GATE_JOBS ($GATE_JOBS_FROM)"
+else
+    GATE_JOBS_HDR="(defaults)"
+fi
 # Wipe ritz1/build too: a gate is a verdict on the commit, not on whatever
 # objects an earlier base left behind.  Reusing it is how #1497 got 30 bogus
 # failures from stale struct layouts (AGAST #1659).
@@ -329,8 +361,8 @@ while :; do
     fi
     n=$((n + 1))
 done
-printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nWT=%s\nBUDGET_SCALE=%s\nCPU_FACTOR=%s\nSLOTS=%s TRAIN_SLOTS=%s\n' \
-    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$WT" "$BUDGET_SCALE" "$CPU_FACTOR_HDR" "$SLOTS" "$TSLOTS" >> "$LOG"
+printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nWT=%s\nBUDGET_SCALE=%s\nCPU_FACTOR=%s\nGATE_JOBS=%s\nSLOTS=%s TRAIN_SLOTS=%s\n' \
+    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$WT" "$BUDGET_SCALE" "$CPU_FACTOR_HDR" "$GATE_JOBS_HDR" "$SLOTS" "$TSLOTS" >> "$LOG"
 
 # Source files the room's worktree has and the commit doesn't (AGAST #3559).
 # The gate can't see them (it runs on a checkout of the SHA), so a gate that
@@ -593,6 +625,7 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=RZ_STARVE="${RZ_GATE_STARVE:-2700}" \
     --setenv=RZ_TEST_BUDGET_SCALE="$BUDGET_SCALE" \
     --setenv=RZ_CPU_FACTOR="$CPU_FACTOR" \
+    "${JOBS_ENV[@]}" \
     /bin/bash "$SCRIPT"
 
 echo "$LOG"

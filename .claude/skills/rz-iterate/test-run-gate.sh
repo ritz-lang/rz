@@ -40,6 +40,9 @@ STUB
 chmod +x "$T/bin/systemd-run" "$T/bin/systemctl"
 export PATH="$T/bin:$PATH"
 export RZ_GATE_DIR="$T/gates" RZ_HOST_ENV="$T/no-host.env" RZ_GATE_SLOTS=1
+# A gate's own -j knobs (AGAST #4971): the caller's RZ_GATE_JOBS overrides
+# host.env, and this suite may itself run inside a gate that set them.
+unset RZ_GATE_JOBS RITZ1_JOBS PYTEST_J RATCHETS_J REGRESSION_JOBS
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 
 W="$T/wt"
@@ -521,6 +524,33 @@ l20="$(RZ_HOST_ENV="$T/factor.env" RZ_CPU_FACTOR=2 RZ_GATE_CMD="$probe" gate "$W
 check 'grep -qx "FACTOR=\[2\]" "$l20" && grep -qx "CPU_FACTOR=2 (environment)" "$l20"' "RZ_CPU_FACTOR in the caller's env overrides host.env"
 out="$(RZ_CPU_FACTOR=1e3 RZ_GATE_CMD="$probe" gate "$W" t20 2>&1)"; rc=$?
 check '[[ $rc -eq 2 ]] && [[ "$out" == *RZ_CPU_FACTOR* ]]' "a malformed factor override is refused (rc=$rc)"
+
+# AGAST #4971: host.env's RZ_GATE_JOBS sizes every -j in the gate.  The unit
+# gets it as RZ_GATE_JOBS (main.yml's rz build/test -j, the Makefile's tool
+# -j) and under each existing knob's own name: RITZ1_JOBS, PYTEST_J,
+# RATCHETS_J, REGRESSION_JOBS.  Unset, none of them is set at all (not even
+# empty: the Makefile's `PYTEST_J ?= 8` keeps an empty env value), so the
+# defaults are today's.  The caller's env overrides the file.
+probe='for v in RZ_GATE_JOBS RITZ1_JOBS PYTEST_J RATCHETS_J REGRESSION_JOBS; do echo "$v=[${!v-unset}]"; done'
+l21="$(RZ_GATE_CMD="$probe" gate "$W" t21)"
+check '[[ "$(grep -c "=\[unset\]$" "$l21")" -eq 5 ]] && grep -qx "GATE_JOBS=(defaults)" "$l21"' \
+    "no RZ_GATE_JOBS: no jobs knob reaches the command, the header says defaults"
+printf 'RZ_GATE_SLOTS=1\nRZ_GATE_JOBS=24\n' > "$T/jobs.env"
+l21="$(RZ_HOST_ENV="$T/jobs.env" RZ_GATE_CMD="$probe" gate "$W" t21)"
+check '[[ "$(grep -c "=\[24\]$" "$l21")" -eq 5 ]] && grep -qx "GATE_JOBS=24 (host.env)" "$l21"' \
+    "host.env's RZ_GATE_JOBS=24 reaches the command under all five names, and the header"
+l21="$(RZ_HOST_ENV="$T/jobs.env" RZ_GATE_JOBS=6 RZ_GATE_CMD="$probe" gate "$W" t21)"
+check '[[ "$(grep -c "=\[6\]$" "$l21")" -eq 5 ]] && grep -qx "GATE_JOBS=6 (environment)" "$l21"' \
+    "RZ_GATE_JOBS in the caller's env overrides host.env"
+for badj in 0 24x -3 ''; do
+    printf 'RZ_GATE_JOBS=%s\n' "$badj" > "$T/jobs-bad.env"
+    out="$(RZ_HOST_ENV="$T/jobs-bad.env" RZ_GATE_CMD="$probe" gate "$W" t21 2>&1)"; rc=$?
+    check '[[ $rc -eq 2 && "$out" == *"jobs-bad.env:1: RZ_GATE_JOBS must be a whole number >= 1: '"'$badj'"'"* ]]' \
+        "host.env's RZ_GATE_JOBS='$badj' is refused with a clear message (rc=$rc)"
+done
+out="$(RZ_GATE_JOBS=many RZ_GATE_CMD="$probe" gate "$W" t21 2>&1)"; rc=$?
+check '[[ $rc -eq 2 && "$out" == *"RZ_GATE_JOBS must be a whole number >= 1: '"'many'"'"* ]]' \
+    "a malformed RZ_GATE_JOBS override is refused (rc=$rc)"
 
 # 21. Reserved train slots (AGAST #4031): RZ_TRAIN_SLOTS of a host's slots
 # (the top ones) only train gates take; room gates get the rest.  2 slots, 1

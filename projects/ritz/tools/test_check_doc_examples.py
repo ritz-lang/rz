@@ -13,6 +13,7 @@ Run with:  cd projects/ritz && python -m pytest tools/test_check_doc_examples.py
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -735,9 +736,12 @@ def test_bootstrap_job_checks_doc_examples_under_ritz1_after_the_build():
 def test_doc_target_checks_the_same_docs_under_both_ritz1_compilers():
     import subprocess
 
+    # Not the gate's -j (AGAST #4971): this compares the docs lists alone.
+    env = {k: v for k, v in os.environ.items() if k not in ("RZ_GATE_JOBS", "MAKEFLAGS")}
+
     def dry(target: str) -> list[str]:
         out = subprocess.run(["make", "-n", "--no-print-directory", target], cwd=C.RITZ_ROOT,
-                             capture_output=True, text=True, check=True).stdout
+                             capture_output=True, text=True, check=True, env=env).stdout
         return [ln for ln in out.splitlines() if "check_doc_examples.py" in ln]
 
     ritz1_runs = dry(DOC_TARGET)

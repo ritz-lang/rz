@@ -85,6 +85,7 @@ ROOMS_MEMORY_HIGH=7G      # all rooms together: 2 rooms at their soft limit
 ROOMS_MEMORY_MAX=8G       # all rooms together, however many are running
 GATE_SLOTS=1              # run-gate.sh's default; reported by --verify
 CPU_FACTOR=measured       # the gate's default (AGAST #4172); reported by --verify
+GATE_JOBS=defaults        # the gate's -j (AGAST #4971); reported by --verify
 # The two ROOMS_ caps (and GATE_SLOTS) are omegalisk's: a host with more RAM
 # overrides them in host.env.  huburght (47 GB, 6 rooms): 28G / 32G and 2
 # gates; 32G rooms + 2 x 3.5G gates leaves ~8G for the host's own agents.
@@ -176,6 +177,7 @@ if [[ "$MODE" != remove && "$MODE" != clear-room-memory ]]; then
     ROOMS_MEMORY_MAX="${HOST_ENV[RZ_ROOMS_MEMORY_MAX]:-$ROOMS_MEMORY_MAX}"
     GATE_SLOTS="${HOST_ENV[RZ_GATE_SLOTS]:-$GATE_SLOTS}"
     CPU_FACTOR="${HOST_ENV[RZ_CPU_FACTOR]:-$CPU_FACTOR}"
+    GATE_JOBS="${HOST_ENV[RZ_GATE_JOBS]:-$GATE_JOBS}"
     if (($(rz_size_bytes "$ROOMS_MEMORY_HIGH") > $(rz_size_bytes "$ROOMS_MEMORY_MAX"))); then
         echo "error: $RZ_HOST_ENV_FILE: rooms MemoryHigh=$ROOMS_MEMORY_HIGH is above" \
             "MemoryMax=$ROOMS_MEMORY_MAX" >&2
@@ -183,7 +185,7 @@ if [[ "$MODE" != remove && "$MODE" != clear-room-memory ]]; then
     fi
 fi
 IN_EFFECT="ritz-rooms.slice: MemoryHigh=$ROOMS_MEMORY_HIGH MemoryMax=$ROOMS_MEMORY_MAX;\
- gate slots=$GATE_SLOTS; cpu factor=$CPU_FACTOR; from $CONFIG_FROM"
+ gate slots=$GATE_SLOTS; cpu factor=$CPU_FACTOR; gate jobs=$GATE_JOBS; from $CONFIG_FROM"
 
 DROPIN_DIR="$UNITS/adele-agent@$ROOM.service.d"
 DROPIN="$DROPIN_DIR/50-ritz-host-budget.conf"
