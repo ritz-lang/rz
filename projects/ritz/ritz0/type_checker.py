@@ -126,6 +126,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         self.lent_locals: Dict[str, rast.Type] = {}
         # The slot an `if`, `match` or block's tails land in (_infer_into).
         self._tail_slot: Optional[rast.Type] = None
+        # The carrier ctor _infer_into is typing into its own slot, which
+        # no user enum's same-named variant makes ambiguous (AGAST #4945).
+        self._carrier_in_slot: Optional[rast.Expr] = None
         # The `if`, `match` or block next inferred is dropped (_infer_discarded).
         self._discarding = False
         # id() of each untyped let / var's value: a generic variant there
@@ -570,7 +573,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             if ty is None:
                 # Check if it's a unit enum variant
                 if expr.name in self.variant_to_enum:
-                    self._check_variant_unambiguous(expr.name, expr.span)
+                    self._check_variant_unambiguous(expr, expr.name, expr.span)
                     return self._variant_type(expr, expr.name, [], [])
                 # A type as a receiver: `Errno.Fault`, `Point.new()`
                 if expr.name in self.enums or expr.name in self.structs:
@@ -962,7 +965,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
             # Check if it's an enum variant constructor
             if fn_name in self.variant_to_enum:
-                self._check_variant_unambiguous(fn_name, expr.func.span)
+                self._check_variant_unambiguous(expr, fn_name, expr.func.span)
                 enum_name = self.variant_to_enum[fn_name]
                 # A bare `V(x)` of a name several enums declare says nothing
                 # about which: _check_parts knows when a slot does.

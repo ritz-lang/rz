@@ -96,20 +96,29 @@ def _rename_uses(node, name: str, new: str, seen: Set[int]) -> None:
         _rename_uses(child, name, new, seen)
 
 
-def _qualified(node, owner: Dict[str, str]):
+# The carriers' constructors that take a payload (LANGUAGE_SPEC §10).
+CARRIER_PAYLOAD_CTORS = ('Some', 'Ok', 'Err')
+
+
+def _qualified(node, owner: Dict[str, str], unit: Set[str]):
     """`node` written qualified, if it is a bare variant `owner` names an
-    enum for: `V` -> `E.V`, `V(x)` -> `E.V(x)`; else None."""
+    enum for: `V` -> `E.V`, `V(x)` -> `E.V(x)`; else None.  `unit` holds the
+    owned names whose variant is a unit one: such a carrier name called with
+    a payload, `Ok(())`, is Option's / Result's constructor, which every file
+    sees, so it stays bare for its slot to decide (AGAST #4945)."""
     if isinstance(node, rast.Ident) and node.name in owner:
         return rast.Field(node.span, rast.Ident(node.span, owner[node.name]),
                           node.name, name_span=node.span)
     if (isinstance(node, rast.Call) and isinstance(node.func, rast.Ident)
-            and node.func.name in owner and not node.type_args):
+            and node.func.name in owner and not node.type_args
+            and not (node.args and node.func.name in unit
+                     and node.func.name in CARRIER_PAYLOAD_CTORS)):
         return rast.MethodCall(node.span, rast.Ident(node.span, owner[node.func.name]),
                                node.func.name, node.args, name_span=node.func.span)
     return None
 
 
-def _qualify_variants(node, owner: Dict[str, str], seen: Set[int]) -> None:
+def _qualify_variants(node, owner: Dict[str, str], unit: Set[str], seen: Set[int]) -> None:
     """Write every bare variant under `node` that `owner` names an enum for
     qualified (import_resolver._qualify_seen_variants).  Patterns are not
     entered: a bare arm resolves against its scrutinee."""
@@ -118,28 +127,32 @@ def _qualify_variants(node, owner: Dict[str, str], seen: Set[int]) -> None:
     seen.add(id(node))
     if isinstance(node, list):
         for i, child in enumerate(node):
-            new = _qualified(child, owner)
+            new = _qualified(child, owner, unit)
             if new is not None:
                 node[i] = child = new
-            _qualify_variants(child, owner, seen)
+            _qualify_variants(child, owner, unit, seen)
         return
     if isinstance(node, tuple):
         for child in node:
-            _qualify_variants(child, owner, seen)
+            _qualify_variants(child, owner, unit, seen)
         return
     if not hasattr(node, '__dataclass_fields__'):
         return
     for attr in node.__dataclass_fields__:
         if attr == 'span':
             continue
+        # A call's callee name is no value: `Ok` of a bare `Ok(())` that
+        # _qualified left for its slot is not `Ev.Ok` called with `()`.
+        if attr == 'func' and isinstance(node, rast.Call) and isinstance(node.func, rast.Ident):
+            continue
         child = getattr(node, attr, None)
         if child is None or isinstance(child, (str, int, float, bool)):
             continue
-        new = _qualified(child, owner)
+        new = _qualified(child, owner, unit)
         if new is not None:
             setattr(node, attr, new)
             child = new
-        _qualify_variants(child, owner, seen)
+        _qualify_variants(child, owner, unit, seen)
 
 
 def _calls(node, name: str) -> bool:
@@ -1502,11 +1515,14 @@ class ImportResolver:
         written qualified: `V` is `E.V`, `V(x)` is `E.V(x)`.  A match arm's
         bare pattern resolves against the scrutinee, so it is left alone."""
         declarers: Dict[str, Set[str]] = {}
+        units: Set[tuple] = set()   # (enum, variant) of each unit variant
         for enum in self.enums.values():
             if enum.type_params:
                 continue
             for variant in enum.variants:
                 declarers.setdefault(variant.name, set()).add(enum.name)
+                if not variant.fields:
+                    units.add((enum.name, variant.name))
         shared = {v: ds for v, ds in declarers.items() if len(ds) >= 2}
         if not shared:
             return
@@ -1521,7 +1537,8 @@ class ImportResolver:
                 if len(mine) == 1:
                     owner[v] = next(iter(mine))
             if owner:
-                _qualify_variants(by_file.get(path, []), owner, set())
+                unit = {v for v, e in owner.items() if (e, v) in units}
+                _qualify_variants(by_file.get(path, []), owner, unit, set())
 
     def _refuse_shared_methods(self, name: str, files_of: Dict[str, Set[str]]) -> None:
         """A method is the symbol `T_m` (§9.4), so two twins `T` may not

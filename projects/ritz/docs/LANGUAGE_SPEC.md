@@ -4675,7 +4675,10 @@ fn main() -> i32
 The error names the two alphabetically-first declaring enums. Bare **match
 arm patterns** are the exception: the scrutinee's enum is known, so `B =>`
 against an `S` is `S.B`. An enum reached twice through an import cycle is
-still one enum.
+still one enum. A carrier's constructor is the other exception: `Some` /
+`None` / `Ok` / `Err` in an `Option` / `Result` slot is that carrier's,
+however many user enums declare the name, and `Ok(())`, with a payload, is
+never a user enum's unit `Ok` (AGAST #4945).
 
 A local or parameter can't be named like a variant (§4.3), so a bare `B` is
 never a local: a name with two meanings is an error at the binding (AGAST

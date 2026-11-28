@@ -248,24 +248,9 @@ pub fn main() -> i32
 """,
         121,
     ),
-    # The qualified form of an ambiguous name compiles.
-    "qualified": (
-        """\
-pub fn main() -> i32
-    let s: S = S.B
-    let t: T = T.B
-    let a: i32 = match s
-        A => 1
-        B => 2
-    let b: i32 = match t
-        B => 10
-        C => 20
-    return a + b
-""",
-        12,
-    ),
-    # Bare arms resolve by the scrutinee's enum in both compilers, so `B =>`
-    # is S.B (tag 1) against an S and T.B (tag 0) against a T: 2 + 10.
+    # The qualified form of an ambiguous name compiles, and bare arms resolve
+    # by the scrutinee's enum in both compilers, so `B =>` is S.B (tag 1)
+    # against an S and T.B (tag 0) against a T: 2 + 10.
     "match_arms_resolve_by_scrutinee": (
         """\
 pub fn main() -> i32
@@ -280,6 +265,62 @@ pub fn main() -> i32
     return a + b
 """,
         12,
+    ),
+    # AGAST #4945: `Ok` / `Err` / `Some` / `None` in a Result or Option slot
+    # is the carrier's constructor even when two user enums declare it (as
+    # goliath's ErrorCode and harland's VtdDma both declare a unit `Ok`): the
+    # slot decides, as for any variant.  ritz0 called `Ok(())` ambiguous; ritz1
+    # didn't.  A bare `Ok` with no slot is still #2039's error.
+    "carrier_ctor_in_its_slot_not_ambiguous": (
+        """\
+enum Code
+    Ok
+    Err
+    Some
+    None
+enum Dma
+    Ok
+    Err
+    Some
+    None
+enum Errno
+    Fault
+fn probe(x: i32) -> Result<(), Errno>
+    if x > 0
+        return Err(Errno.Fault)
+    Ok(())
+fn find(x: i32) -> Option<i32>
+    if x > 0
+        return Some(x)
+    None
+pub fn main() -> i32
+    var r: i32 = 0
+    match probe(0)
+        Ok(_) => r = r + 1
+        Err(_) => r = r + 100
+    match probe(1)
+        Ok(_) => r = r + 100
+        Err(_) => r = r + 2
+    let o: Option<i32> = find(4)
+    match o
+        Some(v) => r = r + v * 10
+        None => r = r + 100
+    match find(0)
+        Some(_) => r = r + 100
+        None => r = r + 3
+    let k: Result<i32, Errno> = Ok(5)
+    match k
+        Ok(v) => r = r + v * 10
+        Err(_) => r = r + 1
+    let c: Code = Code.Ok
+    match c
+        Ok => r = r + 0
+        Err => r = r + 1
+        Some => r = r + 1
+        None => r = r + 1
+    return r
+""",
+        96,
     ),
     # A payload arm, likewise: `Holds(v)` against an E binds E's payload.
     "payload_arm_resolves_by_scrutinee": (

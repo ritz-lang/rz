@@ -24,6 +24,7 @@ from monomorph_core import instance_display_name, note_instance_display
 from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
 from qualified_access import module_item_access_removed
+from type_slots import CARRIER_VARIANTS
 from builtin_types import (BUILTIN_TYPES, PRIMITIVES, is_builtin_target,
                            target_spelling)
 import index_rules
@@ -3302,7 +3303,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 raise EmitError(f"can't infer the `{enum_name}` instance `{name}` builds: "
                                 f"give its slot a `{enum_name}<...>` type", expr.span)
 
-    def _check_variant_unambiguous(self, name: str, span: Optional[rast.Span]):
+    def _check_variant_unambiguous(self, name: str, span: Optional[rast.Span],
+                                   slot_enum: Optional[str] = None):
         """Reject a bare variant name two or more user enums declare (AGAST #2039).
 
         `B` used as a value or a ctor call (`B`, `B()`, `Holds(x)`) when enums
@@ -3310,8 +3312,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         expected type: qualify it (`S.B`).  The diagnostic is ritz1's (#1600),
         naming the two alphabetically-first declaring enums.  Bare match-arm
         patterns are not checked here: they resolve against the scrutinee's
-        enum in both compilers.
+        enum in both compilers.  Nor is a `Some` / `None` / `Ok` / `Err`
+        built into a `slot_enum` of the Option / Result declaring it: the
+        slot names the carrier, whatever user enums declare the name (AGAST
+        #4945, ritz1's users_variant_wins).
         """
+        if slot_enum and name in CARRIER_VARIANTS.get(slot_enum.split('$', 1)[0], ()):
+            return
         declarers = self.variant_declarers.get(name, ())
         if len(declarers) >= 2:
             # Alphabetical, not declaration order: ritz0 registers imported
@@ -3568,23 +3575,26 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         finally:
             self.expected_ritz_type = saved_expected
 
-    def _is_enum_variant_call(self, expr: rast.Expr) -> bool:
-        """Check if expression is an enum variant constructor call."""
-        if isinstance(expr, rast.Call):
-            if isinstance(expr.func, rast.Ident):
-                if expr.func.name in self.variant_to_enum:
-                    self._check_variant_unambiguous(expr.func.name, expr.func.span)
-                    return True
-                return False
-        elif isinstance(expr, rast.Ident):
-            # Unit variant without parens.  No local or param can be named
-            # like one (binder_names, AGAST #2407), so a bare variant name is
-            # the variant at every expected-type site.
-            if expr.name in self.variant_to_enum:
-                self._check_variant_unambiguous(expr.name, expr.span)
-                return True
+    def _variant_ctor_name(self, expr: rast.Expr) -> Optional[Tuple[str, rast.Span]]:
+        """The variant `expr` constructs and the span naming it, or None.
+        A call `V(..)`, or a unit variant without parens: no local or param
+        can be named like one (binder_names, AGAST #2407), so a bare variant
+        name is the variant at every expected-type site."""
+        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            if expr.func.name in self.variant_to_enum:
+                return expr.func.name, expr.func.span
+        elif isinstance(expr, rast.Ident) and expr.name in self.variant_to_enum:
+            return expr.name, expr.span
+        return None
+
+    def _is_enum_variant_call(self, expr: rast.Expr, slot_enum: Optional[str] = None) -> bool:
+        """Check if expression is an enum variant constructor call, built
+        into `slot_enum` when it is known (_check_variant_unambiguous)."""
+        ctor = self._variant_ctor_name(expr)
+        if ctor is None:
             return False
-        return False
+        self._check_variant_unambiguous(*ctor, slot_enum)
+        return True
 
     def _emit_enum_variant_with_type(self, expr: rast.Expr, enum_type_name: str) -> ir.Value:
         """Emit an enum variant constructor with explicit type context.
@@ -3657,7 +3667,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         `Option<GlyphOutline>` fn tail otherwise resolves `Some` through the
         global variant map — whichever specialization registered last.)
         """
-        if expected_enum_name and self._is_enum_variant_call(expr):
+        if expected_enum_name and self._is_enum_variant_call(expr, expected_enum_name):
             return self._emit_enum_variant_with_type(expr, expected_enum_name)
         if not expected_enum_name:
             return self._emit_expr(expr)
@@ -3681,7 +3691,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         is how the path emits the argument otherwise.
         """
         param_enum = self._let_annotation_enum(param_type)
-        if param_enum is not None and self._is_enum_variant_call(arg):
+        if param_enum is not None and self._is_enum_variant_call(arg, param_enum):
             return self._emit_enum_variant_with_type(arg, param_enum)
         saved = getattr(self, '_expected_enum_name', None)
         self._expected_enum_name = param_enum
@@ -11043,7 +11053,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # specialized last (font.ritz: `Ok(cmap) => self.cmap = Some(cmap)`
         # built an Option$Glyph). AGAST #1321.
         target_ritz_type = None
-        if self._is_enum_variant_call(expr.value):
+        ctor = self._variant_ctor_name(expr.value)
+        if ctor is not None:
             target_ritz_type = self._infer_ritz_type(expr.target)
             while isinstance(target_ritz_type, (rast.PtrType, rast.RefType)):
                 target_ritz_type = target_ritz_type.inner
@@ -11053,6 +11064,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if target_enum is None and target_ritz_type.args:
                 target_enum = self._ensure_builtin_generic_specialization(
                     target_ritz_type)
+        if ctor is not None:
+            self._check_variant_unambiguous(*ctor, target_enum)
         target_slot = self._infer_ritz_type(expr.target)
         self._literal_into_slot(target_slot, expr.value)
         # LARB R61 (§13.6): the place is addressed before `v` is emitted:
@@ -11523,11 +11536,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # variant names are global, so `None`/`Some` would otherwise pick
         # whichever Option specialization was registered last.
         field_enum = None
-        if (self._is_enum_variant_call(field_expr)
-                and isinstance(expected_type, rast.NamedType)):
+        ctor = self._variant_ctor_name(field_expr)
+        if ctor is not None and isinstance(expected_type, rast.NamedType):
             field_enum = self._resolve_enum_type_name(expected_type)
             if field_enum is None and expected_type.args:
                 field_enum = self._ensure_builtin_generic_specialization(expected_type)
+        if ctor is not None:
+            self._check_variant_unambiguous(*ctor, field_enum)
         if field_enum is not None:
             field_val = self._emit_enum_variant_with_type(field_expr, field_enum)
         elif self._is_range_index(field_expr):

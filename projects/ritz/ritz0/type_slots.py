@@ -8,6 +8,9 @@ from typing import List, Optional
 import ritz_ast as rast
 from monomorph_core import bind_type_params
 
+# The emitter's own carriers and the variants each declares.
+CARRIER_VARIANTS = {'Option': ('Some', 'None'), 'Result': ('Ok', 'Err')}
+
 
 class SlotInferMixin:
     """TypeChecker methods that type an expression against the slot it fills.
@@ -65,7 +68,9 @@ class SlotInferMixin:
             ty = self._infer_type(expr)
             self._tail_slot = None
             return ty
+        saved, self._carrier_in_slot = self._carrier_in_slot, self._slot_carrier(expr, slot)
         ty = self._infer_type(expr)
+        self._carrier_in_slot = saved
         ty = self._slot_variant_type(expr, ty, slot)
         ty = self._slot_string_type(expr, ty, slot)
         self._check_ref_slot(expr, ty, slot)
@@ -98,10 +103,28 @@ class SlotInferMixin:
         base = self._resolve_alias(slot)
         if not isinstance(base, rast.NamedType):
             return ty
-        builtin = {'Option': ('Some', 'None'), 'Result': ('Ok', 'Err')}
-        if name in builtin.get(base.name, ()) or self._declares_variant(base, name):
+        if name in CARRIER_VARIANTS.get(base.name, ()) or self._declares_variant(base, name):
             return copy.copy(base)
         return ty
+
+    def _slot_carrier(self, expr: rast.Expr,
+                      slot: Optional[rast.Type]) -> Optional[rast.Expr]:
+        """`expr` when it is a bare `Some` / `None` / `Ok(..)` / `Err(..)`
+        landing in an Option or Result slot, else None.  The slot names the
+        carrier, so the variant is its constructor however many user enums
+        also declare the name (AGAST #4945; ritz1's users_variant_wins):
+        goliath's `ErrorCode` and harland's `VtdDma` each declaring a unit
+        `Ok` made every `Ok(())` in the kernel #2039's ambiguity error."""
+        if isinstance(expr, rast.Ident):
+            name = expr.name
+        elif isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            name = expr.func.name
+        else:
+            return None
+        base = self._resolve_alias(slot) if slot is not None else None
+        if isinstance(base, rast.NamedType) and name in CARRIER_VARIANTS.get(base.name, ()):
+            return expr
+        return None
 
     def _slot_string_type(self, expr: rast.Expr, ty: rast.Type,
                           slot: Optional[rast.Type]) -> rast.Type:
@@ -121,13 +144,15 @@ class SlotInferMixin:
         self.typed.record(expr, ty)
         return ty
 
-    def _check_variant_unambiguous(self, name: str, span: Optional[rast.Span]) -> None:
-        """A bare variant two or more concrete user enums declare is an error
-        wherever it appears (AGAST #2039), with the emitter's text: the two
-        alphabetically-first declarers.  Match arms resolve against the
-        scrutinee and don't come here."""
+    def _check_variant_unambiguous(self, expr: rast.Expr, name: str,
+                                   span: Optional[rast.Span]) -> None:
+        """A bare variant `expr` two or more concrete user enums declare is an
+        error wherever it appears (AGAST #2039), with the emitter's text: the
+        two alphabetically-first declarers.  Match arms resolve against the
+        scrutinee and don't come here; a carrier's variant in its own slot is
+        the carrier's (_slot_carrier)."""
         declarers = self.variant_declarers.get(name, ())
-        if len(declarers) >= 2:
+        if len(declarers) >= 2 and expr is not self._carrier_in_slot:
             a, b = sorted(declarers)[:2]
             self._error(f"ambiguous enum variant '{name}': declared by enum '{a}' and "
                         f"enum '{b}'; qualify it, e.g. '{a}.{name}'", span)

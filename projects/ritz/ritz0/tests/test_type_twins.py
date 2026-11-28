@@ -218,15 +218,28 @@ def test_each_twins_generated_from_is_its_own(compiler, tmp_path):
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_hidden_enums_variant_leaves_a_bare_variant_unambiguous(compiler, tmp_path):
     """t's bare `Comment` is its own Ev's: ta's Tag declares a `Comment`
-    too, but t doesn't see Tag (#4012's ParseEvent / State)."""
+    too, but t doesn't see Tag (#4012's ParseEvent / State).  Likewise its
+    bare unit `Ok` is Ev's, ta's hidden Dma declaring one too; but `Ok(())`
+    takes a payload no unit variant does, so it is Result's constructor, not
+    `Ev.Ok(())` (AGAST #4945: harland's kfs saw goliath's ErrorCode.Ok while
+    the kernel's VtdDma.Ok was hidden from it)."""
+    ta = TA + "\npub enum Dma\n    Ok\n    Off\n"
     t = ("import ea { fa }\n\n"
-         "enum Ev\n    Other\n    Comment\n\n"
+         "enum Ev\n    Other\n    Comment\n    Ok\n\n"
          "fn pick() -> Ev\n    Comment\n\n"
+         "fn pick_ok() -> Ev\n    Ok\n\n"
+         "fn probe() -> Result<(), Ev>\n    Ok(())\n\n"
          "fn main() -> i32\n"
+         "    let r: i32 = match probe()\n"
+         "        Ok(_) => 100\n"
+         "        Err(_) => 0\n"
+         "    let k: i32 = match pick_ok()\n"
+         "        Ev.Ok => 50\n"
+         "        _ => 0\n"
          "    match pick()\n"
-         "        Ev.Comment => 20 + fa()\n"
-         "        Ev.Other => 0\n")
-    assert _run(compiler, tmp_path, {"ta": TA, "ea": EA, "t": t}) == 22
+         "        Ev.Comment => r + k + 20 + fa()\n"
+         "        _ => 0\n")
+    assert _run(compiler, tmp_path, {"ta": ta, "ea": EA, "t": t}) == 172
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
