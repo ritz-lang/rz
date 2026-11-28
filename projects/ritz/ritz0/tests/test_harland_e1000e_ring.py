@@ -176,7 +176,8 @@ def _check_netd_matches_the_kind_once_and_runs_one_generic_loop():
         body = _fn_body(netd, fn)
         assert "NicChoice" not in body and "NIC_KIND" not in body, fn
     up = _fn_body(netd, "e1000e_up")
-    _in_order(up, "drv_mmio_map(w.handle)", "E1000eDma {", "g_e1000e.nic.up(MmioRegs { base: bar0 }, runs, e1000e_msix(g_boot))",
+    _in_order(up, "drv_mmio_map(w.handle)", "E1000eDma {", "E1000ePart.I82574(e1000e_msix(g_boot))",
+              "g_e1000e.nic.up(MmioRegs { base: bar0 }, part, runs)",
               "publish_up<E1000eNic<MmioRegs>>(@&g_e1000e)?")
 
 
