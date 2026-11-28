@@ -104,6 +104,7 @@ modules links without sys. A freestanding program defines all three itself.
    - [uring](#uring) - io_uring bindings
 9. [Process Management](#process-management)
    - [process](#process) - Subprocess spawning
+   - [command](#command) - Start a program with its stdio from your fds (Linux and Harland)
    - [term](#term) - Terminal attributes and size
    - [termsession](#termsession) - Raw mode, keys and escape output
    - [timedread](#timedread) - A read that gives up after a timeout
@@ -2091,8 +2092,11 @@ and `Stat` from `ritzlib.sys`, and defines `SEEK_SET`, `SEEK_CUR`, `SEEK_END`.
 `stat` and `close` reach the kernel; `stat` of a file fd reports the file as
 the fd opened it (a write fd's bytes land on close), and of fds 0-2 the
 console (`S_IFCHR`). `dup`, `dup_to`, `truncate`, `chmod`, `lock`,
-`sendfile`, the nonblocking calls and `pipe` are `Err(Other(38))` (ENOSYS)
-there, and `poll` is Linux-only (Harland: `ritzlib.timedread`).
+`sendfile` and the nonblocking calls are `Err(Other(38))` (ENOSYS) there,
+and `poll` is Linux-only (Harland: `ritzlib.timedread`). `pipe` reaches
+Harland's pipe (29, #4955), whose fds also report `S_IFIFO`; on Linux it is
+`pipe2(O_CLOEXEC)`, so a program `ritzlib.command` starts holds only the ends
+it was given.
 
 ```ritz
 struct Fd
@@ -2825,6 +2829,61 @@ fn run_true_into(out: @Fd) -> i32
                         Ok(r) => r.exit_code
                         Err(e) => -e.code()
         Err(e) => -e.code()
+```
+
+---
+
+### command
+
+**Module**: `ritzlib.command` (Linux and Harland)
+
+Start a program with its stdin, stdout and stderr taken from your fds
+(AGAST #4955): the same API and behaviour on both targets, for a program
+like ritz-lsp that runs a compiler and reads its output. `path` runs as given
+(no `$PATH` search) with argv `args`, `args[0]` being argv[0]; a stream you
+don't set is your own. The Fds are borrowed: close your copy of an end you
+handed over, or the EOF never comes. The child holds only fds 0-2: on
+Harland a child gets nothing else, on Linux `ritzlib.fd`'s `pipe` is
+close-on-exec. A file fd is a stream on Linux only (Harland: `Err(BadF)`).
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `command` | `fn(path: StrView, args: Span<StrView>) -> Command` | A program to start, with your stdio |
+| `stdin_from` / `stdout_to` / `stderr_to` | `fn(self: @&Command, fd: @Fd)` | The child's fd 0, 1 or 2 is `fd` |
+| `spawn` | `fn(self: @Command) -> Result<Child, Errno>` | Start it: `Err(NoEnt)`, `Err(Acces)` for a program that can't run (Linux checks before forking), `Err(BadF)` for a closed stream fd |
+| `pid` | `fn(self: @Child) -> i32` | The child's process id |
+| `wait` | `fn(self: @&Child) -> Result<i32, Errno>` | Sleep until it exits: its exit code, 128 + n if signal n killed it; `Err(Child)` the second time |
+
+```ritz
+import ritzlib.command
+import ritzlib.fd
+import ritzlib.string
+import ritzlib.span
+import ritzlib.result
+
+# /bin/echo's output through a pipe, or None if it could not run.
+fn echo_hi() -> Option<String>
+    var args: [2]StrView
+    args[0] = "echo"
+    args[1] = "hi"
+    var out: Pipe = match pipe()
+        Ok(p) => p
+        Err(_) => return None
+    var cmd: Command = command("/bin/echo", span_from_ptr<StrView>(@args[0], 2))
+    cmd.stdout_to(@out.write)
+    var child: Child = match cmd.spawn()
+        Ok(c) => c
+        Err(_) => return None
+    out.write.close()                     # the child's exit is the EOF
+    var text: String = string_new()
+    out.read.read_to_end(@&text)          # "hi\n"
+    out.read.close()
+    match child.wait()
+        Ok(code) =>
+            if code == 0
+                return Some(text)
+        Err(_) => pass
+    None
 ```
 
 ---

@@ -1,0 +1,189 @@
+# Pipes (AGAST #4955, Buddhafinger M7: ritz-lsp talks to its client over
+# stdin/stdout and runs ritz1 per compile).
+#
+# A pipe is a bounded byte ring of PIPE_CAPACITY bytes with two ends: bytes
+# written at the write end are read, in order, at the read end. Each end
+# counts the fds that refer to it, across every process: pipe(2) makes one
+# of each (pipe_create), a spawn that hands an end to a child adds one
+# (pipe_hold), and every close or exit takes one away (pipe_release). The
+# pipe is freed with its last end.
+#
+#   read, bytes buffered        Ok(n): up to dst.len of them, at once
+#   read, empty, a writer left  Err(Again): the caller blocks (or polls)
+#   read, empty, no writer      Ok(0): end of file
+#   write, no reader            Err(Pipe): nobody can ever read it
+#   write, full                 Err(Again): the caller blocks
+#   write, room for some        Ok(n): as many as fit (a short write)
+#
+# This module only moves bytes and counts ends: it never blocks and never
+# wakes anyone. The fd layer (fs/syscall.ritz) binds ends to fds, and the
+# syscall layer (syscall/runtime/pipe.ritz) parks a reader or writer that
+# got Err(Again) and wakes them after every change. Every syscall that
+# reaches a pipe runs on the BSP (none is SYS_LOCAL: an AP forwards them,
+# docs/SMP_USER.md §2) and those callers hold interrupts off around each
+# call, so the pool needs no lock. It imports nothing but errno, so the host tests
+# (ritz0/tests/test_harland_pipes.py) compile it as it is.
+
+import ritzlib.result { Result }
+import ritzlib.span { Span, span_from_ptr }
+import syscall.errno { Errno }
+
+# Bytes a pipe buffers: Linux's PIPE_BUF, so a write of at most this many
+# bytes into an empty pipe goes in whole.
+pub const PIPE_CAPACITY: i64 = 4096
+
+# Pipes open at once, system-wide. ritz-lsp holds three per ritz1 it runs
+# (stdin, stdout, stderr), and the shell one per `|`.
+pub const PIPE_MAX: i32 = 64
+
+# Which end of a pipe an fd refers to.
+pub enum PipeSide
+    Read
+    Write
+
+# One end of pipe number `pipe`: what an fd of FD_KIND_PIPE refers to.
+pub struct PipeEnd
+    pipe: i32
+    side: PipeSide
+
+struct Pipe
+    used: bool
+    head: i64           # index of the oldest buffered byte
+    len: i64            # bytes buffered
+    readers: i32        # fds on the read end
+    writers: i32        # fds on the write end
+    buf: [PIPE_CAPACITY]u8
+
+var pipes: [PIPE_MAX]Pipe
+
+fn pipe_at(pipe: i32) -> *Pipe
+    @pipes[pipe]
+
+fn pipe_live(pipe: i32) -> bool
+    pipe >= 0 and pipe < PIPE_MAX and pipe_at(pipe).used
+
+# A new pipe with one fd on each end: its number, or Err(NFile) when all
+# PIPE_MAX are open.
+pub fn pipe_create() -> Result<i32, Errno>
+    var i: i32 = 0
+    while i < PIPE_MAX
+        let p: *Pipe = pipe_at(i)
+        if not p.used
+            (*p).used = true
+            (*p).head = 0
+            (*p).len = 0
+            (*p).readers = 1
+            (*p).writers = 1
+            return Ok(i)
+        i = i + 1
+    Err(Errno.NFile)
+
+# The read end and the write end of pipe `pipe`.
+pub fn pipe_reader(pipe: i32) -> PipeEnd
+    PipeEnd { pipe: pipe, side: PipeSide.Read }
+
+pub fn pipe_writer(pipe: i32) -> PipeEnd
+    PipeEnd { pipe: pipe, side: PipeSide.Write }
+
+# One more fd refers to `end` (a spawn handed it to a child).
+pub fn pipe_hold(end: PipeEnd)
+    if not pipe_live(end.pipe)
+        return
+    let p: *Pipe = pipe_at(end.pipe)
+    match end.side
+        PipeSide.Read => (*p).readers = p.readers + 1
+        PipeSide.Write => (*p).writers = p.writers + 1
+
+# One fd on `end` is gone (close, or its process exited). With the last
+# writer gone a reader drains what is left and then reads end of file; with
+# the last reader gone a write is Err(Pipe). The pipe is free once both
+# ends are.
+pub fn pipe_release(end: PipeEnd)
+    if not pipe_live(end.pipe)
+        return
+    let p: *Pipe = pipe_at(end.pipe)
+    match end.side
+        PipeSide.Read => (*p).readers = p.readers - 1
+        PipeSide.Write => (*p).writers = p.writers - 1
+    if p.readers <= 0 and p.writers <= 0
+        (*p).used = false
+        (*p).len = 0
+        (*p).head = 0
+
+# The ring's bytes as a span.
+fn pipe_ring(p: *Pipe) -> Span<u8>
+    span_from_ptr<u8>(@(*p).buf[0], PIPE_CAPACITY)
+
+# Move up to dst.len buffered bytes into dst (see the table above).
+pub fn pipe_read(pipe: i32, dst: Span<u8>) -> Result<i64, Errno>
+    if not pipe_live(pipe)
+        return Err(Errno.BadF)
+    let p: *Pipe = pipe_at(pipe)
+    if dst.len() == 0
+        return Ok(0)
+    if p.len == 0
+        if p.writers > 0
+            return Err(Errno.Again)
+        return Ok(0)
+    var want: i64 = dst.len()
+    if want > p.len
+        want = p.len
+    let ring: Span<u8> = pipe_ring(p)
+    # At most two runs: head to the ring's end, then from its start.
+    let first: i64 = dst.copy_from(ring.slice(p.head, p.head + want))
+    if first < want
+        dst.from(first).copy_from(ring.slice(0, want - first))
+    (*p).head = (p.head + want) % PIPE_CAPACITY
+    (*p).len = p.len - want
+    if p.len == 0
+        (*p).head = 0
+    Ok(want)
+
+# Append as many of src's bytes as fit (see the table above).
+pub fn pipe_write(pipe: i32, src: Span<u8>) -> Result<i64, Errno>
+    if not pipe_live(pipe)
+        return Err(Errno.BadF)
+    let p: *Pipe = pipe_at(pipe)
+    if p.readers <= 0
+        return Err(Errno.Pipe)
+    if src.len() == 0
+        return Ok(0)
+    let room: i64 = PIPE_CAPACITY - p.len
+    if room == 0
+        return Err(Errno.Again)
+    var n: i64 = src.len()
+    if n > room
+        n = room
+    let ring: Span<u8> = pipe_ring(p)
+    let tail: i64 = (p.head + p.len) % PIPE_CAPACITY
+    let first: i64 = ring.from(tail).copy_from(src.slice(0, n))
+    if first < n
+        ring.copy_from(src.slice(first, n))
+    (*p).len = p.len + n
+    Ok(n)
+
+# Whether a read would return now: bytes are buffered, or no writer is
+# left (end of file). poll's POLLIN.
+pub fn pipe_readable(pipe: i32) -> bool
+    if not pipe_live(pipe)
+        return false
+    let p: *Pipe = pipe_at(pipe)
+    p.len > 0 or p.writers <= 0
+
+# Whether a write would return now: there is room, or no reader is left
+# (Err(Pipe)). poll's POLLOUT.
+pub fn pipe_writable(pipe: i32) -> bool
+    if not pipe_live(pipe)
+        return false
+    let p: *Pipe = pipe_at(pipe)
+    p.len < PIPE_CAPACITY or p.readers <= 0
+
+# Pipes open now.
+pub fn pipe_count() -> i32
+    var n: i32 = 0
+    var i: i32 = 0
+    while i < PIPE_MAX
+        if pipe_at(i).used
+            n = n + 1
+        i = i + 1
+    n

@@ -52,7 +52,7 @@ AREAS = {
         "current_pid", "process_enter_init",
         "elf_status_errno", "sys_spawn_impl", "sys_spawn_args_impl", "sys_exit_impl", "sys_wait_impl",
         "sys_exit_handler", "sys_open_handler", "sys_spawn_handler", "sys_spawn_args_handler",
-        "sys_spawn_bg_handler", "spawn_process", "wait_for_child",
+        "sys_spawn_bg_handler", "sys_spawn_io_handler", "spawn_bg_from_user", "spawn_process", "wait_for_child",
         "spawn_child_begin", "process_spawn_image", "process_wait",
         "sys_wait_handler", "sys_getpid_handler", "sys_yield_handler", "sys_acpi_poweroff_handler",
     ],
@@ -99,6 +99,8 @@ AREAS = {
     "poll": ["sys_poll_handler"],
     # SmpUser (253) and SmpUserLocal (252): the smp-user boot test (#4881).
     "smp_user": ["sys_smp_user_handler", "sys_smp_user_local_handler"],
+    # Pipe (29) and the blocking pipe read/write (#4955).
+    "pipe": ["sys_pipe_handler", "pipe_read_wait", "pipe_write_wait", "pipe_changed"],
 }
 
 VARS = {
@@ -250,8 +252,8 @@ def test_table_registers_handlers_imported_from_their_area():
     # (229, 230, #4727); 50 with NetPublish (226, #4730); 51 with DrvDmaFree
     # (223, #4725); 53 with the smp-user test's SmpUser and SmpUserLocal
     # (253, 252, #4881); 54 with Getdents64 (217, #4947); 56 with Rmdir and
-    # Unlink (84, 87, #4957).
-    assert len(regs) == 56, regs
+    # Unlink (84, 87, #4957); 58 with Pipe and SpawnIo (29, 90, #4955).
+    assert len(regs) == 58, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"
