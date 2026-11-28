@@ -118,7 +118,7 @@ Every encoder-only form has a unit test that compares razm's bytes with `as --64
 
 ### What razm checks
 
-The corpus is the eight `.s` files, frozen under `projects/razm/tests/corpus/` when the implementation exists: `kernel/boot.s`, `kernel/isr_stubs.s`, `kernel/ap_trampoline.s`, `kernel/syscall_entry.s`, `kernel/proc_switch.s`, `kernel/user_program.s`, `kernel/driver_stub.s`, and `boot/uefi_entry.s`. One synthetic fixture uses `.incbin`; no tracked `.s` file does today. The oracle on Linux is `as --64`.
+The corpus is the nine `.s` files, frozen under `projects/razm/tests/corpus/` and kept equal to the tree (`test_corpus_matches_the_tree`): `kernel/boot.s`, `kernel/isr_stubs.s`, `kernel/ap_trampoline.s`, `kernel/syscall_entry.s`, `kernel/proc_switch.s`, `kernel/user_program.s`, `kernel/driver_stub.s`, `kernel/smp_user_stub.s`, and `boot/uefi_entry.s`. One synthetic fixture uses `.incbin`; no tracked `.s` file does today. The oracle on Linux is `as --64`.
 
 For each file, the check is exact on everything a final link and a loader consume:
 
@@ -574,7 +574,7 @@ The mode is explicit:
 rld's tests reuse the rllvm and razm corpora. Each link is done twice, once by today's linker and once by rld:
 
 - Hosted entries that run under both linkers must match on stdout and exit status.
-- Kernel: the seven kernel `.s` objects (razm's frozen corpus copies, assembled by `as` and by razm) plus `freestanding/kernel.ll`, through the real `harland/kernel/linker.ld`, with `rld/tests/corpus/kernel_stubs.s` defining the C-side symbols they reference. The two outputs must agree on:
+- Kernel: the eight kernel `.s` objects (razm's frozen corpus copies, assembled by `as` and by razm) plus `freestanding/kernel.ll`, through the real `harland/kernel/linker.ld`, with `rld/tests/corpus/kernel_stubs.s` defining the C-side symbols they reference. The two outputs must agree on:
   - entry address
   - the `PT_LOAD` table: virtual address, physical address, permissions, file size, memory size
   - section-to-segment mapping

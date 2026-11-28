@@ -4,7 +4,7 @@ scripts", "rld tests").
 Each link is done by both, and the two executables must agree on the entry,
 the PT_LOAD table (virtual and physical address, permissions, file and memory
 size), which section each segment holds, and every segment's bytes, with no
-masks. The kernel link is the seven kernel `.s` objects plus
+masks. The kernel link is the eight kernel `.s` objects plus
 `freestanding/kernel.ll` through the real `harland/kernel/linker.ld`.
 """
 
@@ -25,7 +25,7 @@ KERNEL_SCRIPT = PROJECTS / "harland" / "kernel" / "linker.ld"
 # razm's frozen copies, which its oracle already proves `as` and razm agree on.
 KERNEL_S = PROJECTS / "razm" / "tests" / "corpus" / "kernel"
 KERNEL_FILES = ["boot", "isr_stubs", "ap_trampoline", "syscall_entry",
-                "proc_switch", "user_program", "driver_stub"]
+                "proc_switch", "user_program", "driver_stub", "smp_user_stub"]
 # freestanding_target for harland's kernel (rllvm's `kernel` profile).
 KERNEL_FLAGS = ["-c", "-ffreestanding", "-fno-builtin", "-march=native", "-msha",
                 "--target=x86_64-none-elf", "-mcmodel=kernel", "-mno-red-zone"]

@@ -24,7 +24,7 @@
 
 .set KSTACK_GUARD_SIZE, 4096
 .set KSTACK_STRIDE, KSTACK_GUARD_SIZE + SYSCALL_STACK_SIZE
-.set KSTACK_SLOTS, 8                # proc/table.ritz MAX_PROCS
+.set KSTACK_SLOTS, 32               # proc/table.ritz MAX_PROCS
 
 # ============================================================================
 # Per-CPU area (AGAST #4192)

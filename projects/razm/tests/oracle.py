@@ -38,6 +38,7 @@ KERNEL_FILES = [
     "kernel/proc_switch.s",
     "kernel/user_program.s",
     "kernel/driver_stub.s",
+    "kernel/smp_user_stub.s",
 ]
 CORPUS_FILES = KERNEL_FILES + ["boot/uefi_entry.s", "synthetic/incbin.s"]
 KERNEL_LINKER_SCRIPT = "kernel/linker.ld"
