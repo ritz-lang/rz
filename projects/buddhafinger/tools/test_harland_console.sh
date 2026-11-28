@@ -16,7 +16,8 @@
 #
 #   first          edit, bare Escape, :w, :q, the shell's terminal state,
 #                  reopen, an empty save, kills before and after the write
-#   reboot         every file persisted
+#   reboot         every file persisted; `:Files` lists the working
+#                  directory's files from / and from /var (AGAST #4947)
 #   contract       `bf-save-contract run plain`: every contract case PASSes,
 #                  exit 0; `prepare persist` / `prepare sync`: the old files
 #   fault-persist  \harland\fault-persist: the persistent update fails; `:w`

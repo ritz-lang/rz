@@ -10,7 +10,9 @@ import ritzlib.span { Span, Bytes, span_from_strview }
 import goliath.blob_id { BlobId }
 import goliath.blob_store { MemoryBlobStore, memory_store_free, memory_store_count, memory_store_get }
 import goliath.hosted { memory_store_new }
-import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve, namespace_hold, namespace_unhold }
+import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve, namespace_hold, namespace_unhold, namespace_dir_entry }
+import goliath.dir_entry { NsEntry, dir_entry_name, dir_entry_is_dir }
+import ritzlib.option
 import goliath.error { ErrorCode }
 
 # Whether `path` reads back exactly `want`.
@@ -129,5 +131,42 @@ fn test_hold_outlives_overwrite_and_delete() -> i32
     assert memory_store_count(@store) == empty
     var none: BlobId = namespace_resolve(@ns, "/missing")
     assert not namespace_hold(@ns, @none)
+    memory_store_free(@store)
+    0
+
+# namespace_dir_entry walks a directory blob by index (AGAST #4947): each
+# entry once, None past the end and for a blob that is no directory, and a
+# held directory lists as it was when its id was taken.
+[[test]]
+fn test_dir_entry_by_index_of_a_held_directory() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
+    assert write_text(@ns, "/d/x", "one") == ErrorCode.Ok
+    assert namespace_mkdir(@ns, "/d/sub") == ErrorCode.Ok
+    var dir: BlobId = namespace_resolve(@ns, "/d")
+    assert namespace_hold(@ns, @dir)
+    # The tree changes after the id was taken: the held blob doesn't.
+    assert write_text(@ns, "/d/later", "two") == ErrorCode.Ok
+    var saw_x: bool = false
+    var saw_sub: bool = false
+    var n: i32 = 0
+    loop
+        var e: NsEntry = match namespace_dir_entry(@ns, @dir, n)
+            Some(found) => found
+            None => break
+        let name: StrView = dir_entry_name(@e)
+        if name.eq("x")
+            saw_x = not dir_entry_is_dir(@e)
+        if name.eq("sub")
+            saw_sub = dir_entry_is_dir(@e)
+        assert not name.eq("later")
+        n = n + 1
+    assert n == 2 and saw_x and saw_sub
+    assert namespace_dir_entry(@ns, @dir, -1).is_none()
+    # A file's blob is no directory
+    var file: BlobId = namespace_resolve(@ns, "/d/x")
+    assert namespace_dir_entry(@ns, @file, 0).is_none()
+    namespace_unhold(@ns, @dir)
     memory_store_free(@store)
     0

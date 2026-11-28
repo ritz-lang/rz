@@ -1,17 +1,19 @@
 # Filesystem Syscalls
 #
 # Implements sys_open, sys_close, sys_read, sys_write and sys_fstat for files
-# (stat by path is fs/stat.ritz stat_at).
+# (stat by path is fs/stat.ritz stat_at), and sys_getdents64 for directory
+# fds (open with O_DIRECTORY; the records are fs/dirent.ritz's, AGAST #4947).
 # Integrates with the kernel namespace (fs/kfs.ritz) and the per-process fd tables (fs/fd.ritz).
 
 import klog { klog }
 import serial { StrView }
-import fs.vfs { O_WRONLY, O_RDWR, O_EXCL, O_TRUNC, O_APPEND, O_SYNC }
+import fs.vfs { O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_SYNC, O_DIRECTORY }
 import fs.fd { FdTable, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_dup, fd_owner, fd_refs, fd_heir }
 import syscall.errno { Errno }
 import fs.kfs { KFS_OK, kfs_get, kfs_ns_for, kfs_local, kfs_is_persist, kfs_is_durable, kfs_persist_write, kfs_persist_create, kfs_persist_mkdir, kfs_commit_durable, kfs_save, kfs_save_later }
 import fs.open_plan { WriteMode, OpenPlan, open_plan }
 import fs.stat { Stat, stat_of_entry, stat_console }
+import fs.dirent { dirent_fill }
 import goliath.namespace { Namespace, NsStat, namespace_resolve, namespace_store, namespace_hold, namespace_unhold, namespace_stat }
 import ritzlib.result
 import ritzlib.option
@@ -57,6 +59,8 @@ struct FsFile
     path_len: u64
     meta: NsStat            # The entry as it was at open: what fstat reports
     create: WriteMode       # Set(mode): the open deferred its create to the close
+    dir: bool               # An O_DIRECTORY fd: blob_id is the directory's,
+                            # position the index of the next entry getdents64 lists
 
 struct FsProc
     pid: u64
@@ -228,6 +232,8 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
     if ns == 0 as *Namespace
         return Errno.Inval as i64
     let local: StrView = kfs_local(path)
+    if (flags & O_DIRECTORY) != 0
+        return fs_open_dir(p, ns, local, flags)
 
     # Resolve the path to a blob ID, and decide what O_CREAT / O_EXCL do
     # about it (fs/persist.ritz open_plan): an O_SYNC create on /var is
@@ -283,6 +289,7 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
     (*f).path = 0 as *u8
     (*f).path_len = 0
     (*f).create = create
+    (*f).dir = false
     if deferred
         # What the close will create: an empty regular file of this mode
         (*f).meta = NsStat { is_dir: false, size: 0, modified: 0, mode: mode }
@@ -315,6 +322,43 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32, mode: u32) -> i64
         (*f).path = copy
         (*f).path_len = path_len
 
+    fd as i64
+
+# open(O_DIRECTORY): an fd on the directory at `local` in `ns`, for
+# getdents64. The fd or an Errno as i64, because it is sys_open's return
+# (the open syscall's register, as every branch of sys_open). It holds the directory's blob, so it lists the directory as it
+# was at this open (fs/dirent.ritz). Read-only: a write, create or truncate
+# flag is Inval; a path that is not a directory is NotDir.
+fn fs_open_dir(p: *FsProc, ns: *Namespace, local: StrView, flags: i32) -> i64
+    if (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0
+        return Errno.Inval as i64
+    let meta: NsStat = match namespace_stat(ns, local)
+        Ok(st) => st
+        Err(_) => return Errno.NoEnt as i64
+    if not meta.is_dir
+        return Errno.NotDir as i64
+    var blob_id: BlobId = namespace_resolve(ns, local)
+    if not namespace_hold(ns, @blob_id)
+        return Errno.NoEnt as i64
+    let fd: i32 = fd_alloc(@(*p).table)
+    if fd < 0
+        namespace_unhold(ns, @blob_id)
+        return fd as i64
+    let f: *FsFile = @(*p).files[fd]
+    (*f).ns = ns
+    (*f).blob_id = blob_id_copy(@blob_id)
+    (*f).data_ptr = 0 as *u8
+    (*f).size = 0
+    (*f).position = 0
+    (*f).flags = flags
+    (*f).wbuf = 0 as *u8
+    (*f).wbuf_size = 0
+    (*f).wbuf_cap = 0
+    (*f).path = 0 as *u8
+    (*f).path_len = 0
+    (*f).meta = meta
+    (*f).create = WriteMode.Keep
+    (*f).dir = true
     fd as i64
 
 # The entry at `local` in `ns` as an fd opened on it records it. The path
@@ -429,6 +473,7 @@ fn fs_file_move(src: *FsFile, dst: *FsFile)
     (*dst).path_len = (*src).path_len
     (*dst).meta = (*src).meta
     (*dst).create = (*src).create
+    (*dst).dir = (*src).dir
 
 # ============================================================================
 # sys_read - Read from a file
@@ -447,6 +492,9 @@ pub fn sys_fs_read(fd: i32, buf: *u8, count: u64) -> i64
     let f: *FsFile = fs_file(fs_current_proc(), fd)
     if f == 0 as *FsFile
         return Errno.BadF as i64
+    # A directory's entries are read with getdents64
+    if (*f).dir
+        return Errno.IsDir as i64
 
     # Check read permission
     let flags: i32 = (*f).flags
@@ -631,6 +679,28 @@ fn fs_flush_write_buffer(f: *FsFile, by: CloseBy) -> i32
     if wbuf != 0 as *u8
         kfree(wbuf)
     result
+
+# ============================================================================
+# sys_getdents64 - A directory fd's entries (AGAST #4947)
+# ============================================================================
+#
+# Fills `out` with Linux's linux_dirent64 records (fs/dirent.ritz) for the
+# entries from the fd's position on, as many as fit, and moves the position
+# past them: Ok(the bytes written), Ok(0) at the end of the directory.
+# Err(BadF) for no open fd, NotDir for a file fd, Inval if `out` can't hold
+# the next record. The handler turns it into the syscall's return.
+
+pub fn sys_getdents64(fd: i32, out: Span<u8>) -> Result<i64, Errno>
+    let f: *FsFile = fs_file(fs_current_proc(), fd)
+    if f == 0 as *FsFile
+        return Err(Errno.BadF)
+    if not (*f).dir
+        return Err(Errno.NotDir)
+    match dirent_fill((*f).ns, @(*f).blob_id, (*f).position as i32, out)
+        Ok(fill) =>
+            (*f).position = fill.next as u64
+            Ok(fill.bytes)
+        Err(e) => Err(e)
 
 # ============================================================================
 # sys_lseek - Seek in a file

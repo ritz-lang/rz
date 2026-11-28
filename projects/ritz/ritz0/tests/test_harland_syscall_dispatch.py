@@ -96,6 +96,9 @@ ABI = {
     "Sync": 162,
     "AcpiPoweroff": 200,
     "FbInfo": 210, "FbMap": 211,
+    # Getdents64 (217): Linux's number, ABI and linux_dirent64 records on an
+    # O_DIRECTORY fd, so ritzlib.fs's DirIter is one code path (#4947).
+    "Getdents64": 217,
     # DrvIrqWait (220): park a driver on its own IRQ object's latch and the
     # DEVICE_WAIT_MS deadline (#4719, RING1_DRIVER.md §4).
     "DrvIrqWait": 220,
@@ -142,7 +145,7 @@ DISPATCHED = {
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
     "Sync", "Smp", "ShmMap", "DrvIrqWait", "DrvMmioMap", "DrvDmaAlloc", "DrvDmaFree", "NetInfo", "NetAddr", "NetAttach", "Poll",
     "ShmWait", "ShmNotify", "NetPublish",
-    "Stat", "Fstat", "SmpUser", "SmpUserLocal",
+    "Stat", "Fstat", "SmpUser", "SmpUserLocal", "Getdents64",
 }
 
 

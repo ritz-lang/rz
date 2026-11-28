@@ -26,7 +26,10 @@ Sessions (docs/BUDDHAFINGER_PROPOSAL.md, "Harland acceptance"):
                  save's write (`--pause-save`): the file holds the old or the
                  new contents, never a prefix; a new .ritz file, coloured,
                  `ipub<Esc>:wq` with no process fault (AGAST #4921)
-  reboot         the same disk: every file of `first` persisted as it was
+  reboot         the same disk: every file of `first` persisted as it was;
+                 `:Files` lists the working directory's tree (AGAST #4947):
+                 from /, a file staged in the image and /var's; from /var,
+                 each file `first` saved; Enter opens one
   contract       the save contract (platform/save_contract.ritz) through the
                  editor's store: `bf-save-contract run plain` prints a PASS
                  line for every case and exits 0; `bf-save-contract prepare
@@ -417,12 +420,63 @@ def first(con: Console, timeout: float) -> int:
     return fails
 
 
+# The files the first session saved in /var, which the reboot loads.
+VAR_FILES = ["notes.txt", "empty.txt", "kill-before-write.txt", "kill-after-write.txt", "hl.ritz"]
+
+
+def picker_rows(ed: Editor) -> list[str]:
+    """The open picker's title (` Files  hits/candidates`) and hit names."""
+    rows = ed.scr.text()
+    for i, row in enumerate(rows):
+        m = re.match(r"\s*Files\s+\d+/\d+", row)
+        if m:
+            return [row.strip()] + [r[2:].strip() for r in rows[i + 1:] if r.startswith(("  ", "> "))]
+    return []
+
+
+def files_picker(con: Console, timeout: float) -> int:
+    """`:Files` lists the working directory's tree (AGAST #4947): from /, a
+    file staged in the image (`bin/buddhafinger`) and one under /var's mount
+    (`var/notes.txt`); from /var, each file the first session saved, as
+    relative paths. Enter on a hit opens it."""
+    fails = 0
+    ed = Editor(con, timeout)
+    fails += _ok(ed.start(NOTES), "`:Files` from /: the editor starts", ed.raw)
+    ed.keys(b":Files\r")
+    title = picker_rows(ed)
+    fails += _ok(bool(title) and not title[0].endswith(" 0/0"),
+                 "`:Files` from / lists files (not 0/0)", repr(ed.scr.text()).encode())
+    for query, want in (("bin/buddhafinger", "bin/buddhafinger"), ("var/notes", "var/notes.txt")):
+        ed.keys(query.encode())
+        rows = picker_rows(ed)
+        fails += _ok(want in rows[1:], f"`:Files` from / lists {want}", repr(rows).encode())
+        ed.keys(b"\x7f" * len(query))
+    ed.keys(b"\x1b")
+    ed.quit()
+    if shell(con, "cd /var", timeout) is None:
+        return fails + _ok(False, "`cd /var` at the prompt", b"")
+    ed = Editor(con, timeout)
+    fails += _ok(ed.start("notes.txt"), "`:Files` from /var: the editor starts on notes.txt", ed.raw)
+    ed.keys(b":Files\r")
+    rows = picker_rows(ed)
+    for name in VAR_FILES:
+        fails += _ok(name in rows[1:], f"`:Files` from /var lists {name}", repr(rows).encode())
+    ed.keys(b"hl.ritz\r")
+    # Its load message, not its first row: the kernel's klog shares the console.
+    fails += _ok("hl.ritz" in ed.scr.status() and '"hl.ritz" 1L, 3B' in ed.scr.message(),
+                 "Enter on hl.ritz opens it", repr([ed.scr.status(), ed.scr.message()]).encode())
+    ed.quit()
+    shell(con, "cd /", timeout)
+    return fails
+
+
 def reboot(con: Console, timeout: float) -> int:
     fails = file_is(con, NOTES, NOTES_TEXT + "\n", len(NOTES_TEXT) + 1, timeout, "after a reboot")
     fails += file_is(con, "/var/empty.txt", "", 0, timeout, "after a reboot")
     fails += file_is(con, "/var/kill-before-write.txt", "old\n", 4, timeout, "after a reboot")
     fails += file_is(con, "/var/kill-after-write.txt", "new old\n", 8, timeout, "after a reboot")
     fails += file_is(con, "/var/hl.ritz", "pub", 3, timeout, "after a reboot")
+    fails += files_picker(con, timeout)
     return fails
 
 

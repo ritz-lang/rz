@@ -63,6 +63,7 @@ AREAS = {
         "sys_read_handler", "sys_readdir_handler", "tty_fd_ok",
         "sys_tty_getattr_handler", "sys_tty_setattr_handler", "sys_tty_setfg_handler",
         "sys_sync_handler",
+        "sys_getdents64_handler",  # Getdents64 (217), #4947
     ],
     "ipc": [
         "sys_channel_create_handler", "sys_ipc_send_handler", "sys_ipc_recv_handler",
@@ -247,8 +248,8 @@ def test_table_registers_handlers_imported_from_their_area():
     # DrvDmaAlloc (221, 222, #4720); 49 with ShmWait and ShmNotify
     # (229, 230, #4727); 50 with NetPublish (226, #4730); 51 with DrvDmaFree
     # (223, #4725); 53 with the smp-user test's SmpUser and SmpUserLocal
-    # (253, 252, #4881).
-    assert len(regs) == 53, regs
+    # (253, 252, #4881); 54 with Getdents64 (217, #4947).
+    assert len(regs) == 54, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

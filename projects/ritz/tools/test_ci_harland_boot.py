@@ -192,6 +192,8 @@ NET_NODEV = "".join(
 WRITE_EMPTY_OK = r"[test] write_empty_test ... [write_empty_test] PASS: /tmp and /var\nPASS (exit=0)\n"
 # indium's stat_test checked /var as well as /tmp (AGAST #4832).
 STAT_OK = r"[test] stat_test ... [stat_test] PASS: /tmp and /var\nPASS (exit=0)\n"
+# indium's dir_test listed /var as well as /tmp (AGAST #4947).
+DIR_OK = r"[test] dir_test ... [dir_test] PASS: /tmp and /var\nPASS (exit=0)\n"
 # The native boot's virtio-blk is modern-only and offers 1024-entry queues;
 # the driver must take the MMIO transport and cap the queue (AGAST #3576).
 BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
@@ -257,7 +259,7 @@ RING_DUMP_END = r"\n=== END RING BUFFER ===\n"
 # dump repeating it.
 RING_OK = (KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_START
            + KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_END)
-PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK + SUITE_PASSED + INIT_EXIT
+PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK + DIR_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -522,7 +524,7 @@ def test_busy_children_coarsely_paired_by_load_pass(tree):
     serial = (RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
               + BUSY_PAIRED_9
               + SCHED_OK
-              + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK
+              + SMP_OK + NET_NODEV + WRITE_EMPTY_OK + STAT_OK + DIR_OK
               + SUITE_PASSED + INIT_EXIT)
     r = _run(tree, serial)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -783,6 +785,16 @@ def test_stat_on_tmp_alone_fails(tree):
     r = _run(tree, PASSED.replace(STAT_OK, tmp_only))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL (native): stat_test did not pass on both /tmp and /var" in r.stdout
+
+
+@pytest.mark.integration
+def test_dir_on_tmp_alone_fails(tree):
+    """dir_test passes with only /tmp when /var/boots is missing; a boot
+    whose storage disk came up must not pass that way (AGAST #4947)."""
+    tmp_only = r"[test] dir_test ... [dir_test] PASS: /tmp (no storage disk, /var skipped)\nPASS (exit=0)\n"
+    r = _run(tree, PASSED.replace(DIR_OK, tmp_only))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): dir_test did not pass on both /tmp and /var" in r.stdout
 
 
 @pytest.mark.integration

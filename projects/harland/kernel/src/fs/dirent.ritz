@@ -1,0 +1,101 @@
+# Harland - a directory's entries as getdents64 records (AGAST #4947)
+#
+# A directory opened with O_DIRECTORY is read with getdents64(fd, buf,
+# size), which fills `buf` with Linux's x86-64 `struct linux_dirent64`
+# records: the record ritzlib.sys's Dirent64 reads on Linux, so ritzlib.fs's
+# DirIter is one code path on both targets.
+#
+#   d_ino     u64 @0    the entry's index plus one (goliath has no inode
+#                       numbers; never 0, which some readers take as unused)
+#   d_off     i64 @8    the index of the next entry: where the next call resumes
+#   d_reclen  u16 @16   the record's bytes, a multiple of 8
+#   d_type    u8  @18   DT_REG, DT_DIR or DT_LNK (DT_UNKNOWN for anything else)
+#   d_name        @19   the name, NUL-terminated, zero-padded to d_reclen
+#
+# goliath's directories hold no "." or "..", so neither is listed; ritzlib's
+# readers skip both anyway, as Linux lists them.
+#
+# The fd holds its directory's blob (fs/syscall.ritz sys_open), and the
+# records come from that blob (goliath namespace_dir_entry), so one fd lists
+# the directory as it was at open, however the tree changes during the walk.
+
+import ritzlib.span { Span, span_from_strview }
+import ritzlib.strview { StrView }
+import ritzlib.result
+import ritzlib.option
+import syscall.errno { Errno }
+import goliath.namespace { Namespace, namespace_dir_entry }
+import goliath.blob_id { BlobId }
+import goliath.dir_entry { NsEntry, ENTRY_FILE, ENTRY_DIRECTORY, ENTRY_SYMLINK, dir_entry_name }
+
+# Linux's d_type values (ritzlib.sys DT_*).
+pub const DT_UNKNOWN: u8 = 0
+pub const DT_DIR: u8 = 4
+pub const DT_REG: u8 = 8
+pub const DT_LNK: u8 = 10
+
+# d_name's offset in a record.
+pub const DIRENT_NAME_OFFSET: i64 = 19
+
+# A record's size for a name of `name_len` bytes: header, name, NUL, rounded
+# up to 8 so the next record's d_ino is aligned.
+pub fn dirent_reclen(name_len: i64) -> i64
+    (DIRENT_NAME_OFFSET + name_len + 1 + 7) / 8 * 8
+
+# The d_type of a goliath entry kind.
+pub fn dirent_type(kind: u8) -> u8
+    if kind == ENTRY_FILE
+        return DT_REG
+    if kind == ENTRY_DIRECTORY
+        return DT_DIR
+    if kind == ENTRY_SYMLINK
+        return DT_LNK
+    DT_UNKNOWN
+
+# Store `v`'s low `n` bytes little-endian at `out[at..at + n]`.
+fn put_le(out: Span<u8>, at: i64, v: u64, n: i64)
+    var x: u64 = v
+    for i in 0..n
+        *out.get_ptr(at + i) = (x & 255) as u8
+        x = x >> 8
+
+# Write one record at `out[at..]`: its size, or None if it doesn't fit.
+pub fn dirent_put(out: Span<u8>, at: i64, ino: u64, next: i64, kind: u8, name: StrView) -> Option<i64>
+    let reclen: i64 = dirent_reclen(name.len)
+    if at < 0 or at + reclen > out.len()
+        return None
+    put_le(out, at, ino, 8)
+    put_le(out, at + 8, next as u64, 8)
+    put_le(out, at + 16, reclen as u64, 2)
+    *out.get_ptr(at + 18) = kind
+    let name_at: i64 = at + DIRENT_NAME_OFFSET
+    out.slice(name_at, name_at + name.len).copy_from(span_from_strview(name))
+    out.slice(name_at + name.len, at + reclen).zero()
+    Some(reclen)
+
+# What one getdents64 call wrote: `bytes` of records, and the index of the
+# first entry it left for the next call.
+pub struct DirentFill
+    bytes: i64
+    next: i32
+
+# Fill `out` with the records of directory blob `dir`'s entries from index
+# `start` on, as many as fit. Ok({ 0, start }) at the end of the directory;
+# Err(Inval) if `out` can't hold even the next record (Linux's EINVAL for a
+# buffer too small).
+pub fn dirent_fill(ns: *Namespace, dir: *BlobId, start: i32, out: Span<u8>) -> Result<DirentFill, Errno>
+    var at: i64 = 0
+    var index: i32 = start
+    loop
+        var e: NsEntry = match namespace_dir_entry(ns, dir, index)
+            Some(found) => found
+            None => break
+        let name: StrView = dir_entry_name(@e)
+        match dirent_put(out, at, index as u64 + 1, index as i64 + 1, dirent_type(e.kind), name)
+            Some(n) => at = at + n
+            None =>
+                if at == 0
+                    return Err(Errno.Inval)
+                break
+        index = index + 1
+    Ok(DirentFill { bytes: at, next: index })
