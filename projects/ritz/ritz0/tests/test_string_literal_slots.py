@@ -342,16 +342,10 @@ ACCEPTED = {
 # An N-D initialiser's leaves are slots too (ritz1: AGAST #3377).
 REJECTED["fit_element_nested"] = (_fn("", "let a: [1][2]u8 = [ [1, 300] ]\n0"), 2, 29, _fits(300, "u8"))
 
-# AGAST #4694: ritz1's literal_slot.ritz never typed these four shapes even
-# under the old rule (a user/builtin variant's scalar, non-array payload
-# (lit_payload only handles ArrayLit/ArrayFill), a call through a
-# struct-field-held fn pointer, and an explicit generic instantiation's
-# argument) — a pre-existing gap this ticket's measurement surfaced, not one
-# it created. ritz0 refuses each at the literal; ritz1 neither refuses nor
-# (so far as this table checks) miscompiles it, so only ritz0 is asserted
-# here. Filed as a follow-up, not fixed in this commit (ROOM.md "finish the
-# job" is about #4694's own goal, not every gap it happens to expose).
-RITZ0_ONLY_PTR_LITERAL = {
+# AGAST #4694, #4779: a bare `"..."` in a `*u8` slot that only a variant's
+# scalar payload (a user enum's or Option's), a call through a fn pointer a
+# struct field holds, or an explicit generic instantiation's argument gives it.
+REJECTED.update({
     "ptr_enum_payload": ("enum E\n    V(*u8)\n    N\n"
                         'fn main() -> i32\n    let e = E.V("A")\n    match e\n'
                         "        V(p) => *p as i32\n        N => 0\n", 5, 17, _PTR_LITERAL),
@@ -363,7 +357,7 @@ RITZ0_ONLY_PTR_LITERAL = {
                                 7, 11, _PTR_LITERAL),
     "ptr_generic_arg": ('fn id<T>(x: T) -> T\n    x\nfn main() -> i32\n'
                        '    let p: *u8 = id<*u8>("A")\n    *p as i32\n', 4, 26, _PTR_LITERAL),
-}
+})
 
 # AGAST #3440 (R62): a `c"..."` is a bare `*u8`, so it fits no `{ ptr, len }`
 # slot. ritz0 gave `.len` 120 with ritzlib.span imported and a traceback without;
@@ -598,15 +592,8 @@ def _rejected_rows():
             yield Row(rid, COMPILERS, Refused(_PRELUDE + source, message, at=(line + 1, col)))
 
 
-def _ritz0_only_rows():
-    for name in sorted(RITZ0_ONLY_PTR_LITERAL):
-        source, line, col, message = RITZ0_ONLY_PTR_LITERAL[name]
-        rid = f"what_does_not_fit_is_a_located_error[{name}]"
-        yield Row(rid, ("ritz0",), Refused(_PRELUDE + source, message, at=(line + 1, col)))
-
-
 # Every REJECTED and ACCEPTED row, checked a chunk at a time per compiler.
-ROWS = list(_rejected_rows()) + list(_ritz0_only_rows()) + [
+ROWS = list(_rejected_rows()) + [
     Row(f"what_fits_compiles_and_runs[{name}]", COMPILERS, Run(_PRELUDE + ACCEPTED[name][0],
                                                                 ACCEPTED[name][1]))
     for name in sorted(ACCEPTED)]

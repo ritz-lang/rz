@@ -504,6 +504,10 @@ fn lit_args(sm: *Sema, params: *Param, args: *Expr)
 
 pub fn literal_call(sm: *Sema, e: *Expr)
     if e.func_name.len == 0
+        # `(h.f)(..)`, `t[i](..)`: the fn value's own signature (AGAST #4779).
+        let sig: *FnDef = sbk_value_fn_sig(sm, e.left)
+        if sig != null
+            lit_args(sm, sig.params, e.args)
         return
     let v: *SemaVar = sema_find_local(sm, e.func_name)
     if v != null
@@ -859,8 +863,25 @@ fn lit_payload_array(sm: *Sema, enum_name: StrView, tag: i32, out: *ArrayArg) ->
         return 0
     array_arg_decode(arg, out)
 
+# 1 when variant `tag` of `enum_name` carries a scalar `*u8` payload: a user
+# enum's `V(*u8)`, or an instance's `V(T)` at T = `*u8` (AGAST #4779).
+fn lit_payload_is_ptr_u8(sm: *Sema, enum_name: StrView, tag: i32) -> bool
+    if enum_name.ptr == null or enum_name.len <= 0
+        return false
+    let uf: *StructField = user_enum_tuple_field(sm.pctx, enum_name, tag)
+    if uf != null
+        return uf.field_type == TypeKind.Ptr and uf.ptr_pointee == TypeKind.U8
+    let arg: StrView = tagged_enum_arg_in(sm.pctx, @sm.struct_map, sm.module, enum_name, tag)
+    name_eq(arg, "ptr_u8") == 1
+
 fn lit_payload(sm: *Sema, enum_name_sv: StrView, tag: i32, payload: *Expr)
-    if payload == null or (payload.kind != ExprKind.ArrayLit and payload.kind != ExprKind.ArrayFill)
+    if payload == null
+        return
+    if payload.kind != ExprKind.ArrayLit and payload.kind != ExprKind.ArrayFill
+        # A scalar payload is a slot too; only its `*u8` refusal is checked
+        # here, as ritz0's `_refuse_strview_literal_as_ptr` is.
+        if lit_payload_is_ptr_u8(sm, enum_name_sv, tag)
+            literal_slot(sm, payload, TypeKind.Ptr, TypeKind.U8)
         return
     var arr: ArrayArg
     if lit_payload_array(sm, enum_name_sv, tag, @arr) == 1

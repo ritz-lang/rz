@@ -147,8 +147,10 @@ UNWRAP_OR_ROWS = {
     "result": (_prog(LOOKUP,
         '    let a: StrView = res(false).unwrap_or("xy")\n'
         '    let b: StrView = res(true).unwrap_or("xy")\n    a.len as i32 + b.len as i32\n'), 6),
+    # `c"q"` (AGAST #4779): `Option<*u8>.unwrap_or`'s `default` is a `*u8`
+    # slot, which never takes a bare `"..."`.
     "scalar_pointer_payload": (_prog(LOOKUP,
-        '    let p: *u8 = cstr(false).unwrap_or("q")\n    let h: *u8 = cstr(true).unwrap_or("q")\n'
+        '    let p: *u8 = cstr(false).unwrap_or(c"q")\n    let h: *u8 = cstr(true).unwrap_or(c"q")\n'
         "    (*p - 'q') as i32 + (*h - 'h') as i32 + 1\n"), 1),
 }
 
