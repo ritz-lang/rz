@@ -38,14 +38,13 @@ import monomorph       # MonoCtx, EmitterState.mono (AGAST #4454)
 const LOCALS_INIT_CAP: i32 = 256
 const STRINGS_INIT_CAP: i32 = 4096  # Self-hosting: merged modules have >256 string literals
 
-# A growable list of names (pointer + length), for the extern and emitted-
-# name sets.  Those were fixed arrays (2048 / 512) that silently dropped
-# entries past the cap (AGAST #1813): a dropped emitted name is emitted twice,
-# a dropped extern is never declared.  Parallel arrays rather than an array
-# of structs: ritz1 cannot take `@s.p[i]` through a pointer field.
+# A growable list of names, for the extern and emitted-name sets.  Those were
+# fixed arrays (2048 / 512) that silently dropped entries past the cap (AGAST
+# #1813): a dropped emitted name is emitted twice, a dropped extern is never
+# declared.  One array of views (AGAST #4919), read and written by value
+# through `*(items + i)`.
 struct NameList
-    names: **u8
-    lens: *i32
+    items: *StrView
     count: i32
     cap: i32
 
@@ -2119,51 +2118,36 @@ struct ForElem
     pointee_name: StrView
 
 pub fn namelist_init(l: *NameList, cap: i32)
-    l.names = malloc((cap as i64) * 8) as **u8
-    l.lens = malloc((cap as i64) * 4) as *i32
+    l.items = malloc((cap as i64) * sizeof(StrView)) as *StrView
     l.count = 0
     l.cap = cap
 
 # Index of `name` in the list, or -1.
-pub fn namelist_find(l: *NameList, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let names: **u8 = l.names
-    let lens: *i32 = l.lens
+pub fn namelist_find(l: *NameList, name: StrView) -> i32
+    let items: *StrView = l.items
     var i: i32 = 0
     while i < l.count
-        let n: i32 = *(lens + i)
-        if n == len
-            let stored: *u8 = *(names + i)
-            if name_eq(StrView { ptr: (stored), len: (n) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
-                return i
+        if name_eq(*(items + i), name) == 1
+            return i
         i = i + 1
     -1
 
-pub fn namelist_push(l: *NameList, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn namelist_push(l: *NameList, name: StrView)
     if l.count >= l.cap
         let cap: i64 = (l.cap as i64) * 2
-        l.names = realloc(l.names as *u8, cap * 8) as **u8
-        l.lens = realloc(l.lens as *u8, cap * 4) as *i32
+        l.items = realloc(l.items as *u8, cap * sizeof(StrView)) as *StrView
         l.cap = cap as i32
-    let names: **u8 = l.names
-    let lens: *i32 = l.lens
-    *(names + l.count) = name
-    *(lens + l.count) = len
+    let items: *StrView = l.items
+    *(items + l.count) = name
     l.count = l.count + 1
 
 pub fn namelist_count(l: *NameList) -> i32
     l.count
 
-pub fn namelist_name(l: *NameList, i: i32) -> *u8
-    let names: **u8 = l.names
-    *(names + i)
-
-pub fn namelist_len(l: *NameList, i: i32) -> i32
-    let lens: *i32 = l.lens
-    *(lens + i)
+# The `i`th name, as pushed.
+pub fn namelist_view(l: *NameList, i: i32) -> StrView
+    let items: *StrView = l.items
+    *(items + i)
 
 # AGAST #1737, #4852 — EmitterState.fcx.x86_features bits: the CPU feature
 # an x86 intrinsic the fn calls needs (llvm.x86.sse2.* is baseline: none).
