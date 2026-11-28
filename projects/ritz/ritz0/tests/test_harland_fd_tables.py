@@ -774,10 +774,10 @@ def test_no_kernel_wide_fd_table_is_left():
     fs = (KERNEL_SRC / "fs" / "syscall.ritz").read_text()
     # one heap FsProc per live process; the BSS keeps only the pointers, and
     # each CPU's current index (AGAST #4879)
-    assert re.search(r"^var fs_procs: \[8\]\*FsProc$", fs, re.M)
+    assert re.search(r"^var fs_procs: \[FS_MAX_PROCS\]\*FsProc$", fs, re.M)
     assert re.search(r"^var fs_current_by_cpu: \[64\]i32$", fs, re.M)
     rest = fs.replace("var fs_procs", "").replace("var fs_current_by_cpu", "")
-    assert not re.search(r"^var \w+: \[\d+\]", rest, re.M)
+    assert not re.search(r"^var \w+: \[(\d+|FS_MAX_PROCS)\]", rest, re.M)
 
 
 def test_init_runs_the_fd_table_tests():

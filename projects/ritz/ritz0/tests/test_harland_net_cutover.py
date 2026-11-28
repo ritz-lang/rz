@@ -263,8 +263,8 @@ def test_the_nvme_idle_probe_never_parks():
 
 
 @pytest.mark.unit
-def test_the_driver_is_one_of_eight_procs():
-    assert re.search(r"^pub const MAX_PROCS: i32 = 8$", TABLE.read_text(), re.M)
+def test_the_driver_is_one_of_thirty_two_procs():
+    assert re.search(r"^pub const MAX_PROCS: i32 = 32$", TABLE.read_text(), re.M)
 
 
 @pytest.mark.unit

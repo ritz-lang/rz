@@ -731,3 +731,38 @@ def test_init_boot_suite_runs_three_level_nesting():
     assert "run_nested_spawn_test()" in _code(INIT).split("fn run_tier1_tests", 1)[1]
     # rzsh runs a script line that runs rzsh, which runs /bin/exitcode
     assert re.search(r"rzsh -c .*exitcode", src), "no init -> rzsh -> script -> command line"
+
+
+# Buddhafinger M7 (#4954, review finding 9): init, rzsh, the editor, ritz-lsp
+# and the ritz1 it runs per compile take five slots before the ring-1 driver,
+# netd or anything the user starts. The table holds 32, and the one constant
+# per module sizes every per-slot array, so raising it can't leave one behind.
+PROC_SLOTS = 32
+
+PER_SLOT_ARRAYS = [
+    ("proc/table.ritz", "procs", "MAX_PROCS", "Proc"),
+    ("fs/syscall.ritz", "fs_procs", "FS_MAX_PROCS", r"\*FsProc"),
+    ("proc/waitset.ritz", "waitset_deadline", "MAX_PROCS", "u64"),
+    ("proc/waitset.ritz", "waitset_console", "MAX_PROCS", "bool"),
+    ("proc/waitset.ritz", "inbox", r"MAX_PROCS \* INBOX_CAP", "WaitEvent"),
+    ("proc/waitset.ritz", "inbox_len", "MAX_PROCS", "u32"),
+    ("proc/waitset.ritz", "inbox_pid", "MAX_PROCS", "u64"),
+]
+
+
+@pytest.mark.unit
+def test_the_table_holds_thirty_two_processes():
+    table = _code(KERNEL_SRC / "proc" / "table.ritz")
+    assert re.search(rf"^pub const MAX_PROCS: i32 = {PROC_SLOTS}$", table, re.M)
+    fs = _code(KERNEL_SRC / "fs" / "syscall.ritz")
+    assert re.search(rf"^pub const FS_MAX_PROCS: i32 = {PROC_SLOTS}$", fs, re.M), \
+        "an FsProc per Proc slot"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rel,name,length,elem", PER_SLOT_ARRAYS,
+                         ids=[a[1] for a in PER_SLOT_ARRAYS])
+def test_per_slot_arrays_take_their_length_from_the_constant(rel, name, length, elem):
+    src = _code(KERNEL_SRC / rel)
+    assert re.search(rf"^var {name}: \[{length}\]{elem}$", src, re.M), \
+        f"{rel}: {name} is not [{length.replace(chr(92), '')}]"
