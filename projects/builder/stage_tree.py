@@ -46,6 +46,7 @@ PYTHON_FILES = [
     "projects/ritz/cas.py",
     "projects/ritz/manifest.py",
     "projects/ritz/packages.py",
+    "projects/ritz/producers.py",
     "projects/ritz/resolve.py",
     "projects/ritz/tools/known_failures.py",
     "projects/ritz/ritz0/compiler_identity.py",
@@ -94,7 +95,9 @@ SKIP_DIRS = {"test", "tests", "docs", "doc", "bench", "benchmarks", "build",
 # dependency. `rz test` links ritzunit's runner into every test binary.
 # The harland kernel is the in-tree `--build-only` package (AGAST #4823);
 # other manifests name harland's ABI subdirectories, not this package.
-ALWAYS = ["projects/ritzunit", "projects/harland"]
+# rllvm and razm write every object a build links (AGAST #4808,
+# ritz/producers.py), and are built from source where they run.
+ALWAYS = ["projects/ritzunit", "projects/harland", "projects/rllvm", "projects/razm"]
 
 
 def library_packages(root: Path) -> list[Path]:

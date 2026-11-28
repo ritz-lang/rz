@@ -1,9 +1,10 @@
 """The build pipeline: compile a package's modules and link its targets.
 
 Split out of build.py (AGAST #3632). Owns the per-module stages (discover,
-emit, verify, `clang -c`, store), the hosted / freestanding / UEFI links,
-the [[lib]] archive, binary provenance, and `build_package`, which runs a
-package's whole plan. build.py re-exports all of it.
+emit, verify, object compile, store), the hosted / freestanding / UEFI
+links, the [[lib]] archive, binary provenance, and `build_package`, which
+runs a package's whole plan. build.py re-exports all of it. Which program
+writes each object (rllvm, razm, clang, as) is producers.py's (AGAST #4808).
 """
 
 import sys
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import bounded_run
+import producers
 from cache import BuildCache, ClosureStore
 import cas
 from manifest import (BinaryConfig, LibraryConfig, SkippedBinary, StrayTestsDirError,
@@ -269,26 +271,11 @@ def _stderr_tail(stderr: str, lines: int = CLANG_OBJ_STDERR_TAIL) -> str:
 OBJ_CLANG_FLAGS = ["-c", "-O2", "-fPIC", *FREESTANDING_FLAGS]
 
 
-def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path,
-                      flags: Optional[List[str]] = None) -> Optional[str]:
-    """Run the bounded `clang <flags>` object compile for one .ll. Return None
-    on success.
-
-    `flags` are the target's object flags (`Target.obj_flags`), the hosted
-    OBJ_CLANG_FLAGS by default. On failure, increments CLANG_OBJ_FAILURES and
-    returns a message naming the file, the exit status (or timeout) and
-    clang's stderr tail. The caller must fail the build with it. See the
-    AGAST #1731 note above.
-    """
-    global CLANG_OBJ_FAILURES
-    timeout = _env_int(CLANG_OBJ_TIMEOUT_ENV, CLANG_OBJ_TIMEOUT_DEFAULT)
-    mem_mb = _env_int(CLANG_OBJ_MEM_ENV, CLANG_OBJ_MEM_MB_DEFAULT)
-    if flags is None:
-        flags = OBJ_CLANG_FLAGS
-    cmd = ["clang", *flags, str(ll_path), "-o", str(obj_path)]
-
-    # Own session, so a timeout kills clang and anything it spawned (cc1 when
-    # not integrated), not just the driver.
+def _run_bounded(cmd: List[str], timeout: int, mem_mb: int) -> Tuple[Optional[int], str, str]:
+    """Run one object compile under the AGAST #1731 bounds. Returns
+    (exit status or None on a timeout, a status phrase, stderr)."""
+    # Own session, so a timeout kills the compiler and anything it spawned
+    # (cc1 when not integrated), not just the driver.
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True,
@@ -302,24 +289,74 @@ def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path,
         except ProcessLookupError:
             pass
         _, stderr = proc.communicate()
-        status = f"timed out after {timeout}s ({CLANG_OBJ_TIMEOUT_ENV})"
-    else:
-        if proc.returncode == 0:
-            return None
-        if proc.returncode < 0:
-            status = f"killed by signal {-proc.returncode}"
-        else:
-            status = f"exit status {proc.returncode}"
+        return None, f"timed out after {timeout}s ({CLANG_OBJ_TIMEOUT_ENV})", stderr
+    if proc.returncode < 0:
+        return proc.returncode, f"killed by signal {-proc.returncode}", stderr
+    return proc.returncode, f"exit status {proc.returncode}", stderr
 
-    CLANG_OBJ_FAILURES += 1
-    obj_path.unlink(missing_ok=True)  # never link a partial object
-    return (
-        f"clang -c failed on {ll_path} (from {src}): {status}\n"
-        f"  flags: {' '.join(flags)}\n"
-        f"  bounds: timeout {timeout}s, address space {mem_mb} MiB "
-        f"({CLANG_OBJ_MEM_ENV})\n"
-        f"  stderr tail:\n" + textwrap.indent(_stderr_tail(stderr), "    ")
-    )
+
+def compile_ll_to_obj(ll_path: Path, obj_path: Path, src: Path,
+                      flags: Optional[List[str]] = None) -> Optional[str]:
+    """Compile one .ll to an object under the AGAST #1731 bounds. Return None
+    on success.
+
+    `flags` are the target's object flags (`Target.obj_flags`), the hosted
+    OBJ_CLANG_FLAGS by default. The program is chosen as DESIGN "Routing
+    unsupported input" says (producers.py, AGAST #4808): an unoptimized,
+    non-kernel ELF compile (small PIC, large, the shims) goes to rllvm first, with the
+    same flags and bounds; on its exit 2 (outside its subset) one line names
+    the file and construct and clang compiles it. rllvm's exit 1, a signal
+    or a timeout fails the build with no fallback, as does clang failing.
+    UEFI, hosted -O2 (rllvm is v1 -O0), the kernel model (v1's frames
+    overflow 4 KiB kernel stacks) and RITZ_OBJ_PRODUCER=clang go straight
+    to clang.
+
+    On failure, increments CLANG_OBJ_FAILURES, unlinks the partial object and
+    returns a message naming the program, the file, the exit status (or
+    timeout) and its stderr tail. The caller must fail the build with it.
+    """
+    global CLANG_OBJ_FAILURES
+    timeout = _env_int(CLANG_OBJ_TIMEOUT_ENV, CLANG_OBJ_TIMEOUT_DEFAULT)
+    mem_mb = _env_int(CLANG_OBJ_MEM_ENV, CLANG_OBJ_MEM_MB_DEFAULT)
+    if flags is None:
+        flags = OBJ_CLANG_FLAGS
+    argv = [*flags, str(ll_path), "-o", str(obj_path)]
+
+    def failed(tool: str, status: str, stderr: str) -> str:
+        global CLANG_OBJ_FAILURES
+        CLANG_OBJ_FAILURES += 1
+        obj_path.unlink(missing_ok=True)  # never link a partial object
+        return (
+            f"{tool} -c failed on {ll_path} (from {src}): {status}\n"
+            f"  flags: {' '.join(flags)}\n"
+            f"  bounds: timeout {timeout}s, address space {mem_mb} MiB "
+            f"({CLANG_OBJ_MEM_ENV})\n"
+            f"  stderr tail:\n" + textwrap.indent(_stderr_tail(stderr), "    ")
+        )
+
+    try:
+        to_rllvm = producers.routes_to_rllvm(flags)
+        rllvm = producers.tool("rllvm") if to_rllvm else None
+    except producers.ProducerError as e:
+        CLANG_OBJ_FAILURES += 1
+        obj_path.unlink(missing_ok=True)
+        return f"no object producer for {ll_path} (from {src}): {e}"
+    if rllvm is not None:
+        code, status, stderr = _run_bounded([str(rllvm), *argv], timeout, mem_mb)
+        if code == 0:
+            return None
+        if code != producers.RLLVM_UNSUPPORTED:
+            return failed("rllvm", status, stderr)
+        # Outside the subset: clang, same flags, one line saying so.
+        obj_path.unlink(missing_ok=True)
+        print(f"  ↪ {ll_path.name} (from {src.name}): rllvm: unsupported "
+              f"{producers.unsupported_construct(stderr)}; compiled by clang",
+              file=sys.stderr)
+
+    code, status, stderr = _run_bounded(["clang", *argv], timeout, mem_mb)
+    if code == 0:
+        return None
+    return failed("clang", status, stderr)
 
 
 def report_obj_failures(failures: List[str]) -> None:
@@ -327,7 +364,7 @@ def report_obj_failures(failures: List[str]) -> None:
     if not failures:
         return
     n = len(failures)
-    print(f"\n  ✗ clang -c failed for {n} IR file{'s' if n != 1 else ''} "
+    print(f"\n  ✗ object compile failed for {n} IR file{'s' if n != 1 else ''} "
           f"(no fallback; see AGAST #1731):", file=sys.stderr)
     for msg in failures:
         print(f"\n  {msg}", file=sys.stderr)
@@ -392,6 +429,18 @@ def cas_module_key(src: Path, cache: BuildCache, compiler: str,
     flags = {"compiler": compiler, "emit": "no-runtime",
              "obj": OBJ_CLANG_FLAGS if object_flags is None else object_flags,
              "verify_ir": _verify_ir_enabled()}
+    # AGAST #4808: the program that writes the object (DESIGN "Cache
+    # identity"), so a warm build runs the producer selected now.
+    if object_flags is None:
+        obj_flags = OBJ_CLANG_FLAGS
+    elif isinstance(object_flags, dict):     # Target.key_flags
+        obj_flags = ["-c", *object_flags.get("clang", [])]
+    else:
+        obj_flags = list(object_flags)
+    try:
+        flags["producer"] = producers.obj_identity(obj_flags)
+    except producers.ProducerError:
+        return None     # compiled uncached; compile_ll_to_obj reports it
     # AGAST #1920: every `rz test --all` file unit is its own process and
     # re-keyed the same ritzlib/ritzunit modules (~5 ms each: closure scan,
     # an interface-hash lookup per import, module identities).
@@ -590,6 +639,10 @@ def cas_harness_key(src: Path, closure, compiler: str) -> Optional[str]:
     None when an import does not parse: compile uncached.
     """
     flags = {"compiler": compiler, "emit": "test-table", "artifact": "o"}
+    try:
+        flags["producer"] = producers.obj_identity(OBJ_CLANG_FLAGS)   # AGAST #4808
+    except producers.ProducerError:
+        return None
     return _cas_key(src, closure, get_build_cache(compiler), compiler, flags)
 
 
@@ -724,6 +777,11 @@ def ensure_runtime_object(obj_path: Path) -> bool:
     A derived artifact must be a dependency, not a documented manual step.
     Compile on demand, keyed on mtime so repeat builds stay free.
 
+    AGAST #4808: compiled as a module's `.ll` is (compile_ll_to_obj: rllvm,
+    clang on its exit 2), with the shim's flags, `-c` alone. The producer
+    that wrote it is in `<obj>.producer` (`runtime_stamp_path`); a missing
+    or different stamp rebuilds the shim.
+
     Returns True if `obj_path` exists (or was just built) and is current.
     """
     ll_path = obj_path.with_suffix(".ll")
@@ -731,8 +789,16 @@ def ensure_runtime_object(obj_path: Path) -> bool:
         print(f"  ✗ Runtime source not found: {ll_path}", file=sys.stderr)
         return False
 
+    try:
+        stamp = producers.stamp_text(producers.obj_identity(RUNTIME_OBJ_FLAGS))
+    except producers.ProducerError as e:
+        print(f"  ✗ Failed to build runtime object {obj_path.name}: {e}", file=sys.stderr)
+        return False
+    stamp_path = runtime_stamp_path(obj_path)
+
     # Up to date? Nothing to do.
-    if obj_path.exists() and obj_path.stat().st_mtime >= ll_path.stat().st_mtime:
+    if (obj_path.exists() and obj_path.stat().st_mtime >= ll_path.stat().st_mtime
+            and _read_text(stamp_path) == stamp):
         return True
 
     # Build into a private temp file and rename it into place (AGAST #2792).
@@ -742,19 +808,40 @@ def ensure_runtime_object(obj_path: Path) -> bool:
     # rename() is atomic on one filesystem, hence the same directory.
     obj_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = obj_path.with_name(f".{obj_path.name}.{os.getpid()}.tmp")
+    tmp_stamp = stamp_path.with_name(f".{stamp_path.name}.{os.getpid()}.tmp")
     try:
-        result = bounded_run.step(
-            ["clang", "-c", "-o", str(tmp_path), str(ll_path)],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(f"  ✗ Failed to build runtime object {obj_path.name}:\n"
-                  f"{result.stderr}", file=sys.stderr)
+        error = compile_ll_to_obj(ll_path, tmp_path, ll_path, RUNTIME_OBJ_FLAGS)
+        if error is not None:
+            print(f"  ✗ Failed to build runtime object {obj_path.name}:\n{error}",
+                  file=sys.stderr)
             return False
         os.replace(tmp_path, obj_path)
+        # The stamp after the object: a concurrent reader at worst pairs a
+        # new object with an old stamp and rebuilds it, never an old object
+        # with a new stamp (DESIGN "Cache identity").
+        tmp_stamp.write_text(stamp)
+        os.replace(tmp_stamp, stamp_path)
     finally:
         tmp_path.unlink(missing_ok=True)
+        tmp_stamp.unlink(missing_ok=True)
     return True
+
+
+# The shim's object flags: the shim is compiled with `-c` alone (no -O2, no
+# -fPIC), as `clang -c -o <shim>.o <shim>.ll` always compiled it.
+RUNTIME_OBJ_FLAGS = ["-c"]
+
+
+def runtime_stamp_path(obj_path: Path) -> Path:
+    """`<obj>.producer`: who wrote a runtime shim object (AGAST #4808)."""
+    return obj_path.with_name(obj_path.name + ".producer")
+
+
+def _read_text(path: Path) -> Optional[str]:
+    try:
+        return path.read_text()
+    except OSError:
+        return None
 
 
 def _crosses_foreign_symlink(logical: Path, root: Path) -> bool:
@@ -943,6 +1030,18 @@ def binary_provenance(sources: list[Path], compiler: str, compiler_hash: str, pr
         "sources": [[str(Path(s).resolve()), _sha256_file(Path(s))] for s in sources],
         "runtime": [[str(Path(r).resolve()), _sha256_file(Path(r))] for r in runtime],
     }
+
+
+def hosted_provenance(sources: list[Path], compiler: str, compiler_hash: str, profile: dict,
+                      runtime: list[Path] = ()) -> dict:
+    """binary_provenance for a hosted binary, plus the program that writes
+    its objects and its shim's (AGAST #4808), so switching producer or
+    rebuilding rllvm relinks rather than serving the old binary. Raises
+    OSError, or producers.ProducerError when rllvm can't be provided."""
+    record = binary_provenance(sources, compiler, compiler_hash, profile, runtime=runtime)
+    record["producer"] = {"objects": producers.obj_identity(OBJ_CLANG_FLAGS),
+                          "runtime": producers.obj_identity(RUNTIME_OBJ_FLAGS)}
+    return record
 
 
 def private_output_path(path: Path) -> Path:
@@ -1343,7 +1442,6 @@ def compile_modules(sources: list[Path], artifact_dir: Path, *, cache, store, us
         path_hash = hashlib.md5(name_key.encode()).hexdigest()[:8]
         src_name = f"{src.stem}_{path_hash}"
         ll_path = artifact_dir / f"{src_name}.ll"
-        bc_path = artifact_dir / f"{src_name}.bc"
         obj_path = artifact_dir / f"{src_name}.o"
 
         # AGAST #1808: the shared content-addressed store. A hit is an
@@ -1453,7 +1551,7 @@ def link_hosted(bin_path: Path, runtime_obj: Path, link_files: list[Path],
     elif shutil.which("gcc"):
         linker_name = "gcc"
     else:
-        print(f"  ✗ Neither clang nor gcc found in PATH", file=sys.stderr)
+        print("  ✗ Neither clang nor gcc found in PATH", file=sys.stderr)
         return False
 
     # Link: runtime.o + all objects -> binary, with profile-specific options.
@@ -1564,10 +1662,10 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     # this binary. A bare `touch` still hits the fast path because content
     # is what's compared. `use_cache` gates it so debug runs always rebuild.
     try:
-        provenance = binary_provenance(
+        provenance = hosted_provenance(
             all_sources, compiler, cache._get_current_compiler_hash(), profile,
             runtime=[ll for ll in (RITZ_START.with_suffix(".ll"),) if ll.exists()])
-    except OSError:
+    except (OSError, producers.ProducerError):
         provenance = None
     if (use_cache and provenance is not None and not compiler_changed
             and binary_is_up_to_date(bin_path, provenance)):
@@ -1819,7 +1917,19 @@ def assemble_objects(asm_files: list[Path], pkg_dir: Path,
                      artifact_dir: Path) -> Optional[list[Path]]:
     """Assemble a freestanding [[bin]]'s .s files. None once a failure has
     been reported. A missing file, or one that .incbin's a file not built
-    yet (user_elf.s), is skipped with a warning."""
+    yet (user_elf.s), is skipped with a warning.
+
+    AGAST #4808: razm assembles them (`razm --64 -o OUT FILE.s`, the argv of
+    `as --64`), or `as` under RITZ_ASM_PRODUCER=as. There is no per-file
+    fallback: a razm failure fails the build (DESIGN "Routing unsupported
+    input")."""
+    try:
+        assembler = (str(producers.tool("razm")) if producers.asm_producer() == "razm"
+                     else "as")
+    except producers.ProducerError as e:
+        print(f"  ✗ no assembler: {e}", file=sys.stderr)
+        return None
+    tool_name = Path(assembler).name if assembler == "as" else "razm"
     objects = []
     print(f"  Assembling {len(asm_files)} assembly file(s)...")
     for asm_file in asm_files:
@@ -1835,12 +1945,13 @@ def assemble_objects(asm_files: list[Path], pkg_dir: Path,
             continue
 
         obj_path = artifact_dir / f"{asm_file.stem}.o"
-        # Use GNU as for assembly (supports .code32/.code64 directives)
         # Run from pkg_dir so .incbin relative paths work
-        as_cmd = ["as", "--64", "-o", str(obj_path), str(asm_file)]
+        as_cmd = [assembler, "--64", "-o", str(obj_path), str(asm_file)]
         result = bounded_run.step(as_cmd, capture_output=True, text=True, cwd=str(pkg_dir))
         if result.returncode != 0:
-            print(f"  ✗ as failed for {asm_file.name}: {result.stderr}", file=sys.stderr)
+            obj_path.unlink(missing_ok=True)
+            print(f"  ✗ {tool_name} failed for {asm_file.name}: {result.stderr}",
+                  file=sys.stderr)
             return None
         objects.append(obj_path)
     return objects
@@ -1915,7 +2026,7 @@ def link_uefi(name: str, bin_path: Path, object_files: list[Path],
 
     # Direct PE/COFF linking with lld-link: a proper PE32+ with the
     # optional header UEFI expects.
-    print(f"  📦 Linking PE/COFF with lld-link...")
+    print("  📦 Linking PE/COFF with lld-link...")
     link_cmd = [lld_link, "/subsystem:efi_application", f"/entry:{entry_symbol}",
                 f"/out:{bin_path}", *[str(obj) for obj in object_files]]
     result = bounded_run.step(link_cmd, capture_output=True, text=True)
@@ -1971,13 +2082,16 @@ def freestanding_provenance(bin_config: BinaryConfig, sources: list[Path], compi
                                runtime=[r for r in runtime if r.exists()])
     del record["profile"]   # unused: the bin's own flags decide
     asm = []
+    asm_id = producers.asm_identity() if bin_config.asm_files else None
     for asm_file in bin_config.asm_files or []:
         incbins = []
         if asm_file.exists():
             incbins = [_file_record(pkg_dir / m.group(1))
                        for line in asm_file.read_text().split("\n")
                        if ".incbin" in line and (m := _INCBIN.search(line))]
-        asm.append(_file_record(asm_file) + [incbins])
+        # AGAST #4808: the assembler's identity next to each .s, so a
+        # rebuilt razm (or the switch to `as`) relinks.
+        asm.append(_file_record(asm_file) + [incbins, asm_id])
     script = bin_config.linker_script
     target_flags = {"objects": freestanding_target(bin_config).key_flags, "uefi": is_uefi,
                     "pic": bin_config.pic, "link_runtime": bin_config.link_runtime}
@@ -1988,6 +2102,7 @@ def freestanding_provenance(bin_config: BinaryConfig, sources: list[Path], compi
     record.update(
         target=target_flags,
         asm=asm,
+        producer=producers.obj_identity(freestanding_target(bin_config).obj_flags),
         linker_script=_file_record(script) if script else None,
     )
     return record
@@ -2075,7 +2190,7 @@ def compile_freestanding_binary(
     try:
         provenance = freestanding_provenance(bin_config, all_sources, compiler,
                                              cache._get_current_compiler_hash(), pkg_dir)
-    except OSError:
+    except (OSError, producers.ProducerError):
         provenance = None
     if (use_cache and provenance is not None and not compiler_changed
             and binary_is_up_to_date(bin_path, provenance)):

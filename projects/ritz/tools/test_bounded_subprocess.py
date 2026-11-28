@@ -145,15 +145,23 @@ def _load_build():
 @pytest.fixture
 def hung_tools(tmp_path, monkeypatch):
     """A PATH whose clang, gcc, as, ar, llvm-ar, ld, ld.lld and lld-link all
-    hang; RITZ_STEP_TIMEOUT=1."""
+    hang, and an rllvm and razm that hang (AGAST #4808); RITZ_STEP_TIMEOUT=1
+    and RITZ_CLANG_OBJ_TIMEOUT=1 (the object compile's own bound)."""
+    import cas
     bindir = tmp_path / "hung-bin"
     bindir.mkdir()
-    for tool in ("clang", "gcc", "as", "ar", "llvm-ar", "ld", "ld.lld", "lld-link"):
+    for tool in ("clang", "gcc", "as", "ar", "llvm-ar", "ld", "ld.lld", "lld-link",
+                 "rllvm", "razm"):
         p = bindir / tool
         p.write_text("#!/bin/sh\nsleep 15\n")
         p.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}/usr/bin{os.pathsep}/bin")
     monkeypatch.setenv(bounded_run.STEP_TIMEOUT_ENV, "1")
+    monkeypatch.setenv("RITZ_CLANG_OBJ_TIMEOUT", "1")
+    monkeypatch.setenv("RITZ_RLLVM", str(bindir / "rllvm"))
+    monkeypatch.setenv("RITZ_RAZM", str(bindir / "razm"))
+    # The producer identity reads clang's version: not from a hung clang.
+    monkeypatch.setattr(cas, "_TARGET", "test-os/test-machine/test-clang")
     return bindir
 
 
@@ -184,7 +192,10 @@ def test_hung_uefi_link_fails_the_link(hung_tools, tmp_path, capsys):
 
 
 @pytest.mark.integration
-def test_hung_assembler_fails_the_build(hung_tools, tmp_path, capsys):
+@pytest.mark.parametrize("assembler", ["razm", "as"])
+def test_hung_assembler_fails_the_build(hung_tools, tmp_path, capsys, monkeypatch,
+                                        assembler):
+    monkeypatch.setenv("RITZ_ASM_PRODUCER", assembler)
     b = _load_build()
     asm = tmp_path / "boot.s"
     asm.write_text(".text\n")
@@ -193,7 +204,10 @@ def test_hung_assembler_fails_the_build(hung_tools, tmp_path, capsys):
 
 
 @pytest.mark.integration
-def test_hung_runtime_object_compile_fails(hung_tools, tmp_path, capsys):
+@pytest.mark.parametrize("producer", ["rllvm", "clang"])
+def test_hung_runtime_object_compile_fails(hung_tools, tmp_path, capsys, monkeypatch,
+                                           producer):
+    monkeypatch.setenv("RITZ_OBJ_PRODUCER", producer)
     b = _load_build()
     obj = tmp_path / "rt.o"
     obj.with_suffix(".ll").write_text("; empty\n")

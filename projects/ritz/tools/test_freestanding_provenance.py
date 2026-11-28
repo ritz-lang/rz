@@ -61,7 +61,7 @@ def kernel(tmp_path):
     pkg = tmp_path / "fs_pkg"
     (pkg / "src").mkdir(parents=True)
     (pkg / "src" / "kern.ritz").write_text("fn _start()\n    return\n")
-    (pkg / "boot.s").write_text(".text\n.globl boot_marker\nboot_marker:\n    ret\n")
+    (pkg / "boot.s").write_text(".text\n.global boot_marker\nboot_marker:\n    ret\n")
     (pkg / "link.ld").write_text("ENTRY(_start)\nSECTIONS { . = 0x100000; "
                                  ".text : { *(.text*) } }\n")
     (pkg / "build").mkdir()
@@ -144,7 +144,7 @@ def test_a_change_rebuilds(build, change):
     if change == "source":
         (pkg / "src" / "kern.ritz").write_text("fn _start()\n    return\n\n")
     elif change == "asm":
-        (pkg / "boot.s").write_text(".text\n.globl other\nother:\n    ret\n")
+        (pkg / "boot.s").write_text(".text\n.global other\nother:\n    ret\n")
     elif change == "incbin":
         (pkg / "blob.bin").write_bytes(b"v2")
     elif change == "linker_script":

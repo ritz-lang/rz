@@ -196,3 +196,26 @@ def test_global_target_compares_by_name_not_value():
     c = Reloc(".text", 4, 4, _sym("g", ".text", 0x10, binding=1), -4, 0)
     assert reloc_key(a) == reloc_key(b)
     assert reloc_key(a) != reloc_key(c)
+
+
+# AGAST #4808: build_pipeline assembles every tracked `.s` with razm, with no
+# per-file fallback, so the frozen corpus is the tree's `.s` files as they are
+# now. driver_stub.s grew `jbe`, `cmpw`, `notq` and five more while its corpus
+# copy stood still, and only the cutover's kernel build noticed.
+TREE = Path(__file__).resolve().parents[2]  # projects/
+
+
+@pytest.mark.parametrize("rel", [r for r in CORPUS_FILES if not r.startswith("synthetic/")]
+                         + [oracle.KERNEL_LINKER_SCRIPT])
+def test_corpus_matches_the_tree(rel):
+    tracked = TREE / "harland" / rel
+    assert (oracle.CORPUS / rel).read_bytes() == tracked.read_bytes(), (
+        f"tests/corpus/{rel} is not projects/harland/{rel}: copy it in, and "
+        f"teach razm what it needs (DESIGN.md \"Text razm accepts\")")
+
+
+def test_every_tracked_s_file_is_in_the_corpus():
+    tracked = sorted(str(p.relative_to(TREE / "harland"))
+                     for p in (TREE / "harland").rglob("*.s") if "build" not in p.parts)
+    frozen = sorted(r for r in CORPUS_FILES if not r.startswith("synthetic/"))
+    assert tracked == frozen, "a .s file razm assembles is missing from the corpus"

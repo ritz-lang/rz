@@ -78,3 +78,12 @@ modules last written by a UEFI bin are left out (ritz0 marks them
 `x86_64-unknown-uefi`; ritz1 writes one triple for every target). Four of
 those (`digits`, `cmp`, `option`, `strview`) are also kernel imports, and
 the hosted and small-pic sets accept them.
+
+## After the survey (AGAST #4808)
+
+The cutover's first builder run met one construct the survey's IR did not
+have: ritz1 now writes an ownership mask wider than `i32` as a `u0x` hex
+literal (`ritz1/src/ownership.ritz` `own_set_const`), first in buddhafinger.
+rllvm exited 1 on it (`expected a constant`), a build failure. `u0x` and
+`s0x` literals are now in the subset (`lex.ritz` `is_prefixed_hex`,
+`tests/test_lower.py` `test_hex_integer_literals_match_clang`).

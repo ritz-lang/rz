@@ -240,6 +240,7 @@ REGRESSION = Step(
            "projects/ritz/Makefile",
            "projects/ritz/build.py",
            "projects/ritz/build_pipeline.py",
+           "projects/ritz/producers.py",
            "projects/ritz/build_testrun.py",
            "projects/ritz/build_cli.py",
            "projects/ritz/manifest.py",

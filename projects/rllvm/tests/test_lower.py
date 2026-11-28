@@ -797,6 +797,63 @@ def test_core_instructions_match_clang(rllvm_bin, tmp_path):
     assert ours == oracle
 
 
+# --- hex integer literals (AGAST #4808) -------------------------------------
+
+# ritz1 writes an ownership mask wider than i32 as `u0x` + hex words
+# (ritz1/src/ownership.ritz own_set_const). LLVM reads `u0x` and `s0x` at any
+# width; the cutover's builder run met them in buddhafinger. Lower- and
+# upper-case digits, both prefixes, every bit pattern edge at i64 and i32.
+HEX_IR = r"""
+declare void @rt_hex(...)
+
+@word = internal global i64 u0x8000000000000001
+
+define i32 @main() {
+  %m = alloca i64
+  store i64 u0x0000000200000000, ptr %m
+  %v = load i64, ptr %m
+  %a = and i64 %v, u0x0000000200000000
+  call void (...) @rt_hex(i64 %a)
+  %b = or i64 %v, u0x0000000000000001
+  call void (...) @rt_hex(i64 %b)
+  %c = and i64 %v, u0xfffffffdffffffff
+  call void (...) @rt_hex(i64 %c)
+  %d = xor i64 %v, u0xFFFFFFFFFFFFFFFF
+  call void (...) @rt_hex(i64 %d)
+  %e = add i32 s0xFFFFFFFF, 3
+  %ex = sext i32 %e to i64
+  call void (...) @rt_hex(i64 %ex)
+  %f = add i32 u0x7fffffff, 0
+  %fx = zext i32 %f to i64
+  call void (...) @rt_hex(i64 %fx)
+  %g = load i64, ptr @word
+  call void (...) @rt_hex(i64 %g)
+  %eq = icmp eq i64 %v, u0x0000000200000000
+  %r = select i1 %eq, i32 7, i32 1
+  ret i32 %r
+}
+"""
+
+
+def test_hex_integer_literals_match_clang(rllvm_bin, tmp_path):
+    src = tmp_path / "hex.ll"
+    src.write_text(HEAD + HEX_IR)
+    shim = c.clang_compile(c.entry("hosted/shim.ll"), tmp_path / "shim.o")
+    extra = c.assemble("hosted", tmp_path / "extra.o")
+    results = []
+    for tool in (["clang"], [rllvm_bin]):
+        obj = tmp_path / f"hex.{Path(tool[0]).name}.o"
+        p = run([*tool, *c.PROFILE_FLAGS["hosted"], str(src), "-o", str(obj)])
+        assert p.returncode == 0, p.stderr
+        exe = tmp_path / f"hex.{Path(tool[0]).name}"
+        link = c.link_hosted([shim, obj, extra], exe)
+        assert link.returncode == 0, link.stderr
+        results.append(c.run(exe))
+    oracle, ours = results
+    assert oracle.status == 7 and oracle.stdout.count(b"\n") == 7
+    assert ours == oracle
+
+
 # --- constant getelementptr off null and off another GEP -----------------
 
 # ritz1's sizeof/offsetof idiom, `ptrtoint (getelementptr (T, ptr null,
