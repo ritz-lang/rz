@@ -465,7 +465,15 @@ main() {
     *) echo "error: unknown verb $verb" >&2; exit 2 ;;
     esac
 }
-main "$@" </dev/null
+# main runs in a subshell with errexit, and this shell ends at EOF with it
+# off, never by the `exit` builtin (AGAST #5001).  `exit` in a login shell
+# runs ~/.bash_logout, under errexit if it is on, and Ubuntu's runs
+# `clear_console -q`, which fails with no console over ssh: errexit then
+# turned every exit code into 1, so bangerang's live gates reported 1, not
+# 124, and the local wait counted five of those as a stopped unit.  A
+# subshell's exit runs no .bash_logout.
+set +e
+( set -euo pipefail; main "$@" ) </dev/null
 EOF
 
 # remote <host> <verb> <args...>: REMOTE_SH on <host>.  sshd joins the
@@ -1325,12 +1333,13 @@ pick_train_host() {
 # train's tip exits 3.  Only an EXIT= line in that log ends a remote wait: it
 # polls in WAIT_SLICE slices with no cap while the remote unit is active (or
 # its state unknown) or the log still grows (AGAST #4116, #4318).  No verdict
-# (98, never exit 0) is only 5 reports in a row of a stopped unit with no
-# EXIT= and a still log, or 5 ssh failures in a row (host unreachable); the
-# EXIT=none line says which.
+# (98, never exit 0) is only 5 reports of a stopped unit with no EXIT= and
+# a still log (the remote's 98), 5 wait errors in a row (any other code: the
+# gate may be live, AGAST #5001), or 5 ssh failures in a row (host
+# unreachable); the EXIT=none line says which.
 # The remote wait runs in the train's own slot tree, $(rwt) (AGAST #4247).
 cmd_wait() {
-    local log="${1:?usage: $0 wait <log>}" s st="" spec="" host ref rlog llog rc tries=0 nov=0 tip
+    local log="${1:?usage: $0 wait <log>}" s st="" spec="" host ref rlog llog rc tries=0 nov=0 errs=0 tip
     # The caller often pastes the local copy `gate --next` printed relative to
     # the repo root, while SPEC records it absolutely (AGAST #4525).  realpath
     # -m resolves a path that does not exist yet (the verdict is fetched
@@ -1377,13 +1386,25 @@ cmd_wait() {
         fi
         printf '%s\n' "$out" > "$llog.tmp" && mv -f "$llog.tmp" "$llog"
         grep -q '^EXIT=' "$llog" && break
-        # The slice ended with no verdict and the remote says the unit has
-        # stopped and its log no longer grows (AGAST #4318: a unit still
-        # active, of unknown state, or a growing log is 124 above, however
-        # long the gate runs).  5 such reports in a row are a dead gate.
-        nov=$((nov + 1))
-        if [[ $nov -ge 5 ]]; then
-            why="unit stopped: the gate on $host ended without writing EXIT="; break
+        # The slice ended with no verdict.  Only the remote's 98 says the
+        # unit has stopped and its log no longer grows (AGAST #4318: a unit
+        # still active, of unknown state, or a growing log is 124 above,
+        # however long the gate runs); 5 such reports are a dead gate, and a
+        # wait error between them doesn't reset the count.  Any other code
+        # is an error in the wait itself, not a stopped unit (AGAST #5001:
+        # bangerang's remote waits all exited 1 and two live train gates
+        # were called dead): retried, and 5 in a row with no 98 between them
+        # are reported as that error.
+        if [[ $rc -eq 98 ]]; then
+            nov=$((nov + 1)); errs=0
+            if [[ $nov -ge 5 ]]; then
+                why="unit stopped: the gate on $host ended without writing EXIT="; break
+            fi
+        else
+            errs=$((errs + 1))
+            if [[ $errs -ge 5 ]]; then
+                why="the remote wait failed 5 times in a row (last exit $rc), so the gate on $host may still be running: check its unit before discarding it"; break
+            fi
         fi
         echo "no EXIT= yet in $host:$rlog (wait exit $rc): polling again" >&2
         sleep "$QUEUED_PAUSE"

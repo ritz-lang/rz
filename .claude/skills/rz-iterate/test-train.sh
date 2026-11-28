@@ -516,6 +516,14 @@ if [[ -e "$RZ_TEST_DIR/ssh-flaky" ]]; then
     fi
     echo 1 > "$RZ_TEST_DIR/ssh-flaky"
 fi
+# ssh-wait-err holds N > 0: the next N remote waits fail with exit 1, an
+# error in the wait itself, not a verdict (AGAST #5001).
+if [[ -e "$RZ_TEST_DIR/ssh-wait-err" && " $* " == *" -- wait "* ]]; then
+    n="$(cat "$RZ_TEST_DIR/ssh-wait-err")"
+    if [[ $n -gt 0 ]]; then
+        echo $((n - 1)) > "$RZ_TEST_DIR/ssh-wait-err"; echo "remote: the wait failed" >&2; exit 1
+    fi
+fi
 # The remote user's own HOME (its venv lives there), and a login shell's
 # PATH: /etc/profile resets it, so no venv on it (AGAST #4025).
 # Each host has its own gate dir, and its own host.env if the test wrote one
@@ -886,6 +894,43 @@ wait4318 failed 99
 touch "$T/ssh-down"; wait4318 active 99; rm -f "$T/ssh-down"
 [[ $rc -eq 98 ]] && has "$out" "EXIT=none .*unreachable" "a host unreachable past the ssh retry budget is 98, saying unreachable" \
     || { bad "a host unreachable past the ssh retry budget is 98, saying unreachable (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+# 11k. AGAST #5001: two bangerang train gates were called dead (EXIT=none,
+# unit stopped) while their units ran.  Each remote `wait` exited 1, never
+# 124: REMOTE_SH ran `exit 124` under set -e in a login shell, so bash ran
+# ~/.bash_logout with errexit on, and Ubuntu's `clear_console -q` fails
+# with no console over ssh: errexit turned every exit code into 1.  The
+# fake remote HOME gets that .bash_logout.  Six timed-out (124) slices,
+# then EXIT=0: a verdict, never EXIT=none.
+printf '%s\n' '# Ubuntu skel: clear the console on logout (fails over ssh)' 'if [ -e "$RZ_TEST_DIR/rlogout-fails" ]; then' '    [ -x /bin/false ] && /bin/false' 'fi' > "$T/rhome/.bash_logout"
+touch "$T/rlogout-fails"
+wait4318 active 6 RZ_FAKE_QUEUED_RC=124
+[[ $rc -eq 0 && "$(polls)" == 7 && "$out" != *EXIT=none* ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" \
+    "a host whose .bash_logout fails under errexit still reports 124 slices: wait goes on to EXIT=0" \
+    || { bad "a host whose .bash_logout fails under errexit still reports 124 slices (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+wait4318 failed 2 RZ_FAKE_QUEUED_RC=98
+[[ "$out" == *"(wait exit 98): polling again"* ]] && ok "and its 98 (a stopped unit) still reaches the local side as 98" \
+    || { bad "and its 98 (a stopped unit) still reaches the local side as 98"; echo "$out" | sed 's/^/     | /'; }
+rm -f "$T/rlogout-fails"
+# Only the remote's 98 means stopped.  Any other exit is an error in the
+# wait itself: retried, never counted as a stopped unit.  The ticket's row:
+# exit 1, then 124, then EXIT=0.
+echo 1 > "$T/ssh-wait-err"; wait4318 active 1 RZ_FAKE_QUEUED_RC=124
+[[ $rc -eq 0 && "$(polls)" == 3 && "$out" != *EXIT=none* ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" \
+    "a remote wait that exits 1, then 124, then EXIT=0 is a verdict" \
+    || { bad "a remote wait that exits 1, then 124, then EXIT=0 is a verdict (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+# Four errors and two stopped reports are six non-124 slices but not five
+# stopped in a row: the old count called that gate dead.
+echo 4 > "$T/ssh-wait-err"; wait4318 failed 2 RZ_FAKE_QUEUED_RC=98
+[[ $rc -eq 0 && "$(polls)" == 7 && "$out" != *EXIT=none* ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" \
+    "wait errors don't count toward the 5 stopped reports that end a wait" \
+    || { bad "wait errors don't count toward the 5 stopped reports that end a wait (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+# Errors only, 5 in a row: no verdict (98), and it says the wait failed and
+# the gate may be live, not that its unit stopped.
+echo 99 > "$T/ssh-wait-err"; wait4318 active 99
+[[ $rc -eq 98 && "$(polls)" == 5 && "$out" != *"unit stopped"* ]] && has "$out" "EXIT=none .*remote wait failed 5 times in a row \(last exit 1\).*may still be running" \
+    "5 wait errors in a row are 98 saying the wait failed, not that the unit stopped" \
+    || { bad "5 wait errors in a row are 98 saying the wait failed, not that the unit stopped (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+rm -f "$T/ssh-wait-err"
 rm -f "$T/queued-polls" "$T/rsystemctl-state"; grep -q '^EXIT=' "$rlog" || echo EXIT=0 >> "$rlog"
 bash "$TR" wait "$llog" >/dev/null 2>&1
 bash "$TR" land "$log1" >/dev/null 2>&1
