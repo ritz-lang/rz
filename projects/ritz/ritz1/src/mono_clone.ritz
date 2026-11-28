@@ -552,7 +552,24 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
                     add_local_var(mono, s.var_name, ekind, esuf)
                     mark_last_local_by_value(mono)
             else if s.var_init != null and s.var_init.kind == ExprKind.Method
-                track_method_init_local(mono, m, s.var_name, s.var_init)
+                # AGAST #4914: `var t = self.st.text()` -- the receiver is a
+                # field of a tracked local (through `self`, possibly a
+                # cross-module struct), not a plain local ident, so
+                # track_method_init_local's Ident-only receiver left `t`
+                # untracked.  Untracked, `t.push_view(..)` wanted `push_view`
+                # at every Vec instance this file had collected through
+                # self.st's own fields, Vec$Item's included (the struct's
+                # *other* field, in the same family as #4778 item 3).
+                # resolve_member_field already resolves a Member receiver's
+                # struct (through the field chain, across modules): reuse it
+                # here, then track `t` as that struct's named method's return
+                # type, as track_method_init_local does for a plain receiver.
+                if s.var_init.left != null and s.var_init.left.kind == ExprKind.Member
+                    let rf: *StructField = resolve_member_field(mono, m, s.var_init.left)
+                    if rf != null and rf.field_type_name.ptr != null and (rf.field_type == TypeKind.Struct or rf.field_type == TypeKind.Ptr or field_is_ref(rf) == 1)
+                        track_impl_method_local(mono, m, s.var_name, rf.field_type_name, s.var_init)
+                else
+                    track_method_init_local(mono, m, s.var_name, s.var_init)
             else if s.var_init != null and s.var_init.kind == ExprKind.Call and s.var_init.call_type_suffix.len == 0
                 # `var w = ms()`: a plain fn's return type, as an annotation of it.
                 var call_fn: *FnDef = find_fn_in_module(m, s.var_init.func_name)

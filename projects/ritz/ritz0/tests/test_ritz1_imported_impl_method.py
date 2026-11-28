@@ -195,23 +195,71 @@ def _build_and_run(
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 
 
+# AGAST #4914: `self.st.text()` -- a method call through a field, where the
+# field's struct (Store) and its method's impl are in another file.  ritz1's
+# monomorphizer's `var t = ...` tracking handled a Method call's receiver
+# only when it was a plain local ident (track_method_init_local): a receiver
+# that is itself a field access, `self.st`, left `t` untracked, so
+# `t.push_view(..)` wanted `push_view` at every Vec instance this file had
+# collected through Store's own fields, Vec<Item>'s included (Item.bytes is
+# the struct's *other* Vec field) -- "cannot move out of a reference" in
+# gvec.ritz, the same family as #4778 items 2-3 and #4838.  The same
+# program with Store in main.ritz's own file built on every compiler, so
+# this needs the two-file split.
+STORE_WITH_FIELD_METHOD = """\
+import ritzlib.gvec
+import ritzlib.strview
+struct Item
+    bytes: Vec<u8>
+pub struct Store
+    items: Vec<Item>
+pub fn store_new() -> Store
+    Store { items: vec_new<Item>() }
+impl Store
+    pub fn text(self: @Store) -> Vec<u8>
+        var out: Vec<u8> = vec_new<u8>()
+        out.push_view("ab")
+        out
+"""
+
+MAIN_FIELD_METHOD = """\
+import store { Store, store_new }
+struct Ed
+    st: Store
+impl Ed
+    fn grab(self: @&Ed) -> i64
+        var t = self.st.text()
+        t.push_view("c")
+        t.len()
+fn main() -> i32
+    var e = Ed { st: store_new() }
+    e.grab() as i32
+"""
+
 CASES = {
     "two_file_repro": ({"main.ritz": MAIN_SQ, "shape.ritz": SHAPE_SQ}, 9),
     "every_return_shape": ({"main.ritz": MAIN_ALL, "shape.ritz": SHAPE_ALL}, None),
     "ritzlib_hashmap": ({"main.ritz": MAIN_HASHMAP}, None),
     "ritzlib_socket": ({"main.ritz": MAIN_SOCKET}, None),
+    "cross_module_field_method_local": (
+        {"main.ritz": MAIN_FIELD_METHOD, "store.ritz": STORE_WITH_FIELD_METHOD}, 3),
 }
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("case", sorted(CASES))
-def test_imported_impl_method_matches_ritz0(ritz1_bin, tmp_path, case):
+def test_imported_impl_method_matches_ritz0(ritz1_bin, ritz1_selfhosted, tmp_path, case):
     files, expected = CASES[case]
     want = _build_and_run("ritz0", tmp_path, case, files)
     if expected is not None:
         assert want == expected, f"ritz0 oracle drifted for {case}: {want}"
     got = _build_and_run("ritz1", tmp_path, case, files)
     assert got == want, f"{case}: ritz1 exit {got}, ritz0 exit {want}"
+    # AGAST #4914: ritz1 and ritz1_selfhosted must accept an identical set of
+    # programs (projects/ritz/CLAUDE.md); this case was the first the two
+    # disagreed on (ritz1_selfhosted inherited the bug from its own source).
+    got_sh = _build_and_run("ritz1_selfhosted", tmp_path, case, files)
+    assert got_sh == want, f"{case}: ritz1_selfhosted exit {got_sh}, ritz0 exit {want}"
 
 
 @pytest.mark.integration

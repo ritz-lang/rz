@@ -147,6 +147,19 @@ def test_a_privately_imported_type_conflicts_with_nothing(compiler, tmp_path):
     """The acceptance case: t's own Tag and Box beside ta's, reached only
     through ea's plain import. Each file's code reaches its own."""
     assert _run(compiler, tmp_path, {"ta": TA, "ea": EA, "t": T_OWN}) == 47
+    # AGAST #4914: the SAME name imported twice from the SAME module stays
+    # allowed (one definition, seen through two selective imports of it) --
+    # unlike importing a name of one definition from two different modules
+    # (test_two_modules_importing_one_name_of_different_kinds_is_refused).
+    same_twice_dir = tmp_path / "same_twice"
+    same_twice_dir.mkdir()
+    assert _run(compiler, same_twice_dir, {
+        "sa": "pub enum Command\n    Quit\n    Goto(i64)\n",
+        "st": ("import sa { Command }\nimport sa { Command }\n\n"
+               "fn main() -> i32\n"
+               "    match Command.Quit\n"
+               "        Command.Quit => 0\n"
+               "        Command.Goto(_) => 1\n")}) == 0
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
@@ -221,6 +234,25 @@ def test_a_file_that_declares_one_and_imports_the_other_is_refused(compiler, tmp
     t = T_OWN.replace("import ea { fa }", "import ea { fa }\nimport ta { Tag }")
     _refused(compiler, tmp_path, {"ta": TA, "ea": EA, "t": t}, "t",
              "Conflicting enum definition for 'Tag'")
+    # AGAST #4914: two modules each selectively import a name of theirs that
+    # names a DIFFERENT KIND -- m/a's `pub enum Command` beside m/b's `pub
+    # struct Command`.  Both compilers used to register each kind in its own
+    # namespace (structs, enums) and never compared one against the other,
+    # so the second selective import silently won wherever the two met
+    # (buddhafinger's core.commands Command enum and core.normal's Command
+    # struct, found by #4909): the ticket's own words for the error this
+    # must be are a guess, so only "Conflicting" and both files are checked.
+    kinds_dir = tmp_path / "dup_kinds"
+    kinds_dir.mkdir()
+    files = {
+        "ka": "pub enum Command\n    Quit\n    Goto(i64)\n",
+        "kb": "pub struct Command\n    count: i64\n    extra: i64\n",
+        "kt": ("import ka { Command }\nimport kb { Command }\n\n"
+               "fn main() -> i32\n"
+               "    let c = Command { count: 1, extra: 2 }\n"
+               "    (c.extra - 2) as i32\n"),
+    }
+    _refused(compiler, kinds_dir, files, "kt", "Conflicting")
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

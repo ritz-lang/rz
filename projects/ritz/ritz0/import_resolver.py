@@ -1370,6 +1370,30 @@ class ImportResolver:
             return True
         return False
 
+    def _cross_kind_twin(self, item: rast.Item, source_file: str) -> bool:
+        """AGAST #4914 (LANGUAGE_SPEC §15.3): a struct, enum or type alias
+        conflicts with one of its name of a *different* kind too -- `pub
+        enum Command` in one file beside `pub struct Command` in another --
+        not only within its own kind.  Each kind used to register into its
+        own dict (self.structs / self.enums / self.type_aliases) and never
+        compared against the others, so both compilers built a program that
+        imported one `Command` of each: the second import silently won
+        wherever the two met.  Held aside as a twin like _twin_of's, so
+        _settle_type_twins judges it by which file sees both."""
+        other = None
+        if not isinstance(item, rast.StructDef):
+            variants = self.structs.get(item.name)
+            if variants:
+                other = variants[0]
+        if other is None and not isinstance(item, rast.EnumDef):
+            other = self.enums.get(item.name)
+        if other is None and not isinstance(item, rast.TypeAlias):
+            other = self.type_aliases.get(item.name)
+        if other is None or other.source_file == source_file:
+            return False
+        self._type_twins.setdefault(item.name, []).append(item)
+        return True
+
     def _type_sees(self, path: str, name: str, files: Set[str]) -> bool:
         """Does the module at `path` see the type `name` that `files`
         declare (one definition, or identical repeats of it): declares it,
@@ -1573,6 +1597,8 @@ class ImportResolver:
             # identical (an identical repeat is dropped). A gated variant
             # beside an ungated one coexists only on its own target;
             # resolve_struct_variants decides that after target filtering.
+            if self._cross_kind_twin(item, source_file):
+                return
             item_target = target_key(item)
             variants = self.structs.setdefault(item.name, [])
             if self._twin_of(item, variants, source_file):
@@ -1692,6 +1718,8 @@ class ImportResolver:
                 self.variables[item.name] = item
 
         elif isinstance(item, rast.EnumDef):
+            if self._cross_kind_twin(item, source_file):
+                return
             if item.name in self.enums:
                 existing = self.enums[item.name]
                 # Allow duplicate if identical definition
@@ -1706,6 +1734,8 @@ class ImportResolver:
                 self.enums[item.name] = item
 
         elif isinstance(item, rast.TypeAlias):
+            if self._cross_kind_twin(item, source_file):
+                return
             if item.name in self.type_aliases:
                 existing = self.type_aliases[item.name]
                 # Allow duplicate if identical definition
