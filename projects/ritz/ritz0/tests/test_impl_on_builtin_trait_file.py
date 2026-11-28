@@ -19,7 +19,8 @@ An inherent impl stays "`u8` is a built-in type; it can't have an `impl`"
 
 The positive rows put the trait and the impl in one file, which is the
 trait's file, and call the method through the receiver's primitive/built-in
-type — the dispatch half of the ruling.  Each returns 42.  ritz0, ritz1 and
+type — the dispatch half of the ruling, and (#4946) a method chained onto
+that call's result.  Each returns 42.  ritz0, ritz1 and
 ritz1_selfhosted all agree.
 """
 
@@ -38,17 +39,37 @@ pytestmark = pytest.mark.integration
 # name -> (program, exit code).  A trait `Pick`/`Size`/`Truth`/`Zero` is
 # declared here, so this file is the trait's file.
 ROWS = {
+    # AGAST #4946: the method's result is typed through the primitive
+    # receiver, so a method chained onto it resolves: on a bounded type
+    # param at i64 (`a.rank(@b).is_lt()`, T: Rank) and on an i64 local in a
+    # bare condition.
     "i64": ("""\
-trait Pick
-    fn pick(self: @Self) -> i32
+enum Order
+    Less
+    NotLess
 
-impl Pick for i64
-    fn pick(self: @i64) -> i32
-        (*self as i32) + 1
+impl Order
+    fn is_lt(self: Order) -> bool
+        self == Order.Less
+
+trait Rank
+    fn rank(self: @Self, other: @Self) -> Order
+
+impl Rank for i64
+    fn rank(self: @i64, other: @i64) -> Order
+        if *self < *other then Order.Less else Order.NotLess
+
+fn first<T: Rank>(a: T, b: T) -> bool
+    a.rank(@b).is_lt()
 
 pub fn main() -> i32
     let x: i64 = 41
-    x.pick()
+    let y: i64 = 42
+    if not first<i64>(x, y) or first<i64>(y, x)
+        return 1
+    if x.rank(@y).is_lt()
+        return 42
+    2
 """, 42),
     "bool": ("""\
 trait Truth

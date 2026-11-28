@@ -1894,6 +1894,33 @@ pub fn span_u8_method_is_strview(s: *EmitterState, m_sv: StrView) -> i32
     let sv: *FnDef = find_impl_method_by_symbol(s.sym.module, sv_sym.as_view())
     (own == null and sv != null) as i32
 
+# AGAST #4294 (R36's revisit): the impl target a receiver names when it is a
+# primitive or a `*u8` — `i64`, `bool`, `ptr_u8`.  `no_name()` for anything
+# else.  A declared type keeps its name (the arms above resolve those).
+# ritz1's value model puts a `*u8` in a slot as an i64, so only the declared
+# pointee says.
+pub fn builtin_receiver_name(s: *EmitterState, recv: *Expr) -> StrView
+    if recv == null or recv.kind != ExprKind.Ident
+        return no_name()
+    let loc: *LocalVar = find_local_struct_name(s, recv.ident)
+    if loc == null or lv_type_name_len(loc) > 0
+        return no_name()
+    if loc.is_bool == 1
+        # A bool local's slot is an i64 (var_type TypeKind.I64); is_bool remembers
+        # the declared type (AGAST #1521).
+        return "bool"
+    match lv_var_type(loc)
+        TypeKind.Ref | TypeKind.MutRef =>
+            if lv_pointee_type(loc) == TypeKind.Ptr and lv_inner_pointee_type(loc) == (TypeKind.U8 as i32)
+                return "ptr_u8"
+            return primitive_spelling(lv_pointee_type(loc))
+        TypeKind.Ptr =>
+            if lv_pointee_type(loc) == TypeKind.U8
+                return "ptr_u8"
+            return no_name()
+        _ => pass
+    primitive_spelling(lv_var_type(loc))
+
 # Receivers: a local (value or pointer -- loc.type_name names the struct
 # either way), a struct / `*S` global, a static `Type.m()`, a struct
 # literal, a struct-returning call, and a struct / pointer field.
@@ -1906,6 +1933,13 @@ fn method_recv_type_name_of(s: *EmitterState, e: *Expr) -> StrView
             let rname: StrView = rcv.ident
             let loc: *LocalVar = find_local_struct_name(s, rname)
             if loc != null
+                # AGAST #4946: a primitive local (`a: T` at T = i64) names the
+                # built-in type's trait impl when it has the method, as
+                # emit_expr_method dispatches it (#4294), so a chain on the
+                # result (`a.compare(@b).is_lt()`) is typed by its return.
+                let prim: StrView = builtin_receiver_name(s, rcv)
+                if not unnamed(prim) and find_impl_method(s, prim, e.ident) != null
+                    return prim
                 return lv_name(loc)
             var glob: *GlobalVarDef = find_global(s, rname)
             if glob != null and global_is_receiver(glob) == 0 and impl_type_named(s, rname) == 1
