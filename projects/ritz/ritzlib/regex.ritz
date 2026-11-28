@@ -58,6 +58,7 @@ import ritzlib.option
 import ritzlib.result
 import ritzlib.span
 import ritzlib.strview
+import ritzlib.utf8 { Utf8Unit, utf8_unit_at }
 
 # The deepest nesting of groups a pattern may have: the compiler recurses
 # once per group.
@@ -207,56 +208,6 @@ const REGEX_SHORTHANDS: [8]RegexShorthand = [
     RegexShorthand { letter: 'h', name: "head" }
 ]
 
-# =============================================================================
-# UTF-8 units
-# =============================================================================
-
-# One unit of text: a code point and its length in bytes. A malformed byte b
-# is a unit of length 1 with the code point 0xDC00 + b, a lone surrogate no
-# well-formed text decodes to (Python's "surrogateescape").
-struct RegexUnit
-    cp: u32
-    len: i64
-
-fn regex_unit_at(s: [u8], i: i64) -> RegexUnit
-    let b = s[i]
-    if b < 0x80
-        return RegexUnit { cp: b as u32, len: 1 }
-    let bad = RegexUnit { cp: 0xDC00 + b as u32, len: 1 }
-    # The sequence length, the range its second byte must fall in (no
-    # overlongs, no surrogates, nothing above U+10FFFF) and the lead's bits.
-    var n: i64 = 0
-    var lo: u8 = 0x80
-    var hi: u8 = 0xBF
-    var cp: u32 = 0
-    if b >= 0xC2 and b <= 0xDF
-        n = 2
-        cp = (b & 0x1F) as u32
-    else if b >= 0xE0 and b <= 0xEF
-        n = 3
-        cp = (b & 0x0F) as u32
-        if b == 0xE0
-            lo = 0xA0
-        else if b == 0xED
-            hi = 0x9F
-    else if b >= 0xF0 and b <= 0xF4
-        n = 4
-        cp = (b & 0x07) as u32
-        if b == 0xF0
-            lo = 0x90
-        else if b == 0xF4
-            hi = 0x8F
-    else
-        return bad
-    if i + n > s.len or s[i + 1] < lo or s[i + 1] > hi
-        return bad
-    for k in 1..n
-        let c = s[i + k]
-        if c < 0x80 or c > 0xBF
-            return bad
-        cp = (cp << 6) | (c & 0x3F) as u32
-    RegexUnit { cp: cp, len: n }
-
 # A byte of a word character: ASCII letters, digits, `_`, and every byte of
 # a non-ASCII code point (Vim's default 'iskeyword').
 fn regex_is_word_byte(b: u8) -> bool
@@ -376,7 +327,7 @@ impl RegexCompiler
             match self.escape(self.src[at + 1])
                 Some(t) => return t
                 None => pass
-            let u = regex_unit_at(self.src, at + 1)
+            let u = utf8_unit_at(self.src, at + 1)
             return regex_literal(u.cp, 1 + u.len)
         let plain: Option<RegexTok> = match b
             '.' => Some(RegexTok.Dot)
@@ -388,7 +339,7 @@ impl RegexCompiler
         match plain
             Some(t) => regex_token(t, 1)
             None =>
-                let u = regex_unit_at(self.src, at)
+                let u = utf8_unit_at(self.src, at)
                 regex_literal(u.cp, u.len)
 
     fn peek(self: @RegexCompiler) -> RegexToken
@@ -589,18 +540,18 @@ impl RegexCompiler
         0
 
     # One code point of a class at `at`: a `\` escape or the unit there.
-    fn class_char(self: @RegexCompiler, at: i64) -> RegexUnit
+    fn class_char(self: @RegexCompiler, at: i64) -> Utf8Unit
         if self.src[at] == '\\' and at + 1 < self.src.len
             let e: u8 = self.src[at + 1]
             match e
-                ']' | '\\' | '^' | '-' => return RegexUnit { cp: e as u32, len: 2 }
-                't' => return RegexUnit { cp: 0x09, len: 2 }
-                'e' => return RegexUnit { cp: 0x1B, len: 2 }
-                'r' => return RegexUnit { cp: 0x0D, len: 2 }
-                'n' => return RegexUnit { cp: 0x0A, len: 2 }
+                ']' | '\\' | '^' | '-' => return Utf8Unit { cp: e as u32, len: 2 }
+                't' => return Utf8Unit { cp: 0x09, len: 2 }
+                'e' => return Utf8Unit { cp: 0x1B, len: 2 }
+                'r' => return Utf8Unit { cp: 0x0D, len: 2 }
+                'n' => return Utf8Unit { cp: 0x0A, len: 2 }
                 _ => pass
         # Any other backslash is a literal one, and what follows is its own.
-        regex_unit_at(self.src, at)
+        utf8_unit_at(self.src, at)
 
     # [...] at pos. With no closing `]` the `[` is a literal.
     fn bracket(self: @&RegexCompiler) -> Result<i64, RegexError>
@@ -750,7 +701,7 @@ impl Regex
             _ => false
 
     # True when instruction pc consumes the unit u.
-    fn takes(self: @Regex, pc: i64, u: RegexUnit) -> bool
+    fn takes(self: @Regex, pc: i64, u: Utf8Unit) -> bool
         match self.prog[pc]
             RegexInst.Char(c) => u.cp == c
             RegexInst.Any => true
@@ -786,7 +737,7 @@ impl Regex
         # Start on a code point: step past the unit `from` falls inside.
         var u0: i64 = 0
         while u0 < i
-            u0 += regex_unit_at(text, u0).len
+            u0 += utf8_unit_at(text, u0).len
         i = u0
         if self.next_start(text, i) > text.len
             # The byte every match starts with isn't there: no VM to run.
@@ -811,7 +762,7 @@ impl Regex
             let nxt = 1 - cur
             vm.clear(nxt)
             step += 1
-            let u: RegexUnit = if i < text.len then regex_unit_at(text, i) else RegexUnit { cp: 0, len: 0 }
+            let u: Utf8Unit = if i < text.len then utf8_unit_at(text, i) else Utf8Unit { cp: 0, len: 0 }
             for t in 0..vm.count(cur)
                 let pc = vm.pc_of(cur, t)
                 if self.is_found(pc)
@@ -850,7 +801,7 @@ impl Regex
                 # The units between i and j can't start a match; step over
                 # them so j is reached on a code point.
                 while i < j
-                    i += regex_unit_at(text, i).len
+                    i += utf8_unit_at(text, i).len
                 if i >= before
                     break
                 step += 1
@@ -864,7 +815,7 @@ impl Regex
             let nxt = 1 - cur
             vm.clear(nxt)
             step += 1
-            let u: RegexUnit = if i < text.len then regex_unit_at(text, i) else RegexUnit { cp: 0, len: 0 }
+            let u: Utf8Unit = if i < text.len then utf8_unit_at(text, i) else Utf8Unit { cp: 0, len: 0 }
             if u.len > 0 and i + u.len < before and not self.anchored and self.can_start(text, i + u.len)
                 self.add_thread(@&vm, nxt, step, 0, i + u.len, text, i + u.len)
             for t in 0..vm.count(cur)

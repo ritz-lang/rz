@@ -1,0 +1,292 @@
+# core/quickfix.ritz - the quickfix list: where a workspace search matched, and the way through it.
+#
+# `:vimgrep /pat/[gj] [glob ...]` and `:grep pat [glob ...]` (AGAST #4972,
+# docs/BUDDHAFINGER_PROPOSAL.md "Everyday code editing") search the
+# workspace and replace the list with what they find; `:cn` `:cp` `:cc`
+# `:cfirst` `:clast` go through it and `:copen` shows it in the picker
+# (core/editor.ritz runs them; it reads the files through the FileStore,
+# so this module only scans text it is given).
+#
+# An entry is a match: its file, the line and byte column it was found at,
+# the line's text (leading blanks off, at most MAX_QF_TEXT bytes, as Vim's
+# list shows it) and its byte offset in the file. The offset follows edits
+# to the file's buffer (Editor.after_key moves it through the buffer's
+# change notes), so `:cn` still lands on the text that matched after lines
+# above it come or go; the line shown stays the one found.
+#
+# A search is bounded: at most MAX_QF_ENTRIES entries (more: the list is
+# marked truncated and says so), and core/editor.ritz bounds the files.
+#
+# Moving follows Vim's rules (quickfix.c, get_nth_valid_entry): `:cn N`
+# goes N on, stopping at the last entry when fewer are left, and is E553
+# only when it can't move at all; `:cc N` goes to entry N, the last when
+# N is past it. Every move on an empty list is E42.
+# Core module: no terminal or OS I/O (see src/platform/).
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.regex { Regex, RegexMatch }
+import ritzlib.result { Result }
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview { StrView }
+
+import core.buffer { Buffer, term_text }
+import core.files { PathList, path_list_new }
+import core.utf8 { utf8_prev }
+
+# The most entries one search keeps.
+pub const MAX_QF_ENTRIES: i64 = 10000
+
+# The most bytes of a match's line an entry keeps, to show.
+pub const MAX_QF_TEXT: i64 = 200
+
+pub const MSG_QF_EMPTY: StrView = "E42: No Errors"
+pub const MSG_QF_NO_MORE: StrView = "E553: No more items"
+pub const MSG_QF_BAD_ARGS: StrView = "E683: File name missing or invalid pattern"
+
+pub enum QfError
+    Empty           # E42: no list, or nothing in it
+    NoMore          # E553: no entry that way
+
+# One match.
+pub struct QfEntry
+    file: i64               # its file: an index into Quickfix.files
+    line: i64               # where it was found: 0-based line, byte column
+    col: i64
+    at: i64                 # its byte offset in the file, kept up with edits
+
+pub struct Quickfix
+    files: PathList         # each file with an entry, once, in search order
+    entries: Vec<QfEntry>   # in file order, then by position
+    texts: PathList         # each entry's line, as shown
+    current: i64            # the current entry (0 on an empty list)
+    truncated: bool         # MAX_QF_ENTRIES stopped the search
+
+pub fn quickfix_new() -> Quickfix
+    Quickfix { files: path_list_new(), entries: vec_new<QfEntry>(), texts: path_list_new(), current: 0, truncated: false }
+
+# What `:vimgrep` and `:grep` were asked for.
+pub struct GrepArgs
+    pattern: StrView        # empty: the last search pattern
+    every: bool             # g: every match on a line, not only the first
+    jump: bool              # no j: go to the first match
+    globs: StrView          # the files, blank-separated globs; empty: all of the workspace
+
+fn is_blank(c: u8) -> bool
+    c == ' ' or c == '\t'
+
+# A character of a Vim identifier ('isident'): what can't delimit a pattern.
+fn is_ident(c: u8) -> bool
+    (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 0x80
+
+fn after_blanks(s: StrView, from: i64) -> i64
+    var i = from
+    while i < s.len() and is_blank(s.get(i))
+        i += 1
+    i
+
+# The index of the first blank in s from `from` on, else s.len().
+fn word_end(s: StrView, from: i64) -> i64
+    var i = from
+    while i < s.len() and not is_blank(s.get(i))
+        i += 1
+    i
+
+# `:vimgrep`'s argument: `/pat/[g][j] [glob ...]`, the pattern between two
+# of any character that isn't an identifier's (`#pat#` too, `\/` inside
+# escaping the delimiter for the regex), or a bare `pat [glob ...]`, the
+# pattern up to the first blank, with no flags. None (Vim's E683) for an
+# empty argument, a pattern with no closing delimiter, or anything but
+# `g` and `j` glued after it.
+pub fn parse_vimgrep(arg: StrView) -> Option<GrepArgs>
+    let s = arg.trim()
+    if s.is_empty()
+        return None
+    let d = s.get(0)
+    if is_ident(d)
+        return parse_grep(s)
+    var i: i64 = 1
+    while i < s.len() and s.get(i) != d
+        if s.get(i) == '\\' and i + 1 < s.len()
+            i += 1
+        i += 1
+    if i >= s.len()
+        return None
+    let pattern = s.slice(1, i)
+    i += 1
+    var every = false
+    var jump = true
+    while i < s.len() and not is_blank(s.get(i))
+        let f = s.get(i)
+        if f == 'g'
+            every = true
+        else if f == 'j'
+            jump = false
+        else
+            return None
+        i += 1
+    let rest = after_blanks(s, i)
+    Some(GrepArgs { pattern: pattern, every: every, jump: jump, globs: s.slice(rest, s.len()) })
+
+# `:grep`'s argument: `pat [glob ...]`, the pattern up to the first blank,
+# a line's first match only, jumping to the first. None when empty.
+pub fn parse_grep(arg: StrView) -> Option<GrepArgs>
+    let s = arg.trim()
+    if s.is_empty()
+        return None
+    let end = word_end(s, 0)
+    let rest = after_blanks(s, end)
+    Some(GrepArgs { pattern: s.slice(0, end), every: false, jump: true, globs: s.slice(rest, s.len()) })
+
+# The `k`th blank-separated word of `globs`, for k below word_count.
+pub fn glob_word(globs: StrView, k: i64) -> StrView
+    var at = after_blanks(globs, 0)
+    for n in 0..k
+        at = after_blanks(globs, word_end(globs, at))
+    globs.slice(at, word_end(globs, at))
+
+pub fn word_count(globs: StrView) -> i64
+    var n: i64 = 0
+    var at = after_blanks(globs, 0)
+    while at < globs.len()
+        n += 1
+        at = after_blanks(globs, word_end(globs, at))
+    n
+
+# The text an entry shows of line `s`: leading blanks off, at most
+# MAX_QF_TEXT bytes, cut on a code point.
+fn shown_text(s: [u8]) -> [u8]
+    var a: i64 = 0
+    while a < s.len and is_blank(s[a])
+        a += 1
+    var b = s.len
+    if b - a > MAX_QF_TEXT
+        b = a + MAX_QF_TEXT
+        # Back onto a code point's start if the cut split one.
+        if b < s.len and (s[b] & 0xC0) == 0x80
+            b = utf8_prev(s, b)
+            if b < a
+                b = a
+    s[a..b]
+
+impl Quickfix
+    pub fn len(self: @Quickfix) -> i64
+        self.entries.len()
+
+    pub fn is_empty(self: @Quickfix) -> bool
+        self.entries.len() == 0
+
+    # A new, empty list for a search.
+    pub fn clear(self: @&Quickfix)
+        self.files = path_list_new()
+        self.entries.clear()
+        self.texts = path_list_new()
+        self.current = 0
+        self.truncated = false
+
+    pub fn entry(self: @Quickfix, k: i64) -> QfEntry
+        self.entries.get(k)
+
+    # Entry k's file name and its line as shown.
+    pub fn path_of(self: @Quickfix, k: i64) -> StrView
+        self.files.get(self.entries.get(k).file)
+
+    pub fn text_of(self: @Quickfix, k: i64) -> StrView
+        self.texts.get(k)
+
+    # Where file `path` is in `files`, if it has entries.
+    pub fn file_index(self: @Quickfix, path: StrView) -> Option<i64>
+        for f in 0..self.files.len()
+            if self.files.get(f).eq(path)
+                return Some(f)
+        None
+
+    # Add the matches of `re` in `b`, the text of file `path`: each line's
+    # first, or every one when `every`. False, the list marked truncated,
+    # when it filled up.
+    pub fn scan(self: @&Quickfix, path: StrView, b: @Buffer, re: @Regex, every: bool) -> bool
+        var file: i64 = -1
+        var start: i64 = 0          # line l's byte offset in the file
+        var lines = b.line_count()
+        if b.has_final_newline()
+            lines -= 1
+        for l in 0..lines
+            let s = b.line(l)
+            var from: i64 = 0
+            while from <= s.len
+                let m: RegexMatch = match re.find_from(s, from)
+                    Some(found) => found
+                    None => break
+                if self.entries.len() >= MAX_QF_ENTRIES
+                    self.truncated = true
+                    return false
+                if file < 0
+                    self.files.push(path)
+                    file = self.files.len() - 1
+                self.entries.push(QfEntry { file: file, line: l, col: m.start, at: start + m.start })
+                self.texts.push(shown_text(s).as_strview())
+                if not every
+                    break
+                # On past the match; past one byte for an empty match.
+                from = if m.end > m.start then m.end else m.start + 1
+            start += s.len + term_text(b.line_term(l)).len()
+        true
+
+    # Move `count` entries on (back when not `forward`): the entry reached,
+    # now current. Short of the end it stops at the last one there is; Err
+    # when it can't move at all.
+    pub fn step(self: @&Quickfix, count: i64, forward: bool) -> Result<i64, QfError>
+        if self.is_empty()
+            return Err(QfError.Empty)
+        let to = if forward then self.current + count else self.current - count
+        var k = to
+        if k > self.entries.len() - 1
+            k = self.entries.len() - 1
+        if k < 0
+            k = 0
+        if k == self.current
+            return Err(QfError.NoMore)
+        self.current = k
+        Ok(k)
+
+    # Entry n, 1-based (0: the current one; past the last: the last), now
+    # current.
+    pub fn go(self: @&Quickfix, n: i64) -> Result<i64, QfError>
+        if self.is_empty()
+            return Err(QfError.Empty)
+        if n > 0
+            self.current = if n > self.entries.len() then self.entries.len() - 1 else n - 1
+        Ok(self.current)
+
+    # `(k of n): text`, the message for entry k; `n+` when the list was
+    # cut short.
+    pub fn label(self: @Quickfix, k: i64) -> String
+        var msg = string_from("(")
+        msg.push_i64(k + 1)
+        msg.push_str(" of ")
+        msg.push_i64(self.entries.len())
+        if self.truncated
+            msg.push('+')
+        msg.push_str("): ")
+        msg.push_str(self.texts.get(k))
+        msg
+
+    # Entry k as the `:copen` list shows it, Vim's quickfix-window line:
+    # `path|line col c| text`, 1-based.
+    pub fn row(self: @Quickfix, k: i64) -> String
+        let e = self.entries.get(k)
+        var line = string_from(self.files.get(e.file))
+        line.push('|')
+        line.push_i64(e.line + 1)
+        line.push_str(" col ")
+        line.push_i64(e.col + 1)
+        line.push_str("| ")
+        line.push_str(self.texts.get(k))
+        line
+
+    # Entry k's offset moved to `at` (its file's buffer changed).
+    pub fn set_at(self: @&Quickfix, k: i64, at: i64)
+        var e = self.entries.get(k)
+        e.at = at
+        self.entries.set(k, e)

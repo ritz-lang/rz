@@ -18,6 +18,20 @@ order anywhere in the name, runs and word starts ranked first. Up/Down or
 Ctrl-P/Ctrl-N move, Enter opens (as `:e` or `:b` would), Escape closes.
 Vim's lower-case `:files` and `:buffers` are still `:ls`.
 
+## Workspace search and quickfix
+
+`:vimgrep /pattern/[g][j] [glob ...]` searches the working directory's
+files (the picker's list) for a pattern in Vim's regular expressions, only
+the files a glob names when there are globs (`*.ritz`, `src/**`,
+`**/test_*.ritz`): a file with a buffer as the buffer holds it, a binary
+one (a NUL in its first 8000 bytes) not at all. `g` lists every match on a
+line, not only the first; `j` stays put rather than going to the first.
+`:grep pattern [glob ...]` is the same with a bare pattern. The matches,
+at most 10000, are the quickfix list: `:cn [N]` and `:cp [N]` (`:cN`) go
+through it, `:cc [N]`, `:cfirst [N]` (`:crewind`) and `:clast [N]` to an
+entry, each showing `(k of n): text`; an entry follows edits to its
+buffer. `:copen` shows the list in the picker, `file|line col c| text`.
+
 ## Language server
 
 A `.ritz` file starts ritz-lsp as a child process, with `RITZ1` pointing at
@@ -48,8 +62,9 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   which decodes Normal- and Visual-mode keys (counts, operators, motions
   and Ctrl-W window commands) into commands, `layout`, the windows' frame
   tree sized equally as Vim's, `editor`, which applies typed keys to the
-  buffer list and its windows, `picker`, the `:Files` / `:Buffers` overlay
-  with its fuzzy matcher and ranking, and `paint`, which composes one frame
+  buffer list and its windows, `picker`, the `:Files` / `:Buffers` / `:copen` overlay
+  with its fuzzy matcher and ranking, `quickfix`, the `:vimgrep` list and
+  the way through it, and `paint`, which composes one frame
   of every window, and the picker over them, for the terminal). It does no terminal or OS
   I/O, so it is tested without a terminal: files go through the
   `FileStore` seam in `files`, which the platform implements.

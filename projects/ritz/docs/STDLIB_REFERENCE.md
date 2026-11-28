@@ -114,6 +114,8 @@ modules links without sys. A freestanding program defines all three itself.
     - [time](#time) - Duration, sleep, wall clock
     - [json](#json) - JSON parsing
     - [regex](#regex) - Regular expressions, linear time
+    - [glob](#glob) - Shell-style path patterns (`**/*.ritz`)
+    - [utf8](#utf8) - Decoding UTF-8 one code point at a time
     - [elf](#elf) - ELF binary parsing
     - [endian](#endian) - Big- and little-endian integers in a byte buffer
     - [testing](#testing) - Removed; use `assert`
@@ -3332,6 +3334,59 @@ fn first_number(line: StrView) -> i64
 
 `RegexMatch` is `{ start: i64, end: i64 }`, byte offsets. `^` and `$` hold at
 the ends of the whole text, not of the part searched.
+
+### glob
+
+**Module**: `ritzlib.glob`
+
+Shell-style path patterns, matched against a whole path: `*` any run of code
+points but `/`, `?` one but `/`, `[a-z]` / `[!...]` / `[^...]` a set (never
+`/`), `**` as a whole segment any run of segments (`a/**/b` matches `a/b`
+and `a/x/y/b`; `src/**` everything below `src`), `\c` a literal `c`. A
+pattern never fails to compile: what isn't syntax is literal (a `[` with no
+`]` too). Matching runs a state set, as `regex` does: O(len(path) *
+len(pattern)), never backtracking.
+
+```ritz
+import ritzlib.glob
+
+[[test]]
+fn test_glob_example() -> i32
+    assert glob_match("**/*.ritz", "src/core/a.ritz")
+    assert not glob_match("*.ritz", "src/a.ritz")      # `*` stays in its segment
+    let g = glob_compile("src/[a-c]*.ritz")             # once, for many paths
+    assert g.matches("src/buffer.ritz") and not g.matches("src/editor.ritz")
+    0
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `glob_match` | `fn(pattern: StrView, path: StrView) -> bool` | Compile and match once |
+| `glob_compile` | `fn(pattern: StrView) -> Glob` | Compile, to match many paths |
+| `g.matches(path)` | `fn(path: StrView) -> bool` | True when the pattern matches all of `path` |
+
+### utf8
+
+**Module**: `ritzlib.utf8`
+
+`utf8_unit_at(text, i)` decodes the code point starting at `text[i]` (`i`
+below `text.len`): a `Utf8Unit { cp: u32, len: i64 }`. Well-formed is RFC
+3629's (no overlongs, no surrogates, nothing past U+10FFFF); a byte that
+doesn't start a well-formed sequence is a unit of length 1 with code point
+`0xDC00 + byte` (Python's "surrogateescape"), so malformed text still steps
+forward. `regex` and `glob` read text through it.
+
+```ritz
+import ritzlib.span
+import ritzlib.utf8
+
+[[test]]
+fn test_utf8_example() -> i32
+    let text = span_from_strview("aé")
+    let u = utf8_unit_at(text, 1)
+    assert u.cp == 0xE9 and u.len == 2
+    0
+```
 
 ### elf
 
