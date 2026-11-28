@@ -150,6 +150,8 @@ def test_hosted_objects_keep_the_hosted_flags(buildpy, obj_calls, tmp_path, monk
     pkg = _two_module_kernel(tmp_path)
     buildpy.compile_binary("kern", pkg / "src" / "kern.ritz", tmp_path, use_cache=False,
                            pkg_dir=pkg, source_roots=["src"])
-    assert len(obj_calls) == 2
-    for _, flags in obj_calls:
+    # The runtime shim's own compile (`-c`, AGAST #4808) is not a module's.
+    modules = [c for c in obj_calls if c[0].endswith(".ritz")]
+    assert len(modules) == 2
+    for _, flags in modules:
         assert flags in (None, buildpy.OBJ_CLANG_FLAGS)

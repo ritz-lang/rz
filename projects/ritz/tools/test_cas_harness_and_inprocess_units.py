@@ -239,6 +239,9 @@ def test_harness_key_names_the_compiler_and_differs_from_the_module_key(tmp_path
     # A key folds in cas.target_id(), whose first call runs `clang --version`;
     # pin it so this pure test starts no process (AGAST #3807, spawn_guard).
     monkeypatch.setattr(cas, "_TARGET", "test-os/test-machine/test-clang")
+    # The producer is in the key (AGAST #4808): clang's, so no rllvm is
+    # built or hashed.
+    monkeypatch.setenv("RITZ_OBJ_PRODUCER", "clang")
     src = tmp_path / "test_x.ritz"
     src.write_text("[[test]]\nfn test_x() -> i32\n    0\n")
     k0 = buildpy.cas_harness_key(src, [], "ritz0")
@@ -250,7 +253,10 @@ def test_harness_key_names_the_compiler_and_differs_from_the_module_key(tmp_path
 
 
 @pytest.mark.unit
-def test_harness_key_is_none_for_an_unparseable_import(tmp_path, buildpy):
+def test_harness_key_is_none_for_an_unparseable_import(tmp_path, buildpy, monkeypatch):
+    # No process: a pinned target, and clang as the producer (AGAST #4808).
+    monkeypatch.setattr(cas, "_TARGET", "test-os/test-machine/test-clang")
+    monkeypatch.setenv("RITZ_OBJ_PRODUCER", "clang")
     src = tmp_path / "test_x.ritz"
     src.write_text("import bad\n[[test]]\nfn test_x() -> i32\n    0\n")
     bad = tmp_path / "bad.ritz"

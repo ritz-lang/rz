@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import importlib.util
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -77,49 +76,65 @@ def buildpy(request):
     return mod
 
 
-def _fake_clang(obj_path: Path, *, rc: int, seen: list):
-    """A clang that writes HALF an object to its -o and records what it saw.
+def _fake_compile(obj_path: Path, *, ok: bool, seen: list):
+    """An object compile (compile_ll_to_obj: rllvm, else clang) that writes
+    HALF an object to its output and records what it saw.
 
     When it runs, the final path must not exist yet: a concurrent reader
-    checks exactly `obj_path.exists()` and its mtime.
+    checks exactly `obj_path.exists()` and its mtime. On failure it unlinks
+    its output, as compile_ll_to_obj does.
     """
-    def run(cmd, **kw):
-        out = Path(cmd[cmd.index("-o") + 1])
+    def compile_ll_to_obj(ll, out, src, flags=None):
+        out = Path(out)
         seen.append({"out": out, "final_existed": obj_path.exists()})
         out.write_bytes(b"\x7fELF-half")
-        err = "" if rc == 0 else "clang: boom"
-        return subprocess.CompletedProcess(cmd, rc, "", err)
-    return run
+        if ok:
+            return None
+        out.unlink()
+        return "rllvm -c failed: boom"
+    return compile_ll_to_obj
 
 
-def test_runtime_object_is_not_written_in_place(buildpy, tmp_path, monkeypatch):
+@pytest.fixture
+def clang_producer(monkeypatch):
+    """Clang's identity in the shim's stamp, so no rllvm is built or hashed
+    (AGAST #4808), and a pinned target, so no `clang --version` runs."""
+    import cas
+    monkeypatch.setenv("RITZ_OBJ_PRODUCER", "clang")
+    monkeypatch.setattr(cas, "_TARGET", "test-os/test-machine/test-clang")
+
+
+def test_runtime_object_is_not_written_in_place(buildpy, tmp_path, monkeypatch,
+                                                clang_producer):
     ll = tmp_path / "ritz_start.x86_64.ll"
     ll.write_text("; shim\n")
     obj = ll.with_suffix(".o")
     seen: list = []
-    monkeypatch.setattr(buildpy.subprocess, "run", _fake_clang(obj, rc=0, seen=seen))
+    monkeypatch.setattr(buildpy, "compile_ll_to_obj", _fake_compile(obj, ok=True, seen=seen))
 
     assert buildpy.ensure_runtime_object(obj) is True
 
     assert len(seen) == 1
-    assert seen[0]["out"] != obj, "clang wrote straight onto the shared runtime object"
+    assert seen[0]["out"] != obj, "the compile wrote straight onto the shared runtime object"
     assert seen[0]["out"].parent == obj.parent, (
         "temp must be on the same filesystem to rename")
     assert seen[0]["final_existed"] is False, "a reader could see the object mid-write"
     assert obj.read_bytes() == b"\x7fELF-half"
-    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([ll.name, obj.name]), (
+    stamp = buildpy.runtime_stamp_path(obj)
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([ll.name, obj.name, stamp.name]), (
         "temp file left behind")
 
 
-def test_failed_runtime_build_publishes_nothing(buildpy, tmp_path, monkeypatch):
+def test_failed_runtime_build_publishes_nothing(buildpy, tmp_path, monkeypatch,
+                                                clang_producer):
     ll = tmp_path / "ritz_start.x86_64.ll"
     ll.write_text("; shim\n")
     obj = ll.with_suffix(".o")
     seen: list = []
-    monkeypatch.setattr(buildpy.subprocess, "run", _fake_clang(obj, rc=1, seen=seen))
+    monkeypatch.setattr(buildpy, "compile_ll_to_obj", _fake_compile(obj, ok=False, seen=seen))
 
     assert buildpy.ensure_runtime_object(obj) is False
 
     assert not obj.exists(), (
-        "a failed clang left a partial object a later build would trust")
+        "a failed compile left a partial object a later build would trust")
     assert [p.name for p in tmp_path.iterdir()] == [ll.name], "temp file left behind"

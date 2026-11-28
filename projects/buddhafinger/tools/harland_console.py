@@ -220,6 +220,20 @@ class Editor:
         self.con.type_bytes(data)
         self.settle()
 
+    def save(self, data: bytes = b":w\r", answer: str = "written") -> str:
+        """Type `data` (ending in `:w`) and return the message line once the
+        save has answered on it with `answer` ("written" also matches "not
+        written: ..."), or the timeout has passed. A quiet
+        QUIET seconds is not an answer: the write and sync to the storage
+        disk can take longer than that before the message is painted, which
+        on a loaded host left the check reading the `:w` still being typed
+        (AGAST #4808's gate)."""
+        self.keys(data)
+        deadline = time.monotonic() + self.timeout
+        while answer not in self.scr.message() and time.monotonic() < deadline:
+            self.settle()
+        return self.scr.message()
+
     def dirty(self) -> bool:
         return "[+]" in self.scr.status()
 
@@ -348,8 +362,7 @@ def failed_save(con: Console, fault: str, timeout: float) -> int:
     ed = Editor(con, timeout, 30, 120)
     fails += _ok(ed.start(f"--rows 30 --cols 120 {NOTES}") and "NORMAL" in ed.scr.row(28),
                  f"{fault}: the editor starts on {NOTES}, its status line on row 29 of 30", ed.raw)
-    ed.keys(b"idraft \x1b:w\r")
-    msg = ed.scr.message()
+    msg = ed.save(b"idraft \x1b:w\r", answer="not saved to storage")
     fails += _ok(ed.dirty(), f"{fault}: the buffer stays dirty ([+])", ed.scr.status().encode())
     fails += _ok(f'"{NOTES}" not written: ' in msg and "may already have changed" not in msg,
                  f"{fault}: the message says the file was not written", msg.encode())
@@ -376,8 +389,7 @@ def first(con: Console, timeout: float) -> int:
     fails += _ok("NORMAL" in ed.scr.status(), "a bare Escape leaves Insert (no next key)",
                  ed.scr.status().encode())
     fails += _ok(ed.dirty(), "the edited buffer is dirty", ed.scr.status().encode())
-    ed.keys(b":w\r")
-    msg = ed.scr.message()
+    msg = ed.save()
     fails += _ok("written" in msg and not ed.dirty(), "`:w` saves and marks the buffer clean",
                  (msg + " | " + ed.scr.status()).encode())
     out = ed.quit()
@@ -394,7 +406,7 @@ def first(con: Console, timeout: float) -> int:
     fails += write_new(con, "/var/empty.txt", "x", timeout, "empty save")
     ed = Editor(con, timeout)
     ed.start("/var/empty.txt")
-    ed.keys(b"x:w\r")
+    ed.save(b"x:w\r")
     fails += _ok("0L, 0B written" in ed.scr.message() and not ed.dirty(), "an empty buffer saves",
                  ed.scr.message().encode())
     ed.quit()
@@ -451,7 +463,7 @@ def ram_only(con: Console, timeout: float) -> int:
     fails = 0
     ed = Editor(con, timeout)
     fails += _ok(ed.start("/tmp/ram.txt"), "no storage device: the editor starts on /tmp/ram.txt", ed.raw)
-    ed.keys(b"iram\x1b:w\r")
+    ed.save(b"iram\x1b:w\r")
     fails += _ok("written" in ed.scr.message() and not ed.dirty(),
                  "no storage device: a RAM-only save is clean", ed.scr.message().encode())
     ed.quit()
@@ -459,8 +471,7 @@ def ram_only(con: Console, timeout: float) -> int:
     # Without a storage device kfs never makes /var, so the open fails.
     ed = Editor(con, timeout)
     ed.start("/var/nodev.txt")
-    ed.keys(b"ivar\x1b:w\r")
-    msg = ed.scr.message()
+    msg = ed.save(b"ivar\x1b:w\r")
     fails += _ok(ed.dirty() and "not written: No such file or directory" in msg,
                  "no storage device: a /var save stays dirty and says why", msg.encode())
     ed.quit(b":q!\r")
