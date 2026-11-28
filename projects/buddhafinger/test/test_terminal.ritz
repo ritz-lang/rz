@@ -6,7 +6,8 @@
 # cases are the proposal's "Screen and I/O tests": open, edit, save and
 # exit; a bare Escape leaving Insert with no key after it; Ctrl-Z (and
 # SIGTSTP) then SIGCONT; SIGTERM, SIGINT and SIGHUP; a resize; then the
-# file picker over a real directory (AGAST #4913). Every exit
+# file picker over a real directory (AGAST #4913), and a workspace search
+# through it with the quickfix list (#4972). Every exit
 # path must leave the terminal's attributes as they were before the editor
 # started, compared field by field (a pty master reads its slave's).
 #
@@ -419,6 +420,40 @@ fn test_file_picker_lists_and_opens() -> i32
     # (the frame skips the unchanged blanks between them).
     assert c.expect("NORMAL")
     assert c.expect("src/walked.ritz")
+    assert c.send(":q\r")
+    assert c.exits_with(0)
+    assert c.restored()
+    c.close()
+    let gone = remove_dir_all(dir.as_view())
+    0
+
+# `:vimgrep` in a real directory: it walks the tree (breadth first, so
+# notes.txt before src/a.ritz), reads the files, and goes to the first
+# match; `:cn` to the next, in another file, then E553; the files it only
+# read leave nothing to save, so `:q` exits.
+[[test]]
+fn test_vimgrep_and_cn_in_a_real_tree() -> i32
+    let dir = fixture_dir("grep")
+    let sub = path_join(dir.as_view(), "src")
+    let made_sub = mkdir(sub.as_view(), 493)
+    let s = write_file(path_join(dir.as_view(), "start.txt").as_view(), "nothing\n")
+    let a = write_file(path_join(dir.as_view(), "notes.txt").as_view(), "needle_in_notes\n")
+    let b = write_file(path_join(sub.as_view(), "a.ritz").as_view(), "fn a\n  needle_call()\n")
+    var c: Child = match spawn_editor_in(dir.as_view(), "start.txt", 24, 80)
+        Some(k) => k
+        None => return 0     # no ptys here
+    assert c.expect("NORMAL")
+    # A frame writes only the cells that changed since the last one drawn,
+    # top row first: each needle is a run no earlier frame had in the same
+    # cells ("notes", not "notes.txt": start.txt's ".txt" is already there).
+    assert c.send(":vimgrep /needle/\r")
+    assert c.expect("notes")
+    assert c.expect("(1 of 2): needle_in_notes")
+    assert c.send(":cn\r")
+    assert c.expect("needle_call()")
+    assert c.expect("src/a")
+    assert c.send(":cn\r")
+    assert c.expect("E553:")
     assert c.send(":q\r")
     assert c.exits_with(0)
     assert c.restored()

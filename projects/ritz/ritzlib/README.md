@@ -85,6 +85,7 @@ pub fn main() -> i32
 | `fmt/spec.ritz` | `ritzlib.fmt.spec` | the `{x:spec}` format specifiers, parsed |
 | `fmt/writer.ritz` | `ritzlib.fmt.writer` | Writer: one byte sink for every formatter |
 | `fs.ritz` | `ritzlib.fs` | Filesystem utility functions |
+| `glob.ritz` | `ritzlib.glob` | shell-style path patterns: `*.ritz`, `src/**/test_*`. |
 | `gvec.ritz` | `ritzlib.gvec` | Generic dynamic array |
 | `hash.ritz` | `ritzlib.hash` | Hashing utilities |
 | `hashmap.ritz` | `ritzlib.hashmap` | Hash maps: HashMap<K, V>, and HashMapI64 |
@@ -114,6 +115,7 @@ pub fn main() -> i32
 | `timedread.ritz` | `ritzlib.timedread` | a read that gives up after a timeout, on Linux and Harland |
 | `timer.ritz` | `ritzlib.timer` | High-performance timing utilities |
 | `uring.ritz` | `ritzlib.uring` | io_uring bindings for Linux |
+| `utf8.ritz` | `ritzlib.utf8` | decoding UTF-8 text one code point at a time. |
 <!-- END module table -->
 
 ## Dependencies

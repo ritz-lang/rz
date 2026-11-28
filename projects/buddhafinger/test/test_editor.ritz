@@ -1762,3 +1762,197 @@ fn test_buffers_names_an_unnamed_buffer() -> i32
     feed(@&ed, @&d, "<cr>")
     assert ed.mode == Mode.Normal and ed.buffer_count() == 1
     0
+
+# ============================================================================
+# Workspace search and the quickfix list (AGAST #4972)
+# ============================================================================
+
+# The disk the search tests list: f.txt (open), two .ritz files with
+# matches, a README without, and a binary file with one.
+fn grep_disk() -> Disk
+    var d = disk_with("f.txt", "a\nb\nc\n")
+    d.add("src/x.ritz", "fn foo\n  foo()\n")
+    d.add("README.md", "no\n")
+    d.add("src/y.ritz", "bar foo\n")
+    d.add("lib.bin", "foo\x00foo\n")
+    d
+
+# The quickfix list's current entry is `k` and the cursor is on it in `path`.
+fn on_entry(ed: @Editor, k: i64, path: StrView, line: i64, col: i64) -> bool
+    ed.quickfix().current == k and ed.path().eq(path) and at(ed, line, col)
+
+[[test]]
+fn test_vimgrep_lists_the_matches_and_goes_to_the_first() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":vimgrep /foo/<cr>")
+    let q = ed.quickfix()
+    assert q.len() == 3, "the binary file is skipped"
+    assert q.path_of(0).eq("src/x.ritz") and q.path_of(2).eq("src/y.ritz")
+    assert on_entry(@ed, 0, "src/x.ritz", 0, 3)
+    assert says(@ed, "(1 of 3): fn foo")
+    assert ed.buffer_count() == 2, "files are read to search, not opened"
+    assert span_from_vec<u8>(@ed.pattern).as_strview().eq("foo"), "the last search's pattern"
+    feed(@&ed, @&d, "n")
+    assert at(@ed, 1, 2), "n finds it again"
+    0
+
+[[test]]
+fn test_vimgrep_g_lists_every_match_and_j_stays() -> i32
+    var d = disk_with("f.txt", "a\n")
+    d.add("g.txt", "x x\nx\n")
+    var ed = open("a\n")
+    feed(@&ed, @&d, ":vimgrep /x/<cr>")
+    assert ed.quickfix().len() == 2
+    feed(@&ed, @&d, ":e f.txt<cr>:vim/x/gj<cr>")
+    assert ed.quickfix().len() == 3
+    assert ed.path().eq("f.txt") and at(@ed, 0, 0), "j: the cursor stays"
+    assert ed.quickfix().current == 0
+    0
+
+[[test]]
+fn test_vimgrep_globs_name_the_files() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":vimgrep /foo/ src/y.ritz<cr>")
+    assert ed.quickfix().len() == 1 and ed.path().eq("src/y.ritz")
+    feed(@&ed, @&d, ":vimgrep /foo/ *.md **/x.*<cr>")
+    assert ed.quickfix().len() == 2 and ed.quickfix().path_of(0).eq("src/x.ritz")
+    feed(@&ed, @&d, ":vimgrep /foo/ *.md<cr>")
+    assert says(@ed, "E480: No match: foo")
+    assert ed.quickfix().is_empty(), "a search that finds nothing empties the list"
+    0
+
+[[test]]
+fn test_grep_takes_a_bare_pattern() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":grep fo. src/**<cr>")
+    assert ed.quickfix().len() == 3
+    assert says(@ed, "(1 of 3): fn foo")
+    0
+
+[[test]]
+fn test_vimgrep_errors() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":vimgrep<cr>")
+    assert says(@ed, "E683: File name missing or invalid pattern")
+    feed(@&ed, @&d, ":vimgrep /foo<cr>")
+    assert says(@ed, "E683: File name missing or invalid pattern")
+    feed(@&ed, @&d, ":vimgrep //<cr>")
+    assert says(@ed, "No previous search pattern")
+    feed(@&ed, @&d, ":vimgrep /\\(/<cr>")
+    assert ed.message.as_view().starts_with("E54"), "the regex's own error"
+    assert ed.quickfix().is_empty()
+    0
+
+[[test]]
+fn test_vimgrep_empty_pattern_is_the_last_search() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, "/b<cr>:vimgrep // src/**<cr>")
+    assert ed.quickfix().len() == 1 and ed.path().eq("src/y.ritz") and at(@ed, 0, 0)
+    0
+
+[[test]]
+fn test_cn_cp_cc_cfirst_clast_go_through_the_list() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":vimgrep /foo/<cr>:cn<cr>")
+    assert on_entry(@ed, 1, "src/x.ritz", 1, 2)
+    assert says(@ed, "(2 of 3): foo()")
+    feed(@&ed, @&d, ":cnext<cr>")
+    assert on_entry(@ed, 2, "src/y.ritz", 0, 4)
+    feed(@&ed, @&d, ":cn<cr>")
+    assert says(@ed, "E553: No more items") and on_entry(@ed, 2, "src/y.ritz", 0, 4)
+    feed(@&ed, @&d, ":cp 5<cr>")
+    assert on_entry(@ed, 0, "src/x.ritz", 0, 3), "a count short of the start stops at the first"
+    feed(@&ed, @&d, ":cp<cr>")
+    assert says(@ed, "E553: No more items")
+    feed(@&ed, @&d, ":cla<cr>")
+    assert on_entry(@ed, 2, "src/y.ritz", 0, 4)
+    feed(@&ed, @&d, ":cN<cr>")
+    assert on_entry(@ed, 1, "src/x.ritz", 1, 2)
+    feed(@&ed, @&d, ":cfirst<cr>")
+    assert on_entry(@ed, 0, "src/x.ritz", 0, 3)
+    feed(@&ed, @&d, ":cc 3<cr>")
+    assert on_entry(@ed, 2, "src/y.ritz", 0, 4)
+    feed(@&ed, @&d, "gg:cc<cr>")
+    assert on_entry(@ed, 2, "src/y.ritz", 0, 4), "a bare :cc: the current entry again"
+    feed(@&ed, @&d, ":cr 2<cr>")
+    assert on_entry(@ed, 1, "src/x.ritz", 1, 2)
+    0
+
+[[test]]
+fn test_quickfix_moves_on_an_empty_list_are_e42() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":cn<cr>")
+    assert says(@ed, "E42: No Errors")
+    feed(@&ed, @&d, ":cc<cr>")
+    assert says(@ed, "E42: No Errors")
+    feed(@&ed, @&d, ":clast<cr>")
+    assert says(@ed, "E42: No Errors")
+    assert ed.path().eq("f.txt")
+    0
+
+[[test]]
+fn test_vimgrep_searches_a_buffer_as_edited_and_leaves_it_dirty() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":e src/y.ritz<cr>Ohere<esc>:e f.txt<cr>:vimgrep /here/<cr>")
+    assert ed.quickfix().len() == 1, "the buffer's pending edit, not the file"
+    assert ed.path().eq("src/y.ritz") and at(@ed, 0, 0)
+    feed(@&ed, @&d, ":vimgrep /foo/<cr>:cla<cr>")
+    assert on_entry(@ed, 2, "src/y.ritz", 1, 4), "below the line typed"
+    feed(@&ed, @&d, ":cfirst<cr>")
+    assert ed.path().eq("src/x.ritz")
+    assert ed.buffer_at(ed.find_path("src/y.ritz").unwrap_or(0)).is_dirty(), "the buffer left stays, pending edits and all"
+    0
+
+[[test]]
+fn test_quickfix_entries_follow_edits_to_their_buffer() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":vimgrep /foo/<cr>Onew<cr>line<esc>")
+    feed(@&ed, @&d, ":cn<cr>")
+    assert on_entry(@ed, 1, "src/x.ritz", 3, 2), "two lines above it now"
+    feed(@&ed, @&d, ":cp<cr>")
+    assert on_entry(@ed, 0, "src/x.ritz", 2, 3)
+    feed(@&ed, @&d, "ggdd:cn<cr>")
+    assert at(@ed, 2, 2), "and one fewer"
+    feed(@&ed, @&d, "u:cp<cr>")
+    assert at(@ed, 2, 3), "undo moves them back"
+    0
+
+[[test]]
+fn test_copen_lists_the_entries_and_enter_goes_to_one() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":vimgrep /foo/<cr>:cn<cr>:copen<cr>")
+    assert ed.mode == Mode.Picker
+    let p = ed.picker()
+    assert p.kind == PickerKind.Quickfix
+    assert p.hit_count() == 3 and p.selected == 1, "the current entry selected"
+    assert p.hit_name(0).eq("src/x.ritz|1 col 4| fn foo")
+    assert p.hit_name(2).eq("src/y.ritz|1 col 5| bar foo")
+    feed(@&ed, @&d, "<down><cr>")
+    assert ed.mode == Mode.Normal
+    assert on_entry(@ed, 2, "src/y.ritz", 0, 4)
+    assert says(@ed, "(3 of 3): bar foo")
+    feed(@&ed, @&d, ":cope<cr>bar<cr>")
+    assert on_entry(@ed, 2, "src/y.ritz", 0, 4), "typing narrows it, as in every picker"
+    feed(@&ed, @&d, ":cclose<cr>")
+    assert says(@ed, "") and ed.mode == Mode.Normal
+    0
+
+[[test]]
+fn test_copen_on_an_empty_list_shows_none() -> i32
+    var d = grep_disk()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, ":copen<cr>")
+    assert ed.mode == Mode.Picker and ed.picker().hit_count() == 0
+    feed(@&ed, @&d, "<cr>")
+    assert ed.mode == Mode.Normal and ed.path().eq("f.txt")
+    0

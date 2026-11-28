@@ -29,6 +29,9 @@
 #   Language      K (hover), gd (go to definition), Ctrl-O / Ctrl-T (jump back)
 #   Pickers       :Files  :Buffers; then type to narrow, Up Down Ctrl-P
 #                 Ctrl-N, Backspace, Enter (open), Escape (close)
+#   Quickfix      :vimgrep /pat/[gj] [glob ...]  :grep pat [glob ...]
+#                 :cn [N]  :cp [N]  :cN [N]  :cc [N]  :cfirst [N]  :crewind [N]
+#                 :clast [N]  :copen  :cclose
 #
 # Buffers (AGAST #4912). Each file has one Buffer, kept in the list with its
 # name, its own undo history and a number (Vim's: 1 up, never used again).
@@ -60,6 +63,23 @@
 # key to it until Enter opens the selected file (as `:e` would) or shows
 # the selected buffer (as `:b` would), or Escape closes it.
 #
+# Workspace search (AGAST #4972). `:vimgrep` and `:grep` search the
+# FileStore's list of the workspace (at most MAX_PICKER_FILES files, only
+# those a glob names when globs are given: ritzlib.glob, `**/*.ritz`) for a
+# pattern, Vim's regular expressions as `/` takes them: a file with a
+# buffer as the buffer holds it, pending edits and all, any other as
+# loaded, skipped when a NUL in its first BINARY_PROBE bytes says it is
+# binary. The matches replace core/quickfix.ritz's list, the pattern
+# becomes the last search's, and unless the `j` flag says not to, the
+# cursor goes to the first. `:cn` `:cp` `:cc` `:cfirst` `:clast` go
+# through the list, showing each entry's file as `:e` would (the buffer
+# left stays, pending edits and all) and `(k of n): text` on the message
+# line; after_key moves the entries of each buffer edited through its
+# change notes, so they stay on the text that matched. `:copen` shows the
+# list in the picker, the current entry selected, and Enter goes to the one
+# picked. `:cclose` closes it, which is nothing to do: the picker closes
+# on Enter or Escape, before a command line can be typed.
+#
 # Files go through the FileStore seam (core/files.ritz), so the core does no
 # I/O. The event loop paints through core.paint, which draws each window of
 # tiling() from the window queries below and keeps their tops in step with
@@ -73,6 +93,7 @@
 # in Visual mode too after $, where the selection takes the line break.
 # Core module: no terminal or OS I/O (see src/platform/).
 
+import ritzlib.glob { Glob, glob_compile }
 import ritzlib.gvec
 import ritzlib.option
 import ritzlib.regex { RegexMatch, Regex, RegexSyntax, regex_compile }
@@ -86,6 +107,7 @@ import core.buffer { Buffer, Change, Pos, Term, buffer_new, buffer_from_bytes, p
 import core.commands { Command, parse_command }
 import core.files { FileStore, LoadError, PathList, SaveError }
 import core.picker { Picker, PickerKind, picker_new }
+import core.quickfix { GrepArgs, MSG_QF_BAD_ARGS, MSG_QF_EMPTY, MSG_QF_NO_MORE, QfError, Quickfix, glob_word, parse_grep, parse_vimgrep, quickfix_new, word_count }
 import core.history { release_all }
 import core.layout { Dir, Layout, Rect, Split, Tiling, layout_new, rect }
 import core.modes { Mode }
@@ -107,6 +129,10 @@ pub const MAX_PUT: i64 = 64 * 1024 * 1024
 
 # The most files the file picker lists: a bigger tree is cut off there.
 pub const MAX_PICKER_FILES: i64 = 20000
+
+# How many of a file's first bytes :vimgrep looks in for a NUL, the sign of
+# a binary file it doesn't search (git's heuristic, and its count).
+pub const BINARY_PROBE: i64 = 8000
 
 # The most jumps kept for Ctrl-O / Ctrl-T; the oldest go first.
 pub const MAX_JUMPS: i64 = 100
@@ -206,6 +232,7 @@ pub struct Editor
     ask: LangAsk            # K or gd, until the loop takes it
     watched: Vec<Watched>   # before_key's notes, for after_key
     picker: Picker          # Picker mode's; empty otherwise
+    qf: Quickfix            # the last workspace search's matches
 
 impl Drop for Editor
     fn drop(self: @&Editor)
@@ -224,7 +251,7 @@ fn editor_with(path: String, buf: Buffer) -> Editor
     bufs.push(listed(1, buf, path))
     var wins: Vec<Window> = vec_new<Window>()
     wins.push(Window { id: 0, number: 1, alt: None, cursor: pos(0, 0), want: 0, top: 0, jumps: jumps_new() })
-    Editor { bufs: bufs, at: 0, wins: wins, cur: 0, layout: layout_new(0), size: DEFAULT_SIZE, next_number: 2, next_id: 1, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), forward: true, cmdline: string_new(), search_op: None, search_count: 0, keys: normal_keys_new(), anchor: pos(0, 0), message: string_new(), quit: false, ask: LangAsk.Nothing, watched: vec_new<Watched>(), picker: picker_new() }
+    Editor { bufs: bufs, at: 0, wins: wins, cur: 0, layout: layout_new(0), size: DEFAULT_SIZE, next_number: 2, next_id: 1, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), forward: true, cmdline: string_new(), search_op: None, search_count: 0, keys: normal_keys_new(), anchor: pos(0, 0), message: string_new(), quit: false, ask: LangAsk.Nothing, watched: vec_new<Watched>(), picker: picker_new(), qf: quickfix_new() }
 
 # ============================================================================
 # Characters and columns
@@ -1156,6 +1183,21 @@ impl Editor
         self.picker.close()
         self.mode = Mode.Normal
 
+    # `:copen`: the picker over the quickfix list, in its order, the
+    # current entry selected.
+    pub fn open_quickfix_picker(self: @&Editor)
+        self.picker.open_quickfix(self.qf.truncated)
+        for k in 0..self.qf.len()
+            let row = self.qf.row(k)
+            self.picker.add_entry(row.as_view(), k)
+        self.picker.ready()
+        self.picker.select_candidate(self.qf.current)
+        self.mode = Mode.Picker
+
+    # The quickfix list (core/quickfix.ritz), for its tests and :copen's.
+    pub fn quickfix(self: @Editor) -> @Quickfix
+        @self.qf
+
 # ============================================================================
 # Buffers and windows
 # ============================================================================
@@ -1713,7 +1755,19 @@ impl Editor
                 self.wins[w].want = units_before(self.bufs[k].buf.line(p.line), p.col)
                 self.wins[w].top = top.line
         for k in 0..self.bufs.len()
+            if self.bufs[k].buf.changes().len > 0
+                self.follow_quickfix(k)
             self.bufs[k].buf.forget_changes()
+
+    # The quickfix entries in buffer k's file moved through its changes.
+    fn follow_quickfix(self: @&Editor, k: i64)
+        let f: i64 = match self.qf.file_index(self.bufs[k].path.as_view())
+            Some(found) => found
+            None => return
+        for e in 0..self.qf.len()
+            let entry = self.qf.entry(e)
+            if entry.file == f
+                self.qf.set_at(e, shifted(@self.bufs[k].buf, entry.at))
 
 # ============================================================================
 # Keys
@@ -1864,6 +1918,13 @@ fn run_command<F: FileStore>(ed: @&Editor, files: @&F, text: StrView)
             Command.Only => ed.only()
             Command.PickFiles => ed.open_file_picker(files.list(MAX_PICKER_FILES))
             Command.PickBuffers => ed.open_buffer_picker()
+            Command.Vimgrep(arg) => grep<F>(ed, files, parse_vimgrep(arg))
+            Command.Grep(arg) => grep<F>(ed, files, parse_grep(arg))
+            Command.QuickfixNext(n) => quickfix_move<F>(ed, files, ed.qf.step(n, true))
+            Command.QuickfixPrev(n) => quickfix_move<F>(ed, files, ed.qf.step(n, false))
+            Command.QuickfixGo(n) => quickfix_move<F>(ed, files, ed.qf.go(n))
+            Command.QuickfixOpen => ed.open_quickfix_picker()
+            Command.QuickfixClose => pass
         None =>
             var msg = string_from("E492: Not an editor command: ")
             msg.push_str(text)
@@ -1906,6 +1967,107 @@ fn open_picked<F: FileStore>(ed: @&Editor, files: @&F)
             let number = ed.picker.number_of(c)
             ed.close_picker()
             ed.show(number)
+        PickerKind.Quickfix =>
+            let k = ed.picker.number_of(c)
+            ed.close_picker()
+            ed.qf.current = k
+            go_entry<F>(ed, files, k)
+
+# ============================================================================
+# Workspace search and the quickfix list (AGAST #4972)
+# ============================================================================
+
+# True when the first BINARY_PROBE bytes of `bytes` hold a NUL.
+fn is_binary(bytes: [u8]) -> bool
+    let n = if bytes.len > BINARY_PROBE then BINARY_PROBE else bytes.len
+    for i in 0..n
+        if bytes[i] == 0
+            return true
+    false
+
+# True when one of `globs` matches `path`, or there are none.
+fn wanted(globs: @Vec<Glob>, path: StrView) -> bool
+    if globs.len() == 0
+        return true
+    for k in 0..globs.len()
+        if globs[k].matches(path)
+            return true
+    false
+
+# :vimgrep and :grep with their argument parsed (None: E683): the quickfix
+# list replaced by the pattern's matches in the workspace's files that the
+# globs name (the module comment has the rest). An empty pattern is the
+# last search's. Nothing found is E480, the list left empty.
+fn grep<F: FileStore>(ed: @&Editor, files: @&F, parsed: Option<GrepArgs>)
+    let args: GrepArgs = match parsed
+        Some(a) => a
+        None =>
+            ed.say(MSG_QF_BAD_ARGS)
+            return
+    var pattern: Vec<u8> = vec_new<u8>()
+    pattern.push_view(if args.pattern.is_empty() then ed.pattern.as_view() else args.pattern)
+    if pattern.len() == 0
+        ed.say(MSG_NO_PATTERN)
+        return
+    let re: Regex = match regex_compile(pattern.as_view(), RegexSyntax.Vim)
+        Ok(r) => r
+        Err(e) =>
+            ed.say(e.message())
+            return
+    var globs: Vec<Glob> = vec_new<Glob>()
+    for k in 0..word_count(args.globs)
+        globs.push(glob_compile(glob_word(args.globs, k)))
+    let list = files.list(MAX_PICKER_FILES)
+    ed.qf.clear()
+    for i in 0..list.len()
+        let path = list.get(i)
+        if not wanted(@globs, path)
+            continue
+        var room = true
+        match ed.find_path(path)
+            Some(k) => room = ed.qf.scan(path, @ed.bufs[k].buf, @re, args.every)
+            None =>
+                match files.load(path)
+                    Ok(bytes) =>
+                        let data = span_from_vec<u8>(@bytes)
+                        if not is_binary(data)
+                            let b = buffer_from_bytes(data)
+                            room = ed.qf.scan(path, @b, @re, args.every)
+                    Err(_) => pass
+        if not room
+            break
+    release_all<Glob>(@&globs)
+    ed.pattern = pattern
+    if ed.qf.is_empty()
+        var msg = string_from("E480: No match: ")
+        msg.push_str(ed.pattern.as_view())
+        ed.say(msg.as_view())
+        return
+    if args.jump
+        go_entry<F>(ed, files, 0)
+
+# A quickfix move's result: to the entry, or its error said.
+fn quickfix_move<F: FileStore>(ed: @&Editor, files: @&F, moved: Result<i64, QfError>)
+    match moved
+        Ok(k) => go_entry<F>(ed, files, k)
+        Err(e) =>
+            let msg: StrView = match e
+                QfError.Empty => MSG_QF_EMPTY
+                QfError.NoMore => MSG_QF_NO_MORE
+            ed.say(msg)
+
+# To quickfix entry k: its file shown as :e would, the cursor on the match
+# (where its offset has moved to), `(k of n): text` said.
+fn go_entry<F: FileStore>(ed: @&Editor, files: @&F, k: i64)
+    let path = string_from(ed.qf.path_of(k))
+    if not ed.path().eq(path.as_view())
+        if not edit<F>(ed, files, path.as_view())
+            return
+    let at = ed.qf.entry(k).at
+    let p = ed.buf_mut().pos_at(at)
+    ed.place(p)
+    let msg = ed.qf.label(k)
+    ed.say(msg.as_view())
 
 # :sp and :vs: a new window; with a path, the file in it as :e would.
 fn split_edit<F: FileStore>(ed: @&Editor, files: @&F, how: Split, path: StrView)

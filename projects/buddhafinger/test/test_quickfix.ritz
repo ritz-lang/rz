@@ -1,0 +1,242 @@
+# test/test_quickfix.ritz - core/quickfix: the list a workspace search fills, and Vim's way through it (AGAST #4972).
+#
+# :vimgrep's and :grep's arguments parsed; a buffer scanned for a pattern's
+# matches (each line's first, or all with `g`), at their lines, columns and
+# file offsets; the list bounded; and :cn / :cp / :cc moving as Vim's do:
+# a count stops at the last entry there is, E553 only when nothing moves,
+# E42 on an empty list.
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.regex { RegexSyntax, regex_compile }
+import ritzlib.result { Result }
+import ritzlib.span
+import ritzlib.string
+import ritzlib.strview { StrView }
+
+import core.buffer { Buffer, buffer_from_bytes }
+import core.quickfix { GrepArgs, MAX_QF_ENTRIES, MAX_QF_TEXT, QfError, Quickfix, glob_word, parse_grep, parse_vimgrep, quickfix_new, word_count }
+
+# q.scan with `pattern` compiled; false too when it doesn't compile.
+fn scan(q: @&Quickfix, path: StrView, b: @Buffer, pattern: StrView, every: bool) -> bool
+    match regex_compile(pattern, RegexSyntax.Vim)
+        Ok(r) => q.scan(path, b, @r, every)
+        Err(_) => false
+
+fn text(s: StrView) -> Buffer
+    buffer_from_bytes(span_from_strview(s))
+
+# The args' shape: "pattern|g|j|globs" (g and j only when set), or "none".
+fn shape(got: Option<GrepArgs>) -> String
+    var s = string_new()
+    match got
+        Some(a) =>
+            s.push_str(a.pattern)
+            s.push('|')
+            if a.every
+                s.push('g')
+            s.push('|')
+            if not a.jump
+                s.push('j')
+            s.push('|')
+            s.push_str(a.globs)
+        None => s.push_str("none")
+    s
+
+fn vimgrep_is(arg: StrView, want: StrView) -> bool
+    shape(parse_vimgrep(arg)).as_view().eq(want)
+
+fn grep_is(arg: StrView, want: StrView) -> bool
+    shape(parse_grep(arg)).as_view().eq(want)
+
+fn moved(r: Result<i64, QfError>, want: i64) -> bool
+    match r
+        Ok(k) => k == want
+        Err(_) => false
+
+fn failed(r: Result<i64, QfError>, want: QfError) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e == want
+
+# A list of three matches in one file: lines 0, 1 and 3.
+fn three() -> Quickfix
+    var q = quickfix_new()
+    let b = text("x one\ny two\nnone\nx three\n")
+    let found = scan(@&q, "f.txt", @b, "x\\|y", false)
+    q
+
+# ============================================================================
+# Arguments
+# ============================================================================
+
+[[test]]
+fn test_vimgrep_takes_a_delimited_pattern_flags_and_globs() -> i32
+    assert vimgrep_is("/foo/", "foo|||")
+    assert vimgrep_is("  /foo/  ", "foo|||")
+    assert vimgrep_is("/a b/gj src/*.ritz  *.md", "a b|g|j|src/*.ritz  *.md")
+    assert vimgrep_is("/x/jg", "x|g|j|")
+    assert vimgrep_is("#x/y# **", "x/y|||**"), "any non-identifier character delimits"
+    assert vimgrep_is("/a\\/b/", "a\\/b|||"), "an escaped delimiter stays in the pattern"
+    assert vimgrep_is("//g", "|g||"), "empty: the last search pattern"
+    0
+
+[[test]]
+fn test_vimgrep_takes_a_bare_word_pattern() -> i32
+    assert vimgrep_is("foo", "foo|||")
+    assert vimgrep_is("foo *.c src/**", "foo|||*.c src/**")
+    0
+
+[[test]]
+fn test_vimgrep_refuses_a_missing_or_open_pattern_and_unknown_flags() -> i32
+    assert vimgrep_is("", "none")
+    assert vimgrep_is("   ", "none")
+    assert vimgrep_is("/foo", "none")
+    assert vimgrep_is("/foo/x", "none")
+    assert vimgrep_is("/foo/gx *.c", "none")
+    0
+
+[[test]]
+fn test_grep_takes_the_first_word() -> i32
+    assert grep_is("foo", "foo|||")
+    assert grep_is("fo.o src/** *.md", "fo.o|||src/** *.md")
+    assert grep_is("/x/", "/x/|||"), "no delimiters: the slashes are the pattern"
+    assert grep_is("", "none")
+    0
+
+[[test]]
+fn test_globs_split_on_blanks() -> i32
+    assert word_count("") == 0 and word_count("   ") == 0
+    assert word_count("a") == 1
+    let g = " *.c  src/**\t*.md "
+    assert word_count(g) == 3
+    assert glob_word(g, 0).eq("*.c") and glob_word(g, 1).eq("src/**") and glob_word(g, 2).eq("*.md")
+    0
+
+# ============================================================================
+# Scanning
+# ============================================================================
+
+[[test]]
+fn test_scan_finds_each_lines_first_match() -> i32
+    var q = quickfix_new()
+    let b = text("alpha\n  beta alpha alpha\nGamma\n")
+    assert scan(@&q, "f.txt", @b, "alpha", false)
+    assert q.len() == 2
+    let a = q.entry(0)
+    assert a.line == 0 and a.col == 0 and a.at == 0
+    let c = q.entry(1)
+    assert c.line == 1 and c.col == 7 and c.at == 6 + 7
+    assert q.path_of(1).eq("f.txt")
+    assert q.text_of(1).eq("beta alpha alpha"), "leading blanks off"
+    0
+
+[[test]]
+fn test_scan_with_g_finds_every_match() -> i32
+    var q = quickfix_new()
+    let b = text("aXa\n")
+    assert scan(@&q, "f.txt", @b, "a", true)
+    assert q.len() == 2
+    assert q.entry(1).col == 2
+    # An empty match steps on a byte, so the scan ends.
+    var e = quickfix_new()
+    assert scan(@&e, "f.txt", @b, "x*", true)
+    assert e.len() == 4
+    0
+
+[[test]]
+fn test_scan_offsets_count_each_lines_terminator() -> i32
+    var q = quickfix_new()
+    let b = text("a\r\nb a\rc a")
+    assert scan(@&q, "f.txt", @b, "a", false)
+    assert q.len() == 3
+    assert q.entry(1).at == 3 + 2
+    assert q.entry(2).line == 2 and q.entry(2).at == 3 + 4 + 2
+    0
+
+[[test]]
+fn test_scan_names_each_file_once_and_skips_files_without_a_match() -> i32
+    var q = quickfix_new()
+    let one = text("k\nk\n")
+    let none = text("z\n")
+    let two = text("ok\n")
+    assert scan(@&q, "a", @one, "k", false)
+    assert scan(@&q, "b", @none, "k", false)
+    assert scan(@&q, "c", @two, "k", false)
+    assert q.len() == 3 and q.files.len() == 2
+    assert q.path_of(2).eq("c")
+    assert q.file_index("c").unwrap_or(-1) == 1 and q.file_index("b").is_none()
+    0
+
+[[test]]
+fn test_scan_stops_at_the_bound() -> i32
+    var s = string_new()
+    for i in 0..(MAX_QF_ENTRIES + 5)
+        s.push_str("x\n")
+    var q = quickfix_new()
+    let b = text(s.as_view())
+    assert not scan(@&q, "f.txt", @b, "x", false)
+    assert q.len() == MAX_QF_ENTRIES and q.truncated
+    let more = text("x\n")
+    assert not scan(@&q, "g.txt", @more, "x", false), "a full list takes no more"
+    assert q.len() == MAX_QF_ENTRIES
+    0
+
+[[test]]
+fn test_a_long_line_is_cut_on_a_code_point() -> i32
+    var s = string_new()
+    for i in 0..300
+        s.push_str("é")
+    var q = quickfix_new()
+    let b = text(s.as_view())
+    assert scan(@&q, "f.txt", @b, "é", false)
+    let shown = q.text_of(0)
+    assert shown.len() <= MAX_QF_TEXT and shown.len() >= MAX_QF_TEXT - 1
+    assert shown.len() % 2 == 0, "never half of a two-byte code point"
+    0
+
+# ============================================================================
+# Moving
+# ============================================================================
+
+[[test]]
+fn test_every_move_on_an_empty_list_is_e42() -> i32
+    var q = quickfix_new()
+    assert failed(q.step(1, true), QfError.Empty)
+    assert failed(q.step(1, false), QfError.Empty)
+    assert failed(q.go(0), QfError.Empty)
+    assert failed(q.go(3), QfError.Empty)
+    0
+
+[[test]]
+fn test_step_stops_at_the_ends_and_fails_only_when_stuck() -> i32
+    var q = three()
+    assert q.len() == 3
+    assert moved(q.step(1, true), 1)
+    assert moved(q.step(5, true), 2), "short of the count: the last"
+    assert failed(q.step(1, true), QfError.NoMore)
+    assert q.current == 2
+    assert moved(q.step(1, false), 1)
+    assert moved(q.step(9, false), 0)
+    assert failed(q.step(1, false), QfError.NoMore)
+    0
+
+[[test]]
+fn test_go_names_an_entry_from_one() -> i32
+    var q = three()
+    assert moved(q.go(2), 1)
+    assert moved(q.go(0), 1), "0: the current one"
+    assert moved(q.go(99), 2), "past the last: the last"
+    assert moved(q.go(1), 0)
+    0
+
+[[test]]
+fn test_label_and_row() -> i32
+    var q = three()
+    assert q.label(1).as_view().eq("(2 of 3): y two")
+    assert q.row(2).as_view().eq("f.txt|4 col 1| x three")
+    q.truncated = true
+    assert q.label(0).as_view().eq("(1 of 3+): x one")
+    q.clear()
+    assert q.is_empty() and q.files.len() == 0 and not q.truncated
+    0

@@ -1,0 +1,219 @@
+# ritzlib/glob.ritz - shell-style path patterns: `*.ritz`, `src/**/test_*`.
+#
+#     glob_match("**/*.ritz", "src/core/a.ritz")      # true
+#     let g = glob_compile("src/*.ritz")              # once, for many paths
+#     g.matches("src/main.ritz")                      # true
+#
+# A pattern matches the whole path. Its syntax, as zsh and Vim read it:
+#
+#   *          any run of code points but `/`
+#   ?          one code point but `/`
+#   [abc]      one code point of a set, never `/`: ranges `a-z`, `[!...]` or
+#              `[^...]` the complement, `]` first and `-` first or last are
+#              members, `\]` escapes; a `[` with no `]` is a literal `[`
+#   **         as a whole segment, any run of whole segments: `a/**/b`
+#              matches `a/b` and `a/x/y/b`, `src/**` everything below src,
+#              `**/x` an `x` at any depth. Inside a segment (`a**b`) a `*`
+#   \c         the character c itself; a trailing `\` is itself
+#
+# Nothing else is special, a leading `.` included. Text is UTF-8, read one
+# code point at a time through ritzlib.utf8, so a malformed byte matches
+# only itself.
+#
+# Matching runs the pattern as a set of states over the path, as
+# ritzlib.regex does: O(len(path) * len(pattern)) whatever the pattern, so
+# `*a*a*a*b` over a long run of a's doesn't backtrack.
+
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.utf8 { Utf8Unit, utf8_unit_at }
+
+enum GlobKind
+    Lit             # the code point `cp`
+    One             # ?
+    Class           # one of ranges[first .. first + count], or not one when `negated`
+    Star            # *
+    Dirs            # **/ at a segment's start: nothing, or segments ending in `/`
+    DirsIn          # **/ inside a segment (always right after its Dirs)
+    Deep            # ** at the end: any run at all
+
+struct GlobTok
+    kind: GlobKind
+    cp: u32
+    first: i64
+    count: i64
+    negated: bool
+
+struct GlobRange
+    lo: u32
+    hi: u32
+
+pub struct Glob
+    toks: Vec<GlobTok>
+    ranges: Vec<GlobRange>
+
+fn tok(kind: GlobKind) -> GlobTok
+    GlobTok { kind: kind, cp: 0, first: 0, count: 0, negated: false }
+
+fn lit(cp: u32) -> GlobTok
+    GlobTok { kind: GlobKind.Lit, cp: cp, first: 0, count: 0, negated: false }
+
+# A pattern never fails to compile: what isn't syntax is literal.
+pub fn glob_compile(pattern: StrView) -> Glob
+    var g = Glob { toks: vec_new<GlobTok>(), ranges: vec_new<GlobRange>() }
+    let p = span_from_strview(pattern)
+    var i: i64 = 0
+    while i < p.len
+        let c = p[i]
+        if c == '\\' and i + 1 < p.len
+            let u = utf8_unit_at(p, i + 1)
+            g.toks.push(lit(u.cp))
+            i += 1 + u.len
+        else if c == '*'
+            var stars: i64 = 1
+            while i + stars < p.len and p[i + stars] == '*'
+                stars += 1
+            let starts_segment = i == 0 or p[i - 1] == '/'
+            let after = i + stars
+            if stars >= 2 and starts_segment and after == p.len
+                g.toks.push(tok(GlobKind.Deep))
+                i = after
+            else if stars >= 2 and starts_segment and p[after] == '/'
+                g.toks.push(tok(GlobKind.Dirs))
+                g.toks.push(tok(GlobKind.DirsIn))
+                i = after + 1
+            else
+                g.toks.push(tok(GlobKind.Star))
+                i = after
+        else if c == '?'
+            g.toks.push(tok(GlobKind.One))
+            i += 1
+        else if c == '['
+            match g.class_at(p, i)
+                Some(end) => i = end
+                None =>
+                    g.toks.push(lit('[' as u32))
+                    i += 1
+        else
+            let u = utf8_unit_at(p, i)
+            g.toks.push(lit(u.cp))
+            i += u.len
+    g
+
+# True when `pattern` matches all of `path`.
+pub fn glob_match(pattern: StrView, path: StrView) -> bool
+    let g = glob_compile(pattern)
+    g.matches(path)
+
+# A member of a class at p[i]: a code point, `\` escaping the next.
+struct ClassChar
+    cp: u32
+    len: i64
+
+fn class_char(p: [u8], i: i64) -> ClassChar
+    if p[i] == '\\' and i + 1 < p.len
+        let u = utf8_unit_at(p, i + 1)
+        return ClassChar { cp: u.cp, len: 1 + u.len }
+    let u = utf8_unit_at(p, i)
+    ClassChar { cp: u.cp, len: u.len }
+
+impl Glob
+    # The class whose `[` is p[at], added as a token: the index after its
+    # `]`. None, adding nothing, when it has no `]`.
+    fn class_at(self: @&Glob, p: [u8], at: i64) -> Option<i64>
+        var i = at + 1
+        let negated = i < p.len and (p[i] == '!' or p[i] == '^')
+        if negated
+            i += 1
+        let first = self.ranges.len()
+        var members = false
+        while i < p.len
+            if p[i] == ']' and members
+                self.toks.push(GlobTok { kind: GlobKind.Class, cp: 0, first: first, count: self.ranges.len() - first, negated: negated })
+                return Some(i + 1)
+            let lo = class_char(p, i)
+            i += lo.len
+            var hi = lo.cp
+            # `a-z`; a `-` before the `]` is a member of its own.
+            if i + 1 < p.len and p[i] == '-' and p[i + 1] != ']'
+                let top = class_char(p, i + 1)
+                hi = top.cp
+                i += 1 + top.len
+            self.ranges.push(GlobRange { lo: lo.cp, hi: hi })
+            members = true
+        while self.ranges.len() > first
+            self.ranges.pop()
+        None
+
+    # True when the class token `t` takes code point `cp`.
+    fn in_class(self: @Glob, t: GlobTok, cp: u32) -> bool
+        var found = false
+        for k in t.first..t.first + t.count
+            let r = self.ranges.get(k)
+            if cp >= r.lo and cp <= r.hi
+                found = true
+        found != t.negated
+
+    # Put state `s` in `set`, with the states a `*`, `**` or `**/` there
+    # reaches by taking nothing. `**/` takes nothing only at a segment's
+    # start: past its DirsIn.
+    fn add(self: @Glob, set: @&Vec<bool>, s: i64)
+        var k = s
+        while k <= self.toks.len() and not set.get(k)
+            set.set(k, true)
+            if k == self.toks.len()
+                return
+            let kind = self.toks.get(k).kind
+            if kind == GlobKind.Dirs
+                k += 2
+            else if kind == GlobKind.Star or kind == GlobKind.Deep
+                k += 1
+            else
+                return
+
+    # True when the pattern matches all of `path`.
+    pub fn matches(self: @Glob, path: StrView) -> bool
+        let n = self.toks.len()
+        let text = span_from_strview(path)
+        var now: Vec<bool> = vec_new<bool>()
+        var next: Vec<bool> = vec_new<bool>()
+        for k in 0..=n
+            now.push(false)
+            next.push(false)
+        self.add(@&now, 0)
+        var i: i64 = 0
+        while i < text.len
+            let u = utf8_unit_at(text, i)
+            i += u.len
+            var live = false
+            for k in 0..=n
+                next.set(k, false)
+            let slash = u.cp == '/' as u32
+            for k in 0..n
+                if now.get(k)
+                    let t = self.toks.get(k)
+                    match t.kind
+                        GlobKind.Lit =>
+                            if u.cp == t.cp
+                                self.add(@&next, k + 1)
+                        GlobKind.One =>
+                            if not slash
+                                self.add(@&next, k + 1)
+                        GlobKind.Class =>
+                            if not slash and self.in_class(t, u.cp)
+                                self.add(@&next, k + 1)
+                        GlobKind.Star =>
+                            if not slash
+                                self.add(@&next, k)
+                        # A `/` ends the segment: back to the start of one.
+                        GlobKind.Dirs => self.add(@&next, if slash then k else k + 1)
+                        GlobKind.DirsIn => self.add(@&next, if slash then k - 1 else k)
+                        GlobKind.Deep => self.add(@&next, k)
+            for k in 0..=n
+                let on = next.get(k)
+                now.set(k, on)
+                live = live or on
+            if not live
+                return false
+        now.get(n)

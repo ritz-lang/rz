@@ -7,7 +7,11 @@
 # each under Vim's names and abbreviations (`:bn` is `:bnext`, `:clo` is
 # `:close`). The pickers (AGAST #4913) are `:Files` and `:Buffers`, whole
 # and capitalised as fzf.vim's are: Vim's `:files` and `:buffers` are
-# `:ls`. core/editor.ritz runs them.
+# `:ls`. Workspace search and the quickfix list (AGAST #4972) are
+# `:vim[grep]`, `:gr[ep]`, `:cn[ext]`, `:cp[revious]` / `:cN[ext]`, `:cc`,
+# `:cfir[st]` / `:cr[ewind]`, `:cla[st]`, `:cope[n]` and `:ccl[ose]`, the
+# moves with Vim's count after them (`:cn 3`); core/quickfix.ritz parses
+# :vimgrep's and :grep's arguments. core/editor.ritz runs them.
 # Core module: no terminal or OS I/O (see src/platform/).
 
 import ritzlib.option { Option }
@@ -32,6 +36,16 @@ pub enum Command
     Only                # `:on`
     PickFiles           # `:Files`: the file picker
     PickBuffers         # `:Buffers`: the buffer picker
+    Vimgrep(StrView)    # `:vim[grep] /pat/[gj] [glob ...]`: the argument
+    Grep(StrView)       # `:gr[ep] pat [glob ...]`: the argument
+    QuickfixNext(i64)   # `:cn [N]`: N entries on (1)
+    QuickfixPrev(i64)   # `:cp [N]`, `:cN [N]`: N back (1)
+    QuickfixGo(i64)     # `:cc [N]` (0: the current entry), `:cfir [N]` (1), `:cla [N]` (QF_LAST)
+    QuickfixOpen        # `:cope`: the list, in the picker
+    QuickfixClose       # `:ccl`
+
+# The entry a bare `:clast` names: past any list, so its last.
+pub const QF_LAST: i64 = 1 << 62
 
 # A command line in Vim's parts: the command's name (its letters), a `!`
 # right after it, and the argument (the rest, blanks trimmed).
@@ -58,29 +72,75 @@ fn parts_of(line: StrView) -> Parts
 fn names(name: StrView, short: StrView, full: StrView) -> bool
     name.len() >= short.len() and full.starts_with(name)
 
+# A quickfix move's count: `none` when there is none, else a positive
+# number; None (not a command) for anything else.
+fn count_arg(arg: StrView, none: i64) -> Option<i64>
+    if arg.is_empty()
+        return Some(none)
+    if not all_digits(arg)
+        return None
+    match arg.parse_i64()
+        Some(n) => if n > 0 then Some(n) else None
+        None => None
+
+fn all_digits(s: StrView) -> bool
+    for i in 0..s.len()
+        let c = s.get(i)
+        if c < '0' or c > '9'
+            return false
+    true
+
+# The quickfix command `:<name> <arg>` is, if it is one.
+fn quickfix_command(name: StrView, arg: StrView) -> Option<Command>
+    let bare = arg.is_empty()
+    if names(name, "vim", "vimgrep")
+        return Some(Command.Vimgrep(arg))
+    if names(name, "gr", "grep")
+        return Some(Command.Grep(arg))
+    if names(name, "cope", "copen") and bare
+        return Some(Command.QuickfixOpen)
+    if names(name, "ccl", "cclose") and bare
+        return Some(Command.QuickfixClose)
+    # A move to an entry: the entry a bare one names.
+    var go: Option<i64> = None
+    if name.eq("cc")
+        go = Some(0)
+    else if names(name, "cfir", "cfirst") or names(name, "cr", "crewind")
+        go = Some(1)
+    else if names(name, "cla", "clast")
+        go = Some(QF_LAST)
+    match go
+        Some(bare_entry) =>
+            return match count_arg(arg, bare_entry)
+                Some(n) => Some(Command.QuickfixGo(n))
+                None => None
+        None => pass
+    let next = names(name, "cn", "cnext")
+    if next or names(name, "cp", "cprevious") or names(name, "cN", "cNext")
+        return match count_arg(arg, 1)
+            Some(n) => Some(if next then Command.QuickfixNext(n) else Command.QuickfixPrev(n))
+            None => None
+    None
+
 # The command a command line names, without its leading `:`, or None.
 pub fn parse_command(text: StrView) -> Option<Command>
     let line = text.trim()
     if line.is_empty()
         return None
-    var digits = true
-    for i in 0..line.len()
-        let c = line.get(i)
-        if c < '0' or c > '9'
-            digits = false
-    if digits
+    if all_digits(line)
         return match line.parse_i64()
             Some(n) => Some(Command.Goto(n))
             None => None
     let p = parts_of(line)
-    # An argument must come after a blank, except a buffer's number (`:b2`).
+    # An argument must come after a blank, except a buffer's number (`:b2`)
+    # and :vimgrep's delimited pattern (`:vim/x/`).
     let glued = p.arg.len() > 0 and not p.bang and line.len() > p.name.len() and line.get(p.name.len()) != ' ' and line.get(p.name.len()) != '\t'
     let bare = p.arg.is_empty()
     if p.name.eq("q") and bare
         return Some(if p.bang then Command.ForceQuit else Command.Quit)
     if p.bang and not names(p.name, "bd", "bdelete")
         return None
-    if glued and not names(p.name, "b", "buffer") and not names(p.name, "bd", "bdelete")
+    if glued and not names(p.name, "b", "buffer") and not names(p.name, "bd", "bdelete") and not names(p.name, "vim", "vimgrep")
         return None
     if p.name.eq("wq") and bare
         return Some(Command.WriteQuit)
@@ -110,4 +170,4 @@ pub fn parse_command(text: StrView) -> Option<Command>
         return Some(Command.PickFiles)
     if p.name.eq("Buffers") and bare
         return Some(Command.PickBuffers)
-    None
+    quickfix_command(p.name, p.arg)
