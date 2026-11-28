@@ -82,6 +82,7 @@ def _load(name, path):
 # The single sources of truth for the two rules the ticket names.
 NARROWING = _load("_reject_parity_narrowing", HERE / "tests" / "test_implicit_narrowing.py")
 ELSE = _load("_reject_parity_else", HERE / "tests" / "test_if_expression_requires_else.py")
+ARRAY_FOLD = _load("_reject_parity_array_fold", HERE / "tests" / "test_ritz1_const_array_fold.py")
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,17 @@ CORPUS["eof/no_trailing_newline"] = Row(
     message="Unknown identifier: a",
     at=(2, 3),
 )
+
+
+# AGAST #4936: a const array element that does not fold is refused at the
+# element, in the input's own file (ritz1 printed `<input>:<const line>:1`).
+# The programs are test_ritz1_const_array_fold's; ritz0's positions.
+for _name, _at in (("CALL", (4, 20)), ("UNKNOWN", (1, 23)), ("FILL", (1, 20))):
+    CORPUS[f"const_array/{_name.lower()}"] = Row(
+        program=getattr(ARRAY_FOLD, f"UNFOLDABLE_{_name}"),
+        message="is not a constant integer expression",
+        at=_at,
+    )
 
 
 def _first_diagnostic(output: str) -> tuple[int, int] | None:

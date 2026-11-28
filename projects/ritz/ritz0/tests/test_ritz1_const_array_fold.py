@@ -352,20 +352,3 @@ def test_ritz1_rejects_unfoldable_element(
     assert f"element {elem}" in comp.stderr, comp.stderr
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "name,program,elem,line",
-    [("call", UNFOLDABLE_CALL, 0, 4), ("unknown_name", UNFOLDABLE_UNKNOWN, 1, 1)],
-)
-def test_ritz0_rejects_unfoldable_element(
-    name: str, program: str, elem: int, line: int, tmp_path: Path
-) -> None:
-    """AGAST #1568: a located error naming the const and element, no traceback."""
-    comp, _ = _compile("ritz0", tmp_path, name, program)
-    assert comp.returncode != 0, (
-        f"ritz0 accepted a non-constant array element for {name}:\n{comp.stderr}"
-    )
-    out = comp.stdout + comp.stderr
-    assert "Traceback" not in out, out
-    assert f"{name}_ritz0.ritz:{line}:" in out, out
-    assert "const 'T'" in out and f"element {elem}" in out, out

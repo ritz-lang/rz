@@ -273,6 +273,21 @@ fn const_fold_float(s: *EmitterState, e: *Expr) -> Option<f64>
         _ => pass
     None
 
+# The file a module-level declaration's diagnostic names: its recorded path,
+# else the driver's input (the main module's declarations record none), so a
+# file with a name never reads `<input>` (AGAST #4936).
+fn decl_diag_file(recorded: StrView) -> StrView
+    if recorded.len > 0
+        return recorded
+    emitter_source_file()
+
+# The file const `c`'s diagnostics name: the file that defined it, else the
+# one its parse recorded, else the driver's input.
+fn const_diag_file(c: *ConstEntry) -> StrView
+    if c.def_file.len > 0
+        return c.def_file
+    decl_diag_file(c.src_file)
+
 # The words every R60 refusal ends with (LANGUAGE_SPEC §4.3), ritz0's
 # _GLOBAL_NON_CONSTANT tail.
 fn global_non_constant_why() -> StrView
@@ -282,15 +297,8 @@ fn global_non_constant_why() -> StrView
 # and a counted error so main refuses to write the output.  line:col is the
 # declaration's, or the initializer's for a fault in the initializer (#3043).
 fn global_init_error(s: *EmitterState, g: *GlobalVarDef, line: i32, col: i32, why: StrView)
-    if g.src_file.len > 0
-        eprints(g.src_file)
-    else
-        eprints("<input>")
-    eprint_char(':')
-    eprint_i64(line as i64)
-    eprint_char(':')
-    eprint_i64(col as i64)
-    eprints(": error: global '")
+    diag_error_at(decl_diag_file(g.src_file), diag_span(line, col))
+    eprints("global '")
     eprint_bytes(g.name)
     eprints("' ")
     eprints(why)
@@ -461,7 +469,7 @@ fn const_fold_error(s: *EmitterState, c: *ConstEntry)
     # the literal.
     let v: *Expr = c.value_expr
     if v != null and (v.kind == ExprKind.ArrayLit or v.kind == ExprKind.ArrayFill) and c.const_type != TypeKind.Array
-        diag_error_at(c.src_file, diag_span(v.span.line, v.span.col))
+        diag_error_at(const_diag_file(c), diag_span(v.span.line, v.span.col))
         eprints("Const array '")
         eprint_bytes(c.name)
         eprints("' must have array type, got ")
@@ -472,19 +480,12 @@ fn const_fold_error(s: *EmitterState, c: *ConstEntry)
     # LARB R63 (AGAST #3489): `MAXV + 1` overflows, which is its own error.
     let site: *Expr = const_overflow_site(s.sym.module.constants, c.value_expr, 1)
     if site != null
-        const_overflow_report(c.src_file, site)
+        const_overflow_report(const_diag_file(c), site)
         format_into(s, "; ERROR: const overflow\n")
         s.diag.error_count = s.diag.error_count + 1
         return
-    if c.src_file.len > 0
-        eprints(c.src_file)
-    else
-        eprints("<input>")
-    eprint_char(':')
-    eprint_i64(c.line as i64)
-    eprint_char(':')
-    eprint_i64(c.col as i64)
-    eprints(": error: const '")
+    diag_error_at(const_diag_file(c), diag_span(c.line, c.col))
+    eprints("const '")
     eprint_bytes(c.name)
     eprints("' has an initializer that is not a constant integer expression (ritz1 folds literals, other integer consts, unary - ~ !, casts and binary operators)\n")
     let name_ir: String = ir_name(c.name)
@@ -579,10 +580,7 @@ fn emit_extern_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
 # error (§4.3): nothing drops it — it lives until the process exits.  A global
 # that needs one is a pointer (`var g: *T`), allocated in its init path.
 fn module_drop_error(s: *EmitterState, is_global: bool, name_sv: StrView, arr_size: i32, ty_sv: StrView, file: StrView, line: i32, col: i32)
-    var f: StrView = file
-    if f.len == 0
-        f = emitter_source_file()
-    diag_error_at(f, diag_span(line, col))
+    diag_error_at(decl_diag_file(file), diag_span(line, col))
     if is_global
         eprints("global '")
     else
@@ -635,10 +633,7 @@ fn const_drop_refused(s: *EmitterState, c: *ConstEntry) -> bool
         return false
     if not own_type_is_move_only(s, name)
         return false
-    var file: StrView = c.def_file
-    if file.len == 0
-        file = c.src_file
-    module_drop_error(s, false, c.name, arr, name, file, c.line, c.col)
+    module_drop_error(s, false, c.name, arr, name, const_diag_file(c), c.line, c.col)
     true
 
 pub fn emit_global_vars(s: *EmitterState)
@@ -1302,12 +1297,7 @@ fn const_field_error_head(s: *EmitterState, c: *ConstEntry, elem_idx: i32, path:
     if path != null and path.at != null and path.at.span.line != 0
         line = path.at.span.line
         col = path.at.span.col
-    var file: StrView = c.def_file
-    if file.len == 0
-        file = c.src_file
-    if file.len == 0
-        file = emitter_source_file()
-    eprints(diag_file_view(file))
+    eprints(diag_file_view(const_diag_file(c)))
     eprint_char(':')
     eprint_i64(line as i64)
     eprint_char(':')
@@ -1352,19 +1342,16 @@ fn eprint_field_path(path: *ConstFieldPath)
         eprint_char('.')
     eprint_bytes(path.fi.name)
 
-# AGAST #1557: element `idx` of the primitive const array `c` isn't a
-# constant integer expression.  Reported at the const's location (elements
-# carry no position of their own) with a `; ERROR` marker in the IR.
-fn const_array_elem_error(s: *EmitterState, c: *ConstEntry, idx: i32)
-    if c.src_file.len > 0
-        eprints(c.src_file)
-    else
-        eprints("<input>")
-    eprint_char(':')
-    eprint_i64(c.line as i64)
-    eprint_char(':')
-    eprint_i64(c.col as i64)
-    eprints(": error: const '")
+# AGAST #1557: element `idx` (`elem`) of the primitive const array `c` isn't
+# a constant integer expression.  Reported at the element, as ritz0 does
+# (AGAST #4936; the const's own position for an element with no span), with
+# a `; ERROR` marker in the IR.
+fn const_array_elem_error(s: *EmitterState, c: *ConstEntry, idx: i32, elem: *Expr)
+    var at: SrcSpan = diag_span(c.line, c.col)
+    if elem != null and elem.span.line != 0
+        at = elem.span
+    diag_error_at(const_diag_file(c), at)
+    eprints("const '")
     eprint_bytes(c.name)
     eprints("' array element ")
     eprint_i64(idx as i64)
@@ -1383,7 +1370,7 @@ fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
     mark_global_emitted(s, c.name)
     var v: i64 = 0
     if c.value_expr.left == null or const_fold_int(s.sym.module.constants, c.value_expr.left, 1, @v) == 0
-        const_array_elem_error(s, c, 0)
+        const_array_elem_error(s, c, 0, c.value_expr.left)
         return
     let name_ir: String = ir_name(c.name)
     let elem_ty: StrView = llvm_text(ty_value_llvm(c.array_elem_type))
@@ -1413,12 +1400,7 @@ fn const_struct_fill_error(s: *EmitterState, c: *ConstEntry)
     if v != null and v.span.line != 0
         line = v.span.line
         col = v.span.col
-    var file: StrView = c.def_file
-    if file.len == 0
-        file = c.src_file
-    if file.len == 0
-        file = emitter_source_file()
-    diag_error_at(file, diag_span(line, col))
+    diag_error_at(const_diag_file(c), diag_span(line, col))
     eprints("const '")
     eprint_bytes(c.name)
     eprints("': a struct table can't be a fill `[v; N]`: write its elements out\n")
@@ -1441,12 +1423,7 @@ fn const_ptr_table_error(s: *EmitterState, c: *ConstEntry, idx: i32, e: *Expr)
     if line == 0
         line = c.line
         col = c.col
-    var file: StrView = c.def_file
-    if file.len == 0
-        file = c.src_file
-    if file.len == 0
-        file = emitter_source_file()
-    diag_error_at(file, diag_span(line, col))
+    diag_error_at(const_diag_file(c), diag_span(line, col))
     eprints("const '")
     eprint_bytes(c.name)
     eprints("' element ")
@@ -1614,7 +1591,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
         while fe != null
             var ignored: i64 = 0
             if const_fold_int(s.sym.module.constants, fe, 1, @ignored) == 0
-                const_array_elem_error(s, c, fi)
+                const_array_elem_error(s, c, fi, fe)
                 bad = true
             fi = fi + 1
             fe = fe.next
