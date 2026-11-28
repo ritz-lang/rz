@@ -15,7 +15,8 @@ import goliath.namespace { Namespace }
 import goliath.dir_entry { NsEntry }
 import goliath.path { GOLIATH_PATH_MAX, PATH_SEP }
 import ritzlib.strview { strview_from_ptr }
-import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_fstat, sys_lseek, sys_mkdir, is_fs_fd, fs_sync }
+import ritzlib.span { span_from_ptr }
+import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_fstat, sys_lseek, sys_mkdir, sys_getdents64, is_fs_fd, fs_sync }
 import fs.stat { Stat, stat_at }
 import ritzlib.result
 import ritzlib.option
@@ -260,6 +261,20 @@ pub fn sys_readdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         if buf_result != 0
             return Errno.Fault as i64
     return sys_readdir_impl(strview_from_ptr(rdi as *u8, path_result), rsi as *u8, rdx as i64)
+
+# getdents64(fd, buf, size): an O_DIRECTORY fd's entries (fs/syscall.ritz
+# sys_getdents64, AGAST #4947). Listing needs CAP_RIGHT_LIST, as readdir.
+pub fn sys_getdents64_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_LIST)
+        klog("[syscall] getdents64 denied (no namespace capability)\n")
+        return Errno.Perm as i64
+    # SECURITY: the records go to the caller's buffer, so all of it must be
+    # writable user memory.
+    if rdx > 0 and uptr_check_write(rsi as *u8, rdx) != 0
+        return Errno.Fault as i64
+    match sys_getdents64(rdi as i32, span_from_ptr<u8>(rsi as *u8, rdx as i64))
+        Ok(n) => n
+        Err(e) => e as i64
 
 # The console's terminal attributes, ritzlib's TtyAttrs: two u32s, the flags
 # (#4254: tty/ldisc.ritz's TTY_ECHO, TTY_ICANON and TTY_ISIG) and the input

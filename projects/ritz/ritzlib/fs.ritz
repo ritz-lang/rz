@@ -20,11 +20,14 @@
 # #4248). A path of FS_PATH_MAX bytes or more fails with NameTooLong.
 #
 # Targets (AGAST #4830, #4832, #4833): read_file, write_file, copy_file,
-# stat / lstat, sync, the predicates, file_size, the path utilities and the
-# mode_is_* helpers compile for Linux and Harland. The rest (mkdir/unlink/rmdir,
-# access .. set_times, dir_open, remove_dir_all) is [[target_os = "linux"]]:
-# it rests on syscalls Harland does not have. Harland has no symlinks, so
-# there lstat is stat and is_symlink is false.
+# stat / lstat, sync, the predicates, file_size, the path utilities, the
+# mode_is_* helpers and directory iteration (dir_open, DirIter: AGAST #4947)
+# compile for Linux and Harland. The rest (mkdir/unlink/rmdir, access ..
+# set_times, remove_dir_all) is [[target_os = "linux"]]: it rests on
+# syscalls Harland does not have. Harland has no symlinks, so there lstat is
+# stat and is_symlink is false. Harland's kernel takes absolute paths only,
+# so there a relative path is resolved against the working directory first
+# (ritzlib.path path_absolute): "." and "src/x" mean what they do on Linux.
 #
 # Note: Stat struct and STAT_SIZE are defined in ritzlib/sys.ritz
 
@@ -36,6 +39,7 @@ import ritzlib.strview
 import ritzlib.result
 import ritzlib.option
 import ritzlib.gvec    # Vec<u8>: DirIter's getdents buffer
+import ritzlib.path { path_absolute }
 # Errno is part of this API (every Err), so importers of fs get it too.
 pub import ritzlib.errno
 
@@ -86,10 +90,14 @@ fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, Errno>
     Ok(st)
 
 # Harland's stat takes the path's bytes and length, (path, path_len, *Stat),
-# so the view goes to the kernel as it is. No symlinks: `follow` changes
-# nothing (AGAST #4832).
+# so an absolute view goes to the kernel as it is; a relative one is
+# resolved first. No symlinks: `follow` changes nothing (AGAST #4832).
 [[target_os = "harland"]]
 fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, Errno>
+    if not path.starts_with("/")
+        return match path_absolute(path)
+            Ok(abs) => fs_stat_impl(abs.as_view(), follow)
+            Err(e) => Err(e)
     if path.len >= FS_PATH_MAX
         return Err(errno_from_raw(FS_ENAMETOOLONG))
     var st: Stat
@@ -289,11 +297,15 @@ fn fs_open(path: StrView, flags: i32, mode: i32) -> i32
     sys_open3(@cpath[0], flags, mode)
 
 # Harland's open takes the path's bytes and length, (path, path_len, flags,
-# mode), so the view goes to the kernel as it is: no copy, no NUL. A file
-# the open creates gets permission bits `mode` (AGAST #4832). Returns the
-# fd, or -errno.
+# mode), so an absolute view goes to the kernel as it is: no copy, no NUL; a
+# relative one is resolved first. A file the open creates gets permission
+# bits `mode` (AGAST #4832). Returns the fd, or -errno.
 [[target_os = "harland"]]
 fn fs_open(path: StrView, flags: i32, mode: i32) -> i32
+    if not path.starts_with("/")
+        return match path_absolute(path)
+            Ok(abs) => fs_open(abs.as_view(), flags, mode)
+            Err(e) => -e.code()
     if path.len >= FS_PATH_MAX
         return -FS_ENAMETOOLONG
     syscall4(SYS_OPEN, path.ptr as i64, path.len, flags as i64, mode as i64) as i32
@@ -581,7 +593,11 @@ pub fn set_times(path: StrView, atime: FileTime, mtime: FileTime) -> Result<(), 
 # ============================================================================
 # Directory Iteration
 # ============================================================================
-# High-level directory iteration API using getdents64.
+# High-level directory iteration API using getdents64: Linux's, and
+# Harland's, which has the same number, O_DIRECTORY open and linux_dirent64
+# records (harland kernel/src/fs/dirent.ritz, AGAST #4947), so one DirIter
+# serves both. Harland lists no "." or ".."; Linux does, so a portable
+# caller skips them.
 #
 # Usage:
 #     var dir: DirIter = match dir_open("/path/to/dir")
@@ -613,7 +629,6 @@ pub struct DirIter
 
 # Open a directory for iteration; Err (NoEnt, NotDir, Acces, ...) if it
 # cannot be opened. The Ok iterator closes when dropped, or early with close().
-[[target_os = "linux"]]
 pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
     let fd: i32 = fs_open(path, O_RDONLY + O_DIRECTORY, 0)
     if fd < 0
@@ -628,7 +643,6 @@ pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
 # the end. Shared by dir_next and dir_next_entry. It takes @&DirIter and only
 # touches fields, because ritz1 cannot forward an @&T parameter into a *T one
 # (AGAST #1652).
-[[target_os = "linux"]]
 fn dir_advance(dir: @&DirIter) -> bool
     # Closed: fd < 0 and buf already freed. Do not hand getdents a null pointer.
     if dir.fd < 0 or dir.buf.cap() < DIR_BUF_SIZE
@@ -654,14 +668,6 @@ fn dir_advance(dir: @&DirIter) -> bool
     dir.buf_pos = dir.buf_pos + reclen as i64
 
     true
-
-# Harland has no getdents64 and no dir_open, so no DirIter is ever open
-# there: DirIter's methods compile on every target, since an impl's methods
-# cannot be gated one by one, and they end at once.
-[[target_os = "harland"]]
-fn dir_advance(dir: @&DirIter) -> bool
-    dir.entry = null
-    false
 
 # Methods (S-IMPL-1): a DirIter is the subject of every operation on it.
 impl DirIter

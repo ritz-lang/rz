@@ -91,6 +91,7 @@ FAKE_QEMU = textwrap.dedent("""\
                 "[test] udp-recv nodev ... udp-recv: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"
                 "[test] write_empty_test ... [write_empty_test] PASS: /tmp and /var\\nPASS (exit=0)\\n"
                 "[test] stat_test ... [stat_test] PASS: /tmp and /var\\nPASS (exit=0)\\n"
+                "[test] dir_test ... [dir_test] PASS: /tmp and /var\\nPASS (exit=0)\\n"
                 "ALL TESTS PASSED\\n"
                 "[exit] init exited with code 0\\n")
     """)

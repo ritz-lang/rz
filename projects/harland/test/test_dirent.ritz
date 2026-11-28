@@ -1,0 +1,134 @@
+# Harland - getdents64's records (AGAST #4947, kernel/src/fs/dirent.ritz)
+#
+# A directory fd lists its entries as Linux's linux_dirent64 records, which
+# ritzlib.fs's DirIter reads on both targets. These tests fill buffers from a
+# real goliath namespace and decode them as a reader does: d_reclen steps
+# from one record to the next, d_off resumes the walk, d_type says file or
+# directory.
+
+import ritzlib.span { Span, Bytes, span_from_ptr, span_from_strview }
+import ritzlib.strview { StrView }
+import ritzlib.result
+import ritzlib.option
+import goliath.hosted { memory_store_new }
+import goliath.blob_id { BlobId }
+import goliath.blob_store { MemoryBlobStore, memory_store_free }
+import goliath.namespace { Namespace, namespace_new, namespace_write, namespace_mkdir, namespace_resolve, namespace_hold, namespace_unhold }
+import goliath.error { ErrorCode }
+import syscall.errno { Errno }
+import fs.dirent { DirentFill, dirent_fill, dirent_reclen, DT_REG, DT_DIR, DIRENT_NAME_OFFSET }
+
+fn write_text(ns: *Namespace, path: StrView, text: StrView) -> ErrorCode
+    let data: Span<u8> = span_from_strview(text)
+    namespace_write(ns, path, @data)
+
+# The little-endian field of `n` bytes at `buf[at..]`.
+fn le(buf: Span<u8>, at: i64, n: i64) -> u64
+    var v: u64 = 0
+    var i: i64 = n - 1
+    while i >= 0
+        v = (v << 8) | buf.get(at + i) as u64
+        i = i - 1
+    v
+
+# One decoded record.
+struct Rec
+    ino: u64
+    off: i64
+    reclen: i64
+    kind: u8
+    name: StrView
+
+# The record at `buf[at..]`; its name runs to the NUL.
+fn rec_at(buf: Span<u8>, at: i64) -> Rec
+    let name_at: i64 = at + DIRENT_NAME_OFFSET
+    var len: i64 = 0
+    while buf.get(name_at + len) != 0
+        len = len + 1
+    Rec { ino: le(buf, at, 8), off: le(buf, at + 8, 8) as i64, reclen: le(buf, at + 16, 2) as i64, kind: buf.get(at + 18), name: buf.slice(name_at, name_at + len).as_strview() }
+
+# /d holds file "a.txt", directory "sub" and file "zz", in that order.
+[[test_helper]]
+fn make_tree(ns: *Namespace)
+    assert namespace_mkdir(ns, "/d") == ErrorCode.Ok
+    assert write_text(ns, "/d/a.txt", "a") == ErrorCode.Ok
+    assert namespace_mkdir(ns, "/d/sub") == ErrorCode.Ok
+    assert write_text(ns, "/d/zz", "z") == ErrorCode.Ok
+
+[[test]]
+fn test_reclen_is_header_name_nul_rounded_to_8() -> i32
+    assert dirent_reclen(0) == 24       # 19 + NUL = 20 -> 24
+    assert dirent_reclen(4) == 24       # 24 exactly
+    assert dirent_reclen(5) == 32
+    assert dirent_reclen(255) == 280
+    0
+
+# One call with room for all: every entry, in order, typed, each record
+# 8-aligned, d_off the next index, d_ino never 0; the next call is the end.
+[[test]]
+fn test_one_fill_lists_every_entry_typed() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    make_tree(@ns)
+    var dir: BlobId = namespace_resolve(@ns, "/d")
+    var buf: [512]u8
+    let out: Span<u8> = span_from_ptr<u8>(@buf[0], 512)
+    let fill: DirentFill = dirent_fill(@ns, @dir, 0, out).unwrap()
+    assert fill.next == 3
+    let a: Rec = rec_at(out, 0)
+    assert a.name.eq("a.txt") and a.kind == DT_REG and a.ino == 1 and a.off == 1 and a.reclen == 32
+    let s: Rec = rec_at(out, a.reclen)
+    assert s.name.eq("sub") and s.kind == DT_DIR and s.off == 2 and s.reclen == 24
+    let z: Rec = rec_at(out, a.reclen + s.reclen)
+    assert z.name.eq("zz") and z.kind == DT_REG and z.ino == 3 and z.off == 3
+    assert fill.bytes == a.reclen + s.reclen + z.reclen
+    let end: DirentFill = dirent_fill(@ns, @dir, fill.next, out).unwrap()
+    assert end.bytes == 0 and end.next == 3
+    memory_store_free(@store)
+    0
+
+# A buffer that holds only some records: the call stops before the one that
+# doesn't fit and the next resumes at it, so no entry is lost or repeated.
+[[test]]
+fn test_a_small_buffer_resumes_where_it_stopped() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    make_tree(@ns)
+    var dir: BlobId = namespace_resolve(@ns, "/d")
+    var buf: [48]u8
+    let out: Span<u8> = span_from_ptr<u8>(@buf[0], 48)
+    # a.txt (32) fits, sub (24) doesn't after it
+    let first: DirentFill = dirent_fill(@ns, @dir, 0, out).unwrap()
+    assert first.bytes == 32 and first.next == 1
+    assert rec_at(out, 0).name.eq("a.txt")
+    let second: DirentFill = dirent_fill(@ns, @dir, first.next, out).unwrap()
+    assert second.bytes == 48 and second.next == 3
+    assert rec_at(out, 0).name.eq("sub") and rec_at(out, 24).name.eq("zz")
+    # Too small for the next record at all: Inval, not a silent end
+    let tiny: Span<u8> = span_from_ptr<u8>(@buf[0], 20)
+    let refused: bool = match dirent_fill(@ns, @dir, 0, tiny)
+        Ok(_) => false
+        Err(e) => e == Errno.Inval
+    assert refused
+    memory_store_free(@store)
+    0
+
+# The records come from the held blob: entries added after the id was taken
+# are not listed, and an empty directory is the end at once.
+[[test]]
+fn test_fill_reads_the_held_directory() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    make_tree(@ns)
+    var dir: BlobId = namespace_resolve(@ns, "/d")
+    assert namespace_hold(@ns, @dir)
+    assert write_text(@ns, "/d/later", "x") == ErrorCode.Ok
+    var buf: [512]u8
+    let out: Span<u8> = span_from_ptr<u8>(@buf[0], 512)
+    assert dirent_fill(@ns, @dir, 0, out).unwrap().next == 3
+    namespace_unhold(@ns, @dir)
+    var sub: BlobId = namespace_resolve(@ns, "/d/sub")
+    let empty: DirentFill = dirent_fill(@ns, @sub, 0, out).unwrap()
+    assert empty.bytes == 0 and empty.next == 0
+    memory_store_free(@store)
+    0

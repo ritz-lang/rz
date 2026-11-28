@@ -229,6 +229,10 @@ pub fn ns_stub_get() -> *Namespace
         add(c"/b", 2, c"bravo", 5)
     @g_ns
 
+# "/d" is a directory: blob 200, which only fs/dirent.ritz's stand-in reads.
+fn is_stub_dir(path: StrView) -> bool
+    path.len == 2 and *path.ptr == 47 and *(path.ptr + 1) == 100
+
 pub fn namespace_resolve(ns: *Namespace, path: StrView) -> BlobId
     var id: BlobId
     var i: i32 = 0
@@ -236,6 +240,8 @@ pub fn namespace_resolve(ns: *Namespace, path: StrView) -> BlobId
         id.hash[i] = 0
         i = i + 1
     id.hash[0] = find(path) as u8
+    if is_stub_dir(path)
+        id.hash[0] = 200
     id
 
 pub fn namespace_store(ns: *Namespace) -> *MemoryBlobStore
@@ -261,6 +267,8 @@ pub fn ns_stub_write(path: StrView, data: *u8, size: u64) -> i32
     0
 
 pub fn namespace_stat(ns: *Namespace, path: StrView) -> Result<NsStat, ErrorCode>
+    if is_stub_dir(path)
+        return Ok(NsStat { is_dir: true, size: 0, modified: 0, mode: 493 })
     if find(path) == 0
         return Err(ErrorCode.NotFound)
     Ok(NsStat { is_dir: false, size: 0, modified: 0, mode: 420 })
@@ -340,6 +348,30 @@ pub fn kfs_commit_durable(path: StrView, data: Span<u8>, mode: WriteMode, excl: 
     Ok(())
 """
 
+# fs/dirent.ritz's records come from goliath (harland/test/test_dirent.ritz
+# tests them); here directory blob 200 has two entries, one record of 8
+# bytes per call, so a test sees the fd's position step and end.
+DIRENT_STUB = """\
+import ritzlib.span { Span }
+import ritzlib.result
+import syscall.errno { Errno }
+import goliath.namespace { Namespace }
+import goliath.blob_id { BlobId }
+
+pub struct DirentFill
+    bytes: i64
+    next: i32
+
+pub fn dirent_fill(ns: *Namespace, dir: *BlobId, start: i32, out: Span<u8>) -> Result<DirentFill, Errno>
+    if (*dir).hash[0] != 200
+        return Err(Errno.Io)
+    if start >= 2
+        return Ok(DirentFill { bytes: 0, next: start })
+    if out.len() < 8
+        return Err(Errno.Inval)
+    Ok(DirentFill { bytes: 8, next: start + 1 })
+"""
+
 # goliath's error enum, as far as the stubs use it.
 ERROR_STUB = """\
 pub enum ErrorCode: i32
@@ -356,6 +388,7 @@ STUBS = {
     "goliath/namespace.ritz": NAMESPACE_STUB,
     "fs/kfs.ritz": KFS_STUB,
     "goliath/error.ritz": ERROR_STUB,
+    "fs/dirent.ritz": DIRENT_STUB,
 }
 REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open_plan.ritz", "syscall/errno.ritz"]
 
@@ -403,7 +436,7 @@ def _run(compiler, tmp_path, src, modules):
 
 FD_MODULES = ["fs/fd.ritz", "syscall/errno.ritz"]
 FS_MODULES = ["serial.ritz", "klog.ritz", "mm/heap.ritz", "goliath/blob_id.ritz", "goliath/blob_store.ritz",
-              "goliath/error.ritz", "goliath/namespace.ritz", "fs/kfs.ritz", "fs/fd.ritz",
+              "goliath/error.ritz", "goliath/namespace.ritz", "fs/kfs.ritz", "fs/dirent.ritz", "fs/fd.ritz",
               "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open_plan.ritz", "syscall/errno.ritz"]
 
 # --- FdTable (fs/fd.ritz) ---------------------------------------------------------
@@ -475,7 +508,8 @@ FS_PRELUDE = """\
 import ritzlib.option
 import syscall.errno { Errno }
 import fs.syscall
-import fs.vfs { O_RDONLY, O_WRONLY, O_CREAT }
+import fs.vfs { O_RDONLY, O_WRONLY, O_CREAT, O_DIRECTORY }
+import ritzlib.span { span_from_ptr }
 import mm.heap { heap_live }
 import goliath.namespace { stub_writes, stub_holds, stub_open_holds }
 
@@ -549,6 +583,72 @@ ISOLATION_CLAIMS = {1: "init gets a table", 2: "init's first fd is 3", 3: "child
 def test_child_has_own_fd_table_released_on_exit(compiler, tmp_path):
     rc = _run(compiler, tmp_path, ISOLATION, FS_MODULES)
     assert rc == 0, f"{compiler}: {ISOLATION_CLAIMS.get(rc, f'exit {rc}')}"
+
+
+# open(O_DIRECTORY) and getdents64 (AGAST #4947): a directory fd holds its
+# blob and steps its position one record per call to the end; a file is
+# NotDir to both, a write flag Inval, read of the directory IsDir; closing
+# drops the hold and frees nothing it didn't take.
+DIRECTORY = FS_PRELUDE + """\
+import ritzlib.result
+import ritzlib.span { Span }
+
+# sys_getdents64's bytes, or its Errno as the syscall returns it.
+fn listed(fd: i32, out: Span<u8>) -> i64
+    match sys_getdents64(fd, out)
+        Ok(n) => n
+        Err(e) => e as i64
+
+fn main() -> i32
+    let base: i64 = heap_live()
+    if fs_process_start(1) != 0
+        return 1
+    let d: i64 = sys_open(c"/d", 2, O_RDONLY | O_DIRECTORY, 0)
+    if d != 3 or stub_open_holds() != 1
+        return 2
+    if sys_open(c"/a", 2, O_RDONLY | O_DIRECTORY, 0) != Errno.NotDir as i64
+        return 3
+    if sys_open(c"/d", 2, O_WRONLY | O_DIRECTORY, 0) != Errno.Inval as i64
+        return 4
+    if sys_open(c"/nope", 5, O_RDONLY | O_DIRECTORY, 0) != Errno.NoEnt as i64
+        return 5
+    var buf: [16]u8
+    if sys_fs_read(d as i32, @buf[0], 16) != Errno.IsDir as i64
+        return 6
+    let out = span_from_ptr<u8>(@buf[0], 16)
+    if listed(d as i32, out) != 8 or listed(d as i32, out) != 8
+        return 7
+    if listed(d as i32, out) != 0
+        return 8
+    let f: i64 = sys_open(c"/a", 2, O_RDONLY, 0)
+    if listed(f as i32, out) != Errno.NotDir as i64
+        return 9
+    if listed(40, out) != Errno.BadF as i64
+        return 10
+    if sys_close(d as i32) != 0 or sys_close(f as i32) != 0 or stub_open_holds() != 0
+        return 11
+    # The slot's next file is a file again: no directory flag left behind
+    if sys_open(c"/a", 2, O_RDONLY, 0) != 3 or not reads(3, c"alpha", 5)
+        return 12
+    if fs_process_end() != 1 or heap_live() != base
+        return 13
+    0
+"""
+
+DIRECTORY_CLAIMS = {1: "init gets a table", 2: "a directory opens and holds its blob",
+                    3: "O_DIRECTORY on a file is NotDir", 4: "O_DIRECTORY with a write flag is Inval",
+                    5: "O_DIRECTORY on a missing path is NoEnt", 6: "read of a directory fd is IsDir",
+                    7: "getdents64 lists one record per call", 8: "then 0 at the end",
+                    9: "getdents64 on a file fd is NotDir", 10: "getdents64 on no fd is BadF",
+                    11: "close drops the directory's hold", 12: "a reused slot is a file again",
+                    13: "nothing left allocated"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_directory_fd_lists_with_getdents64(compiler, tmp_path):
+    rc = _run(compiler, tmp_path, DIRECTORY, FS_MODULES)
+    assert rc == 0, f"{compiler}: {DIRECTORY_CLAIMS.get(rc, f'exit {rc}')}"
 
 
 # More children than FS_MAX_PROCS, one after another, each leaving an fd open:

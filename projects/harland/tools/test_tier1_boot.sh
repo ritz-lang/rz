@@ -730,6 +730,19 @@ stat_ok() {
     return 1
 }
 
+# dir_ok NAME: pass only if indium's dir_test listed /var as well as /tmp
+# (AGAST #4947): ritzlib.fs dir_open / DirIter over O_DIRECTORY and
+# getdents64. As stat_ok: the /tmp leg alone doesn't pass a boot with storage.
+dir_ok() {
+    if grep -aq "\[dir_test\] PASS: /tmp and /var" "$WORK/$1.log"; then
+        echo "PASS ($1): dir_open and DirIter listed directories on /tmp and /var"
+        return 0
+    fi
+    grep -a "\[dir_test\]" "$WORK/$1.log" | head -3
+    echo "FAIL ($1): dir_test did not pass on both /tmp and /var"
+    return 1
+}
+
 # net_nodev NAME: pass only if init ran indium's ping, udp-send and
 # udp-recv and each exited 19 (-Errno.NoDev): a Tier-1 boot runs no ring-2
 # service, so NetAttach answers NoDev and each tool ends before it publishes
@@ -943,6 +956,7 @@ if [ "$MODE" != grub ]; then
     net_nodev native || rc=1
     write_empty native || rc=1
     stat_ok native || rc=1
+    dir_ok native || rc=1
     boot_tests_passed native || rc=1
     smp_stacks native || rc=1
     mbox_round_trip native || rc=1
@@ -986,6 +1000,7 @@ EOF
     net_nodev grub || rc=1
     write_empty grub || rc=1
     stat_ok grub || rc=1
+    dir_ok grub || rc=1
     boot_tests_passed grub || rc=1
     smp_stacks grub || rc=1
     mbox_round_trip grub || rc=1

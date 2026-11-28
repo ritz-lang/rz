@@ -1,0 +1,168 @@
+# dir_test: ritzlib.fs directory iteration on Harland (AGAST #4947).
+#
+# dir_open opens a directory with O_DIRECTORY and DirIter reads it with
+# getdents64, Linux's number and records (harland kernel/src/fs/dirent.ritz),
+# so this is the code Linux runs. On /tmp, and on /var when the boot has a
+# storage disk:
+#
+#   1. a directory of FILES files with long names, more than one getdents64
+#      buffer holds, and a subdirectory: each listed once, files DT_REG, the
+#      subdirectory DT_DIR, nothing else (Harland lists no "." or "..")
+#   2. dir_open of a file is NotDir; of a missing path, NoEnt
+#   3. a relative path resolves against the working directory ("/"):
+#      dir_open(".") lists "bin" as a directory
+#
+# Each exit code names the step that failed: 10 + step for /tmp, 30 + step
+# for /var. The directory's name carries the boot count (/var/boots), as a
+# reboot keeps /var. tools/test_tier1_boot.sh requires the final PASS line
+# to name /var.
+
+import ritzlib.fs { DirIter, DirEntry, dir_open, read_file, write_file }
+import ritzlib.sys { DT_REG, DT_DIR }
+import ritzlib.errno { Errno }
+import ritzlib.option
+import ritzlib.result
+import ritzlib.string { String, string_from }
+import ritzlib.strview { StrView }
+import tool_io { make_directory }
+
+const DIR_EXISTS: i64 = -17
+# Each name is about 90 bytes, a 112-byte record: FILES of them are more
+# than DirIter's 4096-byte getdents64 buffer.
+const FILES: i64 = 48
+
+# Step `step` failed: say why; Err(step), which main turns into the exit code.
+fn fail(step: i32, what: StrView) -> Result<(), i32>
+    print("[dir_test] FAIL step {step}: {what}\n")
+    Err(step)
+
+# File k's name: long, so the listing spans several getdents64 calls.
+fn file_name(k: i64) -> String
+    var s: String = string_from("entry_")
+    s.push_i64(k)
+    s.push_str("_padded_out_to_a_long_name_so_that_one_getdents64_buffer_cannot_hold_them_all")
+    s
+
+# The index k of a name file_name made, or None.
+fn file_index(name: StrView) -> Option<i64>
+    for k in 0..FILES
+        let want: String = file_name(k)
+        if name.eq(want.as_view())
+            return Some(k)
+    None
+
+# `dir` + "/" + `name`
+fn child(dir: StrView, name: StrView) -> String
+    var s: String = string_from(dir)
+    s.push('/')
+    s.push_str(name)
+    s
+
+# The steps in directory `root`: Ok, or Err(the failing step).
+fn run_steps(root: StrView, tag: StrView) -> Result<(), i32>
+    var dname: String = string_from("dir_")
+    dname.push_str(tag)
+    let dir: String = child(root, dname.as_view())
+    let mk: i64 = make_directory(dir.as_view())
+    if mk != 0 and mk != DIR_EXISTS
+        return fail(1, "mkdir of the test directory failed")
+    let sub: String = child(dir.as_view(), "sub")
+    let mk_sub: i64 = make_directory(sub.as_view())
+    if mk_sub != 0 and mk_sub != DIR_EXISTS
+        return fail(1, "mkdir of the subdirectory failed")
+    for k in 0..FILES
+        let name: String = file_name(k)
+        let path: String = child(dir.as_view(), name.as_view())
+        match write_file(path.as_view(), "x")
+            Ok(_) => pass
+            Err(_) => return fail(1, "writing a file failed")
+
+    # 1. Every entry once, typed.
+    var seen: [48]bool
+    for k in 0..FILES
+        seen[k] = false
+    var saw_sub: bool = false
+    var it: DirIter = match dir_open(dir.as_view())
+        Ok(d) => d
+        Err(_) => return fail(1, "dir_open of the test directory failed")
+    loop
+        let e: DirEntry = match it.next_entry()
+            Some(found) => found
+            None => break
+        if e.name.eq("sub")
+            if saw_sub or e.kind != DT_DIR
+                return fail(1, "sub listed twice or not as a directory")
+            saw_sub = true
+            continue
+        let k: i64 = match file_index(e.name)
+            Some(found) => found
+            None => return fail(1, "an entry the test did not make")
+        if seen[k] or e.kind != DT_REG
+            return fail(1, "a file listed twice or not as a regular file")
+        seen[k] = true
+    it.close()
+    if not saw_sub
+        return fail(1, "sub not listed")
+    for k in 0..FILES
+        if not seen[k]
+            return fail(1, "a file not listed")
+
+    # 2. Not a directory; not there.
+    let file: String = file_name(0)
+    let file_path: String = child(dir.as_view(), file.as_view())
+    match dir_open(file_path.as_view())
+        Ok(_) => return fail(2, "dir_open of a file succeeded")
+        Err(e) => match e
+            NotDir => pass
+            _ => return fail(2, "dir_open of a file is not NotDir")
+    match dir_open("/no/such/dir")
+        Ok(_) => return fail(2, "dir_open of a missing path succeeded")
+        Err(e) => match e
+            NoEnt => pass
+            _ => return fail(2, "dir_open of a missing path is not NoEnt")
+    Ok(())
+
+# 3. "." is the working directory, "/": it holds /bin.
+fn relative_step() -> bool
+    var it: DirIter = match dir_open(".")
+        Ok(d) => d
+        Err(_) => return false
+    loop
+        let e: DirEntry = match it.next_entry()
+            Some(found) => found
+            None => return false
+        if e.name.eq("bin")
+            return e.kind == DT_DIR
+
+# The exit code: 0, or the failing step plus `base` (10 for /tmp, 30 for /var).
+fn exit_code(r: Result<(), i32>, base: i32) -> i32
+    match r
+        Ok(_) => 0
+        Err(step) => base + step
+
+pub fn main() -> i32
+    let mk: i64 = make_directory("/tmp")
+    if mk != 0 and mk != DIR_EXISTS
+        return exit_code(fail(1, "mkdir /tmp failed"), 10)
+
+    var boots: String = match read_file("/var/boots")
+        Ok(s) => s
+        Err(_) => string_from("")
+    let has_var: bool = boots.len() > 0
+    if not has_var
+        boots = string_from("0")
+
+    let ram: i32 = exit_code(run_steps("/tmp", boots.as_view()), 10)
+    if ram != 0
+        return ram
+    if not relative_step()
+        return exit_code(fail(3, "dir_open(\".\") does not list /bin as a directory"), 10)
+
+    if not has_var
+        print("[dir_test] PASS: /tmp (no storage disk, /var skipped)\n")
+        return 0
+    let persist: i32 = exit_code(run_steps("/var", boots.as_view()), 30)
+    if persist != 0
+        return persist
+    print("[dir_test] PASS: /tmp and /var\n")
+    0
