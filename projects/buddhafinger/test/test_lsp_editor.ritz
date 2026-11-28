@@ -301,6 +301,31 @@ fn requests_in(dir: @String) -> i64
             Err(_) => return count
         n += 1
 
+# How many of the server's saved messages hold both `a` and `b`.
+fn messages_with(dir: @String, a: StrView, b: StrView) -> i64
+    var count: i64 = 0
+    var n: i64 = 1
+    loop
+        var name = string_from("msg.")
+        name.push_i64(n)
+        let p = file_in(dir, name.as_view())
+        match read_file(p.as_view())
+            Ok(s) =>
+                let v = s.as_view()
+                if v.find(a) < v.len() and v.find(b) < v.len()
+                    count += 1
+            Err(_) => return count
+        n += 1
+
+# Wait up to WAIT_MS for a saved message holding both `a` and `b`.
+fn server_got(dir: @String, a: StrView, b: StrView) -> bool
+    let deadline = now_millis() + WAIT_MS
+    while now_millis() < deadline
+        if messages_with(dir, a, b) > 0
+            return true
+        sleep_ms(10)
+    false
+
 const SOURCE: StrView = "fn helper() -> i32\n    1\n\nfn main() -> i32\n    helper()\n"
 
 # ============================================================================
@@ -431,5 +456,37 @@ fn test_real_ritz_lsp_overlay_hover_and_definition() -> i32
     assert code.unwrap_or(-1) == 0
     assert c.restored()
     c.close()
+    let gone = remove_dir_all(dir.as_view())
+    0
+
+# One document per buffer (AGAST #4912): `:e` opens the second file's beside
+# the first, with its own diagnostics, and `:bd` closes only its own.
+[[test]]
+fn test_each_buffer_is_a_document_of_its_own() -> i32
+    let dir = setup("buffers", "editor.sh", SOURCE)
+    let other = file_in(@dir, "b.ritz")
+    let w = write_file(other.as_view(), "BROKEN\n")
+    let server = file_in(@dir, "server.sh")
+    let cfg = lang_config(server.as_view(), "")
+    var c: Child = match spawn_editor(@dir, @cfg)
+        Some(k) => k
+        None => return 0     # no ptys here
+    assert c.shows(4, "helper()")
+    assert c.send(":e b.ritz\r")
+    assert c.expect(ERROR_SGR)                      # b.ritz's diagnostic, drawn
+    assert server_got(@dir, "didOpen", "b.ritz")
+    assert c.send(":b1\r")
+    assert c.shows(0, "fn helper")
+    assert c.send(":bd 2\r")
+    assert server_got(@dir, "didClose", "b.ritz")
+    assert c.send(":q!\r")
+    let code = c.wait_exit(WAIT_MS)
+    assert code.unwrap_or(-1) == 0
+    assert c.restored()
+    c.close()
+    # a.ritz stayed open throughout: opened once, never closed.
+    assert messages_with(@dir, "didOpen", "a.ritz") == 1
+    assert messages_with(@dir, "didClose", "a.ritz") == 0
+    assert messages_with(@dir, "didClose", "b.ritz") == 1
     let gone = remove_dir_all(dir.as_view())
     0

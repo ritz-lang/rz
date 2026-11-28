@@ -1,13 +1,12 @@
-# core/editor.ritz - the editor: modes and the first-release commands.
+# core/editor.ritz - the editor: modes, the commands, buffers and windows.
 #
-# The editor state is one buffer, the cursor, the viewport's top line and
-# page height, one unnamed register, the last search pattern, the Normal-mode
-# keys typed so far (core/normal.ritz), the command line being typed, and in
-# Visual mode the selection's other end (the anchor) and the last selection.
-# handle_key() applies one typed Key to it; the commands are
-# docs/BUDDHAFINGER_PROPOSAL.md's "First usable release" table, then
-# counts and operators from "Everyday code editing" (Vim behaviour
-# throughout):
+# The editor state is the buffer list and the windows onto it, one unnamed
+# register, the last search pattern, the Normal-mode keys typed so far
+# (core/normal.ritz), the command line being typed, and in Visual mode the
+# selection's other end (the anchor). handle_key() applies one typed Key to
+# it; the commands are docs/BUDDHAFINGER_PROPOSAL.md's "First usable
+# release" table, then counts, operators, Visual mode, buffers and windows
+# from "Everyday code editing" (Vim behaviour throughout):
 #
 #   Motion        h j k l, arrows, w b e, 0 $, gg G, gj gk, Ctrl-F Ctrl-B
 #   Insert        i a o O, Escape, Backspace, Enter, Tab
@@ -22,17 +21,39 @@
 #                 is one undo step
 #   Search        / (a literal pattern), n N
 #   Command line  :w  :w <path>  :q  :q!  :wq  :e <path>  :<line>
+#   Buffers       :ls  :b [N | name]  :bn  :bp  :bd[!] [N]
+#   Windows       :sp [path]  :vs [path]  :close  :only;  Ctrl-W h j k l
+#                 w W (a count names the window), s v, c o q
 #   Language      K (hover), gd (go to definition), Ctrl-O / Ctrl-T (jump back)
+#
+# Buffers (AGAST #4912). Each file has one Buffer, kept in the list with its
+# name, its own undo history and a number (Vim's: 1 up, never used again).
+# `:e` adds a buffer or shows the one the file has, and the one left stays,
+# pending edits and all: no E37 for a buffer hidden that way. `:q` in the
+# last window is refused while any buffer has pending edits (E37 for this
+# one, else E162 for the first other, which it shows). `:bd` takes a buffer
+# off the list, closing the other windows showing it.
+#
+# Windows. Each window shows a buffer through its own cursor, `want`, top
+# line and jump stack; core/layout.ritz lays them out (Vim's frames, sized
+# equally). The current window's cursor, want and top are the Editor's own
+# fields, which every motion and edit uses; park() stores them into its
+# Window when another window becomes current, and enter() loads them back.
+# Two windows onto one buffer share its text and undo history: an edit in
+# one moves the other's cursor and top line through the buffer's change
+# notes (Buffer.changes), so they stay on the same text. The search pattern
+# is the editor's, shared by every window as Vim's last pattern is.
 #
 # K and gd only raise a request (take_ask): the event loop asks the language
 # server and, for gd, calls jump_to with the answer. Each jump_to pushes
-# where the cursor was, and Ctrl-O or Ctrl-T goes back there, reopening the
-# file it was in.
+# where the cursor was onto the window's jump stack, and Ctrl-O or Ctrl-T
+# goes back there, showing the file's buffer again (loading it only when it
+# was deleted).
 #
 # Files go through the FileStore seam (core/files.ritz), so the core does no
-# I/O. The event loop renders through core.screen, using Editor as the
-# LineSource and status() for the status line, and keeps `top` in step with
-# the View render() scrolls.
+# I/O. The event loop paints through core.paint, which draws each window of
+# tiling() from the window queries below and keeps their tops in step with
+# what it scrolls.
 #
 # Lines: a file ending in a newline keeps an empty last line in the Buffer
 # (core/buffer.ritz). Vim doesn't show it as a line, and neither does the
@@ -50,12 +71,14 @@ import ritzlib.strview { StrView }
 import ritzlib.string
 import ritzlib.termsession { Key }
 
-import core.buffer { Buffer, Pos, Term, buffer_new, buffer_from_bytes, pos, pos_before, term_text }
+import core.buffer { Buffer, Change, Pos, Term, buffer_new, buffer_from_bytes, pos, pos_before, term_text }
 import core.commands { Command, parse_command }
 import core.files { FileStore, LoadError, SaveError }
+import core.history { release_all }
+import core.layout { Dir, Layout, Rect, Split, Tiling, layout_new, rect }
 import core.modes { Mode }
-import core.normal { Action, Keymap, Motion, NormalCommand, NormalKeys, Operator, Shape, Step, normal_keys_new }
-import core.screen { LineSource, Selection, Status }
+import core.normal { Action, Keymap, Motion, NormalCommand, NormalKeys, Operator, Shape, Step, WindowCommand, normal_keys_new }
+import core.screen { LineSource, Selection, Size, Status, gutter_width }
 import core.utf8 { utf8_encode, utf8_next, utf8_prev }
 
 pub const MSG_NOT_SAVED: StrView = "E37: No write since last change (add ! to override)"
@@ -63,12 +86,17 @@ pub const MSG_NO_NAME: StrView = "E32: No file name"
 pub const MSG_NO_PATTERN: StrView = "No previous search pattern"
 pub const MSG_NO_JUMP: StrView = "E73: Tag stack empty"
 pub const MSG_TOO_LONG: StrView = "E1240: Resulting text too long"
+pub const MSG_NO_ROOM: StrView = "E36: Not enough room"
+pub const MSG_LAST_WINDOW: StrView = "E444: Cannot close last window"
 
 # The most bytes one put (a count times the register) inserts.
 pub const MAX_PUT: i64 = 64 * 1024 * 1024
 
 # The most jumps kept for Ctrl-O / Ctrl-T; the oldest go first.
 pub const MAX_JUMPS: i64 = 100
+
+# The terminal size an editor assumes until resize() says otherwise.
+pub const DEFAULT_SIZE: Size = Size { rows: 24, cols: 80 }
 
 # What the user asked the language server for (K, gd); the loop takes it.
 pub enum LangAsk
@@ -88,34 +116,81 @@ struct Extent
     from: Pos
     to: Pos
 
-# Where a jump left from: a file (jump_paths[path_at .. path_at + path_len])
-# and the cursor in it.
+# Where a jump left from: a file (Jumps.paths[path_at .. path_at +
+# path_len]) and the cursor in it.
 struct Jump
     path_at: i64
     path_len: i64
     at: Pos
 
-pub struct Editor
+# A window's jump stack: where each jump_to left from, oldest first, at
+# most MAX_JUMPS.
+struct Jumps
+    list: Vec<Jump>
+    paths: Vec<u8>          # their file names, back to back
+
+fn jumps_new() -> Jumps
+    Jumps { list: vec_new<Jump>(), paths: vec_new<u8>() }
+
+# A buffer in the list.
+struct Listed
+    number: i64             # Vim's buffer number: 1 up, never used again
     buf: Buffer
     path: String            # the file name; empty for a new buffer
-    mode: Mode
+    cursor: Pos             # where the cursor was when a window last left it
+    last_selection: Option<Selected>    # the last Visual selection in it, for gv
+
+fn listed(number: i64, buf: Buffer, path: String) -> Listed
+    Listed { number: number, buf: buf, path: path, cursor: pos(0, 0), last_selection: None }
+
+# A window onto a buffer. While it is current, its cursor, want and top are
+# the Editor's fields and these copies are stale (see park/enter).
+struct Window
+    id: i64                 # its name in the layout
+    number: i64             # the buffer it shows
+    alt: Option<i64>        # the buffer it showed before (`#` in :ls)
     cursor: Pos
-    want: i64               # the code-point column j and k aim for
-    top: i64                # the first line on screen
-    page: i64               # text rows on screen (Ctrl-F and Ctrl-B)
+    want: i64
+    top: i64
+    jumps: Jumps
+
+# An other window's cursor and top line as byte offsets into the buffer
+# both show, taken before a key's edits (watch) and moved through them
+# after (follow).
+struct Watched
+    id: i64
+    number: i64
+    cursor: i64
+    top: i64
+
+pub struct Editor
+    bufs: Vec<Listed>       # the buffer list, by number
+    at: i64                 # the current window's buffer: its index in bufs
+    wins: Vec<Window>       # the windows, in no order (layout.order() has it)
+    cur: i64                # the current window: its index in wins
+    layout: Layout
+    size: Size              # the terminal's: the windows share all but its last row
+    next_number: i64        # the next buffer's number
+    next_id: i64            # the next window's id
+    mode: Mode
+    cursor: Pos             # the current window's cursor
+    want: i64               # its code-point column j and k aim for
+    top: i64                # its first line on screen
     reg: Vec<u8>            # the unnamed register
     reg_lines: bool         # it holds whole lines, each with its terminator
     pattern: Vec<u8>        # the last search pattern
     cmdline: String         # the command line: its prompt (`:` or `/`), then the text
     keys: NormalKeys        # the Normal-mode keys of a command not yet complete
     anchor: Pos             # Visual mode: the selection's end the cursor isn't on
-    last_selection: Option<Selected>    # the last Visual selection, for gv
-    message: String         # the message line
+    message: String         # the message line; lines broken by `\n` (:ls) wait for a key
     quit: bool
-    revisions: i64          # text revisions of the buffers before this one (text_revision)
     ask: LangAsk            # K or gd, until the loop takes it
-    jumps: Vec<Jump>        # where each jump_to left from, oldest first
-    jump_paths: Vec<u8>     # their file names, back to back
+    watched: Vec<Watched>   # before_key's notes, for after_key
+
+impl Drop for Editor
+    fn drop(self: @&Editor)
+        release_all<Listed>(@&self.bufs)
+        release_all<Window>(@&self.wins)
 
 pub fn editor_new() -> Editor
     editor_with(string_new(), buffer_new())
@@ -125,7 +200,11 @@ pub fn editor_open(path: StrView, data: [u8]) -> Editor
     editor_with(string_from(path), buffer_from_bytes(data))
 
 fn editor_with(path: String, buf: Buffer) -> Editor
-    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), keys: normal_keys_new(), anchor: pos(0, 0), last_selection: None, message: string_new(), quit: false, revisions: 0, ask: LangAsk.Nothing, jumps: vec_new<Jump>(), jump_paths: vec_new<u8>() }
+    var bufs: Vec<Listed> = vec_new<Listed>()
+    bufs.push(listed(1, buf, path))
+    var wins: Vec<Window> = vec_new<Window>()
+    wins.push(Window { id: 0, number: 1, alt: None, cursor: pos(0, 0), want: 0, top: 0, jumps: jumps_new() })
+    Editor { bufs: bufs, at: 0, wins: wins, cur: 0, layout: layout_new(0), size: DEFAULT_SIZE, next_number: 2, next_id: 1, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), keys: normal_keys_new(), anchor: pos(0, 0), message: string_new(), quit: false, ask: LangAsk.Nothing, watched: vec_new<Watched>() }
 
 # ============================================================================
 # Characters and columns
@@ -253,7 +332,7 @@ impl LineSource for Editor
         self.shown()
 
     fn line(self: @Editor, l: i64) -> [u8]
-        self.buf.line(l)
+        self.buf().line(l)
 
 impl Editor
     # The lines the editor shows: all of the buffer's but the empty one
@@ -273,26 +352,36 @@ impl Editor
     # a later edit that happens to leave the cursor on the same line
     # number (dd, say) is never affected by it.
     pub fn shown(self: @Editor) -> i64
-        let n = self.buf.line_count()
+        let n = self.buf().line_count()
         let splitting = self.mode == Mode.Insert and self.cursor.line == n - 1
-        if self.buf.has_final_newline() and not splitting then n - 1 else n
+        if self.buf().has_final_newline() and not splitting then n - 1 else n
 
     pub fn last(self: @Editor) -> i64
         self.shown() - 1
 
     pub fn status(self: @Editor) -> Status
-        Status { name: self.path.as_view(), dirty: self.buf.is_dirty(), mode: self.mode, lang: "" }
+        Status { name: self.path(), dirty: self.buf().is_dirty(), mode: self.mode, lang: "" }
 
-    # A count that goes up with every change to the text, a new buffer from
-    # `:e` included, and never otherwise (Buffer.revision across buffers).
+    # The current window's buffer.
+    pub fn buf(self: @Editor) -> @Buffer
+        @self.bufs[self.at].buf
+
+    pub fn buf_mut(self: @&Editor) -> @&Buffer
+        @&self.bufs[self.at].buf
+
+    # Its file name; empty for a new buffer.
+    pub fn path(self: @Editor) -> StrView
+        self.bufs[self.at].path.as_view()
+
+    # Its number (Vim's: :b N, :ls).
+    pub fn buffer_number(self: @Editor) -> i64
+        self.bufs[self.at].number
+
+    # A count that goes up with every change to the current buffer's text
+    # and never otherwise (Buffer.revision): with buffer_number, what a
+    # renderer's caches are for.
     pub fn text_revision(self: @Editor) -> i64
-        self.revisions + self.buf.revision()
-
-    # A new buffer: text_revision keeps counting up from the old one's. pub
-    # for handle_key<F>'s `:e`, as say() below is.
-    pub fn replace_buffer(self: @&Editor, buf: Buffer)
-        self.revisions += self.buf.revision() + 1
-        self.buf = buf
+        self.buf().revision()
 
     # The command line as typed, prompt first; empty outside CommandLine mode.
     pub fn command_line(self: @Editor) -> StrView
@@ -320,7 +409,7 @@ impl Editor
     # follows it.
     pub fn place(self: @&Editor, p: Pos)
         let l = self.clamp_line(p.line)
-        let s = self.buf.line(l)
+        let s = self.buf().line(l)
         let col = if p.col > s.len then s.len else p.col
         self.cursor = pos(l, normal_col(s, col))
         self.want = units_before(s, self.cursor.col)
@@ -328,12 +417,12 @@ impl Editor
     # Line l (clamped), at its first non-blank.
     pub fn place_line(self: @&Editor, l: i64)
         let line = self.clamp_line(l)
-        self.place(pos(line, first_non_blank(self.buf.line(line))))
+        self.place(pos(line, first_non_blank(self.buf().line(line))))
 
     # One code point on within the shown text, crossing line ends: the end
     # of a line is a position of its own. None at the end of the last line.
     fn step(self: @Editor, p: Pos) -> Option<Pos>
-        let s = self.buf.line(p.line)
+        let s = self.buf().line(p.line)
         if p.col < s.len
             return Some(pos(p.line, utf8_next(s, p.col)))
         if p.line < self.last()
@@ -343,13 +432,13 @@ impl Editor
     # One code point back, onto the end of the line above from a line start.
     fn back(self: @Editor, p: Pos) -> Option<Pos>
         if p.col > 0
-            return Some(pos(p.line, utf8_prev(self.buf.line(p.line), p.col)))
+            return Some(pos(p.line, utf8_prev(self.buf().line(p.line), p.col)))
         if p.line > 0
-            return Some(pos(p.line - 1, self.buf.line_len(p.line - 1)))
+            return Some(pos(p.line - 1, self.buf().line_len(p.line - 1)))
         None
 
     fn class_at(self: @Editor, p: Pos) -> CharClass
-        class_of(self.buf.line(p.line), p.col)
+        class_of(self.buf().line(p.line), p.col)
 
     # ------------------------------------------------------------------
     # Motions: where each takes the cursor, without moving it
@@ -357,7 +446,7 @@ impl Editor
 
     # True when the step from p to n left p's line or landed on its end.
     fn breaks(self: @Editor, p: Pos, n: Pos) -> bool
-        n.line != p.line or n.col >= self.buf.line_len(n.line)
+        n.line != p.line or n.col >= self.buf().line_len(n.line)
 
     # One step of w from p. With `stop_at_eol`, a step that leaves the line
     # or lands on its end ends the motion there.
@@ -388,7 +477,7 @@ impl Editor
                         Stride.On(n) => p = n
                         Stride.Done(n) => return n
             while self.class_at(p) == CharClass.Blank
-                if p.col == 0 and self.buf.line_len(p.line) == 0
+                if p.col == 0 and self.buf().line_len(p.line) == 0
                     break
                 match self.w_step(p, stop_at_eol)
                     Stride.On(n) => p = n
@@ -402,7 +491,7 @@ impl Editor
             Some(n) => n
             None => return from
         while self.class_at(p) == CharClass.Blank
-            if p.line != from.line and self.buf.line_len(p.line) == 0
+            if p.line != from.line and self.buf().line_len(p.line) == 0
                 break
             match self.back(p)
                 Some(n) => p = n
@@ -410,7 +499,7 @@ impl Editor
         let cls = self.class_at(p)
         if cls != CharClass.Blank
             while p.col > 0
-                let q = pos(p.line, utf8_prev(self.buf.line(p.line), p.col))
+                let q = pos(p.line, utf8_prev(self.buf().line(p.line), p.col))
                 if self.class_at(q) != cls
                     break
                 p = q
@@ -443,7 +532,7 @@ impl Editor
             else if cls == CharClass.Blank or not (change and k == 0)
                 var empty_line = false
                 while self.class_at(p) == CharClass.Blank and not empty_line
-                    if change and p.col == 0 and self.buf.line_len(p.line) == 0
+                    if change and p.col == 0 and self.buf().line_len(p.line) == 0
                         empty_line = true
                     else
                         match self.step(p)
@@ -458,7 +547,7 @@ impl Editor
     # Line l (clamped) at the column `want` names: where j and k go.
     fn vertical(self: @Editor, l: i64) -> Pos
         let line = self.clamp_line(l)
-        let s = self.buf.line(line)
+        let s = self.buf().line(line)
         pos(line, normal_col(s, col_of_unit(s, self.want)))
 
     # Where motion `m` takes the cursor, with `count` as typed (0: none),
@@ -470,7 +559,7 @@ impl Editor
     fn target(self: @Editor, m: Motion, count: i64, op: bool) -> Option<Target>
         let n = if count > 0 then count else 1
         let c = self.cursor
-        let s = self.buf.line(c.line)
+        let s = self.buf().line(c.line)
         match m
             Motion.Left =>
                 var col = c.col
@@ -510,7 +599,7 @@ impl Editor
             Motion.LineStart => Some(Target { at: pos(c.line, 0), reach: Reach.Exclusive })
             Motion.LineEnd =>
                 let l = c.line + n - 1
-                if l > self.last() then None else Some(Target { at: pos(l, self.buf.line_len(l)), reach: Reach.Inclusive })
+                if l > self.last() then None else Some(Target { at: pos(l, self.buf().line_len(l)), reach: Reach.Inclusive })
             Motion.FirstLine => Some(self.line_target(if count > 0 then count - 1 else 0))
             Motion.LastLine => Some(self.line_target(if count > 0 then count - 1 else self.last()))
             Motion.Lines =>
@@ -519,7 +608,7 @@ impl Editor
     # Line l (clamped), at its first non-blank, reached linewise.
     fn line_target(self: @Editor, l: i64) -> Target
         let line = self.clamp_line(l)
-        Target { at: pos(line, first_non_blank(self.buf.line(line))), reach: Reach.Linewise }
+        Target { at: pos(line, first_non_blank(self.buf().line(line))), reach: Reach.Linewise }
 
     # A motion without an operator: the cursor goes to its target. j and k
     # keep the column they aim for. In Visual mode $ goes onto the line's
@@ -531,14 +620,15 @@ impl Editor
                     self.cursor = t.at
                 else if m == Motion.LineEnd and self.selecting()
                     self.cursor = t.at
-                    self.want = units_before(self.buf.line(t.at.line), t.at.col)
+                    self.want = units_before(self.buf().line(t.at.line), t.at.col)
                 else
                     self.place(t.at)
             None => pass
 
     # The lines a page turns over: Vim keeps two of the old page in view.
     fn page_step(self: @Editor) -> i64
-        if self.page > 3 then self.page - 2 else 1
+        let page = self.page()
+        if page > 3 then page - 2 else 1
 
     # Ctrl-F: the page down; the cursor on its top line.
     fn page_down(self: @&Editor)
@@ -554,7 +644,7 @@ impl Editor
         if t < 0
             t = 0
         self.top = t
-        self.place_line(t + self.page - 1)
+        self.place_line(t + self.page() - 1)
 
     # ------------------------------------------------------------------
     # Insert mode
@@ -562,7 +652,7 @@ impl Editor
 
     # Into Insert mode at `at`; the session's edits are one undo step.
     fn start_insert(self: @&Editor, at: Pos)
-        self.buf.begin_group()
+        self.buf_mut().begin_group()
         self.enter_insert(at)
 
     # Into Insert mode at `at`, in the undo step already open (c's).
@@ -573,23 +663,23 @@ impl Editor
     pub fn insert_key(self: @&Editor, key: Key)
         match key
             Key.Escape =>
-                self.buf.end_group()
+                self.buf_mut().end_group()
                 self.mode = Mode.Normal
                 var col = self.cursor.col
                 if col > 0
-                    col = utf8_prev(self.buf.line(self.cursor.line), col)
+                    col = utf8_prev(self.buf().line(self.cursor.line), col)
                 self.place(pos(self.cursor.line, col))
             Key.Backspace =>
                 if self.cursor.col > 0
-                    let from = pos(self.cursor.line, utf8_prev(self.buf.line(self.cursor.line), self.cursor.col))
-                    self.cursor = self.buf.delete(from, self.cursor)
+                    let from = pos(self.cursor.line, utf8_prev(self.buf().line(self.cursor.line), self.cursor.col))
+                    self.cursor = self.buf_mut().delete(from, self.cursor)
                 else if self.cursor.line > 0
-                    self.cursor = self.buf.join_lines(self.cursor.line - 1)
-            Key.Enter => self.cursor = self.buf.split_line(self.cursor)
-            Key.Tab => self.cursor = self.buf.insert(self.cursor, span_from_strview("\t"))
+                    self.cursor = self.buf_mut().join_lines(self.cursor.line - 1)
+            Key.Enter => self.cursor = self.buf_mut().split_line(self.cursor)
+            Key.Tab => self.cursor = self.buf_mut().insert(self.cursor, span_from_strview("\t"))
             Key.Char(c) =>
                 let bytes = utf8_encode(c)
-                self.cursor = self.buf.insert(self.cursor, span_from_vec<u8>(@bytes))
+                self.cursor = self.buf_mut().insert(self.cursor, span_from_vec<u8>(@bytes))
             _ => pass
 
     # ------------------------------------------------------------------
@@ -605,10 +695,13 @@ impl Editor
     # the last line's own or, for the last line of the text, which has
     # none, the one above's or LF.
     fn yank_lines(self: @&Editor, a: i64, b: i64)
-        var text = self.buf.text(pos(a, 0), pos(b, self.buf.line_len(b)))
-        var t = self.buf.line_term(b)
+        # The annotation works around AGAST #4942 (ritz1 types a local set
+        # from a method called on a method's result at another Vec
+        # instance); drop it with that fix.
+        var text: Vec<u8> = self.buf().text(pos(a, 0), pos(b, self.buf().line_len(b)))
+        var t = self.buf().line_term(b)
         if t == Term.NoEol
-            t = if b > 0 then self.buf.line_term(b - 1) else Term.Lf
+            t = if b > 0 then self.buf().line_term(b - 1) else Term.Lf
         text.push_view(term_text(t))
         self.set_register(span_from_vec<u8>(@text), true)
 
@@ -616,18 +709,18 @@ impl Editor
     # cursor on the line that takes their place.
     fn delete_lines(self: @&Editor, a: i64, b: i64)
         self.yank_lines(a, b)
-        if b + 1 < self.buf.line_count()
-            self.buf.delete(pos(a, 0), pos(b + 1, 0))
+        if b + 1 < self.buf().line_count()
+            self.buf_mut().delete(pos(a, 0), pos(b + 1, 0))
         else if a > 0
             # Through the last line: take the terminator before them.
-            self.buf.delete(pos(a - 1, self.buf.line_len(a - 1)), pos(b, self.buf.line_len(b)))
+            self.buf_mut().delete(pos(a - 1, self.buf().line_len(a - 1)), pos(b, self.buf().line_len(b)))
         else
-            self.buf.delete(pos(0, 0), pos(b, self.buf.line_len(b)))
+            self.buf_mut().delete(pos(0, 0), pos(b, self.buf().line_len(b)))
         self.place_line(a)
 
     # True when only blanks come before p on its line (Vim's inindent).
     fn in_indent(self: @Editor, p: Pos) -> bool
-        let s = self.buf.line(p.line)
+        let s = self.buf().line(p.line)
         for i in 0..p.col
             if s[i] != ' ' and s[i] != '\t'
                 return false
@@ -635,7 +728,7 @@ impl Editor
 
     # True when only blanks come from p to its line's end.
     fn blank_after(self: @Editor, p: Pos) -> bool
-        let s = self.buf.line(p.line)
+        let s = self.buf().line(p.line)
         for i in p.col..s.len
             if s[i] != ' ' and s[i] != '\t'
                 return false
@@ -668,13 +761,13 @@ impl Editor
         if t.reach == Reach.Linewise
             self.on_lines(op, a.line, b.line)
             return
-        if t.reach == Reach.Inclusive and b.col < self.buf.line_len(b.line)
-            b = pos(b.line, utf8_next(self.buf.line(b.line), b.col))
+        if t.reach == Reach.Inclusive and b.col < self.buf().line_len(b.line)
+            b = pos(b.line, utf8_next(self.buf().line(b.line), b.col))
         if t.reach == Reach.Exclusive and b.col == 0 and b.line > a.line
             if self.in_indent(a)
                 self.on_lines(op, a.line, b.line - 1)
                 return
-            b = pos(b.line - 1, self.buf.line_len(b.line - 1))
+            b = pos(b.line - 1, self.buf().line_len(b.line - 1))
         if op == Operator.Delete and b.line > a.line and self.in_indent(a) and self.blank_after(b)
             self.on_lines(op, a.line, b.line)
             return
@@ -690,7 +783,7 @@ impl Editor
                 self.take(a, b, true)
                 self.place(a)
             Operator.Change =>
-                self.buf.begin_group()
+                self.buf_mut().begin_group()
                 self.take(a, b, true)
                 self.enter_insert(a)
 
@@ -699,10 +792,10 @@ impl Editor
     fn take(self: @&Editor, a: Pos, b: Pos, cut: bool)
         if not pos_before(a, b)
             return
-        let text = self.buf.text(a, b)
+        let text = self.buf().text(a, b)
         self.set_register(span_from_vec<u8>(@text), false)
         if cut
-            self.buf.delete(a, b)
+            self.buf_mut().delete(a, b)
 
     # An operator over lines a..=b. c leaves one empty line to type on.
     fn on_lines(self: @&Editor, op: Operator, a: i64, b: i64)
@@ -713,9 +806,9 @@ impl Editor
                 if a != self.cursor.line
                     self.cursor = self.vertical(a)
             Operator.Change =>
-                self.buf.begin_group()
+                self.buf_mut().begin_group()
                 self.yank_lines(a, b)
-                self.buf.delete(pos(a, 0), pos(b, self.buf.line_len(b)))
+                self.buf_mut().delete(pos(a, 0), pos(b, self.buf().line_len(b)))
                 self.enter_insert(pos(a, 0))
 
     # p (after) and P (before): put the register `times` over by the
@@ -728,10 +821,10 @@ impl Editor
         let text = span_from_vec<u8>(@repeated)
         if self.reg_lines
             if not after
-                self.buf.insert(pos(l, 0), text)
+                self.buf_mut().insert(pos(l, 0), text)
                 self.place_line(l)
-            else if l + 1 < self.buf.line_count()
-                self.buf.insert(pos(l + 1, 0), text)
+            else if l + 1 < self.buf().line_count()
+                self.buf_mut().insert(pos(l + 1, 0), text)
                 self.place_line(l + 1)
             else
                 # After the last line, which has no terminator: the
@@ -740,14 +833,14 @@ impl Editor
                 var moved: Vec<u8> = vec_new<u8>()
                 moved.push_span(text[body..text.len])
                 moved.push_span(text[0..body])
-                self.buf.insert(pos(l, self.buf.line_len(l)), span_from_vec<u8>(@moved))
+                self.buf_mut().insert(pos(l, self.buf().line_len(l)), span_from_vec<u8>(@moved))
                 self.place_line(l + 1)
             return
         var at = self.cursor
         if after
-            at = pos(l, utf8_next(self.buf.line(l), self.cursor.col))
-        let end = self.buf.insert(at, text)
-        self.place(self.buf.prev_char(end))
+            at = pos(l, utf8_next(self.buf().line(l), self.cursor.col))
+        let end = self.buf_mut().insert(at, text)
+        self.place(self.buf().prev_char(end))
 
     # p (after) or P: by the cursor, or over the selection in Visual mode,
     # where P keeps the register.
@@ -772,7 +865,7 @@ impl Editor
 
     # u, once; false when there was nothing to undo.
     fn undo(self: @&Editor) -> bool
-        match self.buf.undo()
+        match self.buf_mut().undo()
             Some(p) =>
                 self.place(p)
                 true
@@ -782,7 +875,7 @@ impl Editor
 
     # Ctrl-R, once; false when there was nothing to redo.
     fn redo(self: @&Editor) -> bool
-        match self.buf.redo()
+        match self.buf_mut().redo()
             Some(p) =>
                 self.place(p)
                 true
@@ -809,7 +902,7 @@ impl Editor
             from = self.cursor
             to = self.anchor
         if self.mode == Mode.VisualLine
-            return Extent { from: pos(from.line, 0), to: pos(to.line, self.buf.line_len(to.line)) }
+            return Extent { from: pos(from.line, 0), to: pos(to.line, self.buf().line_len(to.line)) }
         Extent { from: from, to: to }
 
     # What the screen draws as selected; None outside Visual mode.
@@ -832,18 +925,18 @@ impl Editor
     # Back to Normal mode, keeping the selection for gv; the cursor back
     # onto a code point.
     fn leave_visual(self: @&Editor)
-        self.last_selection = Some(Selected { anchor: self.anchor, cursor: self.cursor, shape: self.shape() })
+        self.bufs[self.at].last_selection = Some(Selected { anchor: self.anchor, cursor: self.cursor, shape: self.shape() })
         self.mode = Mode.Normal
         self.place(self.cursor)
 
     # gv: the last selection again, its ends moved onto the text as it is
     # now. In Visual mode the current one becomes the last.
     fn reselect(self: @&Editor)
-        let last: Selected = match self.last_selection
+        let last: Selected = match self.bufs[self.at].last_selection
             Some(s) => s
             None => return
         if self.selecting()
-            self.last_selection = Some(Selected { anchor: self.anchor, cursor: self.cursor, shape: self.shape() })
+            self.bufs[self.at].last_selection = Some(Selected { anchor: self.anchor, cursor: self.cursor, shape: self.shape() })
         self.place(last.anchor)
         self.anchor = self.cursor
         self.place(last.cursor)
@@ -854,14 +947,14 @@ impl Editor
         let a = self.anchor
         self.anchor = self.cursor
         self.cursor = a
-        self.want = units_before(self.buf.line(a.line), a.col)
+        self.want = units_before(self.buf().line(a.line), a.col)
 
     # Just past a charwise selection's last end: after its code point, or
     # past its break onto the next line's start. The last shown line's
     # break is the file's final newline, which no selection takes.
     fn past(self: @Editor, to: Pos) -> Pos
-        if to.col < self.buf.line_len(to.line)
-            return pos(to.line, utf8_next(self.buf.line(to.line), to.col))
+        if to.col < self.buf().line_len(to.line)
+            return pos(to.line, utf8_next(self.buf().line(to.line), to.col))
         if to.line < self.last()
             return pos(to.line + 1, 0)
         to
@@ -898,7 +991,7 @@ impl Editor
                 self.yank_lines(e.from.line, e.to.line)
             # The selection's last terminator stays: the put lines' last goes.
             let body = if reg_lines then text[0..text.len - trailing_term_len(text)] else text
-            self.buf.replace(e.from, e.to, body)
+            self.buf_mut().replace(e.from, e.to, body)
             self.place_line(e.from.line)
             return
         let b = self.past(e.to)
@@ -909,11 +1002,11 @@ impl Editor
             var broken: Vec<u8> = vec_with_cap<u8>(text.len + 2)
             broken.push_span(text[text.len - trailing_term_len(text)..text.len])
             broken.push_span(text)
-            self.buf.replace(e.from, b, span_from_vec<u8>(@broken))
+            self.buf_mut().replace(e.from, b, span_from_vec<u8>(@broken))
             self.place_line(e.from.line + 1)
             return
-        let end = self.buf.replace(e.from, b, text)
-        self.place(self.buf.prev_char(end))
+        let end = self.buf_mut().replace(e.from, b, text)
+        self.place(self.buf().prev_char(end))
 
     # ------------------------------------------------------------------
     # Search
@@ -931,7 +1024,7 @@ impl Editor
         let cur = self.cursor
         for k in 0..=n
             let l = if forward then (cur.line + k) % n else (cur.line - k + n) % n
-            let s = self.buf.line(l)
+            let s = self.buf().line(l)
             var hit: Option<i64> = None
             if forward
                 hit = find_from(s, pat, if k == 0 then cur.col + 1 else 0)
@@ -973,9 +1066,9 @@ impl Editor
         var msg = string_from("\"")
         msg.push_str(path)
         msg.push_str("\" ")
-        msg.push_i64(if self.buf.byte_len() == 0 then 0 else self.shown())
+        msg.push_i64(if self.buf().byte_len() == 0 then 0 else self.shown())
         msg.push_str("L, ")
-        msg.push_i64(self.buf.byte_len())
+        msg.push_i64(self.buf().byte_len())
         msg.push('B')
         msg
 
@@ -987,17 +1080,578 @@ impl Editor
         self.say(msg.as_view())
 
 # ============================================================================
+# Buffers and windows
+# ============================================================================
+
+# The lines a window that isn't current shows of `b`: all but the empty one
+# after a final newline (the current window's are shown(), which knows
+# about the line an Insert-mode Enter just split off).
+fn shown_in(b: @Buffer) -> i64
+    let n = b.line_count()
+    if b.has_final_newline() then n - 1 else n
+
+# p moved onto the lines a window shows of `b`, at a Normal-mode column.
+fn settle(b: @Buffer, p: Pos) -> Pos
+    var last = shown_in(b) - 1
+    if last < 0
+        last = 0
+    let l = if p.line > last then last else if p.line < 0 then 0 else p.line
+    let s = b.line(l)
+    pos(l, normal_col(s, if p.col > s.len then s.len else p.col))
+
+# Byte offset `o` moved through `b`'s changes since forget_changes().
+fn shifted(b: @Buffer, o: i64) -> i64
+    let changes = b.changes()
+    var at = o
+    for i in 0..changes.len
+        at = changes[i].shift(at)
+    at
+
+# A buffer's name as :ls and E162 show it.
+fn display_name(path: StrView) -> StrView
+    if path.is_empty() then "[No Name]" else path
+
+# True when `o` is `n`.
+fn holds(o: Option<i64>, n: i64) -> bool
+    match o
+        Some(v) => v == n
+        None => false
+
+# True when `text` is digits only, and some.
+fn all_digits(text: StrView) -> bool
+    if text.is_empty()
+        return false
+    for i in 0..text.len()
+        let c = text.get(i)
+        if c < '0' or c > '9'
+            return false
+    true
+
+impl Editor
+    # ------------------------------------------------------------------
+    # The buffer list. Methods the generic command functions call are pub
+    # for the reason say() gives.
+    # ------------------------------------------------------------------
+
+    pub fn buffer_count(self: @Editor) -> i64
+        self.bufs.len()
+
+    # Buffer k of the list (by number): its number, text and file name.
+    pub fn buffer_number_at(self: @Editor, k: i64) -> i64
+        self.bufs[k].number
+
+    pub fn buffer_at(self: @Editor, k: i64) -> @Buffer
+        @self.bufs[k].buf
+
+    pub fn buffer_path_at(self: @Editor, k: i64) -> StrView
+        self.bufs[k].path.as_view()
+
+    # Where buffer `number` is in the list, if it is.
+    pub fn find_buffer(self: @Editor, number: i64) -> Option<i64>
+        for k in 0..self.bufs.len()
+            if self.bufs[k].number == number
+                return Some(k)
+        None
+
+    # Where buffer `number` is in the list, a buffer a window shows: always
+    # listed (delete_buffer moves its windows off it first).
+    fn slot_of(self: @Editor, number: i64) -> i64
+        self.find_buffer(number).unwrap_or(self.at)
+
+    # Where the buffer of file `path` is in the list, if it has one.
+    pub fn find_path(self: @Editor, path: StrView) -> Option<i64>
+        for k in 0..self.bufs.len()
+            if self.bufs[k].path.as_view().eq(path)
+                return Some(k)
+        None
+
+    # A new buffer for `path` at the end of the list; its number.
+    pub fn add_buffer(self: @&Editor, path: StrView, buf: Buffer) -> i64
+        let n = self.next_number
+        self.next_number += 1
+        self.bufs.push(listed(n, buf, string_from(path)))
+        n
+
+    # The current window shows buffer `number`, the cursor where a window
+    # last left it; the buffer it showed becomes its alternate.
+    pub fn show(self: @&Editor, number: i64)
+        let k: i64 = match self.find_buffer(number)
+            Some(found) => found
+            None => return
+        if k == self.at
+            return
+        self.bufs[self.at].cursor = self.cursor
+        self.wins[self.cur].alt = Some(self.bufs[self.at].number)
+        self.wins[self.cur].number = number
+        self.at = k
+        self.top = 0
+        let back = self.bufs[k].cursor
+        self.place(back)
+
+    # The buffer number `arg` names for :b and :bd: the number typed
+    # (listed or not), or the one buffer whose name it is or is part of.
+    # None, said, when a name matches several (E93) or none (E94).
+    pub fn number_named(self: @&Editor, arg: StrView) -> Option<i64>
+        if all_digits(arg)
+            return arg.parse_i64()
+        var found: i64 = -1
+        var matches: i64 = 0
+        for k in 0..self.bufs.len()
+            let name = self.bufs[k].path.as_view()
+            if name.eq(arg)
+                return Some(self.bufs[k].number)
+            if name.contains(arg)
+                found = k
+                matches += 1
+        if matches == 1
+            return Some(self.bufs[found].number)
+        var msg = string_from(if matches > 1 then "E93: More than one match for " else "E94: No matching buffer for ")
+        msg.push_str(arg)
+        self.say(msg.as_view())
+        None
+
+    # :b [N | name]: show that buffer (E86 for a number with none).
+    pub fn go_to_buffer(self: @&Editor, arg: StrView)
+        if arg.is_empty()
+            return
+        let n: i64 = match self.number_named(arg)
+            Some(named) => named
+            None => return
+        if self.find_buffer(n).is_none()
+            var msg = string_from("E86: Buffer ")
+            msg.push_i64(n)
+            msg.push_str(" does not exist")
+            self.say(msg.as_view())
+            return
+        self.show(n)
+
+    # :bn (forward) and :bp: the next or previous buffer in the list,
+    # round past the ends.
+    pub fn go_round_buffers(self: @&Editor, forward: bool)
+        let n = self.bufs.len()
+        let k = if forward then (self.at + 1) % n else (self.at + n - 1) % n
+        self.show(self.bufs[k].number)
+
+    # True when a window shows buffer `number`.
+    fn shown_anywhere(self: @Editor, number: i64) -> bool
+        for w in 0..self.wins.len()
+            if self.wins[w].number == number
+                return true
+        false
+
+    # :ls: a line per buffer in Vim's columns (number; `%` current or `#`
+    # alternate; `a` shown or `h` hidden; `+` changed; the name in quotes;
+    # its cursor line from column 40), as a message that waits for a key.
+    pub fn list_buffers(self: @&Editor)
+        var msg = string_new()
+        for k in 0..self.bufs.len()
+            if k > 0
+                msg.push('\n')
+            let number = self.bufs[k].number
+            var line = string_new()
+            if number < 100
+                line.push(' ')
+            if number < 10
+                line.push(' ')
+            line.push_i64(number)
+            line.push(' ')
+            line.push(if k == self.at then '%' else if holds(self.wins[self.cur].alt, number) then '#' else ' ')
+            line.push(if self.shown_anywhere(number) then 'a' else 'h')
+            line.push(' ')
+            line.push(if self.bufs[k].buf.is_dirty() then '+' else ' ')
+            line.push_str(" \"")
+            line.push_str(display_name(self.bufs[k].path.as_view()))
+            line.push('"')
+            var width = units_before(span_from_strview(line.as_view()), line.len())
+            line.push(' ')
+            width += 1
+            while width < 40
+                line.push(' ')
+                width += 1
+            line.push_str("line ")
+            var cursor = self.bufs[k].cursor
+            if k == self.at
+                cursor = self.cursor
+            line.push_i64(cursor.line + 1)
+            msg.push_str(line.as_view())
+        self.say(msg.as_view())
+
+    # The first buffer but the current one with pending edits, if any.
+    fn changed_other(self: @Editor) -> Option<i64>
+        for k in 0..self.bufs.len()
+            if k != self.at and self.bufs[k].buf.is_dirty()
+                return Some(k)
+        None
+
+    # The buffer the current window shows when buffer `number` goes: its
+    # alternate, else the next in the list, else the one before, else a
+    # new empty buffer.
+    fn heir_of(self: @&Editor, number: i64) -> i64
+        match self.wins[self.cur].alt
+            Some(alt) =>
+                if alt != number and self.find_buffer(alt).is_some()
+                    return alt
+            None => pass
+        let k = self.slot_of(number)
+        if k + 1 < self.bufs.len()
+            return self.bufs[k + 1].number
+        if k > 0
+            return self.bufs[k - 1].number
+        self.add_buffer("", buffer_new())
+
+    # :bd[!] [N | name]: that buffer (this one when `arg` is empty) off the
+    # list, refused with pending edits unless `force` (E89). Its other
+    # windows close; the current window, if it shows it, shows heir_of's.
+    pub fn delete_buffer(self: @&Editor, arg: StrView, force: bool)
+        var number = self.buffer_number()
+        if not arg.is_empty()
+            number = match self.number_named(arg)
+                Some(named) => named
+                None => return
+            if self.find_buffer(number).is_none()
+                var msg = string_from(if force then "E516: No buffers were deleted: bd! " else "E516: No buffers were deleted: bd ")
+                msg.push_str(arg)
+                self.say(msg.as_view())
+                return
+        if self.bufs[self.slot_of(number)].buf.is_dirty() and not force
+            var msg = string_from("E89: No write since last change for buffer ")
+            msg.push_i64(number)
+            msg.push_str(" (add ! to override)")
+            self.say(msg.as_view())
+            return
+        let order = self.layout.order()
+        for i in 0..order.len()
+            let w = self.window_slot(order.get(i))
+            if w != self.cur and self.wins[w].number == number
+                let closed = self.close_window(w)
+        if self.wins[self.cur].number == number
+            let heir = self.heir_of(number)
+            self.show(heir)
+        for w in 0..self.wins.len()
+            if holds(self.wins[w].alt, number)
+                self.wins[w].alt = None
+        # Off the list, the rest kept in order.
+        let gone = self.slot_of(number)
+        var after: Vec<Listed> = vec_new<Listed>()
+        while self.bufs.len() > gone + 1
+            after.push(self.bufs.pop())
+        let dropped = self.bufs.pop()
+        while after.len() > 0
+            self.bufs.push(after.pop())
+        self.at = self.slot_of(self.wins[self.cur].number)
+
+    # ------------------------------------------------------------------
+    # Windows
+    # ------------------------------------------------------------------
+
+    # A new terminal size: the windows share it out again.
+    pub fn resize(self: @&Editor, size: Size)
+        self.size = size
+
+    # The area the windows share: all of the terminal but the command line.
+    fn area(self: @Editor) -> Rect
+        let rows = self.size.rows as i64 - 1
+        rect(0, 0, if rows > 0 then rows else 0, self.size.cols as i64)
+
+    # Each window's rectangle (its status line its last row), in order,
+    # and the separators.
+    pub fn tiling(self: @Editor) -> Tiling
+        self.layout.tile(self.area())
+
+    # The current window's text rows: what Ctrl-F and Ctrl-B turn over.
+    pub fn page(self: @Editor) -> i64
+        let t = self.tiling()
+        match t.rect_of(self.wins[self.cur].id)
+            Some(r) => if r.rows > 2 then r.rows - 1 else 1
+            None => 1
+
+    pub fn window_count(self: @Editor) -> i64
+        self.wins.len()
+
+    # The index of window `id`, if there is one.
+    pub fn find_window(self: @Editor, id: i64) -> Option<i64>
+        for w in 0..self.wins.len()
+            if self.wins[w].id == id
+                return Some(w)
+        None
+
+    # The index of window `id`, an id the layout gave: always a window.
+    fn window_slot(self: @Editor, id: i64) -> i64
+        self.find_window(id).unwrap_or(self.cur)
+
+    # The index of the k-th window in order (top left first).
+    pub fn window_at(self: @Editor, k: i64) -> i64
+        let order = self.layout.order()
+        self.window_slot(order.get(k))
+
+    # Where the current window is in order.
+    pub fn current_window(self: @Editor) -> i64
+        let order = self.layout.order()
+        let id = self.wins[self.cur].id
+        for k in 0..order.len()
+            if order.get(k) == id
+                return k
+        0
+
+    # Window w (an index): its layout id, whether it is the current one,
+    # its buffer, cursor, top line, and status line.
+    pub fn window_id(self: @Editor, w: i64) -> i64
+        self.wins[w].id
+
+    pub fn is_current(self: @Editor, w: i64) -> bool
+        w == self.cur
+
+    pub fn window_number(self: @Editor, w: i64) -> i64
+        self.wins[w].number
+
+    pub fn window_buffer(self: @Editor, w: i64) -> @Buffer
+        @self.bufs[self.slot_of(self.wins[w].number)].buf
+
+    pub fn window_path(self: @Editor, w: i64) -> StrView
+        self.bufs[self.slot_of(self.wins[w].number)].path.as_view()
+
+    pub fn window_cursor(self: @Editor, w: i64) -> Pos
+        if w == self.cur
+            return self.cursor
+        self.wins[w].cursor
+
+    pub fn window_top(self: @Editor, w: i64) -> i64
+        if w == self.cur then self.top else self.wins[w].top
+
+    # The renderer scrolled window w to `top`.
+    pub fn set_window_top(self: @&Editor, w: i64, top: i64)
+        if w == self.cur
+            self.top = top
+        else
+            self.wins[w].top = top
+
+    # The lines window w shows.
+    pub fn window_lines(self: @Editor, w: i64) -> i64
+        if w == self.cur then self.shown() else shown_in(self.window_buffer(w))
+
+    pub fn window_status(self: @Editor, w: i64) -> Status
+        if w == self.cur
+            return self.status()
+        Status { name: self.window_path(w), dirty: self.window_buffer(w).is_dirty(), mode: Mode.Normal, lang: "" }
+
+    # Store the current window's cursor, want and top into its Window, and
+    # note its buffer's cursor, before another window becomes current.
+    fn park(self: @&Editor)
+        self.wins[self.cur].cursor = self.cursor
+        self.wins[self.cur].want = self.want
+        self.wins[self.cur].top = self.top
+        self.bufs[self.at].cursor = self.cursor
+
+    # Window w current: its buffer, cursor, want and top loaded. The one
+    # current before must be parked (or closed) first.
+    fn enter(self: @&Editor, w: i64)
+        self.cur = w
+        self.at = self.slot_of(self.wins[w].number)
+        self.cursor = self.wins[w].cursor
+        self.want = self.wins[w].want
+        self.top = self.wins[w].top
+
+    # To window `id`, when it is another.
+    fn go_to_window(self: @&Editor, id: i64)
+        let w = self.window_slot(id)
+        if w == self.cur
+            return
+        self.park()
+        self.enter(w)
+
+    # :sp, :vs, Ctrl-W s, Ctrl-W v: a new window above (Stack) or to the
+    # left (Row), current, onto the current buffer with the same cursor and
+    # a copy of the jump stack. False, said (E36), when a window would be
+    # left without a text row.
+    pub fn split(self: @&Editor, how: Split) -> bool
+        let id = self.next_id
+        if not self.layout.split(self.wins[self.cur].id, id, how)
+            return false
+        if not self.tiling().fits()
+            let undone = self.layout.remove(id)
+            self.say(MSG_NO_ROOM)
+            return false
+        self.next_id += 1
+        self.park()
+        let jumps = Jumps { list: self.wins[self.cur].jumps.list.clone(), paths: self.wins[self.cur].jumps.paths.clone() }
+        self.wins.push(Window { id: id, number: self.wins[self.cur].number, alt: self.wins[self.cur].alt, cursor: self.cursor, want: self.want, top: self.top, jumps: jumps })
+        self.enter(self.wins.len() - 1)
+        true
+
+    # Window w gone from `wins` (the layout let it go already): the last
+    # window takes its index.
+    fn forget_window(self: @&Editor, w: i64)
+        let last = self.wins.len() - 1
+        if w == last
+            let gone = self.wins.pop()
+            return
+        let moved = self.wins.pop()
+        let gone = self.wins.replace(w, moved)
+        if self.cur == last
+            self.cur = w
+
+    # Close window w (an index). Closing the current one makes the window
+    # that takes its room current. False, said (E444), for the last window.
+    pub fn close_window(self: @&Editor, w: i64) -> bool
+        let heir: i64 = match self.layout.remove(self.wins[w].id)
+            Some(h) => h
+            None =>
+                self.say(MSG_LAST_WINDOW)
+                return false
+        if w != self.cur
+            self.forget_window(w)
+            return true
+        self.park()
+        self.forget_window(w)
+        self.enter(self.window_slot(heir))
+        true
+
+    # :close, Ctrl-W c.
+    pub fn close_current(self: @&Editor)
+        let closed = self.close_window(self.cur)
+
+    # :only, Ctrl-W o: every other window closed.
+    pub fn only(self: @&Editor)
+        let order = self.layout.order()
+        let here = self.wins[self.cur].id
+        for k in 0..order.len()
+            if order.get(k) != here
+                let closed = self.close_window(self.window_slot(order.get(k)))
+
+    # Ctrl-W h j k l: `count` windows (at least one) `dir`, as far as there
+    # are, as Vim's go: through the cell past the window's edge in the
+    # cursor's screen row or column (its code-point column past the gutter;
+    # horizontal scrolling and wide cells aside).
+    fn go_direction(self: @&Editor, dir: Dir, count: i64)
+        let n = if count > 0 then count else 1
+        for i in 0..n
+            let t = self.tiling()
+            let id = self.wins[self.cur].id
+            let r: Rect = match t.rect_of(id)
+                Some(found) => found
+                None => return
+            var down = self.cursor.line - self.top
+            if down > r.rows - 2
+                down = r.rows - 2
+            if down < 0
+                down = 0
+            let s = self.buf().line(self.cursor.line)
+            var col = r.col + gutter_width(self.shown(), r.cols) + units_before(s, self.cursor.col)
+            if col > r.col + r.cols - 1
+                col = r.col + r.cols - 1
+            match t.neighbour(id, dir, r.row + down, col)
+                Some(next) => self.go_to_window(next)
+                None => return
+
+    # Ctrl-W w (forward) and W: the next or previous window in order, round
+    # past the ends; with a count, window `count` (the last when there are
+    # fewer).
+    fn go_round(self: @&Editor, forward: bool, count: i64)
+        let order = self.layout.order()
+        let n = order.len()
+        var k: i64 = 0
+        if count > 0
+            k = if count > n then n - 1 else count - 1
+        else
+            let here = self.current_window()
+            k = if forward then (here + 1) % n else (here + n - 1) % n
+        self.go_to_window(order.get(k))
+
+    # :q, :q!, :wq and Ctrl-W q: close the window, or in the last one quit,
+    # which unless `force` is refused while any buffer has pending edits:
+    # E37 for this one, else E162 for the first other, which it shows.
+    pub fn quit_window(self: @&Editor, force: bool)
+        if self.wins.len() > 1
+            self.close_current()
+            return
+        if not force
+            if self.buf().is_dirty()
+                self.say(MSG_NOT_SAVED)
+                return
+            match self.changed_other()
+                Some(k) =>
+                    var msg = string_from("E162: No write since last change for buffer \"")
+                    msg.push_str(display_name(self.bufs[k].path.as_view()))
+                    msg.push('"')
+                    self.show(self.bufs[k].number)
+                    self.say(msg.as_view())
+                    return
+                None => pass
+        self.quit = true
+
+    # A window command (Ctrl-W and a key).
+    pub fn window_command(self: @&Editor, wc: WindowCommand, count: i64)
+        match wc
+            WindowCommand.Left => self.go_direction(Dir.Left, count)
+            WindowCommand.Down => self.go_direction(Dir.Down, count)
+            WindowCommand.Up => self.go_direction(Dir.Up, count)
+            WindowCommand.Right => self.go_direction(Dir.Right, count)
+            WindowCommand.Next => self.go_round(true, count)
+            WindowCommand.Previous => self.go_round(false, count)
+            WindowCommand.Split =>
+                let made = self.split(Split.Stack)
+            WindowCommand.VSplit =>
+                let made = self.split(Split.Row)
+            WindowCommand.Close => self.close_current()
+            WindowCommand.Only => self.only()
+            WindowCommand.Quit => self.quit_window(false)
+
+    # ------------------------------------------------------------------
+    # Other windows onto the current buffer follow its edits
+    # ------------------------------------------------------------------
+
+    # Before a key: the other windows onto the current buffer, their
+    # cursors and tops as byte offsets, and the buffer's change notes from
+    # before cleared.
+    pub fn before_key(self: @&Editor)
+        self.buf_mut().forget_changes()
+        self.watched.clear()
+        let number = self.wins[self.cur].number
+        for w in 0..self.wins.len()
+            if w != self.cur and self.wins[w].number == number
+                let c = self.wins[w].cursor
+                let t = self.wins[w].top
+                let co = self.bufs[self.at].buf.offset_of(c)
+                let to = self.bufs[self.at].buf.offset_of(pos(t, 0))
+                self.watched.push(Watched { id: self.wins[w].id, number: number, cursor: co, top: to })
+
+    # After it: each watched window moved through the buffer's changes,
+    # then every buffer's notes cleared.
+    pub fn after_key(self: @&Editor)
+        for i in 0..self.watched.len()
+            let wt = self.watched.get(i)
+            let k: i64 = match self.find_buffer(wt.number)
+                Some(found) => found
+                None => continue
+            let w: i64 = match self.find_window(wt.id)
+                Some(found) => found
+                None => continue
+            if w != self.cur and self.wins[w].number == wt.number and self.bufs[k].buf.changes().len > 0
+                let c = shifted(@self.bufs[k].buf, wt.cursor)
+                let t = shifted(@self.bufs[k].buf, wt.top)
+                let at = self.bufs[k].buf.pos_at(c)
+                let top = self.bufs[k].buf.pos_at(t)
+                let p = settle(@self.bufs[k].buf, at)
+                self.wins[w].cursor = p
+                self.wins[w].want = units_before(self.bufs[k].buf.line(p.line), p.col)
+                self.wins[w].top = top.line
+        for k in 0..self.bufs.len()
+            self.bufs[k].buf.forget_changes()
+
+# ============================================================================
 # Keys
 # ============================================================================
 
 # Apply one typed key. `files` loads and saves for `:e` and `:w`.
 pub fn handle_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
     ed.message.clear()
+    ed.before_key()
     match ed.mode
         Mode.Normal => normal_key<F>(ed, files, key, Keymap.Normal)
         Mode.Visual | Mode.VisualLine => normal_key<F>(ed, files, key, Keymap.Visual)
         Mode.Insert => ed.insert_key(key)
         Mode.CommandLine => command_line_key<F>(ed, files, key)
+    ed.after_key()
 
 # A key of a Normal- or Visual-mode command; run it once complete.
 fn normal_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key, map: Keymap)
@@ -1014,6 +1668,8 @@ fn repeat_search(ed: @&Editor, forward: bool, times: i64)
 # Run one Normal- or Visual-mode command (core/normal.ritz decoded it). A
 # count repeats u, Ctrl-R, n, N, Ctrl-F, Ctrl-B and Ctrl-O until one fails;
 # i, a, o, O, :, /, K, gd and the Visual commands but p and P take none.
+# A window command takes its count as Vim's does (Ctrl-W w: that window;
+# Ctrl-W j: that many down); its others ignore it.
 fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
     let times = cmd.times()
     let l = ed.cursor.line
@@ -1021,13 +1677,13 @@ fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
         Action.Move(m) => ed.move_by(m, cmd.count)
         Action.Operate(op, m) => ed.operate(op, m, cmd.count)
         Action.Insert => ed.start_insert(ed.cursor)
-        Action.Append => ed.start_insert(pos(l, utf8_next(ed.buf.line(l), ed.cursor.col)))
+        Action.Append => ed.start_insert(pos(l, utf8_next(ed.buf().line(l), ed.cursor.col)))
         Action.OpenBelow =>
             ed.start_insert(ed.cursor)
-            ed.cursor = ed.buf.split_line(pos(l, ed.buf.line_len(l)))
+            ed.cursor = ed.buf_mut().split_line(pos(l, ed.buf().line_len(l)))
         Action.OpenAbove =>
             ed.start_insert(pos(l, 0))
-            ed.buf.split_line(pos(l, 0))
+            ed.buf_mut().split_line(pos(l, 0))
         Action.PutAfter => ed.put_key(true, times)
         Action.PutBefore => ed.put_key(false, times)
         Action.Undo =>
@@ -1059,6 +1715,7 @@ fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
         Action.SwapEnds => ed.swap_ends()
         Action.OperateSelection(op) => ed.operate_selection(op)
         Action.Leave => ed.leave_visual()
+        Action.Window(wc) => ed.window_command(wc, cmd.count)
 
 fn command_line_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
     match key
@@ -1100,41 +1757,51 @@ fn run_command<F: FileStore>(ed: @&Editor, files: @&F, text: StrView)
             Command.Write => write_named<F>(ed, files)
             Command.WriteTo(p) =>
                 # A copy, unless the buffer has no name yet or it is this one.
-                let own = ed.path.is_empty() or ed.path.as_view().eq(p)
-                if ed.path.is_empty()
-                    ed.path.push_str(p)
+                let own = ed.path().is_empty() or ed.path().eq(p)
+                if ed.path().is_empty()
+                    ed.name_buffer(p)
                 write<F>(ed, files, p, own)
             Command.WriteQuit =>
                 if write_named<F>(ed, files)
-                    ed.quit = true
-            Command.Quit =>
-                if ed.buf.is_dirty()
-                    ed.say(MSG_NOT_SAVED)
-                else
-                    ed.quit = true
-            Command.ForceQuit => ed.quit = true
+                    ed.quit_window(false)
+            Command.Quit => ed.quit_window(false)
+            Command.ForceQuit => ed.quit_window(true)
             Command.Edit(p) =>
                 let opened = edit<F>(ed, files, p)
+            Command.List => ed.list_buffers()
+            Command.Buffer(arg) => ed.go_to_buffer(arg)
+            Command.BufferNext => ed.go_round_buffers(true)
+            Command.BufferPrev => ed.go_round_buffers(false)
+            Command.BufferDelete(arg, force) => ed.delete_buffer(arg, force)
+            Command.Split(p) => split_edit<F>(ed, files, Split.Stack, p)
+            Command.VSplit(p) => split_edit<F>(ed, files, Split.Row, p)
+            Command.Close => ed.close_current()
+            Command.Only => ed.only()
         None =>
             var msg = string_from("E492: Not an editor command: ")
             msg.push_str(text)
             ed.say(msg.as_view())
 
+# :sp and :vs: a new window; with a path, the file in it as :e would.
+fn split_edit<F: FileStore>(ed: @&Editor, files: @&F, how: Split, path: StrView)
+    if ed.split(how) and not path.is_empty()
+        let opened = edit<F>(ed, files, path)
+
 # Save to the buffer's own name; true when saved.
 fn write_named<F: FileStore>(ed: @&Editor, files: @&F) -> bool
-    if ed.path.is_empty()
+    if ed.path().is_empty()
         ed.say(MSG_NO_NAME)
         return false
-    let path = string_from(ed.path.as_view())
+    let path = string_from(ed.path())
     write<F>(ed, files, path.as_view(), true)
 
 # Save the buffer to `path`, marking it clean when `own` (the buffer's own
 # file). On failure it stays dirty. True when saved.
 fn write<F: FileStore>(ed: @&Editor, files: @&F, path: StrView, own: bool) -> bool
-    match files.save(path, @ed.buf)
+    match files.save(path, ed.buf())
         Ok(_) =>
             if own
-                ed.buf.mark_saved()
+                ed.buf_mut().mark_saved()
             var msg = ed.file_info(path)
             msg.push_str(" written")
             ed.say(msg.as_view())
@@ -1153,40 +1820,78 @@ fn write<F: FileStore>(ed: @&Editor, files: @&F, path: StrView, own: bool) -> bo
                     ed.say_about(path, what.as_view())
             false
 
-# `:e path`: replace the buffer with the file, refused with pending edits.
-# A missing file opens empty under its name.
-# True when the file is now the buffer.
+# `:e path`: show the file's buffer, read into a new one when it has none
+# (the buffer shown before stays in the list, pending edits and all). A
+# missing file opens empty under its name. True when the file is shown.
 fn edit<F: FileStore>(ed: @&Editor, files: @&F, path: StrView) -> bool
     if path.is_empty()
         ed.say(MSG_NO_NAME)
         return false
-    if ed.buf.is_dirty()
-        ed.say(MSG_NOT_SAVED)
-        return false
+    match ed.find_path(path)
+        Some(k) =>
+            ed.show(ed.buffer_number_at(k))
+            let info = ed.file_info(path)
+            ed.say(info.as_view())
+            return true
+        None => pass
     match files.load(path)
         Ok(bytes) =>
-            ed.replace_buffer(buffer_from_bytes(span_from_vec<u8>(@bytes)))
+            let n = ed.add_buffer(path, buffer_from_bytes(span_from_vec<u8>(@bytes)))
+            ed.show(n)
             let info = ed.file_info(path)
             ed.say(info.as_view())
         Err(e) =>
             match e
                 LoadError.NotFound =>
-                    ed.replace_buffer(buffer_new())
+                    let n = ed.add_buffer(path, buffer_new())
+                    ed.show(n)
                     ed.say_about(path, " [New]")
                 LoadError.Failed(errno) =>
                     var what = string_from(": ")
                     what.push_str(errno.message())
                     ed.say_about(path, what.as_view())
                     return false
-    ed.path.clear()
-    ed.path.push_str(path)
-    ed.top = 0
-    ed.place(pos(0, 0))
     true
 
 # ============================================================================
 # Jumps (go to definition and back)
 # ============================================================================
+
+impl Jumps
+    fn depth(self: @Jumps) -> i64
+        self.list.len()
+
+    # Remember the cursor `at` in file `path`; past MAX_JUMPS the oldest
+    # goes.
+    fn push(self: @&Jumps, path: StrView, at: Pos)
+        if self.list.len() >= MAX_JUMPS
+            # Drop the oldest: its name leaves the front of the pool.
+            let old = self.list.get(0)
+            var kept: Vec<Jump> = vec_with_cap<Jump>(MAX_JUMPS)
+            for i in 1..self.list.len()
+                var j = self.list.get(i)
+                j.path_at -= old.path_len
+                kept.push(j)
+            self.list = kept
+            let all: [u8] = self.paths[0..self.paths.len()]
+            let rest = all.len - old.path_len
+            all[0..rest].copy_from(all[old.path_len..all.len])
+            while self.paths.len() > rest
+                self.paths.pop()
+        let start = self.paths.len()
+        self.paths.push_view(path)
+        self.list.push(Jump { path_at: start, path_len: path.len(), at: at })
+
+    # The newest jump, taken off: its file name and cursor.
+    fn pop(self: @&Jumps) -> Option<JumpBack>
+        if self.list.is_empty()
+            return None
+        let j = self.list.pop()
+        let all: [u8] = self.paths[j.path_at..j.path_at + j.path_len]
+        let back = JumpBack { path: string_from(all.as_strview()), at: j.at }
+        while self.paths.len() > j.path_at
+            self.paths.pop()
+        Some(back)
 
 impl Editor
     # K or gd since the last call, cleared.
@@ -1195,76 +1900,59 @@ impl Editor
         self.ask = LangAsk.Nothing
         a
 
-    # How many jumps Ctrl-O / Ctrl-T can go back.
+    # How many jumps Ctrl-O / Ctrl-T can go back in the current window.
     pub fn jump_depth(self: @Editor) -> i64
-        self.jumps.len()
+        self.wins[self.cur].jumps.depth()
 
     # Remember the cursor and file, to come back to. pub only for the
     # generic jump_to<F> (see say()).
     pub fn push_jump(self: @&Editor)
-        if self.jumps.len() >= MAX_JUMPS
-            # Drop the oldest: its name leaves the front of the pool.
-            let old = self.jumps.get(0)
-            var kept: Vec<Jump> = vec_with_cap<Jump>(MAX_JUMPS)
-            for i in 1..self.jumps.len()
-                var j = self.jumps.get(i)
-                j.path_at -= old.path_len
-                kept.push(j)
-            self.jumps = kept
-            let all: [u8] = self.jump_paths[0..self.jump_paths.len()]
-            let rest = all.len - old.path_len
-            all[0..rest].copy_from(all[old.path_len..all.len])
-            while self.jump_paths.len() > rest
-                self.jump_paths.pop()
-        let at = self.jump_paths.len()
-        self.jump_paths.push_view(self.path.as_view())
-        self.jumps.push(Jump { path_at: at, path_len: self.path.len(), at: self.cursor })
+        let path = string_from(self.path())
+        self.wins[self.cur].jumps.push(path.as_view(), self.cursor)
 
     # The newest jump, taken off: its file name and cursor. pub only for
     # the generic jump_back<F>.
     pub fn pop_jump(self: @&Editor) -> Option<JumpBack>
-        if self.jumps.is_empty()
-            return None
-        let j = self.jumps.pop()
-        let all: [u8] = self.jump_paths[j.path_at..j.path_at + j.path_len]
-        let back = JumpBack { path: string_from(all.as_strview()), at: j.at }
-        while self.jump_paths.len() > j.path_at
-            self.jump_paths.pop()
-        Some(back)
+        self.wins[self.cur].jumps.pop()
 
     # Put back a jump pop_jump gave, as it was. pub for jump_back<F>.
     pub fn restore_jump(self: @&Editor, j: @JumpBack)
-        let at = self.jump_paths.len()
-        self.jump_paths.push_view(j.path.as_view())
-        self.jumps.push(Jump { path_at: at, path_len: j.path.len(), at: j.at })
+        self.wins[self.cur].jumps.push(j.path.as_view(), j.at)
+
+    # Name the current buffer `path` (`:w path` on a buffer with none).
+    # pub for the generic run_command<F>.
+    pub fn name_buffer(self: @&Editor, path: StrView)
+        self.bufs[self.at].path.clear()
+        self.bufs[self.at].path.push_str(path)
 
 # A jump taken off the stack (Editor.pop_jump).
 pub struct JumpBack
     path: String
     at: Pos
 
-# Go to `at` in the file `path` (this buffer's when it names it),
-# remembering where the cursor was for Ctrl-O / Ctrl-T. Another file is
-# opened as `:e` would, so pending edits refuse it (E37). True when there.
+# Go to `at` in the file `path` (the current buffer when it names it),
+# remembering where the cursor was for Ctrl-O / Ctrl-T. Another file's
+# buffer is shown as `:e` would, read only when it has none. True when
+# there.
 pub fn jump_to<F: FileStore>(ed: @&Editor, files: @&F, path: StrView, at: Pos) -> bool
     ed.push_jump()
-    if not ed.path.as_view().eq(path)
+    if not ed.path().eq(path)
         if not edit<F>(ed, files, path)
             let dropped = ed.pop_jump()
             return false
     ed.place(at)
     true
 
-# Ctrl-O / Ctrl-T: back to where the last jump_to left from. A file that
-# can't be reopened (pending edits) keeps the jump for another try. True
-# when back.
+# Ctrl-O / Ctrl-T: back to where the last jump_to left from, in that file's
+# buffer (read again only when it was deleted). A file that can't be read
+# keeps the jump for another try. True when back.
 fn jump_back<F: FileStore>(ed: @&Editor, files: @&F) -> bool
     let j: JumpBack = match ed.pop_jump()
         Some(b) => b
         None =>
             ed.say(MSG_NO_JUMP)
             return false
-    if not ed.path.as_view().eq(j.path.as_view())
+    if not ed.path().eq(j.path.as_view())
         if not edit<F>(ed, files, j.path.as_view())
             ed.restore_jump(@j)
             return false

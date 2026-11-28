@@ -2,7 +2,10 @@
 #
 # The first-release list is fixed in docs/BUDDHAFINGER_PROPOSAL.md ("First
 # usable release"): `:w`, `:w <path>`, `:q`, `:q!`, `:wq`, `:e <path>` and
-# `:<line>`. core/editor.ritz runs them.
+# `:<line>`. Buffers and windows come with everyday editing (AGAST #4912):
+# `:ls`, `:b`, `:bn`, `:bp`, `:bd`, `:sp`, `:vs`, `:close` and `:only`,
+# each under Vim's names and abbreviations (`:bn` is `:bnext`, `:clo` is
+# `:close`). core/editor.ritz runs them.
 # Core module: no terminal or OS I/O (see src/platform/).
 
 import ritzlib.option { Option }
@@ -16,18 +19,40 @@ pub enum Command
     WriteQuit
     Edit(StrView)       # `:e <path>`; the path is empty for a bare `:e`
     Goto(i64)           # `:<line>`, 1-based as typed
+    List                # `:ls`, `:buffers`, `:files`
+    Buffer(StrView)     # `:b [N | name]`; empty for a bare `:b`
+    BufferNext          # `:bn`
+    BufferPrev          # `:bp`, `:bN`
+    BufferDelete(StrView, bool)     # `:bd[!] [N]`: the buffer (empty: this one), and the `!`
+    Split(StrView)      # `:sp [path]`
+    VSplit(StrView)     # `:vs [path]`
+    Close               # `:clo`
+    Only                # `:on`
 
-# The argument after a one-letter command `name`: Some("") for the bare
-# name, Some(rest) for the name, blanks and the rest, else None.
-fn argument(line: StrView, name: StrView) -> Option<StrView>
-    if line.eq(name)
-        return Some("")
-    if not line.starts_with(name) or line.len() == name.len()
-        return None
-    let c = line.get(name.len())
-    if c != ' ' and c != '\t'
-        return None
-    Some(line.slice(name.len(), line.len()).trim())
+# A command line in Vim's parts: the command's name (its letters), a `!`
+# right after it, and the argument (the rest, blanks trimmed).
+struct Parts
+    name: StrView
+    bang: bool
+    arg: StrView
+
+fn is_letter(c: u8) -> bool
+    (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')
+
+fn parts_of(line: StrView) -> Parts
+    var n: i64 = 0
+    while n < line.len() and is_letter(line.get(n))
+        n += 1
+    var rest = line.slice(n, line.len())
+    let bang = rest.starts_with("!")
+    if bang
+        rest = rest.slice(1, rest.len())
+    Parts { name: line.slice(0, n), bang: bang, arg: rest.trim() }
+
+# True when `name` is the command `full` or an abbreviation of it at least
+# as long as `short` (Vim's `:bn[ext]`).
+fn names(name: StrView, short: StrView, full: StrView) -> bool
+    name.len() >= short.len() and full.starts_with(name)
 
 # The command a command line names, without its leading `:`, or None.
 pub fn parse_command(text: StrView) -> Option<Command>
@@ -43,16 +68,38 @@ pub fn parse_command(text: StrView) -> Option<Command>
         return match line.parse_i64()
             Some(n) => Some(Command.Goto(n))
             None => None
-    if line.eq("q")
-        return Some(Command.Quit)
-    if line.eq("q!")
-        return Some(Command.ForceQuit)
-    if line.eq("wq")
+    let p = parts_of(line)
+    # An argument must come after a blank, except a buffer's number (`:b2`).
+    let glued = p.arg.len() > 0 and not p.bang and line.len() > p.name.len() and line.get(p.name.len()) != ' ' and line.get(p.name.len()) != '\t'
+    let bare = p.arg.is_empty()
+    if p.name.eq("q") and bare
+        return Some(if p.bang then Command.ForceQuit else Command.Quit)
+    if p.bang and not names(p.name, "bd", "bdelete")
+        return None
+    if glued and not names(p.name, "b", "buffer") and not names(p.name, "bd", "bdelete")
+        return None
+    if p.name.eq("wq") and bare
         return Some(Command.WriteQuit)
-    match argument(line, "w")
-        Some(p) => return Some(if p.is_empty() then Command.Write else Command.WriteTo(p))
-        None => pass
-    match argument(line, "e")
-        Some(p) => return Some(Command.Edit(p))
-        None => pass
+    if p.name.eq("w")
+        return Some(if bare then Command.Write else Command.WriteTo(p.arg))
+    if p.name.eq("e")
+        return Some(Command.Edit(p.arg))
+    if (p.name.eq("ls") or names(p.name, "buffers", "buffers") or names(p.name, "files", "files")) and bare
+        return Some(Command.List)
+    if names(p.name, "bn", "bnext") and bare
+        return Some(Command.BufferNext)
+    if (names(p.name, "bp", "bprevious") or names(p.name, "bN", "bNext")) and bare
+        return Some(Command.BufferPrev)
+    if names(p.name, "bd", "bdelete")
+        return Some(Command.BufferDelete(p.arg, p.bang))
+    if names(p.name, "b", "buffer")
+        return Some(Command.Buffer(p.arg))
+    if names(p.name, "sp", "split")
+        return Some(Command.Split(p.arg))
+    if names(p.name, "vs", "vsplit")
+        return Some(Command.VSplit(p.arg))
+    if names(p.name, "clo", "close") and bare
+        return Some(Command.Close)
+    if names(p.name, "on", "only") and bare
+        return Some(Command.Only)
     None

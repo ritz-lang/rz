@@ -14,7 +14,8 @@ import ritzlib.string
 import ritzlib.termsession { TermOut, term_out, style_plain }
 
 import core.modes { Mode }
-import core.screen { LineSource, Screen, Selection, Size, View, Status, Cell, render, screen_new, screen_with, view_new, checkpoints_with, color_eq, gutter_width, style_eq, style_escape, style_filler, style_gutter, style_status, text_rows }
+import core.layout { rect }
+import core.screen { LineSource, Screen, Selection, Size, View, Status, Cell, PROMPT, begin_frame, draw_message, draw_separator, draw_window, no_styles, render, screen_new, screen_with, view_new, checkpoints_with, color_eq, gutter_width, style_eq, style_escape, style_filler, style_gutter, style_status, style_status_nc, text_rows }
 
 # ============================================================================
 # A line source: lines of bytes, `\n`-separated, `~` standing for 0xFF and
@@ -643,4 +644,118 @@ fn test_no_selection_draws_nothing_reversed() -> i32
     let src = lines("abcd\nef")
     show(@&scr, @src, @&view)
     assert selected_only(@scr, 0, 0, 0) and selected_only(@scr, 1, 0, 0)
+    0
+
+# ============================================================================
+# Windows (AGAST #4912): each in its rectangle with its own status line,
+# separators between windows side by side, long messages over a prompt
+# ============================================================================
+
+fn named(name: StrView) -> Status
+    Status { name: name, dirty: false, mode: Mode.Normal, lang: "" }
+
+# `head`, then `tail`.
+fn joined(head: String, tail: StrView) -> String
+    var s = head
+    s.push_str(tail)
+    s
+
+fn pad(text: StrView, n: i64) -> String
+    var s = string_from(text)
+    while s.len() < n
+        s.push(' ')
+    s
+
+[[test]]
+fn test_windows_side_by_side_with_a_separator() -> i32
+    var scr = screen_new(size(6, 41))
+    let left = lines("ab\ncd")
+    let right = lines("xy")
+    var lv = view_new()
+    var rv = view_new()
+    rv.source = 1
+    var plain = no_styles()
+    begin_frame(@&scr)
+    draw_window(@&scr, rect(0, 0, 5, 20), @left, @&lv, @&plain, named("a.ritz"), false)
+    draw_window(@&scr, rect(0, 21, 5, 20), @right, @&rv, @&plain, named("b.ritz"), true)
+    draw_separator(@&scr, rect(0, 20, 5, 1))
+    draw_message(@&scr, "hi")
+    var r0 = pad("  1 ab", 20)
+    r0.push('|')
+    r0.push_str("  1 xy")
+    assert row_is(@scr, 0, pad(r0.as_view(), 41).as_view())
+    var r1 = pad("  2 cd", 20)
+    r1.push_str("|~")
+    assert row_is(@scr, 1, pad(r1.as_view(), 41).as_view())
+    # The status lines: no mode in the window that isn't current, and where
+    # the separator meets them, a blank in the status style.
+    var r4 = pad(" a.ritz", 16)
+    r4.push_str("1:1   NORMAL  b.ritz 1:1 ")
+    assert row_is(@scr, 4, r4.as_view())
+    assert style_eq(scr.cell(4, 0).style, style_status_nc())
+    assert style_eq(scr.cell(4, 20).style, style_status_nc())
+    assert style_eq(scr.cell(4, 21).style, style_status())
+    assert not style_eq(style_status(), style_status_nc())
+    assert style_eq(scr.cell(2, 20).style, style_status_nc())     # the separator
+    assert row_is(@scr, 5, pad("hi", 41).as_view())
+    # The cursor is the current window's.
+    assert scr.cursor_row() == 0 and scr.cursor_col() == 25
+    0
+
+[[test]]
+fn test_stacked_windows_scroll_on_their_own() -> i32
+    var scr = screen_new(size(7, 20))
+    let src = numbered(9)
+    var top = view_new()
+    var bottom = view_new()
+    bottom.cursor_line = 5                  # line 6: two text rows show 5 and 6
+    var plain = no_styles()
+    begin_frame(@&scr)
+    draw_window(@&scr, rect(0, 0, 3, 20), @src, @&top, @&plain, named("a"), false)
+    draw_window(@&scr, rect(3, 0, 3, 20), @src, @&bottom, @&plain, named("a"), true)
+    draw_message(@&scr, "")
+    assert row_is(@scr, 0, pad("  1 l1", 20).as_view())
+    assert row_is(@scr, 2, joined(pad(" a", 16), "1:1 ").as_view())
+    assert row_is(@scr, 3, pad("  5 l5", 20).as_view())
+    assert row_is(@scr, 4, pad("  6 l6", 20).as_view())
+    assert bottom.top == 4 and top.top == 0
+    assert row_is(@scr, 5, joined(pad(" NORMAL  a", 16), "6:1 ").as_view())
+    assert scr.cursor_row() == 4 and scr.cursor_col() == 4
+    0
+
+[[test]]
+fn test_a_long_message_takes_rows_above_a_prompt() -> i32
+    var scr = screen_new(size(6, 40))
+    var view = view_new()
+    let src = numbered(9)
+    render(@&scr, @src, @&view, status(), "one\ntwo")
+    assert row_is(@scr, 0, pad("  1 l1", 40).as_view())
+    assert row_is(@scr, 3, pad("one", 40).as_view())
+    assert row_is(@scr, 4, pad("two", 40).as_view())
+    assert row_is(@scr, 5, pad(PROMPT, 40).as_view())
+    assert scr.cursor_row() == 5 and scr.cursor_col() == PROMPT.len()
+    # More lines than rows: the last ones, and the prompt.
+    render(@&scr, @src, @&view, status(), "1\n2\n3\n4\n5\n6\n7")
+    assert row_is(@scr, 0, pad("3", 40).as_view())
+    assert row_is(@scr, 4, pad("7", 40).as_view())
+    0
+
+[[test]]
+fn test_checkpoints_are_kept_per_source() -> i32
+    var scr = screen_with(size(3, 20), checkpoints_with(4, 8, 16))
+    let a = repeat("ab", 400)
+    let b = repeat("xy", 400)
+    var va = view_new()
+    var vb = view_new()
+    vb.source = 1
+    va.cursor_byte = 300
+    vb.cursor_byte = 300
+    var plain = no_styles()
+    begin_frame(@&scr)
+    draw_window(@&scr, rect(0, 0, 2, 20), @a, @&va, @&plain, named("a"), true)
+    draw_window(@&scr, rect(0, 0, 2, 20), @b, @&vb, @&plain, named("b"), false)
+    assert scr.marks_in(0, 0) > 0 and scr.marks_in(1, 0) > 0
+    scr.text_changed_in(1, 0, 0)
+    assert scr.marks_in(1, 0) == 0 and scr.marks_in(0, 0) > 0
+    assert scr.marks_for(0) == scr.marks_in(0, 0)                 # source 0's
     0

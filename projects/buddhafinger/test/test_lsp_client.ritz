@@ -71,7 +71,7 @@ fn refused(r: Result<(), Refused>) -> StrView
 
 # What next_reply gave: "none", "bad", or the reply's name.
 fn next_name(c: @&Client) -> StrView
-    match c.next_reply(1)
+    match c.next_reply(URI, 1)
         Ok(r) => match r
             Some(x) => reply_name(x)
             None => "none"
@@ -101,9 +101,9 @@ const CAPS_ALL: StrView = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilit
 fn ready_client(text: StrView, rev: i64) -> Client
     var c = client_new()
     c.start(42, 0)
-    let r = c.receive(CAPS_ALL, rev)
+    let r = c.receive(CAPS_ALL, URI, rev)
     assert c.wants_text(URI, rev, text.len())
-    assert c.send_text(rev, bytes(text))
+    assert c.send_text(URI, rev, bytes(text))
     let drained = sent(@&c)
     c
 
@@ -137,8 +137,8 @@ fn test_initialize_goes_first_and_nothing_else_until_answered() -> i32
     assert has(@first, "\"method\":\"initialize\"")
     assert has(@first, "\"processId\":42")
     assert has(@first, "\"positionEncodings\":[\"utf-16\"]")
-    assert refused(c.ask(AskKind.Hover, 1, 0, 0, 0)).eq("not-ready")
-    assert is_reply(c.receive(CAPS_ALL, 1), Reply.Ready)
+    assert refused(c.ask(AskKind.Hover, URI, 1, 0, 0, 0)).eq("not-ready")
+    assert is_reply(c.receive(CAPS_ALL, URI, 1), Reply.Ready)
     assert c.ready()
     let next = sent(@&c)
     assert has(@next, "\"method\":\"initialized\"")
@@ -149,21 +149,21 @@ fn test_capabilities_decide_what_may_be_asked() -> i32
     var c = client_new()
     c.start(1, 0)
     # Hover only, sync as an options object.
-    let r = c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"hoverProvider\":{},\"definitionProvider\":false}}}", 1)
+    let r = c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"hoverProvider\":{},\"definitionProvider\":false}}}", URI, 1)
     assert c.hover_ok
     assert not c.definition_ok
     assert c.sync_ok
     assert c.wants_text(URI, 1, 3)
-    assert c.send_text(1, bytes("abc"))
-    assert c.ask(AskKind.Hover, 1, 0, 0, 0).is_ok()
-    assert refused(c.ask(AskKind.Definition, 1, 0, 0, 0)).eq("unsupported")
+    assert c.send_text(URI, 1, bytes("abc"))
+    assert c.ask(AskKind.Hover, URI, 1, 0, 0, 0).is_ok()
+    assert refused(c.ask(AskKind.Definition, URI, 1, 0, 0, 0)).eq("unsupported")
     0
 
 [[test]]
 fn test_a_server_without_sync_gets_no_documents() -> i32
     var c = client_new()
     c.start(1, 0)
-    let r = c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}", 1)
+    let r = c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{}}}", URI, 1)
     assert c.ready()
     assert not c.wants_text(URI, 1, 3)
     0
@@ -172,7 +172,7 @@ fn test_a_server_without_sync_gets_no_documents() -> i32
 fn test_initialize_error_or_silence_ends_the_session() -> i32
     var c = client_new()
     c.start(1, 0)
-    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"boom\"}}", 1), Reply.InitFailed)
+    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"boom\"}}", URI, 1), Reply.InitFailed)
     assert c.error_text().eq("boom")
     var d = client_new()
     d.start(1, 100)
@@ -190,10 +190,10 @@ fn test_initialize_error_or_silence_ends_the_session() -> i32
 fn test_did_open_carries_the_revision_and_the_text() -> i32
     var c = client_new()
     c.start(1, 0)
-    let r = c.receive(CAPS_ALL, 7)
+    let r = c.receive(CAPS_ALL, URI, 7)
     let skip = sent(@&c)
     assert c.wants_text(URI, 7, 12)
-    assert c.send_text(7, bytes("fn main()\n\t\"x\""))
+    assert c.send_text(URI, 7, bytes("fn main()\n\t\"x\""))
     let out = sent(@&c)
     assert has(@out, "\"method\":\"textDocument/didOpen\"")
     assert has(@out, "\"uri\":\"file:///src/a.ritz\"")
@@ -212,44 +212,69 @@ fn test_rapid_edits_coalesce_to_the_last() -> i32
         var text = string_from("text at ")
         text.push_i64(rev)
         assert c.wants_text(URI, rev, text.len())
-        assert c.send_text(rev, bytes(text.as_view()))
+        assert c.send_text(URI, rev, bytes(text.as_view()))
     let out = sent(@&c)
     assert count_of(@out, "didChange") == 1
     assert has(@out, "\"version\":49")
     assert has(@out, "text at 49")
     0
 
+# One document per buffer (AGAST #4912): a second opens beside the first,
+# and a sync turn that no longer asks about one closes it.
 [[test]]
-fn test_another_document_closes_the_first() -> i32
+fn test_documents_open_side_by_side_and_close_when_dropped() -> i32
     var c = ready_client("one", 1)
-    assert c.wants_text("file:///src/b.ritz", 2, 3)
-    assert c.send_text(2, bytes("two"))
+    c.begin_sync()
+    assert not c.wants_text(URI, 1, 3)                  # synced already
+    assert c.wants_text("file:///src/b.ritz", 1, 3)
+    assert c.send_text("file:///src/b.ritz", 1, bytes("two"))
+    c.end_sync()
     let out = sent(@&c)
-    assert has(@out, "didClose\",\"params\":{\"textDocument\":{\"uri\":\"file:///src/a.ritz\"}")
+    assert not has(@out, "didClose")
     assert has(@out, "didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///src/b.ritz\"")
-    # Not a Ritz file: closed, nothing opened.
-    assert not c.wants_text("", 3, 3)
+    # Each document has its own diagnostics.
+    let r = c.receive(diag_msg(1, "in a").as_view(), URI, 1)
+    assert c.diagnostics(URI, 1).len == 1
+    assert c.diagnostics("file:///src/b.ritz", 1).len == 0
+    # A turn without a.ritz (its buffer deleted): closed, b stays open.
+    c.begin_sync()
+    assert not c.wants_text("file:///src/b.ritz", 1, 3)
+    assert not c.wants_text("", 1, 3)                   # not a Ritz file: nothing
+    c.end_sync()
     let out2 = sent(@&c)
-    assert has(@out2, "didClose")
-    assert not has(@out2, "didOpen")
+    assert has(@out2, "didClose\",\"params\":{\"textDocument\":{\"uri\":\"file:///src/a.ritz\"}")
+    assert count_of(@out2, "didClose") == 1
+    assert c.diagnostics(URI, 1).len == 0
+    assert refused(c.ask(AskKind.Hover, URI, 1, 0, 0, 0)).eq("not-open")
+    assert c.ask(AskKind.Hover, "file:///src/b.ritz", 1, 0, 0, 0).is_ok()
+    0
+
+# An answer asked about one document is stale once the editor shows another.
+[[test]]
+fn test_an_answer_for_another_document_is_dropped() -> i32
+    var c = ready_client("abc", 2)
+    assert c.ask(AskKind.Hover, URI, 2, 0, 0, 0).is_ok()
+    let a = answer(2, "{\"contents\":\"for a\"}")
+    assert is_reply(c.receive(a.as_view(), "file:///src/b.ritz", 2), Reply.Nothing)
+    assert c.stale == 1
     0
 
 [[test]]
 fn test_sync_suspends_above_the_limit_and_resumes_below() -> i32
     var c = ready_client("small", 1)
-    let r = c.receive(diag_msg(1, "x").as_view(), 1)
-    assert c.diagnostics(1).len == 1
+    let r = c.receive(diag_msg(1, "x").as_view(), URI, 1)
+    assert c.diagnostics(URI, 1).len == 1
     assert not c.wants_text(URI, 2, SYNC_LIMIT_BYTES + 1)
-    assert c.sync_suspended()
+    assert c.sync_suspended(URI)
     let out = sent(@&c)
     assert has(@out, "didClose")
-    assert c.diagnostics(2).len == 0
-    assert refused(c.ask(AskKind.Hover, 2, 0, 0, 0)).eq("not-open")
+    assert c.diagnostics(URI, 2).len == 0
+    assert refused(c.ask(AskKind.Hover, URI, 2, 0, 0, 0)).eq("not-open")
     assert not c.wants_text(URI, 3, SYNC_LIMIT_BYTES + 5)
     assert sent(@&c).is_empty()                  # closed once
     assert c.wants_text(URI, 4, 10)
-    assert c.send_text(4, bytes("small again"))
-    assert not c.sync_suspended()
+    assert c.send_text(URI, 4, bytes("small again"))
+    assert not c.sync_suspended(URI)
     let back = sent(@&c)
     assert has(@back, "didOpen")
     0
@@ -261,42 +286,42 @@ fn test_sync_suspends_above_the_limit_and_resumes_below() -> i32
 [[test]]
 fn test_hover_answer_for_the_current_revision() -> i32
     var c = ready_client("fn f()\nf()\n", 3)
-    assert c.ask(AskKind.Hover, 3, 1, 1, 0).is_ok()
+    assert c.ask(AskKind.Hover, URI, 3, 1, 1, 0).is_ok()
     let out = sent(@&c)
     assert has(@out, "\"method\":\"textDocument/hover\",\"id\":2")
     assert has(@out, "\"position\":{\"line\":1,\"character\":1}")
     let a = answer(2, "{\"contents\":{\"kind\":\"markdown\",\"value\":\"```ritz\\nfn f()\\n```\"}}")
-    assert is_reply(c.receive(a.as_view(), 3), Reply.Hover)
+    assert is_reply(c.receive(a.as_view(), URI, 3), Reply.Hover)
     assert c.hover_text().eq("fn f()")
-    let none = c.ask(AskKind.Hover, 3, 0, 0, 0)
-    assert is_reply(c.receive(answer(3, "null").as_view(), 3), Reply.NoHover)
+    let none = c.ask(AskKind.Hover, URI, 3, 0, 0, 0)
+    assert is_reply(c.receive(answer(3, "null").as_view(), URI, 3), Reply.NoHover)
     0
 
 [[test]]
 fn test_definition_answer_location_or_links() -> i32
     var c = ready_client("x", 1)
-    let a = c.ask(AskKind.Definition, 1, 0, 0, 0)
+    let a = c.ask(AskKind.Definition, URI, 1, 0, 0, 0)
     let loc = answer(2, "{\"uri\":\"file:///lib/b.ritz\",\"range\":{\"start\":{\"line\":4,\"character\":3},\"end\":{\"line\":4,\"character\":6}}}")
-    assert is_reply(c.receive(loc.as_view(), 1), Reply.Definition)
+    assert is_reply(c.receive(loc.as_view(), URI, 1), Reply.Definition)
     assert c.target_uri().eq("file:///lib/b.ritz")
     assert c.target_line == 4
     assert c.target_char == 3
-    let b = c.ask(AskKind.Definition, 1, 0, 0, 0)
+    let b = c.ask(AskKind.Definition, URI, 1, 0, 0, 0)
     let links = answer(3, "[{\"targetUri\":\"file:///c.ritz\",\"targetRange\":{},\"targetSelectionRange\":{\"start\":{\"line\":9,\"character\":0},\"end\":{\"line\":9,\"character\":1}}}]")
-    assert is_reply(c.receive(links.as_view(), 1), Reply.Definition)
+    assert is_reply(c.receive(links.as_view(), URI, 1), Reply.Definition)
     assert c.target_uri().eq("file:///c.ritz")
     assert c.target_line == 9
-    let d = c.ask(AskKind.Definition, 1, 0, 0, 0)
-    assert is_reply(c.receive(answer(4, "[]").as_view(), 1), Reply.NoDefinition)
+    let d = c.ask(AskKind.Definition, URI, 1, 0, 0, 0)
+    assert is_reply(c.receive(answer(4, "[]").as_view(), URI, 1), Reply.NoDefinition)
     0
 
 # The text changed while the answer was on its way: it is dropped.
 [[test]]
 fn test_answer_for_an_older_revision_is_dropped() -> i32
     var c = ready_client("abc", 5)
-    assert c.ask(AskKind.Hover, 5, 0, 0, 0).is_ok()
+    assert c.ask(AskKind.Hover, URI, 5, 0, 0, 0).is_ok()
     let a = answer(2, "{\"contents\":\"stale\"}")
-    assert is_reply(c.receive(a.as_view(), 6), Reply.Nothing)
+    assert is_reply(c.receive(a.as_view(), URI, 6), Reply.Nothing)
     assert c.stale == 1
     assert c.hover_text().is_empty()
     0
@@ -306,36 +331,36 @@ fn test_answer_for_an_older_revision_is_dropped() -> i32
 [[test]]
 fn test_delayed_answer_to_a_replaced_request_is_dropped() -> i32
     var c = ready_client("abc", 5)
-    assert c.ask(AskKind.Hover, 5, 0, 0, 0).is_ok()
-    assert c.ask(AskKind.Hover, 5, 0, 1, 0).is_ok()
-    assert is_reply(c.receive(answer(3, "{\"contents\":\"second\"}").as_view(), 5), Reply.Hover)
-    assert is_reply(c.receive(answer(2, "{\"contents\":\"first\"}").as_view(), 5), Reply.Nothing)
+    assert c.ask(AskKind.Hover, URI, 5, 0, 0, 0).is_ok()
+    assert c.ask(AskKind.Hover, URI, 5, 0, 1, 0).is_ok()
+    assert is_reply(c.receive(answer(3, "{\"contents\":\"second\"}").as_view(), URI, 5), Reply.Hover)
+    assert is_reply(c.receive(answer(2, "{\"contents\":\"first\"}").as_view(), URI, 5), Reply.Nothing)
     assert c.hover_text().eq("second")
     0
 
 [[test]]
 fn test_request_times_out_and_its_late_answer_is_dropped() -> i32
     var c = ready_client("abc", 1)
-    assert c.ask(AskKind.Definition, 1, 0, 0, 1000).is_ok()
+    assert c.ask(AskKind.Definition, URI, 1, 0, 0, 1000).is_ok()
     assert c.deadline().unwrap_or(0) == 1000 + REQUEST_TIMEOUT_MS
     assert is_reply(c.expire(1000 + REQUEST_TIMEOUT_MS - 1), Reply.Nothing)
     assert is_reply(c.expire(1000 + REQUEST_TIMEOUT_MS), Reply.TimedOut(AskKind.Definition))
     assert c.deadline().is_none()
-    assert is_reply(c.receive(answer(2, "null").as_view(), 1), Reply.Nothing)
+    assert is_reply(c.receive(answer(2, "null").as_view(), URI, 1), Reply.Nothing)
     0
 
 [[test]]
 fn test_error_answer_is_reported() -> i32
     var c = ready_client("abc", 1)
-    let a = c.ask(AskKind.Hover, 1, 0, 0, 0)
-    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}", 1), Reply.Failed(AskKind.Hover))
+    let a = c.ask(AskKind.Hover, URI, 1, 0, 0, 0)
+    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}", URI, 1), Reply.Failed(AskKind.Hover))
     assert c.error_text().eq("Method not found")
     0
 
 [[test]]
 fn test_server_requests_are_answered_with_null() -> i32
     var c = ready_client("abc", 1)
-    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"client/registerCapability\",\"params\":{}}", 1), Reply.Nothing)
+    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"client/registerCapability\",\"params\":{}}", URI, 1), Reply.Nothing)
     let out = sent(@&c)
     assert has(@out, "{\"jsonrpc\":\"2.0\",\"id\":77,\"result\":null}")
     0
@@ -347,27 +372,27 @@ fn test_server_requests_are_answered_with_null() -> i32
 [[test]]
 fn test_diagnostics_show_only_for_their_revision() -> i32
     var c = ready_client("abc", 4)
-    assert is_reply(c.receive(diag_msg(4, "undefined name").as_view(), 4), Reply.Diagnostics)
-    let ds = c.diagnostics(4)
+    assert is_reply(c.receive(diag_msg(4, "undefined name").as_view(), URI, 4), Reply.Diagnostics)
+    let ds = c.diagnostics(URI, 4)
     assert ds.len == 1
     let d: Diag = ds[0]
     assert d.line == 1 and d.start == 2 and d.end_line == 1 and d.end == 5
     assert d.severity == 1
-    assert c.message_of(d).eq("undefined name")
+    assert c.message_of(URI, d).eq("undefined name")
     # The text moved on: the list is hidden, not shown against other text.
-    assert c.diagnostics(5).len == 0
+    assert c.diagnostics(URI, 5).len == 0
     0
 
 [[test]]
 fn test_diagnostics_for_an_older_version_are_dropped() -> i32
     var c = ready_client("abc", 4)
-    let r = c.receive(diag_msg(4, "old").as_view(), 4)
-    assert is_reply(c.receive(diag_msg(3, "older").as_view(), 4), Reply.Nothing)
+    let r = c.receive(diag_msg(4, "old").as_view(), URI, 4)
+    assert is_reply(c.receive(diag_msg(3, "older").as_view(), URI, 4), Reply.Nothing)
     assert c.stale == 1
-    assert c.message_of(c.diagnostics(4)[0]).eq("old")
+    assert c.message_of(URI, c.diagnostics(URI, 4)[0]).eq("old")
     # Another document's list is not this one's.
-    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///other.ritz\",\"version\":4,\"diagnostics\":[]}}", 4), Reply.Nothing)
-    assert c.diagnostics(4).len == 1
+    assert is_reply(c.receive("{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///other.ritz\",\"version\":4,\"diagnostics\":[]}}", URI, 4), Reply.Nothing)
+    assert c.diagnostics(URI, 4).len == 1
     0
 
 # No request goes out for diagnostics: they come on their own.
@@ -375,7 +400,7 @@ fn test_diagnostics_for_an_older_version_are_dropped() -> i32
 fn test_no_probe_request_after_a_change() -> i32
     var c = ready_client("abc", 1)
     assert c.wants_text(URI, 2, 4)
-    assert c.send_text(2, bytes("abcd"))
+    assert c.send_text(URI, 2, bytes("abcd"))
     let out = sent(@&c)
     assert count_of(@out, "\"id\":") == 0
     0

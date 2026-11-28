@@ -1756,6 +1756,13 @@ def freestanding_target(bin_config: BinaryConfig) -> Target:
                       # where -march=native doesn't include +sha (e.g.
                       # pre-Skylake).
         ]
+        # Harland enables SSE only: its kernel never sets CR4.OSXSAVE or
+        # XCR0, so an AVX instruction is #UD (Invalid Opcode) in any Harland
+        # process. -march=native would let clang pick AVX from the build
+        # host, as it does for a large struct copy (AGAST #4912, the
+        # editor's 256-byte copies killed buddhafinger at startup).
+        if bin_config.target_os == "harland":
+            clang_flags.append("-mno-avx")
         # Add PIC flag if explicitly requested or for Linux targets
         if bin_config.pic or target.endswith("-linux"):
             clang_flags.append("-fPIC")

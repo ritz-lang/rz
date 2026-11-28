@@ -11,18 +11,43 @@ import ritzlib.strview
 import ritzlib.string
 import ritzlib.termsession { Key, TermOut, term_out }
 
-import core.buffer { pos }
-import core.editor { Editor, editor_open }
+import ritzlib.result { Result }
+
+import core.buffer { Buffer, pos }
+import core.editor { Editor, editor_open, handle_key }
+import core.files { FileStore, LoadError, SaveError }
 import core.paint { Painter, painter_new }
 import core.screen { Size }
 import syntax.highlight { kind_style }
 import syntax.lexer { Kind }
 import core.screen { style_eq }
 import core.modes { Mode }
-import syntax.marks { DiagMark }
+import syntax.marks { DiagMark, marked_style }
 
 fn size(rows: i32, cols: i32) -> Size
     Size { rows: rows, cols: cols }
+
+# Every file holds "fn g\n"; every save works.
+struct AnyFile
+    loads: i64
+
+impl FileStore for AnyFile
+    fn load(self: @&AnyFile, path: StrView) -> Result<Vec<u8>, LoadError>
+        self.loads += 1
+        var out: Vec<u8> = vec_new<u8>()
+        out.push_view("fn g\n")
+        Ok(out)
+
+    fn save(self: @&AnyFile, path: StrView, buf: @Buffer) -> Result<(), SaveError>
+        Ok(())
+
+# Each byte of `text` a key: `\r` Enter, 0x17 Ctrl-W.
+fn keys(ed: @&Editor, text: StrView)
+    var files = AnyFile { loads: 0 }
+    for i in 0..text.len()
+        let c = text.get(i)
+        let k = if c == '\r' then Key.Enter else if c == 0x17 then Key.Ctrl('w') else Key.Char(c as u32)
+        handle_key<AnyFile>(ed, @&files, k)
 
 [[test]]
 fn test_compose_draws_the_text_and_the_cursor() -> i32
@@ -43,7 +68,7 @@ fn test_compose_after_an_edit_shows_the_new_text() -> i32
     var p = painter_new(size(5, 20))
     var out = term_out()
     p.compose(@&ed, "", "", @&out)
-    ed.buf.insert(ed.cursor, span_from_strview("X"))
+    ed.buf_mut().insert(ed.cursor, span_from_strview("X"))
     p.compose(@&ed, "", "", @&out)
     assert p.screen.row_text(0).as_view().starts_with("  1 Xone")
     0
@@ -69,7 +94,7 @@ fn test_an_edit_recolors_the_changed_line() -> i32
     p.compose(@&ed, "", "", @&out)
     assert style_eq(p.screen.cell(0, 4).style, kind_style(Kind.Keyword))
     # `# ` in front: the line is a comment now, `fn` included.
-    ed.buf.insert(ed.cursor, span_from_strview("# "))
+    ed.buf_mut().insert(ed.cursor, span_from_strview("# "))
     p.compose(@&ed, "", "", @&out)
     assert style_eq(p.screen.cell(0, 6).style, kind_style(Kind.Comment))
     0
@@ -126,15 +151,15 @@ fn test_marks_are_underlined_in_any_file() -> i32
     var ed = editor_open("a.ritz", span_from_strview("fn f\n"))
     var p = painter_new(size(5, 20))
     var out = term_out()
-    p.styler.add(DiagMark { line: 0, start: 3, end: 4, error: true })
-    p.styler.sort_marks()
+    p.styler_for(1).add(DiagMark { line: 0, start: 3, end: 4, error: true })
+    p.styler_for(1).sort_marks()
     p.compose(@&ed, "", "", @&out)
     assert style_eq(p.screen.cell(0, 4).style, kind_style(Kind.Keyword))
     assert p.screen.cell(0, 7).style.underline
     var plain = editor_open("a.txt", span_from_strview("fn f\n"))
     var q = painter_new(size(5, 20))
-    q.styler.add(DiagMark { line: 0, start: 0, end: 2, error: false })
-    q.styler.sort_marks()
+    q.styler_for(1).add(DiagMark { line: 0, start: 0, end: 2, error: false })
+    q.styler_for(1).sort_marks()
     q.compose(@&plain, "", "", @&out)
     assert q.screen.cell(0, 4).style.underline
     assert not q.screen.cell(0, 7).style.underline
@@ -161,4 +186,87 @@ fn test_compose_draws_the_selection() -> i32
     ed.mode = Mode.Normal
     p.compose(@&ed, "", "", @&out)
     assert not p.screen.cell(0, 5).style.reverse
+    0
+
+# Windows (AGAST #4912): every window drawn in its place with its status
+# line, the layout shared out again on a resize, each buffer in its own
+# colors and marks.
+
+[[test]]
+fn test_compose_draws_every_window() -> i32
+    var ed = editor_open("a.txt", span_from_strview("one\ntwo\n"))
+    var p = painter_new(size(9, 30))
+    var out = term_out()
+    keys(@&ed, ":sp\r")
+    p.compose(@&ed, "", "", @&out)
+    assert p.screen.row_text(0).as_view().starts_with("  1 one")
+    assert p.screen.row_text(3).as_view().starts_with(" NORMAL  a.txt")
+    assert p.screen.row_text(4).as_view().starts_with("  1 one")
+    assert p.screen.row_text(7).as_view().starts_with(" a.txt ")
+    assert p.screen.cursor_row() == 0
+    keys(@&ed, "\x17j")
+    p.compose(@&ed, "", "", @&out)
+    assert p.screen.cursor_row() == 4
+    assert p.screen.row_text(3).as_view().starts_with(" a.txt ")
+    assert p.screen.row_text(7).as_view().starts_with(" NORMAL  a.txt")
+    # One buffer: an edit shows in both.
+    keys(@&ed, "x")
+    p.compose(@&ed, "", "", @&out)
+    assert p.screen.row_text(0).as_view().starts_with("  1 ne")
+    assert p.screen.row_text(4).as_view().starts_with("  1 ne")
+    0
+
+[[test]]
+fn test_a_resize_shares_the_rows_again() -> i32
+    var ed = editor_open("a.txt", span_from_strview("one\n"))
+    var p = painter_new(size(9, 30))
+    var out = term_out()
+    keys(@&ed, ":sp\r")
+    p.compose(@&ed, "", "", @&out)
+    p.resize(size(13, 30))
+    p.compose(@&ed, "", "", @&out)
+    assert p.screen.row_text(5).as_view().starts_with(" NORMAL  a.txt")
+    assert p.screen.row_text(11).as_view().starts_with(" a.txt ")
+    assert ed.page() == 5
+    0
+
+[[test]]
+fn test_vs_draws_a_separator() -> i32
+    var ed = editor_open("a.txt", span_from_strview("one\n"))
+    var p = painter_new(size(5, 21))
+    var out = term_out()
+    keys(@&ed, ":vs\r")
+    p.compose(@&ed, "", "", @&out)
+    assert p.screen.row_text(0).as_view().eq("  1 one   |  1 one   ")
+    assert p.screen.row_text(1).as_view().eq("~         |~         ")
+    0
+
+[[test]]
+fn test_each_window_draws_its_own_buffer_colors_and_marks() -> i32
+    var ed = editor_open("a.ritz", span_from_strview("fn f\n"))
+    var p = painter_new(size(9, 30))
+    var out = term_out()
+    keys(@&ed, ":sp b.txt\r")                     # above: b.txt, plain
+    p.styler_for(1).add(DiagMark { line: 0, start: 0, end: 2, error: false })
+    p.styler_for(1).sort_marks()
+    p.compose(@&ed, "", "", @&out)
+    assert p.screen.row_text(0).as_view().starts_with("  1 fn g")
+    assert not style_eq(p.screen.cell(0, 4).style, kind_style(Kind.Keyword))
+    assert not p.screen.cell(0, 4).style.underline
+    # a.ritz's window, below: its keyword colors with its mark over them.
+    assert style_eq(p.screen.cell(4, 4).style, marked_style(kind_style(Kind.Keyword), false))
+    assert not p.screen.cell(4, 7).style.underline
+    0
+
+# The event loop builds a buffer's marks once per text revision, and again
+# for every buffer when new diagnostics come.
+[[test]]
+fn test_marks_are_fresh_for_their_revision_until_forgotten() -> i32
+    var p = painter_new(size(5, 20))
+    assert not p.marks_fresh(1, 0)
+    p.note_marks(1, 3)
+    assert p.marks_fresh(1, 3)
+    assert not p.marks_fresh(1, 4) and not p.marks_fresh(2, 3)
+    p.forget_marks()
+    assert not p.marks_fresh(1, 3)
     0

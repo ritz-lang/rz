@@ -21,8 +21,11 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
   request for them) and show underlined, errors in red, only while they are
   for the text on screen; the cursor line's message shows on the message
   line.
+- Each `.ritz` buffer is its own document on the server, synced while it
+  is in the buffer list and closed when `:bd` deletes it; each window shows
+  its buffer's diagnostics.
 - `K` shows hover on the message line; `gd` goes to the definition, in this
-  file or another; `Ctrl-O` or `Ctrl-T` goes back.
+  file's buffer or another's; `Ctrl-O` or `Ctrl-T` goes back.
 - Files over 1 MiB are not synced (`lsp: off (large file)`): colors and
   editing are unaffected.
 - When the server fails or exits the status line says so (`lsp: exited
@@ -32,10 +35,12 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
 
 - `src/core/`: the editor core (`buffer` with its undo `history` and
   `utf8` cursor stepping, `screen`, which also draws the Visual selection,
-  `modes`, `commands`, `normal`, which decodes Normal- and Visual-mode keys
-  (counts, operators and motions) into commands,
-  `editor`, which applies typed keys to the editor state, and `paint`,
-  which composes one frame of it for the terminal). It does no terminal or OS
+  windows' status lines and separators, `modes`, `commands`, `normal`,
+  which decodes Normal- and Visual-mode keys (counts, operators, motions
+  and Ctrl-W window commands) into commands, `layout`, the windows' frame
+  tree sized equally as Vim's, `editor`, which applies typed keys to the
+  buffer list and its windows, and `paint`, which composes one frame of
+  every window for the terminal). It does no terminal or OS
   I/O, so it is tested without a terminal: files go through the
   `FileStore` seam in `files`, which the platform implements.
 - `src/syntax/`: lexical colors. `lexer` splits one line into tokens (no

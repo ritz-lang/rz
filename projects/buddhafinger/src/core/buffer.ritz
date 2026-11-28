@@ -23,6 +23,11 @@
 #
 # Positions are (line, col) with col a byte index 0..=line_len(line); the
 # cursor helpers step them by UTF-8 code point (core/utf8.ritz).
+#
+# Every change to the text (an edit, or one edit of an undo or redo) is also
+# noted in byte offsets until forget_changes(): two windows onto one buffer
+# show each other's edits, and the one that didn't make an edit moves its
+# cursor through the notes (Change.shift) to stay on the same text.
 # Core module: no terminal or OS I/O (see src/platform/).
 
 import ritzlib.gvec
@@ -57,6 +62,22 @@ pub fn pos(line: i64, col: i64) -> Pos
 # True when a comes before b in the text.
 pub fn pos_before(a: Pos, b: Pos) -> bool
     a.line < b.line or (a.line == b.line and a.col < b.col)
+
+# One change to the text, in byte offsets: `removed` bytes at `off` became
+# `inserted` bytes.
+pub struct Change
+    off: i64
+    removed: i64
+    inserted: i64
+
+impl Change
+    # Where byte offset `o` is after the change: moved by its size when at
+    # or after the removed bytes' end, at the change's start when inside
+    # them, and where it was when before them.
+    pub fn shift(self: @Change, o: i64) -> i64
+        if o >= self.off + self.removed
+            return o - self.removed + self.inserted
+        if o > self.off then self.off else o
 
 struct Line
     bytes: Vec<u8>
@@ -127,6 +148,7 @@ pub struct Buffer
     starts: Vec<i64>
     history: History
     revision: i64           # how many times the text has changed (revision())
+    changes: Vec<Change>    # the changes since forget_changes()
 
 impl Drop for Buffer
     fn drop(self: @&Buffer)
@@ -136,13 +158,13 @@ impl Drop for Buffer
 pub fn buffer_new() -> Buffer
     var lines: Vec<Line> = vec_new<Line>()
     lines.push(line_empty())
-    Buffer { lines: lines, total: 0, starts: vec_new<i64>(), history: history_new(), revision: 0 }
+    Buffer { lines: lines, total: 0, starts: vec_new<i64>(), history: history_new(), revision: 0, changes: vec_new<Change>() }
 
 # A buffer holding `data` byte for byte: any terminators, NULs and
 # malformed UTF-8 come back out of serialize() unchanged.
 pub fn buffer_from_bytes(data: [u8]) -> Buffer
     let lines = parse_lines(data)
-    Buffer { lines: lines, total: data.len, starts: vec_new<i64>(), history: history_new(), revision: 0 }
+    Buffer { lines: lines, total: data.len, starts: vec_new<i64>(), history: history_new(), revision: 0, changes: vec_new<Change>() }
 
 impl Buffer
     # ------------------------------------------------------------------
@@ -314,6 +336,7 @@ impl Buffer
         let removed = self.text(s, e)
         self.history.record(off, removed[0..removed.len()], text)
         self.revision += 1
+        self.changes.push(Change { off: off, removed: removed.len(), inserted: text.len })
         if s.line == e.line and not has_break(text) and not self.joins_cr_lf(s.line, removed.len(), text.len)
             # Line-local: splice the one line's bytes in place.
             splice_bytes(@&self.lines[s.line].bytes, s.col, removed.len(), text)
@@ -443,6 +466,7 @@ impl Buffer
             let off = g.edits[k].off
             let n = g.edits[k].inserted.len()
             self.replace_bytes(off, off + n, span_from_vec<u8>(@g.edits[k].removed))
+            self.changes.push(Change { off: off, removed: n, inserted: g.edits[k].removed.len() })
             k -= 1
         let at = g.edits[0].off
         self.history.redo.push(g)
@@ -460,6 +484,7 @@ impl Buffer
             let off = g.edits[k].off
             let n = g.edits[k].removed.len()
             self.replace_bytes(off, off + n, span_from_vec<u8>(@g.edits[k].inserted))
+            self.changes.push(Change { off: off, removed: n, inserted: g.edits[k].inserted.len() })
         let at = g.edits[0].off
         self.history.undo.push(g)
         self.revision += 1
@@ -479,3 +504,10 @@ impl Buffer
     # The current state is what is on disk.
     pub fn mark_saved(self: @&Buffer)
         self.history.mark_saved()
+
+    # The changes to the text since forget_changes(), oldest first.
+    pub fn changes(self: @Buffer) -> [Change]
+        span_from_vec<Change>(@self.changes)
+
+    pub fn forget_changes(self: @&Buffer)
+        self.changes.clear()

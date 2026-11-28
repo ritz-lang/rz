@@ -26,9 +26,15 @@ import core.utf8 { utf8_encode }
 # An in-memory FileStore: one file on "disk", and the last save.
 # ============================================================================
 
+# Another file load finds.
+struct DiskFile
+    path: String
+    text: Vec<u8>
+
 struct Disk
-    disk_path: String       # the one file load finds
+    disk_path: String       # the first file load finds
     disk: Vec<u8>
+    more: Vec<DiskFile>     # the others (add)
     saved_path: String      # the last save's path and bytes
     saved: Vec<u8>
     saves: i64
@@ -37,7 +43,7 @@ struct Disk
     changed: bool           # save refuses: changed on disk
 
 fn disk_new() -> Disk
-    Disk { disk_path: string_new(), disk: vec_new<u8>(), saved_path: string_new(), saved: vec_new<u8>(), saves: 0, fail_load: false, fail_save: false, changed: false }
+    Disk { disk_path: string_new(), disk: vec_new<u8>(), more: vec_new<DiskFile>(), saved_path: string_new(), saved: vec_new<u8>(), saves: 0, fail_load: false, fail_save: false, changed: false }
 
 fn disk_with(path: StrView, text: StrView) -> Disk
     var d = disk_new()
@@ -45,15 +51,26 @@ fn disk_with(path: StrView, text: StrView) -> Disk
     d.disk.push_view(text)
     d
 
+impl Disk
+    # One more file on the disk.
+    fn add(self: @&Disk, path: StrView, text: StrView)
+        var bytes: Vec<u8> = vec_new<u8>()
+        bytes.push_view(text)
+        self.more.push(DiskFile { path: string_from(path), text: bytes })
+
 impl FileStore for Disk
     fn load(self: @&Disk, path: StrView) -> Result<Vec<u8>, LoadError>
         if self.fail_load
             return Err(LoadError.Failed(Errno.Acces))
-        if not path.eq(self.disk_path.as_view())
-            return Err(LoadError.NotFound)
         var out: Vec<u8> = vec_new<u8>()
-        out.push_span(span_from_vec<u8>(@self.disk))
-        Ok(out)
+        if path.eq(self.disk_path.as_view())
+            out.push_span(span_from_vec<u8>(@self.disk))
+            return Ok(out)
+        for i in 0..self.more.len()
+            if path.eq(self.more[i].path.as_view())
+                out.push_span(span_from_vec<u8>(@self.more[i].text))
+                return Ok(out)
+        Err(LoadError.NotFound)
 
     fn save(self: @&Disk, path: StrView, buf: @Buffer) -> Result<(), SaveError>
         if self.changed
@@ -128,7 +145,7 @@ fn run_new(keys: StrView) -> Editor
     ed
 
 fn holds(ed: @Editor, want: StrView) -> bool
-    let out = ed.buf.serialize()
+    let out = ed.buf().serialize()
     let got = span_from_vec<u8>(@out)
     if got.len != want.len
         return false
@@ -285,7 +302,7 @@ fn test_ctrl_f_and_ctrl_b_page() -> i32
         text.push('\n')
     var ed = open(text.as_view())
     var d = disk_new()
-    ed.page = 22                       # 20 lines turn over per page
+    ed.resize(Size { rows: 24, cols: 80 })    # 22 text rows: 20 lines turn over per page
     feed(@&ed, @&d, "<C-f>")
     assert ed.cursor.line == 20 and ed.top == 20
     feed(@&ed, @&d, "<C-f><C-b>")
@@ -458,7 +475,7 @@ fn test_x_then_p_and_P_put_chars() -> i32
 [[test]]
 fn test_yank_keeps_the_buffer_clean() -> i32
     let ed = run("a\nb", "yy")
-    assert not ed.buf.is_dirty()
+    assert not ed.buf().is_dirty()
     assert ed.reg_lines
     0
 
@@ -568,7 +585,7 @@ fn test_d_across_lines_from_the_indent_to_a_blank_end_takes_whole_lines() -> i32
 fn test_y_yanks_without_changing_the_text() -> i32
     let ed = run("foo bar", "yw")
     assert holds(@ed, "foo bar") and at(@ed, 0, 0) and reg_is(@ed, "foo ", false)
-    assert not ed.buf.is_dirty()
+    assert not ed.buf().is_dirty()
     assert holds(@run("foo bar", "ywP"), "foo foo bar")
     assert at(@run("foo bar", "$yb"), 0, 4)                 # to the range's start
     assert holds(@run("a\nb\nc", "yjGp"), "a\nb\nc\na\nb")
@@ -610,7 +627,7 @@ fn test_cc_and_linewise_c_leave_one_line_to_type_on() -> i32
 [[test]]
 fn test_c_and_its_insert_are_one_undo_step() -> i32
     let ed = run("foo bar", "cwxy<esc>u")
-    assert holds(@ed, "foo bar") and not ed.buf.is_dirty()
+    assert holds(@ed, "foo bar") and not ed.buf().is_dirty()
     assert holds(@run("a\nb", "ccxy<esc>u"), "a\nb")
     assert holds(@run("foo bar", "cwxy<esc>u<C-r>"), "xy bar")
     0
@@ -676,7 +693,7 @@ fn test_undo_and_redo_with_nothing_say_so() -> i32
 [[test]]
 fn test_undo_back_to_the_saved_state_is_clean() -> i32
     let ed = run("a", "xu")
-    assert not ed.buf.is_dirty()
+    assert not ed.buf().is_dirty()
     0
 
 # ============================================================================
@@ -737,7 +754,7 @@ fn test_w_saves_and_marks_clean() -> i32
     var d = disk_new()
     feed(@&ed, @&d, "x:w<cr>")
     assert d.saves == 1 and saved(@d, "b") and d.saved_path.as_view().eq("f.txt")
-    assert not ed.buf.is_dirty() and ed.mode == Mode.Normal
+    assert not ed.buf().is_dirty() and ed.mode == Mode.Normal
     assert says(@ed, "\"f.txt\" 1L, 1B written")
     0
 
@@ -746,7 +763,7 @@ fn test_w_without_a_name_is_refused() -> i32
     var ed = editor_new()
     var d = disk_new()
     feed(@&ed, @&d, "ix<esc>:w<cr>")
-    assert d.saves == 0 and ed.buf.is_dirty()
+    assert d.saves == 0 and ed.buf().is_dirty()
     assert says(@ed, "E32: No file name")
     0
 
@@ -756,7 +773,7 @@ fn test_w_path_names_an_unnamed_buffer() -> i32
     var d = disk_new()
     feed(@&ed, @&d, "ix<esc>:w new.txt<cr>")
     assert d.saves == 1 and d.saved_path.as_view().eq("new.txt")
-    assert ed.path.as_view().eq("new.txt") and not ed.buf.is_dirty()
+    assert ed.path().eq("new.txt") and not ed.buf().is_dirty()
     0
 
 [[test]]
@@ -765,7 +782,7 @@ fn test_w_other_path_writes_a_copy() -> i32
     var d = disk_new()
     feed(@&ed, @&d, "x:w copy.txt<cr>")
     assert d.saves == 1 and d.saved_path.as_view().eq("copy.txt") and saved(@d, "b")
-    assert ed.path.as_view().eq("f.txt") and ed.buf.is_dirty()
+    assert ed.path().eq("f.txt") and ed.buf().is_dirty()
     0
 
 [[test]]
@@ -774,12 +791,12 @@ fn test_failed_save_keeps_the_buffer_dirty() -> i32
     var d = disk_new()
     d.fail_save = true
     feed(@&ed, @&d, "x:w<cr>")
-    assert ed.buf.is_dirty()
+    assert ed.buf().is_dirty()
     assert says(@ed, "\"f.txt\" not written: No space left on device")
     d.fail_save = false
     d.changed = true
     feed(@&ed, @&d, ":wq<cr>")
-    assert ed.buf.is_dirty() and not ed.quit
+    assert ed.buf().is_dirty() and not ed.quit
     assert says(@ed, "\"f.txt\" changed on disk since it was read: not written")
     0
 
@@ -807,25 +824,30 @@ fn test_wq_writes_then_quits() -> i32
     0
 
 [[test]]
-fn test_e_replaces_the_buffer() -> i32
+fn test_e_opens_another_buffer() -> i32
     var ed = open("ab")
     var d = disk_with("g.txt", "one\ntwo\n")
     feed(@&ed, @&d, "j:e g.txt<cr>")
     assert holds(@ed, "one\ntwo\n") and at(@ed, 0, 0)
-    assert ed.path.as_view().eq("g.txt") and not ed.buf.is_dirty()
+    assert ed.path().eq("g.txt") and not ed.buf().is_dirty()
     assert says(@ed, "\"g.txt\" 2L, 8B")
-    # The old buffer's undo history went with it.
+    assert ed.buffer_count() == 2 and ed.buffer_number() == 2
+    # Each buffer has its own undo history: nothing to undo in g.txt.
     feed(@&ed, @&d, "u")
     assert holds(@ed, "one\ntwo\n")
     0
 
 [[test]]
-fn test_e_is_refused_with_pending_edits() -> i32
+fn test_e_keeps_a_buffer_with_pending_edits() -> i32
     var ed = open("ab")
     var d = disk_with("g.txt", "one")
     feed(@&ed, @&d, "x:e g.txt<cr>")
-    assert holds(@ed, "b") and ed.path.as_view().eq("f.txt")
-    assert says(@ed, "E37: No write since last change (add ! to override)")
+    assert holds(@ed, "one") and ed.path().eq("g.txt")
+    assert says(@ed, "\"g.txt\" 1L, 3B")
+    feed(@&ed, @&d, ":e f.txt<cr>")                 # its buffer, not the disk's
+    assert holds(@ed, "b") and ed.buf().is_dirty() and ed.buffer_count() == 2
+    feed(@&ed, @&d, "u")                            # with its history
+    assert holds(@ed, "ab")
     0
 
 [[test]]
@@ -833,7 +855,7 @@ fn test_e_of_a_missing_file_opens_it_empty() -> i32
     var ed = open("ab")
     var d = disk_new()
     feed(@&ed, @&d, ":e new.txt<cr>")
-    assert holds(@ed, "") and ed.path.as_view().eq("new.txt")
+    assert holds(@ed, "") and ed.path().eq("new.txt")
     assert says(@ed, "\"new.txt\" [New]")
     0
 
@@ -843,7 +865,7 @@ fn test_e_that_fails_keeps_the_buffer() -> i32
     var d = disk_with("g.txt", "one")
     d.fail_load = true
     feed(@&ed, @&d, ":e g.txt<cr>")
-    assert holds(@ed, "ab") and ed.path.as_view().eq("f.txt")
+    assert holds(@ed, "ab") and ed.path().eq("f.txt")
     assert says(@ed, "\"g.txt\": Permission denied")
     assert says(@run("ab", ":e<cr>"), "E32: No file name")
     0
@@ -888,9 +910,9 @@ fn test_the_screen_shows_the_editor() -> i32
     assert scr.row_text(2).as_view().starts_with(" NORMAL  f.txt [+]")
     0
 
-# text_revision moves on every change to the text, :e's new buffer
-# included, and stays put for motions, a save and an undo with nothing to
-# undo: the event loop re-lexes and re-measures lines only when it moves.
+# text_revision moves on every change to the buffer's text, and stays put
+# for motions, a save and an undo with nothing to undo: the event loop
+# re-lexes and re-measures lines only when it or the buffer number moves.
 [[test]]
 fn test_text_revision_follows_text_changes() -> i32
     var d = disk_with("g.txt", "other\n")
@@ -909,9 +931,12 @@ fn test_text_revision_follows_text_changes() -> i32
     assert r3 > r2
     feed(@&ed, @&d, ":w<cr>")
     assert ed.text_revision() == r3
+    let n = ed.buffer_number()
     feed(@&ed, @&d, ":e g.txt<cr>")
     assert ed.command_line().is_empty()
-    assert ed.text_revision() > r3
+    assert ed.buffer_number() != n
+    feed(@&ed, @&d, ":e f.txt<cr>")                 # back: the same buffer, unchanged
+    assert ed.buffer_number() == n and ed.text_revision() == r3
     0
 
 # ============================================================================
@@ -950,44 +975,50 @@ fn test_jump_in_this_file_and_back() -> i32
     0
 
 [[test]]
-fn test_jump_to_another_file_and_back_reopens_the_first() -> i32
+fn test_jump_to_another_file_and_back_switches_buffers() -> i32
     var d = disk_with("g.ritz", "fn g()\n\nfn h()\n")
     var ed = open("abc\nx\n")
-    feed(@&ed, @&d, "j")
+    feed(@&ed, @&d, "jx")                           # an edit in f.txt, not saved
     assert jump_to<Disk>(@&ed, @&d, "g.ritz", pos(2, 3))
-    assert ed.path.as_view().eq("g.ritz")
+    assert ed.path().eq("g.ritz")
     assert ed.cursor.line == 2 and ed.cursor.col == 3
-    # f.txt isn't on the in-memory disk: it reopens [New], at the old cursor clamped.
-    d.disk_path.clear()
-    d.disk_path.push_str("f.txt")
-    d.disk.clear()
-    d.disk.push_view("abc\nx\n")
+    assert ed.buffer_count() == 2
+    # Back to f.txt's buffer as it is, its edit kept: nothing is read again
+    # (f.txt isn't on the in-memory disk at all).
     feed(@&ed, @&d, "<C-t>")
-    assert ed.path.as_view().eq("f.txt")
+    assert ed.path().eq("f.txt")
+    assert holds(@ed, "abc\n\n") and ed.buf().is_dirty()
     assert ed.cursor.line == 1 and ed.cursor.col == 0
+    # And to g.ritz's buffer again: one buffer per file.
+    assert jump_to<Disk>(@&ed, @&d, "g.ritz", pos(0, 0))
+    assert ed.buffer_count() == 2
     0
 
 [[test]]
-fn test_jump_away_is_refused_with_pending_edits() -> i32
+fn test_jump_away_keeps_pending_edits() -> i32
     var d = disk_with("g.ritz", "fn g()\n")
     var ed = open("abc\n")
     feed(@&ed, @&d, "x")
-    assert not jump_to<Disk>(@&ed, @&d, "g.ritz", pos(0, 0))
-    assert ed.message.as_view().eq(MSG_NOT_SAVED)
-    assert ed.path.as_view().eq("f.txt")
-    assert ed.jump_depth() == 0
+    assert jump_to<Disk>(@&ed, @&d, "g.ritz", pos(0, 0))
+    assert ed.path().eq("g.ritz") and says(@ed, "\"g.ritz\" 1L, 7B")
+    assert ed.jump_depth() == 1
     0
 
 [[test]]
-fn test_jump_back_kept_when_the_file_cannot_reopen() -> i32
+fn test_jump_back_reopens_a_deleted_buffer_or_keeps_the_jump() -> i32
     var d = disk_with("g.ritz", "fn g()\n")
     var ed = open("abc\n")
     assert jump_to<Disk>(@&ed, @&d, "g.ritz", pos(0, 3))
-    feed(@&ed, @&d, "x")                            # pending edits in g.ritz
-    feed(@&ed, @&d, "<C-o>")
-    assert ed.message.as_view().eq(MSG_NOT_SAVED)
-    assert ed.path.as_view().eq("g.ritz")
-    assert ed.jump_depth() == 1
+    feed(@&ed, @&d, ":bd 1<cr>")                    # f.txt's buffer gone
+    assert ed.buffer_count() == 1
+    d.fail_load = true
+    feed(@&ed, @&d, "<C-o>")                        # f.txt can't be read again
+    assert says(@ed, "\"f.txt\": Permission denied")
+    assert ed.path().eq("g.ritz") and ed.jump_depth() == 1
+    d.fail_load = false
+    feed(@&ed, @&d, "<C-o>")                        # not on disk: [New], empty
+    assert ed.path().eq("f.txt") and holds(@ed, "")
+    assert ed.jump_depth() == 0
     0
 
 [[test]]
@@ -1000,7 +1031,7 @@ fn test_jump_stack_keeps_the_newest() -> i32
     # The newest jump left from line (MAX_JUMPS + 3) % 3.
     feed(@&ed, @&d, "<C-o>")
     assert ed.cursor.line == (MAX_JUMPS + 3) % 3
-    assert ed.path.as_view().eq("f.txt")
+    assert ed.path().eq("f.txt")
     0
 
 # ============================================================================
@@ -1146,4 +1177,329 @@ fn test_gv_reselects_the_last_selection() -> i32
     assert back.mode == Mode.Visual and anchor_at(@back, 0, 4) and at(@back, 0, 6)
     # Nothing selected yet: no change.
     assert run("abc", "gv").mode == Mode.Normal
+    0
+
+# ============================================================================
+# Buffers and windows (AGAST #4912)
+# ============================================================================
+
+# Window k (in Ctrl-W w order) has its cursor at (line, col).
+fn win_at(ed: @Editor, k: i64, line: i64, col: i64) -> bool
+    let c = ed.window_cursor(ed.window_at(k))
+    c.line == line and c.col == col
+
+fn win_path(ed: @Editor, k: i64) -> StrView
+    ed.window_path(ed.window_at(k))
+
+# f.txt (the editor's) and g.txt, h.txt on the disk.
+fn disk_gh() -> Disk
+    var d = disk_with("g.txt", "g\n")
+    d.add("h.txt", "h\n")
+    d
+
+[[test]]
+fn test_ls_lists_the_buffers() -> i32
+    var d = disk_with("g.txt", "one\ntwo\n")
+    var ed = open("ab\ncd\n")
+    feed(@&ed, @&d, "jx:e g.txt<cr>j:ls<cr>")
+    # Vim's columns: number, %/# (current, alternate), a/h (shown, hidden),
+    # + (changed), the name, and the cursor line from column 40.
+    assert says(@ed, "  1 #h + \"f.txt\"                        line 2\n  2 %a   \"g.txt\"                        line 2")
+    # A window split off keeps the alternate; both show f.txt.
+    feed(@&ed, @&d, ":e f.txt<cr>u:sp<cr>:ls<cr>")
+    assert says(@ed, "  1 %a   \"f.txt\"                        line 2\n  2 #h   \"g.txt\"                        line 2")
+    0
+
+[[test]]
+fn test_b_bn_and_bp_switch_buffers() -> i32
+    var d = disk_gh()
+    var ed = open("f\n")
+    feed(@&ed, @&d, ":e g.txt<cr>:e h.txt<cr>")
+    assert ed.buffer_number() == 3 and ed.buffer_count() == 3
+    feed(@&ed, @&d, ":b 1<cr>")
+    assert ed.path().eq("f.txt") and holds(@ed, "f\n")
+    feed(@&ed, @&d, ":bn<cr>")
+    assert ed.buffer_number() == 2
+    feed(@&ed, @&d, ":bn<cr>:bn<cr>")
+    assert ed.buffer_number() == 1                  # round past the last
+    feed(@&ed, @&d, ":bp<cr>")
+    assert ed.buffer_number() == 3                  # and back past the first
+    feed(@&ed, @&d, ":bprevious<cr>:bnext<cr>:buffer 2<cr>")
+    assert ed.buffer_number() == 2
+    feed(@&ed, @&d, ":b 9<cr>")
+    assert says(@ed, "E86: Buffer 9 does not exist") and ed.buffer_number() == 2
+    feed(@&ed, @&d, ":b h<cr>")                     # a name: the one buffer it is part of
+    assert ed.path().eq("h.txt")
+    feed(@&ed, @&d, ":b txt<cr>")
+    assert says(@ed, "E93: More than one match for txt")
+    feed(@&ed, @&d, ":b zz<cr>")
+    assert says(@ed, "E94: No matching buffer for zz")
+    feed(@&ed, @&d, ":b<cr>")                       # bare: this one
+    assert ed.path().eq("h.txt") and says(@ed, "")
+    0
+
+[[test]]
+fn test_a_buffer_comes_back_with_its_cursor() -> i32
+    var d = disk_with("g.txt", "one\ntwo\n")
+    var ed = open("a\nbcd\ne\n")
+    feed(@&ed, @&d, "jl:e g.txt<cr>j:b1<cr>")
+    assert at(@ed, 1, 1)
+    feed(@&ed, @&d, ":bn<cr>")
+    assert at(@ed, 1, 0)
+    0
+
+[[test]]
+fn test_bd_deletes_a_buffer() -> i32
+    var d = disk_with("g.txt", "one\n")
+    var ed = open("ab")
+    feed(@&ed, @&d, ":e g.txt<cr>:bd<cr>")
+    assert ed.buffer_count() == 1 and ed.path().eq("f.txt")
+    # Numbers aren't used again: g.txt comes back as buffer 3.
+    feed(@&ed, @&d, ":e g.txt<cr>x:bd<cr>")
+    assert ed.buffer_number() == 3 and ed.buffer_count() == 2
+    assert says(@ed, "E89: No write since last change for buffer 3 (add ! to override)")
+    feed(@&ed, @&d, ":bd!<cr>")
+    assert ed.buffer_count() == 1 and ed.path().eq("f.txt")
+    feed(@&ed, @&d, ":bd 7<cr>")
+    assert says(@ed, "E516: No buffers were deleted: bd 7")
+    # The last buffer: an empty one with no name in its place.
+    feed(@&ed, @&d, ":bdelete<cr>")
+    assert ed.buffer_count() == 1 and ed.path().is_empty() and holds(@ed, "")
+    assert ed.buffer_number() == 4
+    0
+
+# :bd shows the alternate buffer, even when another is nearer in the list.
+[[test]]
+fn test_bd_shows_the_alternate_buffer() -> i32
+    var d = disk_gh()
+    var ed = open("f\n")
+    feed(@&ed, @&d, ":e g.txt<cr>:e h.txt<cr>:b1<cr>:b3<cr>")     # in h.txt, f.txt alternate
+    feed(@&ed, @&d, ":bd<cr>")
+    assert ed.path().eq("f.txt") and ed.buffer_count() == 2
+    0
+
+[[test]]
+fn test_bd_of_a_buffer_in_other_windows_closes_them() -> i32
+    var d = disk_with("g.txt", "one\n")
+    var ed = open("ab")
+    feed(@&ed, @&d, ":e g.txt<cr>:sp<cr>:sp<cr>")
+    assert ed.window_count() == 3
+    feed(@&ed, @&d, ":bd<cr>")
+    assert ed.window_count() == 1 and ed.path().eq("f.txt")
+    # Another window's buffer, by number: its window goes, this one stays.
+    feed(@&ed, @&d, ":sp g.txt<cr><C-w>j:bd 3<cr>")
+    assert ed.window_count() == 1 and ed.path().eq("f.txt") and ed.buffer_count() == 1
+    0
+
+[[test]]
+fn test_q_is_refused_while_a_hidden_buffer_is_changed() -> i32
+    var d = disk_with("g.txt", "one\n")
+    var ed = open("ab")
+    feed(@&ed, @&d, "x:e g.txt<cr>:q<cr>")
+    assert not ed.quit
+    assert says(@ed, "E162: No write since last change for buffer \"f.txt\"")
+    assert ed.path().eq("f.txt")                    # and it is shown
+    feed(@&ed, @&d, ":q!<cr>")
+    assert ed.quit
+    # :wq writes this buffer, then refuses the same way.
+    var ed2 = open("ab")
+    feed(@&ed2, @&d, "x:e g.txt<cr>:wq<cr>")
+    assert d.saves == 1 and not ed2.quit
+    assert says(@ed2, "E162: No write since last change for buffer \"f.txt\"")
+    # A changed buffer with no name.
+    var ed3 = editor_new()
+    feed(@&ed3, @&d, "ix<esc>:e g.txt<cr>:q<cr>")
+    assert says(@ed3, "E162: No write since last change for buffer \"[No Name]\"")
+    0
+
+[[test]]
+fn test_sp_shows_the_buffer_twice_and_moves_the_other_cursor() -> i32
+    var d = disk_new()
+    var ed = open("a\nb\nc\nd\n")
+    feed(@&ed, @&d, "jj:sp<cr>")
+    assert ed.window_count() == 2 and ed.current_window() == 0     # the new one, above
+    assert win_at(@ed, 0, 2, 0) and win_at(@ed, 1, 2, 0)
+    # A line opened above: the other window's cursor stays on its text.
+    feed(@&ed, @&d, "ggOnew<esc>")
+    assert holds(@ed, "new\na\nb\nc\nd\n")
+    assert win_at(@ed, 0, 0, 2) and win_at(@ed, 1, 3, 0)
+    # Its line deleted: it goes to where the line was.
+    feed(@&ed, @&d, "3jdd")
+    assert win_at(@ed, 1, 3, 0) and holds(@ed, "new\na\nb\nd\n")
+    0
+
+[[test]]
+fn test_an_edit_before_the_other_cursor_on_its_line_moves_it() -> i32
+    var d = disk_new()
+    var ed = open("abc def\n")
+    feed(@&ed, @&d, "w:sp<cr>0x")
+    assert win_at(@ed, 1, 0, 3)
+    feed(@&ed, @&d, "ix<esc>")
+    assert win_at(@ed, 1, 0, 4)
+    0
+
+[[test]]
+fn test_deleting_everything_in_one_window_clamps_the_other() -> i32
+    var d = disk_new()
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, "G:sp<cr>ggdG")
+    assert holds(@ed, "") and win_at(@ed, 1, 0, 0)
+    0
+
+[[test]]
+fn test_an_edit_leaves_windows_on_other_buffers_alone() -> i32
+    var d = disk_with("g.txt", "x\ny\nz\n")
+    var ed = open("a\nb\n")
+    feed(@&ed, @&d, "j:sp<cr>:e g.txt<cr>ggdd")
+    assert win_path(@ed, 0).eq("g.txt") and win_path(@ed, 1).eq("f.txt")
+    assert win_at(@ed, 1, 1, 0)
+    0
+
+[[test]]
+fn test_undo_from_either_window() -> i32
+    var d = disk_new()
+    var ed = open("abc\n")
+    feed(@&ed, @&d, ":sp<cr>x<C-w>j")
+    assert ed.current_window() == 1 and holds(@ed, "bc\n")
+    feed(@&ed, @&d, "u")
+    assert holds(@ed, "abc\n")
+    feed(@&ed, @&d, "<C-w>k<C-r>")
+    assert ed.current_window() == 0 and holds(@ed, "bc\n")
+    0
+
+[[test]]
+fn test_ctrl_w_moves_between_windows() -> i32
+    var d = disk_new()
+    var ed = open("a\n")
+    feed(@&ed, @&d, ":vs<cr>")                      # new | old
+    assert ed.window_count() == 2 and ed.current_window() == 0
+    feed(@&ed, @&d, "<C-w>l")
+    assert ed.current_window() == 1
+    feed(@&ed, @&d, "<C-w>h")
+    assert ed.current_window() == 0
+    feed(@&ed, @&d, "<C-w>w")
+    assert ed.current_window() == 1
+    feed(@&ed, @&d, "<C-w><C-w>")
+    assert ed.current_window() == 0                 # round past the last
+    feed(@&ed, @&d, "<C-w>W")
+    assert ed.current_window() == 1
+    feed(@&ed, @&d, "1<C-w>w")                      # a count names the window
+    assert ed.current_window() == 0
+    # Split the left one: Row[Stack[new, left], right].
+    feed(@&ed, @&d, "<C-w>s")
+    assert ed.window_count() == 3 and ed.current_window() == 0
+    feed(@&ed, @&d, "<C-w>j")
+    assert ed.current_window() == 1
+    feed(@&ed, @&d, "<C-w>l")
+    assert ed.current_window() == 2
+    feed(@&ed, @&d, "<C-w>k")                       # nothing above: stays
+    assert ed.current_window() == 2
+    feed(@&ed, @&d, "<C-w>h")                       # the cursor's row picks the top one
+    assert ed.current_window() == 0
+    feed(@&ed, @&d, "<C-w>v")
+    assert ed.window_count() == 4
+    feed(@&ed, @&d, "<C-w>z")                       # not a window command: nothing
+    assert ed.window_count() == 4 and ed.current_window() == 0
+    0
+
+[[test]]
+fn test_ctrl_w_c_o_and_q_close_windows() -> i32
+    var d = disk_new()
+    var ed = open("ab")
+    feed(@&ed, @&d, ":sp<cr>:sp<cr><C-w>j")
+    assert ed.window_count() == 3 and ed.current_window() == 1
+    feed(@&ed, @&d, "<C-w>c")
+    assert ed.window_count() == 2 and ed.current_window() == 1  # the one below took the room
+    feed(@&ed, @&d, "<C-w>o")
+    assert ed.window_count() == 1
+    feed(@&ed, @&d, "<C-w>c")
+    assert says(@ed, "E444: Cannot close last window") and ed.window_count() == 1
+    feed(@&ed, @&d, ":sp<cr>:close<cr>:sp<cr>:only<cr>")
+    assert ed.window_count() == 1
+    # :q closes a window while there are others; the last quits.
+    feed(@&ed, @&d, ":sp<cr>x:q<cr>")
+    assert ed.window_count() == 1 and not ed.quit
+    feed(@&ed, @&d, "<C-w>q")
+    assert not ed.quit and says(@ed, MSG_NOT_SAVED)
+    feed(@&ed, @&d, "u<C-w>q")
+    assert ed.quit
+    0
+
+[[test]]
+fn test_a_split_needs_room() -> i32
+    var d = disk_new()
+    var ed = open("a\n")
+    ed.resize(Size { rows: 5, cols: 80 })           # 4 rows for windows
+    feed(@&ed, @&d, ":sp<cr>")
+    assert ed.window_count() == 2
+    feed(@&ed, @&d, ":sp<cr>")
+    assert ed.window_count() == 2 and says(@ed, "E36: Not enough room")
+    0
+
+[[test]]
+fn test_sp_and_vs_with_a_file_open_it_in_the_new_window() -> i32
+    var d = disk_with("g.txt", "one\n")
+    var ed = open("ab")
+    feed(@&ed, @&d, ":sp g.txt<cr>")
+    assert ed.window_count() == 2 and win_path(@ed, 0).eq("g.txt") and win_path(@ed, 1).eq("f.txt")
+    feed(@&ed, @&d, ":vs f.txt<cr>")
+    assert ed.window_count() == 3 and ed.path().eq("f.txt") and ed.buffer_count() == 2
+    0
+
+[[test]]
+fn test_each_window_keeps_its_own_jumps() -> i32
+    var d = disk_new()
+    var ed = open("a\nb\nc\n")
+    assert jump_to<Disk>(@&ed, @&d, "f.txt", pos(2, 0))
+    feed(@&ed, @&d, ":sp<cr>")                      # the new window has a copy
+    assert ed.jump_depth() == 1
+    feed(@&ed, @&d, "<C-o>")
+    assert ed.jump_depth() == 0 and at(@ed, 0, 0)
+    feed(@&ed, @&d, "<C-w>j")
+    assert ed.jump_depth() == 1 and at(@ed, 2, 0)
+    0
+
+[[test]]
+fn test_page_follows_the_window_height() -> i32
+    var text = string_new()
+    for i in 0..100
+        text.push_i64(i)
+        text.push('\n')
+    var ed = open(text.as_view())
+    var d = disk_new()
+    ed.resize(Size { rows: 24, cols: 80 })
+    feed(@&ed, @&d, ":sp<cr><C-f>")                 # 12 rows: 11 text rows, 9 lines a page
+    assert ed.top == 9 and ed.cursor.line == 9
+    0
+
+# What the painter and the event loop read: each window's state, and the
+# buffer list by index.
+[[test]]
+fn test_window_and_buffer_queries() -> i32
+    var d = disk_with("g.ritz", "one\ntwo\n")
+    var ed = open("a\nb\nc\n")
+    feed(@&ed, @&d, "jj:sp g.ritz<cr>j")        # above: g.ritz at 2:1; below: f.txt at 3:1
+    let t = ed.tiling()
+    assert t.wins.len() == 2
+    let top = ed.window_at(0)
+    let bottom = ed.window_at(1)
+    assert ed.is_current(top) and not ed.is_current(bottom)
+    assert ed.window_id(top) == t.wins.get(0).win
+    assert ed.window_number(top) == 2 and ed.window_number(bottom) == 1
+    assert ed.window_path(top).eq("g.ritz") and ed.window_path(bottom).eq("f.txt")
+    assert ed.window_buffer(bottom).line_count() == 4
+    assert ed.window_lines(top) == 2 and ed.window_lines(bottom) == 3
+    assert win_at(@ed, 0, 1, 0) and win_at(@ed, 1, 2, 0)
+    let st = ed.window_status(bottom)
+    assert st.name.eq("f.txt") and not st.dirty and st.mode == Mode.Normal
+    ed.set_window_top(bottom, 1)
+    assert ed.window_top(bottom) == 1 and ed.window_top(top) == 0
+    ed.set_window_top(top, 1)
+    assert ed.top == 1
+    assert ed.buffer_count() == 2
+    assert ed.buffer_number_at(0) == 1 and ed.buffer_path_at(0).eq("f.txt")
+    assert ed.buffer_number_at(1) == 2 and ed.buffer_at(1).line_count() == 3
+    assert ed.find_buffer(2).unwrap_or(-1) == 1 and ed.find_buffer(9).is_none()
+    assert ed.find_path("g.ritz").unwrap_or(-1) == 1 and ed.find_path("x").is_none()
+    assert ed.find_window(t.wins.get(1).win).unwrap_or(-1) == bottom and ed.find_window(99).is_none()
     0

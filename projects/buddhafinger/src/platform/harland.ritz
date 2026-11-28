@@ -36,10 +36,9 @@ import ritzlib.timedread { wait_readable }
 
 import core.editor { Editor, editor_new, editor_open, handle_key }
 import core.files { FileStore, LoadError }
-import core.modes { Mode }
-import core.screen { Screen, Size, View, render, render_styled, screen_new, text_rows, view_new }
+import core.paint { Painter, painter_new }
+import core.screen { Size }
 import platform.harland_save { HarlandFiles, SavePause, harland_files }
-import syntax.highlight { Highlighter, highlighter_new }
 
 pub const HARLAND_EXIT_OK: i32 = 0
 pub const HARLAND_EXIT_FAILED: i32 = 1
@@ -145,8 +144,8 @@ pub fn run_harland_editor(tty: i32, args: @HarlandArgs) -> i32
             report("not a terminal")
             return HARLAND_EXIT_FAILED
     files.console = Some(term)
-    var c = Console { tty: tty, term: term, reader: key_reader(tty), screen: screen_new(args.size), view: view_new(), styler: highlighter_new(), out: term_out(), drawn: None }
-    ed.page = text_rows(args.size) as i64
+    var c = Console { tty: tty, term: term, reader: key_reader(tty), painter: painter_new(args.size), out: term_out() }
+    ed.resize(args.size)
     c.enter_screen()
     let exit = c.run(@&ed, @&files)
     c.finish()
@@ -189,11 +188,8 @@ struct Console
     tty: i32
     term: TermState         # raw mode; restored by finish()
     reader: KeyReader       # keys, with the Escape timeout
-    screen: Screen
-    view: View
-    styler: Highlighter
+    painter: Painter        # the screen, the windows' views and the buffers' colors (core/paint.ritz)
     out: TermOut
-    drawn: Option<i64>      # the text_revision the caches were built for; None before the first paint
 
 impl Console
     # Paint whenever no input is waiting, then wait for the next key.
@@ -236,35 +232,16 @@ impl Console
         msg.push_str(" bytes lost")
         ed.say(msg.as_view())
 
-    # Compose the editor's frame and write what changed.
+    # Compose the editor's frame and write what changed: Linux's paint
+    # (core/paint.ritz), with no language server.
     fn paint(self: @&Console, ed: @&Editor) -> Result<(), Errno>
-        let rev = ed.text_revision()
-        if self.drawn.unwrap_or(-1) != rev
-            # The text changed: every line's checkpoints and colors may be stale.
-            self.screen.text_changed(0, 0)
-            self.styler = highlighter_new()
-            self.drawn = Some(rev)
-        self.view.top = ed.top
-        self.view.cursor_line = ed.cursor.line
-        self.view.cursor_byte = ed.cursor.col
-        self.view.selection = ed.selection()
-        let message: StrView = match ed.mode
-            Mode.CommandLine => ed.command_line()
-            _ => ed.message.as_view()
-        if ed.path.as_view().ends_with(".ritz")
-            render_styled(@&self.screen, ed, @&self.view, @&self.styler, ed.status(), message)
-        else
-            render(@&self.screen, ed, @&self.view, ed.status(), message)
-        ed.top = self.view.top
-        self.out.hide_cursor()
-        self.screen.emit(@&self.out)
-        self.out.show_cursor()
+        self.painter.compose(ed, "", "", @&self.out)
         self.out.flush(self.tty)
 
     # Onto the alternate screen; the next paint draws everything.
     fn enter_screen(self: @&Console)
         self.out.enter_alt_screen()
-        self.screen.invalidate_terminal()
+        self.painter.invalidate_terminal()
         let flushed = self.out.flush(self.tty)
 
     # Back to the shell's screen in the default style, cursor shown, and

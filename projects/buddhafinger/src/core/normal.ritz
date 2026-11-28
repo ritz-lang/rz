@@ -14,7 +14,12 @@
 # operator takes the selection at once (d x c s y), `o` and `O` swap the
 # selection's ends, v and V switch shape or leave, gv swaps with the last
 # selection and Escape leaves. Keys with no Visual meaning yet (D C Y,
-# i a for text objects, u, Ctrl-R, : / K gd Ctrl-O) cancel.
+# i a for text objects, u, Ctrl-R, : / K gd Ctrl-O, Ctrl-W) cancel.
+#
+# Ctrl-W and a key is a window command (AGAST #4912): h j k l to the window
+# that way, w W the next or previous (a count names the window), s v split,
+# c close, o only, q quit. The second key may be typed with Ctrl too
+# (Ctrl-W Ctrl-J), as Vim allows.
 # Core module: no terminal or OS I/O (see src/platform/).
 
 import ritzlib.option { Option }
@@ -52,6 +57,20 @@ pub enum Motion
     LastLine        # G; a count names the line
     Lines           # an operator typed twice: the cursor's line and count - 1 more
 
+# A window command: Ctrl-W and its key.
+pub enum WindowCommand
+    Left            # h
+    Down            # j
+    Up              # k
+    Right           # l
+    Next            # w; with a count, that window
+    Previous        # W
+    Split           # s S
+    VSplit          # v
+    Close           # c
+    Only            # o
+    Quit            # q
+
 pub enum Action
     Move(Motion)
     Operate(Operator, Motion)
@@ -77,6 +96,7 @@ pub enum Action
     SwapEnds        # o O in Visual mode
     OperateSelection(Operator)  # d x c s y in Visual mode
     Leave           # Escape in Visual mode
+    Window(WindowCommand)   # Ctrl-W and a key
 
 pub struct NormalCommand
     action: Action
@@ -97,9 +117,10 @@ pub struct NormalKeys
     op: Option<Operator>    # the operator waiting for its motion
     op_count: i64           # the count typed before the operator; 0: none
     g: bool                 # a `g` waits for its second key
+    window: bool            # a Ctrl-W waits for its second key
 
 pub fn normal_keys_new() -> NormalKeys
-    NormalKeys { count: 0, op: None, op_count: 0, g: false }
+    NormalKeys { count: 0, op: None, op_count: 0, g: false, window: false }
 
 # a * b for counts, 0 meaning none typed; never past MAX_COUNT.
 fn times_counts(a: i64, b: i64) -> i64
@@ -112,7 +133,7 @@ fn times_counts(a: i64, b: i64) -> i64
 impl NormalKeys
     # True when no key of a command is waiting.
     pub fn is_idle(self: @NormalKeys) -> bool
-        self.count == 0 and self.op.is_none() and not self.g
+        self.count == 0 and self.op.is_none() and not self.g and not self.window
 
     # One more typed key, meaning what it does in `map`.
     pub fn feed(self: @&NormalKeys, key: Key, map: Keymap) -> Step
@@ -121,6 +142,8 @@ impl NormalKeys
             _ => 0
         if self.g
             return self.after_g(c, map)
+        if self.window
+            return self.after_ctrl_w(key)
         if (c >= '1' and c <= '9') or (c == '0' and self.count > 0)
             let digit = (c - '0') as i64
             self.count = if self.count > (MAX_COUNT - digit) / 10 then MAX_COUNT else self.count * 10 + digit
@@ -152,6 +175,27 @@ impl NormalKeys
             'd' => if map == Keymap.Visual then self.cancel() else self.action(Action.Definition)
             _ => self.cancel()
 
+    # The key after Ctrl-W: a letter, or the same letter with Ctrl.
+    fn after_ctrl_w(self: @&NormalKeys, key: Key) -> Step
+        self.window = false
+        let c: u8 = match key
+            Key.Char(ch) => if ch < 0x80 then ch as u8 else 0
+            Key.Ctrl(k) => if k == 'c' then 0 else k
+            _ => 0
+        match c
+            'h' => self.action(Action.Window(WindowCommand.Left))
+            'j' => self.action(Action.Window(WindowCommand.Down))
+            'k' => self.action(Action.Window(WindowCommand.Up))
+            'l' => self.action(Action.Window(WindowCommand.Right))
+            'w' => self.action(Action.Window(WindowCommand.Next))
+            'W' => self.action(Action.Window(WindowCommand.Previous))
+            's' | 'S' => self.action(Action.Window(WindowCommand.Split))
+            'v' => self.action(Action.Window(WindowCommand.VSplit))
+            'c' => self.action(Action.Window(WindowCommand.Close))
+            'o' => self.action(Action.Window(WindowCommand.Only))
+            'q' => self.action(Action.Window(WindowCommand.Quit))
+            _ => self.cancel()
+
     # Ctrl and a key. In Visual mode only the page turns (Ctrl-F, Ctrl-B),
     # which move the cursor end.
     fn ctrl(self: @&NormalKeys, k: u8, map: Keymap) -> Step
@@ -162,6 +206,11 @@ impl NormalKeys
             'b' => self.action(Action.PageUp)
             'r' => self.action(Action.Redo)
             'o' | 't' => self.action(Action.JumpBack)
+            'w' =>
+                if self.op.is_some()
+                    return self.cancel()
+                self.window = true
+                Step.Wait
             _ => self.cancel()
 
     fn char(self: @&NormalKeys, c: u8, map: Keymap) -> Step

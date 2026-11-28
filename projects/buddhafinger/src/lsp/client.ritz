@@ -13,18 +13,23 @@
 #
 #   - Start: `initialize`, then on its answer `initialized` and the
 #     capabilities (Reply.Ready). Nothing else goes before the answer.
-#   - Sync: the document's version is the editor's text revision. Each turn
-#     the loop asks wants_text(uri, revision, size); when it says yes it
-#     builds the text and calls send_text. A didChange that hasn't started
-#     is replaced by the next (Outbox coalescing); didOpen and didClose keep
-#     their place. Above SYNC_LIMIT_BYTES the document is closed on the
-#     server instead (sync suspended) until it shrinks again.
-#   - Requests: hover and definition, each tied to the revision it was asked
-#     at. An answer for an older revision, or for a request since replaced,
-#     is dropped; one that doesn't come in REQUEST_TIMEOUT_MS is
+#   - Sync: one document per buffer that is a Ritz file (AGAST #4912), each
+#     at its buffer's text revision. Each turn the loop calls begin_sync,
+#     asks wants_text(uri, revision, size) for every such buffer, sends the
+#     text with send_text when it says yes, and calls end_sync, which closes
+#     on the server (didClose) every document not asked about: a buffer
+#     deleted, or renamed. A didChange that hasn't started is replaced by
+#     the next (Outbox coalescing); didOpen and didClose keep their place.
+#     Above SYNC_LIMIT_BYTES a document is closed on the server instead
+#     (sync suspended) until it shrinks again.
+#   - Requests: hover and definition, each tied to the document and the
+#     revision it was asked at. An answer for another document or an older
+#     revision than the one the editor shows, or for a request since
+#     replaced, is dropped; one that doesn't come in REQUEST_TIMEOUT_MS is
 #     Reply.TimedOut.
-#   - Diagnostics: kept with their version, and shown (diagnostics()) only
-#     while that version is the current revision.
+#   - Diagnostics: kept per document with their version, taken only for the
+#     version last sent, and shown (diagnostics()) only while that version
+#     is the buffer's revision.
 
 import ritzlib.gvec
 import ritzlib.json { Json, json_parse, json_emit_string, json_emit_bytes }
@@ -89,11 +94,12 @@ impl Reply
 # An outstanding request; id 0 is none.
 struct Ask
     id: i64
+    doc: i64            # the document's key (Doc.key; keys start at 1, as ids do)
     revision: i64
     deadline: i64
 
 fn no_ask() -> Ask
-    Ask { id: 0, revision: 0, deadline: 0 }
+    Ask { id: 0, doc: 0, revision: 0, deadline: 0 }
 
 # One diagnostic: a range in UTF-16 positions, its severity (1 error ..
 # 4 hint) and its message, text[msg_at .. msg_at + msg_len] of the pool.
@@ -106,6 +112,27 @@ pub struct Diag
     msg_at: i64
     msg_len: i64
 
+# A document the editor has (a Ritz file's buffer).
+struct Doc
+    key: i64                    # its name for requests: 1 up, never used again
+    uri: String
+    open: bool                  # open on the server
+    synced: i64                 # the revision last queued for it
+    suspended: bool             # over SYNC_LIMIT_BYTES
+    seen: bool                  # asked about since begin_sync
+    diags: Vec<Diag>
+    diag_text: Vec<u8>          # their messages, back to back
+    diag_version: i64           # the revision `diags` are for; -1: none
+
+fn doc_new(key: i64, uri: StrView) -> Doc
+    Doc { key: key, uri: string_from(uri), open: false, synced: -1, suspended: false, seen: true, diags: vec_new<Diag>(), diag_text: vec_new<u8>(), diag_version: -1 }
+
+impl Doc
+    fn drop_diagnostics(self: @&Doc)
+        self.diags.clear()
+        self.diag_text.clear()
+        self.diag_version = -1
+
 pub struct Client
     out: Outbox
     reader: FrameReader
@@ -116,15 +143,11 @@ pub struct Client
     hover_ok: bool              # the server's capabilities
     definition_ok: bool
     sync_ok: bool
-    doc: String                 # the editor's document's uri; empty: not a Ritz file
-    open: bool                  # `doc` is open on the server
-    synced: i64                 # the revision last queued for it
-    suspended: bool             # `doc` is over SYNC_LIMIT_BYTES
+    docs: Vec<Doc>
+    next_key: i64
+    no_diags: Vec<Diag>         # empty: the list of a document the client hasn't
     hover: Ask
     definition: Ask
-    diags: Vec<Diag>
-    diag_text: Vec<u8>
-    diag_version: i64           # the revision `diags` are for; -1: none
     hover_text: String
     target: String
     target_line: i64
@@ -133,8 +156,14 @@ pub struct Client
     stale: i64                  # answers and diagnostics dropped as outdated
     json: Vec<u8>               # the message being built
 
+# A Vec frees only its own storage: the documents go one by one.
+impl Drop for Client
+    fn drop(self: @&Client)
+        while self.docs.len() > 0
+            let gone = self.docs.pop()
+
 pub fn client_new() -> Client
-    Client { out: outbox_new(QUEUE_CAP_BYTES), reader: frame_reader(), phase: Phase.Starting, next_id: 1, init_id: 0, init_deadline: 0, hover_ok: false, definition_ok: false, sync_ok: false, doc: string_new(), open: false, synced: -1, suspended: false, hover: no_ask(), definition: no_ask(), diags: vec_new<Diag>(), diag_text: vec_new<u8>(), diag_version: -1, hover_text: string_new(), target: string_new(), target_line: 0, target_char: 0, error: string_new(), stale: 0, json: vec_new<u8>() }
+    Client { out: outbox_new(QUEUE_CAP_BYTES), reader: frame_reader(), phase: Phase.Starting, next_id: 1, init_id: 0, init_deadline: 0, hover_ok: false, definition_ok: false, sync_ok: false, docs: vec_new<Doc>(), next_key: 1, no_diags: vec_new<Diag>(), hover: no_ask(), definition: no_ask(), hover_text: string_new(), target: string_new(), target_line: 0, target_char: 0, error: string_new(), stale: 0, json: vec_new<u8>() }
 
 # ============================================================================
 # JSON reading helpers
@@ -233,17 +262,25 @@ impl Client
         id
 
     # `,"params":{"textDocument":{"uri":...` without closing either object.
-    fn doc_params(self: @&Client)
+    fn doc_params(self: @&Client, uri: StrView)
         self.json.push_view(",\"params\":{\"textDocument\":{\"uri\":")
-        json_emit_string(self.doc.as_view(), @&self.json)
+        json_emit_string(uri, @&self.json)
 
     fn body(self: @Client) -> [u8]
         self.json[0..self.json.len()]
 
-    fn drop_diagnostics(self: @&Client)
-        self.diags.clear()
-        self.diag_text.clear()
-        self.diag_version = -1
+    # Where document `uri` is in `docs`, if the client has it.
+    fn doc_of(self: @Client, uri: StrView) -> Option<i64>
+        for k in 0..self.docs.len()
+            if self.docs[k].uri.as_view().eq(uri)
+                return Some(k)
+        None
+
+    # True when request `asked` was about document `uri`.
+    fn asked_about(self: @Client, asked: Ask, uri: StrView) -> bool
+        match self.doc_of(uri)
+            Some(k) => self.docs[k].key == asked.doc
+            None => false
 
     # ------------------------------------------------------------------
     # Start
@@ -266,39 +303,61 @@ impl Client
     # Sync
     # ------------------------------------------------------------------
 
-    # The editor shows document `uri` ("" when it isn't a Ritz file) at
-    # `revision`, `size` bytes long. Queues didClose when the document
-    # changed or grew past SYNC_LIMIT_BYTES. True when the server needs the
-    # text now: build it and call send_text.
+    # A sync turn starts: end_sync closes the documents not asked about by
+    # wants_text before it.
+    pub fn begin_sync(self: @&Client)
+        for k in 0..self.docs.len()
+            self.docs[k].seen = false
+
+    # The turn's end: each document not asked about is closed on the server
+    # and forgotten, its diagnostics with it.
+    pub fn end_sync(self: @&Client)
+        var k: i64 = 0
+        while k < self.docs.len()
+            if self.docs[k].seen
+                k += 1
+            else
+                self.close_doc(k)
+                let moved = self.docs.pop()
+                if k < self.docs.len()
+                    let gone = self.docs.replace(k, moved)
+
+    # The editor has document `uri` (a Ritz file's buffer; "" asks nothing)
+    # at `revision`, `size` bytes long. Queues didClose when it grew past
+    # SYNC_LIMIT_BYTES. True when the server needs the text now: build it
+    # and call send_text.
     pub fn wants_text(self: @&Client, uri: StrView, revision: i64, size: i64) -> bool
-        if self.phase != Phase.Ready or not self.sync_ok
+        if self.phase != Phase.Ready or not self.sync_ok or uri.is_empty()
             return false
-        if not self.doc.as_view().eq(uri)
-            self.close_doc()
-            self.doc.clear()
-            self.doc.push_str(uri)
-            self.synced = -1
-            self.suspended = false
-        if uri.is_empty()
-            return false
+        var k: i64 = 0
+        match self.doc_of(uri)
+            Some(found) => k = found
+            None =>
+                self.docs.push(doc_new(self.next_key, uri))
+                self.next_key += 1
+                k = self.docs.len() - 1
+        self.docs[k].seen = true
         if size > SYNC_LIMIT_BYTES
-            if not self.suspended
-                self.close_doc()
-                self.suspended = true
+            if not self.docs[k].suspended
+                self.close_doc(k)
+                self.docs[k].suspended = true
             return false
-        self.suspended = false
-        if self.open and self.synced == revision
+        self.docs[k].suspended = false
+        if self.docs[k].open and self.docs[k].synced == revision
             return false
         # Don't build a text the queue can't take yet: the server is behind.
         self.out.snapshot_fits(size + size / 8 + 512)
 
-    # The document's text at `revision`, as wants_text asked for. False if
-    # the queue couldn't take it (wants_text asks again next turn).
-    pub fn send_text(self: @&Client, revision: i64, text: [u8]) -> bool
-        let opening = not self.open
+    # Document `uri`'s text at `revision`, as wants_text asked for. False
+    # if the queue couldn't take it (wants_text asks again next turn).
+    pub fn send_text(self: @&Client, uri: StrView, revision: i64, text: [u8]) -> bool
+        let k: i64 = match self.doc_of(uri)
+            Some(found) => found
+            None => return false
+        let opening = not self.docs[k].open
         if opening
             self.begin("textDocument/didOpen")
-            self.doc_params()
+            self.doc_params(uri)
             self.json.push_view(",\"languageId\":\"ritz\",\"version\":")
             self.json.push_view(string_from_i64(revision).as_view())
             self.json.push_view(",\"text\":")
@@ -306,7 +365,7 @@ impl Client
             self.json.push_view("}}}")
         else
             self.begin("textDocument/didChange")
-            self.doc_params()
+            self.doc_params(uri)
             self.json.push_view(",\"version\":")
             self.json.push_view(string_from_i64(revision).as_view())
             self.json.push_view("},\"contentChanges\":[{\"text\":")
@@ -315,31 +374,35 @@ impl Client
         let queued = if opening then self.out.push_ordered(self.body()) else self.out.push_snapshot(self.body())
         if queued.is_err()
             return false
-        self.open = true
-        self.synced = revision
+        self.docs[k].open = true
+        self.docs[k].synced = revision
         true
 
-    # didClose for the open document; its diagnostics go with it.
-    fn close_doc(self: @&Client)
-        self.drop_diagnostics()
-        if not self.open
+    # didClose for document k when it is open; its diagnostics go with it.
+    fn close_doc(self: @&Client, k: i64)
+        self.docs[k].drop_diagnostics()
+        if not self.docs[k].open
             return
+        let uri = string_from(self.docs[k].uri.as_view())
         self.begin("textDocument/didClose")
-        self.doc_params()
+        self.doc_params(uri.as_view())
         self.json.push_view("}}}")
         let queued = self.out.push_ordered(self.body())
-        self.open = false
+        self.docs[k].open = false
 
-    pub fn sync_suspended(self: @Client) -> bool
-        self.suspended
+    # True when document `uri` is over SYNC_LIMIT_BYTES and so not synced.
+    pub fn sync_suspended(self: @Client, uri: StrView) -> bool
+        match self.doc_of(uri)
+            Some(k) => self.docs[k].suspended
+            None => false
 
     # ------------------------------------------------------------------
     # Requests
     # ------------------------------------------------------------------
 
-    # Ask for hover or definition at (line, UTF-16 char) of the document at
-    # `revision`. A request of the same kind still out is forgotten.
-    pub fn ask(self: @&Client, kind: AskKind, revision: i64, line: i64, ch: i64, now: i64) -> Result<(), Refused>
+    # Ask for hover or definition at (line, UTF-16 char) of document `uri`
+    # at `revision`. A request of the same kind still out is forgotten.
+    pub fn ask(self: @&Client, kind: AskKind, uri: StrView, revision: i64, line: i64, ch: i64, now: i64) -> Result<(), Refused>
         if self.phase != Phase.Ready
             return Err(Refused.NotReady)
         let supported = match kind
@@ -347,14 +410,18 @@ impl Client
             AskKind.Definition => self.definition_ok
         if not supported
             return Err(Refused.Unsupported)
-        if not self.open or self.suspended
+        let k: i64 = match self.doc_of(uri)
+            Some(found) => found
+            None => return Err(Refused.NotOpen)
+        if not self.docs[k].open or self.docs[k].suspended
             return Err(Refused.NotOpen)
+        let key = self.docs[k].key
         let method: StrView = match kind
             AskKind.Hover => "textDocument/hover"
             AskKind.Definition => "textDocument/definition"
         let saved_id = self.next_id
         let id = self.begin_request(method)
-        self.doc_params()
+        self.doc_params(uri)
         self.json.push_view("},\"position\":{\"line\":")
         self.json.push_view(string_from_i64(line).as_view())
         self.json.push_view(",\"character\":")
@@ -363,7 +430,7 @@ impl Client
         if self.out.push(self.body()).is_err()
             self.next_id = saved_id
             return Err(Refused.Busy)
-        let a = Ask { id: id, revision: revision, deadline: now + REQUEST_TIMEOUT_MS }
+        let a = Ask { id: id, doc: key, revision: revision, deadline: now + REQUEST_TIMEOUT_MS }
         match kind
             AskKind.Hover => self.hover = a
             AskKind.Definition => self.definition = a
@@ -400,17 +467,19 @@ impl Client
     # Answers
     # ------------------------------------------------------------------
 
-    # The next whole message read, applied: Some(what it means), or None
-    # when no whole message is buffered. Err(()) when the stream is not
-    # LSP framing: the session can't go on.
-    pub fn next_reply(self: @&Client, revision: i64) -> Result<Option<Reply>, ()>
+    # The next whole message read, applied, the editor showing document
+    # `uri` at `revision`: Some(what it means), or None when no whole
+    # message is buffered. Err(()) when the stream is not LSP framing: the
+    # session can't go on.
+    pub fn next_reply(self: @&Client, uri: StrView, revision: i64) -> Result<Option<Reply>, ()>
         match self.reader.next()
-            Framed.Message(m) => Ok(Some(self.receive(m, revision)))
+            Framed.Message(m) => Ok(Some(self.receive(m, uri, revision)))
             Framed.Partial => Ok(None)
             Framed.Bad => Err(())
 
-    # One message from the server, the editor's text at `revision`.
-    pub fn receive(self: @&Client, text: StrView, revision: i64) -> Reply
+    # One message from the server, the editor showing document `uri` at
+    # `revision`: an answer asked about anything else is stale.
+    pub fn receive(self: @&Client, text: StrView, uri: StrView, revision: i64) -> Reply
         let msg: Json = match json_parse(text)
             Ok(j) => j
             Err(_) => return Reply.Nothing
@@ -419,7 +488,7 @@ impl Client
         if not method.is_empty()
             if method.eq("textDocument/publishDiagnostics")
                 match msg.get_field("params")
-                    Some(p) => return self.take_diagnostics(p, revision)
+                    Some(p) => return self.take_diagnostics(p)
                     None => return Reply.Nothing
             if id >= 0
                 # A request from the server (registerCapability and the
@@ -452,18 +521,18 @@ impl Client
             self.phase = Phase.Ready
             return Reply.Ready
         if id == self.hover.id
-            let asked = self.hover.revision
+            let asked = self.hover
             self.hover = no_ask()
-            if asked != revision
+            if asked.revision != revision or not self.asked_about(asked, uri)
                 self.stale += 1
                 return Reply.Nothing
             if failed
                 return self.fail(AskKind.Hover, @msg)
             return self.take_hover(@msg)
         if id == self.definition.id
-            let asked = self.definition.revision
+            let asked = self.definition
             self.definition = no_ask()
-            if asked != revision
+            if asked.revision != revision or not self.asked_about(asked, uri)
                 self.stale += 1
                 return Reply.Nothing
             if failed
@@ -526,31 +595,35 @@ impl Client
         self.target_char = number_of(start.get_field("character"), 0)
         Reply.Definition
 
-    fn take_diagnostics(self: @&Client, p: @Json, revision: i64) -> Reply
-        if not self.open or not string_of(p.get_field("uri")).eq(self.doc.as_view())
+    # A document's list: taken only for the version last sent to it.
+    fn take_diagnostics(self: @&Client, p: @Json) -> Reply
+        let k: i64 = match self.doc_of(string_of(p.get_field("uri")))
+            Some(found) => found
+            None => return Reply.Nothing
+        if not self.docs[k].open
             return Reply.Nothing
         let version = number_of(p.get_field("version"), -1)
-        if version != revision
+        if version != self.docs[k].synced
             # Compiled for text the editor no longer has (or unversioned).
             self.stale += 1
             if version < 0
-                self.drop_diagnostics()
+                self.docs[k].drop_diagnostics()
                 return Reply.Diagnostics
             return Reply.Nothing
-        self.drop_diagnostics()
-        self.diag_version = version
+        self.docs[k].drop_diagnostics()
+        self.docs[k].diag_version = version
         let list: @Json = match p.get_field("diagnostics")
             Some(l) => l
             None => return Reply.Diagnostics
         var i: i64 = 0
         while i < list.array_len() and i < MAX_DIAGNOSTICS
             match list.get_index(i)
-                Some(d) => self.take_diagnostic(d)
+                Some(d) => self.take_diagnostic(k, d)
                 None => pass
             i += 1
         Reply.Diagnostics
 
-    fn take_diagnostic(self: @&Client, d: @Json)
+    fn take_diagnostic(self: @&Client, k: i64, d: @Json)
         let range: @Json = match d.get_field("range")
             Some(r) => r
             None => return
@@ -561,23 +634,30 @@ impl Client
             Some(v) => v
             None => s
         let message = string_of(d.get_field("message"))
-        let at = self.diag_text.len()
-        self.diag_text.push_view(message)
-        self.diags.push(Diag { line: number_of(s.get_field("line"), 0), start: number_of(s.get_field("character"), 0), end_line: number_of(e.get_field("line"), 0), end: number_of(e.get_field("character"), 0), severity: number_of(d.get_field("severity"), 1), msg_at: at, msg_len: message.len() })
+        let at = self.docs[k].diag_text.len()
+        self.docs[k].diag_text.push_view(message)
+        self.docs[k].diags.push(Diag { line: number_of(s.get_field("line"), 0), start: number_of(s.get_field("character"), 0), end_line: number_of(e.get_field("line"), 0), end: number_of(e.get_field("character"), 0), severity: number_of(d.get_field("severity"), 1), msg_at: at, msg_len: message.len() })
 
     # ------------------------------------------------------------------
     # What the editor reads
     # ------------------------------------------------------------------
 
-    # The diagnostics for the text at `revision`: none unless the server's
-    # latest list was compiled for exactly that revision.
-    pub fn diagnostics(self: @Client, revision: i64) -> [Diag]
-        if self.diag_version != revision or not self.open
-            return span_from_vec<Diag>(@self.diags).slice(0, 0)
-        span_from_vec<Diag>(@self.diags)
+    # The diagnostics for document `uri` at `revision`: none unless the
+    # server's latest list for it was compiled for exactly that revision.
+    pub fn diagnostics(self: @Client, uri: StrView, revision: i64) -> [Diag]
+        let k: i64 = match self.doc_of(uri)
+            Some(found) => found
+            None => return span_from_vec<Diag>(@self.no_diags)
+        if self.docs[k].diag_version != revision or not self.docs[k].open
+            return span_from_vec<Diag>(@self.docs[k].diags).slice(0, 0)
+        span_from_vec<Diag>(@self.docs[k].diags)
 
-    pub fn message_of(self: @Client, d: Diag) -> StrView
-        let all: [u8] = self.diag_text[0..self.diag_text.len()]
+    # The message of diagnostic `d` of document `uri`.
+    pub fn message_of(self: @Client, uri: StrView, d: Diag) -> StrView
+        let k: i64 = match self.doc_of(uri)
+            Some(found) => found
+            None => return ""
+        let all: [u8] = self.docs[k].diag_text[0..self.docs[k].diag_text.len()]
         all.slice(d.msg_at, d.msg_at + d.msg_len).as_strview()
 
     pub fn hover_text(self: @Client) -> StrView

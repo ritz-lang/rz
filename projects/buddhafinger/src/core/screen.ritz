@@ -23,6 +23,15 @@
 # the last line show `~`), the status line, and the command/message line.
 # render() scrolls the view so the cursor is on screen.
 #
+# Several windows (AGAST #4912): begin_frame, then draw_window for each in
+# its rectangle (core/layout.ritz's tiling: its text rows and status line),
+# draw_separator for each separator, and draw_message. render_styled is
+# that for one window over the whole screen. Only the current window's
+# status line names the mode, and it is drawn bold; the cursor is the
+# current window's. A message of several lines (`:ls`) takes the rows
+# above the last, over the windows, with PROMPT on the last row, as Vim's
+# does while it waits for a key.
+#
 # Buffer bytes are display data, never terminal commands: a C0 control byte
 # or DEL shows as `^X` (`^[` for ESC, `^?` for DEL), and a byte that does
 # not start well-formed UTF-8 shows as `<xx>`, both in the escape style. The
@@ -43,6 +52,7 @@ import ritzlib.string
 import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.termsession { TermOut, Style, Color, style_plain }
 
+import core.layout { Rect, rect }
 import core.modes { Mode, mode_label }
 
 pub struct Size
@@ -51,6 +61,9 @@ pub struct Size
 
 # Rows below the text area: the status line and the command/message line.
 pub const CHROME_ROWS: i32 = 2
+
+# The last row while a message of several lines waits for a key.
+pub const PROMPT: StrView = "Press ENTER or type command to continue"
 
 # Rows left for buffer text in a viewport of `size`.
 pub fn text_rows(size: Size) -> i32
@@ -89,6 +102,9 @@ pub trait LineStyler
 pub struct NoStyles
     none: Vec<StyleRun>
 
+pub fn no_styles() -> NoStyles
+    NoStyles { none: vec_new<StyleRun>() }
+
 impl LineStyler for NoStyles
     fn runs(self: @&NoStyles, l: i64, bytes: [u8]) -> [StyleRun]
         span_from_vec<StyleRun>(@self.none)
@@ -117,7 +133,16 @@ pub fn style_escape() -> Style
     s.fg = Color.Index(6)
     s
 
+# The current window's status line (Vim's StatusLine: reversed, bold).
 pub fn style_status() -> Style
+    var s = style_plain()
+    s.reverse = true
+    s.bold = true
+    s
+
+
+# The other windows' status lines and the separators (StatusLineNC).
+pub fn style_status_nc() -> Style
     var s = style_plain()
     s.reverse = true
     s
@@ -335,9 +360,11 @@ struct Mark
     byte: i64
     cell: i64
 
-# One cached line: its marks are marks[slot * per_slot ..][0..count], every
-# `stride` bytes or more apart and ascending.
+# One cached line of one source (a buffer: View.source): its marks are
+# marks[slot * per_slot ..][0..count], every `stride` bytes or more apart
+# and ascending.
 struct Slot
+    source: i64
     line: i64       # -1: free
     count: i64
     stride: i64
@@ -369,26 +396,36 @@ pub fn checkpoints_with(lines: i64, per_line: i64, stride: i64) -> Checkpoints
     let per = if per_line < 2 then 2 else per_line
     var slots: Vec<Slot> = vec_new<Slot>()
     for i in 0..lines
-        slots.push(Slot { line: -1, count: 0, stride: stride, used: 0 })
+        slots.push(Slot { source: 0, line: -1, count: 0, stride: stride, used: 0 })
     var marks: Vec<Mark> = vec_with_cap<Mark>(lines * per)
     for i in 0..lines * per
         marks.push(Mark { byte: 0, cell: 0 })
     Checkpoints { slots: slots, marks: marks, per_line: per, stride: if stride < 1 then 1 else stride, tick: 0 }
 
 impl Checkpoints
-    # How many marks line l has (0 when it isn't cached).
+    # How many marks line l of source 0 has (0 when it isn't cached).
     pub fn marks_for(self: @Checkpoints, l: i64) -> i64
-        match self.find(l)
+        self.marks_in(0, l)
+
+    # How many marks line l of `source` has.
+    pub fn marks_in(self: @Checkpoints, source: i64, l: i64) -> i64
+        match self.find(source, l)
             Some(k) => self.slots.get(k).count
             None => 0
 
-    # The text changed at byte `byte` of line l: drop that line's marks from
-    # the edit onward, and those a UTF-8 sequence's length before it (the
-    # unit there may now end elsewhere), and every later line's (lines after
-    # a split or join are other lines now).
+    # invalidate_in for source 0.
     pub fn invalidate(self: @&Checkpoints, l: i64, byte: i64)
+        self.invalidate_in(0, l, byte)
+
+    # The text of `source` changed at byte `byte` of line l: drop that
+    # line's marks from the edit onward, and those a UTF-8 sequence's length
+    # before it (the unit there may now end elsewhere), and every later
+    # line's (lines after a split or join are other lines now).
+    pub fn invalidate_in(self: @&Checkpoints, source: i64, l: i64, byte: i64)
         for k in 0..self.slots.len()
             var s = self.slots.get(k)
+            if s.source != source
+                continue
             if s.line > l
                 s.line = -1
                 s.count = 0
@@ -399,25 +436,27 @@ impl Checkpoints
                 s.count = keep
             self.slots.set(k, s)
 
-    fn find(self: @Checkpoints, l: i64) -> Option<i64>
+    fn find(self: @Checkpoints, source: i64, l: i64) -> Option<i64>
         for k in 0..self.slots.len()
-            if self.slots.get(k).line == l
+            let s = self.slots.get(k)
+            if s.line == l and s.source == source
                 return Some(k)
         None
 
-    # The slot for line l, taking a free or the least recently used one.
-    fn slot_for(self: @&Checkpoints, l: i64) -> Option<i64>
+    # The slot for line l of `source`, taking a free or the least recently
+    # used one.
+    fn slot_for(self: @&Checkpoints, source: i64, l: i64) -> Option<i64>
         if self.slots.len() == 0
             return None
         self.tick += 1
         var pick: i64 = 0
-        match self.find(l)
+        match self.find(source, l)
             Some(k) => pick = k
             None =>
                 for k in 1..self.slots.len()
                     if self.slots.get(k).used < self.slots.get(pick).used
                         pick = k
-                self.slots.set(pick, Slot { line: l, count: 0, stride: self.stride, used: 0 })
+                self.slots.set(pick, Slot { source: source, line: l, count: 0, stride: self.stride, used: 0 })
         var s = self.slots.get(pick)
         s.used = self.tick
         self.slots.set(pick, s)
@@ -470,10 +509,10 @@ struct Scan
     byte: i64
     cell: i64
 
-fn scan_from(cp: @&Checkpoints, l: i64, bytes: [u8], by_cell: bool, at: i64) -> Scan
+fn scan_from(cp: @&Checkpoints, source: i64, l: i64, bytes: [u8], by_cell: bool, at: i64) -> Scan
     if bytes.len < cp.stride
         return Scan { bytes: bytes, slot: None, byte: 0, cell: 0 }
-    let slot = cp.slot_for(l)
+    let slot = cp.slot_for(source, l)
     var m = Mark { byte: 0, cell: 0 }
     match slot
         Some(k) => m = cp.start(k, by_cell, at)
@@ -494,10 +533,10 @@ impl Scan
             Some(k) => cp.note(k, self.byte, self.cell)
             None => pass
 
-# The cell column byte `byte` of line l starts at: the cell after the line
-# when it is at or past the end.
-fn cell_of(cp: @&Checkpoints, l: i64, bytes: [u8], byte: i64) -> i64
-    var sc = scan_from(cp, l, bytes, false, byte)
+# The cell column byte `byte` of line l of `source` starts at: the cell
+# after the line when it is at or past the end.
+fn cell_of(cp: @&Checkpoints, source: i64, l: i64, bytes: [u8], byte: i64) -> i64
+    var sc = scan_from(cp, source, l, bytes, false, byte)
     while not sc.done() and sc.byte < byte
         let u = sc.unit()
         if sc.byte + u.len > byte
@@ -537,16 +576,18 @@ impl Selection
         self.covers(l, len)
 
 # Where the window onto the buffer is: the first line shown, the first cell
-# column shown, the cursor (a line and a byte in it), and the selection.
+# column shown, the cursor (a line and a byte in it), the selection, and
+# which source (buffer) it shows, which keys its long-line checkpoints.
 pub struct View
     top: i64
     left: i64
     cursor_line: i64
     cursor_byte: i64
     selection: Option<Selection>    # None outside Visual mode
+    source: i64
 
 pub fn view_new() -> View
-    View { top: 0, left: 0, cursor_line: 0, cursor_byte: 0, selection: None }
+    View { top: 0, left: 0, cursor_line: 0, cursor_byte: 0, selection: None, source: 0 }
 
 # What the status line shows besides the cursor position.
 pub struct Status
@@ -618,12 +659,19 @@ impl Screen
     pub fn cursor_col(self: @Screen) -> i64
         self.cursor_col
 
-    # The buffer changed at line l, byte `byte` (see Checkpoints.invalidate).
+    # Source 0 changed at line l, byte `byte` (see Checkpoints.invalidate).
     pub fn text_changed(self: @&Screen, l: i64, byte: i64)
         self.marks.invalidate(l, byte)
 
+    # Source `source` changed at line l, byte `byte`.
+    pub fn text_changed_in(self: @&Screen, source: i64, l: i64, byte: i64)
+        self.marks.invalidate_in(source, l, byte)
+
     pub fn marks_for(self: @Screen, l: i64) -> i64
         self.marks.marks_for(l)
+
+    pub fn marks_in(self: @Screen, source: i64, l: i64) -> i64
+        self.marks.marks_in(source, l)
 
     # Append to `out` what turns the terminal's screen into the composed
     # frame: the changed cells, each run after one cursor move and the SGR
@@ -681,9 +729,24 @@ pub fn render<L: LineSource>(scr: @&Screen, src: @L, view: @&View, status: Statu
 # render, with each shown line's text colored by `styler`. Only the lines on
 # screen are asked for.
 pub fn render_styled<L: LineSource, S: LineStyler>(scr: @&Screen, src: @L, view: @&View, styler: @&S, status: Status, message: StrView)
+    begin_frame(scr)
+    let rows = scr.back.rows - 1
+    draw_window(scr, rect(0, 0, if rows > 0 then rows else 0, scr.back.cols), src, view, styler, status, true)
+    draw_message(scr, message)
+
+# A new frame: every cell blank, the cursor on the message line until the
+# current window places it.
+pub fn begin_frame(scr: @&Screen)
     scr.back.clear()
-    let rows: i64 = text_rows(scr.size) as i64
-    let cols: i64 = scr.back.cols
+    scr.cursor_row = if scr.back.rows > 0 then scr.back.rows - 1 else 0
+    scr.cursor_col = 0
+
+# A window in rectangle `at`: its text rows, then its status line on the
+# last row. Scrolls `view` so its cursor is on screen; for the `current`
+# window the frame's cursor goes there and the status line names the mode.
+pub fn draw_window<L: LineSource, S: LineStyler>(scr: @&Screen, at: Rect, src: @L, view: @&View, styler: @&S, status: Status, current: bool)
+    let rows: i64 = if at.rows > 1 then at.rows - 1 else 0
+    let cols: i64 = at.cols
     let count: i64 = src.line_count()
     let gutter: i64 = gutter_width(count, cols)
     let width: i64 = cols - gutter
@@ -695,7 +758,7 @@ pub fn render_styled<L: LineSource, S: LineStyler>(scr: @&Screen, src: @L, view:
         view.cursor_line = 0
     var cursor_cell: i64 = 0
     if view.cursor_line < count
-        cursor_cell = cell_of(@&scr.marks, view.cursor_line, src.line(view.cursor_line), view.cursor_byte)
+        cursor_cell = cell_of(@&scr.marks, view.source, view.cursor_line, src.line(view.cursor_line), view.cursor_byte)
     if view.cursor_line < view.top
         view.top = view.cursor_line
     if rows > 0 and view.cursor_line >= view.top + rows
@@ -708,40 +771,80 @@ pub fn render_styled<L: LineSource, S: LineStyler>(scr: @&Screen, src: @L, view:
         view.top = 0
     if view.left < 0
         view.left = 0
-    scr.cursor_row = view.cursor_line - view.top
-    scr.cursor_col = gutter + cursor_cell - view.left
+    if current and rows > 0
+        scr.cursor_row = at.row + view.cursor_line - view.top
+        scr.cursor_col = at.col + gutter + cursor_cell - view.left
 
     for r in 0..rows
         let l = view.top + r
         if l < count
-            draw_number(@&scr.back, r, gutter, l + 1)
+            draw_number(@&scr.back, at.row + r, at.col, gutter, l + 1)
             let bytes = src.line(l)
-            draw_line(scr, r, gutter, l, bytes, view.left, styler.runs(l, bytes), view.selection)
+            draw_line(scr, at, r, gutter, l, bytes, view.left, view.source, styler.runs(l, bytes), view.selection)
         else
-            scr.back.set(r, 0, Cell { ch: '~' as u32, style: style_filler() })
+            scr.back.set(at.row + r, at.col, Cell { ch: '~' as u32, style: style_filler() })
 
-    if scr.back.rows >= 2
-        draw_status(@&scr.back, scr.back.rows - 2, status, view.cursor_line + 1, cursor_cell + 1)
-    if scr.back.rows >= 1
-        scr.back.put(scr.back.rows - 1, 0, cols, span_from_strview(message), style_text())
-        if rows == 0
-            # No text area: the cursor sits on the message line.
-            scr.cursor_row = scr.back.rows - 1
-            scr.cursor_col = 0
+    if at.rows >= 1
+        draw_status(@&scr.back, at, status, view.cursor_line + 1, cursor_cell + 1, current)
 
-# Line number n, right-aligned in the gutter's digits.
-fn draw_number(g: @&Grid, r: i64, gutter: i64, n: i64)
+# A separator between windows side by side, in rectangle `at` (one column
+# wide): `|` down to the row of the status lines, where the two windows'
+# status lines meet in a blank, as Vim draws it.
+pub fn draw_separator(scr: @&Screen, at: Rect)
+    for r in 0..at.rows
+        let ch = if r == at.rows - 1 then ' ' else '|'
+        scr.back.set(at.row + r, at.col, Cell { ch: ch as u32, style: style_status_nc() })
+
+# The message line: the last row. A message of several lines takes the
+# rows above it too (the last lines, when there are more than rows), with
+# PROMPT on the last row and the cursor after it.
+pub fn draw_message(scr: @&Screen, message: StrView)
+    let total = scr.back.rows
+    if total < 1
+        return
+    let cols = scr.back.cols
+    var lines: i64 = 1
+    for i in 0..message.len()
+        if message.get(i) == '\n'
+            lines += 1
+    if lines == 1
+        scr.back.put(total - 1, 0, cols, span_from_strview(message), style_text())
+        return
+    # Rows total - 1 - shown .. total - 2 hold the last `shown` lines.
+    let shown = if lines > total - 1 then total - 1 else lines
+    var row = total - 1 - shown
+    var line: i64 = 0
+    var start: i64 = 0
+    for i in 0..=message.len()
+        if i == message.len() or message.get(i) == '\n'
+            if line >= lines - shown
+                for c in 0..cols
+                    scr.back.set(row, c, cell_blank())
+                scr.back.put(row, 0, cols, span_from_strview(message.slice(start, i)), style_text())
+                row += 1
+            line += 1
+            start = i + 1
+    let end = scr.back.put(total - 1, 0, cols, span_from_strview(PROMPT), style_text())
+    scr.cursor_row = total - 1
+    scr.cursor_col = if end < cols then end else cols - 1
+
+# Line number n, right-aligned in the gutter's digits, at row r from
+# column `col`.
+fn draw_number(g: @&Grid, r: i64, col: i64, gutter: i64, n: i64)
     if gutter == 0
         return
     var buf: [20]u8
     let digits = fmt_i64_into(@buf, n)
-    g.put(r, gutter - 1 - digits.len, gutter - 1, span_from_strview(digits), style_gutter())
+    g.put(r, col + gutter - 1 - digits.len, col + gutter - 1, span_from_strview(digits), style_gutter())
 
-# Line l's cells from cell column `left`, at columns gutter.. of row r, in
-# the colors `runs` give its bytes, reversed where `sel` covers them.
-fn draw_line(scr: @&Screen, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64, runs: [StyleRun], sel: Option<Selection>)
-    let end = left + scr.back.cols - gutter
-    var sc = scan_from(@&scr.marks, l, bytes, true, left)
+# Line l's cells from cell column `left`, at the columns after the gutter
+# of row r of window `win`, in the colors `runs` give its bytes, reversed
+# where `sel` covers them.
+fn draw_line(scr: @&Screen, win: Rect, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64, source: i64, runs: [StyleRun], sel: Option<Selection>)
+    let end = left + win.cols - gutter
+    let row = win.row + r
+    let base = win.col + gutter
+    var sc = scan_from(@&scr.marks, source, l, bytes, true, left)
     var ri: i64 = 0                 # the first run not wholly before sc.byte
     while not sc.done() and sc.cell < end
         let u = sc.unit()
@@ -757,11 +860,11 @@ fn draw_line(scr: @&Screen, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64,
         for k in 0..u.width
             let at = sc.cell + k
             if at >= left and at < end
-                scr.back.set(r, gutter + at - left, Cell { ch: glyph_char(u, k), style: cell_style })
+                scr.back.set(row, base + at - left, Cell { ch: glyph_char(u, k), style: cell_style })
         sc.advance(@&scr.marks, u)
     # A selected line break: one blank cell after the text.
     if sc.done() and sc.cell >= left and sc.cell < end and selects_break(sel, l, bytes.len)
-        scr.back.set(r, gutter + sc.cell - left, Cell { ch: ' ' as u32, style: style_selected(style_text()) })
+        scr.back.set(row, base + sc.cell - left, Cell { ch: ' ' as u32, style: style_selected(style_text()) })
 
 fn selects(sel: Option<Selection>, l: i64, byte: i64) -> bool
     match sel
@@ -773,28 +876,33 @@ fn selects_break(sel: Option<Selection>, l: i64, len: i64) -> bool
         Some(s) => s.covers_break(l, len)
         None => false
 
-# ` MODE  name [+]  lang` from the left, `line:col ` from the right, reversed.
-fn draw_status(g: @&Grid, r: i64, status: Status, line: i64, col: i64)
-    let cols = g.cols
-    for c in 0..cols
-        g.set(r, c, Cell { ch: ' ' as u32, style: style_status() })
+# Window `w`'s status line, its last row: ` MODE  name [+]  lang` from
+# the left (the current window's; the others' have no mode), `line:col `
+# from the right, reversed.
+fn draw_status(g: @&Grid, w: Rect, status: Status, line: i64, col: i64, current: bool)
+    let r = w.row + w.rows - 1
+    let end = w.col + w.cols
+    let style = if current then style_status() else style_status_nc()
+    for c in w.col..end
+        g.set(r, c, Cell { ch: ' ' as u32, style: style })
     var left = string_from(" ")
-    left.push_str(mode_label(status.mode))
-    left.push_str("  ")
-    var at = g.put(r, 0, cols, span_from_strview(left.as_view()), style_status())
+    if current
+        left.push_str(mode_label(status.mode))
+        left.push_str("  ")
+    var at = g.put(r, w.col, end, span_from_strview(left.as_view()), style)
     let name: StrView = if status.name.is_empty() then "[No Name]" else status.name
-    at = g.put(r, at, cols, span_from_strview(name), style_status())
+    at = g.put(r, at, end, span_from_strview(name), style)
     if status.dirty
-        at = g.put(r, at, cols, span_from_strview(" [+]"), style_status())
+        at = g.put(r, at, end, span_from_strview(" [+]"), style)
     if not status.lang.is_empty()
-        at = g.put(r, at, cols, span_from_strview("  "), style_status())
-        at = g.put(r, at, cols, span_from_strview(status.lang), style_status())
+        at = g.put(r, at, end, span_from_strview("  "), style)
+        at = g.put(r, at, end, span_from_strview(status.lang), style)
     var pos = string_new()
     pos.push_i64(line)
     pos.push(':')
     pos.push_i64(col)
     pos.push(' ')
     # The position only where it fits after a gap: never over the mode.
-    let start = cols - pos.len()
+    let start = end - pos.len()
     if start > at
-        g.put(r, start, cols, span_from_strview(pos.as_view()), style_status())
+        g.put(r, start, end, span_from_strview(pos.as_view()), style)

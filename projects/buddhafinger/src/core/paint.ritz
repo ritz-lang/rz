@@ -1,34 +1,69 @@
 # core/paint.ritz - one frame: the editor's state onto the screen and into TermOut.
 #
 # A Painter holds what lives from frame to frame (the Screen with its two
-# grids and long-line checkpoints, the View, the styler with its lexical-
-# color cache and diagnostic marks, and the text revision they were built
-# for) and compose() turns the Editor into the bytes that update the
-# terminal. The language server's part comes from the caller: it fills
-# styler's marks (Session.build_marks) and passes the status line's tag and
-# the cursor line's diagnostic. The platform's event loop flushes
-# them (platform/linux.ritz); the benchmark (bench/) times compose() as the
-# paint half of edit-to-paint, so both measure the same code.
+# grids and long-line checkpoints, each window's View, and each shown
+# buffer's styler with its lexical-color cache and diagnostic marks, with
+# the text revision they were built for) and compose() turns the Editor
+# into the bytes that update the terminal: every window of the editor's
+# tiling in its place, the separators, then the message line. The language
+# server's part comes from the caller: it fills each buffer's marks
+# (styler_for, Session.build_marks) and passes the current window's status
+# tag and the cursor line's diagnostic. The platform's event loop flushes
+# them (platform/linux.ritz, platform/harland.ritz); the benchmark (bench/)
+# times compose() as the paint half of edit-to-paint, so all of them
+# measure the same code.
 #
 # TermOut only buffers, so this module does no terminal or OS I/O.
 
+import ritzlib.gvec
 import ritzlib.option
 import ritzlib.strview { StrView }
 import ritzlib.termsession { TermOut }
 
+import core.buffer { Buffer }
 import core.editor { Editor }
+import core.history { release_all }
+import core.layout { Rect, Tiling }
 import core.modes { Mode }
-import core.screen { Screen, Size, View, render_styled, screen_new, view_new }
+import core.screen { LineSource, Screen, Size, View, begin_frame, draw_message, draw_separator, draw_window, screen_new, view_new }
 import syntax.marks { Marked, marked_new }
+
+# A window's lines as the screen reads them: the buffer's, `count` of them
+# (the editor's shown lines).
+struct Shown
+    buf: @Buffer
+    count: i64
+
+impl LineSource for Shown
+    fn line_count(self: @Shown) -> i64
+        self.count
+
+    fn line(self: @Shown, l: i64) -> [u8]
+        self.buf.line(l)
+
+# A window's View between frames (its horizontal scroll lives only here).
+struct WindowView
+    id: i64
+    view: View
+
+# A buffer's colors: lexical, with the diagnostics over them.
+struct Styled
+    number: i64             # the buffer's
+    styler: Marked
+    drawn: Option<i64>      # the text revision its caches are for; None before the first frame
+    marks: Option<i64>      # the revision its marks were built for; None: to build
 
 pub struct Painter
     screen: Screen
-    view: View
-    styler: Marked          # lexical colors with the diagnostics over them
-    drawn: Option<i64>      # the text_revision the caches were built for; None before the first frame
+    views: Vec<WindowView>
+    styles: Vec<Styled>
+
+impl Drop for Painter
+    fn drop(self: @&Painter)
+        release_all<Styled>(@&self.styles)
 
 pub fn painter_new(size: Size) -> Painter
-    Painter { screen: screen_new(size), view: view_new(), styler: marked_new(true), drawn: None }
+    Painter { screen: screen_new(size), views: vec_new<WindowView>(), styles: vec_new<Styled>() }
 
 impl Painter
     # A new terminal size: the next frame lays out and draws everything.
@@ -39,34 +74,131 @@ impl Painter
     pub fn invalidate_terminal(self: @&Painter)
         self.screen.invalidate_terminal()
 
+    # Where buffer `number`'s styler is in `styles`, made when it has none.
+    fn style_index(self: @&Painter, number: i64) -> i64
+        for k in 0..self.styles.len()
+            if self.styles[k].number == number
+                return k
+        self.styles.push(Styled { number: number, styler: marked_new(true), drawn: None, marks: None })
+        self.styles.len() - 1
+
+    # Buffer `number`'s styler: its diagnostic marks are the caller's to fill.
+    pub fn styler_for(self: @&Painter, number: i64) -> @&Marked
+        let k = self.style_index(number)
+        @&self.styles[k].styler
+
+    # True when buffer `number`'s marks were built (note_marks) for text
+    # revision `revision`, so needn't be built again.
+    pub fn marks_fresh(self: @&Painter, number: i64, revision: i64) -> bool
+        let k = self.style_index(number)
+        match self.styles[k].marks
+            Some(built) => built == revision
+            None => false
+
+    pub fn note_marks(self: @&Painter, number: i64, revision: i64)
+        let k = self.style_index(number)
+        self.styles[k].marks = Some(revision)
+
+    # Every buffer's marks are to build again (new diagnostics came).
+    pub fn forget_marks(self: @&Painter)
+        for k in 0..self.styles.len()
+            self.styles[k].marks = None
+
+    # Window `id`'s View from the last frame, or a new one.
+    fn view_of(self: @Painter, id: i64) -> View
+        for k in 0..self.views.len()
+            if self.views.get(k).id == id
+                return self.views.get(k).view
+        view_new()
+
+    fn keep_view(self: @&Painter, id: i64, view: View)
+        for k in 0..self.views.len()
+            if self.views.get(k).id == id
+                self.views.set(k, WindowView { id: id, view: view })
+                return
+        self.views.push(WindowView { id: id, view: view })
+
     # Compose the editor's frame and append to `out` what changed, with the
-    # cursor hidden while it is drawn. Scrolls the editor's `top` with the
-    # view. A `.ritz` file is drawn in lexical colors; styler's marks are
-    # drawn over any file. `lang` is the status line's language-server tag
-    # (empty: none); `hint` is the message line when the editor has none
+    # cursor hidden while it is drawn. The editor lays its windows out on
+    # this screen's size, and each window's top follows its View's scroll.
+    # A `.ritz` file is drawn in lexical colors; each buffer's marks are
+    # drawn over any file. `lang` is the current window's language-server
+    # tag (empty: none); `hint` is the message line when the editor has none
     # and isn't on the command line (the diagnostic under the cursor).
     pub fn compose(self: @&Painter, ed: @&Editor, lang: StrView, hint: StrView, out: @&TermOut)
-        let rev = ed.text_revision()
-        if self.drawn.unwrap_or(-1) != rev
-            # The text changed: every line's checkpoints and colors may be
-            # stale. The marks are the caller's to rebuild.
-            self.screen.text_changed(0, 0)
-            self.styler.text_changed()
-            self.drawn = Some(rev)
-        self.view.top = ed.top
-        self.view.cursor_line = ed.cursor.line
-        self.view.cursor_byte = ed.cursor.col
-        self.view.selection = ed.selection()
+        ed.resize(self.screen.size)
+        let t: Tiling = ed.tiling()
+        begin_frame(@&self.screen)
+        for i in 0..t.wins.len()
+            let placed = t.wins.get(i)
+            let w: i64 = match ed.find_window(placed.win)
+                Some(found) => found
+                None => continue
+            let view = self.draw(ed, w, placed.rect, lang)
+            ed.set_window_top(w, view.top)
+            self.keep_view(placed.win, view)
+        for i in 0..t.seps.len()
+            draw_separator(@&self.screen, t.seps.get(i))
         var message: StrView = match ed.mode
             Mode.CommandLine => ed.command_line()
             _ => ed.message.as_view()
         if message.is_empty() and ed.mode != Mode.CommandLine
             message = hint
-        var status = ed.status()
-        status.lang = lang
-        self.styler.lexical = ed.path.as_view().ends_with(".ritz")
-        render_styled(@&self.screen, ed, @&self.view, @&self.styler, status, message)
-        ed.top = self.view.top
+        draw_message(@&self.screen, message)
+        self.prune(ed, @t)
         out.hide_cursor()
         self.screen.emit(out)
         out.show_cursor()
+
+    # Window w of the editor in rectangle `at`; its View as scrolled.
+    fn draw(self: @&Painter, ed: @Editor, w: i64, at: Rect, lang: StrView) -> View
+        let number = ed.window_number(w)
+        let k = self.style_index(number)
+        let src = Shown { buf: ed.window_buffer(w), count: ed.window_lines(w) }
+        let rev = src.buf.revision()
+        if self.styles[k].drawn.unwrap_or(-1) != rev
+            # The text changed: every line's checkpoints and colors may be
+            # stale. The marks are the caller's to rebuild.
+            self.screen.text_changed_in(number, 0, 0)
+            self.styles[k].styler.text_changed()
+            self.styles[k].drawn = Some(rev)
+        let current = ed.is_current(w)
+        var view = self.view_of(ed.window_id(w))
+        view.source = number
+        view.top = ed.window_top(w)
+        let cursor = ed.window_cursor(w)
+        view.cursor_line = cursor.line
+        view.cursor_byte = cursor.col
+        view.selection = if current then ed.selection() else None
+        var status = ed.window_status(w)
+        if current
+            status.lang = lang
+        self.styles[k].styler.lexical = ed.window_path(w).ends_with(".ritz")
+        draw_window(@&self.screen, at, @src, @&view, @&self.styles[k].styler, status, current)
+        view
+
+    # Drop the Views of windows gone and the stylers of buffers no window
+    # shows (one shown again starts afresh).
+    fn prune(self: @&Painter, ed: @Editor, t: @Tiling)
+        var k: i64 = 0
+        while k < self.views.len()
+            if t.rect_of(self.views.get(k).id).is_none()
+                self.views.set(k, self.views.get(self.views.len() - 1))
+                let gone = self.views.pop()
+            else
+                k += 1
+        k = 0
+        while k < self.styles.len()
+            var shown = false
+            for i in 0..t.wins.len()
+                match ed.find_window(t.wins.get(i).win)
+                    Some(w) =>
+                        if ed.window_number(w) == self.styles[k].number
+                            shown = true
+                    None => pass
+            if shown
+                k += 1
+            else
+                let moved = self.styles.pop()
+                if k < self.styles.len()
+                    let gone = self.styles.replace(k, moved)

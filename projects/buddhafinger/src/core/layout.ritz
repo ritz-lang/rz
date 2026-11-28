@@ -1,0 +1,352 @@
+# core/layout.ritz - the windows' layout: Vim's frame tree, sized equally.
+#
+# Each window is a leaf frame; `:sp` and `:vs` (Ctrl-W s, Ctrl-W v) put a
+# new leaf next to a window's, in a Stack (windows top to bottom) or a Row
+# (left to right). A split the way the window's frame already goes adds a
+# sibling; a split across replaces the leaf with a new frame holding both.
+# The new window goes above or to the left, as Vim's does with 'splitbelow'
+# and 'splitright' off. Closing a window gives its room to the window after
+# it (below or right), or before it when it is the last; a frame left with
+# one child is replaced by that child, which joins its new parent's children
+# when the two go the same way, so the tree stays what the same splits from
+# scratch would make.
+#
+# Sizes aren't stored: tile() shares an area out equally every time, as
+# Vim's 'equalalways' (on by default) does after each split, close and
+# resize. A Stack's children get equal rows, a Row's equal columns less a
+# separator column between neighbours; rows or columns left over go to the
+# first children. Each window's rectangle includes its status line, its
+# last row.
+#
+# Windows are named by the caller's ids, which this module only stores.
+# Core module: no terminal or OS I/O (see src/platform/).
+
+import ritzlib.gvec
+import ritzlib.option
+
+# Which way a frame's children go.
+pub enum Split
+    Stack       # top to bottom: :sp
+    Row         # left to right: :vs
+
+# A window's direction from another, for Ctrl-W h j k l.
+pub enum Dir
+    Left
+    Down
+    Up
+    Right
+
+pub struct Rect
+    row: i64
+    col: i64
+    rows: i64
+    cols: i64
+
+pub fn rect(row: i64, col: i64, rows: i64, cols: i64) -> Rect
+    Rect { row: row, col: col, rows: rows, cols: cols }
+
+# A window and where it is.
+pub struct Placed
+    win: i64
+    rect: Rect
+
+# An area shared out: each window's rectangle, in window order (top left to
+# bottom right, as Ctrl-W w walks them), and the one-column separators
+# between windows side by side.
+pub struct Tiling
+    wins: Vec<Placed>
+    seps: Vec<Rect>
+
+enum FrameKind
+    Free        # unused: split() takes it before growing the Vec
+    Leaf
+    Stack
+    Row
+
+# A frame; frames link to their parent, first child and next sibling by
+# index into Layout.frames, -1 for none.
+struct Frame
+    kind: FrameKind
+    win: i64            # a Leaf's window
+    parent: i64
+    first: i64
+    next: i64
+
+fn frame(kind: FrameKind, win: i64) -> Frame
+    Frame { kind: kind, win: win, parent: -1, first: -1, next: -1 }
+
+fn kind_of(s: Split) -> FrameKind
+    match s
+        Split.Stack => FrameKind.Stack
+        Split.Row => FrameKind.Row
+
+pub struct Layout
+    frames: Vec<Frame>
+    root: i64
+
+# One window, `win`, with the whole area.
+pub fn layout_new(win: i64) -> Layout
+    var frames: Vec<Frame> = vec_new<Frame>()
+    frames.push(frame(FrameKind.Leaf, win))
+    Layout { frames: frames, root: 0 }
+
+impl Layout
+    # ------------------------------------------------------------------
+    # Reading the tree
+    # ------------------------------------------------------------------
+
+    fn at(self: @Layout, f: i64) -> Frame
+        self.frames.get(f)
+
+    # The leaf frame of window `win`.
+    fn leaf_of(self: @Layout, win: i64) -> Option<i64>
+        for f in 0..self.frames.len()
+            let fr = self.at(f)
+            if fr.kind == FrameKind.Leaf and fr.win == win
+                return Some(f)
+        None
+
+    # The child before `f` in its parent; None when it is the first.
+    fn prev_of(self: @Layout, f: i64) -> Option<i64>
+        let p = self.at(f).parent
+        var k = self.at(p).first
+        var before: Option<i64> = None
+        while k != f
+            before = Some(k)
+            k = self.at(k).next
+        before
+
+    # The window at the start (top left) or end (bottom right) of frame f.
+    fn edge_window(self: @Layout, f: i64, last: bool) -> i64
+        var k = f
+        while self.at(k).kind != FrameKind.Leaf
+            k = self.at(k).first
+            if last
+                while self.at(k).next >= 0
+                    k = self.at(k).next
+        self.at(k).win
+
+    # How many windows there are.
+    pub fn count(self: @Layout) -> i64
+        var n: i64 = 0
+        for f in 0..self.frames.len()
+            if self.at(f).kind == FrameKind.Leaf
+                n += 1
+        n
+
+    # The windows in order: top left to bottom right, as Ctrl-W w goes.
+    pub fn order(self: @Layout) -> Vec<i64>
+        var out: Vec<i64> = vec_new<i64>()
+        self.collect(self.root, @&out)
+        out
+
+    fn collect(self: @Layout, f: i64, out: @&Vec<i64>)
+        let fr = self.at(f)
+        if fr.kind == FrameKind.Leaf
+            out.push(fr.win)
+            return
+        var k = fr.first
+        while k >= 0
+            self.collect(k, out)
+            k = self.at(k).next
+
+    # ------------------------------------------------------------------
+    # Changing it
+    # ------------------------------------------------------------------
+
+    # A new frame, in a free slot when there is one.
+    fn alloc(self: @&Layout, fr: Frame) -> i64
+        for f in 0..self.frames.len()
+            if self.at(f).kind == FrameKind.Free
+                self.frames.set(f, fr)
+                return f
+        self.frames.push(fr)
+        self.frames.len() - 1
+
+    fn release(self: @&Layout, f: i64)
+        self.frames.set(f, frame(FrameKind.Free, -1))
+
+    fn set_parent(self: @&Layout, f: i64, p: i64)
+        var fr = self.at(f)
+        fr.parent = p
+        self.frames.set(f, fr)
+
+    fn set_next(self: @&Layout, f: i64, n: i64)
+        var fr = self.at(f)
+        fr.next = n
+        self.frames.set(f, fr)
+
+    fn set_first(self: @&Layout, f: i64, c: i64)
+        var fr = self.at(f)
+        fr.first = c
+        self.frames.set(f, fr)
+
+    # Whatever links to child f (the child before it, or its parent's
+    # first-child link) links to `n` instead.
+    fn relink(self: @&Layout, f: i64, n: i64)
+        match self.prev_of(f)
+            Some(before) => self.set_next(before, n)
+            None => self.set_first(self.at(f).parent, n)
+
+    # Link `n` in where `f` is (its parent's child list, or the root); `f`
+    # is left unlinked.
+    fn take_place(self: @&Layout, f: i64, n: i64)
+        let old = self.at(f)
+        self.set_parent(n, old.parent)
+        self.set_next(n, old.next)
+        if old.parent < 0
+            self.root = n
+        else
+            self.relink(f, n)
+        self.set_parent(f, -1)
+        self.set_next(f, -1)
+
+    # A new window `win` next to window `at`, above it (Stack) or to its
+    # left (Row). False, with nothing changed, when `at` isn't a window.
+    pub fn split(self: @&Layout, at: i64, win: i64, how: Split) -> bool
+        let f: i64 = match self.leaf_of(at)
+            Some(found) => found
+            None => return false
+        let kind = kind_of(how)
+        let n = self.alloc(frame(FrameKind.Leaf, win))
+        let p = self.at(f).parent
+        if p >= 0 and self.at(p).kind == kind
+            # The same way as its frame: a sibling, before it.
+            self.set_parent(n, p)
+            self.set_next(n, f)
+            self.relink(f, n)
+            return true
+        # Across: a new frame holding the new window, then the old one.
+        let c = self.alloc(frame(kind, -1))
+        self.take_place(f, c)
+        self.set_first(c, n)
+        self.set_parent(n, c)
+        self.set_next(n, f)
+        self.set_parent(f, c)
+        true
+
+    # Close window `win`: the window that takes its room (the one after it,
+    # else the one before, the nearest of a frame's), or None when it is
+    # the last window or no window at all, and nothing changed.
+    pub fn remove(self: @&Layout, win: i64) -> Option<i64>
+        let f: i64 = match self.leaf_of(win)
+            Some(found) => found
+            None => return None
+        if f == self.root
+            return None
+        let p = self.at(f).parent
+        let after = self.at(f).next
+        var heir: i64 = 0
+        if after >= 0
+            heir = self.edge_window(after, false)
+        else
+            match self.prev_of(f)
+                Some(before) => heir = self.edge_window(before, true)
+                None => return None     # no frame keeps a single child
+        self.relink(f, after)
+        self.release(f)
+        # A frame of one child: the child takes its place.
+        let only = self.at(p).first
+        if self.at(only).next < 0
+            self.take_place(p, only)
+            self.release(p)
+            self.join_parent(only)
+        Some(heir)
+
+    # Frame f, a Stack or Row under a frame going the same way: its
+    # children become the parent's, in its place.
+    fn join_parent(self: @&Layout, f: i64)
+        let fr = self.at(f)
+        if fr.kind == FrameKind.Leaf or fr.parent < 0 or self.at(fr.parent).kind != fr.kind
+            return
+        let p = fr.parent
+        var k = fr.first
+        var last: i64 = -1
+        while k >= 0
+            self.set_parent(k, p)
+            last = k
+            k = self.at(k).next
+        self.set_next(last, fr.next)
+        self.relink(f, fr.first)
+        self.release(f)
+
+    # ------------------------------------------------------------------
+    # Sizes
+    # ------------------------------------------------------------------
+
+    # Each window's rectangle in `area`, and the separators.
+    pub fn tile(self: @Layout, area: Rect) -> Tiling
+        var t = Tiling { wins: vec_new<Placed>(), seps: vec_new<Rect>() }
+        self.tile_frame(self.root, area, @&t)
+        t
+
+    fn tile_frame(self: @Layout, f: i64, area: Rect, t: @&Tiling)
+        let fr = self.at(f)
+        if fr.kind == FrameKind.Leaf
+            t.wins.push(Placed { win: fr.win, rect: area })
+            return
+        var n: i64 = 0
+        var k = fr.first
+        while k >= 0
+            n += 1
+            k = self.at(k).next
+        let row = fr.kind == FrameKind.Row
+        # A Row's room is its columns less the separators between children.
+        let room = if row then area.cols - (n - 1) else area.rows
+        let share = if room > 0 then room / n else 0
+        let extra = if room > 0 then room % n else 0
+        var at = if row then area.col else area.row
+        var i: i64 = 0
+        k = fr.first
+        while k >= 0
+            let size = share + (if i < extra then 1 else 0)
+            if row
+                self.tile_frame(k, rect(area.row, at, area.rows, size), t)
+                at += size
+                if self.at(k).next >= 0
+                    t.seps.push(rect(area.row, at, area.rows, 1))
+                    at += 1
+            else
+                self.tile_frame(k, rect(at, area.col, size, area.cols), t)
+                at += size
+            i += 1
+            k = self.at(k).next
+
+impl Tiling
+    # True when every window has a text row above its status line and a
+    # column: Vim refuses a split that leaves less (E36).
+    pub fn fits(self: @Tiling) -> bool
+        for i in 0..self.wins.len()
+            let r = self.wins.get(i).rect
+            if r.rows < 2 or r.cols < 1
+                return false
+        true
+
+    # Window `win`'s rectangle, if it has one.
+    pub fn rect_of(self: @Tiling, win: i64) -> Option<Rect>
+        for i in 0..self.wins.len()
+            if self.wins.get(i).win == win
+                return Some(self.wins.get(i).rect)
+        None
+
+    # The window `dir` of window `from`, whose cursor is at screen cell
+    # (row, col): the one holding the cell past `from`'s edge in the
+    # cursor's column (Up, Down) or row (Left, Right), as Vim's Ctrl-W j k
+    # h l choose. A separator's column belongs to the window on its left.
+    pub fn neighbour(self: @Tiling, from: i64, dir: Dir, row: i64, col: i64) -> Option<i64>
+        let r: Rect = match self.rect_of(from)
+            Some(found) => found
+            None => return None
+        var y = row
+        var x = col
+        match dir
+            Dir.Down => y = r.row + r.rows
+            Dir.Up => y = r.row - 1
+            Dir.Right => x = r.col + r.cols + 1
+            Dir.Left => x = r.col - 2
+        for i in 0..self.wins.len()
+            let w = self.wins.get(i)
+            let q = w.rect
+            if w.win != from and y >= q.row and y < q.row + q.rows and x >= q.col and x <= q.col + q.cols
+                return Some(w.win)
+        None

@@ -25,12 +25,14 @@
 # Every way out restores the terminal: `:q`, a signal, the terminal closing,
 # a failed poll, read or write.
 #
-# The language server (a Ritz file only): each turn sends the text when it
-# changed (lsp/client.ritz coalesces and bounds it), K and gd's requests,
-# and applies what came back: diagnostics underlined for the revision on
-# screen with the cursor line's message shown, hover on the message line, a
-# definition jumped to (Ctrl-O / Ctrl-T back). Its failures show in the
-# status line.
+# The language server (Ritz files only): each turn sends every Ritz buffer's
+# text that changed, one document per buffer, and closes the documents of
+# buffers gone (lsp/client.ritz coalesces and bounds it); sends K and gd's
+# requests for the current buffer; and applies what came back: each shown
+# buffer's diagnostics underlined for the revision on screen with the
+# cursor line's message shown, hover on the message line, a definition
+# jumped to in its file's buffer (Ctrl-O / Ctrl-T back). Its failures show
+# in the status line.
 
 import ritzlib.errno { Errno }
 import ritzlib.fd { Fd, PollFd, POLLIN, POLLHUP, POLLERR, POLLNVAL, fd_borrow, poll }
@@ -52,7 +54,7 @@ import core.buffer { pos }
 import core.editor { Editor, LangAsk, editor_new, editor_open, handle_key, jump_to }
 import core.files { FileStore, LoadError }
 import core.paint { Painter, painter_new }
-import core.screen { Size, text_rows }
+import core.screen { Size }
 import lsp.client { AskKind, Diag, Refused, Reply, path_of_uri, uri_of_path }
 import lsp.wire { byte_col, utf16_col }
 import platform.lsp { LangConfig, LangServer, LangState, lang_config_from_env, lang_idle }
@@ -152,7 +154,7 @@ pub fn run_editor_with(tty: i32, path: StrView, lang: LangConfig) -> i32
             let back = old_mask.set_mask()
             report("not a terminal")
             return EXIT_FAILED
-    var s = Session { tty: tty, term: term, signals: signals, decoder: key_decoder(), escape_ms: ESCAPE_TIMEOUT_MS as i64, deadline: None, painter: painter_new(query_size(tty)), out: term_out(), dirty: true, suspended: false, lang: lang_idle(), config: lang, uri_for: string_new(), uri: string_new(), marks_for: -1 }
+    var s = Session { tty: tty, term: term, signals: signals, decoder: key_decoder(), escape_ms: ESCAPE_TIMEOUT_MS as i64, deadline: None, painter: painter_new(query_size(tty)), out: term_out(), dirty: true, suspended: false, lang: lang_idle(), config: lang, uris: vec_new<UriOf>() }
     s.size_changed(@&ed)
     s.enter_screen()
     let exit = s.run(@&ed, @&files)
@@ -197,6 +199,11 @@ fn query_size(tty: i32) -> Size
 # The loop
 # ============================================================================
 
+# A file name and its file:// uri ("" unless it is a Ritz file).
+struct UriOf
+    path: String
+    uri: String
+
 struct Session
     tty: i32
     term: TermSession       # raw mode; restored by finish() and on drop
@@ -210,9 +217,7 @@ struct Session
     suspended: bool         # stopped by Ctrl-Z or SIGTSTP; SIGCONT ends it
     lang: LangServer        # the language server session (platform/lsp.ritz)
     config: LangConfig      # which server
-    uri_for: String         # the editor path `uri` was made for
-    uri: String             # its file:// uri; empty when it isn't a Ritz file
-    marks_for: i64          # the revision styler's marks are for; -1: rebuild
+    uris: Vec<UriOf>        # the uris made so far, by file name
 
 impl Session
     fn run(self: @&Session, ed: @&Editor, files: @&LinuxFiles) -> Exit
@@ -380,20 +385,24 @@ impl Session
     fn size_changed(self: @&Session, ed: @&Editor)
         let size = query_size(self.tty)
         self.painter.resize(size)
-        ed.page = text_rows(size) as i64
+        ed.resize(size)
         self.dirty = true
 
     # ------------------------------------------------------------------
     # The screen
     # ------------------------------------------------------------------
 
-    # Compose the editor's frame and write what changed.
+    # Compose the editor's frame and write what changed: first each shown
+    # buffer's marks, where its text moved on since they were built.
     fn paint(self: @&Session, ed: @&Editor) -> Result<(), Errno>
-        let rev = ed.text_revision()
-        if self.marks_for != rev
-            self.build_marks(ed, rev)
-        let hint = self.diagnostic_at(ed.cursor.line, rev)
-        self.painter.compose(ed, self.lang.tag(), hint, @&self.out)
+        for i in 0..ed.window_count()
+            let number = ed.window_number(i)
+            let rev = ed.window_buffer(i).revision()
+            if not self.painter.marks_fresh(number, rev)
+                self.build_marks(ed, i, rev)
+        let uri = string_from(self.uri_of(ed.path()))
+        let hint = string_from(self.diagnostic_at(uri.as_view(), ed.cursor.line, ed.text_revision()))
+        self.painter.compose(ed, self.lang.tag(uri.as_view()), hint.as_view(), @&self.out)
         self.dirty = false
         self.out.flush(self.tty)
 
@@ -422,32 +431,31 @@ impl Session
     # The language server
     # ------------------------------------------------------------------
 
-    # The editor's file as a file:// uri, "" unless it is a Ritz file.
-    fn doc_uri(self: @&Session, ed: @Editor) -> StrView
-        if self.uri_for.as_view().eq(ed.path.as_view()) and not self.uri_for.is_empty()
-            return self.uri.as_view()
-        self.uri_for.clear()
-        self.uri_for.push_str(ed.path.as_view())
-        self.uri.clear()
-        let p = ed.path.as_view()
-        if not p.ends_with(".ritz")
-            return ""
-        if p.starts_with("/")
-            self.uri = uri_of_path(p)
-        else
-            match cwd()
-                Ok(dir) =>
-                    var abs = dir
-                    abs.push('/')
-                    abs.push_str(p)
-                    self.uri = uri_of_path(abs.as_view())
-                Err(_) => pass
-        self.uri.as_view()
+    # File `path` as a file:// uri, "" unless it is a Ritz file.
+    fn uri_of(self: @&Session, path: StrView) -> StrView
+        for k in 0..self.uris.len()
+            if self.uris[k].path.as_view().eq(path)
+                return self.uris[k].uri.as_view()
+        var uri = string_new()
+        if path.ends_with(".ritz")
+            if path.starts_with("/")
+                uri = uri_of_path(path)
+            else
+                match cwd()
+                    Ok(dir) =>
+                        var abs = dir
+                        abs.push('/')
+                        abs.push_str(path)
+                        uri = uri_of_path(abs.as_view())
+                    Err(_) => pass
+        self.uris.push(UriOf { path: string_from(path), uri: uri })
+        self.uris[self.uris.len() - 1].uri.as_view()
 
-    # Before the poll: start the server for a Ritz file, send the text if
-    # it changed, send K / gd's request, and act on any timeouts.
+    # Before the poll: start the server once there is a Ritz file, send
+    # each Ritz buffer's text that changed (and close the documents of
+    # buffers gone), send K / gd's request, and act on any timeouts.
     fn lang_turn(self: @&Session, ed: @&Editor, files: @&LinuxFiles)
-        let uri = string_from(self.doc_uri(ed))
+        let uri = string_from(self.uri_of(ed.path()))
         let ask = ed.take_ask()
         if self.lang.state == LangState.Off and not uri.is_empty() and not self.config.server.is_empty()
             if not self.lang.start(@self.config, now_millis())
@@ -455,21 +463,26 @@ impl Session
         if not self.lang.running()
             if ask != LangAsk.Nothing
                 if self.lang.state == LangState.Ended
-                    ed.say(self.lang.tag())
+                    ed.say(self.lang.tag(uri.as_view()))
                 else
                     ed.say("lsp: no language server")
                 self.dirty = true
             return
+        self.lang.client.begin_sync()
+        for k in 0..ed.buffer_count()
+            let doc = string_from(self.uri_of(ed.buffer_path_at(k)))
+            let b = ed.buffer_at(k)
+            if self.lang.client.wants_text(doc.as_view(), b.revision(), b.byte_len())
+                let text = b.serialize()
+                let sent = self.lang.client.send_text(doc.as_view(), b.revision(), span_from_vec<u8>(@text))
+                self.dirty = true
+        self.lang.client.end_sync()
         let rev = ed.text_revision()
-        if self.lang.client.wants_text(uri.as_view(), rev, ed.buf.byte_len())
-            let text = ed.buf.serialize()
-            let sent = self.lang.client.send_text(rev, span_from_vec<u8>(@text))
-            self.dirty = true
         if ask != LangAsk.Nothing
             let kind = if ask == LangAsk.Hover then AskKind.Hover else AskKind.Definition
             let line = ed.cursor.line
-            let ch = utf16_col(ed.buf.line(line), ed.cursor.col)
-            match self.lang.client.ask(kind, rev, line, ch, now_millis())
+            let ch = utf16_col(ed.buf().line(line), ed.cursor.col)
+            match self.lang.client.ask(kind, uri.as_view(), rev, line, ch, now_millis())
                 Ok(_) => pass
                 Err(e) =>
                     ed.say(refusal(e))
@@ -486,7 +499,8 @@ impl Session
             return
         self.lang.service(fds)
         loop
-            match self.lang.next_reply(ed.text_revision())
+            let uri = string_from(self.uri_of(ed.path()))
+            match self.lang.next_reply(uri.as_view(), ed.text_revision())
                 Some(r) => self.apply(ed, files, r)
                 None => break
         if not self.lang.running()
@@ -498,13 +512,13 @@ impl Session
         if self.lang.reported
             return
         self.lang.reported = true
-        var what = string_from(self.lang.tag())
+        var what = string_from(self.lang.tag(""))
         let last = self.lang.last_log_line()
         if not last.is_empty()
             what.push_str(": ")
             what.push_str(last)
         ed.say(what.as_view())
-        self.marks_for = -1
+        self.painter.forget_marks()
         self.dirty = true
 
     fn apply(self: @&Session, ed: @&Editor, files: @&LinuxFiles, r: Reply)
@@ -512,7 +526,7 @@ impl Session
         match r
             Reply.Nothing => pass
             Reply.Ready => pass
-            Reply.Diagnostics => self.marks_for = -1
+            Reply.Diagnostics => self.painter.forget_marks()
             Reply.Hover => ed.say(self.lang.client.hover_text())
             Reply.NoHover => ed.say("lsp: nothing to show here")
             Reply.Definition => self.go_to_definition(ed, files)
@@ -527,14 +541,16 @@ impl Session
                 self.report_end(ed)
 
     # Jump to the definition the server named (its UTF-16 column made a
-    # byte column on the line it lands on).
+    # byte column on the line it lands on): in the buffer whose file it is
+    # when there is one, under the name the file has there.
     fn go_to_definition(self: @&Session, ed: @&Editor, files: @&LinuxFiles)
-        let target = self.lang.client.target_uri()
+        let target = string_from(self.lang.client.target_uri())
         var path = string_new()
-        if target.eq(self.uri.as_view())
-            path.push_str(ed.path.as_view())     # this file, under the name it has here
-        else
-            match path_of_uri(target)
+        for k in 0..ed.buffer_count()
+            if path.is_empty() and self.uri_of(ed.buffer_path_at(k)).eq(target.as_view())
+                path.push_str(ed.buffer_path_at(k))
+        if path.is_empty()
+            match path_of_uri(target.as_view())
                 Some(p) => path = p
                 None =>
                     ed.say("lsp: definition is not in a file")
@@ -543,38 +559,43 @@ impl Session
         let ch = self.lang.client.target_char
         if jump_to<LinuxFiles>(ed, files, path.as_view(), pos(line, 0))
             let l = ed.cursor.line
-            ed.place(pos(l, byte_col(ed.buf.line(l), ch)))
+            ed.place(pos(l, byte_col(ed.buf().line(l), ch)))
 
-    # The diagnostics for revision `rev` as byte ranges on screen: none
-    # unless the server's latest list is for exactly this text.
-    fn build_marks(self: @&Session, ed: @Editor, rev: i64)
-        self.marks_for = rev
-        self.painter.styler.clear_marks()
-        if not self.lang.running()
+    # Window w's buffer's diagnostics for revision `rev` as byte ranges for
+    # its styler: none unless the server's latest list for it is for
+    # exactly this text.
+    fn build_marks(self: @&Session, ed: @Editor, w: i64, rev: i64)
+        let number = ed.window_number(w)
+        let uri = string_from(self.uri_of(ed.window_path(w)))
+        self.painter.note_marks(number, rev)
+        self.painter.styler_for(number).clear_marks()
+        if not self.lang.running() or uri.is_empty()
             return
-        let ds = self.lang.client.diagnostics(rev)
-        let last = ed.shown() - 1
+        let b = ed.window_buffer(w)
+        let ds = self.lang.client.diagnostics(uri.as_view(), rev)
+        let last = ed.window_lines(w) - 1
         for i in 0..ds.len
             let d: Diag = ds[i]
             var l = d.line
             let stop = if d.end_line < d.line + MAX_MARK_LINES then d.end_line else d.line + MAX_MARK_LINES - 1
             while l <= stop and l <= last
-                let text = ed.buf.line(l)
+                let text = b.line(l)
                 let a = if l == d.line then byte_col(text, d.start) else 0
-                let b = if l == d.end_line then byte_col(text, d.end) else text.len
-                self.painter.styler.add(DiagMark { line: l, start: a, end: b, error: d.severity == 1 })
+                let e = if l == d.end_line then byte_col(text, d.end) else text.len
+                self.painter.styler_for(number).add(DiagMark { line: l, start: a, end: e, error: d.severity == 1 })
                 l += 1
-        self.painter.styler.sort_marks()
+        self.painter.styler_for(number).sort_marks()
 
-    # The message of the first diagnostic on line `l`, for the message line.
-    fn diagnostic_at(self: @Session, l: i64, rev: i64) -> StrView
+    # The message of the first diagnostic of document `uri` at `rev` on
+    # line `l`, for the message line.
+    fn diagnostic_at(self: @Session, uri: StrView, l: i64, rev: i64) -> StrView
         if not self.lang.running()
             return ""
-        let ds = self.lang.client.diagnostics(rev)
+        let ds = self.lang.client.diagnostics(uri, rev)
         for i in 0..ds.len
             let d: Diag = ds[i]
             if d.line <= l and l <= d.end_line
-                return self.lang.client.message_of(d)
+                return self.lang.client.message_of(uri, d)
         ""
 
 # What the message line says when a request can't be sent.
