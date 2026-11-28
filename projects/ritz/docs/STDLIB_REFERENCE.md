@@ -3363,6 +3363,11 @@ fn test_glob_example() -> i32
 |---|---|---|
 | `glob_match` | `fn(pattern: StrView, path: StrView) -> bool` | Compile and match once |
 | `glob_compile` | `fn(pattern: StrView) -> Glob` | Compile, to match many paths |
+
+**Methods** (`impl Glob`):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `g.matches(path)` | `fn(path: StrView) -> bool` | True when the pattern matches all of `path` |
 
 ### utf8
