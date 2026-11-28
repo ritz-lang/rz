@@ -3,6 +3,7 @@
 # Runs under ritz0 (the package step) and ritz1 / ritz1_selfhosted
 # (make ritzlib-tests-ritz1).
 
+import ritzlib.errno
 import ritzlib.fmt
 import ritzlib.string
 import ritzlib.span
@@ -13,12 +14,18 @@ import ritzlib.result
 fn view_is(w: @Writer, want: StrView) -> bool
     (w.view()).eq(want)
 
+# r failed with errno `code` (AGAST #4930: a failed write is an Errno).
+fn err_is(r: Result<(), Errno>, code: i32) -> bool
+    match r
+        Ok(_) => false
+        Err(e) => e.code() == code
+
 [[test]]
 fn test_span_writer_fills_from_the_start() -> i32
     var buf: [16]u8
     var w: Writer = span_writer(@buf)
-    assert w.write_str("abc") == 3
-    assert w.write_byte(100) == 1
+    assert w.write_str("abc").is_ok()
+    assert w.write_byte(100).is_ok()
     assert w.len() == 4
     assert view_is(@w, "abcd")
     0
@@ -27,21 +34,24 @@ fn test_span_writer_fills_from_the_start() -> i32
 fn test_span_writer_refuses_overflow_whole() -> i32
     var buf: [4]u8
     var w: Writer = span_writer(@buf)
-    assert w.write_str("ab") == 2
-    # Three more bytes don't fit: -1, and nothing of them is written.
-    assert w.write_str("cde") == -1
+    assert w.write_str("ab").is_ok()
+    # Three more bytes don't fit: ENOSPC, and nothing of them is written.
+    assert err_is(w.write_str("cde"), 28)
     assert view_is(@w, "ab")
-    assert w.write_str("cd") == 2
+    assert w.write_str("cd").is_ok()
     assert view_is(@w, "abcd")
-    assert w.write_byte(101) == -1
+    assert err_is(w.write_byte(101), 28)
+    # The raw (data, len) form keeps the count protocol, with -ENOSPC.
+    let f: StrView = "f"
+    assert w.write(f.ptr, f.len) == -28
     0
 
 [[test]]
 fn test_string_writer_appends() -> i32
     var s: String = string_from("x=")
     var w: Writer = string_writer(@&s)
-    assert w.write_str("12") == 2
-    assert w.write_fill(46, 40) == 40   # longer than one fill chunk
+    assert w.write_str("12").is_ok()
+    assert w.write_fill(46, 40).is_ok()   # longer than one fill chunk
     assert s.len() == 44
     assert w.len() == 42
     assert (s.as_view()).starts_with("x=12....")
@@ -50,15 +60,15 @@ fn test_string_writer_appends() -> i32
 [[test]]
 fn test_null_writer_counts() -> i32
     var w: Writer = null_writer()
-    assert w.write_str("hello") == 5
-    assert w.write_str(", world") == 7
+    assert w.write_str("hello").is_ok()
+    assert w.write_str(", world").is_ok()
     assert w.len() == 12
     0
 
 [[test]]
 fn test_empty_write_is_zero() -> i32
     var w: Writer = null_writer()
-    assert w.write_str("") == 0
+    assert w.write_str("").is_ok()
     assert w.len() == 0
     0
 
@@ -68,7 +78,7 @@ fn test_fd_writer_writes_the_fd() -> i32
         Ok(pp) => pp
         Err(_) => return 1
     var w: Writer = fd_writer(p.write.raw())
-    assert writeln(@&w, "piped") == 6
+    assert writeln(@&w, "piped").is_ok()
     assert p.write.close().is_ok()
     var got: String = string_new()
     assert p.read.read_to_end(@&got).is_ok()
@@ -79,8 +89,26 @@ fn test_fd_writer_writes_the_fd() -> i32
 [[test]]
 fn test_fd_writer_reports_the_error() -> i32
     var w: Writer = fd_writer(-1)
-    assert write(@&w, "x") < 0
+    assert err_is(write(@&w, "x"), 9)   # EBADF
     assert w.len() == 0
+    0
+
+[[test]]
+fn test_span_writer_fill_reports_nospc() -> i32
+    var buf: [4]u8
+    var w: Writer = span_writer(@buf)
+    assert err_is(w.write_fill(46, 5), 28)
+    assert w.write_fill(46, 4).is_ok()
+    assert view_is(@w, "....")
+    0
+
+[[test]]
+fn test_writeln_stops_at_the_first_error() -> i32
+    var buf: [3]u8
+    var w: Writer = span_writer(@buf)
+    # The text fits, the newline doesn't.
+    assert err_is(writeln(@&w, "abc"), 28)
+    assert view_is(@w, "abc")
     0
 
 [[test]]

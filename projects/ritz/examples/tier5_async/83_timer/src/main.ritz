@@ -6,8 +6,10 @@
 # ordering.  It never prints a time.
 #
 # It drives the public API: clock_gettime and the CLOCK_* / NANOS_PER_*
-# consts, now_nanos/micros/millis, timer_init/start/stop/elapsed_*, and the
-# stopwatch fns (AGAST #3732 made them `pub`).  timer_print and
+# consts, now_nanos/micros/millis, timer_new/start/stop/elapsed_*, and the
+# stopwatch fns (AGAST #3732 made them `pub`).  clock_gettime and
+# Timer.start/stop return a Result (AGAST #4930), so the golden prints ok-ness,
+# not a status code.  timer_print and
 # stopwatch_print print times, so they are not called.
 #
 # The golden stdout is pinned by test.sh.  Checks with no line of their own
@@ -16,6 +18,7 @@
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.errno
 import ritzlib.timer
 
 fn b(v: bool) -> i64
@@ -33,30 +36,29 @@ fn check(ok: bool, what: StrView) -> i32
 fn main() -> i32
     var fails: i32 = 0
 
-    var ts: Timespec
-    let rc: i32 = clock_gettime(CLOCK_MONOTONIC, @&ts)
-    print("clock_gettime(MONOTONIC) rc: {rc}\n")
+    let mono_now: Result<Timespec, Errno> = clock_gettime(CLOCK_MONOTONIC)
+    print("clock_gettime(MONOTONIC) ok: {b(mono_now.is_ok())}\n")
+    var ts: Timespec = Timespec { tv_sec: -1, tv_nsec: -1 }
+    match mono_now
+        Ok(got) => ts = got
+        Err(_) =>
+            fails += 1
     print("tv_nsec in [0, 1e9): {b(ts.tv_nsec >= 0 and ts.tv_nsec < NANOS_PER_SEC)}\n")
 
-    # timer_init must zero both ends, whatever was there before.
-    var t: Timer
-    t.start.tv_sec = 99
-    t.start.tv_nsec = 99
-    t.end.tv_sec = 99
-    t.end.tv_nsec = 99
-    t.init()
+    # timer_new zeroes both ends.
+    var t: Timer = timer_new()
     let zeroed: bool = t.start.tv_sec == 0 and t.start.tv_nsec == 0 and t.end.tv_sec == 0 and t.end.tv_nsec == 0
-    print("timer_init zeroes start/end: {b(zeroed)}\n")
+    print("timer_new zeroes start/end: {b(zeroed)}\n")
 
     # Start, do some work, stop.
-    let rs: i32 = t.start()
+    let rs: bool = (t.start()).is_ok()
     var acc: i64 = 0
     var i: i64 = 0
     while i < 10000
         acc += i
         i += 1
-    let re: i32 = t.stop()
-    print("start/stop rc: {rs} {re}\n")
+    let re: bool = (t.stop()).is_ok()
+    print("start/stop ok: {b(rs)} {b(re)}\n")
     let s: i64 = t.start.tv_sec * NANOS_PER_SEC + t.start.tv_nsec
     let e: i64 = t.end.tv_sec * NANOS_PER_SEC + t.end.tv_nsec
     print("end >= start: {b(e >= s)}\n")
@@ -69,8 +71,7 @@ fn main() -> i32
 
     # A real run is too short to tell the units apart, so check the
     # conversions on a fixed span: 2s + 345678912ns.
-    var f: Timer
-    f.init()
+    var f: Timer = timer_new()
     f.start.tv_sec = 10
     f.start.tv_nsec = 100000000
     f.end.tv_sec = 12
@@ -95,21 +96,23 @@ fn main() -> i32
     fails += check(now_millis() >= prev / NANOS_PER_MILLI, "now_millis monotonic")
 
     # Wall clock: 1577836800 is 2020-01-01T00:00:00Z.
-    clock_gettime(CLOCK_REALTIME, @&ts)
-    print("CLOCK_REALTIME after 2020: {b(ts.tv_sec > 1577836800)}\n")
+    var wall: i64 = 0
+    match clock_gettime(CLOCK_REALTIME)
+        Ok(got) => wall = got.tv_sec
+        Err(_) =>
+            fails += 1
+    print("CLOCK_REALTIME after 2020: {b(wall > 1577836800)}\n")
 
-    # An invalid clock id is rejected by the kernel (-EINVAL).
-    let bad: i32 = clock_gettime(12345, @&ts)
-    print("bad clock id rc < 0: {b(bad < 0)}\n")
+    # An invalid clock id is rejected by the kernel (EINVAL).
+    var einval: bool = false
+    match clock_gettime(12345)
+        Ok(_) => einval = false
+        Err(err) => einval = err.code() == 22
+    print("bad clock id is EINVAL: {b(einval)}\n")
 
-    var sw: Stopwatch
-    sw.total_ns = 5
-    sw.count = 5
-    sw.running = 1
-    sw.start_ns = 5
-    sw.init()
+    var sw: Stopwatch = stopwatch_new()
     let swz: bool = sw.total_ns == 0 and sw.count == 0 and sw.running == 0 and sw.start_ns == 0
-    print("stopwatch_init zeroes: {b(swz)}\n")
+    print("stopwatch_new zeroes: {b(swz)}\n")
 
     # Stopwatch rules: stop before start and a second start are refused;
     # each start/stop pair adds one to the count.

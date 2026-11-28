@@ -3,10 +3,11 @@
 #4929 taught status-return a callee's negative passed back up (`if r < 0` /
 `return r`), `Err(e) => return -e.code()`, a trailing negative literal and an
 integer return that is only ever 0.  async/ and uring.ritz were ported to
-Result/TaskStep in the same commit and have none left.  These are the rest of
-ritzlib, the fmt/timer/buf methods of the sibling ticket (AGAST #4930) plus
-hashmap's `-1`-when-full slot: pinned down-only by name, so the list may shrink
-(delete the row you port) and never grow.
+Result/TaskStep in the same commit and have none left.  The rest of ritzlib
+(fmt/timer/buf and hashmap's `-1`-when-full slot) were pinned here by name
+until AGAST #4930 ported them; the by-name allowance is gone and the count is
+0.  A site that is a genuine protocol boundary carries a `standard-exempt:
+status-return:` comment instead.
 """
 
 import sys
@@ -22,35 +23,14 @@ pytestmark = pytest.mark.unit
 
 RITZLIB = Path(__file__).resolve().parent.parent.parent / "ritzlib"
 
-# (module, fn) of every non-exempt status-return site left in ritzlib.
-PINNED = {
-    ("buf.ritz", "clear"),
-    ("buf.ritz", "free"),
-    ("buf.ritz", "from_str"),
-    ("buf.ritz", "get_loc"),
-    ("buf.ritz", "init"),
-    ("buf.ritz", "restore"),
-    ("buf.ritz", "skip"),
-    ("fmt.ritz", "writeln"),
-    ("fmt/display.ritz", "fmt_show_with"),
-    ("fmt/impls.ritz", "fmt_debug_bytes"),
-    ("fmt/impls.ritz", "fmt_debug_strview"),
-    ("fmt/writer.ritz", "push_bytes"),
-    ("fmt/writer.ritz", "write_fill"),
-    ("hashmap.ritz", "find_slot"),
-    ("timer.ritz", "init"),
-    ("timer.ritz", "print"),
-    ("timer.ritz", "reset"),
-}
-
-
 def _sites(key):
     return [s for s in scan_tree([RITZLIB]) if s.key == key and s.exempt is None]
 
 
-def test_status_return_sites_are_only_the_pinned_ones():
-    found = {(Path(s.path).relative_to(RITZLIB).as_posix(), s.fn) for s in _sites("status-return")}
-    assert found <= PINNED, f"new status-return sites: {sorted(found - PINNED)}"
+def test_ritzlib_has_no_status_return_site():
+    """#4930 acceptance: the by-name pin is gone; every site is ported or exempt."""
+    found = sorted((Path(s.path).relative_to(RITZLIB).as_posix(), s.fn) for s in _sites("status-return"))
+    assert found == []
 
 
 def test_async_and_uring_have_no_status_return():

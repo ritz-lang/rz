@@ -35,7 +35,7 @@ tokens_section() { sed -n '/^== tokens ==/,$p'; }
 # 1. Empty stdin: the whole program -- API section plus the built-in config.
 want=$(cat <<'GOLDEN'
 == api ==
-from_str len: 12
+buf_new len: 12
 pos: 0
 remaining: 12
 eof: 0

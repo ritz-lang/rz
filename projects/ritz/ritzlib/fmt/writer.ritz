@@ -8,9 +8,14 @@
 #     var w = stdout_writer()
 #     writer_write_str(@&w, "hello\n")
 #
-# Every write returns the bytes it accepted, or a negative value on error
-# (a -errno from the fd sinks, -1 from a full span). `len` counts every byte
-# a sink has accepted, so a null_writer measures what would be written.
+# write_str / write_byte / write_fill return Result<(), Errno> (AGAST #4930):
+# a write that succeeds took every byte, so success has no count to report.
+# A full span is NoSpc and a String that can't grow is NoMem, both writing
+# nothing; an fd sink retries short writes and returns the kernel's errno (Io
+# for a write that made no progress), which may follow a partial write.
+# The raw `write(data, len)` the print builtins lower to keeps the count
+# protocol: len, or the -errno. `len` counts every byte a sink has accepted,
+# so a null_writer measures what would be written.
 #
 # Writers are short-lived stack values and the sink they name (a String, a
 # buffer) must outlive them (V1_ABI_CLEANUP "Implementation-time questions" 4).
@@ -19,6 +24,7 @@
 # `push_bytes` method makes `format_into(@&w, "x = {x}\n")` work on any sink.
 
 import ritzlib.sys
+import ritzlib.errno
 import ritzlib.string
 
 pub struct Writer
@@ -33,12 +39,13 @@ impl Writer
     # format_into's sink (LANGUAGE_SPEC §2.6, AGAST #4555): 0 when every
     # byte was accepted, -1 otherwise. The compiler builds the Span.
     # `write` stays the raw pair the write/writeln builtins lower to.
+    # standard-exempt: status-return: LANGUAGE_SPEC §2.6 sink protocol: format_into's lowering calls push_bytes and ignores its i32
     pub fn push_bytes(self: @&Writer, data: Span<u8>) -> i32
         if self.write(data.ptr, data.len) == data.len
             return 0
         -1
 
-    # Write len bytes from data. Returns len, or a negative value on error. The
+    # Write len bytes from data. Returns len, or the -errno on error. The
     # `write`/`writeln` builtins lower to this exact (data, len) signature.
     # standard-exempt: ptr-len-param: compiler ABI: `write`/`writeln` lower to this exact signature
 # standard-exempt: raw-ptr-param: compiler ABI: the write/writeln builtins lower to this signature
@@ -50,16 +57,18 @@ impl Writer
             self.len = self.len + n
         n
 
-    pub fn write_str(self: @&Writer, s: StrView) -> i64
-        self.write(s.ptr, s.len)
+    # Every byte of s, or the sink's error.
+    pub fn write_str(self: @&Writer, s: StrView) -> Result<(), Errno>
+        writer_done(self.write(s.ptr, s.len))
 
-    pub fn write_byte(self: @&Writer, b: u8) -> i64
+    pub fn write_byte(self: @&Writer, b: u8) -> Result<(), Errno>
         var one: [1]u8
         one[0] = b
-        self.write(@one[0] as *u8, 1)
+        writer_done(self.write(@one[0] as *u8, 1))
 
-    # `b` written n times (padding). Returns n, or the first error.
-    pub fn write_fill(self: @&Writer, b: u8, n: i64) -> i64
+    # `b` written n times (padding). Stops at the first error, which may
+    # leave a prefix of the padding written.
+    pub fn write_fill(self: @&Writer, b: u8, n: i64) -> Result<(), Errno>
         var chunk: [32]u8
         var i: i64 = 0
         while i < 32
@@ -70,18 +79,22 @@ impl Writer
             var step: i64 = left
             if step > 32
                 step = 32
-            let got: i64 = self.write(@chunk[0] as *u8, step)
-            if got < 0
-                return got
+            writer_done(self.write(@chunk[0] as *u8, step))?
             left = left - step
-        n
+        Ok(())
 
     # Bytes accepted so far.
     pub fn len(self: @Writer) -> i64
         self.len
 
+# A raw write's count (len, or -errno) as a Result.
+fn writer_done(n: i64) -> Result<(), Errno>
+    if n < 0
+        return Err(errno_from_raw(n as i32))
+    Ok(())
+
 # ============================================================================
-# Sinks
+# Sinks: each returns len, or the -errno
 # ============================================================================
 
 # Write all len bytes to w.fd, retrying short writes.
@@ -92,20 +105,20 @@ fn fd_sink(w: @&Writer, data: *u8, len: i64) -> i64
         if n < 0
             return n
         if n == 0
-            return -1
+            return -5     # -EIO: the fd accepted nothing
         done = done + n
     done
 
 fn string_sink(w: @&Writer, data: *u8, len: i64) -> i64
     let s: *String = w.state as *String
     if not s.push_span(Span<u8> { ptr: (data), len: (len) as i64 })
-        return -1
+        return -12        # -ENOMEM: the String couldn't grow
     len
 
-# All or nothing: a write that doesn't fit is -1 and leaves the buffer as it was.
+# All or nothing: a write that doesn't fit is -ENOSPC and leaves the buffer as it was.
 fn span_sink(w: @&Writer, data: *u8, len: i64) -> i64
     if len > w.cap - w.len
-        return -1
+        return -28        # -ENOSPC
     var i: i64 = 0
     while i < len
         *(w.state + w.len + i) = *(data + i)

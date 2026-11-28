@@ -24,11 +24,28 @@
 # up to its NUL. Under x X b o a negative signed value prints its two's
 # complement at its own width: `{-1 as i8:x}` is `ff`.
 
+import ritzlib.errno
 import ritzlib.fmt.digits
 import ritzlib.fmt.spec
 import ritzlib.fmt.writer
 import ritzlib.string
 import ritzlib.strview
+
+# ============================================================================
+# The Display protocol's count
+# ============================================================================
+
+# A Writer write of n bytes as `show`'s count: n, or the -errno (AGAST #4930:
+# the Writer reports a Result; Display.show still reports i64 counts).
+# standard-exempt: status-return: Display protocol: `show` reports i64 byte counts and a negative one is its error channel; this is the one place a Writer Result becomes that count
+pub fn fmt_count(r: Result<(), Errno>, n: i64) -> i64
+    match r
+        Ok(_) => n
+        Err(e) => -(e.code() as i64)
+
+# One byte, as a count.
+fn fmt_put(w: @&Writer, b: u8) -> i64
+    fmt_count(w.write_byte(b), 1)
 
 # ============================================================================
 # Padding
@@ -45,7 +62,7 @@ fn fmt_write_padded(w: @&Writer, body: *u8, len: i64, sign: i64, spec: @FmtSpec,
         let a: i64 = w.write(body, sign)
         if a < 0
             return a
-        let z: i64 = w.write_fill(48, pad)
+        let z: i64 = fmt_count(w.write_fill(48, pad), pad)
         if z < 0
             return z
         let b: i64 = w.write(body + sign, len - sign)
@@ -60,13 +77,13 @@ fn fmt_write_padded(w: @&Writer, body: *u8, len: i64, sign: i64, spec: @FmtSpec,
         before = pad
     else if align == FMT_ALIGN_CENTER
         before = pad / 2
-    let x: i64 = w.write_fill(32, before)
+    let x: i64 = fmt_count(w.write_fill(32, before), before)
     if x < 0
         return x
     let y: i64 = w.write(body, len)
     if y < 0
         return y
-    let z: i64 = w.write_fill(32, pad - before)
+    let z: i64 = fmt_count(w.write_fill(32, pad - before), pad - before)
     if z < 0
         return z
     spec.width
@@ -201,8 +218,8 @@ fn fmt_text_with(w: @&Writer, ptr: *u8, len: i64, spec: @FmtSpec) -> i64
 
 pub fn fmt_show_bool(v: bool, w: @&Writer) -> i64
     if v
-        return w.write_str("true")
-    w.write_str("false")
+        return fmt_show_strview("true", w)
+    fmt_show_strview("false", w)
 
 pub fn fmt_show_bool_with(v: bool, w: @&Writer, spec: StrView) -> i64
     let s: FmtSpec = fmt_spec_parse(spec)
@@ -243,14 +260,15 @@ pub fn fmt_show_bytes_with(v: Span<u8>, w: @&Writer, spec: StrView) -> i64
     fmt_text_with(w, v.ptr, v.len, @s)
 
 # `[1, 2, 255]`
+# standard-exempt: status-return: Display protocol: Debug's body, an i64 byte count or a negative error like every show
 pub fn fmt_debug_bytes(v: Span<u8>, w: @&Writer) -> i64
-    var total: i64 = w.write_byte(91)   # '['
+    var total: i64 = fmt_put(w, 91)   # '['
     if total < 0
         return total
     var i: i64 = 0
     while i < v.len
         if i > 0
-            let c: i64 = w.write_str(", ")
+            let c: i64 = fmt_show_strview(", ", w)
             if c < 0
                 return c
             total = total + c
@@ -259,7 +277,7 @@ pub fn fmt_debug_bytes(v: Span<u8>, w: @&Writer) -> i64
             return n
         total = total + n
         i += 1
-    let e: i64 = w.write_byte(93)        # ']'
+    let e: i64 = fmt_put(w, 93)        # ']'
     if e < 0
         return e
     total + e
@@ -296,8 +314,9 @@ fn fmt_hex_digit(nibble: u8) -> u8
 
 # `"a\"b\n"`: quoted; '"', '\\', \n \t \r escaped, other bytes outside
 # ' '..'~' as \xNN. Runs of plain bytes go to the Writer in one write.
+# standard-exempt: status-return: Display protocol: Debug's body, an i64 byte count or a negative error like every show
 pub fn fmt_debug_strview(v: StrView, w: @&Writer) -> i64
-    var total: i64 = w.write_byte(34)
+    var total: i64 = fmt_put(w, 34)
     if total < 0
         return total
     var esc: [4]u8
@@ -320,7 +339,7 @@ pub fn fmt_debug_strview(v: StrView, w: @&Writer) -> i64
                 total = total + b
             run = i + 1
         i += 1
-    let e: i64 = w.write_byte(34)
+    let e: i64 = fmt_put(w, 34)
     if e < 0
         return e
     total + e

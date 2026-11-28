@@ -5,16 +5,16 @@
 set -uo pipefail
 
 want=$(cat <<'GOLDEN'
-clock_gettime(MONOTONIC) rc: 0
+clock_gettime(MONOTONIC) ok: 1
 tv_nsec in [0, 1e9): 1
-timer_init zeroes start/end: 1
-start/stop rc: 0 0
+timer_new zeroes start/end: 1
+start/stop ok: 1 1
 end >= start: 1
 elapsed >= 0: 1
 monotonic over 1000 reads: 1
 CLOCK_REALTIME after 2020: 1
-bad clock id rc < 0: 1
-stopwatch_init zeroes: 1
+bad clock id is EINVAL: 1
+stopwatch_new zeroes: 1
 GOLDEN
 )
 out=$(./timer_demo </dev/null); rc=$?

@@ -1238,28 +1238,31 @@ Phase 2). It `pub import`s `ritzlib.fmt.digits`, `.spec`, `.writer`,
 and `eprint` are builtins ([LANGUAGE_SPEC §2.6](LANGUAGE_SPEC.md)).
 
 **Writer** (`ritzlib.fmt.writer`). A byte sink: a fn pointer and the state it
-needs. Every write returns the bytes accepted, or a negative value (a -errno
-from an fd, -1 from a full span). `w.len` counts every byte accepted. A Writer
-is a `format_into` sink: it has `push_bytes`.
+needs. `write_str`, `write_byte`, `write_fill`, `write` and `writeln` return
+`Result<(), Errno>` (AGAST #4930): a write that succeeds took every byte. A
+full span is `NoSpc` and a String that can't grow is `NoMem`, both writing
+nothing; an fd returns the kernel's errno, possibly after a partial write. The raw `w.write(data, len)` that the print
+builtins lower to keeps its count: `len`, or the -errno. `w.len` counts every
+byte accepted. A Writer is a `format_into` sink: it has `push_bytes`.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `stdout_writer` / `stderr_writer` | `fn() -> Writer` | fd 1 / fd 2 |
 | `fd_writer` | `fn(fd: i32) -> Writer` | Any fd; short writes are retried |
 | `string_writer` | `fn(s: @&String) -> Writer` | Appends to `*s` |
-| `span_writer` | `fn(buf: Span<u8>) -> Writer` | Fills `buf`; a write that doesn't fit is -1 and writes nothing |
+| `span_writer` | `fn(buf: Span<u8>) -> Writer` | Fills `buf`; a write that doesn't fit is `Err(NoSpc)` and writes nothing |
 | `null_writer` | `fn() -> Writer` | Discards; `w.len` measures |
-| `write` / `writeln` | `fn(w: @&Writer, s: StrView) -> i64` | `s` (and a newline) to `w` |
+| `write` / `writeln` | `fn(w: @&Writer, s: StrView) -> Result<(), Errno>` | `s` (and a newline) to `w`; stops at the first error |
 | `format` | `fn(s: StrView) -> String` | `s` copied into a new String |
 
 **Methods** (`impl Writer`, AGAST #4445):
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `w.write(data, len)` | `fn(data: *u8, len: i64) -> i64` | `len` bytes |
-| `w.write_str(s)` | `fn(s: StrView) -> i64` | A view's bytes |
-| `w.write_byte(b)` | `fn(b: u8) -> i64` | One byte |
-| `w.write_fill(b, n)` | `fn(b: u8, n: i64) -> i64` | `b`, `n` times |
+| `w.write(data, len)` | `fn(data: *u8, len: i64) -> i64` | `len` bytes; `len` or the -errno (the print builtins' ABI) |
+| `w.write_str(s)` | `fn(s: StrView) -> Result<(), Errno>` | A view's bytes |
+| `w.write_byte(b)` | `fn(b: u8) -> Result<(), Errno>` | One byte |
+| `w.write_fill(b, n)` | `fn(b: u8, n: i64) -> Result<(), Errno>` | `b`, `n` times; an error may leave a prefix written |
 | `w.push_bytes(data)` | `fn(data: Span<u8>) -> i32` | The `format_into` sink: 0 if every byte was accepted, else -1 |
 | `w.len()` | `fn() -> i64` | Bytes accepted so far |
 | `w.view()` | `fn() -> StrView` | What a `span_writer` holds |
@@ -1388,11 +1391,10 @@ struct Buffer
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `buf_new` | `fn(s: StrView) -> Buffer` | Cursor at the start of `s` (borrows its bytes) |
+| `buf_from` | `fn(data: Span<u8>) -> Buffer` | Cursor at the start of `data` (borrows it) |
 
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `b.from_str(s)` | `fn(s: StrView) -> i32` | Re-point an existing cursor at `s` |
-| `b.init(data)` | `fn(data: Span<u8>) -> i32` | From a `Span<u8>` |
+`b.init(data)` and `b.from_str(s)` went with AGAST #4930: assign
+`buf_from(data)` or `buf_new(s)` instead.
 
 **Position**:
 
@@ -1404,7 +1406,7 @@ struct Buffer
 | `b.eof()` | `fn() -> bool` | At end? |
 | `b.rest()` | `fn() -> StrView` | Unread bytes, as a slice |
 | `b.save()` | `fn() -> i64` | Save position |
-| `b.restore(pos)` | `fn(pos: i64) -> i32` | Restore position |
+| `b.restore(pos)` | `fn(pos: i64)` | Restore position |
 
 **Peek (Don't Advance)**:
 
@@ -1420,7 +1422,7 @@ struct Buffer
 |--------|-----------|-------------|
 | `b.advance()` | `fn() -> u8` | Read and advance |
 | `b.advance_n(n)` | `fn(n: i64) -> i64` | Advance n bytes (clamped) |
-| `b.skip(n)` | `fn(n: i64) -> i32` | Skip n bytes (clamped) |
+| `b.skip(n)` | `fn(n: i64)` | Skip n bytes (clamped) |
 
 **Pattern Matching**:
 
@@ -1479,7 +1481,7 @@ struct BufLoc
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `b.get_loc(loc)` | `fn(loc: @&BufLoc) -> i32` | Get line/column |
+| `b.loc()` | `fn() -> BufLoc` | The cursor's 1-based line and column, and its offset (was `get_loc(@&loc)`) |
 
 #### GrowBuf (Growable Buffer)
 
@@ -1505,14 +1507,14 @@ explicit release. To read a whole file descriptor, use `vec_read_all_fd`
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `b.free()` | `fn() -> i32` | Free (deprecated, use Drop) |
+| `b.free()` | `fn()` | Free (deprecated, use Drop) |
 | `b.grow(new_cap)` | `fn(new_cap: i64) -> bool` | Grow capacity |
 | `b.ensure_cap(needed)` | `fn(needed: i64) -> bool` | Ensure capacity |
 | `b.append(data)` | `fn(data: Span<u8>) -> bool` | Append bytes |
 | `b.append_view(s)` | `fn(s: StrView) -> bool` | Append a StrView |
 | `b.append_byte(byte)` | `fn(byte: u8) -> bool` | Append single byte |
 | `b.push_bytes(data)` | `fn(data: Span<u8>) -> bool` | Append a byte span; the sink `format_into(@&b, "...")` appends through (AGAST #4555) |
-| `b.clear()` | `fn() -> i32` | Clear (keep capacity) |
+| `b.clear()` | `fn()` | Clear (keep capacity) |
 | `b.len()` | `fn() -> i64` | Get length |
 | `b.cap()` | `fn() -> i64` | Get capacity |
 | `b.get(idx)` | `fn(idx: i64) -> u8` | Byte at index (0 out of range) |
@@ -3107,35 +3109,42 @@ struct Stopwatch
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
+| `clock_gettime` | `fn(clock_id: i32) -> Result<Timespec, Errno>` | The time on `clock_id`; `Err(Inval)` for a clock the kernel doesn't have |
 | `now_nanos` | `fn() -> i64` | Current time in nanoseconds |
 | `now_micros` | `fn() -> i64` | Current time in microseconds |
 | `now_millis` | `fn() -> i64` | Current time in milliseconds |
 
 **Timer**:
 
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `timer_new` | `fn() -> Timer` | A Timer with zero start and end (was `t.init()`) |
+
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `t.init()` | `fn() -> i32` | Initialize |
-| `t.start()` | `fn() -> i32` | Start timer |
-| `t.stop()` | `fn() -> i32` | Stop timer |
+| `t.start()` | `fn() -> Result<(), Errno>` | Start timer |
+| `t.stop()` | `fn() -> Result<(), Errno>` | Stop timer |
 | `t.elapsed_nanos()` | `fn() -> i64` | Get elapsed ns |
 | `t.elapsed_micros()` | `fn() -> i64` | Get elapsed us |
 | `t.elapsed_millis()` | `fn() -> i64` | Get elapsed ms |
 | `t.elapsed_secs_x1000()` | `fn() -> i64` | Elapsed seconds x1000 (3 decimal places), truncated: the same value as `elapsed_millis()` |
-| `t.print()` | `fn() -> i32` | Print human-readable |
+| `t.print()` | `fn()` | Print human-readable |
 
 **Stopwatch** (cumulative timing):
 
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `stopwatch_new` | `fn() -> Stopwatch` | Stopped, nothing timed (was `sw.init()`) |
+
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `sw.init()` | `fn() -> i32` | Initialize |
 | `sw.start()` | `fn() -> bool` | Start (false if already running) |
 | `sw.stop()` | `fn() -> bool` | Stop (false if not running) |
-| `sw.reset()` | `fn() -> i32` | Reset |
+| `sw.reset()` | `fn()` | Reset |
 | `sw.total_nanos()` | `fn() -> i64` | Total ns |
 | `sw.avg_nanos()` | `fn() -> i64` | Average ns |
 | `sw.count()` | `fn() -> i64` | Number of samples |
-| `sw.print()` | `fn() -> i32` | Print stats |
+| `sw.print()` | `fn()` | Print stats |
 
 ---
 

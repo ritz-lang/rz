@@ -926,10 +926,13 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             interp_line = (fn_name in ('println', 'eprintln')
                            and any(isinstance(a, rast.InterpString)
                                    for a in expr.args))
-            # write/writeln interpolate through their Writer; with ritzlib in
-            # scope their own i64 signature stays the authority.
+            # write/writeln interpolate through their Writer, and the lowering
+            # (_emit_interp_string_print) is the call whatever fn of the name
+            # is in scope, so its value is the i64 byte total a Display body
+            # returns.  ritzlib.fmt's own write/writeln return
+            # Result<(), Errno> since AGAST #4930; typing the builtin by them
+            # refused `show`'s `write(w, "({self.x})")` tail (AGAST #4962).
             interp_writer = (fn_name in ('write', 'writeln')
-                             and fn_name not in self.functions
                              and len(expr.args) == 2
                              and isinstance(expr.args[1], rast.InterpString))
             if (fn_name in ('print', 'eprint', 'format_into')

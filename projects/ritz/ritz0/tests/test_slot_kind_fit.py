@@ -115,6 +115,11 @@ REFUSED = {
     "let_payload_into_strview": ("fn f(r: Result<i64, i32>) -> i32\n    match r\n        Ok(v) =>\n"
                                  "            »let s: StrView = v\n            0\n        Err(_) => 0\n" + MAIN,
                                  "`s` is declared `StrView` but its initialiser has type `i64`"),
+    # AGAST #4930: a print builtin's value is the emitter's i64 byte count,
+    # whatever fn of its name is in scope; ritz1 typed it as nothing (or as
+    # ritzlib.fmt's writeln, now a Result) and stored the i64 in the slot.
+    "let_print_into_struct": ('fn main() -> i32\n    »let p: P = print("x")\n    p.a as i32\n',
+                              "`p` is declared `P` but its initialiser has type `i64`"),
     # test_strlit_span_slot_checker.py TestStillRefused::test_mixed_tails_judge_the_non_literal
     "tail_arm_strview_into_span": ('fn g(b: bool, v: StrView) -> Span<u8>\n    »if b\n        "ab"\n'
                                    "    else\n        v\n" + MAIN,
@@ -155,6 +160,7 @@ ACCEPTED = {
     "ptr_into_u64": "fn f(p: *T) -> u64\n    let n: u64 = p\n    n\n" + MAIN,
     "null_into_ptr": "fn main() -> i32\n    var p: *u8 = null\n    p = null\n    0\n",
     "string_lit_into_span": 'fn g() -> Span<u8>\n    "ab"\n' + MAIN,
+    "print_value_into_i64": 'fn main() -> i32\n    let n: i64 = print("x")\n    n as i32\n',
     "struct_field_of_its_own": "fn main() -> i32\n    let h = H { f: 7, g: true }\n    h.f as i32\n",
 }
 

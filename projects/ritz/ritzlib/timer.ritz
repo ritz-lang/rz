@@ -4,6 +4,7 @@
 # Uses clock_gettime(CLOCK_MONOTONIC) for reliable, monotonic timestamps.
 
 import ritzlib.sys
+import ritzlib.errno
 import ritzlib.io
 
 
@@ -48,21 +49,23 @@ struct Timer
 # Functions
 # ============================================================================
 
-# Get current time with nanosecond precision. `ts` is the kernel's output.
-pub fn clock_gettime(clock_id: i32, ts: @&Timespec) -> i32
-    let ret = syscall2(SYS_CLOCK_GETTIME, clock_id as i64, ts as i64)
-    return ret as i32
+# The time on clock `clock_id`, with nanosecond precision. Err(Inval) for a
+# clock the kernel doesn't have.
+pub fn clock_gettime(clock_id: i32) -> Result<Timespec, Errno>
+    var ts: Timespec = Timespec { tv_sec: 0, tv_nsec: 0 }
+    let ret: i64 = syscall2(SYS_CLOCK_GETTIME, clock_id as i64, @&ts as i64)
+    if ret < 0
+        return Err(errno_from_raw(ret as i32))
+    Ok(ts)
 
 
 # Get monotonic time in nanoseconds (since some unspecified epoch).
 # CLOCK_MONOTONIC does not fail on Linux, so there is no error to report; a
-# failed syscall (never observed) leaves `ts` zeroed and yields 0.
+# failed syscall (never observed) yields 0.
 pub fn now_nanos() -> i64
-    var ts: Timespec
-    ts.tv_sec = 0
-    ts.tv_nsec = 0
-    clock_gettime(CLOCK_MONOTONIC, @&ts)
-    return ts.tv_sec * NANOS_PER_SEC + ts.tv_nsec
+    match clock_gettime(CLOCK_MONOTONIC)
+        Ok(ts) => ts.tv_sec * NANOS_PER_SEC + ts.tv_nsec
+        Err(_) => 0
 
 
 # Get monotonic time in microseconds
@@ -75,23 +78,21 @@ pub fn now_millis() -> i64
     return now_nanos() / NANOS_PER_MILLI
 
 
+# A Timer with zero start and end (AGAST #4930: was Timer.init).
+pub fn timer_new() -> Timer
+    Timer { start: Timespec { tv_sec: 0, tv_nsec: 0 }, end: Timespec { tv_sec: 0, tv_nsec: 0 } }
+
 # Methods (S-IMPL-1): a Timer is the subject of every operation on it.
 impl Timer
-    # Initialize a timer
-    pub fn init(self: @&Timer) -> i32
-        self.start.tv_sec = 0
-        self.start.tv_nsec = 0
-        self.end.tv_sec = 0
-        self.end.tv_nsec = 0
-        return 0
+    # Start the timer: the start time is now.
+    pub fn start(self: @&Timer) -> Result<(), Errno>
+        self.start = clock_gettime(CLOCK_MONOTONIC)?
+        Ok(())
 
-    # Start the timer
-    pub fn start(self: @&Timer) -> i32
-        return clock_gettime(CLOCK_MONOTONIC, @&self.start)
-
-    # Stop the timer
-    pub fn stop(self: @&Timer) -> i32
-        return clock_gettime(CLOCK_MONOTONIC, @&self.end)
+    # Stop the timer: the end time is now.
+    pub fn stop(self: @&Timer) -> Result<(), Errno>
+        self.end = clock_gettime(CLOCK_MONOTONIC)?
+        Ok(())
 
     # Get elapsed time in nanoseconds
     pub fn elapsed_nanos(self: @Timer) -> i64
@@ -114,7 +115,7 @@ impl Timer
         return self.elapsed_nanos() * 1000 / NANOS_PER_SEC
 
     # Print elapsed time in human-readable format
-    pub fn print(self: @Timer) -> i32
+    pub fn print(self: @Timer)
         let ns = self.elapsed_nanos()
         if ns < 1000
             print("{ns}ns")
@@ -127,7 +128,6 @@ impl Timer
         else
             let frac = (ns % 1000000000) / 100000000
             print("{ns / 1000000000}.{frac}s")
-        return 0
 
 
 # ============================================================================
@@ -141,14 +141,12 @@ struct Stopwatch
     start_ns: i64
 
 
+# A stopped Stopwatch with nothing timed (AGAST #4930: was Stopwatch.init).
+pub fn stopwatch_new() -> Stopwatch
+    Stopwatch { total_ns: 0, count: 0, running: 0, start_ns: 0 }
+
 # A Stopwatch is the subject of every operation on it (S-IMPL-1).
 impl Stopwatch
-    pub fn init(self: @&Stopwatch) -> i32
-        self.total_ns = 0
-        self.count = 0
-        self.running = 0
-        self.start_ns = 0
-        return 0
 
     # Start the stopwatch.  false if it was already running.
     pub fn start(self: @&Stopwatch) -> bool
@@ -168,12 +166,9 @@ impl Stopwatch
         self.running = 0
         return true
 
-    pub fn reset(self: @&Stopwatch) -> i32
-        self.total_ns = 0
-        self.count = 0
-        self.running = 0
-        self.start_ns = 0
-        return 0
+    # Back to stopped, with nothing timed.
+    pub fn reset(self: @&Stopwatch)
+        *self = stopwatch_new()
 
     pub fn total_nanos(self: @Stopwatch) -> i64
         return self.total_ns
@@ -187,11 +182,10 @@ impl Stopwatch
         return self.count
 
     # Print stopwatch stats
-    pub fn print(self: @Stopwatch) -> i32
+    pub fn print(self: @Stopwatch)
         print("Stopwatch: total={self.total_ns / 1000000}ms, count={self.count}, avg=")
         if self.count > 0
             let avg_us = self.total_ns / self.count / 1000
             print("{avg_us}µs")
         else
             print("N/A")
-        return 0
