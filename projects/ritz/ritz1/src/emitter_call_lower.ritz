@@ -637,44 +637,45 @@ fn arg_pointee_name(s: *EmitterState, arg: *Expr) -> StrView
         return no_name()
     lv_name(loc)
 
-# What the place `value` holds: its array's dimensions in `out`, or that it's no
-# array, or ARG_DIMS_UNKNOWN when ritz1 can't tell from here.  Emits nothing.
-fn place_array_dims(s: *EmitterState, value: *Expr, out: *ArrayDims) -> i32
+# What the place `value` holds: Ok(its array's dimensions), or
+# Err(DimsMiss.NotArray) that it's no array, or Err(DimsMiss.Unknown) when
+# ritz1 can't tell from here.  Emits nothing.
+fn place_array_dims(s: *EmitterState, value: *Expr) -> Result<ArrayDims, DimsMiss>
     var src: ArraySrc
     if arg_array_shape(s, value, @src) == 1
-        return array_dims_1d(out, src.size, src.elem, src.name)
+        return Ok(array_dims_1d(src.size, src.elem, src.name))
     match value.kind
         ExprKind.Ident =>
             let sh: *ArrayShape = nd_array_ident_shape(s, value)
             if sh != null
-                return array_dims_nd(out, sh, 0)
+                return array_dims_nd(sh, 0)
             if find_local_struct_name(s, ident_sv(value)) != null or find_global(s, ident_sv(value)) != null
-                return ARG_DIMS_NOT_ARRAY
-            return ARG_DIMS_UNKNOWN
+                return Err(DimsMiss.NotArray)
+            return Err(DimsMiss.Unknown)
         ExprKind.Member =>
             let msh: *ArrayShape = nd_array_member_shape(s, value)
             if msh != null
-                return array_dims_nd(out, msh, 0)
+                return array_dims_nd(msh, 0)
             let f: *StructField = member_field_def(s, value)
             if f != null and f.field_type != TypeKind.Array
-                return ARG_DIMS_NOT_ARRAY
-            return ARG_DIMS_UNKNOWN
+                return Err(DimsMiss.NotArray)
+            return Err(DimsMiss.Unknown)
         _ => pass
     if value.kind == ExprKind.Index
         var depth: i32 = 0
         let ish: *ArrayShape = nd_index_shape(s, value, @depth)
         if ish != null
-            return array_dims_nd(out, ish, depth)
+            return array_dims_nd(ish, depth)
         # An element of a 1-D array.
-        var base: ArrayDims
-        if value.left.kind != ExprKind.Index and place_array_dims(s, value.left, @base) == ARG_DIMS_ARRAY
-            return ARG_DIMS_NOT_ARRAY
-    ARG_DIMS_UNKNOWN
+        if value.left.kind != ExprKind.Index and place_array_dims(s, value.left).is_ok()
+            return Err(DimsMiss.NotArray)
+    Err(DimsMiss.Unknown)
 
-# What `arg` points at, for a param that takes an array by address.
-fn ref_arg_dims(s: *EmitterState, arg: *Expr, out: *ArrayDims) -> i32
+# What `arg` points at, for a param that takes an array by address: as
+# place_array_dims says.
+fn ref_arg_dims(s: *EmitterState, arg: *Expr) -> Result<ArrayDims, DimsMiss>
     if arg.kind == ExprKind.Unary and (arg.op == OpKind.Addr or arg.op == OpKind.AddrMut)
-        return place_array_dims(s, arg.operand, out)
+        return place_array_dims(s, arg.operand)
     if arg.kind == ExprKind.Ident
         let loc: *LocalVar = find_local_struct_name(s, ident_sv(arg))
         if loc != null and lv_var_type(loc) != TypeKind.Array
@@ -683,10 +684,10 @@ fn ref_arg_dims(s: *EmitterState, arg: *Expr, out: *ArrayDims) -> i32
                 # AGAST #4122: a plane pointer `*[N][M]T` points at its shape,
                 # not the flat `[N*M]T` it is kept as (`:& *[N][M]T` takes it).
                 if lv_pointee_array_shape(ploc) != null and lv_var_type(ploc) == TypeKind.Ptr
-                    return array_dims_nd(out, lv_pointee_array_shape(ploc), 0)
-                return array_dims_1d(out, lv_pointee_array_size(ploc), lv_pointee_array_elem_type(ploc), array_ptr_elem_name(ploc))   # #2548
+                    return array_dims_nd(lv_pointee_array_shape(ploc), 0)
+                return Ok(array_dims_1d(lv_pointee_array_size(ploc), lv_pointee_array_elem_type(ploc), array_ptr_elem_name(ploc)))   # #2548
             if lv_is_lent(loc) == 1
-                return ARG_DIMS_NOT_ARRAY
+                return Err(DimsMiss.NotArray)
             # AGAST #2323: `let p: @[N]T = @a` and `var p = @a` record N and T,
             # and array_ptr_local answered for them.  A pointer local whose
             # pointee is known and no array (`p: *i32`, `*u8`, `**T`, `@S`) is
@@ -694,9 +695,9 @@ fn ref_arg_dims(s: *EmitterState, arg: *Expr, out: *ArrayDims) -> i32
             # that records no pointee, or an array without its N, says nothing.
             if lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.PtrPtr or lv_var_type(loc) == TypeKind.Ref or lv_var_type(loc) == TypeKind.MutRef
                 if lv_pointee_type(loc) == TypeKind.Array or lv_pointee_type(loc) == TypeKind.Unknown or lv_pointee_type(loc) == TypeKind.Void
-                    return ARG_DIMS_UNKNOWN
-                return ARG_DIMS_NOT_ARRAY
-    return place_array_dims(s, arg, out)
+                    return Err(DimsMiss.Unknown)
+                return Err(DimsMiss.NotArray)
+    return place_array_dims(s, arg)
 
 # Fill `out` when `arg` is a whole 1-D array, as a place or an inline field.
 pub fn arg_array_shape(s: *EmitterState, arg: *Expr, out: *ArraySrc) -> i32
@@ -960,10 +961,12 @@ fn pointer_place_fits(s: *EmitterState, arg: *Expr, pl: *PlaceType, p: *Param) -
         if pl.pointee != TypeKind.Array
             return false
         var got: ArrayDims
-        if ref_arg_dims(s, arg, @got) != ARG_DIMS_ARRAY
-            return true
-        var dims: ArrayDims
-        param_pointee_dims(@dims, p)
+        match ref_arg_dims(s, arg)
+            Ok(d) =>
+                got = d
+            Err(_) =>
+                return true
+        var dims: ArrayDims = param_pointee_dims(p)
         return array_dims_match(@got, @dims) == 1
     if want == TypeKind.Struct or pl.pointee == TypeKind.Struct
         return want == pl.pointee and name_eq(param_type_sv(p), pl.name) == 1
@@ -981,10 +984,12 @@ fn place_fits_borrow(s: *EmitterState, arg: *Expr, pl: *PlaceType, p: *Param) ->
             if pt != TypeKind.Array
                 return false
             var got: ArrayDims
-            var want: ArrayDims
-            if place_array_dims(s, arg, @got) != ARG_DIMS_ARRAY
-                return false
-            param_pointee_dims(@want, p)
+            match place_array_dims(s, arg)
+                Ok(d) =>
+                    got = d
+                Err(_) =>
+                    return false
+            var want: ArrayDims = param_pointee_dims(p)
             return array_dims_match(@got, @want) == 1
         _ => pass
     # AGAST #2994: a `bool` local or param is a `bool`, though its slot is
@@ -1138,9 +1143,7 @@ pub fn users_variant_wins(s: *EmitterState, e: *Expr) -> bool
     let fname: StrView = e.func_name
     if is_variant_carrier(fname) == 0 and is_variant_null(fname) == 0
         return false
-    var a: i32 = 0
-    var b: i32 = 0
-    if user_variant_ctor_ambiguous(s.sym.mono.pctx, e, @a, @b) == 0
+    if user_variant_ctor_ambiguous(s.sym.mono.pctx, e).is_none()
         let en: StrView = user_variant_ctor_enum(s.sym.mono.pctx, e)
         if unnamed(en)
             return false
@@ -1460,12 +1463,11 @@ fn sizeof_times(count: i64, elem: i64) -> i64
 
 # A type alias `name`, sized; -1 when `name` is no alias (or sizes to nothing).
 fn sizeof_alias_size(s: *EmitterState, name_sv: StrView) -> i64
-    var count: i64 = 0
-    var leaf: TypeKind = TypeKind.Void
-    var leaf_name: StrView = strview_empty()
-    if type_alias_sizeof_shape(s.sym.mono.pctx, name_sv, @count, @leaf, @leaf_name) == 0
-        return -1
-    return sizeof_times(count, sizeof_kind_size(s, leaf, leaf_name))
+    match type_alias_sizeof_shape(s.sym.mono.pctx, name_sv)
+        Some(a) =>
+            return sizeof_times(a.count, sizeof_kind_size(s, a.leaf, a.leaf_name))
+        None =>
+            return -1
 
 # Is `name` a value in scope: a local or param, a global or a const?
 fn sizeof_is_value(s: *EmitterState, name: StrView) -> bool

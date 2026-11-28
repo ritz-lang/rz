@@ -529,3 +529,89 @@ fn test_an_asm_body_indent_points_at_its_text() -> i32
   let line: Token = lexer_next(@lex)
   assert is_at(line, TOK_ASM_LINE, src.ptr, 14, 3) == 1
   0
+
+# --- The scanners return what they found (AGAST #4926), not C's
+# "kind back, length in *out_len" or "1 with the token in *out".
+
+# lexer_match's kind and length at the start of `src`, or kind -1 for None.
+fn match_at(src: StrView) -> Lexeme
+  var lex: Lexer
+  feed(@lex, src)
+  match lexer_match(@lex)
+    Some(m) =>
+      return m
+    None => pass
+  Lexeme { kind: -1, len: 0 }
+
+[[test]]
+fn test_lexer_match_returns_the_lexeme() -> i32
+  let id: Lexeme = match_at("abc1 x")
+  assert id.kind == TOK_IDENT
+  assert id.len == 4
+  let num: Lexeme = match_at("0x1f+")
+  assert num.kind == TOK_NUMBER
+  assert num.len == 4
+  let fl: Lexeme = match_at("2.5e3 ")
+  assert fl.kind == TOK_FLOAT
+  assert fl.len == 5
+  let ch: Lexeme = match_at("'a' ")
+  assert ch.kind == TOK_CHAR
+  assert ch.len == 3
+  let op: Lexeme = match_at("*%= 1")
+  assert op.kind == TOK_STARPCT_EQ
+  assert op.len == 3
+  0
+
+[[test]]
+fn test_lexer_match_is_none_where_no_token_starts() -> i32
+  assert match_at("''").kind == -1         # an empty char literal
+  assert match_at("`x").kind == -1         # a stray byte
+  0
+
+[[test]]
+fn test_an_exponent_without_digits_is_its_own_kind() -> i32
+  # `1e+` : the digit should be at offset 3.
+  let m: Lexeme = match_at("1e+ ")
+  assert m.kind == LEX_NO_EXP_DIGIT
+  assert m.len == 3
+  0
+
+# lexer_cook over `src` from offset 1 (past its opening quote): the closing
+# quote's offset, -1 for Unclosed, -2 for BadEscape (its token a TOK_ERROR).
+fn cook_at(src: StrView) -> i64
+  var lex: Lexer
+  feed(@lex, src)
+  match lexer_cook(@lex, 1, 1, 0, 1, 1)
+    Cooked.Closed(q) =>
+      return q
+    Cooked.Unclosed =>
+      return -1
+    Cooked.BadEscape(bad) =>
+      if bad.kind != TOK_ERROR
+        return -3
+      return -2
+
+[[test]]
+fn test_lexer_cook_says_how_the_literal_ended() -> i32
+  assert cook_at("\"ab\\n\" x") == 5
+  assert cook_at("\"ab\n\"") == -1
+  assert cook_at("\"ab") == -1
+  assert cook_at("\"a\\q\"") == -2
+  0
+
+[[test]]
+fn test_check_separators_is_none_for_placed_underscores() -> i32
+  var lex: Lexer
+  feed(@lex, "1_000 ")
+  match lexer_check_separators(@lex, 5)
+    Some(_) =>
+      assert false
+    None => pass
+  feed(@lex, "1__0 ")
+  match lexer_check_separators(@lex, 4)
+    Some(bad) =>
+      assert bad.kind == TOK_ERROR
+      assert bad.col == 2
+    None =>
+      assert false
+  0

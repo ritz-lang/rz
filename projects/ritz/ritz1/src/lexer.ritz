@@ -155,34 +155,33 @@ fn lexer_asm_reset(lex: *Lexer)
   lex.asm_body = 0
 
 # At the start of a line in asm body mode (AGAST #3394), with lex.pos at its
-# first byte.  Returns 1 with a token in out_tok (the body's INDENT, or a tab
-# error), 0 to go on scanning: a blank or comment-only line was skipped, the
+# first byte.  The token to return (the body's INDENT, or a tab error), or
+# None to go on scanning: a blank or comment-only line was skipped, the
 # line's text is next (at_line_start is 0), or the line ends the body (the
 # mode is off and at_line_start still 1, so it is laid out as usual).
-fn lexer_asm_line_start(lex: *Lexer, out_tok: *Token) -> i32
+fn lexer_asm_line_start(lex: *Lexer) -> Option<Token>
   var indent: i32 = 0
   while lexer_peek_at(lex, indent) == 32  # space
     indent = indent + 1
   let c: i32 = lexer_peek_at(lex, indent)
   # A blank or comment-only line, a tab, or the end of input: as anywhere.
   if c == 10 or c == '#' or c == 9 or lex.pos + indent >= lex.src.len
-    return lexer_handle_indent(lex, out_tok)
+    return lexer_handle_indent(lex)
   if indent <= lex.asm_base
     lex.asm_raw = 0
-    return 0
+    return None
   lex.pos = lex.pos + indent
   lex.col = lex.col + indent
   lex.line_indent = indent
   lex.at_line_start = 0
   if lex.asm_body == 1
-    return 0
+    return None
   if lex.indent_depth >= MAX_INDENT_DEPTH
-    return lexer_fail(lex, out_tok, "blocks nested more than 64 levels deep")
+    return Some(lexer_fail(lex, "blocks nested more than 64 levels deep"))
   lex.asm_body = 1
   lex.indent_stack[lex.indent_depth] = indent
   lex.indent_depth = lex.indent_depth + 1
-  *out_tok = token_new(TOK_INDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
-  1
+  Some(token_new(TOK_INDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col))
 
 # One line of an asm body, from lex.pos (past its indentation) to the end of
 # the line, as TOK_ASM_LINE.  A `#` and what follows it is a comment and is
@@ -254,12 +253,12 @@ fn lexer_fail_block(lex: *Lexer, at: StrView, line: i32, col: i32) -> Token
 # Return a located, fatal TOK_ERROR at the current position and stop lexing:
 # the next lexer_next returns EOF.  The tab case used to return TOK_ERROR
 # without advancing, so tokenize looped forever printing the same error.
-fn lexer_fail(lex: *Lexer, out_tok: *Token, msg: StrView) -> i32
-  *out_tok = token_new(TOK_ERROR, lex.src.skip(lex.pos).take(1), lex.line, lex.col)
+fn lexer_fail(lex: *Lexer, msg: StrView) -> Token
+  let tok: Token = token_new(TOK_ERROR, lex.src.skip(lex.pos).take(1), lex.line, lex.col)
   lex.error_msg = msg
   lex.pos = lex.src.len
   lex.pending_dedents = 0
-  1
+  tok
 
 # The byte a one-char escape `\<esc>` cooks to, or -1 if the language defines
 # no such escape (AGAST #1978).  `braces` is 1 for "..." and '.' literals,
@@ -442,9 +441,9 @@ fn lexer_skip_comment(lex: *Lexer) -> i32
     lex.col = lex.col + 1
   0
 
-# Handle indentation at line start
-# Returns: 1 if we should return a token, 0 if we should continue scanning
-fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
+# Handle indentation at line start: the token to return (INDENT, DEDENT, an
+# error), or None to go on scanning.
+fn lexer_handle_indent(lex: *Lexer) -> Option<Token>
   # Count leading spaces
   var indent: i32 = 0
   while lexer_peek_at(lex, indent) == 32  # space
@@ -454,7 +453,7 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
   if lexer_peek_at(lex, indent) == 9  # tab
     lex.pos = lex.pos + indent
     lex.col = lex.col + indent
-    return lexer_fail(lex, out_tok, "Tabs not allowed for indentation; use spaces")
+    return Some(lexer_fail(lex, "Tabs not allowed for indentation; use spaces"))
 
   # Skip blank lines (just newline after spaces)
   if lexer_peek_at(lex, indent) == 10  # newline
@@ -462,7 +461,7 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
     lex.line = lex.line + 1
     lex.col = 1
     # Stay at line start for next line
-    return 0  # Continue scanning
+    return None  # Continue scanning
 
   # Skip comment-only lines (but NOT @attributes)
   if lexer_peek_at(lex, indent) == 35  # '#'
@@ -470,7 +469,7 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
     lex.col = lex.col + indent
     lexer_skip_comment(lex)
     # The main loop will handle the newline
-    return 0  # Continue scanning
+    return None  # Continue scanning
 
   # Advance past leading spaces
   lex.pos = lex.pos + indent
@@ -490,18 +489,17 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
     lex.at_line_start = 0
     if indent < current
       lex.col = 1
-      return lexer_fail(lex, out_tok, "continuation line is indented less than the statement it continues; indent it at least as far as the statement's first line")
-    return 0
+      return Some(lexer_fail(lex, "continuation line is indented less than the statement it continues; indent it at least as far as the statement's first line"))
+    return None
 
   if indent > current
     # Deeper indentation - push and emit INDENT
     if lex.indent_depth >= MAX_INDENT_DEPTH
-      return lexer_fail(lex, out_tok, "blocks nested more than 64 levels deep")
+      return Some(lexer_fail(lex, "blocks nested more than 64 levels deep"))
     lex.indent_stack[lex.indent_depth] = indent
     lex.indent_depth = lex.indent_depth + 1
-    *out_tok = token_new(TOK_INDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
     lex.at_line_start = 0
-    return 1
+    return Some(token_new(TOK_INDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col))
 
   if indent < current
     # Shallower indentation - pop and queue DEDENTs
@@ -513,13 +511,12 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
       count = count + 1
     # Queue all but one DEDENT (we return the first one now)
     lex.pending_dedents = count - 1
-    *out_tok = token_new(TOK_DEDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
     lex.at_line_start = 0
-    return 1
+    return Some(token_new(TOK_DEDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col))
 
   # Same indentation - just continue
   lex.at_line_start = 0
-  0
+  None
 
 # Get next token from the lexer, noting the `if` / `match` inside brackets
 # (LARB R46a) and the declaration keywords (LARB R46).
@@ -613,17 +610,20 @@ fn lexer_run_sep(lex: *Lexer, at: i64, class: i32) -> i64
     c = lexer_at(lex, at + n)
   n
 
+# A token lexer_match found at lex.pos: its kind and its length in bytes.
+pub struct Lexeme
+  kind: i32
+  len: i32
+
 # IDENT /[a-zA-Z_][a-zA-Z0-9_]*/, or the keyword (lexer_keyword) it spells.
 # A `c` straight before `"` never gets here: it is lexer_scan_string's.
-# Returns the kind, its length in *out_len.
-fn lexer_scan_ident(lex: *Lexer, out_len: *i32) -> i32
+fn lexer_scan_ident(lex: *Lexer) -> Lexeme
   let at: i64 = lex.pos
   let n: i64 = 1 + lexer_run(lex, at + 1, CLASS_IDENT)
-  *out_len = n as i32
-  lexer_keyword(lex.src.ptr + at, n)
+  Lexeme { kind: lexer_keyword(lex.src.ptr + at, n), len: n as i32 }
 
 # lexer_match's kind for a number whose exponent has no digit (`1e`, `1e+`,
-# `2.0e-x`): *out_len is the offset of the byte where the digit should be.
+# `2.0e-x`): its len is the offset of the byte where the digit should be.
 const LEX_NO_EXP_DIGIT: i32 = -2
 
 # The length of the exponent `[eE][+-]?[0-9]+` at `at`; 0 if no `e`/`E` is
@@ -650,7 +650,7 @@ fn lexer_exponent(lex: *Lexer, at: i64) -> i64
 # its sign) is LEX_NO_EXP_DIGIT.  Suffixes are lexer_number_suffix's.
 # Each digit run also takes in every `_` it meets (lexer_run_sep, AGAST
 # #3584); lexer_check_separators refuses the misplaced ones.
-fn lexer_scan_number(lex: *Lexer, out_len: *i32) -> i32
+fn lexer_scan_number(lex: *Lexer) -> Lexeme
   let at: i64 = lex.pos
   let digits: i64 = lexer_run_sep(lex, at, CLASS_DIGIT)
   var mant: i64 = digits
@@ -666,11 +666,9 @@ fn lexer_scan_number(lex: *Lexer, out_len: *i32) -> i32
   if lex.last_kind != TOK_DOT
     exp = lexer_exponent(lex, at + mant)
   if exp < 0
-    *out_len = (mant - 1 - exp) as i32
-    return LEX_NO_EXP_DIGIT
+    return Lexeme { kind: LEX_NO_EXP_DIGIT, len: (mant - 1 - exp) as i32 }
   if mant > digits or exp > 0
-    *out_len = (mant + exp) as i32
-    return TOK_FLOAT
+    return Lexeme { kind: TOK_FLOAT, len: (mant + exp) as i32 }
   var n: i64 = digits
   if lexer_at(lex, at) == 48                                     # 0
     var radix: i64 = 0
@@ -680,18 +678,16 @@ fn lexer_scan_number(lex: *Lexer, out_len: *i32) -> i32
       radix = lexer_run_sep(lex, at + 2, CLASS_BIN)
     if radix > 0 and radix + 2 > n
       n = radix + 2
-  *out_len = n as i32
-  TOK_NUMBER
+  Lexeme { kind: TOK_NUMBER, len: n as i32 }
 
-# CHAR /'([^'\\]|\\.|\\x[^'\n]*)'/ at a `'`: TOK_CHAR with its length in
-# *out_len, or -1.  The `\x` arm runs to the next quote on the line, so a
+# CHAR /'([^'\\]|\\.|\\x[^'\n]*)'/ at a `'`: a TOK_CHAR, or None.  The `\x` arm runs to the next quote on the line, so a
 # short or non-hex `'\x1'` is a CHAR that lexer_check_char refuses with the
 # hex message.  A `\x` the `\\.` arm also matches (`'\x'`) is the same length.
-fn lexer_scan_char(lex: *Lexer, out_len: *i32) -> i32
+fn lexer_scan_char(lex: *Lexer) -> Option<Lexeme>
   let at: i64 = lex.pos
   let c1: i32 = lexer_at(lex, at + 1)
   if c1 < 0 or c1 == '\''                                          # '' or EOF
-    return -1
+    return None
   var end: i64 = at + 2                                          # 'c'
   if c1 == '\\'
     end = at + 3                                                 # '\c'
@@ -699,42 +695,51 @@ fn lexer_scan_char(lex: *Lexer, out_len: *i32) -> i32
       while end < lex.src.len and lexer_at(lex, end) != 39 and lexer_at(lex, end) != 10
         end = end + 1
     else if lexer_at(lex, at + 2) < 0
-      return -1
+      return None
   if lexer_at(lex, end) != 39
-    return -1
-  *out_len = (end + 1 - at) as i32
-  TOK_CHAR
+    return None
+  Some(Lexeme { kind: TOK_CHAR, len: (end + 1 - at) as i32 })
 
-# The longest token at lex.pos: its kind and, in *out_len, its length; -1 if
-# none starts there (a stray byte, the end of input).  "..." / c"..." are lexer_scan_string's.
-fn lexer_match(lex: *Lexer, out_len: *i32) -> i32
+# The longest token at lex.pos, or None if none starts there (a stray byte,
+# the end of input).  "..." / c"..." are lexer_scan_string's.
+pub fn lexer_match(lex: *Lexer) -> Option<Lexeme>
   let c: i32 = lexer_at(lex, lex.pos)
   if lexer_is_ident_start(c) == 1
-    return lexer_scan_ident(lex, out_len)
+    return Some(lexer_scan_ident(lex))
   if c >= '0' and c <= '9'
-    return lexer_scan_number(lex, out_len)
+    return Some(lexer_scan_number(lex))
   if c == '\''
-    return lexer_scan_char(lex, out_len)
-  lexer_operator(lex.src.ptr + lex.pos, lex.src.len - lex.pos, out_len)
+    return lexer_scan_char(lex)
+  # lexer_operator is ritzgen's (lexer_scan_gen) and still answers C's way.
+  var len: i32 = 0
+  let kind: i32 = lexer_operator(lex.src.ptr + lex.pos, lex.src.len - lex.pos, @len)
+  if kind < 0
+    return None
+  Some(Lexeme { kind: kind, len: len })
+
+# How lexer_cook's scan of a string literal's body ended.
+pub enum Cooked
+    Closed(i64)        # at the closing quote, this offset
+    Unclosed           # a newline or the end of input came first
+    BadEscape(Token)   # the fatal escape-error token
 
 # The one escape cooker (AGAST #1821): every string literal's body goes
 # through here, "..." and c"...".  Cooks the bytes from *at into the scratch
-# buffer (lexer_str_begin .. lexer_str_finish) up to the closing quote.
-# Returns 1 with *at on that quote; 0 if a newline or the end of input comes
-# first; -1 with a fatal escape-error token in *err, located by the literal's
-# `start` offset, `line` and `col`.  `braces` is as for lexer_cook_escape_at.
-fn lexer_cook(lex: *Lexer, at: *i64, braces: i32, start: i64, line: i32, col: i32, err: *Token) -> i32
+# buffer (lexer_str_begin .. lexer_str_finish) up to the closing quote:
+# Closed at that quote's offset; Unclosed if a newline or the end of input
+# comes first; BadEscape with a fatal escape-error token, located by the
+# literal's `start` offset, `line` and `col`.  `braces` is as for
+# lexer_cook_escape_at.
+pub fn lexer_cook(lex: *Lexer, from: i64, braces: i32, start: i64, line: i32, col: i32) -> Cooked
   lexer_str_begin(lex)
   let end: i64 = lex.src.len
-  var i: i64 = *at
-  var status: i32 = 0
+  var i: i64 = from
   while i < end
     let c: i32 = lexer_at(lex, i)
     if c == '"'
-      status = 1
-      break
+      return Cooked.Closed(i)
     if c == 10
-      break
+      return Cooked.Unclosed
     if c != '\\'
       lexer_str_push(lex, c as i8)
       i = i + 1
@@ -745,11 +750,9 @@ fn lexer_cook(lex: *Lexer, at: *i64, braces: i32, start: i64, line: i32, col: i3
       match lexer_cook_escape_at(esc, braces)
         Ok(b) => lexer_str_push(lex, b as i8)
         Err(why) =>
-          *err = lexer_fail_escape(lex, i, line, col + (i - start) as i32, esc, why)
-          return -1
+          return Cooked.BadEscape(lexer_fail_escape(lex, i, line, col + (i - start) as i32, esc, why))
       i = i + lexer_escape_width(lexer_at(lex, i))
-  *at = i
-  status
+  Cooked.Unclosed
 
 # A string literal of `kind` whose opening quote is `prefix` bytes on from
 # lex.pos ("..." 1, c"..." 2), ending on its own line, as in ritz0: a raw
@@ -758,29 +761,29 @@ fn lexer_cook(lex: *Lexer, at: *i64, braces: i32, start: i64, line: i32, col: i3
 # the end of input, ritz0's fatal error located at the literal's start (the
 # `c` of a c"...", ritz0's span).
 fn lexer_scan_string(lex: *Lexer, kind: i32, prefix: i32) -> Token
-  var tok: Token = token_new(TOK_ERROR, strview_empty(), 0, 0)
   let start: i64 = lex.pos
   let line: i32 = lex.line
   let col: i32 = lex.col
   var braces: i32 = 1
   if kind == TOK_CSTRING
     braces = 0                   # c"..." has no interpolation
-  var at: i64 = start + prefix
-  let status: i32 = lexer_cook(lex, @at, braces, start, line, col, @tok)
-  if status < 0
-    lex.col = tok.col            # scanned up to the bad escape
-    return tok
-  if status == 0
-    var msg: StrView = "Unterminated string literal"
-    if kind == TOK_CSTRING
-      msg = "Unterminated C-string literal"
-    lexer_fail(lex, @tok, msg)   # at lex.pos, still the literal's start
-    return tok
+  var at: i64 = 0
+  match lexer_cook(lex, start + prefix, braces, start, line, col)
+    Cooked.Closed(q) =>
+      at = q
+    Cooked.Unclosed =>
+      var msg: StrView = "Unterminated string literal"
+      if kind == TOK_CSTRING
+        msg = "Unterminated C-string literal"
+      return lexer_fail(lex, msg)   # at lex.pos, still the literal's start
+    Cooked.BadEscape(bad) =>
+      lex.col = bad.col            # scanned up to the bad escape
+      return bad
   lex.pos = at + 1
   lex.col = col + (lex.pos - start) as i32
   # A token's span length is passed as i32 (lexer_token); the *position*
   # stays i64 (#1399).
-  tok = lexer_token(lex, kind, start, (lex.pos - start) as i32, line, col)
+  var tok: Token = lexer_token(lex, kind, start, (lex.pos - start) as i32, line, col)
   tok.string_val = lexer_str_finish(lex)
   tok
 
@@ -799,20 +802,20 @@ fn lexer_token(lex: *Lexer, kind: i32, start: i64, len: i32, line: i32, col: i32
 #   AGAST #1615: `f32` / `f64` is part of a TOK_FLOAT (`2.5f32`); expr_float
 #   casts the literal to it.  No follow-byte guard: `2.5f32x` lexes as
 #   `2.5f32` + `x`, a parse error either way.
-fn lexer_number_suffix(lex: *Lexer, kind: i32, len: *i32) -> i32
-  if kind == TOK_FLOAT and lex.last_kind == TOK_DOT
-    *len = lexer_run_sep(lex, lex.pos, CLASS_DIGIT) as i32
-    return TOK_NUMBER
-  let at: i64 = lex.pos + *len
-  if kind == TOK_NUMBER
-    *len = *len + lexer_int_suffix(lex, at)
-  if kind == TOK_FLOAT and at + 2 < lex.src.len
+fn lexer_number_suffix(lex: *Lexer, m: Lexeme) -> Lexeme
+  if m.kind == TOK_FLOAT and lex.last_kind == TOK_DOT
+    return Lexeme { kind: TOK_NUMBER, len: lexer_run_sep(lex, lex.pos, CLASS_DIGIT) as i32 }
+  let at: i64 = lex.pos + m.len
+  var len: i32 = m.len
+  if m.kind == TOK_NUMBER
+    len = len + lexer_int_suffix(lex, at)
+  if m.kind == TOK_FLOAT and at + 2 < lex.src.len
     let f1: i32 = lexer_at(lex, at + 1)
     let f2: i32 = lexer_at(lex, at + 2)
     # f32 | f64
     if lexer_at(lex, at) == 102 and ((f1 == 51 and f2 == 50) or (f1 == 54 and f2 == 52))
-      *len = *len + 3
-  kind
+      len = len + 3
+  Lexeme { kind: m.kind, len: len }
 
 # The length of the typed integer suffix at `at` (AGAST #107), or 0.  Each
 # form must leave a byte after it in the source (`at + width < len`): one
@@ -844,8 +847,8 @@ fn lexer_int_suffix(lex: *Lexer, at: i64) -> i32
 # follows `0x` / `0b`, stands by another `_`, or touches a `.`, an exponent or
 # a suffix is a lexer error at it, in ritz0's words (lexer._check_separators).
 # lexer_run_sep took every `_` the digits ran into, so each is in the `len`
-# bytes from lex.pos.  Returns 1 with the error in *err.
-fn lexer_check_separators(lex: *Lexer, len: i32, err: *Token) -> i32
+# bytes from lex.pos.  The error, or None if every `_` is in place.
+pub fn lexer_check_separators(lex: *Lexer, len: i32) -> Option<Token>
   let at: i64 = lex.pos
   var class: i32 = CLASS_DIGIT
   if lexer_at(lex, at) == 48 and lexer_at(lex, at + 1) == 120     # 0x
@@ -858,10 +861,9 @@ fn lexer_check_separators(lex: *Lexer, len: i32, err: *Token) -> i32
       if lexer_in_class(lexer_at(lex, at + i - 1), class) == 0 or lexer_in_class(lexer_at(lex, at + i + 1), class) == 0
         lex.pos = at + i
         lex.col = lex.col + i as i32
-        lexer_fail(lex, err, "`_` must stand between two digits of a numeric literal")
-        return 1
+        return Some(lexer_fail(lex, "`_` must stand between two digits of a numeric literal"))
     i = i + 1
-  0
+  None
 
 # A number token's text less its `_` separators, in its own allocation, so
 # every reader of the literal's text (parse_int, the 2^64 check, a float's
@@ -950,35 +952,37 @@ fn lexer_bad_byte(lex: *Lexer) -> Token
 
 # The token at lex.pos, past layout, blanks and comments.
 fn lexer_scan_token(lex: *Lexer) -> Token
-  var tok: Token = token_new(TOK_ERROR, strview_empty(), 0, 0)
   let ch: i32 = lexer_at(lex, lex.pos)
   # `$` is no identifier character: a monomorph's internal `W$i32_bump`
   # can't be written (spec §2.5, LARB R37, AGAST #3373).  An asm body's
   # lines never get here.  ritz0's words (ref_rules.DOLLAR_OUTSIDE_ASM).
   if ch == '$'
-    lexer_fail(lex, @tok, "`$` isn't part of a name: it's written only in an `asm` body")
-    return tok
+    return lexer_fail(lex, "`$` isn't part of a name: it's written only in an `asm` body")
   # "..." and c"..." end on their line (lexer_scan_string).
   if ch == '"'
     return lexer_scan_string(lex, TOK_STRING, 1)
   if ch == 'c' and lexer_at(lex, lex.pos + 1) == 34
     return lexer_scan_string(lex, TOK_CSTRING, 2)
-  var len: i32 = 0
-  var kind: i32 = lexer_match(lex, @len)
-  if kind == LEX_NO_EXP_DIGIT
+  var m: Lexeme = Lexeme { kind: TOK_ERROR, len: 0 }
+  match lexer_match(lex)
+    Some(found) =>
+      m = found
+    None =>
+      return lexer_bad_byte(lex)
+  if m.kind == LEX_NO_EXP_DIGIT
     # ritz0's error, at the byte where the exponent's digit should be.
-    lex.pos = lex.pos + len as i64
-    lex.col = lex.col + len
-    lexer_fail(lex, @tok, "Expected digit after exponent")
-    return tok
-  if kind < 0
-    return lexer_bad_byte(lex)
-  kind = lexer_number_suffix(lex, kind, @len)
-  if kind == TOK_NUMBER or kind == TOK_FLOAT
-    if lexer_check_separators(lex, len, @tok) == 1
-      return tok
-  tok = lexer_emit(lex, kind, len)
-  if kind == TOK_NUMBER or kind == TOK_FLOAT
+    lex.pos = lex.pos + m.len as i64
+    lex.col = lex.col + m.len
+    return lexer_fail(lex, "Expected digit after exponent")
+  m = lexer_number_suffix(lex, m)
+  let numeric: bool = m.kind == TOK_NUMBER or m.kind == TOK_FLOAT
+  if numeric
+    match lexer_check_separators(lex, m.len)
+      Some(bad) =>
+        return bad
+      None => pass
+  var tok: Token = lexer_emit(lex, m.kind, m.len)
+  if numeric
     lexer_drop_separators(@tok)
   tok
 
@@ -990,9 +994,9 @@ fn lexer_skip_blanks(lex: *Lexer)
     lex.col = lex.col + 1
     c = lexer_at(lex, lex.pos)
 
-# At the start of a line.  Returns 1 with a token in *out_tok (INDENT,
-# DEDENT, an error), 0 to go on scanning.
-fn lexer_line_start(lex: *Lexer, out_tok: *Token) -> i32
+# At the start of a line: the token to return (INDENT, DEDENT, an error), or
+# None to go on scanning.
+fn lexer_line_start(lex: *Lexer) -> Option<Token>
   # Inside brackets: no INDENT/DEDENT, just skip the leading spaces.
   if lex.bracket_depth > 0
     lex.line_indent = 0
@@ -1001,14 +1005,14 @@ fn lexer_line_start(lex: *Lexer, out_tok: *Token) -> i32
       lex.col = lex.col + 1
       lex.line_indent = lex.line_indent + 1
     lex.at_line_start = 0
-    return 0
+    return None
   if lex.asm_raw == 1
-    return lexer_asm_line_start(lex, out_tok)
-  lexer_handle_indent(lex, out_tok)
+    return lexer_asm_line_start(lex)
+  lexer_handle_indent(lex)
 
-# At a newline.  Returns 1 with NEWLINE (or an error) in *out_tok, 0 inside
-# brackets, where a newline is no token.
-fn lexer_newline(lex: *Lexer, out_tok: *Token) -> i32
+# At a newline: NEWLINE (or an error), or None inside brackets, where a
+# newline is no token.
+fn lexer_newline(lex: *Lexer) -> Option<Token>
   let start: i64 = lex.pos
   let line: i32 = lex.line
   let col: i32 = lex.col
@@ -1021,15 +1025,13 @@ fn lexer_newline(lex: *Lexer, out_tok: *Token) -> i32
   # (its condition goes on), would open a block (LARB R46a).
   if lex.bracket_depth > 0
     if lex.if_line != 0 and lex.if_depth == lex.bracket_depth and lexer_is_infix(lex.last_kind) == 0
-      *out_tok = lexer_fail_block(lex, lex.if_text, lex.if_line, lex.if_col)
-      return 1
-    return 0
+      return Some(lexer_fail_block(lex, lex.if_text, lex.if_line, lex.if_col))
+    return None
   # Outside them, a line ending in an operator makes the next one a
   # continuation (LARB R46).
   lex.cont_line = lexer_ends_in_operator(lex)
   lex.decl_line = 0
-  *out_tok = lexer_token(lex, TOK_NEWLINE, start, 1, line, col)
-  1
+  Some(lexer_token(lex, TOK_NEWLINE, start, 1, line, col))
 
 # Whether a file ending straight after a `last` token ends a line first: not
 # before any token (EOF), after an error, or after a layout token.
@@ -1040,16 +1042,19 @@ fn lexer_next_token(lex: *Lexer) -> Token
   if lex.pending_dedents > 0
     lex.pending_dedents = lex.pending_dedents - 1
     return token_new(TOK_DEDENT, lex.src.skip(lex.pos).take(0), lex.line, lex.col)
-  var tok: Token = token_new(TOK_ERROR, strview_empty(), 0, 0)
   while lex.pos < lex.src.len
     if lex.at_line_start == 1
-      if lexer_line_start(lex, @tok) == 1
-        return tok
+      match lexer_line_start(lex)
+        Some(tok) =>
+          return tok
+        None => pass
       continue
     let ch: i32 = lexer_at(lex, lex.pos)
     if ch == 10
-      if lexer_newline(lex, @tok) == 1
-        return tok
+      match lexer_newline(lex)
+        Some(tok) =>
+          return tok
+        None => pass
       continue
     # An asm body line is text (AGAST #3394).
     if lex.asm_raw == 1

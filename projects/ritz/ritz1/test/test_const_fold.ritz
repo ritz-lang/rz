@@ -1,0 +1,125 @@
+# ritz1/test/test_const_fold.ritz - constant folding and literal values, as Options (AGAST #4926)
+#
+# ast_expr_syntax folds a constant integer expression (const_fold_int and its
+# operator steps const_fold_binary / const_fold_unsigned), reads an integer
+# literal's value (lit_int_value) and spells a primitive type argument
+# (primitive_arg_spelling), each as an Option of the answer in place of C's
+# `int f(..., i64 *out)`.  These hold what each answers, and when it answers
+# None.  Run by `make ritz1-unit` (tools/ritz1_unit.py).
+
+import ritzlib.strview
+import ritzlib.option
+import ast
+import ast_expr_syntax
+
+fn int_lit(v: i64) -> Expr
+    Expr { kind: ExprKind.IntLit, int_val: v }
+
+# The folded value, or `miss` when it does not fold.
+fn binary_or(op: OpKind, a: i64, b: i64, miss: i64) -> i64
+    match const_fold_binary(op, a, b)
+        Some(v) => v
+        None => miss
+
+fn unsigned_or(op: OpKind, a: u64, b: u64, miss: i64) -> i64
+    match const_fold_unsigned(op, a, b)
+        Some(v) => v
+        None => miss
+
+[[test]]
+fn test_binary_folds_arithmetic_bitwise_and_compares() -> i32
+    assert binary_or(OpKind.Add, 2, 3, -99) == 5
+    assert binary_or(OpKind.Sub, 2, 3, -99) == -1
+    assert binary_or(OpKind.Div, 7, 2, -99) == 3
+    assert binary_or(OpKind.Mod, 7, 2, -99) == 1
+    assert binary_or(OpKind.BitAnd, 6, 3, -99) == 2
+    assert binary_or(OpKind.Shl, 1, 4, -99) == 16
+    assert binary_or(OpKind.Lt, 1, 2, -99) == 1
+    assert binary_or(OpKind.Eq, 1, 2, -99) == 0
+    0
+
+[[test]]
+fn test_binary_refuses_a_zero_divisor_and_a_wide_shift() -> i32
+    let div: Option<i64> = const_fold_binary(OpKind.Div, 7, 0)
+    assert div.is_none()
+    let rem: Option<i64> = const_fold_binary(OpKind.Mod, 7, 0)
+    assert rem.is_none()
+    let shl: Option<i64> = const_fold_binary(OpKind.Shl, 1, 64)
+    assert shl.is_none()
+    let neg: Option<i64> = const_fold_binary(OpKind.Shr, 1, -1)
+    assert neg.is_none()
+    0
+
+[[test]]
+fn test_unsigned_reads_the_operands_as_u64() -> i32
+    # 0xFFFF_FFFF_FFFF_FFFE is -2 as an i64: unsigned it is the larger one.
+    let big: u64 = (0 - 2) as u64
+    assert unsigned_or(OpKind.Gt, big, 1, -99) == 1
+    assert unsigned_or(OpKind.Lt, big, 1, -99) == 0
+    assert unsigned_or(OpKind.Div, big, 2, -99) == 9223372036854775807
+    assert unsigned_or(OpKind.Mod, 7, 4, -99) == 3
+    let div: Option<i64> = const_fold_unsigned(OpKind.Div, big, 0)
+    assert div.is_none()
+    0
+
+[[test]]
+fn test_const_fold_int_folds_a_tree_and_refuses_a_zero_divisor() -> i32
+    var a: Expr = int_lit(12)
+    var b: Expr = int_lit(4)
+    var zero: Expr = int_lit(0)
+    var q: Expr = Expr { kind: ExprKind.Binary, op: OpKind.Div, left: @a, right: @b }
+    let folded: i64 = match const_fold_int(null, @q, 0)
+        Some(v) => v
+        None => return 1
+    assert folded == 3
+    var bad: Expr = Expr { kind: ExprKind.Binary, op: OpKind.Div, left: @a, right: @zero }
+    let refused: Option<i64> = const_fold_int(null, @bad, 0)
+    assert refused.is_none()
+    let nothing: Option<i64> = const_fold_int(null, null, 0)
+    assert nothing.is_none()
+    # An unknown name folds to nothing.
+    var name: Expr = Expr { kind: ExprKind.Ident, ident: "K" }
+    let unknown: Option<i64> = const_fold_int(null, @name, 0)
+    assert unknown.is_none()
+    0
+
+[[test]]
+fn test_lit_int_value_reads_a_literal_and_its_negation() -> i32
+    var five: Expr = int_lit(5)
+    let v: i64 = match lit_int_value(@five)
+        Some(n) => n
+        None => return 1
+    assert v == 5
+    var neg: Expr = Expr { kind: ExprKind.Unary, op: OpKind.Neg, operand: @five }
+    let nv: i64 = match lit_int_value(@neg)
+        Some(n) => n
+        None => return 2
+    assert nv == -5
+    0
+
+[[test]]
+fn test_lit_int_value_is_none_for_anything_else() -> i32
+    var name: Expr = Expr { kind: ExprKind.Ident, ident: "x" }
+    let ident: Option<i64> = lit_int_value(@name)
+    assert ident.is_none()
+    var five: Expr = int_lit(5)
+    var not5: Expr = Expr { kind: ExprKind.Unary, op: OpKind.BitNot, operand: @five }
+    let bitnot: Option<i64> = lit_int_value(@not5)
+    assert bitnot.is_none()
+    0
+
+[[test]]
+fn test_primitive_arg_spelling_spells_primitives_only() -> i32
+    let u32s: StrView = match primitive_arg_spelling(TypeKind.U32)
+        Some(sp) => sp
+        None => return 1
+    assert u32s.eq("u32")
+    let bools: StrView = match primitive_arg_spelling(TypeKind.Bool)
+        Some(sp) => sp
+        None => return 2
+    assert bools.eq("bool")
+    let st: Option<StrView> = primitive_arg_spelling(TypeKind.Struct)
+    assert st.is_none()
+    let ptr: Option<StrView> = primitive_arg_spelling(TypeKind.Ptr)
+    assert ptr.is_none()
+    0

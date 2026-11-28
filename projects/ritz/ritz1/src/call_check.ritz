@@ -984,9 +984,7 @@ fn cc_variant_ctor(sm: *Sema, e: *Expr) -> i32
         return 1
     if name_eq(name, "None") == 1 or name_eq(name, "Err") == 1
         return 1
-    var a: i32 = 0
-    var b: i32 = 0
-    if user_variant_ctor_ambiguous(sm.pctx, e, @a, @b) == 1
+    if user_variant_ctor_ambiguous(sm.pctx, e).is_some()
         return 1
     let en: StrView = user_variant_ctor_enum(sm.pctx, e)
     if en.ptr != null
@@ -995,8 +993,7 @@ fn cc_variant_ctor(sm: *Sema, e: *Expr) -> i32
     if generic_enum_of_variant(sm.pctx, name, @vi) >= 0
         return 1
     # AGAST #4153: `Z(1)` / `One()`, refused by emit_expr_call with the count.
-    var mei: i32 = 0
-    if user_variant_ctor_miscounted(sm.pctx, e, @mei, @vi) == 1 and cc_named_fn(sm, e) == null
+    if user_variant_ctor_miscounted(sm.pctx, e).is_some() and cc_named_fn(sm, e) == null
         return 1
     0
 
@@ -1701,39 +1698,19 @@ fn ca_base_ptr_array(sm: *Sema, e: *Expr) -> *Param
         return null
     pa
 
-# Why a place has no ArrayDims: it is no array, or Sema can't tell.  The
-# emitter's ast_query codes (ARG_DIMS_*) map onto it in ca_dims_nd.
-enum DimsMiss
-    NotArray
-    Unknown
-
-# A 1-D `[size]elem` (array_dims_1d's).
-fn ca_dims_1d(size: i32, elem: TypeKind, name_sv: StrView) -> ArrayDims
-    var d: ArrayDims
-    array_dims_1d(@d, size, elem, name_sv)
-    d
-
-# The array left of `sh` once `from` indices are applied (array_dims_nd's);
-# Err(DimsMiss.NotArray), an element, with none left.
-fn ca_dims_nd(sh: *ArrayShape, from: i32) -> Result<ArrayDims, DimsMiss>
-    var d: ArrayDims
-    if array_dims_nd(@d, sh, from) != ARG_DIMS_ARRAY
-        return Err(DimsMiss.NotArray)
-    Ok(d)
-
 # N and T of the `[N]T` that `*e` is, `e` a `*[N]T` local, param, field, global
 # (array_ptr_shape).  A step `p + k` isn't judged.
 fn ca_array_ptr_shape(sm: *Sema, e: *Expr) -> Option<ArrayDims>
     let loc: *LocalVar = ca_array_ptr_local(sm, e)
     if loc != null
         let en: StrView = array_ptr_elem_name(loc)
-        return Some(ca_dims_1d(lv_pointee_array_size(loc), lv_pointee_array_elem_type(loc), en))
+        return Some(array_dims_1d(lv_pointee_array_size(loc), lv_pointee_array_elem_type(loc), en))
     if e.kind == ExprKind.Binary
         return None
     let pa: *Param = ca_base_ptr_array(sm, e)
     if pa == null
         return None
-    Some(ca_dims_1d(pa.param_pointee_array_size, pa.param_pointee_array_elem_type, pa.param_type_name))
+    Some(array_dims_1d(pa.param_pointee_array_size, pa.param_pointee_array_elem_type, pa.param_type_name))
 
 # A whole 1-D array `value` reads (arg_array_shape): a local or by-value param,
 # a global, `*@a`, `*p` of a `*[N]T`, a field.
@@ -1743,13 +1720,13 @@ fn ca_array_shape(sm: *Sema, value: *Expr) -> Option<ArrayDims>
         if loc != null
             # An inferred `let b = g(a)` of a generic's `[N]T` keeps no N here.
             if lv_var_type(loc) == TypeKind.Array and lv_array_shape(loc) == null and lv_array_size(loc) > 0
-                return Some(ca_dims_1d(lv_array_size(loc), lv_array_elem_type(loc), lv_name(loc)))
+                return Some(array_dims_1d(lv_array_size(loc), lv_array_elem_type(loc), lv_name(loc)))
             return None
         if ca_is_local(sm, value) == 1
             return None
         let g: *GlobalVarDef = ca_global(sm, value)
         if g != null and g.var_type == TypeKind.Array and g.array_shape == null
-            return Some(ca_dims_1d(g.array_size, g.array_elem_type, g.array_elem_type_name))
+            return Some(array_dims_1d(g.array_size, g.array_elem_type, g.array_elem_type_name))
         return None
     if value.kind == ExprKind.Unary and value.op == OpKind.Deref and value.operand != null
         let o: *Expr = value.operand
@@ -1762,7 +1739,7 @@ fn ca_array_shape(sm: *Sema, value: *Expr) -> Option<ArrayDims>
     if value.kind == ExprKind.Member
         let f: *StructField = rs_field(sm, value)
         if f != null and f.field_type == TypeKind.Array and f.array_shape == null
-            return Some(ca_dims_1d(f.array_size, f.array_elem_type, f.array_elem_type_name))
+            return Some(array_dims_1d(f.array_size, f.array_elem_type, f.array_elem_type_name))
     None
 
 # The N-D array a name or field is (nd_array_base_shape), or null.
@@ -1796,7 +1773,7 @@ fn ca_place_dims(sm: *Sema, value: *Expr) -> Result<ArrayDims, DimsMiss>
         ExprKind.Ident =>
             let sh: *ArrayShape = ca_nd_shape(sm, value)
             if sh != null
-                return ca_dims_nd(sh, 0)
+                return array_dims_nd(sh, 0)
             let loc: *LocalVar = ca_local(sm, value)
             if loc != null and lv_var_type(loc) == TypeKind.Array
                 return Err(DimsMiss.Unknown)
@@ -1806,7 +1783,7 @@ fn ca_place_dims(sm: *Sema, value: *Expr) -> Result<ArrayDims, DimsMiss>
         ExprKind.Member =>
             let f: *StructField = rs_field(sm, value)
             if f != null and f.field_type == TypeKind.Array and f.array_shape != null
-                return ca_dims_nd(f.array_shape, 0)
+                return array_dims_nd(f.array_shape, 0)
             if f != null and f.field_type != TypeKind.Array
                 return Err(DimsMiss.NotArray)
             return Err(DimsMiss.Unknown)
@@ -1826,7 +1803,7 @@ fn ca_place_dims(sm: *Sema, value: *Expr) -> Result<ArrayDims, DimsMiss>
         if sh != null
             if depth > sh.rank
                 return Err(DimsMiss.Unknown)
-            return ca_dims_nd(sh, depth)
+            return array_dims_nd(sh, depth)
         # An element of a 1-D array.
         if value.left.kind != ExprKind.Index and ca_place_dims(sm, value.left).is_ok()
             return Err(DimsMiss.NotArray)
@@ -1843,9 +1820,9 @@ fn ca_ref_dims(sm: *Sema, arg: *Expr) -> Result<ArrayDims, DimsMiss>
             if ploc != null
                 # AGAST #4122: a plane pointer `*[N][M]T` points at its shape.
                 if lv_pointee_array_shape(ploc) != null and lv_var_type(ploc) == TypeKind.Ptr
-                    return ca_dims_nd(lv_pointee_array_shape(ploc), 0)
+                    return array_dims_nd(lv_pointee_array_shape(ploc), 0)
                 let en: StrView = array_ptr_elem_name(ploc)
-                return Ok(ca_dims_1d(lv_pointee_array_size(ploc), lv_pointee_array_elem_type(ploc), en))
+                return Ok(array_dims_1d(lv_pointee_array_size(ploc), lv_pointee_array_elem_type(ploc), en))
             if lv_is_lent(loc) == 1
                 return Err(DimsMiss.NotArray)
             # A pointer whose pointee is known and no array (AGAST #2323).
@@ -1868,8 +1845,7 @@ fn ca_array_ref(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Exp
     # A struct element the image doesn't name (`let p = q` of an `@&[3]S`) is unjudged.
     if got.leaf == TypeKind.Struct and got.name.len <= 0
         return
-    var want: ArrayDims
-    param_pointee_dims(@want, p)
+    var want: ArrayDims = param_pointee_dims(p)
     if array_dims_match(@got, @want) == 0
         ca_error(sm, call, call, fname_sv, argno, "the array isn't the one the parameter points at")
 
@@ -2113,8 +2089,7 @@ fn ca_pointer_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
         # unjudged, as in ca_array_ref.
         if got.leaf == TypeKind.Struct and got.name.len <= 0
             return 1
-        var dims: ArrayDims
-        param_pointee_dims(@dims, p)
+        var dims: ArrayDims = param_pointee_dims(p)
         return array_dims_match(@got, @dims)
     if want == TypeKind.Struct or pl.pointee == TypeKind.Struct
         return (want == pl.pointee and name_eq(p.param_type_name, pl.name) == 1) as i32
@@ -2156,8 +2131,7 @@ fn ca_place_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
             got = d
         Err(_) =>
             return 0
-    var want: ArrayDims
-    param_pointee_dims(@want, p)
+    var want: ArrayDims = param_pointee_dims(p)
     array_dims_match(@got, @want)
 
 # What `arg` is to the `:&` param `p` (the emitter's borrow_arg_kind).
