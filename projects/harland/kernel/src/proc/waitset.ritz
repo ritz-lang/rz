@@ -42,8 +42,10 @@
 # A wake only makes the process runnable: the wait collects again under
 # cli, and parks again when nothing matched and the deadline is not due.
 #
-# Processes run on the BSP only (proc/sched.ritz). A latch on another CPU
-# is recorded but wakes nobody, as waitq_wake_irq does.
+# Any CPU may post (AGAST #4881, docs/SMP_USER.md §4 "Consequences"): an
+# MSI-X aimed at an AP, a ShmNotify run on its caller's AP, and a kernel
+# post each wake the waiter wherever it is homed, with the CAS below and a
+# kick of its CPU if that CPU idles (proc/table.ritz wake_word).
 #
 # Lock-free across CPUs (AGAST #4879, docs/SMP_USER.md §4): an IRQ object's
 # `latched` count and a shm latch's `bits` are changed only by atomic
@@ -58,13 +60,11 @@
 import proc.table { MAX_PROCS, BLOCK_WAIT, proc_at, proc_wake_pid }
 import driver_abi.wait { WaitEvent, EVENT_DATA, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_USER_MASK, WAIT_SOURCE_CAP, WAIT_OUT_CAP }
 
-# Declared, not imported: the kernel's are cap/table.ritz and
-# arch/x86_64/apic.ritz. msix.ritz calls in here from irq_handler, and the
-# cap table pulls in the shm and page-table code; the extern keeps this
-# module at proc/table.ritz alone, so test_harland_waitset.py compiles it
-# on the host with stand-ins.
+# Declared, not imported: the kernel's is cap/table.ritz. msix.ritz calls
+# in here from irq_handler, and the cap table pulls in the shm and
+# page-table code; the extern keeps this module at proc/table.ritz alone, so
+# test_harland_waitset.py compiles it on the host with a stand-in.
 extern fn cap_irq_owner(object_id: u64) -> u32
-extern fn lapic_is_bsp() -> bool
 
 # How many IRQ objects the kernel registers at once: one per device
 # interrupt it hands a process, as cap/table.ritz MAX_IRQ_CAP_OWNERS.
@@ -153,8 +153,7 @@ pub fn irq_object_known(object_id: u64) -> bool
 fn irq_object_post(slot: i32)
     # notify.bump
     atomic_fetch_add(@irq_objects[slot].latched, 1)
-    if lapic_is_bsp()
-        proc_wake_pid(cap_irq_owner(irq_objects[slot].object_id) as u64, BLOCK_WAIT)
+    proc_wake_pid(cap_irq_owner(irq_objects[slot].object_id) as u64, BLOCK_WAIT)
 
 # A kernel post to `object_id`: the same latch and wake an MSI-X on its
 # vector makes. False (and nothing latched) for an unregistered id. Call
@@ -279,8 +278,7 @@ fn latch_slot(object_id: u64, pid: u64) -> i32
 fn latch_post(i: i32, bits: u32)
     # notify.bump
     atomic_fetch_or(@shm_latches[i].bits, bits)
-    if lapic_is_bsp()
-        proc_wake_pid(shm_latches[i].pid, BLOCK_WAIT)
+    proc_wake_pid(shm_latches[i].pid, BLOCK_WAIT)
 
 # `pid` now holds a handle for shm object `object_id`: make its latch,
 # cold. True if it has one (already, or now); false only when the table is
@@ -381,8 +379,7 @@ pub fn waitset_inbox_post(pid: u64, handle: u64, bits: u32) -> bool
     inbox[at].bits = bits
     inbox[at]._pad = 0
     inbox_len[slot] = inbox_len[slot] + 1
-    if lapic_is_bsp()
-        proc_wake_pid(pid, BLOCK_WAIT)
+    proc_wake_pid(pid, BLOCK_WAIT)
     true
 
 # Records on `pid`'s inbox (0 for an unknown pid).

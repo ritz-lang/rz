@@ -11,14 +11,8 @@
 # registry starts zeroed, exactly as a fresh boot has it. The pids are
 # unique per test because the registry outlives each test function.
 
-import cap.table { CapTable, cap_table_alloc, cap_table_get, cap_table_insert, cap_process_has, cap_process_has_any, cap_init_bootstrap, cap_inherit_ambient }
+import cap.table { CapTable, cap_table_alloc, cap_table_get, cap_table_insert, cap_process_has, cap_process_has_any, cap_init_bootstrap, cap_inherit_ambient, cap_insert_serve, cap_inserts_served_count }
 import cap.types { CapEntry, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_EXECUTE, CAP_RIGHT_SEND, CAP_RIGHT_RECV, CAP_RIGHT_CREATE, CAP_RIGHT_LIST, CAP_RIGHT_ALL }
-
-# cap/table.ritz makes a shm handle's latch in proc/waitset.ritz (#4727),
-# which declares the kernel's arch/x86_64/apic.ritz lapic_is_bsp. On the
-# host there is one CPU, and it runs every process.
-pub fn lapic_is_bsp() -> bool
-    true
 
 # cap/table.ritz declares syscall/runtime/driver.ritz driver_quiesce_object
 # (#4733) for the last IRQ handle dropped; on the host no device is bound,
@@ -168,4 +162,27 @@ fn test_has_any_right() -> i32
         return 4
     if cap_process_has_any(55, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND | CAP_RIGHT_RECV)
         return 5
+    return 0
+
+# The owner's side of CAP_INSERT (AGAST #4881, sync/mbox.ritz): the entry
+# lands in the table of the pid named, the packed handle (index |
+# generation << 32) comes back, and the serving CPU counts it. An unknown
+# pid is refused with index 0xFFFFFFFF.
+[[test]]
+fn test_cap_insert_serve_writes_the_owners_table() -> i32
+    let served: u64 = cap_inserts_served_count(0)
+    if cap_table_alloc(61) == 0 as *CapTable
+        return 1
+    let packed: u64 = cap_insert_serve(61, CAP_TYPE_CHANNEL as u32, CAP_RIGHT_SEND, 0)
+    if (packed & 0xFFFFFFFF) == 0xFFFFFFFF or (packed >> 32) == 0
+        return 2
+    if not cap_process_has(61, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND) or cap_process_has(61, CAP_TYPE_CHANNEL, CAP_RIGHT_RECV)
+        return 3
+    let entry: *CapEntry = entry_at(61, (packed & 0xFFFFFFFF) as i32)
+    if entry.generation as u64 != packed >> 32
+        return 4
+    if (cap_insert_serve(62, CAP_TYPE_CHANNEL as u32, CAP_RIGHT_SEND, 0) & 0xFFFFFFFF) != 0xFFFFFFFF
+        return 5
+    if cap_inserts_served_count(0) != served + 2
+        return 6
     return 0

@@ -7,7 +7,7 @@
 import ritzlib.option
 import klog { klog_serial }
 import arch.x86_64.cpu_map { cpu_apic_ids }
-import sync.mbox { MboxMsg, KICK_VECTOR, MBOX_SLOTS, MBOX_CALL, MBOX_CALL_DONE, MBOX_PING, MBOX_PONG, MBOX_UNMAP, MBOX_UNMAP_DONE, MBOX_KERNEL_INVLPG, MBOX_KERNEL_INVLPG_DONE, mbox_init, mbox_msg, mbox_post, mbox_take, mbox_has_work, mbox_drain, mbox_kick_irq, mbox_stray_count }
+import sync.mbox { MboxMsg, KICK_VECTOR, MBOX_SLOTS, MBOX_CALL, MBOX_CALL_DONE, MBOX_PING, MBOX_PONG, MBOX_UNMAP, MBOX_UNMAP_DONE, MBOX_KERNEL_INVLPG, MBOX_KERNEL_INVLPG_DONE, MBOX_FORWARD, MBOX_RETURN, MBOX_CAP_INSERT, MBOX_CAP_INSERT_DONE, mbox_init, mbox_msg, mbox_post, mbox_take, mbox_has_work, mbox_drain, mbox_kick_irq, mbox_stray_count, mbox_moves_in_count, mbox_wait_reply }
 import sync.idle { cpu_idle_begin, cpu_idle_cancel, cpu_is_idle, cpu_kick, cpu_kick_if_idle }
 
 # The kernel hooks sync/mbox.ritz and sync/idle.ritz declare `extern`.
@@ -48,6 +48,18 @@ pub fn tlb_serve(kind: u32, pml4: u64, vaddr: u64, pages: u64, mode: u64) -> u64
     g_tlb_kind = kind
     g_tlb_args = [pml4, vaddr, pages, mode]
     g_tlb_answer
+
+# cap/table.ritz's CAP_INSERT hook, on the owner.
+var g_cap_calls: i32 = 0
+var g_cap_cpu: i32 = -1
+var g_cap_args: [4]u64
+var g_cap_answer: u64 = 0
+
+pub fn cap_insert_serve(pid: u64, cap_type: u32, rights: u32, object_id: u64) -> u64
+    g_cap_calls = g_cap_calls + 1
+    g_cap_cpu = g_me
+    g_cap_args = [pid, cap_type as u64, rights as u64, object_id]
+    g_cap_answer
 
 fn fresh()
     # A hosted test has no COM1: the drop's log line goes to the ring only.
@@ -234,6 +246,61 @@ fn test_drain_serves_kernel_invlpg_and_acks() -> i32
         return 2
     let ack: MboxMsg = take(0)
     if ack.kind != MBOX_KERNEL_INVLPG_DONE or ack.from != 3 or ack.arg[0] != 8
+        return 3
+    0
+
+# The owner's drain serves a CAP_INSERT (AGAST #4881): cap/table.ritz's hook
+# writes the entry on the owner, and CAP_INSERT_DONE goes back to the sender
+# with the request id, the pid and the packed handle.
+[[test]]
+fn test_drain_serves_cap_insert_and_replies_the_handle() -> i32
+    fresh()
+    g_cap_calls = 0
+    var req: MboxMsg = mbox_msg(MBOX_CAP_INSERT)
+    req.pid = 9
+    req.arg[0] = 44
+    req.arg[1] = 9
+    req.arg[2] = 3
+    req.arg[3] = 0xAB
+    mbox_post(3, req)
+    g_me = 3
+    g_cap_answer = 0x500000002
+    mbox_drain()
+    if g_cap_calls != 1 or g_cap_cpu != 3
+        return 1
+    if g_cap_args[0] != 9 or g_cap_args[1] != 9 or g_cap_args[2] != 3 or g_cap_args[3] != 0xAB
+        return 2
+    let done: MboxMsg = take(0)
+    if done.kind != MBOX_CAP_INSERT_DONE or done.from != 3 or done.pid != 9
+        return 3
+    if done.arg[0] != 44 or done.arg[1] != 0x500000002
+        return 4
+    0
+
+# A reply wait (the BSP's, for CAP_INSERT_DONE) keeps a FORWARD or RETURN it
+# meets as the move it is, drops a late reply of its kind, and returns its
+# own reply.
+[[test]]
+fn test_reply_wait_keeps_moves_and_drops_late_replies() -> i32
+    fresh()
+    g_me = 3
+    mbox_post(0, mbox_msg(MBOX_FORWARD))
+    var late: MboxMsg = mbox_msg(MBOX_CAP_INSERT_DONE)
+    late.arg[0] = 6
+    mbox_post(0, late)
+    mbox_post(0, mbox_msg(MBOX_RETURN))
+    var mine: MboxMsg = mbox_msg(MBOX_CAP_INSERT_DONE)
+    mine.arg[0] = 7
+    mine.arg[1] = 0x100000004
+    mbox_post(0, mine)
+    g_me = 0
+    let moves: u64 = mbox_moves_in_count(0)
+    let got: MboxMsg = mbox_wait_reply(MBOX_CAP_INSERT_DONE, 3, 7)
+    if got.arg[0] != 7 or got.arg[1] != 0x100000004
+        return 1
+    if mbox_moves_in_count(0) != moves + 2
+        return 2
+    if mbox_stray_count(0) != 1 or mbox_has_work(0)
         return 3
     0
 

@@ -25,18 +25,34 @@
 #     count exact, the local windows overlap, and the AP process's local
 #     WHERE said cpu K while its forwarded WHERE said cpu 0. F is the
 #     FORWARDs the AP sent: one per forwarded call, its exit included.
+#   [smp-user] cross-CPU wake OK: woken on cpu K by cpu 0, on cpu 0 by cpu K
+#     test (b): the stub's MODE_WAKE. A process on AP K and one on the BSP
+#     hold one shm object; each gets its handle from the kernel after it
+#     started (cap_kernel_grant: the AP's by CAP_INSERT, served on K). The
+#     AP process ShmWaits and the BSP process, once the waiter is parked
+#     and its CPU idles, ShmNotifies: the waiter resumes on K. Then the
+#     reverse: the BSP process parks and the AP process notifies it, a wake
+#     made on an AP. Each wait has a 5 s deadline, so a lost wake is a FAIL
+#     line, not a hang (unless no kick reaches the idle CPU at all): the
+#     deadline's own wake collects the DATA bit too, so a wait must return
+#     within WAKE_LATE_US of the notifier seeing it parked.
 #   [smp-user] single CPU: pinned spawn ran on the BSP
 #     no AP started: place_pinned falls back to the BSP, and the spawn runs
 #     there (SMP_USER.md §5).
 
 import klog { klog, klog_dec }
 import io { cpu_pause, rdtsc }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import ritzlib.span { Span, span_from_ptr }
 import syscall.errno { Errno }
 import ritzlib.strview { StrView }
 import arch.x86_64.percpu { cpu_index }
 import arch.x86_64.cpu_map { MAX_CPUS, place_pinned }
-import proc.table { PROC_BSP_CPU, proc_current_slot }
+import proc.table { PROC_BSP_CPU, PROC_BLOCKED, BLOCK_WAIT, proc_current_slot, proc_state, proc_at, proc_on }
+import sync.idle { cpu_is_idle }
+import mm.shm { shm_create, shm_destroy, shm_exists }
+import cap.table { cap_kernel_grant, cap_inserts_served_count }
+import cap.types { CapHandle, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE }
 import proc.sched { sched_start, sched_stop, sched_moves_out_count }
 import ritzlib.result { Result }
 import syscall.runtime.process { process_spawn_image_on, process_spawn_program_on, process_wait }
@@ -49,11 +65,25 @@ const OP_ARRIVE: u64 = 1     # local: count this process in
 const OP_GO: u64 = 2         # local: 1 once both processes arrived
 const OP_BUMP: u64 = 3       # local: this CPU's counter; forwarded: smp_shared
 const OP_WHERE: u64 = 4      # the CPU the call runs on
+const OP_HANDLE: u64 = 5     # local, RSI the role: its shm handle, 0 until granted
+const OP_PEER_PARKED: u64 = 6    # local, RSI the role: 1 once the other role is parked on an idle CPU
+const OP_DONE: u64 = 7       # local, RSI the role: its wait returned
+const OP_PEER_DONE: u64 = 8  # local, RSI the role: 1 once the other role's wait returned
 
 # The stub's modes (RDI at entry) and what it exits with: its local WHERE,
 # and its forwarded WHERE shifted left 8.
 const MODE_COUNT: u64 = 1    # RSI bumps of each kind, after both arrived
 const MODE_WHERE: u64 = 2    # only the two WHEREs
+const MODE_WAKE: u64 = 3     # test (b): RSI the role
+
+# MODE_WAKE's roles, and the slots of wake_handle and wake_slot.
+const WAITS_FIRST: u64 = 0       # the AP process
+const NOTIFIES_FIRST: u64 = 1    # the BSP process
+# ShmWait's return when it copied records but no IRQ (driver.ritz
+# wait_collect).
+const WAIT_EVENTS: i64 = 2
+# A wake that took longer came from the wait's 5 s deadline, not the notify.
+const WAKE_LATE_US: u64 = 1000000
 
 # Calls of each kind per process (SMP_USER.md §6: 100k).
 const SMP_USER_CALLS: u64 = 100000
@@ -70,6 +100,16 @@ var smp_arrived: u32 = 0
 var smp_local: [64]u64
 var smp_first: [64]u64
 var smp_last: [64]u64
+# MODE_WAKE: each role's packed shm handle (0 until granted) and process
+# slot (-1 until it asked for its handle).
+var wake_handle: [2]u64
+var wake_slot: [2]i32
+# MODE_WAKE: each role's wait has returned (u32: an atomic word).
+var wake_done: [2]u32
+# MODE_WAKE: by when each role's wait must return (set as its notifier saw
+# it parked), and whether it returned later.
+var wake_by: [2]u64
+var wake_late: [2]bool
 
 fn reset()
     smp_shared = 0
@@ -80,6 +120,14 @@ fn reset()
         smp_first[c] = 0
         smp_last[c] = 0
         c = c + 1
+    var r: i32 = 0
+    while r < 2
+        atomic_store(@wake_handle[r], 0)
+        wake_slot[r] = -1
+        atomic_store(@wake_done[r], 0)
+        wake_by[r] = 0
+        wake_late[r] = false
+        r = r + 1
 
 # SmpUser: forwarded from an AP, so it always runs on the BSP.
 pub fn sys_smp_user_handler(op: u64, a2: u64, a3: u64, a4: u64) -> i64
@@ -118,7 +166,37 @@ pub fn sys_smp_user_local_handler(op: u64, a2: u64, a3: u64, a4: u64) -> i64
         return 0
     if op == OP_WHERE
         return cpu as i64
+    if op == OP_HANDLE or op == OP_PEER_PARKED or op == OP_DONE or op == OP_PEER_DONE
+        if a2 >= 2
+            return Errno.Inval as i64
+        return wake_op(op, a2 as i32)
     Errno.Inval as i64
+
+# MODE_WAKE's ops for role `role` (0 or 1), on the caller's CPU.
+fn wake_op(op: u64, role: i32) -> i64
+    let peer: i32 = 1 - role
+    if op == OP_HANDLE
+        let h: u64 = atomic_load(@wake_handle[role])
+        if h != 0
+            wake_slot[role] = proc_current_slot()
+        return h as i64
+    if op == OP_PEER_PARKED
+        if not peer_parked(wake_slot[peer])
+            return 0
+        volatile_store(@wake_by[peer], deadline_after_us(WAKE_LATE_US))
+        return 1
+    if op == OP_DONE
+        let by: u64 = volatile_load(@wake_by[role])
+        wake_late[role] = by == 0 or deadline_passed(by)
+        atomic_store(@wake_done[role], 1)
+        return 0
+    # OP_PEER_DONE
+    atomic_load(@wake_done[peer]) as i64
+
+# Process slot `slot` is parked on its wait set and its CPU idles: a wake
+# needs the CAS and the kick.
+fn peer_parked(slot: i32) -> bool
+    slot >= 0 and proc_state(slot) == PROC_BLOCKED and proc_at(slot).block == BLOCK_WAIT and cpu_is_idle(proc_on(slot))
 
 fn is_no_ent(e: Errno) -> bool
     match e
@@ -206,6 +284,76 @@ fn concurrent(ap: i32) -> bool
     klog("\n")
     true
 
+fn handle_pack(h: CapHandle) -> u64
+    (h.index as u64) | ((h.generation as u64) << 32)
+
+# MODE_WAKE's exit status for a waiter that resumed on `woke` and a
+# notifier on `notified`: ShmWait copied one DATA record.
+fn wake_status(woke: i32, notified: i32) -> i64
+    WAIT_EVENTS | ((woke as i64) << 8) | ((notified as i64) << 16) | (1 << 24) | (1 << 28)
+
+fn wake_spawn(role: u64, cpu: i32) -> u64
+    match process_spawn_image_on(stub(), MODE_WAKE, role, cpu)
+        Ok(p) => p
+        Err(_) => 0
+
+# Test (b): processes on AP `ap` and on the BSP wake each other.
+fn cross_wake(ap: i32) -> bool
+    let obj: u64 = match shm_create(1)
+        Some(id) => id
+        None => return fail("no shm object for the wake test")
+    let served_before: u64 = cap_inserts_served_count(ap)
+    sched_start(proc_current_slot())
+    let ap_pid: u64 = wake_spawn(WAITS_FIRST, ap)
+    let bsp_pid: u64 = wake_spawn(NOTIFIES_FIRST, PROC_BSP_CPU)
+    var granted: bool = false
+    if ap_pid != 0 and bsp_pid != 0
+        # The AP process is running on its AP: its handle is a CAP_INSERT.
+        let ha: CapHandle = cap_kernel_grant(ap_pid as u32, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_WRITE, obj)
+        let hb: CapHandle = cap_kernel_grant(bsp_pid as u32, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_WRITE, obj)
+        granted = ha.index != 0xFFFFFFFF and hb.index != 0xFFFFFFFF
+        if granted
+            atomic_store(@wake_handle[WAITS_FIRST as i32], handle_pack(ha))
+            atomic_store(@wake_handle[NOTIFIES_FIRST as i32], handle_pack(hb))
+    # A process left without its handle polls for it: the kill is its exit.
+    var ap_status: i64 = -1
+    var bsp_status: i64 = -1
+    if granted
+        ap_status = process_wait(ap_pid as i32)
+        bsp_status = process_wait(bsp_pid as i32)
+    sched_stop()
+    let served: u64 = cap_inserts_served_count(ap) - served_before
+    if shm_exists(obj)
+        shm_destroy(obj)
+    klog("[smp-user] wake statuses ")
+    klog_dec(ap_status)
+    klog(" ")
+    klog_dec(bsp_status)
+    klog(", CAP_INSERTs ")
+    klog_dec(served as i64)
+    klog("\n")
+    if ap_pid == 0 or bsp_pid == 0
+        return fail("a wake-test spawn failed")
+    if not granted
+        return fail("a wake-test handle was refused")
+    if served != 1
+        return fail("the AP process's handle was not written by its CPU (CAP_INSERT)")
+    if ap_status != wake_status(ap, ap)
+        return fail("the AP waiter was not woken from the BSP onto its AP")
+    if bsp_status != wake_status(PROC_BSP_CPU, PROC_BSP_CPU)
+        # Its own notify ran on the BSP; it was woken from the AP.
+        return fail("the BSP waiter was not woken from the AP")
+    if wake_late[WAITS_FIRST as i32]
+        return fail("the AP waiter was woken only by its deadline")
+    if wake_late[NOTIFIES_FIRST as i32]
+        return fail("the BSP waiter was woken only by its deadline, not from the AP")
+    klog("[smp-user] cross-CPU wake OK: woken on cpu ")
+    klog_dec(ap as i64)
+    klog(" by cpu 0, on cpu 0 by cpu ")
+    klog_dec(ap as i64)
+    klog("\n")
+    true
+
 # The smp-user boot test, as pid 1 on its own kernel stack.
 pub fn smp_user_selftest() -> bool
     klog("\nTesting user processes on APs...\n")
@@ -224,6 +372,6 @@ pub fn smp_user_selftest() -> bool
     if ap == PROC_BSP_CPU
         ok = single_cpu()
     else
-        ok = concurrent(ap)
+        ok = concurrent(ap) and cross_wake(ap)
     smp_active = false
     ok

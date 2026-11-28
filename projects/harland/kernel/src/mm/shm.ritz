@@ -39,7 +39,7 @@
 import ritzlib.option
 import io { disable_interrupts, enable_interrupts, interrupts_enabled }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
-import proc.table { BLOCK_WAIT, proc_wake_pid, proc_on_cpu }
+import proc.table { BLOCK_WAIT, PROC_BSP_CPU, proc_wake_pid, proc_on_cpu }
 import proc.waitset { shm_latch_post_peers }
 import driver_abi.wait { SHM_DETACH_TIMEOUT_MS }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
@@ -394,15 +394,18 @@ pub fn shm_detach_expired() -> u32
 
 # The tick over kernel code may not unmap (shm_detach_expired): it wakes
 # each holder of an expired mapping that is parked on its wait set instead,
-# whose wait then runs the sweep before it collects. IF=0.
+# whose wait then runs the sweep before it collects. Only a holder on the
+# BSP: a wait on an AP does not sweep (AGAST #4881), and the BSP's idle
+# loop sweeps for it. IF=0.
 pub fn shm_detach_wake_due()
     var slot: i32 = 0
     while slot < MAX_SHM_OBJECTS
         if shm_detach_due(slot)
             var m: i32 = 0
             while m < MAX_SHM_MAPS
-                if shm_maps[m].in_use and shm_maps[m].object_id == shm_objects[slot].id
-                    proc_wake_pid(shm_maps[m].pid as u64, BLOCK_WAIT)
+                let pid: u64 = shm_maps[m].pid as u64
+                if shm_maps[m].in_use and shm_maps[m].object_id == shm_objects[slot].id and proc_on_cpu(pid) == PROC_BSP_CPU
+                    proc_wake_pid(pid, BLOCK_WAIT)
                 m = m + 1
         slot = slot + 1
 

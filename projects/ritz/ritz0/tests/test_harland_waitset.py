@@ -12,9 +12,9 @@ shared BLOCK_IRQ queue. proc/waitset.ritz holds what that needs:
 * a per-process deadline that sched_tick's waitset_tick wakes once it has
   passed, without touching the shared LAPIC watchdog.
 
-proc/waitset.ritz imports only proc/table.ritz and declares cap_irq_owner
-and lapic_is_bsp, so the behaviour test compiles the real module into a
-host program with stand-ins for those two. The syscall's own boot-level
+proc/waitset.ritz imports only proc/table.ritz and declares cap_irq_owner,
+so the behaviour test compiles the real module into a host program with a
+stand-in for it. The syscall's own boot-level
 proof is the drv-irq-wait boot test (postinit.ritz), and the ring-3 refusal
 is indium's drv_refuse_test Tier-1 program.
 """
@@ -69,15 +69,16 @@ def _compile(tmp_path, path, name, extra=()):
     return ll
 
 
-def _run(tmp_path, src):
-    """Compile the real proc/table.ritz and proc/waitset.ritz with `src`, link, run."""
+def _run(tmp_path, src, hooks=CPU_HOOKS):
+    """Compile the real proc/table.ritz and proc/waitset.ritz with `src`
+    (and the CPU `hooks`), link, run."""
     tree = tmp_path / "tree"
     for rel, real in MODULES.items():
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
         (tree / rel).write_text(real.read_text())
     objs = [str(_compile(tmp_path, tree / rel, rel[:-5].replace("/", "_"), ("--no-runtime",)))
             for rel in MODULES]
-    (tmp_path / "t.ritz").write_text(src + CPU_HOOKS)
+    (tmp_path / "t.ritz").write_text(src + hooks)
     objs.insert(0, str(_compile(tmp_path, tmp_path / "t.ritz", "t")))
     exe = tmp_path / "t"
     link = fast_link.clang(["clang", "-Wno-override-module", *objs, "-o", str(exe),
@@ -97,16 +98,13 @@ const VEC_A: u8 = 64
 const DRIVER: u64 = 2               # slot 1 owns A
 const OTHER: u64 = 3                # slot 2 owns B
 
-# The kernel's are cap/table.ritz cap_irq_owner and apic.ritz lapic_is_bsp.
+# The kernel's is cap/table.ritz cap_irq_owner.
 pub fn cap_irq_owner(object_id: u64) -> u32
     if object_id == OBJ_A
         return DRIVER as u32
     if object_id == OBJ_B
         return OTHER as u32
     0
-
-pub fn lapic_is_bsp() -> bool
-    true
 
 fn park(slot: i32, reason: u8)
     let was: i32 = proc_current_slot()
@@ -300,9 +298,6 @@ pub fn cap_irq_owner(object_id: u64) -> u32
     if object_id == IRQ
         return DRIVER as u32
     0
-
-pub fn lapic_is_bsp() -> bool
-    true
 
 fn park(slot: i32)
     let was: i32 = proc_current_slot()
@@ -540,6 +535,100 @@ fn main() -> i32
 @pytest.mark.integration
 def test_shm_latches_notify_inbox_and_collect(tmp_path):
     assert _run(tmp_path, SHM_WAIT) == 0
+
+
+# Wakes across CPUs (AGAST #4881, SMP_USER.md §4 "Consequences"): a post
+# made on an AP wakes a waiter parked on the BSP with the CAS, and kicks the
+# BSP if it idles, for each of the wait set's three kinds of post. The hooks
+# let the program say which CPU it runs on, and record the kicks.
+SMP_HOOKS = """
+var host_cpu: i32 = 0
+var kicked_cpu: i32 = -1
+var kicks: i32 = 0
+
+pub fn cpu_index() -> i32
+    host_cpu
+
+pub fn cpu_kick_if_idle(cpu: i32)
+    kicked_cpu = cpu
+    kicks = kicks + 1
+"""
+
+WAKE_FROM_AP = """\
+import proc.table
+import proc.waitset
+import driver_abi.wait { EVENT_DATA }
+
+const IRQ: u64 = 0x10
+const SHM: u64 = 0x20
+const DRIVER: u64 = 2
+const PEER: u64 = 3
+const AP: i32 = 3
+
+pub fn cap_irq_owner(object_id: u64) -> u32
+    if object_id == IRQ
+        return DRIVER as u32
+    0
+
+# Park `slot` on its wait set, as the BSP: it is homed there.
+fn park(slot: i32)
+    host_cpu = 0
+    let was: i32 = proc_current_slot()
+    proc_set_current(slot)
+    proc_block(BLOCK_WAIT, 0)
+    proc_set_current(was)
+
+fn woken_by_ap(slot: i32) -> bool
+    let ok: bool = proc_state(slot) == PROC_RUNNING and kicked_cpu == PROC_BSP_CPU and kicks == 1
+    kicks = 0
+    kicked_cpu = -1
+    host_cpu = 0
+    ok
+
+fn main() -> i32
+    proc_table_reset()
+    proc_enter_init(0)
+    let d: i32 = proc_new_child()
+    proc_start(d)
+    let p: i32 = proc_new_child()
+    proc_start(p)
+    if proc_at(d).pid != DRIVER or proc_at(p).pid != PEER
+        return 100
+    if not irq_object_register(IRQ, IRQ_NO_VECTOR)
+        return 101
+    if not shm_latch_create(SHM, DRIVER) or not shm_latch_create(SHM, PEER)
+        return 102
+    kicks = 0
+
+    # A ShmNotify on the AP wakes the BSP's waiter, and kicks the BSP.
+    park(d)
+    host_cpu = AP
+    shm_notify(SHM, PEER, EVENT_DATA)
+    if not woken_by_ap(d)
+        return 1
+    # An IRQ object latched on the AP (an MSI-X aimed there) wakes its owner.
+    park(d)
+    host_cpu = AP
+    irq_object_latch(IRQ)
+    if not woken_by_ap(d)
+        return 2
+    # A kernel inbox post made on the AP wakes the process it is for.
+    park(d)
+    host_cpu = AP
+    waitset_inbox_post(DRIVER, 0x55, EVENT_DATA)
+    if not woken_by_ap(d)
+        return 3
+    0
+"""
+
+
+@pytest.mark.integration
+def test_a_post_on_an_ap_wakes_a_waiter_on_the_bsp(tmp_path):
+    """No BSP-only gate is left in the wait set (AGAST #4881): a ShmNotify,
+    an IRQ latch and an inbox post made on an AP each wake the waiter parked
+    on the BSP (the CAS) and kick its CPU."""
+    assert _run(tmp_path, WAKE_FROM_AP, SMP_HOOKS) == 0
+    assert "lapic_is_bsp" not in (KERNEL_SRC / "proc" / "waitset.ritz").read_text()
 
 
 def _fn_body(src, name):

@@ -48,6 +48,10 @@ pub fn lapic_eoi()
 pub fn ap_call_run(kind: u32) -> i32
     -1
 
+# cap/table.ritz's CAP_INSERT hook (AGAST #4881): nothing here inserts.
+pub fn cap_insert_serve(pid: u64, cap_type: u32, rights: u32, object_id: u64) -> u64
+    0xFFFFFFFF
+
 fn zero_page(p: u64)
     var i: u64 = 0
     while i < 512

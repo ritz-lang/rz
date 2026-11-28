@@ -858,8 +858,12 @@ tlb_owner_unmap() {
 # once, every count exact: "[smp-user] concurrent syscalls OK: cpu0 100000
 # cpuK 100000, forwarded F". At one CPU the pinned spawn must have fallen
 # back to the BSP: "[smp-user] single CPU: pinned spawn ran on the BSP".
+# With APs, a process parked on cpu K must also have been woken from the BSP
+# and resumed on cpu K, and one parked on the BSP woken from cpu K (test
+# (b)): "[smp-user] cross-CPU wake OK: woken on cpu K by cpu 0, on cpu 0 by
+# cpu K".
 smp_user() {
-    local last=$((SMP_NCPUS - 1)) line
+    local last=$((SMP_NCPUS - 1)) line wake
     if grep -aq '\[smp-user\] FAIL' "$WORK/$1.log"; then
         grep -a '\[smp-user\]' "$WORK/$1.log" | head -5
         echo "FAIL ($1): the smp-user boot test failed"
@@ -874,13 +878,20 @@ smp_user() {
         return 1
     fi
     line="$(grep -aoE '\[smp-user\] concurrent syscalls OK: cpu0 100000 cpu[0-9]+ 100000, forwarded [0-9]+' "$WORK/$1.log" | head -1)"
-    if printf '%s\n' "$line" | grep -q " cpu$last 100000,"; then
-        echo "PASS ($1): $line"
-        return 0
+    if ! printf '%s\n' "$line" | grep -q " cpu$last 100000,"; then
+        grep -a '\[smp-user\]' "$WORK/$1.log" | head -5
+        echo "FAIL ($1): no concurrent-syscalls verdict for a process on cpu $last (got: ${line:-none})"
+        return 1
     fi
-    grep -a '\[smp-user\]' "$WORK/$1.log" | head -5
-    echo "FAIL ($1): no concurrent-syscalls verdict for a process on cpu $last (got: ${line:-none})"
-    return 1
+    wake="$(grep -aoE '\[smp-user\] cross-CPU wake OK: woken on cpu [0-9]+ by cpu [0-9]+, on cpu [0-9]+ by cpu [0-9]+' "$WORK/$1.log" | head -1)"
+    if [ "$wake" != "[smp-user] cross-CPU wake OK: woken on cpu $last by cpu 0, on cpu 0 by cpu $last" ]; then
+        grep -a '\[smp-user\]' "$WORK/$1.log" | head -5
+        echo "FAIL ($1): no cross-CPU wake verdict for a process on cpu $last (got: ${wake:-none})"
+        return 1
+    fi
+    echo "PASS ($1): $line"
+    echo "PASS ($1): $wake"
+    return 0
 }
 
 # sysret_ring0 NAME: pass only if the "sysret" self-test's non-canonical

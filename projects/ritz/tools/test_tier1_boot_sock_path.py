@@ -85,6 +85,7 @@ FAKE_QEMU = textwrap.dedent("""\
                 "[tlb] owner unmap OK: cpu 2 saw the unmap\\n[tlb] kernel invlpg OK: cpu 2 saw the unmap\\n"
                 "[tlb] owner unmap OK: cpu 3 saw the unmap\\n[tlb] kernel invlpg OK: cpu 3 saw the unmap\\n"
                 "[smp-user] concurrent syscalls OK: cpu0 100000 cpu3 100000, forwarded 100002\\n"
+                "[smp-user] cross-CPU wake OK: woken on cpu 3 by cpu 0, on cpu 0 by cpu 3\\n"
                 "[test] ping nodev ... ping: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"
                 "[test] udp-send nodev ... udp-send: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"
                 "[test] udp-recv nodev ... udp-recv: NetAttach: Errno.NoDev (no network service) (-19)\\nPASS (exit=19)\\n"

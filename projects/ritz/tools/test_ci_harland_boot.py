@@ -227,7 +227,10 @@ TLB_NONE = "[tlb] no APs for the owner unmap\n"
 # §6); at one CPU the pinned spawn fell back to the BSP.
 SMP_USER_OK = "[smp-user] concurrent syscalls OK: cpu0 100000 cpu3 100000, forwarded 100002\n"
 SMP_USER_NONE = "[smp-user] single CPU: pinned spawn ran on the BSP\n"
-SMP_OK = SMP_OK + MBOX_OK + TLB_OK + SMP_USER_OK
+# A process parked on the last AP was woken from the BSP and resumed on its
+# AP, then the reverse (AGAST #4881, SMP_USER.md §4, §6).
+SMP_WAKE_OK = "[smp-user] cross-CPU wake OK: woken on cpu 3 by cpu 0, on cpu 0 by cpu 3\n"
+SMP_OK = SMP_OK + MBOX_OK + TLB_OK + SMP_USER_OK + SMP_WAKE_OK
 PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
 # The native ESP carries \\harland\\klog-dump, so the kernel dumps its crash
 # ring before init: the dump must be exactly the kernel's serial output up to
@@ -681,6 +684,26 @@ def test_a_process_pinned_to_the_last_ap_must_make_its_syscalls(tree, line, verd
     and one on the BSP each made 100000 forwarded and 100000 local syscalls
     at once, every count exact, and no FAIL line."""
     r = _run(tree, PASSED.replace(SMP_USER_OK, line))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert verdict in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "line, verdict",
+    [
+        ("", "no cross-CPU wake verdict for a process on cpu 3 (got: none)"),
+        (SMP_WAKE_OK.replace("cpu 3 by", "cpu 2 by"), "no cross-CPU wake verdict for a process on cpu 3"),
+        (SMP_WAKE_OK.replace("by cpu 3", "by cpu 2"), "no cross-CPU wake verdict for a process on cpu 3"),
+        ("[smp-user] FAIL: the BSP waiter was not woken from cpu 3\n", "the smp-user boot test failed"),
+    ],
+    ids=["silent", "woken-elsewhere", "woken-by-another", "failed"],
+)
+def test_a_wake_must_cross_cpus_both_ways(tree, line, verdict):
+    """Test (b) of the smp-user boot test (AGAST #4881): a process parked on
+    the last AP is woken by one on the BSP and resumes on its AP, and a
+    process parked on the BSP is woken from that AP."""
+    r = _run(tree, PASSED.replace(SMP_WAKE_OK, line))
     assert r.returncode == 1, r.stdout + r.stderr
     assert verdict in r.stdout
 
