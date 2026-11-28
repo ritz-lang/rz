@@ -8106,7 +8106,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         self._temp_frames.append([])
         try:
             if isinstance(tail, rast.If):
-                self._emit_if(tail)
+                # Its arms are not merged either: a unit arm beside a
+                # valued one made a phi of mismatched types (AGAST #4070).
+                self._emit_if(tail, discard=True)
             else:
                 self._emit_expr(tail)
         finally:

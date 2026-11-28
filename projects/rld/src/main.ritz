@@ -5,20 +5,24 @@
 #   rld [-o OUT] [--pie --no-dynamic-linker] [-T SCRIPT] OBJ...
 #
 # Without --hosted the link is freestanding: --pie --no-dynamic-linker is
-# the freestanding PIE, and neither is the no-script executable.
+# the freestanding PIE, and neither is the executable. SCRIPT lays it out,
+# else the no-script layout does; a scripted link prints one line per
+# orphan section.
 #
 # Exit status: 0 linked (or --help/-h printed the usage), 1 failed (usage,
-# an unreadable or malformed object, a symbol undefined or defined twice, a
-# value that does not fit its field). stderr names the cause.
+# an unreadable or malformed object or script, a symbol undefined or defined
+# twice, a value that does not fit its field). stderr names the cause.
 import ritzlib.fmt
 import ritzlib.gvec { Vec, vec_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
 import ritzlib.span { Span, span_from_vec }
 import ritzlib.string { String, string_from, string_from_i64 }
 import ritzlib.strview { StrView }
-import ritzlib.option { Option }
 import rld.dynamic { Output }
 import rld.input { LinkError, Linker, linker_new }
 import rld.link
+import rld.scripted { link_script }
 
 const EXIT_FAILED: i32 = 1
 const USAGE: StrView = "Usage: rld --hosted [-o OUT] OBJ...\n       rld [-o OUT] [--pie --no-dynamic-linker] [-T SCRIPT] OBJ..."
@@ -71,6 +75,20 @@ fn link_error_message(e: LinkError) -> String
         Unwritable(path) =>
             m.push_str(path)
             m.push_str(": cannot write the executable")
+        Discarded(name) =>
+            m.push_str("relocation against ")
+            m.push_str(name)
+            m.push_str(", in a section the script discards")
+        Script(path, line, what, token) =>
+            m.push_str(path)
+            if line > 0
+                m.push_str(":line ")
+                m.push_string(@string_from_i64(line))
+            m.push_str(": ")
+            m.push_str(what)
+            if token.len > 0
+                m.push_str(" ")
+                m.push_str(token)
     m
 
 # The mode the flags name (DESIGN.md "CLI"), or why they name none.
@@ -85,8 +103,8 @@ fn output_of(hosted: bool, pie: bool, no_interp: bool, script: Option<StrView>) 
         return Err("--pie needs --no-dynamic-linker")
     if no_interp and not pie
         return Err("--no-dynamic-linker needs --pie")
-    if script.is_some()
-        return Err("-T: linker scripts are not supported yet")
+    if pie and script.is_some()
+        return Err("-T: a scripted PIE is not supported yet")
     Ok(if pie then Output.Pie else Output.Executable)
 
 pub fn main(args: Span<StrView>) -> i32
@@ -128,7 +146,11 @@ pub fn main(args: Span<StrView>) -> i32
         return usage_error("no input files")
 
     var l: Linker = linker_new()
-    match link(@&l, span_from_vec<StrView>(@inputs), out, output)
+    let objs: Span<StrView> = span_from_vec<StrView>(@inputs)
+    let linked: Result<(), LinkError> = match script
+        Some(path) => link_script(@&l, objs, path, out)
+        None => link(@&l, objs, out, output)
+    match linked
         Ok(_) => 0
         Err(e) =>
             let why: String = link_error_message(e)

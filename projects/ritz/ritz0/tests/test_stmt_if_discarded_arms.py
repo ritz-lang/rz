@@ -97,6 +97,28 @@ fn run(flag: i32, out: @&i32) -> i32
     7
 """
 
+# The if/else is the tail of a loop body, whose value is discarded too.
+LOOP = """\
+fn run(flag: i32, out: @&i32)
+    var k: i32 = 0
+    while k < 1
+        k = k + 1
+        if flag == 1
+            side(out)
+        else
+            mk(out)
+"""
+
+# The same, in a `for` body.
+FOR = """\
+fn run(flag: i32, out: @&i32)
+    for k in 0..1
+        if flag == 1
+            side(out)
+        else
+            mk(out)
+"""
+
 MAIN = """
 pub fn main() -> i32
     var n: i32 = 0
@@ -111,6 +133,8 @@ ROWS = {
     "nested": (NESTED, 11),
     "match": (MATCH, 11),
     "valued": (VALUED, 11),
+    "loop": (LOOP, 11),
+    "for": (FOR, 11),
 }
 
 

@@ -2,7 +2,7 @@
 
 Two programs replace the host tools that turn this tree's code into relocatable ELF64. [razm](#razm) replaces `as --64`. [rllvm](#what-rllvm-replaces) replaces `clang -c` on the `.ll` this tree already emits. Both write objects today's linkers already accept: hosted `clang` or `gcc` (`link_hosted`), and freestanding `ld.lld` (`link_freestanding_elf`). Neither links.
 
-The native linker is [rld](#rld). This document specifies it. The no-script executable and the two PIEs are implemented.
+The native linker is [rld](#rld). This document specifies it. The no-script executable, the scripted executable (`-T`) and the two no-script PIEs are implemented.
 
 Pipeline facts below are from `projects/ritz/build_pipeline.py` (`compile_ll_to_obj`, `OBJ_CLANG_FLAGS`, `freestanding_target`, `link_hosted`, `link_freestanding_elf`, `assemble_objects`, `ensure_runtime_object`) and from `projects/ritz/runtime/ritz_start.x86_64.ll` and `ritz_start.harland.x86_64.ll`.
 
@@ -12,7 +12,7 @@ Pipeline facts below are from `projects/ritz/build_pipeline.py` (`compile_ll_to_
 |---|---|---|---|
 | razm | `projects/razm` | first implementation | AT&T text → relocatable ELF64, and the one ELF writer |
 | rllvm | `projects/rllvm` | after razm encodes | `.ll` → instructions, encoded by razm |
-| rld | `projects/rld` | no-script executable; scripts, PIE and hosted to come | ELF objects + linker scripts → Linux and Harland executables |
+| rld | `projects/rld` | no-script and scripted executables, no-script PIEs; scripted PIE to come | ELF objects + linker scripts → Linux and Harland executables |
 
 razm is the assembler, as a library and a driver. Indium has no GNU `as`. The kernel's `.s` files (`assemble_objects` runs `as --64`) have to assemble on Indium, and that program has to be written in Ritz. razm is that program. It is the short one: it encodes instructions the text already chose. It does not select them, allocate registers, or parse LLVM IR.
 
@@ -489,7 +489,7 @@ Today those bins (`bootx64`, `hwinv`, target `x86_64-unknown-uefi`) compile with
 
 ## rld
 
-rld is `projects/rld`. It reads ELF through razm's `razm.elf` records, the ones razm's writer uses. Its first slice is the no-script executable with the object reader, symbol resolution, relocations and GOT relaxation below. The hosted and freestanding PIEs, with their load-time relocations, come next. The linker scripts come after them.
+rld is `projects/rld`. It reads ELF through razm's `razm.elf` records, the ones razm's writer uses. The no-script executable, with the object reader, symbol resolution, relocations and GOT relaxation below, the scripted executable, and the hosted and freestanding PIEs with their load-time relocations are implemented.
 
 ### Inputs
 
@@ -514,17 +514,23 @@ Accepted, and nothing else:
 - A pattern is a literal section name or a name ending in `*` (`.text.*`, `.note*`, `.eh_frame*`, `.text*`). The file part is always `*`.
 - Expressions: integers (decimal, `0x`, and a `K` or `M` suffix, as in `4K`), symbols, `.`, `+`, `-`, `ALIGN(n)`, `ADDR(section)`.
 
+Anything else is an error that names the script's line (`INCLUDE`, `MEMORY`, `PHDRS`, `SORT`, a file name other than `*`, `> region`, `*` other than at a pattern's end). An expression names only symbols the script assigned before it, and `ADDR` only a section placed before it.
+
 Semantics, matching `ld.lld`:
 
-- Placement is first match. Output section statements are visited in script order, and within each statement its patterns in order. Each pattern claims every input section it matches that no earlier pattern claimed, in command-line object order and section order within each object. So in the kernel script `.boot`'s `*(.boot .boot.*)` claims `.boot.data` and `.boot.bss`, which leaves the later `.boot.data` and `(NOLOAD) .boot.bss` statements empty. `ld.lld` and GNU `ld` both do this today, and rld does the same.
+- Placement is first match. Output section statements are visited in script order, and within each statement its input descriptions (`*( ... )`) in order. Each description claims every input section one of its patterns matches that no earlier description claimed, in command-line object order and section order within each object, so `*(.a .b)` keeps input order where `*(.a) *(.b)` puts every `.a` first. So in the kernel script `.boot`'s `*(.boot .boot.*)` claims `.boot.data` and `.boot.bss`, which leaves the later `.boot.data` and `(NOLOAD) .boot.bss` statements empty. `ld.lld` and GNU `ld` both do this today, and rld does the same.
 - `/DISCARD/` drops what its patterns claim, under the same first-match order.
-- An allocated orphan (matched by no pattern) is placed after the last output section with the same flags (alloc, write, exec, `NOBITS`), or at the end of the image when no such section exists. rld prints one line per orphan. `.eh_frame` from clang objects under `user/linker.ld` is the orphan the tree has today.
+- An allocated orphan (matched by no pattern) goes in the output section of its own name: the script's, if it has one, else a new one. A new one is placed as `ld.lld` places it (`findOrphanPos`): each output section has a sort rank from its flags (read-only, executable, writable, RELRO, `NOBITS`, and `SHF_X86_64_LARGE`, which puts `.lrodata` before `.rodata` and `.ldata` after `.bss`). The orphan goes beside the section whose rank shares the most leading bits with its own: after it, and after the sections that follow it with the same closeness and a rank no greater, when its rank is no greater than the orphan's, else before it. rld prints one line per orphan input section. `.eh_frame` from clang objects under `user/linker.ld` is the orphan the tree has today, and the large-model bins add `.ltext`, `.lrodata` and `.ldata`. rld does not rebuild `.eh_frame` as `ld.lld` does (merged CIEs, a zero terminator): it concatenates the input sections, so an image with an orphan `.eh_frame` matches `ld.lld`'s in placement, not in addresses after it.
 - `KEEP` is accepted and changes nothing, because nothing is collected.
-- `(NOLOAD)` makes the output section `SHT_NOBITS`. It takes address space and no file bytes.
+- `(NOLOAD)` makes the output section `SHT_NOBITS`, whatever its inputs. It takes address space and no file bytes.
+- An output section with no inputs is dropped, unless its address or `AT` names a symbol, an `ADDR()` names it, or it assigns a symbol (not a `PROVIDE`). A kept empty one takes the flags of the last section with inputs before it, less exec. In the kernel script that keeps the empty `.boot.bss` and `.got`.
+- An output section with an address expression starts exactly there; one whose address is not a multiple of its alignment is an error (`ld.lld` warns). Without one, `.` is aligned to the largest input alignment.
+- In an executable output section, the padding between input sections is `int3` (`0xcc`), as `ld.lld` writes it.
 - `AT(expr)` sets the section's load address. A later section with no `AT` keeps the same VMA-to-LMA offset as the section before it. With no `AT` anywhere, load address equals VMA.
-- `.got`, `.got.plt`, `.rela.dyn`, and `.rela.plt` patterns name sections the linker makes. rld puts its GOT in the output section whose pattern names `.got`, and its dynamic relocations in the one that names `.rela.dyn`. Without such a pattern, they are orphans.
-- `PROVIDE(sym = expr)` defines `sym` only when an input references it and no input defines it.
-- Segments: a new `PT_LOAD` starts when permissions change or when the VMA-to-LMA offset changes. `p_paddr` is the load address, `p_align` is `0x1000`, and file offset equals VMA modulo `0x1000`. A `NOBITS` section at the end of a segment adds to `p_memsz` only.
+- `.got`, `.got.plt`, `.rela.dyn`, and `.rela.plt` patterns name sections the linker makes. They are inputs after every object section, claimed by the same first-match rule: rld puts its GOT in the output section whose pattern matches `.got`, and its dynamic relocations in the one that matches `.rela.dyn`. Without such a pattern, they are orphans. As in `ld.lld`, an input's reference to `_GLOBAL_OFFSET_TABLE_` (`as` writes one for every GOT relocation) makes a `.got.plt` of three zero words, defines the symbol at it, and keeps `.got` though it is empty.
+- `PROVIDE(sym = expr)` defines `sym` only when an input references it and no input defines it. A plain assignment defines its symbol over any input's.
+- A relocation that reaches a symbol in a section `/DISCARD/` dropped is an error, as in `ld.lld`.
+- Segments, as `ld.lld`'s `createPhdrs`: a new `PT_LOAD` starts when permissions change, at every section with its own `AT()` (so each `AT` section of the kernel script is its own segment), and at the first section after the RELRO ones (`.got`). A `PT_LOAD` that spans no bytes is dropped, and its sections belong to none. `p_paddr` is the first section's load address and `p_align` is `0x1000` (or a larger section alignment). A segment's file offset equals its VMA modulo `p_align`, and each later section in it keeps its address distance in the file. A `NOBITS` section at the end of a segment adds to `p_memsz` only. The ELF and program headers are not loaded: every script in the tree starts on a page boundary, and a script that leaves room for them below its first section is refused.
 
 ### Outputs
 
@@ -568,14 +574,15 @@ The mode is explicit:
 rld's tests reuse the rllvm and razm corpora. Each link is done twice, once by today's linker and once by rld:
 
 - Hosted entries that run under both linkers must match on stdout and exit status.
-- Kernel: the seven kernel `.s` objects plus `freestanding/kernel.ll`, through the real `harland/kernel/linker.ld`. The two outputs must agree on:
+- Kernel: the seven kernel `.s` objects (razm's frozen corpus copies, assembled by `as` and by razm) plus `freestanding/kernel.ll`, through the real `harland/kernel/linker.ld`, with `rld/tests/corpus/kernel_stubs.s` defining the C-side symbols they reference. The two outputs must agree on:
   - entry address
   - the `PT_LOAD` table: virtual address, physical address, permissions, file size, memory size
   - section-to-segment mapping
   - the bytes of every segment
   - the Multiboot2 header's file offset, within the first 32 KiB and 8-byte aligned
 
-  rld relaxes GOT loads as `ld.lld` does, so segment bytes compare exactly, with no masks.
+  rld relaxes GOT loads as `ld.lld` does, so segment bytes compare exactly, with no masks. The allocated section table (name, type, flags, address, size) and the values of the script's symbols must agree too.
+- The other scripts: each of the five tree scripts and the `rld/tests/corpus/scripts` fixtures (AT carried forward, NOLOAD over PROGBITS, PROVIDE, an orphan rank tie, a kept GOT under `.got` and as an orphan) link a corpus program both ways, under the same comparison. The large-model bin (the Harland shim, `freestanding/large.ll` and the razm object through `user/linker.ld`) must agree on its section order, segment permissions and section-to-segment mapping; its `.eh_frame` orphan keeps the addresses from matching (see [Linker scripts](#linker-scripts)).
 - Freestanding PIE: `freestanding/pic.ll` through `user/linker_pie.ld`, with the initialized-pointer fixture above. The two outputs must agree on the `PT_LOAD` table, on the dynamic tags present, and on the multiset of dynamic relocations as (offset, type, addend).
 - No-script executable: a corpus entry in the `rzrz` shape, linked both ways and run on Linux. Output and status must match.
 

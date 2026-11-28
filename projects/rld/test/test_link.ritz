@@ -14,6 +14,8 @@ import rld.dynamic
 import rld.input
 import rld.link
 import rld.relax { Relax }
+import rld.script
+import rld.scripted { script_layout }
 
 # _start: exit with the quad at `answer`, loaded through the GOT.
 #   movq answer@GOTPCREL(%rip), %rax; movq (%rax), %rdi
@@ -264,6 +266,63 @@ fn test_supported_relocation_types() -> i32
     assert reloc_supported(R_X86_64_64) and reloc_supported(R_X86_64_32S)
     assert not reloc_supported(19), "R_X86_64_TLSGD"
     assert not reloc_supported(37), "R_X86_64_IRELATIVE"
+    0
+
+
+# program() through a script: .text at 0x400000, .data on the next page
+# loading at 0x9000, a symbol inside .data, and one PROVIDE no input wants.
+const AT_SCRIPT: StrView = "ENTRY(_start)\nSECTIONS {\n  . = 0x400000;\n  .text : { *(.text) }\n  .data ALIGN(4K) : AT(0x9000) { __data = .; *(.data) }\n}\nPROVIDE(unwanted = 1);\n"
+# The same, with .data discarded: `answer` goes with it.
+const DISCARD_SCRIPT: StrView = "SECTIONS { . = 0x400000; .text : { *(.text) } /DISCARD/ : { *(.data) } }"
+
+[[test]]
+fn test_script_layout_places_at_the_script_addresses() -> i32
+    var obj: Object = program()
+    let path: String = save(@obj, "script.o")
+    match parse_script(AT_SCRIPT)
+        Ok(s) =>
+            var l: Linker = linker_new()
+            read(@&l, @path)
+            assert l.resolve().is_ok()
+            match script_layout(@&l, @s, "at.ld")
+                Ok(img) =>
+                    assert img.entry == 0x400000, "_start opens .text"
+                    assert img.segs.len == 2, "text, then data under its own AT"
+                    let data: Segment = img.segs[1]
+                    assert data.addr == 0x401000 and data.paddr == 0x9000
+                    assert data.offset % PAGE == data.addr % PAGE
+                    assert img.relax[0] == Relax.PcRelative, "the GOT load still relaxes"
+                    let sym: i64 = l.lookup("__data")
+                    assert sym != UNRESOLVED and l.symbols[sym].value == 0x401000
+                    assert l.lookup("unwanted") == UNRESOLVED, "PROVIDE only what is wanted"
+                Err(_) =>
+                    assert false, "script_layout"
+        Err(_) =>
+            assert false, "parse"
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_reference_into_discarded_section_is_an_error() -> i32
+    var obj: Object = program()
+    let path: String = save(@obj, "discard.o")
+    match parse_script(DISCARD_SCRIPT)
+        Ok(s) =>
+            var l: Linker = linker_new()
+            read(@&l, @path)
+            assert l.resolve().is_ok()
+            match script_layout(@&l, @s, "discard.ld")
+                Ok(_) =>
+                    assert false, "a reference into /DISCARD/ accepted"
+                Err(e) =>
+                    match e
+                        Discarded(name) =>
+                            assert name.eq("answer")
+                        _ =>
+                            assert false, "not Discarded"
+        Err(_) =>
+            assert false, "parse"
+    unlink(path.as_view())
     0
 
 # The program, with a pointer to `answer` after it in a section with

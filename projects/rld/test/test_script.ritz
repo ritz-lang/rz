@@ -1,0 +1,179 @@
+# The linker-script parser: what each construct of the subset parses to,
+# and the line an error names.
+import ritzlib.gvec { Vec }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.strview { StrView }
+import ritzlib.fmt
+import ritzlib.testlib
+import rld.script
+
+const KERNELISH: StrView = "OUTPUT_FORMAT(\"elf64-x86-64\")\nOUTPUT_ARCH(i386:x86-64)\nENTRY(kmain)\nBASE = 0x100000;\nSECTIONS\n{\n    . = BASE;\n    .boot ALIGN(4K) : { *(.boot .boot.*) }\n    .bss ALIGN(4K) (NOLOAD) : AT(ADDR(.bss) - BASE)\n    {\n        __bss_start = .;\n        KEEP(*(.bss))\n        *(COMMON)\n    }\n    /DISCARD/ : { *(.eh_frame) }\n}\nPROVIDE(__size = __bss_start - 4K);\n"
+
+# The line parse_script's error names; None when it accepts `text`
+# (lines count from 1, so `unwrap_or(0)` never passes for an accept).
+[[test_helper]]
+fn error_line(text: StrView, what: StrView) -> Option<i64>
+    match parse_script(text)
+        Ok(_) => None
+        Err(e) =>
+            assert e.what.eq(what)
+            Some(line_of(text, e.at))
+
+[[test]]
+fn test_commands_in_script_order() -> i32
+    match parse_script(KERNELISH)
+        Ok(s) =>
+            assert s.entry.eq("kmain")
+            assert s.commands.len == 6, "BASE, `.`, .boot, .bss, /DISCARD/, PROVIDE"
+            match s.commands[0]
+                Assign(name, _, provide) =>
+                    assert name.eq("BASE") and not provide
+                _ =>
+                    assert false, "BASE ="
+            match s.commands[1]
+                SetDot(e) =>
+                    match s.exprs[e]
+                        Symbol(name) =>
+                            assert name.eq("BASE")
+                        _ =>
+                            assert false, "`. = BASE`"
+                _ =>
+                    assert false, "`. =`"
+            match s.commands[4]
+                Output(o) =>
+                    assert s.outputs[o].is_discard()
+                _ =>
+                    assert false, "/DISCARD/"
+        Err(e) =>
+            eprint("parse error at {e.at}: {e.what} {e.token}\n")
+            assert false, "the script parses"
+    0
+
+[[test]]
+fn test_provide_after_sections() -> i32
+    match parse_script("SECTIONS { }\nPROVIDE(x = 1);")
+        Ok(s) =>
+            assert s.commands.len == 1
+            match s.commands[0]
+                Assign(name, _, provide) =>
+                    assert name.eq("x") and provide
+                _ =>
+                    assert false, "PROVIDE"
+        Err(e) =>
+            eprint("parse error at {e.at}: {e.what} {e.token}\n")
+            assert false, "the script parses"
+    0
+
+[[test]]
+fn test_output_statement_parts() -> i32
+    match parse_script(KERNELISH)
+        Ok(s) =>
+            let boot: OutputStmt = s.outputs[0]
+            assert boot.name.eq(".boot") and not boot.noload
+            assert boot.lma.is_none()
+            match boot.addr
+                Some(e) =>
+                    match s.exprs[e]
+                        Align(a) =>
+                            match s.exprs[a]
+                                Number(n) =>
+                                    assert n == 4096, "4K"
+                                _ =>
+                                    assert false, "ALIGN(4K)"
+                        _ =>
+                            assert false, "ALIGN"
+                None =>
+                    assert false, "address"
+            let bss: OutputStmt = s.outputs[1]
+            assert bss.noload, "(NOLOAD)"
+            assert bss.item_count == 3, "the symbol, KEEP and COMMON"
+            match bss.lma
+                Some(e) =>
+                    match s.exprs[e]
+                        Sub(a, _) =>
+                            match s.exprs[a]
+                                Addr(name) =>
+                                    assert name.eq(".bss")
+                                _ =>
+                                    assert false, "ADDR(.bss)"
+                        _ =>
+                            assert false, "ADDR - BASE"
+                None =>
+                    assert false, "AT"
+            assert s.addr_taken(".bss") and not s.addr_taken(".boot")
+            assert s.uses_symbol(bss.lma.unwrap())
+        Err(e) =>
+            eprint("parse error at {e.at}: {e.what} {e.token}\n")
+            assert false, "the script parses"
+    0
+
+[[test]]
+fn test_patterns() -> i32
+    match parse_script(KERNELISH)
+        Ok(s) =>
+            let d: InputDesc = s.descs[0]
+            assert d.count == 2, ".boot .boot.*"
+            let exact: Pattern = s.patterns[d.first]
+            let wild: Pattern = s.patterns[d.first + 1]
+            assert exact.matches(".boot") and not exact.matches(".boot.data")
+            assert wild.matches(".boot.data") and not wild.matches(".boot")
+            assert not wild.matches(".bootx")
+        Err(e) =>
+            eprint("parse error at {e.at}: {e.what} {e.token}\n")
+            assert false, "the script parses"
+    0
+
+[[test]]
+fn test_numbers() -> i32
+    match parse_script("X = 0xFFFFFFFF80000000 + 2M + 10;")
+        Ok(s) =>
+            match s.commands[0]
+                Assign(_, e, _) =>
+                    match s.exprs[e]
+                        Add(left, ten) =>
+                            match s.exprs[ten]
+                                Number(n) =>
+                                    assert n == 10
+                                _ =>
+                                    assert false, "10"
+                            match s.exprs[left]
+                                Add(high, mib) =>
+                                    match s.exprs[high]
+                                        Number(n) =>
+                                            assert n == 0 - 0x80000000, "the high 2 GiB, as an i64"
+                                        _ =>
+                                            assert false, "hex"
+                                    match s.exprs[mib]
+                                        Number(n) =>
+                                            assert n == 0x200000
+                                        _ =>
+                                            assert false, "2M"
+                                _ =>
+                                    assert false, "left-assoc"
+                        _ =>
+                            assert false, "+"
+                _ =>
+                    assert false, "X ="
+        Err(e) =>
+            eprint("parse error at {e.at}: {e.what} {e.token}\n")
+            assert false, "the script parses"
+    assert error_line("X = 0x1FFFFFFFFFFFFFFFF;", "bad number").unwrap_or(0) == 1
+    assert error_line("X = 12Q;", "bad number").unwrap_or(0) == 1
+    0
+
+[[test]]
+fn test_errors_name_the_line() -> i32
+    assert error_line("SECTIONS {\n  .text : { foo.o(.text) }\n}", "an input pattern's file part must be *").unwrap_or(0) == 2
+    assert error_line("\n\nINCLUDE other.ld", "unsupported command").unwrap_or(0) == 3
+    assert error_line("SECTIONS { . = 4 * 2; }", "expected ;").unwrap_or(0) == 1
+    assert error_line("SECTIONS { }\nSECTIONS { }", "a second SECTIONS").unwrap_or(0) == 2
+    assert error_line("/* open", "unterminated comment").unwrap_or(0) == 1
+    assert error_line("SECTIONS { .t : { *(SORT(.text)) } }", "unsupported pattern").unwrap_or(0) == 1
+    assert error_line("SECTIONS { .t : { *(.te*xt) } }", "unsupported pattern").unwrap_or(0) == 1
+    assert error_line("SECTIONS { .t : { *(.text) } > RAM }", "unsupported output section attribute").unwrap_or(0) == 1
+    assert error_line("OUTPUT_FORMAT(elf32-i386)", "unsupported output").unwrap_or(0) == 1
+    assert error_line("SECTIONS { . = MAX(1, 2); }", "unsupported function").unwrap_or(0) == 1
+    assert error_line("SECTIONS { .t : { *(.text) }", "expected }").unwrap_or(0) == 1
+    assert error_line("ENTRY(x)\x00", "a NUL byte").unwrap_or(0) == 1
+    0

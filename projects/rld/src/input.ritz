@@ -17,6 +17,11 @@ const ELFDATA2LSB: i64 = 1
 
 # Global table value for a name only referenced so far.
 pub const UNRESOLVED: i64 = -1
+# x86-64's large-model section flag ('l'): ld.lld ranks .ltext, .lrodata and
+# .ldata by it, so the reader keeps it.
+pub const SHF_X86_64_LARGE: i64 = 0x10000000
+# The `file` of a symbol a linker script defines.
+pub const SCRIPT_FILE: i64 = -1
 
 pub enum LinkError
     Unreadable(StrView)                 # path
@@ -29,13 +34,15 @@ pub enum LinkError
     Overflow(StrView, i64)              # symbol, relocation type
     NotPic(StrView, i64)                # symbol, relocation type: an address no PIE can load
     Unwritable(StrView)                 # output path
+    Script(StrView, i64, StrView, StrView)  # script path, line, what is wrong, the word it is about
+    Discarded(StrView)                  # a symbol in a section a script discarded
 
 # One input section, in file order.
 pub struct InSection
     file: i64
     name: StrView
     stype: i64
-    flags: i64          # SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR bits only
+    flags: i64          # SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_X86_64_LARGE bits only
     align: i64
     data: Span<u8>      # the bytes; empty for NOBITS
     size: i64
@@ -179,7 +186,7 @@ impl Linker
                 file: file,
                 name: name,
                 stype: h.stype,
-                flags: h.flags & (SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR),
+                flags: h.flags & (SHF_WRITE | SHF_ALLOC | SHF_EXECINSTR | SHF_X86_64_LARGE),
                 align: align,
                 data: if nobits or h.stype == SHT_NULL then span_empty<u8>() else bytes.slice(h.offset, h.offset + h.size),
                 size: h.size,
@@ -344,6 +351,38 @@ impl Linker
         match self.globals.get(s.name)
             Some(d) => d
             None => UNRESOLVED
+
+    # Whether an input references `name` and none defines it.
+    pub fn wants(self: @Linker, name: StrView) -> bool
+        match self.globals.get(name)
+            Some(d) => d == UNRESOLVED
+            None => false
+
+    # Define `name` as an absolute symbol a script assigns, over any input's
+    # definition, as ld.lld does; its value is set as the script is
+    # evaluated. The new symbol's index.
+    pub fn define_script_symbol(self: @&Linker, name: StrView) -> i64
+        self.symbols.push(InSymbol {
+            file: SCRIPT_FILE,
+            name: name,
+            bind: STB_GLOBAL,
+            stype: STT_NOTYPE,
+            shndx: SHN_ABS,
+            value: 0,
+            size: 0
+        })
+        self.globals.insert(name, self.symbols.len - 1)
+        self.symbols.len - 1
+
+    # Drop the relocations that patch a section the link does not keep, as
+    # one a script discards.
+    pub fn drop_unkept_relocs(self: @&Linker)
+        var kept: Vec<InReloc> = vec_new<InReloc>()
+        for r in 0..self.relocs.len
+            let rel: InReloc = self.relocs[r]
+            if self.is_kept(rel.section)
+                kept.push(rel)
+        self.relocs = kept
 
     # The global definition of `name`, or UNRESOLVED.
     pub fn lookup(self: @Linker, name: StrView) -> i64

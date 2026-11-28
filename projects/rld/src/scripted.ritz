@@ -1,0 +1,841 @@
+# The scripted executable (../razm/DESIGN.md "Linker scripts", "Outputs"):
+# ET_EXEC at the script's addresses, entry from its ENTRY, laid out as
+# ld.lld lays out the same script.
+#
+# Inputs are the kept object sections, then the sections the linker makes
+# (the GOT), which patterns match like any other, after them, as ld.lld's
+# synthetic sections. Placement is first match: output statements in script
+# order, each `*(pat ...)` claiming in input order every unclaimed input any
+# of its patterns matches. /DISCARD/ drops what it claims. An input nothing
+# claims is an orphan, placed by ld.lld's sort-rank proximity.
+#
+# Segments follow ld.lld's rules: a new PT_LOAD where the permissions change,
+# where a section has its own AT(), and after the RELRO sections; a PT_LOAD
+# that spans no bytes is dropped. Each PT_LOAD's file offset is its address
+# modulo its alignment, and the sections after its first keep their address
+# distance in the file.
+import ritzlib.fmt
+import ritzlib.fs { read_file }
+import ritzlib.gvec { Vec, vec_new, vec_zeroed }
+import ritzlib.hashmap { HashMap, hashmap_new }
+import ritzlib.option { Option }
+import ritzlib.result { Result }
+import ritzlib.span { Span }
+import ritzlib.string { String }
+import ritzlib.strview { StrView }
+import razm.elf
+import rld.dynamic { Output }
+import rld.input
+import rld.link
+import rld.script
+
+# The linker-made inputs, after the object sections: the GOT, whose size
+# the GOT plan sets, and .got.plt, which ld.lld makes (three reserved words,
+# zero in an executable with no _DYNAMIC) when an input references
+# _GLOBAL_OFFSET_TABLE_, as `as` does for every GOT relocation. The symbol
+# is .got.plt's address, and the GOT is kept then, empty or not.
+const SYNTH_GOT: i64 = 0
+const SYNTH_GOTPLT: i64 = 1
+const SYNTHETICS: i64 = 2
+const GOT_NAME: StrView = ".got"
+const GOTPLT_NAME: StrView = ".got.plt"
+const GOT_TABLE: StrView = "_GLOBAL_OFFSET_TABLE_"
+const GOTPLT_SIZE: i64 = 3 * GOT_ENTRY
+
+# ld.lld's sort-rank bits (lld/ELF/Writer.cpp getSectionRank), the subset
+# an executable's sections reach. Orphans go beside the section whose rank
+# shares the most leading bits with theirs.
+const RF_WRITE: i64 = 1 << 14
+const RF_EXEC_WRITE: i64 = 1 << 13
+const RF_EXEC: i64 = 1 << 12
+const RF_RODATA: i64 = 1 << 11
+const RF_LARGE: i64 = 1 << 9
+const RF_NOT_RELRO: i64 = 1 << 8
+const RF_NOT_TLS: i64 = 1 << 7
+const RF_BSS: i64 = 1 << 6
+
+# Output sections ld.lld makes RELRO by name.
+const RELRO_NAMES: [9]StrView = [".data.rel.ro", ".bss.rel.ro", ".ctors", ".dtors", ".jcr", ".dynamic", ".init_array", ".fini_array", ".preinit_array"]
+
+# One output section of the layout.
+struct ScriptOut
+    name: StrView
+    stmt: Option<i64>   # its OutputStmt; None for an orphan
+    flags: i64
+    nobits: bool        # (NOLOAD), or every member NOBITS
+    align: i64
+    has_inputs: bool    # a pattern matched an input, if only an empty GOT
+    empty: bool         # no member with a place in it
+    kept: bool          # placed: not empty, or ld.lld keeps it empty
+    relro: bool
+    rank: i64
+    addr: i64
+    lma: i64
+    size: i64
+    offset: i64
+    seg: Option<i64>    # its PT_LOAD in `segs`, if one holds it
+    index: i64          # in the image's outs, once placed
+
+# A command of the script, or an orphan output section, in layout order.
+enum LayoutStep
+    Cmd(i64)            # a Command
+    Orphan(i64)         # an ScriptOut
+
+# The first-match claims, made once.
+struct ScriptClaims
+    members: Vec<i64>           # claimed inputs, InputDesc by InputDesc
+    desc_first: Vec<i64>        # per InputDesc, its first member
+    desc_count: Vec<i64>
+    claimed: Vec<bool>          # per input, sections then linker-made ones
+
+# A PT_LOAD being built: its first and last ScriptOut.
+struct LoadRun
+    first: i64
+    last: i64
+    flags: i64
+
+struct ScriptLayout
+    path: StrView               # the script's, for errors
+    nsec: i64                   # object sections: inputs below this are theirs
+    claims: ScriptClaims
+    symbols: HashMap<StrView, i64>  # each name the script defines: its InSymbol
+    values: HashMap<StrView, i64>   # each script symbol evaluated so far
+    addrs: HashMap<StrView, i64>    # each output section placed so far: its address
+    got_table: Option<i64>      # the _GLOBAL_OFFSET_TABLE_ InSymbol, when an input wants it
+
+fn script_error(path: StrView, what: StrView, token: StrView) -> LinkError
+    LinkError.Script(path, 0, what, token)
+
+# The leading zero bits of a 32-bit rank.
+fn clz32(v: i64) -> i64
+    var n: i64 = 0
+    var bit: i64 = 1 << 31
+    while bit != 0 and (v & bit) == 0
+        n += 1
+        bit = bit >> 1
+    n
+
+# Whether address `a` is below `b`, as unsigned 64-bit values.
+fn below(a: i64, b: i64) -> bool
+    let top: i64 = 1 << 63
+    (a ^ top) < (b ^ top)
+
+fn pf_flags(shf: i64) -> i64
+    var f: i64 = PF_R
+    if (shf & SHF_WRITE) != 0
+        f = f | PF_W
+    if (shf & SHF_EXECINSTR) != 0
+        f = f | PF_X
+    f
+
+# ld.lld's rank for an allocated output section.
+fn rank_of(o: ScriptOut) -> i64
+    let write: bool = (o.flags & SHF_WRITE) != 0
+    let exec: bool = (o.flags & SHF_EXECINSTR) != 0
+    let large: bool = (o.flags & SHF_X86_64_LARGE) != 0
+    var rank: i64 = 0
+    if not write and not exec
+        if not o.nobits
+            rank = rank | RF_RODATA
+        # .lrodata goes before .rodata: further from .text.
+        if not large
+            rank = rank | RF_LARGE
+    else if exec
+        rank = rank | (if write then RF_EXEC_WRITE else RF_EXEC)
+    else
+        rank = rank | RF_WRITE | RF_NOT_TLS
+        if not o.relro
+            rank = rank | RF_NOT_RELRO
+        # .ldata and .lbss go after .bss.
+        if large
+            rank = rank | RF_LARGE
+    if o.nobits
+        rank = rank | RF_BSS
+    rank
+
+impl ScriptLayout
+    fn input_count(self: @ScriptLayout) -> i64
+        self.nsec + SYNTHETICS
+
+    fn name(self: @ScriptLayout, l: @Linker, i: i64) -> StrView
+        synthetic_name(l, i)
+
+    fn flags(self: @ScriptLayout, l: @Linker, i: i64) -> i64
+        if i < self.nsec then l.sections[i].flags else SHF_ALLOC | SHF_WRITE
+
+    fn align(self: @ScriptLayout, l: @Linker, i: i64) -> i64
+        if i < self.nsec then l.sections[i].align else GOT_ENTRY
+
+    fn size(self: @ScriptLayout, l: @Linker, img: @Image, i: i64) -> i64
+        if i < self.nsec
+            return l.sections[i].size
+        if i == self.nsec + SYNTH_GOT
+            return img.got_syms.len * GOT_ENTRY
+        if self.got_table.is_some() then GOTPLT_SIZE else 0
+
+    # Whether linker-made input `i` is in the image: the GOT when it has an
+    # entry or _GLOBAL_OFFSET_TABLE_ is referenced, .got.plt in that case.
+    # Object sections always are.
+    fn needed(self: @ScriptLayout, img: @Image, i: i64) -> bool
+        if i < self.nsec
+            return true
+        if i == self.nsec + SYNTH_GOT and img.got_syms.len > 0
+            return true
+        self.got_table.is_some()
+
+    fn nobits(self: @ScriptLayout, l: @Linker, i: i64) -> bool
+        i < self.nsec and l.sections[i].stype == SHT_NOBITS
+
+    fn is_got(self: @ScriptLayout, i: i64) -> bool
+        i == self.nsec + SYNTH_GOT
+
+    fn is_gotplt(self: @ScriptLayout, i: i64) -> bool
+        i == self.nsec + SYNTH_GOTPLT
+
+    # Whether input `i` goes in the link at all: a kept object section, or
+    # a linker-made one.
+    fn candidate(self: @ScriptLayout, l: @Linker, i: i64) -> bool
+        i >= self.nsec or l.is_kept(i)
+
+    # An expression's value, with `.` at `dot`. Addresses wrap at 64 bits.
+    fn eval(self: @ScriptLayout, s: @Script, e: i64, dot: i64) -> Result<i64, LinkError>
+        match s.exprs[e]
+            Number(n) => Ok(n)
+            Dot => Ok(dot)
+            Symbol(name) =>
+                match self.values.get(name)
+                    Some(v) => Ok(v)
+                    None => Err(LinkError.Undefined(name))
+            Add(a, b) => Ok(self.eval(s, a, dot)? +% self.eval(s, b, dot)?)
+            Sub(a, b) => Ok(self.eval(s, a, dot)? -% self.eval(s, b, dot)?)
+            Align(a) =>
+                let n: i64 = self.eval(s, a, dot)?
+                if n <= 0 or (n & (n - 1)) != 0
+                    return Err(script_error(self.path, "ALIGN of a value that is not a power of two", ""))
+                Ok(align_up(dot, n))
+            Addr(name) =>
+                match self.addrs.get(name)
+                    Some(v) => Ok(v)
+                    None => Err(script_error(self.path, "ADDR of a section not placed before it", name))
+
+    # Assign a script symbol: its value, and its InSymbol's.
+    fn assign(self: @&ScriptLayout, l: @&Linker, name: StrView, value: i64)
+        self.values.insert(name, value)
+        match self.symbols.get(name)
+            Some(sym) =>
+                var s: InSymbol = l.symbols[sym]
+                s.value = value
+                l.symbols[sym] = s
+            None => pass
+
+    # Whether the script defines `name`: always for an assignment, and for
+    # a PROVIDE only when an input wants it.
+    fn defines(self: @ScriptLayout, name: StrView) -> bool
+        match self.symbols.get(name)
+            Some(_) => true
+            None => false
+
+# Input `i`'s section name: an object section's, else a linker-made one's.
+fn synthetic_name(l: @Linker, i: i64) -> StrView
+    let nsec: i64 = l.sections.len
+    if i < nsec
+        return l.sections[i].name
+    if i == nsec + SYNTH_GOT then GOT_NAME else GOTPLT_NAME
+
+# First match, once: each InputDesc in script order claims, in input order,
+# every unclaimed input one of its patterns matches. /DISCARD/'s claims are
+# dropped from the link.
+fn claim(l: @&Linker, s: @Script, nsec: i64) -> ScriptClaims
+    var c: ScriptClaims = ScriptClaims {
+        members: vec_new<i64>(),
+        desc_first: vec_zeroed<i64>(s.descs.len),
+        desc_count: vec_zeroed<i64>(s.descs.len),
+        claimed: vec_zeroed<bool>(nsec + SYNTHETICS)
+    }
+    for o in 0..s.outputs.len
+        let stmt: OutputStmt = s.outputs[o]
+        for it in stmt.first_item..(stmt.first_item + stmt.item_count)
+            match s.items[it]
+                Inputs(d) =>
+                    let desc: InputDesc = s.descs[d]
+                    c.desc_first[d] = c.members.len
+                    for i in 0..(nsec + SYNTHETICS)
+                        if c.claimed[i] or not (i >= nsec or l.is_kept(i))
+                            continue
+                        let name: StrView = synthetic_name(l, i)
+                        var hit: bool = false
+                        for p in desc.first..(desc.first + desc.count)
+                            if s.patterns[p].matches(name)
+                                hit = true
+                                break
+                        if not hit
+                            continue
+                        c.claimed[i] = true
+                        if stmt.is_discard()
+                            if i < nsec
+                                var sec: InSection = l.sections[i]
+                                sec.discarded = true
+                                l.sections[i] = sec
+                        else
+                            c.members.push(i)
+                    c.desc_count[d] = c.members.len - c.desc_first[d]
+                _ => pass
+    c
+
+# Define every symbol the script assigns, and each PROVIDE an input wants.
+fn define_symbols(l: @&Linker, s: @Script) -> HashMap<StrView, i64>
+    var defined: HashMap<StrView, i64> = hashmap_new<StrView, i64>()
+    for c in 0..s.commands.len
+        match s.commands[c]
+            Assign(name, _, provide) => define_one(l, @&defined, name, provide)
+            Output(o) =>
+                let stmt: OutputStmt = s.outputs[o]
+                for it in stmt.first_item..(stmt.first_item + stmt.item_count)
+                    match s.items[it]
+                        Assign(name, _, provide) => define_one(l, @&defined, name, provide)
+                        _ => pass
+            _ => pass
+    defined
+
+fn define_one(l: @&Linker, defined: @&HashMap<StrView, i64>, name: StrView, provide: bool)
+    match defined.get(name)
+        Some(_) => return
+        None => pass
+    if provide and not l.wants(name)
+        return
+    defined.insert(name, l.define_script_symbol(name))
+
+# The scripted layout of the linked inputs. Prints a line for each orphan.
+pub fn script_layout(l: @&Linker, s: @Script, path: StrView) -> Result<Image, LinkError>
+    let nsec: i64 = l.sections.len
+    let got_table: Option<i64> = if l.wants(GOT_TABLE) then Some(l.define_script_symbol(GOT_TABLE)) else None
+    var lay: ScriptLayout = ScriptLayout {
+        path: path,
+        nsec: nsec,
+        claims: claim(l, s, nsec),
+        symbols: define_symbols(l, s),
+        values: hashmap_new<StrView, i64>(),
+        addrs: hashmap_new<StrView, i64>(),
+        got_table: got_table
+    }
+    l.drop_unkept_relocs()
+    check_undefined(l)?
+    check_discarded(l)?
+    var img: Image = image_new(l, Output.Executable)
+    loop
+        plan_got(l, @&img)
+        place(l, s, @&lay, @&img)?
+        if not unrelax_out_of_range(l, @&img)
+            break
+    let start: i64 = l.lookup(s.entry)
+    if start == UNRESOLVED
+        return Err(LinkError.NoEntry(s.entry))
+    img.entry = address(l, @img, start)
+    report_orphans(l, @lay, @img)
+    Ok(img)
+
+# A kept relocation must not reach into a section /DISCARD/ dropped, as
+# ld.lld refuses it too.
+fn check_discarded(l: @Linker) -> Result<(), LinkError>
+    for r in 0..l.relocs.len
+        let rel: InReloc = l.relocs[r]
+        let d: i64 = l.definition(rel.symbol)
+        if d == UNRESOLVED
+            continue
+        let sec: i64 = l.symbol_section(d)
+        if sec >= 0 and l.sections[sec].discarded
+            return Err(LinkError.Discarded(l.symbols[rel.symbol].name))
+    Ok(())
+
+# The orphans, one line each: `rld: orphan section NAME from FILE`, or
+# `made by the linker` for a linker-made one.
+fn report_orphans(l: @Linker, lay: @ScriptLayout, img: @Image)
+    for i in 0..lay.input_count()
+        if lay.claims.claimed[i] or not lay.candidate(l, i) or not lay.needed(img, i)
+            continue
+        let name: StrView = lay.name(l, i)
+        if i < lay.nsec
+            let file: StrView = l.paths[l.sections[i].file]
+            print("rld: orphan section {name} from {file}\n")
+        else
+            print("rld: orphan section {name} made by the linker\n")
+
+# Where orphan output `o` goes in `order` (lld/ELF/LinkerScript.cpp
+# findOrphanPos): beside the section whose rank shares the most leading
+# bits with its own, after it when that rank is no greater, else before it,
+# and after any run of sections that tie.
+fn orphan_pos(outs: @Vec<ScriptOut>, order: @Vec<LayoutStep>, s: @Script, o: i64) -> i64
+    let me: ScriptOut = outs[o]
+    # The first `. =` before any section stays first.
+    var b: i64 = 0
+    while b < order.len
+        let first_cmd: bool = match order[b]
+            Cmd(c) =>
+                match s.commands[c]
+                    SetDot(_) => true
+                    Output(_) => true
+                    _ => false
+            Orphan(_) => true
+        if first_cmd
+            break
+        b += 1
+    if b < order.len
+        match order[b]
+            Cmd(c) =>
+                match s.commands[c]
+                    SetDot(_) =>
+                        b += 1
+                    _ => pass
+            _ => pass
+    let e: i64 = order.len
+    var best: i64 = e
+    var max_p: i64 = 0
+    for j in b..e
+        let p: i64 = proximity(outs, order, s, j, me.rank)
+        if p < 0
+            continue
+        let other: ScriptOut = slot_out(outs, order, s, j)
+        if p > max_p or (p == max_p and other.rank <= me.rank)
+            max_p = p
+            best = j
+    if best == e
+        return e
+    var i: i64 = best
+    while i < e
+        let p: i64 = proximity(outs, order, s, i, me.rank)
+        if p >= 0
+            if p != max_p or me.rank < slot_out(outs, order, s, i).rank
+                break
+        i += 1
+    # Back to just after the last section with inputs before `i`.
+    while i > b and proximity(outs, order, s, i - 1, me.rank) < 0
+        i -= 1
+    i
+
+# The ScriptOut a slot holds; one with no inputs for a slot that holds none.
+fn slot_out(outs: @Vec<ScriptOut>, order: @Vec<LayoutStep>, s: @Script, j: i64) -> ScriptOut
+    let none: ScriptOut = ScriptOut { name: "", stmt: None, flags: 0, nobits: false, align: 1, has_inputs: false, empty: true, kept: false, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0 }
+    match order[j]
+        Orphan(o) => outs[o]
+        Cmd(c) =>
+            match s.commands[c]
+                Output(st) =>
+                    match out_of_stmt(outs, st)
+                        Some(o) => outs[o]
+                        None => none
+                _ => none
+
+# The ScriptOut of OutputStmt `st`; None for /DISCARD/.
+fn out_of_stmt(outs: @Vec<ScriptOut>, st: i64) -> Option<i64>
+    for o in 0..outs.len
+        match outs[o].stmt
+            Some(x) =>
+                if x == st
+                    return Some(o)
+            None => pass
+    None
+
+# How many leading rank bits slot `j`'s section shares with `rank`, or -1
+# when it is no anchor (not a section, or one with no inputs).
+fn proximity(outs: @Vec<ScriptOut>, order: @Vec<LayoutStep>, s: @Script, j: i64, rank: i64) -> i64
+    let o: ScriptOut = slot_out(outs, order, s, j)
+    if not o.has_inputs or not o.kept
+        return -1
+    clz32(o.rank ^ rank)
+
+# Lay the sections out: build the output sections, place the orphans,
+# assign addresses, then make the segments and file offsets.
+fn place(l: @&Linker, s: @Script, lay: @&ScriptLayout, img: @&Image) -> Result<(), LinkError>
+    img.got_out = -1
+    img.got_at = 0
+    var outs: Vec<ScriptOut> = vec_new<ScriptOut>()
+    for st in 0..s.outputs.len
+        let stmt: OutputStmt = s.outputs[st]
+        if stmt.is_discard()
+            continue
+        outs.push(ScriptOut { name: stmt.name, stmt: Some(st), flags: 0, nobits: true, align: 1, has_inputs: false, empty: true, kept: false, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0 })
+
+    # Orphans: each by its own name, into the output of that name if there
+    # is one, else a new output section.
+    var extra_out: Vec<i64> = vec_new<i64>()
+    var extra_in: Vec<i64> = vec_new<i64>()
+    for i in 0..lay.input_count()
+        if lay.claims.claimed[i] or not lay.candidate(l, i)
+            continue
+        if not lay.needed(img, i)
+            continue
+        let name: StrView = lay.name(l, i)
+        var target: i64 = 0
+        while target < outs.len and not outs[target].name.eq(name)
+            target += 1
+        if target == outs.len
+            outs.push(ScriptOut { name: name, stmt: None, flags: 0, nobits: true, align: 1, has_inputs: true, empty: true, kept: true, relro: false, rank: 0, addr: 0, lma: 0, size: 0, offset: 0, seg: None, index: 0 })
+        extra_out.push(target)
+        extra_in.push(i)
+
+    # Each output's flags, type and alignment from its members.
+    for o in 0..outs.len
+        var out: ScriptOut = outs[o]
+        var noload: bool = false
+        match out.stmt
+            Some(st) =>
+                let stmt: OutputStmt = s.outputs[st]
+                noload = stmt.noload
+                for it in stmt.first_item..(stmt.first_item + stmt.item_count)
+                    match s.items[it]
+                        Inputs(d) =>
+                            let first: i64 = lay.claims.desc_first[d]
+                            for m in first..(first + lay.claims.desc_count[d])
+                                out = with_member(lay, l, img, out, lay.claims.members[m])
+                        _ => pass
+            None => pass
+        for x in 0..extra_out.len
+            if extra_out[x] == o
+                out = with_member(lay, l, img, out, extra_in[x])
+        if noload
+            out.nobits = true
+        else if out.empty
+            out.nobits = false
+        outs[o] = out
+
+    # Which empty script outputs ld.lld keeps, and the flags they take: those
+    # of the last output with inputs before them, less exec.
+    var prev_flags: i64 = SHF_ALLOC
+    for o in 0..outs.len
+        var out: ScriptOut = outs[o]
+        let st: i64 = match out.stmt
+            Some(st) => st
+            None => continue
+        out.kept = not out.empty or keeps_empty(s, s.outputs[st])
+        if out.has_inputs and out.kept
+            prev_flags = out.flags
+        if out.empty
+            out.flags = prev_flags & (SHF_ALLOC | SHF_WRITE)
+        outs[o] = out
+    for o in 0..outs.len
+        var out: ScriptOut = outs[o]
+        out.relro = is_relro(out.name) or holds_got(lay, s, @lay.claims, out, @extra_out, @extra_in, o)
+        out.rank = rank_of(out)
+        outs[o] = out
+
+    # The layout order: the script's commands, then each orphan output
+    # inserted where ld.lld puts it, lowest rank first.
+    var order: Vec<LayoutStep> = vec_new<LayoutStep>()
+    for c in 0..s.commands.len
+        order.push(LayoutStep.Cmd(c))
+    var pending: Vec<i64> = vec_new<i64>()
+    for o in 0..outs.len
+        if outs[o].stmt.is_none()
+            pending.push(o)
+    # Stable by rank.
+    for a in 1..pending.len
+        var k: i64 = a
+        while k > 0 and outs[pending[k - 1]].rank > outs[pending[k]].rank
+            pending.swap(k - 1, k)
+            k -= 1
+    for p in 0..pending.len
+        let at: i64 = orphan_pos(@outs, @order, s, pending[p])
+        var next: Vec<LayoutStep> = vec_new<LayoutStep>()
+        for j in 0..order.len
+            if j == at
+                next.push(LayoutStep.Orphan(pending[p]))
+            next.push(order[j])
+        if at == order.len
+            next.push(LayoutStep.Orphan(pending[p]))
+        order = next
+
+    # Addresses, in layout order.
+    lay.values = hashmap_new<StrView, i64>()
+    lay.addrs = hashmap_new<StrView, i64>()
+    var dot: i64 = 0
+    var lma_offset: i64 = 0
+    var placed: Vec<i64> = vec_new<i64>()
+    for j in 0..order.len
+        match order[j]
+            Orphan(o) =>
+                placed.push(o)
+                let out: ScriptOut = outs[o]
+                dot = align_up(dot, out.align)
+                var at: ScriptOut = out
+                at.addr = dot
+                at.lma = dot +% lma_offset
+                lay.addrs.insert(at.name, dot)
+                for x in 0..extra_out.len
+                    if extra_out[x] == o
+                        dot = put_member(lay, l, img, at, o, dot, extra_in[x])
+                at.size = dot - at.addr
+                outs[o] = at
+            Cmd(c) =>
+                match s.commands[c]
+                    SetDot(e) =>
+                        dot = lay.eval(s, e, dot)?
+                    Assign(name, e, _) =>
+                        if lay.defines(name)
+                            let v: i64 = lay.eval(s, e, dot)?
+                            lay.assign(l, name, v)
+                    Output(st) =>
+                        let o: i64 = match out_of_stmt(@outs, st)
+                            Some(o) => o
+                            None => continue
+                        if not outs[o].kept
+                            continue
+                        placed.push(o)
+                        var out: ScriptOut = outs[o]
+                        let stmt: OutputStmt = s.outputs[st]
+                        match stmt.addr
+                            Some(e) =>
+                                dot = lay.eval(s, e, dot)?
+                                if (dot & (out.align - 1)) != 0
+                                    return Err(script_error(lay.path, "the address of an output section is not a multiple of its alignment:", out.name))
+                            None =>
+                                dot = align_up(dot, out.align)
+                        out.addr = dot
+                        lay.addrs.insert(out.name, dot)
+                        match stmt.lma
+                            Some(e) =>
+                                lma_offset = lay.eval(s, e, dot)? -% dot
+                            None => pass
+                        out.lma = dot +% lma_offset
+                        for it in stmt.first_item..(stmt.first_item + stmt.item_count)
+                            match s.items[it]
+                                Assign(name, e, _) =>
+                                    if lay.defines(name)
+                                        let v: i64 = lay.eval(s, e, dot)?
+                                        lay.assign(l, name, v)
+                                Inputs(d) =>
+                                    let first: i64 = lay.claims.desc_first[d]
+                                    for m in first..(first + lay.claims.desc_count[d])
+                                        dot = put_member(lay, l, img, out, o, dot, lay.claims.members[m])
+                        for x in 0..extra_out.len
+                            if extra_out[x] == o
+                                dot = put_member(lay, l, img, out, o, dot, extra_in[x])
+                        out.size = dot - out.addr
+                        outs[o] = out
+
+    # Members were recorded by ScriptOut index; the image numbers its outputs in
+    # layout order.
+    for k in 0..placed.len
+        var out: ScriptOut = outs[placed[k]]
+        out.index = k
+        outs[placed[k]] = out
+    for i in 0..lay.nsec
+        var sec: InSection = l.sections[i]
+        if sec.out >= 0 and sec.out < outs.len
+            sec.out = outs[sec.out].index
+            l.sections[i] = sec
+    if img.got_out >= 0 and img.got_out < outs.len
+        img.got_out = outs[img.got_out].index
+
+    segments(lay, s, @&outs, @placed, img)?
+    Ok(())
+
+# `out` with input `i` among its members.
+fn with_member(lay: @ScriptLayout, l: @Linker, img: @Image, out: ScriptOut, i: i64) -> ScriptOut
+    var o: ScriptOut = out
+    o.has_inputs = true
+    o.flags = o.flags | lay.flags(l, i)
+    let align: i64 = lay.align(l, i)
+    if align > o.align
+        o.align = align
+    # A linker-made section the image does not need takes no place.
+    if lay.needed(img, i)
+        o.empty = false
+        if not lay.nobits(l, i)
+            o.nobits = false
+    o
+
+# Place input `i` at `dot` in output `o` (whose address is `out.addr`);
+# the address after it. Its output is recorded by ScriptOut index for now.
+fn put_member(lay: @ScriptLayout, l: @&Linker, img: @&Image, out: ScriptOut, o: i64, dot: i64, i: i64) -> i64
+    let at: i64 = align_up(dot, lay.align(l, i))
+    if lay.is_got(i)
+        img.got_out = o
+        img.got_at = at - out.addr
+    else if lay.is_gotplt(i)
+        match lay.got_table
+            Some(t) =>
+                var sym: InSymbol = l.symbols[t]
+                sym.value = at
+                l.symbols[t] = sym
+            None => pass
+    else
+        var sec: InSection = l.sections[i]
+        sec.out = o
+        sec.offset = at - out.addr
+        l.sections[i] = sec
+    at + lay.size(l, img, i)
+
+# Whether ld.lld keeps output statement `stmt` though nothing is in it: an
+# address or AT() that names a symbol, an ADDR() of it, or a symbol
+# assigned in it.
+fn keeps_empty(s: @Script, stmt: OutputStmt) -> bool
+    match stmt.addr
+        Some(e) =>
+            if s.uses_symbol(e)
+                return true
+        None => pass
+    match stmt.lma
+        Some(e) =>
+            if s.uses_symbol(e)
+                return true
+        None => pass
+    if s.addr_taken(stmt.name)
+        return true
+    for it in stmt.first_item..(stmt.first_item + stmt.item_count)
+        match s.items[it]
+            Assign(_, _, provide) =>
+                if not provide
+                    return true
+            _ => pass
+    false
+
+fn is_relro(name: StrView) -> bool
+    for k in 0..9
+        if name.eq(RELRO_NAMES[k])
+            return true
+    false
+
+# Whether output `o` holds the GOT: a pattern of its statement claimed
+# it, or it is the GOT's orphan output.
+fn holds_got(lay: @ScriptLayout, s: @Script, claims: @ScriptClaims, out: ScriptOut, extra_out: @Vec<i64>, extra_in: @Vec<i64>, o: i64) -> bool
+    let got: i64 = lay.nsec + SYNTH_GOT
+    match out.stmt
+        Some(st) =>
+            let stmt: OutputStmt = s.outputs[st]
+            for it in stmt.first_item..(stmt.first_item + stmt.item_count)
+                match s.items[it]
+                    Inputs(d) =>
+                        let first: i64 = claims.desc_first[d]
+                        for m in first..(first + claims.desc_count[d])
+                            if claims.members[m] == got
+                                return true
+                    _ => pass
+        None => pass
+    for x in 0..extra_out.len
+        if extra_out[x] == o and extra_in[x] == got
+            return true
+    false
+
+# The PT_LOADs and file offsets of the placed outputs, and the image's
+# output sections.
+fn segments(lay: @ScriptLayout, s: @Script, outs: @&Vec<ScriptOut>, placed: @Vec<i64>, img: @&Image) -> Result<(), LinkError>
+    # The ELF and program headers load only if they fit below the first
+    # section on its page; none of the tree's scripts leaves room.
+    var min: i64 = -1
+    for k in 0..placed.len
+        let a: i64 = outs[placed[k]].addr
+        if k == 0 or below(a, min)
+            min = a
+    # The first section after the RELRO ones starts a PT_LOAD.
+    var relro_end: Option<i64> = None
+    var in_relro: bool = false
+    for k in 0..placed.len
+        if outs[placed[k]].relro
+            in_relro = true
+        else if in_relro and relro_end.is_none()
+            relro_end = Some(k)
+            in_relro = false
+
+    var loads: Vec<LoadRun> = vec_new<LoadRun>()
+    for k in 0..placed.len
+        let out: ScriptOut = outs[placed[k]]
+        let flags: i64 = pf_flags(out.flags)
+        # A section with its own AT() starts a PT_LOAD (ld.lld's createPhdrs).
+        let own_at: bool = match out.stmt
+            Some(st) => s.outputs[st].lma.is_some()
+            None => false
+        let after_relro: bool = match relro_end
+            Some(e) => e == k
+            None => false
+        var start: bool = loads.len == 0 or after_relro or own_at
+        if loads.len > 0 and loads[loads.len - 1].flags != flags
+            start = true
+        if start
+            loads.push(LoadRun { first: k, last: k, flags: flags })
+        else
+            var ld: LoadRun = loads[loads.len - 1]
+            ld.last = k
+            loads[loads.len - 1] = ld
+    # A PT_LOAD that spans nothing is dropped.
+    var kept: Vec<LoadRun> = vec_new<LoadRun>()
+    for g in 0..loads.len
+        let ld: LoadRun = loads[g]
+        let first: ScriptOut = outs[placed[ld.first]]
+        let last: ScriptOut = outs[placed[ld.last]]
+        if last.addr + last.size - first.addr != 0
+            for k in ld.first..(ld.last + 1)
+                var o: ScriptOut = outs[placed[k]]
+                o.seg = Some(kept.len)
+                outs[placed[k]] = o
+            kept.push(ld)
+
+    let phnum: i64 = kept.len + 1
+    let headers: i64 = EHDR_SIZE + phnum * PHDR_SIZE
+    if placed.len > 0 and (min & (PAGE - 1)) >= headers
+        return Err(script_error(lay.path, "the first section leaves room for the ELF headers on its page; loading them is not supported", ""))
+
+    # Segment alignment: the page, or a member's larger alignment.
+    var seg_align: Vec<i64> = vec_zeroed<i64>(kept.len)
+    for g in 0..kept.len
+        seg_align[g] = PAGE
+    for k in 0..placed.len
+        let o: ScriptOut = outs[placed[k]]
+        match o.seg
+            Some(g) =>
+                if o.align > seg_align[g]
+                    seg_align[g] = o.align
+            None => pass
+
+    # File offsets (lld/ELF/Writer.cpp computeFileOffset).
+    var off: i64 = headers
+    for k in 0..placed.len
+        var o: ScriptOut = outs[placed[k]]
+        match o.seg
+            Some(g) =>
+                if kept[g].first == k
+                    off = off + ((o.addr - off) & (seg_align[g] - 1))
+                else if not o.nobits
+                    let first: ScriptOut = outs[placed[kept[g].first]]
+                    off = first.offset + (o.addr - first.addr)
+            None =>
+                if not o.nobits
+                    off = align_up(off, o.align)
+        o.offset = off
+        if not o.nobits
+            off += o.size
+        outs[placed[k]] = o
+
+    var segs: Vec<Segment> = vec_new<Segment>()
+    for g in 0..kept.len
+        let first: ScriptOut = outs[placed[kept[g].first]]
+        let last: ScriptOut = outs[placed[kept[g].last]]
+        var filesz: i64 = last.offset - first.offset
+        if not last.nobits
+            filesz += last.size
+        segs.push(Segment { flags: kept[g].flags, offset: first.offset, addr: first.addr, paddr: first.lma, filesz: filesz, memsz: last.addr + last.size - first.addr, align: seg_align[g], used: true })
+    img.segs = segs
+
+    var image_outs: Vec<OutSection> = vec_new<OutSection>()
+    var identity: Vec<i64> = vec_new<i64>()
+    for k in 0..placed.len
+        let o: ScriptOut = outs[placed[k]]
+        image_outs.push(OutSection { name: o.name, stype: if o.nobits then SHT_NOBITS else SHT_PROGBITS, flags: o.flags, align: o.align, size: o.size, nobits: o.nobits, addr: o.addr, lma: o.lma, offset: o.offset })
+        identity.push(k)
+    img.outs = image_outs
+    img.placed = identity
+    Ok(())
+
+# Link the objects at `paths` through the script at `script_path` into the
+# executable at `out`. Prints a line for each orphan.
+pub fn link_script(l: @&Linker, paths: Span<StrView>, script_path: StrView, out: StrView) -> Result<(), LinkError>
+    let text: String = match read_file(script_path)
+        Ok(t) => t
+        Err(_) => return Err(LinkError.Unreadable(script_path))
+    let s: Script = match parse_script(text.as_view())
+        Ok(s) => s
+        Err(e) => return Err(LinkError.Script(script_path, line_of(text.as_view(), e.at), e.what, e.token))
+    for i in 0..paths.len
+        l.add_file(paths[i])?
+    l.resolve()?
+    let img: Image = script_layout(l, @s, script_path)?
+    write_executable(l, @img, out)

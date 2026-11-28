@@ -21,11 +21,12 @@ import rld.input
 import rld.relax { Relax, apply_relax, relax_fits, relax_kind }
 
 pub const BASE: i64 = 0x200000
-const PAGE: i64 = 0x1000
-const GOT_ENTRY: i64 = 8
+pub const PAGE: i64 = 0x1000
+pub const GOT_ENTRY: i64 = 8
 const PHDR_ALIGN: i64 = 8
 const ENTRY: StrView = "_start"
 const EXEC_MODE: i32 = 0x1ed      # rwxr-xr-x
+const TRAP: u8 = 0xcc             # int3
 
 # The segments, in address order.
 const SEG_R: i64 = 0
@@ -41,14 +42,18 @@ pub struct OutSection
     size: i64
     nobits: bool
     addr: i64
+    lma: i64            # its load address: addr, unless a script says AT
     offset: i64         # in the file; for NOBITS, where it would start
 
-struct Segment
+# One PT_LOAD.
+pub struct Segment
     flags: i64          # PF_* bits
     offset: i64
     addr: i64
+    paddr: i64
     filesz: i64
     memsz: i64
+    align: i64
     used: bool
 
 pub struct Image
@@ -56,15 +61,17 @@ pub struct Image
     relax: Vec<Relax>           # per InReloc
     got: HashMapI64             # defining InSymbol: its GOT slot
     got_syms: Vec<i64>          # per slot, the defining InSymbol
-    got_out: i64                # the .got output section, or -1
+    got_out: i64                # the output section holding the GOT, or -1
+    got_at: i64                 # the GOT's offset in that output section
     placed: Vec<i64>            # per gathered output section, its index in outs
+    segs: Vec<Segment>          # the PT_LOADs, in address order
     entry: i64
     output: Output
     data_relatives: i64         # R_X86_64_64 relocations a PIE loads as RELATIVE
     made: Vec<Made>             # the dynamic-linking sections (not the GOT)
     made_out: Vec<i64>          # per made section, its index in outs
 
-fn align_up(v: i64, align: i64) -> i64
+pub fn align_up(v: i64, align: i64) -> i64
     (v + align - 1) & ~(align - 1)
 
 fn segment_of(o: OutSection) -> i64
@@ -141,7 +148,7 @@ fn relative_count(l: @Linker, img: @Image) -> i64
     n
 
 # The address of the symbol a relocation against `sym` reaches.
-fn address(l: @Linker, img: @Image, sym: i64) -> i64
+pub fn address(l: @Linker, img: @Image, sym: i64) -> i64
     let d: i64 = l.definition(sym)
     let s: InSymbol = l.symbols[d]
     if s.shndx == SHN_ABS or s.shndx == SHN_UNDEF
@@ -152,7 +159,7 @@ fn address(l: @Linker, img: @Image, sym: i64) -> i64
     img.outs[img.placed[sec.out]].addr + sec.offset + s.value
 
 # Every relocation's symbol resolves: else the first one that does not.
-fn check_undefined(l: @Linker) -> Result<(), LinkError>
+pub fn check_undefined(l: @Linker) -> Result<(), LinkError>
     for r in 0..l.relocs.len
         let rel: InReloc = l.relocs[r]
         if rel.rtype == R_X86_64_NONE
@@ -174,7 +181,7 @@ fn gather(l: @&Linker) -> Vec<OutSection>
         let o: i64 = match by_name.get(s.name)
             Some(o) => o
             None =>
-                outs.push(OutSection { name: s.name, stype: s.stype, flags: 0, align: 1, size: 0, nobits: true, addr: 0, offset: 0 })
+                outs.push(OutSection { name: s.name, stype: s.stype, flags: 0, align: 1, size: 0, nobits: true, addr: 0, lma: 0, offset: 0 })
                 by_name.insert(s.name, outs.len - 1)
                 outs.len - 1
         var out: OutSection = outs[o]
@@ -205,23 +212,8 @@ pub fn layout(l: @&Linker, output: Output) -> Result<Image, LinkError>
     check_undefined(l)?
     let data_relatives: i64 = if is_pic(output) then count_data_relatives(l)? else 0
     let gathered: Vec<OutSection> = gather(l)
-    var img: Image = Image {
-        outs: vec_new<OutSection>(),
-        relax: vec_new<Relax>(),
-        got: hashmap_i64_new(),
-        got_syms: vec_new<i64>(),
-        got_out: -1,
-        placed: vec_new<i64>(),
-        entry: 0,
-        output: output,
-        data_relatives: data_relatives,
-        made: vec_new<Made>(),
-        made_out: vec_new<i64>()
-    }
-    for r in 0..l.relocs.len
-        let rel: InReloc = l.relocs[r]
-        let code: Span<u8> = l.sections[rel.section].data
-        img.relax.push(relax_kind(code, rel.offset, rel.rtype, rel.addend, is_pic(output)))
+    var img: Image = image_new(l, output)
+    img.data_relatives = data_relatives
     loop
         plan_got(l, @&img)
         place(l, @&img, @gathered)
@@ -231,10 +223,35 @@ pub fn layout(l: @&Linker, output: Output) -> Result<Image, LinkError>
     if start == UNRESOLVED
         return Err(LinkError.NoEntry(ENTRY))
     img.entry = address(l, @img, start)
+    img.segs = segments(l, @img)
     Ok(img)
 
+# An `output` image with nothing placed, and each GOT load relaxed where it
+# can be.
+pub fn image_new(l: @Linker, output: Output) -> Image
+    var img: Image = Image {
+        outs: vec_new<OutSection>(),
+        relax: vec_new<Relax>(),
+        got: hashmap_i64_new(),
+        got_syms: vec_new<i64>(),
+        got_out: -1,
+        got_at: 0,
+        placed: vec_new<i64>(),
+        segs: vec_new<Segment>(),
+        entry: 0,
+        output: output,
+        data_relatives: 0,
+        made: vec_new<Made>(),
+        made_out: vec_new<i64>()
+    }
+    for r in 0..l.relocs.len
+        let rel: InReloc = l.relocs[r]
+        let code: Span<u8> = l.sections[rel.section].data
+        img.relax.push(relax_kind(code, rel.offset, rel.rtype, rel.addend, is_pic(output)))
+    img
+
 # A GOT slot for each GOT load that is kept.
-fn plan_got(l: @Linker, img: @&Image)
+pub fn plan_got(l: @Linker, img: @&Image)
     for r in 0..l.relocs.len
         let rel: InReloc = l.relocs[r]
         let got_load: bool = rel.rtype == R_X86_64_GOTPCREL or rel.rtype == R_X86_64_GOTPCRELX or rel.rtype == R_X86_64_REX_GOTPCRELX
@@ -248,7 +265,7 @@ fn plan_got(l: @Linker, img: @&Image)
 
 # Any relaxed load whose symbol is now out of its reach goes back
 # through the GOT; whether there was one.
-fn unrelax_out_of_range(l: @Linker, img: @&Image) -> bool
+pub fn unrelax_out_of_range(l: @Linker, img: @&Image) -> bool
     var changed: bool = false
     for r in 0..l.relocs.len
         let kind: Relax = img.relax[r]
@@ -271,7 +288,7 @@ fn place_offset(l: @Linker, img: @Image, rel: InReloc) -> i64
     img.outs[img.placed[sec.out]].offset + sec.offset + rel.offset
 
 fn made_section(m: Made, size: i64) -> OutSection
-    OutSection { name: made_name(m), stype: made_type(m), flags: made_flags(m), align: made_align(m), size: size, nobits: false, addr: 0, offset: 0 }
+    OutSection { name: made_name(m), stype: made_type(m), flags: made_flags(m), align: made_align(m), size: size, nobits: false, addr: 0, lma: 0, offset: 0 }
 
 # Order the output sections, the ones the linker makes among them, by
 # segment and rank, and give each its address and file offset. The ELF and
@@ -313,6 +330,7 @@ fn place(l: @Linker, img: @&Image, gathered: @Vec<OutSection>)
         if not out.nobits
             off = addr - base
         out.addr = addr
+        out.lma = addr
         out.offset = off
         addr += out.size
         if not out.nobits
@@ -342,11 +360,11 @@ fn made_addr(img: @Image, m: Made) -> i64
         None => 0
 
 # The segments the placed sections make.
-fn segments(l: @Linker, img: @Image) -> [3]Segment
+fn segments(l: @Linker, img: @Image) -> Vec<Segment>
     var segs: [3]Segment = [
-        Segment { flags: PF_R, offset: 0, addr: base_of(img.output), filesz: 0, memsz: 0, used: true },
-        Segment { flags: PF_R | PF_X, offset: 0, addr: 0, filesz: 0, memsz: 0, used: false },
-        Segment { flags: PF_R | PF_W, offset: 0, addr: 0, filesz: 0, memsz: 0, used: false }
+        Segment { flags: PF_R, offset: 0, addr: base_of(img.output), paddr: base_of(img.output), filesz: 0, memsz: 0, align: PAGE, used: true },
+        Segment { flags: PF_R | PF_X, offset: 0, addr: 0, paddr: 0, filesz: 0, memsz: 0, align: PAGE, used: false },
+        Segment { flags: PF_R | PF_W, offset: 0, addr: 0, paddr: 0, filesz: 0, memsz: 0, align: PAGE, used: false }
     ]
     for o in 0..img.outs.len
         let out: OutSection = img.outs[o]
@@ -356,6 +374,7 @@ fn segments(l: @Linker, img: @Image) -> [3]Segment
             s.used = true
             s.offset = out.offset
             s.addr = out.addr
+            s.paddr = out.addr
         if not out.nobits
             s.filesz = out.offset + out.size - s.offset
         s.memsz = out.addr + out.size - s.addr
@@ -365,7 +384,11 @@ fn segments(l: @Linker, img: @Image) -> [3]Segment
         r.filesz = header_size(l, img)
         r.memsz = r.filesz
         segs[SEG_R] = r
-    segs
+    var used: Vec<Segment> = vec_new<Segment>()
+    for g in 0..SEGMENTS
+        if segs[g].used
+            used.push(segs[g])
+    used
 
 fn header_size(l: @Linker, img: @Image) -> i64
     EHDR_SIZE + phnum_of(@img.outs, img.output) * PHDR_SIZE
@@ -377,10 +400,16 @@ fn phnum_of(outs: @Vec<OutSection>, output: Output) -> i64
     var used: [3]bool = [true, false, false]
     for o in 0..outs.len
         used[segment_of(outs[o])] = true
-    var n: i64 = 1
+    var n: i64 = extra_phdrs(output)
     for g in 0..SEGMENTS
         if used[g]
             n += 1
+    n
+
+# The program headers besides the PT_LOADs: PT_GNU_STACK, and in a PIE
+# PT_PHDR and PT_DYNAMIC, and in the hosted one PT_INTERP.
+pub fn extra_phdrs(output: Output) -> i64
+    var n: i64 = 1
     if is_pic(output)
         n += 2
     if output == Output.Hosted
@@ -432,7 +461,7 @@ fn apply(l: @Linker, img: @Image, bytes: @&Vec<u8>, r: i64) -> Result<Option<Rel
                     let slot: i64 = match img.got.get(l.definition(rel.symbol))
                         Some(n) => n
                         None => return Err(overflow)
-                    let g: i64 = img.outs[img.got_out].addr + slot * GOT_ENTRY
+                    let g: i64 = img.outs[img.got_out].addr + img.got_at + slot * GOT_ENTRY
                     if not fits_signed32(g + a - p)
                         return Err(overflow)
                     patch_le(bytes, at, g + a - p, 4)
@@ -445,18 +474,29 @@ fn apply(l: @Linker, img: @Image, bytes: @&Vec<u8>, r: i64) -> Result<Option<Rel
 # table of the global definitions, and the name tables. A RELATIVE's place
 # also holds the link-time address, which a loader that applies none keeps.
 pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
-    let segs: [3]Segment = segments(l, img)
-    var end: i64 = header_size(l, img)
+    let phnum: i64 = img.segs.len + extra_phdrs(img.output)
+    var end: i64 = EHDR_SIZE + phnum * PHDR_SIZE
     for o in 0..img.outs.len
         let out: OutSection = img.outs[o]
         if not out.nobits and out.offset + out.size > end
             end = out.offset + out.size
     var bytes: Vec<u8> = vec_zeroed<u8>(end)
+    # As ld.lld does, the padding between input sections in an executable
+    # output section is int3, not zero; a NOBITS input in one stays zero.
+    for o in 0..img.outs.len
+        let out: OutSection = img.outs[o]
+        if not out.nobits and (out.flags & SHF_EXECINSTR) != 0
+            for b in out.offset..(out.offset + out.size)
+                bytes[b] = TRAP
     for i in 0..l.sections.len
         let s: InSection = l.sections[i]
-        if s.out < 0 or s.stype == SHT_NOBITS
+        if s.out < 0 or img.outs[img.placed[s.out]].nobits
             continue
         let at: i64 = img.outs[img.placed[s.out]].offset + s.offset
+        if s.stype == SHT_NOBITS
+            for b in 0..s.size
+                bytes[at + b] = 0
+            continue
         for b in 0..s.data.len
             bytes[at + b] = s.data[b]
     var relatives: Vec<RelaEntry> = vec_new<RelaEntry>()
@@ -464,9 +504,10 @@ pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
         let got: OutSection = img.outs[img.got_out]
         for slot in 0..img.got_syms.len
             let target: i64 = address(l, img, img.got_syms[slot])
-            patch_le(@&bytes, got.offset + slot * GOT_ENTRY, target, 8)
+            let at: i64 = img.got_at + slot * GOT_ENTRY
+            patch_le(@&bytes, got.offset + at, target, 8)
             if is_pic(img.output) and not is_absolute(l, img.got_syms[slot])
-                relatives.push(relative(got.addr + slot * GOT_ENTRY, target))
+                relatives.push(relative(got.addr + at, target))
     for r in 0..l.relocs.len
         match apply(l, img, @&bytes, r)?
             Some(e) => relatives.push(e)
@@ -477,7 +518,6 @@ pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
     let ident: [8]u8 = [0x7f, 'E', 'L', 'F', 2, 1, 1, 0]   # ELFCLASS64, ELFDATA2LSB, EV_CURRENT, SysV
     for i in 0..8
         bytes[i] = ident[i]
-    let phnum: i64 = phnum_of(@img.outs, img.output)
     let etype: i64 = if is_pic(img.output) then ELF_ET_DYN else ELF_ET_EXEC as i64
     patch_le(@&bytes, 16, etype, 2)
     patch_le(@&bytes, 18, ELF_EM_X86_64 as i64, 2)
@@ -492,27 +532,25 @@ pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
     var ph: i64 = EHDR_SIZE
     if is_pic(img.output)
         let base: i64 = base_of(img.output)
-        patch_phdr(@&bytes, ph, PT_PHDR, PF_R, EHDR_SIZE, base + EHDR_SIZE, phnum * PHDR_SIZE, phnum * PHDR_SIZE, PHDR_ALIGN)
+        patch_phdr(@&bytes, ph, PT_PHDR, PF_R, EHDR_SIZE, base + EHDR_SIZE, base + EHDR_SIZE, phnum * PHDR_SIZE, phnum * PHDR_SIZE, PHDR_ALIGN)
         ph += PHDR_SIZE
     match made_at(img, Made.Interp)
         Some(o) =>
             let interp: OutSection = img.outs[o]
-            patch_phdr(@&bytes, ph, PT_INTERP, PF_R, interp.offset, interp.addr, interp.size, interp.size, 1)
+            patch_phdr(@&bytes, ph, PT_INTERP, PF_R, interp.offset, interp.addr, interp.lma, interp.size, interp.size, 1)
             ph += PHDR_SIZE
         None => pass
-    for g in 0..SEGMENTS
-        let s: Segment = segs[g]
-        if not s.used
-            continue
-        patch_phdr(@&bytes, ph, PT_LOAD, s.flags, s.offset, s.addr, s.filesz, s.memsz, PAGE)
+    for g in 0..img.segs.len
+        let s: Segment = img.segs[g]
+        patch_phdr(@&bytes, ph, PT_LOAD, s.flags, s.offset, s.addr, s.paddr, s.filesz, s.memsz, s.align)
         ph += PHDR_SIZE
     match made_at(img, Made.Dynamic)
         Some(o) =>
             let dynamic: OutSection = img.outs[o]
-            patch_phdr(@&bytes, ph, PT_DYNAMIC, PF_R | PF_W, dynamic.offset, dynamic.addr, dynamic.size, dynamic.size, GOT_ENTRY)
+            patch_phdr(@&bytes, ph, PT_DYNAMIC, PF_R | PF_W, dynamic.offset, dynamic.addr, dynamic.lma, dynamic.size, dynamic.size, GOT_ENTRY)
             ph += PHDR_SIZE
         None => pass
-    patch_phdr(@&bytes, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0)
+    patch_phdr(@&bytes, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0, 0)
 
     # Section headers: null, each output section, .symtab, .strtab,
     # .shstrtab.
@@ -549,7 +587,10 @@ pub fn write_image(l: @Linker, img: @Image) -> Result<Vec<u8>, LinkError>
             continue
         var shndx: i64 = SHN_ABS
         if s.shndx != SHN_ABS
-            shndx = 1 + img.placed[l.sections[l.symbol_section(i)].out]
+            let out: i64 = l.sections[l.symbol_section(i)].out
+            if out < 0
+                continue        # in a section a script discarded
+            shndx = 1 + img.placed[out]
         let name: i64 = add_name(@&strtab, s.name)
         push_sym(@&symtab, SymbolEntry { name: name, bind: s.bind, stype: s.stype, shndx: shndx, value: address(l, img, i), size: s.size })
     let symtab_index: i64 = headers.len
@@ -605,12 +646,12 @@ fn write_made(img: @Image, bytes: @&Vec<u8>, relatives: @Vec<RelaEntry>)
         for b in 0..content.len
             bytes[offset + b] = content[b]
 
-fn patch_phdr(out: @&Vec<u8>, at: i64, ptype: i64, flags: i64, offset: i64, addr: i64, filesz: i64, memsz: i64, align: i64)
+fn patch_phdr(out: @&Vec<u8>, at: i64, ptype: i64, flags: i64, offset: i64, addr: i64, paddr: i64, filesz: i64, memsz: i64, align: i64)
     patch_le(out, at, ptype, 4)
     patch_le(out, at + 4, flags, 4)
     patch_le(out, at + 8, offset, 8)
     patch_le(out, at + 16, addr, 8)
-    patch_le(out, at + 24, addr, 8)     # p_paddr
+    patch_le(out, at + 24, paddr, 8)
     patch_le(out, at + 32, filesz, 8)
     patch_le(out, at + 40, memsz, 8)
     patch_le(out, at + 48, align, 8)
@@ -621,7 +662,11 @@ pub fn link(l: @&Linker, paths: Span<StrView>, out: StrView, output: Output) -> 
         l.add_file(paths[i])?
     l.resolve()?
     let img: Image = layout(l, output)?
-    let bytes: Vec<u8> = write_image(l, @img)?
+    write_executable(l, @img, out)
+
+# Write the image to `out`, executable.
+pub fn write_executable(l: @Linker, img: @Image, out: StrView) -> Result<(), LinkError>
+    let bytes: Vec<u8> = write_image(l, img)?
     match write_file(out, span_from_vec<u8>(@bytes).as_strview())
         Ok(_) => pass
         Err(_) => return Err(LinkError.Unwritable(out))
