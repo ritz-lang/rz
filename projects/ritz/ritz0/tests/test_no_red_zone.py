@@ -39,7 +39,6 @@ import test_ir
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
-RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 HARLAND = RITZ_ROOT.parent / "harland"
 CHECKER = HARLAND / "tools" / "check_no_red_zone.py"
 
@@ -131,9 +130,10 @@ def _ritz0(tmp_path: Path, src: Path, *extra) -> str:
     return ll.read_text()
 
 
-def _ritz1(tmp_path: Path, src: Path, *extra) -> str:
+def _ritz1(ritz1: Path, tmp_path: Path, src: Path, *extra) -> str:
+    """Compile with `ritz1`: the `ritz1_bin` fixture's path (AGAST #5005)."""
     ll = tmp_path / (src.stem + ".ll")
-    proc = subprocess.run([str(RITZ1_BIN), str(src), "-o", str(ll), *extra],
+    proc = subprocess.run([str(ritz1), str(src), "-o", str(ll), *extra],
                           cwd=tmp_path, capture_output=True, text=True, timeout=300,
                           env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)))
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -245,28 +245,28 @@ def test_ritz0_every_define_carries_noredzone(tmp_path, program):
 # --- ritz1 (the gate builds it first, as for test_stack_protector.py) -------
 
 @pytest.mark.integration
-def test_ritz1_flag_marks_every_defined_fn(tmp_path, program):
-    _assert_all_noredzone(_ritz1(tmp_path, program, "--no-red-zone"), "Ctr_bump")
+def test_ritz1_flag_marks_every_defined_fn(ritz1_bin, tmp_path, program):
+    _assert_all_noredzone(_ritz1(ritz1_bin, tmp_path, program, "--no-red-zone"), "Ctr_bump")
 
 
 @pytest.mark.integration
-def test_ritz1_every_define_carries_noredzone(tmp_path, program):
-    ir = _ritz1(tmp_path, program, "--no-red-zone")
+def test_ritz1_every_define_carries_noredzone(ritz1_bin, tmp_path, program):
+    ir = _ritz1(ritz1_bin, tmp_path, program, "--no-red-zone")
     assert "__ritz_sret_copy" in _define_lines(ir), "expected an sret helper"
     _assert_every_define_noredzone(ir)
 
 
 @pytest.mark.integration
-def test_ritz1_default_emits_no_noredzone(tmp_path, program):
-    _assert_none_noredzone(_ritz1(tmp_path, program))
+def test_ritz1_default_emits_no_noredzone(ritz1_bin, tmp_path, program):
+    _assert_none_noredzone(_ritz1(ritz1_bin, tmp_path, program))
 
 
 @pytest.mark.integration
-def test_ritz1_warm_compile_keys_on_the_flag(tmp_path, program):
+def test_ritz1_warm_compile_keys_on_the_flag(ritz1_bin, tmp_path, program):
     """ritz1's sig fast path (AGAST #1807) must not hand back red-zone IR."""
-    _assert_none_noredzone(_ritz1(tmp_path, program))
-    assert "noredzone" in _ritz1(tmp_path, program, "--no-red-zone")
-    _assert_none_noredzone(_ritz1(tmp_path, program))
+    _assert_none_noredzone(_ritz1(ritz1_bin, tmp_path, program))
+    assert "noredzone" in _ritz1(ritz1_bin, tmp_path, program, "--no-red-zone")
+    _assert_none_noredzone(_ritz1(ritz1_bin, tmp_path, program))
 
 
 # --- harland's checker -------------------------------------------------------

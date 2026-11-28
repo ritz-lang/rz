@@ -139,16 +139,30 @@ RITZLIB_OBJ = $(patsubst %,$(BUILD_DIR)/ritzlib_%.o,$(RITZLIB_MODULES))
 # Runtime - the one entry point (AGAST #200): calls main(argc, argv, envp)
 # and handles exit. ritz1's main(argc, argv) ignores envp; it reads RITZ_PATH
 # through ritzlib.os.env (AGAST #1750).
-RUNTIME = ../runtime/ritz_start.x86_64.o
+#
+# ritz1 links its own object of the tracked shim, not ../runtime's (AGAST
+# #5005).  That one is shared: build.py rewrites it whenever its producer
+# stamp differs (rllvm, AGAST #4808), which is at the first hosted build of
+# a fresh tree, mid-test-session.  Linked from there, ritz1 went stale under
+# every test session and the next `make ritz1` relinked it while xdist
+# workers were exec'ing it.  Built here it follows the .ll alone, so an
+# edited shim still relinks ritz1 and nothing else does.
+RUNTIME_SRC = ../runtime/ritz_start.x86_64.ll
+RUNTIME = $(BUILD_DIR)/ritz_start.x86_64.o
 
-# The runtime .o files are gitignored build products of tracked .ll sources.
-# Without this rule a fresh clone dies with "No rule to make target
-# '../runtime/ritz_start.x86_64.o'" — which is exactly how main CI
-# failed, since a CI checkout never has the stale .o a dev tree accumulates.
-# Delegate to runtime/Makefile so there is one place that knows how to
-# lower a shim, and so an edited .ll actually forces a relink.
-../runtime/%.o: ../runtime/%.ll
-	@$(MAKE) -C ../runtime $*.o
+$(RUNTIME): $(RUNTIME_SRC) | $(BUILD_DIR)
+	clang -c -o $@.tmp.$$$$ $< && mv -f $@.tmp.$$$$ $@ || { rm -f $@.tmp.$$$$; exit 1; }
+
+# Link to a private temp file and rename it over the binary (AGAST #5005).
+# ld unlinks its output and writes a new, not-yet-executable file in its
+# place, so a test exec'ing ritz1 during a relink found it missing or got
+# EACCES.  rename() within one directory is atomic: an exec sees the old
+# binary or the new one, each whole, and a failed link leaves the old one.
+# RITZ1_LD is the linker (tools/test_ritz1_incremental_deps.py substitutes
+# one that fails, or that looks at the target before returning).
+RITZ1_LD = ld
+atomic_link = $(RITZ1_LD) $(LD_FLAGS) -o $@.tmp.$$$$ $(1) && mv -f $@.tmp.$$$$ $@ \
+	|| { rm -f $@.tmp.$$$$; exit 1; }
 
 # Compiler flags
 LLC_FLAGS = -O2
@@ -269,7 +283,7 @@ ritz1: $(RITZ1)
 
 $(RITZ1): $(OBJ_FILES) $(RITZLIB_OBJ) $(RUNTIME)
 	@echo "=== Linking ritz1 ==="
-	ld $(LD_FLAGS) -o $@ $(RUNTIME) $(OBJ_FILES) $(RITZLIB_OBJ)
+	$(call atomic_link,$(RUNTIME) $(OBJ_FILES) $(RITZLIB_OBJ))
 	@echo "✓ ritz1 binary created: $(RITZ1)"
 	@ls -lh $@
 
@@ -296,7 +310,7 @@ $(RITZ1_SELFHOSTED): $(SELFHOSTED_OBJ) $(RITZLIB_OBJ) $(RUNTIME)
 	# Link ritzlib_*.o FIRST so its strong symbols (T) win over the
 	# ritz1-compiled weak_odr (W) duplicates in $(SELFHOSTED_OBJ).
 	# Without this, buggy ritz1-emitted malloc/realloc/etc. are used.
-	ld $(LD_FLAGS) -o $@ $(RUNTIME) $(RITZLIB_OBJ) $(SELFHOSTED_OBJ)
+	$(call atomic_link,$(RUNTIME) $(RITZLIB_OBJ) $(SELFHOSTED_OBJ))
 	@echo "✓ Self-hosted binary created: $(RITZ1_SELFHOSTED)"
 	@ls -lh $@
 

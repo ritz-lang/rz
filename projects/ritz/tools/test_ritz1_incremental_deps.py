@@ -110,11 +110,9 @@ def tree(built_tree: Path, tmp_path: Path) -> Path:
     return dst
 
 
-def _make(tree: Path) -> list[str]:
-    """Run `make -C ritz1 ritz1`; return the sources ritz0 compiled."""
-    log = tree / "compiled.log"
-    log.unlink(missing_ok=True)
-    proc = subprocess.run(
+def _make_proc(tree: Path, *extra: str) -> subprocess.CompletedProcess:
+    """Run `make -C ritz1 ritz1` with the fakes, plus `extra` make arguments."""
+    return subprocess.run(
         [
             "make",
             "-C",
@@ -123,10 +121,18 @@ def _make(tree: Path) -> list[str]:
             f"RITZ0={sys.executable} {tree / 'fake_ritz0.py'}",
             f"CAS_OBJ={sys.executable} {tree / 'fake_cas_obj.py'}",
             f"RITZ0_ID=cat {tree / 'fake_ritz0.id'}",
+            *extra,
         ],
         capture_output=True,
         text=True,
     )
+
+
+def _make(tree: Path) -> list[str]:
+    """Run `make -C ritz1 ritz1`; return the sources ritz0 compiled."""
+    log = tree / "compiled.log"
+    log.unlink(missing_ok=True)
+    proc = _make_proc(tree)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return sorted(log.read_text().split()) if log.exists() else []
 
@@ -219,6 +225,119 @@ def test_clean_removes_dep_files(tree: Path) -> None:
         ["make", "-C", str(tree / "ritz1"), "clean"], check=True, capture_output=True
     )
     assert not list((tree / "ritz1" / "build").glob("*.d"))
+
+
+# --- AGAST #5005: ritz1 is relinked only for its own inputs, and atomically --
+#
+# Under xdist a test exec'd ritz1/build/ritz1 while a nested session's
+# `make -C ritz1 ritz1` relinked it: `PermissionError: [Errno 13]`, or the file
+# missing.  ld writes its output in place, so for the length of the link the
+# path is a truncated, not-yet-executable file.  The relink had no reason of
+# ritz1's own either: build.py rewrites runtime/ritz_start.x86_64.o whenever its
+# producer stamp differs (rllvm, AGAST #4808), and ritz1 linked that shared
+# object, so the first hosted build of a session made ritz1 stale.
+
+
+def _identity(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return st.st_ino, st.st_mtime_ns
+
+
+def _make_newer(tree: Path, path: Path) -> None:
+    """Make `path` the one file newer than everything else in `tree`.
+
+    The rest of the tree is aged rather than `path` dated ahead: a future
+    mtime makes make warn of clock skew.
+    """
+    earlier = time.time() - 60
+    for f in tree.rglob("*"):
+        if f.is_file() and not f.is_symlink():
+            os.utime(f, (earlier, earlier))
+    os.utime(path)
+
+
+def _link_temps(tree: Path) -> list[Path]:
+    return sorted((tree / "ritz1" / "build").glob("*.tmp.*"))
+
+
+@pytest.mark.integration
+def test_a_rewritten_shared_runtime_object_does_not_relink_ritz1(tree: Path) -> None:
+    ritz1 = tree / "ritz1" / "build" / "ritz1"
+    shared = tree / "runtime" / "ritz_start.x86_64.o"
+    shared.write_bytes(b"what build.py's rllvm wrote")
+    _make_newer(tree, shared)
+    before = _identity(ritz1)
+    assert _make(tree) == []
+    assert _identity(ritz1) == before, "ritz1 relinked for build.py's runtime object"
+
+
+@pytest.mark.integration
+def test_an_edited_runtime_shim_relinks_ritz1(tree: Path) -> None:
+    """The converse: ritz1 still follows the shim's source."""
+    ritz1 = tree / "ritz1" / "build" / "ritz1"
+    before = _identity(ritz1)
+    shim = tree / "runtime" / "ritz_start.x86_64.ll"
+    shim.write_text(shim.read_text() + "; edited\n")
+    _make_newer(tree, shim)
+    _make(tree)
+    assert _identity(ritz1) != before, "an edited runtime shim left ritz1 as it was"
+
+
+@pytest.mark.integration
+def test_relink_replaces_ritz1_atomically(tree: Path) -> None:
+    """Until the new binary is whole, the path is the old binary, whole.
+
+    The ld below is the real one, then a look at ritz1/build/ritz1 before it
+    returns: linked in place, the path is already the new file (and was
+    missing, then not executable, while ld wrote it).
+    """
+    ritz1 = tree / "ritz1" / "build" / "ritz1"
+    held = tree / "held_ritz1"  # the old binary, as an exec in flight has it
+    os.link(ritz1, held)
+    old_bytes = held.read_bytes()
+    seen = tree / "seen"
+    peeking_ld = tree / "peeking_ld"
+    peeking_ld.write_text(textwrap.dedent(
+        f"""\
+        #!/bin/sh
+        ld "$@" || exit
+        if [ -x {ritz1} ] && cmp -s {ritz1} {held}; then
+            echo old > {seen}
+        else
+            echo replaced > {seen}
+        fi
+        """))
+    peeking_ld.chmod(0o755)
+    _make_newer(tree, tree / "ritz1" / "build" / "main.o")
+    proc = _make_proc(tree, f"RITZ1_LD={peeking_ld}")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert seen.read_text() == "old\n", "ritz1 was replaced while ld still ran"
+    assert ritz1.stat().st_ino != held.stat().st_ino, "ritz1 was not relinked"
+    assert held.read_bytes() == old_bytes
+    assert os.access(ritz1, os.X_OK)
+    assert _link_temps(tree) == []
+
+
+@pytest.mark.integration
+def test_a_failed_link_keeps_the_old_ritz1(tree: Path) -> None:
+    ritz1 = tree / "ritz1" / "build" / "ritz1"
+    old_bytes = ritz1.read_bytes()
+    broken_ld = tree / "broken_ld"
+    broken_ld.write_text(textwrap.dedent(
+        """\
+        #!/bin/sh
+        # Write half an output, as a killed or failing ld leaves one.
+        while [ "$1" != "-o" ]; do shift; done
+        echo half > "$2"
+        exit 1
+        """))
+    broken_ld.chmod(0o755)
+    _make_newer(tree, tree / "ritz1" / "build" / "main.o")
+    before = _identity(ritz1)
+    proc = _make_proc(tree, f"RITZ1_LD={broken_ld}")
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _identity(ritz1) == before and ritz1.read_bytes() == old_bytes
+    assert _link_temps(tree) == []
 
 
 # AGAST #2241: `build.py build --all` leaves a convenience link at

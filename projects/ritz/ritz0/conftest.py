@@ -153,6 +153,17 @@ AGAST #1392. Two things live here, and they are independent.
    before any worker starts, though no inproc test uses it.  An option, not
    an environment variable, for item 4's reason: a nested pytest must not
    inherit it.
+
+15. A ritz1 row gets its compiler (AGAST #5005) — an `integration` row
+   parametrized with a ritz1 compiler's name (`compiler="ritz1"`, under any
+   parameter name) gets that compiler's fixtures (`ritz1_row_fixtures`): `ritz1_bin` for both,
+   plus `ritz1_selfhosted` for that one.  The matrix files run
+   `ritz1/build/<compiler>` from helpers (`test_ref_into_value._emit`) that
+   checked only that the file existed.  A serial run then ran a binary no
+   make had brought current, and a missing build failed as a bare assert,
+   not with make's output.  test_ritz1_exec_through_fixture.py fails a test
+   module that names a ritz1 binary path and neither asks for a fixture nor
+   carries such rows.
 """
 
 import os
@@ -235,6 +246,11 @@ SMOKE_FILES = (
 _SMOKE_PATHS = frozenset((Path(__file__).resolve().parent / f) for f in SMOKE_FILES)
 # Fixtures that build ritz1; a test that asks for one is not smoke.
 _BUILD_FIXTURES = ("ritz1_bin", "ritz_start", "ritz1_selfhosted")
+# Item 15: the fixtures a row parametrized with each ritz1 compiler's name needs.
+RITZ1_ROW_FIXTURES = {
+    "ritz1": ("ritz1_bin",),
+    "ritz1_selfhosted": ("ritz1_bin", "ritz1_selfhosted"),
+}
 # Item 9's `integration` tests let off starting nothing; only remove entries.
 NOSPAWN_ALLOWLIST = Path(HARNESS_DIR) / "integration_without_spawn.txt"
 
@@ -248,6 +264,22 @@ def is_inproc_item(item) -> bool:
     if item.get_closest_marker("integration") is not None:
         return False
     return not any(f in item.fixturenames for f in _BUILD_FIXTURES)
+
+
+def ritz1_row_fixtures(item) -> list[str]:
+    """Item 15: the build fixtures a row's ritz1 compiler parameters need.
+
+    Only an `integration` row can run a compiler (item 9); elsewhere "ritz1"
+    is a name (test_build.py's cache-mode rows), and those stay inproc.
+    """
+    callspec = getattr(item, "callspec", None)
+    if callspec is None or item.get_closest_marker("integration") is None:
+        return []
+    names = set()
+    for value in callspec.params.values():
+        if isinstance(value, str):
+            names.update(RITZ1_ROW_FIXTURES.get(value, ()))
+    return sorted(names)
 
 
 def is_smoke_item(item) -> bool:
@@ -460,6 +492,13 @@ def ritz1_bin(request) -> Path:
     if verdict:
         pytest.fail(verdict)
     return RITZ1_BIN
+
+
+@pytest.fixture(autouse=True)
+def _ritz1_row_compiler(request):
+    """Item 15: a row parametrized with a ritz1 compiler gets its fixtures."""
+    for name in ritz1_row_fixtures(request.node):
+        request.getfixturevalue(name)
 
 
 @pytest.fixture(scope="session")

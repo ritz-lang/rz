@@ -48,7 +48,6 @@ pub fn cpu_kick_if_idle(cpu: i32)
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
-RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 PROJECTS = RITZ_ROOT.parent
 HARLAND = PROJECTS / "harland"
@@ -402,14 +401,8 @@ REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/stat.ritz", "fs/open
 def _compile(compiler, tmp_path, path, name, extra=()):
     ll = tmp_path / f"{name}_{compiler}.ll"
     env = dict(os.environ, RITZ_PATH=f"{tmp_path / 'tree'}:{RITZ_ROOT}:{tmp_path}")
-    if compiler == "ritz0":
-        proc = run_ritz0([str(path), "-o", str(ll), *extra], cwd=tmp_path, env=env, timeout=300)
-    else:
-        binary = RITZ1_BUILD / compiler
-        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
-        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
-        proc = subprocess.run([str(binary), str(path), "-o", str(ll)], cwd=tmp_path,
-                              env=env, capture_output=True, text=True, timeout=300)
+    assert compiler in COMPILERS, compiler
+    proc = run_ritz0([str(path), "-o", str(ll), *extra], cwd=tmp_path, env=env, timeout=300)
     assert proc.returncode == 0 and ll.exists(), \
         f"{compiler} rejected {name}:\n{proc.stdout}{proc.stderr}"
     return ll

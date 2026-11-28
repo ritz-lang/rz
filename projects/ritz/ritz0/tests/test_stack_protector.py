@@ -42,7 +42,6 @@ from test_harland_kernel_features import harland_deps_args
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
-RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 HARLAND = RITZ_ROOT.parent / "harland"
 KERNEL_SRC = HARLAND / "kernel" / "src"
 
@@ -110,9 +109,10 @@ def _ritz0(tmp_path: Path, src: Path, *extra) -> str:
     return ll.read_text()
 
 
-def _ritz1(tmp_path: Path, src: Path, *extra) -> str:
+def _ritz1(ritz1: Path, tmp_path: Path, src: Path, *extra) -> str:
+    """Compile with `ritz1`: the `ritz1_bin` fixture's path (AGAST #5005)."""
     ll = tmp_path / (src.stem + ".ll")
-    proc = subprocess.run([str(RITZ1_BIN), str(src), "-o", str(ll), *extra],
+    proc = subprocess.run([str(ritz1), str(src), "-o", str(ll), *extra],
                           cwd=tmp_path, capture_output=True, text=True, timeout=300,
                           env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)))
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -149,16 +149,16 @@ def test_ritz0_warm_compile_keys_on_the_flag(tmp_path, program):
 # --- ritz1 (the gate builds it first, as for test_ritz1_target_os.py) -------
 
 @pytest.mark.integration
-def test_ritz1_flag_protects_every_defined_fn_but_naked(tmp_path, program):
-    _assert_protected(_ritz1(tmp_path, program, "--stack-protector"), "Ctr_bump")
+def test_ritz1_flag_protects_every_defined_fn_but_naked(ritz1_bin, tmp_path, program):
+    _assert_protected(_ritz1(ritz1_bin, tmp_path, program, "--stack-protector"), "Ctr_bump")
 
 
 @pytest.mark.integration
-def test_ritz1_warm_compile_keys_on_the_flag(tmp_path, program):
+def test_ritz1_warm_compile_keys_on_the_flag(ritz1_bin, tmp_path, program):
     """ritz1's sig fast path (AGAST #1807) must not hand back unprotected IR."""
-    assert "sspstrong" not in _ritz1(tmp_path, program)
-    assert "sspstrong" in _ritz1(tmp_path, program, "--stack-protector")
-    assert "sspstrong" not in _ritz1(tmp_path, program)
+    assert "sspstrong" not in _ritz1(ritz1_bin, tmp_path, program)
+    assert "sspstrong" in _ritz1(ritz1_bin, tmp_path, program, "--stack-protector")
+    assert "sspstrong" not in _ritz1(ritz1_bin, tmp_path, program)
 
 
 # --- harland ---------------------------------------------------------------
