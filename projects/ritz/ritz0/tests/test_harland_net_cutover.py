@@ -233,10 +233,10 @@ def test_the_device_object_is_bound_to_the_domain_and_recorded_for_quiesce():
 @pytest.mark.unit
 def test_a_kernel_spawned_program_inherits_no_capabilities():
     body = _fn_body(_code(PROCESS), "process_spawn_program")
-    assert "errno_result(spawn_process(path, 0, 0, false, PROC_BSP_CPU, spawn_stdio_inherit()))" in body
+    assert "errno_result(spawn_process(path, 0, 0, false, PROC_BSP_CPU, None))" in body
     assert "spawn_child_begin(parent_pid, inherit_caps, stdio)" in _fn_body(_code(PROCESS), "spawn_process")
     # sys_spawn's children still inherit
-    assert "spawn_process(path, argc, argv_bytes, true, PROC_BSP_CPU, spawn_stdio_inherit())" in _fn_body(_code(PROCESS), "spawn_and_block")
+    assert "spawn_process(path, argc, argv_bytes, true, PROC_BSP_CPU, Some(spawn_stdio_inherit()))" in _fn_body(_code(PROCESS), "spawn_and_block")
 
 
 @pytest.mark.unit

@@ -498,9 +498,16 @@ def test_poll_reports_and_waits_for_pipe_fds():
     assert "waitset_watch_pipes(" in handler
 
 
-def test_every_spawn_hands_over_stdio():
+def test_every_user_spawn_hands_over_stdio():
     begin = _fn(PROCESS, "spawn_child_begin")
     assert begin.index("fs_process_start(") < begin.index("fs_process_give_stdio(")
+    # a process's spawns carry a map; a kernel spawn (netd, its respawn in
+    # the dying netd's exit) carries none and the child keeps the console
+    assert "spawn_stdio_inherit())" not in begin
+    assert "Some(spawn_stdio_inherit())" in _fn(PROCESS, "spawn_and_block")
+    assert "Some(spawn_stdio_inherit())" in _fn(PROCESS, "sys_spawn_bg_handler")
+    assert "Some(stdio)" in _fn(PROCESS, "sys_spawn_io_handler")
+    assert "PROC_BSP_CPU, None)" in _fn(PROCESS, "process_spawn_program")
     io = _fn(PROCESS, "sys_spawn_io_handler")
     # the map is copied out of user memory before any page-table switch
     assert "uptr_check_read(" in io and "SpawnStdio" in io
