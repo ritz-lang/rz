@@ -1,0 +1,270 @@
+# ritz1/src/emitter_try.ritz - the try operator `x?` (AGAST #134)
+#
+# Moved out of emitter_expr (AGAST #4918) so emitter_aggregate, which
+# emitter_expr imports, can store an array payload straight from the carrier
+# (`let a: [N]T = f()?`, `s.f = f()?`): emit_try_array_ptr.  Recursion into
+# the operand goes through the emit table (emitter_seam.ritz).
+
+import ritzlib.string
+
+import ast
+import ast_helpers      # is_enum_type
+import types
+import emitter_core
+import emitter_seam
+import text_bridge
+import emitter_abi
+import emitter_types
+import emitter_call_lower
+import emitter_decl
+import emitter_match     # resolve_scrutinee_enum
+import monomorph         # ArrayArg
+
+# The E of the Result `name` (`Result$T$E`), as tagged_enum_arg splits it;
+# `no_name()` when it has none.
+fn result_err_arg(s: *EmitterState, name: StrView) -> StrView
+    tagged_enum_arg(s, name, 1)
+
+# AGAST #1898: the Err / None carrier in `inner_slot` (a `%inner`), rebuilt
+# as the enclosing fn's return type in a fresh slot, which is returned.  The
+# tag byte is copied; for a Result the Err payload's bytes are copied field 2
+# to field 2 — E's size when it can be measured, else the smaller payload.
+fn emit_try_err_relayout(s: *EmitterState, inner_slot: i32, inner: StrView) -> i32
+    let out_name: StrView = s.fcx.ret_type_name
+    let out_ir: String = ir_name(out_name)
+    let out: i32 = next_reg(s)
+    entry_alloca_reg_begin_named(s, out)
+    format_into(s, "{out_ir.as_view()}  ; try: Err relayout\n")
+    entry_alloca_reg_end(s)
+    format_into(s, "  store %{out_ir.as_view()} zeroinitializer, ptr %.{out}\n")
+    # Tag: field 0 of both.
+    let tag: i32 = next_reg(s)
+    format_into(s, "  %.{tag} = load i8, ptr %.{inner_slot}\n")
+    format_into(s, "  store i8 %.{tag}, ptr %.{out}\n")
+    # Err payload bytes (Option's None carries none).
+    var nbytes: i64 = 0
+    if out_name.starts_with("Result") and inner.starts_with("Result")
+        let err: StrView = result_err_arg(s, out_name)
+        var e_align: i64 = 1
+        if not unnamed(err)
+            nbytes = mangled_type_size_align(s, err, @e_align)
+        if nbytes == 0
+            var pad_in: i64 = 0
+            var pad_out: i64 = 0
+            nbytes = tagged_enum_layout(s, inner, @pad_in)
+            let n_out: i64 = tagged_enum_layout(s, out_name, @pad_out)
+            if n_out < nbytes
+                nbytes = n_out
+    if nbytes > 0
+        let src: i32 = next_reg(s)
+        gep_struct_open(s, src, inner)
+        format_into(s, ", ptr %.{inner_slot}, i32 0, i32 2\n")
+        let dst: i32 = next_reg(s)
+        gep_struct_open(s, dst, out_name)
+        format_into(s, ", ptr %.{out}, i32 0, i32 2\n")
+        let bytes: i32 = next_reg(s)
+        format_into(s, "  %.{bytes} = load [{nbytes} x i8], ptr %.{src}\n")
+        format_into(s, "  store [{nbytes} x i8] %.{bytes}, ptr %.{dst}\n")
+    out
+
+# AGAST #4455: the name ritz0 prints for the enclosing fn's return type after
+# `(got ` — `_resolve_fn_return_enum_name`'s enum name, else `None`.  Only a
+# registered enum (a user enum or a Result$/Option$ instantiation) names
+# itself; a struct, pointer, ref or absent return is `None`.
+fn try_ret_enum_name(s: *EmitterState) -> StrView
+    if s.fcx.fn_ret_type == TypeKind.Struct and s.fcx.ret_type_name.ptr != null and s.fcx.ret_type_name.len > 0
+        let ret_sv: StrView = s.fcx.ret_type_name
+        if is_enum_type(s.sym.mono.pctx, ret_sv) == 1 or is_tagged_enum_type(ret_sv) == 1
+            return ret_sv
+    "None"
+
+# ritz0's `fn_ret_type_name` for the Result message: a struct or enum's name,
+# a primitive's keyword (`got i32` for a scalar fn), else `None`.
+fn try_ret_type_name(s: *EmitterState) -> StrView
+    if s.fcx.fn_ret_type == TypeKind.Struct and s.fcx.ret_type_name.ptr != null and s.fcx.ret_type_name.len > 0
+        return s.fcx.ret_type_name
+    let prim: StrView = primitive_spelling(s.fcx.fn_ret_type)
+    if not unnamed(prim)
+        return prim
+    "None"
+
+# AGAST #4455 (LANGUAGE_SPEC §14.2): `?` requires the enclosing function's
+# return carrier to match the operand's — an Option for an Option, a Result
+# for a Result.  Nothing upstream enforced it: with a scalar-returning fn the
+# early return lowered to `ret % %.N` (an empty type name), clang rejected the
+# IR, and the compiler exited 0, so check_doc_examples counted the program as
+# COMPILED.  ritz0 refuses at the emitter; this mirrors its messages, located
+# at the `?` operand as ritz0's are.
+#
+# `?` on a Result also needs a Result-returning fn with the same E (§14.2,
+# AGAST #4467): canonical (mangled) name equality, aliases already resolved by
+# monomorphisation.  The different-E message names no type because ritz0 and
+# ritz1 spell instantiations differently.
+# True when refused (the diagnostic is emitted), false when the carriers agree.
+fn try_carrier_refused(s: *EmitterState, e: *Expr, carrier: StrView) -> bool
+    if unnamed(carrier) or carrier.len <= 0
+        return false
+    let ret_sv: StrView = s.fcx.ret_type_name
+
+    if carrier.eq("Option") or carrier.starts_with("Option$")
+        # ritz0: the fn must itself return an Option.
+        if ret_sv.eq("Option") or ret_sv.starts_with("Option$")
+            return false
+        var msg: String = string_new()
+        format_into(@&msg, "Try operator on an Option used in a function that does not return an Option (got {try_ret_enum_name(s)})")
+        emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
+        return true
+
+    if carrier.starts_with("Result$")
+        # §14.2: the fn must return a Result, not just any enum.  #4455's
+        # weaker check let a Result operand into an Option- or user-enum-
+        # returning fn.
+        if s.fcx.fn_ret_type == TypeKind.Struct and s.fcx.ret_type_name.ptr != null and s.fcx.ret_type_name.len > 0
+            if ret_sv.starts_with("Result$")
+                # ... and with the same E (tagged_enum_arg splits `Result$T$E`).
+                let op_e: StrView = result_err_arg(s, carrier)
+                let ret_e: StrView = result_err_arg(s, ret_sv)
+                if not unnamed(op_e) and not unnamed(ret_e) and op_e.eq(ret_e)
+                    return false
+                emit_nd_error_sv(s, e.span.line, e.span.col, "Try operator on a Result used in a function returning a Result with a different error type")
+                return true
+        var msg: String = string_new()
+        format_into(@&msg, "Try operator used in function not returning Result type (got {try_ret_type_name(s)})")
+        emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
+        return true
+    false
+
+# The enclosing fn's return type name (no_name() when it has none).
+fn try_fn_ret_sv(s: *EmitterState) -> StrView
+    s.fcx.ret_type_name
+
+# The carrier `expr?` unwraps: the inner expression's declared type, else the
+# enclosing fn's return type when the inner is opaque (same type by
+# definition of `?`).
+fn try_carrier_name(s: *EmitterState, inner: *Expr) -> StrView
+    var inner_sv: StrView = StrView { ptr: null, len: 0 }
+    if resolve_scrutinee_enum(s, inner, @inner_sv) != 0
+        return inner_sv
+    # AGAST #3238: a method's Result is its FnDef's, not the fn's: `r.rd()?`
+    # in a `-> Result<P, E>` fn spilled a `%Result$u32$E` as `%Result$P$E`.
+    let carrier: StrView = try_method_carrier(s, inner)
+    if carrier.len > 0
+        return carrier
+    try_fn_ret_sv(s)
+
+# Lower `expr?`:
+#   * On Some/Ok: extract payload from the carrier struct, continue with it.
+#   * On None/Err: early-return the whole struct back to the caller.
+#
+# Post-task-133 layout: Result$/Option$ is `{ i8 tag, [N x i8] payload }` with
+# tag 0 = Ok/Some (carrier) and tag 1 = Err/None.  The enclosing function's
+# return type must carry the same carrier (§14.2); try_carrier_refused checks
+# that and refuses otherwise (AGAST #4455 — the briefing does not ensure it).
+# Because the Err/None encoding is byte-identical we can return the struct
+# verbatim without a rebuild.
+pub fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
+    let enum_sv: StrView = try_carrier_name(s, e.left)
+    let pay_ptr: i32 = match emit_try_payload_ptr(s, e, enum_sv)
+        Some(p) => p
+        None => return 0   # refused, located: emit_expr's no-value
+
+    # The Ok/Some payload's struct or user-enum type, if any (e.g.
+    # "Result$Vec$u8$E" → "Vec$u8"; "Option$Opt" → "Opt"; "Option$i32" →
+    # none).  For scalar payloads, emit_variant_struct stores them as i64 so
+    # an i64 load is fine.  For struct payloads (e.g., Result<Vec<u8>, E>'s Ok
+    # holds a 24-byte %Vec$u8), an i64 load truncates to 8 bytes, corrupting
+    # the value.  AGAST #2105: a user enum is stored as its aggregate (#1466),
+    # so it loads as one, exactly as the match-bind side does (#2100).
+    let pay_sv: StrView = tagged_enum_payload_named(s, enum_sv, 1)
+    if unnamed(pay_sv)
+        # Scalar payload at its own width (AGAST #1898), widened to i64.
+        return emit_tagged_payload_load(s, pay_ptr, enum_sv, 0)
+    # Aggregate payload — load the actual type so the 24-byte (or larger)
+    # value is preserved for the caller's let-decl / arg coercion.
+    let payload: i32 = next_reg(s)
+    let pay_ir: String = ir_name(pay_sv)
+    format_into(s, "  %.{payload} = load %{pay_ir.as_view()}, ptr %.{pay_ptr}  ; try: unwrap struct payload\n")
+    payload
+
+# AGAST #4918: `e?` (carrier `enum_sv`, try_carrier_name) up to its Ok/Some
+# branch: the carrier spilled, its Err/None early-returned, and the address
+# of the Ok/Some payload in the spill returned, open in the Ok/Some block.
+# None when the carriers disagree (refused, located).
+fn emit_try_payload_ptr(s: *EmitterState, e: *Expr, enum_sv: StrView) -> Option<i32>
+    # Evaluate the inner Result/Option (yields a struct SSA register).
+    let value: i32 = emit_expr(s, e.left)
+
+    # AGAST #4455: refuse before lowering anything that assumes the enclosing
+    # fn can receive the early return.  An unlocated empty type name used to
+    # reach the IR and only clang noticed.
+    if try_carrier_refused(s, e, enum_sv)
+        return None
+
+    # Spill the struct so we can GEP for tag + payload.
+    let slot: i32 = next_reg(s)
+    entry_alloca_reg_begin_named(s, slot)
+    let enum_ir: String = ir_name(enum_sv)
+    format_into(s, "{enum_ir.as_view()}  ; try: spill scrutinee\n")
+    entry_alloca_reg_end(s)
+    emit_struct_store_or_copy(s, TypeKind.Struct, enum_sv, value, slot)
+
+    # Load tag byte at field 0.
+    let tag_ptr: i32 = next_reg(s)
+    gep_struct_open(s, tag_ptr, enum_sv)
+    format_into(s, ", ptr %.{slot}, i32 0, i32 0\n")
+    let tag: i32 = next_reg(s)
+    format_into(s, "  %.{tag} = load i8, ptr %.{tag_ptr}\n")
+
+    # Ok/Some (tag == 0) → fall through to the Ok branch; else early-return.
+    let tag_ok: i32 = next_reg(s)
+    format_into(s, "  %.{tag_ok} = icmp eq i8 %.{tag}, 0  ; try: tag == carrier\n")
+
+    let ok_label: i32 = next_label(s)
+    let err_label: i32 = next_label(s)
+    format_into(s, "  br i1 %.{tag_ok}, label %L{ok_label}, label %L{err_label}\n")
+
+    begin_block(s, err_label)
+    emit_try_early_return(s, slot, enum_sv)
+
+    # Ok/Some branch: the payload is field 2 (#1898).
+    begin_block(s, ok_label)
+    let pay_ptr: i32 = next_reg(s)
+    gep_struct_open(s, pay_ptr, enum_sv)
+    format_into(s, ", ptr %.{slot}, i32 0, i32 2\n")
+    Some(pay_ptr)
+
+# AGAST #4918: when `e` is `x?` whose Ok/Some payload is an array, its `[N]T`
+# (variant_array_type, the type a `Some(m)` binding reads), else None.
+pub fn try_array_payload(s: *EmitterState, e: *Expr) -> Option<ArrayArg>
+    if e == null or e.kind != ExprKind.Try or e.left == null
+        return None
+    var arr: ArrayArg
+    if variant_array_type(s, try_carrier_name(s, e.left), 0, @arr) == 0
+        return None
+    Some(arr)
+
+# AGAST #4918: the address of `x?`'s array payload (try_array_payload), in
+# the carrier's spill, its Err/None early-returned first.  None when refused.
+pub fn emit_try_array_ptr(s: *EmitterState, e: *Expr) -> Option<i32>
+    emit_try_payload_ptr(s, e, try_carrier_name(s, e.left))
+
+# `expr?`'s Err/None branch: early-return the carrier spilled at `slot` as the
+# enclosing fn's return type.  AGAST #1898: inner (e.g. Result$Big$i32) and
+# outer (Result$i32$i32) are laid out per instantiation like ritz0's, so the
+# Err payload's offset depends on the Ok type: unless the two names match,
+# rebuild the outer value — zeroed, tag copied, E's bytes copied payload to
+# payload — rather than reinterpreting the inner bytes.
+fn emit_try_early_return(s: *EmitterState, slot: i32, enum_sv: StrView)
+    let ret_sv: StrView = try_fn_ret_sv(s)
+    var ret_slot: i32 = slot
+    if is_tagged_enum_type(enum_sv) == 1 and is_tagged_enum_type(ret_sv) == 1 and name_eq(enum_sv, ret_sv) == 0
+        ret_slot = emit_try_err_relayout(s, slot, enum_sv)
+    if s.fcx.ret_sret == 1
+        # AGAST #1730 — never taken today (tagged enums keep their ABI; see
+        # struct_ret_uses_sret), but a `ret %T` in an sret fn is invalid IR.
+        emit_sret_ret_from_ptr(s, ret_slot)
+        return
+    let ret_reg: i32 = next_reg(s)
+    let ret_ir: String = ir_name(ret_sv)
+    format_into(s, "  %.{ret_reg} = load %{ret_ir.as_view()}, ptr %.{ret_slot}\n")
+    format_into(s, "  ret %{ret_ir.as_view()} %.{ret_reg}\n")

@@ -69,6 +69,7 @@ SOURCES = \
 	emitter_print \
 	emitter_expr \
 	emitter_match \
+	emitter_try \
 	enum_as_int \
 	sema \
 	sema_type \

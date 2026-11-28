@@ -121,6 +121,31 @@ SAME = {
     "argument": "fn g(a: [4]u8) -> i32\n    a[3] as i32\n\nfn f() -> i32\n    var a: [4]u8 = [0, 0, 0, 3]\n    g(a)\n",
     "elementwise_loop": ("fn f() -> i32\n    var a: [4]i64 = [0, 0, 0, 3]\n    var b: [4]i32\n"
                          "    for i in 0..4\n        b[i] = a[i] as i32\n    b[3]\n"),
+    # AGAST #4918: a whole-array value from a `match` with an arm that leaves,
+    # or from `?`, stored into a field and into a local.
+    "match_return_arm_field": ("struct W\n    a: [4]i32\n\nfn rd(ok: bool) -> Option<[4]i32>\n    if ok\n"
+                               "        return Some([0, 0, 0, 3])\n    None\n\nfn put(w:& W, ok: bool) -> i32\n"
+                               "    w.a = match rd(ok)\n        Some(m) => m\n        None => return 9\n    w.a[3]\n\n"
+                               "fn f() -> i32\n    var w: W\n    if put(@&w, false) != 9\n        return 1\n"
+                               "    put(@&w, true)\n"),
+    "match_return_arm_local": ("fn rd(ok: bool) -> Option<[4]i32>\n    if ok\n        return Some([0, 0, 0, 3])\n"
+                               "    None\n\nfn get(ok: bool) -> i32\n    let a: [4]i32 = match rd(ok)\n"
+                               "        Some(m) => m\n        None => return 9\n    a[3]\n\n"
+                               "fn f() -> i32\n    if get(false) != 9\n        return 1\n    get(true)\n"),
+    "try_local_and_field": ("struct W\n    a: [4]i32\n\nfn rd(ok: bool) -> Result<[4]i32, E>\n    if ok\n"
+                            "        return Ok([0, 0, 0, 3])\n    Err(E.B)\n\n"
+                            "fn get(w:& W, ok: bool) -> Result<i32, E>\n    let a: [4]i32 = rd(ok)?\n"
+                            "    w.a = rd(ok)?\n    Ok(a[3] * 10 + w.a[3])\n\nfn f() -> i32\n    var w: W\n"
+                            "    let bad: i32 = match get(@&w, false)\n        Ok(_) => 1\n        Err(_) => 0\n"
+                            "    if bad != 0\n        return 1\n    match get(@&w, true)\n"
+                            "        Ok(v) => v - 30\n        Err(_) => 2\n"),
+    "payload_from_array_values": ("var GA: [4]i32\n\nfn wrap(p: *[4]i32, k: i32) -> Option<[4]i32>\n"
+                                  "    var m: [4]i32 = [0, 0, 0, 1]\n    if k == 0\n        return Some(m)\n"
+                                  "    if k == 1\n        return Some(*p)\n    if k == 2\n        return Some(GA)\n"
+                                  "    Some(if k == 3 then m else GA)\n\nfn at3(o: Option<[4]i32>) -> i32\n"
+                                  "    match o\n        Some(a) => a[3]\n        None => 0\n\nfn f() -> i32\n"
+                                  "    GA[3] = 1\n    var q: [4]i32 = [0, 0, 0, 1]\n"
+                                  "    at3(wrap(@q, 0)) + at3(wrap(@q, 1)) + at3(wrap(@q, 2)) + at3(wrap(@q, 3)) - 1\n"),
 }
 
 

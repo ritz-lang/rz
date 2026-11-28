@@ -22,6 +22,8 @@ import emitter_decl
 import emitter_stmt_parts
 import emitter_expr_access   # emit_nd_index_ptr, emit_plane_ptr, emit_lent_referent
 import emitter_match         # emit_match_into, emit_match_arm_stmts
+import emitter_try           # try_array_payload, emit_try_array_ptr (AGAST #4918)
+import monomorph             # ArrayArg
 import ownership
 
 # The address of the array array_ptr_shape recognised behind `e`.
@@ -128,6 +130,29 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
         src_size = cra.param_array_size
         src_et = cra.param_array_elem_type
         src_name = cra.param_type_name
+    else if value.kind == ExprKind.If or value.kind == ExprKind.Match
+        # AGAST #4918: an array-valued `if` / `match`, its arms held to the
+        # field's N and T, built in a temporary (an arm may read the field).
+        src_ptr = next_reg(s)
+        entry_alloca_reg_begin(s, src_ptr)
+        emit_local_array_llvm_type(s, field.array_size, field.array_elem_type, field.array_elem_type_name)
+        format_into(s, "  ; #4918 array arm value\n")
+        entry_alloca_reg_end(s)
+        emit_array_local_whole_assign_impl(s, src_ptr, field.array_size, field.array_elem_type, field.array_elem_type_name, value)
+        src_size = field.array_size
+        src_et = field.array_elem_type
+        src_name = field.array_elem_type_name
+    else
+        match try_array_payload(s, value)
+            Some(tap) =>
+                # AGAST #4918: `x?`'s array payload, read from the carrier's spill.
+                src_ptr = match emit_try_array_ptr(s, value)
+                    Some(p) => p
+                    None => return   # refused, located
+                src_size = tap.size
+                src_et = tap.elem
+                src_name = tap.name
+            None => pass
     if src_ptr < 0
         emit_ir_error_sv(s, value.span, "whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
         return
@@ -348,6 +373,11 @@ fn emit_array_place_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: 
             return
         emit_call_array_store(s, value, cra, dst_ptr)
         return
+    match try_array_payload(s, value)
+        Some(tap) =>
+            emit_try_array_into(s, dst_ptr, dst_size, dst_et, dst_name, value, tap)
+            return
+        None => pass
     var place: ArraySrc
     if nd_row_src(s, value, @place)
         # AGAST #2517: a row `g[i]`, `x.m[i]`, `mk().m[i]` or `mkp().m[i]`.
@@ -367,6 +397,17 @@ fn emit_array_place_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: 
     if not array_store_fits(s, value, place.elem, place.name, dst_et, dst_name)
         return
     emit_local_array_copy(s, dst_size, dst_et, dst_name, emit_array_place_ptr(s, value), dst_ptr)
+
+# AGAST #4918: `x?` whose payload is the array `tap`, copied from the
+# carrier's spill into the local at `dst_ptr` once its N and T are checked.
+fn emit_try_array_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: TypeKind, dst_name: StrView, value: *Expr, tap: ArrayArg)
+    if not array_len_matches(s, value, tap.size, dst_size, "array length does not match the local array's length")
+        return
+    if not array_store_fits(s, value, tap.elem, tap.name, dst_et, dst_name)
+        return
+    match emit_try_array_ptr(s, value)
+        Some(pay) => emit_local_array_copy(s, dst_size, dst_et, dst_name, pay, dst_ptr)
+        None => pass   # refused, located
 
 # `[a, b, ..]` / `[v; N]`: how many elements the literal has.
 fn array_literal_len(value: *Expr) -> i32
