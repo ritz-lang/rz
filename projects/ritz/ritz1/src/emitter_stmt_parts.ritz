@@ -650,10 +650,11 @@ pub fn stmt_is_if_or_match(st: *Stmt) -> bool
 
 # AGAST #3421: settle a statement-`if` arm's scalar value `reg` against the
 # merge's float type `fr` in the arm's own block, before its `br`, as a match
-# arm's is (LARB R43, §7.5: an integer arm converts in a float slot and is
-# refused next to a float arm without one).  The arm's value is its last
-# statement: an expression, or a nested `if` / `match` statement, whose phi
-# type it published (last_match_float_ty).  Its phi was `i64` over doubles.
+# arm's is (LARB R43, §7.5: an integer arm converts in a float slot; one next
+# to a float arm without one is Sema's refusal, AGAST #4933).  The arm's
+# value is its last statement: an expression, or a nested `if` / `match`
+# statement, whose phi type it published (last_match_float_ty).  Its phi was
+# `i64` over doubles.
 pub fn if_stmt_arm_float_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: StrView, fr: *MatchResult) -> i32
     if reg <= 0 or not unnamed(agg)
         return reg
@@ -852,7 +853,8 @@ pub fn match_arm_float_ty(s: *EmitterState, e: *Expr) -> TypeKind
 
 # AGAST #1946: settle a scalar arm's value against the phi's float type.  A
 # float slot (result.hint_ty) fixes it up front; otherwise the first float arm
-# does, and an integer arm on either side of it is an error (LARB R43).  Once
+# does, and an integer arm on either side of it was refused on Sema (LARB
+# R43, float_slot.ritz's float_mix_settle, AGAST #4933).  Once
 # fixed, a float of the other width, or in a slot an integer, is converted in
 # the arm's own block before its `br`.  Called while
 # the arm's pattern binding is in scope.  Returns the register to record.
@@ -863,15 +865,16 @@ pub fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, 
 # `aft` (0 if none).  A statement `if`'s arms come here too, and one whose
 # value is a nested statement `if` / `match` has no expression (`arm_body`
 # null): its phi's type is `aft`, and if that is an integer in a float merge,
-# it is the R43 mix (the nested one had the slot too, so it would be float).
-# `at` is the arm's value, where an R43 mix is reported (AGAST #3621).
+# it is the R43 mix Sema refused (the nested one had the slot too, so it would
+# be float).
+# `at` is the arm's value, where an arm Sema could not type is reported.
 pub fn float_arm_settle(s: *EmitterState, aft: TypeKind, arm_body: *Expr, at: SrcSpan, body_reg: i32, result: *MatchResult) -> i32
     if result.float_ty == TypeKind.Void
         if aft == TypeKind.Void
             result.int_arms = result.int_arms + 1
             return body_reg
         if result.int_arms > 0
-            refuse_int_float_mix(s, at)
+            refuse_arm_beside_float(s, at)
         result.float_ty = aft
         return body_reg
     if aft == result.float_ty
@@ -879,7 +882,7 @@ pub fn float_arm_settle(s: *EmitterState, aft: TypeKind, arm_body: *Expr, at: Sr
     if aft != TypeKind.Void
         return emit_float_coerce(s, body_reg, aft, result.float_ty)
     if arm_body == null
-        refuse_int_float_mix(s, at)
+        refuse_arm_beside_float(s, at)
         return body_reg
     if is_int_const_type(expr_slot_ty(arm_body)) == 1
         # AGAST #3313, LARB R43a: an integer arm lands in the float slot as
@@ -888,20 +891,20 @@ pub fn float_arm_settle(s: *EmitterState, aft: TypeKind, arm_body: *Expr, at: Sr
         if result.hint_ty != TypeKind.Void
             return emit_int_into_float_slot(s, body_reg, float_slot_unsigned(arm_body), result.float_ty)
         # LARB R43 (#3385): with no float slot (hint_ty Void) the float type
-        # came from an earlier arm, and an integer arm next to it is refused,
-        # as one BEFORE the first float arm is above: the rule doesn't depend
-        # on order.  The slot is known before any arm is emitted, so no
-        # pre-pass is needed.
-        refuse_int_float_mix(s, at)
+        # came from an earlier arm, and Sema refused an integer arm next to
+        # it at the merge (float_slot.ritz's float_mix_settle, AGAST #4933).
+        refuse_arm_beside_float(s, at)
         return body_reg
     # A pointer arm was refused on Sema, in ritz0's words (AGAST #3626, #3892).
     emit_ir_error_sv(s, arm_body.span, "match arm yields a non-numeric value where the other arms yield a float")
     body_reg
 
-# LARB R43: an integer arm and a float arm meet with no float slot to settle
-# them, refused at `at`.
-fn refuse_int_float_mix(s: *EmitterState, at: SrcSpan)
-    emit_ir_error_sv(s, at, "match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+# A non-float arm and a float arm meet with no float slot to settle them.
+# LARB R43's integer arm is Sema's, refused at the merge (float_mix_settle,
+# AGAST #4933); what reaches here is an arm Sema could not type (a `bool`),
+# which has no float to become either.
+fn refuse_arm_beside_float(s: *EmitterState, at: SrcSpan)
+    emit_ir_error_sv(s, at, "this if / match arm's value is not a float, but another arm's is, and nothing gives the merge a float type; write it as a float or annotate the binding")
 
 # The i64 condition `cond` as the i1 a `br` takes (AGAST #1367): every
 # condition value, a bool included, is an i64 register.

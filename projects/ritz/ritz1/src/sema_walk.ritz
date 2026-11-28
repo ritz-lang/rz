@@ -288,6 +288,9 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discar
 
         float_arm_note(sm, owner, arm)   # AGAST #3892, likewise
 
+        if arm.is_pass == 0
+            float_mix_value(sm, arm.body)   # AGAST #4933, likewise
+
         match_value_note(sm, @mv, arm)   # AGAST #4656, likewise
 
         own_check_arm_end(sm)   # AGAST #3507: before its bindings leave scope
@@ -355,7 +358,10 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
             var scrut: *Expr = null
             if k == ExprKind.Match
                 scrut = e.left
+            var fm: FloatMix   # LARB R43 (AGAST #4933): its arms' values
+            float_mix_begin(sm, @fm, e as i64, discard == 0, e.span.line, e.span.col)
             sema_walk_arms(sm, scrut, e.args as *MatchArm, e, discard)
+            float_mix_settle(sm, @fm)
         ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
             if k == ExprKind.Index
                 # One report per `[` (AGAST #3755 / #3893): a scalar element is
@@ -379,6 +385,8 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
 
             sema_walk_expr(sm, e.left)
         ExprKind.Call =>
+            float_mix_args(sm, e)   # LARB R43 (AGAST #4933): before its arguments
+
             # LARB R37 (AGAST #3373), else AGAST #1629 / #3503.  let_check's
             # argument rule first, as emit_expr_call ran it first (#3294 / #3504).
             let gm: i32 = generic_method_check(sm, e)
@@ -416,6 +424,8 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
             sema_walk_list(sm, e.args)
             array_lit_one_type(sm, e)   # AGAST #4656
         ExprKind.Method =>
+            float_mix_args(sm, e)   # LARB R43 (AGAST #4933): before its arguments
+
             # After the receiver, as emit_expr_method lowers it first.
             let_another_struct_method(sm, e)   # AGAST #3294
 
@@ -741,6 +751,12 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         if fn_tail == 1
             fn_slot_tail(sm, st)   # AGAST #4310
 
+            # LARB R43 (AGAST #4933): the fn's value lands in its return type.
+            if st.kind == StmtKind.Expr
+                float_mix_slot(sm, st.expr, sm.cur_fn.return_type, sm.cur_fn.return_type_name)
+            else
+                float_mix_slot_stmt(sm, st, sm.cur_fn.return_type, sm.cur_fn.return_type_name)
+
         if tail_value == 1 and st.next == null and st.kind == StmtKind.Expr
             slot_narrowing_tail(sm, st.expr)   # AGAST #4081: the fn's value
 
@@ -760,6 +776,8 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
                 fn_slot_decl(sm, st)      # AGAST #4310
 
                 match_value_let(sm, st)   # AGAST #4656
+
+                float_mix_slot(sm, st.var_init, st.var_declared_type, st.var_type_name)   # AGAST #4933
                 sema_walk_expr(sm, st.var_init)
                 check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
                 sema_bind_decl(sm, st)
@@ -802,6 +820,16 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
 
                 if_arm_want_tail(in_tail)
 
+                # AGAST #4933: a tail `if`'s value is judged at the outermost one.
+                let if_site: Option<*Stmt> = sm.tail_site
+                if tail_value == 1 and st.next == null and if_site.is_none()
+                    sm.tail_site = Some(st)
+
+                # LARB R43 (AGAST #4933): a tail `if` with both arms merges them.
+                var if_fm: FloatMix
+                let if_used: bool = tail_value == 1 and st.next == null and st.if_else != null
+                float_mix_begin(sm, @if_fm, st as i64, if_used, st.span.line, st.span.col)
+
                 own_check_if_then(sm, st)   # AGAST #3507: the arms' moves merge
                 sema_walk_stmts(sm, st.if_then, 0)
 
@@ -809,6 +837,10 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
 
                 if_arm_want_tail(in_tail)
                 sema_walk_stmts(sm, st.if_else, 0)
+
+                sm.tail_site = if_site
+
+                float_mix_settle(sm, @if_fm)
 
                 own_check_if_end(sm, st)
             StmtKind.While =>
@@ -844,7 +876,14 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
                 # AGAST #3980: its arms are values only if it is the block's.
                 let discard_m: i32 = (tail_value == 0 or st.next != null) as i32
                 match_value_stmt_at(sm, st)   # AGAST #4656
+                let match_site: Option<*Stmt> = sm.tail_site   # AGAST #4933, as an `if`
+                if discard_m == 0 and match_site.is_none()
+                    sm.tail_site = Some(st)
+                var match_fm: FloatMix   # LARB R43 (AGAST #4933)
+                float_mix_begin(sm, @match_fm, st as i64, discard_m == 0, st.span.line, st.span.col)
                 sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm, null, discard_m)
+                float_mix_settle(sm, @match_fm)
+                sm.tail_site = match_site
             StmtKind.Return =>
                 bool_check_return(sm, st.return_value)
 
@@ -859,6 +898,8 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
                     fn_slot_return(sm, st)   # AGAST #4310
 
                 slot_narrowing_return(sm, st.return_value)   # AGAST #4081
+
+                float_mix_slot(sm, st.return_value, sm.cur_fn.return_type, sm.cur_fn.return_type_name)   # AGAST #4933
                 sema_walk_expr(sm, st.return_value)
             StmtKind.Expr =>
                 # Only a block's last statement can be its value (AGAST #2137).
@@ -918,6 +959,11 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         ref_value_after(sm, st)   # its binding's notes (AGAST #3926)
 
         own_check_after(sm, st)   # AGAST #3507: registers what it binds
+
+        # LARB R43 (AGAST #4933): a value block's last statement is its value,
+        # an arm of the statement `if` it is a branch of.
+        if tail_value == 1 and st.next == null
+            float_mix_tail(sm, st)
         st = st.next
 
 # enum_as_int (AGAST #2136 / #3511) on statement `st` of the list `first`:

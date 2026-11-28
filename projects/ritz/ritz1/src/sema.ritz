@@ -69,6 +69,7 @@ import ritzlib.io
 import ritzlib.hash
 import ritzlib.span       # span_from_strview: fnv1a_str keys
 import ritzlib.hashmap
+import ritzlib.option
 import ritzlib.str
 
 import ast
@@ -167,6 +168,17 @@ struct SemaVar
     tuple: i32
     bk_tuple: *SemaTupleNote   # bool_check's tuple note (AGAST #3768); else null
 
+# AGAST #4933, LARB R43 (float_slot.ritz's float_mix_*): an if / match being
+# walked, and what its arms yield.  Each lives in the walker's frame; `up` is
+# the merge it is nested in (Sema.fmix is the innermost).
+pub struct FloatMix
+    key: i64          # the ExprKind.If / ExprKind.Match, or the if / match Stmt
+    want: bool        # its value is used: a statement's arms are not merged
+    seen: i32         # FM_INT | FM_FLOAT: what its arms yield
+    line: i32         # where it is refused
+    col: i32
+    up: Option<*FloatMix>
+
 struct Sema
     module: *Module
     file: StrView              # the input path every diagnostic names
@@ -201,6 +213,16 @@ struct Sema
     # the match being walked, and the match statement whose arms are next.
     mv_let: *Stmt
     mv_stmt: *Stmt
+    # AGAST #4933: the outermost `if` / `match` statement of the fn's tail
+    # chain being walked.  ritz0 judges that merge's value, so a narrowing
+    # arm anywhere in it is reported there (slot_narrowing_tail).
+    tail_site: Option<*Stmt>
+    # LARB R43 (AGAST #4933, float_slot.ritz's float_mix_*): the innermost
+    # if / match being walked; the if / matches that land in a float slot
+    # (-> 1); and what each judged one yields (-> FM_KNOWN | FM_INT | FM_FLOAT).
+    fmix: Option<*FloatMix>
+    fm_slot: HashMapI64
+    fm_class: HashMapI64
     # The first array literal element not of element 0's type, held until
     # the move check is done (array_lit_settle); al_line 0: none.
     al_line: i32
@@ -241,6 +263,10 @@ pub fn sema_init(ctx: *ParseCtx, sm: *Sema, m: *Module, file: StrView)
     sm.cur_impl = null
     sm.mv_let = null
     sm.mv_stmt = null
+    sm.tail_site = None
+    sm.fmix = None
+    sm.fm_slot = hashmap_i64_with_cap(64)
+    sm.fm_class = hashmap_i64_with_cap(64)
     sm.al_line = 0
     sm.al_col = 0
     sm.al_index = 0

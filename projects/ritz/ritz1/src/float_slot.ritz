@@ -42,6 +42,7 @@ import ritzlib.memory
 import ast
 import types           # the one primitive type table (AGAST #1889)
 import ast_helpers
+import ast_query   # name_eq
 import narrowing
 import bool_check
 import sema
@@ -397,3 +398,194 @@ fn c_float_name(t: TypeKind) -> StrView
     if t == TypeKind.F32
         return "f32"
     "f64"
+
+# ---- An integer arm beside a float arm (LARB R43, AGAST #4933) ----
+#
+#     let a = match c          # error, at the `match`: write `1.0`, or
+#         0 => 1.5             # `let a: f64 = ...`
+#         _ => 1
+#
+# An if / match whose value is used and whose arms yield both an integer and
+# a float has no type to merge at, unless it lands in a float slot that gives
+# it one (§7.5: then an integer arm converts, float_slot_check above).  Those
+# slots are ritz0's (_float_slot, _float_tail_ids): a typed `let` / `var`, a
+# `return` or fn tail at a float return type, an f32 / f64 parameter, and
+# every if / match that is a value tail of one of them.  An assignment or a
+# field is not one (ritz0 refuses `x = if c then 0 else 1.5` too).
+#
+# ritz0 refuses it at the merge whose own arms mix: the inner `if` of
+# `if a then 1 else if b then 2.5 else 3`, the outer one when the outer arm
+# is what mixes.  So sema_walk opens a FloatMix at each if / match
+# (float_mix_begin), notes each arm's value while the arm's bindings are in
+# scope (float_mix_value / float_mix_tail), and judges the merge once its
+# arms are walked (float_mix_settle).  A nested merge is its parent's arm as
+# what it yields, and one refused yields nothing, so it is said once.  The
+# emitter used to refuse this at the arm, as it merged (AGAST #3385).
+
+const FM_INT: i32 = 1
+const FM_FLOAT: i32 = 2
+const FM_KNOWN: i32 = 4   # Sema.fm_class: the merge was judged
+
+# TypeKind.F32 / TypeKind.F64 when a slot of type (`ty`, `ty_name`) is a
+# float, else TypeKind.Void (the emitter's slot_float_type).
+fn fm_slot_type(ty: TypeKind, ty_name: StrView) -> TypeKind
+    if ty == TypeKind.F32 or ty == TypeKind.F64
+        return ty
+    if ty == TypeKind.Struct and name_eq(ty_name, "f32") == 1
+        return TypeKind.F32
+    if ty == TypeKind.Struct and name_eq(ty_name, "f64") == 1
+        return TypeKind.F64
+    TypeKind.Void
+
+fn fm_last(list: *Stmt) -> *Stmt
+    var last: *Stmt = list
+    while last != null and last.next != null
+        last = last.next
+    last
+
+# `e` and each if / match that is its value tail land in the float slot.
+fn fm_mark(sm: *Sema, e: *Expr)
+    if e == null or (e.kind != ExprKind.If and e.kind != ExprKind.Match)
+        return
+    sm.fm_slot.insert(e as i64, 1)
+    fm_mark_arms(sm, e.args as *MatchArm)
+
+fn fm_mark_arms(sm: *Sema, arms: *MatchArm)
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.is_pass == 0
+            fm_mark(sm, arm.body)
+        else
+            fm_mark_stmt(sm, fm_last(arm.body_stmts))
+        arm = arm.next
+
+# The statement form: a block's last statement, the value it ends in.
+fn fm_mark_stmt(sm: *Sema, st: *Stmt)
+    if st == null
+        return
+    match st.kind
+        StmtKind.Expr =>
+            fm_mark(sm, st.expr)
+        StmtKind.If =>
+            sm.fm_slot.insert(st as i64, 1)
+            fm_mark_stmt(sm, fm_last(st.if_then))
+            fm_mark_stmt(sm, fm_last(st.if_else))
+        StmtKind.Match =>
+            sm.fm_slot.insert(st as i64, 1)
+            fm_mark_arms(sm, st.if_then as *MatchArm)
+        _ => pass
+
+# `e` lands in a slot of type (`ty`, `ty_name`): a typed `let` / `var`'s
+# initialiser, a `return`'s value or a fn's tail expression.
+pub fn float_mix_slot(sm: *Sema, e: *Expr, ty: TypeKind, ty_name: StrView)
+    if fm_slot_type(ty, ty_name) != TypeKind.Void
+        fm_mark(sm, e)
+
+# A fn's tail `if` / `match` statement `st`, at return type (`ty`, `ty_name`).
+pub fn float_mix_slot_stmt(sm: *Sema, st: *Stmt, ty: TypeKind, ty_name: StrView)
+    if fm_slot_type(ty, ty_name) != TypeKind.Void
+        fm_mark_stmt(sm, st)
+
+fn fm_args(sm: *Sema, params: *Param, args: *Expr)
+    var p: *Param = params
+    var a: *Expr = args
+    while p != null and a != null
+        float_mix_slot(sm, a, p.param_type, p.param_type_name)
+        p = p.next
+        a = a.next
+
+# The arguments of call `e` land in its callee's parameters: a fn, a fn
+# pointer local, a nameless callee (`hs[0](..)`), a method or a static one.
+pub fn float_mix_args(sm: *Sema, e: *Expr)
+    if e.kind == ExprKind.Call
+        if e.func_name.len == 0
+            let sig: *FnDef = sbk_value_fn_sig(sm, e.left)
+            if sig != null
+                fm_args(sm, sig.params, e.args)
+            return
+        let v: *SemaVar = sema_find_local(sm, e.func_name)
+        if v != null
+            if v.fn_sig != null
+                fm_args(sm, v.fn_sig.params, e.args)
+            return
+        let fd: *FnDef = sema_call_fn(sm, e)
+        if fd != null
+            fm_args(sm, fd.params, e.args)
+        return
+    if e.kind != ExprKind.Method
+        return
+    let tn: StrView = sbk_method_recv(sm, e)
+    if tn.ptr == null
+        return
+    let md: *FnDef = sema_method_fn(sm, tn, e.ident)
+    if md == null or md.params == null
+        return
+    # `self` is the receiver, not the first argument (literal_method's rule).
+    if name_eq(md.params.name, "self") == 1
+        fm_args(sm, md.params.next, e.args)
+    else
+        fm_args(sm, md.params, e.args)
+
+# Open the if / match `key` (its Expr or Stmt), refused at `line`:`col`;
+# `want` false when its value is discarded.  float_mix_settle closes it.
+pub fn float_mix_begin(sm: *Sema, mx: *FloatMix, key: i64, want: bool, line: i32, col: i32)
+    mx.key = key
+    mx.want = want
+    mx.seen = 0
+    mx.line = line
+    mx.col = col
+    mx.up = sm.fmix
+    sm.fmix = Some(mx)
+
+# What the judged if / match `key` yields, as its parent's arm: 0 if unjudged.
+fn fm_class_of(sm: *Sema, key: i64) -> i32
+    (sm.fm_class.get(key).unwrap_or(0) as i32) & (FM_INT | FM_FLOAT)
+
+# What value `v` yields as an arm, typed in the arm's scope: FM_INT, FM_FLOAT
+# or 0 (unsure, or neither).
+fn fm_value_class(sm: *Sema, v: *Expr) -> i32
+    if v.kind == ExprKind.If or v.kind == ExprKind.Match
+        return fm_class_of(sm, v as i64)
+    let k: i32 = sema_bool_kind(sm, v)
+    if k == BK_FLOAT
+        return FM_FLOAT
+    if k == BK_INT
+        return FM_INT
+    0
+
+# The open merge `mx` has an arm that yields `class`.
+fn fm_note(mx: *FloatMix, class: i32)
+    if mx.want
+        mx.seen = mx.seen | class
+
+# `v` is an arm's value of the innermost open merge, its bindings in scope.
+pub fn float_mix_value(sm: *Sema, v: *Expr)
+    if v == null
+        return
+    match sm.fmix
+        Some(mx) => fm_note(mx, fm_value_class(sm, v))
+        None => pass
+
+# `st` is the last statement of an arm of the innermost open merge (a
+# statement `if`'s branch): its value.
+pub fn float_mix_tail(sm: *Sema, st: *Stmt)
+    match st.kind
+        StmtKind.Expr =>
+            float_mix_value(sm, st.expr)
+        StmtKind.If | StmtKind.Match =>
+            match sm.fmix
+                Some(mx) => fm_note(mx, fm_class_of(sm, st as i64))
+                None => pass
+        _ => pass
+
+# Every arm of `mx` was noted: refuse it if they mix with no float slot.
+pub fn float_mix_settle(sm: *Sema, mx: *FloatMix)
+    sm.fmix = mx.up
+    if not mx.want
+        return
+    var seen: i32 = mx.seen
+    if seen == (FM_INT | FM_FLOAT) and not sm.fm_slot.contains(mx.key)
+        sema_error_at(sm, mx.line, mx.col)
+        eprints("match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding\n")
+        seen = 0
+    sm.fm_class.insert(mx.key, (seen | FM_KNOWN) as i64)

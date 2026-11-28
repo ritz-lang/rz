@@ -85,6 +85,11 @@ ELSE = _load("_reject_parity_else", HERE / "tests" / "test_if_expression_require
 ARRAY_FOLD = _load("_reject_parity_array_fold", HERE / "tests" / "test_ritz1_const_array_fold.py")
 
 
+# AGAST #4933: LARB R43's mixed integer / float arms, and the return-slot rows.
+MIXED = _load("_reject_parity_mixed", HERE / "tests" / "test_unannotated_mixed_float_arms.py")
+SLOTS = _load("_reject_parity_slots", HERE / "tests" / "test_implicit_narrowing_slots.py")
+
+
 @dataclass(frozen=True)
 class Row:
     """One expect-error row.
@@ -155,6 +160,54 @@ for _label, _table in (("value", ELSE.VALUE_POSITIONS), ("operand", ELSE.OPERAND
             oracle_message="no `else`",
             gap=_gap,
         )
+
+# AGAST #4933: LARB R43's used if / match with an integer arm and a float arm
+# and no float slot, every shape in #2094's REFUSED table.  ritz0 refuses it at
+# the merge whose arms mix (the inner `if` of an `else if` chain whose inner
+# arms mix, the outer one of a chain whose outer arm does), and so must ritz1.
+# The table gives the line; the column is measured with ritz0 at 89ff3038.  A
+# new REFUSED row with no column here is a KeyError at collection: measure it.
+MIXED_COL = {
+    "if-int-then-float": 13, "if-float-then-int": 13, "else-if-chain": 34,
+    "if-as-argument": 14, "fn-tail": 5, "stmt-fn-tail": 5,
+    "stmt-else-if-tail": 5, "enum-match": 13, "integer-match": 13,
+}
+for _param in MIXED.REFUSED:
+    _program, _line = _param.values
+    CORPUS[f"mixed/{_param.id}"] = Row(
+        program=_program,
+        message="match arms yield both an integer and a float value",
+        at=(_line, MIXED_COL[_param.id]),
+    )
+# ... and the places that are not float slots to ritz0 (_float_slot), where
+# ritz1's emitter merged at the slot's type and accepted them.
+_MAIN = "\nfn main() -> i32\n    f(0)\n"
+NOT_A_FLOAT_SLOT = {
+    "assign-local": ("fn f(c: i32) -> i32\n    var a: f64 = 0.0\n"
+                     "    a = if c > 0 then 0 else 1.5\n    a as i32\n", (3, 9)),
+    "assign-global": ("var G: f64 = 0.0\n\nfn f(c: i32) -> i32\n"
+                      "    G = if c > 0 then 0 else 1.5\n    G as i32\n", (4, 9)),
+    "assign-element": ("fn f(c: i32) -> i32\n    var xs: [2]f64 = [0.0, 0.0]\n"
+                       "    xs[0] = if c > 0 then 0 else 1.5\n    xs[0] as i32\n", (3, 13)),
+    "struct-field": ("struct S\n    v: f64\n\nfn f(c: i32) -> i32\n"
+                     "    let s = S { v: if c > 0 then 0 else 1.5 }\n    s.v as i32\n", (5, 20)),
+}
+for _name, (_program, _at) in NOT_A_FLOAT_SLOT.items():
+    CORPUS[f"mixed/{_name}"] = Row(
+        program=_program + _MAIN,
+        message="match arms yield both an integer and a float value",
+        at=_at,
+    )
+
+# AGAST #4933: a fn's tail `if` / `match` with an arm too wide for the return
+# type is refused at that `if` / `match` (ritz0 judges the merge), not at the
+# arm.  Both are the statement on line 2 of the wrapper, column 5.
+for _name in ("tail_else_if_wide_arm", "tail_match_unfitting_arm"):
+    CORPUS[f"narrowing-slots/{_name}"] = Row(
+        program=SLOTS.PRELUDE + SLOTS.REJECTED[_name],
+        message="implicit narrowing:",
+        at=(SLOTS.PRELUDE_LINES + 2, 5),
+    )
 
 
 # AGAST #4932: a source whose last line has no trailing newline.  ritz1's
