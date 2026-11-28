@@ -206,6 +206,10 @@ def _build_and_run(
 # gvec.ritz, the same family as #4778 items 2-3 and #4838.  The same
 # program with Store in main.ritz's own file built on every compiler, so
 # this needs the two-file split.
+#
+# AGAST #4942: the same, with the receiver a method's result rather than a
+# field, `self.store().text()` (`store` returning `@Store`, as buddhafinger's
+# `Editor.buf()`): that receiver was untracked too.
 STORE_WITH_FIELD_METHOD = """\
 import ritzlib.gvec
 import ritzlib.strview
@@ -231,9 +235,15 @@ impl Ed
         var t = self.st.text()
         t.push_view("c")
         t.len()
+    fn store(self: @Ed) -> @Store
+        @self.st
+    fn grab_through(self: @&Ed) -> i64
+        var t = self.store().text()
+        t.push_view("cd")
+        t.len()
 fn main() -> i32
     var e = Ed { st: store_new() }
-    e.grab() as i32
+    (e.grab() + e.grab_through()) as i32
 """
 
 CASES = {
@@ -242,7 +252,7 @@ CASES = {
     "ritzlib_hashmap": ({"main.ritz": MAIN_HASHMAP}, None),
     "ritzlib_socket": ({"main.ritz": MAIN_SOCKET}, None),
     "cross_module_field_method_local": (
-        {"main.ritz": MAIN_FIELD_METHOD, "store.ritz": STORE_WITH_FIELD_METHOD}, 3),
+        {"main.ritz": MAIN_FIELD_METHOD, "store.ritz": STORE_WITH_FIELD_METHOD}, 7),
 }
 
 
