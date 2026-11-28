@@ -165,7 +165,8 @@ rllvm is the program those three invocations call for ELF. razm writes the objec
 | `-O0` `-O1` `-O2` `-O3` `-Os` `-Oz` | Accepted. v1 codegen does not change with the level. See [Optimization](#optimization-bar). |
 | `-ffreestanding` `-fno-builtin` | Accepted and ignored. They are frontend flags. On `.ll` input they do not change codegen, and they are not what keeps libc calls out of the object. The IR's `"no-builtins"` attribute is. |
 | `-mno-red-zone` | Accepted and ignored. It is a frontend flag and does nothing on `.ll` input. The IR's `noredzone` attribute is what the kernel uses (`--no-red-zone` on ritz). |
-| `-march=native` `-msha` `-maes` `-mpclmul` | Accepted and ignored. Instruction selection of SHA, AES, and CLMUL follows the function's `"target-features"`, not the host CPU. |
+| `-march=native` `-march=x86-64` `-march=x86-64-v2` `-msha` `-maes` `-mpclmul` | Accepted and ignored. rllvm emits baseline x86-64, which every accepted `-march` level includes (Harland builds at `-march=x86-64-v2`). Instruction selection of SHA, AES, and CLMUL follows the function's `"target-features"`, not the host CPU. Other `-march` values exit 1. |
+| `-mno-avx` | Accepted and ignored: rllvm emits no VEX instruction, so AVX is already off. |
 | `-g` | Accepted and ignored. v1 objects have no DWARF. |
 | `--target=<triple>` | Selects ELF vs rejection. See triples below. Absent: use the module triple, or `x86_64-unknown-linux-gnu` when the module has none. |
 

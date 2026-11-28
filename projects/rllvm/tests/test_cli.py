@@ -53,6 +53,8 @@ def test_help_prints_usage_to_stdout_and_exits_0(rllvm_bin, flag):
     (["-c", "-mcmodel=medium", "m.ll"], "unknown code model 'medium'"),
     (["-c", "-O4", "m.ll"], "unknown option '-O4'"),
     (["-c", "-S", "m.ll"], "unknown option '-S'"),
+    (["-c", "-march=x86-64-v3", "m.ll"], "unknown option '-march=x86-64-v3'"),
+    (["-c", "-mavx", "m.ll"], "unknown option '-mavx'"),
     (["-c", "-mcmodel=large", "-fPIC", "m.ll"], "-mcmodel=large with -fPIC"),
     (["-c", "-fPIC", "-mcmodel=large", "m.ll"], "-mcmodel=large with -fPIC"),
     (["-c", "no/such.ll"], "no/such.ll: cannot read file"),
@@ -71,6 +73,25 @@ def test_every_accepted_flag_compiles(rllvm_bin, tmp_path):
              "-Os", "-Oz", "-ffreestanding", "-fno-builtin", "-mno-red-zone",
              "-march=native", "-msha", "-maes", "-mpclmul", "-g"]
     p = rllvm(rllvm_bin, *flags, m, "-o", tmp_path / "out.o")
+    assert compiled(p, tmp_path / "out.o"), p
+
+
+@pytest.mark.parametrize("march", ["x86-64", "x86-64-v2"])
+def test_baseline_march_is_accepted(rllvm_bin, tmp_path, march):
+    # Harland builds at -march=x86-64-v2 (build_pipeline.HARLAND_MARCH).
+    # rllvm emits baseline x86-64 only, which both levels include.
+    p = rllvm(rllvm_bin, "-c", "-mcmodel=kernel", f"-march={march}",
+              module(tmp_path, BODY))
+    assert compiled(p, tmp_path / "m.o"), p
+
+
+def test_harland_argv_is_accepted(rllvm_bin, tmp_path):
+    # build_pipeline's argv for a target_os = "harland" binary (AGAST #4965):
+    # -mno-avx is a no-op because rllvm emits no VEX instruction at all.
+    m = module(tmp_path, BODY)
+    p = rllvm(rllvm_bin, "-c", "--target=x86_64-unknown-none", "-ffreestanding",
+              "-fno-builtin", "-march=x86-64-v2", "-msha", "-mno-avx", "-fPIC",
+              "-mno-red-zone", m, "-o", tmp_path / "out.o")
     assert compiled(p, tmp_path / "out.o"), p
 
 
