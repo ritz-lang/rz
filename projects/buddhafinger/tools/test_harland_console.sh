@@ -116,6 +116,24 @@ for f in "$EDITOR_ELF" "$CONTRACT_ELF"; do
         || { echo "FAIL: the packaged /bin/$(basename "$f" .elf) was not built by ritz1_selfhosted"; exit 1; }
 done
 echo "packaged: /bin/buddhafinger and /bin/bf-save-contract built by ritz1_selfhosted"
+# Harland never sets CR4.OSXSAVE/XCR0, so a VEX or EVEX instruction is #UD
+# in any process (AGAST #4912, #4965: the builder's editor copied structs
+# with %ymm on an AVX-512 build host and died at startup). Every packaged
+# ELF, whichever compiler built it: no %ymm/%zmm/%k register, no v-prefixed
+# SSE-register op.
+command -v objdump >/dev/null || setup_error "objdump not found (binutils)"
+vex=0
+for f in "$WORK"/bin/*.elf; do
+    hits="$(objdump -d --no-show-raw-insn "$f" \
+        | grep -E $'\tv[a-z0-9]+ .*%[xyz]mm|%[yz]mm[0-9]|%k[0-7]\\b' | head -3)"
+    if [ -n "$hits" ]; then
+        echo "FAIL: /bin/$(basename "$f" .elf) has AVX (VEX/EVEX) instructions, #UD on Harland:"
+        echo "$hits"
+        vex=1
+    fi
+done
+[ "$vex" -eq 0 ] || exit 1
+echo "packaged: no /bin ELF has an AVX instruction"
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" --init init_interactive \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 qemu-img create -q -f qcow2 "$WORK/storage.qcow2" 64M || { echo "FAIL: qemu-img create failed"; exit 1; }

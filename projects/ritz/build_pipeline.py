@@ -176,6 +176,11 @@ _WARNED_NO_VERIFIER = False
 # add them somewhere new expecting them to fix a libc-call regression on IR.
 FREESTANDING_FLAGS = ["-ffreestanding", "-fno-builtin"]
 
+# The CPU a `target_os = "harland"` binary compiles for (AGAST #4965): SSE4.2
+# and POPCNT, no AVX, whatever the build host is. Harland runs on QEMU's
+# Haswell-v1 under TCG and on `-cpu host` under KVM; both have it.
+HARLAND_MARCH = "x86-64-v2"
+
 # AGAST #1731: bounds for the per-source `clang -c -O2 <x>.ll` object compile.
 #
 # That compile used to run unbounded, and a failure quietly fell back to
@@ -1769,10 +1774,19 @@ def freestanding_target(bin_config: BinaryConfig) -> Target:
             "-ffreestanding",
         ]
     else:
+        # Harland enables SSE only: its kernel never sets CR4.OSXSAVE or
+        # XCR0, so any VEX/EVEX instruction is #UD (Invalid Opcode) in a
+        # Harland process. A Harland binary names a fixed CPU, never the
+        # build host's: #4912's `-march=native -mno-avx` still emitted
+        # %ymm struct copies on an AVX10 host (+avx10.1-512 survives
+        # -avx), and the object's store key never said which host built it
+        # (AGAST #4965). -mno-avx stays as a belt over a baseline change.
+        harland = bin_config.target_os == "harland"
         clang_flags = [
             f"--target={target}",
             *FREESTANDING_FLAGS,
-            "-march=native",  # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
+            # Enable CPU-specific features (SHA-NI, AES-NI, etc.)
+            f"-march={HARLAND_MARCH}" if harland else "-march=native",
             "-msha",  # Force SHA extensions: code using the SHA-NI
                       # intrinsics (e.g. cryptosec's test_sha_ni.ritz) must
                       # compile even where it never runs. Without this,
@@ -1780,12 +1794,7 @@ def freestanding_target(bin_config: BinaryConfig) -> Target:
                       # where -march=native doesn't include +sha (e.g.
                       # pre-Skylake).
         ]
-        # Harland enables SSE only: its kernel never sets CR4.OSXSAVE or
-        # XCR0, so an AVX instruction is #UD (Invalid Opcode) in any Harland
-        # process. -march=native would let clang pick AVX from the build
-        # host, as it does for a large struct copy (AGAST #4912, the
-        # editor's 256-byte copies killed buddhafinger at startup).
-        if bin_config.target_os == "harland":
+        if harland:
             clang_flags.append("-mno-avx")
         # Add PIC flag if explicitly requested or for Linux targets
         if bin_config.pic or target.endswith("-linux"):
