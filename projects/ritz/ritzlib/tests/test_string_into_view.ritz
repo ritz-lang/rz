@@ -1,0 +1,58 @@
+# Tests for ritzlib/string's string_into_view (AGAST #4915 slice 3).
+#
+# A handful of ritz1/src sites (tuple_subst, subst_components in
+# mono_clone.ritz) build a name by hand: a size pass over a linked list or
+# re-scanned string, one malloc, then a memcpy-per-piece fill loop. They
+# stay on the heap allocator (their result outlives the parser), so the
+# chain-aware replacement for them is the existing growable `String` (already
+# has `push_str`) plus a way to hand its buffer to a caller that owns and
+# frees it exactly like the hand-written loop did. string_into_view is that
+# hand-off: it empties `self.data` to [data: null, len: 0, cap: 0] first (the
+# same state Vec::deinit leaves it in), so self's end-of-scope Drop sees an
+# already-empty Vec and is a safe no-op rather than a double free.
+import ritzlib.memory  # free
+import ritzlib.string
+import ritzlib.strview
+
+[[test]]
+fn test_into_view_returns_pushed_bytes() -> i32
+    var s: String = string_from("foo")
+    s.push_str("bar")
+    let r: StrView = s.into_view()
+    if r.eq("foobar") == false
+        return 1
+    free(r.ptr)
+    return 0
+
+[[test]]
+fn test_into_view_is_nul_terminated() -> i32
+    var s: String = string_from("a")
+    s.push_str("b")
+    let r: StrView = s.into_view()
+    if *(r.ptr + r.len) != 0
+        return 1
+    free(r.ptr)
+    return 0
+
+# After into_view, `s` must be safe to drop without touching freed memory
+# (its Vec was emptied, not merely aliased) — scope exit below must not
+# double-free the bytes `r` now owns.
+[[test]]
+fn test_into_view_leaves_source_empty_and_safe_to_drop() -> i32
+    var s: String = string_from("hello")
+    let r: StrView = s.into_view()
+    if r.eq("hello") == false
+        free(r.ptr)
+        return 1
+    free(r.ptr)
+    return 0
+
+[[test]]
+fn test_into_view_of_empty_string() -> i32
+    var s: String = string_new()
+    let r: StrView = s.into_view()
+    if r.len != 0
+        free(r.ptr)
+        return 1
+    free(r.ptr)
+    return 0

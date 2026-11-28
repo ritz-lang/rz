@@ -1416,70 +1416,40 @@ fn subst_components(mono: *MonoCtx, name: StrView, type_param: StrView, new_suff
     if name.ptr == null or type_param.ptr == null or new_suffix.len < 1
         return name
     let arg: StrView = new_suffix.skip(1)
-    let arg_len: i32 = arg.len as i32
-    # Pass 1: each component's replacement, to size the output.  A tuple's
-    # is registered once (tuple_subst is idempotent), so pass 2 asks again.
+    # Single pass (AGAST #4915 slice 3): a growable String means no size
+    # pre-pass is needed, so each `$`-delimited component's replacement
+    # (tuple_subst, piece_param_head) is computed once instead of twice.
     var hits: i32 = 0
-    var total: i32 = 0
+    var s: String = string_new()
     var pos: i32 = 0
     while pos <= name.len
         var end: i32 = pos
         while end < name.len and name.get(end) != '$'   # '$'
             end = end + 1
+        let piece: StrView = name.skip(pos).take(end - pos)
         if plain == 1 and end - pos == type_param.len and memcmp(name.ptr + pos, type_param.ptr, type_param.len) == 0
             hits = hits + 1
-            total = total + arg_len
-        else if tuple_subst(mono, name.skip(pos).take(end - pos), type_param, new_suffix).ptr != null
-            hits = hits + 1
-            total = total + tuple_subst(mono, name.skip(pos).take(end - pos), type_param, new_suffix).len as i32
-        else if plain == 1 and piece_param_head(name.skip(pos).take(end - pos), type_param) > 0
-            hits = hits + 1
-            total = total + piece_param_head(name.skip(pos).take(end - pos), type_param) + arg_len
+            s.push_str(arg)
         else
-            total = total + end - pos
-        if end < name.len
-            total = total + 1
-        pos = end + 1
-    if hits == 0
-        return name
-    # Pass 2: build it.
-    let out: *u8 = malloc(total as i64 + 1) as *u8
-    var o: i32 = 0
-    pos = 0
-    while pos <= name.len
-        var end: i32 = pos
-        while end < name.len and name.get(end) != '$'
-            end = end + 1
-        var tn_sv: StrView = strview_empty()
-        if plain == 1 and end - pos == type_param.len and memcmp(name.ptr + pos, type_param.ptr, type_param.len) == 0
-            for j in 0..arg_len
-                *(out + o) = arg.get(j)
-                o = o + 1
-        else
-            tn_sv = tuple_subst(mono, name.skip(pos).take(end - pos), type_param, new_suffix)
-            let head: i32 = piece_param_head(name.skip(pos).take(end - pos), type_param)
+            let tn_sv: StrView = tuple_subst(mono, piece, type_param, new_suffix)
+            let head: i32 = piece_param_head(piece, type_param)
             if tn_sv.ptr != null
-                for j in 0..(tn_sv.len as i32)
-                    *(out + o) = *((tn_sv.ptr) + j)
-                    o = o + 1
+                hits = hits + 1
+                s.push_str(tn_sv)
             else if plain == 1 and head > 0
                 # AGAST #3748: `ptr_A` at A = `Box2_u8` is `ptr_Box2_u8`.
-                for j in pos..(pos + head)
-                    *(out + o) = name.get(j)
-                    o = o + 1
-                for j in 0..arg_len
-                    *(out + o) = arg.get(j)
-                    o = o + 1
+                hits = hits + 1
+                s.push_str(name.skip(pos).take(head))
+                s.push_str(arg)
             else
-                for j in pos..end
-                    *(out + o) = name.get(j)
-                    o = o + 1
+                s.push_str(piece)
         if end < name.len
-            *(out + o) = 36
-            o = o + 1
+            s.push('$')
         pos = end + 1
-    *(out + o) = 0
-    strview_from_ptr(out, o as i64)
+    if hits == 0
+        s.deinit()
+        return name
+    s.into_view()
 
 # The module being monomorphized (AGAST #2975).  Not mono.mono_module, which
 # is set only once a fn is specialised: a struct's `f: (T, i32)` is
@@ -1502,7 +1472,6 @@ fn tuple_subst(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, suffix:
     var last_e: *TupleElem = null
     var fields: *StructField = null
     var last_f: *StructField = null
-    var total: i32 = 5   # "tuple"
     var e: *TupleElem = r.elems
     var f: *StructField = r.def.fields
     while e != null and f != null
@@ -1559,22 +1528,15 @@ fn tuple_subst(mono: *MonoCtx, name_sv: StrView, type_param_sv: StrView, suffix:
             last_f.next = nf
         last_e = ne
         last_f = nf
-        total = total + 1 + (sp.len as i32)
         e = e.next
         f = f.next
-    let nm: *u8 = malloc(total as i64 + 1) as *u8
-    let tuple_lit: StrView = "tuple"
-    memcpy(nm, tuple_lit.ptr, tuple_lit.len)
-    var pos: i32 = 5
+    var nm_s: String = string_from("tuple")
     e = elems
     while e != null
-        *(nm + pos) = 95   # '_'
-        pos = pos + 1
-        memcpy(nm + pos, e.ga.name.ptr, e.ga.name.len)
-        pos = pos + (e.ga.name.len as i32)
+        nm_s.push('_')
+        nm_s.push_str(e.ga.name)
         e = e.next
-    *(nm + pos) = 0
-    let nm_sv: StrView = StrView { ptr: nm, len: pos as i64 }
+    let nm_sv: StrView = nm_s.into_view()
     var got: *TupleReg = tuple_reg_lookup(mono.pctx, nm_sv)
     if got == null
         # The parameters left: the template's, less type_param.

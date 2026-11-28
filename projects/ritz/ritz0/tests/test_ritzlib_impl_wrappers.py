@@ -63,9 +63,9 @@ STRING_STATIC = {
     "from_i64", "from_hex",
 }
 STRING_METHODS = STRING_STATIC | {
-    "len", "cap", "is_empty", "as_ptr", "as_view", "get", "push", "push_str",
-    "push_string", "push_bytes", "push_span", "clear", "pop", "eq",
-    "eq_string", "hash", "clone", "starts_with_string",
+    "len", "cap", "is_empty", "as_ptr", "as_view", "into_view", "get", "push",
+    "push_str", "push_string", "push_bytes", "push_span", "clear", "pop",
+    "eq", "eq_string", "hash", "clone", "starts_with_string",
     "ends_with_string", "contains_string", "find", "slice", "char_at",
     "set_char", "starts_with", "ends_with", "contains", "push_i64",
     "to_lower", "eq_strview", "deinit",

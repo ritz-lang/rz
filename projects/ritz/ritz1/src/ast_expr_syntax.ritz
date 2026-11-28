@@ -55,6 +55,72 @@ pub fn parser_join3(p: *Parser, a: StrView, b: StrView, c: StrView) -> StrView
     *(buf + n) = 0
     StrView { ptr: (buf), len: (n) }
 
+# ============================================================================
+# ParserChain - arena-backed chain join (AGAST #4915 slice 3)
+# ============================================================================
+#
+# parser_join2/3 above cover the fixed 2-/3-piece case. A handful of sites
+# join an unbounded, loop-accumulated number of pieces instead (a linked
+# list's N nodes, an array's N dimensions, a repeated "ptr_" prefix depth):
+# a chain. Each of those did its own two-pass size-then-fill by hand.
+# ParserChain is that loop, written once: push each piece (or byte) as you
+# go, into a parser_alloc'd buffer that grows by doubling. A grow abandons
+# the old chunk rather than freeing it — safe and cheap here because
+# parser_alloc never frees individual allocations; the whole arena goes
+# with `p`.
+struct ParserChain
+    buf: *u8
+    len: i64
+    cap: i64
+
+# Start an empty chain. `cap_hint` seeds the first allocation (0 is fine;
+# the first push grows it from nothing) so a caller that already knows
+# roughly how many bytes it needs can skip the first grow.
+pub fn parser_chain_new(p: *Parser, cap_hint: i64) -> ParserChain
+    if cap_hint <= 0
+        return ParserChain { buf: (null), len: 0, cap: 0 }
+    ParserChain { buf: (parser_alloc(p, cap_hint)), len: 0, cap: cap_hint }
+
+# Grow `c` so it holds at least `c.len + extra` bytes, doubling (or jumping
+# straight to what's needed, if that's bigger) and copying the bytes
+# written so far into the new chunk. `pub`: a caller that writes digits or
+# other fixed-width text straight into `c.buf` (write_dec_i32, say) reserves
+# room with this first, then advances `c.len` itself (see spell_last_array).
+pub fn parser_chain_ensure(p: *Parser, c:& ParserChain, extra: i64)
+    let need: i64 = c.len + extra
+    if need <= c.cap
+        return
+    var new_cap: i64 = c.cap * 2
+    if new_cap < need
+        new_cap = need
+    if new_cap < 8
+        new_cap = 8
+    let new_buf: *u8 = parser_alloc(p, new_cap)
+    if c.len > 0
+        memcpy(new_buf, c.buf, c.len)
+    c.buf = new_buf
+    c.cap = new_cap
+
+# Append `sv`'s bytes to the chain.
+pub fn parser_chain_push(p: *Parser, c:& ParserChain, sv: StrView)
+    parser_chain_ensure(p, c, sv.len)
+    memcpy(c.buf + c.len, sv.ptr, sv.len)
+    c.len = c.len + sv.len
+
+# Append one literal byte (e.g. a '$' or '_' separator, or a repeated
+# fixed-text fragment written byte-by-byte).
+pub fn parser_chain_push_byte(p: *Parser, c:& ParserChain, b: u8)
+    parser_chain_ensure(p, c, 1)
+    *(c.buf + c.len) = b
+    c.len = c.len + 1
+
+# Finish the chain into a fresh, NUL-terminated StrView in the parser's
+# arena. Same ownership as parser_join2/3: freed with `p`, not individually.
+pub fn parser_chain_view(p: *Parser, c:& ParserChain) -> StrView
+    parser_chain_ensure(p, c, 1)
+    *(c.buf + c.len) = 0
+    StrView { ptr: (c.buf), len: c.len }
+
 # =============================================================================
 # Module helpers
 # =============================================================================
@@ -1301,20 +1367,11 @@ pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, 
         base = prim_spelled.ptr
     if base_len <= 0
         return strview_empty()
-    let total: i32 = depth * 4 + base_len
-    let name: *u8 = parser_alloc(p, (total + 1) as i64)
-    var pos: i32 = 0
+    var c: ParserChain = parser_chain_new(p, (depth * 4 + base_len) as i64)
     for d in 0..depth
-        *(name + pos) = 112      # 'p'
-        *(name + pos + 1) = 116  # 't'
-        *(name + pos + 2) = 114  # 'r'
-        *(name + pos + 3) = 95   # '_'
-        pos = pos + 4
-    for i in 0..base_len
-        *(name + pos) = *(base + i)
-        pos = pos + 1
-    *(name + pos) = 0
-    return StrView { ptr: (name), len: (pos) as i64 }
+        parser_chain_push(p, c, "ptr_")
+    parser_chain_push(p, c, StrView { ptr: (base), len: (base_len) as i64 })
+    return parser_chain_view(p, c)
 
 # AGAST #2037: build a single-token generic call's suffix — "$" + prefix +
 # the type argument's mangled spelling.  The token rules (`f<T>`, `f<*T>`,
@@ -1377,26 +1434,14 @@ pub fn generic_arg_spelling(ga: *GenericArg) -> StrView
 # captured argument list.  Returns an arena-allocated, NUL-terminated name
 # and its length in *out_len.
 pub fn mangle_generic_args(p: *Parser, base_name: StrView, ga: *GenericArg) -> StrView
-    var total: i32 = (base_name.len as i32)
+    var c: ParserChain = parser_chain_new(p, base_name.len)
+    parser_chain_push(p, c, base_name)
     var cur: *GenericArg = ga
     while cur != null
-        total = total + 1 + (generic_arg_spelling(cur).len as i32)
+        parser_chain_push_byte(p, c, 36)  # '$'
+        parser_chain_push(p, c, generic_arg_spelling(cur))
         cur = cur.next
-    let mangled: *u8 = parser_alloc(p, (total + 1) as i64)
-    var pos: i32 = 0
-    for i in 0..(base_name.len as i32)
-        *(mangled + pos) = base_name.get(i)
-        pos = pos + 1
-    cur = ga
-    while cur != null
-        *(mangled + pos) = 36  # '$'
-        pos = pos + 1
-        let spell: StrView = generic_arg_spelling(cur)
-        memcpy(mangled + pos, spell.ptr, spell.len)
-        pos = pos + (spell.len as i32)
-        cur = cur.next
-    *(mangled + pos) = 0
-    return StrView { ptr: (mangled), len: (pos) as i64 }
+    return parser_chain_view(p, c)
 
 # Mangle a generic type like Result<Vec<u8>, StrView> → Result$Vec$u8$StrView
 # from the arguments captured by capture_first_generic_arg.  Returns
