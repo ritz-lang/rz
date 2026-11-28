@@ -619,7 +619,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     test_ci_shell_boot.py), the no-serial framebuffer boot (#4868;
     test_ci_fbcon_boot.py), the AHCI persist boot (#4884;
     test_ci_ahci_boot.py), the xHCI keyboard boot (#4887;
-    test_ci_usb_boot.py) and typing into rzsh on that keyboard (#4888;
+    test_ci_usb_boot.py), typing into rzsh on that keyboard (#4888;
+    test_ci_usb_boot.py) and on its plain-MSI and polled fallbacks (#4891;
     test_ci_usb_boot.py). So does resolving the builder image the boots
     stage Buddhafinger with (#4834; projects/builder/resolve_image.sh: 3
     only for a missing docker). A new step here must make the same promise."""
@@ -666,6 +667,10 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/harland/tools/test_usb_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_usb_boot.sh keyboard",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs" SKIP_BUILD=1 '
+        "bash projects/harland/tools/test_usb_boot.sh keyboard-msi",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs" SKIP_BUILD=1 '
+        "bash projects/harland/tools/test_usb_boot.sh keyboard-poll",
     ]
 
 

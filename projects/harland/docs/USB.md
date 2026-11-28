@@ -100,12 +100,15 @@ The driver adds no lock, no message kind and no CPU of its own.
   joins the "In-kernel drivers" row of SMP_USER's inventory, next to
   `drivers/nvme`, `virtio/blk`, `virtio/net` and `ena`. It needs no lock
   because only the BSP ever touches it: its three entry points all run there.
-  These are the MSI-X vector, the polled-fallback tick and the console's
-  readers, each covered below. Unlike the other rows it is never lent to an
+  These are the controller's vector (MSI-X, or plain MSI), the
+  polled-fallback tick and the console's readers, each covered below. Unlike the other rows it is never lent to an
   AP, because no AP call reaches it.
 - **Interrupts go to the BSP.** Each controller's interrupter 0 gets one
-  MSI-X vector from `msix_vector_alloc` with the BSP as its destination
-  (`irq_route_dest`, and an IRTE when remapping is on). The console's wait
+  vector from `msix_vector_alloc` with the BSP as its destination
+  (`irq_route_dest`, and an IRTE when remapping is on): MSI-X entry 0, or,
+  on a function with no MSI-X (the X99's Intel 8086:8d31), plain MSI with
+  one message (`msi_enable`, #4885). `setup_vector` in
+  `drivers/usb/xhci.ritz` is the one place the source is chosen. The console's wait
   set and the `tty/ldisc.ritz` state it feeds are BSP-owned rows too, so the
   whole keystroke path stays on one CPU and needs no kick.
 - **`irq_handler` calls the driver.** The MSI-X branch counts the vector as
@@ -135,12 +138,21 @@ The driver adds no lock, no message kind and no CPU of its own.
   each device is a state machine that the event moves forward. Hot-plug
   therefore never stalls the BSP's other work or keystroke latency, and never
   delays the forwarded calls of netd's core.
-- **Polling fallback.** A controller with no usable vector (MSI-only before
-  MSI support lands, or a vector that never fires) is polled from the BSP's
-  100 Hz tick (`usb_tick`, which already runs each controller's health check
-  and recovery), calling the same `xhci_irq` body. Ten
-  milliseconds is well inside what typing needs. Only the BSP's tick polls, so
-  the poll stays on the owner. The APs' ticks never call it.
+- **Polling fallback.** A controller with no usable vector (neither MSI-X
+  nor MSI, or neither could be aimed at a CPU) has its INTx masked and is
+  polled from the BSP's 100 Hz tick (`usb_tick`, which already runs each
+  controller's health check and recovery), calling the same `xhci_irq` body.
+  So is one whose vector never fires: at each 100 ms health check
+  (`VectorWatch`, `drivers/usb/irq_mode.ritz`), an event waiting on
+  interrupter 0's event ring at two checks in a row with no interrupt
+  counted on its vector between them moves the controller to the poll for
+  good, and the log says so. The ring is asked rather than `IMAN.IP`, which
+  can stay set over a drained ring. Ten milliseconds is well inside what typing needs. Only the BSP's tick
+  polls, so the poll stays on the owner. The APs' ticks never call it.
+- **Test hooks.** The boot options `\harland\usb-no-msix` (GRUB:
+  `usb-no-msix`) leave MSI-X off, so each controller uses plain MSI, and
+  `\harland\usb-poll` (`usb-poll`) gives no controller a vector, so the
+  tick polls each one (#4891). Only the fallback boots set them.
 
 ## Data path
 
@@ -237,7 +249,8 @@ How it is built (#4889):
 | Hot-plug | the keyboard boot (`fbcon_screen.py --qmp-do`) | QMP `device_del` of `usb-kbd`: its port is detached and its slot disabled. `device_add`: it is ready again and `echo back` types |
 | Hub | the same script, `-device usb-hub` with `usb-kbd` behind it | typing works through the hub |
 | Several controllers | the keyboard boot: two `qemu-xhci` devices, the keyboard on the second | the keyboard on any controller works, as on chungus |
-| MSI-only and polled | the same script, with MSI-X forced off by a boot option | typing works on the fallback path |
+| MSI-only and polled | `tools/test_usb_boot.sh keyboard-msi` (`make test-usb-msi`) and `keyboard-poll` (`make test-usb-poll`): the keyboard boot with `\harland\usb-no-msix` (and `qemu-xhci,msi=on`: QEMU offers MSI only when asked) or `\harland\usb-poll` | hc1's keyboard-ready line on screen names its source (`MSI`, or `polled`; MSI-X boots say `MSI-X`) and no controller runs any other way; `echo hi` types and Ctrl-C kills `spin` (`$?` = 130) |
+| Dead-vector watch | host, `test/test_usb_irq_mode.ritz` | which sources each boot option allows; a pending interrupt across two health checks with none delivered is a stall, one look or a delivered interrupt is not |
 
 The script joins the `test-tier1` family in `Makefile` as `test-usb`, and the
 gate runs it.

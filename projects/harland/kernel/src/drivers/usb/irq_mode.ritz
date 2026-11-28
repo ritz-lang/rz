@@ -1,0 +1,59 @@
+# How an xHCI controller's interrupter 0 reaches the BSP (AGAST #4891,
+# docs/USB.md "Concurrency under SMP_USER.md")
+#
+# drivers/usb/xhci.ritz's setup_vector tries, in order: MSI-X entry 0, then
+# plain MSI (capability 05h: the X99's Intel 8086:8d31 has no MSI-X), then
+# no vector at all, when the BSP's tick polls the controller (usb_tick
+# calling the same xhci_irq body). The boot options narrow that for the
+# tests: `usb-no-msix` skips MSI-X, `usb-poll` skips both.
+#
+# A controller can also have a vector that never fires (an interrupt
+# remapper or chipset that drops it). VectorWatch finds that from the
+# health check xhci_tick already runs every 100 ms: an event waiting on
+# interrupter 0's event ring at two looks in a row with no interrupt
+# delivered on the vector between them. That controller is then polled too.
+#
+# Pure: no kernel imports, so test/test_usb_irq_mode.ritz runs it on the host.
+
+# The interrupt sources the boot options allow a controller.
+pub enum UsbIrqMode
+    Auto                    # MSI-X, else plain MSI, else the tick's poll
+    NoMsix                  # plain MSI, else the poll (usb-no-msix)
+    Poll                    # the poll alone (usb-poll)
+
+# The mode for the boot options: `usb-poll` (poll) wins over `usb-no-msix`
+# (no_msix).
+pub fn usb_irq_mode(no_msix: bool, poll: bool) -> UsbIrqMode
+    if poll
+        return UsbIrqMode.Poll
+    if no_msix
+        return UsbIrqMode.NoMsix
+    UsbIrqMode.Auto
+
+impl UsbIrqMode
+    pub fn allows_msix(self) -> bool
+        self == UsbIrqMode.Auto
+
+    pub fn allows_msi(self) -> bool
+        self != UsbIrqMode.Poll
+
+# One controller's vector, as its health checks saw it.
+pub struct VectorWatch
+    pending: bool           # an event waited on the ring at the last look
+    count: u64              # the vector's interrupts by the last look
+
+impl VectorWatch
+    pub fn new() -> VectorWatch
+        VectorWatch { pending: false, count: 0 }
+
+    # One look: `pending` is whether an event waits on the ring now, `count`
+    # the interrupts delivered on the vector so far (msix_vector_count).
+    # True when one waited at the last look and still does, with none
+    # delivered between: an event has waited a whole health period for an
+    # interrupt that did not come. One look with an event waiting proves
+    # nothing, since its interrupt may be in flight.
+    pub fn stalled(self: @&VectorWatch, pending: bool, count: u64) -> bool
+        let stuck: bool = pending and self.pending and count == self.count
+        self.pending = pending
+        self.count = count
+        stuck

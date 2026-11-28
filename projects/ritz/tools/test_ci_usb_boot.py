@@ -27,6 +27,11 @@ controller alone and enumerates its keyboard again. These pin:
     i8042=off, -serial none) on the second of two controllers, types each
     step the docs promise, then unplugs and replugs it over QMP and types
     again.
+  * the fallback boots (`keyboard-msi`, `keyboard-poll`, #4891): their own
+    CI steps after the keyboard boot, and `make test-usb-msi` /
+    `test-usb-poll`; against the stub, each puts its boot option on the ESP
+    (usb-no-msix, usb-poll), waits for hc1 running that way on screen, and
+    types `echo hi` and Ctrl-C.
 
 Run with:
     python3 -m pytest projects/ritz/tools/test_ci_usb_boot.py -q
@@ -115,7 +120,7 @@ def configured(slot: int, hc: int = 0) -> str:
 
 
 def ready(slot: int, hc: int = 0) -> str:
-    return rf"[usb] hc{hc} slot {slot}: keyboard ready (endpoint 0x81, interval 6)\n"
+    return rf"[usb] hc{hc} slot {slot}: keyboard ready (endpoint 0x81, interval 6, MSI-X)\n"
 
 
 # hc1's one keyboard, enumerated at boot and again after its reset.
@@ -380,9 +385,17 @@ def test_hc1_error_disturbing_hc0_fails(tree):
 
 
 @pytest.mark.integration
-def test_no_msix_vector_fails(tree):
-    polled = r"[xhci] hc0 running: no MSI-X vector: events wait for the polled fallback\n"
-    lines = [polled if part == RUNNING else part for part in PASSED_LINES]
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        pytest.param(r"[xhci] hc0 running: no vector, polled from the BSP tick\n", id="polled"),
+        pytest.param(r"[xhci] hc0 running: MSI vector 64 -> BSP\n", id="plain-msi"),
+    ],
+)
+def test_no_msix_vector_fails(tree, fallback):
+    """With no boot option qemu-xhci must get MSI-X: plain MSI or the poll
+    there is a broken MSI-X path, not a pass."""
+    lines = [fallback if part == RUNNING else part for part in PASSED_LINES]
     r = _run(tree, log(lines))
     assert r.returncode == 1, r.stdout + r.stderr
 
@@ -413,11 +426,13 @@ def test_no_tier1_verdict_fails(tree):
 # the test asks for.
 FBCON_STUB = """import os, sys
 open(os.environ["FBCON_ARGV"], "w").write("\\n".join(sys.argv[1:]))
+esp = [a.split("fat:rw:", 1)[1] for a in sys.argv if "fat:rw:" in a][0]
+open(os.environ["FBCON_ARGV"] + ".esp", "w").write("\\n".join(sorted(os.listdir(os.path.join(esp, "harland")))))
 sys.exit(int(os.environ.get("FBCON_RC", "0")))
 """
 
 
-def _keyboard_run(tree, rc: int = 0) -> tuple[subprocess.CompletedProcess, list[str]]:
+def _keyboard_run(tree, rc: int = 0, mode: str = "keyboard") -> tuple[subprocess.CompletedProcess, list[str]]:
     tools = tree["script"].parent
     (tools / "fbcon_screen.py").write_text(FBCON_STUB)
     for rel in ("projects/indium/build/debug/init_interactive.elf", "projects/rzsh/build/debug/rzsh.elf"):
@@ -438,7 +453,7 @@ def _keyboard_run(tree, rc: int = 0) -> tuple[subprocess.CompletedProcess, list[
         "FBCON_RC": str(rc),
     }
     r = subprocess.run(
-        ["/bin/bash", str(tree["script"]), "keyboard"],
+        ["/bin/bash", str(tree["script"]), mode],
         env=env, capture_output=True, text=True, timeout=60,
     )
     return r, argv_file.read_text().split("\n") if argv_file.exists() else []
@@ -477,7 +492,7 @@ def test_keyboard_boot_types_each_step_with_the_usb_keyboard_alone(tree):
         "e c h o spc b a c k ret",
     ]
     expects = [argv[i + 1] for i, a in enumerate(argv) if a == "--expect"]
-    assert any("hc1 slot 1: keyboard ready" in e for e in expects)
+    assert any("hc1 slot 1: keyboard ready" in e and e.endswith(", MSI-X\\)") for e in expects)
     assert any("back" in e for e in expects), "typing must work after the replug"
     assert any("130" in e for e in expects), "Ctrl-C's kill must show $? = 130"
 
@@ -487,3 +502,91 @@ def test_keyboard_boot_failure_fails(tree):
     r, _ = _keyboard_run(tree, rc=1)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "PASS" not in r.stdout
+
+
+# --------------------------------------------------------------------------
+# The fallbacks (#4891): plain MSI, and the BSP tick's poll
+# --------------------------------------------------------------------------
+
+FALLBACKS = {
+    # mode: (boot option on the ESP, the source hc1's keyboard-ready line
+    # names, make target)
+    "keyboard-msi": ("usb-no-msix", "MSI", "test-usb-msi"),
+    "keyboard-poll": ("usb-poll", "polled", "test-usb-poll"),
+}
+
+
+@pytest.mark.parametrize("mode", sorted(FALLBACKS))
+def test_each_fallback_boot_is_its_own_gate_after_the_keyboard_boot(mode):
+    steps = _build_all()
+    [kbd] = _indices(steps, USB_SCRIPT, "keyboard")
+    [fb] = _indices(steps, USB_SCRIPT, mode)
+    uploads = [
+        i for i, s in enumerate(steps) if "upload-artifact" in str(s.get("uses", ""))
+    ]
+    assert kbd < fb < min(uploads)
+    step = steps[fb]
+    assert "continue-on-error" not in step
+    assert "|| true" not in step["run"]
+    assert step.get("timeout-minutes")
+    assert "boot-logs" in step["run"]
+    target = FALLBACKS[mode][2]
+    text = (REPO / "projects/harland/Makefile").read_text()
+    assert f"\n{target}:\n\t./tools/test_usb_boot.sh {mode}\n" in text
+    assert target in text.split("\n.PHONY:", 1)[1].split("\n", 1)[0]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("mode", sorted(FALLBACKS))
+def test_fallback_boot_sets_its_option_and_types_on_it(tree, mode):
+    option, via, _ = FALLBACKS[mode]
+    r, argv = _keyboard_run(tree, mode=mode)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: typed into rzsh on a USB keyboard" in r.stdout
+    esp = (tree["tmp"] / "fbcon.argv.esp").read_text().split("\n")
+    assert option in esp, esp
+    others = {o for o, _, _ in FALLBACKS.values()} | {"fault-usb"}
+    assert not (others - {option}) & set(esp), esp
+    expects = [argv[i + 1] for i, a in enumerate(argv) if a == "--expect"]
+    assert any("hc1 slot 1: keyboard ready" in e and e.endswith(f", {via}\\)") for e in expects), expects
+    absents = [argv[i + 1] for i, a in enumerate(argv) if a == "--absent"]
+    assert any("hc[01] running:" in a for a in absents), "another source must fail"
+    assert any("130" in e for e in expects), "Ctrl-C's kill must show $? = 130"
+    assert _steps(argv) == [
+        "e c h o spc h i ret",
+        "s p i n ret",
+        "ctrl-c",
+        "e c h o spc shift-4 shift-slash ret",
+    ]
+    qemu = argv[argv.index("--") + 1 :]
+    assert qemu.count("usb-kbd,id=kbd,bus=xhci1.0") == 1
+    # qemu-xhci has an MSI capability only with msi=on: the MSI boot needs
+    # it on both controllers, or its "MSI" boot is the poll in disguise.
+    opt = ",msi=on" if mode == "keyboard-msi" else ""
+    assert qemu.count(f"qemu-xhci,id=xhci0{opt}") == 1
+    assert qemu.count(f"qemu-xhci,id=xhci1{opt}") == 1
+
+
+@pytest.mark.integration
+def test_keyboard_boot_sets_no_fallback_option(tree):
+    r, _ = _keyboard_run(tree)
+    assert r.returncode == 0, r.stdout + r.stderr
+    esp = (tree["tmp"] / "fbcon.argv.esp").read_text().split("\n")
+    assert "usb-no-msix" not in esp and "usb-poll" not in esp
+
+
+@pytest.mark.integration
+def test_fallback_boot_failure_fails(tree):
+    r, _ = _keyboard_run(tree, rc=1, mode="keyboard-poll")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS" not in r.stdout
+
+
+@pytest.mark.integration
+def test_a_keyboard_ready_off_msix_fails(tree):
+    """The enumeration boot's keyboards must be serviced on MSI-X: a ready
+    line naming plain MSI or the poll does not count."""
+    lines = [part.replace("MSI-X)", "polled)") if part == ready(2) else part for part in PASSED_LINES]
+    r = _run(tree, log(lines))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "hc0 was disturbed" in r.stdout

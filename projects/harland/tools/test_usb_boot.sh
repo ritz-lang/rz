@@ -8,8 +8,9 @@
 # controller up in kernel_main (BIOS handoff, reset, rings, interrupter 0 on
 # an MSI-X vector aimed at the BSP); the keyboard then enumerates on events
 # alone: port reset, Enable Slot, Address Device, the device and
-# configuration descriptors, SET_CONFIGURATION. There is no polled fallback
-# yet (#4891), so every step proves an MSI-X interrupt reached the BSP.
+# configuration descriptors, SET_CONFIGURATION. With no boot option a
+# controller with MSI-X never polls (#4891's fallback is for one with no
+# working vector), so every step proves an MSI-X interrupt reached the BSP.
 #
 # Two controllers (AGAST #4889, docs/USB.md "Hot-plug"). The first, hc0,
 # has two keyboards: usb-kbd at its default high speed, and one with
@@ -53,7 +54,18 @@
 #     `echo back` types;
 #   - no panic or exception on screen.
 #
-# Usage: tools/test_usb_boot.sh [enumerate|keyboard]   (default enumerate)
+# keyboard-msi and keyboard-poll (AGAST #4891, docs/USB.md "Polling
+# fallback"): the keyboard boot with the boot option \harland\usb-no-msix
+# (each controller on plain MSI, as the X99's MSI-only Intel xHCI) or
+# \harland\usb-poll (no vector: the BSP's tick polls each controller).
+# QEMU's qemu-xhci offers plain MSI only with msi=on, which the MSI boot
+# sets on both controllers. Passes only if hc1's keyboard is ready on that source (its ready line
+# names it: "MSI" or "polled"; the keyboard boot's says "MSI-X"), no
+# controller is seen running any other way, `echo hi` types, and Ctrl-C
+# kills `spin` ($? = 130: on the poll, the kill is the tick's).
+#
+# Usage: tools/test_usb_boot.sh [enumerate|keyboard|keyboard-msi|keyboard-poll]
+#                                                       (default enumerate)
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for the boot (default 120)
 #        KEEP_WORK=DIR  copy the serial log (usb.log), or the keyboard boot's
@@ -67,10 +79,14 @@
 set -u
 
 MODE="${1:-enumerate}"
-if [ "$MODE" != "enumerate" ] && [ "$MODE" != "keyboard" ]; then
-    echo "usage: $0 [enumerate|keyboard]" >&2
-    exit 2
-fi
+case "$MODE" in
+    enumerate|keyboard|keyboard-msi|keyboard-poll) ;;
+    *) echo "usage: $0 [enumerate|keyboard|keyboard-msi|keyboard-poll]" >&2; exit 2 ;;
+esac
+# Every keyboard boot types into rzsh on the screen; keyboard-msi and
+# keyboard-poll differ only in the boot option and what they type.
+KBD=0
+case "$MODE" in keyboard*) KBD=1 ;; esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
@@ -120,9 +136,9 @@ fi
 KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
 LOADER_EFI="$HARLAND_DIR/build/debug/BOOTX64.EFI"
 INIT=init
-[ "$MODE" = keyboard ] && INIT=init_interactive
+[ "$KBD" = 1 ] && INIT=init_interactive
 need_built=("$KERNEL_ELF" "$LOADER_EFI" "$PROJECTS_DIR/indium/build/debug/$INIT.elf")
-[ "$MODE" = keyboard ] && need_built+=("$PROJECTS_DIR/rzsh/build/debug/rzsh.elf")
+[ "$KBD" = 1 ] && need_built+=("$PROJECTS_DIR/rzsh/build/debug/rzsh.elf")
 for f in "${need_built[@]}"; do
     [ -f "$f" ] || { echo "FAIL: not built: $f"; exit 1; }
 done
@@ -134,13 +150,16 @@ bash "$STAGE" --no-build "$WORK/bin" || { echo "FAIL: staging the initramfs pack
 ESP="$WORK/esp"
 mkdir -p "$ESP/EFI/BOOT" "$ESP/harland"
 init_arg=()
-[ "$MODE" = keyboard ] && init_arg=(--init "$INIT")
+[ "$KBD" = 1 ] && init_arg=(--init "$INIT")
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" "${init_arg[@]}" \
     --output "$ESP/harland/initramfs.tar" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 cp "$LOADER_EFI" "$ESP/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$ESP/harland/kernel.elf"
 # The enumerate boot fails its second controller once (AGAST #4889).
 [ "$MODE" = enumerate ] && : > "$ESP/harland/fault-usb"
+# The fallback boots (AGAST #4891): plain MSI, or the BSP tick's poll.
+[ "$MODE" = keyboard-msi ] && : > "$ESP/harland/usb-no-msix"
+[ "$MODE" = keyboard-poll ] && : > "$ESP/harland/usb-poll"
 
 vars=()
 if [ -n "$OVMF_VARS" ]; then
@@ -148,34 +167,61 @@ if [ -n "$OVMF_VARS" ]; then
     vars=(-drive "if=pflash,format=raw,file=$WORK/vars.fd")
 fi
 
-if [ "$MODE" = keyboard ]; then
+if [ "$KBD" = 1 ]; then
     # Each --send waits for its text on screen, then types. `spin` prints
     # one line and computes in ring 3 until killed; the prompt after its ^C
     # is the one `echo $?` is typed at.
+    # The keyboard-ready line names how its controller is serviced: the
+    # line that proves the boot option took. (Each controller's "running"
+    # line comes earlier and can scroll by between screenshots.)
+    # qemu-xhci has no MSI capability unless asked (msi=on): the MSI boot's
+    # controllers get one, as the X99's Intel xHCI has.
+    XHCI_OPT=""
+    [ "$MODE" = keyboard-msi ] && XHCI_OPT=",msi=on"
+    case "$MODE" in
+        keyboard) VIA=MSI-X ;;
+        keyboard-msi) VIA=MSI ;;
+        keyboard-poll) VIA=polled ;;
+    esac
+    common=(
+        --expect "\\[usb\\] hc1 slot 1: keyboard ready \\(endpoint 0x81, interval [0-9]+, $VIA\\)"
+        --send '(?m)^rzsh>$' 'e c h o spc h i ret'
+        --expect '(?m)^rzsh> echo hi\nhi$'
+        --send '(?m)^hi\nrzsh>$' 's p i n ret'
+        --send '(?m)^spin: running, Ctrl-C stops me$' 'ctrl-c'
+        --send '(?m)^\^C\nrzsh>$' 'e c h o spc shift-4 shift-slash ret'
+        --expect '(?m)^rzsh> echo \$\?\n130$'
+    )
+    case "$MODE" in
+    keyboard)
+        steps=(
+            "${common[@]}"
+            --send '(?m)^130\nrzsh>$' 'e c h o spc caps_lock a b caps_lock c ret'
+            --expect '(?m)^rzsh> echo ABc\nABc$'
+            --send '(?m)^ABc\nrzsh>$' 'e c h o spc x@1200 ret'
+            --expect '(?m)^rzsh> echo xxxx+\nxxxx+$'
+            --qmp-do '(?m)^xxxx+\nrzsh>$' 'device_del id=kbd'
+            --expect '\[usb\] hc1 slot [0-9]+: keyboard gone, keys released'
+            --qmp-do '\[usb\] hc1 port [0-9]+: detached \(slot [0-9]+ disabled\)' 'device_add driver=usb-kbd id=kbd bus=xhci1.0'
+            --send '(?s)hc1 port [0-9]+: detached \(slot [0-9]+ disabled\).*\[usb\] hc1 slot [0-9]+: keyboard ready[^\n]*\n' 'e c h o spc b a c k ret'
+            --expect '(?m)^echo back\nback$'
+        )
+        how="a USB keyboard" ;;
+    keyboard-msi)
+        steps=("${common[@]}" --absent '\[xhci\] hc[01] running: (MSI-X vector|no vector)')
+        how="a USB keyboard on plain MSI (MSI-X off)" ;;
+    keyboard-poll)
+        steps=("${common[@]}" --absent '\[xhci\] hc[01] running: MSI(-X)? vector')
+        how="a USB keyboard polled from the BSP tick (no vector)" ;;
+    esac
     python3 "$SCRIPT_DIR/fbcon_screen.py" watch --qmp "$WORK/qmp.sock" --shots "$WORK/kbd" \
-        --timeout "$TIMEOUT" \
-        --expect '\[usb\] hc1 slot 1: keyboard ready \(endpoint 0x81, interval [0-9]+\)' \
-        --send '(?m)^rzsh>$' 'e c h o spc h i ret' \
-        --expect '(?m)^rzsh> echo hi\nhi$' \
-        --send '(?m)^hi\nrzsh>$' 's p i n ret' \
-        --send '(?m)^spin: running, Ctrl-C stops me$' 'ctrl-c' \
-        --send '(?m)^\^C\nrzsh>$' 'e c h o spc shift-4 shift-slash ret' \
-        --expect '(?m)^rzsh> echo \$\?\n130$' \
-        --send '(?m)^130\nrzsh>$' 'e c h o spc caps_lock a b caps_lock c ret' \
-        --expect '(?m)^rzsh> echo ABc\nABc$' \
-        --send '(?m)^ABc\nrzsh>$' 'e c h o spc x@1200 ret' \
-        --expect '(?m)^rzsh> echo xxxx+\nxxxx+$' \
-        --qmp-do '(?m)^xxxx+\nrzsh>$' 'device_del id=kbd' \
-        --expect '\[usb\] hc1 slot [0-9]+: keyboard gone, keys released' \
-        --qmp-do '\[usb\] hc1 port [0-9]+: detached \(slot [0-9]+ disabled\)' 'device_add driver=usb-kbd id=kbd bus=xhci1.0' \
-        --send '(?s)hc1 port [0-9]+: detached \(slot [0-9]+ disabled\).*\[usb\] hc1 slot [0-9]+: keyboard ready[^\n]*\n' 'e c h o spc b a c k ret' \
-        --expect '(?m)^echo back\nback$' \
+        --timeout "$TIMEOUT" "${steps[@]}" \
         --absent 'KERNEL PANIC|!!! EXCEPTION !!!' -- \
         qemu-system-x86_64 -cpu Haswell-v1 -smp 1 -m 2G \
         -machine q35,i8042=off -serial none -display none -vga std -no-reboot -monitor none \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$ESP" \
-        -device qemu-xhci,id=xhci0 -device qemu-xhci,id=xhci1 -device usb-kbd,id=kbd,bus=xhci1.0
+        -device "qemu-xhci,id=xhci0$XHCI_OPT" -device "qemu-xhci,id=xhci1$XHCI_OPT" -device usb-kbd,id=kbd,bus=xhci1.0
     rc=$?
     [ "$rc" -eq "$EXIT_SETUP" ] && setup_error "QEMU could not be started"
     if [ "$rc" -ne 0 ]; then
@@ -183,7 +229,7 @@ if [ "$MODE" = keyboard ]; then
         cat "$WORK/kbd/screen.txt" 2>/dev/null
         echo "------------------------------------------"
     else
-        echo "PASS: typed into rzsh on a USB keyboard (no COM1, framebuffer console)"
+        echo "PASS: typed into rzsh on $how (no COM1, framebuffer console)"
     fi
     exit "$rc"
 fi
@@ -265,7 +311,7 @@ done
 need '\[xhci\] hc1: fault-usb: forcing a controller error$' "the fault-usb boot option fails hc1 once its keyboard is ready"
 need '\[xhci\] hc1: controller error \(USBSTS 0x[0-9A-F]+\): resetting it alone$' "hc1's error is seen and only hc1 is reset"
 need '\[xhci\] hc1: reset done, ports re-enumerating$' "hc1 comes back from its reset"
-ready() { grep -acE "\\[usb\\] hc$1 slot [0-9]+: keyboard ready \\(endpoint 0x81, interval [0-9]+\\)$" "$SERIAL"; }
+ready() { grep -acE "\\[usb\\] hc$1 slot [0-9]+: keyboard ready \\(endpoint 0x81, interval [0-9]+, MSI-X\\)$" "$SERIAL"; }
 if [ "$(ready 1)" -eq 2 ]; then
     echo "PASS: hc1's keyboard is ready before the error and again after the reset"
 else

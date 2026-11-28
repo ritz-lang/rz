@@ -1,0 +1,93 @@
+# Host checks for how an xHCI controller's interrupter 0 reaches the BSP
+# (AGAST #4891, docs/USB.md "Concurrency under SMP_USER.md"): which sources
+# the boot options allow (MSI-X, plain MSI, the BSP tick's poll), and the
+# watch that moves a controller whose vector never fires to the poll.
+# drivers/usb/xhci.ritz acts on these; a wrong answer leaves the X99's
+# MSI-only controller, or one whose vector is lost, with no keystrokes.
+
+import drivers.usb.irq_mode { UsbIrqMode, usb_irq_mode, VectorWatch }
+
+[[test]]
+fn test_no_option_tries_msix_then_msi() -> i32
+    let m: UsbIrqMode = usb_irq_mode(false, false)
+    if m != UsbIrqMode.Auto
+        return 1
+    if not m.allows_msix() or not m.allows_msi()
+        return 2
+    return 0
+
+[[test]]
+fn test_no_msix_option_allows_plain_msi_only() -> i32
+    let m: UsbIrqMode = usb_irq_mode(true, false)
+    if m != UsbIrqMode.NoMsix
+        return 1
+    if m.allows_msix()
+        return 2
+    if not m.allows_msi()
+        return 3
+    return 0
+
+[[test]]
+fn test_poll_option_allows_no_vector_and_wins() -> i32
+    let m: UsbIrqMode = usb_irq_mode(false, true)
+    if m != UsbIrqMode.Poll
+        return 1
+    if m.allows_msix() or m.allows_msi()
+        return 2
+    if usb_irq_mode(true, true) != UsbIrqMode.Poll
+        return 3
+    return 0
+
+[[test]]
+fn test_watch_quiet_controller_is_not_stalled() -> i32
+    var w: VectorWatch = VectorWatch.new()
+    for i in 0..5
+        if w.stalled(false, 0)
+            return 1
+    return 0
+
+[[test]]
+fn test_watch_pending_once_is_not_stalled() -> i32
+    # An event arrived just before the look: its interrupt may still be
+    # on its way. One look with IP set proves nothing.
+    var w: VectorWatch = VectorWatch.new()
+    if w.stalled(true, 3)
+        return 1
+    return 0
+
+[[test]]
+fn test_watch_pending_across_two_looks_with_no_interrupt_is_stalled() -> i32
+    var w: VectorWatch = VectorWatch.new()
+    if w.stalled(true, 7)
+        return 1
+    if not w.stalled(true, 7)
+        return 2
+    return 0
+
+[[test]]
+fn test_watch_interrupt_between_looks_is_not_stalled() -> i32
+    # IP set at both looks, but the vector fired between them: a busy
+    # controller whose events keep coming, not a dead vector.
+    var w: VectorWatch = VectorWatch.new()
+    if w.stalled(true, 7)
+        return 1
+    if w.stalled(true, 8)
+        return 2
+    if w.stalled(true, 9)
+        return 3
+    return 0
+
+[[test]]
+fn test_watch_cleared_between_looks_is_not_stalled() -> i32
+    # IP cleared (an interrupt handled it) then set again: no stall, and the
+    # pending look after it starts a fresh pair.
+    var w: VectorWatch = VectorWatch.new()
+    if w.stalled(true, 1)
+        return 1
+    if w.stalled(false, 1)
+        return 2
+    if w.stalled(true, 1)
+        return 3
+    if not w.stalled(true, 1)
+        return 4
+    return 0

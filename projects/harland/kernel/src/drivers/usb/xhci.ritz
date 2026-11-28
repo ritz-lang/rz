@@ -1,8 +1,9 @@
 # Harland xHCI host controllers (AGAST #4887, #4889, docs/USB.md)
 #
 # Every PCI function of class 0C/03/30 (chungus has three), each with its
-# own state here and its own interrupter-0 vector aimed at the BSP, brought
-# up once in kernel_main (docs/USB.md "xHCI bring-up, in order", steps 1-6):
+# own state here and its own interrupter-0 vector aimed at the BSP (MSI-X,
+# else plain MSI, else none and the BSP's tick polls it: setup_vector,
+# #4891), brought up once in kernel_main (docs/USB.md "xHCI bring-up, in order", steps 1-6):
 # BAR0, the USB Legacy Support handoff, halt and reset, the DCBAA,
 # scratchpad, command ring, event ring and ERST, interrupter 0, then
 # Run/Stop and port power. The layouts, rings and decoders are usb_abi's;
@@ -13,7 +14,8 @@
 # field here is BSP-owned and has no lock. Only the BSP touches it: the
 # boot (interrupts off, before any AP runs a process), xhci_irq
 # (drivers/usb/usb.ritz) from each controller's vector, aimed at the BSP,
-# and the BSP's tick (usb_tick). It is never lent to an AP.
+# and the BSP's tick (usb_tick, which also polls a controller with no
+# working vector). It is never lent to an AP.
 #
 # Waiting: at boot the halt, reset and BIOS handoff are busy-waits, each
 # under a TSC deadline. After boot nothing spins: a controller that fails
@@ -25,8 +27,9 @@ import ritzlib.option
 import ritzlib.result
 import klog { klog, klog_dec, klog_hex, klog_hex_width }
 import io { cpu_pause }
-import drivers.pci { PciDevice, PCI_CLASS_SERIAL_BUS, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory }
-import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry }
+import drivers.pci { PciDevice, PCI_CLASS_SERIAL_BUS, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory, pci_disable_intx }
+import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count, msi_probe, msi_enable }
+import drivers.usb.irq_mode { UsbIrqMode, VectorWatch }
 import mm.vmm { vmm_map_mmio, phys_to_virt }
 import mm.dma { dma_alloc_zeroed, dma_free_pages }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
@@ -91,6 +94,19 @@ enum HcState
     Starting                # reprogrammed, Run/Stop set: HCHalted to clear
     Failed                  # recovery gave up; the controller stays off
 
+# How a controller's interrupter 0 reaches the BSP (setup_vector). Poll is
+# first, so a controller never brought up reads as one.
+enum IrqVia
+    Poll                    # no vector: the BSP's tick runs xhci_irq
+    MsiX                    # MSI-X entry 0
+    Msi                     # plain MSI, one message
+
+fn via_name(v: IrqVia) -> StrView
+    match v
+        Poll => "polled"
+        MsiX => "MSI-X"
+        Msi => "MSI"
+
 # What xhci_tick tells usb.ritz about a controller.
 pub enum HcStep
     Idle                    # nothing changed
@@ -117,7 +133,9 @@ struct Xhci
     events: EventRing
     erst: u64               # the event ring segment table (phys)
     msix: MsixInfo
+    via: IrqVia
     vector: u8              # interrupter 0's vector, 0 if none
+    watch: VectorWatch      # does the vector fire (health checks, #4891)
     protocols: [8]PortProtocol
     nprotocols: u32
     state: HcState
@@ -337,24 +355,66 @@ fn program_memory(h: *Xhci)
     wr64(ir0(h) + IR_ERSTBA, h.erst)
 
 # How controller `h`'s interrupter 0 reaches the BSP: the one place a
-# controller's interrupt source is chosen (#4891 adds plain MSI and the
-# polled fallback here). Today MSI-X entry 0 on a new vector of its own,
-# aimed at this CPU, the BSP (msix_set_entry: irq_route_dest, and an IRTE
-# when remapping is on). A recovery reset leaves the PCI function's MSI-X
-# table alone, so this runs once per controller. False when the controller
-# has no usable MSI-X: its events then wait for the polled fallback.
-fn setup_vector(h: *Xhci) -> bool
-    if msix_probe(h.pci, @h.msix) != 0
-        return false
+# controller's interrupt source is chosen, once per controller (a recovery
+# reset leaves the PCI function's MSI-X table and MSI registers alone).
+# Each vector is a new one of its own, aimed at this CPU, the BSP
+# (irq_route_dest, and an IRTE when remapping is on), from the first of
+# these `mode` allows that works:
+#   - MSI-X entry 0 (msix_set_entry);
+#   - plain MSI, one message (msi_enable, AGAST #4885), when the function
+#     has no MSI-X: the X99's Intel 8086:8d31;
+#   - none: INTx is masked and the BSP's tick polls the controller.
+# A function whose MSI-X was turned on and then could not be aimed is
+# polled rather than tried on MSI: the two must never be on together. A
+# controller left to the poll says why.
+fn setup_vector(h: *Xhci, mode: UsbIrqMode) -> IrqVia
+    if not mode.allows_msi()
+        return poll(h, "usb-poll")
+    if mode.allows_msix() and msix_probe(h.pci, @h.msix) == 0
+        return match msix_vector(h)
+            Ok(v) =>
+                h.vector = v
+                IrqVia.MsiX
+            Err(why) => poll(h, why)
+    match msi_vector(h)
+        Ok(v) =>
+            h.vector = v
+            IrqVia.Msi
+        Err(why) => poll(h, why)
+
+# MSI-X entry 0 of a function msix_probe found it on, on a new vector.
+fn msix_vector(h: *Xhci) -> Result<u8, StrView>
     if msix_enable(@h.msix) != 0
-        return false
+        return Err("MSI-X table not mappable")
     let v: u8 = msix_vector_alloc()
     if v == 0
-        return false
+        return Err("out of MSI-X vectors")
     if msix_set_entry(@h.msix, 0, v) != 0
-        return false
-    h.vector = v
-    true
+        return Err("MSI-X entry not aimed at a CPU")
+    Ok(v)
+
+# Plain MSI, one message, on a new vector.
+fn msi_vector(h: *Xhci) -> Result<u8, StrView>
+    let m = match msi_probe(h.pci)
+        Some(m) => m
+        None => return Err("no MSI-X or MSI capability")
+    let v: u8 = msix_vector_alloc()
+    if v == 0
+        return Err("out of MSI vectors")
+    match msi_enable(m, v)
+        Ok(_) => Ok(v)
+        Err(_) => Err("MSI not aimed at a CPU")
+
+# No vector, for the reason `why`: mask INTx, which USBCMD.INTE would
+# otherwise raise with no handler, and leave the controller to the BSP's
+# tick.
+fn poll(h: *Xhci, why: StrView) -> IrqVia
+    log_hc(h)
+    klog(": no vector (")
+    klog(why)
+    klog("): the BSP tick polls it\n")
+    pci_disable_intx(h.pci)
+    IrqVia.Poll
 
 # Interrupter 0 on (moderation off at first, docs/USB.md step 5), the
 # status bits cleared, then Run/Stop and the interrupt enables.
@@ -401,7 +461,7 @@ fn log_found(h: *Xhci, dw0: u32)
         klog(", 64-bit DMA")
     klog("\n")
 
-fn bring_up(h: *Xhci) -> Result<bool, XhciError>
+fn bring_up(h: *Xhci, mode: UsbIrqMode) -> Result<bool, XhciError>
     let d: *PciDevice = h.pci
     if d.bar[0] == 0 or d.bar_is_io[0] != 0 or d.bar_size[0] == 0
         return Err(XhciError.BadBar)
@@ -425,7 +485,8 @@ fn bring_up(h: *Xhci) -> Result<bool, XhciError>
     alloc_memory(h)?
     program_memory(h)
 
-    let irq: bool = setup_vector(h)
+    h.via = setup_vector(h, mode)
+    h.watch = VectorWatch.new()
     start(h)
     if not op_wait(h, OP_USBSTS, USBSTS_HCH, 0, HALT_US)
         return Err(XhciError.StartTimeout)
@@ -434,20 +495,22 @@ fn bring_up(h: *Xhci) -> Result<bool, XhciError>
 
     log_hc(h)
     klog(" running: ")
-    if irq
-        klog("MSI-X vector ")
-        klog_dec(h.vector as i64)
-        klog(" -> BSP\n")
-    else
-        klog("no MSI-X vector: events wait for the polled fallback\n")
+    match h.via
+        Poll => klog("no vector, polled from the BSP tick\n")
+        MsiX | Msi =>
+            klog(via_name(h.via))
+            klog(" vector ")
+            klog_dec(h.vector as i64)
+            klog(" -> BSP\n")
     Ok(true)
 
 # Bring up every xHCI controller, at most XHCS_MAX. Boot only, on the BSP,
-# with interrupts off and before any AP runs a process. One that fails is
+# with interrupts off and before any AP runs a process; `mode` is the
+# interrupt sources the boot options allow (setup_vector). One that fails is
 # logged and left off; the others still come up. The number running, or
 # NotFound if there is no controller, or the first one's error if none came
 # up.
-pub fn xhci_init() -> Result<u8, XhciError>
+pub fn xhci_init(mode: UsbIrqMode) -> Result<u8, XhciError>
     let n: i32 = pci_get_device_count()
     var first_err: Option<XhciError> = None
     var running: u8 = 0
@@ -466,7 +529,7 @@ pub fn xhci_init() -> Result<u8, XhciError>
         h.pci = d
         h.index = nxhcs
         nxhcs += 1
-        match bring_up(h)
+        match bring_up(h, mode)
             Ok(_) =>
                 running += 1
             Err(e) =>
@@ -493,6 +556,27 @@ fn dead(h: *Xhci) -> bool
     let s: u32 = op_rd(h, OP_USBSTS)
     s == 0xFFFFFFFF or (s & (USBSTS_HSE | USBSTS_HCE)) != 0
 
+# A healthy controller's vector, at its health check: an event that has
+# waited on the event ring a whole check period for an interrupt that never
+# came (VectorWatch) moves the controller to the BSP tick's poll for good.
+# The ring is asked, not IMAN.IP: an event posted between xhci_irq's ack
+# and its drain sets IP again and is drained in the same pass, leaving IP
+# set over an empty ring (seen on QEMU, #4891's enumerate boot). Its vector stays
+# bound, so one that comes back late does no harm: xhci_irq finds the ring
+# already drained.
+fn watch_vector(h: *Xhci)
+    if h.via == IrqVia.Poll
+        return
+    if not h.watch.stalled(h.events.pending(), msix_vector_count(h.vector))
+        return
+    log_hc(h)
+    klog(": ")
+    klog(via_name(h.via))
+    klog(" vector ")
+    klog_dec(h.vector as i64)
+    klog(" never fired: polled from the BSP tick\n")
+    h.via = IrqVia.Poll
+
 fn give_up(h: *Xhci, why: StrView) -> HcStep
     h.state = HcState.Failed
     log_hc(h)
@@ -513,6 +597,7 @@ pub fn xhci_tick(hc: u8) -> HcStep
                 return HcStep.Idle
             h.ticks = 0
             if not dead(h)
+                watch_vector(h)
                 return HcStep.Idle
             log_hc(h)
             klog(": controller error (USBSTS 0x")
@@ -579,6 +664,16 @@ pub fn xhci_count() -> u8
 
 pub fn xhci_running(hc: u8) -> bool
     hc < nxhcs and hc_of(hc).state == HcState.Running
+
+# How controller `hc` is serviced now: "MSI-X", "MSI" or "polled"
+# (setup_vector, watch_vector), for the log.
+pub fn xhci_irq_via(hc: u8) -> StrView
+    via_name(hc_of(hc).via)
+
+# A running controller the BSP's tick must poll: it has no vector, or its
+# vector never fired (setup_vector, watch_vector).
+pub fn xhci_polled(hc: u8) -> bool
+    xhci_running(hc) and hc_of(hc).via == IrqVia.Poll
 
 pub fn xhci_ctx64(hc: u8) -> bool
     hc_of(hc).params.ctx64

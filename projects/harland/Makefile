@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all build clean test test-smp test-tier1 test-usb test-usb-kbd kernel iso help inventory-img test-inventory
+.PHONY: all build clean test test-smp test-tier1 test-usb test-usb-kbd test-usb-msi test-usb-poll kernel iso help inventory-img test-inventory
 
 all: kernel
 
@@ -90,6 +90,15 @@ test-usb:
 # over QMP before typing again (#4889).
 test-usb-kbd:
 	./tools/test_usb_boot.sh keyboard
+
+# The fallbacks (#4891): the keyboard boot with MSI-X off (each controller on
+# plain MSI, as the X99's Intel xHCI) and with no vector at all (the BSP's
+# tick polls each controller). Typing and Ctrl-C work on each.
+test-usb-msi:
+	./tools/test_usb_boot.sh keyboard-msi
+
+test-usb-poll:
+	./tools/test_usb_boot.sh keyboard-poll
 
 # Hardware-inventory USB stick (AGAST #3406): HWINV.EFI on a GPT + FAT32
 # image for `dd` or Etcher. See inventory/README.md.

@@ -28,7 +28,7 @@
 # it drains that controller's event ring into this state machine. Like the
 # controllers, all of it is BSP-owned and has no lock (SMP_USER.md section
 # 2, "In-kernel drivers"). Every other BSP path into it (usb_init here, and
-# usb_tick: recovery, hid_kbd's repeat, #4891's poll) runs with interrupts
+# usb_tick: recovery, hid_kbd's repeat, the poll) runs with interrupts
 # off, so xhci_irq never interleaves with it.
 
 import ritzlib.option
@@ -38,11 +38,12 @@ import klog { klog, klog_dec, klog_hex, klog_hex_width }
 import io { interrupts_enabled, disable_interrupts, enable_interrupts }
 import arch.x86_64.apic { lapic_is_bsp }
 import mm.vmm { phys_to_virt }
-import drivers.usb.xhci { XhciError, EVENTS_PER_IRQ, xhci_init, xhci_error_name, xhci_count, xhci_running, xhci_ctx64, xhci_max_ports, xhci_port_protocol, xhci_portsc, xhci_portsc_write, xhci_set_device_context, xhci_doorbell, xhci_command, xhci_command_done, xhci_port_commands, xhci_irq_ack, xhci_next_event, xhci_events_done, xhci_alloc_page, xhci_free_page, xhci_of_vector, xhci_tick, xhci_inject_fault }
+import drivers.usb.xhci { XhciError, EVENTS_PER_IRQ, xhci_init, xhci_error_name, xhci_count, xhci_running, xhci_polled, xhci_ctx64, xhci_max_ports, xhci_port_protocol, xhci_portsc, xhci_portsc_write, xhci_set_device_context, xhci_doorbell, xhci_command, xhci_command_done, xhci_port_commands, xhci_irq_ack, xhci_next_event, xhci_events_done, xhci_alloc_page, xhci_free_page, xhci_of_vector, xhci_tick, xhci_inject_fault }
 import usb_abi.regs { UsbSpeed, PORTSC_CCS, PORTSC_PED, PORTSC_CHANGE, portsc_ack, portsc_start_reset, portsc_speed, speed_from_psiv, speed_name, ep0_max_packet, ep_interval }
 import usb_abi.trb { Trb, Completion, completion_ok, Event, CommandEvent, TransferEvent, trb_enable_slot, trb_disable_slot, trb_stop_endpoint, trb_address_device, trb_evaluate_context, trb_setup_stage, trb_data_stage, trb_status_stage }
 import usb_abi.ring { TrbPage, TrbRing, RING_TRBS }
 import usb_abi.context { InputContext, DeviceContext, EpType, ADD_SLOT, ADD_EP0, input_control, slot_ctx, ep_ctx, slot_address }
+import drivers.usb.irq_mode { UsbIrqMode }
 import drivers.usb.hid_kbd { HidAttach, hid_kbd_attach, hid_kbd_command, hid_kbd_transfer, hid_kbd_detach, hid_kbd_free, hid_kbd_tick }
 import usb_abi.desc { SetupPacket, DeviceDesc, ConfigHeader, DescWalk, DescError, setup_get_descriptor, setup_set_configuration, parse_device, device_max_packet0, parse_config_header, DESC_DEVICE, DESC_CONFIG, DEVICE_DESC_LEN, CONFIG_DESC_LEN }
 
@@ -699,8 +700,8 @@ fn on_event(hc: u8, ev: Event, from_user: bool) -> bool
 
 # Controller `hc`'s interrupt: drain up to EVENTS_PER_IRQ events into the
 # port state machines, then tell the controller how far it got. From
-# usb_irq (irq_handler, on the BSP) for the controller's vector, and
-# #4891's poll; from_user: the interrupt came from a process (any non-zero
+# usb_irq (irq_handler, on the BSP) for the controller's vector, or
+# usb_tick's poll of a controller with none (#4891); from_user: the interrupt came from a process (any non-zero
 # CPL). Returns true if the caller must send its EOI and call
 # tty_console_irq_kill: a Ctrl-C typed on a USB keyboard for the process
 # it interrupted. A failed controller is left to xhci_tick.
@@ -728,10 +729,11 @@ pub fn usb_irq(vector: u64, from_user: bool) -> bool
         None => false
 
 # The periodic tick, on every CPU (irq_handler, after its EOI). On the BSP:
-# each controller's health check or recovery step (xhci_tick), the
-# fault-usb injection when due, and the keyboards' typematic repeat. True
-# for a repeated Ctrl-C that must kill the process `from_user` says was
-# interrupted.
+# each controller's health check or recovery step (xhci_tick), the poll of
+# each controller with no working vector (xhci_irq, as its interrupt would
+# run it: docs/USB.md "Polling fallback", #4891), the fault-usb injection
+# when due, and the keyboards' typematic repeat. True for a Ctrl-C (typed,
+# or repeated) that must kill the process `from_user` says was interrupted.
 pub fn usb_tick(from_user: bool) -> bool
     if not lapic_is_bsp()
         return false
@@ -743,7 +745,13 @@ pub fn usb_tick(from_user: bool) -> bool
             Died => controller_died(hc)
             Restarted => controller_restarted(hc)
             Idle | GaveUp => pass
-    hid_kbd_tick(from_user)
+    var kill: bool = false
+    for hc in 0..xhci_count()
+        if xhci_polled(hc) and xhci_irq(hc, from_user)
+            kill = true
+    if hid_kbd_tick(from_user)
+        kill = true
+    kill
 
 # ============================================================================
 # Boot
@@ -754,18 +762,18 @@ pub fn usb_tick(from_user: bool) -> bool
 # events. Boot only, on the BSP. Interrupts are held off throughout (and
 # restored after), because xhci_irq is the state's only other user: an
 # event taken mid-scan would run port_changed inside port_changed.
-fn usb_init() -> Result<u8, XhciError>
+fn usb_init(mode: UsbIrqMode) -> Result<u8, XhciError>
     let was_on: bool = interrupts_enabled()
     disable_interrupts()
-    let r: Result<u8, XhciError> = usb_init_quiet()
+    let r: Result<u8, XhciError> = usb_init_quiet(mode)
     if was_on
         enable_interrupts()
     r
 
 # xhci_init's own Result is returned: a bare `Ok(...)` is ambiguous here,
 # where hid_kbd's imports bring enums with an `Ok` variant (syscall/errno.ritz).
-fn usb_init_quiet() -> Result<u8, XhciError>
-    let r: Result<u8, XhciError> = xhci_init()
+fn usb_init_quiet(mode: UsbIrqMode) -> Result<u8, XhciError>
+    let r: Result<u8, XhciError> = xhci_init(mode)
     match r
         Ok(_) =>
             for hc in 0..xhci_count()
@@ -780,11 +788,12 @@ fn usb_init_quiet() -> Result<u8, XhciError>
 # controller's vector is aimed at the BSP) and before any AP runs a
 # process; the resets and BIOS handoffs are the driver's only busy-waits.
 # `fault` is the fault-usb boot option (AGAST #4889): fail the last
-# controller once a keyboard on it is ready.
-pub fn usb_boot(fault: bool)
+# controller once a keyboard on it is ready. `irq` is the interrupt sources
+# the usb-no-msix and usb-poll boot options allow (AGAST #4891).
+pub fn usb_boot(fault: bool, irq: UsbIrqMode)
     # Armed first: a keyboard can be ready before usb_init returns.
     usb_fault_armed = fault
-    match usb_init()
+    match usb_init(irq)
         Ok(_) => klog("  [OK] USB (xHCI)\n")
         Err(e) =>
             match e
