@@ -10,6 +10,7 @@ import ritzlib.testlib
 import razm.fixup { Fixup, FixupKind }
 import razm.object
 import razm.elf
+import rld.dynamic
 import rld.input
 import rld.link
 import rld.relax { Relax }
@@ -21,6 +22,7 @@ const START: [15]u8 = [0x48, 0x8b, 0x05, 0, 0, 0, 0, 0x48, 0x8b, 0x38, 0xb8, 0x3
 const SYSCALL: [2]u8 = [0x0f, 0x05]
 const ANSWER: [8]u8 = [42, 0, 0, 0, 0, 0, 0, 0]
 const RET: [1]u8 = [0xc3]
+const QUAD: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
 
 fn text_flags() -> SectionFlags
     SectionFlags { alloc: true, write: false, exec: true }
@@ -193,7 +195,7 @@ fn test_undefined_reference_is_an_error() -> i32
     var l: Linker = linker_new()
     read(@&l, @path)
     assert l.resolve().is_ok()
-    match layout(@&l)
+    match layout(@&l, Output.Executable)
         Ok(_) =>
             assert false, "undefined accepted"
         Err(e) =>
@@ -212,7 +214,7 @@ fn test_got_load_relaxes_with_no_got_entry() -> i32
     var l: Linker = linker_new()
     read(@&l, @path)
     assert l.resolve().is_ok()
-    match layout(@&l)
+    match layout(@&l, Output.Executable)
         Ok(img) =>
             assert img.relax[0] == Relax.PcRelative
             assert img.got_syms.len == 0 and img.got_out == -1
@@ -229,7 +231,7 @@ fn test_linked_program_runs() -> i32
     let exe: String = sandbox_path("rld_link", "run.out")
     let inputs: [1]StrView = [obj_path.as_view()]
     var l: Linker = linker_new()
-    assert link(@&l, @inputs, exe.as_view()).is_ok(), "link"
+    assert link(@&l, @inputs, exe.as_view(), Output.Executable).is_ok(), "link"
     match exec_capture(exe.as_view(), span_empty<StrView>(), span_empty<StrView>(), span_empty<u8>())
         Ok(c) =>
             assert c.status.exit_code == 42, "the GOT load reaches `answer`"
@@ -262,4 +264,127 @@ fn test_supported_relocation_types() -> i32
     assert reloc_supported(R_X86_64_64) and reloc_supported(R_X86_64_32S)
     assert not reloc_supported(19), "R_X86_64_TLSGD"
     assert not reloc_supported(37), "R_X86_64_IRELATIVE"
+    0
+
+# The program, with a pointer to `answer` after it in a section with
+# `flags`: `.data`'s for an initialized pointer, `.rodata`'s for one no PIE
+# can load.
+[[test_helper]]
+fn pointer_program(name: StrView, flags: SectionFlags) -> Object
+    var obj: Object = program()
+    let sec: SectionId = ok_section(obj.add_section(name, SectionKind.Progbits, flags))
+    emit(@&obj, sec, @QUAD)
+    let f = Fixup { offset: 0, width: 8, kind: FixupKind.Absolute, target: "answer", addend: 0 }
+    assert obj.add_fixup(sec, 0, f).is_ok(), "add_fixup"
+    obj
+
+[[test_helper]]
+fn has_made(img: @Image, m: Made) -> bool
+    for i in 0..img.made.len
+        if img.made[i] == m
+            return true
+    false
+
+[[test]]
+fn test_pie_sections_by_output() -> i32
+    assert pie_sections(Output.Executable, 3).len == 0
+    let hosted: Vec<Made> = pie_sections(Output.Hosted, 0)
+    assert hosted.len == 5
+    assert hosted[0] == Made.Interp and hosted[1] == Made.Dynsym and hosted[2] == Made.GnuHash
+    assert hosted[3] == Made.Dynstr and hosted[4] == Made.Dynamic, "no .hash, no empty .rela.dyn"
+    let pie: Vec<Made> = pie_sections(Output.Pie, 2)
+    assert pie.len == 6
+    assert pie[2] == Made.Hash and pie[4] == Made.RelaDyn
+    assert made_size(Made.RelaDyn, Output.Pie, 2) == 48
+    assert made_size(Made.Dynamic, Output.Pie, 2) == 13 * DYN_SIZE, "ld.lld's 12 tags and DT_NULL"
+    assert made_size(Made.Dynamic, Output.Hosted, 0) == 8 * DYN_SIZE
+    assert made_size(Made.Interp, Output.Hosted, 0) == 28
+    0
+
+[[test]]
+fn test_pie_loads_data_pointer_as_relative() -> i32
+    var obj: Object = pointer_program(".data.rel", data_flags())
+    let path: String = save(@obj, "pie.o")
+    var l: Linker = linker_new()
+    read(@&l, @path)
+    assert l.resolve().is_ok()
+    match layout(@&l, Output.Pie)
+        Ok(img) =>
+            assert img.data_relatives == 1
+            assert img.relax[0] == Relax.PcRelative, "a PIE relaxes mov to lea"
+            assert img.got_out == -1
+            assert has_made(@img, Made.RelaDyn) and has_made(@img, Made.Dynamic) and has_made(@img, Made.Hash)
+            assert not has_made(@img, Made.Interp)
+            assert img.entry == 0x1000, "a PIE links at 0"
+        Err(_) =>
+            assert false, "layout"
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_executable_makes_no_dynamic_sections() -> i32
+    var obj: Object = pointer_program(".data.rel", data_flags())
+    let path: String = save(@obj, "exec.o")
+    var l: Linker = linker_new()
+    read(@&l, @path)
+    assert l.resolve().is_ok()
+    match layout(@&l, Output.Executable)
+        Ok(img) =>
+            assert img.data_relatives == 0 and img.made.len == 0
+        Err(_) =>
+            assert false, "layout"
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_read_only_pointer_is_not_pic() -> i32
+    var obj: Object = pointer_program(".rodata", SectionFlags { alloc: true, write: false, exec: false })
+    let path: String = save(@obj, "textrel.o")
+    var l: Linker = linker_new()
+    read(@&l, @path)
+    assert l.resolve().is_ok()
+    match layout(@&l, Output.Pie)
+        Ok(_) =>
+            assert false, "text relocation accepted"
+        Err(e) =>
+            match e
+                NotPic(name, rtype) =>
+                    assert name.eq("answer") and rtype == R_X86_64_64
+                _ =>
+                    assert false, "not NotPic"
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_hosted_pie_runs() -> i32
+    var obj: Object = pointer_program(".data.rel", data_flags())
+    let obj_path: String = save(@obj, "hosted.o")
+    let exe: String = sandbox_path("rld_link", "hosted.out")
+    let inputs: [1]StrView = [obj_path.as_view()]
+    var l: Linker = linker_new()
+    assert link(@&l, @inputs, exe.as_view(), Output.Hosted).is_ok(), "link"
+    match exec_capture(exe.as_view(), span_empty<StrView>(), span_empty<StrView>(), span_empty<u8>())
+        Ok(c) =>
+            assert c.status.exit_code == 42, "ld.so loads it and _start reaches `answer`"
+        Err(_) =>
+            assert false, "spawn"
+    unlink(obj_path.as_view())
+    unlink(exe.as_view())
+    0
+
+[[test]]
+fn test_made_bytes_fill_their_sections() -> i32
+    assert gnu_hash_bytes().len == made_size(Made.GnuHash, Output.Pie, 0)
+    assert hash_bytes().len == made_size(Made.Hash, Output.Pie, 0)
+    assert interp_bytes().len == made_size(Made.Interp, Output.Hosted, 0)
+    let at: DynAddrs = DynAddrs { rela: 0x10, dynsym: 0x20, dynstr: 0x30, gnu_hash: 0x40, hash: 0x50 }
+    for k in 0..3
+        let relatives: i64 = k
+        assert dynamic_bytes(Output.Pie, relatives, at).len == made_size(Made.Dynamic, Output.Pie, relatives)
+        assert dynamic_bytes(Output.Hosted, relatives, at).len == made_size(Made.Dynamic, Output.Hosted, relatives)
+    let entries: [2]RelaEntry = [relative(0x100, 0x200), relative(0x108, 0x208)]
+    let rela: Vec<u8> = rela_bytes(@entries)
+    assert rela.len == made_size(Made.RelaDyn, Output.Pie, 2)
+    assert rela[8] == R_X86_64_RELATIVE as u8 and rela[16] == 0, "type 8, addend 0x200"
+    assert rela[17] == 2
     0

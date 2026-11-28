@@ -33,8 +33,12 @@ RZRZ_FLAGS = ["-c", "--target=x86_64-unknown-linux-gnu", "-ffreestanding",
 # ensure_runtime_object: the shim is `clang -c` with nothing else.
 SHIM_FLAGS = ["-c"]
 
-PT_LOAD = 1
+PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_PHDR = 1, 2, 3, 6
 PF_X, PF_W, PF_R = 1, 2, 4
+ET_EXEC, ET_DYN = 2, 3
+R_X86_64_RELATIVE = 8
+DT_NULL, DT_NEEDED, DT_RELA, DT_RELASZ, DT_RELAENT = 0, 1, 7, 8, 9
+DT_FLAGS_1, DF_1_PIE = 0x6ffffffb, 0x08000000
 
 
 def tool(env: str, pkg: str, name: str) -> Path | None:
@@ -69,8 +73,21 @@ def link_lld(objs: list[Path], out: Path) -> subprocess.CompletedProcess:
     return run_tool(["ld.lld", "-o", out, *objs])
 
 
-def link_rld(rld: Path, objs: list[Path], out: Path) -> subprocess.CompletedProcess:
-    return run_tool([rld, "-o", out, *objs])
+def link_lld_pie(objs: list[Path], out: Path,
+                 script: Path | None = None) -> subprocess.CompletedProcess:
+    """link_freestanding_elf for a `pic` bin: --pie --no-dynamic-linker."""
+    t = ["-T", script] if script else []
+    return run_tool(["ld.lld", "--pie", "--no-dynamic-linker", *t, "-o", out, *objs])
+
+
+def link_clang_hosted(objs: list[Path], out: Path) -> subprocess.CompletedProcess:
+    """link_hosted: `clang -nostdlib`, the runtime object first."""
+    return run_tool(["clang", "-nostdlib", "-o", out, *objs])
+
+
+def link_rld(rld: Path, objs: list[Path], out: Path,
+             flags: list = ()) -> subprocess.CompletedProcess:
+    return run_tool([rld, *flags, "-o", out, *objs])
 
 
 @dataclass(frozen=True)
@@ -144,3 +161,45 @@ def mnemonics(binary: Path, section: str = ".text") -> list[str]:
         if len(parts) >= 2 and line.startswith(" ") and parts[1].strip():
             out.append(parts[1].split()[0])
     return out
+
+
+@dataclass(frozen=True)
+class Dynamic:
+    tags: dict[int, int]                    # d_tag: d_val (each tag once)
+    relocs: list[tuple[int, int, int]]      # (offset, type, addend)
+    interp: str | None
+
+
+def read_dynamic(path: Path) -> Dynamic:
+    """The PT_DYNAMIC tags of a PIE, the .rela.dyn entries DT_RELA names,
+    and the PT_INTERP path. Addresses map to file offsets through PT_LOAD."""
+    data = path.read_bytes()
+    exe = read_executable(path)
+
+    def file_at(vaddr: int) -> int:
+        for s in exe.segments:
+            if s.ptype == PT_LOAD and s.vaddr <= vaddr < s.vaddr + s.filesz:
+                return s.offset + vaddr - s.vaddr
+        raise AssertionError(f"{path}: {vaddr:#x} is in no PT_LOAD's file bytes")
+
+    tags: dict[int, int] = {}
+    interp = None
+    for s in exe.segments:
+        if s.ptype == PT_INTERP:
+            interp = data[s.offset:s.offset + s.filesz].rstrip(b"\0").decode()
+        if s.ptype != PT_DYNAMIC:
+            continue
+        for at in range(s.offset, s.offset + s.filesz, 16):
+            tag, val = struct.unpack_from("<qQ", data, at)
+            if tag == DT_NULL:
+                break
+            assert tag not in tags, f"{path}: tag {tag:#x} twice"
+            tags[tag] = val
+    relocs = []
+    if DT_RELA in tags:
+        assert tags[DT_RELAENT] == 24
+        start = file_at(tags[DT_RELA])
+        for at in range(start, start + tags[DT_RELASZ], 24):
+            offset, info, addend = struct.unpack_from("<QQq", data, at)
+            relocs.append((offset, info & 0xffffffff, addend))
+    return Dynamic(tags, relocs, interp)

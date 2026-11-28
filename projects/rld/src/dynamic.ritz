@@ -1,0 +1,231 @@
+# The sections a PIE's loader reads (../razm/DESIGN.md "Outputs", "Load-time
+# relocations"): `.interp` in the hosted PIE, the empty dynamic symbol
+# table with its string and hash tables, `.rela.dyn` with one
+# R_X86_64_RELATIVE per absolute address in writable data, and `.dynamic`
+# with the tags ld.lld writes. No symbol is exported and nothing is
+# imported, so no DT_NEEDED, GLOB_DAT or JUMP_SLOT.
+#
+# The linker makes these sections, as it makes `.got`; link.ritz places
+# them and asks here for their sizes and bytes.
+import ritzlib.gvec { Vec, vec_new }
+import ritzlib.option { Option }
+import ritzlib.span { Span }
+import ritzlib.strview { StrView }
+import razm.elf
+
+pub const ELF_ET_DYN: i64 = 3
+pub const PT_DYNAMIC: i64 = 2
+pub const PT_INTERP: i64 = 3
+pub const PT_PHDR: i64 = 6
+pub const SHT_HASH: i64 = 5
+pub const SHT_DYNAMIC: i64 = 6
+pub const SHT_DYNSYM: i64 = 11
+pub const SHT_GNU_HASH: i64 = 0x6ffffff6
+pub const R_X86_64_RELATIVE: i64 = 8
+
+const DT_NULL: i64 = 0
+const DT_HASH: i64 = 4
+const DT_STRTAB: i64 = 5
+const DT_SYMTAB: i64 = 6
+const DT_RELA: i64 = 7
+const DT_RELASZ: i64 = 8
+const DT_RELAENT: i64 = 9
+const DT_STRSZ: i64 = 10
+const DT_SYMENT: i64 = 11
+const DT_DEBUG: i64 = 21
+const DT_GNU_HASH: i64 = 0x6ffffef5
+const DT_RELACOUNT: i64 = 0x6ffffff9
+const DT_FLAGS_1: i64 = 0x6ffffffb
+const DF_1_PIE: i64 = 0x08000000
+
+pub const DYN_SIZE: i64 = 16            # one Elf64_Dyn
+const HASH_SIZE: i64 = 16               # nbucket, nchain, bucket[0], chain[0]
+const GNU_HASH_SIZE: i64 = 28           # header, one bloom word, one bucket
+const GNU_HASH_SHIFT: i64 = 26          # ld.lld's bloom shift
+pub const INTERP: StrView = "/lib64/ld-linux-x86-64.so.2"
+
+# What the link writes (DESIGN.md "CLI"). Of the PIEs, the hosted one has
+# `.interp` and no `.hash` (`--hash-style=gnu`), the freestanding one the
+# reverse.
+pub enum Output
+    Executable          # ET_EXEC: no load-time relocations
+    Pie                 # --pie --no-dynamic-linker
+    Hosted              # --hosted: the Linux PIE ld.so loads
+
+# A section the linker makes, in the order the no-script layout places
+# them: the read-only ones open the read-only segment, the writable ones
+# open the writable segment.
+pub enum Made
+    Interp
+    Dynsym
+    GnuHash
+    Hash
+    Dynstr
+    RelaDyn
+    Dynamic
+    Got
+
+pub fn made_name(m: Made) -> StrView
+    match m
+        Interp => ".interp"
+        Dynsym => ".dynsym"
+        GnuHash => ".gnu.hash"
+        Hash => ".hash"
+        Dynstr => ".dynstr"
+        RelaDyn => ".rela.dyn"
+        Dynamic => ".dynamic"
+        Got => ".got"
+
+pub fn made_type(m: Made) -> i64
+    match m
+        Interp => SHT_PROGBITS
+        Dynsym => SHT_DYNSYM
+        GnuHash => SHT_GNU_HASH
+        Hash => SHT_HASH
+        Dynstr => SHT_STRTAB
+        RelaDyn => SHT_RELA
+        Dynamic => SHT_DYNAMIC
+        Got => SHT_PROGBITS
+
+pub fn made_flags(m: Made) -> i64
+    match m
+        Interp | Dynsym | GnuHash | Hash | Dynstr | RelaDyn => SHF_ALLOC
+        Dynamic | Got => SHF_ALLOC | SHF_WRITE
+
+pub fn made_align(m: Made) -> i64
+    match m
+        Interp | Dynstr => 1
+        Hash => 4
+        Dynsym | GnuHash | RelaDyn | Dynamic | Got => 8
+
+# The section whose index a made section's sh_link holds, if any.
+pub fn made_link(m: Made) -> Option<Made>
+    match m
+        Dynsym => Some(Made.Dynstr)
+        Dynamic => Some(Made.Dynstr)
+        GnuHash => Some(Made.Dynsym)
+        Hash => Some(Made.Dynsym)
+        RelaDyn => Some(Made.Dynsym)
+        _ => None
+
+pub fn made_entsize(m: Made) -> i64
+    match m
+        Dynsym => SYM_SIZE
+        Hash => 4
+        RelaDyn => RELA_SIZE
+        Dynamic => DYN_SIZE
+        Interp | GnuHash | Dynstr | Got => 0
+
+# The dynamic-linking sections of an output with `relatives` load-time
+# relocations, in placement order: none for the executable. An empty
+# `.rela.dyn` is left out, as ld.lld leaves it out.
+pub fn pie_sections(output: Output, relatives: i64) -> Vec<Made>
+    var out: Vec<Made> = vec_new<Made>()
+    if output == Output.Executable
+        return out
+    if output == Output.Hosted
+        out.push(Made.Interp)
+    out.push(Made.Dynsym)
+    out.push(Made.GnuHash)
+    if output == Output.Pie
+        out.push(Made.Hash)
+    out.push(Made.Dynstr)
+    if relatives > 0
+        out.push(Made.RelaDyn)
+    out.push(Made.Dynamic)
+    out
+
+# The size of a dynamic-linking section (not the GOT, whose size is its
+# slots).
+pub fn made_size(m: Made, output: Output, relatives: i64) -> i64
+    match m
+        Interp => INTERP.len + 1
+        Dynsym => SYM_SIZE                  # the null symbol only
+        GnuHash => GNU_HASH_SIZE
+        Hash => HASH_SIZE
+        Dynstr => 1                         # the empty name only
+        RelaDyn => relatives * RELA_SIZE
+        Dynamic => dynamic_tags(output, relatives) * DYN_SIZE
+        Got => 0
+
+# The number of entries `.dynamic` holds, DT_NULL included.
+fn dynamic_tags(output: Output, relatives: i64) -> i64
+    var n: i64 = 8              # FLAGS_1 DEBUG SYMTAB SYMENT STRTAB STRSZ GNU_HASH NULL
+    if output == Output.Pie
+        n += 1                  # HASH
+    if relatives > 0
+        n += 4                  # RELA RELASZ RELAENT RELACOUNT
+    n
+
+# The addresses `.dynamic` points at: each made section's, or 0 when the
+# PIE has none.
+pub struct DynAddrs
+    rela: i64
+    dynsym: i64
+    dynstr: i64
+    gnu_hash: i64
+    hash: i64
+
+fn push_dyn(out: @&Vec<u8>, tag: i64, value: i64)
+    push_le(out, tag, 8)
+    push_le(out, value, 8)
+
+# `.dynamic`, in ld.lld's tag order.
+pub fn dynamic_bytes(output: Output, relatives: i64, at: DynAddrs) -> Vec<u8>
+    var out: Vec<u8> = vec_new<u8>()
+    push_dyn(@&out, DT_FLAGS_1, DF_1_PIE)
+    push_dyn(@&out, DT_DEBUG, 0)
+    if relatives > 0
+        push_dyn(@&out, DT_RELA, at.rela)
+        push_dyn(@&out, DT_RELASZ, relatives * RELA_SIZE)
+        push_dyn(@&out, DT_RELAENT, RELA_SIZE)
+        push_dyn(@&out, DT_RELACOUNT, relatives)
+    push_dyn(@&out, DT_SYMTAB, at.dynsym)
+    push_dyn(@&out, DT_SYMENT, SYM_SIZE)
+    push_dyn(@&out, DT_STRTAB, at.dynstr)
+    push_dyn(@&out, DT_STRSZ, 1)
+    push_dyn(@&out, DT_GNU_HASH, at.gnu_hash)
+    if output == Output.Pie
+        push_dyn(@&out, DT_HASH, at.hash)
+    push_dyn(@&out, DT_NULL, 0)
+    out
+
+# `.gnu.hash` for no symbols: one bucket, symbols from index 1, one bloom
+# word, all empty.
+pub fn gnu_hash_bytes() -> Vec<u8>
+    var out: Vec<u8> = vec_new<u8>()
+    push_le(@&out, 1, 4)                # nbuckets
+    push_le(@&out, 1, 4)                # symoffset: past the null symbol
+    push_le(@&out, 1, 4)                # bloom words
+    push_le(@&out, GNU_HASH_SHIFT, 4)
+    push_le(@&out, 0, 8)                # the bloom word
+    push_le(@&out, 0, 4)                # bucket 0: empty
+    out
+
+# `.hash` for the null symbol only: one bucket, one chain, both empty.
+pub fn hash_bytes() -> Vec<u8>
+    var out: Vec<u8> = vec_new<u8>()
+    push_le(@&out, 1, 4)
+    push_le(@&out, 1, 4)
+    push_le(@&out, 0, 4)
+    push_le(@&out, 0, 4)
+    out
+
+# `.rela.dyn`: each R_X86_64_RELATIVE as (where, the link-time address it
+# holds); the loader adds the load base to both.
+pub fn rela_bytes(relatives: Span<RelaEntry>) -> Vec<u8>
+    var out: Vec<u8> = vec_new<u8>()
+    for i in 0..relatives.len
+        push_rela(@&out, relatives[i])
+    out
+
+pub fn relative(offset: i64, addend: i64) -> RelaEntry
+    RelaEntry { offset: offset, rtype: R_X86_64_RELATIVE, symbol: 0, addend: addend }
+
+# `.interp`: the hosted PIE's loader, NUL-terminated as PT_INTERP requires.
+pub fn interp_bytes() -> Vec<u8>
+    var out: Vec<u8> = vec_new<u8>()
+    for i in 0..INTERP.len
+        out.push(INTERP.get(i))
+    out.push(0)
+    out

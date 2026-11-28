@@ -1,5 +1,11 @@
-# rld [-o OUT] OBJ...: link relocatable ELF64 x86-64 objects into the
-# no-script executable OUT (a.out by default).
+# Link relocatable ELF64 x86-64 objects into OUT (a.out by default)
+# (../razm/DESIGN.md "CLI"):
+#
+#   rld --hosted [-o OUT] OBJ...       the Linux PIE, runtime object first
+#   rld [-o OUT] [--pie --no-dynamic-linker] [-T SCRIPT] OBJ...
+#
+# Without --hosted the link is freestanding: --pie --no-dynamic-linker is
+# the freestanding PIE, and neither is the no-script executable.
 #
 # Exit status: 0 linked (or --help/-h printed the usage), 1 failed (usage,
 # an unreadable or malformed object, a symbol undefined or defined twice, a
@@ -9,11 +15,13 @@ import ritzlib.gvec { Vec, vec_new }
 import ritzlib.span { Span, span_from_vec }
 import ritzlib.string { String, string_from, string_from_i64 }
 import ritzlib.strview { StrView }
+import ritzlib.option { Option }
+import rld.dynamic { Output }
 import rld.input { LinkError, Linker, linker_new }
 import rld.link
 
 const EXIT_FAILED: i32 = 1
-const USAGE: StrView = "Usage: rld [-o OUT] OBJ..."
+const USAGE: StrView = "Usage: rld --hosted [-o OUT] OBJ...\n       rld [-o OUT] [--pie --no-dynamic-linker] [-T SCRIPT] OBJ..."
 const DEFAULT_OUT: StrView = "a.out"
 
 fn usage_error(msg: StrView) -> i32
@@ -54,35 +62,73 @@ fn link_error_message(e: LinkError) -> String
             m.push_str(" against ")
             m.push_str(name)
             m.push_str(" is out of range")
+        NotPic(name, rtype) =>
+            m.push_str("relocation type ")
+            m.push_string(@string_from_i64(rtype))
+            m.push_str(" against ")
+            m.push_str(name)
+            m.push_str(" is not position-independent: recompile with -fPIC")
         Unwritable(path) =>
             m.push_str(path)
             m.push_str(": cannot write the executable")
     m
 
+# The mode the flags name (DESIGN.md "CLI"), or why they name none.
+fn output_of(hosted: bool, pie: bool, no_interp: bool, script: Option<StrView>) -> Result<Output, StrView>
+    if hosted
+        if pie or no_interp
+            return Err("--hosted takes no --pie")
+        if script.is_some()
+            return Err("--hosted takes no -T")
+        return Ok(Output.Hosted)
+    if pie and not no_interp
+        return Err("--pie needs --no-dynamic-linker")
+    if no_interp and not pie
+        return Err("--no-dynamic-linker needs --pie")
+    if script.is_some()
+        return Err("-T: linker scripts are not supported yet")
+    Ok(if pie then Output.Pie else Output.Executable)
+
 pub fn main(args: Span<StrView>) -> i32
     var out: StrView = DEFAULT_OUT
     var inputs: Vec<StrView> = vec_new<StrView>()
+    var hosted: bool = false
+    var pie: bool = false
+    var no_interp: bool = false
+    var script: Option<StrView> = None
     var i: i64 = 1
     while i < args.len
         let arg: StrView = args[i]
         if arg.eq("--help") or arg.eq("-h")
             print("{USAGE}\n")
             return 0
-        else if arg.eq("-o")
+        else if arg.eq("-o") or arg.eq("-T")
             if i + 1 >= args.len
-                return usage_error("-o needs a path")
+                return usage_error(if arg.eq("-o") then "-o needs a path" else "-T needs a path")
             i += 1
-            out = args[i]
+            if arg.eq("-o")
+                out = args[i]
+            else
+                script = Some(args[i])
+        else if arg.eq("--hosted")
+            hosted = true
+        else if arg.eq("--pie")
+            pie = true
+        else if arg.eq("--no-dynamic-linker")
+            no_interp = true
         else if arg.starts_with("-")
             return usage_error("unknown option")
         else
             inputs.push(arg)
         i += 1
+    let output: Output = match output_of(hosted, pie, no_interp, script)
+        Ok(o) => o
+        Err(why) => return usage_error(why)
     if inputs.len == 0
         return usage_error("no input files")
 
     var l: Linker = linker_new()
-    match link(@&l, span_from_vec<StrView>(@inputs), out)
+    match link(@&l, span_from_vec<StrView>(@inputs), out, output)
         Ok(_) => 0
         Err(e) =>
             let why: String = link_error_message(e)

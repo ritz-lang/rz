@@ -2,7 +2,7 @@
 
 Two programs replace the host tools that turn this tree's code into relocatable ELF64. [razm](#razm) replaces `as --64`. [rllvm](#what-rllvm-replaces) replaces `clang -c` on the `.ll` this tree already emits. Both write objects today's linkers already accept: hosted `clang` or `gcc` (`link_hosted`), and freestanding `ld.lld` (`link_freestanding_elf`). Neither links.
 
-The native linker is [rld](#rld). This document specifies it. Its first slice, the no-script executable, is implemented.
+The native linker is [rld](#rld). This document specifies it. The no-script executable and the two PIEs are implemented.
 
 Pipeline facts below are from `projects/ritz/build_pipeline.py` (`compile_ll_to_obj`, `OBJ_CLANG_FLAGS`, `freestanding_target`, `link_hosted`, `link_freestanding_elf`, `assemble_objects`, `ensure_runtime_object`) and from `projects/ritz/runtime/ritz_start.x86_64.ll` and `ritz_start.harland.x86_64.ll`.
 
@@ -484,7 +484,7 @@ Today those bins (`bootx64`, `hwinv`, target `x86_64-unknown-uefi`) compile with
 
 ## rld
 
-rld is `projects/rld`. It reads ELF through razm's `razm.elf` records, the ones razm's writer uses. Its first slice is the no-script executable with the object reader, symbol resolution, relocations and GOT relaxation below; the linker scripts, the PIEs and the hosted mode come after it.
+rld is `projects/rld`. It reads ELF through razm's `razm.elf` records, the ones razm's writer uses. Its first slice is the no-script executable with the object reader, symbol resolution, relocations and GOT relaxation below. The hosted and freestanding PIEs, with their load-time relocations, come next. The linker scripts come after them.
 
 ### Inputs
 
