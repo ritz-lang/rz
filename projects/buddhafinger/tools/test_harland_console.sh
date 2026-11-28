@@ -147,6 +147,11 @@ boot() {
         echo "FAIL: [$session] kernel exception or panic on the serial console"
         brc=1
     fi
+    # A process the kernel killed for a fault (AGAST #4921): the editor died.
+    if grep -aqF "[fault]" "$WORK/$session.log" 2>/dev/null; then
+        echo "FAIL: [$session] a process faulted: $(grep -aF "[fault]" "$WORK/$session.log" | head -1 | tr -d '\r')"
+        brc=1
+    fi
     if [ "$brc" -ne 0 ]; then
         echo "----- [$session] serial tail -----"
         tail -c 1500 "$WORK/$session.log" 2>/dev/null | tr -d '\r'

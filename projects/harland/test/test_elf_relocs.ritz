@@ -1,0 +1,207 @@
+# Harland PIE relocation tests (AGAST #4921)
+#
+# The loader mapped a PIE's segments but never applied .rela.dyn, so every
+# initialized pointer in user space stayed 0: Buddhafinger's first keystroke
+# in a .ritz file compared a word against the lexer's `const [N]StrView`
+# keyword table and faulted at CR2 0 (StrView_eq). loader/image.ritz's
+# elf_relocs and elf_fixup are the pure half of the fix elf_load applies;
+# these tests feed them a PIE built by hand: one RW PT_LOAD (file bytes
+# 0..0x800, memory 0..0x1000) and a PT_DYNAMIC naming two RELATIVE entries.
+
+import ritzlib.result
+import ritzlib.span
+
+import loader.image { ElfFixup, ElfRelocs, ElfStatus, DT_JMPREL, DT_NULL, DT_RELA, DT_RELAENT, DT_RELASZ, ELF64_PHDR_SIZE, ELFCLASS64, ELFDATA2LSB, EM_X86_64, ET_DYN, PT_DYNAMIC, PT_LOAD, R_X86_64_RELATIVE, elf_fixup, elf_relocs, elf_validate_image }
+
+const IMAGE_SIZE: u64 = 4096
+const PHDR0: u64 = 64
+const DYNAMIC: u64 = 0x400          # PT_DYNAMIC's file offset and vaddr
+const RELA: u64 = 0x500             # the Elf64Rela table
+const BIAS: u64 = 0x100000000       # USER_IMAGE_BASE
+
+var g_image: [4096]u8
+
+fn base() -> u64
+    return @g_image as u64
+
+fn data() -> *u8
+    return @g_image as *u8
+
+# The whole scratch image, as elf_load hands it over.
+fn image() -> [u8]
+    span_from_ptr<u8>(data(), IMAGE_SIZE as i64)
+
+fn put_u8(off: u64, v: u8)
+    *( (base() + off) as *u8 ) = v
+
+fn put_u16(off: u64, v: u16)
+    *( (base() + off) as *u16 ) = v
+
+fn put_u32(off: u64, v: u32)
+    *( (base() + off) as *u32 ) = v
+
+fn put_u64(off: u64, v: u64)
+    *( (base() + off) as *u64 ) = v
+
+# Dynamic entry k: tag and value.
+fn put_dyn(k: u64, tag: i64, val: u64)
+    put_u64(DYNAMIC + k * 16, tag as u64)
+    put_u64(DYNAMIC + k * 16 + 8, val)
+
+# Relocation k: where, the type, the addend.
+fn put_rela(k: u64, at: u64, kind: u32, addend: u64)
+    put_u64(RELA + k * 24, at)
+    put_u64(RELA + k * 24 + 8, kind as u64)
+    put_u64(RELA + k * 24 + 16, addend)
+
+fn build_pie()
+    for i in 0..IMAGE_SIZE
+        put_u8(i, 0)
+    put_u8(0, 0x7F)
+    put_u8(1, 0x45)
+    put_u8(2, 0x4C)
+    put_u8(3, 0x46)
+    put_u8(4, ELFCLASS64)
+    put_u8(5, ELFDATA2LSB)
+    put_u16(16, ET_DYN)
+    put_u16(18, EM_X86_64)
+    put_u64(24, 0x100)              # e_entry
+    put_u64(32, PHDR0)              # e_phoff
+    put_u16(54, ELF64_PHDR_SIZE)
+    put_u16(56, 2)                  # e_phnum
+    # PT_LOAD, RW: file 0..0x800, memory 0..0x1000 (the rest is bss).
+    put_u32(PHDR0, PT_LOAD)
+    put_u32(PHDR0 + 4, 6)
+    put_u64(PHDR0 + 8, 0)
+    put_u64(PHDR0 + 16, 0)
+    put_u64(PHDR0 + 32, 0x800)
+    put_u64(PHDR0 + 40, 0x1000)
+    # PT_DYNAMIC: four entries at 0x400.
+    let dynp: u64 = PHDR0 + ELF64_PHDR_SIZE as u64
+    put_u32(dynp, PT_DYNAMIC)
+    put_u32(dynp + 4, 6)
+    put_u64(dynp + 8, DYNAMIC)
+    put_u64(dynp + 16, DYNAMIC)
+    put_u64(dynp + 32, 64)
+    put_u64(dynp + 40, 64)
+    put_dyn(0, DT_RELA, RELA)
+    put_dyn(1, DT_RELASZ, 48)
+    put_dyn(2, DT_RELAENT, 24)
+    put_dyn(3, DT_NULL, 0)
+    put_rela(0, 0x600, R_X86_64_RELATIVE, 0x123)
+    put_rela(1, 0x608, R_X86_64_RELATIVE, 0x200)
+
+fn relocs() -> Result<ElfRelocs, ElfStatus>
+    elf_relocs(image())
+
+fn status(r: Result<ElfRelocs, ElfStatus>) -> ElfStatus
+    match r
+        Ok(_) => ElfStatus.Ok
+        Err(e) => e
+
+fn fixup_status(r: @ElfRelocs, i: u64) -> ElfStatus
+    match elf_fixup(image(), r, i, BIAS)
+        Ok(_) => ElfStatus.Ok
+        Err(e) => e
+
+[[test]]
+fn test_the_hand_built_pie_is_a_valid_image() -> i32
+    build_pie()
+    assert elf_validate_image(data(), IMAGE_SIZE, BIAS) == ElfStatus.Ok
+    0
+
+[[test]]
+fn test_the_rela_table_is_found_through_pt_dynamic() -> i32
+    build_pie()
+    let r = relocs().unwrap()
+    assert r.table == RELA
+    assert r.count == 2
+    0
+
+[[test]]
+fn test_a_relative_fixup_is_bias_plus_addend_at_the_biased_address() -> i32
+    build_pie()
+    let r = relocs().unwrap()
+    let a: ElfFixup = elf_fixup(image(), @r, 0, BIAS).unwrap()
+    assert a.at == BIAS + 0x600
+    assert a.value == BIAS + 0x123
+    let b: ElfFixup = elf_fixup(image(), @r, 1, BIAS).unwrap()
+    assert b.at == BIAS + 0x608
+    assert b.value == BIAS + 0x200
+    0
+
+[[test]]
+fn test_no_pt_dynamic_means_no_relocations() -> i32
+    build_pie()
+    put_u16(56, 1)                  # only the PT_LOAD
+    assert relocs().unwrap().count == 0
+    0
+
+[[test]]
+fn test_a_dynamic_array_without_rela_means_no_relocations() -> i32
+    build_pie()
+    put_dyn(0, DT_NULL, 0)
+    assert relocs().unwrap().count == 0
+    0
+
+[[test]]
+fn test_a_dynamic_segment_outside_the_file_is_refused() -> i32
+    build_pie()
+    put_u64(PHDR0 + ELF64_PHDR_SIZE as u64 + 8, IMAGE_SIZE - 16)   # p_offset; p_filesz 64 runs past
+    assert status(relocs()) == ElfStatus.BadReloc
+    0
+
+[[test]]
+fn test_a_wrong_entry_size_is_refused() -> i32
+    build_pie()
+    put_dyn(2, DT_RELAENT, 16)
+    assert status(relocs()) == ElfStatus.BadReloc
+    0
+
+[[test]]
+fn test_a_table_size_not_a_whole_number_of_entries_is_refused() -> i32
+    build_pie()
+    put_dyn(1, DT_RELASZ, 40)
+    assert status(relocs()) == ElfStatus.BadReloc
+    0
+
+[[test]]
+fn test_a_table_outside_the_file_bytes_is_refused() -> i32
+    build_pie()
+    put_dyn(0, DT_RELA, 0x7F0)      # 48 bytes from 0x7F0 pass p_filesz 0x800
+    assert status(relocs()) == ElfStatus.BadReloc
+    0
+
+[[test]]
+fn test_plt_relocations_are_refused() -> i32
+    build_pie()
+    put_dyn(3, DT_JMPREL, 0x700)
+    assert status(relocs()) == ElfStatus.BadReloc
+    0
+
+[[test]]
+fn test_a_relocation_type_other_than_relative_is_refused() -> i32
+    build_pie()
+    put_rela(1, 0x608, 1, 0x200)     # R_X86_64_64: needs a symbol
+    let r = relocs().unwrap()
+    assert fixup_status(@r, 0) == ElfStatus.Ok
+    assert fixup_status(@r, 1) == ElfStatus.BadReloc
+    0
+
+[[test]]
+fn test_an_unaligned_target_is_refused() -> i32
+    build_pie()
+    put_rela(0, 0x604, R_X86_64_RELATIVE, 0x123)
+    let r = relocs().unwrap()
+    assert fixup_status(@r, 0) == ElfStatus.BadReloc
+    0
+
+[[test]]
+fn test_a_target_in_bss_is_applied_and_one_past_memory_refused() -> i32
+    build_pie()
+    put_rela(0, 0xFF8, R_X86_64_RELATIVE, 0x123)   # the last u64 of p_memsz
+    put_rela(1, 0x1000, R_X86_64_RELATIVE, 0x200)  # just past it
+    let r = relocs().unwrap()
+    assert fixup_status(@r, 0) == ElfStatus.Ok
+    assert fixup_status(@r, 1) == ElfStatus.BadReloc
+    0

@@ -24,7 +24,8 @@ Sessions (docs/BUDDHAFINGER_PROPOSAL.md, "Harland acceptance"):
                  echo and rubout, Ctrl-C kills, $? = 130); reopen it and
                  check the bytes; an empty save; kills before and after a
                  save's write (`--pause-save`): the file holds the old or the
-                 new contents, never a prefix
+                 new contents, never a prefix; a new .ritz file, coloured,
+                 `ipub<Esc>:wq` with no process fault (AGAST #4921)
   reboot         the same disk: every file of `first` persisted as it was
   fault-persist  booted with \\harland\\fault-persist: `:w` keeps the buffer
                  dirty and says the live file may already have changed; a
@@ -282,6 +283,27 @@ def kill_during_save(con: Console, when: str, timeout: float) -> int:
     return fails
 
 
+def ritz_file(con: Console, timeout: float) -> int:
+    """A .ritz file is drawn in colour (AGAST #4921): typing `pub`, a
+    keyword, into a new one and `:wq` saves it, with no process fault."""
+    path = "/var/hl.ritz"
+    ed = Editor(con, timeout)
+    fails = _ok(ed.start(path), f"the editor starts on a new {path}", ed.raw)
+    ed.keys(b"ipub")
+    fails += _ok("INSERT" in ed.scr.status() and ed.scr.text()[0].split() == ["1", "pub"],
+                 f"{path}: `ipub` is shown in Insert", repr(ed.scr.text()[:1] + [ed.scr.status()]).encode())
+    # The keyword's colour: bold magenta (syntax/highlight.ritz kind_style).
+    fails += _ok(b"\x1b[0;1;38;5;5mpub" in ed.raw,
+                 f"{path}: the keyword is coloured", ed.raw[-400:])
+    ed.keys(b"\x1b")
+    out = ed.quit(b":wq\r")
+    fails += _ok(out is not None and ALT_OFF in out and b"[fault]" not in out,
+                 f"{path}: written with :wq, no process fault", out if out is not None else ed.raw)
+    # No newline is added to a new file's last line (as ram_only's "ram").
+    fails += file_is(con, path, "pub", 3, timeout, ".ritz save")
+    return fails
+
+
 def failed_save(con: Console, fault: str, live: str, timeout: float) -> int:
     """`:w` with the persistent update or the sync failing: dirty, the
     message, and `live`, what the running system then reads. The editor
@@ -343,6 +365,7 @@ def first(con: Console, timeout: float) -> int:
     fails += file_is(con, "/var/empty.txt", "", 0, timeout, "empty save")
     fails += kill_during_save(con, "before-write", timeout)
     fails += kill_during_save(con, "after-write", timeout)
+    fails += ritz_file(con, timeout)
     return fails
 
 
@@ -351,6 +374,7 @@ def reboot(con: Console, timeout: float) -> int:
     fails += file_is(con, "/var/empty.txt", "", 0, timeout, "after a reboot")
     fails += file_is(con, "/var/kill-before-write.txt", "old\n", 4, timeout, "after a reboot")
     fails += file_is(con, "/var/kill-after-write.txt", "new old\n", 8, timeout, "after a reboot")
+    fails += file_is(con, "/var/hl.ritz", "pub", 3, timeout, "after a reboot")
     return fails
 
 

@@ -5,6 +5,7 @@
 #   - ELF64 format (x86-64)
 #   - PT_LOAD segments (code, data, bss)
 #   - Position-independent executables (PIE) or static
+#   - a PIE's R_X86_64_RELATIVE relocations (AGAST #4921)
 #
 # ELF Header Format (64-bit):
 #   0x00: e_ident[16]     - Magic number and other info
@@ -29,6 +30,8 @@ import mm.vmm { vmm_map_page, vmm_virt_to_phys, vmm_flush_tlb_all, phys_to_virt,
 # pub: loader.elf is still the module callers (and test_harland_errno.py)
 # import for ElfStatus, so re-export what moved to loader.image.
 pub import loader.image
+import ritzlib.result
+import ritzlib.span { span_from_ptr }
 
 # External functions from main.ritz
 extern fn alloc_user_stack() -> u64
@@ -219,10 +222,35 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
 
         phdr_idx = phdr_idx + 1
 
+    # The pointers the file leaves for the loader (AGAST #4921).
+    let relocated: ElfStatus = elf_relocate(elf_data, elf_size, bias)
+    if relocated != ElfStatus.Ok
+        result.error = relocated
+        return result
+
     # Flush TLB for the new mappings
     vmm_flush_tlb_all()
 
     return result
+
+# Apply the image's R_X86_64_RELATIVE relocations (loader/image.ritz
+# elf_relocs, elf_fixup) to the segments just loaded, through the physmap as
+# elf_load_page copied them: each target is 8-byte aligned, so in one page.
+# Takes elf_load's raw image and makes it the span the pure half reads.
+fn elf_relocate(elf_data: *u8, elf_size: u64, bias: u64) -> ElfStatus
+    let image: [u8] = span_from_ptr<u8>(elf_data, elf_size as i64)
+    let relocs: ElfRelocs = match elf_relocs(image)
+        Ok(r) => r
+        Err(e) => return e
+    for i in 0..relocs.count
+        let f: ElfFixup = match elf_fixup(image, @relocs, i, bias)
+            Ok(f) => f
+            Err(e) => return e
+        let phys: u64 = vmm_virt_to_phys(f.at)
+        if phys == 0
+            return ElfStatus.MapFailed
+        *(phys_to_virt(phys) as *u64) = f.value
+    ElfStatus.Ok
 
 # Load an ELF and execute it in userspace
 pub fn elf_exec(elf_data: *u8, elf_size: u64) -> ElfStatus

@@ -13,6 +13,9 @@
 #     no two PT_LOAD memory ranges overlap;
 #   - the entry point is a user address.
 #
+# and, for the loader to apply after the segments are in (AGAST #4921), the
+# image's R_X86_64_RELATIVE relocations, each checked to land in the image.
+#
 # Nothing here imports the pmm, the vmm or the serial port: a hosted test
 # (harland/test/test_elf_image.ritz) links this module alone and feeds it
 # truncated, overlapping and kernel-address images.
@@ -21,6 +24,10 @@
 # one set the UEFI loader also parses the kernel with (AGAST #4578).
 # Re-exported whole: kernel modules and tests import them from here.
 pub import boot_abi.elf64
+
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span
 
 # Highest user address (end of the canonical lower half) and the exclusive
 # limit above it: the same range mm/uptr.ritz validates syscall pointers
@@ -50,6 +57,7 @@ pub enum ElfStatus
     BadPhdr             # program header table or segment sizes are unusable
     BadAddress          # a segment or the entry point is not a user address
     Overlap             # two PT_LOAD segments claim the same memory
+    BadReloc            # PT_DYNAMIC or a relocation the loader can't apply
 
 # Numeric code for serial logs (Ok = 0).
 pub fn elf_status_code(s: ElfStatus) -> u64
@@ -179,3 +187,114 @@ pub fn elf_validate_image(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfSt
         return ElfStatus.NoSegments
 
     return ElfStatus.Ok
+
+# ============================================================================
+# Relocations (AGAST #4921)
+# ============================================================================
+# A PIE's initialized pointers (a `const [N]StrView` table's `ptr`s, a global
+# holding an address) are 0 in the file: the linker leaves each as an
+# R_X86_64_RELATIVE in .rela.dyn, for the loader to set to bias + addend.
+# Loading without them left every such pointer null in user space: the first
+# Buddhafinger keystroke in a .ritz file read the lexer's keyword table and
+# faulted at CR2 0. elf_relocs finds the table through PT_DYNAMIC; elf_fixup
+# gives each entry as the u64 to store, checked against the image. Both run
+# after elf_validate_image, on the image as a span: every read is inside it.
+#
+# Only R_X86_64_RELATIVE is supported: user programs are linked without a
+# dynamic linker or symbols, so a DT_REL or DT_JMPREL table, or any other
+# relocation type, is refused rather than silently skipped.
+
+# An image's relocation table: `count` Elf64Rela at file offset `table`.
+pub struct ElfRelocs
+    table: u64
+    count: u64
+
+# One relocation, resolved: the u64 at loaded address `at` becomes `value`.
+pub struct ElfFixup
+    at: u64
+    value: u64
+
+# The program header at index i (elf_validate_image checked the table).
+fn elf_phdr(elf_data: *u8, i: u64) -> *Elf64Phdr
+    let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
+    (elf_data + (*ehdr).e_phoff + i * ELF64_PHDR_SIZE as u64) as *Elf64Phdr
+
+# The file offset of the `len` bytes at link-time vaddr `vaddr`, when they
+# lie in one PT_LOAD's file bytes.
+fn elf_file_offset(elf_data: *u8, vaddr: u64, len: u64) -> Option<u64>
+    let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
+    for i in 0..(*ehdr).e_phnum as u64
+        let p: *Elf64Phdr = elf_phdr(elf_data, i)
+        if (*p).p_type == PT_LOAD and vaddr >= (*p).p_vaddr
+            let into: u64 = vaddr - (*p).p_vaddr
+            if into <= (*p).p_filesz and len <= (*p).p_filesz - into
+                return Some((*p).p_offset + into)
+    None
+
+# Whether the `len` bytes at link-time vaddr `vaddr` lie in one PT_LOAD's
+# memory (file bytes or bss).
+fn elf_in_memory(elf_data: *u8, vaddr: u64, len: u64) -> bool
+    let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
+    for i in 0..(*ehdr).e_phnum as u64
+        let p: *Elf64Phdr = elf_phdr(elf_data, i)
+        if (*p).p_type == PT_LOAD and vaddr >= (*p).p_vaddr
+            let into: u64 = vaddr - (*p).p_vaddr
+            if into <= (*p).p_memsz and len <= (*p).p_memsz - into
+                return true
+    false
+
+# The image's relocation table: none (count 0) without a PT_DYNAMIC or a
+# DT_RELA; BadReloc when PT_DYNAMIC or the table is outside the file, the
+# entry size isn't Elf64Rela's, or the image needs a table kind this loader
+# doesn't apply.
+pub fn elf_relocs(image: [u8]) -> Result<ElfRelocs, ElfStatus>
+    let elf_data: *u8 = image.as_ptr()
+    let elf_size: u64 = image.len() as u64
+    let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
+    var none = ElfRelocs { table: 0, count: 0 }
+    var dynamic: Option<*Elf64Phdr> = None
+    for i in 0..(*ehdr).e_phnum as u64
+        let p: *Elf64Phdr = elf_phdr(elf_data, i)
+        if (*p).p_type == PT_DYNAMIC
+            dynamic = Some(p)
+    let dyn_phdr: *Elf64Phdr = match dynamic
+        Some(p) => p
+        None => return Ok(none)
+    if (*dyn_phdr).p_offset > elf_size or (*dyn_phdr).p_filesz > elf_size - (*dyn_phdr).p_offset
+        return Err(ElfStatus.BadReloc)
+    var rela: u64 = 0
+    var relasz: u64 = 0
+    var relaent: u64 = ELF64_RELA_SIZE
+    for k in 0..(*dyn_phdr).p_filesz / ELF64_DYN_SIZE
+        let d: *Elf64Dyn = (elf_data + (*dyn_phdr).p_offset + k * ELF64_DYN_SIZE) as *Elf64Dyn
+        let tag: i64 = (*d).d_tag
+        if tag == DT_NULL
+            break
+        if tag == DT_RELA
+            rela = (*d).d_val
+        else if tag == DT_RELASZ
+            relasz = (*d).d_val
+        else if tag == DT_RELAENT
+            relaent = (*d).d_val
+        else if tag == DT_REL or tag == DT_JMPREL
+            return Err(ElfStatus.BadReloc)
+    if relasz == 0
+        return Ok(none)
+    if relaent != ELF64_RELA_SIZE or relasz % ELF64_RELA_SIZE != 0
+        return Err(ElfStatus.BadReloc)
+    match elf_file_offset(elf_data, rela, relasz)
+        Some(off) => Ok(ElfRelocs { table: off, count: relasz / ELF64_RELA_SIZE })
+        None => Err(ElfStatus.BadReloc)
+
+# Relocation i of `relocs` for an image loaded with `bias` (elf_bias): the
+# 8-byte-aligned u64 it sets, inside a PT_LOAD's memory, and its value.
+# BadReloc for any type but R_X86_64_RELATIVE, or a target outside the image.
+pub fn elf_fixup(image: [u8], relocs: @ElfRelocs, i: u64, bias: u64) -> Result<ElfFixup, ElfStatus>
+    let elf_data: *u8 = image.as_ptr()
+    let r: *Elf64Rela = (elf_data + relocs.table + i * ELF64_RELA_SIZE) as *Elf64Rela
+    if ((*r).r_info & 0xFFFFFFFF) as u32 != R_X86_64_RELATIVE
+        return Err(ElfStatus.BadReloc)
+    let at: u64 = (*r).r_offset
+    if at % 8 != 0 or not elf_in_memory(elf_data, at, 8)
+        return Err(ElfStatus.BadReloc)
+    Ok(ElfFixup { at: at + bias, value: bias +% (*r).r_addend as u64 })
