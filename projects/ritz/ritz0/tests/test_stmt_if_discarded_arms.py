@@ -15,14 +15,16 @@ was typed i32 but fed the struct, and clang refused the IR:
 
 Neither arm's value is wanted, so neither reaches a phi.  Each program
 exits 0 only if every arm ran its side effect the right number of times.
+
+The rows are a table, one test per compiler (test_table_rows.py; AGAST
+#4999 folded the 21-case matrix to keep the suite under its cap).
 """
 
 import pytest
-from test_ref_into_value import _run
+from test_ref_into_value import COMPILERS
+from test_table_rows import assert_runs
 
-pytestmark = [pytest.mark.integration, pytest.mark.batched]
-
-COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+pytestmark = pytest.mark.integration
 
 PRELUDE = """\
 struct V
@@ -127,7 +129,7 @@ pub fn main() -> i32
     n - {want}
 """
 
-ROWS = {
+BODIES = {
     "tail": (TAIL, 11),
     "mid": (MID, 211),
     "nested": (NESTED, 11),
@@ -137,10 +139,13 @@ ROWS = {
     "for": (FOR, 11),
 }
 
+# Each row exits 0: `main` subtracts what its arms should have added.
+ROWS = {
+    row: (PRELUDE + body + MAIN.format(want=want), 0)
+    for row, (body, want) in BODIES.items()
+}
+
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("row", sorted(ROWS))
-def test_discarded_if_arms_of_differing_types(compiler, row, tmp_path):
-    body, want = ROWS[row]
-    src = PRELUDE + body + MAIN.format(want=want)
-    assert _run(compiler, tmp_path, row, src) == 0
+def test_discarded_if_arms_of_differing_types(compiler, tmp_path):
+    assert_runs(compiler, tmp_path, ROWS)
