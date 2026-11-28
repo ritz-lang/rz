@@ -99,6 +99,7 @@ pub fn main() -> i32
 | `path.ritz` | `ritzlib.path` | lexical path resolution (AGAST #4776) |
 | `process.ritz` | `ritzlib.process` | Process spawning and I/O |
 | `ptr.ritz` | `ritzlib.ptr` | reads through a raw pointer that take ownership |
+| `regex.ritz` | `ritzlib.regex` | regular expressions that run in linear time. |
 | `result.ritz` | `ritzlib.result` | `Result<T, E>`, a success value or an error |
 | `span.ritz` | `ritzlib.span` | Non-owning views into contiguous memory |
 | `str.ritz` | `ritzlib.str` | byte predicates and the libc memory symbols |

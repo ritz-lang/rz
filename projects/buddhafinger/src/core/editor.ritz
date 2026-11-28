@@ -19,7 +19,9 @@
 #                 and p P on the selection; gv reselects the last one
 #   Undo          u Ctrl-R; an Insert session (with the c that opened it)
 #                 is one undo step
-#   Search        / (a literal pattern), n N
+#   Search        / ? (Vim's regular expressions: ritzlib.regex), n N
+#                 (the last search's way, and the other), * # (the word
+#                 under the cursor); each a motion for an operator (d/pat)
 #   Command line  :w  :w <path>  :q  :q!  :wq  :e <path>  :<line>
 #   Buffers       :ls  :b [N | name]  :bn  :bp  :bd[!] [N]
 #   Windows       :sp [path]  :vs [path]  :close  :only;  Ctrl-W h j k l
@@ -65,6 +67,7 @@
 
 import ritzlib.gvec
 import ritzlib.option
+import ritzlib.regex { RegexMatch, Regex, RegexSyntax, regex_compile }
 import ritzlib.result { Result }
 import ritzlib.span
 import ritzlib.strview { StrView }
@@ -84,6 +87,7 @@ import core.utf8 { utf8_encode, utf8_next, utf8_prev }
 pub const MSG_NOT_SAVED: StrView = "E37: No write since last change (add ! to override)"
 pub const MSG_NO_NAME: StrView = "E32: No file name"
 pub const MSG_NO_PATTERN: StrView = "No previous search pattern"
+pub const MSG_NO_STRING: StrView = "E348: No string under cursor"
 pub const MSG_NO_JUMP: StrView = "E73: Tag stack empty"
 pub const MSG_TOO_LONG: StrView = "E1240: Resulting text too long"
 pub const MSG_NO_ROOM: StrView = "E36: Not enough room"
@@ -179,7 +183,10 @@ pub struct Editor
     reg: Vec<u8>            # the unnamed register
     reg_lines: bool         # it holds whole lines, each with its terminator
     pattern: Vec<u8>        # the last search pattern
-    cmdline: String         # the command line: its prompt (`:` or `/`), then the text
+    forward: bool           # the last search went forward (/ *), not back (? #)
+    cmdline: String         # the command line: its prompt (`:`, `/` or `?`), then the text
+    search_op: Option<Operator> # the operator waiting for the `/` or `?` being typed
+    search_count: i64       # and the count typed before it (0: none)
     keys: NormalKeys        # the Normal-mode keys of a command not yet complete
     anchor: Pos             # Visual mode: the selection's end the cursor isn't on
     message: String         # the message line; lines broken by `\n` (:ls) wait for a key
@@ -204,7 +211,7 @@ fn editor_with(path: String, buf: Buffer) -> Editor
     bufs.push(listed(1, buf, path))
     var wins: Vec<Window> = vec_new<Window>()
     wins.push(Window { id: 0, number: 1, alt: None, cursor: pos(0, 0), want: 0, top: 0, jumps: jumps_new() })
-    Editor { bufs: bufs, at: 0, wins: wins, cur: 0, layout: layout_new(0), size: DEFAULT_SIZE, next_number: 2, next_id: 1, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), keys: normal_keys_new(), anchor: pos(0, 0), message: string_new(), quit: false, ask: LangAsk.Nothing, watched: vec_new<Watched>() }
+    Editor { bufs: bufs, at: 0, wins: wins, cur: 0, layout: layout_new(0), size: DEFAULT_SIZE, next_number: 2, next_id: 1, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), forward: true, cmdline: string_new(), search_op: None, search_count: 0, keys: normal_keys_new(), anchor: pos(0, 0), message: string_new(), quit: false, ask: LangAsk.Nothing, watched: vec_new<Watched>() }
 
 # ============================================================================
 # Characters and columns
@@ -236,6 +243,11 @@ enum Reach
 struct Target
     at: Pos
     reach: Reach
+
+# Where a search landed, and whether it wrapped around the text to get there.
+struct Hit
+    at: Pos
+    wrapped: bool
 
 # One step of w: keep going from a position, or end there.
 enum Stride
@@ -277,35 +289,6 @@ fn first_non_blank(s: [u8]) -> i64
     while c < s.len and (s[c] == ' ' or s[c] == '\t')
         c += 1
     normal_col(s, c)
-
-# True when `needle` occurs in `hay` at `at`.
-fn matches_at(hay: [u8], needle: [u8], at: i64) -> bool
-    if at < 0 or at + needle.len > hay.len
-        return false
-    for k in 0..needle.len
-        if hay[at + k] != needle[k]
-            return false
-    true
-
-# Where `needle` first starts in `hay` at or after `from`.
-fn find_from(hay: [u8], needle: [u8], from: i64) -> Option<i64>
-    var i = if from < 0 then 0 else from
-    while i + needle.len <= hay.len
-        if matches_at(hay, needle, i)
-            return Some(i)
-        i += 1
-    None
-
-# Where `needle` last starts in `hay` before `before`.
-fn find_before(hay: [u8], needle: [u8], before: i64) -> Option<i64>
-    var i = hay.len - needle.len
-    if i > before - 1
-        i = before - 1
-    while i >= 0
-        if matches_at(hay, needle, i)
-            return Some(i)
-        i -= 1
-    None
 
 # The length of the line terminator ending `text`: 2 for CRLF, 1 for LF or
 # CR, 0 for none.
@@ -556,7 +539,9 @@ impl Editor
     # a line motion can't go at all (k on the first line): no move, and an
     # operator does nothing. h and l that can't move stay put, so an
     # operator gets an empty range (ch at a line's start still inserts).
-    fn target(self: @Editor, m: Motion, count: i64, op: bool) -> Option<Target>
+    # A search motion says why when it finds nothing, and * and # set the
+    # last pattern.
+    fn target(self: @&Editor, m: Motion, count: i64, op: bool) -> Option<Target>
         let n = if count > 0 then count else 1
         let c = self.cursor
         let s = self.buf().line(c.line)
@@ -604,6 +589,10 @@ impl Editor
             Motion.LastLine => Some(self.line_target(if count > 0 then count - 1 else self.last()))
             Motion.Lines =>
                 if n > 1 and c.line >= self.last() then None else Some(self.line_target(c.line + n - 1))
+            Motion.SearchNext => self.search_target(c, self.forward, n)
+            Motion.SearchPrev => self.search_target(c, not self.forward, n)
+            Motion.StarWord => self.word_search(true, n)
+            Motion.HashWord => self.word_search(false, n)
 
     # Line l (clamped), at its first non-blank, reached linewise.
     fn line_target(self: @Editor, l: i64) -> Target
@@ -733,7 +722,7 @@ impl Editor
 
     # Where operator `op` reaches with motion `m`: the motion's target,
     # except that cw on a word changes to the word's end (Vim's cw is ce).
-    fn operator_target(self: @Editor, op: Operator, m: Motion, count: i64) -> Option<Target>
+    fn operator_target(self: @&Editor, op: Operator, m: Motion, count: i64) -> Option<Target>
         let c = self.cursor
         if op == Operator.Change and m == Motion.WordForward and self.class_at(c) != CharClass.Blank
             let n = if count > 0 then count else 1
@@ -1009,41 +998,82 @@ impl Editor
     # Search
     # ------------------------------------------------------------------
 
-    # n (forward) and N: the next match of the last pattern, wrapping
-    # around the buffer once, the cursor's own match last. False when there
-    # is none.
-    fn search(self: @&Editor, forward: bool) -> bool
+    # The match of `re` nearest p the way `forward` goes, wrapping around
+    # the text once: a match at p itself only when it is the only one.
+    fn next_match(self: @Editor, re: @Regex, p: Pos, forward: bool) -> Option<Hit>
+        let n = self.shown()
+        for k in 0..=n
+            let l = if forward then (p.line + k) % n else (p.line - k + n) % n
+            let s = self.buf().line(l)
+            var hit: Option<RegexMatch> = None
+            if forward
+                hit = re.find_from(s, if k == 0 then p.col + 1 else 0)
+            else
+                hit = re.find_before(s, if k == 0 then p.col else s.len + 1)
+            match hit
+                Some(m) =>
+                    # Back on p's line after the wrap, only p's own side
+                    # of it is left to search.
+                    let beyond = if forward then m.start > p.col else m.start < p.col
+                    if k < n or not beyond
+                        let wrapped = if forward then p.line + k >= n else p.line - k < 0
+                        return Some(Hit { at: pos(l, m.start), wrapped: wrapped })
+                None => pass
+        None
+
+    # The `count`th match of the last pattern from `from`, the way
+    # `forward` goes. None, saying why, when there is none; a search that
+    # wrapped around the text says so.
+    fn search_target(self: @&Editor, from: Pos, forward: bool, count: i64) -> Option<Target>
         if self.pattern.len() == 0
             self.say(MSG_NO_PATTERN)
-            return false
-        let pat = span_from_vec<u8>(@self.pattern)
-        let n = self.shown()
-        let cur = self.cursor
-        for k in 0..=n
-            let l = if forward then (cur.line + k) % n else (cur.line - k + n) % n
-            let s = self.buf().line(l)
-            var hit: Option<i64> = None
-            if forward
-                hit = find_from(s, pat, if k == 0 then cur.col + 1 else 0)
-                if k == n and hit.unwrap_or(0) > cur.col
-                    hit = None
-            else
-                hit = find_before(s, pat, if k == 0 then cur.col else s.len + 1)
-                if k == n and hit.unwrap_or(s.len) < cur.col
-                    hit = None
-            match hit
-                Some(col) =>
-                    self.place(pos(l, col))
-                    if forward and cur.line + k >= n
-                        self.say("search hit BOTTOM, continuing at TOP")
-                    else if not forward and cur.line - k < 0
-                        self.say("search hit TOP, continuing at BOTTOM")
-                    return true
-                None => pass
-        var msg = string_from("Pattern not found: ")
-        msg.push_span(pat)
-        self.say(msg.as_view())
-        false
+            return None
+        let re: Regex = match regex_compile(self.pattern.as_view(), RegexSyntax.Vim)
+            Ok(r) => r
+            Err(e) =>
+                self.say(e.message())
+                return None
+        var p = from
+        var wrapped = false
+        for k in 0..count
+            match self.next_match(@re, p, forward)
+                Some(h) =>
+                    p = h.at
+                    wrapped = wrapped or h.wrapped
+                None =>
+                    var msg = string_from("Pattern not found: ")
+                    msg.push_str(self.pattern.as_view())
+                    self.say(msg.as_view())
+                    return None
+        if wrapped
+            self.say(if forward then "search hit BOTTOM, continuing at TOP" else "search hit TOP, continuing at BOTTOM")
+        Some(Target { at: p, reach: Reach.Exclusive })
+
+    # * (forward) and #: the word under the cursor, or else the first after
+    # it on the line, searched for whole (\<word\>) from the word's start.
+    # It becomes the last pattern, and its way the last search's.
+    fn word_search(self: @&Editor, forward: bool, count: i64) -> Option<Target>
+        let l = self.cursor.line
+        let s: [u8] = self.buf().line(l)
+        var a = self.cursor.col
+        while a < s.len and class_of(s, a) != CharClass.Word
+            a += 1
+        if a >= s.len
+            self.say(MSG_NO_STRING)
+            return None
+        while a > 0 and class_of(s, a - 1) == CharClass.Word
+            a -= 1
+        var b = a
+        while b < s.len and class_of(s, b) == CharClass.Word
+            b += 1
+        let word = s[a..b]
+        var pat: Vec<u8> = vec_new<u8>()
+        pat.push_view("\\<")
+        pat.push_span(word)
+        pat.push_view("\\>")
+        self.pattern = pat
+        self.forward = forward
+        self.search_target(pos(l, a), forward, count)
 
     # ------------------------------------------------------------------
     # The command line
@@ -1057,6 +1087,14 @@ impl Editor
     pub fn close_command_line(self: @&Editor)
         self.cmdline.clear()
         self.mode = Mode.Normal
+
+    # / or ?: the command line, prompted with the way to search; the
+    # operator and the count wait there for the pattern (each / or ? sets
+    # them, so an Escape leaves nothing behind).
+    fn open_search(self: @&Editor, op: Option<Operator>, forward: bool, count: i64)
+        self.open_command_line(if forward then '/' else '?')
+        self.search_op = op
+        self.search_count = count
 
     # The editor's size message for `path`: `"path" 2L, 8B`.
     pub fn file_info(self: @Editor, path: StrView) -> String
@@ -1656,15 +1694,10 @@ fn normal_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key, map: Keymap)
         Step.Run(cmd) => run_normal<F>(ed, files, cmd)
         Step.Wait | Step.Cancel => pass
 
-# n or N `times` over, stopping at the first miss.
-fn repeat_search(ed: @&Editor, forward: bool, times: i64)
-    var k: i64 = 0
-    while k < times and ed.search(forward)
-        k += 1
-
 # Run one Normal- or Visual-mode command (core/normal.ritz decoded it). A
-# count repeats u, Ctrl-R, n, N, Ctrl-F, Ctrl-B and Ctrl-O until one fails;
-# i, a, o, O, :, /, K, gd and the Visual commands but p and P take none.
+# count repeats u, Ctrl-R, Ctrl-F, Ctrl-B and Ctrl-O until one fails; / and
+# ? keep theirs for the search (3/x: the third x); i, a, o, O, :, K, gd and
+# the Visual commands but p and P take none.
 # A window command takes its count as Vim's does (Ctrl-W w: that window;
 # Ctrl-W j: that many down); its others ignore it.
 fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
@@ -1691,8 +1724,6 @@ fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
             var k: i64 = 0
             while k < times and ed.redo()
                 k += 1
-        Action.SearchNext => repeat_search(ed, true, times)
-        Action.SearchPrev => repeat_search(ed, false, times)
         Action.PageDown =>
             for k in 0..(if times > ed.shown() then ed.shown() else times)
                 ed.page_down()
@@ -1700,7 +1731,8 @@ fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
             for k in 0..(if times > ed.shown() then ed.shown() else times)
                 ed.page_up()
         Action.CommandLine => ed.open_command_line(':')
-        Action.Search => ed.open_command_line('/')
+        Action.Search(forward) => ed.open_search(None, forward, cmd.count)
+        Action.OperateSearch(op, forward) => ed.open_search(Some(op), forward, cmd.count)
         Action.Hover => ed.ask = LangAsk.Hover
         Action.Definition => ed.ask = LangAsk.Definition
         Action.JumpBack =>
@@ -1730,8 +1762,9 @@ fn command_line_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
             let line = string_from(ed.cmdline.as_view())
             ed.close_command_line()
             let text = line.as_view().slice(1, line.len())
-            if line.get(0) == '/'
-                run_search(ed, text)
+            let prompt = line.get(0)
+            if prompt == '/' or prompt == '?'
+                run_search(ed, text, prompt == '/')
             else
                 run_command<F>(ed, files, text)
         Key.Tab => ed.cmdline.push('\t')
@@ -1740,12 +1773,24 @@ fn command_line_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
             ed.cmdline.push_span(span_from_vec<u8>(@bytes))
         _ => pass
 
-# `/text`: search for `text` from the cursor; an empty one repeats the last.
-fn run_search(ed: @&Editor, text: StrView)
+# `/text` (forward) or `?text`: search for the pattern `text` from the
+# cursor, as many matches on as the count typed before the / or ?, moving
+# there or applying the operator typed before it up to there; an empty one
+# searches for the last pattern. A pattern that doesn't compile says Vim's
+# error and leaves the last one as it was.
+fn run_search(ed: @&Editor, text: StrView, forward: bool)
     if not text.is_empty()
-        ed.pattern.clear()
-        ed.pattern.push_view(text)
-    let found = ed.search(true)
+        match regex_compile(text, RegexSyntax.Vim)
+            Ok(re) =>
+                ed.pattern.clear()
+                ed.pattern.push_view(text)
+            Err(e) =>
+                ed.say(e.message())
+                return
+    ed.forward = forward
+    match ed.search_op
+        Some(op) => ed.operate(op, Motion.SearchNext, ed.search_count)
+        None => ed.move_by(Motion.SearchNext, ed.search_count)
 
 fn run_command<F: FileStore>(ed: @&Editor, files: @&F, text: StrView)
     match parse_command(text)

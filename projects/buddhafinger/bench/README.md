@@ -56,6 +56,8 @@ microseconds) and `_n`, the sample count.
 | `delete_middle`, `undo_delete`, `redo_delete` | 100 `x` in Normal mode, then 100 `u`, then 100 Ctrl-R |
 | `undo_typing` | `u` undoing a 20-key Insert session, 20 times |
 | `search`, `search_next` | `/needle_4821` Enter from the top (the match is at the end), 20 times; then 20 `n`, each wrapping the whole file |
+| `search_back` | `?needle_4821` Enter from the last line's start, 20 times: back over the whole file (on one line, wrapping onto it) |
+| `search_regex` | `/\(\w*\)*_4821` Enter from the top, 5 times: nested repeats with no first byte to skip ahead to, so the regex VM steps through every byte (exponential for a backtracker) |
 | `page_down`, `line_down` | 200 Ctrl-F, then 500 `j`, from the top |
 | `word_right` | on the one-line workloads, 500 `w` from the start instead of `j` |
 | `jump_end`, `jump_start` | `G` and `gg` (or `$` and `0` on one line), 20 times each |

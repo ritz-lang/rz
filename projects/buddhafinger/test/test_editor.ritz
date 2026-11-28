@@ -93,7 +93,8 @@ fn open(text: StrView) -> Editor
     editor_open("f.txt", span_from_strview(text))
 
 # Feed `keys`: each byte a key, except `<esc>` `<cr>` `<bs>` `<tab>`
-# `<up>` `<down>` `<left>` `<right>` and `<C-x>` (Ctrl plus a letter).
+# `<up>` `<down>` `<left>` `<right>`, `<C-x>` (Ctrl plus a letter) and
+# `<lt>` (a `<`, as Vim writes it).
 fn feed(ed: @&Editor, d: @&Disk, keys: StrView)
     var i: i64 = 0
     while i < keys.len
@@ -125,6 +126,8 @@ fn key_named(name: StrView) -> Key
         return Key.Left
     if name.eq("right")
         return Key.Right
+    if name.eq("lt")
+        return Key.Char('<' as u32)
     if name.len == 3 and name.starts_with("C-")
         return Key.Ctrl(name.get(2))
     Key.Unknown
@@ -701,10 +704,112 @@ fn test_undo_back_to_the_saved_state_is_clean() -> i32
 # ============================================================================
 
 [[test]]
-fn test_slash_finds_a_literal_forward() -> i32
-    let ed = run("a.c abc\nx a.c", "/a.c<cr>")
-    assert at(@ed, 1, 2) and ed.mode == Mode.Normal          # literal: `.` is a dot
+fn test_slash_finds_a_pattern_forward() -> i32
+    let ed = run("a.c abc\nx a.c", "/a\\.c<cr>")
+    assert at(@ed, 1, 2) and ed.mode == Mode.Normal          # \. is a dot
+    assert at(@run("a.c abc\nx a.c", "/a.c<cr>"), 0, 4)      # . is any character
     assert at(@run("abc abc", "/abc<cr>"), 0, 4)              # starts after the cursor
+    assert at(@run("this is it", "/\\<lt>is\\><cr>"), 0, 5)      # a whole word
+    assert at(@run("ab\nx12y", "/\\d\\+<cr>"), 1, 1)
+    assert at(@run("x foo\nfoo", "/^foo<cr>"), 1, 0)         # ^ is the line's start
+    assert at(@run("x a\nb", "/a\\|b<cr>"), 0, 2)
+    0
+
+[[test]]
+fn test_question_mark_searches_backward() -> i32
+    let ed = run("ab ab ab", "$?ab<cr>")
+    assert at(@ed, 0, 6) and ed.mode == Mode.Normal
+    assert at(@run("ab ab ab", "$?ab<cr>?<cr>"), 0, 3)        # empty: the last pattern
+    assert at(@run("ab\nxx\nab x", "G$?ab<cr>"), 2, 0)
+    assert at(@run("ab\nab\nxx", "G?ab<cr>"), 1, 0)          # the line above
+    assert ed.command_line().is_empty()
+    assert says(@run("ab", "?<cr>"), "No previous search pattern")
+    0
+
+[[test]]
+fn test_n_and_N_follow_the_last_way() -> i32
+    assert at(@run("ab ab ab ab", "$?ab<cr>n"), 0, 6)         # ? then n: back again
+    assert at(@run("ab ab ab ab", "$?ab<cr>nN"), 0, 9)        # N: the other way
+    assert at(@run("ab ab ab ab", "$?ab<cr>/<cr>n"), 0, 3)    # / turns it forward
+    assert at(@run("ab ab ab ab", "$?ab<cr>2n"), 0, 3)
+    0
+
+# Vim's last pattern and its way are the editor's, not a window's: n in
+# another window, on another buffer, repeats them there.
+[[test]]
+fn test_n_repeats_the_last_search_in_another_window() -> i32
+    var d = disk_with("g.txt", "xx ab ab\n")
+    var ed = open("ab x ab\n")
+    feed(@&ed, @&d, ":sp g.txt<cr>$?ab<cr>")
+    assert win_path(@ed, 0).eq("g.txt") and at(@ed, 0, 6)
+    feed(@&ed, @&d, "<C-w>jn")                      # back from 0,0: wraps to the end
+    assert ed.current_window() == 1 and at(@ed, 0, 5)
+    feed(@&ed, @&d, "<C-w>kN")                      # forward from 6: wraps to 3
+    assert ed.current_window() == 0 and at(@ed, 0, 3)
+    0
+
+[[test]]
+fn test_backward_search_wraps_and_says_so() -> i32
+    let ed = run("ab\nxx\nab", "?ab<cr>")
+    assert at(@ed, 2, 0) and says(@ed, "search hit TOP, continuing at BOTTOM")
+    let fwd = run("ab\nxx\nab", "?ab<cr>N")
+    assert at(@fwd, 0, 0) and says(@fwd, "search hit BOTTOM, continuing at TOP")
+    let quiet = run("ab\nxx\nab", "G?ab<cr>")
+    assert at(@quiet, 0, 0) and says(@quiet, "")
+    # The only match is under the cursor: it wraps onto itself.
+    let self_ = run("ab", "?ab<cr>")
+    assert at(@self_, 0, 0) and says(@self_, "search hit TOP, continuing at BOTTOM")
+    0
+
+[[test]]
+fn test_an_invalid_pattern_says_why_and_stays() -> i32
+    let ed = run("ab (ab", "l/\\(ab<cr>")
+    assert at(@ed, 0, 1) and says(@ed, "E54: Unmatched \\(") and ed.mode == Mode.Normal
+    # The last pattern is the one before.
+    let kept = run("ab (ab ab", "/ab<cr>/a\\)<cr>n")
+    assert at(@kept, 0, 7)
+    assert says(@run("ab", "/\\+<cr>"), "E64: \\+ follows nothing")
+    assert says(@run("ab", "?a**<cr>"), "E61: Nested *")
+    assert says(@run("ab", "/[b-a]<cr>"), "E944: Reverse range in character class")
+    0
+
+[[test]]
+fn test_star_and_hash_search_the_word_under_the_cursor() -> i32
+    let ed = run("foo foobar foo", "*")
+    assert at(@ed, 0, 11) and says(@ed, "")                  # whole words only
+    assert at(@run("foo foobar foo", "ll*"), 0, 11)           # from inside the word
+    assert at(@run("= foo; foo", "*"), 0, 7)                  # the first word after
+    let wrap = run("foo foobar foo", "#")
+    assert at(@wrap, 0, 11) and says(@wrap, "search hit TOP, continuing at BOTTOM")
+    assert at(@run("foo x foo", "$#"), 0, 0)                  # from the word's start
+    assert at(@run("ab ab ab", "*n"), 0, 6)                   # * sets pattern and way
+    assert at(@run("ab ab ab", "$#n"), 0, 0)                  # # goes back, so n does
+    assert at(@run("ab ab ab", "$#N"), 0, 6)                  # N: forward again
+    assert at(@run("ab ab ab", "2*"), 0, 6)
+    assert at(@run("été x été", "*"), 0, 8)                  # non-ASCII words
+    let none = run("  ;", "*")
+    assert at(@none, 0, 0) and says(@none, "E348: No string under cursor")
+    0
+
+[[test]]
+fn test_search_motions_take_an_operator() -> i32
+    let d = run("abc def", "d/d<cr>")
+    assert holds(@d, "def") and at(@d, 0, 0)
+    assert holds(@run("abc def", "$d?b<cr>"), "af")            # back from the f
+    assert holds(@run("ab ab ab", "/ab<cr>dn"), "ab ab")
+    assert holds(@run("ab ab ab", "d*"), "ab ab")
+    assert holds(@run("ab ab ab", "$d#"), "ab b")
+    assert holds(@run("ab ab ab", "d2/ab<cr>"), "ab")
+    let c = run("abc def", "c/e<cr>X<esc>")
+    assert holds(@c, "Xef")
+    let y = run("abc def", "y/e<cr>P")
+    assert holds(@y, "abc dabc def")
+    # Not found: nothing happens, and the line says so.
+    let miss = run("abc", "d/zz<cr>")
+    assert holds(@miss, "abc") and says(@miss, "Pattern not found: zz")
+    # Escape drops the operator with the search.
+    let esc = run("abc def", "d/d<esc>x")
+    assert holds(@esc, "bc def")
     0
 
 [[test]]

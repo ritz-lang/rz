@@ -6026,6 +6026,29 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             body = body.expr
         return isinstance(body, rast.Ident) and body.name == 'pass'
 
+    def _ends_in_procedure_call(self, body) -> bool:
+        """An arm whose tail calls a procedure (AGAST #4911): it has no value,
+        as a `pass` arm has none.  Its dummy i32 was merged with the other
+        arms', so `x => v.push(1)` (a bool) beside `_ => v.clear()` was
+        refused as an integer used as bool.  A used one is refused where the
+        call resolves (_resolved_to_procedure, #2046), so only a statement
+        arm gets here.  Valid once the arm is emitted: the call is recorded
+        then."""
+        while isinstance(body, rast.Block) and body.expr is not None:
+            body = body.expr
+        return id(body) in self._procedure_calls
+
+    def _arm_has_no_value(self, body) -> bool:
+        """A `pass` arm, a procedure-call arm, or one ending in an `if` with
+        no `else` (AGAST #4911: its block's dummy i32 beside a bool arm was
+        refused as an integer used as bool): see _fill_pass_arms."""
+        tail = body
+        while isinstance(tail, rast.Block) and tail.expr is not None:
+            tail = tail.expr
+        if isinstance(tail, rast.If) and tail.else_block is None:
+            return True
+        return self._ends_in_pass(body) or self._ends_in_procedure_call(body)
+
     def _fill_pass_arms(self, arm_values: list) -> list:
         """A `pass` arm's dummy takes the other arms' type (AGAST #3491).
 
@@ -7948,7 +7971,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # arms' types are not compared: reading that arm's type was an error.
         # Two valued arms are still compared when discarded, so a clash such
         # as `if c then h() else q()` (f64 vs *u8) is still refused (#4199).
-        valueless_arm = has_no_value(then_value) or has_no_value(else_value)
+        valueless_arm = (has_no_value(then_value) or has_no_value(else_value)
+                         or self._ends_in_procedure_call(if_expr.then_block)
+                         or self._ends_in_procedure_call(if_expr.else_block))
         if (then_value is not None and else_value is not None
                 and not (discard and valueless_arm)):
             if then_value.type != else_value.type:

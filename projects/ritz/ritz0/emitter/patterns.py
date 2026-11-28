@@ -928,7 +928,7 @@ class PatternEmitter:
             # with the exit blocks, so appending a value only for live arms
             # paired a `return` arm's `None` block with the next arm's value
             # and the tail yielded a dummy 0 (AGAST #3318).
-            arm_values.append(_PASS_ARM if self._ends_in_pass(arm.body) else arm_val)
+            arm_values.append(_PASS_ARM if self._arm_has_no_value(arm.body) else arm_val)
             if not self.builder.block.is_terminated:
                 arm_exit_blocks.append(self.builder.block)
                 self.builder.branch(merge_block)
@@ -1379,7 +1379,7 @@ class PatternEmitter:
             self.has_returned = _saved_arm_returned
             self._end_diverging_arm(arm.body)
             self._pin_arm_unsigned(arm_val)  # `n` still bound (AGAST #3344)
-            arm_values.append(_PASS_ARM if self._ends_in_pass(arm.body) else arm_val)
+            arm_values.append(_PASS_ARM if self._arm_has_no_value(arm.body) else arm_val)
 
             # Check if the arm already terminated (e.g., with return)
             if not self.builder.block.is_terminated:

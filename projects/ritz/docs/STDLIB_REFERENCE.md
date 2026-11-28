@@ -112,6 +112,7 @@ modules links without sys. A freestanding program defines all three itself.
     - [timer](#timer) - High-precision timing
     - [time](#time) - Duration, sleep, wall clock
     - [json](#json) - JSON parsing
+    - [regex](#regex) - Regular expressions, linear time
     - [elf](#elf) - ELF binary parsing
     - [endian](#endian) - Big- and little-endian integers in a byte buffer
     - [testing](#testing) - Removed; use `assert`
@@ -3223,6 +3224,48 @@ To take a value apart, `match *v` on `Array(xs)` / `Object(ms)`.
 | `v.to_string()` | `fn() -> String` | JSON text; the caller owns it, and its `Drop` impl frees it at scope end |
 
 ---
+
+### regex
+
+**Module**: `ritzlib.regex`
+
+Regular expressions that run in linear time: a Pike VM, so a search over n
+bytes with a program of m instructions costs O(n * m) whatever the pattern.
+Two dialects, differing in which operators take a backslash: `RegexSyntax.Vim`
+(Vim's default 'magic': `\( \) \| \+ \? \=`) and `RegexSyntax.Extended`
+(POSIX ERE: `( ) | + ?`). Text is `[u8]` and read as UTF-8, a malformed byte
+being a unit of its own; the module's header comment has the full syntax and
+where it follows Vim rather than ERE.
+
+```ritz
+import ritzlib.option
+import ritzlib.regex
+import ritzlib.result
+import ritzlib.span
+import ritzlib.strview
+
+fn first_number(line: StrView) -> i64
+    match regex_compile("\\d\\+", RegexSyntax.Vim)
+        Ok(re) =>
+            match re.find_from(span_from_strview(line), 0)
+                Some(m) => m.start
+                None => 0 - 1
+        Err(e) => 0 - 2    # e.message() is Vim's E-message, e.pos the offset
+```
+
+| Function | Signature | Description |
+|---|---|---|
+| `regex_compile` | `fn(pattern: StrView, syntax: RegexSyntax) -> Result<Regex, RegexError>` | Compile; an error carries Vim's message (`E54: Unmatched \(`) and its byte offset |
+
+| Method | Signature | Description |
+|---|---|---|
+| `re.find_from(text, from)` | `fn(text: [u8], from: i64) -> Option<RegexMatch>` | The leftmost match starting at or after `from` (leftmost-first, as Vim and Perl prefer) |
+| `re.find_before(text, before)` | `fn(text: [u8], before: i64) -> Option<RegexMatch>` | The match with the last start before `before`, as Vim's `?` finds it |
+| `re.is_match(text)` | `fn(text: [u8]) -> bool` | A match anywhere |
+| `e.message()` | `fn() -> StrView` | Vim's message, spelled in the pattern's dialect |
+
+`RegexMatch` is `{ start: i64, end: i64 }`, byte offsets. `^` and `$` hold at
+the ends of the whole text, not of the part searched.
 
 ### elf
 

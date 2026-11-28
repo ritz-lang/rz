@@ -1,0 +1,338 @@
+# Tests for ritzlib/regex.ritz: syntax (Vim magic and ERE), anchors, word
+# boundaries, classes, UTF-8, backward search, errors and linear time.
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.regex
+import ritzlib.result
+import ritzlib.span
+import ritzlib.strview
+
+# Where `pat` (Vim syntax) first matches `hay` at or after `from`: the start,
+# or -1 for no match, -2 for a pattern that doesn't compile.
+fn find_in(pat: StrView, syntax: RegexSyntax, hay: StrView, from: i64) -> RegexMatch
+    match regex_compile(pat, syntax)
+        Ok(re) => match re.find_from(span_from_strview(hay), from)
+            Some(m) => m
+            None => RegexMatch { start: -1, end: -1 }
+        Err(e) => RegexMatch { start: -2, end: -2 }
+
+fn at(pat: StrView, hay: StrView) -> i64
+    find_in(pat, RegexSyntax.Vim, hay, 0).start
+
+fn end_of(pat: StrView, hay: StrView) -> i64
+    find_in(pat, RegexSyntax.Vim, hay, 0).end
+
+fn ere(pat: StrView, hay: StrView) -> i64
+    find_in(pat, RegexSyntax.Extended, hay, 0).start
+
+fn ere_end(pat: StrView, hay: StrView) -> i64
+    find_in(pat, RegexSyntax.Extended, hay, 0).end
+
+# Where the last match of `pat` starting before `before` starts (-1: none).
+fn last(pat: StrView, hay: StrView, before: i64) -> i64
+    match regex_compile(pat, RegexSyntax.Vim)
+        Ok(re) => match re.find_before(span_from_strview(hay), before)
+            Some(m) => m.start
+            None => -1
+        Err(e) => -2
+
+fn last_end(pat: StrView, hay: StrView, before: i64) -> i64
+    match regex_compile(pat, RegexSyntax.Vim)
+        Ok(re) => match re.find_before(span_from_strview(hay), before)
+            Some(m) => m.end
+            None => -1
+        Err(e) => -2
+
+# The error message compiling `pat`, or "" when it compiles.
+fn error_of(pat: StrView, syntax: RegexSyntax) -> StrView
+    match regex_compile(pat, syntax)
+        Ok(re) => ""
+        Err(e) => e.message()
+
+fn error_pos(pat: StrView) -> i64
+    match regex_compile(pat, RegexSyntax.Vim)
+        Ok(re) => -1
+        Err(e) => e.pos
+
+# ============================================================================
+# Literals, dot, repeats
+# ============================================================================
+
+[[test]]
+fn test_literal() -> i32
+    assert at("abc", "xxabcxx") == 2
+    assert end_of("abc", "xxabcxx") == 5
+    assert at("abd", "xxabcxx") == -1
+    assert at("", "abc") == 0 and end_of("", "abc") == 0
+    0
+
+[[test]]
+fn test_dot_matches_one_code_point() -> i32
+    assert at("a.c", "abc") == 0
+    assert at("a.c", "ac") == -1
+    # é is two bytes: `.` takes both.
+    assert at("a.c", "aéc") == 0 and end_of("a.c", "aéc") == 4
+    0
+
+[[test]]
+fn test_star_is_greedy_and_leftmost() -> i32
+    assert at("ab*", "xabbbc") == 1 and end_of("ab*", "xabbbc") == 5
+    assert at("b*", "abc") == 0 and end_of("b*", "abc") == 0
+    assert at("x*y", "aaxxxy") == 2
+    0
+
+[[test]]
+fn test_vim_plus_and_question() -> i32
+    assert at("ab\\+", "ac abb") == 3 and end_of("ab\\+", "ac abb") == 6
+    assert at("colou\\?r", "color") == 0
+    assert at("colou\\?r", "colour") == 0 and end_of("colou\\?r", "colour") == 6
+    assert at("colou\\=r", "colour") == 0
+    # Unescaped, they are literal in Vim's syntax.
+    assert at("a+", "aa a+") == 3
+    assert at("a?", "a?") == 0 and end_of("a?", "a?") == 2
+    0
+
+[[test]]
+fn test_star_at_branch_start_is_literal() -> i32
+    assert at("*a", "b*a") == 1
+    assert at("^*", "*x") == 0 and end_of("^*", "*x") == 1
+    0
+
+# ============================================================================
+# Groups and alternation
+# ============================================================================
+
+[[test]]
+fn test_vim_groups_and_alternation() -> i32
+    assert at("foo\\|bar", "xxbar") == 2
+    assert at("foo\\|bar", "xxfoo") == 2
+    assert at("\\(ab\\)\\+", "xababx") == 1 and end_of("\\(ab\\)\\+", "xababx") == 5
+    assert at("a\\(b\\|c\\)d", "acd") == 0
+    assert at("a\\(b\\|c\\)d", "aed") == -1
+    # Unescaped parens and bar are literal in Vim's syntax.
+    assert at("(a|b)", "x(a|b)") == 1
+    0
+
+[[test]]
+fn test_alternation_prefers_the_first_branch() -> i32
+    assert end_of("a\\|ab", "ab") == 1
+    assert end_of("ab\\|a", "ab") == 2
+    0
+
+[[test]]
+fn test_extended_syntax() -> i32
+    assert ere("(ab)+", "xababx") == 1 and ere_end("(ab)+", "xababx") == 5
+    assert ere("foo|bar", "xbar") == 1
+    assert ere("colou?r", "color") == 0
+    assert ere("a+", "baa") == 1 and ere_end("a+", "baa") == 3
+    # Escaped, the operators are literal.
+    assert ere("\\(a\\)", "(a)") == 0
+    assert ere("a\\+", "aa+") == 1
+    0
+
+[[test]]
+fn test_empty_loops_terminate() -> i32
+    assert at("\\(a*\\)*b", "aaab") == 0
+    assert at("\\(\\)*x", "yx") == 1
+    assert at("\\(a\\|\\)\\+c", "aac") == 0
+    0
+
+# ============================================================================
+# Anchors and word boundaries
+# ============================================================================
+
+[[test]]
+fn test_line_anchors() -> i32
+    assert at("^ab", "abab") == 0
+    assert at("^ab", "xab") == -1
+    assert at("ab$", "abab") == 2
+    assert at("^$", "") == 0
+    assert at("^$", "x") == -1
+    # `^` holds at the start of the text, not at `from`.
+    assert find_in("^a", RegexSyntax.Vim, "aa", 1).start == -1
+    0
+
+[[test]]
+fn test_vim_anchors_only_at_branch_ends() -> i32
+    # Inside a pattern `^` and `$` are literal, as Vim's magic has them.
+    assert at("a^b", "xa^b") == 1
+    assert at("a$b", "a$b") == 0
+    assert at("\\(^a\\|b$\\)", "ab") == 0
+    assert at("x\\|b$", "ab") == 1
+    0
+
+[[test]]
+fn test_word_boundaries() -> i32
+    assert at("\\<is\\>", "this is") == 5
+    assert at("\\<is", "this island") == 5
+    assert at("is\\>", "island this") == 9
+    assert at("\\<x\\>", "x") == 0
+    # Non-ASCII letters are word characters.
+    assert at("\\<été\\>", "l'été") == 2
+    assert at("\\<t\\>", "ét") == -1
+    0
+
+# ============================================================================
+# Classes
+# ============================================================================
+
+[[test]]
+fn test_bracket_classes() -> i32
+    assert at("[bc]", "abc") == 1
+    assert at("[^ab]", "abc") == 2
+    assert at("[a-c]\\+", "xxbcaz") == 2 and end_of("[a-c]\\+", "xxbcaz") == 5
+    assert at("[]x]", "a]") == 1
+    assert at("[x-]", "a-") == 1
+    assert at("[\\]]", "a]") == 1
+    assert at("[[:digit:]]\\+", "ab42") == 2
+    assert at("[[:upper:][:space:]]", "ab C") == 2
+    0
+
+[[test]]
+fn test_unclosed_bracket_is_literal() -> i32
+    assert at("[ab", "x[ab") == 1
+    0
+
+[[test]]
+fn test_classes_take_code_points() -> i32
+    # [^a] takes all of é, so the match ends after both of its bytes.
+    assert at("[^a]", "é") == 0 and end_of("[^a]", "é") == 2
+    # A range of code points: à (U+00E0) to ÿ (U+00FF).
+    assert at("[à-ÿ]", "aé") == 1
+    assert at("[à-ÿ]", "aĀ") == -1
+    0
+
+[[test]]
+fn test_shorthand_classes() -> i32
+    assert at("\\d\\+", "ab123") == 2 and end_of("\\d\\+", "ab123") == 5
+    assert at("\\D", "12a") == 2
+    assert at("\\s", "ab c") == 2
+    assert at("\\S", "  c") == 2
+    assert at("\\w\\+", "  foo_1!") == 2 and end_of("\\w\\+", "  foo_1!") == 7
+    assert at("\\W", "ab-") == 2
+    assert at("\\a", "1x") == 1
+    assert at("\\l", "Ax") == 1
+    assert at("\\u", "xA") == 1
+    assert at("\\x\\+", "zzBEEF") == 2
+    assert at("\\h", "1_") == 1
+    0
+
+[[test]]
+fn test_escapes() -> i32
+    assert at("a\\.b", "axb a.b") == 4
+    assert at("\\*", "a*") == 1
+    assert at("\\[", "a[") == 1
+    assert at("\\\\", "a\\") == 1
+    assert at("\\/", "a/") == 1
+    assert at("\\t", "a\t") == 1
+    # A trailing backslash is a literal one, as in Vim.
+    assert at("a\\", "a\\") == 0
+    0
+
+# ============================================================================
+# UTF-8
+# ============================================================================
+
+[[test]]
+fn test_utf8_literals_and_starts() -> i32
+    assert at("é", "café") == 3
+    # A match never starts inside a code point: é's second byte is 0xA9.
+    var tail: Vec<u8> = vec_new<u8>()
+    tail.push(0xA9)
+    assert at(tail.as_view(), "é") == -1
+    # Malformed bytes are units of their own and match themselves.
+    var bad: Vec<u8> = vec_new<u8>()
+    bad.push(0xFF)
+    var text: Vec<u8> = vec_new<u8>()
+    text.push('a')
+    text.push(0xFF)
+    text.push('b')
+    assert at(bad.as_view(), text.as_view()) == 1
+    assert at("a.b", text.as_view()) == 0 and end_of("a.b", text.as_view()) == 3
+    0
+
+# ============================================================================
+# Forward from an offset, backward before one
+# ============================================================================
+
+[[test]]
+fn test_is_match() -> i32
+    match regex_compile("b\\+", RegexSyntax.Vim)
+        Ok(re) =>
+            assert re.is_match(span_from_strview("abbc"))
+            assert not re.is_match(span_from_strview("ac"))
+        Err(e) => return 1
+    0
+
+[[test]]
+fn test_find_from_offset() -> i32
+    assert find_in("ab", RegexSyntax.Vim, "ab ab ab", 1).start == 3
+    assert find_in("ab", RegexSyntax.Vim, "ab ab ab", 7).start == -1
+    assert find_in("", RegexSyntax.Vim, "abc", 3).start == 3
+    assert find_in("ab", RegexSyntax.Vim, "ab", 9).start == -1
+    # From inside a code point: the search starts at the next one.
+    assert find_in(".", RegexSyntax.Vim, "éx", 1).start == 2
+    0
+
+[[test]]
+fn test_find_before() -> i32
+    assert last("ab", "ab ab ab", 8) == 6
+    assert last("ab", "ab ab ab", 6) == 3
+    assert last("ab", "ab ab ab", 1) == 0
+    assert last("ab", "ab ab ab", 0) == -1
+    # The match may run past `before`; its end is the forward match's.
+    assert last("ab\\+", "abbb", 1) == 0 and last_end("ab\\+", "abbb", 1) == 4
+    # The latest start wins even when an earlier one shares its path.
+    assert last("a*b", "aaab", 4) == 3
+    assert last("\\<\\w\\+", "foo bar baz", 9) == 8
+    assert last("^a", "aaa", 3) == 0
+    # A start inside a code point doesn't count.
+    assert last(".", "é", 2) == 0
+    0
+
+# ============================================================================
+# Errors: Vim's messages
+# ============================================================================
+
+[[test]]
+fn test_errors() -> i32
+    assert error_of("\\(a", RegexSyntax.Vim).eq("E54: Unmatched \\(")
+    assert error_of("a\\)", RegexSyntax.Vim).eq("E55: Unmatched \\)")
+    assert error_of("\\+", RegexSyntax.Vim).eq("E64: \\+ follows nothing")
+    assert error_of("\\?", RegexSyntax.Vim).eq("E64: \\? follows nothing")
+    assert error_of("a**", RegexSyntax.Vim).eq("E61: Nested *")
+    assert error_of("a*\\+", RegexSyntax.Vim).eq("E62: Nested \\+")
+    assert error_of("[z-a]", RegexSyntax.Vim).eq("E944: Reverse range in character class")
+    assert error_of("(a", RegexSyntax.Extended).eq("E54: Unmatched (")
+    assert error_of("a)", RegexSyntax.Extended).eq("E55: Unmatched )")
+    assert error_of("+", RegexSyntax.Extended).eq("E64: + follows nothing")
+    assert error_of("a+?", RegexSyntax.Extended).eq("E62: Nested ?")
+    assert error_of("a\\|b", RegexSyntax.Vim).is_empty()
+    assert error_pos("ab\\)") == 2
+    0
+
+[[test]]
+fn test_deep_nesting_is_refused() -> i32
+    var pat: Vec<u8> = vec_new<u8>()
+    for i in 0..(REGEX_MAX_DEPTH + 1)
+        pat.push_view("\\(")
+    assert error_of(pat.as_view(), RegexSyntax.Vim).eq("E339: Pattern too long")
+    0
+
+# ============================================================================
+# No catastrophic backtracking
+# ============================================================================
+
+[[test]]
+fn test_pathological_pattern_is_linear() -> i32
+    # (a*)*b over a run of a's with no b: exponential for a backtracker.
+    var hay: Vec<u8> = vec_new<u8>()
+    for i in 0..200000
+        hay.push('a')
+    let s = hay.as_view()
+    assert at("\\(a*\\)*b", s) == -1
+    assert last("\\(a*\\)*b", s, s.len) == -1
+    assert at("\\(a\\|aa\\)\\+$", s) == 0
+    assert last("\\(a\\|aa\\)\\+$", s, s.len) == s.len - 1
+    0

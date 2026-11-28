@@ -1,0 +1,889 @@
+# ritzlib/regex.ritz - regular expressions that run in linear time.
+#
+#     match regex_compile(pattern, RegexSyntax.Vim)        # pattern: StrView
+#         Ok(re) => re.find_from(text, 0)             # text: [u8] -> Option<RegexMatch>
+#         Err(e) => report(e.message())               # Vim's E-message
+#
+# The engine is a Pike VM (Thompson's construction, run breadth-first): a
+# match over n bytes with a program of m instructions costs O(n * m) time
+# and O(m) memory, whatever the pattern. There is no backtracking, so
+# `\(a*\)*b` over a megabyte of a's is as quick as `b`.
+#
+# find_from(text, from) is the leftmost match starting at or after `from`,
+# preferring, as Vim and Perl do, the first alternative and the longest
+# repeat (leftmost-first, not POSIX leftmost-longest). find_before(text,
+# before) is the match with the last start before `before`, as Vim's `?`
+# finds it. Anchors and word boundaries look at the whole text, not just
+# the part searched: `^` holds at offset 0 only.
+#
+# Text is UTF-8: `.`, a class and a literal each take one code point, and a
+# match only starts on a code point. A byte that does not start a
+# well-formed sequence (RFC 3629) is a unit of its own, so malformed text is
+# searchable and a malformed byte in a pattern matches the same byte.
+#
+# RegexSyntax. Two dialects, differing only in which characters need a backslash:
+#
+#   Vim (Vim's default 'magic')   \( \) \| \+ \? \=    ( ) | + ? are literal
+#   Extended (POSIX ERE)          ( ) | + ?            \( \) \| \+ \? literal
+#
+# Both have:
+#   .               any code point
+#   [abc] [^a-z]    a class; `]` first and `-` first or last are literal;
+#                   [:alnum:] [:alpha:] [:blank:] [:digit:] [:lower:]
+#                   [:punct:] [:space:] [:upper:] [:xdigit:]; \] \\ \^ \-
+#                   \t \e \r \n inside; a `[` with no `]` is a literal `[`
+#   *               zero or more (a `*` with nothing before it is literal)
+#   \< \>           the start and end of a word: ASCII letters, digits, `_`
+#                   and every non-ASCII code point are word characters
+#   ^ $             the start and end of the text
+#   \d \s \w \a \l \u \x \h   digit, space or tab, [0-9A-Za-z_], letter,
+#                   lowercase, uppercase, hex digit, [A-Za-z_]; uppercase
+#                   (\D \S \W ...) is the complement
+#   \t \e \r \n     tab, escape, CR, LF; a backslash before any other
+#                   character makes it literal; a trailing `\` is literal
+#
+# Where Vim's rules differ from POSIX ERE, both dialects follow Vim:
+#   - `^` is an anchor only at the start of a branch (the pattern, after
+#     `\(` or `\|`) and `$` only at the end of one; elsewhere each is literal.
+#   - a repeat after a repeat is an error (E61 / E62), and `+` or `?` with
+#     nothing before it is one (E64).
+#   - inside [...], a backslash escape works (POSIX takes it literally).
+#
+# Not supported: counted repeats \{n,m}, lazy repeats, \v \V \m \M, \c \C,
+# `~`, back-references and reporting what a group matched: a group only
+# groups. A `\{` is a literal `{`.
+
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span
+import ritzlib.strview
+
+# The deepest nesting of groups a pattern may have: the compiler recurses
+# once per group.
+pub const REGEX_MAX_DEPTH: i64 = 200
+
+# =============================================================================
+# Types
+# =============================================================================
+
+pub enum RegexSyntax
+    Vim             # Vim's 'magic': \( \) \| \+ \? \= are operators
+    Extended        # POSIX ERE: ( ) | + ? are operators
+
+# Where a match is in the text: bytes start..end.
+pub struct RegexMatch
+    start: i64
+    end: i64
+
+pub enum RegexErrorKind
+    UnmatchedOpen       # a group with no closing paren
+    UnmatchedClose      # a closing paren with no group
+    PlusFollowsNothing  # + with no atom before it
+    QuestFollowsNothing # ? (or \=) with no atom before it
+    NestedStar          # * straight after a repeat
+    NestedPlus          # + straight after a repeat
+    NestedQuest         # ? straight after a repeat
+    ReverseRange        # [z-a]
+    TooDeep             # groups nested more than REGEX_MAX_DEPTH deep
+
+pub struct RegexError
+    kind: RegexErrorKind
+    pos: i64            # byte offset of the error in the pattern
+    syntax: RegexSyntax
+
+impl RegexError
+    # Vim's message for the error, spelled in the pattern's dialect.
+    pub fn message(self: @RegexError) -> StrView
+        let vim = self.syntax == RegexSyntax.Vim
+        match self.kind
+            UnmatchedOpen => if vim then "E54: Unmatched \\(" else "E54: Unmatched ("
+            UnmatchedClose => if vim then "E55: Unmatched \\)" else "E55: Unmatched )"
+            PlusFollowsNothing => if vim then "E64: \\+ follows nothing" else "E64: + follows nothing"
+            QuestFollowsNothing => if vim then "E64: \\? follows nothing" else "E64: ? follows nothing"
+            NestedStar => "E61: Nested *"
+            NestedPlus => if vim then "E62: Nested \\+" else "E62: Nested +"
+            NestedQuest => if vim then "E62: Nested \\?" else "E62: Nested ?"
+            ReverseRange => "E944: Reverse range in character class"
+            TooDeep => "E339: Pattern too long"
+
+# A zero-width test of the position.
+enum RegexLook
+    TextStart       # ^
+    TextEnd         # $
+    WordStart       # \<
+    WordEnd         # \>
+
+# One VM instruction. Jumps are relative to the instruction's own index, so
+# a piece of program means the same wherever it sits: the compiler inserts
+# a Split in front of a piece without fixing up the jumps inside it.
+enum RegexInst
+    Char(u32)           # one code point
+    Any                 # any code point
+    Class(i64)          # a code point in classes[k]
+    Assert(RegexLook)
+    Jmp(i64)
+    Split(i64, i64)     # both; the first is preferred
+    Found
+
+# Code points lo..=hi.
+struct RegexRange
+    lo: u32
+    hi: u32
+
+# A class: ranges[first .. first + count], or everything else when negated.
+# ascii_lo and ascii_hi are its ASCII members as bits (code point c is bit
+# c of ascii_lo below 64, bit c - 64 of ascii_hi above), negation applied:
+# most text is ASCII, and a bit test is cheaper than the ranges.
+struct RegexClass
+    first: i64
+    count: i64
+    negated: bool
+    ascii_lo: u64
+    ascii_hi: u64
+
+pub struct Regex
+    prog: Vec<RegexInst>
+    classes: Vec<RegexClass>
+    ranges: Vec<RegexRange>
+    lead: Option<u8>    # an ASCII byte every match starts with
+    anchored: bool      # every match starts at offset 0
+
+# =============================================================================
+# Named sets of code points
+# =============================================================================
+
+# One range of a named set: [:digit:] and \d are "digit"'s one row.
+struct RegexNamedRange
+    name: StrView
+    lo: u32
+    hi: u32
+
+const REGEX_NAMED_RANGES: [26]RegexNamedRange = [
+    RegexNamedRange { name: "alnum", lo: 0x30, hi: 0x39 },
+    RegexNamedRange { name: "alnum", lo: 0x41, hi: 0x5A },
+    RegexNamedRange { name: "alnum", lo: 0x61, hi: 0x7A },
+    RegexNamedRange { name: "alpha", lo: 0x41, hi: 0x5A },
+    RegexNamedRange { name: "alpha", lo: 0x61, hi: 0x7A },
+    RegexNamedRange { name: "blank", lo: 0x09, hi: 0x09 },
+    RegexNamedRange { name: "blank", lo: 0x20, hi: 0x20 },
+    RegexNamedRange { name: "digit", lo: 0x30, hi: 0x39 },
+    RegexNamedRange { name: "lower", lo: 0x61, hi: 0x7A },
+    RegexNamedRange { name: "punct", lo: 0x21, hi: 0x2F },
+    RegexNamedRange { name: "punct", lo: 0x3A, hi: 0x40 },
+    RegexNamedRange { name: "punct", lo: 0x5B, hi: 0x60 },
+    RegexNamedRange { name: "punct", lo: 0x7B, hi: 0x7E },
+    RegexNamedRange { name: "space", lo: 0x09, hi: 0x0D },
+    RegexNamedRange { name: "space", lo: 0x20, hi: 0x20 },
+    RegexNamedRange { name: "upper", lo: 0x41, hi: 0x5A },
+    RegexNamedRange { name: "xdigit", lo: 0x30, hi: 0x39 },
+    RegexNamedRange { name: "xdigit", lo: 0x41, hi: 0x46 },
+    RegexNamedRange { name: "xdigit", lo: 0x61, hi: 0x66 },
+    RegexNamedRange { name: "word", lo: 0x30, hi: 0x39 },
+    RegexNamedRange { name: "word", lo: 0x41, hi: 0x5A },
+    RegexNamedRange { name: "word", lo: 0x5F, hi: 0x5F },
+    RegexNamedRange { name: "word", lo: 0x61, hi: 0x7A },
+    RegexNamedRange { name: "head", lo: 0x41, hi: 0x5A },
+    RegexNamedRange { name: "head", lo: 0x5F, hi: 0x5F },
+    RegexNamedRange { name: "head", lo: 0x61, hi: 0x7A }
+]
+
+# The names [:name:] takes; "word" and "head" are \w's and \h's only.
+const REGEX_POSIX_CLASSES: [9]StrView = ["alnum", "alpha", "blank", "digit", "lower", "punct", "space", "upper", "xdigit"]
+
+# A backslash class (\d) and its named set; uppercase is the complement.
+struct RegexShorthand
+    letter: u8
+    name: StrView
+
+const REGEX_SHORTHANDS: [8]RegexShorthand = [
+    RegexShorthand { letter: 'd', name: "digit" },
+    RegexShorthand { letter: 's', name: "blank" },
+    RegexShorthand { letter: 'w', name: "word" },
+    RegexShorthand { letter: 'a', name: "alpha" },
+    RegexShorthand { letter: 'l', name: "lower" },
+    RegexShorthand { letter: 'u', name: "upper" },
+    RegexShorthand { letter: 'x', name: "xdigit" },
+    RegexShorthand { letter: 'h', name: "head" }
+]
+
+# =============================================================================
+# UTF-8 units
+# =============================================================================
+
+# One unit of text: a code point and its length in bytes. A malformed byte b
+# is a unit of length 1 with the code point 0xDC00 + b, a lone surrogate no
+# well-formed text decodes to (Python's "surrogateescape").
+struct RegexUnit
+    cp: u32
+    len: i64
+
+fn regex_unit_at(s: [u8], i: i64) -> RegexUnit
+    let b = s[i]
+    if b < 0x80
+        return RegexUnit { cp: b as u32, len: 1 }
+    let bad = RegexUnit { cp: 0xDC00 + b as u32, len: 1 }
+    # The sequence length, the range its second byte must fall in (no
+    # overlongs, no surrogates, nothing above U+10FFFF) and the lead's bits.
+    var n: i64 = 0
+    var lo: u8 = 0x80
+    var hi: u8 = 0xBF
+    var cp: u32 = 0
+    if b >= 0xC2 and b <= 0xDF
+        n = 2
+        cp = (b & 0x1F) as u32
+    else if b >= 0xE0 and b <= 0xEF
+        n = 3
+        cp = (b & 0x0F) as u32
+        if b == 0xE0
+            lo = 0xA0
+        else if b == 0xED
+            hi = 0x9F
+    else if b >= 0xF0 and b <= 0xF4
+        n = 4
+        cp = (b & 0x07) as u32
+        if b == 0xF0
+            lo = 0x90
+        else if b == 0xF4
+            hi = 0x8F
+    else
+        return bad
+    if i + n > s.len or s[i + 1] < lo or s[i + 1] > hi
+        return bad
+    for k in 1..n
+        let c = s[i + k]
+        if c < 0x80 or c > 0xBF
+            return bad
+        cp = (cp << 6) | (c & 0x3F) as u32
+    RegexUnit { cp: cp, len: n }
+
+# A byte of a word character: ASCII letters, digits, `_`, and every byte of
+# a non-ASCII code point (Vim's default 'iskeyword').
+fn regex_is_word_byte(b: u8) -> bool
+    (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_' or b >= 0x80
+
+# =============================================================================
+# The compiler
+# =============================================================================
+
+# One token of the pattern; `len` is its length in bytes.
+enum RegexTok
+    End
+    Alt
+    Open
+    Close
+    Star
+    Plus
+    Quest
+    Dot
+    Caret
+    Dollar
+    Bracket
+    WordStart
+    WordEnd
+    Short           # \d \s \w ...: `cp` is the letter
+    Lit             # a literal code point: `cp`
+
+# What a repeat does to the atom before it.
+enum RegexRepeat
+    Star            # zero or more
+    Plus            # one or more
+    Quest           # zero or one
+
+struct RegexToken
+    tok: RegexTok
+    len: i64
+    cp: u32
+
+fn regex_token(tok: RegexTok, len: i64) -> RegexToken
+    RegexToken { tok: tok, len: len, cp: 0 }
+
+fn regex_literal(cp: u32, len: i64) -> RegexToken
+    RegexToken { tok: RegexTok.Lit, len: len, cp: cp }
+
+struct RegexCompiler
+    src: [u8]
+    pos: i64
+    syntax: RegexSyntax
+    depth: i64
+    prog: Vec<RegexInst>
+    classes: Vec<RegexClass>
+    ranges: Vec<RegexRange>
+
+# Compile `pattern`. Every syntax error is reported with Vim's message and
+# the byte offset it was found at.
+pub fn regex_compile(pattern: StrView, syntax: RegexSyntax) -> Result<Regex, RegexError>
+    var c = RegexCompiler { src: span_from_strview(pattern), pos: 0, syntax: syntax, depth: 0, prog: vec_new<RegexInst>(), classes: vec_new<RegexClass>(), ranges: vec_new<RegexRange>() }
+    c.alternation()?
+    if c.pos < c.src.len
+        # alternation() stops early only at a closing paren.
+        return Err(c.error(RegexErrorKind.UnmatchedClose))
+    c.prog.push(RegexInst.Found)
+    let lead: Option<u8> = match c.prog.get(0)
+        RegexInst.Char(cp) => if cp < 0x80 then Some(cp as u8) else None
+        _ => None
+    let anchored = match c.prog.get(0)
+        RegexInst.Assert(look) => look == RegexLook.TextStart
+        _ => false
+    Ok(Regex { prog: c.prog, classes: c.classes, ranges: c.ranges, lead: lead, anchored: anchored })
+
+impl RegexCompiler
+    fn error(self: @RegexCompiler, kind: RegexErrorKind) -> RegexError
+        RegexError { kind: kind, pos: self.pos, syntax: self.syntax }
+
+    # ------------------------------------------------------------------
+    # Tokens
+    # ------------------------------------------------------------------
+
+    # The operator `b` is in this dialect, written after a backslash
+    # (`escaped`) or not; None where it is a literal. `\=` is Vim's `\?`.
+    fn dialect_op(self: @RegexCompiler, b: u8, escaped: bool) -> Option<RegexTok>
+        if escaped != (self.syntax == RegexSyntax.Vim)
+            return None
+        match b
+            '|' => Some(RegexTok.Alt)
+            '(' => Some(RegexTok.Open)
+            ')' => Some(RegexTok.Close)
+            '+' => Some(RegexTok.Plus)
+            '?' => Some(RegexTok.Quest)
+            '=' => if escaped then Some(RegexTok.Quest) else None
+            _ => None
+
+    # The token a backslash and `e` make; None for a character the
+    # backslash just makes literal.
+    fn escape(self: @RegexCompiler, e: u8) -> Option<RegexToken>
+        match e
+            '<' => Some(regex_token(RegexTok.WordStart, 2))
+            '>' => Some(regex_token(RegexTok.WordEnd, 2))
+            'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'a' | 'A' | 'l' | 'L' | 'u' | 'U' | 'x' | 'X' | 'h' | 'H' => Some(RegexToken { tok: RegexTok.Short, len: 2, cp: e as u32 })
+            't' => Some(regex_literal(0x09, 2))
+            'e' => Some(regex_literal(0x1B, 2))
+            'r' => Some(regex_literal(0x0D, 2))
+            'n' => Some(regex_literal(0x0A, 2))
+            _ => match self.dialect_op(e, true)
+                Some(t) => Some(regex_token(t, 2))
+                None => None
+
+    # The token at `at`, in the pattern's dialect.
+    fn token_at(self: @RegexCompiler, at: i64) -> RegexToken
+        if at >= self.src.len
+            return regex_token(RegexTok.End, 0)
+        let b: u8 = self.src[at]
+        if b == '\\'
+            if at + 1 >= self.src.len
+                # A trailing backslash is a literal one, as in Vim.
+                return regex_literal('\\' as u32, 1)
+            match self.escape(self.src[at + 1])
+                Some(t) => return t
+                None => pass
+            let u = regex_unit_at(self.src, at + 1)
+            return regex_literal(u.cp, 1 + u.len)
+        let plain: Option<RegexTok> = match b
+            '.' => Some(RegexTok.Dot)
+            '*' => Some(RegexTok.Star)
+            '[' => Some(RegexTok.Bracket)
+            '^' => Some(RegexTok.Caret)
+            '$' => Some(RegexTok.Dollar)
+            _ => self.dialect_op(b, false)
+        match plain
+            Some(t) => regex_token(t, 1)
+            None =>
+                let u = regex_unit_at(self.src, at)
+                regex_literal(u.cp, u.len)
+
+    fn peek(self: @RegexCompiler) -> RegexToken
+        self.token_at(self.pos)
+
+    # ------------------------------------------------------------------
+    # Program pieces
+    # ------------------------------------------------------------------
+
+    # Put `inst` at index `at`, moving the program from there on up one.
+    fn insert(self: @&RegexCompiler, at: i64, inst: RegexInst)
+        self.prog.push(inst)
+        var i = self.prog.len() - 1
+        while i > at
+            self.prog.set(i, self.prog.get(i - 1))
+            i -= 1
+        self.prog.set(at, inst)
+
+    # branch ( | branch )*, up to the end or a closing paren. Each branch
+    # but the last becomes Split(it, rest) ... Jmp(end).
+    fn alternation(self: @&RegexCompiler) -> Result<i64, RegexError>
+        var exits: Vec<i64> = vec_new<i64>()
+        var start = self.prog.len()
+        self.branch()?
+        while self.peek().tok == RegexTok.Alt
+            self.pos += 1 + (if self.syntax == RegexSyntax.Vim then 1 else 0)
+            self.insert(start, RegexInst.Split(1, self.prog.len() - start + 2))
+            exits.push(self.prog.len())
+            self.prog.push(RegexInst.Jmp(0))
+            start = self.prog.len()
+            self.branch()?
+        let end = self.prog.len()
+        for k in 0..exits.len()
+            let at = exits.get(k)
+            self.prog.set(at, RegexInst.Jmp(end - at))
+        Ok(end)
+
+    # A run of pieces, up to `|`, a closing paren or the end.
+    fn branch(self: @&RegexCompiler) -> Result<i64, RegexError>
+        let branch_start = self.prog.len()
+        # Where the last atom's code starts; -1 when there is none to repeat.
+        var atom: i64 = -1
+        loop
+            let t = self.peek()
+            match t.tok
+                RegexTok.End | RegexTok.Alt | RegexTok.Close => return Ok(self.prog.len())
+                RegexTok.Star =>
+                    if atom < 0
+                        # Nothing to repeat: a literal `*`.
+                        atom = self.prog.len()
+                        self.prog.push(RegexInst.Char('*' as u32))
+                        self.pos += 1
+                    else
+                        self.repeat(atom, RegexRepeat.Star, t.len)?
+                        atom = -1
+                RegexTok.Plus =>
+                    if atom < 0
+                        return Err(self.error(RegexErrorKind.PlusFollowsNothing))
+                    self.repeat(atom, RegexRepeat.Plus, t.len)?
+                    atom = -1
+                RegexTok.Quest =>
+                    if atom < 0
+                        return Err(self.error(RegexErrorKind.QuestFollowsNothing))
+                    self.repeat(atom, RegexRepeat.Quest, t.len)?
+                    atom = -1
+                RegexTok.Caret =>
+                    let at_start = self.prog.len() == branch_start
+                    self.pos += 1
+                    if at_start or self.syntax == RegexSyntax.Extended
+                        self.prog.push(RegexInst.Assert(RegexLook.TextStart))
+                        atom = -1
+                    else
+                        atom = self.prog.len()
+                        self.prog.push(RegexInst.Char('^' as u32))
+                RegexTok.Dollar =>
+                    self.pos += 1
+                    let next = self.peek().tok
+                    let at_end = next == RegexTok.End or next == RegexTok.Alt or next == RegexTok.Close
+                    if at_end or self.syntax == RegexSyntax.Extended
+                        self.prog.push(RegexInst.Assert(RegexLook.TextEnd))
+                        atom = -1
+                    else
+                        atom = self.prog.len()
+                        self.prog.push(RegexInst.Char('$' as u32))
+                RegexTok.WordStart =>
+                    self.pos += t.len
+                    self.prog.push(RegexInst.Assert(RegexLook.WordStart))
+                    atom = -1
+                RegexTok.WordEnd =>
+                    self.pos += t.len
+                    self.prog.push(RegexInst.Assert(RegexLook.WordEnd))
+                    atom = -1
+                RegexTok.Open =>
+                    let open_at = self.pos
+                    self.pos += t.len
+                    if self.depth >= REGEX_MAX_DEPTH
+                        return Err(self.error(RegexErrorKind.TooDeep))
+                    atom = self.prog.len()
+                    self.depth += 1
+                    self.alternation()?
+                    self.depth -= 1
+                    if self.peek().tok != RegexTok.Close
+                        self.pos = open_at
+                        return Err(self.error(RegexErrorKind.UnmatchedOpen))
+                    self.pos += self.peek().len
+                RegexTok.Dot =>
+                    self.pos += 1
+                    atom = self.prog.len()
+                    self.prog.push(RegexInst.Any)
+                RegexTok.Bracket =>
+                    atom = self.prog.len()
+                    self.bracket()?
+                RegexTok.Short =>
+                    self.pos += t.len
+                    atom = self.prog.len()
+                    let k = self.shorthand(t.cp as u8)
+                    self.prog.push(RegexInst.Class(k))
+                RegexTok.Lit =>
+                    self.pos += t.len
+                    atom = self.prog.len()
+                    self.prog.push(RegexInst.Char(t.cp))
+
+    # The repeat `t` over the atom whose code starts at `atom`; a second
+    # repeat straight after it is an error, as in Vim.
+    fn repeat(self: @&RegexCompiler, atom: i64, r: RegexRepeat, len: i64) -> Result<i64, RegexError>
+        self.pos += len
+        let n = self.prog.len() - atom
+        match r
+            RegexRepeat.Star =>
+                # L: Split(body, out); body; Jmp(L)
+                self.insert(atom, RegexInst.Split(1, n + 2))
+                self.prog.push(RegexInst.Jmp(0 - (n + 1)))
+            RegexRepeat.Plus =>
+                # body; Split(body, out)
+                self.prog.push(RegexInst.Split(0 - n, 1))
+            RegexRepeat.Quest =>
+                # Split(body, out); body
+                self.insert(atom, RegexInst.Split(1, n + 1))
+        match self.peek().tok
+            RegexTok.Star => Err(self.error(RegexErrorKind.NestedStar))
+            RegexTok.Plus => Err(self.error(RegexErrorKind.NestedPlus))
+            RegexTok.Quest => Err(self.error(RegexErrorKind.NestedQuest))
+            _ => Ok(self.prog.len())
+
+    # ------------------------------------------------------------------
+    # Classes
+    # ------------------------------------------------------------------
+
+    fn add_range(self: @&RegexCompiler, lo: u32, hi: u32)
+        self.ranges.push(RegexRange { lo: lo, hi: hi })
+
+    # A class of ranges[first..] to the end, as class index.
+    fn close_class(self: @&RegexCompiler, first: i64, negated: bool) -> i64
+        var lo: u64 = 0
+        var hi: u64 = 0
+        for r in first..self.ranges.len()
+            let range = self.ranges.get(r)
+            var c = range.lo
+            while c <= range.hi and c < 128
+                if c < 64
+                    lo = lo | ((1 as u64) << (c as u64))
+                else
+                    hi = hi | ((1 as u64) << ((c - 64) as u64))
+                c += 1
+        if negated
+            lo = ~lo
+            hi = ~hi
+        self.classes.push(RegexClass { first: first, count: self.ranges.len() - first, negated: negated, ascii_lo: lo, ascii_hi: hi })
+        self.classes.len() - 1
+
+    # Add the ranges of the named set `name` (REGEX_NAMED_RANGES).
+    fn add_named(self: @&RegexCompiler, name: StrView)
+        for r in REGEX_NAMED_RANGES
+            if r.name.eq(name)
+                self.add_range(r.lo, r.hi)
+
+    # The class for \d \s \w \a \l \u \x \h, or their uppercase complements.
+    fn shorthand(self: @&RegexCompiler, letter: u8) -> i64
+        let first = self.ranges.len()
+        let lower = if letter >= 'A' and letter <= 'Z' then letter + 32 else letter
+        for sh in REGEX_SHORTHANDS
+            if sh.letter == lower
+                self.add_named(sh.name)
+        self.close_class(first, letter != lower)
+
+    # [:name:] at `at` (just past its `[`): its ranges added, and the
+    # length of its text after the `[`; 0, adding none, when no POSIX class
+    # by that name is there.
+    fn named_class(self: @&RegexCompiler, at: i64) -> i64
+        let rest = self.src[at..self.src.len].as_strview()
+        if not rest.starts_with(":")
+            return 0
+        for name in REGEX_POSIX_CLASSES
+            let n = name.len
+            if rest.len > n + 2 and rest.slice(1, n + 1).eq(name) and rest.slice(n + 1, n + 3).eq(":]")
+                self.add_named(name)
+                return n + 3
+        0
+
+    # One code point of a class at `at`: a `\` escape or the unit there.
+    fn class_char(self: @RegexCompiler, at: i64) -> RegexUnit
+        if self.src[at] == '\\' and at + 1 < self.src.len
+            let e: u8 = self.src[at + 1]
+            match e
+                ']' | '\\' | '^' | '-' => return RegexUnit { cp: e as u32, len: 2 }
+                't' => return RegexUnit { cp: 0x09, len: 2 }
+                'e' => return RegexUnit { cp: 0x1B, len: 2 }
+                'r' => return RegexUnit { cp: 0x0D, len: 2 }
+                'n' => return RegexUnit { cp: 0x0A, len: 2 }
+                _ => pass
+        # Any other backslash is a literal one, and what follows is its own.
+        regex_unit_at(self.src, at)
+
+    # [...] at pos. With no closing `]` the `[` is a literal.
+    fn bracket(self: @&RegexCompiler) -> Result<i64, RegexError>
+        let open_at = self.pos
+        let first = self.ranges.len()
+        var at = self.pos + 1
+        var negated = false
+        if at < self.src.len and self.src[at] == '^'
+            negated = true
+            at += 1
+        var leading = true
+        while at < self.src.len and (leading or self.src[at] != ']')
+            leading = false
+            if self.src[at] == '['
+                let n = self.named_class(at + 1)
+                if n > 0
+                    at += 1 + n
+                    continue
+            let lo = self.class_char(at)
+            at += lo.len
+            var hi = lo.cp
+            if at + 1 < self.src.len and self.src[at] == '-' and self.src[at + 1] != ']'
+                let h = self.class_char(at + 1)
+                if h.cp < lo.cp
+                    self.pos = at
+                    return Err(self.error(RegexErrorKind.ReverseRange))
+                hi = h.cp
+                at += 1 + h.len
+            self.add_range(lo.cp, hi)
+        if at >= self.src.len
+            # No `]`: forget the ranges, and the `[` is a literal.
+            while self.ranges.len() > first
+                self.ranges.pop()
+            self.pos = open_at + 1
+            self.prog.push(RegexInst.Char('[' as u32))
+            return Ok(self.prog.len())
+        self.pos = at + 1
+        let k = self.close_class(first, negated)
+        self.prog.push(RegexInst.Class(k))
+        Ok(self.prog.len())
+
+# =============================================================================
+# The VM
+# =============================================================================
+
+# Two thread lists, `side` 0 and 1, each up to n threads: thread i of a side
+# is at pc[side * n + i], started at start[side * n + i]. mark[side * n + pc]
+# is the step that last added pc to that side, so each pc is on a list
+# once per step: the first thread to reach it, the one with priority, keeps
+# it. `stack` follows a thread's jumps and splits: each pc is visited once
+# per step and pushes at most two, so 2n + 1 slots hold it.
+struct RegexVm
+    n: i64
+    pc: Vec<i64>
+    start: Vec<i64>
+    mark: Vec<i64>
+    count0: i64
+    count1: i64
+    stack: Vec<i64>
+
+fn regex_vm_new(n: i64) -> RegexVm
+    RegexVm { n: n, pc: vec_zeroed<i64>(2 * n), start: vec_zeroed<i64>(2 * n), mark: vec_zeroed<i64>(2 * n), count0: 0, count1: 0, stack: vec_zeroed<i64>(2 * n + 1) }
+
+impl RegexVm
+    fn count(self: @RegexVm, side: i64) -> i64
+        if side == 0 then self.count0 else self.count1
+
+    fn clear(self: @&RegexVm, side: i64)
+        if side == 0
+            self.count0 = 0
+        else
+            self.count1 = 0
+
+    fn push(self: @&RegexVm, side: i64, pc: i64, start: i64)
+        let i = side * self.n + self.count(side)
+        self.pc[i] = pc
+        self.start[i] = start
+        if side == 0
+            self.count0 += 1
+        else
+            self.count1 += 1
+
+    fn pc_of(self: @RegexVm, side: i64, i: i64) -> i64
+        self.pc[side * self.n + i]
+
+    fn start_of(self: @RegexVm, side: i64, i: i64) -> i64
+        self.start[side * self.n + i]
+
+impl Regex
+    # True when `look` holds at offset i of `text`.
+    fn holds(self: @Regex, look: RegexLook, text: [u8], i: i64) -> bool
+        let before = i > 0 and regex_is_word_byte(text[i - 1])
+        let after = i < text.len and regex_is_word_byte(text[i])
+        match look
+            RegexLook.TextStart => i == 0
+            RegexLook.TextEnd => i == text.len
+            RegexLook.WordStart => after and not before
+            RegexLook.WordEnd => before and not after
+
+    fn in_class(self: @Regex, k: i64, cp: u32) -> bool
+        let c = self.classes.get(k)
+        if cp < 64
+            return ((c.ascii_lo >> (cp as u64)) & 1) != 0
+        if cp < 128
+            return ((c.ascii_hi >> ((cp - 64) as u64)) & 1) != 0
+        for r in c.first..(c.first + c.count)
+            let range = self.ranges.get(r)
+            if cp >= range.lo and cp <= range.hi
+                return not c.negated
+        c.negated
+
+    # Add a thread at `pc0`, started at `start`, to `side` at offset i,
+    # following its jumps, splits and true assertions (in priority order)
+    # to the instructions that consume a code point or match. `step` marks
+    # the pcs already on the list this step.
+    fn add_thread(self: @Regex, vm: @&RegexVm, side: i64, step: i64, pc0: i64, start: i64, text: [u8], i: i64)
+        vm.stack[0] = pc0
+        var top: i64 = 1
+        while top > 0
+            top -= 1
+            let pc = vm.stack[top]
+            let m = side * vm.n + pc
+            if vm.mark[m] == step
+                continue
+            vm.mark[m] = step
+            match self.prog[pc]
+                RegexInst.Jmp(off) =>
+                    vm.stack[top] = pc + off
+                    top += 1
+                RegexInst.Split(a, b) =>
+                    vm.stack[top] = pc + b
+                    vm.stack[top + 1] = pc + a
+                    top += 2
+                RegexInst.Assert(look) =>
+                    if self.holds(look, text, i)
+                        vm.stack[top] = pc + 1
+                        top += 1
+                # The instructions that consume a unit or match: the thread
+                # waits there for the next unit.
+                RegexInst.Char(c) => vm.push(side, pc, start)
+                RegexInst.Class(k) => vm.push(side, pc, start)
+                RegexInst.Any | RegexInst.Found => vm.push(side, pc, start)
+
+    fn is_found(self: @Regex, pc: i64) -> bool
+        match self.prog[pc]
+            RegexInst.Found => true
+            _ => false
+
+    # True when instruction pc consumes the unit u.
+    fn takes(self: @Regex, pc: i64, u: RegexUnit) -> bool
+        match self.prog[pc]
+            RegexInst.Char(c) => u.cp == c
+            RegexInst.Any => true
+            RegexInst.Class(k) => self.in_class(k, u.cp)
+            _ => false
+
+    # True when a match can start at offset i: on the lead byte, when the
+    # pattern has one.
+    fn can_start(self: @Regex, text: [u8], i: i64) -> bool
+        match self.lead
+            Some(b) => i < text.len and text[i] == b
+            None => true
+
+    # Where the next match can start at or after `i`: the next `lead` byte
+    # (an ASCII byte always starts a unit), else i itself. text.len + 1 when
+    # it can't.
+    fn next_start(self: @Regex, text: [u8], i: i64) -> i64
+        match self.lead
+            Some(b) =>
+                var j = i
+                while j < text.len and text[j] != b
+                    j += 1
+                if j < text.len then j else text.len + 1
+            None => i
+
+    # The leftmost match starting at or after `from` (clamped to the text).
+    # Threads are kept in priority order and a match cuts off every thread
+    # after it, so the match found is the one Vim's backtracker finds.
+    pub fn find_from(self: @Regex, text: [u8], from: i64) -> Option<RegexMatch>
+        var i = if from < 0 then 0 else from
+        if i > text.len or (self.anchored and i > 0)
+            return None
+        # Start on a code point: step past the unit `from` falls inside.
+        var u0: i64 = 0
+        while u0 < i
+            u0 += regex_unit_at(text, u0).len
+        i = u0
+        if self.next_start(text, i) > text.len
+            # The byte every match starts with isn't there: no VM to run.
+            return None
+        var vm = regex_vm_new(self.prog.len())
+        var found: Option<RegexMatch> = None
+        var cur: i64 = 0
+        var step: i64 = 1
+        loop
+            if found.is_none() and vm.count(cur) == 0
+                # No thread alive: skip to where a match can start. The
+                # list's marks are for the old offset: a new step.
+                i = self.next_start(text, i)
+                if i > text.len or (self.anchored and i > 0)
+                    break
+                step += 1
+            if found.is_none() and not (self.anchored and i > 0) and self.can_start(text, i)
+                # A new thread starting here, after every older one.
+                self.add_thread(@&vm, cur, step, 0, i, text, i)
+            if found.is_some() and vm.count(cur) == 0
+                break
+            let nxt = 1 - cur
+            vm.clear(nxt)
+            step += 1
+            let u: RegexUnit = if i < text.len then regex_unit_at(text, i) else RegexUnit { cp: 0, len: 0 }
+            for t in 0..vm.count(cur)
+                let pc = vm.pc_of(cur, t)
+                if self.is_found(pc)
+                    found = Some(RegexMatch { start: vm.start_of(cur, t), end: i })
+                    break
+                if u.len > 0 and self.takes(pc, u)
+                    self.add_thread(@&vm, nxt, step, pc + 1, vm.start_of(cur, t), text, i + u.len)
+            if u.len == 0
+                break
+            cur = nxt
+            i += u.len
+        found
+
+    # The match with the last start before `before`: Vim's backward search.
+    # One pass from the start of the text: each step's new thread goes
+    # first, so a list holds its threads latest start first and a pc
+    # reached by two keeps the later start. The match is then the forward
+    # one from that start.
+    pub fn find_before(self: @Regex, text: [u8], before: i64) -> Option<RegexMatch>
+        if before <= 0 or self.next_start(text, 0) >= before
+            return None
+        var vm = regex_vm_new(self.prog.len())
+        var best: i64 = -1
+        var cur: i64 = 0
+        var step: i64 = 1
+        var i: i64 = 0
+        self.add_thread(@&vm, cur, step, 0, 0, text, 0)
+        loop
+            if vm.count(cur) == 0
+                # No thread alive: skip to where a match can start.
+                if i >= before or self.anchored
+                    break
+                let j = self.next_start(text, i + 1)
+                if j >= before or j > text.len
+                    break
+                # The units between i and j can't start a match; step over
+                # them so j is reached on a code point.
+                while i < j
+                    i += regex_unit_at(text, i).len
+                if i >= before
+                    break
+                step += 1
+                self.add_thread(@&vm, cur, step, 0, i, text, i)
+                continue
+            # With no new starts to come, a list's first thread has its
+            # latest start: past the best already found, or nothing more
+            # is to be found.
+            if i + 1 >= before and vm.start_of(cur, 0) <= best
+                break
+            let nxt = 1 - cur
+            vm.clear(nxt)
+            step += 1
+            let u: RegexUnit = if i < text.len then regex_unit_at(text, i) else RegexUnit { cp: 0, len: 0 }
+            if u.len > 0 and i + u.len < before and not self.anchored and self.can_start(text, i + u.len)
+                self.add_thread(@&vm, nxt, step, 0, i + u.len, text, i + u.len)
+            for t in 0..vm.count(cur)
+                let pc = vm.pc_of(cur, t)
+                if self.is_found(pc)
+                    # The threads after this one started no later.
+                    if vm.start_of(cur, t) > best
+                        best = vm.start_of(cur, t)
+                    break
+                if u.len > 0 and self.takes(pc, u)
+                    self.add_thread(@&vm, nxt, step, pc + 1, vm.start_of(cur, t), text, i + u.len)
+            if u.len == 0
+                break
+            cur = nxt
+            i += u.len
+        if best < 0
+            return None
+        self.find_from(text, best)
+
+    # True when `text` has a match anywhere.
+    pub fn is_match(self: @Regex, text: [u8]) -> bool
+        self.find_from(text, 0).is_some()
