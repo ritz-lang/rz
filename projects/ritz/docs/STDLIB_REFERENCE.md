@@ -2850,6 +2850,9 @@ close-on-exec. A file fd is a stream on Linux only (Harland: `Err(BadF)`).
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `command` | `fn(path: StrView, args: Span<StrView>) -> Command` | A program to start, with your stdio |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `stdin_from` / `stdout_to` / `stderr_to` | `fn(self: @&Command, fd: @Fd)` | The child's fd 0, 1 or 2 is `fd` |
 | `spawn` | `fn(self: @Command) -> Result<Child, Errno>` | Start it: `Err(NoEnt)`, `Err(Acces)` for a program that can't run (Linux checks before forking), `Err(BadF)` for a closed stream fd |
 | `pid` | `fn(self: @Child) -> i32` | The child's process id |

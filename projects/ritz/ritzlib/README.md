@@ -71,6 +71,7 @@ pub fn main() -> i32
 | `box.ritz` | `ritzlib.box` | Owned heap allocation |
 | `buf.ritz` | `ritzlib.buf` | Buffer and reader utilities for parsing |
 | `cmp.ritz` | `ritzlib.cmp` | Ordering, the result of a three-way comparison |
+| `command.ritz` | `ritzlib.command` | start a program with its stdin, stdout and stderr |
 | `cstr.ritz` | `ritzlib.cstr` | C interop only; StrView/String everywhere else |
 | `ct.ritz` | `ritzlib.ct` | Constant-time comparison (AGAST #1863) |
 | `drop.ritz` | `ritzlib.drop` | Drop trait for automatic cleanup |

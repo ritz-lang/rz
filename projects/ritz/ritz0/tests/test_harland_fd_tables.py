@@ -842,7 +842,7 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
     # #4881)
     assert "spawn_image(image, arg0, arg1, PROC_BSP_CPU)" in _fn(PROCESS, "process_spawn_image")
     image = _fn(PROCESS, "spawn_image")
-    assert "spawn_child_begin(parent_pid, false, spawn_stdio_inherit())" in image
+    assert "spawn_child_begin(parent_pid, false, None)" in image
     assert begin.index("if inherit_caps") < begin.index("cap_inherit_ambient(")
     # every failure after the child exists gives its slot back
     assert image.count("spawn_undo(slot, parent_pid)") == 2, image

@@ -142,11 +142,12 @@ fn spawn_capture_argv(argv: **u8, argc: i32) -> i64
 # The first half of every spawn, in the parent's address space: a child
 # slot of the running process `parent_pid`, its capability table (the
 # parent's ambient capabilities when `inherit_caps`), its own fd table with
-# fds 0-2 from the parent's under `stdio` (#4955), and an isolated page table
+# fds 0-2 from the parent's under `stdio` (#4955; None for a kernel spawn:
+# the console's, nothing from the running process), and an isolated page table
 # (kernel mappings, empty user space) in its Proc.
 # The parent's fd table is current again on return. The child's slot, or a
 # negative errno with nothing left behind.
-fn spawn_child_begin(parent_pid: u64, inherit_caps: bool, stdio: SpawnStdio) -> i64
+fn spawn_child_begin(parent_pid: u64, inherit_caps: bool, stdio: Option<SpawnStdio>) -> i64
     let slot: i32 = proc_new_child()
     if slot < 0
         klog("[spawn_args] No child process slot\n")
@@ -177,13 +178,20 @@ fn spawn_child_begin(parent_pid: u64, inherit_caps: bool, stdio: SpawnStdio) -> 
         proc_abort_child(slot)
         return fs_result as i64
 
-    # Its stdin, stdout and stderr: the parent's own, or the parent fds
-    # spawn_io named; a pipe end is shared, so its EOF waits for both.
-    match fs_process_give_stdio(child_pid, stdio)
-        Ok(_) => pass
-        Err(e) =>
-            spawn_undo(slot, parent_pid)
-            return e as i64
+    # Its stdin, stdout and stderr: a process's spawn gives the parent's
+    # own, or the parent fds spawn_io named; a pipe end is shared, so its EOF
+    # waits for both. A kernel spawn gives nothing: the running process is
+    # whoever the kernel happens to run on (netd's respawn runs in the dying
+    # netd's exit, its fds already released), so the child keeps the
+    # console fds its new table starts with.
+    match stdio
+        Some(map) =>
+            match fs_process_give_stdio(child_pid, map)
+                Ok(_) => pass
+                Err(e) =>
+                    spawn_undo(slot, parent_pid)
+                    return e as i64
+        None => pass
 
     # An isolated address space: kernel mappings, empty user space.
     let child_pml4: u64 = vmm_create_user_pml4()
@@ -201,7 +209,7 @@ fn spawn_child_begin(parent_pid: u64, inherit_caps: bool, stdio: SpawnStdio) -> 
 #
 # ISOLATION: each child gets its own page table (CR3); it cannot read or
 # write the parent's user memory.
-fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: bool, home: i32, stdio: SpawnStdio) -> i64
+fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: bool, home: i32, stdio: Option<SpawnStdio>) -> i64
     # Read file from namespace (using kernel's page table). A path under
     # /var comes from the persistent subtree (fs/kfs.ritz, #4321).
     let ns: *Namespace = kfs_ns_for(path_view)
@@ -270,7 +278,7 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: b
 pub fn process_spawn_program(path: StrView) -> Result<u64, Errno>
     if proc_current() == 0 as *Proc
         return Err(Errno.Srch)
-    errno_result(spawn_process(path, 0, 0, false, PROC_BSP_CPU, spawn_stdio_inherit()))
+    errno_result(spawn_process(path, 0, 0, false, PROC_BSP_CPU, None))
 
 # process_spawn_program, homed on CPU `cpu` (SMP_USER.md §5): kernel-only
 # placement, the spawn on the BSP, which owns the process table. The child
@@ -280,7 +288,7 @@ pub fn process_spawn_program(path: StrView) -> Result<u64, Errno>
 pub fn process_spawn_program_on(path: StrView, cpu: i32) -> Result<u64, Errno>
     if proc_current() == 0 as *Proc
         return Err(Errno.Srch)
-    errno_result(spawn_process(path, 0, 0, false, cpu, spawn_stdio_inherit()))
+    errno_result(spawn_process(path, 0, 0, false, cpu, None))
 
 # The most pages process_spawn_image maps for an image (AGAST #4731): the
 # boot-test stub grew past one page when the frame-ring modes landed beside
@@ -316,7 +324,7 @@ fn spawn_image(image: Span<u8>, arg0: u64, arg1: u64, cpu: i32) -> i64
     let parent_pml4: u64 = vmm_get_current_pml4()
     (*parent).pml4 = parent_pml4
 
-    let begun: i64 = spawn_child_begin(parent_pid, false, spawn_stdio_inherit())
+    let begun: i64 = spawn_child_begin(parent_pid, false, None)
     if begun < 0
         return begun
     let slot: i32 = begun as i32
@@ -378,7 +386,7 @@ fn wait_for_child(pid: u64, code: *i64) -> i32
 # sys_wait to collect the status; a negative exit code fails the spawn with
 # -1 instead, and the child is reaped here since no wait will come.
 fn spawn_and_block(path: StrView, argc: i32, argv_bytes: i64) -> i64
-    let pid: i64 = spawn_process(path, argc, argv_bytes, true, PROC_BSP_CPU, spawn_stdio_inherit())
+    let pid: i64 = spawn_process(path, argc, argv_bytes, true, PROC_BSP_CPU, Some(spawn_stdio_inherit()))
     if pid <= 0
         return pid
     var code: i64 = 0
@@ -700,11 +708,11 @@ pub fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # the child's pid comes back at once, both run (#3629), and wait(pid)
 # collects its exit code.
 pub fn sys_spawn_bg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    return spawn_bg_from_user(rdi, rsi, rdx, spawn_stdio_inherit())
+    return spawn_bg_from_user(rdi, rsi, rdx, Some(spawn_stdio_inherit()))
 
 # spawn_bg's and spawn_io's body: path `rdi`, argv `rsi`, argc `rdx` from
 # the caller, the child's fds 0-2 under `stdio` (already copied in).
-fn spawn_bg_from_user(rdi: u64, rsi: u64, rdx: u64, stdio: SpawnStdio) -> i64
+fn spawn_bg_from_user(rdi: u64, rsi: u64, rdx: u64, stdio: Option<SpawnStdio>) -> i64
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
         return Errno.Fault as i64
@@ -729,7 +737,7 @@ pub fn sys_spawn_io_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if uptr_check_read(r10 as *u8, sizeof(SpawnStdio) as u64) != 0
         return Errno.Fault as i64
     let stdio: SpawnStdio = *(r10 as *SpawnStdio)
-    return spawn_bg_from_user(rdi, rsi, rdx, stdio)
+    return spawn_bg_from_user(rdi, rsi, rdx, Some(stdio))
 
 # wait(pid)
 pub fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

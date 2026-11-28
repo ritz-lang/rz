@@ -100,6 +100,22 @@ def test_the_restart_waits_out_its_backoff_then_respawns():
               "sched_yield()", "sti_hlt()")
 
 
+@pytest.mark.unit
+def test_a_respawn_takes_no_stdio_from_the_dying_netd():
+    """The restart runs as the dying netd, whose fds are already released:
+    a kernel spawn must not hand the child the running process's fds 0-2
+    (#4955's inherit map made every respawn BadF, so netd never came back).
+    process_spawn_program passes no map; spawn_child_begin hands over stdio
+    only for Some(map)."""
+    for name in ("process_spawn_program", "process_spawn_program_on", "spawn_image"):
+        body = _fn_body(_code(PROCESS), name)
+        assert "spawn_stdio_inherit()" not in body, name
+        assert re.search(r"spawn_(?:process|child_begin)\(.*\bNone\)", body), name
+    begin = _fn_body(_code(PROCESS), "spawn_child_begin")
+    assert "stdio: Option<SpawnStdio>" in begin
+    _in_order(begin, "match stdio", "Some(map)", "fs_process_give_stdio(child_pid, map)")
+
+
 
 
 
