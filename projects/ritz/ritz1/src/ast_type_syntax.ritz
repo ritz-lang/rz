@@ -1113,33 +1113,32 @@ pub fn type_alias_resolve(p: *Parser, name_sv: StrView) -> *TypeRef
         t.fn_sig = e.fn_sig
     t
 
-# `sizeof(Alias)` (AGAST #2124): the alias's target as `count` values of leaf
-# kind `*leaf` (struct `*out` for TypeKind.Struct).  0 when `name` is no
-# alias.  The emitter sizes the leaf; an alias of a pointer is one pointer.
+# What `sizeof(Alias)` multiplies out: `count` values of kind `leaf`, a
+# struct's `leaf_name` for TypeKind.Struct.
+pub struct AliasSizeofShape
+    count: i64
+    leaf: TypeKind
+    leaf_name: StrView
+
+# `sizeof(Alias)` (AGAST #2124): the alias's target as `count` values of one
+# leaf kind, or None when `name` is no alias.  The emitter sizes the leaf; an
+# alias of a pointer is one pointer.
 # #4035: reads the alias table's flat snapshot, which outlives the Parser.
-pub fn type_alias_sizeof_shape(ctx: *ParseCtx, name_sv: StrView, count: *i64, leaf: *TypeKind, out: *StrView) -> i32
+pub fn type_alias_sizeof_shape(ctx: *ParseCtx, name_sv: StrView) -> Option<AliasSizeofShape>
     let e: *AliasEntry = type_alias_find(ctx, name_sv)
     if e == null
-        return 0
-    *count = 1
-    *leaf = e.kind
-    *out = e.type_name
-    if e.kind == TypeKind.Array
-        let sh: *ArrayShape = e.array_shape
-        if sh != null
-            var n: i64 = 1
-            var d: i32 = 0
-            while d < sh.rank
-                n = n * (sh.dims[d] as i64)
-                d = d + 1
-            *count = n
-            *leaf = sh.leaf_type
-            *out = sh.leaf_name
-        else
-            *count = e.array_size as i64
-            *leaf = e.array_elem_type
-            *out = e.array_elem_type_name
-    return 1
+        return None
+    if e.kind != TypeKind.Array
+        return Some(AliasSizeofShape { count: 1, leaf: e.kind, leaf_name: e.type_name })
+    let sh: *ArrayShape = e.array_shape
+    if sh == null
+        return Some(AliasSizeofShape { count: e.array_size as i64, leaf: e.array_elem_type, leaf_name: e.array_elem_type_name })
+    var n: i64 = 1
+    var d: i32 = 0
+    while d < sh.rank
+        n = n * (sh.dims[d] as i64)
+        d = d + 1
+    Some(AliasSizeofShape { count: n, leaf: sh.leaf_type, leaf_name: sh.leaf_name })
 
 # item dispatcher for type_alias_def: like item_dispatch_enum, the alias
 # has no AST node (it lives in the alias table), so only reset skip_item.
@@ -1321,9 +1320,11 @@ fn spell_ref_generic_arg(p: *Parser, tr: *TypeRef) -> StrView
             base = bsv.ptr
             base_len = bsv.len as i32
         _ =>
-            var prim_spelled: StrView = strview_empty()
-            base_len = primitive_arg_spelling(inner, @prim_spelled)
+            let prim_spelled: StrView = match primitive_arg_spelling(inner)
+                Some(sp) => sp
+                None => strview_empty()
             base = prim_spelled.ptr
+            base_len = prim_spelled.len as i32
     if base == null or base_len <= 0
         return strview_empty()
     var prefix: StrView = "ref_"
@@ -1377,13 +1378,17 @@ fn spell_last_array(p: *Parser, tr: *TypeRef) -> StrView
                 elem = en.ptr
                 elem_len = (en.len as i32)
             else
-                var ptr_spelled: StrView = strview_empty()
-                elem_len = primitive_arg_spelling(ep, @ptr_spelled)
+                let ptr_spelled: StrView = match primitive_arg_spelling(ep)
+                    Some(sp) => sp
+                    None => strview_empty()
                 elem = ptr_spelled.ptr
+                elem_len = ptr_spelled.len as i32
         _ =>
-            var prim_spelled: StrView = strview_empty()
-            elem_len = primitive_arg_spelling(et, @prim_spelled)
+            let prim_spelled: StrView = match primitive_arg_spelling(et)
+                Some(sp) => sp
+                None => strview_empty()
             elem = prim_spelled.ptr
+            elem_len = prim_spelled.len as i32
     if elem_len <= 0 or elem == null
         return strview_empty()
     # ("arr" + up to 10 digits + "_") per dimension + "ptr_" + elem

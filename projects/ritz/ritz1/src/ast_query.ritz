@@ -1231,34 +1231,49 @@ pub fn array_ptr_elem_name(loc: *LocalVar) -> StrView
 
 # =========================================================================
 # The variant-constructor queries (AGAST #4391; moved from emitter_core).
-# AGAST #4153: 1 when the call `e` names a variant of one user enum with a
-# list user_variant_ctor_enum leaves to a fn of that name: values for a bare
-# variant, `Z(1)`, or none for a payload one, `One()`.  *out_ei / *out_vi
-# name the variant.  With no such fn it was "Unknown function: Z".
-pub fn user_variant_ctor_miscounted(ctx: *ParseCtx, e: *Expr, out_ei: *i32, out_vi: *i32) -> i32
+# Variant `variant` of the user enum at index `enum_idx` (enum_name_at's).
+pub struct VariantAt
+    enum_idx: i32
+    variant: i32
+
+# The two enums a variant name is ambiguous between, as enum indices: the
+# alphabetically first two that declare it (enum_of_variant_unique's -2).
+pub struct VariantClash
+    first: i32
+    second: i32
+
+# AGAST #4153: the variant the call `e` names, when it is a variant of one
+# user enum given a list user_variant_ctor_enum leaves to a fn of that name:
+# values for a bare variant, `Z(1)`, or none for a payload one, `One()`.
+# None for any other call.  With no such fn it was "Unknown function: Z".
+pub fn user_variant_ctor_miscounted(ctx: *ParseCtx, e: *Expr) -> Option<VariantAt>
     if e == null or e.kind != ExprKind.Call
-        return 0
+        return None
+    var vi: i32 = 0
     var other: i32 = 0
-    let ei: i32 = enum_of_variant_unique(ctx, e.func_name, out_vi, @other)
+    let ei: i32 = enum_of_variant_unique(ctx, e.func_name, @vi, @other)
     if ei < 0
-        return 0
-    *out_ei = ei
-    let kind: i32 = enum_variant_kind(ctx, ei, *out_vi)
+        return None
+    let kind: i32 = enum_variant_kind(ctx, ei, vi)
+    var miscounted: bool = false
     if kind == ENUM_VARIANT_UNIT
-        return (e.args != null) as i32
-    if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
-        return (e.args == null) as i32
-    0
+        miscounted = e.args != null
+    else if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
+        miscounted = e.args == null
+    if not miscounted
+        return None
+    Some(VariantAt { enum_idx: ei, variant: vi })
 
 # AGAST #2039: a call `B()` / `Holds(x)` whose callee name two or more
-# non-generic enums declare as a variant.  Returns 1 and fills *out_a /
-# *out_b with the two enums to name (enum_of_variant_unique's -2), else 0.
-pub fn user_variant_ctor_ambiguous(ctx: *ParseCtx, e: *Expr, out_a: *i32, out_b: *i32) -> i32
+# non-generic enums declare as a variant: the two enums to name, else None.
+pub fn user_variant_ctor_ambiguous(ctx: *ParseCtx, e: *Expr) -> Option<VariantClash>
     if e == null or e.kind != ExprKind.Call
-        return 0
-    if enum_of_variant_unique(ctx, e.func_name, out_a, out_b) == 0 - 2
-        return 1
-    return 0
+        return None
+    var a: i32 = 0
+    var b: i32 = 0
+    if enum_of_variant_unique(ctx, e.func_name, @a, @b) != 0 - 2
+        return None
+    Some(VariantClash { first: a, second: b })
 
 # =========================================================================
 # Helper: find the leftmost/base expression in a chain of binary ops
@@ -1324,31 +1339,29 @@ pub struct ArrayDims
     leaf: TypeKind
     name: StrView
 
-# What ref_arg_dims can say about an argument.
-pub const ARG_DIMS_UNKNOWN: i32 = 0
-pub const ARG_DIMS_ARRAY: i32 = 1
-pub const ARG_DIMS_NOT_ARRAY: i32 = 2
+# Why a place or argument has no ArrayDims: it is no array, or ritz1 can't
+# tell (the emitter's ref_arg_dims / place_array_dims, call_check's ca_*_dims).
+pub enum DimsMiss
+    NotArray
+    Unknown
 
-pub fn array_dims_1d(out: *ArrayDims, size: i32, elem: TypeKind, name_sv: StrView) -> i32
-    out.rank = 1
-    out.dims[0] = size
-    out.leaf = elem
-    out.name = name_sv
-    ARG_DIMS_ARRAY
+# A 1-D `[size]elem`; `name_sv` names a struct element.
+pub fn array_dims_1d(size: i32, elem: TypeKind, name_sv: StrView) -> ArrayDims
+    var d: ArrayDims = ArrayDims { rank: 1, leaf: elem, name: name_sv }
+    d.dims[0] = size
+    d
 
 # The array left of `sh` once `from` indices are applied.  With none left it's
-# an element.
-pub fn array_dims_nd(out: *ArrayDims, sh: *ArrayShape, from: i32) -> i32
+# an element: Err(DimsMiss.NotArray).
+pub fn array_dims_nd(sh: *ArrayShape, from: i32) -> Result<ArrayDims, DimsMiss>
     if from >= sh.rank
-        return ARG_DIMS_NOT_ARRAY
-    out.rank = sh.rank - from
+        return Err(DimsMiss.NotArray)
+    var d: ArrayDims = ArrayDims { rank: sh.rank - from, leaf: sh.leaf_type, name: sh.leaf_name }
     var i: i32 = 0
-    while i < out.rank
-        out.dims[i] = sh.dims[from + i]
+    while i < d.rank
+        d.dims[i] = sh.dims[from + i]
         i = i + 1
-    out.leaf = sh.leaf_type
-    out.name = sh.leaf_name
-    ARG_DIMS_ARRAY
+    Ok(d)
 
 pub fn array_dims_match(a: *ArrayDims, b: *ArrayDims) -> i32
     if a.rank != b.rank
@@ -1418,12 +1431,14 @@ pub fn lent_self_call_view_in(m: *Module, f: *FnDef) -> *FnDef
     view
 
 # =========================================================================
-# The array `p`, an `@[N]T` or the like, points at.
-pub fn param_pointee_dims(out: *ArrayDims, p: *Param)
-    if p.param_pointee_array_shape != null
-        array_dims_nd(out, p.param_pointee_array_shape, 0)
-    else
-        array_dims_1d(out, p.param_pointee_array_size, p.param_pointee_array_elem_type, p.param_type_name)
+# The array `p`, an `@[N]T` or the like, points at.  A shape of rank 0, which
+# the parser never builds, is no dimensions at all (rank 0).
+pub fn param_pointee_dims(p: *Param) -> ArrayDims
+    if p.param_pointee_array_shape == null
+        return array_dims_1d(p.param_pointee_array_size, p.param_pointee_array_elem_type, p.param_type_name)
+    match array_dims_nd(p.param_pointee_array_shape, 0)
+        Ok(d) => d
+        Err(_) => ArrayDims { rank: 0, leaf: TypeKind.Void, name: strview_empty() }
 
 # =========================================================================
 # 1 when two array element types name the same type (struct elements by name).

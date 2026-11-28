@@ -446,12 +446,13 @@ fn global_init_check(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
         gi.kind = GlobalInitKind.Int
         gi.int_val = 0
         return
-    var v: i64 = 0
-    if const_fold_int(s.sym.module.constants, g.init_expr, 1, @v) == 0
-        match const_fold_float(s, g.init_expr)
-            Some(_) => global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, "is not a float type but has a float initializer")
-            None => global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
-        return
+    let v: i64 = match const_fold_int(s.sym.module.constants, g.init_expr, 1)
+        Some(n) => n
+        None =>
+            match const_fold_float(s, g.init_expr)
+                Some(_) => global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, "is not a float type but has a float initializer")
+                None => global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
+            return
     gi.kind = GlobalInitKind.Int
     gi.int_val = v
 
@@ -895,12 +896,12 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
     # AGAST #1569: an integer field is folded, as #1557 folds primitive
     # elements.  A raw `int_val` is 0 for `-5`, `K`, `A * 4 - 1`...
     if is_int_const_type(ft) == 1
-        var folded: i64 = 0
-        if const_fold_int(s.sym.module.constants, v, 1, @folded) == 0
-            format_into(s, "0")
-            const_field_error(s, c, elem_idx, path, "is not a constant integer expression")
-            return
-        format_into(s, "{folded}")
+        match const_fold_int(s.sym.module.constants, v, 1)
+            Some(folded) =>
+                format_into(s, "{folded}")
+            None =>
+                format_into(s, "0")
+                const_field_error(s, c, elem_idx, path, "is not a constant integer expression")
         return
     match ft
         TypeKind.Ptr | TypeKind.PtrPtr =>
@@ -1368,10 +1369,11 @@ fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
     if was_global_emitted(s, c.name) == 1
         return
     mark_global_emitted(s, c.name)
-    var v: i64 = 0
-    if c.value_expr.left == null or const_fold_int(s.sym.module.constants, c.value_expr.left, 1, @v) == 0
-        const_array_elem_error(s, c, 0, c.value_expr.left)
-        return
+    let v: i64 = match const_fold_int(s.sym.module.constants, c.value_expr.left, 1)   # None for no `v`
+        Some(n) => n
+        None =>
+            const_array_elem_error(s, c, 0, c.value_expr.left)
+            return
     let name_ir: String = ir_name(c.name)
     let elem_ty: StrView = ty_value_llvm(c.array_elem_type)
     format_into(s, "@{name_ir.as_view()} = internal constant [{c.array_size} x {elem_ty}] [")
@@ -1589,10 +1591,11 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
         var fe: *Expr = c.value_expr.args
         var fi: i32 = 0
         while fe != null
-            var ignored: i64 = 0
-            if const_fold_int(s.sym.module.constants, fe, 1, @ignored) == 0
-                const_array_elem_error(s, c, fi, fe)
-                bad = true
+            match const_fold_int(s.sym.module.constants, fe, 1)
+                Some(_) => pass
+                None =>
+                    const_array_elem_error(s, c, fi, fe)
+                    bad = true
             fi = fi + 1
             fe = fe.next
         if bad
@@ -1605,8 +1608,10 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
         while pe != null
             if pi > 0
                 format_into(s, ", ")
-            var v: i64 = 0
-            const_fold_int(s.sym.module.constants, pe, 1, @v)
+            # Every element folded above.
+            let v: i64 = match const_fold_int(s.sym.module.constants, pe, 1)
+                Some(n) => n
+                None => 0
             format_into(s, "{elem_ty} {v}")
             pi = pi + 1
             pe = pe.next

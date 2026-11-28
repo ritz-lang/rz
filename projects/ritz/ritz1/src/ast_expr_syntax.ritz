@@ -381,92 +381,82 @@ pub fn const_resolve(consts: *ConstEntry, c: *ConstEntry) -> i32
     if c.fold_state != CONST_FOLD_PENDING
         return 0
     c.fold_state = CONST_FOLD_ACTIVE
-    var v: i64 = 0
-    if c.value_expr != null and const_fold_int(consts, c.value_expr, 1, @v) == 1
-        c.value = const_wrap_to_type(c.const_type, v)
-        c.fold_state = CONST_FOLD_DONE
-        return 1
+    if c.value_expr != null
+        match const_fold_int(consts, c.value_expr, 1)
+            Some(v) =>
+                c.value = const_wrap_to_type(c.const_type, v)
+                c.fold_state = CONST_FOLD_DONE
+                return 1
+            None => pass
     c.fold_state = CONST_FOLD_BAD
     0
 
 # The value of the integer const `name` in `consts` (first occurrence wins,
 # as in the emitter's const_map).  With resolve == 0 (parse time) only an
 # already-folded const counts; with resolve == 1 (emit time, every module
-# merged) a PENDING one is resolved first.
-fn const_fold_ident(consts: *ConstEntry, name_sv: StrView, resolve: i32, out: *i64) -> i32
+# merged) a PENDING one is resolved first.  None when the name is no
+# folded integer const.
+fn const_fold_ident(consts: *ConstEntry, name_sv: StrView, resolve: i32) -> Option<i64>
     var c: *ConstEntry = consts
     while c != null
         if const_name_eq(c, name_sv) == 1
             if c.fold_state == CONST_FOLD_PENDING and resolve == 1
                 const_resolve(consts, c)
             if c.fold_state != CONST_FOLD_DONE
-                return 0
+                return None
             # A float/struct const's `value` is not its value.
             if is_int_const_type(c.const_type) == 0
-                return 0
-            *out = c.value
-            return 1
+                return None
+            return Some(c.value)
         c = c.next
-    0
+    None
 
-# Fold a constant integer expression into *out: int / char / bool literals,
+# The value of a constant integer expression: int / char / bool literals,
 # unary - ~ !, `as` casts (the value is kept; the const's own type governs its
 # use), binary arithmetic, bitwise, shift, comparison and logical operators,
-# and references to integer consts in `consts`.  Returns 1 on success, 0 if
-# `e` is not such an expression (a call, an unknown name, division by zero,
-# an out-of-range shift, ...).
-pub fn const_fold_int(consts: *ConstEntry, e: *Expr, resolve: i32, out: *i64) -> i32
+# and references to integer consts in `consts`.  None if `e` is not such an
+# expression (a call, an unknown name, division by zero, an out-of-range
+# shift, ...).
+pub fn const_fold_int(consts: *ConstEntry, e: *Expr, resolve: i32) -> Option<i64>
     if e == null
-        return 0
+        return None
     match e.kind
         ExprKind.IntLit | ExprKind.CharLit =>
-            *out = e.int_val
-            return 1
+            return Some(e.int_val)
         ExprKind.Ident =>
-            return const_fold_ident(consts, e.ident, resolve, out)
+            return const_fold_ident(consts, e.ident, resolve)
         ExprKind.Cast =>
-            return const_fold_int(consts, e.left, resolve, out)
+            return const_fold_int(consts, e.left, resolve)
         ExprKind.Unary =>
-            var x: i64 = 0
-            if const_fold_int(consts, e.operand, resolve, @x) == 0
-                return 0
+            let x: i64 = const_fold_int(consts, e.operand, resolve)?
             # The i64 holds u64 values too (0x8000000000000000 is i64::MIN), so
             # negation is two's complement and wraps by design (LARB R63).
             match e.op
                 OpKind.Neg =>
-                    *out = 0 -% x
-                    return 1
+                    return Some(0 -% x)
                 OpKind.BitNot =>
-                    *out = 0 -% x -% 1
-                    return 1
+                    return Some(0 -% x -% 1)
                 OpKind.Not =>
                     if x == 0
-                        *out = 1
-                    else
-                        *out = 0
-                    return 1
+                        return Some(1)
+                    return Some(0)
                 _ => pass
-            return 0
+            return None
         ExprKind.Binary =>
-            var a: i64 = 0
-            var b: i64 = 0
-            if const_fold_int(consts, e.left, resolve, @a) == 0
-                return 0
-            if const_fold_int(consts, e.right, resolve, @b) == 0
-                return 0
+            let a: i64 = const_fold_int(consts, e.left, resolve)?
+            let b: i64 = const_fold_int(consts, e.right, resolve)?
             # AGAST #2356: the i64 `a` has lost whether it was a u64.
             if e.op == OpKind.Shr and b >= 0 and b <= 63 and const_expr_is_u64(consts, e.left) == 1
-                *out = ((a as u64) >> (b as u64)) as i64
-                return 1
+                return Some(((a as u64) >> (b as u64)) as i64)
             # AGAST #3062: so are `/`, `%` and the ordering compares over a u64.
             if const_fold_unsigned_op(e.op) == 1
                 if const_expr_is_u64(consts, e.left) == 1 or const_expr_is_u64(consts, e.right) == 1
-                    return const_fold_unsigned(e.op, a as u64, b as u64, out)
+                    return const_fold_unsigned(e.op, a as u64, b as u64)
             if const_fold_traps(consts, e, a, b) == 1
-                return 0   # LARB R63 (AGAST #3489): const_overflow_site names it
-            return const_fold_binary(e.op, a, b, out)
+                return None   # LARB R63 (AGAST #3489): const_overflow_site names it
+            return const_fold_binary(e.op, a, b)
         _ => pass
-    0
+    None
 
 # =============================================================================
 # Integer overflow (LARB R63, AGAST #3489)
@@ -564,10 +554,12 @@ pub fn const_overflow_site(consts: *ConstEntry, e: *Expr, resolve: i32) -> *Expr
     let inner_r: *Expr = const_overflow_site(consts, e.right, resolve)
     if inner_r != null
         return inner_r
-    var a: i64 = 0
-    var b: i64 = 0
-    if const_fold_int(consts, e.left, resolve, @a) == 0 or const_fold_int(consts, e.right, resolve, @b) == 0
-        return null
+    let a: i64 = match const_fold_int(consts, e.left, resolve)
+        Some(v) => v
+        None => return null
+    let b: i64 = match const_fold_int(consts, e.right, resolve)
+        Some(v) => v
+        None => return null
     if const_fold_traps(consts, e, a, b) == 1
         return e
     null
@@ -619,13 +611,14 @@ fn const_fold_unsigned_op(op: OpKind) -> i32
         return 1
     0
 
-# `op` (one const_fold_unsigned_op accepts) on two u64 operands.
-fn const_fold_unsigned(op: OpKind, a: u64, b: u64, out: *i64) -> i32
+# `op` (one const_fold_unsigned_op accepts) on two u64 operands, as the i64
+# holding its bit pattern; None for a division by zero.
+pub fn const_fold_unsigned(op: OpKind, a: u64, b: u64) -> Option<i64>
     var r: u64 = 0
     match op
         OpKind.Div | OpKind.Mod =>
             if b == 0
-                return 0
+                return None
             if op == OpKind.Div
                 r = a / b
             else
@@ -642,46 +635,43 @@ fn const_fold_unsigned(op: OpKind, a: u64, b: u64, out: *i64) -> i32
         _ =>
             if a >= b
                 r = 1
-    *out = r as i64
-    1
+    Some(r as i64)
 
 # Folding wraps: a plain `+ - *` that would wrap, and signed MIN / -1, were
 # refused before here (const_fold_traps, LARB R63), so what reaches this is
-# `+%` and its kin, or a value that fits.
-fn const_fold_binary(op: OpKind, a: i64, b: i64, out: *i64) -> i32
+# `+%` and its kin, or a value that fits.  None for a division by zero, a
+# shift out of 0..63, or an operator that is not a binary one.
+pub fn const_fold_binary(op: OpKind, a: i64, b: i64) -> Option<i64>
     match op
         OpKind.Add =>
-            *out = a +% b
+            return Some(a +% b)
         OpKind.Sub =>
-            *out = a -% b
+            return Some(a -% b)
         OpKind.Mul =>
-            *out = a *% b
+            return Some(a *% b)
         OpKind.Div | OpKind.Mod =>
             if b == 0
-                return 0
+                return None
             if op == OpKind.Div
-                *out = a / b
-            else
-                *out = a % b
+                return Some(a / b)
+            return Some(a % b)
         OpKind.BitAnd =>
-            *out = a & b
+            return Some(a & b)
         OpKind.BitOr =>
-            *out = a | b
+            return Some(a | b)
         OpKind.BitXor =>
-            *out = a ^ b
+            return Some(a ^ b)
         OpKind.Shl | OpKind.Shr =>
             if b < 0 or b > 63
-                return 0
+                return None
             if op == OpKind.Shl
-                *out = a << b
-            else
-                *out = a >> b
-        _ =>
-            let t: i32 = const_fold_compare(op, a, b)
-            if t < 0
-                return 0
-            *out = t as i64
-    1
+                return Some(a << b)
+            return Some(a >> b)
+        _ => pass
+    let t: i32 = const_fold_compare(op, a, b)
+    if t < 0
+        return None
+    Some(t as i64)
 
 # 1 / 0 for a comparison or logical operator, -1 if `op` is neither.
 fn const_fold_compare(op: OpKind, a: i64, b: i64) -> i32
@@ -1099,19 +1089,24 @@ fn tn_drop_after_as(p: *Parser)
         p.ctx.tn_pending = p.ctx.tn_pending.next
 
 pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem: *TypeRef) -> *TypeRef
+    var folded: Option<i64> = const_fold_int(p.module.constants, len_expr, 0)
+    match folded
+        Some(_) => pass
+        None =>
+            if p.ctx.array_len_seed != null
+                folded = const_fold_int(p.ctx.array_len_seed, len_expr, 1)
     var v: i64 = 0
-    var folded: i32 = const_fold_int(p.module.constants, len_expr, 0, @v)
-    if folded == 0 and p.ctx.array_len_seed != null
-        folded = const_fold_int(p.ctx.array_len_seed, len_expr, 1, @v)
-    if folded == 0
-        if p.ctx.array_len_reparse == 0
-            p.ctx.array_len_pending = 1
-        else if array_len_overflow(p, len_expr) == 0
-            array_len_report(p.ctx, line, col, "is not a constant integer expression")
-        v = 0
-    else if v < 0 or v > 2147483647
-        array_len_report(p.ctx, line, col, "is out of range (it must be 0 to 2147483647)")
-        v = 0
+    match folded
+        Some(n) =>
+            v = n
+            if v < 0 or v > 2147483647
+                array_len_report(p.ctx, line, col, "is out of range (it must be 0 to 2147483647)")
+                v = 0
+        None =>
+            if p.ctx.array_len_reparse == 0
+                p.ctx.array_len_pending = 1
+            else if array_len_overflow(p, len_expr) == 0
+                array_len_report(p.ctx, line, col, "is not a constant integer expression")
     type_array_sized(p, v as i32, elem)
 
 # The backtracking parser re-runs an action each time it retries the
@@ -1311,49 +1306,36 @@ pub fn type_alias_find(ctx: *ParseCtx, name_sv: StrView) -> *AliasEntry
     return null
 
 # Spelling of a primitive type argument, as ritz0 mangles it (its type
-# name).  Returns its length (0 for a non-primitive) and the view in *out.
-# AGAST #1922: only u8/i8/i32/i64/u64 were spelled, so `Option<u32>` mangled
-# as `Option$` and tagged_enum_layout could not measure it.  AGAST #4780:
-# `out` is `*StrView`, not `**u8` — a literal-spelling out-param always holds
-# Ritz text, never a C string.
-pub fn primitive_arg_spelling(ty: TypeKind, out: *StrView) -> i32
+# name); None for a non-primitive.  AGAST #1922: only u8/i8/i32/i64/u64 were
+# spelled, so `Option<u32>` mangled as `Option$` and tagged_enum_layout could
+# not measure it.  AGAST #4780, #4926: the spelling is a StrView, returned,
+# not written through an out-param beside a length.
+pub fn primitive_arg_spelling(ty: TypeKind) -> Option<StrView>
     match ty
         TypeKind.U8 =>
-            *out = "u8"
-            return 2
+            return Some("u8")
         TypeKind.I8 =>
-            *out = "i8"
-            return 2
+            return Some("i8")
         TypeKind.U16 =>
-            *out = "u16"
-            return 3
+            return Some("u16")
         TypeKind.I16 =>
-            *out = "i16"
-            return 3
+            return Some("i16")
         TypeKind.U32 =>
-            *out = "u32"
-            return 3
+            return Some("u32")
         TypeKind.I32 =>
-            *out = "i32"
-            return 3
+            return Some("i32")
         TypeKind.U64 =>
-            *out = "u64"
-            return 3
+            return Some("u64")
         TypeKind.I64 =>
-            *out = "i64"
-            return 3
+            return Some("i64")
         TypeKind.F32 =>
-            *out = "f32"
-            return 3
+            return Some("f32")
         TypeKind.F64 =>
-            *out = "f64"
-            return 3
+            return Some("f64")
         TypeKind.Bool =>
-            *out = "bool"
-            return 4
+            return Some("bool")
         _ => pass
-    *out = strview_empty()
-    return 0
+    None
 
 # spell_ptr_generic_arg over explicit parts, so an alias table entry (which
 # saved the same fields) spells without replaying itself into p.
@@ -1369,21 +1351,17 @@ pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, 
         # procedure.
         depth = ptr_ptr_slot_levels(inner)
         leaf = ptr_ptr_slot_inner(inner)
-    var base: *u8 = null
-    var base_len: i32 = 0
-    if leaf == TypeKind.Struct
-        base = type_name.ptr
-        base_len = (type_name.len as i32)
-    else
-        var prim_spelled: StrView = strview_empty()
-        base_len = primitive_arg_spelling(leaf, @prim_spelled)
-        base = prim_spelled.ptr
-    if base_len <= 0
+    var base: StrView = type_name
+    if leaf != TypeKind.Struct
+        base = match primitive_arg_spelling(leaf)
+            Some(sp) => sp
+            None => return strview_empty()
+    if (base.len as i32) <= 0
         return strview_empty()
-    var c: ParserChain = parser_chain_new(p, (depth * 4 + base_len) as i64)
+    var c: ParserChain = parser_chain_new(p, (depth * 4) as i64 + base.len)
     for d in 0..depth
         parser_chain_push(p, c, "ptr_")
-    parser_chain_push(p, c, StrView { ptr: (base), len: (base_len) as i64 })
+    parser_chain_push(p, c, base)
     return parser_chain_view(p, c)
 
 # AGAST #2037: build a single-token generic call's suffix — "$" + prefix +
@@ -1396,38 +1374,32 @@ pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, 
 # Anything else spells as the token text.  Reads the table without touching
 # parser state.
 pub fn generic_tok_suffix(p: *Parser, prefix: StrView, tok: Token) -> StrView
-    var spell: *u8 = tok.text.ptr
-    var spell_len: i32 = (tok.text.len as i32)
+    var spell: StrView = tok.text
     # AGAST #3935 (LARB R53): `usize` / `isize` spell as `u64` / `i64`, as a
     # type_spec argument does (capture_first_generic_arg): `vec_new<usize>`
     # is `vec_new$u64`, returning the `Vec$u64` a `Vec<usize>` local is.
     if is_word_type_name(tok.text) == 1
-        var word_spelled: StrView = strview_empty()
-        spell_len = primitive_arg_spelling(word_type(tok.text), @word_spelled)
-        spell = word_spelled.ptr
+        spell = match primitive_arg_spelling(word_type(tok.text))
+            Some(sp) => sp
+            None => strview_empty()
     else if p.ctx.alias_count > 0
         let e: *AliasEntry = type_alias_find(p.ctx, tok.text)
         if e != null
-            var n: i32 = 0
+            var target: StrView = strview_empty()
             match e.kind
                 TypeKind.Struct =>
-                    spell = e.type_name.ptr
-                    n = e.type_name.len as i32
+                    target = e.type_name
                 TypeKind.Ptr | TypeKind.PtrPtr =>
-                    let spelled_sv: StrView = spell_ptr_parts(p, e.kind, e.pointee_type, e.inner_pointee_type, e.type_name)
-                    spell = spelled_sv.ptr
-                    n = spelled_sv.len as i32
+                    target = spell_ptr_parts(p, e.kind, e.pointee_type, e.inner_pointee_type, e.type_name)
                 _ =>
-                    var alias_spelled: StrView = strview_empty()
-                    n = primitive_arg_spelling(e.kind, @alias_spelled)
-                    spell = alias_spelled.ptr
+                    target = match primitive_arg_spelling(e.kind)
+                        Some(sp) => sp
+                        None => strview_empty()
             # A target with no spelling (array, fn type, ...) keeps the alias
             # name: no worse than before, and the mismatch stays visible.
-            if n > 0
-                spell_len = n
-            else
-                spell = tok.text.ptr
-    return parser_join3(p, "$", prefix, StrView { ptr: (spell), len: (spell_len) as i64 })
+            if (target.len as i32) > 0
+                spell = target
+    return parser_join3(p, "$", prefix, spell)
 
 # Mangled spelling of one argument: the primitive's name, or the captured
 # struct/generic/pointer name.  The one speller for generic type annotations,
@@ -1439,9 +1411,9 @@ pub fn generic_arg_spelling(ga: *GenericArg) -> StrView
     # `usize` is TypeKind.U64 now; its spelling is unchanged.
     if (ty_int_bits(ga.ty) == 64) and ga.name.ptr != null and (ga.name.len as i32) > 0
         return ga.name
-    var prim_spelled: StrView = strview_empty()
-    primitive_arg_spelling(ga.ty, @prim_spelled)
-    prim_spelled
+    match primitive_arg_spelling(ga.ty)
+        Some(sp) => sp
+        None => strview_empty()
 
 # Mangle `base<a1, a2, ...>` as "base$a1$a2..." (AGAST #1574), from the
 # captured argument list.  Returns an arena-allocated, NUL-terminated name
@@ -2594,17 +2566,15 @@ fn int_lit_suffix_type(start: StrView) -> TypeKind
     TypeKind.Void
 
 # The value of an integer literal (literal_slot.ritz, the emitter's R21
-# operand typing), `-1` included: 1, and `out` set, if it is one.
-pub fn lit_int_value(e: *Expr, out: *i64) -> i32
+# operand typing), `-1` included; None if `e` is no plain integer literal.
+pub fn lit_int_value(e: *Expr) -> Option<i64>
     if e.kind == ExprKind.IntLit and e.lit_kind == LIT_PLAIN
-        *out = e.int_val
-        return 1
+        return Some(e.int_val)
     if e.kind == ExprKind.Unary and e.op == OpKind.Neg and e.operand != null
         if e.operand.kind == ExprKind.IntLit and e.operand.lit_kind == LIT_PLAIN
             # `-9223372036854775808`: the negation wraps, by request (R63).
-            *out = 0 -% e.operand.int_val
-            return 1
-    0
+            return Some(0 -% e.operand.int_val)
+    None
 
 # A NUMBER token's base and its digits: the text after a `0x` / `0b`
 # prefix, a type suffix (`42i32`) included.
