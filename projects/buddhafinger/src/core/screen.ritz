@@ -15,7 +15,8 @@
 #
 # render_styled(@&scr, @lines, @&view, @&styler, status, "") colors the text
 # by a LineStyler's runs (syntax/highlight.ritz's Highlighter gives the
-# lexical colors); render draws it plain.
+# lexical colors); render draws it plain. A view.selection (Visual mode) is
+# drawn in reverse video over the colors.
 #
 # Layout, top to bottom: the text area (a line-number gutter, then the
 # lines from view.top, horizontally scrolled by view.left cells; rows past
@@ -120,6 +121,12 @@ pub fn style_status() -> Style
     var s = style_plain()
     s.reverse = true
     s
+
+# `s` as a selected cell draws it: reversed, its colors kept.
+fn style_selected(s: Style) -> Style
+    var out = s
+    out.reverse = true
+    out
 
 pub fn color_eq(a: Color, b: Color) -> bool
     match a
@@ -502,16 +509,44 @@ fn cell_of(cp: @&Checkpoints, l: i64, bytes: [u8], byte: i64) -> i64
 # The view and the status line
 # ============================================================================
 
+# What Visual mode selects, from its first end to its last. Charwise, both
+# ends are code points the selection includes (the code point starting at
+# each byte); an end on a line's end selects that line's break. Linewise,
+# the lines from_line..=to_line whole (from_byte 0, to_byte their last
+# line's length).
+pub struct Selection
+    from_line: i64
+    from_byte: i64
+    to_line: i64
+    to_byte: i64
+    lines: bool
+
+impl Selection
+    # True when the code point starting at byte `byte` of line l is
+    # selected; `byte` at the line's end stands for its break.
+    pub fn covers(self: @Selection, l: i64, byte: i64) -> bool
+        let after_from = l > self.from_line or (l == self.from_line and byte >= self.from_byte)
+        let before_to = l < self.to_line or (l == self.to_line and byte <= self.to_byte)
+        after_from and before_to
+
+    # True when the cell after line l's `len` bytes shows as selected: its
+    # break, charwise; linewise only an empty line's, so it shows at all.
+    pub fn covers_break(self: @Selection, l: i64, len: i64) -> bool
+        if self.lines
+            return len == 0 and self.covers(l, 0)
+        self.covers(l, len)
+
 # Where the window onto the buffer is: the first line shown, the first cell
-# column shown, and the cursor (a line and a byte in it).
+# column shown, the cursor (a line and a byte in it), and the selection.
 pub struct View
     top: i64
     left: i64
     cursor_line: i64
     cursor_byte: i64
+    selection: Option<Selection>    # None outside Visual mode
 
 pub fn view_new() -> View
-    View { top: 0, left: 0, cursor_line: 0, cursor_byte: 0 }
+    View { top: 0, left: 0, cursor_line: 0, cursor_byte: 0, selection: None }
 
 # What the status line shows besides the cursor position.
 pub struct Status
@@ -681,7 +716,7 @@ pub fn render_styled<L: LineSource, S: LineStyler>(scr: @&Screen, src: @L, view:
         if l < count
             draw_number(@&scr.back, r, gutter, l + 1)
             let bytes = src.line(l)
-            draw_line(scr, r, gutter, l, bytes, view.left, styler.runs(l, bytes))
+            draw_line(scr, r, gutter, l, bytes, view.left, styler.runs(l, bytes), view.selection)
         else
             scr.back.set(r, 0, Cell { ch: '~' as u32, style: style_filler() })
 
@@ -703,8 +738,8 @@ fn draw_number(g: @&Grid, r: i64, gutter: i64, n: i64)
     g.put(r, gutter - 1 - digits.len, gutter - 1, span_from_strview(digits), style_gutter())
 
 # Line l's cells from cell column `left`, at columns gutter.. of row r, in
-# the colors `runs` give its bytes.
-fn draw_line(scr: @&Screen, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64, runs: [StyleRun])
+# the colors `runs` give its bytes, reversed where `sel` covers them.
+fn draw_line(scr: @&Screen, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64, runs: [StyleRun], sel: Option<Selection>)
     let end = left + scr.back.cols - gutter
     var sc = scan_from(@&scr.marks, l, bytes, true, left)
     var ri: i64 = 0                 # the first run not wholly before sc.byte
@@ -716,11 +751,27 @@ fn draw_line(scr: @&Screen, r: i64, gutter: i64, l: i64, bytes: [u8], left: i64,
         var style = style_text()
         if ri < runs.len and runs[ri].start <= sc.byte
             style = runs[ri].style
+        var cell_style = unit_style(u, style)
+        if selects(sel, l, sc.byte)
+            cell_style = style_selected(cell_style)
         for k in 0..u.width
             let at = sc.cell + k
             if at >= left and at < end
-                scr.back.set(r, gutter + at - left, Cell { ch: glyph_char(u, k), style: unit_style(u, style) })
+                scr.back.set(r, gutter + at - left, Cell { ch: glyph_char(u, k), style: cell_style })
         sc.advance(@&scr.marks, u)
+    # A selected line break: one blank cell after the text.
+    if sc.done() and sc.cell >= left and sc.cell < end and selects_break(sel, l, bytes.len)
+        scr.back.set(r, gutter + sc.cell - left, Cell { ch: ' ' as u32, style: style_selected(style_text()) })
+
+fn selects(sel: Option<Selection>, l: i64, byte: i64) -> bool
+    match sel
+        Some(s) => s.covers(l, byte)
+        None => false
+
+fn selects_break(sel: Option<Selection>, l: i64, len: i64) -> bool
+    match sel
+        Some(s) => s.covers_break(l, len)
+        None => false
 
 # ` MODE  name [+]  lang` from the left, `line:col ` from the right, reversed.
 fn draw_status(g: @&Grid, r: i64, status: Status, line: i64, col: i64)

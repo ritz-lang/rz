@@ -1,4 +1,4 @@
-# core/normal.ritz - Normal-mode keys into commands.
+# core/normal.ritz - Normal- and Visual-mode keys into commands.
 #
 # Vim's Normal-mode grammar: `[count] command`, or `[count] operator [count]
 # motion`, where an operator typed twice (dd cc yy) means the cursor's lines
@@ -9,6 +9,12 @@
 #
 # `0` is a motion unless it continues a count. `gj` and `gk` are j and k:
 # with no soft wrap a screen line is a buffer line.
+#
+# Visual mode (Keymap.Visual) has the same counts and motions, but an
+# operator takes the selection at once (d x c s y), `o` and `O` swap the
+# selection's ends, v and V switch shape or leave, gv swaps with the last
+# selection and Escape leaves. Keys with no Visual meaning yet (D C Y,
+# i a for text objects, u, Ctrl-R, : / K gd Ctrl-O) cancel.
 # Core module: no terminal or OS I/O (see src/platform/).
 
 import ritzlib.option { Option }
@@ -16,6 +22,16 @@ import ritzlib.termsession { Key }
 
 # The largest count kept: more digits leave it there, as Vim does.
 pub const MAX_COUNT: i64 = 99_999_999
+
+# Which keys' meanings apply: Normal mode's, or Visual mode's.
+pub enum Keymap
+    Normal
+    Visual
+
+# What a selection holds: code points (v), or whole lines (V).
+pub enum Shape
+    Chars
+    Lines
 
 pub enum Operator
     Delete          # d
@@ -56,6 +72,11 @@ pub enum Action
     Hover           # K
     Definition      # gd
     JumpBack        # Ctrl-O, Ctrl-T
+    Select(Shape)   # v V: start a selection, or in one switch shape or leave
+    Reselect        # gv
+    SwapEnds        # o O in Visual mode
+    OperateSelection(Operator)  # d x c s y in Visual mode
+    Leave           # Escape in Visual mode
 
 pub struct NormalCommand
     action: Action
@@ -93,13 +114,13 @@ impl NormalKeys
     pub fn is_idle(self: @NormalKeys) -> bool
         self.count == 0 and self.op.is_none() and not self.g
 
-    # One more typed key.
-    pub fn feed(self: @&NormalKeys, key: Key) -> Step
+    # One more typed key, meaning what it does in `map`.
+    pub fn feed(self: @&NormalKeys, key: Key, map: Keymap) -> Step
         let c: u8 = match key
             Key.Char(ch) => if ch < 0x80 then ch as u8 else 0
             _ => 0
         if self.g
-            return self.after_g(c)
+            return self.after_g(c, map)
         if (c >= '1' and c <= '9') or (c == '0' and self.count > 0)
             let digit = (c - '0') as i64
             self.count = if self.count > (MAX_COUNT - digit) / 10 then MAX_COUNT else self.count * 10 + digit
@@ -109,21 +130,33 @@ impl NormalKeys
             Key.Right => self.motion(Motion.Right)
             Key.Up => self.motion(Motion.Up)
             Key.Down => self.motion(Motion.Down)
-            Key.Ctrl(k) => self.ctrl(k)
-            Key.Char(_) => self.char(c)
+            Key.Ctrl(k) => self.ctrl(k, map)
+            Key.Escape => self.escape(map)
+            Key.Char(_) => self.char(c, map)
             _ => self.cancel()
 
+    # Escape leaves Visual mode; in Normal mode it drops what was typed.
+    fn escape(self: @&NormalKeys, map: Keymap) -> Step
+        match map
+            Keymap.Visual => self.run(Action.Leave)
+            Keymap.Normal => self.cancel()
+
     # The second key of a g command.
-    fn after_g(self: @&NormalKeys, c: u8) -> Step
+    fn after_g(self: @&NormalKeys, c: u8, map: Keymap) -> Step
         self.g = false
         match c
             'g' => self.motion(Motion.FirstLine)
             'j' => self.motion(Motion.Down)
             'k' => self.motion(Motion.Up)
-            'd' => self.action(Action.Definition)
+            'v' => self.action(Action.Reselect)
+            'd' => if map == Keymap.Visual then self.cancel() else self.action(Action.Definition)
             _ => self.cancel()
 
-    fn ctrl(self: @&NormalKeys, k: u8) -> Step
+    # Ctrl and a key. In Visual mode only the page turns (Ctrl-F, Ctrl-B),
+    # which move the cursor end.
+    fn ctrl(self: @&NormalKeys, k: u8, map: Keymap) -> Step
+        if map == Keymap.Visual and k != 'f' and k != 'b'
+            return self.cancel()
         match k
             'f' => self.action(Action.PageDown)
             'b' => self.action(Action.PageUp)
@@ -131,7 +164,24 @@ impl NormalKeys
             'o' | 't' => self.action(Action.JumpBack)
             _ => self.cancel()
 
-    fn char(self: @&NormalKeys, c: u8) -> Step
+    fn char(self: @&NormalKeys, c: u8, map: Keymap) -> Step
+        match map
+            Keymap.Visual => self.visual_char(c)
+            Keymap.Normal => self.normal_char(c)
+
+    # A key in Visual mode: an operator takes the selection, and the keys
+    # that move, switch, put or search mean what they do in Normal mode.
+    fn visual_char(self: @&NormalKeys, c: u8) -> Step
+        match c
+            'd' | 'x' => self.action(Action.OperateSelection(Operator.Delete))
+            'c' | 's' => self.action(Action.OperateSelection(Operator.Change))
+            'y' => self.action(Action.OperateSelection(Operator.Yank))
+            'o' | 'O' => self.action(Action.SwapEnds)
+            # Vim's linewise D C Y and its text objects (i a) come later.
+            'D' | 'C' | 'Y' | 'i' | 'a' | 'u' | ':' | '/' | 'K' => self.cancel()
+            _ => self.normal_char(c)
+
+    fn normal_char(self: @&NormalKeys, c: u8) -> Step
         match c
             'h' => self.motion(Motion.Left)
             'l' => self.motion(Motion.Right)
@@ -146,6 +196,8 @@ impl NormalKeys
             'g' =>
                 self.g = true
                 Step.Wait
+            'v' => self.action(Action.Select(Shape.Chars))
+            'V' => self.action(Action.Select(Shape.Lines))
             'd' => self.operator(Operator.Delete)
             'c' => self.operator(Operator.Change)
             'y' => self.operator(Operator.Yank)

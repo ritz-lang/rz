@@ -1,14 +1,16 @@
-# test/test_normal.ritz - Normal-mode keys into commands (AGAST #4909).
+# test/test_normal.ritz - Normal- and Visual-mode keys into commands
+# (AGAST #4909, #4910).
 #
 # core/normal.ritz's decoder alone: counts before and after an operator, an
-# operator typed twice, the g prefix, the shorthands (x D C Y), and the keys
-# that cancel what was typed. test_editor.ritz runs the commands.
+# operator typed twice, the g prefix, the shorthands (x D C Y), the keys
+# that cancel what was typed, and Visual mode's own meanings for keys.
+# test_editor.ritz runs the commands.
 
 import ritzlib.option
 import ritzlib.strview
 import ritzlib.termsession { Key }
 
-import core.normal { Action, Motion, NormalCommand, NormalKeys, Operator, Step, MAX_COUNT, normal_keys_new }
+import core.normal { Action, Keymap, Motion, NormalCommand, NormalKeys, Operator, Shape, Step, MAX_COUNT, normal_keys_new }
 
 # ============================================================================
 # Helpers
@@ -20,7 +22,15 @@ fn step_of(keys: StrView) -> Step
     var nk = normal_keys_new()
     step_after(@&nk, keys)
 
+# step_of, in Visual mode's keymap.
+fn visual_step_of(keys: StrView) -> Step
+    var nk = normal_keys_new()
+    step_in(@&nk, Keymap.Visual, keys)
+
 fn step_after(nk: @&NormalKeys, keys: StrView) -> Step
+    step_in(nk, Keymap.Normal, keys)
+
+fn step_in(nk: @&NormalKeys, map: Keymap, keys: StrView) -> Step
     var last = Step.Wait
     var i: i64 = 0
     while i < keys.len
@@ -28,12 +38,12 @@ fn step_after(nk: @&NormalKeys, keys: StrView) -> Step
             let close = keys.slice(i, keys.len).find_byte('>')
             let name = keys.slice(i + 1, i + close)
             if name.eq("esc")
-                last = nk.feed(Key.Escape)
+                last = nk.feed(Key.Escape, map)
             else
-                last = nk.feed(Key.Ctrl(name.get(2)))
+                last = nk.feed(Key.Ctrl(name.get(2)), map)
             i += close + 1
             continue
-        last = nk.feed(Key.Char(keys.get(i) as u32))
+        last = nk.feed(Key.Char(keys.get(i) as u32), map)
         i += 1
     last
 
@@ -56,6 +66,50 @@ fn operates(keys: StrView, o: Operator, m: Motion, count: i64) -> bool
             Action.Operate(got_o, got_m) => got_o == o and got_m == m and c.count == count
             _ => false
         None => false
+
+# The Visual-mode action `keys` complete, or None when they wait or cancel.
+fn visual_action_of(keys: StrView) -> Option<Action>
+    match visual_step_of(keys)
+        Step.Run(c) => Some(c.action)
+        Step.Wait | Step.Cancel => None
+
+fn visual_moves(keys: StrView, m: Motion) -> bool
+    match visual_action_of(keys)
+        Some(a) => match a
+            Action.Move(got) => got == m
+            _ => false
+        None => false
+
+fn on_selection(keys: StrView, o: Operator) -> bool
+    match visual_action_of(keys)
+        Some(a) => match a
+            Action.OperateSelection(got) => got == o
+            _ => false
+        None => false
+
+fn selects(a: Option<Action>, shape: Shape) -> bool
+    match a
+        Some(got) => match got
+            Action.Select(s) => s == shape
+            _ => false
+        None => false
+
+fn reselects(a: Option<Action>) -> bool
+    match a
+        Some(got) => match got
+            Action.Reselect => true
+            _ => false
+        None => false
+
+fn normal_action_of(keys: StrView) -> Option<Action>
+    match command_of(keys)
+        Some(c) => Some(c.action)
+        None => None
+
+fn visual_cancels(keys: StrView) -> bool
+    match visual_step_of(keys)
+        Step.Cancel => true
+        _ => false
 
 fn cancels(keys: StrView) -> bool
     match step_of(keys)
@@ -207,4 +261,79 @@ fn test_commands_without_a_motion_keep_their_count() -> i32
                 assert c.count == 2
             _ => return 7
         None => return 8
+    0
+
+# ============================================================================
+# Visual mode (AGAST #4910)
+# ============================================================================
+
+[[test]]
+fn test_v_V_and_gv_start_a_selection() -> i32
+    assert selects(normal_action_of("v"), Shape.Chars)
+    assert selects(normal_action_of("V"), Shape.Lines)
+    assert reselects(normal_action_of("gv"))
+    0
+
+[[test]]
+fn test_in_visual_v_and_V_switch_or_leave_and_gv_reselects() -> i32
+    assert selects(visual_action_of("v"), Shape.Chars)
+    assert selects(visual_action_of("V"), Shape.Lines)
+    assert reselects(visual_action_of("gv"))
+    0
+
+[[test]]
+fn test_in_visual_the_motions_and_their_counts_move() -> i32
+    assert visual_moves("w", Motion.WordForward)
+    assert visual_moves("$", Motion.LineEnd)
+    assert visual_moves("gg", Motion.FirstLine)
+    assert visual_moves("G", Motion.LastLine)
+    match visual_step_of("3j")
+        Step.Run(c) =>
+            assert c.count == 3
+        Step.Wait | Step.Cancel => return 1
+    0
+
+[[test]]
+fn test_in_visual_an_operator_takes_the_selection_at_once() -> i32
+    assert on_selection("d", Operator.Delete)
+    assert on_selection("x", Operator.Delete)
+    assert on_selection("c", Operator.Change)
+    assert on_selection("s", Operator.Change)
+    assert on_selection("y", Operator.Yank)
+    0
+
+[[test]]
+fn test_in_visual_o_swaps_the_ends_and_escape_leaves() -> i32
+    match visual_action_of("o")
+        Some(a) => match a
+            Action.SwapEnds => pass
+            _ => return 1
+        None => return 2
+    match visual_action_of("<esc>")
+        Some(a) => match a
+            Action.Leave => pass
+            _ => return 3
+        None => return 4
+    match visual_action_of("2p")
+        Some(a) => match a
+            Action.PutAfter => pass
+            _ => return 5
+        None => return 6
+    0
+
+[[test]]
+fn test_in_visual_keys_with_no_visual_meaning_cancel() -> i32
+    assert visual_cancels("i")              # text objects come later
+    assert visual_cancels("a")
+    assert visual_cancels("u")              # Vim's lowercase, not undo
+    assert visual_cancels(":")
+    assert visual_cancels("/")
+    assert visual_cancels("K")
+    assert visual_cancels("gd")
+    assert visual_cancels("<C-o>")
+    assert visual_cancels("D")              # Vim's linewise D C Y come later
+    assert visual_cancels("C")
+    assert visual_cancels("Y")
+    assert visual_cancels("<C-r>")
+    assert visual_cancels("z")
     0

@@ -31,8 +31,9 @@ the monorepo's `ritz1_selfhosted`, else the one on `$PATH`.
 ## Layout
 
 - `src/core/`: the editor core (`buffer` with its undo `history` and
-  `utf8` cursor stepping, `screen`, `modes`, `commands`, `normal`, which
-  decodes Normal-mode keys (counts, operators and motions) into commands,
+  `utf8` cursor stepping, `screen`, which also draws the Visual selection,
+  `modes`, `commands`, `normal`, which decodes Normal- and Visual-mode keys
+  (counts, operators and motions) into commands,
   `editor`, which applies typed keys to the editor state, and `paint`,
   which composes one frame of it for the terminal). It does no terminal or OS
   I/O, so it is tested without a terminal: files go through the

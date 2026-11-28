@@ -1,4 +1,5 @@
-# test/test_editor.ritz - modes and the first-release command list (AGAST #4818).
+# test/test_editor.ritz - modes and the first-release command list (AGAST #4818),
+# then counts and operators (#4909) and Visual mode (#4910).
 #
 # Each command in docs/BUDDHAFINGER_PROPOSAL.md's "First usable release"
 # table, driven by key sequences, asserting the buffer, the cursor and the
@@ -1000,4 +1001,149 @@ fn test_jump_stack_keeps_the_newest() -> i32
     feed(@&ed, @&d, "<C-o>")
     assert ed.cursor.line == (MAX_JUMPS + 3) % 3
     assert ed.path.as_view().eq("f.txt")
+    0
+
+# ============================================================================
+# Visual and Visual Line (AGAST #4910)
+# ============================================================================
+
+# The selection's other end, the one the cursor didn't move.
+fn anchor_at(ed: @Editor, line: i64, col: i64) -> bool
+    ed.anchor.line == line and ed.anchor.col == col
+
+[[test]]
+fn test_v_and_V_enter_switch_and_leave() -> i32
+    let v = run("abc", "lv")
+    assert v.mode == Mode.Visual and anchor_at(@v, 0, 1) and at(@v, 0, 1)
+    assert v.status().mode == Mode.Visual
+    assert run("abc", "V").mode == Mode.VisualLine
+    assert run("abc", "vV").mode == Mode.VisualLine
+    assert run("abc", "Vv").mode == Mode.Visual
+    assert run("abc", "vv").mode == Mode.Normal
+    assert run("abc", "VV").mode == Mode.Normal
+    let esc = run("abc", "lv<esc>")
+    assert esc.mode == Mode.Normal and at(@esc, 0, 1) and holds(@esc, "abc")
+    0
+
+[[test]]
+fn test_every_motion_moves_the_cursor_end() -> i32
+    let w = run("foo bar baz", "vw")
+    assert at(@w, 0, 4) and anchor_at(@w, 0, 0)
+    assert at(@run("foo bar baz", "v2w"), 0, 8)
+    assert at(@run("foo bar baz", "ve"), 0, 2)
+    assert at(@run("foo bar baz", "$vb"), 0, 8)
+    assert at(@run("abc\ndef", "lvj"), 1, 1)
+    assert at(@run("a\nb\nc\nd", "v2j"), 2, 0)
+    assert at(@run("a\nb\nc", "vG"), 2, 0)
+    assert at(@run("a\nb\nc", "Gvgg"), 0, 0)
+    assert at(@run("abc", "vll"), 0, 2)
+    assert at(@run("abc", "vlll"), 0, 2)                    # l stops on the last code point
+    # $ selects through the line break: the cursor sits on it.
+    assert at(@run("abc\nd", "v$"), 0, 3)
+    # Back in Normal mode the cursor returns onto a code point.
+    assert at(@run("abc\nd", "v$<esc>"), 0, 2)
+    0
+
+[[test]]
+fn test_charwise_operators_are_inclusive_of_both_ends() -> i32
+    let y = run("foo bar", "vey")
+    assert holds(@y, "foo bar") and at(@y, 0, 0) and reg_is(@y, "foo", false) and y.mode == Mode.Normal
+    let one = run("foo bar", "wvd")
+    assert holds(@one, "foo ar") and at(@one, 0, 4) and reg_is(@one, "b", false)
+    let d = run("foo bar", "lvlld")
+    assert holds(@d, "fbar") and at(@d, 0, 1) and reg_is(@d, "oo ", false)
+    assert holds(@run("foo bar", "lvllx"), "fbar")
+    # Selected backwards: the same text.
+    let back = run("abcdef", "$vhhd")
+    assert holds(@back, "abc") and at(@back, 0, 2)
+    # o swaps the ends: the cursor goes to the other one and moves from there.
+    let o = run("abcdef", "lvllo")
+    assert at(@o, 0, 1) and anchor_at(@o, 0, 3)
+    assert holds(@run("abcdef", "lvllohd"), "ef")
+    0
+
+[[test]]
+fn test_charwise_across_lines() -> i32
+    let d = run("abc\ndef", "lvjd")
+    assert holds(@d, "af") and at(@d, 0, 1) and reg_is(@d, "bc\nde", false)
+    # $ takes the line break too.
+    let eol = run("ab\ncd", "v$d")
+    assert holds(@eol, "cd") and reg_is(@eol, "ab\n", false)
+    # An empty line inside the selection is taken with its break.
+    assert holds(@run("a\n\nb\nc", "vjjd"), "\nc")
+    # The last line's break is the file's final newline: never selected.
+    assert holds(@run("ab\n", "v$d"), "\n")
+    0
+
+[[test]]
+fn test_charwise_change_and_its_insert_are_one_undo_step() -> i32
+    let c = run("foo bar", "vecX<esc>")
+    assert holds(@c, "X bar") and c.mode == Mode.Normal
+    assert holds(@run("foo bar", "vesX<esc>"), "X bar")
+    assert holds(@run("foo bar", "vecX<esc>u"), "foo bar")
+    assert holds(@run("abc\ndef", "lvjdu"), "abc\ndef")
+    0
+
+[[test]]
+fn test_linewise_operators_take_whole_lines() -> i32
+    let d = run("a\nb\nc\n", "Vd")
+    assert holds(@d, "b\nc\n") and reg_is(@d, "a\n", true) and d.mode == Mode.Normal
+    let up = run("a\nb\nc\n", "jVkd")
+    assert holds(@up, "c\n") and at(@up, 0, 0) and reg_is(@up, "a\nb\n", true)
+    assert holds(@run("a\nb\nc\nd\n", "V2jd"), "d\n")
+    let deep = run("x\n  ab\ncd\n", "jllVjd")
+    assert holds(@deep, "x\n")
+    # y: the cursor goes to the first line's start (Vim's '< for V is column 0).
+    let y = run("  ab\ncd\n", "llVjy")
+    assert holds(@y, "  ab\ncd\n") and at(@y, 0, 0) and reg_is(@y, "  ab\ncd\n", true)
+    let c = run("a\nb\nc\n", "VjcX<esc>")
+    assert holds(@c, "X\nc\n")
+    assert holds(@run("a\nb\nc\n", "VjcX<esc>u"), "a\nb\nc\n")
+    assert holds(@run("a\nb\nc\n", "Vjdu"), "a\nb\nc\n")
+    0
+
+[[test]]
+fn test_p_over_a_selection_replaces_it() -> i32
+    # Charwise over charwise: the replaced text goes to the register.
+    let p = run("foo bar", "yewvep")
+    assert holds(@p, "foo foo") and at(@p, 0, 6) and reg_is(@p, "bar", false)
+    # P keeps the register.
+    let keep = run("foo bar", "yewveP")
+    assert holds(@keep, "foo foo") and reg_is(@keep, "foo", false)
+    # Lines over lines.
+    let ll = run("a\nb\nc\n", "yyjVp")
+    assert holds(@ll, "a\na\nc\n") and at(@ll, 1, 0) and reg_is(@ll, "b\n", true)
+    # Chars over lines: the text becomes the line.
+    assert holds(@run("ab\ncd\n", "yljVp"), "ab\na\n")
+    # Lines over chars: they go on lines of their own.
+    let lc = run("abc\nX\n", "jyyklvp")
+    assert holds(@lc, "a\nX\nc\nX\n") and at(@lc, 1, 0) and reg_is(@lc, "b", false)
+    # A count repeats the register.
+    assert holds(@run("ab", "ylv3p"), "aaab")
+    # One undo step.
+    assert holds(@run("foo bar", "yewvepu"), "foo bar")
+    assert holds(@run("a\nb\nc\n", "yyjVpu"), "a\nb\nc\n")
+    # Nothing in the register: the selection just ends.
+    let none = run("abc", "vlp")
+    assert holds(@none, "abc") and none.mode == Mode.Normal
+    0
+
+[[test]]
+fn test_gv_reselects_the_last_selection() -> i32
+    let g = run("abc def", "vey<esc>wgv")
+    assert g.mode == Mode.Visual and anchor_at(@g, 0, 0) and at(@g, 0, 2)
+    assert holds(@run("abc def", "vey<esc>wgvd"), " def")
+    let lines = run("a\nb\nc\n", "Vj<esc>Ggv")
+    assert lines.mode == Mode.VisualLine
+    assert holds(@run("a\nb\nc\n", "Vj<esc>Ggvd"), "c\n")
+    # Lines deleted since: the ends move onto the text that is left.
+    let gone = run("a\nb\nc", "GVk<esc>ddddgv")
+    assert gone.mode == Mode.VisualLine and at(@gone, 0, 0)
+    # In Visual mode gv swaps with the last selection.
+    let swap = run("abc def", "vl<esc>wvegv")
+    assert anchor_at(@swap, 0, 0) and at(@swap, 0, 1)
+    let back = run("abc def", "vl<esc>wvegvgv")
+    assert back.mode == Mode.Visual and anchor_at(@back, 0, 4) and at(@back, 0, 6)
+    # Nothing selected yet: no change.
+    assert run("abc", "gv").mode == Mode.Normal
     0

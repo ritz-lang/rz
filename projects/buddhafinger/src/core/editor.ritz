@@ -2,7 +2,8 @@
 #
 # The editor state is one buffer, the cursor, the viewport's top line and
 # page height, one unnamed register, the last search pattern, the Normal-mode
-# keys typed so far (core/normal.ritz) and the command line being typed.
+# keys typed so far (core/normal.ritz), the command line being typed, and in
+# Visual mode the selection's other end (the anchor) and the last selection.
 # handle_key() applies one typed Key to it; the commands are
 # docs/BUDDHAFINGER_PROPOSAL.md's "First usable release" table, then
 # counts and operators from "Everyday code editing" (Vim behaviour
@@ -14,6 +15,9 @@
 #                 one unnamed register
 #   Counts        before a motion, a command or an operator, and after an
 #                 operator (2d3w: six words); {count}G and {count}gg name a line
+#   Visual        v V (switch shape, or leave), Escape; every motion with
+#                 counts moves the cursor end, o O swap the ends; d x c s y
+#                 and p P on the selection; gv reselects the last one
 #   Undo          u Ctrl-R; an Insert session (with the c that opened it)
 #                 is one undo step
 #   Search        / (a literal pattern), n N
@@ -34,7 +38,8 @@
 # (core/buffer.ritz). Vim doesn't show it as a line, and neither does the
 # editor: motions stop at the line before it (shown() / last()).
 # Columns are byte indexes into a line. In Normal mode the cursor sits on a
-# code point, never past the last; in Insert mode it may sit at the end.
+# code point, never past the last; in Insert mode it may sit at the end, and
+# in Visual mode too after $, where the selection takes the line break.
 # Core module: no terminal or OS I/O (see src/platform/).
 
 import ritzlib.gvec
@@ -49,8 +54,8 @@ import core.buffer { Buffer, Pos, Term, buffer_new, buffer_from_bytes, pos, pos_
 import core.commands { Command, parse_command }
 import core.files { FileStore, LoadError, SaveError }
 import core.modes { Mode }
-import core.normal { Action, Motion, NormalCommand, NormalKeys, Operator, Step, normal_keys_new }
-import core.screen { LineSource, Status }
+import core.normal { Action, Keymap, Motion, NormalCommand, NormalKeys, Operator, Shape, Step, normal_keys_new }
+import core.screen { LineSource, Selection, Status }
 import core.utf8 { utf8_encode, utf8_next, utf8_prev }
 
 pub const MSG_NOT_SAVED: StrView = "E37: No write since last change (add ! to override)"
@@ -70,6 +75,18 @@ pub enum LangAsk
     Nothing
     Hover
     Definition
+
+# A selection as Visual mode left it, for gv: its ends and shape.
+struct Selected
+    anchor: Pos
+    cursor: Pos
+    shape: Shape
+
+# A selection's ends in order: both included, `to` on a line's end
+# standing for its break.
+struct Extent
+    from: Pos
+    to: Pos
 
 # Where a jump left from: a file (jump_paths[path_at .. path_at + path_len])
 # and the cursor in it.
@@ -91,6 +108,8 @@ pub struct Editor
     pattern: Vec<u8>        # the last search pattern
     cmdline: String         # the command line: its prompt (`:` or `/`), then the text
     keys: NormalKeys        # the Normal-mode keys of a command not yet complete
+    anchor: Pos             # Visual mode: the selection's end the cursor isn't on
+    last_selection: Option<Selected>    # the last Visual selection, for gv
     message: String         # the message line
     quit: bool
     revisions: i64          # text revisions of the buffers before this one (text_revision)
@@ -106,7 +125,7 @@ pub fn editor_open(path: StrView, data: [u8]) -> Editor
     editor_with(string_from(path), buffer_from_bytes(data))
 
 fn editor_with(path: String, buf: Buffer) -> Editor
-    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), keys: normal_keys_new(), message: string_new(), quit: false, revisions: 0, ask: LangAsk.Nothing, jumps: vec_new<Jump>(), jump_paths: vec_new<u8>() }
+    Editor { buf: buf, path: path, mode: Mode.Normal, cursor: pos(0, 0), want: 0, top: 0, page: 24, reg: vec_new<u8>(), reg_lines: false, pattern: vec_new<u8>(), cmdline: string_new(), keys: normal_keys_new(), anchor: pos(0, 0), last_selection: None, message: string_new(), quit: false, revisions: 0, ask: LangAsk.Nothing, jumps: vec_new<Jump>(), jump_paths: vec_new<u8>() }
 
 # ============================================================================
 # Characters and columns
@@ -503,12 +522,16 @@ impl Editor
         Target { at: pos(line, first_non_blank(self.buf.line(line))), reach: Reach.Linewise }
 
     # A motion without an operator: the cursor goes to its target. j and k
-    # keep the column they aim for.
+    # keep the column they aim for. In Visual mode $ goes onto the line's
+    # end, so the selection takes its break.
     fn move_by(self: @&Editor, m: Motion, count: i64)
         match self.target(m, count, false)
             Some(t) =>
                 if m == Motion.Up or m == Motion.Down
                     self.cursor = t.at
+                else if m == Motion.LineEnd and self.selecting()
+                    self.cursor = t.at
+                    self.want = units_before(self.buf.line(t.at.line), t.at.col)
                 else
                     self.place(t.at)
             None => pass
@@ -700,15 +723,10 @@ impl Editor
     # p (after) and P (before): put the register `times` over by the
     # cursor, its lines by the cursor's line. One undo step.
     fn put(self: @&Editor, after: bool, times: i64)
-        if self.reg.len() == 0
-            return
-        if times > MAX_PUT / self.reg.len()
-            self.say(MSG_TOO_LONG)
-            return
+        let repeated: Vec<u8> = match self.repeated_register(times)
+            Some(r) => r
+            None => return
         let l = self.cursor.line
-        var repeated: Vec<u8> = vec_with_cap<u8>(self.reg.len() * times)
-        for k in 0..times
-            repeated.push_span(span_from_vec<u8>(@self.reg))
         let text = span_from_vec<u8>(@repeated)
         if self.reg_lines
             if not after
@@ -733,6 +751,27 @@ impl Editor
         let end = self.buf.insert(at, text)
         self.place(self.buf.prev_char(end))
 
+    # p (after) or P: by the cursor, or over the selection in Visual mode,
+    # where P keeps the register.
+    fn put_key(self: @&Editor, after: bool, times: i64)
+        if self.selecting()
+            self.put_over(not after, times)
+        else
+            self.put(after, times)
+
+    # The register `times` over, for a put. None when it is empty, or when
+    # that is more than MAX_PUT bytes, which says so.
+    fn repeated_register(self: @&Editor, times: i64) -> Option<Vec<u8>>
+        if self.reg.len() == 0
+            return None
+        if times > MAX_PUT / self.reg.len()
+            self.say(MSG_TOO_LONG)
+            return None
+        var out: Vec<u8> = vec_with_cap<u8>(self.reg.len() * times)
+        for k in 0..times
+            out.push_span(span_from_vec<u8>(@self.reg))
+        Some(out)
+
     # u, once; false when there was nothing to undo.
     fn undo(self: @&Editor) -> bool
         match self.buf.undo()
@@ -752,6 +791,131 @@ impl Editor
             None =>
                 self.say("Already at newest change")
                 false
+
+    # ------------------------------------------------------------------
+    # Visual mode
+    # ------------------------------------------------------------------
+
+    # True in Visual or Visual Line mode.
+    fn selecting(self: @Editor) -> bool
+        self.mode == Mode.Visual or self.mode == Mode.VisualLine
+
+    fn shape(self: @Editor) -> Shape
+        if self.mode == Mode.VisualLine then Shape.Lines else Shape.Chars
+
+    # The selection's ends in order; linewise, its lines whole.
+    fn extent(self: @Editor) -> Extent
+        var from = self.anchor
+        var to = self.cursor
+        if pos_before(to, from)
+            from = self.cursor
+            to = self.anchor
+        if self.mode == Mode.VisualLine
+            return Extent { from: pos(from.line, 0), to: pos(to.line, self.buf.line_len(to.line)) }
+        Extent { from: from, to: to }
+
+    # What the screen draws as selected; None outside Visual mode.
+    pub fn selection(self: @Editor) -> Option<Selection>
+        if not self.selecting()
+            return None
+        let e = self.extent()
+        Some(Selection { from_line: e.from.line, from_byte: e.from.col, to_line: e.to.line, to_byte: e.to.col, lines: self.mode == Mode.VisualLine })
+
+    # v or V: start a selection of `shape` at the cursor; in one, switch
+    # to `shape`, or leave when it is that already.
+    fn select(self: @&Editor, shape: Shape)
+        if not self.selecting()
+            self.anchor = self.cursor
+        else if self.shape() == shape
+            self.leave_visual()
+            return
+        self.mode = if shape == Shape.Lines then Mode.VisualLine else Mode.Visual
+
+    # Back to Normal mode, keeping the selection for gv; the cursor back
+    # onto a code point.
+    fn leave_visual(self: @&Editor)
+        self.last_selection = Some(Selected { anchor: self.anchor, cursor: self.cursor, shape: self.shape() })
+        self.mode = Mode.Normal
+        self.place(self.cursor)
+
+    # gv: the last selection again, its ends moved onto the text as it is
+    # now. In Visual mode the current one becomes the last.
+    fn reselect(self: @&Editor)
+        let last: Selected = match self.last_selection
+            Some(s) => s
+            None => return
+        if self.selecting()
+            self.last_selection = Some(Selected { anchor: self.anchor, cursor: self.cursor, shape: self.shape() })
+        self.place(last.anchor)
+        self.anchor = self.cursor
+        self.place(last.cursor)
+        self.mode = if last.shape == Shape.Lines then Mode.VisualLine else Mode.Visual
+
+    # o: the cursor to the selection's other end.
+    fn swap_ends(self: @&Editor)
+        let a = self.anchor
+        self.anchor = self.cursor
+        self.cursor = a
+        self.want = units_before(self.buf.line(a.line), a.col)
+
+    # Just past a charwise selection's last end: after its code point, or
+    # past its break onto the next line's start. The last shown line's
+    # break is the file's final newline, which no selection takes.
+    fn past(self: @Editor, to: Pos) -> Pos
+        if to.col < self.buf.line_len(to.line)
+            return pos(to.line, utf8_next(self.buf.line(to.line), to.col))
+        if to.line < self.last()
+            return pos(to.line + 1, 0)
+        to
+
+    # d, c or y on the selection, then Normal mode (Insert for c). The
+    # cursor goes to the selection's start, as Vim's does: for a linewise
+    # y the start of its first line.
+    fn operate_selection(self: @&Editor, op: Operator)
+        let e = self.extent()
+        let lines = self.mode == Mode.VisualLine
+        self.leave_visual()
+        if not lines
+            self.on_chars(op, e.from, self.past(e.to))
+            return
+        self.on_lines(op, e.from.line, e.to.line)
+        if op == Operator.Yank
+            self.place(e.from)
+
+    # p and P on a selection: the register, `times` over, in its place, in
+    # one undo step. p puts the replaced text in the register; P keeps it.
+    # Lines over a charwise selection go on lines of their own; a charwise
+    # register over lines becomes their text.
+    fn put_over(self: @&Editor, keep: bool, times: i64)
+        let e = self.extent()
+        let lines = self.mode == Mode.VisualLine
+        self.leave_visual()
+        let repeated: Vec<u8> = match self.repeated_register(times)
+            Some(r) => r
+            None => return
+        let text = span_from_vec<u8>(@repeated)
+        let reg_lines = self.reg_lines
+        if lines
+            if not keep
+                self.yank_lines(e.from.line, e.to.line)
+            # The selection's last terminator stays: the put lines' last goes.
+            let body = if reg_lines then text[0..text.len - trailing_term_len(text)] else text
+            self.buf.replace(e.from, e.to, body)
+            self.place_line(e.from.line)
+            return
+        let b = self.past(e.to)
+        if not keep
+            self.take(e.from, b, false)
+        if reg_lines
+            # A line break in front: the text is lines after the start's.
+            var broken: Vec<u8> = vec_with_cap<u8>(text.len + 2)
+            broken.push_span(text[text.len - trailing_term_len(text)..text.len])
+            broken.push_span(text)
+            self.buf.replace(e.from, b, span_from_vec<u8>(@broken))
+            self.place_line(e.from.line + 1)
+            return
+        let end = self.buf.replace(e.from, b, text)
+        self.place(self.buf.prev_char(end))
 
     # ------------------------------------------------------------------
     # Search
@@ -832,12 +996,16 @@ impl Editor
 pub fn handle_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
     ed.message.clear()
     match ed.mode
-        Mode.Normal =>
-            match ed.keys.feed(key)
-                Step.Run(cmd) => run_normal<F>(ed, files, cmd)
-                Step.Wait | Step.Cancel => pass
+        Mode.Normal => normal_key<F>(ed, files, key, Keymap.Normal)
+        Mode.Visual | Mode.VisualLine => normal_key<F>(ed, files, key, Keymap.Visual)
         Mode.Insert => ed.insert_key(key)
         Mode.CommandLine => command_line_key<F>(ed, files, key)
+
+# A key of a Normal- or Visual-mode command; run it once complete.
+fn normal_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key, map: Keymap)
+    match ed.keys.feed(key, map)
+        Step.Run(cmd) => run_normal<F>(ed, files, cmd)
+        Step.Wait | Step.Cancel => pass
 
 # n or N `times` over, stopping at the first miss.
 fn repeat_search(ed: @&Editor, forward: bool, times: i64)
@@ -845,9 +1013,9 @@ fn repeat_search(ed: @&Editor, forward: bool, times: i64)
     while k < times and ed.search(forward)
         k += 1
 
-# Run one Normal-mode command (core/normal.ritz decoded it). A count
-# repeats u, Ctrl-R, n, N, Ctrl-F, Ctrl-B and Ctrl-O until one fails; i, a,
-# o, O, :, /, K and gd take none.
+# Run one Normal- or Visual-mode command (core/normal.ritz decoded it). A
+# count repeats u, Ctrl-R, n, N, Ctrl-F, Ctrl-B and Ctrl-O until one fails;
+# i, a, o, O, :, /, K, gd and the Visual commands but p and P take none.
 fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
     let times = cmd.times()
     let l = ed.cursor.line
@@ -862,8 +1030,8 @@ fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
         Action.OpenAbove =>
             ed.start_insert(pos(l, 0))
             ed.buf.split_line(pos(l, 0))
-        Action.PutAfter => ed.put(true, times)
-        Action.PutBefore => ed.put(false, times)
+        Action.PutAfter => ed.put_key(true, times)
+        Action.PutBefore => ed.put_key(false, times)
         Action.Undo =>
             var k: i64 = 0
             while k < times and ed.undo()
@@ -888,6 +1056,11 @@ fn run_normal<F: FileStore>(ed: @&Editor, files: @&F, cmd: NormalCommand)
             var k: i64 = 0
             while k < times and jump_back<F>(ed, files)
                 k += 1
+        Action.Select(shape) => ed.select(shape)
+        Action.Reselect => ed.reselect()
+        Action.SwapEnds => ed.swap_ends()
+        Action.OperateSelection(op) => ed.operate_selection(op)
+        Action.Leave => ed.leave_visual()
 
 fn command_line_key<F: FileStore>(ed: @&Editor, files: @&F, key: Key)
     match key
