@@ -7,11 +7,9 @@
 # examples/tier2_stdlib/77_args checks the same text through `$(...)`, which
 # strips trailing newlines, and does not reach every error kind.
 #
-# Each case runs in a forked child with fd 1 and fd 2 on their own pipes.
-# The capture helpers are repeated in test_env_output: the runner builds one
-# harness per file.
+# Each case runs under testlib's capture: a forked child with fd 1 and fd 2
+# on their own pipes.
 
-import ritzlib.sys
 import ritzlib.io
 import ritzlib.option
 import ritzlib.result
@@ -19,67 +17,8 @@ import ritzlib.strview
 import ritzlib.span
 import ritzlib.gvec
 import ritzlib.argspec
+import ritzlib.testlib
 
-# ============================================================================
-# Capture helpers
-# ============================================================================
-
-var g_out: [4096]u8
-var g_out_len: i64 = 0
-var g_err: [4096]u8
-var g_err_len: i64 = 0
-
-fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
-    var got: i64 = 0
-    var n: i64 = 1
-    while n > 0 and got < cap
-        n = sys_read(fd, buf + got, cap - got)
-        if n > 0
-            got = got + n
-    got
-
-# 0 when buf[0..len] is exactly `want`.
-fn bytes_differ(buf: *u8, len: i64, want: StrView) -> i32
-    if len != want.len
-        return 1
-    var i: i64 = 0
-    while i < len
-        if *(buf + i) != *(want.ptr + i)
-            return 2
-        i += 1
-    0
-
-# Run case `which` in a child with stdout/stderr captured into g_out/g_err.
-# Returns the child's exit status.
-fn run_case(which: i32) -> i32
-    var o: [2]i32
-    var e: [2]i32
-    sys_pipe(@o[0])
-    sys_pipe(@e[0])
-    let pid: i32 = sys_fork()
-    if pid == 0
-        sys_dup2(o[1], 1)
-        sys_dup2(e[1], 2)
-        sys_close(o[0])
-        sys_close(o[1])
-        sys_close(e[0])
-        sys_close(e[1])
-        sys_exit(run_body(which))
-    sys_close(o[1])
-    sys_close(e[1])
-    g_out_len = read_all(o[0], @g_out[0], 4096)
-    g_err_len = read_all(e[0], @g_err[0], 4096)
-    sys_close(o[0])
-    sys_close(e[0])
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    (status >> 8) & 255
-
-fn out_is(want: StrView) -> i32
-    bytes_differ(@g_out[0], g_out_len, want)
-
-fn err_is(want: StrView) -> i32
-    bytes_differ(@g_err[0], g_err_len, want)
 
 # ============================================================================
 # Cases
@@ -171,61 +110,36 @@ fn case_help_minimal() -> i32
     many.print_help()
     0
 
-fn run_body(which: i32) -> i32
-    if which == 1
-        return case_option_errors()
-    if which == 2
-        return case_value_errors()
-    if which == 3
-        return case_help_full()
-    if which == 5
-        return case_one_letter_long()
-    if which == 6
-        return case_not_set_dashes()
-    case_help_minimal()
-
 # ============================================================================
 # Tests
 # ============================================================================
 
 [[test]]
 fn test_option_errors_exact_stderr() -> i32
-    assert run_case(1) == 0
-    assert out_is("") == 0
-    assert err_is("demo: unknown option '--bogus'\ndemo: unknown option '-z'\ndemo: option '-n' requires a value\ndemo: option '--count' requires a value\ndemo: option '--verbose' doesn't accept a value\ndemo: option '--count' has no value\ndemo: option '-q' has no value\n") == 0
+    expect_capture(case_option_errors, "", "demo: unknown option '--bogus'\ndemo: unknown option '-z'\ndemo: option '-n' requires a value\ndemo: option '--count' requires a value\ndemo: option '--verbose' doesn't accept a value\ndemo: option '--count' has no value\ndemo: option '-q' has no value\n")
     0
 
 [[test]]
 fn test_one_letter_long_keeps_double_dash() -> i32
-    assert run_case(5) == 0
-    assert out_is("") == 0
-    assert err_is("demo: unknown option '--f'\ndemo: option '--f' requires a value\ndemo: option '--f' doesn't accept a value\n") == 0
+    expect_capture(case_one_letter_long, "", "demo: unknown option '--f'\ndemo: option '--f' requires a value\ndemo: option '--f' doesn't accept a value\n")
     0
 
 [[test]]
 fn test_not_set_dashes_follow_the_spec() -> i32
-    assert run_case(6) == 0
-    assert out_is("") == 0
-    assert err_is("ns: option '--f' has no value\nns: option '-g' has no value\nns: option '--nosuch' has no value\n") == 0
+    expect_capture(case_not_set_dashes, "", "ns: option '--f' has no value\nns: option '-g' has no value\nns: option '--nosuch' has no value\n")
     0
 
 [[test]]
 fn test_value_errors_exact_stderr() -> i32
-    assert run_case(2) == 0
-    assert out_is("") == 0
-    assert err_is("demo: missing required argument 'FILE'\ndemo: too many arguments (at most 3): unexpected 'd'\ndemo: too many arguments (at most -1): unexpected 'e'\ndemo: invalid number 'abc'\n") == 0
+    expect_capture(case_value_errors, "", "demo: missing required argument 'FILE'\ndemo: too many arguments (at most 3): unexpected 'd'\ndemo: too many arguments (at most -1): unexpected 'e'\ndemo: invalid number 'abc'\n")
     0
 
 [[test]]
 fn test_help_full_exact_stdout() -> i32
-    assert run_case(3) == 0
-    assert err_is("") == 0
-    assert out_is("Usage: demo [OPTIONS] FILE...\n\nA demo program\n\nOptions:\n  -v, --verbose\n        Say more\n  -q\n        Say less\n  -n, --count=NUM\n        How many (default: 10)\n      --name=S\n        Who\n  -x N\n        Short value (default: 3)\n      --dry-run\n        Pretend\n\nArguments:\n  FILE\n        Input files\n") == 0
+    expect_capture(case_help_full, "Usage: demo [OPTIONS] FILE...\n\nA demo program\n\nOptions:\n  -v, --verbose\n        Say more\n  -q\n        Say less\n  -n, --count=NUM\n        How many (default: 10)\n      --name=S\n        Who\n  -x N\n        Short value (default: 3)\n      --dry-run\n        Pretend\n\nArguments:\n  FILE\n        Input files\n", "")
     0
 
 [[test]]
 fn test_help_minimal_exact_stdout() -> i32
-    assert run_case(4) == 0
-    assert err_is("") == 0
-    assert out_is("Usage: bare\nUsage: one [ARG]\n\nArguments:\n  ARG\n        The arg\nUsage: many [F]...\n\nLots\n\nArguments:\n  F\n        Files\n") == 0
+    expect_capture(case_help_minimal, "Usage: bare\nUsage: one [ARG]\n\nArguments:\n  ARG\n        The arg\nUsage: many [F]...\n\nLots\n\nArguments:\n  F\n        Files\n", "")
     0

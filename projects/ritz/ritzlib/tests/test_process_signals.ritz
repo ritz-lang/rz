@@ -17,6 +17,9 @@ import ritzlib.fd
 import ritzlib.errno
 import ritzlib.option
 import ritzlib.result
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.fs
 
 const E_BADF: i32 = 9
 const E_INVAL: i32 = 22
@@ -71,10 +74,31 @@ fn sig_of(r: Result<Option<i32>, Errno>) -> i32
 # process ids
 # ============================================================================
 
+# The kernel's own word on who this process is, independent of the wrapper
+# under test: /proc/self links to "<pid>", and /proc/self/status has a
+# "Uid:\t<real>\t<effective>..." line.  -1 if either can't be read.
+fn proc_self_pid() -> i64
+    match read_link("/proc/self")
+        Ok(link) => link.as_view().parse_i64().unwrap_or(-1)
+        Err(_) => -1
+
+fn proc_self_real_uid() -> i64
+    match read_file("/proc/self/status")
+        Ok(status) =>
+            let text: StrView = status.as_view()
+            let at: i64 = text.find("\nUid:\t")
+            if at >= text.len
+                return -1
+            let rest: StrView = text.slice(at + 6, text.len)
+            match rest.split_once('\t')
+                Some(fields) => fields.before.parse_i64().unwrap_or(-1)
+                None => -1
+        Err(_) => -1
+
 [[test]]
 fn test_process_id_is_this_process() -> i32
     assert process_id() > 0
-    assert process_id() == sys_getpid()
+    assert process_id() as i64 == proc_self_pid()
     0
 
 var g_parent_pid: i32 = 0
@@ -94,7 +118,8 @@ fn test_parent_process_id_of_a_child_is_the_forker() -> i32
 
 [[test]]
 fn test_user_id_is_the_real_uid() -> i32
-    assert user_id() == sys_getuid() as u32
+    assert proc_self_real_uid() >= 0
+    assert user_id() as i64 == proc_self_real_uid()
     0
 
 # ============================================================================

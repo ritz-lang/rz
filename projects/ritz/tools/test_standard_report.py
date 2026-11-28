@@ -589,6 +589,23 @@ def test_callers_count_import_filtered_calls_outside_the_library(tmp_path):
     assert got == [("malloc", "proj/a/main.ritz", 5), ("sys_pipe", "proj/a/main.ritz", 4)]
 
 
+def test_callers_count_the_librarys_own_tests(tmp_path):
+    """AGAST #4928: the library's sources are skipped, its tests/ is not: a
+    test of a Ritz-level API that goes around it through the raw layer is a
+    caller like any other."""
+    call = "import ritzlib.sys\nfn f()\n    sys_pipe(null)\n"
+    _tree(tmp_path, {
+        "proj/lib/sys.ritz": LIB_SYS,
+        "proj/lib/io.ritz": call,
+        "proj/lib/os/env.ritz": call,
+        "proj/lib/tests/test_io.ritz": call,
+        "proj/a/m.ritz": call,
+    })
+    sites = count_callers(tmp_path / "proj" / "lib", [tmp_path / "proj"])
+    got = sorted(Path(s.path).relative_to(tmp_path).as_posix() for s in sites)
+    assert got == ["proj/a/m.ritz", "proj/lib/tests/test_io.ritz"]
+
+
 def test_callers_totals_per_project(tmp_path):
     _tree(tmp_path, {
         "lib/sys.ritz": LIB_SYS,

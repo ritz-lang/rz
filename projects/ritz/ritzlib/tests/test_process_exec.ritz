@@ -12,13 +12,14 @@
 # lines in environ order, so the expected output is the parent's env_iter().
 
 import ritzlib.sys
-import ritzlib.str
 import ritzlib.gvec
+import ritzlib.string
 import ritzlib.strview
 import ritzlib.span
 import ritzlib.option
 import ritzlib.result
 import ritzlib.errno
+import ritzlib.fd
 import ritzlib.process
 import ritzlib.os.env
 
@@ -26,53 +27,49 @@ import ritzlib.os.env
 [[test]]
 fn test_exec_inherits_parent_env() -> i32
     assert env_iter().len > 0
-    var argv: [1]StrView
-    argv[0] = "env"
-    var ex: Exec = match exec_prepare("/usr/bin/env", span_from_ptr<StrView>(@argv[0], 1))
+    let argv: [1]StrView = ["env"]
+    var ex: Exec = match exec_prepare("/usr/bin/env", @argv)
         Ok(e) => e
         Err(_) => return 1
 
-    var fds: [2]i32
-    assert sys_pipe(@fds[0]) == 0
-    let pid: i32 = sys_fork()
-    if pid == 0
-        sys_dup2(fds[1], 1)
-        sys_close(fds[0])
-        sys_close(fds[1])
-        ex.run()
-        sys_exit(126)
-    sys_close(fds[1])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 1
+    let pid: i32 = match fork()
+        Ok(side) => match side
+            Child =>
+                p.write.dup_to(1)
+                p.close()
+                ex.run()
+                sys_exit(126)
+                0
+            Parent(child) => child
+        Err(_) => return 1
+    p.write.close()
     ex.free()
 
-    var got: Vec<u8> = vec_new<u8>()
-    var chunk: [4096]u8
-    loop
-        let n: i64 = sys_read(fds[0], @chunk[0], 4096)
-        if n <= 0
-            break
-        got.push_span(Span<u8> { ptr: @chunk[0], len: n })
-    sys_close(fds[0])
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    assert status == 0
+    var got: String = string_new()
+    assert p.read.read_to_end(@&got).is_ok()
+    p.close()
+    match wait_pid(pid)
+        Ok(r) =>
+            assert r.success()
+        Err(_) =>
+            assert false, "wait_pid"
 
-    var want: Vec<u8> = vec_new<u8>()
+    var want: String = string_new()
     let entries: Span<StrView> = env_iter()
     for i in 0..entries.len
-        let e: *StrView = entries.ptr + i
-        want.push_span(Span<u8> { ptr: e.ptr, len: e.len })
-        want.push('\n' as u8)
-    assert got.len == want.len
-    for i in 0..want.len
-        assert got.get(i) == want.get(i)
+        want.push_str(entries[i])
+        want.push('\n')
+    assert got.as_view().eq(want.as_view())
     0
 
 [[test]]
 fn test_exec_missing_path_returns_enoent() -> i32
     # A failed execve(2) returns, so this needs no fork.
-    var argv: [1]StrView
-    argv[0] = "nope"
-    var ex: Exec = match exec_prepare("/ritz-no-such-dir/nope", span_from_ptr<StrView>(@argv[0], 1))
+    let argv: [1]StrView = ["nope"]
+    var ex: Exec = match exec_prepare("/ritz-no-such-dir/nope", @argv)
         Ok(e) => e
         Err(_) => return 1
     let e: Errno = ex.run()
@@ -87,19 +84,22 @@ fn test_exec_missing_path_returns_enoent() -> i32
 fn test_exec_args_use_view_length() -> i32
     # Views into longer strings: each argv entry is exactly `len` bytes.
     # /bin/sh -c 'exit 7' x: the exit status shows argv reached the child.
-    var argv: [3]StrView
-    argv[0] = ("shXX").slice(0, 2)
-    argv[1] = ("-cZZ").slice(0, 2)
-    argv[2] = ("exit 7;;;").slice(0, 6)
-    var ex: Exec = match exec_prepare(("/bin/shQQ").slice(0, 7), span_from_ptr<StrView>(@argv[0], 3))
+    let argv: [3]StrView = [("shXX").slice(0, 2), ("-cZZ").slice(0, 2), ("exit 7;;;").slice(0, 6)]
+    var ex: Exec = match exec_prepare(("/bin/shQQ").slice(0, 7), @argv)
         Ok(e) => e
         Err(_) => return 1
-    let pid: i32 = sys_fork()
-    if pid == 0
-        ex.run()
-        sys_exit(126)
+    let pid: i32 = match fork()
+        Ok(side) => match side
+            Child =>
+                ex.run()
+                sys_exit(126)
+                0
+            Parent(child) => child
+        Err(_) => return 1
     ex.free()
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    assert ((status >> 8) & 255) == 7
+    match wait_pid(pid)
+        Ok(r) =>
+            assert r.exit_code == 7
+        Err(_) =>
+            assert false, "wait_pid"
     0

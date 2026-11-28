@@ -8,6 +8,9 @@
 #   * exec_capture           — run a binary with the given args, env and stdin
 #                              (delivered race-free via a temp file) and
 #                              capture its stdout and stderr, merged
+#   * capture                — run an in-process body as a child process
+#                              (process.spawn_fn) and capture its stdout and
+#                              stderr, apart
 #
 # File I/O is ritzlib.fs's read_file / write_file (AGAST #4643 deleted the
 # cstr copies here, which also collided with fs's names).
@@ -26,7 +29,7 @@
 # Every input is a StrView, a Span<StrView> or a Span<u8>, and every failure an
 # Err(Errno) (AGAST #4643): this file is the template every example test
 # copies, so a C-string shape here spreads to all of them.  The fork and exec
-# live in ritzlib.process (spawn_env_merged), not here.
+# live in ritzlib.process (spawn_env_merged, spawn_fn), not here.
 
 import ritzlib.sys
 # Every type this API names comes with it (#3891): String (sandbox_path),
@@ -38,6 +41,7 @@ pub import ritzlib.strview
 pub import ritzlib.span
 pub import ritzlib.result
 pub import ritzlib.process
+import ritzlib.fd
 import ritzlib.os.env
 
 # ============================================================================
@@ -101,7 +105,7 @@ pub fn sandbox_path_under(dir: StrView, prefix: StrView, suffix: StrView) -> Str
     p.push_str("/ritz_")
     p.push_str(prefix)
     p.push('_')
-    let pid: String = string_from_i64(sys_getpid() as i64)
+    let pid: String = string_from_i64(process_id() as i64)
     p.push_string(@pid)
     p.push('_')
     p.push_str(suffix)
@@ -111,19 +115,26 @@ pub fn sandbox_path_under(dir: StrView, prefix: StrView, suffix: StrView) -> Str
 # Process exec / capture
 # ============================================================================
 
-# What exec_capture saw: how the child exited (status.exit_code, or
-# status.signaled / status.signal), and everything it wrote to stdout and
-# stderr, merged in the order written.  c.output() is that as a Span<u8>,
-# for buf_eq / buf_contains.
+# What exec_capture or capture saw: how the child exited (status.exit_code,
+# or status.signaled / status.signal) and what it wrote.  exec_capture merges
+# stderr into `out` in the order written, so its `err` is empty; capture
+# keeps them apart, stdout in `out` and stderr in `err`.  c.output() and
+# c.err_output() are those as a Span<u8>, for buf_eq / buf_contains.
 pub struct Captured
     status: ProcessResult
     out: Vec<u8>
+    err: Vec<u8>
 
 impl Captured
-    # The captured bytes as a view.  span_from_vec, not `@self.out`: ritz1
-    # emits a ptrtoint, not a Span, for `@` of a Vec field in a Span slot.
+    # The captured stdout (exec_capture: stdout and stderr) as a view.
+    # span_from_vec, not `@self.out`: ritz1 emits a ptrtoint, not a Span, for
+    # `@` of a Vec field in a Span slot.
     pub fn output(self: @Captured) -> Span<u8>
         span_from_vec<u8>(@self.out)
+
+    # The captured stderr as a view (capture only; empty for exec_capture).
+    pub fn err_output(self: @Captured) -> Span<u8>
+        span_from_vec<u8>(@self.err)
 
 # Run `bin` with `args` (argv[1..]; argv[0] is `bin`), environment exactly
 # `env` ("KEY=VALUE" views; empty is an empty environment, not ours), and
@@ -168,6 +179,71 @@ pub fn exec_capture(bin: StrView, args: Span<StrView>, env: Span<StrView>, stdin
             let waited: Result<ProcessResult, Errno> = q.wait()
             q.cleanup()
             match waited
-                Ok(st) => Ok(Captured { status: st, out: out })
+                Ok(st) => Ok(Captured { status: st, out: out, err: vec_new<u8>() })
                 Err(e) => Err(e)
         Err(e) => Err(e)
+
+# Run `body` in a child process (ritzlib.process's spawn_fn) with stdin at
+# EOF and its stdout and stderr on two pipes; wait for it and capture both,
+# apart.  c.status.exit_code is body's return value, and a body killed by a
+# signal is status.signaled.  A test of what a printer writes calls the
+# printer in a body: `capture(case_help)`, then buf_eq(c.output(), "...").
+#
+# Both pipes are drained together (poll), not one then the other: a child
+# that fills the stderr pipe (64 KiB) while the parent waits on stdout's EOF
+# would block forever.  Err only when a pipe, the fork or the wait fails.
+pub fn capture(body: fn() -> i32) -> Result<Captured, Errno>
+    var p: Process = spawn_fn(body)?
+    p.close_stdin()
+    var out: Vec<u8> = vec_new<u8>()
+    var err: Vec<u8> = vec_new<u8>()
+    let drained: Result<(), Errno> = drain_both(p.stdout(), @&out, p.stderr(), @&err)
+    # Before the wait: if the drain failed, a child still writing a full pipe
+    # gets EPIPE instead of blocking forever, and the wait returns.
+    p.close_pipes()
+    let waited: Result<ProcessResult, Errno> = p.wait()
+    p.cleanup()
+    drained?
+    Ok(Captured { status: waited?, out: out, err: err })
+
+# The usual capture test, as one assert-ing helper: `body` exits 0 having
+# written exactly `out` to stdout and `err` to stderr.  A failure names the
+# calling test's line.
+[[test_helper]]
+pub fn expect_capture(body: fn() -> i32, out: Span<u8>, err: Span<u8>)
+    match capture(body)
+        Ok(c) =>
+            assert c.status.success()
+            assert buf_eq(c.output(), out)
+            assert buf_eq(c.err_output(), err)
+        Err(_) =>
+            assert false, "fork"
+
+# Read `a` into `a_into` and `b` into `b_into` until both are at EOF,
+# reading whichever poll says is ready.  The Fds are borrowed: their owner
+# closes them.
+fn drain_both(a: Fd, a_into: @&Vec<u8>, b: Fd, b_into: @&Vec<u8>) -> Result<(), Errno>
+    var fds: [2]PollFd
+    # A drained end's slot is -1, which poll skips.
+    fds[0] = PollFd { fd: a.raw(), events: POLLIN, revents: 0 }
+    fds[1] = PollFd { fd: b.raw(), events: POLLIN, revents: 0 }
+    while fds[0].fd >= 0 or fds[1].fd >= 0
+        fds[0].revents = 0
+        fds[1].revents = 0
+        match poll(span_from_ptr<PollFd>(@fds[0], 2), -1)
+            Ok(_) => pass
+            Err(err) => match err
+                Intr => continue
+                _ => return Err(err)
+        if fds[0].revents != 0 and not read_chunk(a, a_into)?
+            fds[0].fd = -1
+        if fds[1].revents != 0 and not read_chunk(b, b_into)?
+            fds[1].fd = -1
+    Ok(())
+
+# One read(2) from `fd` onto `into`: Ok(false) at EOF.
+fn read_chunk(fd: Fd, into: @&Vec<u8>) -> Result<bool, Errno>
+    var chunk: [4096]u8
+    let n: i64 = fd.read(span_from_ptr<u8>(@chunk[0], 4096))?
+    into.push_span(span_from_ptr<u8>(@chunk[0], n))
+    Ok(n > 0)

@@ -2,43 +2,21 @@
 # (AGAST #1476). DirEntry tests live in test_fs_dirent.ritz; the split keeps
 # each file under build.py's 180s per-file test timeout.
 #
-# Each test owns its fixtures under /tmp and removes them, so the verdict does
+# Each test owns its fixtures under a sandbox_path and removes them, so the verdict does
 # not depend on the cwd build.py happens to run the binary from.
 
-import ritzlib.cstr
-import ritzlib.sys
 import ritzlib.fs
+import ritzlib.sys { Stat }
 import ritzlib.errno
-import ritzlib.str
-import ritzlib.memory
-import ritzlib.fmt.digits { fmt_i64_into }
+import ritzlib.string
 import ritzlib.strview
 import ritzlib.result
 import ritzlib.option
+import ritzlib.testlib
 
 # ============================================================================
 # Helpers
 # ============================================================================
-
-# "/tmp/ritzlib_<pid>_<name>" into dst (>= 96 bytes); returns dst. The pid
-# keeps concurrent test runs (gate slots, compiler variants) off each other's
-# fixtures (AGAST #4084). ritzlib.testlib's sandbox_path now builds the same
-# shape as a String (AGAST #4643 dropped the read_file/write_file that kept
-# these files off testlib); this helper predates it.
-fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
-    let head: *u8 = c"/tmp/ritzlib_"
-    let head_len: i64 = strlen(head)
-    memcpy(dst, head, head_len)
-    var num: [20]u8
-    let pid: StrView = fmt_i64_into(@num, sys_getpid() as i64)
-    memcpy(dst + head_len, pid.ptr, pid.len)
-    var i: i64 = head_len + pid.len
-    *(dst + i) = '_'
-    i += 1
-    let name_len: i64 = strlen(name)
-    memcpy(dst + i, name, name_len)
-    *(dst + i + name_len) = 0
-    dst
 
 fn zero_stat() -> Stat
     var s: Stat
@@ -53,26 +31,22 @@ fn zero_stat() -> Stat
     s.st_blocks = 0
     s
 
-fn stat_or_zero(r: *Result<Stat, Errno>) -> Stat
+fn stat_or_zero(r: @Result<Stat, Errno>) -> Stat
     match *r
         Ok(s) => s
         Err(_) => zero_stat()
 
-fn err_of(r: *Result<Stat, Errno>) -> i32
+fn err_of(r: @Result<Stat, Errno>) -> i32
     match *r
         Ok(_) => 0
         Err(e) => e.code()
 
-fn write_fixture(path: *u8, len: i64) -> i32
-    let fd: i32 = sys_open3(path, 577, 420)
-    if fd < 0
-        return fd
-    var buf: [64]u8
+# `len` bytes of 'x' written to `path` (created or truncated).
+fn write_fixture(path: StrView, len: i64) -> Result<i64, Errno>
+    var body: String = string_new()
     for i in 0..len
-        buf[i] = 'x' as u8
-    sys_write(fd, @buf[0], len)
-    sys_close(fd)
-    0
+        body.push('x')
+    write_file(path, body.as_view())
 
 # ============================================================================
 # stat / lstat
@@ -102,13 +76,12 @@ fn test_stat_missing_is_enoent() -> i32
 
 [[test]]
 fn test_stat_size_matches_written_bytes() -> i32
-    var pbuf: [96]u8
-    let p: *u8 = pid_tmp_path(@pbuf[0], c"1476_size.tmp")
-    if write_fixture(p, 37) != 0
+    let p: String = sandbox_path("fs_stat", "1476_size.tmp")
+    if write_fixture(p.as_view(), 37).is_err()
         return 1
-    var r: Result<Stat, Errno> = stat(strview_from_cstr(p))
+    var r: Result<Stat, Errno> = stat(p.as_view())
     let st: Stat = stat_or_zero(@r)
-    sys_unlink(p)
+    unlink(p.as_view())
     if st.st_size != 37
         return 2
     if not mode_is_file(st.st_mode)
@@ -121,7 +94,8 @@ fn test_stat_size_matches_written_bytes() -> i32
 fn test_stat_unterminated_view() -> i32
     # A StrView is (ptr, len) with no NUL. "/tmpXYZ" sliced to 4 bytes must
     # stat "/tmp", not "/tmpXYZ" -- stat() has to terminate the path itself.
-    let v: StrView = strview_from_ptr(c"/tmpXYZ", 4)
+    let whole: StrView = "/tmpXYZ"
+    let v: StrView = whole.slice(0, 4)
     var r: Result<Stat, Errno> = stat(v)
     if not r.is_ok()
         return 1
@@ -134,10 +108,10 @@ fn test_stat_unterminated_view() -> i32
 
 [[test]]
 fn test_stat_path_too_long() -> i32
-    var big: [5000]u8
+    var big: String = string_new()
     for i in 0..5000
-        big[i] = 'a' as u8
-    var r: Result<Stat, Errno> = stat(strview_from_ptr(@big[0], 5000))
+        big.push('a')
+    var r: Result<Stat, Errno> = stat(big.as_view())
     # 36 = ENAMETOOLONG, reported without touching the kernel.
     if err_of(@r) != 36
         return 1
@@ -150,22 +124,20 @@ fn test_stat_path_too_long() -> i32
 
 [[test]]
 fn test_lstat_vs_stat_on_symlink() -> i32
-    var targetbuf: [96]u8
-    let target: *u8 = pid_tmp_path(@targetbuf[0], c"1476_target.tmp")
-    var linkbuf: [96]u8
-    let link: *u8 = pid_tmp_path(@linkbuf[0], c"1476_link.tmp")
-    sys_unlink(link)
-    if write_fixture(target, 5) != 0
+    let target: String = sandbox_path("fs_stat", "1476_target.tmp")
+    let link: String = sandbox_path("fs_stat", "1476_link.tmp")
+    unlink(link.as_view())
+    if write_fixture(target.as_view(), 5).is_err()
         return 1
-    if sys_symlink(target, link) != 0
-        sys_unlink(target)
+    if symlink(target.as_view(), link.as_view()).is_err()
+        unlink(target.as_view())
         return 2
-    var rl: Result<Stat, Errno> = lstat(strview_from_cstr(link))
-    var rs: Result<Stat, Errno> = stat(strview_from_cstr(link))
+    var rl: Result<Stat, Errno> = lstat(link.as_view())
+    var rs: Result<Stat, Errno> = stat(link.as_view())
     let sl: Stat = stat_or_zero(@rl)
     let ss: Stat = stat_or_zero(@rs)
-    sys_unlink(link)
-    sys_unlink(target)
+    unlink(link.as_view())
+    unlink(target.as_view())
     if not mode_is_link(sl.st_mode)
         return 3
     if not mode_is_file(ss.st_mode)

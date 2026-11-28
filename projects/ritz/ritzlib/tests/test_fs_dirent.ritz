@@ -1,65 +1,38 @@
 # test_fs_dirent.ritz - Typed fs API: DirEntry { ino, kind, name: StrView }
 # from dir_next_entry / dir_entry (AGAST #1476). stat tests: test_fs_stat.ritz.
 #
-# Each test owns its fixtures under /tmp and removes them, so the verdict does
+# Each test owns its fixtures under a sandbox_path and removes them, so the verdict does
 # not depend on the cwd build.py happens to run the binary from.
 
-import ritzlib.cstr
-import ritzlib.sys
 import ritzlib.fs
+import ritzlib.sys { Stat }
 import ritzlib.errno
-import ritzlib.str
-import ritzlib.memory
-import ritzlib.fmt.digits { fmt_i64_into }
+import ritzlib.string
 import ritzlib.strview
 import ritzlib.result
 import ritzlib.option
+import ritzlib.testlib
 
 # ============================================================================
 # Helpers
 # ============================================================================
 
-# "/tmp/ritzlib_<pid>_<name>" into dst (>= 96 bytes); returns dst. The pid
-# keeps concurrent test runs (gate slots, compiler variants) off each other's
-# fixtures (AGAST #4084). ritzlib.testlib's sandbox_path now builds the same
-# shape as a String (AGAST #4643 dropped the read_file/write_file that kept
-# these files off testlib); this helper predates it.
-fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
-    let head: *u8 = c"/tmp/ritzlib_"
-    let head_len: i64 = strlen(head)
-    memcpy(dst, head, head_len)
-    var num: [20]u8
-    let pid: StrView = fmt_i64_into(@num, sys_getpid() as i64)
-    memcpy(dst + head_len, pid.ptr, pid.len)
-    var i: i64 = head_len + pid.len
-    *(dst + i) = '_'
-    i += 1
-    let name_len: i64 = strlen(name)
-    memcpy(dst + i, name, name_len)
-    *(dst + i + name_len) = 0
-    dst
-
-fn inode_of(path: *u8) -> i64
-    var r: Result<Stat, Errno> = stat(strview_from_cstr(path))
-    match r
+fn inode_of(path: StrView) -> i64
+    match stat(path)
         Ok(st) => st.st_ino
         Err(_) => -1
 
-fn entry_or_empty(o: *Option<DirEntry>) -> DirEntry
+fn entry_or_empty(o: @Option<DirEntry>) -> DirEntry
     match *o
         Some(e) => e
         None => DirEntry { ino: -1, kind: 0, name: strview_empty() }
 
-fn write_fixture(path: *u8, len: i64) -> i32
-    let fd: i32 = sys_open3(path, 577, 420)
-    if fd < 0
-        return fd
-    var buf: [64]u8
+# `len` bytes of 'x' written to `path` (created or truncated).
+fn write_fixture(path: StrView, len: i64) -> Result<i64, Errno>
+    var body: String = string_new()
     for i in 0..len
-        buf[i] = 'x' as u8
-    sys_write(fd, @buf[0], len)
-    sys_close(fd)
-    0
+        body.push('x')
+    write_file(path, body.as_view())
 
 # ============================================================================
 # DirEntry
@@ -67,28 +40,25 @@ fn write_fixture(path: *u8, len: i64) -> i32
 
 [[test]]
 fn test_dir_next_entry_yields_typed_entries() -> i32
-    var dbuf: [96]u8
-    var fbuf: [96]u8
-    var subbuf: [96]u8
-    let d: *u8 = pid_tmp_path(@dbuf[0], c"1476_dir")
-    let f: *u8 = pid_tmp_path(@fbuf[0], c"1476_dir/alpha")
-    let sub: *u8 = pid_tmp_path(@subbuf[0], c"1476_dir/beta")
-    sys_unlink(f)
-    sys_rmdir(sub)
-    sys_rmdir(d)
-    if sys_mkdir(d, 493) != 0
+    let d: String = sandbox_path("fs_dirent", "1476_dir")
+    let f: String = path_join(d.as_view(), "alpha")
+    let sub: String = path_join(d.as_view(), "beta")
+    unlink(f.as_view())
+    rmdir(sub.as_view())
+    rmdir(d.as_view())
+    if mkdir(d.as_view(), 493).is_err()
         return 1
-    if write_fixture(f, 3) != 0
+    if write_fixture(f.as_view(), 3).is_err()
         return 2
-    if sys_mkdir(sub, 493) != 0
+    if mkdir(sub.as_view(), 493).is_err()
         return 3
-    let f_ino: i64 = inode_of(f)
+    let f_ino: i64 = inode_of(f.as_view())
 
     var seen_alpha: i32 = 0
     var seen_beta: i32 = 0
     var count: i32 = 0
     var bad: i32 = 0
-    var dir: DirIter = match dir_open(strview_from_cstr(d))
+    var dir: DirIter = match dir_open(d.as_view())
         Ok(it) => it
         Err(_) => return 7
     loop
@@ -111,9 +81,9 @@ fn test_dir_next_entry_yields_typed_entries() -> i32
             if e.kind != DT_DIR
                 bad = 13
     dir.close()
-    sys_unlink(f)
-    sys_rmdir(sub)
-    sys_rmdir(d)
+    unlink(f.as_view())
+    rmdir(sub.as_view())
+    rmdir(d.as_view())
     if bad != 0
         return bad
     if seen_alpha == 0

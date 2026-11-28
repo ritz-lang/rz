@@ -4,8 +4,9 @@
 import ritzlib.sys
 import ritzlib.errno
 import ritzlib.strview
-import ritzlib.str
-import ritzlib.memory
+import ritzlib.string
+import ritzlib.result
+import ritzlib.fd
 
 # ritz1 cannot emit a method call whose receiver is a qualified variant
 # literal (`code(Errno.NoEnt)`), so a variant's method is reached through a
@@ -19,19 +20,18 @@ fn name(e: Errno) -> StrView
 fn message(e: Errno) -> StrView
     e.message()
 
-# errno_write's output through a pipe, compared with `want`. 1 if equal.
-fn written_is(e: Errno, want: StrView) -> i32
-    var fds: [2]i32
-    if sys_pipe(@fds[0]) != 0
-        return 0
-    let n: i64 = errno_write(fds[1], e)
-    sys_close(fds[1])
-    var buf: [128]u8
-    let got: i64 = sys_read(fds[0], @buf[0], 128)
-    sys_close(fds[0])
-    if n != got
-        return 0
-    (strview_from_ptr(@buf[0], got)).eq(want) as i32
+# errno_write's output through a pipe, compared with `want`: errno_write
+# takes the raw fd number, so it writes to the pipe's write end by number.
+fn written_is(e: Errno, want: StrView) -> bool
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return false
+    let n: i64 = errno_write(p.write.raw(), e)
+    p.write.close()
+    var got: String = string_new()
+    let read: Result<i64, Errno> = p.read.read_to_end(@&got)
+    p.read.close()
+    read.unwrap_or(-1) == n and got.as_view().eq(want)
 
 [[test]]
 fn test_from_raw_named_variants() -> i32
@@ -173,12 +173,12 @@ fn test_message() -> i32
 
 [[test]]
 fn test_write_named() -> i32
-    if written_is(Errno.Exist, "File exists") == 0
+    if not written_is(Errno.Exist, "File exists")
         return 1
     0
 
 [[test]]
 fn test_write_other_appends_number() -> i32
-    if written_is(Errno.Other(95), "Unknown error 95") == 0
+    if not written_is(Errno.Other(95), "Unknown error 95")
         return 1
     0

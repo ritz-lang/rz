@@ -6,6 +6,7 @@
 #   try_wait_pid(pid) -> Result<Option<ProcessResult>, Errno>
 #   try_wait_any() -> Result<Option<Reaped>, Errno>   any child, WNOHANG
 #   kill(pid, sig) -> Result<(), Errno>
+#   spawn_fn(body: fn() -> i32) -> Result<Process, Errno>   a fn as a child
 #
 # For running a program and reading its output, prefer spawn (see
 # test_process_api.ritz); these are for the callers that need a bare fork.
@@ -20,6 +21,7 @@ import ritzlib.strview
 import ritzlib.span
 import ritzlib.option
 import ritzlib.result
+import ritzlib.gvec
 
 const E_NOENT: i32 = 2
 const E_CHILD: i32 = 10
@@ -167,10 +169,8 @@ fn test_exec_in_child_runs_the_program() -> i32
                         Child =>
                             p.read.close()
                             p.write.dup_to(1)
-                            var args: [2]StrView
-                            args[0] = "hello"
-                            args[1] = "exec"
-                            exec("/bin/echo", span_from_ptr<StrView>(@args[0], 2))
+                            let args: [2]StrView = ["hello", "exec"]
+                            exec("/bin/echo", @args)
                             sys_exit(127)
                         Parent(pid) =>
                             p.write.close()
@@ -225,7 +225,7 @@ fn test_signalfd_for_shutdown_reads_a_sigterm() -> i32
                     if unit_err(kill(process_id(), SIGTERM)) != 0
                         sys_exit(3)
                     var info: [128]u8
-                    match sfd.read(Span<u8> { ptr: @info[0], len: 128 })
+                    match sfd.read(@info)
                         Ok(n) =>
                             if n != 128
                                 sys_exit(4)
@@ -238,3 +238,58 @@ fn test_signalfd_for_shutdown_reads_a_sigterm() -> i32
         Err(_) =>
             assert false
             0
+
+# ============================================================================
+# spawn_fn: a function as a child process
+# ============================================================================
+
+fn fn_body_streams() -> i32
+    fd_stdout().write_str("out")
+    fd_stderr().write_str("err")
+    5
+
+# Reads its whole stdin, which the parent closes at once: EOF, not the
+# harness's stdin.
+fn fn_body_reads_stdin() -> i32
+    var got: String = string_new()
+    match fd_stdin().read_to_end(@&got)
+        Ok(n) => n as i32
+        Err(_) => 99
+
+[[test]]
+fn test_spawn_fn_pipes_and_exit_code() -> i32
+    match spawn_fn(fn_body_streams)
+        Ok(p) =>
+            var q: Process = p
+            q.close_stdin()
+            let out: Vec<u8> = q.read_stdout_all()
+            let err: Vec<u8> = q.read_stderr_all()
+            let st: Result<ProcessResult, Errno> = q.wait()
+            q.cleanup()
+            assert out.as_view().eq("out")
+            assert err.as_view().eq("err")
+            match st
+                Ok(r) =>
+                    assert r.exit_code == 5
+                Err(_) =>
+                    assert false, "wait"
+        Err(_) =>
+            assert false, "spawn_fn"
+    0
+
+[[test]]
+fn test_spawn_fn_stdin_is_a_pipe() -> i32
+    match spawn_fn(fn_body_reads_stdin)
+        Ok(p) =>
+            var q: Process = p
+            q.write_all("abcd")
+            q.close_stdin()
+            match q.wait()
+                Ok(r) =>
+                    assert r.exit_code == 4
+                Err(_) =>
+                    assert false, "wait"
+            q.cleanup()
+        Err(_) =>
+            assert false, "spawn_fn"
+    0

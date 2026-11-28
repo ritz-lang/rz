@@ -1126,6 +1126,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             if self._is_strview_as_bytes(receiver, expr):
                 return self._span_of_u8(expr.span)
             return (self._builtin_generic_method_ret(receiver, expr.method)
+                    or self._source_method_ret(receiver, expr.method)
                     or rast.NamedType(expr.span, 'unknown', []))
         type_name = self._get_type_name(receiver)
 
@@ -1386,6 +1387,22 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         if all(isinstance(p, rast.Ident) for p in parts):
             return f"{name}({', '.join(p.name for p in parts)})"
         return f"{name}(...)"
+
+    def _source_method_ret(self, receiver: rast.Type, method: str) -> Optional[rast.Type]:
+        """What a non-generic built-in receiver's source method returns:
+        ritzlib's `impl StrView` declares `parse_i64` (`StrView_parse_i64`)
+        `-> Option<i64>`. None for a generic receiver, whose `T` this can't
+        substitute, or no such method.  Untyped, `s.parse_i64().unwrap_or(0)`
+        named no instance, so monomorph wanted `unwrap_or` on every Result
+        too, and a move-only one was refused (AGAST #4928)."""
+        if not isinstance(receiver, rast.NamedType) or receiver.args:
+            return None
+        if receiver.name in BUILTIN_GENERICS:
+            return None
+        sig = self.functions.get(f"{self._get_type_name(receiver)}_{method}")
+        if sig is None or sig.ret_type is None:
+            return None
+        return sig.ret_type
 
     def _check_value_args(self, expr: rast.MethodCall, receiver: rast.Type) -> None:
         """The by-value slots of the fn the emitter dispatches `expr` to when

@@ -9,128 +9,48 @@
 # listed).  ritzlib/tests/test_elf.ritz is a manual tool that needs a file
 # argument, so nothing exercised the printer before.
 #
-# Capture helpers: see test_argspec_output.ritz (buffers are larger here).
+# Run under testlib's capture: a forked child, stdout and stderr on their
+# own pipes.
 
-import ritzlib.cstr
-import ritzlib.sys
 import ritzlib.io
-import ritzlib.memory
 import ritzlib.strview
 import ritzlib.result
+import ritzlib.fs
 import ritzlib.elf
+import ritzlib.testlib
 
-
-# ============================================================================
-# Capture helpers
-# ============================================================================
-
-var g_out: [65536]u8
-var g_out_len: i64 = 0
-var g_err: [65536]u8
-var g_err_len: i64 = 0
-
-fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
-    var got: i64 = 0
-    var n: i64 = 1
-    while n > 0 and got < cap
-        n = sys_read(fd, buf + got, cap - got)
-        if n > 0
-            got = got + n
-    got
-
-# 0 when buf[0..len] is exactly `want`.
-fn bytes_differ(buf: *u8, len: i64, want: StrView) -> i32
-    if len != want.len
-        return 1
-    var i: i64 = 0
-    while i < len
-        if *(buf + i) != *(want.ptr + i)
-            return 2
-        i += 1
-    0
-
-# Run case `which` in a child with stdout/stderr captured into g_out/g_err.
-# Returns the child's exit status.
-fn run_case(which: i32) -> i32
-    var o: [2]i32
-    var e: [2]i32
-    sys_pipe(@o[0])
-    sys_pipe(@e[0])
-    let pid: i32 = sys_fork()
-    if pid == 0
-        sys_dup2(o[1], 1)
-        sys_dup2(e[1], 2)
-        sys_close(o[0])
-        sys_close(o[1])
-        sys_close(e[0])
-        sys_close(e[1])
-        sys_exit(run_body(which))
-    sys_close(o[1])
-    sys_close(e[1])
-    g_out_len = read_all(o[0], @g_out[0], 65536)
-    g_err_len = read_all(e[0], @g_err[0], 65536)
-    sys_close(o[0])
-    sys_close(e[0])
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    (status >> 8) & 255
-
-fn out_is(want: StrView) -> i32
-    bytes_differ(@g_out[0], g_out_len, want)
-
-fn err_is(want: StrView) -> i32
-    bytes_differ(@g_err[0], g_err_len, want)
 
 # ============================================================================
 # Cases
 # ============================================================================
 
-var g_want: [65536]u8
-var g_want_len: i64 = 0
-
-fn want_add(s: *u8)
-    var i: i64 = 0
-    while *(s + i) != 0 and g_want_len < 65536
-        g_want[g_want_len] = *(s + i)
-        g_want_len += 1
-        i += 1
-
-# Load /proc/self/exe into `reader`; 0 on success.
-fn load_self(reader: *ElfReader) -> i32
-    let fd: i32 = sys_open(c"/proc/self/exe", O_RDONLY)
-    if fd < 0
-        return 1
-    let size: i64 = sys_lseek(fd, 0, 2)
-    sys_lseek(fd, 0, 0)
-    let data: *u8 = malloc(size)
-    var got: i64 = read_all(fd, data, size)
-    sys_close(fd)
-    if got != size
-        return 2
-    match reader.init(Span<u8> { ptr: data, len: size })
-        Ok(_) => pass
-        Err(_) => return 3
-    match reader.parse_sections()
-        Ok(_) => pass
-        Err(_) => return 4
-    0
-
-fn run_body(which: i32) -> i32
+# A reader over `image`, this test binary's bytes, its sections parsed.
+# The reader points into `image`, which must outlive it.
+fn reader_over(image: @String) -> Result<ElfReader, ElfError>
     var reader: ElfReader
-    let rc = load_self(@reader)
-    if rc != 0
-        return rc
-    reader.print_test_functions()
-    0
+    reader.init(span_from_strview(image.as_view()))?
+    reader.parse_sections()?
+    Ok(reader)
 
-# Expected bytes, assembled from the symbol table without the printer.
-# Returns how many of this file's markers were listed.
-fn build_want() -> i32
-    var reader: ElfReader
-    if load_self(@reader) != 0
-        return -1
-    want_add(c"Test functions found:\n")
-    var mine: i32 = 0
+# The child: print this binary's test functions.  Exits 2 when the binary
+# can't be read, 3 when it doesn't parse.
+fn case_print_self() -> i32
+    match read_file("/proc/self/exe")
+        Ok(image) => match reader_over(@image)
+            Ok(reader) =>
+                reader.print_test_functions()
+                0
+            Err(_) => 3
+        Err(_) => 2
+
+# Expected bytes, assembled from the symbol table without the printer, and
+# how many of this file's markers were listed.
+struct Want
+    text: String
+    mine: i32
+
+fn build_want(reader: @ElfReader) -> Want
+    var want = Want { text: string_from("Test functions found:\n"), mine: 0 }
     var i: i64 = 0
     while i < reader.symtab_count
         let info: u8 = reader.get_symbol_info(i)
@@ -138,22 +58,33 @@ fn build_want() -> i32
             match reader.get_symbol_name(i)
                 Some(name) =>
                     if name.starts_with("test_")
-                        want_add(c"  ")
-                        want_add(name.ptr)   # the strtab entry is NUL-terminated
-                        want_add(c"\n")
+                        want.text.push_str("  ")
+                        want.text.push_str(name)
+                        want.text.push_str("\n")
                         if name.starts_with("test_elf_output_marker")
-                            mine += 1
+                            want.mine += 1
                 None => pass
         i += 1
-    mine
+    want
 
 [[test]]
 fn test_elf_print_test_functions_exact() -> i32
-    assert build_want() == 2
-    assert run_case(1) == 0
-    let want = StrView { ptr: @g_want[0], len: g_want_len }
-    assert out_is(want) == 0
-    assert err_is("") == 0
+    match read_file("/proc/self/exe")
+        Ok(image) => match reader_over(@image)
+            Ok(reader) =>
+                let want = build_want(@reader)
+                assert want.mine == 2
+                match capture(case_print_self)
+                    Ok(c) =>
+                        assert c.status.success()
+                        assert buf_eq(c.output(), span_from_strview(want.text.as_view()))
+                        assert c.err.len == 0
+                    Err(_) =>
+                        assert false, "fork"
+            Err(_) =>
+                assert false, "parse /proc/self/exe"
+        Err(_) =>
+            assert false, "read /proc/self/exe"
     0
 
 # Global `test_` functions for the printer to find (see the header).

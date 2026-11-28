@@ -601,9 +601,9 @@ const DIR_BUF_SIZE: i64 = 4096
 # `buf` is a Vec of DIR_BUF_SIZE bytes, not an inline array. DirIter is
 # returned by value inside Result; a 4096-byte field makes that aggregate
 # about 4 KB, and clang's instruction selection then takes about a minute
-# on dir_open and on every caller. The Vec makes DirIter move-only and frees
-# the buffer when its owner goes out of scope (AGAST #4686); close() frees
-# it early, with the fd.
+# on dir_open and on every caller. DirIter is move-only, and its Drop
+# (close) releases the fd and the buffer when its owner goes out of scope
+# (AGAST #4686, #4928); close() releases them early.
 pub struct DirIter
     fd: i32              # Directory file descriptor
     buf: Vec<u8>         # getdents64 buffer; cap 0 once closed
@@ -612,7 +612,7 @@ pub struct DirIter
     entry: *u8           # Current entry pointer
 
 # Open a directory for iteration; Err (NoEnt, NotDir, Acces, ...) if it
-# cannot be opened. Release the Ok iterator with dir_close.
+# cannot be opened. The Ok iterator closes when dropped, or early with close().
 [[target_os = "linux"]]
 pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
     let fd: i32 = fs_open(path, O_RDONLY + O_DIRECTORY, 0)
@@ -730,6 +730,12 @@ impl DirIter
         # Assigning drops the old Vec, freeing the buffer.
         self.buf = vec_new<u8>()
         self.entry = null
+
+# An iterator going out of scope closes itself: the fd is released with the
+# buffer, whether or not close() was called (a closed one closes nothing).
+impl Drop for DirIter
+    fn drop(self: @&DirIter)
+        self.close()
 
 # ============================================================================
 # remove_dir_all -> Result<(), Errno> (AGAST #4637)

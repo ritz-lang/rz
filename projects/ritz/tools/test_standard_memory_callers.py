@@ -40,6 +40,11 @@ PINS = {
     "indium": 16,
     "ritz/ritz0": 18,
     "ritz/ritz1": 511,
+    # ritzlib's own tests (AGAST #4928): test_memory (100) and test_allocator
+    # (15) test the allocator itself; test_strview_join (8) and
+    # test_string_into_view (6) free what the buffer-handing
+    # strview_join2/3 and String.into_view under test give back.
+    "ritz/ritzlib": 129,
 }
 
 

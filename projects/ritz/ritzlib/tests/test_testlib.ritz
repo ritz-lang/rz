@@ -2,8 +2,12 @@
 # (AGAST #4643).
 #
 #   exec_capture(bin, args, env, stdin) -> Result<Captured, Errno>
-#       Captured { status: ProcessResult, out: Vec<u8> }: stdout and stderr
-#       merged (2>&1), stdin staged through a temp file, env exactly `env`.
+#       Captured { status: ProcessResult, out: Vec<u8>, err: Vec<u8> }:
+#       stdout and stderr merged (2>&1) in `out`, `err` empty, stdin staged
+#       through a temp file, env exactly `env`.
+#   capture(body) -> Result<Captured, Errno> (AGAST #4928): `body` in a
+#       forked child, stdout in `out` and stderr in `err`, exit code = its
+#       return value.
 #   sandbox_path(prefix, suffix) -> String: "<tmp>/ritz_<prefix>_<pid>_<suffix>",
 #       <tmp> = $TMPDIR if set and non-empty, else /tmp
 #   sandbox_path_under(dir, prefix, suffix) -> String: the same, under `dir`
@@ -19,6 +23,8 @@ import ritzlib.span
 import ritzlib.result
 import ritzlib.option
 import ritzlib.os.env
+import ritzlib.fd
+import ritzlib.fs
 import ritzlib.testlib
 
 # `sh -c <script>` with no env and no stdin.
@@ -119,14 +125,14 @@ fn test_exec_capture_removes_its_stdin_file() -> i32
         Err(_) =>
             assert false, "spawn /bin/sh"
     var staged: String = sandbox_path("stdin", "in")
-    assert sys_access(staged.as_ptr(), F_OK) < 0, "stdin temp file left behind"
+    assert not path_exists(staged.as_view()), "stdin temp file left behind"
     0
 
 # "<dir>/ritz_pfx_<pid>_sfx", the shape every sandbox path has.
 fn want_path(dir: StrView) -> String
     var want: String = string_from(dir)
     want.push_str("/ritz_pfx_")
-    var pid: String = string_from_i64(sys_getpid() as i64)
+    var pid: String = string_from_i64(process_id() as i64)
     want.push_string(@pid)
     want.push_str("_sfx")
     want
@@ -170,4 +176,104 @@ fn test_sandbox_path_under_empty_dir_is_tmp() -> i32
     let want: String = want_path("/tmp")
     let got: String = sandbox_path_under("", "pfx", "sfx")
     assert got.eq_string(@want)
+    0
+
+# ============================================================================
+# capture: an in-process body, stdout and stderr apart
+# ============================================================================
+
+fn body_out_err_exit3() -> i32
+    fd_stdout().write_str("to out\n")
+    fd_stderr().write_str("to err\n")
+    3
+
+fn body_silent() -> i32
+    0
+
+# 200000 bytes of stderr before any stdout: a parent draining stdout first
+# blocks on a child stuck writing a full stderr pipe.
+fn body_floods_stderr() -> i32
+    var line: String = string_new()
+    var i: i32 = 0
+    while i < 1000
+        line.push_str("0123456789")
+        i += 1
+    var n: i32 = 0
+    while n < 20
+        fd_stderr().write_str(line.as_view())
+        n += 1
+    fd_stdout().write_str("done\n")
+    0
+
+fn body_killed() -> i32
+    fd_stdout().write_str("before\n")
+    kill(process_id(), 9)
+    0
+
+[[test]]
+fn test_capture_splits_streams_and_reports_exit() -> i32
+    match capture(body_out_err_exit3)
+        Ok(c) =>
+            assert c.status.exit_code == 3
+            assert c.status.signaled == 0
+            assert buf_eq(c.output(), "to out\n")
+            assert buf_eq(c.err_output(), "to err\n")
+        Err(_) =>
+            assert false, "fork"
+    0
+
+[[test]]
+fn test_capture_silent_body_is_empty_success() -> i32
+    match capture(body_silent)
+        Ok(c) =>
+            assert c.status.success()
+            assert c.out.len == 0
+            assert c.err.len == 0
+        Err(_) =>
+            assert false, "fork"
+    0
+
+[[test]]
+fn test_capture_drains_both_pipes() -> i32
+    match capture(body_floods_stderr)
+        Ok(c) =>
+            assert c.status.exit_code == 0
+            assert c.err.len == 200000
+            assert buf_eq(c.output(), "done\n")
+        Err(_) =>
+            assert false, "fork"
+    0
+
+[[test]]
+fn test_capture_reports_a_signal() -> i32
+    match capture(body_killed)
+        Ok(c) =>
+            assert c.status.signaled == 1
+            assert c.status.signal == 9
+            assert buf_eq(c.output(), "before\n")
+        Err(_) =>
+            assert false, "fork"
+    0
+
+# exec_capture merges stderr into `out`, so its `err` is always empty.
+[[test]]
+fn test_exec_capture_err_is_empty() -> i32
+    match sh("echo x >&2")
+        Ok(c) =>
+            assert buf_eq(c.output(), "x\n")
+            assert c.err.len == 0
+        Err(_) =>
+            assert false, "spawn /bin/sh"
+    0
+
+fn body_out_and_err() -> i32
+    fd_stdout().write_str("o\n")
+    fd_stderr().write_str("e\n")
+    0
+
+# expect_capture: exit 0 and both streams exact, as a test_helper.
+[[test]]
+fn test_expect_capture_passes_on_exact_streams() -> i32
+    expect_capture(body_out_and_err, "o\n", "e\n")
+    expect_capture(body_silent, "", "")
     0

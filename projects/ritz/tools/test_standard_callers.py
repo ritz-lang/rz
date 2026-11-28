@@ -37,6 +37,7 @@ from standard_report import (
     c_literal_breaches,
     c_literals_by_project,
     callers_by_project,
+    count_c_literals,
     count_callers,
 )
 
@@ -66,18 +67,15 @@ PINS = {
     # ritz/examples keeps 3, typed wrappers at a syscall boundary: time.sleep
     # (nanosleep; exempt only for its free-fn name) in 10_sleep and 40_watch,
     # process.exec (execve; owns the argv block) in 35_nohup.
-    "ritz": 1357,
+    "ritz": 806,
     "ritz-lsp": 0,
     "ritzunit": 0,
-    "rzrz": 3,
-    # rzsh: src/rawio.ritz's sys_write x2, sys_read, sys_getpid: src/ also
-    # builds the freestanding Harland bin, where ritzlib.fd / ritzlib.process
-    # don't build, so stdio and the pid stay raw in that one shim (RAW_OK).
-    # strview_from_cstr x1, src/os.ritz os_environ: the kernel's envp is a C
-    # array of NUL-terminated strings (ritzlib.os.env's env_iter would do it,
-    # but importing it pulls in ritzlib.io, whose println collides with
-    # common's).
-    "rzsh": 5,
+    "rzrz": 0,
+    # rzsh: src/rawio.ritz's sys_getpid x1: src/ also builds the
+    # freestanding Harland bin, where ritzlib.process doesn't build (its
+    # fork/exec/wait/signalfd syscalls are Linux-only), so the pid stays raw
+    # in that one shim (RAW_OK). Its stdio is ritzlib.fd's (AGAST #4928).
+    "rzsh": 1,
     "sage": 0,
     "spire": 0,
     "squeeze": 0,
@@ -100,16 +98,84 @@ PINS = {
 }
 
 
+# AGAST #4928: ritzlib's own tests count (standard_report skips the library's
+# sources, not its tests/), per file. A test of a Ritz-level API reaches it
+# through that API (testlib.capture for what a printer writes, sandbox_path +
+# fs.* for files, "..." literals for views), so a file not named here is 0.
+# The files named here test the raw boundary itself: the calls are their
+# subject.
+RITZLIB_TESTS = RITZ_ROOT / "ritzlib" / "tests"
+RITZLIB_TEST_PINS = {
+    # ritzlib.memory: malloc/free/realloc/calloc, memcpy/memmove/memset/
+    # memcmp, the allocator's own API, each tested directly.
+    "test_memory.ritz": 116,
+    # ritzlib.allocator: allocator_of / heap_alloc / heap_free and the raw
+    # blocks they hand out.
+    "test_allocator.ritz": 42,
+    # ritzlib.cstr: strlen, streq, strview_from_cstr, cstr_of ... on
+    # NUL-terminated input, the C-string boundary.
+    "test_cstr.ritz": 19,
+    # strview_join2 / strview_join3 (+ the free each result needs): the
+    # pointer-returning join is the subject.
+    "test_strview_join.ritz": 16,
+    # String.into_view hands its buffer to the caller, who frees it with
+    # free(result.ptr) (the same exempt hand-off as strview_join2/3, AGAST
+    # #4915): each test frees the view it took.
+    "test_string_into_view.ritz": 6,
+    # ritzlib.mapping's mmap_shared / munmap: the mmap owner's own API.
+    "test_mapping.ritz": 7,
+    # spawn_env / spawn_env_merged (exempt: they own the argv/envp blocks).
+    "test_process_env.ritz": 3,
+    "test_process_pipes.ritz": 1,
+    # process.exec (exempt for the same reason) x2: the exec tests; and
+    # process.spawn_fn x2 (exempt: its child exits with the body's value,
+    # AGAST #4928): the spawn_fn tests.
+    "test_process_fork.ritz": 4,
+    # strview_from_cstr / strview_from_ptr, each tested once.
+    "test_strview.ritz": 2,
+    # time.sleep (exempt only as a free fn): its own tests.
+    "test_time.ritz": 2,
+    # AGAST #4929 ports these (hand-rolled fork/pipe capture around async
+    # bodies) and lowers them to 0; test_async_server is at what #4929's
+    # rewrite left.
+    "test_async_server.ritz": 29,
+    "test_async_spawn.ritz": 39,
+    "test_block_on_future.ritz": 9,
+}
+
+
+def _is_ritzlib_test(site) -> bool:
+    return Path(site.path).resolve().is_relative_to(RITZLIB_TESTS.resolve())
+
+
 @pytest.fixture(scope="module")
-def by_project():
-    return callers_by_project(
-        count_callers(RITZ_ROOT / "ritzlib", [PROJECTS]), PROJECTS
-    )
+def sites():
+    return count_callers(RITZ_ROOT / "ritzlib", [PROJECTS])
+
+
+@pytest.fixture(scope="module")
+def by_project(sites):
+    return callers_by_project([s for s in sites if not _is_ritzlib_test(s)], PROJECTS)
 
 
 def test_raw_api_callers_only_go_down(by_project):
     over = {p: (n, PINS.get(p, 0)) for p, n in by_project.items() if n > PINS.get(p, 0)}
     assert over == {}, f"project: (calls, pin) over the pin: {over}"
+
+
+def test_ritzlib_tests_raw_callers_only_go_down(sites):
+    by_file: dict[str, list[str]] = {}
+    for s in sites:
+        if _is_ritzlib_test(s):
+            by_file.setdefault(Path(s.path).name, []).append(f"{s.line} {s.api}")
+    over = {f: (len(v), RITZLIB_TEST_PINS.get(f, 0), v[:8]) for f, v in by_file.items()
+            if len(v) > RITZLIB_TEST_PINS.get(f, 0)}
+    assert over == {}, f"ritzlib/tests file: (calls, pin, first sites) over the pin: {over}"
+
+
+def test_ritzlib_tests_are_counted(sites):
+    """The pin above sees ritzlib/tests at all: the boundary tests have calls."""
+    assert any(_is_ritzlib_test(s) and Path(s.path).name == "test_memory.ritz" for s in sites)
 
 
 # AGAST #4691: the syscalls ritzlib now wraps (ritzlib.process ids, SigSet,
@@ -147,10 +213,10 @@ C_LITERAL_PINS = {
     "mausoleum": 33,
     "nexus": 0,
     "prism": 1,
-    "ritz": 3876,
+    "ritz": 384,
     "ritz-lsp": 0,
     "ritzunit": 63,
-    "rzrz": 34,
+    "rzrz": 0,
     "rzsh": 0,
     "sage": 0,
     "spire": 0,
@@ -163,3 +229,29 @@ C_LITERAL_PINS = {
 def test_c_literals_only_go_down():
     over = c_literal_breaches(c_literals_by_project([PROJECTS]), C_LITERAL_PINS)
     assert over == [], f"new c\"\" literals (S-TEXT-1: C interop only): {over}"
+
+
+# AGAST #4928: ritzlib/tests' `c"..."` literals per file, down only (they are
+# also in the `ritz` total above). A "..." literal is a StrView; a c"" stays
+# only where NUL termination is the subject: the C-string tests, and the
+# compilers' lexer tests of the c"" literal itself. Any other file is 0.
+RITZLIB_TEST_C_LITERAL_PINS = {
+    # ritzlib.cstr's strlen / streq / strview_from_cstr need NUL-terminated input.
+    "test_cstr.ritz": 22,
+    # strview_from_cstr's own test needs one NUL-terminated input.
+    "test_strview.ritz": 1,
+    # The `*u8` Display / Debug impls: a NUL-terminated pointer is the input.
+    "test_fmt_impls.ritz": 1,
+    # AGAST #4929 ports these and lowers them to 0.
+    "test_async_server.ritz": 3,
+    "test_async_spawn.ritz": 4,
+}
+
+
+def test_ritzlib_tests_c_literals_only_go_down():
+    over = {}
+    for f in sorted(RITZLIB_TESTS.glob("*.ritz")):
+        n = sum(count_c_literals(ln) for ln in f.read_text().split("\n"))
+        if n > RITZLIB_TEST_C_LITERAL_PINS.get(f.name, 0):
+            over[f.name] = (n, RITZLIB_TEST_C_LITERAL_PINS.get(f.name, 0))
+    assert over == {}, f'ritzlib/tests file: (c"" literals, pin) over the pin: {over}'

@@ -4,9 +4,9 @@
 # mismatch. These used to assert constants against themselves and never
 # call parse_args (AGAST #2790).
 
-import ritzlib.cstr
 import ritzlib.fmt
-import ritzlib.span { Span, span_from_ptr }
+import ritzlib.option
+import ritzlib.span { Span }
 import ritzlib.strview { StrView }
 import src.args
 
@@ -14,78 +14,63 @@ fn fail(name: StrView) -> i32
     print("FAIL: {name}\n")
     1
 
-# Whether a parsed positional (an argv pointer, NUL-terminated; null if
-# absent) is set and reads `want`.
-fn same(got: *u8, want: StrView) -> bool
-    if got == null
-        return false
-    strview_from_cstr(got).eq(want)
+# Whether a parsed positional is set and reads `want`.
+fn same(got: Option<StrView>, want: StrView) -> bool
+    match got
+        Some(v) => v.eq(want)
+        None => false
 
-# parse_args with argv = ["rzrz", a1, a2, ...]; a null ends the list.
-fn parse5(a1: *u8, a2: *u8, a3: *u8, a4: *u8, a5: *u8) -> Args
-    var raw: [5]*u8
-    raw[0] = a1
-    raw[1] = a2
-    raw[2] = a3
-    raw[3] = a4
-    raw[4] = a5
-    var argv: [6]StrView
-    argv[0] = "rzrz"
-    var n: i64 = 1
-    var i: i32 = 0
-    while i < 5 and raw[i] != null
-        argv[n] = strview_from_cstr(raw[i])
-        n += 1
-        i += 1
-    parse_args(span_from_ptr<StrView>(@argv[0], n))
-
-fn command_of(a1: *u8) -> i32
-    let args: Args = parse5(a1, null, null, null, null)
+# parse_args with argv = ["rzrz", cmd].
+fn command_of(cmd: StrView) -> i32
+    let argv: [2]StrView = ["rzrz", cmd]
+    let args: Args = parse_args(@argv)
     args.command
 
 [[test]]
 fn test_parse_no_args() -> i32
-    let args: Args = parse5(null, null, null, null, null)
+    let argv: [1]StrView = ["rzrz"]
+    let args: Args = parse_args(@argv)
     if args.command != CMD_HELP
         return fail("no args -> CMD_HELP")
-    if args.project != null or args.all_projects != 0 or args.release_mode != 0
+    if args.project.is_some() or args.all_projects or args.release_mode
         return fail("no args -> empty Args")
     0
 
 [[test]]
 fn test_parse_each_command() -> i32
-    if command_of(c"build") != CMD_BUILD
+    if command_of("build") != CMD_BUILD
         return fail("build")
-    if command_of(c"test") != CMD_TEST
+    if command_of("test") != CMD_TEST
         return fail("test")
-    if command_of(c"run") != CMD_RUN
+    if command_of("run") != CMD_RUN
         return fail("run")
-    if command_of(c"list") != CMD_LIST
+    if command_of("list") != CMD_LIST
         return fail("list")
-    if command_of(c"clean") != CMD_CLEAN
+    if command_of("clean") != CMD_CLEAN
         return fail("clean")
-    if command_of(c"--help") != CMD_HELP or command_of(c"-h") != CMD_HELP
+    if command_of("--help") != CMD_HELP or command_of("-h") != CMD_HELP
         return fail("--help/-h")
-    if command_of(c"--version") != CMD_VERSION or command_of(c"-V") != CMD_VERSION
+    if command_of("--version") != CMD_VERSION or command_of("-V") != CMD_VERSION
         return fail("--version/-V")
     0
 
 [[test]]
 fn test_parse_unknown_command() -> i32
-    if command_of(c"bogus") != CMD_NONE
+    if command_of("bogus") != CMD_NONE
         return fail("unknown -> CMD_NONE")
     0
 
 [[test]]
 fn test_parse_project_and_flags() -> i32
-    let args: Args = parse5(c"build", c"--release", c"sage", c"--all", null)
+    let argv: [5]StrView = ["rzrz", "build", "--release", "sage", "--all"]
+    let args: Args = parse_args(@argv)
     if args.command != CMD_BUILD
         return fail("flags: command")
     if not same(args.project, "sage")
         return fail("flags: project")
-    if args.all_projects != 1
+    if not args.all_projects
         return fail("flags: --all")
-    if args.release_mode != 1
+    if not args.release_mode
         return fail("flags: --release")
     if args.rest_index != 0
         return fail("flags: no -- means rest_index 0")
@@ -93,10 +78,11 @@ fn test_parse_project_and_flags() -> i32
 
 [[test]]
 fn test_parse_no_flags() -> i32
-    let args: Args = parse5(c"test", c"sage", null, null, null)
+    let argv: [3]StrView = ["rzrz", "test", "sage"]
+    let args: Args = parse_args(@argv)
     if not same(args.project, "sage")
         return fail("no flags: project")
-    if args.all_projects != 0 or args.release_mode != 0
+    if args.all_projects or args.release_mode
         return fail("no flags: flags stay 0")
     0
 
@@ -104,20 +90,21 @@ fn test_parse_no_flags() -> i32
 fn test_parse_compare_is_unknown() -> i32
     # `./rz compare` was deleted as dead code (AGAST #1836), so rzrz no
     # longer forwards to it: `compare` is an unknown command.
-    if command_of(c"compare") != CMD_NONE
+    if command_of("compare") != CMD_NONE
         return fail("compare -> CMD_NONE")
     0
 
 [[test]]
 fn test_parse_double_dash_stops_parsing() -> i32
     # rzrz run p -- x --all : argv[3] is "--", the rest is the program's.
-    let args: Args = parse5(c"run", c"p", c"--", c"x", c"--all")
+    let argv: [6]StrView = ["rzrz", "run", "p", "--", "x", "--all"]
+    let args: Args = parse_args(@argv)
     if not same(args.project, "p")
         return fail("--: project")
     if args.rest_index != 4
         return fail("--: rest_index is the index after --")
-    if args.all_projects != 0
+    if args.all_projects
         return fail("--: --all after -- is not ours")
-    if args.tier != null
+    if args.tier.is_some()
         return fail("--: x after -- is not a tier")
     0

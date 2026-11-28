@@ -205,6 +205,19 @@ KEPT = {
     "each_arm_binds_v": (
         "fn f(r: Result<i32, i32>) -> i32\n    match r\n        Ok(v) => v\n        Err(v) => v + 1\n"
         "fn main() -> i32\n    f(Ok(5)) * 10 + f(Err(5))\n", 56),
+    # ...an earlier arm's `var`, then a payload of the same name (AGAST #4928:
+    # ritz0 read the earlier arm's slot, since a `var` outranks a binding).
+    "payload_after_an_arms_var": (
+        "fn f(r: Result<i32, i32>) -> i32\n    match r\n        Ok(x) =>\n"
+        "            var v: i32 = x\n            v = v + 1\n            v\n"
+        "        Err(v) => v * 10\n"
+        "fn main() -> i32\n    f(Ok(1)) + f(Err(5))\n", 52),
+    # ...the same for an integer match's name.
+    "arm_name_after_an_arms_var": (
+        "fn g(n: i32) -> i32\n    match n\n        0 =>\n"
+        "            var m: i32 = 7\n            m = m + 1\n            m\n"
+        "        m => m * 2\n"
+        "fn main() -> i32\n    g(0) + g(5)\n", 18),
     # ...two matches in a row.
     "two_matches_bind_v": (
         "fn f(o: Option<i32>, p: Option<i32>) -> i32\n    var s: i32 = 0\n    match o\n"
@@ -286,19 +299,30 @@ def test_a_local_cant_reuse_a_name_in_scope(request, tmp_path, compiler, name):
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
+# KEPT's rows are table rows of one test per compiler, not a case each
+# (AGAST #4928: the suite sat at its case cap; docs/TESTING.md, "What a ritz0
+# pytest case costs").  Every row runs, and each failing row is named.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(KEPT))
-def test_a_name_out_of_scope_is_free(request, tmp_path, compiler, name):
-    source, code = KEPT[name]
-    proc, ll = _compile(request, compiler, tmp_path, source)
-    assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-1500:]}"
-    exe = tmp_path / "unit"
-    link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
-    if compiler != "ritz0":
-        link.insert(3, str(RITZ_START))
-    fast_link.clang(link, check=True)
-    assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
+def test_a_name_out_of_scope_is_free(request, tmp_path, compiler):
+    failed = []
+    for name in sorted(KEPT):
+        source, code = KEPT[name]
+        work = tmp_path / name
+        work.mkdir()
+        proc, ll = _compile(request, compiler, work, source)
+        if proc.returncode != 0:
+            failed.append(f"{name}: refused:\n{(proc.stdout + proc.stderr)[-800:]}")
+            continue
+        exe = work / "unit"
+        link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
+        if compiler != "ritz0":
+            link.insert(3, str(RITZ_START))
+        fast_link.clang(link, check=True)
+        got = subprocess.run([str(exe)], timeout=60).returncode
+        if got != code:
+            failed.append(f"{name}: exit {got}, want {code}")
+    assert failed == [], f"{compiler}:\n" + "\n".join(failed)
 
 
 @pytest.mark.integration

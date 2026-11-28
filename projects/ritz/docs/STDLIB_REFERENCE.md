@@ -1888,7 +1888,7 @@ fn size_or_minus_one(path: StrView) -> i64
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `d.next()` | `fn() -> bool` | Advance; true if an entry is available, false at the end |
-| `d.close()` | `fn()` | Close the fd and free the buffer early; a second close is a no-op. The buffer is a `Vec<u8>`, so a dropped `DirIter` frees it anyway (AGAST #4686) |
+| `d.close()` | `fn()` | Close the fd and free the buffer early; a second close is a no-op. A dropped `DirIter` closes itself (`impl Drop`, AGAST #4928), so `close()` is only for releasing them before the end of scope |
 | `d.entry()` | `fn() -> DirEntry` | Current entry after `d.next()` returns true |
 | `d.next_entry()` | `fn() -> Option<DirEntry>` | Advance and return the next entry, `None` at the end |
 | `d.entry_type()` | `fn() -> Option<u8>` | Type of the current entry (`DT_REG`, `DT_DIR`, ...), `None` if there is none |
@@ -2247,6 +2247,7 @@ struct EpollEvent
 | `s.close()` | `fn() -> Result<(), Errno>` | Close and set `fd = -1`; `Ok(())` if already closed, else `Err(errno)` from close(2) |
 | `s.raw()` | `fn() -> i32` | The fd, for io_uring SQEs and other code that drives it directly; -1 once closed |
 | `s.local_port()` | `fn() -> Result<i32, Errno>` | The bound port (host order), e.g. the kernel's pick for port 0; `Err(errno)` from getsockname(2) |
+| `s.local_ip()` | `fn() -> Result<u32, Errno>` | The bound IPv4 address in network byte order (as `parse_ipv4` gives it), 0 for 0.0.0.0; `Err(errno)` from getsockname(2) |
 | `s.shutdown(how)` | `fn(how: i32) -> Result<(), Errno>` | `SHUT_RD` / `SHUT_WR` / `SHUT_RDWR`; the fd stays open; `Err(errno)`, e.g. `NotConn` |
 
 **Socket Options**:
@@ -2254,10 +2255,12 @@ struct EpollEvent
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `s.set_opt_int(level, optname, value)` | `fn(level: i32, optname: i32, value: i32) -> Result<(), Errno>` | setsockopt with an int; `Err(errno)` |
+| `s.get_opt_int(level, optname)` | `fn(level: i32, optname: i32) -> Result<i32, Errno>` | getsockopt of an int: what `set_opt_int` set; `Err(errno)` |
 | `s.set_reuseaddr()` | `fn() -> Result<(), Errno>` | Enable SO_REUSEADDR |
 | `s.set_reuseport()` | `fn() -> Result<(), Errno>` | Enable SO_REUSEPORT |
 | `s.set_nodelay()` | `fn() -> Result<(), Errno>` | Disable Nagle |
 | `s.set_io_timeout(timeout_ms)` | `fn(timeout_ms: i32) -> Result<(), Errno>` | SO_RCVTIMEO + SO_SNDTIMEO; 0 clears |
+| `s.recv_timeout_ms()` / `s.send_timeout_ms()` | `fn() -> Result<i64, Errno>` | SO_RCVTIMEO / SO_SNDTIMEO in ms, 0 for none (rounded up to a kernel tick) |
 
 **Server Operations**:
 
@@ -2653,7 +2656,8 @@ struct ProcessResult
 |----------|-----------|-------------|
 | `spawn` | `fn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>` | Spawn `cmd` (found by `find_command`) with `args` as argv[1..]; argv[0] is `cmd` as given. `Err` is an `Errno`: `NoEnt` not found, `Acces` not executable, `NoMem`, or a pipe/fork failure |
 | `spawn_env` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>) -> Result<Process, Errno>` | `spawn`, but the child's environment is exactly `env` (`"KEY=VALUE"` views, nothing of ours merged in; an empty span is empty). `spawn` inherits ours |
-| `spawn_env_merged` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>, stdin_fd: i32) -> Result<Process, Errno>` | `spawn_env`, but the child reads stdin from `stdin_fd` (dup'd; the caller still closes it; negative is `Err(BadF)`) and its stderr goes down the stdout pipe (`2>&1`), so `read_stdout_all` gets both in order. The `Process` has no stdin or stderr pipe. For test harnesses: `ritzlib.testlib`'s `exec_capture` |
+| `spawn_env_merged` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>, stdin_fd: i32) -> Result<Process, Errno>` | `spawn_env`, but the child reads stdin from `stdin_fd` (dup'd; the caller still closes it; negative is `Err(BadF)`) and its stderr goes down the stdout pipe (`2>&1`), so `read_stdout_all` gets both in order. The `Process` has no stdin or stderr pipe. For test harnesses: `ritzlib.testlib`'s `exec_capture` (a binary's merged output) and `capture(body: fn() -> i32)` (a function's stdout and stderr, apart, from a forked child) |
+| `spawn_fn` | `fn(body: fn() -> i32) -> Result<Process, Errno>` | Fork, and run `body` in the child with stdin, stdout and stderr on pipes; the child exits with `body`'s value. The `Process` is used as `spawn`'s is (`close_stdin`, `read_stdout_all` / `read_stderr_all`, `wait`, `cleanup`). `ritzlib.testlib`'s `capture` is built on it |
 
 A spawned child starts with an empty signal mask, whatever this process has
 blocked (for a signalfd, say): the mask would otherwise survive execve(2)

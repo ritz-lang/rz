@@ -146,6 +146,33 @@ fn test_basic_invocation() -> i32
 - A missing or non-executable `bin` is `Err(NoEnt)` / `Err(Acces)`, not a
   child that exits 127.
 
+What a function prints, rather than a binary, is `capture(body: fn() -> i32)
+-> Result<Captured, Errno>` (AGAST #4928): `body` runs in a child process
+(`ritzlib.process`'s `spawn_fn`) with stdin at EOF and stdout and stderr on two pipes, drained together (a child filling one
+pipe can't stall the other), and exits with `body`'s return value. Here
+`c.output()` is stdout alone and `c.err_output()` stderr. Never hand-roll
+fork + pipe + dup2 in a test:
+
+```ritz
+import ritzlib.io
+import ritzlib.testlib
+
+fn case_help() -> i32
+    print("usage: demo\n")
+    0
+
+[[test]]
+fn test_help_is_exact() -> i32
+    match capture(case_help)
+        Ok(c) =>
+            assert c.status.exit_code == 0
+            assert buf_eq(c.output(), "usage: demo\n")
+            assert c.err_output().len == 0
+        Err(_) =>
+            assert false, "fork"
+    0
+```
+
 Scratch files go under `sandbox_path(prefix, suffix) -> String`
 (`<tmp>/ritz_<prefix>_<pid>_<suffix>`, where `<tmp>` is `$TMPDIR` when it
 is set and non-empty, else `/tmp`: a host's `/tmp` may be noexec, so the gate

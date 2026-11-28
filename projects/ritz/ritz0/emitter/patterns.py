@@ -25,6 +25,19 @@ from emitter.common import (EmitError, NoValue, _PASS_ARM, has_no_value)
 class PatternEmitter:
     """Pattern and match emission for `LLVMEmitter`; mixed in with its bases."""
 
+    def _bind_arm_name(self, name: str, val: ir.Value, ty: ir.Type) -> None:
+        """Bind an arm's name (a payload's, or the arm's own) for its body.
+
+        Name lookup tries `self.locals` (the `var`s) before `self.params`, and a
+        `var` isn't dropped from `locals` when its block ends. The checker lets
+        a binding reuse a name only once the earlier one is out of scope (an
+        earlier arm's, a finished block's: LANGUAGE_SPEC §4.3), so a `locals`
+        entry of this name is stale: drop it, as a `let` does, or the arm
+        reads that dead slot (AGAST #4928).
+        """
+        self.locals.pop(name, None)
+        self.params[name] = (val, ty)
+
     def _emit_match(self, expr: rast.Match) -> ir.Value:
         """Emit a match expression.
 
@@ -877,8 +890,7 @@ class PatternEmitter:
 
                     # Bind the field value to the pattern variable
                     if isinstance(field_pattern, rast.IdentPattern):
-                        # Store in params so it can be used in the arm body
-                        self.params[field_pattern.name] = (field_val, llvm_field_type)
+                        self._bind_arm_name(field_pattern.name, field_val, llvm_field_type)
                         # Also store the Ritz type for field access on reference types
                         self.ritz_types[field_pattern.name] = field_type
                         if scrut_flag is not None and takes:
@@ -899,7 +911,7 @@ class PatternEmitter:
                                and not self._has_enum_variant(enum_name, pattern.name))
             if binds_scrutinee:
                 scrut_val = self.builder.load(enum_alloca)
-                self.params[pattern.name] = (scrut_val, enum_type)
+                self._bind_arm_name(pattern.name, scrut_val, enum_type)
                 self.ritz_types[pattern.name] = rast.NamedType(None, enum_name, [])
                 if scrut_flag is not None and takes:
                     # The binding took the scrutinee (its drop flag is
@@ -1358,8 +1370,7 @@ class PatternEmitter:
             # Bind identifier pattern to the match value
             arm_binds = binds(pattern)
             if arm_binds:
-                # Bind the match value to the pattern name for use in the arm body
-                self.params[pattern.name] = (match_val, match_val.type)
+                self._bind_arm_name(pattern.name, match_val, match_val.type)
                 # The binding has the scrutinee's Ritz type, so a u32 `n`
                 # reads unsigned in the arm (AGAST #3344). No outer name can
                 # share it: a local can't rebind one, nor take a global's.

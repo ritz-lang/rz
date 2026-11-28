@@ -28,6 +28,13 @@
 #   epoll_del(epfd: i32, fd: i32) -> Result<(), Errno>
 #   epoll_wait_events(epfd, events: @&EpollEvent, max, timeout_ms) -> Result<i32, Errno>
 #
+# and (AGAST #4928) the readers, so no test hands getsockname(2) or
+# getsockopt(2) an out-parameter:
+#
+#   s.local_ip() -> Result<u32, Errno>                  network byte order
+#   s.get_opt_int(level, optname) -> Result<i32, Errno>
+#   s.recv_timeout_ms() / s.send_timeout_ms() -> Result<i64, Errno>
+#
 # An Err carries a ritzlib.errno Errno (was a positive i32 errno, AGAST
 # #4298); the helpers below compare its errno_code with the numbers.
 #
@@ -38,13 +45,16 @@
 # so no test depends on what else is listening on this host.
 
 import ritzlib.sys
-import ritzlib.str
 import ritzlib.gvec
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.span
 import ritzlib.option
 import ritzlib.result
+import ritzlib.errno
+import ritzlib.fd
+import ritzlib.process
+import ritzlib.time
 import ritzlib.net
 
 const E_BADF: i32 = 9
@@ -71,11 +81,6 @@ fn ip_none(o: Option<u32>) -> i32
     match o
         Some(_) => 0
         None => 1
-
-fn unit_ok(r: Result<(), Errno>) -> i32
-    match r
-        Ok(_) => 1
-        Err(_) => 0
 
 # The errno number of an Err, 0 for Ok.
 fn unit_err(r: Result<(), Errno>) -> i32
@@ -125,31 +130,23 @@ fn accept_err(r: Result<Socket, Errno>) -> i32
             0
         Err(e) => e.code()
 
-fn bytes_are(v: *Vec<u8>, want: StrView) -> i32
-    (strview_from_ptr(v.data, v.len)).eq(want) as i32
+# The port the kernel gave a socket bound to port 0, in host byte order
+# (-1000 - errno if getsockname failed).
+fn bound_port(sock: @Socket) -> i32
+    int_of(sock.local_port())
 
-# The port the kernel gave a socket bound to port 0, in host byte order.
-fn bound_port(sock: *Socket) -> i32
-    var addr: SockAddrIn
-    var len: i32 = 16
-    if sys_getsockname(sock.fd, @addr as *u8, @len) < 0
-        return -1
-    ntohs(addr.port)
+# The address a socket is bound to, network byte order (u32 max on Err).
+fn bound_addr(sock: @Socket) -> u32
+    sock.local_ip().unwrap_or(4294967295)
 
-fn bound_addr(sock: *Socket) -> u32
-    var addr: SockAddrIn
-    var len: i32 = 16
-    sys_getsockname(sock.fd, @addr as *u8, @len)
-    addr.addr
-
-# A listening server on 127.0.0.1:<any>; its port in *port.
-fn listen_loopback(port: *i32) -> Socket
+# A listening server on 127.0.0.1:<any> (a closed one if bind failed); its
+# port is bound_port(@srv).
+fn listen_loopback() -> Socket
     var s: Socket = tcp()
-    if unit_ok(s.bind("127.0.0.1", 0)) == 0
-        s.fd = -1
+    if s.bind("127.0.0.1", 0).is_err()
+        s.close()
         return s
     s.listen(4)
-    *port = bound_port(@s)
     s
 
 # ============================================================================
@@ -239,7 +236,7 @@ fn test_socket_valid_is_bool() -> i32
 [[test]]
 fn test_bind_loopback_ok() -> i32
     var s: Socket = tcp()
-    assert unit_ok(s.bind("127.0.0.1", 0)) == 1
+    assert s.bind("127.0.0.1", 0).is_ok()
     assert bound_addr(@s) == LOOPBACK_NBO
     assert bound_port(@s) > 0
     s.close()
@@ -248,7 +245,7 @@ fn test_bind_loopback_ok() -> i32
 [[test]]
 fn test_bind_address_from_a_slice() -> i32
     var s: Socket = tcp()
-    assert unit_ok(s.bind(("127.0.0.1NOPE").slice(0, 9), 0)) == 1
+    assert s.bind(("127.0.0.1NOPE").slice(0, 9), 0).is_ok()
     assert bound_addr(@s) == LOOPBACK_NBO
     s.close()
     0
@@ -263,8 +260,8 @@ fn test_bind_garbage_address_is_einval() -> i32
 
 [[test]]
 fn test_bind_syscall_failure_is_positive_errno() -> i32
-    var port: i32 = 0
-    var a: Socket = listen_loopback(@port)
+    var a: Socket = listen_loopback()
+    let port: i32 = bound_port(@a)
     assert a.fd >= 0
     var b: Socket = tcp()
     assert unit_err(b.bind("127.0.0.1", port)) == E_ADDRINUSE
@@ -275,7 +272,7 @@ fn test_bind_syscall_failure_is_positive_errno() -> i32
 [[test]]
 fn test_bind_method() -> i32
     var s: Socket = tcp()
-    assert unit_ok(s.bind("127.0.0.1", 0)) == 1
+    assert s.bind("127.0.0.1", 0).is_ok()
     assert bound_addr(@s) == LOOPBACK_NBO
     s.close()
     0
@@ -284,7 +281,7 @@ fn test_bind_method() -> i32
 fn test_bind_any_address_binds_every_interface() -> i32
     # socket_bind_any is gone (#3835): "0.0.0.0" is how to say it.
     var s: Socket = tcp()
-    assert unit_ok(s.bind("0.0.0.0", 0)) == 1
+    assert s.bind("0.0.0.0", 0).is_ok()
     assert bound_addr(@s) == 0
     s.close()
     0
@@ -303,39 +300,28 @@ const L_SO_RCVTIMEO: i32 = 20
 const L_SO_SNDTIMEO: i32 = 21
 const L_IPPROTO_TCP: i32 = 6
 const L_TCP_NODELAY: i32 = 1
-const L_F_GETFL: i64 = 3
-const L_O_NONBLOCK: i32 = 2048
 
+# An integer option's value, -1 if getsockopt fails.
 fn opt_of(sock: @Socket, level: i32, name: i32) -> i32
-    var val: i32 = -1
-    var len: i32 = 4
-    if sys_getsockopt(sock.fd, level, name, @val as *u8, @len) < 0
-        return -1
-    val
-
-# SO_RCVTIMEO or SO_SNDTIMEO in ms, -1 if getsockopt fails.
-fn timeout_of(sock: @Socket, name: i32) -> i64
-    var tv: [2]i64
-    var len: i32 = 16
-    if sys_getsockopt(sock.fd, L_SOL_SOCKET, name, @tv[0] as *u8, @len) < 0
-        return -1
-    tv[0] * 1000 + tv[1] / 1000
+    sock.get_opt_int(level, name).unwrap_or(-1)
 
 [[test]]
 fn test_close_marks_closed_and_is_idempotent() -> i32
     var s: Socket = tcp()
-    assert unit_ok(s.close()) == 1
+    assert s.close().is_ok()
     assert s.fd == -1
-    assert unit_ok(s.close()) == 1
+    assert s.close().is_ok()
     var t: Socket = tcp()
-    assert unit_ok(t.close()) == 1
+    assert t.close().is_ok()
     assert not t.valid()
     0
 
 [[test]]
 fn test_close_failure_is_errno_and_still_marks_closed() -> i32
     var s: Socket = tcp()
-    sys_close(s.fd)
+    # Closed behind the Socket's back, through a second handle on its fd.
+    var behind: Socket = socket_from_raw(s.raw())
+    assert behind.close().is_ok()
     assert unit_err(s.close()) == E_BADF
     assert s.fd == -1
     0
@@ -343,24 +329,24 @@ fn test_close_failure_is_errno_and_still_marks_closed() -> i32
 [[test]]
 fn test_option_setters_set_their_option() -> i32
     var s: Socket = tcp()
-    assert unit_ok(s.set_reuseaddr()) == 1
+    assert s.set_reuseaddr().is_ok()
     assert opt_of(@s, L_SOL_SOCKET, L_SO_REUSEADDR) == 1
-    assert unit_ok(s.set_reuseport()) == 1
+    assert s.set_reuseport().is_ok()
     assert opt_of(@s, L_SOL_SOCKET, L_SO_REUSEPORT) == 1
-    assert unit_ok(s.set_nodelay()) == 1
+    assert s.set_nodelay().is_ok()
     assert opt_of(@s, L_IPPROTO_TCP, L_TCP_NODELAY) == 1
-    assert unit_ok(s.set_opt_int(L_SOL_SOCKET, L_SO_KEEPALIVE, 1)) == 1
+    assert s.set_opt_int(L_SOL_SOCKET, L_SO_KEEPALIVE, 1).is_ok()
     assert opt_of(@s, L_SOL_SOCKET, L_SO_KEEPALIVE) == 1
     # The kernel stores SO_*TIMEO in jiffies and rounds up, so the readback
     # is exact only for a whole number of ticks. 3000 ms is one at
     # HZ=100/250/300/1000; 1250 ms read back as 1252 at HZ=250.
-    assert unit_ok(s.set_io_timeout(3000)) == 1
-    assert timeout_of(@s, L_SO_RCVTIMEO) == 3000
-    assert timeout_of(@s, L_SO_SNDTIMEO) == 3000
-    assert unit_ok(s.set_io_timeout(0)) == 1
-    assert timeout_of(@s, L_SO_SNDTIMEO) == 0
+    assert s.set_io_timeout(3000).is_ok()
+    assert s.recv_timeout_ms().unwrap_or(-1) == 3000
+    assert s.send_timeout_ms().unwrap_or(-1) == 3000
+    assert s.set_io_timeout(0).is_ok()
+    assert s.send_timeout_ms().unwrap_or(-1) == 0
     var t: Socket = tcp()
-    assert unit_ok(t.set_reuseaddr()) == 1
+    assert t.set_reuseaddr().is_ok()
     assert opt_of(@t, L_SOL_SOCKET, L_SO_REUSEADDR) == 1
     t.close()
     s.close()
@@ -380,8 +366,8 @@ fn test_option_setter_failures_are_positive_errno() -> i32
 [[test]]
 fn test_listen_ok_and_failure_is_errno() -> i32
     var s: Socket = tcp()
-    assert unit_ok(s.bind("127.0.0.1", 0)) == 1
-    assert unit_ok(s.listen(4)) == 1
+    assert s.bind("127.0.0.1", 0).is_ok()
+    assert s.listen(4).is_ok()
     s.close()
     assert unit_err(s.listen(4)) == E_BADF
     0
@@ -399,24 +385,23 @@ fn test_accept_failure_is_errno_not_a_dead_socket() -> i32
 
 [[test]]
 fn test_accept_nonblock_eagain_then_nonblocking_peer() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     assert srv.fd >= 0
     # A blocking listener, nothing pending: accept4(SOCK_NONBLOCK) only
     # makes the *accepted* socket non-blocking, so make srv non-blocking too.
-    syscall3(72, srv.fd as i64, 4, L_O_NONBLOCK as i64)
+    assert fd_borrow(srv.raw()).set_nonblocking(true).is_ok()
     assert accept_err(srv.accept_nonblock()) == E_AGAIN
 
     var c: Socket = tcp()
-    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    assert c.connect("127.0.0.1", port).is_ok()
     match srv.accept_nonblock()
         Ok(p) =>
             var peer: Socket = p
             assert peer.valid()
             assert peer.family == AF_INET and peer.socktype == SOCK_STREAM
-            let fl: i32 = syscall3(72, peer.fd as i64, L_F_GETFL, 0) as i32
-            assert (fl & L_O_NONBLOCK) != 0
-            assert unit_ok(peer.close()) == 1
+            assert fd_borrow(peer.raw()).is_nonblocking().unwrap_or(false)
+            assert peer.close().is_ok()
         Err(_) =>
             assert 0 == 1
     c.close()
@@ -425,10 +410,10 @@ fn test_accept_nonblock_eagain_then_nonblocking_peer() -> i32
 
 [[test]]
 fn test_accept_method_returns_connected_socket() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     var c: Socket = tcp()
-    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    assert c.connect("127.0.0.1", port).is_ok()
     var peer: Socket = peer_of(srv.accept())
     assert peer.valid()
     assert count_of(c.send_str("ok")) == 2
@@ -445,11 +430,11 @@ fn test_accept_method_returns_connected_socket() -> i32
 
 [[test]]
 fn test_connect_loopback_ok() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     assert srv.fd >= 0
     var c: Socket = tcp()
-    assert unit_ok(c.connect(("127.0.0.1:x").slice(0, 9), port)) == 1
+    assert c.connect(("127.0.0.1:x").slice(0, 9), port).is_ok()
     c.close()
     srv.close()
     0
@@ -479,12 +464,12 @@ fn test_connect_refused_is_positive_errno() -> i32
 
 [[test]]
 fn test_connect_timeout_loopback_ok() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     assert srv.fd >= 0
     var c: Socket = tcp()
     # A slice of a longer literal: the address needs no terminator.
-    assert unit_ok(c.connect_timeout(("127.0.0.1:x").slice(0, 9), port, 5000)) == 1
+    assert c.connect_timeout(("127.0.0.1:x").slice(0, 9), port, 5000).is_ok()
     # The socket is blocking again afterwards: a send of one byte completes.
     assert count_of(c.send_str("x")) == 1
     c.close()
@@ -495,8 +480,8 @@ fn test_connect_timeout_loopback_ok() -> i32
 fn test_connect_timeout_garbage_address_is_einval() -> i32
     # EINVAL, not a connect to 0.0.0.0, where this very listener (bound to
     # 127.0.0.1) would have answered.
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     var c: Socket = tcp()
     assert unit_err(c.connect_timeout("bogus", port, 1000)) == E_INVAL
     c.close()
@@ -520,11 +505,11 @@ fn test_connect_timeout_expiry_is_etimedout() -> i32
     # A listener with backlog 0 whose accept queue is already full drops
     # the next SYN, so that connect stays in progress until the timeout.
     var srv: Socket = tcp()
-    assert unit_ok(srv.bind("127.0.0.1", 0)) == 1
+    assert srv.bind("127.0.0.1", 0).is_ok()
     srv.listen(0)
     let port: i32 = bound_port(@srv)
     var a: Socket = tcp()
-    assert unit_ok(a.connect("127.0.0.1", port)) == 1
+    assert a.connect("127.0.0.1", port).is_ok()
     var b: Socket = tcp()
     assert unit_err(b.connect_timeout("127.0.0.1", port, 100)) == E_TIMEDOUT
     b.close()
@@ -542,10 +527,10 @@ fn test_connect_timeout_bad_fd_is_ebadf() -> i32
 
 [[test]]
 fn test_connect_method() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     var c: Socket = tcp()
-    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    assert c.connect("127.0.0.1", port).is_ok()
     c.close()
     srv.close()
     0
@@ -556,17 +541,17 @@ fn test_connect_method() -> i32
 
 [[test]]
 fn test_send_and_recv_into_round_trip() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     var c: Socket = tcp()
-    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    assert c.connect("127.0.0.1", port).is_ok()
     var peer: Socket = peer_of(srv.accept())
     assert peer.valid()
 
     assert count_of(c.send_all("hello world")) == 11
     var buf: Vec<u8> = vec_new<u8>()
     assert count_of(peer.recv_into(@&buf, 64)) == 11
-    assert bytes_are(@buf, "hello world") == 1
+    assert buf.as_view().eq("hello world")
 
     peer.close()
     c.close()
@@ -575,8 +560,8 @@ fn test_send_and_recv_into_round_trip() -> i32
 
 [[test]]
 fn test_recv_into_appends_and_respects_max() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     var c: Socket = tcp()
     c.connect("127.0.0.1", port)
     var peer: Socket = peer_of(srv.accept())
@@ -586,9 +571,9 @@ fn test_recv_into_appends_and_respects_max() -> i32
     buf.push('>')
     # At most 4 bytes this time; the rest stays in the socket.
     assert count_of(peer.recv_into(@&buf, 4)) == 4
-    assert bytes_are(@buf, ">abcd") == 1
+    assert buf.as_view().eq(">abcd")
     assert count_of(peer.recv_into(@&buf, 64)) == 2
-    assert bytes_are(@buf, ">abcdef") == 1
+    assert buf.as_view().eq(">abcdef")
 
     peer.close()
     c.close()
@@ -597,8 +582,8 @@ fn test_recv_into_appends_and_respects_max() -> i32
 
 [[test]]
 fn test_recv_into_eof_is_ok_zero() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     var c: Socket = tcp()
     c.connect("127.0.0.1", port)
     var peer: Socket = peer_of(srv.accept())
@@ -622,10 +607,10 @@ fn test_send_and_recv_errors_are_positive_errno() -> i32
 
 [[test]]
 fn test_send_all_sends_a_vec_span_and_methods() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     var c: Socket = tcp()
-    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    assert c.connect("127.0.0.1", port).is_ok()
     var peer: Socket = peer_of(srv.accept())
 
     var out: Vec<u8> = vec_new<u8>()
@@ -640,19 +625,12 @@ fn test_send_all_sends_a_vec_span_and_methods() -> i32
         let n: i64 = count_of(peer.recv(@&buf, 64))
         assert n > 0
         got += n
-    assert bytes_are(@buf, "hithere") == 1
+    assert buf.as_view().eq("hithere")
 
     peer.close()
     c.close()
     srv.close()
     0
-
-fn sleep_ms(ms: i64)
-    var ts: [2]i64
-    # tv_nsec must stay below 1e9, or nanosleep fails EINVAL at once.
-    ts[0] = ms / 1000
-    ts[1] = (ms % 1000) * 1000000
-    sys_nanosleep(@ts[0], null)
 
 # A blocking write() on a TCP socket only comes back short when something
 # cuts it off; SO_SNDTIMEO does, once the call has spent that long in total
@@ -669,44 +647,53 @@ fn sleep_ms(ms: i64)
 # wakes early, the first write() just completes: the test passes without
 # covering a short write, rather than failing.
 # The child exits 0 iff it read every byte.
+# The forked reader: 3 s asleep, then accept and read to EOF.  0 iff it read
+# all `total` bytes.
+fn drain_after_3s(srv: @&Socket, total: i64) -> i32
+    sleep_ms(3000)
+    var peer: Socket = peer_of(srv.accept())
+    var got: i64 = 0
+    var chunk: Vec<u8> = vec_with_cap<u8>(65536)
+    loop
+        chunk.clear()
+        let n: i64 = count_of(peer.recv_into(@&chunk, 65536))
+        if n <= 0
+            break
+        got += n
+    if got == total then 0 else 1
+
 [[test]]
 fn test_send_all_completes_after_short_writes() -> i32
     let total: i64 = 16777216
     # Filled before the fork, so the first write() starts right after connect.
-    var big: Vec<u8> = vec_new<u8>()
-    big.ensure_cap(total)
-    memset(big.data, 'z', total)
-    big.len = total
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var big: Vec<u8> = vec_zeroed<u8>(total)
+    assert big.len == total
+    span_from_vec<u8>(@big).fill('z')
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     assert srv.fd >= 0
 
-    let pid: i32 = sys_fork()
-    if pid == 0
-        sleep_ms(3000)
-        var peer: Socket = peer_of(srv.accept())
-        var got: i64 = 0
-        var chunk: Vec<u8> = vec_with_cap<u8>(65536)
-        loop
-            chunk.clear()
-            let n: i64 = count_of(peer.recv_into(@&chunk, 65536))
-            if n <= 0
-                break
-            got += n
-        if got == total
-            sys_exit(0)
-        sys_exit(1)
+    let pid: i32 = match fork()
+        Ok(side) => match side
+            Child =>
+                sys_exit(drain_after_3s(@&srv, total))
+                0
+            Parent(child) => child
+        Err(_) => return 1
 
     var c: Socket = tcp()
-    assert unit_ok(c.connect("127.0.0.1", port)) == 1
-    assert unit_ok(c.set_io_timeout(2000)) == 1
+    assert c.connect("127.0.0.1", port).is_ok()
+    assert c.set_io_timeout(2000).is_ok()
     assert count_of(c.send_all(span_from_vec<u8>(@big))) == total
     c.close()
 
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
+    let waited: Result<ProcessResult, Errno> = wait_pid(pid)
     srv.close()
-    assert status == 0
+    match waited
+        Ok(r) =>
+            assert r.success()
+        Err(_) =>
+            assert false, "wait_pid"
     0
 
 # ============================================================================
@@ -721,9 +708,8 @@ fn test_socket_tcp_is_ok_stream() -> i32
             var t: Socket = s
             assert t.fd >= 0
             assert t.family == AF_INET and t.socktype == SOCK_STREAM
-            let fl: i32 = syscall3(72, t.fd as i64, L_F_GETFL, 0) as i32
-            assert (fl & L_O_NONBLOCK) == 0
-            assert unit_ok(t.close()) == 1
+            assert not fd_borrow(t.raw()).is_nonblocking().unwrap_or(true)
+            assert t.close().is_ok()
         Err(_) =>
             assert 0 == 1
     0
@@ -736,8 +722,7 @@ fn test_socket_tcp_nonblock_is_ok_nonblocking() -> i32
             assert t.fd >= 0
             # The bare SOCK_STREAM, not SOCK_STREAM | SOCK_NONBLOCK.
             assert t.socktype == SOCK_STREAM
-            let fl: i32 = syscall3(72, t.fd as i64, L_F_GETFL, 0) as i32
-            assert (fl & L_O_NONBLOCK) != 0
+            assert fd_borrow(t.raw()).is_nonblocking().unwrap_or(false)
             t.close()
         Err(_) =>
             assert 0 == 1
@@ -751,7 +736,7 @@ fn test_socket_udp_is_ok_dgram() -> i32
             assert t.fd >= 0
             assert t.family == AF_INET and t.socktype == SOCK_DGRAM
             # A datagram socket binds like any other.
-            assert unit_ok(t.bind("127.0.0.1", 0)) == 1
+            assert t.bind("127.0.0.1", 0).is_ok()
             t.close()
         Err(_) =>
             assert 0 == 1
@@ -798,67 +783,72 @@ fn test_connect_refused_is_connrefused_variant() -> i32
 
 const L_EPOLLIN: u32 = 1
 
+# A fresh pipe (both ends closed if pipe(2) failed, so the test's next use
+# of them reports EBADF).
+fn new_pipe() -> Pipe
+    match pipe()
+        Ok(p) => p
+        Err(_) => Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+
 [[test]]
 fn test_epoll_create_is_ok_fd() -> i32
-    let ep: i32 = int_of(epoll_create())
-    assert ep >= 0
-    sys_close(ep)
+    var ep: Fd = fd_adopt(int_of(epoll_create()))
+    assert ep.raw() >= 0
+    assert ep.close().is_ok()
     0
 
 [[test]]
 fn test_epoll_add_twice_is_exist() -> i32
-    let ep: i32 = int_of(epoll_create())
-    var fds: [2]i32
-    assert sys_pipe(@fds[0]) == 0
-    assert unit_ok(epoll_add(ep, fds[0], L_EPOLLIN)) == 1
-    assert unit_err(epoll_add(ep, fds[0], L_EPOLLIN)) == EEXIST
-    match epoll_add(ep, fds[0], L_EPOLLIN)
+    var epfd: Fd = fd_adopt(int_of(epoll_create()))
+    let ep: i32 = epfd.raw()
+    var p: Pipe = new_pipe()
+    let r: i32 = p.read.raw()
+    assert epoll_add(ep, r, L_EPOLLIN).is_ok()
+    assert unit_err(epoll_add(ep, r, L_EPOLLIN)) == EEXIST
+    match epoll_add(ep, r, L_EPOLLIN)
         Ok(_) =>
             assert 0 == 1
         Err(e) => match e
             Exist => pass
             _ =>
                 assert 0 == 1
-    sys_close(fds[0])
-    sys_close(fds[1])
-    sys_close(ep)
+    p.close()
+    epfd.close()
     0
 
 [[test]]
 fn test_epoll_del_and_mod_of_unwatched_fd_is_noent() -> i32
-    let ep: i32 = int_of(epoll_create())
-    var fds: [2]i32
-    assert sys_pipe(@fds[0]) == 0
-    assert unit_err(epoll_del(ep, fds[0])) == ENOENT
-    assert unit_err(epoll_mod(ep, fds[0], L_EPOLLIN)) == ENOENT
-    assert unit_ok(epoll_add(ep, fds[0], L_EPOLLIN)) == 1
-    assert unit_ok(epoll_mod(ep, fds[0], L_EPOLLIN)) == 1
-    assert unit_ok(epoll_del(ep, fds[0])) == 1
-    assert unit_err(epoll_del(ep, fds[0])) == ENOENT
+    var epfd: Fd = fd_adopt(int_of(epoll_create()))
+    let ep: i32 = epfd.raw()
+    var p: Pipe = new_pipe()
+    let r: i32 = p.read.raw()
+    assert unit_err(epoll_del(ep, r)) == ENOENT
+    assert unit_err(epoll_mod(ep, r, L_EPOLLIN)) == ENOENT
+    assert epoll_add(ep, r, L_EPOLLIN).is_ok()
+    assert epoll_mod(ep, r, L_EPOLLIN).is_ok()
+    assert epoll_del(ep, r).is_ok()
+    assert unit_err(epoll_del(ep, r)) == ENOENT
     # A closed epoll fd is EBADF, not a bare -9.
-    sys_close(ep)
-    assert unit_err(epoll_add(ep, fds[0], L_EPOLLIN)) == E_BADF
-    sys_close(fds[0])
-    sys_close(fds[1])
+    epfd.close()
+    assert unit_err(epoll_add(ep, r, L_EPOLLIN)) == E_BADF
+    p.close()
     0
 
 [[test]]
 fn test_epoll_wait_events_counts_ready_fds() -> i32
-    let ep: i32 = int_of(epoll_create())
-    var fds: [2]i32
-    assert sys_pipe(@fds[0]) == 0
-    assert unit_ok(epoll_add(ep, fds[0], L_EPOLLIN)) == 1
+    var epfd: Fd = fd_adopt(int_of(epoll_create()))
+    let ep: i32 = epfd.raw()
+    var p: Pipe = new_pipe()
+    assert epoll_add(ep, p.read.raw(), L_EPOLLIN).is_ok()
     # Room for more than one event whatever EpollEvent's padding.
     var evs: [4]EpollEvent
     # Idle: a timeout of 0 is Ok(0), not an error.
     assert int_of(epoll_wait_events(ep, @&evs[0], 1, 0)) == 0
-    var b: u8 = 'x'
-    assert sys_write(fds[1], @b, 1) == 1
+    assert count_of(p.write.write("x")) == 1
     assert int_of(epoll_wait_events(ep, @&evs[0], 1, 0)) == 1
     assert (evs[0].events & L_EPOLLIN) != 0
-    sys_close(fds[0])
-    sys_close(fds[1])
-    sys_close(ep)
+    p.close()
+    epfd.close()
     # On a closed epoll fd the wait is Err(BadF).
     assert int_of(epoll_wait_events(ep, @&evs[0], 1, 0)) == -1000 - E_BADF
     0
@@ -886,16 +876,16 @@ fn test_epoll_event_is_kernel_layout() -> i32
 # kernel's offset as well as the field, for each of two ready fds.
 [[test]]
 fn test_epoll_wait_events_returns_fd_in_data() -> i32
-    let ep: i32 = int_of(epoll_create())
-    var a: [2]i32
-    var b: [2]i32
-    assert sys_pipe(@a[0]) == 0
-    assert sys_pipe(@b[0]) == 0
-    assert unit_ok(epoll_add(ep, a[0], L_EPOLLIN)) == 1
-    assert unit_ok(epoll_add(ep, b[0], L_EPOLLIN)) == 1
-    var c: u8 = 'x'
-    assert sys_write(a[1], @c, 1) == 1
-    assert sys_write(b[1], @c, 1) == 1
+    var epfd: Fd = fd_adopt(int_of(epoll_create()))
+    let ep: i32 = epfd.raw()
+    var a: Pipe = new_pipe()
+    var b: Pipe = new_pipe()
+    let ar: i32 = a.read.raw()
+    let br: i32 = b.read.raw()
+    assert epoll_add(ep, ar, L_EPOLLIN).is_ok()
+    assert epoll_add(ep, br, L_EPOLLIN).is_ok()
+    assert count_of(a.write.write("x")) == 1
+    assert count_of(b.write.write("x")) == 1
     # Poison the buffer so a stale or misplaced byte cannot pass by luck.
     var evs: [4]EpollEvent
     let raw: *u8 = @evs[0] as *u8
@@ -912,22 +902,20 @@ fn test_epoll_wait_events_returns_fd_in_data() -> i32
         let kdata: u64 = *((raw + k * 12 + 4) as *u64)
         assert evs[k].data == kdata
         assert (evs[k].events & L_EPOLLIN) != 0
-        if kdata == a[0] as u64
+        if kdata == ar as u64
             seen_a += 1
-        if kdata == b[0] as u64
+        if kdata == br as u64
             seen_b += 1
         k += 1
     assert seen_a == 1
     assert seen_b == 1
     # epoll_mod re-registers `.data` the same way.
-    assert unit_ok(epoll_mod(ep, a[0], L_EPOLLIN)) == 1
+    assert epoll_mod(ep, ar, L_EPOLLIN).is_ok()
     assert int_of(epoll_wait_events(ep, @&evs[0], 1, 0)) >= 1
-    assert evs[0].data == a[0] as u64 or evs[0].data == b[0] as u64
-    sys_close(a[0])
-    sys_close(a[1])
-    sys_close(b[0])
-    sys_close(b[1])
-    sys_close(ep)
+    assert evs[0].data == ar as u64 or evs[0].data == br as u64
+    a.close()
+    b.close()
+    epfd.close()
     0
 
 # ============================================================================
@@ -940,10 +928,14 @@ fn test_epoll_wait_events_returns_fd_in_data() -> i32
 [[test]]
 fn test_local_port_is_the_kernel_chosen_port() -> i32
     var s: Socket = tcp()
-    assert unit_ok(s.bind("127.0.0.1", 0)) == 1
+    assert s.bind("127.0.0.1", 0).is_ok()
     let got: i32 = int_of(s.local_port())
     assert got > 0
-    assert got == bound_port(@s)
+    # It is the port the socket is on: a connect to it reaches this listener.
+    assert s.listen(1).is_ok()
+    var c: Socket = tcp()
+    assert c.connect("127.0.0.1", got).is_ok()
+    c.close()
     s.close()
     0
 
@@ -970,22 +962,22 @@ fn test_socket_from_raw_adopts_the_descriptor() -> i32
     assert t.fd == s.fd
     assert t.family == AF_INET and t.socktype == SOCK_STREAM
     # The same descriptor: an option set through one is seen through the other.
-    assert unit_ok(t.set_reuseaddr()) == 1
-    assert unit_ok(t.bind("127.0.0.1", 0)) == 1
+    assert t.set_reuseaddr().is_ok()
+    assert t.bind("127.0.0.1", 0).is_ok()
     assert int_of(s.local_port()) == int_of(t.local_port())
     s.close()
     0
 
 [[test]]
 fn test_shutdown_write_gives_peer_eof() -> i32
-    var port: i32 = 0
-    var srv: Socket = listen_loopback(@port)
+    var srv: Socket = listen_loopback()
+    let port: i32 = bound_port(@srv)
     var c: Socket = tcp()
-    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    assert c.connect("127.0.0.1", port).is_ok()
     var peer: Socket = peer_of(srv.accept())
     assert peer.valid()
     assert count_of(c.send_str("hi")) == 2
-    assert unit_ok(c.shutdown(SHUT_WR)) == 1
+    assert c.shutdown(SHUT_WR).is_ok()
     var buf: Vec<u8> = vec_new<u8>()
     assert count_of(peer.recv_into(@&buf, 8)) == 2
     # The half-close reached the peer: the next read is end of stream.
@@ -1001,4 +993,55 @@ fn test_shutdown_unconnected_is_enotconn() -> i32
     assert unit_err(s.shutdown(SHUT_RDWR)) == 107
     s.close()
     assert unit_err(s.shutdown(SHUT_RDWR)) == E_BADF
+    0
+
+# ============================================================================
+# local_ip / get_opt_int / recv_timeout_ms / send_timeout_ms (AGAST #4928)
+#
+# The readers beside bind / set_opt_int / set_io_timeout, so a caller never
+# hands getsockname(2) or getsockopt(2) an out-parameter.
+# ============================================================================
+
+[[test]]
+fn test_local_ip_is_the_bound_address() -> i32
+    var s: Socket = tcp()
+    assert s.bind("127.0.0.1", 0).is_ok()
+    match s.local_ip()
+        Ok(ip) =>
+            assert ip == LOOPBACK_NBO
+        Err(_) =>
+            assert false, "local_ip"
+    s.close()
+    match s.local_ip()
+        Ok(_) =>
+            assert false, "local_ip of a closed socket"
+        Err(e) =>
+            assert e.code() == E_BADF
+    0
+
+[[test]]
+fn test_get_opt_int_reads_what_set_opt_int_set() -> i32
+    var s: Socket = tcp()
+    assert s.get_opt_int(L_SOL_SOCKET, L_SO_KEEPALIVE).unwrap_or(-1) == 0
+    assert s.set_opt_int(L_SOL_SOCKET, L_SO_KEEPALIVE, 1).is_ok()
+    assert s.get_opt_int(L_SOL_SOCKET, L_SO_KEEPALIVE).unwrap_or(-1) == 1
+    s.close()
+    match s.get_opt_int(L_SOL_SOCKET, L_SO_KEEPALIVE)
+        Ok(_) =>
+            assert false, "get_opt_int of a closed socket"
+        Err(e) =>
+            assert e.code() == E_BADF
+    0
+
+[[test]]
+fn test_timeouts_read_back_what_set_io_timeout_set() -> i32
+    var s: Socket = tcp()
+    assert s.recv_timeout_ms().unwrap_or(-1) == 0
+    assert s.send_timeout_ms().unwrap_or(-1) == 0
+    assert s.set_io_timeout(3000).is_ok()
+    assert s.recv_timeout_ms().unwrap_or(-1) == 3000
+    assert s.send_timeout_ms().unwrap_or(-1) == 3000
+    s.close()
+    assert s.recv_timeout_ms().is_err()
+    assert s.send_timeout_ms().is_err()
     0

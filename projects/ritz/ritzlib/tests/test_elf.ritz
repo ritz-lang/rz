@@ -5,68 +5,41 @@
 # "a test file that cannot fail" (AGAST #1686). /proc/self/exe is always a
 # valid, unstripped ELF64 executable that contains this file's test functions.
 
-import ritzlib.cstr
-import ritzlib.sys
-import ritzlib.memory
+import ritzlib.fs
+import ritzlib.string
 import ritzlib.result
 import ritzlib.strview
 import ritzlib.elf
 
-const SEEK_SET: i32 = 0
-const SEEK_END: i32 = 2
-
-# Read the whole file at `path` into a malloc'd buffer; writes its size to
-# `out_size`. Returns null on any failure.
-fn read_whole_file(path: *u8, out_size: *i64) -> *u8
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        return null
-    let size: i64 = sys_lseek(fd, 0, SEEK_END)
-    sys_lseek(fd, 0, SEEK_SET)
-    if size <= 0
-        sys_close(fd)
-        return null
-    let data: *u8 = malloc(size)
-    if data == null
-        sys_close(fd)
-        return null
-    # read() may return short counts on large files; loop until done.
-    var got: i64 = 0
-    while got < size
-        let n: i64 = sys_read(fd, data + got, size - got)
-        if n <= 0
-            break
-        got += n
-    sys_close(fd)
-    if got != size
-        free(data)
-        return null
-    *out_size = size
-    data
+# The bytes of the running test binary.
+[[test_helper]]
+fn self_exe() -> String
+    match read_file("/proc/self/exe")
+        Ok(s) => s
+        Err(_) =>
+            assert false
+            string_new()
 
 [[test]]
 fn test_elf_parses_self_exe() -> i32
-    var size: i64 = 0
-    let data: *u8 = read_whole_file(c"/proc/self/exe", @size)
-    assert data != null
+    let data: String = self_exe()
+    assert data.len() > 0
     var reader: ElfReader
-    match reader.init(Span<u8> { ptr: data, len: size })
+    match reader.init(data[0..data.len()])
         Ok(_) => pass
         Err(_) => return 1
     match reader.parse_sections()
         Ok(_) => pass
         Err(_) => return 2
     assert reader.symbol_count() > 0
-    free(data)
     0
 
 [[test]]
 fn test_elf_finds_own_test_symbols() -> i32
-    var size: i64 = 0
-    let data: *u8 = read_whole_file(c"/proc/self/exe", @size)
-    assert data != null
+    let data: String = self_exe()
+    assert data.len() > 0
     var reader: ElfReader
-    match reader.init(Span<u8> { ptr: data, len: size })
+    match reader.init(data[0..data.len()])
         Ok(_) => pass
         Err(_) => return 1
     match reader.parse_sections()
@@ -87,7 +60,6 @@ fn test_elf_finds_own_test_symbols() -> i32
             None => pass
         i += 1
     assert found >= 4
-    free(data)
     0
 
 [[test]]
@@ -112,7 +84,7 @@ fn test_elf_rejects_non_elf() -> i32
         buf[i] = 0x41
         i += 1
     var reader: ElfReader
-    match reader.init(Span<u8> { ptr: @buf[0], len: 64 })
+    match reader.init(@buf)
         Ok(_) => return 1
         Err(_) => pass
     0

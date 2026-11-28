@@ -96,7 +96,7 @@ fn poll2(a: Fd, a_events: i16, b: Fd, b_events: i16) -> i32
     var fds: [2]PollFd
     fds[0] = PollFd { fd: a.raw(), events: a_events, revents: 0 }
     fds[1] = PollFd { fd: b.raw(), events: b_events, revents: 0 }
-    match poll(span_from_ptr<PollFd>(@fds[0], 2), PIPE_POLL_MS)
+    match poll(@fds, PIPE_POLL_MS)
         Ok(n) => n
         Err(_) => -1
 
@@ -106,7 +106,7 @@ fn drain_to_eof(fd: Fd) -> i64
     var buf: [4096]u8
     var total: i64 = 0
     loop
-        let n: i64 = read_code(fd.try_read(Span<u8> { ptr: @buf[0], len: PIPE_CHUNK }))
+        let n: i64 = read_code(fd.try_read(@buf))
         if n == 0
             return total
         if n < -1
@@ -154,10 +154,10 @@ fn test_try_read_tells_would_block_data_and_eof_apart() -> i32
     var p: Pipe = pipe_or_closed()
     assert unit_ok(p.read.set_nonblocking(true)) == 1
     var buf: [16]u8
-    let span: Span<u8> = Span<u8> { ptr: @buf[0], len: 16 }
+    let span: Span<u8> = @buf
     # Empty, writer open: WouldBlock, not Eof.
     assert read_code(p.read.try_read(span)) == -1
-    assert write_code(p.write.try_write(Span<u8> { ptr: "xyz".ptr, len: 3 })) == 3
+    assert write_code(p.write.try_write("xyz")) == 3
     assert read_code(p.read.try_read(span)) == 3
     assert buf[0] == 'x' and buf[2] == 'z'
     assert read_code(p.read.try_read(span)) == -1
@@ -178,7 +178,7 @@ fn test_try_write_on_a_full_pipe_would_block() -> i32
     var last: i64 = 0
     # A default pipe holds 64 KiB; 1 MiB is a cap, not the expected count.
     while total < PIPE_TOTAL and last >= 0
-        last = write_code(p.write.try_write(Span<u8> { ptr: @chunk[0], len: PIPE_CHUNK }))
+        last = write_code(p.write.try_write(@chunk))
         if last > 0
             total += last
     assert last == -1
@@ -187,7 +187,7 @@ fn test_try_write_on_a_full_pipe_would_block() -> i32
     var fds: [1]PollFd
     fds[0] = PollFd { fd: p.write.raw(), events: POLLOUT, revents: 0 }
     var ready: i32 = -1
-    match poll(span_from_ptr<PollFd>(@fds[0], 1), 0)
+    match poll(@fds, 0)
         Ok(n) => ready = n
         Err(_) => ready = -1
     assert ready == 0
@@ -198,8 +198,8 @@ fn test_try_write_on_a_full_pipe_would_block() -> i32
 fn test_try_read_and_try_write_on_a_closed_fd_are_badf() -> i32
     let f: Fd = fd_adopt(-1)
     var buf: [4]u8
-    assert read_code(f.try_read(Span<u8> { ptr: @buf[0], len: 4 })) == -1009
-    assert write_code(f.try_write(Span<u8> { ptr: @buf[0], len: 4 })) == -1009
+    assert read_code(f.try_read(@buf)) == -1009
+    assert write_code(f.try_write(@buf)) == -1009
     assert unit_ok(f.set_nonblocking(true)) == 0
     0
 
@@ -223,7 +223,7 @@ fn test_process_pipe_accessors_borrow_the_parent_ends() -> i32
     p.close_stdin()
     assert not p.stdin().valid()
     var buf: [4]u8
-    assert write_code(p.stdin().try_write(Span<u8> { ptr: @buf[0], len: 4 })) == -1009
+    assert write_code(p.stdin().try_write(@buf)) == -1009
     assert drain_to_eof(p.stdout()) == 0
     assert exit_of(p.wait()) == 0
     p.cleanup()
@@ -234,7 +234,7 @@ fn test_process_pipe_accessors_borrow_the_parent_ends() -> i32
 fn merged_accessors(null_in: i32) -> i32
     var env: [1]StrView
     env[0] = "PATH=/usr/bin:/bin"
-    match spawn_env_merged("true", no_args(), span_from_ptr<StrView>(@env[0], 1), null_in)
+    match spawn_env_merged("true", no_args(), @env, null_in)
         Ok(q) =>
             var p: Process = q
             if p.stdin().valid() or p.stderr().valid() or not p.stdout().valid()
@@ -299,7 +299,8 @@ fn test_cat_round_trip_through_polled_nonblocking_pipes() -> i32
                 n = PIPE_CHUNK
             for i in 0..n
                 wbuf[i] = pattern(sent + i)
-            let w: i64 = write_code(p.stdin().try_write(Span<u8> { ptr: @wbuf[0], len: n }))
+            let wspan: Span<u8> = @wbuf
+            let w: i64 = write_code(p.stdin().try_write(wspan[0..n]))
             assert w >= -1
             if w == -1
                 blocked += 1
@@ -311,7 +312,7 @@ fn test_cat_round_trip_through_polled_nonblocking_pipes() -> i32
                 # EOF for cat; p.stdin() is a closed Fd from here on.
                 p.close_stdin()
 
-        let r: i64 = read_code(p.stdout().try_read(Span<u8> { ptr: @rbuf[0], len: PIPE_CHUNK }))
+        let r: i64 = read_code(p.stdout().try_read(@rbuf))
         assert r >= -1
         if r == 0
             eof = true
@@ -346,7 +347,7 @@ fn test_child_exit_reads_eof_on_stdout_and_stderr() -> i32
     assert p.valid()
     assert unit_ok(p.set_nonblocking()) == 1
     var buf: [64]u8
-    let span: Span<u8> = Span<u8> { ptr: @buf[0], len: 64 }
+    let span: Span<u8> = @buf
     assert read_code(p.stdout().try_read(span)) == -1
     assert read_code(p.stderr().try_read(span)) == -1
     p.close_stdin()
@@ -381,7 +382,7 @@ fn epipe_on_a_closed_stdin() -> i32
             if exit_of(wait_pid(p.pid)) != 0
                 return 5
             p.waited = 1
-    let w: i64 = write_code(p.stdin().try_write(Span<u8> { ptr: "x".ptr, len: 1 }))
+    let w: i64 = write_code(p.stdin().try_write("x"))
     # Err(Pipe) is EPIPE 32: neither WouldBlock nor a count.
     if w != -1032
         return 6
@@ -441,14 +442,14 @@ fn child_mask_is_empty_after_blocked_parent() -> i32
 
     var args: [1]StrView
     args[0] = "/proc/self/status"
-    var p: Process = spawn_or_dead("cat", span_from_ptr<StrView>(@args[0], 1))
+    var p: Process = spawn_or_dead("cat", @args)
     if not p.valid()
         return 4
     let out: Vec<u8> = p.read_stdout_all()
     if exit_of(p.wait()) != 0
         return 5
     p.cleanup()
-    let r: i32 = sigblk_empty(strview_from_ptr(out.data, out.len))
+    let r: i32 = sigblk_empty(out.as_view())
     if r != 1
         return 10 + r
     0

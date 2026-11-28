@@ -100,7 +100,7 @@ An exemption says a raw boundary is raw by nature; it doesn't say the rest
 of the tree should use it.  ``--callers`` counts how far the raw layer
 escapes: for each *exempt API* (a ``pub`` module-level fn of the library
 with at least one exempt site), every call ``name(`` in the given trees,
-outside the library, in a file that imports the defining module
+outside the library's sources (its ``tests/`` counts, AGAST #4928), in a file that imports the defining module
 (``import ritzlib.<mod>``, and when the import lists names, lists this
 one).  A method call ``x.name(`` is not a call of the free fn.  Totals are
 grouped by project (the first directory under each PATH; default:
@@ -647,11 +647,18 @@ SKIP_DIRS = {"build", "target"}
 
 
 def _ritz_files(root: Path, skip: Path):
-    """Every .ritz file under `root`, outside `skip`, hidden dirs and SKIP_DIRS."""
+    """Every .ritz file under `root`, outside `skip`, hidden dirs and SKIP_DIRS.
+
+    `skip`'s own tests/ is walked (AGAST #4928): the library's sources call
+    its raw layer by design, but its tests are callers of its API like any
+    other, and a test that goes around a Ritz-level API counts."""
     for dirpath, dirnames, filenames in os.walk(root):
         d = Path(dirpath)
+        if d != root and d.resolve() == skip:
+            dirnames[:] = [n for n in dirnames if n == "tests"]
+            continue
         dirnames[:] = sorted(n for n in dirnames if not n.startswith(".")
-                             and n not in SKIP_DIRS and (d / n).resolve() != skip)
+                             and n not in SKIP_DIRS)
         for n in sorted(filenames):
             if n.endswith(".ritz"):
                 yield d / n
@@ -659,7 +666,8 @@ def _ritz_files(root: Path, skip: Path):
 
 def count_callers(lib: Path, roots: list[Path],
                   apis: dict[str, set[str]] | None = None) -> list[CallSite]:
-    """Every call of an exempt API of `lib` under `roots`, outside `lib`.
+    """Every call of an exempt API of `lib` under `roots`, outside `lib`'s
+    sources (`lib`/tests counts: see _ritz_files).
 
     `apis` ({name: {module}}) replaces the exempt set: #4638's memory pin
     also counts sys_mmap, which is raw but not exempt."""

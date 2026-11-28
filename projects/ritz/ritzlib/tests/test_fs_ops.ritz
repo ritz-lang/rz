@@ -2,71 +2,29 @@
 #
 # Predicates (path_exists/is_dir/is_file/is_symlink) return bool. Fallible
 # operations return Result<T, Errno> (ritzlib.errno, AGAST #4248): the helpers
-# below compare errno_code(e), 2 = ENOENT, 17 = EEXIST.
+# below compare e.code(), 2 = ENOENT, 17 = EEXIST.
 #
-# Each test owns its fixtures under /tmp and removes them, so the verdict does
+# Each test owns its fixtures under a sandbox_path and removes them, so the verdict does
 # not depend on the cwd build.py runs the binary from.
 
-import ritzlib.cstr
-import ritzlib.sys
 import ritzlib.fs
 import ritzlib.errno
-import ritzlib.str
-import ritzlib.memory
-import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.result
+import ritzlib.testlib
 
-# "/tmp/ritzlib_<pid>_<name>" into dst (>= 96 bytes); returns dst. The pid
-# keeps concurrent test runs (gate slots, compiler variants) off each other's
-# fixtures (AGAST #4084). ritzlib.testlib's sandbox_path now builds the same
-# shape as a String (AGAST #4643 dropped the read_file/write_file that kept
-# these files off testlib); this helper predates it.
-fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
-    let head: *u8 = c"/tmp/ritzlib_"
-    let head_len: i64 = strlen(head)
-    memcpy(dst, head, head_len)
-    var num: [20]u8
-    let pid: StrView = fmt_i64_into(@num, sys_getpid() as i64)
-    memcpy(dst + head_len, pid.ptr, pid.len)
-    var i: i64 = head_len + pid.len
-    *(dst + i) = '_'
-    i += 1
-    let name_len: i64 = strlen(name)
-    memcpy(dst + i, name, name_len)
-    *(dst + i + name_len) = 0
-    dst
-
-# pid_tmp_path as a StrView.
-fn tmp_view(dst: *u8, name: *u8) -> StrView
-    strview_from_cstr(pid_tmp_path(dst, name))
-
-fn i64_err(r: *Result<i64, Errno>) -> i32
+# errno code of `r`'s Err, 0 when it is Ok.
+fn err_code<T>(r: @Result<T, Errno>) -> i32
     match *r
         Ok(_) => 0
         Err(e) => e.code()
 
-fn i64_ok(r: *Result<i64, Errno>) -> i64
+# true if `r` is Ok and its String equals `want`.
+fn string_ok_is(r: @Result<String, Errno>, want: StrView) -> bool
     match *r
-        Ok(v) => v
-        Err(_) => -1
-
-fn unit_err(r: *Result<i32, Errno>) -> i32
-    match *r
-        Ok(_) => 0
-        Err(e) => e.code()
-
-fn string_err(r: *Result<String, Errno>) -> i32
-    match *r
-        Ok(_) => 0
-        Err(e) => e.code()
-
-# 1 if `r` is Ok and its String equals `want`.
-fn string_ok_is(r: *Result<String, Errno>, want: StrView) -> i32
-    match *r
-        Ok(s) => s.eq(want) as i32
-        Err(_) => 0
+        Ok(s) => s.eq(want)
+        Err(_) => false
 
 # ============================================================================
 # Predicates -> bool
@@ -98,36 +56,34 @@ fn test_is_dir() -> i32
 
 [[test]]
 fn test_is_file() -> i32
-    var pathbuf: [96]u8
-    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_file.tmp")
-    var w: Result<i64, Errno> = write_file(path, "x")
-    if i64_err(@w) != 0
+    let path: String = sandbox_path("fs_ops", "file.tmp")
+    var w: Result<i64, Errno> = write_file(path.as_view(), "x")
+    if err_code(@w) != 0
         return 1
-    if not is_file(path)
+    if not is_file(path.as_view())
         return 2
     # A directory must not satisfy the predicate.
     if is_file("/tmp")
         return 3
-    unlink(path)
-    if is_file(path)
+    unlink(path.as_view())
+    if is_file(path.as_view())
         return 4
     0
 
 [[test]]
 fn test_is_symlink() -> i32
-    var linkbuf: [96]u8
-    let link: StrView = tmp_view(@linkbuf[0], c"fs_ops_link.tmp")
-    unlink(link)
-    if sys_symlink(c"/tmp", @linkbuf[0]) != 0
+    let link: String = sandbox_path("fs_ops", "link.tmp")
+    unlink(link.as_view())
+    if symlink("/tmp", link.as_view()).is_err()
         return 1
-    if not is_symlink(link)
+    if not is_symlink(link.as_view())
         return 2
     # Predicates use lstat: the link itself is not a directory.
-    if is_dir(link)
+    if is_dir(link.as_view())
         return 3
     if is_symlink("/tmp")
         return 4
-    unlink(link)
+    unlink(link.as_view())
     0
 
 # ============================================================================
@@ -136,21 +92,20 @@ fn test_is_symlink() -> i32
 
 [[test]]
 fn test_file_size_ok() -> i32
-    var pathbuf: [96]u8
-    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_size.tmp")
-    var w: Result<i64, Errno> = write_file(path, "12345")
-    if i64_err(@w) != 0
+    let path: String = sandbox_path("fs_ops", "size.tmp")
+    var w: Result<i64, Errno> = write_file(path.as_view(), "12345")
+    if err_code(@w) != 0
         return 1
-    var r: Result<i64, Errno> = file_size(path)
-    unlink(path)
-    if i64_ok(@r) != 5
+    var r: Result<i64, Errno> = file_size(path.as_view())
+    unlink(path.as_view())
+    if r.unwrap_or(-1) != 5
         return 2
     0
 
 [[test]]
 fn test_file_size_err_is_errno() -> i32
     var r: Result<i64, Errno> = file_size("/nonexistent/path")
-    if i64_err(@r) != 2
+    if err_code(@r) != 2
         return 1
     0
 
@@ -160,30 +115,29 @@ fn test_file_size_err_is_errno() -> i32
 
 [[test]]
 fn test_write_then_read_file() -> i32
-    var pathbuf: [96]u8
-    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_rw.tmp")
-    var w: Result<i64, Errno> = write_file(path, "Hello, Result!")
-    if i64_ok(@w) != 14
+    let path: String = sandbox_path("fs_ops", "rw.tmp")
+    var w: Result<i64, Errno> = write_file(path.as_view(), "Hello, Result!")
+    if w.unwrap_or(-1) != 14
         return 1
-    var r: Result<String, Errno> = read_file(path)
-    unlink(path)
-    if string_ok_is(@r, "Hello, Result!") == 0
+    var r: Result<String, Errno> = read_file(path.as_view())
+    unlink(path.as_view())
+    if not string_ok_is(@r, "Hello, Result!")
         return 2
     0
 
 [[test]]
 fn test_read_file_missing_is_enoent() -> i32
-    var missingbuf: [96]u8
-    var r: Result<String, Errno> = read_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
-    if string_err(@r) != 2
+    let missing: String = sandbox_path("fs_ops", "does_not_exist.tmp")
+    var r: Result<String, Errno> = read_file(missing.as_view())
+    if err_code(@r) != 2
         return 1
     0
 
 [[test]]
 fn test_read_file_missing_is_noent_variant() -> i32
     # The Err is the typed variant, not just a number that happens to be 2.
-    var missingbuf: [96]u8
-    match read_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
+    let missing: String = sandbox_path("fs_ops", "does_not_exist.tmp")
+    match read_file(missing.as_view())
         Ok(_) => return 1
         Err(e) => match e
             NoEnt => pass
@@ -203,49 +157,46 @@ fn test_read_file_dir_is_eisdir() -> i32
 # old bytes, and an empty one leaves an empty file (AGAST #4830).
 [[test]]
 fn test_write_file_shorter_replaces_all() -> i32
-    var pathbuf: [96]u8
-    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_shorter.tmp")
-    write_file(path, "Hello, world")
-    var w: Result<i64, Errno> = write_file(path, "Hi")
-    var r: Result<String, Errno> = read_file(path)
-    unlink(path)
-    if i64_ok(@w) != 2
+    let path: String = sandbox_path("fs_ops", "shorter.tmp")
+    write_file(path.as_view(), "Hello, world")
+    var w: Result<i64, Errno> = write_file(path.as_view(), "Hi")
+    var r: Result<String, Errno> = read_file(path.as_view())
+    unlink(path.as_view())
+    if w.unwrap_or(-1) != 2
         return 1
-    if string_ok_is(@r, "Hi") == 0
+    if not string_ok_is(@r, "Hi")
         return 2
     0
 
 [[test]]
 fn test_write_file_empty_truncates() -> i32
-    var pathbuf: [96]u8
-    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_empty.tmp")
-    write_file(path, "old contents")
-    var w: Result<i64, Errno> = write_file(path, "")
-    var size: Result<i64, Errno> = file_size(path)
-    var r: Result<String, Errno> = read_file(path)
-    unlink(path)
-    if i64_ok(@w) != 0
+    let path: String = sandbox_path("fs_ops", "empty.tmp")
+    write_file(path.as_view(), "old contents")
+    var w: Result<i64, Errno> = write_file(path.as_view(), "")
+    var size: Result<i64, Errno> = file_size(path.as_view())
+    var r: Result<String, Errno> = read_file(path.as_view())
+    unlink(path.as_view())
+    if w.unwrap_or(-1) != 0
         return 1
-    if i64_ok(@size) != 0
+    if size.unwrap_or(-1) != 0
         return 2
-    if string_ok_is(@r, "") == 0
+    if not string_ok_is(@r, "")
         return 3
     0
 
 [[test]]
 fn test_write_file_empty_creates() -> i32
-    var pathbuf: [96]u8
-    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_new_empty.tmp")
-    unlink(path)
-    var w: Result<i64, Errno> = write_file(path, "")
-    let made: bool = is_file(path)
-    var size: Result<i64, Errno> = file_size(path)
-    unlink(path)
-    if i64_ok(@w) != 0
+    let path: String = sandbox_path("fs_ops", "new_empty.tmp")
+    unlink(path.as_view())
+    var w: Result<i64, Errno> = write_file(path.as_view(), "")
+    let made: bool = is_file(path.as_view())
+    var size: Result<i64, Errno> = file_size(path.as_view())
+    unlink(path.as_view())
+    if w.unwrap_or(-1) != 0
         return 1
     if not made
         return 2
-    if i64_ok(@size) != 0
+    if size.unwrap_or(-1) != 0
         return 3
     0
 
@@ -261,7 +212,7 @@ fn test_write_file_to_dir_is_eisdir() -> i32
 [[test]]
 fn test_write_file_bad_dir_is_enoent() -> i32
     var w: Result<i64, Errno> = write_file("/nonexistent/dir/f", "x")
-    if i64_err(@w) != 2
+    if err_code(@w) != 2
         return 1
     0
 
@@ -271,34 +222,33 @@ fn test_write_file_bad_dir_is_enoent() -> i32
 
 [[test]]
 fn test_mkdir_rmdir() -> i32
-    var pathbuf: [96]u8
-    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_dir")
-    rmdir(path)
-    var mk: Result<i32, Errno> = mkdir(path, 493)  # 0755
-    if unit_err(@mk) != 0
+    let path: String = sandbox_path("fs_ops", "dir")
+    rmdir(path.as_view())
+    var mk: Result<i32, Errno> = mkdir(path.as_view(), 493)  # 0755
+    if err_code(@mk) != 0
         return 1
-    if not is_dir(path)
+    if not is_dir(path.as_view())
         return 2
-    var again: Result<i32, Errno> = mkdir(path, 493)
-    if unit_err(@again) != 17
+    var again: Result<i32, Errno> = mkdir(path.as_view(), 493)
+    if err_code(@again) != 17
         return 3
     match again
         Ok(_) => return 6
         Err(e) => match e
             Exist => pass
             _ => return 7
-    var rm: Result<i32, Errno> = rmdir(path)
-    if unit_err(@rm) != 0
+    var rm: Result<i32, Errno> = rmdir(path.as_view())
+    if err_code(@rm) != 0
         return 4
-    if path_exists(path)
+    if path_exists(path.as_view())
         return 5
     0
 
 [[test]]
 fn test_unlink_missing_is_enoent() -> i32
-    var missingbuf: [96]u8
-    var r: Result<i32, Errno> = unlink(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
-    if unit_err(@r) != 2
+    let missing: String = sandbox_path("fs_ops", "does_not_exist.tmp")
+    var r: Result<i32, Errno> = unlink(missing.as_view())
+    if err_code(@r) != 2
         return 1
     0
 
@@ -308,30 +258,27 @@ fn test_unlink_missing_is_enoent() -> i32
 
 [[test]]
 fn test_copy_file() -> i32
-    var srcbuf: [96]u8
-    let src: StrView = tmp_view(@srcbuf[0], c"fs_ops_src.tmp")
-    var dstbuf: [96]u8
-    let dst: StrView = tmp_view(@dstbuf[0], c"fs_ops_dst.tmp")
-    write_file(src, "Content to copy")
-    var c: Result<i64, Errno> = copy_file(src, dst, 420)  # 0644
-    if i64_ok(@c) != 15
+    let src: String = sandbox_path("fs_ops", "src.tmp")
+    let dst: String = sandbox_path("fs_ops", "dst.tmp")
+    write_file(src.as_view(), "Content to copy")
+    var c: Result<i64, Errno> = copy_file(src.as_view(), dst.as_view(), 420)  # 0644
+    if c.unwrap_or(-1) != 15
         return 1
-    var r: Result<String, Errno> = read_file(dst)
-    unlink(src)
-    unlink(dst)
-    if string_ok_is(@r, "Content to copy") == 0
+    var r: Result<String, Errno> = read_file(dst.as_view())
+    unlink(src.as_view())
+    unlink(dst.as_view())
+    if not string_ok_is(@r, "Content to copy")
         return 2
     0
 
 [[test]]
 fn test_copy_file_missing_src_is_enoent() -> i32
-    var missingbuf: [96]u8
-    var neverbuf: [96]u8
-    let never: StrView = tmp_view(@neverbuf[0], c"fs_ops_never.tmp")
-    var c: Result<i64, Errno> = copy_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"), never, 420)
-    if i64_err(@c) != 2
+    let missing: String = sandbox_path("fs_ops", "does_not_exist.tmp")
+    let never: String = sandbox_path("fs_ops", "never.tmp")
+    var c: Result<i64, Errno> = copy_file(missing.as_view(), never.as_view(), 420)
+    if err_code(@c) != 2
         return 1
-    if path_exists(never)
+    if path_exists(never.as_view())
         return 2
     0
 

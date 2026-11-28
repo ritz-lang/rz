@@ -407,6 +407,54 @@ fn spawn_fork(path: *u8, argv: **u8, envp: **u8, stdin_fd: i32, merge: bool) -> 
 
     Ok(p)
 
+# Run `body` as a child process: fork, and in the child put stdin, stdout and
+# stderr on three pipes and exit with body's return value.  The parent gets
+# the Process with its ends, as from spawn: write and close_stdin, read the
+# output (stdout and stderr apart), wait, cleanup.  A body killed by a signal
+# is wait's `signaled`.  Err is the Errno of a failed pipe or fork.  For
+# testing what a function writes (ritzlib.testlib's capture).
+#
+# standard-exempt: lib-exit: the forked child has no caller to return to; its exit status is body's value (S-ERR-3)
+pub fn spawn_fn(body: fn() -> i32) -> Result<Process, Errno>
+    var inp: Pipe = pipe()?
+    var out: Pipe
+    match pipe()
+        Ok(p) => out = p
+        Err(err) =>
+            inp.close()
+            return Err(err)
+    var err_p: Pipe
+    match pipe()
+        Ok(p) => err_p = p
+        Err(err) =>
+            inp.close()
+            out.close()
+            return Err(err)
+    match fork()
+        Ok(side) => match side
+            Child =>
+                inp.read.dup_to(STDIN)
+                out.write.dup_to(STDOUT)
+                err_p.write.dup_to(STDERR)
+                inp.close()
+                out.close()
+                err_p.close()
+                sys_exit(body())
+                # Never reached: sys_exit doesn't return, but the arm needs a
+                # value of the match's type (Ritz has no never type).
+                Err(Errno.Other(0))
+            Parent(pid) =>
+                inp.read.close()
+                out.write.close()
+                err_p.write.close()
+                # The Process owns the parent's ends from here (close_pipes).
+                Ok(Process { pid: pid, stdin_fd: inp.write.raw(), stdout_fd: out.read.raw(), stderr_fd: err_p.read.raw(), waited: 0 })
+        Err(err) =>
+            inp.close()
+            out.close()
+            err_p.close()
+            Err(err)
+
 # ============================================================================
 # Process validity check
 # ============================================================================

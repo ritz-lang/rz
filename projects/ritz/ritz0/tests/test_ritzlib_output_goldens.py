@@ -82,12 +82,11 @@ def _check(exe: Path, args, env_extra, want_rc, want_out, want_err, label):
 # ---------------------------------------------------------------------------
 
 
-def _golden_body(name: str, start: str, prefix: str) -> str:
+def _golden_body(name: str, start: str) -> str:
     """ritzlib/tests/test_<name>_output.ritz from `start` up to its first
-    [[test]], with `run_body` renamed `<prefix>_body`."""
+    [[test]]: its case_* functions."""
     src = (RITZ_ROOT / "ritzlib" / "tests" / f"test_{name}_output.ritz").read_text()
-    body = src[src.index(start) : src.index("[[test]]")]
-    return body.replace("fn run_body(", f"fn {prefix}_body(")
+    return src[src.index(start) : src.index("[[test]]")]
 
 
 def _printers_program() -> str:
@@ -95,17 +94,17 @@ def _printers_program() -> str:
     return (
         "import ritzlib.sys\nimport ritzlib.io\nimport ritzlib.strview\n"
         "import ritzlib.timer\nimport ritzlib.iovec\n\n"
-        + _golden_body("timer", "fn show(", "timer")
-        + _golden_body("iovec", "fn case_empty(", "iovec")
+        + _golden_body("timer", "fn show(")
+        + _golden_body("iovec", "fn case_empty(")
         + """pub fn main(args: Span<StrView>) -> i32
     let which: u8 = args[1].ptr[0]
     if which == '1'
-        return timer_body(1)
+        return case_timer()
     if which == '2'
-        return timer_body(2)
+        return case_stopwatch()
     if which == '3'
-        return iovec_body(1)
-    iovec_body(2)
+        return case_empty()
+    case_mixed()
 """
     )
 

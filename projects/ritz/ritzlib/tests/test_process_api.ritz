@@ -15,28 +15,29 @@
 # literal): the callee must copy exactly `len` bytes and terminate them itself.
 
 import ritzlib.sys
-import ritzlib.str
 import ritzlib.gvec
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.span
 import ritzlib.option
 import ritzlib.result
+import ritzlib.fs
+import ritzlib.time
 import ritzlib.process
 
 # 1 if `o` is Some and its String equals `want`.
-fn some_is(o: *Option<String>, want: StrView) -> i32
+fn some_is(o: @Option<String>, want: StrView) -> i32
     match *o
         Some(s) => s.eq(want) as i32
         None => 0
 
-fn is_none(o: *Option<String>) -> bool
+fn is_none(o: @Option<String>) -> bool
     match *o
         Some(_) => false
         None => true
 
 # The errno number of a failed spawn, 0 if it succeeded.
-fn spawn_err(r: *Result<Process, Errno>) -> i32
+fn spawn_err(r: @Result<Process, Errno>) -> i32
     match *r
         Ok(_) => 0
         Err(e) => e.code()
@@ -53,20 +54,21 @@ fn wait_code(p: @&Process) -> i32
         Ok(res) => res.exit_code
         Err(e) => -1000 - e.code()
 
-# Run the spawned process to completion: stdout into *out, the exit code back
-# (-1 if spawn failed).
-fn run(r: *Result<Process, Errno>, out: *Vec<u8>) -> i32
-    match *r
+# A spawned process run to completion: its exit code (-1 if spawn failed)
+# and everything it wrote to stdout.
+struct Ran
+    code: i32
+    out: Vec<u8>
+
+fn run(r: Result<Process, Errno>) -> Ran
+    match r
         Ok(p) =>
             var q: Process = p
-            *out = q.read_stdout_all()
+            let out: Vec<u8> = q.read_stdout_all()
             let code: i32 = wait_code(@&q)
             q.cleanup()
-            code
-        Err(_) => -1
-
-fn bytes_are(v: *Vec<u8>, want: StrView) -> i32
-    (strview_from_ptr(v.data, v.len)).eq(want) as i32
+            Ran { code: code, out: out }
+        Err(_) => Ran { code: -1, out: vec_new<u8>() }
 
 # ============================================================================
 # find_command_in -> Option<String>
@@ -129,7 +131,7 @@ fn test_find_command_finds_sh() -> i32
     match o
         Some(s) =>
             assert s.ends_with("/sh")
-            assert sys_access(s.as_ptr(), X_OK) == 0
+            assert access(s.as_view(), X_OK).is_ok()
         None =>
             assert false
     0
@@ -153,7 +155,7 @@ fn test_spawn_no_args_cat_echoes_stdin() -> i32
             assert count_of(q.write_all("hello\n")) == 6
             q.close_stdin()
             var out: Vec<u8> = q.read_stdout_all()
-            assert bytes_are(@out, "hello\n") == 1
+            assert out.as_view().eq("hello\n")
             assert wait_code(@&q) == 0
             q.cleanup()
         Err(_) =>
@@ -165,9 +167,8 @@ fn test_spawn_searches_path_and_passes_args() -> i32
     var args: [2]StrView
     args[0] = "-c"
     args[1] = "exit 3"
-    var r: Result<Process, Errno> = spawn("sh", span_from_ptr<StrView>(@args[0], 2))
-    var out: Vec<u8> = vec_new<u8>()
-    assert run(@r, @out) == 3
+    let ran: Ran = run(spawn("sh", @args))
+    assert ran.code == 3
     0
 
 [[test]]
@@ -188,10 +189,9 @@ fn test_spawn_args_are_exact_bytes() -> i32
     shifted[3] = args[2]
     shifted[4] = args[3]
     shifted[5] = args[4]
-    var r: Result<Process, Errno> = spawn("sh", span_from_ptr<StrView>(@shifted[0], 6))
-    var out: Vec<u8> = vec_new<u8>()
-    assert run(@r, @out) == 0
-    assert bytes_are(@out, "3|a b||xyz") == 1
+    let ran: Ran = run(spawn("sh", @shifted))
+    assert ran.code == 0
+    assert ran.out.as_view().eq("3|a b||xyz")
     0
 
 [[test]]
@@ -200,10 +200,9 @@ fn test_spawn_argv0_is_cmd_as_given() -> i32
     var args: [2]StrView
     args[0] = "-c"
     args[1] = "printf '%s' \"$0\""
-    var r: Result<Process, Errno> = spawn(("shNOPE").slice(0, 2), span_from_ptr<StrView>(@args[0], 2))
-    var out: Vec<u8> = vec_new<u8>()
-    assert run(@r, @out) == 0
-    assert bytes_are(@out, "sh") == 1
+    let ran: Ran = run(spawn(("shNOPE").slice(0, 2), @args))
+    assert ran.code == 0
+    assert ran.out.as_view().eq("sh")
     0
 
 [[test]]
@@ -246,7 +245,7 @@ fn test_process_write_all_writes_view_length() -> i32
             assert count_of(q.write_all(("abcNOPE").slice(0, 3))) == 3
             q.close_stdin()
             var out: Vec<u8> = q.read_stdout_all()
-            assert bytes_are(@out, "abc") == 1
+            assert out.as_view().eq("abc")
             assert wait_code(@&q) == 0
             q.cleanup()
         Err(_) =>
@@ -282,15 +281,15 @@ fn test_process_read_stdout_reads_then_eof() -> i32
     var args: [2]StrView
     args[0] = "-c"
     args[1] = "printf out; printf err >&2"
-    match spawn("sh", span_from_ptr<StrView>(@args[0], 2))
+    match spawn("sh", @args)
         Ok(p) =>
             var q: Process = p
-            var buf: [16]u8
-            assert count_of(q.read_stdout(Span<u8> { ptr: (@buf[0]), len: (16) as i64 })) == 3
-            assert (strview_from_ptr(@buf[0], 3)).eq("out")
-            assert count_of(q.read_stdout(Span<u8> { ptr: (@buf[0]), len: (16) as i64 })) == 0
-            assert count_of(q.read_stderr(Span<u8> { ptr: (@buf[0]), len: (16) as i64 })) == 3
-            assert (strview_from_ptr(@buf[0], 3)).eq("err")
+            var buf: Vec<u8> = vec_zeroed<u8>(16)
+            assert count_of(q.read_stdout(span_from_vec<u8>(@buf))) == 3
+            assert buf.as_view().slice(0, 3).eq("out")
+            assert count_of(q.read_stdout(span_from_vec<u8>(@buf))) == 0
+            assert count_of(q.read_stderr(span_from_vec<u8>(@buf))) == 3
+            assert buf.as_view().slice(0, 3).eq("err")
             assert wait_code(@&q) == 0
             q.cleanup()
         Err(_) =>
@@ -306,9 +305,9 @@ fn test_process_read_after_close_is_badf() -> i32
             q.kill()
             assert wait_code(@&q) == 128 + 9
             q.close_pipes()
-            var buf: [4]u8
-            assert count_of(q.read_stdout(Span<u8> { ptr: (@buf[0]), len: (4) as i64 })) == -1000 - EBADF as i64
-            assert count_of(q.read_stderr(Span<u8> { ptr: (@buf[0]), len: (4) as i64 })) == -1000 - EBADF as i64
+            var buf: Vec<u8> = vec_zeroed<u8>(4)
+            assert count_of(q.read_stdout(span_from_vec<u8>(@buf))) == -1000 - EBADF as i64
+            assert count_of(q.read_stderr(span_from_vec<u8>(@buf))) == -1000 - EBADF as i64
             q.cleanup()
         Err(_) =>
             assert false
@@ -326,7 +325,7 @@ fn sh_result(script: StrView) -> ProcessResult
     args[0] = "-c"
     args[1] = script
     var bad: ProcessResult = ProcessResult { exit_code: -1, signaled: 0, signal: 0 }
-    match spawn("sh", span_from_ptr<StrView>(@args[0], 2))
+    match spawn("sh", @args)
         Ok(p) =>
             var q: Process = p
             assert q.valid()
@@ -408,7 +407,7 @@ fn test_process_kill_then_wait_reports_signal() -> i32
 # ============================================================================
 
 [[test_helper]]
-fn try_wait_code(o: *Option<ProcessResult>) -> i32
+fn try_wait_code(o: @Option<ProcessResult>) -> i32
     match *o
         Some(r) => r.exit_code
         None => -100
@@ -425,14 +424,11 @@ fn test_process_try_wait_is_none_while_running_then_reaps() -> i32
             assert q.waited == 0
             q.close_stdin()
             var tries: i32 = 0
-            var ts: [2]i64
-            ts[0] = 0
-            ts[1] = 10000000
             o = q.try_wait()
             # Up to 30 s: only a cap, since the loop ends as soon as cat
             # exits.  It was 5 s, which a loaded host can use up (#3942).
             while try_wait_code(@o) == -100 and tries < 3000
-                sys_nanosleep(@ts[0], null)
+                sleep_ms(10)
                 o = q.try_wait()
                 tries += 1
             assert try_wait_code(@o) == 0
