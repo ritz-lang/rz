@@ -24,6 +24,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.memory
+import ritzlib.option
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.string  # strview_join2 (AGAST #4915)
@@ -39,7 +40,7 @@ import mono_clone   # AGAST #1818: cloning moved out of monomorph
 # for a TypeKind.Ptr / TypeKind.Ref / TypeKind.MutRef whose pointee is TypeKind.Struct.
 # AGAST #3277: for a TypeKind.Array, name is the whole `[N]E` already spelled as a
 # type argument, "arr" N "_" E (gi_array_spell), and a T binds to it as is.
-struct GiType
+pub struct GiType
     kind: TypeKind
     name: StrView
     pointee: TypeKind
@@ -59,7 +60,7 @@ var g_gi_errors: i32 = 0
 var g_gi_input: StrView  # the file compiled
 var g_gi_file: StrView   # the file the fn being walked is written in
 
-fn gi_add_local(name_sv: StrView, t: *GiType)
+fn gi_add_local(name_sv: StrView, t: GiType)
     if g_gi_count >= g_gi_cap
         var cap: i64 = (g_gi_cap as i64) * 2
         if cap < 64
@@ -83,11 +84,8 @@ fn gi_find_local(name_sv: StrView) -> i32
         i = i - 1
     -1
 
-fn gi_set(out: *GiType, kind: TypeKind, name_sv: StrView, pointee: TypeKind) -> i32
-    out.kind = kind
-    out.name = name_sv
-    out.pointee = pointee
-    1
+pub fn gi_new(kind: TypeKind, name_sv: StrView, pointee: TypeKind) -> GiType
+    GiType { kind: kind, name: name_sv, pointee: pointee }
 
 fn gi_is_ptr_kind(k: TypeKind) -> i32
     if k == TypeKind.Ptr or k == TypeKind.Ref or k == TypeKind.MutRef
@@ -97,11 +95,11 @@ fn gi_is_ptr_kind(k: TypeKind) -> i32
 # AGAST #3277: a 1-D `[size]elem` as a type argument, spelled as ast_helpers'
 # spell_last_array spells `g<[4]i32>`'s, so monomorph's array_arg_decode reads
 # it back: "arr" size "_" E, E a primitive's name, a struct's (elem_name), or
-# "ptr_" + either for a `*U` element (U elem_pointee).  Sets *out to
-# TypeKind.Array and returns 1, or 0 for an element a suffix can't spell.
+# "ptr_" + either for a `*U` element (U elem_pointee).  A TypeKind.Array
+# GiType, or None for an element a suffix can't spell.
 # AGAST #4178: an array element (elem TypeKind.Array, elem_name its own
 # spelling) nests as spell_last_array nests `[N][M]E`: "arr2_arr3_u8".
-fn gi_array_spell(size: i32, elem: TypeKind, elem_name: StrView, elem_pointee: TypeKind, out: *GiType) -> i32
+pub fn gi_array_spell(size: i32, elem: TypeKind, elem_name: StrView, elem_pointee: TypeKind) -> Option<GiType>
     var e: *u8 = null
     var el: i32 = 0
     var ptr: i32 = 0
@@ -123,7 +121,7 @@ fn gi_array_spell(size: i32, elem: TypeKind, elem_name: StrView, elem_pointee: T
             el = primitive_arg_spelling(elem, @prim_spelled)
             e = prim_spelled.ptr
     if e == null or el <= 0 or size <= 0
-        return 0
+        return None
     # "arr" + up to 10 digits + "_" + "ptr_" + E + NUL
     let buf: *u8 = malloc((el + 19) as i64)
     let arr_lit: StrView = "arr"
@@ -139,7 +137,7 @@ fn gi_array_spell(size: i32, elem: TypeKind, elem_name: StrView, elem_pointee: T
     memcpy(buf + pos, e, el as i64)
     pos = pos + el
     *(buf + pos) = 0
-    gi_set(out, TypeKind.Array, StrView { ptr: (buf), len: (pos) as i64 }, TypeKind.Void)
+    Some(gi_new(TypeKind.Array, StrView { ptr: (buf), len: (pos) as i64 }, TypeKind.Void))
 
 # 1 for a primitive TYPE_* that a suffix can spell.
 fn gi_is_prim(k: TypeKind) -> i32
@@ -160,112 +158,109 @@ fn gi_is_int_literal(e: *Expr) -> i32
         return 0
     1
 
-# The type a one-argument suffix ("$u8", "$Vec$u8", "$ptr_u8") names.
-fn gi_type_from_suffix(suffix: StrView, out: *GiType) -> i32
+# The type a one-argument suffix ("$u8", "$Vec$u8", "$ptr_u8") names, or
+# None for one no GiType spells.
+pub fn gi_type_from_suffix(suffix: StrView) -> Option<GiType>
     let k: TypeKind = parse_type_from_suffix(suffix)
     match k
         TypeKind.Array =>
             # AGAST #3277: "$arr4_i32" is the array gi_array_spell spelled.
             var arr: ArrayArg
             if suffix.len < 2 or array_arg_decode(suffix.skip(1), @arr) == 0
-                return 0
-            return gi_set(out, TypeKind.Array, suffix.skip(1), TypeKind.Void)
+                return None
+            return Some(gi_new(TypeKind.Array, suffix.skip(1), TypeKind.Void))
         TypeKind.Void =>
-            return 0
+            return None
         _ => pass
     let n: StrView = get_type_name_from_suffix(suffix)
     match k
         TypeKind.Ptr =>
             let pk: TypeKind = primitive_type_from_name(n)
             if pk != TypeKind.Void
-                return gi_set(out, TypeKind.Ptr, strview_empty(), pk)
-            return gi_set(out, TypeKind.Ptr, n, TypeKind.Struct)
+                return Some(gi_new(TypeKind.Ptr, strview_empty(), pk))
+            return Some(gi_new(TypeKind.Ptr, n, TypeKind.Struct))
         TypeKind.Struct =>
-            return gi_set(out, TypeKind.Struct, n, TypeKind.Void)
+            return Some(gi_new(TypeKind.Struct, n, TypeKind.Void))
         _ => pass
-    gi_set(out, k, strview_empty(), TypeKind.Void)
+    Some(gi_new(k, strview_empty(), TypeKind.Void))
 
 # The return type of a call: a plain fn's, or a one-parameter generic's with
 # its suffix substituted (`vec_new<u64>()` is a Vec$u64).
-fn gi_call_type(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
+fn gi_call_type(mono: *MonoCtx, m: *Module, e: *Expr) -> Option<GiType>
     let f: *FnDef = find_fn_in_module(m, e.func_name)
     if f == null or f.return_type == TypeKind.Void
-        return 0
+        return None
     if f.type_params == null
         if f.return_type == TypeKind.Struct
             if f.return_type_name.ptr == null
-                return 0
-            return gi_set(out, TypeKind.Struct, f.return_type_name, TypeKind.Void)
+                return None
+            return Some(gi_new(TypeKind.Struct, f.return_type_name, TypeKind.Void))
         if gi_is_prim(f.return_type) == 1
-            return gi_set(out, f.return_type, strview_empty(), TypeKind.Void)
+            return Some(gi_new(f.return_type, strview_empty(), TypeKind.Void))
         # AGAST #4677: a `-> *T` / `@T` / `@&T` return keeps T's name in
         # return_type_name (sx_ret_pointee): a primitive's, or a struct's.
         if gi_is_ptr_kind(f.return_type) == 1 and f.return_type_name.ptr != null and f.ret_ptr_array == null and f.ret_fn_sig == null
-            return gi_ptr_type(f.return_type, f.return_type_name, primitive_type_from_name(f.return_type_name), out)
-        return 0
+            return gi_ptr_type(f.return_type, f.return_type_name, primitive_type_from_name(f.return_type_name))
+        return None
     if e.call_type_suffix.len <= 0 or f.type_params.next != null or f.return_type_name.ptr == null
-        return 0
+        return None
     let tp: *TypeParam = f.type_params
     var is_tp: i32 = 0
     if f.return_type_name.eq(tp.name)
         is_tp = 1
     if f.return_type == TypeKind.Struct
         if is_tp == 1
-            return gi_type_from_suffix(e.call_type_suffix, out)
-        return gi_set(out, TypeKind.Struct, substitute_type_param_in_name(mono, f.return_type_name, tp.name, e.call_type_suffix), TypeKind.Void)
+            return gi_type_from_suffix(e.call_type_suffix)
+        return Some(gi_new(TypeKind.Struct, substitute_type_param_in_name(mono, f.return_type_name, tp.name, e.call_type_suffix), TypeKind.Void))
     if gi_is_ptr_kind(f.return_type) == 1 and is_tp == 1
-        var inner: GiType
-        if gi_type_from_suffix(e.call_type_suffix, @inner) == 0
-            return 0
+        let inner: GiType = gi_type_from_suffix(e.call_type_suffix)?
         if inner.kind == TypeKind.Struct
-            return gi_set(out, f.return_type, inner.name, TypeKind.Struct)
+            return Some(gi_new(f.return_type, inner.name, TypeKind.Struct))
         if gi_is_prim(inner.kind) == 1
-            return gi_set(out, f.return_type, strview_empty(), inner.kind)
+            return Some(gi_new(f.return_type, strview_empty(), inner.kind))
         if inner.kind == TypeKind.Array and inner.name.ptr != null
             # AGAST #4182: `put<[2]i32>(..)` is a `*[2]i32`; name keeps the
             # `[N]E` spelling ("arr2_i32") for gi_index_type.
-            return gi_set(out, f.return_type, inner.name, TypeKind.Array)
-    0
+            return Some(gi_new(f.return_type, inner.name, TypeKind.Array))
+    None
 
 # The struct a value of type t is, or points at (one level): its name, or null.
-fn gi_struct_of(t: *GiType) -> StrView
+fn gi_struct_of(t: GiType) -> StrView
     if t.kind == TypeKind.Struct or (gi_is_ptr_kind(t.kind) == 1 and t.pointee == TypeKind.Struct)
         return t.name
     strview_empty()
 
-fn gi_member_type(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
-    var base: GiType
-    if gi_type_of(mono, m, e.left, @base) == 0
-        return 0
-    let sn_sv: StrView = gi_struct_of(@base)
+fn gi_member_type(mono: *MonoCtx, m: *Module, e: *Expr) -> Option<GiType>
+    let base: GiType = gi_type_of(mono, m, e.left)?
+    let sn_sv: StrView = gi_struct_of(base)
     if sn_sv.ptr == null
-        return 0
+        return None
     let st: *StructDef = find_concrete_struct(m, sn_sv)
     if st == null
-        return gi_instance_member_type(mono, m, sn_sv, e, out)
+        return gi_instance_member_type(mono, m, sn_sv, e)
     var f: *StructField = st.fields
     while f != null
         if f.name.eq(e.ident)
             if f.field_type == TypeKind.Struct and f.field_type_name.ptr != null
-                return gi_set(out, TypeKind.Struct, f.field_type_name, TypeKind.Void)
+                return Some(gi_new(TypeKind.Struct, f.field_type_name, TypeKind.Void))
             if gi_is_prim(f.field_type) == 1
-                return gi_set(out, f.field_type, strview_empty(), TypeKind.Void)
+                return Some(gi_new(f.field_type, strview_empty(), TypeKind.Void))
             # AGAST #4677: a `p: *T` field (or `@T`, lowered to one): T is
             # ptr_pointee, a struct T's name field_type_name.
             if gi_is_ptr_kind(f.field_type) == 1 and f.ptr_array == null and f.fn_sig == null
-                return gi_ptr_type(f.field_type, f.field_type_name, f.ptr_pointee, out)
-            return 0
+                return gi_ptr_type(f.field_type, f.field_type_name, f.ptr_pointee)
+            return None
         f = f.next
-    0
+    None
 
 # AGAST #4677: a pointer-kind `k` to `pointee` (a primitive), or to the struct
-# `name` when pointee is TypeKind.Struct or unset; 0 for any other pointee.
-fn gi_ptr_type(k: TypeKind, name_sv: StrView, pointee: TypeKind, out: *GiType) -> i32
+# `name` when pointee is TypeKind.Struct or unset; None for any other pointee.
+pub fn gi_ptr_type(k: TypeKind, name_sv: StrView, pointee: TypeKind) -> Option<GiType>
     if gi_is_prim(pointee) == 1
-        return gi_set(out, k, strview_empty(), pointee)
+        return Some(gi_new(k, strview_empty(), pointee))
     if (pointee == TypeKind.Struct or pointee == TypeKind.Void) and name_sv.ptr != null and name_sv.len > 0
-        return gi_set(out, k, name_sv, TypeKind.Struct)
-    0
+        return Some(gi_new(k, name_sv, TypeKind.Struct))
+    None
 
 # AGAST #4299: `b.v` where b is a generic struct's instance (`Bag$Nope`, a
 # `var b: Bag<Nope>`): monomorph hasn't made `Bag$Nope` yet, so the field is
@@ -273,169 +268,168 @@ fn gi_ptr_type(k: TypeKind, name_sv: StrView, pointee: TypeKind, out: *GiType) -
 # for the params (`T` is `Nope`; `V` of `Pair<K, V>` is the 2nd arg), then
 # typed as the one-argument suffix "$Nope" is.  Mirrors ritz0, which types
 # the member through the instantiated struct.
-fn gi_instance_member_type(mono: *MonoCtx, m: *Module, sn: StrView, e: *Expr, out: *GiType) -> i32
+fn gi_instance_member_type(mono: *MonoCtx, m: *Module, sn: StrView, e: *Expr) -> Option<GiType>
     var i: i32 = 0
     while i < sn.len and sn.get(i) != '$'   # '$'
         i = i + 1
     if i == sn.len
-        return 0
+        return None
     let st: *StructDef = find_generic_struct(m, sn.take(i))
     if st == null
-        return 0
+        return None
     let f: *StructField = gi_field_named(st, e.ident)
     if f == null
-        return 0
+        return None
     if f.field_type != TypeKind.Struct or f.field_type_name.ptr == null
         if gi_is_prim(f.field_type) == 1
-            return gi_set(out, f.field_type, strview_empty(), TypeKind.Void)
-        return 0
+            return Some(gi_new(f.field_type, strview_empty(), TypeKind.Void))
+        return None
     let suffix: StrView = sn.skip(i)
     let cap: i32 = mangled_arg_capacity(suffix)
     let starts: *i32 = malloc((cap as i64) * 4) as *i32
     let lens: *i32 = malloc((cap as i64) * 4) as *i32
-    var r: i32 = 0
+    var r: Option<GiType> = None
     if split_mangled_args(mono.pctx, m, suffix, starts, lens) == count_type_params(st.type_params)
         let tn_sv: StrView = substitute_params_in_mangled(mono, st.type_params, suffix, starts, lens, f.field_type_name)
         # As a one-argument suffix: "$" + the substituted type's name (AGAST #4915).
         let one: StrView = strview_join2("$", tn_sv)
-        r = gi_type_from_suffix(one, out)
+        r = gi_type_from_suffix(one)
     free(starts as *u8)
     free(lens as *u8)
     r
 
 # `b[i]`: a Vec's or Span's element, a `*T`'s T, or a `[N]E`'s or `*[N]E`'s E.
-fn gi_index_type(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
-    var base: GiType
-    if gi_type_of(mono, m, e.left, @base) == 0
-        return 0
+fn gi_index_type(mono: *MonoCtx, m: *Module, e: *Expr) -> Option<GiType>
+    let base: GiType = gi_type_of(mono, m, e.left)?
     if base.kind == TypeKind.Ptr and base.pointee != TypeKind.Struct and gi_is_prim(base.pointee) == 1
-        return gi_set(out, base.pointee, strview_empty(), TypeKind.Void)
+        return Some(gi_new(base.pointee, strview_empty(), TypeKind.Void))
     # A 1-D `[N]E` local's element (AGAST #3408: `Span { ptr: @a[1], .. }`),
     # or a `*[N]E`'s, as a `-> *T` at T = `[N]E` returns (AGAST #4182).
     if (base.kind == TypeKind.Array or (base.kind == TypeKind.Ptr and base.pointee == TypeKind.Array)) and base.name.ptr != null
         var arr: ArrayArg
         if array_arg_decode(base.name, @arr) == 0
-            return 0
+            return None
         match arr.elem
             TypeKind.Struct =>
-                return gi_set(out, TypeKind.Struct, arr.name, TypeKind.Void)
+                return Some(gi_new(TypeKind.Struct, arr.name, TypeKind.Void))
             TypeKind.Ptr =>
-                return gi_set(out, TypeKind.Ptr, arr.name, arr.pointee)
+                return Some(gi_new(TypeKind.Ptr, arr.name, arr.pointee))
             _ => pass
         if gi_is_prim(arr.elem) == 1
-            return gi_set(out, arr.elem, strview_empty(), TypeKind.Void)
-        return 0
-    let sn_sv: StrView = gi_struct_of(@base)
+            return Some(gi_new(arr.elem, strview_empty(), TypeKind.Void))
+        return None
+    let sn_sv: StrView = gi_struct_of(base)
     if sn_sv.ptr == null
-        return 0
+        return None
     var suf: StrView = strview_empty()
     if classify_collection_type(sn_sv, @suf) == 0
-        return 0
-    gi_type_from_suffix(suf, out)
+        return None
+    gi_type_from_suffix(suf)
 
-# The type of `e`, or 0 when this pass can't tell.  Literals take their
+# The type of `e`, or None when this pass can't tell.  Literals take their
 # default type, as `let x = <literal>` gives them.
-fn gi_type_of(mono: *MonoCtx, m: *Module, e: *Expr, out: *GiType) -> i32
+fn gi_type_of(mono: *MonoCtx, m: *Module, e: *Expr) -> Option<GiType>
     if e == null
-        return 0
+        return None
     let k: ExprKind = e.kind
     match k
         ExprKind.IntLit =>
             if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
-                return gi_set(out, TypeKind.Bool, strview_empty(), TypeKind.Void)
+                return Some(gi_new(TypeKind.Bool, strview_empty(), TypeKind.Void))
             if e.lit_kind == LIT_UNIT or e.lit_kind == LIT_PASS
-                return 0
-            return gi_set(out, TypeKind.I64, strview_empty(), TypeKind.Void)
+                return None
+            return Some(gi_new(TypeKind.I64, strview_empty(), TypeKind.Void))
         ExprKind.FloatLit =>
-            return gi_set(out, TypeKind.F64, strview_empty(), TypeKind.Void)
+            return Some(gi_new(TypeKind.F64, strview_empty(), TypeKind.Void))
         ExprKind.CharLit =>
-            return gi_set(out, TypeKind.U8, strview_empty(), TypeKind.Void)
+            return Some(gi_new(TypeKind.U8, strview_empty(), TypeKind.Void))
         ExprKind.StringLit =>
-            return gi_set(out, TypeKind.Struct, "StrView", TypeKind.Void)
+            return Some(gi_new(TypeKind.Struct, "StrView", TypeKind.Void))
         ExprKind.CstringLit =>
-            return gi_set(out, TypeKind.Ptr, strview_empty(), TypeKind.U8)
+            return Some(gi_new(TypeKind.Ptr, strview_empty(), TypeKind.U8))
         ExprKind.Ident =>
             let idx: i32 = gi_find_local(e.ident)
             if idx < 0
-                return 0
-            return gi_set(out, *(g_gi_kinds + idx), *(g_gi_tnames + idx), *(g_gi_pointees + idx))
+                return None
+            return Some(gi_new(*(g_gi_kinds + idx), *(g_gi_tnames + idx), *(g_gi_pointees + idx)))
         ExprKind.Cast =>
             if e.type_kind == TypeKind.Ptr
                 if e.cast_pointee == TypeKind.Struct and e.ident.ptr != null
-                    return gi_set(out, TypeKind.Ptr, e.ident, TypeKind.Struct)
+                    return Some(gi_new(TypeKind.Ptr, e.ident, TypeKind.Struct))
                 if gi_is_prim(e.cast_pointee) == 1
-                    return gi_set(out, TypeKind.Ptr, strview_empty(), e.cast_pointee)
-                return 0
+                    return Some(gi_new(TypeKind.Ptr, strview_empty(), e.cast_pointee))
+                return None
             if gi_is_prim(e.type_kind) == 1
-                return gi_set(out, e.type_kind, strview_empty(), TypeKind.Void)
-            return 0
+                return Some(gi_new(e.type_kind, strview_empty(), TypeKind.Void))
+            return None
         ExprKind.Unary =>
             if e.op == OpKind.Not
-                return gi_set(out, TypeKind.Bool, strview_empty(), TypeKind.Void)
-            var inner: GiType
-            if gi_type_of(mono, m, e.operand, @inner) == 0
-                return 0
+                return Some(gi_new(TypeKind.Bool, strview_empty(), TypeKind.Void))
+            let inner: GiType = gi_type_of(mono, m, e.operand)?
             match e.op
                 OpKind.Neg | OpKind.BitNot =>
-                    return gi_set(out, inner.kind, inner.name, inner.pointee)
+                    return Some(inner)
                 OpKind.Deref =>
                     if gi_is_ptr_kind(inner.kind) == 0
-                        return 0
+                        return None
                     if inner.pointee == TypeKind.Struct
-                        return gi_set(out, TypeKind.Struct, inner.name, TypeKind.Void)
+                        return Some(gi_new(TypeKind.Struct, inner.name, TypeKind.Void))
                     if gi_is_prim(inner.pointee) == 1
-                        return gi_set(out, inner.pointee, strview_empty(), TypeKind.Void)
-                    return 0
+                        return Some(gi_new(inner.pointee, strview_empty(), TypeKind.Void))
+                    return None
                 _ => pass
             if e.op == OpKind.Addr or e.op == OpKind.AddrMut
                 var rk: TypeKind = TypeKind.Ref
                 if e.op == OpKind.AddrMut
                     rk = TypeKind.MutRef
                 if inner.kind == TypeKind.Struct
-                    return gi_set(out, rk, inner.name, TypeKind.Struct)
+                    return Some(gi_new(rk, inner.name, TypeKind.Struct))
                 if gi_is_prim(inner.kind) == 1
-                    return gi_set(out, rk, strview_empty(), inner.kind)
-            return 0
+                    return Some(gi_new(rk, strview_empty(), inner.kind))
+            return None
         ExprKind.Binary =>
             if op_is_cmp_or_logic(e.op)
-                return gi_set(out, TypeKind.Bool, strview_empty(), TypeKind.Void)
-            let lk: i32 = gi_type_of(mono, m, e.left, out)
-            if lk == 0 or gi_is_int_literal(e.left) == 1
-                var r: GiType
-                if gi_is_int_literal(e.right) == 0 and gi_type_of(mono, m, e.right, @r) == 1
-                    return gi_set(out, r.kind, r.name, r.pointee)
-            return lk
+                return Some(gi_new(TypeKind.Bool, strview_empty(), TypeKind.Void))
+            # The left's type, unless it's untyped or a literal and the
+            # right (not a literal) has one.
+            let l: Option<GiType> = gi_type_of(mono, m, e.left)
+            if l.is_none() or gi_is_int_literal(e.left) == 1
+                if gi_is_int_literal(e.right) == 0
+                    let r: Option<GiType> = gi_type_of(mono, m, e.right)
+                    if r.is_some()
+                        return r
+            return l
         ExprKind.Call =>
-            return gi_call_type(mono, m, e, out)
+            return gi_call_type(mono, m, e)
         ExprKind.Member =>
-            return gi_member_type(mono, m, e, out)
+            return gi_member_type(mono, m, e)
         ExprKind.Index =>
-            return gi_index_type(mono, m, e, out)
+            return gi_index_type(mono, m, e)
         ExprKind.StructLit =>
-            return gi_struct_lit_type(m, e, out)
+            return gi_struct_lit_type(m, e)
         _ => pass
-    0
+    None
 
 # AGAST #3064: `D { .. }` is a D, and `Box<i32> { .. }` (parsed as `Box$i32`)
 # a Box$i32, so an un-annotated `let t = D { .. }` binds T in `take(@t)`.  A
 # generic struct's literal without args (`Cell { v: 3 }`) has them by now:
 # gi_slot or gi_struct_lit_args renamed it (#3408).  A tuple literal (no name)
 # is untyped.  Mirrors ritz0's _infer_value_type.
-fn gi_struct_lit_type(m: *Module, e: *Expr, out: *GiType) -> i32
+fn gi_struct_lit_type(m: *Module, e: *Expr) -> Option<GiType>
     if e.ident.ptr == null or e.ident.len <= 0
-        return 0
+        return None
     if find_concrete_struct(m, e.ident) == null
         # Not a plain struct: an instance only when spelled with its args.
         var i: i32 = 0
         while i < (e.ident.len as i32) and *(e.ident.ptr + i) != '$'   # '$'
             i = i + 1
         if i == (e.ident.len as i32) or find_generic_struct(m, e.ident.take(i as i64)) == null
-            return 0
-    gi_set(out, TypeKind.Struct, e.ident, TypeKind.Void)
+            return None
+    Some(gi_new(TypeKind.Struct, e.ident, TypeKind.Void))
 
 # How a type binds a bare T: a primitive's name, a struct's mangled name, or
 # "ptr_" and the pointee's.  null for anything a suffix can't spell.
-fn gi_spell(t: *GiType) -> StrView
+fn gi_spell(t: GiType) -> StrView
     var s: *u8 = null
     var n: i32 = 0
     if t.kind == TypeKind.Struct or (t.kind == TypeKind.Array and t.name.ptr != null)
@@ -552,7 +546,7 @@ fn gi_match_mangled(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p: StrView, a: 
 
 # A param written `pname` (a struct-ish name: `T`, `Vec$T`) against an
 # argument of type t.
-fn gi_unify_named(ctx: *ParseCtx, m: *Module, tps: *TypeParam, pname_sv: StrView, t: *GiType, b: *GiBind)
+fn gi_unify_named(ctx: *ParseCtx, m: *Module, tps: *TypeParam, pname_sv: StrView, t: GiType, b: *GiBind)
     let idx: i32 = type_param_index(tps, pname_sv)
     if idx >= 0
         let s_sv: StrView = gi_spell(t)
@@ -561,7 +555,7 @@ fn gi_unify_named(ctx: *ParseCtx, m: *Module, tps: *TypeParam, pname_sv: StrView
     if t.kind == TypeKind.Struct
         gi_match_mangled(ctx, m, tps, pname_sv, t.name, b)
 
-fn gi_unify_param(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p: *Param, t: *GiType, b: *GiBind)
+fn gi_unify_param(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p: *Param, t: GiType, b: *GiBind)
     let pk: TypeKind = p.param_type
     if p.param_type_name.ptr == null or p.param_type_name.len <= 0
         return
@@ -572,12 +566,10 @@ fn gi_unify_param(ctx: *ParseCtx, m: *Module, tps: *TypeParam, p: *Param, t: *Gi
         gi_unify_named(ctx, m, tps, p.param_type_name, t, b)
         return
     if gi_is_ptr_kind(pk) == 1 and p.param_pointee_type == TypeKind.Struct and gi_is_ptr_kind(t.kind) == 1
-        var inner: GiType
+        var inner: GiType = gi_new(t.pointee, strview_empty(), TypeKind.Void)
         if t.pointee == TypeKind.Struct
-            gi_set(@inner, TypeKind.Struct, t.name, TypeKind.Void)
-        else
-            gi_set(@inner, t.pointee, strview_empty(), TypeKind.Void)
-        gi_unify_named(ctx, m, tps, p.param_type_name, @inner, b)
+            inner = gi_new(TypeKind.Struct, t.name, TypeKind.Void)
+        gi_unify_named(ctx, m, tps, p.param_type_name, inner, b)
 
 # 1 when `p` is a bare `T` (or `x:& T`) of the callee: what a literal binds.
 fn gi_bare_param_index(tps: *TypeParam, p: *Param) -> i32
@@ -603,22 +595,27 @@ fn gi_error(e: *Expr, tp: *TypeParam, fname: StrView)
 # AGAST #3986, #4159: an array-literal call argument, `put([a, b])` or `heap
 # [a, b]` (`__heap_new([a, b])`), binds T to the `[N]E` ritz0's type checker
 # gives the literal: N its length, E its first element's type (`[x, 5]` with
-# an i32 x is `[2]i32`; `[5, x]` is `[2]i64`).  1 and *out set, or 0: for
-# `[]`, which ritz0 can't type either.  AGAST #4178: a nested literal's
+# an i32 x is `[2]i32`; `[5, x]` is `[2]i64`).  None for `[]`, which ritz0
+# can't type either.  AGAST #4178: a nested literal's
 # first element types by this same rule, so `[ [1, 2], [3, 4] ]` is
 # `[2][2]i64`, as ritz0's ArrayLit rule recurses.
-fn gi_array_lit_type(mono: *MonoCtx, m: *Module, arg: *Expr, out: *GiType) -> i32
+fn gi_array_lit_type(mono: *MonoCtx, m: *Module, arg: *Expr) -> Option<GiType>
     if arg == null or arg.kind != ExprKind.ArrayLit or arg.args == null
-        return 0
+        return None
     var n: i32 = 0
     var it: *Expr = arg.args
     while it != null
         n = n + 1
         it = it.next
-    var el: GiType
-    if gi_type_of(mono, m, arg.args, @el) == 0 and gi_array_lit_type(mono, m, arg.args, @el) == 0
-        return 0
-    gi_array_spell(n, el.kind, el.name, el.pointee, out)
+    let el: GiType = gi_value_type(mono, m, arg.args)?
+    gi_array_spell(n, el.kind, el.name, el.pointee)
+
+# An argument's type: its gi_type_of, else an array literal's.
+fn gi_value_type(mono: *MonoCtx, m: *Module, e: *Expr) -> Option<GiType>
+    let t: Option<GiType> = gi_type_of(mono, m, e)
+    if t.is_some()
+        return t
+    gi_array_lit_type(mono, m, e)
 
 fn gi_infer_call(mono: *MonoCtx, m: *Module, e: *Expr)
     if e.call_type_suffix.len > 0
@@ -637,9 +634,9 @@ fn gi_infer_call(mono: *MonoCtx, m: *Module, e: *Expr)
             if li >= 0
                 *(b.lit + li) = 1
         else
-            var t: GiType
-            if gi_type_of(mono, m, arg, @t) == 1 or gi_array_lit_type(mono, m, arg, @t) == 1
-                gi_unify_param(mono.pctx, m, f.type_params, p, @t, @b)
+            match gi_value_type(mono, m, arg)
+                Some(t) => gi_unify_param(mono.pctx, m, f.type_params, p, t, @b)
+                None => pass
         p = p.next
         arg = arg.next
     # The suffix: "$" and each binding, in the callee's param order.
@@ -689,22 +686,24 @@ fn gi_walk_arms(mono: *MonoCtx, m: *Module, arms: *MatchArm)
         arm = arm.next
 
 fn gi_note_decl(mono: *MonoCtx, m: *Module, s: *Stmt)
-    var t: GiType
     if s.var_declared_type != TypeKind.Void
         if s.var_type == TypeKind.Struct and s.var_type_name.ptr == null
             return
         if s.var_type == TypeKind.Array
             # A 1-D `var a: [N]E`; `[N][M]E` spells as no type argument, so
             # binds nothing (TypeKind.Void), but `a` is still a local.
-            gi_set(@t, TypeKind.Void, strview_empty(), TypeKind.Void)
+            var t: GiType = gi_new(TypeKind.Void, strview_empty(), TypeKind.Void)
             if s.var_array_shape == null
-                gi_array_spell(s.var_array_size, s.var_array_elem_type, s.var_type_name, s.var_array_elem_pointee, @t)
-            gi_add_local(s.var_name, @t)
+                match gi_array_spell(s.var_array_size, s.var_array_elem_type, s.var_type_name, s.var_array_elem_pointee)
+                    Some(a) => t = a
+                    None => pass
+            gi_add_local(s.var_name, t)
             return
-        gi_set(@t, s.var_type, s.var_type_name, s.var_pointee_type)
-        gi_add_local(s.var_name, @t)
-    else if gi_type_of(mono, m, s.var_init, @t) == 1
-        gi_add_local(s.var_name, @t)
+        gi_add_local(s.var_name, gi_new(s.var_type, s.var_type_name, s.var_pointee_type))
+        return
+    match gi_type_of(mono, m, s.var_init)
+        Some(t) => gi_add_local(s.var_name, t)
+        None => pass
 
 # ----------------------------------------------------------------------------
 # AGAST #2927: an untyped `let s = Full(5)` / `var s = Empty`, `Full` a variant
@@ -747,18 +746,16 @@ fn gi_unify_field(mono: *MonoCtx, m: *Module, tps: *TypeParam, f: *StructField, 
             if li >= 0
                 *(b.lit + li) = 1
         return
-    var t: GiType
-    if gi_type_of(mono, m, arg, @t) == 0
-        return
+    let t: GiType = match gi_type_of(mono, m, arg)
+        Some(x) => x
+        None => return
     if f.field_type == TypeKind.Struct
-        gi_unify_named(mono.pctx, m, tps, f.field_type_name, @t, b)
+        gi_unify_named(mono.pctx, m, tps, f.field_type_name, t, b)
     else if gi_is_ptr_kind(f.field_type) == 1 and f.ptr_pointee == TypeKind.Struct and gi_is_ptr_kind(t.kind) == 1
-        var inner: GiType
+        var inner: GiType = gi_new(t.pointee, strview_empty(), TypeKind.Void)
         if t.pointee == TypeKind.Struct
-            gi_set(@inner, TypeKind.Struct, t.name, TypeKind.Void)
-        else
-            gi_set(@inner, t.pointee, strview_empty(), TypeKind.Void)
-        gi_unify_named(mono.pctx, m, tps, f.field_type_name, @inner, b)
+            inner = gi_new(TypeKind.Struct, t.name, TypeKind.Void)
+        gi_unify_named(mono.pctx, m, tps, f.field_type_name, inner, b)
 
 fn gi_type_variant_let(mono: *MonoCtx, m: *Module, s: *Stmt)
     let init: *Expr = s.var_init
@@ -997,10 +994,10 @@ fn gi_slot_call(mono: *MonoCtx, m: *Module, e: *Expr)
 
 # `recv.method(args)` on a plain impl: its params after `self`.
 fn gi_slot_method(mono: *MonoCtx, m: *Module, e: *Expr)
-    var rt: GiType
-    if gi_type_of(mono, m, e.left, @rt) == 0
-        return
-    let rn_sv: StrView = gi_struct_of(@rt)
+    let rt: GiType = match gi_type_of(mono, m, e.left)
+        Some(x) => x
+        None => return
+    let rn_sv: StrView = gi_struct_of(rt)
     if rn_sv.ptr == null
         return
     var ib: *ImplBlock = m.impls
@@ -1204,21 +1201,22 @@ fn gi_walk_fn(mono: *MonoCtx, m: *Module, f: *FnDef, impl_name_sv: StrView)
         g_gi_file = f.def_file
     var p: *Param = f.params
     while p != null
-        var t: GiType
         # Not typed, a param still shadows: gi_infer_call skips a call through it.
-        gi_set(@t, TypeKind.Void, strview_empty(), TypeKind.Void)
+        var t: GiType = gi_new(TypeKind.Void, strview_empty(), TypeKind.Void)
         if p.param_type == TypeKind.Array
             # AGAST #3277: a by-value `a: [N]E`.
-            gi_array_spell(p.param_array_size, p.param_array_elem_type, p.param_type_name, p.param_array_elem_pointee, @t)
+            match gi_array_spell(p.param_array_size, p.param_array_elem_type, p.param_type_name, p.param_array_elem_pointee)
+                Some(a) => t = a
+                None => pass
         else if p.is_self_borrow == 1 and p.param_type_name.len == 0
-            gi_set(@t, TypeKind.Struct, impl_name_sv, TypeKind.Void)
+            t = gi_new(TypeKind.Struct, impl_name_sv, TypeKind.Void)
         else if p.is_borrow == 1 and p.param_pointee_type == TypeKind.Struct
-            gi_set(@t, TypeKind.Struct, p.param_type_name, TypeKind.Void)
+            t = gi_new(TypeKind.Struct, p.param_type_name, TypeKind.Void)
         else if p.is_borrow == 1
-            gi_set(@t, p.param_pointee_type, strview_empty(), TypeKind.Void)
+            t = gi_new(p.param_pointee_type, strview_empty(), TypeKind.Void)
         else
-            gi_set(@t, p.param_type, p.param_type_name, p.param_pointee_type)
-        gi_add_local(p.name, @t)
+            t = gi_new(p.param_type, p.param_type_name, p.param_pointee_type)
+        gi_add_local(p.name, t)
         p = p.next
     gi_slot_block(mono.pctx, m, f.body, g_gi_ret)   # the tail (#3408)
     gi_walk_stmts(mono, m, f.body)

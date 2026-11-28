@@ -76,7 +76,7 @@ REFUSED = {
     "let_fixed_pointer_field": (_refused("    ^let v: i32 = w.home\n"), _LET + "*Point"),
     "let_fixed_pointer_field_two_params": (_refused("    ^let v: i32 = p.home\n"), _LET + "*Point"),
     # ritz1 judged no scalar argument of a named fn's call (cc_kind's
-    # SKF_NUM): these went unrefused whatever the argument was.
+    # SlotMisfit.Num): these went unrefused whatever the argument was.
     "arg_float": (_refused("    let d: f64 = 1.5\n    take(^d)\n"), _ARG + "f64"),
     "arg_null": (_refused("    take(^null)\n"), _ARG + "null"),
     "arg_int_for_pointer": (_refused("    let n: i32 = 1\n    take_byte(^n)\n"),

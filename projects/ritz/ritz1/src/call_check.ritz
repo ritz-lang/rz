@@ -457,18 +457,18 @@ fn cc_kind_error(sm: *Sema, a: *Expr, fname_sv: StrView, argno: i32, p: *Param) 
 # Argument `argno` of `fname`, `a`, for param `p`: slot_kind_fit's rule.  An
 # argument is refused here for a struct on either side; with `num` 1 (a call
 # of a named fn: ritz0 judges no method's argument) a float, `null` or pointer
-# into an integer param, or a narrow integer into a pointer one (SKF_NUM),
-# too, in ritz0's typing pass's words (AGAST #4680).
+# into an integer param, or a narrow integer into a pointer one
+# (SlotMisfit.Num), too, in ritz0's typing pass's words (AGAST #4680).
 fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param, num: i32)
     if a == null or p == null or p.is_borrow == 1
         return
-    var fit: SlotFit
     let pname: StrView = p.param_type_name
-    let k: i32 = slot_kind_fit(sm, a, p.param_type, pname, p.param_pointee_type, 0, @fit)
-    if k == SKF_NUM and num == 1
+    let fit: SlotFit = slot_kind_fit(sm, a, p.param_type, pname, p.param_pointee_type, 0)
+    let k: SlotMisfit = fit.misfit
+    if k == SlotMisfit.Num and num == 1
         cc_num_error(sm, a, argno, p, @fit)
         return
-    if k != SKF_AGG
+    if k != SlotMisfit.Agg
         return
     if fit.slot_class == SKS_STRUCT
         if cc_kind_error(sm, a, fname_sv, argno, p) == 1
@@ -489,25 +489,27 @@ fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param, num: i
 # kind, the name a struct (or a pointer's struct pointee) has, and a pointer's
 # pointee kind, read off whatever declared it.
 #
-#   slot              value refused                                 class
-#   struct            an integer, float, `bool`, `null`, C string   SKF_AGG
+#   slot              value refused                                 SlotMisfit
+#   struct            an integer, float, `bool`, `null`, C string   Agg
 #                     or pointer (cc_not_a_struct)
-#   int/float/bool    a struct                                      SKF_AGG
-#   int               a float or `null`; a pointer, but into an     SKF_NUM
+#   int/float/bool    a struct                                      Agg
+#   int               a float or `null`; a pointer, but into an     Num
 #                     i64 / u64
-#   pointer           a struct, but one of its own pointee          SKF_AGG
+#   pointer           a struct, but one of its own pointee          Agg
 #                     (ref_check's) or a String / StrView into a
 #                     `*u8` (literal_slot's); a float
-#   pointer           an integer narrower than i64 / u64            SKF_NUM
+#   pointer           an integer narrower than i64 / u64            Num
 #
 # A struct of another struct is let_check's (another_struct_source), said
 # in its words at a let, a store, a return and an argument; `other` 1 asks
 # for it here too, for the arms of a fn's `if` / `match` tail, which
 # let_check doesn't reach.  A value Sema can't type fits.
 
-const SKF_FITS: i32 = 0
-const SKF_AGG: i32 = 1    # a struct on one side, or a float / struct into a pointer
-const SKF_NUM: i32 = 2    # scalar into scalar: ritz0's type checker's words
+# What slot_kind_fit says of a value in its slot.
+pub enum SlotMisfit
+    Fits
+    Agg    # a struct on one side, or a float / struct into a pointer
+    Num    # scalar into scalar: ritz0's type checker's words
 
 const SKS_NONE: i32 = 0
 const SKS_STRUCT: i32 = 1
@@ -524,10 +526,11 @@ const SKV_BOOL: i32 = 4
 const SKV_NULL: i32 = 5
 const SKV_PTR: i32 = 6
 
-# What slot_kind_fit found: the slot's and value's classes, and the value's
-# type as Ritz writes it: `name` is a struct's name, a pointer's pointee
-# (`*` before it) or a scalar's.
+# What slot_kind_fit found: its verdict, the slot's and value's classes, and
+# the value's type as Ritz writes it: `name` is a struct's name, a pointer's
+# pointee (`*` before it) or a scalar's.
 pub struct SlotFit
+    misfit: SlotMisfit
     slot_class: i32
     value_class: i32
     name: StrView
@@ -535,10 +538,16 @@ pub struct SlotFit
     value_pointee: TypeKind  # a pointer value's pointee
     value_depth: i32         # a pointer value's `*`s: 1 for `*T`, 2 for `**S` (#4935)
 
-fn skf_named(out: *SlotFit, class: i32, name: StrView) -> i32
-    out.value_class = class
-    out.name = name
-    class
+# A fit of nothing found yet: no class on either side, `pointee` the slot's.
+fn skf_new(pointee: TypeKind) -> SlotFit
+    SlotFit { misfit: SlotMisfit.Fits, slot_class: SKS_NONE, value_class: SKV_NONE, name: strview_empty(), slot_pointee: pointee, value_pointee: TypeKind.Void, value_depth: 1 }
+
+# A value of class `class` whose type is named `name`.
+fn skf_named(class: i32, name: StrView) -> SlotFit
+    var v: SlotFit = skf_new(TypeKind.Void)
+    v.value_class = class
+    v.name = name
+    v
 
 # An integer kind's name, or an empty view for any other kind.
 fn skf_int_name(t: TypeKind) -> StrView
@@ -546,15 +555,16 @@ fn skf_int_name(t: TypeKind) -> StrView
         return strview_empty()
     primitive_name_sv(t)
 
-# The class of value `a`, its type's name into `out`.
-fn skf_value(sm: *Sema, a: *Expr, out: *SlotFit) -> i32
+# The value side of `a`: its class (SKV_NONE when it has none here), its
+# type's name, and a pointer's pointee.
+fn skf_value(sm: *Sema, a: *Expr) -> SlotFit
     match a.kind
         ExprKind.NilLit =>
-            return skf_named(out, SKV_NULL, "null")
+            return skf_named(SKV_NULL, "null")
         ExprKind.CstringLit =>
-            return skf_named(out, SKV_PTR, "u8")
+            return skf_named(SKV_PTR, "u8")
         ExprKind.StringLit | ExprKind.If | ExprKind.Match | ExprKind.ArrayLit | ExprKind.ArrayFill =>
-            return SKV_NONE
+            return skf_new(TypeKind.Void)
         _ => pass
     # A `c:& C` param reads as the C it borrows (#2250).
     let lent: i32 = (cc_lent(sm, a) != null) as i32
@@ -563,72 +573,84 @@ fn skf_value(sm: *Sema, a: *Expr, out: *SlotFit) -> i32
     let k: TypeKind = sema_expr_ty(sm, a, @t)
     if bk == BK_FLOAT
         if k == TypeKind.F32
-            return skf_named(out, SKV_FLOAT, "f32")
-        return skf_named(out, SKV_FLOAT, "f64")
+            return skf_named(SKV_FLOAT, "f32")
+        return skf_named(SKV_FLOAT, "f64")
     if bk == BK_BOOL
-        return skf_named(out, SKV_BOOL, "bool")
+        return skf_named(SKV_BOOL, "bool")
     if bk == BK_INT and cc_sure_int(sm, a) == 1
         var name: StrView = skf_int_name(k)
         if name.len == 0 and (a.kind == ExprKind.IntLit or a.kind == ExprKind.CharLit)
             name = "i64"
         if name.len == 0
-            return SKV_NONE
-        return skf_named(out, SKV_INT, name)
+            return skf_new(TypeKind.Void)
+        return skf_named(SKV_INT, name)
     if bk == BK_PTR
         match cc_ptr_ptr_struct(sm, a)
             Some(pps) =>
-                out.value_pointee = TypeKind.Ptr
-                out.value_depth = 2
-                return skf_named(out, SKV_PTR, pps)
+                var pp: SlotFit = skf_named(SKV_PTR, pps)
+                pp.value_pointee = TypeKind.Ptr
+                pp.value_depth = 2
+                return pp
             None => pass
         if k != TypeKind.Ptr
-            return SKV_NONE
-        out.value_pointee = t.pointee
+            return skf_new(TypeKind.Void)
+        # The pointee is kept though the class stays SKV_NONE below.
+        var v: SlotFit = skf_new(TypeKind.Void)
+        v.value_pointee = t.pointee
         if t.pointee == TypeKind.Struct
             if t.name.ptr == null or t.name.len <= 0
-                return SKV_NONE
-            out.value_class = SKV_PTR
-            out.name = t.name
-            return SKV_PTR
+                return v
+            v.value_class = SKV_PTR
+            v.name = t.name
+            return v
         let pn: StrView = primitive_name_sv(t.pointee)
         if pn.len == 0
-            return SKV_NONE
-        return skf_named(out, SKV_PTR, pn)
+            return v
+        v.value_class = SKV_PTR
+        v.name = pn
+        return v
     var sv: StrView = cc_struct_value(sm, a)
     if sv.ptr == null and a.kind == ExprKind.StructLit and a.ident.len > 0 and sema_find_struct(sm, a.ident) != null
         sv = a.ident
     if sv.ptr == null
-        return SKV_NONE
-    out.value_class = SKV_STRUCT
-    out.name = sv
-    SKV_STRUCT
+        return skf_new(TypeKind.Void)
+    skf_named(SKV_STRUCT, sv)
 
 fn skf_is_view(name_sv: StrView) -> i32
     (name_eq(name_sv, "StrView") == 1 or name_eq(name_sv, "Span$u8") == 1) as i32
 
-# The class of a slot of kind `t`; a pointer's pointee into out.slot_pointee.
-fn skf_slot(sm: *Sema, t: TypeKind, name_sv: StrView, pointee: TypeKind, out: *SlotFit) -> i32
-    out.slot_pointee = pointee
+# The slot side of a slot of kind `t`: its class, and a pointer's pointee
+# (TypeKind.Struct for a known struct's `*T`).
+fn skf_slot(sm: *Sema, t: TypeKind, name_sv: StrView, pointee: TypeKind) -> SlotFit
+    var f: SlotFit = skf_new(pointee)
     match t
         TypeKind.Struct =>
             if name_sv.ptr == null or name_sv.len <= 0 or sema_find_struct(sm, name_sv) == null
-                return SKS_NONE
-            return SKS_STRUCT
+                return f
+            f.slot_class = SKS_STRUCT
+            return f
         TypeKind.Bool =>
-            return SKS_BOOL
+            f.slot_class = SKS_BOOL
+            return f
         TypeKind.F32 | TypeKind.F64 =>
-            return SKS_FLOAT
+            f.slot_class = SKS_FLOAT
+            return f
         TypeKind.Ptr => pass
         _ =>
             if ty_int_bits(t) > 0
-                return SKS_INT
-            return SKS_NONE
+                f.slot_class = SKS_INT
+            return f
     # `-> *T` keeps T's name, not its kind: a known struct is the pointee.
     if pointee != TypeKind.Struct and primitive_name_len(pointee) == 0 and name_sv.ptr != null and name_sv.len > 0 and sema_find_struct(sm, name_sv) != null
-        out.slot_pointee = TypeKind.Struct
-    if out.slot_pointee == TypeKind.Struct and (name_sv.ptr == null or name_sv.len <= 0 or sema_find_struct(sm, name_sv) == null)
-        return SKS_NONE
-    SKS_PTR
+        f.slot_pointee = TypeKind.Struct
+    if f.slot_pointee == TypeKind.Struct and (name_sv.ptr == null or name_sv.len <= 0 or sema_find_struct(sm, name_sv) == null)
+        return f
+    f.slot_class = SKS_PTR
+    f
+
+# Slot `slot` with value `v`'s side, and the verdict `misfit`.
+fn skf_verdict(slot: SlotFit, v: SlotFit, misfit: SlotMisfit) -> SlotFit
+    SlotFit { misfit: misfit, slot_class: slot.slot_class, value_class: v.value_class, name: v.name, slot_pointee: slot.slot_pointee, value_pointee: v.value_pointee, value_depth: v.value_depth }
 
 fn skf_wide_int(name: StrView) -> i32
     (name.eq("i64") or name.eq("u64")) as i32
@@ -677,64 +699,61 @@ fn skf_bare_variant(sm: *Sema, a: *Expr, slot: StrView) -> i32
     1
 
 # Does `a` fit a slot of kind `t` named `name` (a pointer's: its pointee's),
-# pointing at `pointee`?  SKF_FITS, or the misfit's class with what was found
-# in `out`.  `other` 1: a struct of another struct is judged here too.  A bare
-# variant of another enum in an enum slot is said here, the same in every slot
-# (skf_bare_variant), and then fits: the slot has nothing to add.
-pub fn slot_kind_fit(sm: *Sema, a: *Expr, t: TypeKind, name_sv: StrView, pointee: TypeKind, other: i32, out: *SlotFit) -> i32
-    out.slot_class = SKS_NONE
-    out.value_class = SKV_NONE
-    out.name = strview_empty()
-    out.slot_pointee = pointee
-    out.value_pointee = TypeKind.Void
-    out.value_depth = 1
+# pointing at `pointee`?  The verdict, SlotMisfit.Fits or the misfit's class,
+# with what was found.  `other` 1: a struct of another struct is judged here
+# too.  A bare variant of another enum in an enum slot is said here, the same
+# in every slot (skf_bare_variant), and then fits: the slot has nothing to add.
+pub fn slot_kind_fit(sm: *Sema, a: *Expr, t: TypeKind, name_sv: StrView, pointee: TypeKind, other: i32) -> SlotFit
     if a == null or skf_bare_variant(sm, a, name_sv) == 1
-        return SKF_FITS
-    let sc: i32 = skf_slot(sm, t, name_sv, pointee, out)
-    out.slot_class = sc
+        return skf_new(pointee)
+    let slot: SlotFit = skf_slot(sm, t, name_sv, pointee)
+    let sc: i32 = slot.slot_class
     if sc == SKS_NONE
-        return SKF_FITS
+        return slot
     if sc == SKS_STRUCT
         # A C-string literal into a StrView / `Span<u8>` is literal_slot's (#3440).
         if a.kind == ExprKind.CstringLit and skf_is_view(name_sv) == 1
-            return SKF_FITS
+            return slot
         if cc_not_a_struct(sm, a, name_sv).ptr != null
-            skf_value(sm, a, out)
-            return SKF_AGG
-        if other == 0 or a.kind == ExprKind.Cast or skf_value(sm, a, out) != SKV_STRUCT
-            return SKF_FITS
-        let vsv: StrView = out.name
+            return skf_verdict(slot, skf_value(sm, a), SlotMisfit.Agg)
+        if other == 0 or a.kind == ExprKind.Cast
+            return slot
+        let sv: SlotFit = skf_value(sm, a)
+        if sv.value_class != SKV_STRUCT
+            return skf_verdict(slot, sv, SlotMisfit.Fits)
+        let vsv: StrView = sv.name
         if name_eq(vsv, name_sv) == 1
-            return SKF_FITS
+            return skf_verdict(slot, sv, SlotMisfit.Fits)
         # A `Span<u8>` converts to a StrView (#168), not back (#3441).
         if name_eq(vsv, "Span$u8") == 1 and name_eq(name_sv, "StrView") == 1
-            return SKF_FITS
-        return SKF_AGG
-    let vc: i32 = skf_value(sm, a, out)
+            return skf_verdict(slot, sv, SlotMisfit.Fits)
+        return skf_verdict(slot, sv, SlotMisfit.Agg)
+    let v: SlotFit = skf_value(sm, a)
+    let vc: i32 = v.value_class
     if vc == SKV_STRUCT
         if sc != SKS_PTR
-            return SKF_AGG
-        let vn: StrView = out.name
+            return skf_verdict(slot, v, SlotMisfit.Agg)
+        let vn: StrView = v.name
         # One of its own pointee is ref_check's ("a value doesn't fit a
         # reference slot"); a String / StrView into a `*u8` literal_slot's.
-        if out.slot_pointee == TypeKind.Struct and name_eq(vn, name_sv) == 1
-            return SKF_FITS
-        if out.slot_pointee == TypeKind.U8 and (skf_is_view(vn) == 1 or name_eq(vn, "String") == 1)
-            return SKF_FITS
-        return SKF_AGG
+        if slot.slot_pointee == TypeKind.Struct and name_eq(vn, name_sv) == 1
+            return skf_verdict(slot, v, SlotMisfit.Fits)
+        if slot.slot_pointee == TypeKind.U8 and (skf_is_view(vn) == 1 or name_eq(vn, "String") == 1)
+            return skf_verdict(slot, v, SlotMisfit.Fits)
+        return skf_verdict(slot, v, SlotMisfit.Agg)
     if sc == SKS_INT
         if vc == SKV_FLOAT or vc == SKV_NULL
-            return SKF_NUM
+            return skf_verdict(slot, v, SlotMisfit.Num)
         # A pointer to the slot's own type is ref_value's ("write `*`").
-        if vc == SKV_PTR and out.value_pointee != t and ty_int_bits(t) != 64
-            return SKF_NUM
-        return SKF_FITS
+        if vc == SKV_PTR and v.value_pointee != t and ty_int_bits(t) != 64
+            return skf_verdict(slot, v, SlotMisfit.Num)
+        return skf_verdict(slot, v, SlotMisfit.Fits)
     if sc == SKS_PTR
         if vc == SKV_FLOAT
-            return SKF_AGG
-        if vc == SKV_INT and skf_wide_int(out.name) == 0
-            return SKF_NUM
-    SKF_FITS
+            return skf_verdict(slot, v, SlotMisfit.Agg)
+        if vc == SKV_INT and skf_wide_int(v.name) == 0
+            return skf_verdict(slot, v, SlotMisfit.Num)
+    skf_verdict(slot, v, SlotMisfit.Fits)
 
 # How slot_kind_fit's two sides are spelled in a refusal: here, beside SlotFit,
 # for cc_num_error and slot_kind.ritz's sites.
@@ -1682,49 +1701,69 @@ fn ca_base_ptr_array(sm: *Sema, e: *Expr) -> *Param
         return null
     pa
 
+# Why a place has no ArrayDims: it is no array, or Sema can't tell.  The
+# emitter's ast_query codes (ARG_DIMS_*) map onto it in ca_dims_nd.
+enum DimsMiss
+    NotArray
+    Unknown
+
+# A 1-D `[size]elem` (array_dims_1d's).
+fn ca_dims_1d(size: i32, elem: TypeKind, name_sv: StrView) -> ArrayDims
+    var d: ArrayDims
+    array_dims_1d(@d, size, elem, name_sv)
+    d
+
+# The array left of `sh` once `from` indices are applied (array_dims_nd's);
+# Err(DimsMiss.NotArray), an element, with none left.
+fn ca_dims_nd(sh: *ArrayShape, from: i32) -> Result<ArrayDims, DimsMiss>
+    var d: ArrayDims
+    if array_dims_nd(@d, sh, from) != ARG_DIMS_ARRAY
+        return Err(DimsMiss.NotArray)
+    Ok(d)
+
 # N and T of the `[N]T` that `*e` is, `e` a `*[N]T` local, param, field, global
 # (array_ptr_shape).  A step `p + k` isn't judged.
-fn ca_array_ptr_shape(sm: *Sema, e: *Expr, out: *ArrayDims) -> i32
+fn ca_array_ptr_shape(sm: *Sema, e: *Expr) -> Option<ArrayDims>
     let loc: *LocalVar = ca_array_ptr_local(sm, e)
     if loc != null
         let en: StrView = array_ptr_elem_name(loc)
-        return array_dims_1d(out, lv_pointee_array_size(loc), lv_pointee_array_elem_type(loc), en)
+        return Some(ca_dims_1d(lv_pointee_array_size(loc), lv_pointee_array_elem_type(loc), en))
     if e.kind == ExprKind.Binary
-        return 0
+        return None
     let pa: *Param = ca_base_ptr_array(sm, e)
     if pa == null
-        return 0
-    array_dims_1d(out, pa.param_pointee_array_size, pa.param_pointee_array_elem_type, pa.param_type_name)
+        return None
+    Some(ca_dims_1d(pa.param_pointee_array_size, pa.param_pointee_array_elem_type, pa.param_type_name))
 
 # A whole 1-D array `value` reads (arg_array_shape): a local or by-value param,
 # a global, `*@a`, `*p` of a `*[N]T`, a field.
-fn ca_array_shape(sm: *Sema, value: *Expr, out: *ArrayDims) -> i32
+fn ca_array_shape(sm: *Sema, value: *Expr) -> Option<ArrayDims>
     if value.kind == ExprKind.Ident
         let loc: *LocalVar = ca_local(sm, value)
         if loc != null
             # An inferred `let b = g(a)` of a generic's `[N]T` keeps no N here.
             if lv_var_type(loc) == TypeKind.Array and lv_array_shape(loc) == null and lv_array_size(loc) > 0
-                return array_dims_1d(out, lv_array_size(loc), lv_array_elem_type(loc), lv_name(loc))
-            return 0
+                return Some(ca_dims_1d(lv_array_size(loc), lv_array_elem_type(loc), lv_name(loc)))
+            return None
         if ca_is_local(sm, value) == 1
-            return 0
+            return None
         let g: *GlobalVarDef = ca_global(sm, value)
         if g != null and g.var_type == TypeKind.Array and g.array_shape == null
-            return array_dims_1d(out, g.array_size, g.array_elem_type, g.array_elem_type_name)
-        return 0
+            return Some(ca_dims_1d(g.array_size, g.array_elem_type, g.array_elem_type_name))
+        return None
     if value.kind == ExprKind.Unary and value.op == OpKind.Deref and value.operand != null
         let o: *Expr = value.operand
         if o.kind == ExprKind.Unary and (o.op == OpKind.Addr or o.op == OpKind.AddrMut) and o.operand != null
             let x: *Expr = o.operand
             if x.kind == ExprKind.Ident or x.kind == ExprKind.Unary
-                return ca_array_shape(sm, x, out)
-            return 0
-        return ca_array_ptr_shape(sm, o, out)
+                return ca_array_shape(sm, x)
+            return None
+        return ca_array_ptr_shape(sm, o)
     if value.kind == ExprKind.Member
         let f: *StructField = rs_field(sm, value)
         if f != null and f.field_type == TypeKind.Array and f.array_shape == null
-            return array_dims_1d(out, f.array_size, f.array_elem_type, f.array_elem_type_name)
-    0
+            return Some(ca_dims_1d(f.array_size, f.array_elem_type, f.array_elem_type_name))
+    None
 
 # The N-D array a name or field is (nd_array_base_shape), or null.
 fn ca_nd_shape(sm: *Sema, base: *Expr) -> *ArrayShape
@@ -1745,29 +1784,32 @@ fn ca_nd_shape(sm: *Sema, base: *Expr) -> *ArrayShape
         return g.array_shape
     null
 
-# What the place `value` holds (place_array_dims): its dimensions, that it's
-# no array, or ARG_DIMS_UNKNOWN.
-fn ca_place_dims(sm: *Sema, value: *Expr, out: *ArrayDims) -> i32
-    if ca_array_shape(sm, value, out) == 1
-        return ARG_DIMS_ARRAY
+# What the place `value` holds (place_array_dims): Ok(its dimensions), or
+# Err(DimsMiss.NotArray) that it's no array, Err(DimsMiss.Unknown) that Sema
+# can't tell.
+fn ca_place_dims(sm: *Sema, value: *Expr) -> Result<ArrayDims, DimsMiss>
+    match ca_array_shape(sm, value)
+        Some(d) =>
+            return Ok(d)
+        None => pass
     match value.kind
         ExprKind.Ident =>
             let sh: *ArrayShape = ca_nd_shape(sm, value)
             if sh != null
-                return array_dims_nd(out, sh, 0)
+                return ca_dims_nd(sh, 0)
             let loc: *LocalVar = ca_local(sm, value)
             if loc != null and lv_var_type(loc) == TypeKind.Array
-                return ARG_DIMS_UNKNOWN
+                return Err(DimsMiss.Unknown)
             if loc != null or ca_global(sm, value) != null
-                return ARG_DIMS_NOT_ARRAY
-            return ARG_DIMS_UNKNOWN
+                return Err(DimsMiss.NotArray)
+            return Err(DimsMiss.Unknown)
         ExprKind.Member =>
             let f: *StructField = rs_field(sm, value)
             if f != null and f.field_type == TypeKind.Array and f.array_shape != null
-                return array_dims_nd(out, f.array_shape, 0)
+                return ca_dims_nd(f.array_shape, 0)
             if f != null and f.field_type != TypeKind.Array
-                return ARG_DIMS_NOT_ARRAY
-            return ARG_DIMS_UNKNOWN
+                return Err(DimsMiss.NotArray)
+            return Err(DimsMiss.Unknown)
         _ => pass
     if value.kind == ExprKind.Index
         # The chain's base and depth (nd_index_shape).  A `[K]*[N][M]T`
@@ -1779,22 +1821,21 @@ fn ca_place_dims(sm: *Sema, value: *Expr, out: *ArrayDims) -> i32
             base = base.left
         let bl: *LocalVar = ca_local(sm, base)
         if bl != null and (lv_array_rec(bl) != null or lv_pointee_array_shape(bl) != null)
-            return ARG_DIMS_UNKNOWN
+            return Err(DimsMiss.Unknown)
         let sh: *ArrayShape = ca_nd_shape(sm, base)
         if sh != null
             if depth > sh.rank
-                return ARG_DIMS_UNKNOWN
-            return array_dims_nd(out, sh, depth)
+                return Err(DimsMiss.Unknown)
+            return ca_dims_nd(sh, depth)
         # An element of a 1-D array.
-        var whole: ArrayDims
-        if value.left.kind != ExprKind.Index and ca_place_dims(sm, value.left, @whole) == ARG_DIMS_ARRAY
-            return ARG_DIMS_NOT_ARRAY
-    ARG_DIMS_UNKNOWN
+        if value.left.kind != ExprKind.Index and ca_place_dims(sm, value.left).is_ok()
+            return Err(DimsMiss.NotArray)
+    Err(DimsMiss.Unknown)
 
 # What `arg` points at, for a param that takes an array by address (ref_arg_dims).
-fn ca_ref_dims(sm: *Sema, arg: *Expr, out: *ArrayDims) -> i32
+fn ca_ref_dims(sm: *Sema, arg: *Expr) -> Result<ArrayDims, DimsMiss>
     if arg.kind == ExprKind.Unary and (arg.op == OpKind.Addr or arg.op == OpKind.AddrMut)
-        return ca_place_dims(sm, arg.operand, out)
+        return ca_place_dims(sm, arg.operand)
     if arg.kind == ExprKind.Ident
         let loc: *LocalVar = ca_local(sm, arg)
         if loc != null and lv_var_type(loc) != TypeKind.Array
@@ -1802,27 +1843,28 @@ fn ca_ref_dims(sm: *Sema, arg: *Expr, out: *ArrayDims) -> i32
             if ploc != null
                 # AGAST #4122: a plane pointer `*[N][M]T` points at its shape.
                 if lv_pointee_array_shape(ploc) != null and lv_var_type(ploc) == TypeKind.Ptr
-                    return array_dims_nd(out, lv_pointee_array_shape(ploc), 0)
+                    return ca_dims_nd(lv_pointee_array_shape(ploc), 0)
                 let en: StrView = array_ptr_elem_name(ploc)
-                return array_dims_1d(out, lv_pointee_array_size(ploc), lv_pointee_array_elem_type(ploc), en)
+                return Ok(ca_dims_1d(lv_pointee_array_size(ploc), lv_pointee_array_elem_type(ploc), en))
             if lv_is_lent(loc) == 1
-                return ARG_DIMS_NOT_ARRAY
+                return Err(DimsMiss.NotArray)
             # A pointer whose pointee is known and no array (AGAST #2323).
             if lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.PtrPtr or lv_var_type(loc) == TypeKind.Ref or lv_var_type(loc) == TypeKind.MutRef
                 if lv_pointee_type(loc) == TypeKind.Array or lv_pointee_type(loc) == TypeKind.Unknown or lv_pointee_type(loc) == TypeKind.Void
-                    return ARG_DIMS_UNKNOWN
-                return ARG_DIMS_NOT_ARRAY
-    ca_place_dims(sm, arg, out)
+                    return Err(DimsMiss.Unknown)
+                return Err(DimsMiss.NotArray)
+    ca_place_dims(sm, arg)
 
 # AGAST #2290: `a[i]` in the callee trusts the N and T its param declares.
 fn ca_array_ref(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Expr, p: *Param)
     var got: ArrayDims
-    let known: i32 = ca_ref_dims(sm, arg, @got)
-    if known == ARG_DIMS_UNKNOWN
-        return
-    if known == ARG_DIMS_NOT_ARRAY
-        ca_error(sm, call, call, fname_sv, argno, "the parameter points at an array")
-        return
+    match ca_ref_dims(sm, arg)
+        Ok(d) =>
+            got = d
+        Err(known) =>
+            if known == DimsMiss.NotArray
+                ca_error(sm, call, call, fname_sv, argno, "the parameter points at an array")
+            return
     # A struct element the image doesn't name (`let p = q` of an `@&[3]S`) is unjudged.
     if got.leaf == TypeKind.Struct and got.name.len <= 0
         return
@@ -1842,18 +1884,23 @@ fn ca_strview(p: *Param) -> i32
 fn ca_strview_array(sm: *Sema, arg: *Expr, p: *Param) -> i32
     if ca_strview(p) == 0
         return 0
-    var src: ArrayDims
     if arg.kind == ExprKind.Ident or arg.kind == ExprKind.Member
-        if ca_array_ptr_shape(sm, arg, @src) == 1
-            if ty_int_bits(src.leaf) == 8
-                return 1
-            return 2
+        match ca_array_ptr_shape(sm, arg)
+            Some(p_src) =>
+                if ty_int_bits(p_src.leaf) == 8
+                    return 1
+                return 2
+            None => pass
     var x: *Expr = arg
     let addr: i32 = (x.kind == ExprKind.Unary and (x.op == OpKind.Addr or x.op == OpKind.AddrMut) and x.operand != null) as i32
     if addr == 1
         x = x.operand
-    if ca_array_shape(sm, x, @src) == 0
-        return 0
+    var src: ArrayDims
+    match ca_array_shape(sm, x)
+        Some(d) =>
+            src = d
+        None =>
+            return 0
     if ty_int_bits(src.leaf) == 8
         return 1
     if addr == 1
@@ -1886,30 +1933,27 @@ const CA_BORROW_SHARED: i32 = 5    # reached through an `@T`, read-only
 
 # The type of a place, as the emitter's PlaceType: `name` is a struct's, or for
 # a pointer the struct it points at.
-struct CaPlace
+pub struct CaPlace
     kind: TypeKind
     pointee: TypeKind
     name: StrView
 
-fn ca_place_set(out: *CaPlace, kind: TypeKind, pointee: TypeKind, name_sv: StrView) -> i32
-    out.kind = kind
-    out.pointee = pointee
-    out.name = name_sv
-    1
+pub fn ca_place_new(kind: TypeKind, pointee: TypeKind, name_sv: StrView) -> CaPlace
+    CaPlace { kind: kind, pointee: pointee, name: name_sv }
 
 fn ca_is_pointer(t: TypeKind) -> i32
     (t == TypeKind.Ptr or t == TypeKind.PtrPtr or t == TypeKind.Ref or t == TypeKind.MutRef) as i32
 
-# What `*x` gives, for `x` of type `base`.
-fn ca_place_deref(base: *CaPlace, out: *CaPlace) -> i32
+# What `*x` gives, for `x` of type `base`; None for no pointer.
+pub fn ca_place_deref(base: CaPlace) -> Option<CaPlace>
     var held: TypeKind = TypeKind.Unknown
     if base.name.len > 0
         held = TypeKind.Struct
     if base.kind == TypeKind.PtrPtr
-        return ca_place_set(out, TypeKind.Ptr, held, base.name)
+        return Some(ca_place_new(TypeKind.Ptr, held, base.name))
     if ca_is_pointer(base.kind) == 0
-        return 0
-    ca_place_set(out, base.pointee, held, base.name)
+        return None
+    Some(ca_place_new(base.pointee, held, base.name))
 
 # The plane `[N][M]T` a plane pointer local `q` (`*[N][M]T`), or `*r` of an
 # `@*[N][M]T` / `**[N][M]T` one, points at (plane_ptr_shape), or null.
@@ -1930,7 +1974,7 @@ fn ca_plane_shape(sm: *Sema, e: *Expr) -> *ArrayShape
 
 # What `x[i]` gives (place_index_type): the array shapes know what they hold; a
 # pointer is `*x`.  An element of a `[K]*[N][M]T` is the emitter's to type.
-fn ca_place_index(sm: *Sema, value: *Expr, out: *CaPlace) -> i32
+fn ca_place_index(sm: *Sema, value: *Expr) -> Option<CaPlace>
     var depth: i32 = 0
     var base: *Expr = value
     while base.kind == ExprKind.Index
@@ -1941,48 +1985,43 @@ fn ca_place_index(sm: *Sema, value: *Expr, out: *CaPlace) -> i32
         sh = ca_plane_shape(sm, base)
     if sh != null and depth <= sh.rank
         if depth < sh.rank
-            return ca_place_set(out, TypeKind.Array, TypeKind.Unknown, sh.leaf_name)
-        return ca_place_set(out, sh.leaf_type, TypeKind.Unknown, sh.leaf_name)
-    var src: ArrayDims
-    if ca_array_shape(sm, value.left, @src) == 1
-        var held: TypeKind = TypeKind.Unknown
-        if src.name.len > 0
-            held = TypeKind.Struct
-        return ca_place_set(out, src.leaf, held, src.name)
-    var b: CaPlace
-    if ca_place_type(sm, value.left, @b) == 0
-        return 0
-    ca_place_deref(@b, out)
+            return Some(ca_place_new(TypeKind.Array, TypeKind.Unknown, sh.leaf_name))
+        return Some(ca_place_new(sh.leaf_type, TypeKind.Unknown, sh.leaf_name))
+    match ca_array_shape(sm, value.left)
+        Some(src) =>
+            var held: TypeKind = TypeKind.Unknown
+            if src.name.len > 0
+                held = TypeKind.Struct
+            return Some(ca_place_new(src.leaf, held, src.name))
+        None => pass
+    ca_place_deref(ca_place_type(sm, value.left)?)
 
-# 1 and `out` when Sema can type the place `e` (place_type_of).
-fn ca_place_type(sm: *Sema, e: *Expr, out: *CaPlace) -> i32
+# The type of the place `e`, when Sema can type it (place_type_of).
+fn ca_place_type(sm: *Sema, e: *Expr) -> Option<CaPlace>
     match e.kind
         ExprKind.Ident =>
             if ca_is_local(sm, e) == 1
                 let loc: *LocalVar = ca_local(sm, e)
                 if loc == null
-                    return 0
-                return ca_place_set(out, lv_var_type(loc), lv_pointee_type(loc), lv_name(loc))
+                    return None
+                return Some(ca_place_new(lv_var_type(loc), lv_pointee_type(loc), lv_name(loc)))
             let g: *GlobalVarDef = sbk_global(sm, e.ident)
             if g == null
-                return 0
+                return None
             if ca_is_pointer(g.var_type) == 1
-                return ca_place_set(out, g.var_type, g.pointee_type, g.pointee_type_name)
-            return ca_place_set(out, g.var_type, TypeKind.Unknown, g.type_name)
+                return Some(ca_place_new(g.var_type, g.pointee_type, g.pointee_type_name))
+            return Some(ca_place_new(g.var_type, TypeKind.Unknown, g.type_name))
         ExprKind.Member =>
             let f: *StructField = rs_field(sm, e)
             if f == null
-                return 0
-            return ca_place_set(out, f.field_type, ptr_field_elem_kind(f), f.field_type_name)
+                return None
+            return Some(ca_place_new(f.field_type, ptr_field_elem_kind(f), f.field_type_name))
         ExprKind.Index =>
-            return ca_place_index(sm, e, out)
+            return ca_place_index(sm, e)
         _ => pass
     if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
-        var b: CaPlace
-        if ca_place_type(sm, find_base_expr(e.operand), @b) == 0
-            return 0
-        return ca_place_deref(@b, out)
-    0
+        return ca_place_deref(ca_place_type(sm, find_base_expr(e.operand))?)
+    None
 
 # 1 when `e` is a place: it names storage the caller can see afterwards.  A
 # field or element of a call result isn't one.
@@ -2022,9 +2061,11 @@ fn ca_rvalue_borrow(sm: *Sema, arg: *Expr, p: *Param) -> i32
 # 1 when the place `e` is an `@T`, or the nearest indirection on its path to the
 # root is one.  An `@&T` or `*T` nearer than that makes it writable.
 fn ca_behind_shared(sm: *Sema, e: *Expr) -> i32
-    var pl: CaPlace
-    if ca_place_type(sm, e, @pl) == 1 and pl.kind == TypeKind.Ref
-        return 1
+    match ca_place_type(sm, e)
+        Some(pl) =>
+            if pl.kind == TypeKind.Ref
+                return 1
+        None => pass
     var at: *Expr = e
     while at != null
         if at.kind == ExprKind.Member or at.kind == ExprKind.Index
@@ -2033,11 +2074,13 @@ fn ca_behind_shared(sm: *Sema, e: *Expr) -> i32
             at = find_base_expr(at.operand)
         else
             return 0
-        if ca_place_type(sm, at, @pl) == 1
-            if pl.kind == TypeKind.Ref
-                return 1
-            if ca_is_pointer(pl.kind) == 1
-                return 0
+        match ca_place_type(sm, at)
+            Some(pl) =>
+                if pl.kind == TypeKind.Ref
+                    return 1
+                if ca_is_pointer(pl.kind) == 1
+                    return 0
+            None => pass
     0
 
 # AGAST #2354: 1 when `arg` names a by-value `@&U` param of the fn walked.
@@ -2061,8 +2104,11 @@ fn ca_pointer_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
         if pl.pointee != TypeKind.Array
             return 0
         var got: ArrayDims
-        if ca_ref_dims(sm, arg, @got) != ARG_DIMS_ARRAY
-            return 1
+        match ca_ref_dims(sm, arg)
+            Ok(d) =>
+                got = d
+            Err(_) =>
+                return 1
         # A struct element the image doesn't name (a `var q: *[3]S`) is
         # unjudged, as in ca_array_ref.
         if got.leaf == TypeKind.Struct and got.name.len <= 0
@@ -2105,9 +2151,12 @@ fn ca_place_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
     if pt != TypeKind.Array
         return 0
     var got: ArrayDims
+    match ca_place_dims(sm, arg)
+        Ok(d) =>
+            got = d
+        Err(_) =>
+            return 0
     var want: ArrayDims
-    if ca_place_dims(sm, arg, @got) != ARG_DIMS_ARRAY
-        return 0
     param_pointee_dims(@want, p)
     array_dims_match(@got, @want)
 
@@ -2126,7 +2175,12 @@ fn ca_borrow_kind(sm: *Sema, arg: *Expr, p: *Param) -> i32
     if ca_behind_shared(sm, arg) == 1
         return CA_BORROW_SHARED
     var pl: CaPlace
-    if ca_place_type(sm, arg, @pl) == 0 or pl.kind == TypeKind.Unknown
+    match ca_place_type(sm, arg)
+        Some(t) =>
+            pl = t
+        None =>
+            return CA_BORROW_UNTYPED
+    if pl.kind == TypeKind.Unknown
         return CA_BORROW_UNTYPED
     if ca_is_pointer(pl.kind) == 1
         return ca_pointer_place(sm, arg, @pl, p)
@@ -2164,8 +2218,12 @@ fn ca_array(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Expr, p
         ca_array_ref(sm, call, fname_sv, argno, arg, p)
         return
     var src: ArrayDims
-    if literal == 0 and ca_array_shape(sm, arg, @src) == 0
-        return
+    if literal == 0
+        match ca_array_shape(sm, arg)
+            Some(d) =>
+                src = d
+            None =>
+                return
     if p.param_type == TypeKind.Array
         if literal == 0 and src.dims[0] != p.param_array_size
             ca_error(sm, call, call, fname_sv, argno, "the array's length isn't the parameter's")

@@ -188,10 +188,25 @@ MKDEPS = python3 mkdeps.py
 # missing .ll and recompiles every module.
 .SECONDARY: $(LL_FILES) $(patsubst %,$(BUILD_DIR)/%_sh.ll,$(SOURCES))
 
+# ritz0's fingerprint (compiler_identity.hash_ritz0_sources, the one CAS keys
+# and fn_cache use), rewritten only when it changes (AGAST #4926).  A ritz0 .ll
+# depended on its .ritz alone, so after a ritz0 edit an incremental build kept
+# the modules the old ritz0 compiled, and ritz1 kept the bug the edit fixed.
+# RITZ0_ID prints the fingerprint; tools/test_ritz1_incremental_deps.py's fake
+# ritz0 brings its own.
+RITZ0_ID = cd ../ritz0 && python3 -c 'import compiler_identity as c; print(c.hash_ritz0_sources("."))'
+RITZ0_STAMP = $(BUILD_DIR)/ritz0.hash
+$(RITZ0_STAMP): FORCE | $(BUILD_DIR)
+	@h=$$($(RITZ0_ID)) && \
+	  if [ "$$(cat $@ 2>/dev/null)" != "$$h" ]; then echo "$$h" > $@; fi
+
+.PHONY: FORCE
+FORCE:
+
 # Compile .ritz to .ll (1:1, with imports as external declarations).
 # All modules use --no-runtime: main.ritz defines main(), and _start comes
 # from runtime/ritz_start*.o at link time.
-$(BUILD_DIR)/%.ll: $(SRC_DIR)/%.ritz | $(BUILD_DIR)
+$(BUILD_DIR)/%.ll: $(SRC_DIR)/%.ritz $(RITZ0_STAMP) | $(BUILD_DIR)
 	@echo "Compiling $< → $@"
 	@$(MKDEPS) $< $@ $(BUILD_DIR)/$*_sh.ll > $(BUILD_DIR)/$*.d.tmp && mv $(BUILD_DIR)/$*.d.tmp $(BUILD_DIR)/$*.d
 	$(RITZ0) $< --no-runtime -o $@

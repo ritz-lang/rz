@@ -53,7 +53,7 @@ struct LetEnv
     sm: *Sema
 
 # The type of the place reached so far along a `let`'s own storage.
-struct LetPlace
+pub struct LetPlace
     name: StrView            # the `let` binding's name
     kind: TypeKind            # TYPE_* of the place; TypeKind.Unknown when Sema can't say
     type_name: StrView       # struct name when kind == TypeKind.Struct (or a pointer's pointee)
@@ -68,6 +68,11 @@ struct LetPlace
     shape: *ArrayShape
     depth: i32
 
+# The root place of binding `name`: a `kind` / `type_name` value with
+# nothing reached through it yet.
+pub fn let_place_new(name: StrView, kind: TypeKind, type_name: StrView) -> LetPlace
+    LetPlace { name: name, kind: kind, type_name: type_name, elem: TypeKind.Void, elem_name: strview_empty(), is_const: 0, pointee: TypeKind.Void, inner: (TypeKind.Void as i32), tuple: 0, shape: null, depth: 0 }
+
 fn let_find_struct(env: *LetEnv, name_sv: StrView) -> *StructDef
     if env.s != null
         return find_struct(env.s, name_sv)
@@ -77,33 +82,29 @@ fn let_find_struct(env: *LetEnv, name_sv: StrView) -> *StructDef
 # (`internal constant`), so a write into it (`A[i] = v`, `A[i].f = v`) or a
 # mutable borrow of it faulted at run time.  It is a place like a `let`'s,
 # under its own message.  A local or global of the name is what it names.
-fn let_place_const(env: *LetEnv, name_sv: StrView, out: *LetPlace) -> i32
+fn let_place_const(env: *LetEnv, name_sv: StrView) -> Option<LetPlace>
     var ce: *ConstEntry = null
     if env.s != null
         if find_global(env.s, name_sv) != null
-            return 0
+            return None
         ce = find_const_entry(env.s, name_sv)
     else
         if sbk_global(env.sm, name_sv) != null
-            return 0
+            return None
         ce = sbk_const(env.sm, name_sv)
     if ce == null or (ce.const_type != TypeKind.Array and ce.const_type != TypeKind.Struct)
-        return 0
-    out.name = ce.name
-    out.kind = ce.const_type
-    out.type_name = strview_empty()
-    out.elem = TypeKind.Void
-    out.elem_name = strview_empty()
+        return None
+    var pl: LetPlace = let_place_new(ce.name, ce.const_type, strview_empty())
     if ce.const_type == TypeKind.Array
-        out.elem = ce.array_elem_type
-        out.elem_name = ce.array_elem_type_name
+        pl.elem = ce.array_elem_type
+        pl.elem_name = ce.array_elem_type_name
     else
         # LARB R60 / R48: a struct or enum const is read-only data too, so a
         # write into it (`C.k = 2`) or a mutable borrow is refused as a const
         # array's is.
-        out.type_name = ce.type_name
-    out.is_const = 1
-    return 1
+        pl.type_name = ce.type_name
+    pl.is_const = 1
+    Some(pl)
 
 # `sh` when it is an N-D shape (rank >= 2), else null.
 fn let_nd_shape(sh: *ArrayShape) -> *ArrayShape
@@ -111,131 +112,120 @@ fn let_nd_shape(sh: *ArrayShape) -> *ArrayShape
         return null
     sh
 
-# 1 and fill `out` when `name` is currently bound by a `let`.
-fn let_place_root(env: *LetEnv, name_sv: StrView, out: *LetPlace) -> i32
-    out.is_const = 0
-    out.pointee = TypeKind.Void
-    out.inner = (TypeKind.Void as i32)
-    out.tuple = 0
-    out.shape = null
-    out.depth = 0
+# The place `name` is when it is currently bound by a `let` (or names a
+# module const); None otherwise.
+fn let_place_root(env: *LetEnv, name_sv: StrView) -> Option<LetPlace>
     # LocalVar does not record an array's element struct name; SemaVar's
     # let_name does.  Without it a `.f` past `a[i]` stays permissive
-    # (let_place_member answers 0).
-    out.elem_name = strview_empty()
+    # (let_place_member answers None).
     if env.s == null
         let v: *SemaVar = sema_find_local(env.sm, name_sv)
         if v == null
-            return let_place_const(env, name_sv, out)
+            return let_place_const(env, name_sv)
         if v.is_let != 1
-            return 0
-        out.name = v.name
-        out.kind = v.let_kind
-        out.type_name = v.let_name
-        out.elem = v.let_elem
-        out.pointee = v.let_pointee
-        out.inner = v.inner
-        out.tuple = v.tuple
+            return None
+        var pl: LetPlace = let_place_new(v.name, v.let_kind, v.let_name)
+        pl.elem = v.let_elem
+        pl.pointee = v.let_pointee
+        pl.inner = v.inner
+        pl.tuple = v.tuple
         # AGAST #3399: a 1-D array's let_name is its element struct.
         if v.let_kind == TypeKind.Array and v.let_elem == TypeKind.Struct
-            out.elem_name = v.let_name
+            pl.elem_name = v.let_name
         # AGAST #4071: an N-D array's element struct is its shape's leaf.
         if v.let_kind == TypeKind.Array
-            out.shape = let_nd_shape(v.shape)
-        return 1
+            pl.shape = let_nd_shape(v.shape)
+        return Some(pl)
     let idx: i32 = find_local_idx(env.s, name_sv)
     if idx < 0
-        return let_place_const(env, name_sv, out)
+        return let_place_const(env, name_sv)
     let loc: *LocalVar = local_at(env.s, idx)
     if loc.is_let != 1
-        return 0
-    out.name = loc.name
-    out.kind = lv_var_type(loc)
-    out.type_name = lv_name(loc)
-    out.elem = lv_array_elem_type(loc)
-    out.pointee = lv_pointee_type(loc)
-    out.inner = lv_inner_pointee_type(loc)
-    return 1
+        return None
+    var pl: LetPlace = let_place_new(loc.name, lv_var_type(loc), lv_name(loc))
+    pl.elem = lv_array_elem_type(loc)
+    pl.pointee = lv_pointee_type(loc)
+    pl.inner = lv_inner_pointee_type(loc)
+    Some(pl)
 
-# Step `out` into field `field` of a by-value struct.  0 when the place is
-# not a struct value (a pointer, say), so the field lives outside the `let`.
-fn let_place_member(env: *LetEnv, out: *LetPlace, field_sv: StrView) -> i32
-    if out.kind == TypeKind.Struct and out.tuple == 1
+# `at`'s field `field`, when `at` is a by-value struct.  None when the place
+# is not a struct value (a pointer, say), so the field lives outside the `let`.
+fn let_place_member(env: *LetEnv, at: LetPlace, field_sv: StrView) -> Option<LetPlace>
+    var pl: LetPlace = at
+    if pl.kind == TypeKind.Struct and pl.tuple == 1
         # `p.0` of `let p = (1, 2)`: the emitter names the tuple's struct
         # only as it lowers it, and Sema's own (`(tuple)N`, AGAST #4251) is
         # none let_find_struct finds.  The field is the `let`'s own storage.
-        out.kind = TypeKind.Unknown
-        out.tuple = 0
-        out.type_name = strview_empty()
-        return 1
-    if out.kind != TypeKind.Struct or out.type_name.len <= 0
-        return 0
-    let st: *StructDef = let_find_struct(env, out.type_name)
+        pl.kind = TypeKind.Unknown
+        pl.tuple = 0
+        pl.type_name = strview_empty()
+        return Some(pl)
+    if pl.kind != TypeKind.Struct or pl.type_name.len <= 0
+        return None
+    let st: *StructDef = let_find_struct(env, pl.type_name)
     if st == null
-        return 0
+        return None
     let fidx: i32 = find_field_index(st, field_sv)
     if fidx < 0
-        return 0
+        return None
     let fld: *StructField = get_field_type(st, fidx)
     if fld == null
-        return 0
-    out.kind = fld.field_type
-    out.type_name = fld.field_type_name
-    out.elem = fld.array_elem_type
-    out.elem_name = fld.array_elem_type_name
-    out.pointee = fld.ptr_pointee
-    out.inner = fld.inner_pointee_type
-    out.shape = null
-    out.depth = 0
+        return None
+    pl.kind = fld.field_type
+    pl.type_name = fld.field_type_name
+    pl.elem = fld.array_elem_type
+    pl.elem_name = fld.array_elem_type_name
+    pl.pointee = fld.ptr_pointee
+    pl.inner = fld.inner_pointee_type
+    pl.shape = null
+    pl.depth = 0
     if fld.field_type == TypeKind.Array
-        out.shape = let_nd_shape(fld.array_shape)
-    return 1
+        pl.shape = let_nd_shape(fld.array_shape)
+    Some(pl)
 
-# Step `out` into an element of a by-value array.  0 for a pointer or slice:
-# its elements are the pointee's.
-fn let_place_index(out: *LetPlace) -> i32
-    if out.kind != TypeKind.Array
-        return 0
+# An element of `at`, when `at` is a by-value array.  None for a pointer or
+# slice: its elements are the pointee's.
+pub fn let_place_index(at: LetPlace) -> Option<LetPlace>
+    if at.kind != TypeKind.Array
+        return None
+    var pl: LetPlace = at
     # AGAST #4071: an N-D array stays an array until the path indexes every
     # dimension, then is its leaf `T`: `g[1][0]` of `[2][2]Pt` is a Pt.
-    if out.shape != null
-        out.depth = out.depth + 1
-        if out.depth < out.shape.rank
-            return 1
-        out.kind = out.shape.leaf_type
-        out.type_name = out.shape.leaf_name
-        out.pointee = out.shape.leaf_pointee
-        out.shape = null
-        out.depth = 0
-        out.elem = TypeKind.Void
-        out.elem_name = strview_empty()
-        out.inner = (TypeKind.Void as i32)
-        return 1
-    out.kind = out.elem
-    out.type_name = out.elem_name
-    out.elem = TypeKind.Void
-    out.elem_name = strview_empty()
-    out.pointee = TypeKind.Void
-    out.inner = (TypeKind.Void as i32)
-    return 1
+    if pl.shape != null
+        pl.depth = pl.depth + 1
+        if pl.depth < pl.shape.rank
+            return Some(pl)
+        pl.kind = pl.shape.leaf_type
+        pl.type_name = pl.shape.leaf_name
+        pl.pointee = pl.shape.leaf_pointee
+        pl.shape = null
+        pl.depth = 0
+        pl.elem = TypeKind.Void
+        pl.elem_name = strview_empty()
+        pl.inner = (TypeKind.Void as i32)
+        return Some(pl)
+    pl.kind = pl.elem
+    pl.type_name = pl.elem_name
+    pl.elem = TypeKind.Void
+    pl.elem_name = strview_empty()
+    pl.pointee = TypeKind.Void
+    pl.inner = (TypeKind.Void as i32)
+    Some(pl)
 
-# 1 when `e` (an ident / `.f` / `[i]` chain) is a `let`'s own storage.
-fn let_place(env: *LetEnv, e: *Expr, out: *LetPlace) -> i32
+# The place `e` (an ident / `.f` / `[i]` chain) is, when it is a `let`'s own
+# storage; None otherwise.
+fn let_place(env: *LetEnv, e: *Expr) -> Option<LetPlace>
     if e == null
-        return 0
+        return None
     match e.kind
         ExprKind.Ident =>
-            return let_place_root(env, e.ident, out)
+            return let_place_root(env, e.ident)
         ExprKind.Member =>
-            if let_place(env, e.left, out) == 0
-                return 0
-            return let_place_member(env, out, e.ident)
+            return let_place_member(env, let_place(env, e.left)?, e.ident)
         ExprKind.Index =>
-            if let_place(env, e.left, out) == 0
-                return 0
-            return let_place_index(out)
+            return let_place_index(let_place(env, e.left)?)
         _ => pass
-    return 0
+    None
 
 fn let_eprint_name(name: StrView)
     var i: i32 = 0
@@ -255,19 +245,19 @@ fn let_error(env: *LetEnv, line: i32, col: i32, head: StrView, name: StrView, ta
     let_eprint_name(name)
     eprints(tail)
 
-fn let_error_assign_through(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
+fn let_error_assign_through(env: *LetEnv, line: i32, col: i32, pl: LetPlace)
     if pl.is_const == 1
         let_error(env, line, col, "cannot assign through const `", pl.name, "`; it is read-only data\n")
         return
     let_error(env, line, col, "cannot assign through `let` binding `", pl.name, "`; declare it `var`\n")
 
-fn let_error_assign_whole(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
+fn let_error_assign_whole(env: *LetEnv, line: i32, col: i32, pl: LetPlace)
     if pl.is_const == 1
         let_error(env, line, col, "cannot assign to const `", pl.name, "`; it is read-only data\n")
         return
     let_error(env, line, col, "cannot assign to `let` binding `", pl.name, "`; declare it `var`\n")
 
-fn let_error_borrow(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
+fn let_error_borrow(env: *LetEnv, line: i32, col: i32, pl: LetPlace)
     if pl.is_const == 1
         let_error(env, line, col, "cannot borrow const `", pl.name, "` as mutable; it is read-only data\n")
         return
@@ -289,15 +279,17 @@ pub fn let_addr_of_own(sm: *Sema, e: *Expr) -> i32
         return 0
     var env: LetEnv
     let_sema_env(sm, @env)
-    var pl: LetPlace
-    let_place(@env, e.operand, @pl)
+    let found: Option<LetPlace> = let_place(@env, e.operand)
+    if found.is_some()
+        return 1
+    0
 
 pub fn let_error_addr(sm: *Sema, e: *Expr)
     var env: LetEnv
     let_sema_env(sm, @env)
-    var pl: LetPlace
-    if let_place(@env, e.operand, @pl) == 1
-        let_error_borrow(@env, e.span.line, e.span.col, @pl)
+    match let_place(@env, e.operand)
+        Some(pl) => let_error_borrow(@env, e.span.line, e.span.col, pl)
+        None => pass
 
 # =============================================================================
 # Sema's local table: what each binding is (let_note_*)
@@ -317,78 +309,82 @@ fn let_tuple_lit(e: *Expr) -> i32
         return 0
     1
 
-fn let_set_value(kind: TypeKind, name: StrView, out_kind: *TypeKind, out_name: *StrView) -> i32
+# A type with no pointee and no shape: what let_check notes of a value.
+fn let_ty(kind: TypeKind, name: StrView, pointee: TypeKind) -> SemaTy
+    SemaTy { kind: kind, name: name, pointee: pointee, fn_sig: null, shape: null }
+
+# A struct or scalar value of `kind` (a struct's `name`); None for anything
+# else, and for a struct with no name.
+pub fn let_value(kind: TypeKind, name: StrView) -> Option<SemaTy>
     if kind == TypeKind.Struct and name.len <= 0
-        return 0
-    if kind == TypeKind.Struct or kind == TypeKind.Bool or kind == TypeKind.F32 or kind == TypeKind.F64 or sema_is_int_kind(kind) == 1
-        *out_kind = kind
-        *out_name = name
-        if kind != TypeKind.Struct
-            *out_name = strview_empty()
-        return 1
-    0
+        return None
+    if kind == TypeKind.Struct
+        return Some(let_ty(kind, name, TypeKind.Void))
+    if kind == TypeKind.Bool or kind == TypeKind.F32 or kind == TypeKind.F64 or sema_is_int_kind(kind) == 1
+        return Some(let_ty(kind, strview_empty(), TypeKind.Void))
+    None
 
 # What an untyped `let x = e` holds where sema_expr_ty can't say but the
 # emitter types it anyway: a method's result, an element of an array, a
 # field reached through what Sema's resolvers name, an `if` / `match` arm's
-# value.  1 and the kind (and a struct's name) for a struct or scalar value;
-# 0 otherwise, a pointer included (its pointee isn't recorded here).
-fn let_value_ty(sm: *Sema, e: *Expr, out_kind: *TypeKind, out_name: *StrView, depth: i32) -> i32
+# value.  The kind (and a struct's name) for a struct or scalar value; None
+# otherwise, a pointer included (its pointee isn't recorded here).
+fn let_value_ty(sm: *Sema, e: *Expr, depth: i32) -> Option<SemaTy>
     if e == null or depth > 8
-        return 0
+        return None
     var t: SemaTy
     let k: TypeKind = sema_expr_ty(sm, e, @t)
     if k != TypeKind.Unknown
-        return let_set_value(k, t.name, out_kind, out_name)
+        return let_value(k, t.name)
     match e.kind
         ExprKind.Method =>
             # StrView.as_bytes() is a `Span$u8` (resolve_expr_struct_name).
             if name_eq(e.ident, "as_bytes") == 1
-                return let_set_value(TypeKind.Struct, "Span$u8", out_kind, out_name)
+                return let_value(TypeKind.Struct, "Span$u8")
             if e.args == null and name_eq(e.ident, "unwrap") == 1
                 # `r.unwrap()` of an Option$S / Result$S$E is an S.
                 var un: StrView = strview_empty()
                 sbk_receiver(sm, e, @un)
-                return let_set_value(TypeKind.Struct, un, out_kind, out_name)
+                return let_value(TypeKind.Struct, un)
             let fd: *FnDef = sbk_method_def(sm, e)
             if fd == null
-                return 0
-            return let_set_value(fd.return_type, fd.return_type_name, out_kind, out_name)
+                return None
+            return let_value(fd.return_type, fd.return_type_name)
         ExprKind.Index =>
             if e.right != null and e.right.kind == ExprKind.Range
-                return 0
+                return None
             let b: *Expr = e.left
             if b == null
-                return 0
+                return None
             if b.kind == ExprKind.Ident
                 let lv: *SemaVar = sema_find_local(sm, b.ident)
                 if lv != null
                     if lv.let_kind != TypeKind.Array or lv.let_elem == TypeKind.Array
-                        return 0
-                    return let_set_value(lv.let_elem, lv.let_name, out_kind, out_name)
+                        return None
+                    return let_value(lv.let_elem, lv.let_name)
                 let g: *GlobalVarDef = sbk_global(sm, b.ident)
                 if g != null and g.var_type == TypeKind.Array and g.array_elem_type != TypeKind.Array
-                    return let_set_value(g.array_elem_type, g.array_elem_type_name, out_kind, out_name)
-                return 0
+                    return let_value(g.array_elem_type, g.array_elem_type_name)
+                return None
             if b.kind == ExprKind.Member
                 let f: *StructField = sbk_member_field(sm, b)
                 if f != null and f.field_type == TypeKind.Array and f.array_elem_type != TypeKind.Array
-                    return let_set_value(f.array_elem_type, f.array_elem_type_name, out_kind, out_name)
-            return 0
+                    return let_value(f.array_elem_type, f.array_elem_type_name)
+            return None
         ExprKind.Member =>
             let f: *StructField = sbk_member_field(sm, e)
             if f == null
-                return 0
-            return let_set_value(f.field_type, f.field_type_name, out_kind, out_name)
+                return None
+            return let_value(f.field_type, f.field_type_name)
         _ => pass
     if e.kind == ExprKind.If or e.kind == ExprKind.Match
         # The first arm with a value says what the merged value is.
         var arm: *MatchArm = e.args as *MatchArm
         while arm != null
             if arm.is_pass == 0 and arm.body != null
-                return let_value_ty(sm, arm.body, out_kind, out_name, depth + 1)
+                return let_value_ty(sm, arm.body, depth + 1)
             arm = arm.next
-    0
+    None
 
 # AGAST #4458: `let x = r.unwrap()` whose Option / Result payload is a
 # reference or pointer (`Option<@&Font>`, `Option<*T>`): the kind, the pointee
@@ -397,24 +393,22 @@ fn let_value_ty(sm: *Sema, e: *Expr, out_kind: *TypeKind, out_name: *StrView, de
 # an untyped i64 for Sema's checks and call_check refused passing it.
 # `r`'s mangled carrier name comes from sbk_receiver, the payload from
 # tagged_enum_arg_in (the same `ref_` / `refmut_` / `ptr_` spelling the emitter
-# reads).  Returns 1 when it typed the payload, 0 otherwise.
-pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr, out_kind: *TypeKind, out: *StrView, out_pointee: *TypeKind) -> i32
-    *out_kind = TypeKind.Void
-    *out = strview_empty()
-    *out_pointee = TypeKind.Void
+# reads).  The payload's type (kind, pointee, name) when it typed one, else
+# None.
+pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr) -> Option<SemaTy>
     if e == null or e.kind != ExprKind.Method or e.left == null
-        return 0
+        return None
     let is_unwrap: bool = e.args == null and name_eq(e.ident, "unwrap") == 1
     let is_unwrap_or: bool = e.args != null and e.args.next == null and name_eq(e.ident, "unwrap_or") == 1
     if not is_unwrap and not is_unwrap_or
-        return 0
+        return None
     var en: StrView = strview_empty()
     sbk_receiver(sm, e.left, @en)
     if en.ptr == null or en.len <= 0 or is_tagged_enum_type(en) == 0
-        return 0
+        return None
     let pay: StrView = tagged_enum_arg_in(sm.pctx, @sm.struct_map, sm.module, en, 0)
     if pay.ptr == null or pay.len <= 0
-        return 0
+        return None
     var kind: TypeKind = TypeKind.Void
     var skip: i32 = 0
     if (pay.len as i32) > 7 and pay.starts_with("refmut_")
@@ -427,48 +421,51 @@ pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr, out_kind: *TypeKind, out:
         kind = TypeKind.Ptr
         skip = 4
     else
-        return 0
+        return None
     let base: StrView = pay.skip(skip)
     if base.len <= 0
-        return 0
+        return None
     if base.len > 4 and base.starts_with("ptr_")
         let inner: StrView = base.skip(4)
         if inner.len <= 0
-            return 0
-        if kind == TypeKind.Ptr
-            *out_kind = TypeKind.PtrPtr
-            if sema_find_struct(sm, inner) != null
-                *out = inner
-            else if ty_from_name(inner) == TypeKind.Void and is_tagged_enum_type(inner) == 0 and user_enum_index(sm.pctx, inner) < 0
-                return 0
-        else
-            *out_kind = kind
-        *out_pointee = TypeKind.Ptr
-        return 1
+            return None
+        if kind != TypeKind.Ptr
+            return Some(let_ty(kind, strview_empty(), TypeKind.Ptr))
+        if sema_find_struct(sm, inner) != null
+            return Some(let_ty(TypeKind.PtrPtr, inner, TypeKind.Ptr))
+        if ty_from_name(inner) == TypeKind.Void and is_tagged_enum_type(inner) == 0 and user_enum_index(sm.pctx, inner) < 0
+            return None
+        return Some(let_ty(TypeKind.PtrPtr, strview_empty(), TypeKind.Ptr))
     if sema_find_struct(sm, base) != null or is_tagged_enum_type(base) == 1 or user_enum_index(sm.pctx, base) >= 0
-        *out_kind = kind
-        *out = base
-        *out_pointee = TypeKind.Struct
-        return 1
+        return Some(let_ty(kind, base, TypeKind.Struct))
     let prim: TypeKind = ty_from_name(base)
     if prim == TypeKind.Void
-        return 0
-    *out_kind = kind
-    *out_pointee = prim
-    1
+        return None
+    Some(let_ty(kind, strview_empty(), prim))
 
 # let_unwrap_payload_pointer onto the binding, keeping the fields untouched
 # when it can't type it.
-fn let_note_unwrap_pointer(sm: *Sema, init: *Expr, v: *SemaVar) -> i32
-    var k: TypeKind = TypeKind.Void
-    var n: StrView = strview_empty()
-    var p: TypeKind = TypeKind.Void
-    if let_unwrap_payload_pointer(sm, init, @k, @n, @p) == 0
-        return 0
-    v.let_kind = k
-    v.let_name = n
-    v.let_pointee = p
-    1
+fn let_note_unwrap_pointer(sm: *Sema, init: *Expr, v: *SemaVar) -> bool
+    match let_unwrap_payload_pointer(sm, init)
+        Some(t) =>
+            v.let_kind = t.kind
+            v.let_name = t.name
+            v.let_pointee = t.pointee
+            return true
+        None => pass
+    false
+
+# let_value_ty onto the binding, keeping the fields untouched when it can't
+# type it.
+fn let_note_value(sm: *Sema, init: *Expr, v: *SemaVar) -> bool
+    match let_value_ty(sm, init, 0)
+        Some(t) =>
+            v.let_kind = t.kind
+            v.let_name = t.name
+            v.let_pointee = TypeKind.Void
+            return true
+        None => pass
+    false
 
 # The `let` / `var` `st` just bound by sema_bind_decl: an array's element,
 # and what an untyped one holds where Sema's typer leaves it unknown and
@@ -486,9 +483,9 @@ pub fn let_note_decl(sm: *Sema, st: *Stmt)
         return
     if let_tuple_lit(init) == 1
         v.tuple = 1
-    else if v.let_kind == TypeKind.Unknown and let_value_ty(sm, init, @v.let_kind, @v.let_name, 0) == 1
-        v.let_pointee = TypeKind.Void
-    else if v.let_kind == TypeKind.Unknown and let_note_unwrap_pointer(sm, init, v) == 1
+    else if v.let_kind == TypeKind.Unknown and let_note_value(sm, init, v)
+        pass
+    else if v.let_kind == TypeKind.Unknown and let_note_unwrap_pointer(sm, init, v)
         pass   # AGAST #4458: a `@T` / `@&T` / `*T` unwrap payload
     else if v.let_kind == TypeKind.Unknown and (init.kind == ExprKind.ArrayLit or init.kind == ExprKind.ArrayFill)
         # AGAST #2266 / #3014: `[a, b]` / `[x; N]` is an `[N]T` local.
@@ -517,25 +514,19 @@ pub fn let_note_param(sm: *Sema, p: *Param)
         v.let_lent = 1
 
 # The element of a Vec, Span or String value (or a pointer to one) of type
-# `name`, through its buffer field as the emitter indexes it: 1 and the
-# element's kind (and struct name) in *out_*, else 0.
+# `name`, through its buffer field as the emitter indexes it: its kind (and
+# struct name, empty when it has none), else None.
 # Sema's one element typer answers it (sema_buffer_ty, AGAST #4259).
-pub fn let_through_elem(sm: *Sema, kind: TypeKind, pointee: TypeKind, name: StrView, out_kind: *TypeKind, out: *StrView) -> i32
+pub fn let_through_elem(sm: *Sema, kind: TypeKind, pointee: TypeKind, name: StrView) -> Option<SemaTy>
     if name.ptr == null or name.len <= 0
-        return 0
-    var bt: SemaTy
-    bt.kind = kind
-    bt.pointee = pointee
-    bt.name = name
-    bt.fn_sig = null
-    bt.shape = null
+        return None
+    let bt: SemaTy = let_ty(kind, name, pointee)
     var t: SemaTy
     if sema_buffer_ty(sm, @bt, @t) == TypeKind.Unknown
-        return 0
-    *out_kind = t.kind
-    if t.name.ptr != null
-        *out = t.name
-    1
+        return None
+    if t.name.ptr == null
+        t.name = strview_empty()
+    Some(t)
 
 # A `for` variable just bound: an element of `for x in <iterable>` is a
 # `let` (AGAST #2389); a range variable is a `var`.
@@ -563,7 +554,11 @@ pub fn let_note_for(sm: *Sema, st: *Stmt)
                 name = lv.let_name
             else
                 # A Vec<S> / Span<S> local (#2389's iterables): its element.
-                let_through_elem(sm, lv.let_kind, lv.let_pointee, lv.let_name, @kind, @name)
+                match let_through_elem(sm, lv.let_kind, lv.let_pointee, lv.let_name)
+                    Some(et) =>
+                        kind = et.kind
+                        name = et.name
+                    None => pass
         else
             let g: *GlobalVarDef = sbk_global(sm, e.ident)
             if g != null and g.var_type == TypeKind.Array
@@ -579,7 +574,11 @@ pub fn let_note_for(sm: *Sema, st: *Stmt)
                 kind = f.array_elem_type
                 name = f.array_elem_type_name
         else if f != null
-            let_through_elem(sm, f.field_type, f.ptr_pointee, f.field_type_name, @kind, @name)
+            match let_through_elem(sm, f.field_type, f.ptr_pointee, f.field_type_name)
+                Some(et) =>
+                    kind = et.kind
+                    name = et.name
+                None => pass
     sm.scope_top = sm.scope_top + 1
     # AGAST #2410 / #3379: over an N-D `[N][M]..T` each turn binds a row, an
     # `[M]T` local, or a plane, whose elements are arrays.
@@ -664,12 +663,12 @@ fn let_method_recv_type(sm: *Sema, recv: *Expr) -> StrView
 # view: a 1-D array's as let_value_ty types it, an N-D `[N][M]..S` array's
 # when `e` indexes every dimension.
 fn let_index_struct(sm: *Sema, e: *Expr) -> StrView
-    var kind: TypeKind = TypeKind.Unknown
-    var name: StrView = strview_empty()
-    if let_value_ty(sm, e, @kind, @name, 0) == 1
-        if kind != TypeKind.Struct or name.len <= 0
-            return strview_empty()
-        return name
+    match let_value_ty(sm, e, 0)
+        Some(t) =>
+            if t.kind != TypeKind.Struct or t.name.len <= 0
+                return strview_empty()
+            return t.name
+        None => pass
     # Down the index chain to the N-D array it starts at.
     var depth: i32 = 0
     var at: *Expr = e
@@ -712,7 +711,7 @@ fn let_method_call_def(sm: *Sema, e: *Expr) -> *FnDef
 
 # Pointers between the place and its struct, as local_struct_levels counts
 # a local's; -1 when Sema can't say.
-fn let_place_levels(pl: *LetPlace) -> i32
+fn let_place_levels(pl: LetPlace) -> i32
     let k: TypeKind = pl.kind
     match k
         TypeKind.Struct =>
@@ -732,32 +731,32 @@ fn let_place_levels(pl: *LetPlace) -> i32
         _ => pass
     0 - 1
 
-# 1 when `p`, a `:&` param, borrows the pointer-holding `let` place `pl`
+# True when `p`, a `:&` param, borrows the pointer-holding `let` place `pl`
 # itself rather than taking the pointer it holds: borrow_arg_kind's
 # BORROW_PLACE (AGAST #2335), for a place rooted at a by-value `let`.
-fn let_ptr_place_lent(pl: *LetPlace, p: *Param) -> i32
+fn let_ptr_place_lent(pl: LetPlace, p: *Param) -> bool
     if p.is_borrow != 1 or p.param_type != TypeKind.MutRef
-        return 0
+        return false
     # Through an `@T` it is read-only: no borrow (BORROW_SHARED).
     if pl.kind == TypeKind.Ref
-        return 0
+        return false
     if param_borrows_struct_ptr_ptr(p) == 1
         if let_place_levels(pl) == ptr_ptr_ident_levels(p.param_inner_pointee_type)
-            return 1
+            return true
     if p.param_pointee_type != TypeKind.Ptr
-        return 0
+        return false
     if pl.kind == TypeKind.PtrPtr or pl.pointee == TypeKind.Ptr
-        return 0
+        return false
     if pl.kind != TypeKind.Ptr and pl.kind != TypeKind.MutRef
-        return 0
+        return false
     # pointer_place_fits.  A `:& *U` param always records its U, and Sema
     # never records an unknown pointee, so both sides are known here.
     let want: TypeKind = p.param_ref_ptr_pointee
     if want == TypeKind.Array and p.param_pointee_array_size > 0
-        return (pl.pointee == TypeKind.Array) as i32
+        return pl.pointee == TypeKind.Array
     if want == TypeKind.Struct or pl.pointee == TypeKind.Struct
-        return (want == pl.pointee and name_eq(p.param_type_name, pl.type_name) == 1) as i32
-    (want == pl.pointee) as i32
+        return want == pl.pointee and name_eq(p.param_type_name, pl.type_name) == 1
+    want == pl.pointee
 
 # 1 when an `[a..b]` slice is on `e`'s path: no place (arg_is_place).
 fn let_path_slices(e: *Expr) -> i32
@@ -782,17 +781,18 @@ fn let_check_implicit(sm: *Sema, arg: *Expr, p: *Param)
     var env: LetEnv
     let_sema_env(sm, @env)
     var pl: LetPlace
-    if let_place(@env, arg, @pl) == 0
-        return
+    match let_place(@env, arg)
+        Some(found) => pl = found
+        None => return
     # Sema can't say whether it holds a pointer: no refusal on a guess.
     if pl.kind == TypeKind.Unknown
         return
     # A `let` that holds a pointer passes that pointer, unless `:& *U` borrows
     # its own storage (AGAST #2335).
     if pl.kind == TypeKind.Ptr or pl.kind == TypeKind.PtrPtr or pl.kind == TypeKind.Ref or pl.kind == TypeKind.MutRef
-        if let_path_slices(arg) == 1 or let_ptr_place_lent(@pl, p) == 0
+        if let_path_slices(arg) == 1 or not let_ptr_place_lent(pl, p)
             return
-    let_error_borrow(@env, arg.span.line, arg.span.col, @pl)
+    let_error_borrow(@env, arg.span.line, arg.span.col, pl)
 
 # AGAST #2403: a receiver one pointer short of a `self: **S` (or deeper) is
 # lent as `@&recv`: refused when that place is a `let`'s own storage.  A
@@ -810,12 +810,13 @@ pub fn let_check_receiver(sm: *Sema, e: *Expr)
     var env: LetEnv
     let_sema_env(sm, @env)
     var pl: LetPlace
-    if let_place(@env, recv, @pl) == 0
-        return
-    let levels: i32 = let_place_levels(@pl)
+    match let_place(@env, recv)
+        Some(found) => pl = found
+        None => return
+    let levels: i32 = let_place_levels(pl)
     if levels < 0 or levels + 1 != want
         return
-    let_error_borrow(@env, recv.span.line, recv.span.col, @pl)
+    let_error_borrow(@env, recv.span.line, recv.span.col, pl)
 
 # Reject every `@&<let place>` in `e`.  Walks only the expression kinds
 # whose children are plain sub-expressions, as the emitter did: a match /
@@ -831,9 +832,9 @@ pub fn let_check_expr(sm: *Sema, e: *Expr)
             if e.op == OpKind.AddrMut
                 var env: LetEnv
                 let_sema_env(sm, @env)
-                var pl: LetPlace
-                if let_place(@env, e.operand, @pl) == 1
-                    let_error_borrow(@env, e.span.line, e.span.col, @pl)
+                match let_place(@env, e.operand)
+                    Some(pl) => let_error_borrow(@env, e.span.line, e.span.col, pl)
+                    None => pass
             let_check_expr(sm, e.operand)
         ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
             let_check_expr(sm, e.left)
@@ -865,20 +866,34 @@ pub fn let_check_expr(sm: *Sema, e: *Expr)
                 a = a.next
         _ => pass
 
+# The `let` place a `name[i] = v`, `name.f = v` or `name.f[i] = v` writes
+# into; None for any other statement, or a place outside a `let`.
+fn let_stmt_place(env: *LetEnv, stmt: *Stmt) -> Option<LetPlace>
+    match stmt.kind
+        StmtKind.IndexAssign =>
+            return let_place_index(let_place_root(env, stmt.assign_target)?)
+        StmtKind.LocalFieldAssign =>
+            return let_place_member(env, let_place_root(env, stmt.var_name)?, stmt.assign_target)
+        StmtKind.LocalFieldIndexAssign =>
+            let field: LetPlace = let_place_member(env, let_place_root(env, stmt.var_name)?, stmt.assign_target)?
+            return let_place_index(field)
+        _ => pass
+    None
+
 # The write target of an assignment-kind statement, if it is a `let` place.
 fn let_check_write(sm: *Sema, stmt: *Stmt)
     let line: i32 = stmt.span.line
     let col: i32 = stmt.span.col
     var env: LetEnv
     let_sema_env(sm, @env)
-    var pl: LetPlace
     let k: StmtKind = stmt.kind
     match k
         StmtKind.Assign =>
             if stmt.assign_target.len > 0
                 # `x = v` / `x op= v`: the whole binding.
-                if let_place_root(@env, stmt.assign_target, @pl) == 1
-                    let_error_assign_whole(@env, line, col, @pl)
+                match let_place_root(@env, stmt.assign_target)
+                    Some(pl) => let_error_assign_whole(@env, line, col, pl)
+                    None => pass
                 return
             # `expr = v`; the target expr is in if_cond.  `*p = v` (ExprKind.Unary)
             # writes the pointee and never matches.
@@ -886,31 +901,19 @@ fn let_check_write(sm: *Sema, stmt: *Stmt)
             if target == null
                 return
             if target.kind == ExprKind.Ident
-                if let_place_root(@env, target.ident, @pl) == 1
-                    let_error_assign_whole(@env, line, col, @pl)
+                match let_place_root(@env, target.ident)
+                    Some(pl) => let_error_assign_whole(@env, line, col, pl)
+                    None => pass
                 return
             if target.kind == ExprKind.Member or target.kind == ExprKind.Index
-                if let_place(@env, target, @pl) == 1
-                    let_error_assign_through(@env, line, col, @pl)
+                match let_place(@env, target)
+                    Some(pl) => let_error_assign_through(@env, line, col, pl)
+                    None => pass
             return
-        StmtKind.IndexAssign =>
-            # `name[i] = v`
-            if let_place_root(@env, stmt.assign_target, @pl) == 1
-                if let_place_index(@pl) == 1
-                    let_error_assign_through(@env, line, col, @pl)
-            return
-        StmtKind.LocalFieldAssign =>
-            # `name.f = v`
-            if let_place_root(@env, stmt.var_name, @pl) == 1
-                if let_place_member(@env, @pl, stmt.assign_target) == 1
-                    let_error_assign_through(@env, line, col, @pl)
-            return
-        StmtKind.LocalFieldIndexAssign =>
-            # `name.f[i] = v`
-            if let_place_root(@env, stmt.var_name, @pl) == 1
-                if let_place_member(@env, @pl, stmt.assign_target) == 1
-                    if let_place_index(@pl) == 1
-                        let_error_assign_through(@env, line, col, @pl)
+        StmtKind.IndexAssign | StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
+            match let_stmt_place(@env, stmt)
+                Some(pl) => let_error_assign_through(@env, line, col, pl)
+                None => pass
             return
         _ => pass
     # StmtKind.MemberAssign / StmtKind.MemberIndexAssign are `(*p).f = v`: through
@@ -924,40 +927,29 @@ fn let_check_write(sm: *Sema, stmt: *Stmt)
 # resolve_expr_struct_name names it: a `"..."` is a `Span$u8` there, a
 # struct local, a struct const, an enum variant, a call's or an impl
 # method's struct return, a struct literal.  `strview_empty()` when unknown.
-#
-# AGAST #4780: `out` is `*StrView`, not `**u8`/`*i32` — a spelling out-param
-# always holds Ritz text.  The `*u8`/`_len` field pairs this reads (AST/type
-# name fields, #4773's territory) are wrapped into a StrView right here, at
-# the boundary, rather than converting those fields themselves.
-fn let_struct_name(sm: *Sema, e: *Expr, out: *StrView)
-    *out = strview_empty()
+fn let_struct_name(sm: *Sema, e: *Expr) -> StrView
     if e == null
-        return
+        return strview_empty()
     if e.kind == ExprKind.StringLit
-        *out = "Span$u8"
-        return
+        return "Span$u8"
     if e.kind == ExprKind.Cast and e.type_kind == TypeKind.Struct
         # AGAST #3004: `r as C` through a reference reads the `C` itself.
         var t: SemaTy
         let k: TypeKind = sema_expr_ty(sm, e.left, @t)
         if (k == TypeKind.Ptr or k == TypeKind.Ref or k == TypeKind.MutRef) and t.pointee == TypeKind.Struct and name_eq(t.name, e.ident) == 1
-            *out = e.ident
-            return
-        let_struct_name(sm, e.left, out)
-        return
+            return e.ident
+        return let_struct_name(sm, e.left)
     match e.kind
         ExprKind.Method =>
             if name_eq(e.ident, "as_bytes") == 1
-                *out = "Span$u8"
-                return
+                return "Span$u8"
             # AGAST #1466: a qualified variant ctor `Opt.Holds(x)` is the enum.
             let q: *Expr = e.left
             if q != null and q.kind == ExprKind.Ident and sema_find_local(sm, q.ident) == null and sbk_global(sm, q.ident) == null
                 let ei: i32 = enum_find(sm.pctx, q.ident)
                 if ei >= 0 and enum_variant_index(sm.pctx, q.ident, e.ident) >= 0 and enum_is_generic(sm.pctx, ei) != 1
                     let en: StrView = enum_name_at(sm.pctx, ei)
-                    *out = en
-                    return
+                    return en
             # An impl method on a local receiver: its struct return.
             if q != null and q.kind == ExprKind.Ident
                 let v: *SemaVar = sema_find_local(sm, q.ident)
@@ -969,59 +961,53 @@ fn let_struct_name(sm: *Sema, e: *Expr, out: *StrView)
                             while m != null
                                 if name_eq(m.name, e.ident) == 1
                                     if m.return_type == TypeKind.Struct and (m.return_type_name.len as i32) > 0
-                                        *out = m.return_type_name
-                                    return
+                                        return m.return_type_name
+                                    return strview_empty()
                                 m = m.next
-                            return
+                            return strview_empty()
                         ib = ib.next
-            return
+            return strview_empty()
         ExprKind.Ident =>
             let v: *SemaVar = sema_find_local(sm, e.ident)
             if v != null and v.let_name.len > 0 and v.let_kind == TypeKind.Struct
-                *out = v.let_name
-                return
+                return v.let_name
             # AGAST #189: a struct const (`const FOO: StrView = "..."`).
             let ce: *ConstEntry = sbk_const(sm, e.ident)
             if ce != null and ce.const_type == TypeKind.Struct and (ce.type_name.len as i32) > 0
-                *out = ce.type_name
-                return
+                return ce.type_name
             # AGAST #1600: a bare unit variant `B` is a value of its enum.
             if ce != null or is_builtin_const(e.ident) == 1 or v != null
-                return
+                return strview_empty()
             if sbk_global(sm, e.ident) != null or sema_find_fn(sm, e.ident) != null
-                return
+                return strview_empty()
             var vi: i32 = 0
             var other: i32 = 0
             let ei: i32 = enum_of_variant_unique(sm.pctx, e.ident, @vi, @other)
             if ei >= 0 and enum_variant_kind(sm.pctx, ei, vi) == ENUM_VARIANT_UNIT
                 let en: StrView = enum_name_at(sm.pctx, ei)
-                *out = en
-            return
+                return en
         ExprKind.Call =>
             # AGAST #1797: a user-enum payload ctor `Holds(x)` is the enum.
             let ctor_name: StrView = user_variant_ctor_enum(sm.pctx, e)
             if ctor_name.ptr != null
-                *out = ctor_name
-                return
+                return ctor_name
             let fdr: *FnDef = let_call_fn(sm, e)
             if fdr != null and fdr.return_type == TypeKind.Struct and (fdr.return_type_name.len as i32) > 0
-                *out = fdr.return_type_name
-            return
+                return fdr.return_type_name
         _ => pass
     if e.kind == ExprKind.StructLit
         if e.ident.ptr != null and (e.ident.len as i32) > 0
-            *out = e.ident
+            return e.ident
+    strview_empty()
 
-# 1 when `init` is a known struct of another type than the known struct `want`,
-# with its name in `*out` (AGAST #2293, #3293).
-fn another_struct_source(sm: *Sema, init: *Expr, want: StrView, out: *StrView) -> i32
+# The name of `init`'s struct when it is a known struct of another type than
+# the known struct `want` (AGAST #2293, #3293); None otherwise.
+fn another_struct_source(sm: *Sema, init: *Expr, want: StrView) -> Option<StrView>
     if init == null or init.kind == ExprKind.Cast
-        return 0
+        return None
     if want.ptr == null or want.len <= 0
-        return 0
-    var src_sv: StrView = strview_empty()
-    let_struct_name(sm, init, @src_sv)
-    var src: StrView = src_sv
+        return None
+    var src: StrView = let_struct_name(sm, init)
     # A `c:& C` param holds its referent (#2250).
     var lent: *SemaVar = null
     if init.kind == ExprKind.Ident
@@ -1031,22 +1017,21 @@ fn another_struct_source(sm: *Sema, init: *Expr, want: StrView, out: *StrView) -
     if src.ptr == null and lent != null and lent.let_kind == TypeKind.MutRef
         src = lent.let_name
     if src.ptr == null or src.len <= 0
-        return 0
+        return None
     # AGAST #3579 / #3564: a local bound to an unannotated `"..."`, to a
     # `... as StrView` or to another such local is a StrView value, as in
     # ritz0: Sema binds it so (sema_expr_ty), where the emitter's local is the
     # literal's `Span$u8` it marks str_view.
     if name_eq(src, want) == 1
-        return 0
+        return None
     # AGAST #3441 (R49): of the StrView / Span$u8 pair only a `"..."` converts,
     # either way, and it reads as a `Span$u8` here.  A StrView value never fits
     # a `Span<u8>` slot, nor a `Span<u8>` value a StrView one (#3564).
     if init.kind == ExprKind.StringLit and is_layout_equiv_pair(src, want) == 1
-        return 0
+        return None
     if sema_find_struct(sm, src) == null or sema_find_struct(sm, want) == null
-        return 0
-    *out = src
-    return 1
+        return None
+    Some(src)
 
 # `<head>`<name>` is declared `<want>` but <what> is a `<src>``, at (line, col).
 fn let_error_another(sm: *Sema, line: i32, col: i32, head: StrView, name: StrView, want: StrView, what: StrView, src: StrView)
@@ -1069,8 +1054,9 @@ fn let_check_another_struct(sm: *Sema, stmt: *Stmt)
     if stmt.var_declared_type != TypeKind.Struct
         return
     var src: StrView = strview_empty()
-    if another_struct_source(sm, stmt.var_init, stmt.var_type_name, @src) == 0
-        return
+    match another_struct_source(sm, stmt.var_init, stmt.var_type_name)
+        Some(found) => src = found
+        None => return
     let_error_another(sm, stmt.span.line, stmt.span.col, "`", stmt.var_name, stmt.var_type_name, "` but its initialiser is a `", src)
 
 # `let s: String = "abc"`: 1 when it reported one.  With no `String` in scope
@@ -1132,8 +1118,9 @@ pub fn return_check_another_struct(sm: *Sema, e: *Expr, line: i32, col: i32) -> 
     if f == null or f.return_type != TypeKind.Struct
         return 0
     var src: StrView = strview_empty()
-    if another_struct_source(sm, e, f.return_type_name, @src) == 0
-        return 0
+    match another_struct_source(sm, e, f.return_type_name)
+        Some(found) => src = found
+        None => return 0
     var env: LetEnv
     let_sema_env(sm, @env)
     let_error(@env, line, col, "the fn is declared `-> ", f.return_type_name, "` but its return value is a `")
@@ -1172,8 +1159,9 @@ fn let_check_another_struct_store(sm: *Sema, stmt: *Stmt)
         _ =>
             return
     var src: StrView = strview_empty()
-    if another_struct_source(sm, stmt.assign_value, want, @src) == 0
-        return
+    match another_struct_source(sm, stmt.assign_value, want)
+        Some(found) => src = found
+        None => return
     var head: StrView = "`"
     if stmt.kind != StmtKind.Assign
         head = "field `"
@@ -1187,8 +1175,9 @@ pub fn let_check_another_struct_arg(sm: *Sema, p: *Param, a: *Expr)
     if p.param_type != TypeKind.Struct or p.is_borrow == 1
         return
     var src: StrView = strview_empty()
-    if another_struct_source(sm, a, p.param_type_name, @src) == 0
-        return
+    match another_struct_source(sm, a, p.param_type_name)
+        Some(found) => src = found
+        None => return
     let_error_another(sm, a.span.line, a.span.col, "parameter `", p.name, p.param_type_name, "` but its argument is a `", src)
 
 fn let_another_struct_args(sm: *Sema, params: *Param, args: *Expr)

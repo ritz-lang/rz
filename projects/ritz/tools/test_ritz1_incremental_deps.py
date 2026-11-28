@@ -96,6 +96,7 @@ def built_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     _copy_sources(ROOT, tmp_path)
     (tmp_path / "fake_ritz0.py").write_text(FAKE_RITZ0)
     (tmp_path / "fake_cas_obj.py").write_text(FAKE_CAS_OBJ)
+    (tmp_path / "fake_ritz0.id").write_text("ritz0-v1\n")
     _make(tmp_path)
     assert (tmp_path / "ritz1" / "build" / "ritz1").exists()
     return tmp_path
@@ -121,6 +122,7 @@ def _make(tree: Path) -> list[str]:
             "ritz1",
             f"RITZ0={sys.executable} {tree / 'fake_ritz0.py'}",
             f"CAS_OBJ={sys.executable} {tree / 'fake_cas_obj.py'}",
+            f"RITZ0_ID=cat {tree / 'fake_ritz0.id'}",
         ],
         capture_output=True,
         text=True,
@@ -192,6 +194,23 @@ def test_ritzlib_struct_change_rebuilds_importers(tree: Path) -> None:
     compiled = set(_make(tree))
     assert "ritzlib/gvec.ritz" in compiled
     assert "main.ritz" in compiled  # main imports ritzlib.gvec
+
+
+@pytest.mark.integration
+def test_ritz0_change_rebuilds_every_module(tree: Path) -> None:
+    # AGAST #4926: a .ll depended on its .ritz alone, so after a ritz0 fix an
+    # incremental build linked the modules the old ritz0 compiled, bug
+    # included.  ritz0's fingerprint (RITZ0_ID) is a prerequisite of each.
+    (tree / "fake_ritz0.id").write_text("ritz0-v2\n")
+    compiled = set(_make(tree))
+    every = {p.name for p in (tree / "ritz1" / "src").glob("*.ritz")}
+    missing = every - compiled
+    assert not missing, f"compiled by the old ritz0: {sorted(missing)}"
+    # ritzlib's objects come from the CAS, keyed on ritz0 already.
+    assert not any(c.startswith("ritzlib/") for c in compiled)
+    # The same fingerprint again is a no-op: the stamp is rewritten only
+    # when it changes.
+    assert _make(tree) == []
 
 
 @pytest.mark.integration
