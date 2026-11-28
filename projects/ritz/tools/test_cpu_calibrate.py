@@ -32,13 +32,14 @@ import exec_tmpdir  # noqa: E402
 
 # --- how many copies run at once -----------------------------------------------
 #
-# The suite runs under `-n auto --maxprocesses 8`, and a core shared by two
+# The suite runs under `-n auto --maxprocesses "${PYTEST_J:-8}"`, and a core shared by two
 # busy hyperthreads spends more CPU-s on the same work.  The workload runs as
 # many copies at once as the suite has workers, so it pays the same contention.
 
 
 @pytest.mark.unit
 def test_jobs_follow_xdist_auto_capped_at_maxprocesses(monkeypatch):
+    monkeypatch.delenv("PYTEST_J", raising=False)
     monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "3")
     assert cal.default_jobs() == 3
     monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "20")
@@ -46,7 +47,23 @@ def test_jobs_follow_xdist_auto_capped_at_maxprocesses(monkeypatch):
 
 
 @pytest.mark.unit
+def test_jobs_cap_follows_the_gates_pytest_j(monkeypatch):
+    """AGAST #4971: a gate with RZ_GATE_JOBS runs the suite at
+    `--maxprocesses "${PYTEST_J:-8}"`, so the copies are capped there too."""
+    monkeypatch.setenv("PYTEST_J", "24")
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "30")
+    assert cal.default_jobs() == 24
+    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "20")
+    assert cal.default_jobs() == 20
+    for unusable in ("", "0", "many"):  # main.yml's `${PYTEST_J:-8}` reads "" as 8
+        monkeypatch.setenv("PYTEST_J", unusable)
+        monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "30")
+        assert cal.default_jobs() == cal.MAX_PROCESSES == 8
+
+
+@pytest.mark.unit
 def test_jobs_without_the_override_use_the_cpu_count(monkeypatch):
+    monkeypatch.delenv("PYTEST_J", raising=False)
     monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
     n = cal.default_jobs()
     assert 1 <= n <= cal.MAX_PROCESSES

@@ -22,6 +22,15 @@
 #                              it for a few seconds before each suite, which a
 #                              busy box misreads (skronk: 1.054 for ~1.67).
 #                              Measure it once, idle: cpu_calibrate.py --runs 5
+#   RZ_GATE_JOBS=24            the gate's parallelism (AGAST #4971): run-gate.sh
+#                              hands it to the gate as RZ_GATE_JOBS and as
+#                              RITZ1_JOBS, PYTEST_J, RATCHETS_J and
+#                              REGRESSION_JOBS, so every -j in it follows: the
+#                              ritz1 builds, the pytest suites, rz build/test,
+#                              the regression corpus and matrix, the builder
+#                              image's bootstrap.  Unset: each keeps its own
+#                              default (mostly 8).  A whole number >= 1; per
+#                              gate, so RZ_GATE_SLOTS gates may run N each
 #   RZ_TRAIN_DEPTH=6           trains the coordinator may queue in flight
 #                              (AGAST #4409; train.sh).  A whole number >= 1.
 #   RZ_TRAIN_HOSTS="a b c"     hosts `train.sh gate --next` may start a
@@ -102,7 +111,7 @@ rz_host_env_load() {
                     return 1
                 }
                 ;;
-            RZ_TRAIN_DEPTH)
+            RZ_TRAIN_DEPTH | RZ_GATE_JOBS)
                 [[ "$val" =~ ^[1-9][0-9]*$ ]] || {
                     echo "error: $RZ_HOST_ENV_FILE:$n: $key must be a whole number >= 1: '$val'" >&2
                     return 1
@@ -124,7 +133,7 @@ rz_host_env_load() {
             *)
                 echo "error: $RZ_HOST_ENV_FILE:$n: unknown key $key" \
                     "(known: RZ_ROOMS_MEMORY_HIGH RZ_ROOMS_MEMORY_MAX RZ_GATE_SLOTS" \
-                    "RZ_TRAIN_SLOTS RZ_TEST_BUDGET_SCALE RZ_CPU_FACTOR" \
+                    "RZ_TRAIN_SLOTS RZ_TEST_BUDGET_SCALE RZ_CPU_FACTOR RZ_GATE_JOBS" \
                     "RZ_TRAIN_DEPTH RZ_TRAIN_HOSTS RZ_ROOM_ACCOUNTS)" >&2
                 return 1
                 ;;

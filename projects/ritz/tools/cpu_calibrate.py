@@ -31,7 +31,7 @@ exists to see.  Only the host moves this figure: its CPU, kernel, Python and
 clang, and how loaded it is right now.
 
 `--jobs` copies run at once, one per xdist worker the suite will have (the
-step's `-n auto --maxprocesses 8`): two busy hyperthreads on one core spend
+step's `-n auto --maxprocesses "${PYTEST_J:-8}"`): two busy hyperthreads on one core spend
 more CPU-s on the same work, and the suite pays that too.  `--rounds` repeats
 it after one uncounted warm-up; the figure is the median round's CPU-s per
 copy.  Out: {"cpu_s", "jobs",
@@ -80,8 +80,15 @@ import exec_tmpdir  # AGAST #3704: the one exec-capable-dir probe
 
 DEFAULT_BUDGET = Path(__file__).resolve().parent / "test_budget.toml"
 
-# main.yml's `--maxprocesses 8`.
+# main.yml's `--maxprocesses "${PYTEST_J:-8}"`: 8 unless the gate sets
+# PYTEST_J (run-gate.sh does, from host.env's RZ_GATE_JOBS; AGAST #4971).
 MAX_PROCESSES = 8
+
+
+def max_processes() -> int:
+    """The suite's --maxprocesses: $PYTEST_J if a whole number >= 1, else 8."""
+    raw = os.environ.get("PYTEST_J", "")
+    return int(raw) if raw.isdigit() and int(raw) >= 1 else MAX_PROCESSES
 
 # Runs of the linked binary per copy: a process start each, as each test's
 # run step is.
@@ -196,7 +203,7 @@ def resolve_scratch(scratch: Path | None = None,
 
 
 def default_jobs() -> int:
-    """The suite's worker count: xdist's own `-n auto`, capped at --maxprocesses.
+    """The suite's worker count: xdist's own `-n auto`, capped at max_processes().
 
     xdist's hook, not a copy of it: physical cores when psutil is installed,
     the affinity mask's CPUs when not, $PYTEST_XDIST_AUTO_NUM_WORKERS over both.
@@ -205,7 +212,7 @@ def default_jobs() -> int:
 
     from xdist.plugin import pytest_xdist_auto_num_workers
     config = SimpleNamespace(option=SimpleNamespace(numprocesses="auto"))
-    return max(1, min(int(pytest_xdist_auto_num_workers(config)), MAX_PROCESSES))
+    return max(1, min(int(pytest_xdist_auto_num_workers(config)), max_processes()))
 
 
 def _children_cpu() -> float:

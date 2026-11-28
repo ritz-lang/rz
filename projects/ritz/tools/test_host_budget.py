@@ -81,6 +81,10 @@ def _env(tmp_path: Path) -> dict[str, str]:
     # #2998): every test starts as a host with no config file.
     env["RZ_HOST_ENV"] = str(tmp_path / "host.env")
     env.pop("RZ_GATE_SLOTS", None)
+    # Nor a gate's own -j knobs (AGAST #4971): these tests run inside gates
+    # that set them, and the caller's RZ_GATE_JOBS overrides host.env.
+    for k in ("RZ_GATE_JOBS", "RITZ1_JOBS", "PYTEST_J", "RATCHETS_J", "REGRESSION_JOBS"):
+        env.pop(k, None)
     return env
 
 
@@ -336,9 +340,10 @@ def test_verify_reports_the_values_in_effect(tmp_path):
     assert "MemoryHigh=7G MemoryMax=8G" in r.stdout
     assert "gate slots=1" in r.stdout
     assert "cpu factor=measured" in r.stdout  # AGAST #4172: no key, live calibration
+    assert "gate jobs=defaults" in r.stdout  # AGAST #4971: no key, each knob's own
     assert "no host config" in r.stdout
 
-    _host_env(tmp_path, HUBURGHT_ENV + "RZ_CPU_FACTOR=1.67\n")
+    _host_env(tmp_path, HUBURGHT_ENV + "RZ_CPU_FACTOR=1.67\nRZ_GATE_JOBS=24\n")
     # The installed slice is now stale against the host's config.
     r = _budget(tmp_path, env, "--verify", ROOM)
     assert r.returncode != 0
@@ -350,6 +355,7 @@ def test_verify_reports_the_values_in_effect(tmp_path):
     assert "MemoryHigh=28G MemoryMax=32G" in r.stdout
     assert "gate slots=2" in r.stdout
     assert "cpu factor=1.67" in r.stdout
+    assert "gate jobs=24" in r.stdout
     assert env["RZ_HOST_ENV"] in r.stdout
 
 
@@ -369,6 +375,9 @@ def test_verify_reports_the_values_in_effect(tmp_path):
         "RZ_TEST_BUDGET_SCALE=\n",
         "RZ_CPU_FACTOR=0\n",  # AGAST #4172: a factor must be > 0 (shared check)
         "RZ_CPU_FACTOR=fast\n",
+        "RZ_GATE_JOBS=0\n",  # AGAST #4971: a whole number >= 1
+        "RZ_GATE_JOBS=24x\n",
+        "RZ_GATE_JOBS=\n",
     ],
 )
 def test_bad_config_is_refused_and_writes_nothing(tmp_path, text):
@@ -788,7 +797,9 @@ def test_run_gate_runs_the_configured_number_of_gates(
         _kill_gates(tmp_path)
 
 
-@pytest.mark.parametrize("text", ["RZ_GATE_SLOTS=0\n", "RZ_GATE_SLOTS=two\n"])
+@pytest.mark.parametrize(
+    "text", ["RZ_GATE_SLOTS=0\n", "RZ_GATE_SLOTS=two\n", "RZ_GATE_JOBS=0\n"]
+)
 def test_run_gate_refuses_a_bad_config(tmp_path, text):
     wt = _git_worktree(tmp_path)
     env = _env(tmp_path)
@@ -803,3 +814,39 @@ def test_run_gate_refuses_a_bad_config(tmp_path, text):
     assert r.returncode != 0
     assert "host.env" in r.stderr
     assert not any(c.startswith("systemd-run ") for c in _calls(tmp_path))
+
+
+# AGAST #4971: the knobs RZ_GATE_JOBS drives, as run-gate.sh hands them to the unit.
+JOB_KNOBS = ("RZ_GATE_JOBS", "RITZ1_JOBS", "PYTEST_J", "RATCHETS_J", "REGRESSION_JOBS")
+
+
+def _gate_setenvs(tmp_path: Path, env: dict[str, str]) -> dict[str, str]:
+    """Start one gate; return the unit's --setenv=K=V pairs."""
+    wt = _git_worktree(tmp_path)
+    env["RZ_GATE_DIR"] = str(tmp_path / "gates")
+    r = subprocess.run(
+        ["bash", str(RUN_GATE), str(wt), "t4971"],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    runs = [c for c in _calls(tmp_path) if c.startswith("systemd-run ")]
+    assert len(runs) == 1, _calls(tmp_path)
+    pairs = [a.removeprefix("--setenv=") for a in runs[0].split() if a.startswith("--setenv=")]
+    return dict(p.split("=", 1) for p in pairs)
+
+
+def test_run_gate_without_gate_jobs_sets_no_jobs_knob(tmp_path):
+    """Unset: none of the knobs is in the unit's environment, not even empty
+    (the Makefile's `PYTEST_J ?= 8` would keep an empty value), so every -j
+    is the tool's own default, as before."""
+    setenv = _gate_setenvs(tmp_path, _env(tmp_path))
+    assert not set(JOB_KNOBS) & set(setenv), setenv
+
+
+def test_run_gate_exports_gate_jobs_into_the_gate(tmp_path):
+    env = _env(tmp_path)
+    _host_env(tmp_path, "RZ_GATE_JOBS=24\n")
+    setenv = _gate_setenvs(tmp_path, env)
+    assert {k: setenv.get(k) for k in JOB_KNOBS} == dict.fromkeys(JOB_KNOBS, "24")

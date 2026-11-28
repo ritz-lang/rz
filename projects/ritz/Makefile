@@ -28,6 +28,13 @@ export RITZ_PATH := $(ROOT)
 # byte-identical binaries.  See scripts/ritz1-jobs.sh for why it is a cap.
 RITZ1_J := $(shell RITZ1_JOBS='$(RITZ1_JOBS)' sh scripts/ritz1-jobs.sh)
 
+# The gate's -j for every tool that takes one (AGAST #4971): run-gate.sh sets
+# RZ_GATE_JOBS from host.env (.claude/host-env.sh).  Unset, it is empty and
+# each tool keeps its own default (check_doc_examples 8, ritz1_unit 4, rz.toml
+# [build] max_jobs, ...).  The knobs with names of their own (RITZ1_JOBS,
+# PYTEST_J, RATCHETS_J, REGRESSION_JOBS) the gate sets directly.
+GATE_J := $(if $(RZ_GATE_JOBS),-j $(RZ_GATE_JOBS))
+
 all: test
 
 # Run everything
@@ -63,7 +70,7 @@ DOC_EXAMPLE_DOCS := \
 .PHONY: check-doc-examples
 check-doc-examples:
 	@echo "=== Compiling documentation examples ==="
-	@$(PYTHON) tools/check_doc_examples.py $(DOC_EXAMPLE_DOCS)
+	@$(PYTHON) tools/check_doc_examples.py $(GATE_J) $(DOC_EXAMPLE_DOCS)
 
 # AGAST #3928. The same documents under ritz1 and ritz1_selfhosted: a doc
 # example ritz0 accepts and ritz1 refuses (or miscompiles) used to pass the
@@ -71,8 +78,8 @@ check-doc-examples:
 # known-failures/<ticket>.toml (#3963, #1834). ~1 s per compiler once built.
 .PHONY: check-doc-examples-ritz1
 check-doc-examples-ritz1: ritz1-bootstrap
-	@$(PYTHON) tools/check_doc_examples.py --compiler ritz1 $(DOC_EXAMPLE_DOCS)
-	@$(PYTHON) tools/check_doc_examples.py --compiler ritz1_selfhosted $(DOC_EXAMPLE_DOCS)
+	@$(PYTHON) tools/check_doc_examples.py $(GATE_J) --compiler ritz1 $(DOC_EXAMPLE_DOCS)
+	@$(PYTHON) tools/check_doc_examples.py $(GATE_J) --compiler ritz1_selfhosted $(DOC_EXAMPLE_DOCS)
 
 # docs/RITZ_TOML_SPEC.md is generated from manifest.py's schema, the one rz
 # and build.py validate every ritz.toml / rz.toml against (AGAST #1837).
@@ -236,7 +243,7 @@ arch-ratchet:
 .PHONY: example-tests
 example-tests:
 	@echo "=== Running example [[test]] suites ==="
-	@$(PYTHON) tools/example_tests.py
+	@$(PYTHON) tools/example_tests.py $(GATE_J)
 
 # Self-tests for scripts/regression.sh's own logic. Same problem as tools-unit
 # above, one layer down: scripts/test-regression-stage5.sh existed since the
@@ -342,7 +349,7 @@ ritz1-bootstrap:
 # files at all.  CI's bootstrap job runs it; ~5 s.
 .PHONY: ritz1-unit
 ritz1-unit:
-	@$(PYTHON) tools/ritz1_unit.py
+	@$(PYTHON) tools/ritz1_unit.py $(GATE_J)
 
 # ritzlib's [[test]] suites under ritz1 AND ritz1_selfhosted (AGAST #3805).
 # The regression matrix was the only ritz1 run, so whole ritzlib test files
@@ -351,8 +358,8 @@ ritz1-unit:
 # makes the prerequisite a no-op; ~20 s per compiler.
 .PHONY: ritzlib-tests-ritz1
 ritzlib-tests-ritz1: ritz1-bootstrap
-	cd ../.. && ./rz test ritz/ritzlib/tests --compiler ritz1
-	cd ../.. && ./rz test ritz/ritzlib/tests --compiler ritz1_selfhosted
+	cd ../.. && ./rz test ritz/ritzlib/tests --compiler ritz1 $(GATE_J)
+	cd ../.. && ./rz test ritz/ritzlib/tests --compiler ritz1_selfhosted $(GATE_J)
 
 # Every workspace package built by ritz1 (AGAST #4272) and ritz1_selfhosted
 # (#4317): goal 2 of the self-hosting loop, "ritz1 builds every package ritz0
@@ -362,8 +369,8 @@ ritzlib-tests-ritz1: ritz1-bootstrap
 # built under each on 0a839f97: ~56 s / ~58 s cold, ~9 s warm, on 8 workers.
 .PHONY: build-all-ritz1
 build-all-ritz1: ritz1-bootstrap
-	cd ../.. && ./rz build --all --compiler ritz1
-	cd ../.. && ./rz build --all --compiler ritz1_selfhosted
+	cd ../.. && ./rz build --all --compiler ritz1 $(GATE_J)
+	cd ../.. && ./rz build --all --compiler ritz1_selfhosted $(GATE_J)
 
 # Build and test all examples (always runs). The walk starts in examples/:
 # build.py --all skips rz.toml's [workspace.exclude] dirs, and examples/ is
@@ -422,14 +429,14 @@ valgrind: build
 # DO NOT add a `clean` step here. Make's dep tracking is correct; if it
 # isn't, that's a Makefile bug. See docs/VALIDATION.md "Hard rules".
 matrix-quick: regen-check | _matrix_ritz1_built
-	@$(PYTHON) tools/run_regression_matrix.py --compiler ritz1
+	@$(PYTHON) tools/run_regression_matrix.py --compiler ritz1 $(GATE_J)
 
 matrix: matrix-quick
 
 matrix-full: regen-check | _matrix_ritz1_built
 	@echo "=== Full matrix (ritz0 + ritz1 + ritz1_selfhosted) ==="
 	@echo "    This will incrementally rebuild ritz1_selfhosted (~3 min if ritz1 source changed)."
-	@$(PYTHON) tools/run_regression_matrix.py --rebuild
+	@$(PYTHON) tools/run_regression_matrix.py --rebuild $(GATE_J)
 
 # Guard against the cardinal sin: hand-editing a generated file instead of
 # regenerating from grammars/ritz1.grammar.  Runs the generator into a tmp

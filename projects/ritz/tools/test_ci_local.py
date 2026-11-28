@@ -32,6 +32,10 @@ sys.path.insert(0, str(HERE))
 
 import ci_local  # noqa: E402
 
+# main.yml's build-all step: the gate's -j when run-gate.sh sets RZ_GATE_JOBS
+# (AGAST #4971), else rz.toml's [build] max_jobs.
+BUILD_ALL = './rz build --all ${RZ_GATE_JOBS:+-j "$RZ_GATE_JOBS"}'
+
 
 # --------------------------------------------------------------------------
 # A real (non --dry-run) main() ends by trimming the artifact store and sets
@@ -590,7 +594,7 @@ def test_real_ritz0_pytest_step_cannot_report_a_setup_error():
     _, rest = ci_local.plan_likely_first([ritz0], [])
     if rest is not None:
         assert not ci_local.is_setup_exit(rest, 3)
-    build = next(s for s in steps if s.job == "build-all" and s.run.strip() == "./rz build --all")
+    build = next(s for s in steps if s.job == "build-all" and s.run.strip() == BUILD_ALL)
     assert ci_local.is_setup_exit(build, 3)
 
 
@@ -628,7 +632,7 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     only for a missing docker). A new step here must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
     assert [s.run.strip().splitlines()[-1] for s in steps] == [
-        "./rz build --all",
+        BUILD_ALL,
         "bash projects/nexus/test/e2e_large_page.sh",
         "bash projects/valet/test/test_tls_socket.sh",
         "bash projects/valet/test/test_split_request.sh",
@@ -1171,7 +1175,8 @@ def test_the_gate_builds_every_package_under_ritz1():
     m = re.search(r"^build-all-ritz1:.*\n((?:\t.*\n)+)", makefile, re.M)
     assert m, "projects/ritz/Makefile has no build-all-ritz1 target"
     for compiler in ("ritz1", "ritz1_selfhosted"):  # + AGAST #4317
-        assert re.search(rf"\./rz build --all --compiler {compiler}$",
+        # --all and nothing after it but the gate's -j (AGAST #4971).
+        assert re.search(rf"\./rz build --all --compiler {compiler}( \$\(GATE_J\))?$",
                          m.group(1), re.M), (compiler, m.group(1))
 
 

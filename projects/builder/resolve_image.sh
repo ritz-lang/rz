@@ -68,9 +68,17 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 git -C "$ROOT" archive --format=tar "$commit" > "$work/context.tar"
 build() { docker build -q -f projects/builder/Dockerfile "$@" - < "$work/context.tar" >&2; }
+# The bootstrap's make -j: the caller's RITZ1_JOBS (a gate's, from host.env's
+# RZ_GATE_JOBS; AGAST #4971), as projects/builder/test.sh passes it.  Unset,
+# no build-arg, so the Dockerfile's default (ritz1-jobs.sh's cap) stays in the
+# build cache key.
+boot_jobs=()
+if [[ -n ${RITZ1_JOBS:-} ]]; then
+    boot_jobs+=(--build-arg "RITZ1_JOBS=${RITZ1_JOBS}")
+fi
 boot_tag="rz-builder-bootstrap:src-$key"
 echo "resolve_image: pass 1, the bootstrap (ritz0 -> ritz1 -> ritz1_selfhosted)" >&2
-build --target bootstrap -t "$boot_tag" || { echo "resolve_image: the bootstrap stage failed" >&2; exit 1; }
+build --target bootstrap "${boot_jobs[@]}" -t "$boot_tag" || { echo "resolve_image: the bootstrap stage failed" >&2; exit 1; }
 sha="$(docker run --rm "$boot_tag" sha256sum projects/ritz/ritz1/build/ritz1_selfhosted | cut -d' ' -f1)"
 echo "resolve_image: pass 2, the runtime image (ritz1_selfhosted $sha)" >&2
 build --build-arg "RZ_COMMIT=$commit" --build-arg "RITZ1_SHA256=$sha" -t "$local_tag" \
