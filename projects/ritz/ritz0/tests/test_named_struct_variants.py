@@ -21,8 +21,10 @@ variant declared without field names, an unknown field, a repeated one or a
 missing one is refused at the variant's name.
 """
 
+import re
+
 import pytest
-from test_ref_into_value import COMPILERS, _assert_refused, _run
+from test_ref_into_value import COMPILERS, _assert_refused, _compile, _run
 
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
@@ -210,3 +212,24 @@ REFUSED = {
 def test_named_forms_refused(tmp_path, compiler, site):
     marked, message = REFUSED[site]
     _assert_refused(compiler, tmp_path, site, ENUM + marked + MAIN, message)
+
+
+# AGAST #4923: the parser tries a form more than once as it backtracks and
+# notes it on each try; ritz1 keys the forms it has reported by the SrcPos of
+# the variant's name, so each refused form is reported once, as ritz0 does.
+ONCE = (
+    ENUM
+    + "fn f(m: Msg) -> i32\n    match m\n        SetViewport { depth } => 1\n        _ => 0\n\n"
+    + "fn g() -> Msg\n    SetViewport { depth: 3 }\n"
+    + MAIN
+)
+
+
+# One case over the compilers, not one each: the suite's test count is capped.
+def test_each_refused_form_is_reported_once(tmp_path):
+    for compiler in COMPILERS:
+        comp, ll, _ = _compile(compiler, tmp_path, "once", ONCE)
+        out = comp.stdout + comp.stderr
+        assert comp.returncode != 0, f"{compiler} accepted:\n{ONCE}"
+        found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?variant `SetViewport` has no field `depth`", out)
+        assert sorted(found) == ["14:9", "18:5"], f"{compiler}:\n{out[-2000:]}"

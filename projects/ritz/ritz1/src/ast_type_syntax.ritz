@@ -28,20 +28,17 @@ pub fn gated_decl_log(ctx: *ParseCtx, name_sv: StrView)
     ctx.gated_count = ctx.gated_count + 1
 
 pub const ATTR_WIN64: i32 = 32       # [[callconv = "win64"]] (AGAST #1879)
-pub fn item_attr_record(ctx: *ParseCtx, item: *u8, bits: i32)
-    if ctx.item_attr_count + 2 > ctx.item_attr_cap
-        var cap: i64 = ctx.item_attr_cap * 2
-        if cap == 0
-            cap = 32
-        let grown: *i64 = realloc(ctx.item_attrs as *u8, cap * 8) as *i64
-        if grown == null
-            eprints("error: ritz1: out of memory recording attributes\n")
-            sys_exit(70)
-        ctx.item_attrs = grown
-        ctx.item_attr_cap = cap
-    *(ctx.item_attrs + ctx.item_attr_count) = item as i64
-    *(ctx.item_attrs + ctx.item_attr_count + 1) = bits as i64
-    ctx.item_attr_count = ctx.item_attr_count + 2
+# Record ATTR_* `bits` for fn `f`; a later record of the same fn is not
+# read (fn_attr_bits reads the first).
+pub fn fn_attr_record(ctx: *ParseCtx, f: *FnDef, bits: i32)
+    if not ctx.fn_attrs.push(FnAttrs { f: f, bits: bits })
+        eprints("error: ritz1: out of memory recording attributes\n")
+        sys_exit(70)
+
+pub fn struct_attr_record(ctx: *ParseCtx, st: *StructDef, bits: i32)
+    if not ctx.struct_attrs.push(StructAttrs { st: st, bits: bits })
+        eprints("error: ritz1: out of memory recording attributes\n")
+        sys_exit(70)
 
 pub fn is_prim_type_tok(k: i32) -> i32
     if k >= TOK_I8 and k <= TOK_BOOL
@@ -546,13 +543,13 @@ pub fn array_lit_length_decl(p: *Parser, tr: *TypeRef, init: *Expr)
 # and count it in ctx.attr_errors, which fails the compile.  ritz1 has no trait
 # objects; whether the language does is AGAST #1620's decision.
 pub fn dyn_kw_refuse(p: *Parser, name_sv: StrView, line: i32, col: i32) -> i32
-    var name: *u8 = name_sv.ptr
     if not name_sv.eq("dyn")
         p.error = 1
         return 0
-    if p.ctx.dyn_last != null and name <= p.ctx.dyn_last
+    let at: Option<SrcPos> = src_pos_of(p.ctx, name_sv)
+    if not src_pos_after(at, p.ctx.dyn_last)
         return 0
-    p.ctx.dyn_last = name
+    p.ctx.dyn_last = at
     p.ctx.attr_errors = p.ctx.attr_errors + 1
     diag_error(p.ctx.parse_file, diag_span(line, col), "`dyn Trait` is not supported (AGAST #1620)")
     return 0
@@ -571,12 +568,20 @@ pub fn closure_ahead_check(p: *Parser) -> i32
 # Grammar action for a closure or lambda expression (LARB R56, AGAST #3471):
 # refuse it at its `|` / `||` / `fn`, once, in ritz0's words, and count it in
 # ctx.attr_errors, which fails the compile.  The value is a placeholder `null`.
-pub fn closure_refused(p: *Parser, at: *u8, line: i32, col: i32) -> *Expr
-    if p.skip_item == 0 and (p.ctx.closure_last == null or at > p.ctx.closure_last)
-        p.ctx.closure_last = at
+pub fn closure_refused(p: *Parser, at: StrView, line: i32, col: i32) -> *Expr
+    if p.skip_item == 0 and closure_unreported(p.ctx, src_pos_of(p.ctx, at))
         p.ctx.attr_errors = p.ctx.attr_errors + 1
         diag_error(p.ctx.parse_file, diag_span(line, col), "closures aren't supported: write a named fn and pass it by name (§5.5)")
     expr_nil(p, line, col)
+
+# True for the first try at a closure written at `at`, recorded then: the
+# parser backtracks over it, and the next closure is written after it.
+fn closure_unreported(ctx: *ParseCtx, at: Option<SrcPos>) -> bool
+    if not src_pos_after(at, ctx.closure_last)
+        return false
+    if at.is_some()
+        ctx.closure_last = at
+    true
 
 # Grammar action for `[pub] async fn` (AGAST #1456): mark `f` async.
 # async_lower.ritz lowers it to ritz0's state machine (AGAST #3814).
@@ -586,7 +591,7 @@ pub fn fn_async(p: *Parser, f: *FnDef, col: i32) -> *FnDef
 
 # Grammar action for `await e` (AGAST #1456): an ExprKind.Await node, which
 # async_lower.ritz lowers (AGAST #3814).
-pub fn expr_await(p: *Parser, operand: *Expr, at: *u8, line: i32, col: i32) -> *Expr
+pub fn expr_await(p: *Parser, operand: *Expr, line: i32, col: i32) -> *Expr
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = ExprKind.Await
     e.span.line = line
@@ -904,7 +909,7 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     # AGAST #1879: a fn-type alias keeps its signature.
     e.fn_sig = f.fn_sig
     if e.fn_sig != null and (p.ctx.attr_bits & ATTR_WIN64) != 0
-        item_attr_record(p.ctx, e.fn_sig as *u8, ATTR_WIN64)
+        fn_attr_record(p.ctx, e.fn_sig, ATTR_WIN64)
     let spell_sv: StrView = type_alias_spell(p, name_sv)
     e.spelling = spell_sv
     return tr

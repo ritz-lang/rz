@@ -46,6 +46,14 @@ pub fn parse_ctx_new() -> *ParseCtx
     ctx.array_len_line = -1
     ctx.array_len_col = -1
     ctx.open_if_end = 0 - 1
+    # AGAST #4923: a zeroed Option is Some, so each place starts at None.
+    ctx.attr_last_err = None
+    ctx.index_impl_last_err = None
+    ctx.generic_method_last_err = None
+    ctx.decl_last_err = None
+    ctx.dyn_last = None
+    ctx.closure_last = None
+    ctx.asm_last_block = None
     ctx
 
 # =============================================================================
@@ -180,14 +188,14 @@ pub fn is_test_fn(ctx: *ParseCtx, f: *FnDef) -> i32
 # 1 if `f` was declared `[[test_helper]]` (AGAST #1869), or is a monomorph
 # instance of such a fn (fn_copy_instance_attrs marks those).
 pub fn is_test_helper_fn(ctx: *ParseCtx, f: *FnDef) -> i32
-    if (item_attr_bits(ctx, f as *u8) & ATTR_TEST_HELPER) != 0
+    if (fn_attr_bits(ctx, f) & ATTR_TEST_HELPER) != 0
         return 1
     0
 
 # 1 if `f` was declared `[[must_use]]` (AGAST #2137), or is a monomorph
 # instance of such a fn (fn_copy_instance_attrs marks those).
 pub fn is_must_use_fn(ctx: *ParseCtx, f: *FnDef) -> i32
-    if f != null and (item_attr_bits(ctx, f as *u8) & ATTR_MUST_USE) != 0
+    if f != null and (fn_attr_bits(ctx, f) & ATTR_MUST_USE) != 0
         return 1
     0
 
@@ -204,7 +212,8 @@ pub fn test_fns_reset(ctx: *ParseCtx)
     ctx.attr_target_os = 0
     ctx.attr_target_arch = 0
     # The re-parse allocates new items, possibly at a freed item's address.
-    ctx.item_attr_count = 0
+    ctx.fn_attrs.clear()
+    ctx.struct_attrs.clear()
 
 # =============================================================================
 # Item dispatchers — honour p.skip_item set by attrs (5F.3c)
@@ -252,15 +261,15 @@ pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
             fn_def.target_gated = 1
         if (p.ctx.attr_bits & ATTR_TEST) != 0
             if fn_is_decl(p.ctx, fn_def) == 1
-                decl_refused(p.ctx, tok_span_of(p, fn_def.name.ptr, fn_def.line), "[[test]] fn", fn_def.name, strview_empty(), "a test needs its body")
+                decl_refused(p.ctx, tok_span_of(p, fn_def.name, fn_def.line), "[[test]] fn", fn_def.name, strview_empty(), "a test needs its body")
             test_fn_record(p.ctx, fn_def)
         if (p.ctx.attr_bits & ATTR_NAKED) != 0
             if fn_is_decl(p.ctx, fn_def) == 1
-                decl_refused(p.ctx, tok_span_of(p, fn_def.name.ptr, fn_def.line), "[[naked]] fn", fn_def.name, strview_empty(), "a naked fn is its asm body")
+                decl_refused(p.ctx, tok_span_of(p, fn_def.name, fn_def.line), "[[naked]] fn", fn_def.name, strview_empty(), "a naked fn is its asm body")
             asm_check_naked(p.ctx, fn_def)
         let fn_bits: i32 = p.ctx.attr_bits & (ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_WIN64 | ATTR_TEST_HELPER | ATTR_MUST_USE | ATTR_NAKED)
         if fn_bits != 0
-            item_attr_record(p.ctx, fn_def as *u8, fn_bits)
+            fn_attr_record(p.ctx, fn_def, fn_bits)
     p.skip_item = 0
     p.ctx.attr_bits = 0
     p.ctx.attr_target_os = 0
@@ -281,7 +290,7 @@ pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
     if p.skip_item == 0
         module_add_struct(p.module, st)
         if (p.ctx.attr_bits & ATTR_PACKED) != 0
-            item_attr_record(p.ctx, st as *u8, ATTR_PACKED)
+            struct_attr_record(p.ctx, st, ATTR_PACKED)
     p.skip_item = 0
     p.ctx.attr_bits = 0
     p.ctx.attr_target_os = 0
@@ -369,10 +378,10 @@ pub fn parser_reset_diagnostics(ctx: *ParseCtx)
     ctx.last_drop_at = -1
     ctx.parse_reported = 0
     ctx.attr_errors = 0
-    ctx.attr_last_err = null
-    ctx.asm_last_block = null   # AGAST #3394
-    ctx.dyn_last = null   # AGAST #2298
-    ctx.closure_last = null   # AGAST #3471
+    ctx.attr_last_err = None
+    ctx.asm_last_block = None   # AGAST #3394
+    ctx.dyn_last = None   # AGAST #2298
+    ctx.closure_last = None   # AGAST #3471
     ctx.array_len_line = -1
     ctx.array_len_col = -1
 
@@ -404,11 +413,15 @@ fn parse_error_at(p: *Parser, pos: i32)
 
 # Where the token starting at `at` (a name in the source) is; `line`:0 when
 # no token starts there.  For an item that keeps only its line (FnDef).
-fn tok_span_of(p: *Parser, at: *u8, line: i32) -> SrcSpan
+fn tok_span_of(p: *Parser, at: StrView, line: i32) -> SrcSpan
+    var pos: SrcPos = SrcPos { off: 0 }
+    match src_pos_of(p.ctx, at)
+        Some(q) => pos = q
+        None => return diag_span(line, 0)
     var i: i32 = 0
     while i < p.token_count
         let t: *Token = p.tokens + i
-        if t.text.ptr == at
+        if tok_starts_at(p.ctx, t, pos)
             return diag_span(t.line, t.col)
         i += 1
     diag_span(line, 0)
@@ -497,8 +510,8 @@ const ATTR_ITEM_FN_ALIAS: i32 = 5    # `type X = fn(..) ..`
 fn attr_target_key(ctx: *ParseCtx) -> u64
     struct_variant_target_pair_key(ctx.attr_target_os, ctx.attr_target_arch)
 
-# (item pointer, ATTR_* bits) pairs, for attributes the emitter reads.
-# State: ParseCtx.item_attrs, .item_attr_count, .item_attr_cap
+# (item, ATTR_* bits) pairs, for attributes the emitter reads.
+# State: ParseCtx.fn_attrs, .struct_attrs
 
 # The kind of item the attribute list at p.pos is attached to: skip the rest
 # of the attribute lines and a `pub`, then look at the keyword.  The grammar
@@ -536,9 +549,10 @@ fn attr_item_kind(p: *Parser) -> i32
 
 # `<file>:<line>:<col>: error: attribute '<name>' <msg>`, once per token.
 fn attr_error(ctx: *ParseCtx, name: StrView, line: i32, col: i32, msg: StrView)
-    if name.ptr == ctx.attr_last_err
+    let at: Option<SrcPos> = src_pos_of(ctx, name)
+    if src_pos_same(at, ctx.attr_last_err)
         return
-    ctx.attr_last_err = name.ptr
+    ctx.attr_last_err = at
     ctx.attr_errors = ctx.attr_errors + 1
     diag_error_at(ctx.parse_file, diag_span(line, col))
     eprints("attribute '")
@@ -547,10 +561,10 @@ fn attr_error(ctx: *ParseCtx, name: StrView, line: i32, col: i32, msg: StrView)
     eprintln(msg)
 
 fn attr_unknown(ctx: *ParseCtx, name_sv: StrView, line: i32, col: i32)
-    var name: *u8 = name_sv.ptr
-    if name == ctx.attr_last_err
+    let at: Option<SrcPos> = src_pos_of(ctx, name_sv)
+    if src_pos_same(at, ctx.attr_last_err)
         return
-    ctx.attr_last_err = name
+    ctx.attr_last_err = at
     ctx.attr_errors = ctx.attr_errors + 1
     diag_error_name(ctx.parse_file, diag_span(line, col), "unknown attribute '", name_sv, "' (known: always_inline, callconv, inline, must_use, naked, noinline, packed, target_arch, target_os, test, test_helper)")
 
@@ -568,7 +582,6 @@ fn attr_is_bare_name(name_sv: StrView) -> i32
 
 # Grammar action for `[[name]]`.
 pub fn attr_flag(p: *Parser, name_sv: StrView, line: i32, col: i32) -> i32
-    var name: *u8 = name_sv.ptr
     var bit: i32 = 0
     var applies_to: i32 = ATTR_ITEM_FN
     if name_sv.eq("test")
@@ -611,7 +624,6 @@ pub fn attr_flag(p: *Parser, name_sv: StrView, line: i32, col: i32) -> i32
 
 # Grammar action for `[[name = "value"]]`.
 pub fn attr_kv(p: *Parser, name_sv: StrView, line: i32, col: i32, str_val_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
     if name_sv.eq("target_os")
         let tk: i32 = attr_item_kind(p)
         if tk != ATTR_ITEM_FN and tk != ATTR_ITEM_STRUCT and tk != ATTR_ITEM_CONST
@@ -639,8 +651,9 @@ pub fn attr_kv(p: *Parser, name_sv: StrView, line: i32, col: i32, str_val_sv: St
         if str_val_sv.eq("win64")
             p.ctx.attr_bits = p.ctx.attr_bits | ATTR_WIN64
         else if not str_val_sv.eq("c")
-            if name != p.ctx.attr_last_err
-                p.ctx.attr_last_err = name
+            let at: Option<SrcPos> = src_pos_of(p.ctx, name_sv)
+            if not src_pos_same(at, p.ctx.attr_last_err)
+                p.ctx.attr_last_err = at
                 p.ctx.attr_errors = p.ctx.attr_errors + 1
                 diag_error_name(p.ctx.parse_file, diag_span(line, col), "unknown calling convention '", str_val_sv, "' (known: c, win64)")
         return 0
@@ -650,14 +663,20 @@ pub fn attr_kv(p: *Parser, name_sv: StrView, line: i32, col: i32, str_val_sv: St
     attr_unknown(p.ctx, name_sv, line, col)
     0
 
-# ATTR_* bits recorded for `item` (by identity), 0 if none.
-fn item_attr_bits(ctx: *ParseCtx, item: *u8) -> i32
-    let key: i64 = item as i64
-    var i: i64 = 0
-    while i < ctx.item_attr_count
-        if *(ctx.item_attrs + i) == key
-            return *(ctx.item_attrs + i + 1) as i32
-        i = i + 2
+# ATTR_* bits recorded for fn `f` (its first record), 0 if none.
+fn fn_attr_bits(ctx: *ParseCtx, f: *FnDef) -> i32
+    for i in 0..ctx.fn_attrs.len
+        let a: FnAttrs = ctx.fn_attrs.get(i)
+        if a.f == f
+            return a.bits
+    0
+
+# ATTR_* bits recorded for struct `st` (its first record), 0 if none.
+fn struct_attr_bits(ctx: *ParseCtx, st: *StructDef) -> i32
+    for i in 0..ctx.struct_attrs.len
+        let a: StructAttrs = ctx.struct_attrs.get(i)
+        if a.st == st
+            return a.bits
     0
 
 # 1 if `st` was declared `[[packed]]` (or is a clone of one: monomorph marks
@@ -665,16 +684,16 @@ fn item_attr_bits(ctx: *ParseCtx, item: *u8) -> i32
 pub fn struct_is_packed(ctx: *ParseCtx, st: *StructDef) -> i32
     if st == null
         return 0
-    if (item_attr_bits(ctx, st as *u8) & ATTR_PACKED) != 0
+    if (struct_attr_bits(ctx, st) & ATTR_PACKED) != 0
         return 1
     0
 
 pub fn struct_mark_packed(ctx: *ParseCtx, st: *StructDef)
-    item_attr_record(ctx, st as *u8, ATTR_PACKED)
+    struct_attr_record(ctx, st, ATTR_PACKED)
 
 # 1 if `f` was declared `[[naked]]` (§17.5, AGAST #3395).
 pub fn fn_is_naked(ctx: *ParseCtx, f: *FnDef) -> i32
-    if (item_attr_bits(ctx, f as *u8) & ATTR_NAKED) != 0
+    if (fn_attr_bits(ctx, f) & ATTR_NAKED) != 0
         return 1
     0
 
@@ -686,7 +705,7 @@ pub fn fn_is_naked(ctx: *ParseCtx, f: *FnDef) -> i32
 pub fn fn_inline_kept(ctx: *ParseCtx, f: *FnDef) -> i32
     if f.is_pub == 0
         return 0
-    if (item_attr_bits(ctx, f as *u8) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
+    if (fn_attr_bits(ctx, f) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
         return 0
     1
 
@@ -702,7 +721,7 @@ pub fn fn_inline_kept(ctx: *ParseCtx, f: *FnDef) -> i32
 # which only costs ritz1 the inlining.  Its body is kept (fn_inline_kept);
 # emitter.ritz emit_fn defines it.
 pub fn fn_inline_import(ctx: *ParseCtx, f: *FnDef) -> i32
-    if (item_attr_bits(ctx, f as *u8) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
+    if (fn_attr_bits(ctx, f) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
         return 0
     if f.is_pub == 0 or f.type_params != null or f.is_async != 0 or f.from_generated != 0
         return 0
@@ -802,7 +821,7 @@ fn ii_expr(f: *FnDef, e: *Expr) -> i32
 # LLVM fn attribute text for `f`'s inline attribute (with a leading space),
 # or "" when it has none.
 pub fn fn_inline_attr(ctx: *ParseCtx, f: *FnDef) -> StrView
-    let bits: i32 = item_attr_bits(ctx, f as *u8)
+    let bits: i32 = fn_attr_bits(ctx, f)
     if (bits & ATTR_INLINE) != 0
         return " inlinehint"
     if (bits & ATTR_ALWAYS_INLINE) != 0
@@ -816,7 +835,7 @@ pub fn fn_inline_attr(ctx: *ParseCtx, f: *FnDef) -> StrView
 # #1879).  `f` is a fn, an extern fn, or the signature of a fn type (a
 # `[[callconv]]` fn-type alias's, which type_alias_record marks).
 pub fn fn_callconv_kw(ctx: *ParseCtx, f: *FnDef) -> StrView
-    if f != null and (item_attr_bits(ctx, f as *u8) & ATTR_WIN64) != 0
+    if f != null and (fn_attr_bits(ctx, f) & ATTR_WIN64) != 0
         return "win64cc "
     ""
 
@@ -825,13 +844,13 @@ pub fn fn_callconv_kw(ctx: *ParseCtx, f: *FnDef) -> StrView
 # [[inline]] / [[always_inline]] / [[noinline]] (#1961) and [[naked]] (§17.5,
 # #3633): it calls, is called, may assert, inlines and gets a prologue as the
 # template does.  One record: an item's bits are read from its first record
-# only (item_attr_bits).
+# only (fn_attr_bits).
 pub fn fn_copy_instance_attrs(ctx: *ParseCtx, dst: *FnDef, src: *FnDef)
     if src == null
         return
-    let bits: i32 = item_attr_bits(ctx, src as *u8) & (ATTR_WIN64 | ATTR_TEST_HELPER | ATTR_MUST_USE | ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_NAKED)
+    let bits: i32 = fn_attr_bits(ctx, src) & (ATTR_WIN64 | ATTR_TEST_HELPER | ATTR_MUST_USE | ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_NAKED)
     if bits != 0
-        item_attr_record(ctx, dst as *u8, bits)
+        fn_attr_record(ctx, dst, bits)
 
 # Describe token `pos` for a diagnostic: its quoted lexeme, or a name for
 # the layout tokens whose lexeme is whitespace or empty.
@@ -1314,53 +1333,58 @@ fn index_impl_on_builtin(p: *Parser, trait_name: StrView, type_name: StrView)
         return
     if not type_name.eq("Vec") and not type_name.eq("Span") and not type_name.eq("String")
         return
-    if type_name.ptr == p.ctx.index_impl_last_err
+    let at: Option<SrcPos> = src_pos_of(p.ctx, type_name)
+    if src_pos_same(at, p.ctx.index_impl_last_err)
         return
-    p.ctx.index_impl_last_err = type_name.ptr
+    p.ctx.index_impl_last_err = at
     p.ctx.attr_errors = p.ctx.attr_errors + 1
-    diag_error_at(p.ctx.parse_file, tok_span_of(p, type_name.ptr, 0))
+    diag_error_at(p.ctx.parse_file, tok_span_of(p, type_name, 0))
     eprints("`")
     sys_write(2, type_name.ptr, type_name.len)
     eprints("` is indexed by the language: it can't implement `")
     sys_write(2, trait_name.ptr, trait_name.len)
     eprintln("` (§7.8)")
 
-# AGAST #3015: where the trait name `at` is (R17's rule-1 errors name it).
-fn impl_trait_span(p: *Parser, at: *u8, out: *SrcSpan)
-    var i: i32 = 0
-    while i < p.token_count
-        let t: *Token = p.tokens + i
-        if t.text.ptr == at
-            out.line = t.line
-            out.col = t.col
-            return
-        i += 1
+# AGAST #3015: where the trait name `at` is (R17's rule-1 errors name it);
+# 0:0 if no token starts there.
+fn impl_trait_span(p: *Parser, at: StrView) -> SrcSpan
+    tok_span_of(p, at, 0)
 
 # AGAST #3162: where the `impl` keyword of the block naming `type_name` is:
 # the nearest `impl` token before that name (`impl<T> Tr for Span<T>` puts
 # generic params and a trait name between them).  Zero if not found.
-# AGAST #3264: and where that name is, in `at_type` ("unknown type").
-fn impl_keyword_span(p: *Parser, type_name: *u8, out: *SrcSpan, at_type: *SrcSpan)
-    out.line = 0
-    out.col = 0
-    at_type.line = 0
-    at_type.col = 0
+# AGAST #3264: and where that name is, in `type_at` ("unknown type").
+struct ImplSpans
+    impl_kw: SrcSpan
+    type_at: SrcSpan
+
+fn impl_keyword_span(p: *Parser, type_name: StrView) -> ImplSpans
+    var spans: ImplSpans = ImplSpans { impl_kw: diag_span(0, 0), type_at: diag_span(0, 0) }
+    var pos: SrcPos = SrcPos { off: 0 }
+    match src_pos_of(p.ctx, type_name)
+        Some(q) => pos = q
+        None => return spans
     var i: i32 = 0
     while i < p.token_count
         let t: *Token = p.tokens + i
-        if t.text.ptr == type_name
-            at_type.line = t.line
-            at_type.col = t.col
+        if tok_starts_at(p.ctx, t, pos)
+            spans.type_at = diag_span(t.line, t.col)
             var k: i32 = i
             while k >= 0
                 let kt: *Token = p.tokens + k
                 if kt.kind == TOK_IMPL
-                    out.line = kt.line
-                    out.col = kt.col
-                    return
+                    spans.impl_kw = diag_span(kt.line, kt.col)
+                    return spans
                 k = k - 1
-            return
+            return spans
         i += 1
+    spans
+
+# Fill `ib`'s impl keyword and type name spans for `type_name`.
+fn impl_spans_set(p: *Parser, ib: *ImplBlock, type_name: StrView)
+    let spans: ImplSpans = impl_keyword_span(p, type_name)
+    ib.impl_span = spans.impl_kw
+    ib.type_span = spans.type_at
 
 # AGAST #3494 (LARB R65): `type_args` is the target's generic arguments as
 # written (`<u8>` of `impl G<u8>`), kept so impl_placement.ritz can refuse one
@@ -1392,7 +1416,6 @@ pub fn impl_block_ptr_new(p: *Parser, trait_name_sv: StrView, pointee: StrView, 
     ib
 
 fn impl_block_core(p: *Parser, trait_name: StrView, type_name_sv: StrView, type_params: *TypeParam, impl_args: *GenericArg, methods: *FnDef, ptr_target: i32, ptr_pointee_sv: StrView) -> *ImplBlock
-    var type_name: *u8 = type_name_sv.ptr
     if trait_name.ptr != null
         index_impl_on_builtin(p, trait_name, type_name_sv)
     let ib: *ImplBlock = parser_alloc(p, sizeof(ImplBlock)) as *ImplBlock
@@ -1400,8 +1423,8 @@ fn impl_block_core(p: *Parser, trait_name: StrView, type_name_sv: StrView, type_
     ib.trait_span.line = 0
     ib.trait_span.col = 0
     if trait_name.ptr != null
-        impl_trait_span(p, trait_name.ptr, @ib.trait_span)   # AGAST #3015, #4211
-    impl_keyword_span(p, type_name, @ib.impl_span, @ib.type_span)   # AGAST #3162, #3264
+        ib.trait_span = impl_trait_span(p, trait_name)   # AGAST #3015, #4211
+    impl_spans_set(p, ib, type_name_sv)   # AGAST #3162, #3264
     ib.def_file = parse_file_copy_shared(p)
     ib.trait_name = trait_name
     ib.type_name = type_name_sv
@@ -1418,11 +1441,11 @@ fn impl_block_core(p: *Parser, trait_name: StrView, type_name_sv: StrView, type_
         # m.functions before monomorph appends the specialised methods.
         mt.def_file = parse_file_copy_shared(p)
         if mt.type_params != null
-            generic_method_error(p.ctx, tok_span_of(p, mt.name.ptr, mt.line), mt, type_name_sv)
+            generic_method_error(p.ctx, tok_span_of(p, mt.name, mt.line), mt, type_name_sv)
         if type_params != null and fn_is_decl(p.ctx, mt) == 1
-            decl_refused(p.ctx, tok_span_of(p, mt.name.ptr, mt.line), "method", mt.name, type_name_sv, "importers instantiate its body")
+            decl_refused(p.ctx, tok_span_of(p, mt.name, mt.line), "method", mt.name, type_name_sv, "importers instantiate its body")
         if trait_name.len == 4 and name_is_drop(trait_name.ptr) == 1 and mt.name.len == 4 and name_is_drop_fn(mt.name.ptr) == 1
-            drop_by_value_error(p.ctx, tok_span_of(p, mt.name.ptr, mt.line), mt)
+            drop_by_value_error(p.ctx, tok_span_of(p, mt.name, mt.line), mt)
         impl_spell_self(p, mt, type_name_sv, type_params)   # AGAST #3249
         if ptr_target == 1
             impl_spell_self_ptr(mt, ptr_pointee_sv)   # AGAST #4294
@@ -1450,7 +1473,6 @@ fn impl_block_core(p: *Parser, trait_name: StrView, type_name_sv: StrView, type_
 # methods are `Span$u8_show` and its `self` is `@Span$u8`.  A generic impl
 # (`impl<T> Trait for Foo<T>`) keeps the base name; monomorph specializes it.
 pub fn impl_block_generic_new(p: *Parser, trait_name_sv: StrView, base_sv: StrView, args: *GenericArg, type_params: *TypeParam, methods: *FnDef) -> *ImplBlock
-    var base: *u8 = base_sv.ptr
     if type_params != null or args == null
         return impl_block_new(p, trait_name_sv, base_sv, type_params, args, methods)
     let name_sv: StrView = mangle_generic_args(p, base_sv, args)
@@ -1458,7 +1480,7 @@ pub fn impl_block_generic_new(p: *Parser, trait_name_sv: StrView, base_sv: StrVi
     # `Span$u8` is not in the source; locate the diagnostic at the base token
     # the user wrote (`Span`), as the pointer target does with its `*`.
     if ib.type_span.line == 0
-        impl_keyword_span(p, base, @ib.impl_span, @ib.type_span)
+        impl_spans_set(p, ib, base_sv)
     ib
 
 fn impl_spell_self(p: *Parser, mt: *FnDef, type_name_sv: StrView, type_params: *TypeParam)
@@ -1559,9 +1581,10 @@ fn impl_self_spelling(p: *Parser, type_name: StrView, type_params: *TypeParam) -
 # State: ParseCtx.generic_method_last_err
 
 fn generic_method_error(ctx: *ParseCtx, at: SrcSpan, mt: *FnDef, type_name_sv: StrView)
-    if mt.name.ptr == ctx.generic_method_last_err
+    let place: Option<SrcPos> = src_pos_of(ctx, mt.name)
+    if src_pos_same(place, ctx.generic_method_last_err)
         return
-    ctx.generic_method_last_err = mt.name.ptr
+    ctx.generic_method_last_err = place
     ctx.attr_errors = ctx.attr_errors + 1
     diag_error_at(ctx.parse_file, at)
     eprints("method '")
@@ -1599,9 +1622,10 @@ pub fn fn_is_decl(ctx: *ParseCtx, f: *FnDef) -> i32
 
 # `owner` (a generic impl's type name) may be null.
 fn decl_refused(ctx: *ParseCtx, at: SrcSpan, what: StrView, name: StrView, owner: StrView, why: StrView)
-    if name.ptr == ctx.decl_last_err
+    let place: Option<SrcPos> = src_pos_of(ctx, name)
+    if src_pos_same(place, ctx.decl_last_err)
         return
-    ctx.decl_last_err = name.ptr
+    ctx.decl_last_err = place
     ctx.attr_errors = ctx.attr_errors + 1
     diag_error_at(ctx.parse_file, at)
     eprints(what)
@@ -2276,13 +2300,13 @@ pub fn type_named(p: *Parser, name: StrView) -> *TypeRef
         return type_prim(p, TypeKind.F32)
     if name.eq("f64")
         return type_prim(p, TypeKind.F64)
-    note_type_name_at(p, name.ptr)
+    note_type_name_at(p, name)
     let t: *TypeRef = typeref_new(p, TypeKind.Struct)
     t.name = name
     t
 
 # AGAST #3932: where each type name type_named saw was written, keyed by the
-# name's pointer into the source, which the AST's type-name slots keep.
+# name's SrcPos (#4923), which the AST's type-name slots keep as views.
 # type_name_check.ritz reads it to locate "unknown type `Nope`".  An
 # alternative the parser backtracks out of (`a < b` tried as `a<b>(..)`)
 # leaves its entry behind; nothing in the AST points at it, so it is never
@@ -2291,14 +2315,16 @@ pub fn type_named(p: *Parser, name: StrView) -> *TypeRef
 
 # State: ParseCtx.type_name_at
 
-fn note_type_name_at(p: *Parser, name: *u8)
+fn note_type_name_at(p: *Parser, name: StrView)
     # The action runs just past the IDENT it names.
     if p.pos <= 0 or p.pos > p.token_count
         return
     let t: *Token = p.tokens + (p.pos - 1)
-    if t.text.ptr != name
-        return
-    note_type_name_written(p, name, t.line, t.col)
+    match src_pos_of(p.ctx, name)
+        Some(at) =>
+            if tok_starts_at(p.ctx, t, at)
+                note_type_name_written(p, t.text, t.line, t.col)
+        None => return
 
 # AGAST #4171: a struct-style variant's fields (`A` / `    x: Nope`) have no
 # StructDef for type_name_check.ritz to walk; the enum claims these notes.
@@ -2306,22 +2332,18 @@ fn note_type_name_at(p: *Parser, name: *u8)
 # the field's name, as tn_struct judges a struct's: `f: fn(i64) -> i64`
 # after `-> @&T` keeps that `T` (test_unknown_type_name.py KNOWN's `CbE`),
 # which was judged where it was written.
-fn tn_note_slot(p: *Parser, field: *u8, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    if field == null or name == null or (name as i64) <= (field as i64)
-        return
-    var c: *u8 = field
-    while (c as i64) < (name as i64)
-        if *c == 10 or *c == 0
-            return
-        c = c + 1
-    tn_note(p, name_sv)
+fn tn_note_slot(p: *Parser, field: StrView, name_sv: StrView)
+    match src_between(p.ctx, field, name_sv)
+        Some(between) =>
+            if between.len > 0 and between.find_byte('\n') == between.len
+                tn_note(p, name_sv)
+        None => return
 
 fn tn_note_fields(p: *Parser, fields: *StructField)
     var f: *StructField = fields
     while f != null
-        tn_note_slot(p, f.name.ptr, f.field_type_name)
-        tn_note_slot(p, f.name.ptr, f.array_elem_type_name)
+        tn_note_slot(p, f.name, f.field_type_name)
+        tn_note_slot(p, f.name, f.array_elem_type_name)
         f = f.next
 
 # impl_block_new: its methods see its type parameters.  A method's scope is
@@ -2347,15 +2369,23 @@ pub fn tn_notes_reset(ctx: *ParseCtx)
     ctx.tn_scopes = null
     ctx.tn_enum_params = null
 
-# Where the type name at `name` was written; null for one no source spells.
-# Linear, so asked only about a name already found unknown.
-pub fn type_name_written_at(ctx: *ParseCtx, name: *u8) -> *TypeNameAt
+# Where the type name at `name` was written, marked reported now; None for
+# one no source spells or one already reported, so each place is reported
+# once.  Linear, so asked only about a name already found unknown.
+pub fn type_name_claim(ctx: *ParseCtx, name: StrView) -> Option<*TypeNameAt>
+    var pos: SrcPos = SrcPos { off: 0 }
+    match src_pos_of(ctx, name)
+        Some(q) => pos = q
+        None => return None
     var at: *TypeNameAt = ctx.type_name_at
     while at != null
-        if at.name == name
-            return at
+        if at.at.eq(pos)
+            if at.reported == 1
+                return None
+            at.reported = 1
+            return Some(at)
         at = at.next
-    null
+    None
 
 # Capture the return type name after parsing return_type but before parsing block.
 # This prevents last_type_name from being overwritten by type_spec calls in the function body.

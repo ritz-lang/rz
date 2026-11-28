@@ -1083,6 +1083,7 @@ Search:
 | `s.find(t)` | `fn(t: StrView) -> i64` | First index of `t`, or `len` when absent (0 for an empty needle) |
 | `s.rfind(t)` | `fn(t: StrView) -> i64` | Last index of `t`, or `len` when absent |
 | `s.find_byte(c)` | `fn(c: u8) -> i64` | First index of byte `c`, or `len` when absent |
+| `s.offset_of(v)` | `fn(v: StrView) -> Option<i64>` | Where view `v` starts inside `s` (`0..=len`), or `None` when `v` is not a view into `s`: a position, not a search (equal bytes elsewhere don't count) |
 
 The constructors stay free functions: they have no method form (LARB R66).
 

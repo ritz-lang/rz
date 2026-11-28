@@ -6,6 +6,7 @@
 import tokens_gen
 import ritzlib.gvec     # ParseCtx's twin tables (AGAST #4609)
 import ritzlib.option   # TypeKind.from (type_kind_of)
+import ritzlib.strview  # StrView.offset_of (src_pos_of)
 
 # Expression kinds
 pub enum ExprKind: i32
@@ -341,6 +342,134 @@ pub fn op_is_bitwise(op: OpKind) -> bool
 struct SrcSpan
   line: i32
   col: i32
+
+# AGAST #4923: where a byte is in the compile's sources, as a value.  Each
+# source the lexer reads is registered (src_register) at the next free run
+# of positions, as rustc's SourceMap gives each file a BytePos range, so two
+# positions compare as numbers across files: equal is the same byte, and in
+# one source a smaller one was written first.  ritz1 used a `*u8` into the
+# source for this, which said nothing of what it was.
+struct SrcPos
+    off: i64
+
+impl SrcPos
+    pub fn eq(self: SrcPos, other: SrcPos) -> bool
+        self.off == other.off
+
+# A registered source: its text and the position of its first byte.
+struct SrcText
+    text: StrView
+    base: i64
+
+# AGAST #4923: an item's ATTR_* bits (item_attr_record).  Keyed by the item,
+# not by where it is written: a monomorph clone shares its template's place
+# and gets its bits by its own record (fn_copy_instance_attrs).
+struct FnAttrs
+    f: *FnDef
+    bits: i32
+
+struct StructAttrs
+    st: *StructDef
+    bits: i32
+
+# Register `text`, a source the lexer reads, so views into it have positions.
+# A text already registered (the driver re-parses the main file) keeps its
+# range.  Positions start at 1 and a gap follows each source, so no two
+# sources' ranges touch: an empty view at one's end is not the next's start.
+pub fn src_register(ctx: *ParseCtx, text: StrView)
+    var i: i64 = 0
+    while i < ctx.src_texts.len
+        let s: SrcText = ctx.src_texts.get(i)
+        if s.text.len == text.len and s.text.offset_of(text).unwrap_or(0 - 1) == 0
+            return
+        i += 1
+    ctx.src_texts.push(SrcText { text: text, base: ctx.src_end + 1 })
+    ctx.src_end = ctx.src_end + 1 + text.len
+
+# The registered source `v` is a view into, newest first: memory a freed
+# text held can hold a later one, and a view is into the later.  None for a
+# name the compiler built.
+fn src_text_of(ctx: *ParseCtx, v: StrView) -> Option<SrcText>
+    var i: i64 = ctx.src_texts.len
+    while i > 0
+        i -= 1
+        let s: SrcText = ctx.src_texts.get(i)
+        if s.text.offset_of(v).is_some()
+            return Some(s)
+    None
+
+# The registered source that holds position `pos`.  Bases rise in
+# registration order, so it is a binary search.
+fn src_text_at(ctx: *ParseCtx, pos: SrcPos) -> Option<SrcText>
+    var lo: i64 = 0
+    var hi: i64 = ctx.src_texts.len
+    while lo < hi
+        let mid: i64 = (lo + hi) / 2
+        if ctx.src_texts.get(mid).base <= pos.off
+            lo = mid + 1
+        else
+            hi = mid
+    if lo == 0
+        return None
+    let s: SrcText = ctx.src_texts.get(lo - 1)
+    if pos.off > s.base + s.text.len
+        return None
+    Some(s)
+
+# Where view `v` starts, or None for one no registered source holds.
+pub fn src_pos_of(ctx: *ParseCtx, v: StrView) -> Option<SrcPos>
+    match src_text_of(ctx, v)
+        Some(s) =>
+            match s.text.offset_of(v)
+                Some(off) => return Some(SrcPos { off: s.base + off })
+                None => pass
+        None => pass
+    None
+
+# True when both are positions and the same one.
+pub fn src_pos_same(a: Option<SrcPos>, b: Option<SrcPos>) -> bool
+    match a
+        Some(x) =>
+            match b
+                Some(y) => x.eq(y)
+                None => false
+        None => false
+
+# True when `at`, where an action that reports once per place runs, is past
+# `last`, the furthest place it reported: the parser backtracks only to
+# earlier tokens of the same source.  A place no source holds is reported.
+pub fn src_pos_after(at: Option<SrcPos>, last: Option<SrcPos>) -> bool
+    match at
+        Some(pos) =>
+            match last
+                Some(l) => pos.off > l.off
+                None => true
+        None => true
+
+# True when token `t` starts at `pos`.  Looked for in `pos`'s own source,
+# so a scan over a parse's tokens costs no search of the others.
+pub fn tok_starts_at(ctx: *ParseCtx, t: *Token, pos: SrcPos) -> bool
+    match src_text_at(ctx, pos)
+        Some(s) =>
+            match s.text.offset_of(t.text)
+                Some(off) => return s.base + off == pos.off
+                None => pass
+        None => pass
+    false
+
+# The source text from where `a` starts to where `b` starts, when `b` is in
+# the same source as `a` and not before it; None otherwise.
+pub fn src_between(ctx: *ParseCtx, a: StrView, b: StrView) -> Option<StrView>
+    match src_text_of(ctx, a)
+        Some(s) =>
+            let from: i64 = s.text.offset_of(a).unwrap_or(0)   # `a` is in `s`
+            match s.text.offset_of(b)
+                Some(to) =>
+                    if to >= from
+                        return Some(s.text.slice(from, to))
+                None => pass
+        None => pass
+    None
 
 # AGAST #109: a destructure's third and later names, `c, d` of
 # `let (a, b, c, d) = e`, in order (Stmt.tuple_more).  `_` binds nothing.
@@ -1300,14 +1429,13 @@ struct ParseCtx
     attr_target_os: u64
     attr_target_arch: u64
     attr_errors: i32
-    attr_last_err: *u8
-    item_attrs: *i64
-    item_attr_count: i64
-    item_attr_cap: i64
-    index_impl_last_err: *u8
-    generic_method_last_err: *u8
+    attr_last_err: Option<SrcPos>
+    fn_attrs: Vec<FnAttrs>          # AGAST #4923: typed, not `*u8`-keyed
+    struct_attrs: Vec<StructAttrs>
+    index_impl_last_err: Option<SrcPos>
+    generic_method_last_err: Option<SrcPos>
     stripped_body: Stmt
-    decl_last_err: *u8
+    decl_last_err: Option<SrcPos>
     trait_names: *StrView
     trait_files: *StrView
     trait_count: i32
@@ -1331,8 +1459,8 @@ struct ParseCtx
     nd_reject_col: i32
     lit_len_line: i32
     lit_len_col: i32
-    dyn_last: *u8
-    closure_last: *u8
+    dyn_last: Option<SrcPos>
+    closure_last: Option<SrcPos>
     array_len_pending: i32
     array_len_reparse: i32
     array_len_seed: *ConstEntry
@@ -1354,7 +1482,7 @@ struct ParseCtx
     tuple_ret_slot: *StructDef
     tuple_p: *Parser   # tuple_resolve_module's, for the AST built here
     tuple_split_n: i32   # numbers the arm-index locals, unique per compile
-    asm_last_block: *u8
+    asm_last_block: Option<SrcPos>
     pass_bound: i32
     open_if_end: i32
     named_forms: *NamedForm
@@ -1364,13 +1492,19 @@ struct ParseCtx
     twin_renames: Vec<TwinRename>
     variant_views: Vec<VariantView>
     variant_site: StrView
+    # AGAST #4923: the sources lexed so far (src_register), so a view into
+    # one has a SrcPos; in registration order, so by position too.
+    src_texts: Vec<SrcText>
+    src_end: i64
+    # named_variants.ritz: the forms already reported.
+    nv_seen: Vec<SrcPos>
 
 # AGAST #4609 (type_twins.ritz): the twin `name`, renamed `new_name` in the
-# module whose VisMod key is `seer` (one pointer per module).
+# module whose VisMod key is `seer`.
 struct TwinRename
     name: StrView
     new_name: StrView
-    seer: *u8
+    seer: StrView
 
 # AGAST #4609 (enum_of_variant_unique): does the file `site` (a fn's
 # diag_fn_source_file) see the enum `e`?
@@ -1380,7 +1514,7 @@ struct VariantView
     seen: i32
 
 struct TypeNameAt
-    name: *u8
+    at: SrcPos   # where the name starts
     line: i32
     col: i32
     file: StrView

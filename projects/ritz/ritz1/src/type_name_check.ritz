@@ -12,7 +12,7 @@
 # the merged module (an import counts), an alias, a primitive, a SIMD vector,
 # a built-in (`StrView`, `Span`, `Option`, `Result`), `Self` and `void`.
 #
-# Only a name the source spells is judged: type_name_written_at locates it
+# Only a name the source spells is judged: type_name_claim locates it
 # (ast_helpers.ritz records each one type_named sees).  A name the compiler
 # builds, such as a generic instance's `Vec$u8`, has no entry.  Each written
 # name is reported once.
@@ -80,27 +80,26 @@ fn tn_known(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> i32
 
 const TN_SCAN_MAX: i64 = 4096
 
-# 1 when `ty` is written after `decl` in the same source: on its line if
-# `same_line`, else within TN_SCAN_MAX bytes.  Never reads past the source's NUL.
-fn tn_written_after(decl: *u8, ty: *u8, same_line: i32) -> i32
-    if decl == null
-        return 0
-    var i: i64 = 0
-    while i < TN_SCAN_MAX
-        if decl + i == ty
-            return 1
-        let c: u8 = *(decl + i)
-        if c == 0 or (same_line == 1 and c == 10)
-            return 0
-        i += 1
-    0
+# True when `ty` is written after `decl` in the same source: on its line if
+# `same_line`, else within TN_SCAN_MAX bytes.  Positions in one registered
+# source (src_between), so it reads only that source's bytes.
+fn tn_written_after(ctx: *ParseCtx, decl: StrView, ty: StrView, same_line: bool) -> bool
+    match src_between(ctx, decl, ty)
+        Some(between) =>
+            if between.len >= TN_SCAN_MAX
+                return false
+            if same_line and between.find_byte('\n') < between.len
+                return false
+            return true
+        None => pass
+    false
 
 # 1 if the type name at `name`, written after `decl` (tn_written_after), is
 # unknown; reported at the name.
-fn tn_judge(ctx: *ParseCtx, m: *Module, decl: *u8, same_line: i32, name: StrView) -> i32
+fn tn_judge(ctx: *ParseCtx, m: *Module, decl: StrView, same_line: bool, name: StrView) -> i32
     if name.ptr == null or name.len <= 0
         return 0
-    if tn_written_after(decl, name.ptr, same_line) == 0
+    if not tn_written_after(ctx, decl, name, same_line)
         return 0
     tn_judge_written(ctx, m, name)
 
@@ -108,15 +107,15 @@ fn tn_judge(ctx: *ParseCtx, m: *Module, decl: *u8, same_line: i32, name: StrView
 fn tn_judge_written(ctx: *ParseCtx, m: *Module, name: StrView) -> i32
     if tn_known(ctx, m, name) == 1
         return 0
-    let at: *TypeNameAt = type_name_written_at(ctx, name.ptr)
-    if at == null or at.reported == 1
-        return 0
-    at.reported = 1
-    diag_error_at(at.file, diag_span(at.line, at.col))
-    eprints("unknown type `")
-    sys_write(2, name.ptr, name.len)
-    eprints("`\n")
-    1
+    match type_name_claim(ctx, name)
+        Some(at) =>
+            diag_error_at(at.file, diag_span(at.line, at.col))
+            eprints("unknown type `")
+            sys_write(2, name.ptr, name.len)
+            eprints("`\n")
+            return 1
+        None => pass
+    0
 
 fn tn_arms(ctx: *ParseCtx, m: *Module, arms: *MatchArm) -> i32
     var errors: i32 = 0
@@ -142,7 +141,7 @@ fn tn_stmts(ctx: *ParseCtx, m: *Module, first: *Stmt) -> i32
         match s.kind
             StmtKind.VarDecl =>
                 if s.var_declared_type != TypeKind.Void
-                    errors = errors + tn_judge(ctx, m, s.var_name.ptr, 1, s.var_type_name)
+                    errors = errors + tn_judge(ctx, m, s.var_name, true, s.var_type_name)
                 errors = errors + tn_expr(ctx, m, s.var_init)
             StmtKind.For =>
                 errors = errors + tn_stmts(ctx, m, s.for_body)
@@ -169,10 +168,10 @@ fn tn_stmts(ctx: *ParseCtx, m: *Module, first: *Stmt) -> i32
 
 fn tn_fn(ctx: *ParseCtx, m: *Module, f: *FnDef) -> i32
     g_tn_inner = f.type_params
-    var errors: i32 = tn_judge(ctx, m, f.name.ptr, 0, f.return_type_name)
+    var errors: i32 = tn_judge(ctx, m, f.name, false, f.return_type_name)
     var p: *Param = f.params
     while p != null
-        errors = errors + tn_judge(ctx, m, p.name.ptr, 1, p.param_type_name)
+        errors = errors + tn_judge(ctx, m, p.name, true, p.param_type_name)
         p = p.next
     errors = errors + tn_stmts(ctx, m, f.body)
     g_tn_inner = null
@@ -183,16 +182,16 @@ fn tn_struct(ctx: *ParseCtx, m: *Module, st: *StructDef) -> i32
     var errors: i32 = 0
     var f: *StructField = st.fields
     while f != null
-        errors = errors + tn_judge(ctx, m, f.name.ptr, 1, f.field_type_name)
-        errors = errors + tn_judge(ctx, m, f.name.ptr, 1, f.array_elem_type_name)
+        errors = errors + tn_judge(ctx, m, f.name, true, f.field_type_name)
+        errors = errors + tn_judge(ctx, m, f.name, true, f.array_elem_type_name)
         f = f.next
     g_tn_inner = null
     errors
 
 fn tn_global(ctx: *ParseCtx, m: *Module, g: *GlobalVarDef) -> i32
-    var errors: i32 = tn_judge(ctx, m, g.name.ptr, 1, g.type_name)
-    errors = errors + tn_judge(ctx, m, g.name.ptr, 1, g.pointee_type_name)
-    errors + tn_judge(ctx, m, g.name.ptr, 1, g.array_elem_type_name)
+    var errors: i32 = tn_judge(ctx, m, g.name, true, g.type_name)
+    errors = errors + tn_judge(ctx, m, g.name, true, g.pointee_type_name)
+    errors + tn_judge(ctx, m, g.name, true, g.array_elem_type_name)
 
 # The names the parser noted (AGAST #4021), each in its item's scope.
 fn tn_notes(ctx: *ParseCtx, m: *Module) -> i32

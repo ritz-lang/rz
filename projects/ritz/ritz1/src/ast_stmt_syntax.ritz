@@ -247,12 +247,12 @@ fn asm_scan_line(p: *Parser, b: *AsmBlock, l: *AsmLine, report: i32)
 
 # Grammar action for an asm block (LANGUAGE_SPEC §18.6, AGAST #3394).
 pub fn stmt_asm(p: *Parser, arch_sv: StrView, aline: i32, acol: i32, clauses: *AsmOperand, lines: *AsmLine, line: i32, col: i32) -> *Stmt
-    var arch: *u8 = arch_sv.ptr
     # A block the parser backtracked over and builds again is not re-reported.
     var report: i32 = 0
-    if p.ctx.asm_last_block == null or (arch as i64) > (p.ctx.asm_last_block as i64)
+    let at: Option<SrcPos> = src_pos_of(p.ctx, arch_sv)
+    if src_pos_after(at, p.ctx.asm_last_block)
         report = 1
-        p.ctx.asm_last_block = arch
+        p.ctx.asm_last_block = at
     let b: *AsmBlock = parser_alloc(p, sizeof(AsmBlock)) as *AsmBlock
     b.arch = arch_sv
     b.lines = lines
@@ -483,27 +483,17 @@ pub fn stmt_assign_deref(p: *Parser, target: *Expr, val: *Expr, line: i32, col: 
 
 # Where the token after the one starting at `at` is: the `[` of `h.t[k] = v`
 # after its field name (AGAST #2847).  Line 0 when it isn't found.
-fn tok_span_after(p: *Parser, at: *u8, out: *SrcSpan)
-    out.line = 0
-    out.col = 0
-    var i: i32 = p.pos
-    if i >= p.token_count
-        i = p.token_count - 1
-    var n: i32 = 0
-    while i >= 0 and n < 512
-        let t: *Token = p.tokens + i
-        if t.text.ptr == at
+fn tok_span_after(p: *Parser, at: StrView) -> SrcSpan
+    match tok_index_back(p, at)
+        Some(i) =>
             if i + 1 < p.token_count
                 let after: *Token = p.tokens + i + 1
-                out.line = after.line
-                out.col = after.col
-            return
-        i -= 1
-        n += 1
+                return diag_span(after.line, after.col)
+            diag_span(0, 0)
+        None => diag_span(0, 0)
 
 # Member assignment through pointer: ptr.field = value
 pub fn stmt_assign_member(p: *Parser, ptr_expr: *Expr, field_sv: StrView, val: *Expr, line: i32, col: i32) -> *Stmt
-    var field: *u8 = field_sv.ptr
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = StmtKind.MemberAssign
     s.span.line = line
@@ -512,7 +502,7 @@ pub fn stmt_assign_member(p: *Parser, ptr_expr: *Expr, field_sv: StrView, val: *
     s.if_cond = ptr_expr
     # Store field name in assign_target
     s.assign_target = field_sv
-    tok_span_back(p, field, @s.bracket)   # AGAST #3015
+    s.bracket = tok_span_back(p, field_sv)   # AGAST #3015
     # Store value in assign_value
     s.assign_value = val
     s.next = null
@@ -520,7 +510,6 @@ pub fn stmt_assign_member(p: *Parser, ptr_expr: *Expr, field_sv: StrView, val: *
 
 # Indexed member assignment through pointer: ptr.field[index] = value
 pub fn stmt_assign_member_index(p: *Parser, ptr_expr: *Expr, field_sv: StrView, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
-    var field: *u8 = field_sv.ptr
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = StmtKind.MemberIndexAssign
     s.span.line = line
@@ -529,8 +518,8 @@ pub fn stmt_assign_member_index(p: *Parser, ptr_expr: *Expr, field_sv: StrView, 
     s.if_cond = ptr_expr
     # Store field name in assign_target
     s.assign_target = field_sv
-    tok_span_back(p, field, @s.bracket)   # AGAST #3015
-    tok_span_after(p, field, @s.index_at)   # AGAST #2847
+    s.bracket = tok_span_back(p, field_sv)   # AGAST #3015
+    s.index_at = tok_span_after(p, field_sv)   # AGAST #2847
     # Store index expression in while_cond (reuse)
     s.while_cond = idx
     # Store value in assign_value
@@ -556,7 +545,6 @@ pub fn stmt_assign_expr(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i
 
 # Local struct field assignment: var.field = value
 pub fn stmt_assign_local_field(p: *Parser, var_name_sv: StrView, field_sv: StrView, val: *Expr, line: i32, col: i32) -> *Stmt
-    var field: *u8 = field_sv.ptr
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = StmtKind.LocalFieldAssign
     s.span.line = line
@@ -565,7 +553,7 @@ pub fn stmt_assign_local_field(p: *Parser, var_name_sv: StrView, field_sv: StrVi
     s.var_name = var_name_sv
     # Store field name in assign_target/assign_target_len
     s.assign_target = field_sv
-    tok_span_back(p, field, @s.bracket)   # AGAST #3015
+    s.bracket = tok_span_back(p, field_sv)   # AGAST #3015
     # Store value in assign_value
     s.assign_value = val
     s.next = null
@@ -573,7 +561,6 @@ pub fn stmt_assign_local_field(p: *Parser, var_name_sv: StrView, field_sv: StrVi
 
 # Local struct field array assignment: var.field[index] = value
 pub fn stmt_assign_local_field_index(p: *Parser, var_name_sv: StrView, field_sv: StrView, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
-    var field: *u8 = field_sv.ptr
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = StmtKind.LocalFieldIndexAssign
     s.span.line = line
@@ -582,8 +569,8 @@ pub fn stmt_assign_local_field_index(p: *Parser, var_name_sv: StrView, field_sv:
     s.var_name = var_name_sv
     # Store field name in assign_target/assign_target_len
     s.assign_target = field_sv
-    tok_span_back(p, field, @s.bracket)   # AGAST #3015
-    tok_span_after(p, field, @s.index_at)   # AGAST #2847
+    s.bracket = tok_span_back(p, field_sv)   # AGAST #3015
+    s.index_at = tok_span_after(p, field_sv)   # AGAST #2847
     # Store index expression in while_cond (reuse)
     s.while_cond = idx
     # Store value in assign_value
@@ -681,7 +668,6 @@ pub fn stmt_compound_assign_deref(p: *Parser, target: *Expr, op: OpKind, val: *E
 # synthesizes is at the `*` (star_line, star_col), where ritz0 places that
 # binary's left operand and so reports a value narrowed into it (AGAST #4288).
 pub fn stmt_compound_assign_member(p: *Parser, ptr_expr: *Expr, field_sv: StrView, op: OpKind, val: *Expr, line: i32, col: i32, star_line: i32, star_col: i32) -> *Stmt
-    var field: *u8 = field_sv.ptr
     # Create deref expression: *ptr
     let deref: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     deref.kind = ExprKind.Unary
@@ -697,7 +683,7 @@ pub fn stmt_compound_assign_member(p: *Parser, ptr_expr: *Expr, field_sv: StrVie
     member.span.col = star_col
     member.left = deref
     member.ident = field_sv
-    tok_span_back(p, field, @member.bracket)   # AGAST #3015
+    member.bracket = tok_span_back(p, field_sv)   # AGAST #3015
     member.next = null
     # Create binary expression: (*ptr).field op val
     let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
@@ -715,7 +701,6 @@ pub fn stmt_compound_assign_member(p: *Parser, ptr_expr: *Expr, field_sv: StrVie
 # Compound assignment for indexed member: (*ptr).field[idx] op= val
 # Synthesized at the `*`, as stmt_compound_assign_member is.
 pub fn stmt_compound_assign_member_index(p: *Parser, ptr_expr: *Expr, field_sv: StrView, idx: *Expr, op: OpKind, val: *Expr, line: i32, col: i32, star_line: i32, star_col: i32) -> *Stmt
-    var field: *u8 = field_sv.ptr
     # Create deref expression: *ptr
     let deref: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     deref.kind = ExprKind.Unary
@@ -731,7 +716,7 @@ pub fn stmt_compound_assign_member_index(p: *Parser, ptr_expr: *Expr, field_sv: 
     member.span.col = star_col
     member.left = deref
     member.ident = field_sv
-    tok_span_back(p, field, @member.bracket)   # AGAST #3015
+    member.bracket = tok_span_back(p, field_sv)   # AGAST #3015
     member.next = null
     # Create index expression: (*ptr).field[idx]
     let indexed: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
@@ -757,7 +742,6 @@ pub fn stmt_compound_assign_member_index(p: *Parser, ptr_expr: *Expr, field_sv: 
 
 # Compound assignment for local field: var.field op= val
 pub fn stmt_compound_assign_local_field(p: *Parser, var_name_sv: StrView, field_sv: StrView, op: OpKind, val: *Expr, line: i32, col: i32) -> *Stmt
-    var field: *u8 = field_sv.ptr
     # Create identifier for variable
     let ident: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     ident.kind = ExprKind.Ident
@@ -772,7 +756,7 @@ pub fn stmt_compound_assign_local_field(p: *Parser, var_name_sv: StrView, field_
     member.span.col = col
     member.left = ident
     member.ident = field_sv
-    tok_span_back(p, field, @member.bracket)   # AGAST #3015
+    member.bracket = tok_span_back(p, field_sv)   # AGAST #3015
     member.next = null
     # Create binary: var.field op val
     let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
@@ -789,7 +773,6 @@ pub fn stmt_compound_assign_local_field(p: *Parser, var_name_sv: StrView, field_
 
 # Compound assignment for local field index: var.field[idx] op= val
 pub fn stmt_compound_assign_local_field_index(p: *Parser, var_name_sv: StrView, field_sv: StrView, idx: *Expr, op: OpKind, val: *Expr, line: i32, col: i32) -> *Stmt
-    var field: *u8 = field_sv.ptr
     # Create identifier for variable
     let ident: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     ident.kind = ExprKind.Ident
@@ -804,7 +787,7 @@ pub fn stmt_compound_assign_local_field_index(p: *Parser, var_name_sv: StrView, 
     member.span.col = col
     member.left = ident
     member.ident = field_sv
-    tok_span_back(p, field, @member.bracket)   # AGAST #3015
+    member.bracket = tok_span_back(p, field_sv)   # AGAST #3015
     member.next = null
     # Create index expression: var.field[idx]
     let indexed: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr

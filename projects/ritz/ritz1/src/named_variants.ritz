@@ -38,61 +38,51 @@ import diag
 import ast_query   # name_eq & co., off emitter_core (AGAST #3513)
 import ritzlib.strview
 
-# Positions already reported: a form the parser tried more than once is noted
-# once per try.
-var g_nv_seen: **u8 = null
-var g_nv_seen_count: i32 = 0
-var g_nv_seen_cap: i32 = 0
+# True the first time the form `f` is reported: the parser notes a form it
+# tried more than once once per try, each at its name's place.  The places
+# reported: ParseCtx.nv_seen.  A name no source holds is always reported.
+fn nv_first_report(ctx: *ParseCtx, f: *NamedForm) -> bool
+    var at: SrcPos = SrcPos { off: 0 }
+    match src_pos_of(ctx, f.name)
+        Some(q) => at = q
+        None => return true
+    for i in 0..ctx.nv_seen.len
+        if ctx.nv_seen.get(i).eq(at)
+            return false
+    ctx.nv_seen.push(at)
+    true
 
-# 1 the first time the form beginning at `at` is reported.
-fn nv_first_report(at: *u8) -> i32
-    for i in 0..g_nv_seen_count
-        if *(g_nv_seen + i) == at
-            return 0
-    if g_nv_seen_count == g_nv_seen_cap
-        var cap: i32 = g_nv_seen_cap * 2
-        if cap == 0
-            cap = 16
-        g_nv_seen = realloc(g_nv_seen as *u8, (cap as i64) * 8) as **u8
-        g_nv_seen_cap = cap
-    *(g_nv_seen + g_nv_seen_count) = at
-    g_nv_seen_count = g_nv_seen_count + 1
-    1
-
-# `<file>:<line>:<col>: error: ` for form `f`, or 0 if it was reported.
-fn nv_error_begin(f: *NamedForm) -> i32
-    if nv_first_report(f.name.ptr) == 0
-        return 0
+# `<file>:<line>:<col>: error: ` for form `f`; false if it was reported.
+fn nv_error_begin(ctx: *ParseCtx, f: *NamedForm) -> bool
+    if not nv_first_report(ctx, f)
+        return false
     diag_error_at(f.file, f.span)
-    1
+    true
 
-fn nv_no_named_fields(f: *NamedForm)
-    if nv_error_begin(f) == 1
+fn nv_no_named_fields(ctx: *ParseCtx, f: *NamedForm)
+    if nv_error_begin(ctx, f)
         eprints("variant `")
         eprint_bytes(f.name)
         eprints("` has no named fields\n")
 
-fn nv_no_such_field(f: *NamedForm, field_sv: StrView)
-    var field: *u8 = field_sv.ptr
-    if nv_error_begin(f) == 1
+fn nv_no_such_field(ctx: *ParseCtx, f: *NamedForm, field_sv: StrView)
+    if nv_error_begin(ctx, f)
         eprints("variant `")
         eprint_bytes(f.name)
         eprints("` has no field `")
         eprint_bytes(field_sv)
         eprints("`\n")
 
-fn nv_named_twice(f: *NamedForm, field_sv: StrView)
-    var field: *u8 = field_sv.ptr
-    if nv_error_begin(f) == 1
+fn nv_named_twice(ctx: *ParseCtx, f: *NamedForm, field_sv: StrView)
+    if nv_error_begin(ctx, f)
         eprints("field `")
         eprint_bytes(field_sv)
         eprints("` of variant `")
         eprint_bytes(f.name)
         eprints("` named twice\n")
 
-fn nv_missing(f: *NamedForm, field_sv: StrView)
-    var field: *u8 = field_sv.ptr
-    if nv_error_begin(f) == 1
+fn nv_missing(ctx: *ParseCtx, f: *NamedForm, field_sv: StrView)
+    if nv_error_begin(ctx, f)
         eprints("missing field `")
         eprint_bytes(field_sv)
         eprints("` of variant `")
@@ -135,7 +125,7 @@ fn nv_is_struct(m: *Module, f: *NamedForm) -> i32
 # error reported.
 fn nv_order(ctx: *ParseCtx, f: *NamedForm, ei: i32, vi: i32, wn: *StrView, nw: i32, order: *i32) -> i32
     if enum_variant_kind(ctx, ei, vi) != ENUM_VARIANT_STRUCT
-        nv_no_named_fields(f)
+        nv_no_named_fields(ctx, f)
         return 1
     let fields: *StructField = enum_variant_fields(ctx, ei, vi)
     for i in 0..nw
@@ -146,11 +136,11 @@ fn nv_order(ctx: *ParseCtx, f: *NamedForm, ei: i32, vi: i32, wn: *StrView, nw: i
                 known = 1
             fd = fd.next
         if known == 0
-            nv_no_such_field(f, *(wn + i))
+            nv_no_such_field(ctx, f, *(wn + i))
             return 1
         for j in 0..i
             if name_eq(*(wn + j), *(wn + i)) == 1
-                nv_named_twice(f, *(wn + i))
+                nv_named_twice(ctx, f, *(wn + i))
                 return 1
     var k: i32 = 0
     var fd: *StructField = fields
@@ -160,7 +150,7 @@ fn nv_order(ctx: *ParseCtx, f: *NamedForm, ei: i32, vi: i32, wn: *StrView, nw: i
             if name_eq(fd.name, *(wn + i)) == 1
                 at = i
         if at < 0
-            nv_missing(f, fd.name)
+            nv_missing(ctx, f, fd.name)
             return 1
         *(order + k) = at
         k = k + 1
@@ -258,9 +248,7 @@ fn nv_literal_as_written(f: *NamedForm)
 fn nv_literal(ctx: *ParseCtx, f: *NamedForm, ei: i32, vi: i32) -> i32
     let e: *Expr = f.lit
     # Its name is the variant's: not an unknown type, whatever comes of it.
-    let at: *TypeNameAt = type_name_written_at(ctx, f.name.ptr)
-    if at != null
-        at.reported = 1
+    type_name_claim(ctx, f.name)
     var nw: i32 = 0
     var fi: *FieldInit = e.args as *FieldInit
     while fi != null

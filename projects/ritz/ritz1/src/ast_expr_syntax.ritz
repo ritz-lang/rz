@@ -1003,9 +1003,16 @@ pub fn type_facts(p: *Parser, tr: *TypeRef) -> *TypeFacts
     f.fn_sig = tr_chain_fn_sig(tr)
     f
 
-pub fn note_type_name_written(p: *Parser, name: *u8, line: i32, col: i32)
+# Note the type name `name`, a view into the source written at line:col.  A
+# name no source holds (a twin's rename) has no SrcPos and is not noted:
+# nothing could look it up.
+pub fn note_type_name_written(p: *Parser, name: StrView, line: i32, col: i32)
+    var pos: SrcPos = SrcPos { off: 0 }
+    match src_pos_of(p.ctx, name)
+        Some(q) => pos = q
+        None => return
     let at: *TypeNameAt = parser_alloc(p, sizeof(TypeNameAt)) as *TypeNameAt
-    at.name = name
+    at.at = pos
     at.line = line
     at.col = col
     at.file = parse_file_copy_shared(p)
@@ -1061,7 +1068,7 @@ pub fn tn_note_last(p: *Parser, back: i32)
 pub fn tn_note_tok(p: *Parser, tok: Token)
     if p.skip_item != 0 or tok.kind != TOK_IDENT
         return
-    note_type_name_written(p, tok.text.ptr, tok.line, tok.col)
+    note_type_name_written(p, tok.text, tok.line, tok.col)
     tn_note(p, tok.text)
 
 # AGAST #4171: a generic call's full argument list `g<i32, *Nope>(3)`.  Each
@@ -1452,17 +1459,21 @@ pub fn mangle_generic_args(p: *Parser, base_name: StrView, ga: *GenericArg) -> S
 # token and note it for type_name_check.ritz, which knows a generic struct
 # or enum template by its base name.  `[T]`'s builtin "Span" is no token.
 fn tn_note_base(p: *Parser, name_sv: StrView)
-    if p.skip_item != 0 or name_sv.ptr == null
+    if p.skip_item != 0
         return
+    var pos: SrcPos = SrcPos { off: 0 }
+    match src_pos_of(p.ctx, name_sv)
+        Some(q) => pos = q
+        None => return
     var i: i32 = p.pos - 1
     if i >= p.token_count
         i = p.token_count - 1
     let stop: i32 = i - 512   # the base precedes only its own `<...>`
     while i >= 0 and i > stop
         let t: *Token = p.tokens + i
-        if t.text.ptr == name_sv.ptr
+        if tok_starts_at(p.ctx, t, pos)
             if t.kind == TOK_IDENT
-                note_type_name_written(p, t.text.ptr, t.line, t.col)
+                note_type_name_written(p, t.text, t.line, t.col)
                 tn_note(p, name_sv)
             return
         i = i - 1
@@ -1519,21 +1530,30 @@ fn generic_use_note_mangled(ctx: *ParseCtx, mangled: StrView, args: *GenericArg,
 
 # AGAST #3015: where the token starting at `at` is, from the last few tokens
 # before the parser's position (a field name just parsed); 0:0 if not there.
-pub fn tok_span_back(p: *Parser, at: *u8, out: *SrcSpan)
-    out.line = 0
-    out.col = 0
+pub fn tok_span_back(p: *Parser, at: StrView) -> SrcSpan
+    match tok_index_back(p, at)
+        Some(i) =>
+            let t: *Token = p.tokens + i
+            diag_span(t.line, t.col)
+        None => diag_span(0, 0)
+
+# The token starting at `at` nearest p.pos, at or before it and within 512
+# tokens: the window tok_span_back and tok_span_after search.
+pub fn tok_index_back(p: *Parser, at: StrView) -> Option<i32>
+    var pos: SrcPos = SrcPos { off: 0 }
+    match src_pos_of(p.ctx, at)
+        Some(q) => pos = q
+        None => return None
     var i: i32 = p.pos
     if i >= p.token_count
         i = p.token_count - 1
     var n: i32 = 0
     while i >= 0 and n < 512
-        let t: *Token = p.tokens + i
-        if t.text.ptr == at
-            out.line = t.line
-            out.col = t.col
-            return
+        if tok_starts_at(p.ctx, p.tokens + i, pos)
+            return Some(i)
         i -= 1
         n += 1
+    None
 
 pub fn stmt_expr(p: *Parser, e: *Expr, line: i32, col: i32) -> *Stmt
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
@@ -2253,11 +2273,10 @@ pub fn postfix_index(p: *Parser, index: *Expr, line: i32, col: i32) -> *PostfixO
     return op
 
 pub fn postfix_member(p: *Parser, name_sv: StrView) -> *PostfixOp
-    var name: *u8 = name_sv.ptr
     let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
     op.kind = POSTFIX_MEMBER
     op.member_name = name_sv
-    tok_span_back(p, name, @op.bracket)   # AGAST #3015: the field name's place
+    op.bracket = tok_span_back(p, name_sv)   # AGAST #3015: the field name's place
     op.next = null
     return op
 
@@ -2412,7 +2431,7 @@ fn struct_lit_expr(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
     # nothing, at the name.  An unannotated `let a = Nope { .. }` compiled to
     # an uninitialised alloca.  A token, not the action's p.pos: the
     # literal's fields have been parsed since its name.
-    note_type_name_written(p, tok.text.ptr, tok.line, tok.col)
+    note_type_name_written(p, tok.text, tok.line, tok.col)
     tn_note(p, tok.text)
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = ExprKind.StructLit
